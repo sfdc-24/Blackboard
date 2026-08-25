@@ -1,1 +1,2 @@
 # Blackboard
+Project initialized
