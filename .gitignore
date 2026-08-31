@@ -4,6 +4,18 @@ logs/
 # Env
 .env
 .env.*
+# Credential-bearing one-shot clients -- see Issue Journal REQ-M6HZK4.
+# These four scripts and the helper below hardcode the live BUS_SECRET in
+# cleartext. They are untracked today; without these lines a single
+# `git add -A` would commit the secret into history permanently, and git
+# history cannot be swapped the way a Doc can. Ignoring them is a guard,
+# NOT the fix -- the values still need scrubbing or the files deleting,
+# and that is Mr. Salam's call under REQ-M6HZK4.
+establish_inbox.py
+onboard_gemini.py
+send_dispatch.py
+send_chatgpt_drill.py
+projects/sfdc24-bus-helper/
 # OS / Editor
 .DS_Store
 Thumbs.db
