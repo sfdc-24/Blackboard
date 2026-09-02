@@ -29,8 +29,15 @@ RULES THIS SCRIPT DOES NOT RELAX
   ISSUE 006: put timestamps in the form "2026-08-26 3:00 PM EDT" (EDT suffix).
 #>
 param(
+  # 'upload' here is a DEPLOY PROBE, not a working uploader -- this client cannot
+  # carry file bytes. Run `bus.ps1 -Action upload` with no other arguments after
+  # redeploying Code.gs: "Unknown action: upload" means the live URL is still on
+  # the old version (DEPLOY.md section 5 -- saving the editor does NOT redeploy,
+  # and "New deployment" mints a DIFFERENT URL). Once the action is live the same
+  # probe answers "base64 content required", which is the deploy landing.
+  # The real uploader is scripts/glasses_capture.py --upload bus.
   [Parameter(Mandatory = $true)]
-  [ValidateSet('ping', 'time', 'read', 'append', 'replace', 'list')]
+  [ValidateSet('ping', 'time', 'read', 'append', 'replace', 'list', 'upload')]
   [string]$Action,
   [string]$Title,
   [string]$FileId,

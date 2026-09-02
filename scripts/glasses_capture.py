@@ -150,15 +150,24 @@ def write_jpeg(frame, path: Path, quality: int) -> int:
 
 
 def upload_via_bus(path: Path, cfg: dict) -> dict:
-    """POST the frame to the v1 bus as base64.
+    """POST the frame as base64 to whichever endpoint can store it.
 
-    Requires the `upload` action from scripts/codegs_upload_action.gs to be
-    deployed. Until then the gateway answers "Unknown action: upload" and this
-    raises -- loudly, by design. Never report a staged frame as delivered.
+    Prefers GLASSES_URL -- the standalone uploader in scripts/glasses_uploader.gs.
+    That exists because on 2026-09-02 the v1 bus turned out to be a CONTAINER-BOUND
+    script (bound to the "Blackboard - Alpha DB" sheet), which is why it never
+    appeared in the standalone project list or in Drive's script search, and so
+    could not be patched. Falls back to BUS_URL for the day the bus gains the
+    action from scripts/codegs_upload_action.gs.
+
+    Either way, a gateway that does not know the action answers with an error and
+    this raises -- loudly, by design. Never report a staged frame as delivered.
     """
-    url, secret = cfg.get("BUS_URL"), cfg.get("BUS_SECRET")
+    url, secret = cfg.get("GLASSES_URL"), cfg.get("GLASSES_SECRET")
     if not url or not secret:
-        raise RuntimeError("BUS_URL / BUS_SECRET missing from .env (D-18)")
+        url, secret = cfg.get("BUS_URL"), cfg.get("BUS_SECRET")
+    if not url or not secret:
+        raise RuntimeError("no upload endpoint configured: set GLASSES_URL / "
+                           "GLASSES_SECRET (or BUS_URL / BUS_SECRET) in .env (D-18)")
 
     payload = {
         "action": "upload",
