@@ -126,9 +126,15 @@ function doPost(e) {
  *     "delete everything"; it is rejected. Fail closed on destructive input.
  */
 function prune_(body) {
-  var keep = Number(body.keep);
-  if (!isFinite(keep) || keep < 1 || Math.floor(keep) !== keep) {
-    return json_({ ok: false, error: 'keep must be a positive integer -- refusing to prune' });
+  var keep = Number(body.keep) || 0;
+  var maxAgeMin = Number(body.maxAgeMin) || 0;
+  // At least one cap must be a sane positive number. Absent that, this would
+  // mean "trash everything", which is never what a missing field should do.
+  if (keep < 1 && maxAgeMin < 1) {
+    return json_({ ok: false, error: 'keep or maxAgeMin must be a positive integer -- refusing to prune' });
+  }
+  if (keep < 0 || maxAgeMin < 0) {
+    return json_({ ok: false, error: 'keep and maxAgeMin must not be negative' });
   }
 
   var folderId = body.folderId
@@ -152,9 +158,16 @@ function prune_(body) {
   }
   items.sort(function (a, b) { return b.at - a.at; }); // newest first
 
+  var cutoff = maxAgeMin > 0 ? (Date.now() - maxAgeMin * 60 * 1000) : null;
   var trashed = [];
+  var agedOut = 0;
   var freed = 0;
-  for (var i = keep; i < items.length; i++) {
+
+  for (var i = 0; i < items.length; i++) {
+    var tooMany = keep > 0 && i >= keep;
+    var tooOld = cutoff !== null && items[i].at < cutoff;
+    if (!tooMany && !tooOld) continue;
+    if (tooOld) agedOut++;
     freed += items[i].file.getSize();
     trashed.push(items[i].file.getName());
     items[i].file.setTrashed(true);
@@ -162,8 +175,9 @@ function prune_(body) {
 
   return json_({
     ok: true,
-    kept: Math.min(items.length, keep),
+    kept: items.length - trashed.length,
     trashed: trashed.length,
+    agedOut: agedOut,
     bytesFreed: freed,
     names: trashed.slice(0, 20),
     prunedAt: new Date().toISOString()

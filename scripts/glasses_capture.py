@@ -203,45 +203,66 @@ def upload_via_bus(path: Path, cfg: dict) -> dict:
     return out
 
 
-def prune_local(stage: Path, keep: int, protect: Path) -> dict:
-    """Keep the `keep` newest staged frames, delete the rest.
+def prune_local(stage: Path, keep: int, max_age_min: int, protect: Path) -> dict:
+    """Delete staged frames that are older than max_age_min OR beyond the newest
+    `keep`. Either cap alone is enough to mark a frame; both default to on.
 
     Deliberately narrow so this can never eat something it did not create:
     only files matching glasses_*.jpg, only in the staging directory itself
-    (no recursion), and never the frame this run just wrote. --keep 0 disables.
-    Probe frames are left alone; they are diagnostics a human asked for.
+    (no recursion), and never the frame this run just wrote. Probe frames are
+    left alone; they are diagnostics a human asked for. 0 disables either cap.
+
+    Age comes from the file's mtime rather than its filename. The name carries a
+    UTC stamp and would work, but mtime cannot drift out of sync with reality if
+    a file is ever copied or renamed by hand.
     """
-    if keep <= 0:
-        return {"pruned": 0, "bytes_freed": 0, "note": "disabled (--keep 0)"}
+    if keep <= 0 and max_age_min <= 0:
+        return {"pruned": 0, "bytes_freed": 0, "note": "disabled (--keep 0 --max-age-min 0)"}
 
     frames = [f for f in stage.glob("glasses_*.jpg") if f.is_file()]
     frames.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
+    cutoff = time.time() - (max_age_min * 60) if max_age_min > 0 else None
+    doomed = []
+    for i, f in enumerate(frames):
+        too_many = keep > 0 and i >= keep
+        too_old = cutoff is not None and f.stat().st_mtime < cutoff
+        if too_many or too_old:
+            doomed.append(f)
+
     freed = 0
     removed = 0
-    for f in frames[keep:]:
+    aged_out = 0
+    for f in doomed:
         if f.resolve() == protect.resolve():
             continue
         try:
-            size = f.stat().st_size
+            st = f.stat()
+            if cutoff is not None and st.st_mtime < cutoff:
+                aged_out += 1
             f.unlink()
-            freed += size
+            freed += st.st_size
             removed += 1
         except OSError:
             # A locked or already-gone file is not worth failing the capture over.
             continue
-    return {"pruned": removed, "bytes_freed": freed, "kept": min(len(frames), keep)}
+    return {
+        "pruned": removed,
+        "aged_out": aged_out,
+        "bytes_freed": freed,
+        "remaining": len(frames) - removed,
+    }
 
 
-def prune_drive(cfg: dict, keep: int) -> dict:
+def prune_drive(cfg: dict, keep: int, max_age_min: int) -> dict:
     """Ask the uploader to trash all but the `keep` newest frames in the folder.
 
     Requires the 'prune' action in scripts/glasses_uploader.gs. The gateway
     TRASHES rather than destroys, so a mistake is recoverable from Drive's bin.
     Disabled by default: nothing deletes anything remote unless asked.
     """
-    if keep <= 0:
-        return {"note": "disabled (--drive-keep 0)"}
+    if keep <= 0 and max_age_min <= 0:
+        return {"note": "disabled (--drive-keep 0 --drive-max-age-min 0)"}
 
     url, secret = cfg.get("GLASSES_URL"), cfg.get("GLASSES_SECRET")
     if not url or not secret:
@@ -254,6 +275,7 @@ def prune_drive(cfg: dict, keep: int) -> dict:
             "secret": secret,
             "folderId": DRIVE_FOLDER_ID,
             "keep": keep,
+            "maxAgeMin": max_age_min,
         }).encode("utf-8"),
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
@@ -328,10 +350,10 @@ def capture_once(args, cfg) -> int:
 
     # Prune AFTER the upload, never before: a frame that failed to upload is
     # still staged evidence, and deleting it first would destroy the only copy.
-    record["prune_local"] = prune_local(stage, args.keep, path)
-    if args.drive_keep > 0:
+    record["prune_local"] = prune_local(stage, args.keep, args.max_age_min, path)
+    if args.drive_keep > 0 or args.drive_max_age_min > 0:
         try:
-            record["prune_drive"] = prune_drive(cfg, args.drive_keep)
+            record["prune_drive"] = prune_drive(cfg, args.drive_keep, args.drive_max_age_min)
         except Exception as exc:  # noqa: BLE001 - report, do not fail the capture
             record["prune_drive"] = {"error": str(exc)}
 
@@ -374,9 +396,13 @@ def main(argv=None) -> int:
     # output); remote pruning is opt-in, because nothing should silently delete
     # from Drive. --keep 0 / --drive-keep 0 disable them.
     p.add_argument("--keep", type=int, default=288,
-                   help="keep this many newest staged frames locally (0 disables; default ~1 day at 5-min cadence)")
+                   help="keep this many newest staged frames locally (0 disables)")
+    p.add_argument("--max-age-min", type=int, default=60,
+                   help="delete staged frames older than this many minutes (0 disables; default 60)")
     p.add_argument("--drive-keep", type=int, default=0,
                    help="trash all but this many newest frames in the Drive folder (0 disables)")
+    p.add_argument("--drive-max-age-min", type=int, default=0,
+                   help="trash Drive frames older than this many minutes (0 disables)")
     args = p.parse_args(argv)
 
     cfg = load_env()
