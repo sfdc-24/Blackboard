@@ -16,6 +16,12 @@ onboard_gemini.py
 send_dispatch.py
 send_chatgpt_drill.py
 projects/sfdc24-bus-helper/
+# Glasses Intake capture frames (wf=GLASSES-INTAKE). The webcam faces the desk,
+# so these JPEGs contain whatever is on screen and on the sticky notes below the
+# monitor -- observed 2026-09-02 to include an email address and handwritten
+# notes. Staged frames are working data, never repository content. Same lesson
+# as REQ-M6HZK4: git history cannot be scrubbed the way a Doc can.
+data/
 # OS / Editor
 .DS_Store
 Thumbs.db
