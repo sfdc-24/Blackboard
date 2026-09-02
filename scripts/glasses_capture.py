@@ -30,11 +30,18 @@ UPLOAD LEG, read this before wondering why nothing is in Drive:
   scripts/codegs_upload_action.gs, then pass --upload bus.
 
 USAGE
-  python scripts/glasses_capture.py --probe
-  python scripts/glasses_capture.py --once
-  python scripts/glasses_capture.py --once --source screen
+  python scripts/glasses_capture.py --probe                     # map camera indexes
+  python scripts/glasses_capture.py --once                      # screen grab (default)
+  python scripts/glasses_capture.py --once --source camera      # opt in to the webcam
   python scripts/glasses_capture.py --loop --interval 30
-  python scripts/glasses_capture.py --once --upload bus
+  python scripts/glasses_capture.py --once --upload bus         # what the scheduler runs
+
+SOURCE DEFAULT · screen, by Mr. Salam's ruling of 2026-09-02. Drive runs OCR over
+every uploaded frame, so on-screen text becomes SEARCHABLE to every instance with
+access to the Glasses Intake folder -- demonstrated that day, when a webcam frame
+gave up Script Property names and a deployment URL through Drive's own OCR. A
+camera aimed at a desk turns anything lying there into a grep target; a screen
+grab captures only what is deliberately on the monitor. --source camera opts in.
 """
 
 from __future__ import annotations
@@ -270,7 +277,14 @@ def main(argv=None) -> int:
                       help="capture every --interval seconds until interrupted")
     mode.add_argument("--probe", action="store_true",
                       help="capture one frame from every camera index that opens")
-    p.add_argument("--source", choices=["camera", "screen"], default="camera")
+    # DEFAULT IS screen, BY RULING (Mr. Salam, 2026-09-02), and it is fail-safe:
+    # an invocation that forgets the flag must not switch a camera on. Drive OCRs
+    # every uploaded frame, so anything the lens catches becomes searchable text
+    # to every instance with folder access -- a camera aimed at the desk turns
+    # stray paper into a grep target. A screen grab captures only what is already
+    # on the monitor, which is under deliberate control. Pass --source camera to
+    # opt in explicitly.
+    p.add_argument("--source", choices=["camera", "screen"], default="screen")
     p.add_argument("--index", type=int, default=1,
                    help="camera index; 1 is the monitor-facing C922 on this machine (see --probe)")
     p.add_argument("--interval", type=float, default=30.0, help="seconds between frames in --loop")
