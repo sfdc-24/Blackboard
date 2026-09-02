@@ -55,8 +55,10 @@ function doPost(e) {
     if (String(body.secret || '') !== secret) {
       return json_({ ok: false, error: 'Unauthorized' });
     }
-    if (String(body.action || 'upload') !== 'upload') {
-      return json_({ ok: false, error: 'Unknown action: ' + body.action });
+    var action = String(body.action || 'upload');
+    if (action === 'prune') return prune_(body);
+    if (action !== 'upload') {
+      return json_({ ok: false, error: 'Unknown action: ' + action });
     }
 
     var filename = String(body.filename || '').trim();
@@ -110,6 +112,62 @@ function doPost(e) {
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
+}
+
+/**
+ * Retention: keep the N newest capture frames in the folder, TRASH the rest.
+ *
+ * Three deliberate limits, because this is the only destructive path here:
+ *   - only files whose name starts with "glasses_" -- the capture feeder's own
+ *     output. Anything else a human filed in that folder is untouchable.
+ *   - setTrashed, never setTrashed-and-purge: a mistake is recoverable from the
+ *     Drive bin for 30 days.
+ *   - keep must be a positive integer. A missing or zero keep does NOT mean
+ *     "delete everything"; it is rejected. Fail closed on destructive input.
+ */
+function prune_(body) {
+  var keep = Number(body.keep);
+  if (!isFinite(keep) || keep < 1 || Math.floor(keep) !== keep) {
+    return json_({ ok: false, error: 'keep must be a positive integer -- refusing to prune' });
+  }
+
+  var folderId = body.folderId
+    || PropertiesService.getScriptProperties().getProperty('FOLDER_ID')
+    || DEFAULT_FOLDER_ID;
+
+  var folder;
+  try {
+    folder = DriveApp.getFolderById(folderId);
+  } catch (err) {
+    return json_({ ok: false, error: 'folder not found or not accessible: ' + folderId });
+  }
+
+  var items = [];
+  var it = folder.getFiles();
+  while (it.hasNext()) {
+    var f = it.next();
+    if (f.getName().indexOf('glasses_') === 0) {
+      items.push({ file: f, at: f.getDateCreated().getTime() });
+    }
+  }
+  items.sort(function (a, b) { return b.at - a.at; }); // newest first
+
+  var trashed = [];
+  var freed = 0;
+  for (var i = keep; i < items.length; i++) {
+    freed += items[i].file.getSize();
+    trashed.push(items[i].file.getName());
+    items[i].file.setTrashed(true);
+  }
+
+  return json_({
+    ok: true,
+    kept: Math.min(items.length, keep),
+    trashed: trashed.length,
+    bytesFreed: freed,
+    names: trashed.slice(0, 20),
+    prunedAt: new Date().toISOString()
+  });
 }
 
 function json_(obj) {

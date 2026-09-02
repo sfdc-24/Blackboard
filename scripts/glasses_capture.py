@@ -203,6 +203,72 @@ def upload_via_bus(path: Path, cfg: dict) -> dict:
     return out
 
 
+def prune_local(stage: Path, keep: int, protect: Path) -> dict:
+    """Keep the `keep` newest staged frames, delete the rest.
+
+    Deliberately narrow so this can never eat something it did not create:
+    only files matching glasses_*.jpg, only in the staging directory itself
+    (no recursion), and never the frame this run just wrote. --keep 0 disables.
+    Probe frames are left alone; they are diagnostics a human asked for.
+    """
+    if keep <= 0:
+        return {"pruned": 0, "bytes_freed": 0, "note": "disabled (--keep 0)"}
+
+    frames = [f for f in stage.glob("glasses_*.jpg") if f.is_file()]
+    frames.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+    freed = 0
+    removed = 0
+    for f in frames[keep:]:
+        if f.resolve() == protect.resolve():
+            continue
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            freed += size
+            removed += 1
+        except OSError:
+            # A locked or already-gone file is not worth failing the capture over.
+            continue
+    return {"pruned": removed, "bytes_freed": freed, "kept": min(len(frames), keep)}
+
+
+def prune_drive(cfg: dict, keep: int) -> dict:
+    """Ask the uploader to trash all but the `keep` newest frames in the folder.
+
+    Requires the 'prune' action in scripts/glasses_uploader.gs. The gateway
+    TRASHES rather than destroys, so a mistake is recoverable from Drive's bin.
+    Disabled by default: nothing deletes anything remote unless asked.
+    """
+    if keep <= 0:
+        return {"note": "disabled (--drive-keep 0)"}
+
+    url, secret = cfg.get("GLASSES_URL"), cfg.get("GLASSES_SECRET")
+    if not url or not secret:
+        raise RuntimeError("--drive-keep needs GLASSES_URL / GLASSES_SECRET in .env")
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({
+            "action": "prune",
+            "secret": secret,
+            "folderId": DRIVE_FOLDER_ID,
+            "keep": keep,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    try:
+        out = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"gateway returned non-JSON: {body[:200]}")
+    if not out.get("ok"):
+        raise RuntimeError(f"gateway refused the prune: {body[:300]}")
+    return out
+
+
 def probe(width: int, height: int, stage: Path) -> int:
     """Capture one frame from every index that opens, so the index-to-device
     mapping is established by looking, not by guessing."""
@@ -260,6 +326,15 @@ def capture_once(args, cfg) -> int:
             record["delivery"] = "STAGED_UPLOAD_FAILED"
             record["upload_error"] = str(exc)
 
+    # Prune AFTER the upload, never before: a frame that failed to upload is
+    # still staged evidence, and deleting it first would destroy the only copy.
+    record["prune_local"] = prune_local(stage, args.keep, path)
+    if args.drive_keep > 0:
+        try:
+            record["prune_drive"] = prune_drive(cfg, args.drive_keep)
+        except Exception as exc:  # noqa: BLE001 - report, do not fail the capture
+            record["prune_drive"] = {"error": str(exc)}
+
     print(json.dumps(record, indent=2))
     # D-4: the gateway's reply is not proof the row landed. Read the folder
     # back before believing this. Exit code reports the LOCAL write only.
@@ -293,6 +368,15 @@ def main(argv=None) -> int:
     p.add_argument("--quality", type=int, default=90)
     p.add_argument("--stage", default=str(DEFAULT_STAGE))
     p.add_argument("--upload", choices=["none", "bus"], default="none")
+    # Retention. At the scheduler's 5-minute cadence a screen frame is ~600KB,
+    # so 288 frames/day is ~170MB/day in BOTH places and it never stops growing.
+    # Local pruning is on by default (it only ever removes this script's own
+    # output); remote pruning is opt-in, because nothing should silently delete
+    # from Drive. --keep 0 / --drive-keep 0 disable them.
+    p.add_argument("--keep", type=int, default=288,
+                   help="keep this many newest staged frames locally (0 disables; default ~1 day at 5-min cadence)")
+    p.add_argument("--drive-keep", type=int, default=0,
+                   help="trash all but this many newest frames in the Drive folder (0 disables)")
     args = p.parse_args(argv)
 
     cfg = load_env()
