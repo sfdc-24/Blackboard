@@ -34,10 +34,22 @@
 
 var DEFAULT_FOLDER_ID = '1skJIwAYenlwMovtW07BsdFOi18cFchlZ'; // "Glasses Intake"
 
+/**
+ * BUMP THIS whenever you change what the script can do, and the unauthenticated
+ * GET becomes a deploy check: if the live URL does not report the version and
+ * actions you just pasted, the editor was saved but the DEPLOYMENT was not
+ * advanced (Manage deployments -> pencil -> Version: New version -> Deploy).
+ * That mistake has cost this project an hour twice; this makes it a one-glance
+ * diagnosis that needs no secret.
+ */
+var CONTRACT_VERSION = 2; // v1 upload only; v2 adds prune
+
 function doGet() {
   return json_({
     ok: true,
     service: 'sfdc24-glasses-uploader',
+    version: CONTRACT_VERSION,
+    actions: ['upload', 'prune'],
     time: new Date().toISOString()
   });
 }
