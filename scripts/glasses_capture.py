@@ -31,7 +31,8 @@ UPLOAD LEG, read this before wondering why nothing is in Drive:
 
 USAGE
   python scripts/glasses_capture.py --probe                     # map camera indexes
-  python scripts/glasses_capture.py --once                      # screen grab (default)
+  python scripts/glasses_capture.py --once                      # all screens (default)
+  python scripts/glasses_capture.py --once --monitor 2          # one display only
   python scripts/glasses_capture.py --once --source camera      # opt in to the webcam
   python scripts/glasses_capture.py --loop --interval 30
   python scripts/glasses_capture.py --once --upload bus         # what the scheduler runs
@@ -119,15 +120,39 @@ def grab_camera(index: int, width: int, height: int):
         cap.release()
 
 
-def grab_screen():
-    """Native screenshot fallback. Immune to the moire and glare that a camera
-    aimed at an LCD suffers, so this is the path that keeps text readable."""
-    import cv2
-    import numpy as np
+def _mss():
+    """mss.mss is deprecated in 10.x in favour of mss.MSS; support both."""
     import mss
 
-    with mss.mss() as sct:
-        shot = sct.grab(sct.monitors[1])  # [1] is the primary monitor
+    return getattr(mss, "MSS", None) or mss.mss
+
+
+def monitor_count() -> int:
+    """Number of physical monitors. mss index 0 is the virtual union of them
+    all, so the real ones are 1..n."""
+    with _mss()() as sct:
+        return len(sct.monitors) - 1
+
+
+def grab_screen(which: int = 1):
+    """Native screenshot of one monitor. Immune to the moire and glare a camera
+    aimed at an LCD suffers, so this is the path that keeps text readable.
+
+    `which` indexes mss's monitor list: 1..n are the physical displays and 0 is
+    the virtual bounding box spanning all of them. Avoid 0 for capture -- on a
+    layout like this machine's (2560x1600 primary flanked by two 1080p panels at
+    different vertical offsets) the union is 6400x1729 and mostly dead space,
+    which wastes bytes and hurts OCR. Capture each screen separately instead.
+    """
+    import numpy as np
+
+    with _mss()() as sct:
+        if which >= len(sct.monitors):
+            raise RuntimeError(
+                f"monitor {which} does not exist; this machine has "
+                f"{len(sct.monitors) - 1} (use --monitor all, or 1..{len(sct.monitors) - 1})"
+            )
+        shot = sct.grab(sct.monitors[which])
         img = np.array(shot)[:, :, :3]  # BGRA -> BGR
     return img, (img.shape[1], img.shape[0])
 
@@ -203,7 +228,7 @@ def upload_via_bus(path: Path, cfg: dict) -> dict:
     return out
 
 
-def prune_local(stage: Path, keep: int, max_age_min: int, protect: Path) -> dict:
+def prune_local(stage: Path, keep: int, max_age_min: int, protect) -> dict:
     """Delete staged frames that are older than max_age_min OR beyond the newest
     `keep`. Either cap alone is enough to mark a frame; both default to on.
 
@@ -218,6 +243,11 @@ def prune_local(stage: Path, keep: int, max_age_min: int, protect: Path) -> dict
     """
     if keep <= 0 and max_age_min <= 0:
         return {"pruned": 0, "bytes_freed": 0, "note": "disabled (--keep 0 --max-age-min 0)"}
+
+    # Frames written by the current wake -- never prune these, whatever the caps
+    # say. With multi-monitor capture a single wake writes several at once, and a
+    # tight --keep could otherwise delete a frame seconds after creating it.
+    keepsafe = {p.resolve() for p in protect}
 
     frames = [f for f in stage.glob("glasses_*.jpg") if f.is_file()]
     frames.sort(key=lambda f: f.stat().st_mtime, reverse=True)
@@ -234,7 +264,7 @@ def prune_local(stage: Path, keep: int, max_age_min: int, protect: Path) -> dict
     removed = 0
     aged_out = 0
     for f in doomed:
-        if f.resolve() == protect.resolve():
+        if f.resolve() in keepsafe:
             continue
         try:
             st = f.stat()
@@ -314,53 +344,81 @@ def probe(width: int, height: int, stage: Path) -> int:
 
 def capture_once(args, cfg) -> int:
     stage = Path(args.stage)
+
+    # One wake can produce several frames (one per monitor). They share a single
+    # timestamp so a downstream consumer can tell at a glance which frames belong
+    # to the same moment across screens.
+    stamp = utc_stamp()
+    targets = []  # (label, grab callable)
+
     if args.source == "screen":
-        frame, actual = grab_screen()
-        label = "screen"
+        if args.monitor == "all":
+            for m in range(1, monitor_count() + 1):
+                targets.append((f"screen{m}", lambda m=m: grab_screen(m)))
+        else:
+            m = int(args.monitor)
+            targets.append((f"screen{m}", lambda m=m: grab_screen(m)))
     else:
-        frame, actual = grab_camera(args.index, args.width, args.height)
-        label = f"cam{args.index}"
+        targets.append((f"cam{args.index}",
+                        lambda: grab_camera(args.index, args.width, args.height)))
 
-    stats = frame_stats(frame)
-    name = f"glasses_{label}_{utc_stamp()}.jpg"
-    path = stage / name
-    size = write_jpeg(frame, path, args.quality)
-
-    record = {
-        "file": str(path),
-        "resolution": f"{actual[0]}x{actual[1]}",
-        "bytes": size,
-        "stats": stats,
-        "delivery": "STAGED",
-    }
-
-    # A frame with no tonal spread is a dead capture (lens cap, sleeping
-    # monitor, camera held by another process). Say so; do not pretend.
-    if stats["stdev"] < 3.0:
-        record["warning"] = ("near-uniform frame (stdev %.1f) -- likely a black or "
-                             "blown-out capture, not a usable image" % stats["stdev"])
-
-    if args.upload == "bus":
+    records = []
+    written = []
+    for label, grab in targets:
         try:
-            record["gateway"] = upload_via_bus(path, cfg)
-            record["delivery"] = "UPLOADED"
-        except Exception as exc:  # noqa: BLE001 - the reason must reach the log
-            record["delivery"] = "STAGED_UPLOAD_FAILED"
-            record["upload_error"] = str(exc)
+            frame, actual = grab()
+        except Exception as exc:  # noqa: BLE001 - one dead screen must not cost the others
+            records.append({"label": label, "error": str(exc)})
+            continue
 
-    # Prune AFTER the upload, never before: a frame that failed to upload is
+        stats = frame_stats(frame)
+        path = stage / f"glasses_{label}_{stamp}.jpg"
+        size = write_jpeg(frame, path, args.quality)
+        written.append(path)
+
+        record = {
+            "file": str(path),
+            "resolution": f"{actual[0]}x{actual[1]}",
+            "bytes": size,
+            "stats": stats,
+            "delivery": "STAGED",
+        }
+
+        # A frame with no tonal spread is a dead capture (lens cap, sleeping
+        # monitor, camera held by another process). Say so; do not pretend.
+        if stats["stdev"] < 3.0:
+            record["warning"] = ("near-uniform frame (stdev %.1f) -- likely a black or "
+                                 "blown-out capture, not a usable image" % stats["stdev"])
+
+        if args.upload == "bus":
+            try:
+                record["gateway"] = upload_via_bus(path, cfg)
+                record["delivery"] = "UPLOADED"
+            except Exception as exc:  # noqa: BLE001 - the reason must reach the log
+                record["delivery"] = "STAGED_UPLOAD_FAILED"
+                record["upload_error"] = str(exc)
+
+        records.append(record)
+
+    # Prune AFTER the uploads, never before: a frame that failed to upload is
     # still staged evidence, and deleting it first would destroy the only copy.
-    record["prune_local"] = prune_local(stage, args.keep, args.max_age_min, path)
+    summary = {
+        "captured": len([r for r in records if "file" in r]),
+        "frames": records,
+        "prune_local": prune_local(stage, args.keep, args.max_age_min, written),
+    }
     if args.drive_keep > 0 or args.drive_max_age_min > 0:
         try:
-            record["prune_drive"] = prune_drive(cfg, args.drive_keep, args.drive_max_age_min)
+            summary["prune_drive"] = prune_drive(cfg, args.drive_keep, args.drive_max_age_min)
         except Exception as exc:  # noqa: BLE001 - report, do not fail the capture
-            record["prune_drive"] = {"error": str(exc)}
+            summary["prune_drive"] = {"error": str(exc)}
 
-    print(json.dumps(record, indent=2))
-    # D-4: the gateway's reply is not proof the row landed. Read the folder
-    # back before believing this. Exit code reports the LOCAL write only.
-    if record["delivery"] == "STAGED_UPLOAD_FAILED":
+    print(json.dumps(summary, indent=2))
+    # D-4: the gateway's reply is not proof the file landed. Read the folder back
+    # before believing it. Exit code reports the LOCAL writes only.
+    if not written:
+        return 1
+    if any(r.get("delivery") == "STAGED_UPLOAD_FAILED" for r in records):
         return 2
     return 0
 
@@ -384,6 +442,12 @@ def main(argv=None) -> int:
     p.add_argument("--source", choices=["camera", "screen"], default="screen")
     p.add_argument("--index", type=int, default=1,
                    help="camera index; 1 is the monitor-facing C922 on this machine (see --probe)")
+    # "all" writes one file per physical monitor, sharing one timestamp. This
+    # machine has three (2560x1600 primary plus two 1080p). Capturing them
+    # separately rather than as mss's virtual union avoids the union's dead
+    # space -- 6400x1729 of mostly nothing, which wastes bytes and hurts OCR.
+    p.add_argument("--monitor", default="all",
+                   help="which display to capture with --source screen: 'all' (default) or a 1-based index")
     p.add_argument("--interval", type=float, default=30.0, help="seconds between frames in --loop")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
