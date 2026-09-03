@@ -192,6 +192,14 @@ was already correct. `curl` reported the loop from cache while `nslookup`
 against 1.1.1.1 already showed Google. **Flush before concluding a DNS fix
 failed** — and test with `curl --resolve` to bypass cache entirely.
 
+**The diagnostic that actually settled it:** `Get-DnsClientCache -Name
+'*sfdc24*'` listed the stale `www -> 45.77.x` A records still sitting in the
+Windows resolver cache while `nslookup` against 1.1.1.1 returned Google. Adding
+`-w '%{remote_ip}'` to curl showed it connecting to `207.246.78.75`, proving the
+loop was local, not live. Flushing with `Clear-DnsClientCache` gave 200 on both
+hostnames immediately. The cache repopulated stale once *after* an earlier
+flush, so a single passing test is not proof — check `remote_ip`.
+
 ---
 
 ## ISS-008 · RESOLVED — NameSilo DNS form fails silently — MED
