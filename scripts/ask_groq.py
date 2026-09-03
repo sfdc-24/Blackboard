@@ -66,7 +66,17 @@ def call(url: str, key: str, payload: dict | None = None, timeout: int = 180):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         url, data=data,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Cloudflare sits in front of api.groq.com and rejects urllib's
+            # default signature with 403 / error 1010 -- which reads like an auth
+            # failure and is not one. A browser UA is required.
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36",
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
