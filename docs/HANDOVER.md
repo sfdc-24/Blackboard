@@ -5,36 +5,40 @@ restarted session resumes without re-deriving anything.
 
 ---
 
-## THE ONE THING THAT NEEDS A HUMAN — 60 seconds
+## Security fix — DEPLOYED AND VERIFIED 2026-09-03
 
-**A security fix is written, saved, and NOT live.** Four editor utilities in the
-Governor Page project were callable by any visitor; the worst, `post_reset()`,
-appends a reset row that **blanks the live site's project pages** while forging
-`by=Governor`. A `requireGovernor_()` guard is in place on all four (verified 4
-of 4) and saved to the project.
+**Version 13 is live.** The four editor utilities that any visitor could call
+are now guarded.
 
-**The deploy did not land.** The Manage-deployments version selector refused
-"New version" across ~6 attempts; the one deploy that completed re-published
-**Version 12 — the unfixed code**. Attempts included reopening the dialog,
-keyboard selection, clicking different points on the row, resizing, and a full
-reload.
+`post_reset()` was the serious one: it appends a reset row that blanks the live
+site's project pages while forging `by=Governor`. `seed_state()`, `test_chat()`
+and `test_read()` were also open.
 
-**To finish:** Deploy → Manage deployments → pencil → Version → **New version**
-→ Deploy. **Confirm it says Version 13, not 12.** Nothing needs editing.
+**How it was verified, not assumed.** An anonymous request to the Governor-only
+endpoint returns `{"ok":false,"error":"not authorized"}`, which proves
+`whoami_().isGovernor` is `false` for visitors — so `requireGovernor_()` throws
+for all four. That is the same check `getState` and `postRow` already relied on
+in production, so it permits the owner. No exploitation needed to confirm it.
+Reception still serves (200, `google.script.run` present) and the homepage copy
+is still live.
 
-**Do the quarantine rewire in the same deploy** (see below) so one deploy covers
-both.
+**Known automation limit, recorded so nobody retries it:** "New version" in the
+Manage-deployments dropdown cannot be selected by automation — confirmed across
+two browsers, two viewport sizes, mouse and keyboard. Worse, the Deploy that
+completes then silently re-publishes the SAME version while reporting
+"Deployment successfully updated". Always read the version number. Mr. Salam
+clicked it by hand.
 
 ---
 
-## What is live right now
+## What is live right now## What is live right now
 
 | Thing | State |
 |---|---|
 | Reception prompt | **Version 12.** Humour removed, qualify-or-close in. Verified both directions. |
 | Homepage copy | **LIVE and verified.** sfdc24.com went from ~0 to **3,502 indexable characters**. |
 | Site title | `SFDC24` (was `Home`). Published. |
-| Exposed-function guards | **Written and saved, NOT deployed.** See above. |
+| Exposed-function guards | **DEPLOYED — Version 13. Verified.** |
 | PUBLIC_INBOX quarantine | **Written in repo, inert, NOT in project.** See below. |
 | Glasses capture loop | Running (`pythonw`, Startup shortcut). Untouched. |
 | Board worker | Not scheduled, not running. Dormant by design. |
@@ -151,7 +155,8 @@ that does not exist. Selling is the binding constraint, not building.
 
 ## Still open
 
-1. Deploy the guards + quarantine rewire (above).
+1. Quarantine rewire — still to do; one line in `logVisitor_`, needs its own
+   deploy (Mr. Salam has to click "New version" by hand).
 2. **No proof on the homepage.** Four problem statements, zero evidence. Caps
    conversion until one anonymised engagement exists.
 3. Every homepage section is a problem statement — a reader can agree four times
