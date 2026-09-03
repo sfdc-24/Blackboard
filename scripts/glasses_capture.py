@@ -580,7 +580,7 @@ def post_pointer_row(cfg: dict, file_id: str, name: str, stamp: str,
     view = f"https://drive.google.com/file/d/{file_id}/view"
     payload = (
         "BCB|v=1|wf=GLASSES-INTAKE|sub=BOARD-POINTER|phase=ASSET"
-        "|from=claude-code-cli|to=ALL|kind=situation-board"
+        "|from=glasses-uploader|to=ALL|kind=situation-board"
         f"|file_id={file_id}|name={name}|url={view}"
         f"|captured={stamp}|tiles={live}/{len(tiles)}"
         f"|folder={DRIVE_FOLDER_ID}"
@@ -593,7 +593,12 @@ def post_pointer_row(cfg: dict, file_id: str, name: str, stamp: str,
     row = [
         str(uuid.uuid4()),
         dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-        "claude-code-cli",
+        # ISS-009: this loop used to write as "claude-code-cli", the same tag as
+        # the interactive laptop session. Three writers under one name made the
+        # check-in register useless and hid a live DNS edit from a sibling
+        # instance on Sep 3, which took the site down. A tag is a claimed
+        # identity, not a machine (REQ-R6WNT2) -- so this one claims its own.
+        "glasses-uploader",
         "ALL",
         "APPEND",
         payload,
