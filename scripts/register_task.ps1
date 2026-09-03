@@ -40,7 +40,11 @@ param(
   # Which camera fills the board's fourth tile. Indexes are NOT stable across
   # replug -- confirm with `glasses_capture.py --probe` after any USB change.
   # As probed 2026-09-03: 0 faces the operator, 1 faces the monitors.
-  [int]$RoomIndex = 0
+  [string]$RoomIndex = '0',
+  # Helmet overlay on detected faces. Doubles as anonymisation: boards land in
+  # a folder three vendor instances read, and Google OCRs every one.
+  [switch]$Mask,
+  [string]$MaskName = 'MR. SALAM'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +82,7 @@ $argList = @(
   '--max-age-min'; "$MaxAgeMin"
 )
 if ($NoRoom) { $argList += '--no-room' } else { $argList += @('--room-index'; "$RoomIndex") }
+if ($Mask)   { $argList += @('--mask'; '--mask-name'; "`"$MaskName`"") }
 if (-not $NoUpload) {
   $argList += @('--upload'; 'bus'; '--drive-max-age-min'; "$MaxAgeMin")
 }

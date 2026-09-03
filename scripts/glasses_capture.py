@@ -164,6 +164,24 @@ def grab_screen(which: int = 1):
 # than a ceiling camera.
 BOARD_W, BOARD_H = 1920, 1200
 BANNER_H = 60
+
+# Human-readable captions for the camera tiles, keyed by index. Probed
+# 2026-09-03 on this machine; indexes are not stable across replug, so re-probe
+# and update these rather than trusting them blindly after a USB change.
+CAMERA_CAPTIONS = {0: "OPERATOR", 1: "SETUP"}
+
+
+def parse_indexes(spec) -> list:
+    """Accept 1, "1", or "0,1" -- the scheduler passes strings and a human
+    editing the shortcut should be able to write a list without ceremony."""
+    if isinstance(spec, int):
+        return [spec]
+    out = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
 INK = (236, 236, 240)     # near-white, BGR
 GROUND = (18, 18, 22)     # near-black canvas
 DIM = (150, 150, 158)     # secondary text
@@ -186,18 +204,44 @@ def fit_into(img, w: int, h: int):
     return canvas
 
 
-def compose_board(tiles, stamp: str, host: str):
-    """Tile up to four sources into one board image.
+def compose_board(rows, stamp: str, host: str):
+    """Compose rows of sources into one board image.
 
-    tiles: list of (label, image-or-None). A None image becomes a visible
-    "no signal" cell rather than being skipped -- a missing screen is
-    information, and a board that silently reflows would hide it.
+    rows: list of rows; each row is a list of (label, image-or-None). Rows are
+    laid out independently, so screens and cameras can be grouped and sized on
+    their own terms rather than forced into one uniform grid.
+
+    Each row's height is derived from the WIDEST-relative content it holds --
+    cell_width / smallest aspect ratio -- so nothing is ever cropped and the
+    letterboxing stays minimal. A row of 16:9 cameras is therefore shorter than
+    a row containing a 16:10 screen, which is what keeps the board compact.
+
+    A None image becomes a visible NO SIGNAL cell rather than being skipped: a
+    missing screen is information, and a board that silently reflowed would
+    hide it.
     """
     import cv2
     import numpy as np
 
-    canvas = np.full((BOARD_H, BOARD_W, 3), GROUND, dtype=np.uint8)
-    cell_w, cell_h = BOARD_W // 2, (BOARD_H - BANNER_H) // 2
+    rows = [r for r in rows if r]
+    if not rows:
+        raise RuntimeError("no tiles to compose")
+
+    geom = []
+    for row in rows:
+        cell_w = BOARD_W // len(row)
+        aspects = []
+        for _, img in row:
+            if img is None:
+                aspects.append(16 / 9)
+            else:
+                h, w = img.shape[:2]
+                aspects.append(w / h)
+        cell_h = int(round(cell_w / min(aspects)))
+        geom.append((cell_w, cell_h))
+
+    height = BANNER_H + sum(h for _, h in geom)
+    canvas = np.full((height, BOARD_W, 3), GROUND, dtype=np.uint8)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(canvas, "SFDC24 - GLASSES INTAKE", (18, 40), font, 0.8, INK, 2, cv2.LINE_AA)
@@ -206,29 +250,141 @@ def compose_board(tiles, stamp: str, host: str):
     cv2.putText(canvas, right, (BOARD_W - tw - 18, 39), font, 0.62, DIM, 1, cv2.LINE_AA)
     cv2.line(canvas, (0, BANNER_H - 1), (BOARD_W, BANNER_H - 1), (60, 60, 68), 1)
 
-    for i, (label, img) in enumerate(tiles[:4]):
-        r, c = divmod(i, 2)
-        x0, y0 = c * cell_w, BANNER_H + r * cell_h
-        pad = 3
-        iw, ih = cell_w - pad * 2, cell_h - pad * 2
+    y0 = BANNER_H
+    for row, (cell_w, cell_h) in zip(rows, geom):
+        for c, (label, img) in enumerate(row):
+            x0 = c * cell_w
+            pad = 3
+            iw, ih = cell_w - pad * 2, cell_h - pad * 2
 
-        if img is None:
-            cell = np.full((ih, iw, 3), GROUND, dtype=np.uint8)
-            msg = "NO SIGNAL"
-            (tw, th), _ = cv2.getTextSize(msg, font, 0.9, 2)
-            cv2.putText(cell, msg, ((iw - tw) // 2, (ih + th) // 2), font, 0.9, (70, 70, 90), 2, cv2.LINE_AA)
-        else:
-            cell = fit_into(img, iw, ih)
+            if img is None:
+                cell = np.full((ih, iw, 3), GROUND, dtype=np.uint8)
+                msg = "NO SIGNAL"
+                (mw, mh), _ = cv2.getTextSize(msg, font, 0.9, 2)
+                cv2.putText(cell, msg, ((iw - mw) // 2, (ih + mh) // 2), font, 0.9,
+                            (70, 70, 90), 2, cv2.LINE_AA)
+            else:
+                cell = fit_into(img, iw, ih)
 
-        canvas[y0 + pad:y0 + pad + ih, x0 + pad:x0 + pad + iw] = cell
-        cv2.rectangle(canvas, (x0 + pad, y0 + pad), (x0 + pad + iw - 1, y0 + pad + ih - 1),
-                      (60, 60, 68), 1)
-        # Label sits on its own strip so it stays readable over any content.
-        cv2.rectangle(canvas, (x0 + pad, y0 + pad), (x0 + pad + 260, y0 + pad + 26),
-                      GROUND, -1)
-        cv2.putText(canvas, label, (x0 + pad + 8, y0 + pad + 19), font, 0.52, INK, 1, cv2.LINE_AA)
+            canvas[y0 + pad:y0 + pad + ih, x0 + pad:x0 + pad + iw] = cell
+            cv2.rectangle(canvas, (x0 + pad, y0 + pad),
+                          (x0 + pad + iw - 1, y0 + pad + ih - 1), (60, 60, 68), 1)
+            # Label sits on its own strip so it stays readable over any content.
+            label_w = min(iw, max(150, 9 * len(label) + 16))
+            cv2.rectangle(canvas, (x0 + pad, y0 + pad),
+                          (x0 + pad + label_w, y0 + pad + 26), GROUND, -1)
+            cv2.putText(canvas, label, (x0 + pad + 8, y0 + pad + 19), font, 0.52, INK, 1,
+                        cv2.LINE_AA)
+        y0 += cell_h
 
     return canvas
+
+
+# --- Daft Punk helmet overlay ----------------------------------------------
+# Doubles as a privacy control: boards land in a Drive folder that the Gemini,
+# ChatGPT and Meta instances all read, and Google OCRs every one. A helmeted
+# operator is recognisable as "someone is at the desk" without publishing a
+# face to three vendors.
+YUNET_MODEL = REPO / "models" / "face_detection_yunet_2023mar.onnx"
+_detector = None
+
+CHROME = (176, 174, 168)
+CHROME_LIT = (226, 224, 218)
+CHROME_DARK = (104, 103, 100)
+VISOR = (26, 22, 20)
+# BGR, not RGB. Amber is (blue-low, green-mid, red-high); writing it the RGB way
+# round produced a cyan visor on the first attempt.
+LED = (40, 190, 250)
+LED_GLOW = (10, 70, 120)
+
+
+def detect_faces(img):
+    """Return [(x, y, w, h), ...] using OpenCV's bundled YuNet DNN detector.
+
+    Returns [] when the model file is absent rather than raising -- a missing
+    model should cost the mask, not the capture.
+    """
+    global _detector
+    import cv2
+
+    if not YUNET_MODEL.exists():
+        return []
+    h, w = img.shape[:2]
+    if _detector is None:
+        _detector = cv2.FaceDetectorYN.create(str(YUNET_MODEL), "", (320, 320), 0.6, 0.3, 5000)
+    _detector.setInputSize((w, h))
+    _, faces = _detector.detect(img)
+    if faces is None:
+        return []
+    return [tuple(int(v) for v in f[:4]) for f in faces]
+
+
+def apply_helmet(img, name: str):
+    """Draw a Daft Punk style helmet over every detected face, with `name`
+    running across the visor as LED text. Returns (image, faces_masked)."""
+    import cv2
+
+    faces = detect_faces(img)
+    if not faces:
+        return img, 0
+
+    import numpy as np
+
+    out = img.copy()
+    H, W = out.shape[:2]
+    for (x, y, w, h) in faces:
+        cx, cy = x + w // 2, int(y + h * 0.44)
+        ax, ay = int(w * 0.88), int(h * 0.80)           # helmet semi-axes
+
+        # Chrome is a gradient, not a fill. Paint a vertical light-to-dark ramp
+        # through an ellipse mask so the dome reads as curved metal; a flat
+        # ellipse just looks like a grey egg.
+        shell = np.zeros((H, W), np.uint8)
+        cv2.ellipse(shell, (cx, cy), (ax, ay), 0, 0, 360, 255, -1, cv2.LINE_AA)
+        ys = np.clip((np.arange(H) - (cy - ay)) / max(2 * ay, 1), 0, 1)[:, None]
+        ramp = (np.array(CHROME_LIT) * (1 - ys) + np.array(CHROME_DARK) * ys)
+        ramp = np.repeat(ramp[:, None, :], W, axis=1).astype(np.uint8)
+        m3 = shell[:, :, None] > 0
+        out = np.where(m3, ramp, out)
+
+        # Specular highlight, blended rather than painted, so it reads as a
+        # soft reflection instead of a white sticker.
+        spec = out.copy()
+        cv2.ellipse(spec, (int(cx - ax * 0.30), int(cy - ay * 0.42)),
+                    (int(ax * 0.42), int(ay * 0.20)), 25, 0, 360, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.GaussianBlur(spec, (0, 0), max(3, ax // 8), dst=spec)
+        blended = cv2.addWeighted(out, 0.62, spec, 0.38, 0)
+        out = np.where(m3, blended, out)
+        cv2.ellipse(out, (cx, cy), (ax, ay), 0, 0, 360, CHROME_DARK, 2, cv2.LINE_AA)
+
+        # Visor: a wide rounded band on the eye line, not a circle.
+        vx, vy = cx, int(cy - ay * 0.10)
+        vax, vay = int(ax * 0.90), int(ay * 0.30)
+        visor = np.zeros((H, W), np.uint8)
+        cv2.ellipse(visor, (vx, vy), (vax, vay), 0, 0, 360, 255, -1, cv2.LINE_AA)
+        vys = np.clip((np.arange(H) - (vy - vay)) / max(2 * vay, 1), 0, 1)[:, None]
+        vramp = (np.array((54, 48, 44)) * (1 - vys) + np.array(VISOR) * vys)
+        vramp = np.repeat(vramp[:, None, :], W, axis=1).astype(np.uint8)
+        out = np.where(visor[:, :, None] > 0, vramp, out)
+        cv2.ellipse(out, (vx, vy), (vax, vay), 0, 0, 360, (92, 88, 84), 2, cv2.LINE_AA)
+        # Thin bright sliver along the top edge sells it as glass.
+        cv2.ellipse(out, (vx, int(vy - vay * 0.30)), (int(vax * 0.74), int(vay * 0.26)),
+                    0, 195, 345, (120, 116, 112), 2, cv2.LINE_AA)
+
+        # LED name across the visor, scaled to fit whatever the name is.
+        text = name.upper()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (bw, bh), _ = cv2.getTextSize(text, font, 1.0, 2)
+        target = vax * 1.45
+        scale = max(0.28, min(2.4, target / max(bw, 1)))
+        thick = max(1, int(round(scale * 1.7)))
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        org = (int(vx - tw / 2), int(vy + th / 2))
+        # Glow first, bright core over it -- cheap but convincingly lit.
+        cv2.putText(out, text, org, font, scale, LED_GLOW, thick + 3, cv2.LINE_AA)
+        cv2.putText(out, text, org, font, scale, LED, thick, cv2.LINE_AA)
+
+    return out, len(faces)
 
 
 def frame_stats(frame) -> dict:
@@ -440,25 +596,36 @@ def capture_once(args, cfg) -> int:
     if args.layout == "board":
         import socket
 
-        tiles = []
         errors = []
+        screen_row = []
         for m in range(1, monitor_count() + 1):
             try:
                 img, actual = grab_screen(m)
-                tiles.append((f"SCREEN {m}  {actual[0]}x{actual[1]}", img))
+                screen_row.append((f"SCREEN {m}  {actual[0]}x{actual[1]}", img))
             except Exception as exc:  # noqa: BLE001 - a dead screen is a NO SIGNAL tile
-                tiles.append((f"SCREEN {m}", None))
+                screen_row.append((f"SCREEN {m}", None))
                 errors.append({"tile": f"screen{m}", "error": str(exc)})
 
+        # Cameras get their own row so they are not squeezed into a grid sized
+        # for screens. Each index is captured in turn; a camera that another
+        # process is holding becomes NO SIGNAL rather than killing the wake.
+        camera_row = []
         if not args.no_room:
-            try:
-                img, actual = grab_camera(args.room_index, args.width, args.height)
-                tiles.append((f"ROOM  cam{args.room_index}  {actual[0]}x{actual[1]}", img))
-            except Exception as exc:  # noqa: BLE001
-                tiles.append((f"ROOM  cam{args.room_index}", None))
-                errors.append({"tile": "room", "error": str(exc)})
+            for idx in parse_indexes(args.room_index):
+                caption = CAMERA_CAPTIONS.get(idx, f"CAMERA {idx}")
+                try:
+                    img, actual = grab_camera(idx, args.width, args.height)
+                    if args.mask:
+                        img, masked = apply_helmet(img, args.mask_name)
+                        if masked:
+                            caption = f"{caption} [{masked} MASKED]"
+                    camera_row.append((f"{caption}  cam{idx}  {actual[0]}x{actual[1]}", img))
+                except Exception as exc:  # noqa: BLE001
+                    camera_row.append((f"{caption}  cam{idx}", None))
+                    errors.append({"tile": f"cam{idx}", "error": str(exc)})
 
-        board = compose_board(tiles, stamp, socket.gethostname())
+        tiles = screen_row + camera_row
+        board = compose_board([screen_row, camera_row], stamp, socket.gethostname())
         path = stage / f"glasses_board_{stamp}.jpg"
         size = write_jpeg(board, path, args.quality)
 
@@ -587,10 +754,15 @@ def main(argv=None) -> int:
     # faster cadence affordable.
     p.add_argument("--layout", choices=["frames", "board"], default="frames",
                    help="'frames' writes one file per source; 'board' composites them into one situation board")
-    p.add_argument("--room-index", type=int, default=0,
-                   help="camera index for the ROOM tile of the board (0 is the room-facing camera here)")
+    p.add_argument("--room-index", default="0",
+                   help="camera index(es) for the board's camera row; comma-separated, e.g. '0,1' "
+                        "(here 0 faces the operator, 1 faces the monitors)")
     p.add_argument("--no-room", action="store_true",
                    help="build the board from screens only, omitting the room camera")
+    p.add_argument("--mask", action="store_true",
+                   help="draw a Daft Punk style helmet over detected faces (also anonymises them)")
+    p.add_argument("--mask-name", default="MR. SALAM",
+                   help="text shown as LED across the helmet visor")
     p.add_argument("--interval", type=float, default=30.0, help="seconds between frames in --loop")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
