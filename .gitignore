@@ -37,6 +37,11 @@ data/
 # as the entries above -- a push is not undoable the way a local delete is, and
 # a repo can change visibility later without anyone re-reading what is in it.
 docs/security-review.md
+# Same rule, same reason: the multi-agent review repeats the confirmed findings
+# (the google.script.run exposure, the visitor-text-into-the-agent-board
+# crossing) and is therefore an attack map too. Local only until Mr. Salam says
+# otherwise.
+docs/multi-agent-review-2026-09-03.md
 # Python
 __pycache__/
 *.pyc
