@@ -44,7 +44,13 @@ $TaskName = 'SFDC24 Glasses Intake'
 
 if ($Remove) {
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-  Write-Output "removed scheduled task: $TaskName"
+  $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'SFDC24 Glasses Intake.lnk'
+  if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force }
+  # Kill any loop still running from this session.
+  Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" |
+    Where-Object { $_.CommandLine -like '*glasses_capture.py*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Write-Output "removed: scheduled task, startup shortcut, and any running capture loop"
   return
 }
 
@@ -53,6 +59,11 @@ $python = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $python) { throw "python not found on PATH" }
 $script = Join-Path $PSScriptRoot 'glasses_capture.py'
 if (-not (Test-Path -LiteralPath $script)) { throw "capture script not found: $script" }
+
+# pythonw.exe is python without a console window. A capture loop that parks a
+# black console on the desktop would also park it in every screenshot it takes.
+$runner = Join-Path (Split-Path -Parent $python) 'pythonw.exe'
+if (-not (Test-Path -LiteralPath $runner)) { $runner = $python }
 
 $argList = @(
   "`"$script`""
@@ -80,20 +91,53 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-  -Principal $principal -Settings $settings -Force | Out-Null
+# A logon-triggered task needs administrator rights; a non-elevated shell gets
+# "Access is denied" (0x80070005). Rather than demand an admin prompt, fall back
+# to a Startup-folder shortcut, which achieves the same thing -- start at logon,
+# run in the user's own session -- with no elevation at all. The scheduled task
+# is still preferred when available: it restarts on failure and survives battery
+# transitions, which a shortcut cannot.
+$mechanism = $null
+try {
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+    -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+  $mechanism = 'scheduled-task'
+} catch {
+  Write-Output "Task Scheduler refused ($($_.Exception.Message.Trim())) -- falling back to a Startup shortcut."
+  $startup = [Environment]::GetFolderPath('Startup')
+  $lnkPath = Join-Path $startup 'SFDC24 Glasses Intake.lnk'
+  $shell = New-Object -ComObject WScript.Shell
+  $lnk = $shell.CreateShortcut($lnkPath)
+  # pythonw runs without a console window; plain python would leave one open.
+  $lnk.TargetPath = $runner
+  $lnk.Arguments = ($argList -join ' ')
+  $lnk.WorkingDirectory = (Split-Path -Parent $PSScriptRoot)
+  $lnk.WindowStyle = 7   # minimised
+  $lnk.Description = 'SFDC24 Glasses Intake capture loop'
+  $lnk.Save()
+  $mechanism = "startup-shortcut ($lnkPath)"
+}
 
-Write-Output "registered: $TaskName"
-Write-Output ("  runs   : {0} {1}" -f $python, ($argList -join ' '))
+Write-Output "registered via: $mechanism"
+Write-Output ("  runs   : {0} {1}" -f $runner, ($argList -join ' '))
 Write-Output  "  trigger: at logon"
 
 if ($Start) {
-  Start-ScheduledTask -TaskName $TaskName
-  Start-Sleep -Seconds 2
-  $info = Get-ScheduledTask -TaskName $TaskName
-  Write-Output ("  state  : {0}" -f $info.State)
-  Write-Output "Frames should appear in data\glasses_intake within ~$Interval seconds."
-  Write-Output "Verify by READ-BACK, not by this message: refresh the Drive folder."
+  # Start it now regardless of mechanism -- neither trigger fires until the next
+  # logon, and waiting for that to find out whether it works is a bad trade.
+  $proc = Start-Process -FilePath $runner -ArgumentList $argList `
+          -WorkingDirectory (Split-Path -Parent $PSScriptRoot) `
+          -WindowStyle Hidden -PassThru
+  Start-Sleep -Seconds 3
+  if ($proc.HasExited) {
+    Write-Output ("  STARTED BUT EXITED immediately, code {0} -- run the capture once by hand to see why:" -f $proc.ExitCode)
+    Write-Output ("  {0} `"{1}`" --once --layout {2}" -f $python, $script, $Layout)
+  } else {
+    Write-Output ("  state  : running, pid {0}" -f $proc.Id)
+    Write-Output "Frames should appear in data\glasses_intake within ~$Interval seconds."
+    Write-Output "Verify by READ-BACK, not by this message: refresh the Drive folder."
+    Write-Output ("To stop it:  Stop-Process -Id {0}" -f $proc.Id)
+  }
 } else {
-  Write-Output "Not started. Run with -Start, or: schtasks /Run /TN `"$TaskName`""
+  Write-Output "Not started. Re-run with -Start."
 }
