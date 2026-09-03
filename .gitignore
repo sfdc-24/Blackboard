@@ -4,6 +4,15 @@ logs/
 # Env
 .env
 .env.*
+# Backup copies of .env made by hand during rotations. These hold LIVE
+# credentials in cleartext and the patterns above do not catch them --
+# ".env-OLD.txt" matches neither ".env" nor ".env.*". Appeared 2026-09-03.
+# This is exactly the shape of REQ-M6HZK4: one `git add -A` from permanent
+# history, and git history cannot be scrubbed the way a Doc can.
+.env-*
+*.env
+env.bak
+.env.bak
 # Credential-bearing one-shot clients -- see Issue Journal REQ-M6HZK4.
 # These four scripts and the helper below hardcode the live BUS_SECRET in
 # cleartext. They are untracked today; without these lines a single
@@ -22,6 +31,9 @@ projects/sfdc24-bus-helper/
 # notes. Staged frames are working data, never repository content. Same lesson
 # as REQ-M6HZK4: git history cannot be scrubbed the way a Doc can.
 data/
+# Python
+__pycache__/
+*.pyc
 # OS / Editor
 .DS_Store
 Thumbs.db
