@@ -144,3 +144,43 @@ proof: it has to earn attention by being useful rather than by being short.
 the bottom having agreed four times without ever learning what actually gets
 delivered. The diagnostic offer — fixed fee, written recommendation — belongs on
 this page, not just in the intake flow.
+
+---
+
+## ADDITION — the missing offer section (2026-09-03)
+
+Goes **after** "Nobody clearly owns what should happen next" and **before** "AI
+agents do the legwork". Order matters: problem → what you get → how it is
+delivered → ask.
+
+Groq drafted the skeleton in 1.3 seconds and the structure was right — what
+happens, what lands on your desk, what it commits you to. Three things in its
+draft were wrong and had to go: it wrote **"we"** when there is one consultant;
+it promised **"pulling the current configuration and data from your Salesforce
+org"**, which claims access the reception explicitly tells visitors it does not
+have; and "shows the impact of each action" overclaims quantified prediction.
+
+No price, deliberately — that decision is open (BLK-004). A price can be added
+as one sentence without touching anything else.
+
+### What the first piece of work looks like
+
+Before anything gets changed, there is a diagnostic: a fixed piece of work that
+ends in a written recommendation.
+
+It starts with a conversation and a look at what you already have. How the
+process is supposed to run, what the system is actually doing, and where the two
+have come apart. Where a read-only look at the org is useful and you are
+comfortable granting it, that helps; where you are not, the work runs on your
+own descriptions, exports and screenshots. Usually a week or two, depending on
+how many people need talking to.
+
+What arrives at the end is a short document, not a slide deck. What is actually
+wrong, ordered by what it is costing you. What should be done first, and why.
+What to leave alone for now. Where a fix is straightforward it says so. Where it
+needs a decision from someone with authority, it names the decision rather than
+burying it in a backlog.
+
+It commits you to nothing. If the recommendation is worth acting on and you want
+it done, that is a separate conversation. If it is not, you still have the
+document.
