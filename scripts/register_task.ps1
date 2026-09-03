@@ -44,7 +44,11 @@ param(
   # Helmet overlay on detected faces. Doubles as anonymisation: boards land in
   # a folder three vendor instances read, and Google OCRs every one.
   [switch]$Mask,
-  [string]$MaskName = 'MR. SALAM'
+  [string]$MaskName = 'MR. SALAM',
+  # How often to announce the latest board on the Alpha DB sheet, so the fleet
+  # can find these images at all. 0 disables. Rate-limited by design: one row
+  # per board would be ~90 rows an hour on a board other instances must read.
+  [int]$PointerEveryMin = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,6 +87,7 @@ $argList = @(
 )
 if ($NoRoom) { $argList += '--no-room' } else { $argList += @('--room-index'; "$RoomIndex") }
 if ($Mask)   { $argList += @('--mask'; '--mask-name'; "`"$MaskName`"") }
+$argList += @('--pointer-every-min'; "$PointerEveryMin")
 if (-not $NoUpload) {
   $argList += @('--upload'; 'bus'; '--drive-max-age-min'; "$MaxAgeMin")
 }

@@ -551,6 +551,79 @@ def prune_drive(cfg: dict, keep: int, max_age_min: int) -> dict:
     return out
 
 
+_last_pointer = 0.0
+
+
+def post_pointer_row(cfg: dict, file_id: str, name: str, stamp: str,
+                     tiles: list, live: int) -> dict:
+    """Append one row to the board announcing the latest situation board.
+
+    WHY: the images are invisible to the fleet without this. An instance
+    following the BOOT wake protocol reads the board, and nothing there
+    referenced the Glasses Intake folder -- so the frames were discoverable
+    only by someone who already knew to look.
+
+    phase=ASSET, deliberately NOT phase=VIEWPORT. The wake protocol says to read
+    the newest VIEWPORT row; posting these as VIEWPORT would hijack every
+    instance's wake with a screenshot pointer several times an hour.
+
+    Cells are comma-free per the LEARNINGS sheetRow convention, and all ten
+    columns are supplied -- the sheet does not auto-fill Row_ID or Timestamp,
+    and a short array silently shifts every field left (claude-mobile, Sep 2).
+    """
+    import uuid
+
+    url, secret = cfg.get("BUS_URL"), cfg.get("BUS_SECRET")
+    if not url or not secret:
+        raise RuntimeError("BUS_URL / BUS_SECRET missing from .env (D-18)")
+
+    view = f"https://drive.google.com/file/d/{file_id}/view"
+    payload = (
+        "BCB|v=1|wf=GLASSES-INTAKE|sub=BOARD-POINTER|phase=ASSET"
+        "|from=claude-code-cli|to=ALL|kind=situation-board"
+        f"|file_id={file_id}|name={name}|url={view}"
+        f"|captured={stamp}|tiles={live}/{len(tiles)}"
+        f"|folder={DRIVE_FOLDER_ID}"
+        "|note=newest composite of every screen plus the operator and setup cameras."
+        " Faces are helmet-masked. Retention is 1 hour so this link expires -"
+        " read the newest ASSET row rather than an older one."
+        "|caveat=screen tiles are downscaled so OCR recovers headings not body text -"
+        " act on the board sheet for state and treat this as visual provenance (D-12)."
+    )
+    row = [
+        str(uuid.uuid4()),
+        dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "claude-code-cli",
+        "ALL",
+        "APPEND",
+        payload,
+        "DONE",
+        "GLASSES-INTAKE",
+        "",
+        "",
+    ]
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({
+            "action": "append",
+            "secret": secret,
+            "title": "Blackboard - Alpha DB",
+            "sheetRow": row,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    try:
+        out = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"bus returned non-JSON: {body[:200]}")
+    if not out.get("ok"):
+        raise RuntimeError(f"bus refused the pointer row: {body[:300]}")
+    return {"ok": True, "row_id": row[0], "appendedAt": out.get("appendedAt")}
+
+
 def probe(width: int, height: int, stage: Path) -> int:
     """Capture one frame from every index that opens, so the index-to-device
     mapping is established by looking, not by guessing."""
@@ -647,6 +720,21 @@ def capture_once(args, cfg) -> int:
             except Exception as exc:  # noqa: BLE001
                 record["delivery"] = "STAGED_UPLOAD_FAILED"
                 record["upload_error"] = str(exc)
+
+        # Pointer row: rate-limited, and only once the image is actually IN Drive.
+        # Announcing a file that failed to upload would be a dangling link on a
+        # board other instances trust.
+        global _last_pointer
+        if (args.pointer_every_min > 0
+                and record.get("delivery") == "UPLOADED"
+                and (time.time() - _last_pointer) >= args.pointer_every_min * 60):
+            try:
+                gw = record["gateway"]
+                record["pointer_row"] = post_pointer_row(
+                    cfg, gw["fileId"], gw["name"], stamp, tiles, record["live_tiles"])
+                _last_pointer = time.time()
+            except Exception as exc:  # noqa: BLE001 - never fail a capture over this
+                record["pointer_row"] = {"error": str(exc)}
 
         summary = {
             "captured": 1,
@@ -763,6 +851,11 @@ def main(argv=None) -> int:
                    help="draw a Daft Punk style helmet over detected faces (also anonymises them)")
     p.add_argument("--mask-name", default="MR. SALAM",
                    help="text shown as LED across the helmet visor")
+    # Rate-limited on purpose: at a 40s cadence a row per board would be ~90
+    # rows an hour of noise on a board other instances have to read.
+    p.add_argument("--pointer-every-min", type=int, default=5,
+                   help="append a board row pointing at the latest situation board, "
+                        "at most this often in minutes (0 disables)")
     p.add_argument("--interval", type=float, default=30.0, help="seconds between frames in --loop")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
