@@ -123,6 +123,17 @@ Write-Output ("  runs   : {0} {1}" -f $runner, ($argList -join ' '))
 Write-Output  "  trigger: at logon"
 
 if ($Start) {
+  # Kill any loop already running before starting another. Without this, a
+  # second -Start silently leaves TWO loops uploading, doubling the frame rate,
+  # the storage and the quota burn -- and the duplicates look exactly like
+  # correct output, so nothing would flag it.
+  $existing = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" |
+                Where-Object { $_.CommandLine -like '*glasses_capture.py*--loop*' })
+  foreach ($e in $existing) {
+    Stop-Process -Id $e.ProcessId -Force -ErrorAction SilentlyContinue
+    Write-Output ("  stopped existing loop, pid {0}" -f $e.ProcessId)
+  }
+
   # Start it now regardless of mechanism -- neither trigger fires until the next
   # logon, and waiting for that to find out whether it works is a bad trade.
   $proc = Start-Process -FilePath $runner -ArgumentList $argList `
