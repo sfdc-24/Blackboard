@@ -157,6 +157,80 @@ def grab_screen(which: int = 1):
     return img, (img.shape[1], img.shape[0])
 
 
+# --- Situation Board composition -------------------------------------------
+# One frame that shows the whole workspace at a glance: every screen plus the
+# room, tiled, stamped and labelled. A webcam cannot give a literal overhead
+# shot, so this is the practical "bird's eye view" -- mission control rather
+# than a ceiling camera.
+BOARD_W, BOARD_H = 1920, 1200
+BANNER_H = 60
+INK = (236, 236, 240)     # near-white, BGR
+GROUND = (18, 18, 22)     # near-black canvas
+DIM = (150, 150, 158)     # secondary text
+
+
+def fit_into(img, w: int, h: int):
+    """Scale to fit inside w x h preserving aspect, centred on the canvas
+    ground. Letterboxing rather than cropping -- a tile that silently cut off
+    half a screen would be worse than one with bars."""
+    import cv2
+    import numpy as np
+
+    canvas = np.full((h, w, 3), GROUND, dtype=np.uint8)
+    ih, iw = img.shape[:2]
+    scale = min(w / iw, h / ih)
+    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    x, y = (w - nw) // 2, (h - nh) // 2
+    canvas[y:y + nh, x:x + nw] = resized
+    return canvas
+
+
+def compose_board(tiles, stamp: str, host: str):
+    """Tile up to four sources into one board image.
+
+    tiles: list of (label, image-or-None). A None image becomes a visible
+    "no signal" cell rather than being skipped -- a missing screen is
+    information, and a board that silently reflows would hide it.
+    """
+    import cv2
+    import numpy as np
+
+    canvas = np.full((BOARD_H, BOARD_W, 3), GROUND, dtype=np.uint8)
+    cell_w, cell_h = BOARD_W // 2, (BOARD_H - BANNER_H) // 2
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(canvas, "SFDC24 - GLASSES INTAKE", (18, 40), font, 0.8, INK, 2, cv2.LINE_AA)
+    right = f"{stamp}   ·   {host}"
+    (tw, _), _ = cv2.getTextSize(right, font, 0.62, 1)
+    cv2.putText(canvas, right, (BOARD_W - tw - 18, 39), font, 0.62, DIM, 1, cv2.LINE_AA)
+    cv2.line(canvas, (0, BANNER_H - 1), (BOARD_W, BANNER_H - 1), (60, 60, 68), 1)
+
+    for i, (label, img) in enumerate(tiles[:4]):
+        r, c = divmod(i, 2)
+        x0, y0 = c * cell_w, BANNER_H + r * cell_h
+        pad = 3
+        iw, ih = cell_w - pad * 2, cell_h - pad * 2
+
+        if img is None:
+            cell = np.full((ih, iw, 3), GROUND, dtype=np.uint8)
+            msg = "NO SIGNAL"
+            (tw, th), _ = cv2.getTextSize(msg, font, 0.9, 2)
+            cv2.putText(cell, msg, ((iw - tw) // 2, (ih + th) // 2), font, 0.9, (70, 70, 90), 2, cv2.LINE_AA)
+        else:
+            cell = fit_into(img, iw, ih)
+
+        canvas[y0 + pad:y0 + pad + ih, x0 + pad:x0 + pad + iw] = cell
+        cv2.rectangle(canvas, (x0 + pad, y0 + pad), (x0 + pad + iw - 1, y0 + pad + ih - 1),
+                      (60, 60, 68), 1)
+        # Label sits on its own strip so it stays readable over any content.
+        cv2.rectangle(canvas, (x0 + pad, y0 + pad), (x0 + pad + 260, y0 + pad + 26),
+                      GROUND, -1)
+        cv2.putText(canvas, label, (x0 + pad + 8, y0 + pad + 19), font, 0.52, INK, 1, cv2.LINE_AA)
+
+    return canvas
+
+
 def frame_stats(frame) -> dict:
     """Cheap legibility signal. A frame that is uniformly dark or blown out
     has near-zero spread -- worth failing on rather than shipping a black
@@ -362,6 +436,66 @@ def capture_once(args, cfg) -> int:
         targets.append((f"cam{args.index}",
                         lambda: grab_camera(args.index, args.width, args.height)))
 
+    # --- Situation Board: one composite frame instead of one file per source ---
+    if args.layout == "board":
+        import socket
+
+        tiles = []
+        errors = []
+        for m in range(1, monitor_count() + 1):
+            try:
+                img, actual = grab_screen(m)
+                tiles.append((f"SCREEN {m}  {actual[0]}x{actual[1]}", img))
+            except Exception as exc:  # noqa: BLE001 - a dead screen is a NO SIGNAL tile
+                tiles.append((f"SCREEN {m}", None))
+                errors.append({"tile": f"screen{m}", "error": str(exc)})
+
+        if not args.no_room:
+            try:
+                img, actual = grab_camera(args.room_index, args.width, args.height)
+                tiles.append((f"ROOM  cam{args.room_index}  {actual[0]}x{actual[1]}", img))
+            except Exception as exc:  # noqa: BLE001
+                tiles.append((f"ROOM  cam{args.room_index}", None))
+                errors.append({"tile": "room", "error": str(exc)})
+
+        board = compose_board(tiles, stamp, socket.gethostname())
+        path = stage / f"glasses_board_{stamp}.jpg"
+        size = write_jpeg(board, path, args.quality)
+
+        record = {
+            "file": str(path),
+            "resolution": f"{BOARD_W}x{BOARD_H}",
+            "bytes": size,
+            "tiles": [t[0] for t in tiles],
+            "live_tiles": sum(1 for t in tiles if t[1] is not None),
+            "delivery": "STAGED",
+        }
+        if errors:
+            record["tile_errors"] = errors
+
+        if args.upload == "bus":
+            try:
+                record["gateway"] = upload_via_bus(path, cfg)
+                record["delivery"] = "UPLOADED"
+            except Exception as exc:  # noqa: BLE001
+                record["delivery"] = "STAGED_UPLOAD_FAILED"
+                record["upload_error"] = str(exc)
+
+        summary = {
+            "captured": 1,
+            "layout": "board",
+            "frames": [record],
+            "prune_local": prune_local(stage, args.keep, args.max_age_min, [path]),
+        }
+        if args.drive_keep > 0 or args.drive_max_age_min > 0:
+            try:
+                summary["prune_drive"] = prune_drive(cfg, args.drive_keep, args.drive_max_age_min)
+            except Exception as exc:  # noqa: BLE001
+                summary["prune_drive"] = {"error": str(exc)}
+
+        print(json.dumps(summary, indent=2))
+        return 2 if record["delivery"] == "STAGED_UPLOAD_FAILED" else 0
+
     records = []
     written = []
     for label, grab in targets:
@@ -448,6 +582,15 @@ def main(argv=None) -> int:
     # space -- 6400x1729 of mostly nothing, which wastes bytes and hurts OCR.
     p.add_argument("--monitor", default="all",
                    help="which display to capture with --source screen: 'all' (default) or a 1-based index")
+    # Board layout composites every screen plus the room into ONE frame. Besides
+    # reading better, it cuts uploads 4:1 -- the quota headroom that makes a
+    # faster cadence affordable.
+    p.add_argument("--layout", choices=["frames", "board"], default="frames",
+                   help="'frames' writes one file per source; 'board' composites them into one situation board")
+    p.add_argument("--room-index", type=int, default=0,
+                   help="camera index for the ROOM tile of the board (0 is the room-facing camera here)")
+    p.add_argument("--no-room", action="store_true",
+                   help="build the board from screens only, omitting the room camera")
     p.add_argument("--interval", type=float, default=30.0, help="seconds between frames in --loop")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)

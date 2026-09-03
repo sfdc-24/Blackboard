@@ -30,7 +30,13 @@ param(
   [switch]$Remove,      # unregister and exit
   [int]$Interval = 30,  # seconds between wakes
   [int]$MaxAgeMin = 60, # retention, both local and Drive
-  [switch]$NoUpload     # capture locally only; do not send to Drive
+  [switch]$NoUpload,    # capture locally only; do not send to Drive
+  # 'board' composites every screen plus the room into ONE situation board.
+  # Besides reading better, it is a single upload per wake instead of four,
+  # which is what makes a faster cadence affordable against Apps Script quota.
+  [ValidateSet('board', 'frames')]
+  [string]$Layout = 'board',
+  [switch]$NoRoom       # board from screens only, omitting the room camera
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,9 +58,11 @@ $argList = @(
   "`"$script`""
   '--loop'
   '--interval'; "$Interval"
+  '--layout'; $Layout
   '--keep'; '0'
   '--max-age-min'; "$MaxAgeMin"
 )
+if ($NoRoom) { $argList += '--no-room' }
 if (-not $NoUpload) {
   $argList += @('--upload'; 'bus'; '--drive-max-age-min'; "$MaxAgeMin")
 }
