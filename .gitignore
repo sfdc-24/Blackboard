@@ -54,3 +54,7 @@ Thumbs.db
 node_modules/
 dist/
 build/
+
+# Quant research venv and cached market data. The venv is 300MB+ of wheels and
+# the market cache is vendor data, not repository content.
+.venv-quant/
