@@ -110,6 +110,50 @@ One test row sits in `PUBLIC_INBOX` as the evidence. Reception still serves 200.
 
 ---
 
+## Idempotency FIXED — Version 15, verified 2026-09-03
+
+Duplicate Governor events (confirmed 1.7s apart) are gone. `appendRow_` had no
+dedup at all — it minted a fresh UUID and appended unconditionally. The
+LockService lock only serialised writes; it never stopped repeats.
+
+**The fix, and why it is shaped this way.** A dedup check now runs INSIDE the
+script lock, and it reads the sheet, not CacheService. Gemini's finding was
+right: CacheService is eventually consistent, so two executions racing can both
+`cache.get()`, both miss, and both write. The sheet is the only strongly
+consistent record, and read inside the lock it is authoritative.
+
+Two details that matter:
+- `SpreadsheetApp.flush()` fires at the top of the critical section. Reads can
+  be served from a snapshot taken when the spreadsheet was first touched — and
+  `sheet_()` touches it before the lock. Without the flush the scan can miss a
+  row committed a second earlier, which is exactly the case being fixed.
+- **The read-back moved inside the lock too.** It used to sit outside, so a
+  concurrent append between release and read-back made a perfectly good row
+  report `MISSING`. That was a real latent bug, unrelated to duplicates.
+
+Match is on payload + `Source_Tag` within `DEDUP_WINDOW_MS` (90s), scanning the
+last 40 rows. Source is part of the key on purpose: two agents posting the same
+text are two real events. A duplicate returns `{ok:true, duplicate:true}` with
+the EXISTING row_id — success, not failure, so a client that retried after a
+timeout does not retry again.
+
+**Verified with three runs, not one:**
+
+| scenario | expected | result |
+|---|---|---|
+| same execution, inside window | deduped, board +1 | PASS |
+| **separate execution, inside window** | **both deduped, board +0** | **PASS** |
+| after the 90s window expires | writes again, board +1 | PASS |
+
+The second is the one that matters — same-execution dedup would pass even with
+a broken design. The third matters just as much: it proves this is a window and
+not a permanent block that would silently swallow real repeated events.
+
+Test function kept out of version 15 and deleted after. Reception serves 200,
+sfdc24.com serves 200.
+
+---
+
 ## What is live right now
 
 | Thing | State |
@@ -117,8 +161,9 @@ One test row sits in `PUBLIC_INBOX` as the evidence. Reception still serves 200.
 | Reception prompt | Humour removed, qualify-or-close in. Verified both directions. Now serving under **Version 13**. |
 | Homepage copy | **LIVE and verified.** sfdc24.com went from ~0 to **3,502 indexable characters**. |
 | Site title | `SFDC24` (was `Home`). Published. |
-| Exposed-function guards | **DEPLOYED — carried into Version 14. Verified.** |
-| PUBLIC_INBOX quarantine | **LIVE — Version 14. Verified against the real sheets.** |
+| Exposed-function guards | **DEPLOYED — carried into Version 15. Verified.** |
+| PUBLIC_INBOX quarantine | **LIVE — Version 14, carried into 15. Verified.** |
+| Idempotent board writes | **LIVE — Version 15. Verified across executions.** |
 | Glasses capture loop | Running (`pythonw`, Startup shortcut). Untouched. |
 | Board worker | Not scheduled, not running. Dormant by design. |
 | Per-prompt log | Live via Stop hook. |
@@ -241,9 +286,7 @@ that does not exist. Selling is the binding constraint, not building.
 3. Every homepage section is a problem statement — a reader can agree four times
    without learning what they receive. The (now free) diagnostic offer belongs
    on the page.
-4. Idempotency: duplicate Governor events confirmed 1.7s apart. **Gemini's
-   verdict: CacheService is insufficient, LockService is required** — it is
-   eventually consistent, so two executions both pass `cache.get()`.
+4. ~~Idempotency~~ — **DONE, Version 15.** See above.
 5. Bus secret rotation (deferred by Mr. Salam). `codegs_rotation_window.gs`
    exists to make it zero-downtime.
 6. Human gate (`scripts/human_gate.gs`) still not wired.
