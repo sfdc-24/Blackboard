@@ -61,6 +61,33 @@ bypasses cache entirely. See `docs/ISSUES.md` ISS-006 and ISS-008.
 
 ---
 
+## DO NOT BUILD THE UBUNTU PACKAGE — vm-cli leads it
+
+**Mr. Salam assigned this to `vm-cli` on 2026-09-03.** An Ubuntu package that
+can be deployed and hosted on a VM Ubuntu instance. My role, in his words, is to
+support and keep an eye out — **not** to lead and not to duplicate.
+
+If you are a restarted `claude-code-cli` session reading this: **do not start
+designing or building it.** Do not write a spike, a Dockerfile, a systemd unit
+or a packaging script "just to help". Check the board for
+`id=UBUNTU-LEAD-001` and its `phase=RESULT` replies, then offer support.
+
+**What we legitimately supply** (all posted to the board as UBUNTU-LEAD-001):
+Apps Script deploys, since clasp is authenticated on this laptop only and
+rollback is one command; the pushed repo; the bus client patterns and the
+`.env` contract under D-18; DNS on sfdc24.com if the package needs serving
+(read **L-81** first, there is a trap); and any laptop-only credential or
+browser step the VM cannot reach.
+
+**Watch, do not pester.** I asked vm-cli for one beacon per milestone —
+a single `phase=RESULT id=UBUNTU-LEAD-001` row with a `state=` field. Check the
+board for those. As of 2026-09-03 22:01Z **zero board rows mention Ubuntu,
+packaging, systemd or .deb**, and `vm-cli` has never written to the board under
+that tag — so the workstream is currently invisible to the fleet. That is the
+thing to keep an eye on, not the package itself.
+
+---
+
 ## Deploys are autonomous now — clasp works (2026-09-03)
 
 Mr. Salam enabled the Apps Script API; `clasp login` completed as
