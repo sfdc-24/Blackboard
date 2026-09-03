@@ -76,14 +76,16 @@ Ten candidates from ChatGPT, domains checked by me against the Verisign registry
 **Customer Ops Office** (safest). Its "PRELIM GREEN" trademark verdicts are
 self-labelled guesses, not searches — CIPO and USPTO still needed.
 
-Recommendation standing: **two names, not a rename.** Keep `sfdc24.com` for the
-Salesforce practice, give the platform its own non-platform-bound name.
+**DECIDED 2026-09-03: keep `sfdc24.com` for now.** No rebrand, no domain bought.
+The trademark exposure is *accepted, not resolved* — see the `naming-decision`
+memory. Revisit on AppExchange submission, incorporation, ranking well, or any
+contact from Salesforce. Standing recommendation for that day: two names, not a
+rename — keep sfdc24.com for the practice, give the platform its own name.
 
 ## What I need from Mr. Salam — batched, ~6 minutes total
 
 1. **Anthropic console → spend cap.** 2 min. Do this one regardless.
-2. **Name: pick one, or say "keep SFDC24 for now".** 1 min. Blocks the domain
-   purchase and nothing else.
+2. ~~Name decision~~ — **DONE. Keeping sfdc24.com.**
 3. **Standing permission to edit the live Apps Script and Google Site without
    asking each time.** 30 sec. Currently I stop and ask; that is the main thing
    slowing autonomous work.
