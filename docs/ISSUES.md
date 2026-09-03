@@ -11,6 +11,8 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-003 | 2026-09-03 | MED | No way to reach Mr. Salam for a decision when he is away from the desk | OPEN |
 | ISS-004 | 2026-09-03 | LOW | Chrome extension blocks reading Apps Script / long AI chat source via JS | OPEN |
 | ISS-005 | 2026-09-03 | LOW | ChatGPT tab renderer freezes on long transcripts | OPEN |
+| ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | OPEN |
+| ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
 
 ---
 
@@ -81,3 +83,69 @@ match counts. Audit by searching, not extracting.
 Screenshots time out and `get_page_text` returns ~99 chars. **Workaround:** click
 the conversation in the sidebar to force a re-render. Cheaper still: ask it to
 restate the answer briefly rather than extracting the long one.
+
+
+---
+
+## ISS-006 · sfdc24.com is down — DNS moved off Google — CRITICAL
+
+**Found** 2026-09-03 ~16:40Z while verifying a homepage edit. The verification
+caught it; nothing else would have.
+
+**Symptom.** `https://www.sfdc24.com` returns `301 Moved Permanently` from
+**nginx**, redirecting to itself — an infinite loop. The site is unreachable.
+
+**Diagnosis.** Both apex and www now resolve to `45.77.75.133`,
+`45.77.92.157`, `207.246.78.75`. Reverse DNS on those is
+**vultrusercontent.com**. `www` was a CNAME to `ghs.googlehosted.com` earlier
+today; it is now an A record set pointing at Vultr.
+
+**Everything else is healthy** — this is only the domain pointer:
+
+| | |
+|---|---|
+| Google Sites content | 200, 934 KB |
+| Reception app | 200, 25 KB |
+| Email (MX) | intact, `SMTP.GOOGLE.com` |
+
+**Almost certainly NameSilo's parking/forwarding layer.** The identical failure
+happened on 2026-09-02: re-saving NameSilo forwarding injected A records for
+both `@` and `www`, overriding the `www` CNAME. Note the apex now resolves,
+where it was NXDOMAIN a few hours ago — consistent with forwarding being
+(re)enabled.
+
+**Not caused by this session.** No DNS was touched. Work this session was Google
+Sites content and Apps Script only, neither of which can alter DNS records.
+
+**The fix, which worked last time.** In NameSilo: delete the A records for `@`
+and `www`, re-add `www` as a CNAME to `ghs.googlehosted.com`. Verify with
+`Server: ESF` in the response headers.
+
+**Why I did not just do it.** DNS is explicitly outside standing permission —
+Mr. Salam granted Apps Script and Google Sites only — and I broke this exact
+thing on 2026-09-02 by touching NameSilo forwarding. Raised instead as BLK-005
+on the blockers page with a one-tap "fix it now", which is the case that page
+was built for.
+
+---
+
+## ISS-007 · Google Sites iframe steals keyboard focus mid-typing — MED
+
+**Symptom.** While typing into a Sites text box on a page that embeds the
+reception app, focus jumps into the reception's chat input part-way through.
+Text intended for the page lands in the live chat, and pressing Enter **sends a
+real message**, spending tokens and creating junk rows.
+
+**Cause.** The reception page focuses its input on any keypress — the "type
+anywhere" affordance that makes the terminal UI feel right. In an editor iframe
+it is a hazard.
+
+**Happened twice**, costing a partial publish and two junk visitor messages.
+
+**Workaround that works.** Re-click into the text box before EVERY chunk and
+screenshot after each. Do not type more than one paragraph per click. Verified:
+three paragraphs typed this way all landed correctly.
+
+**Real fix, when reception is next deployed.** Gate the focus-steal on
+`window.self === window.top` so it never fires inside an iframe. One line, and it
+also stops the same thing happening to a real visitor embedding the page.
