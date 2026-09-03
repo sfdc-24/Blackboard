@@ -36,7 +36,11 @@ param(
   # which is what makes a faster cadence affordable against Apps Script quota.
   [ValidateSet('board', 'frames')]
   [string]$Layout = 'board',
-  [switch]$NoRoom       # board from screens only, omitting the room camera
+  [switch]$NoRoom,      # board from screens only, omitting the room camera
+  # Which camera fills the board's fourth tile. Indexes are NOT stable across
+  # replug -- confirm with `glasses_capture.py --probe` after any USB change.
+  # As probed 2026-09-03: 0 faces the operator, 1 faces the monitors.
+  [int]$RoomIndex = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,7 +77,7 @@ $argList = @(
   '--keep'; '0'
   '--max-age-min'; "$MaxAgeMin"
 )
-if ($NoRoom) { $argList += '--no-room' }
+if ($NoRoom) { $argList += '--no-room' } else { $argList += @('--room-index'; "$RoomIndex") }
 if (-not $NoUpload) {
   $argList += @('--upload'; 'bus'; '--drive-max-age-min'; "$MaxAgeMin")
 }
