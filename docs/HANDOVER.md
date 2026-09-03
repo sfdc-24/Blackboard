@@ -31,11 +31,11 @@ clicked it by hand.
 
 ---
 
-## What is live right now## What is live right now
+## What is live right now
 
 | Thing | State |
 |---|---|
-| Reception prompt | **Version 12.** Humour removed, qualify-or-close in. Verified both directions. |
+| Reception prompt | Humour removed, qualify-or-close in. Verified both directions. Now serving under **Version 13**. |
 | Homepage copy | **LIVE and verified.** sfdc24.com went from ~0 to **3,502 indexable characters**. |
 | Site title | `SFDC24` (was `Home`). Published. |
 | Exposed-function guards | **DEPLOYED — Version 13. Verified.** |
