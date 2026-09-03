@@ -14,6 +14,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | **RESOLVED** |
 | ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
 | ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
+| ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
 
@@ -279,3 +280,62 @@ component, not that one dropdown.
 file.** The picker always pre-selects the first function in the open file, so a
 file containing exactly one function needs no click at all. That is how
 `test_quarantine` was run. Verified.
+
+---
+
+## ISS-009 · Tag collision — three writers share `claude-code-cli` — HIGH
+
+**This caused the Sep 3 outage, and my earlier RCA was incomplete.** I reported
+the loop as leftover NameSilo parking from Sep 2. It was not. It was created at
+roughly 11:57 AM EDT **that same day, by another instance writing under my own
+tag**, and I had no way to see it.
+
+**The real sequence, reconciled from the board:**
+
+1. Sep 2 DNS edits auto-removed NameSilo Domain Forwarding, so the apex went
+   dark. (Board row 15:24:55Z — `ANDON` — apex A record GONE, www healthy.)
+2. ~11:57 AM EDT Sep 3 an instance tagged `claude-code-cli` re-enabled Domain
+   Forwarding to restore the apex, and filed **L-77**. (Board row 15:57:20Z —
+   `ANDON-CLEAR`.)
+3. Re-enabling forwarding made NameSilo **install its forwarder A records on
+   `www` as well as the apex, silently replacing the `www` CNAME**. The
+   ANDON-CLEAR line "www CNAME untouched throughout" was wrong.
+4. That forwarder 301s every host it answers for to `www`, so `www` began
+   redirecting to itself and the whole site went down — which is what I found
+   at ~1:20 PM and fixed by splitting the records.
+
+**So both RCAs were half right.** L-77 correctly identified that forwarding gets
+auto-removed; mine correctly identified the self-loop. Neither saw the join:
+**re-enabling forwarding destroys the `www` CNAME.** Filed as **L-81**, with
+**L-78**'s dismissal of L-77 explicitly withdrawn.
+
+**Why it happened.** At least three writers share the tag `claude-code-cli`:
+this laptop session, the glasses capture loop posting `ASSET` rows every five
+minutes, and whoever filed the noon ANDON-CLEAR. The check-in register exists to
+prevent exactly this — one instance sees another holding a file and waits — and
+it cannot work when three writers answer to one name. `REQ-R6WNT2` already says
+a tag is a claimed identity, not a machine; nothing enforces it.
+
+**Raised to Mr. Salam as BLK-008** with a concrete split: laptop keeps
+`claude-code-cli`, the VM takes `vm-cli`, the glasses loop takes
+`glasses-uploader`. Tag assignment is his call, not mine to take unilaterally.
+
+**Mitigation already shipped:** `DNS-COORD-001` is on the board addressed to
+ALL, carrying the trap, the correct end state, and the verification chain, so
+the next instance to touch this domain cannot repeat it by accident.
+
+---
+
+## ISS-010 · Bus writes return redirect artifacts that look like failures — MED
+
+Twice in ten minutes a bus append returned either `hop 2 redirected again --
+one-shot key consumed or expired` or a Google Drive "Page Not Found" HTML body.
+**Both writes had landed intact**, full payload, exactly once. A blind retry
+would have created duplicates — and the v15 idempotency fix does **not** protect
+these, because the bus is a different Apps Script with no dedup of its own.
+
+Reads degrade the same way under rapid use; a ~45s backoff cleared it, which
+points at rate limiting rather than a broken key.
+
+**Rule, filed as L-80:** always read back before retrying any bus write, and
+never assume the bus protects you the way the Governor API now does.
