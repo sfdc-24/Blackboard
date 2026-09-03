@@ -7,12 +7,13 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | # | Opened | Severity | Title | Status |
 |---|--------|----------|-------|--------|
 | ISS-001 | 2026-09-03 | HIGH | Apps Script "New version" cannot be selected by browser automation | OPEN |
-| ISS-002 | 2026-09-03 | MED | Multiple Chrome browsers connected — session blocked until one is chosen | OPEN |
+| ISS-002 | 2026-09-03 | MED | Multiple Chrome browsers connected — session blocked until one is chosen | **RESOLVED** |
 | ISS-003 | 2026-09-03 | MED | No way to reach Mr. Salam for a decision when he is away from the desk | OPEN |
 | ISS-004 | 2026-09-03 | LOW | Chrome extension blocks reading Apps Script / long AI chat source via JS | OPEN |
 | ISS-005 | 2026-09-03 | LOW | ChatGPT tab renderer freezes on long transcripts | OPEN |
-| ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | OPEN |
+| ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | **RESOLVED** |
 | ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
+| ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
 
 ---
 
@@ -149,3 +150,81 @@ three paragraphs typed this way all landed correctly.
 **Real fix, when reception is next deployed.** Gate the focus-steal on
 `window.self === window.top` so it never fires inside an iframe. One line, and it
 also stops the same thing happening to a real visitor embedding the page.
+
+---
+
+## ISS-006 · RESOLVED 2026-09-03 — sfdc24.com redirect loop
+
+**Root cause, found and proved.** NameSilo **Domain Forwarding was ON** with a
+301 to `https://www.sfdc24.com`. Its parking template had put the same three
+forwarding A records (`45.77.75.133`, `45.77.92.157`, `207.246.78.75`) on
+**both `@` and `www`**. The forwarding server 301s *everything it is asked for*
+to `www`. So `www` pointed at a server whose only job was to redirect to `www`.
+
+Proved directly rather than inferred, by pinning the Host header to the
+forwarding IP:
+
+```
+Host: sfdc24.com      -> 301 Location: https://www.sfdc24.com/   correct
+Host: www.sfdc24.com  -> 301 Location: https://www.sfdc24.com    ITSELF - the loop
+```
+
+The forwarding was never wrong. Having `www` among the records it answers for
+is what was wrong.
+
+**Fix applied.** Deleted all six A records. Re-added `www CNAME
+ghs.googlehosted.com` (Google Sites) and the three forwarding A records on
+**`@` only**. TTL dropped 7207 -> 3600 on everything touched. Domain Forwarding
+left ON and untouched — it is doing exactly the right job for the apex, which
+Google Sites cannot serve natively.
+
+**Final zone:** `www` CNAME -> Google. `@` A -> NameSilo forwarding -> 301 ->
+`https://www.sfdc24.com`. `www` carries no A record, so the loop cannot recur.
+All TXT / MX / DKIM / DMARC untouched throughout; email was never at risk.
+
+**Verified.** `www.sfdc24.com` returns **200 from Google** with the full
+homepage including the new offer section ("first piece of work looks like",
+"short document, not a slide deck").
+
+**Cost of the stale TTL.** The old records carried TTL 7207 (~2h), so resolvers
+and the local OS cache kept serving the dead nginx for a while after the zone
+was already correct. `curl` reported the loop from cache while `nslookup`
+against 1.1.1.1 already showed Google. **Flush before concluding a DNS fix
+failed** — and test with `curl --resolve` to bypass cache entirely.
+
+---
+
+## ISS-008 · RESOLVED — NameSilo DNS form fails silently — MED
+
+Three separate traps in one form, each of which cost a wasted cycle:
+
+**1. The hostname field must be `@` for the apex, not blank.** Blank is
+rejected — but on the first two submits the dialog simply closed and the record
+was never created, with no error shown. Only the third attempt surfaced "Should
+not be empty". **Two records I believed were saved did not exist.**
+
+**2. The native `<select>` for record Type ignores synthetic clicks on its
+options** — the same failure as ISS-001. It opens and lists correctly, the
+click closes it, the old value stays. **What works: click the select to open
+it, then Down / Down / Enter.** Worth retrying on ISS-001 with this technique.
+
+**3. `ctrl+a` inserts a literal `a`** into these inputs instead of selecting
+all — `ghs.googlehosted.com` was submitted as `aghs.googlehosted.com` and had
+to be caught by eye. Use triple-click then `Delete`.
+
+**The real lesson is the verification method, not the form.** Screenshots
+cannot show a 16-row record list, so "the dialog closed" got read as success
+three times. **`get_page_text` returns the entire NameSilo record table as
+plain text** and settled it in one call. On any list-shaped page, read the text,
+do not photograph it.
+
+---
+
+## ISS-002 · RESOLVED — it was not two Chromes
+
+I was driving **Microsoft Edge**, not Chrome. It surfaced only when NameSilo's
+device check flagged an unrecognised browser. The "two browsers" in the picker
+are two different applications, not two profiles.
+
+**Rule: check which browser is selected before blaming a site.** Where a login
+or device trust matters, use Browser 2 (Chrome), which holds the Google session.

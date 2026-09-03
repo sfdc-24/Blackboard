@@ -31,6 +31,36 @@ clicked it by hand.
 
 ---
 
+## sfdc24.com outage — FIXED AND VERIFIED 2026-09-03
+
+The domain was serving an infinite redirect loop. **It is fixed.**
+`http://sfdc24.com` -> 301 -> `https://sfdc24.com/` -> 301 ->
+`https://www.sfdc24.com/` -> **200 with the full homepage**, offer section
+included. Verified end to end with `curl --resolve`, not assumed.
+
+**Cause, proved not guessed.** NameSilo Domain Forwarding (301 -> www) is fine
+and stays ON. The bug was that its parking template put the same three
+forwarding A records on **`www` as well as `@`** — and that server 301s
+whatever it is asked for to `www`. So `www` redirected to itself, forever:
+
+```
+Host: sfdc24.com      -> Location: https://www.sfdc24.com/   correct
+Host: www.sfdc24.com  -> Location: https://www.sfdc24.com    the loop
+```
+
+**Zone now, do not undo this:** `www` = CNAME -> `ghs.googlehosted.com`.
+`@` = the three A records `45.77.75.133`, `45.77.92.157`, `207.246.78.75`
+(NameSilo forwarding). **`www` must never carry an A record** — that is the
+entire failure mode. TTLs on everything touched dropped 7207 -> 3600.
+TXT/MX/DKIM/DMARC untouched; email was never affected.
+
+**If it ever looks broken again, flush DNS first.** The dead records had a 2h
+TTL, so `curl` kept reporting the loop from cache long after the zone was
+already correct. `nslookup ... 1.1.1.1` showed the truth; `curl --resolve`
+bypasses cache entirely. See `docs/ISSUES.md` ISS-006 and ISS-008.
+
+---
+
 ## What is live right now
 
 | Thing | State |
