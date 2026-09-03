@@ -1,109 +1,205 @@
-# Handover — state as of 2026-09-03
+# Handover — 2026-09-03
 
-Written so a restarted session can pick up without re-deriving anything. Read
-this first, then `MEMORY.md` in the memory directory.
+Read this first, then `MEMORY.md` in the memory directory. Written so a
+restarted session resumes without re-deriving anything.
+
+---
+
+## THE ONE THING THAT NEEDS A HUMAN — 60 seconds
+
+**A security fix is written, saved, and NOT live.** Four editor utilities in the
+Governor Page project were callable by any visitor; the worst, `post_reset()`,
+appends a reset row that **blanks the live site's project pages** while forging
+`by=Governor`. A `requireGovernor_()` guard is in place on all four (verified 4
+of 4) and saved to the project.
+
+**The deploy did not land.** The Manage-deployments version selector refused
+"New version" across ~6 attempts; the one deploy that completed re-published
+**Version 12 — the unfixed code**. Attempts included reopening the dialog,
+keyboard selection, clicking different points on the row, resizing, and a full
+reload.
+
+**To finish:** Deploy → Manage deployments → pencil → Version → **New version**
+→ Deploy. **Confirm it says Version 13, not 12.** Nothing needs editing.
+
+**Do the quarantine rewire in the same deploy** (see below) so one deploy covers
+both.
+
+---
 
 ## What is live right now
 
 | Thing | State |
 |---|---|
-| Reception prompt | **Version 12** deployed. Humour removed; qualify-or-close in. Verified both directions. |
-| sfdc24.com title | Fixed — `<title>` is now `SFDC24`, was `Home`. Published and verified. |
+| Reception prompt | **Version 12.** Humour removed, qualify-or-close in. Verified both directions. |
+| Homepage copy | **LIVE and verified.** sfdc24.com went from ~0 to **3,502 indexable characters**. |
+| Site title | `SFDC24` (was `Home`). Published. |
+| Exposed-function guards | **Written and saved, NOT deployed.** See above. |
+| PUBLIC_INBOX quarantine | **Written in repo, inert, NOT in project.** See below. |
 | Glasses capture loop | Running (`pythonw`, Startup shortcut). Untouched. |
-| Board worker | **Not** scheduled, **not** running. Dormant by design. |
-| Per-prompt log | Live via a **Stop hook**. Backfilled 99 prompts. |
+| Board worker | Not scheduled, not running. Dormant by design. |
+| Per-prompt log | Live via Stop hook. |
 
-## The three things that matter most, unfixed
+---
 
-1. **Anthropic console spend cap.** Two minutes, needs Mr. Salam, protects an
-   endpoint that is already public. Repeatedly recommended, still not done.
-2. **`google.script.run` exposes every function without a trailing underscore.**
-   Cheapest live exploit. Gemini confirmed the mechanism. The audit is blocked
-   because the browser extension will not let me read `Code.gs` — the planned
-   workaround is a temporary diagnostic function that logs global names, then
-   read the execution log. Gemini was asked whether that works in V8.
-3. **Visitor text writes straight into the agent board.** ChatGPT rated it
-   CRITICAL from production rows. Quarantine design agreed: `PUBLIC_INBOX` +
-   provenance (`trust_level=EXTERNAL_UNTRUSTED`, `instruction_authority=NONE`).
-   Gemini was asked for the code.
+## Verified facts — do not re-derive these
 
-## Verified facts worth not re-deriving
+**Rate limits DO exist** (previously flagged unverified):
+`CHAT_SESSION_CAP = 12`, `CHAT_DAILY_DEFAULT = 150`, `CHAT_MAX_INPUT = 1000`,
+plus `CHAT_ENABLED` as a kill switch. Cost-exhaustion is bounded. Model is
+`claude-sonnet-4-5`.
 
-- **Salesforce trademark policy does NOT name "SFDC"** — zero occurrences in
-  their guidelines PDF. Gemini claimed it did; that was wrong. But the policy
-  bans **"abbreviations … of any of Salesforce's trademarks"** and any
-  "recognizable portion" in a **domain name**, which plausibly covers it. Verify
-  before acting; this is interpretation, not a quoted prohibition.
-- **WhatsApp does not deliver marketing templates to US phone numbers.**
-  Confirmed on Meta's own docs (updated Jun 17 2026), error `131049`. **Canada
-  is not covered** — the rule is "+1 with a US area code". Inbound still works
-  everywhere. EEA/UK/Japan/Korea are exempt from the throttle.
-- **The homepage has no indexable text** — everything is inside one iframe.
-  Google Sites has no meta description field. Real words on the page is the only
-  fix, which is why ChatGPT was asked to write the copy.
-- **All four markets have free data including TSX** (Composite to 1979, S&P to
-  1927). Intraday depth measured: 1m ≈ 8 days, 1h ≈ 1060 days. Delay
-  **undetermined** — must be measured during a live session.
-- **Six pre-registered trading hypotheses all failed** out-of-sample after costs.
-  Real result, not a failed run.
-- **Economics:** overhead is ~42% of job cost, agent tokens ~4%. Utilisation, not
-  token efficiency, sets the price.
+**Clickjacking is confirmed, not suspected** — `setXFrameOptionsMode(ALLOWALL)`
+at Code.gs line 58. Required for the Google Sites embed, so a deliberate trade,
+but any site can frame the reception.
 
-## Open agent conversations
+**The exposed-function audit, complete.** Nine functions in Code.gs are callable
+via `google.script.run`. Five are fine — `doGet`, `doPost`, `getState`,
+`postRow`, `reception` are entry points or check authorisation internally.
+`getState` carries the comment *"scope enforced here, not by obscurity"*, which
+is correct. The four unguarded ones were `post_reset`, `seed_state`,
+`test_chat`, `test_read`.
 
-Retrievable by URL; they hold context worth reusing.
+**WhatsApp does not deliver marketing templates to US numbers.** Confirmed on
+Meta's own docs (updated Jun 17 2026), error `131049`. **Canada is not covered**
+— the rule is "+1 with a US area code". Inbound works everywhere. EEA/UK/Japan/
+Korea are exempt from the throttle. So WhatsApp is dead for US outbound and fine
+for inbound, which is what the intake funnel actually needs.
 
-- ChatGPT — site review, naming, business models, and (in flight) homepage copy:
+**Salesforce trademark policy does NOT name "SFDC"** — zero occurrences in their
+guidelines PDF. Gemini claimed it did; that was wrong. But the policy bans
+**"abbreviations … of any of Salesforce's trademarks"** and any "recognizable
+portion" in a **domain name**. Interpretation, not a quoted prohibition.
+**Decision: keeping sfdc24.com. Exposure accepted, not resolved.**
+
+**There is no Meta chat model on the Groq account.** The only Meta models
+reachable are `llama-prompt-guard-2` (22m/86m), tiny safety classifiers. The
+gateway lane labelled "Meta Llama" is `openai/gpt-oss-120b`.
+
+**Six pre-registered trading hypotheses all failed** out-of-sample after costs.
+A real result. 19 names are worth 3.6–10.8 *independent* observations, so the
+Six Sigma n≈20 rule does not transfer to correlated markets.
+
+**Economics:** overhead is ~42% of job cost, agent tokens ~4%. Utilisation, not
+token efficiency, sets price.
+
+---
+
+## The quarantine rewire — one line, do it with the deploy
+
+`scripts/public_inbox_quarantine.gs` is written and **inert**. It was
+deliberately not wired because nothing could be deployed or tested from that
+session, and rewiring a live logging path you cannot verify or roll back is
+reckless.
+
+To apply: paste the file into the project as a new `.gs`, then replace the body
+of `logVisitor_` in Code.gs with:
+
+```js
+function logVisitor_(sid, who, text) { logVisitorQuarantined_(sid, who, text); }
+```
+
+That reroutes all six call sites at once. Then send one reception message and
+confirm a row lands in `PUBLIC_INBOX` and **not** on the board.
+
+**Hazard already avoided, do not undo it:** the quarantine sheet's first column
+is `Inbox_ID`, **not** `Row_ID`. `sheet_()` finds the operational board by
+scanning for a `Row_ID` header, so a second sheet with that header could make it
+bind to the wrong one and break every board write.
+
+---
+
+## Open agent conversations — reuse, do not restart
+
+- **ChatGPT** — site review, naming, business models, homepage copy:
   `https://chatgpt.com/c/6a9922ef-5f74-83e9-b99f-02ed4a0fa443`
-  *Note: this tab freezes on long renders. Click the conversation in the sidebar
-  to force a re-render; do not fight it with screenshots.*
-- Gemini — architecture, open-source stack, demand, and (in flight) the
-  quarantine/idempotency/audit code:
+  *Freezes on long renders. Click the conversation in the sidebar to force a
+  re-render; do not fight it with screenshots.*
+- **Gemini** — architecture, open-source stack, demand, quarantine/idempotency:
   `https://gemini.google.com/app/258380d5e09ea83c`
-- Meta AI — WhatsApp platform reality:
+- **Meta AI** — WhatsApp platform reality:
   `https://www.meta.ai/prompt/00dad258-484e-458b-8733-254c0d6066af`
 
-**There is no Meta model in the fleet.** The gateway's "Meta Llama" lane is Groq
-serving `openai/gpt-oss-120b`, which self-reports as ChatGPT. Use meta.ai in the
-browser for genuine Meta input.
+**Groq works now** (`scripts/ask_groq.py`). 14 models; best chat model is
+`openai/gpt-oss-120b`. Use it for bulk work — free and fast (3.4s for a
+1,500-token critique).
 
-## Naming
+---
 
-Ten candidates from ChatGPT, domains checked by me against the Verisign registry
-(RDAP, definitive). **Eight of ten .com are available.** Taken:
-`goodordersystems.com` (registered 2026-09-02, the day before we looked) and
-`crmrepair.com`. Best of the list: **Ops Before Apps** (has a point of view) and
-**Customer Ops Office** (safest). Its "PRELIM GREEN" trademark verdicts are
-self-labelled guesses, not searches — CIPO and USPTO still needed.
+## Strategy — what the round-table settled
 
-**DECIDED 2026-09-03: keep `sfdc24.com` for now.** No rebrand, no domain bought.
-The trademark exposure is *accepted, not resolved* — see the `naming-decision`
-memory. Revisit on AppExchange submission, incorporation, ranking well, or any
-contact from Salesforce. Standing recommendation for that day: two names, not a
-rename — keep sfdc24.com for the practice, give the platform its own name.
+**All four models independently said: abandon ecommerce, fitness and games; go
+deeper on Salesforce.** Training/education is the one real bridge (ChatGPT and I
+say real, Gemini said no — 2:1).
 
-## What I need from Mr. Salam — batched, ~6 minutes total
+**Groq broke the plan we were about to build, correctly.** Automating the
+diagnostic destroys what made it sellable — it becomes a lead magnet, not a
+product. **Give the diagnostic away, charge downstream** for interpretation,
+implementation and monitoring. `intake/` needs revising for this.
 
-1. **Anthropic console → spend cap.** 2 min. Do this one regardless.
-2. ~~Name decision~~ — **DONE. Keeping sfdc24.com.**
-3. **Standing permission to edit the live Apps Script and Google Site without
-   asking each time.** 30 sec. Currently I stop and ask; that is the main thing
-   slowing autonomous work.
-4. **Real numbers for `scripts/quote.py`, when convenient** (he has said later is
-   fine): actual $/token from an invoice, his hourly rate, and a realistic
-   jobs-per-month. The defaults are marked unverified and the tool says so.
+**New product direction nobody else raised:** make the audit trail *the
+product*, not a consulting differentiator — a recurring API for buyers who need
+auditability. **But the honest first step is tamper-evident logging.** Groq
+claimed the trail has "cryptographic hashes"; it does not. It is a Google Sheet
+with UUIDs.
 
-## Tools built this session
+**Groq's own bias, for calibration:** it assumes distribution is free because
+production is free. Ten micro-products and "autopilot sales" presume an audience
+that does not exist. Selling is the binding constraint, not building.
+
+---
+
+## Still open
+
+1. Deploy the guards + quarantine rewire (above).
+2. **No proof on the homepage.** Four problem statements, zero evidence. Caps
+   conversion until one anonymised engagement exists.
+3. Every homepage section is a problem statement — a reader can agree four times
+   without learning what they receive. The (now free) diagnostic offer belongs
+   on the page.
+4. Idempotency: duplicate Governor events confirmed 1.7s apart. **Gemini's
+   verdict: CacheService is insufficient, LockService is required** — it is
+   eventually consistent, so two executions both pass `cache.get()`.
+5. Bus secret rotation (deferred by Mr. Salam). `codegs_rotation_window.gs`
+   exists to make it zero-downtime.
+6. Human gate (`scripts/human_gate.gs`) still not wired.
+7. Real numbers for `scripts/quote.py` — rates are marked UNVERIFIED.
+8. llm-wiki v0.24.4 is installed and enabled; its commands load on restart.
+   `archive`, `checkpoint`, `ingest`, `librarian` are the relevant ones. The
+   Obsidian vault is `C:\Users\salam\My Drive\SFDC 24 - Claude` — its 98 files
+   are `.gdoc`/`.gsheet` **pointers Obsidian cannot read**, which is why it
+   indexes as empty. Real markdown is in `Claude Archive/`.
+
+---
+
+## Tools built
 
 ```
-trading/        fetch.py, backtest.py, research.py — data + honest backtesting
-intake/         questions.json, README.md — the intake funnel and project record
-scripts/prompt_log.py    per-prompt time and tokens, real data, Stop hook
-scripts/quote.py         job estimator with overhead absorption and margin
-web/sfdc24-cli.html      CLI-mode site prototype (unpublished)
+trading/     fetch.py, backtest.py, research.py   market data + honest backtesting
+intake/      questions.json, README.md            intake funnel and project record
+scripts/prompt_log.py       per-prompt time and tokens, real data, Stop hook
+scripts/quote.py            job estimator with overhead absorption
+scripts/ask_groq.py         free bulk offload
+scripts/public_inbox_quarantine.gs   quarantine (inert)
+scripts/audit_exposed_functions.gs   REST-API function audit (unused; editor search sufficed)
+web/sfdc24-cli.html         CLI-mode site prototype (unpublished)
+prompts/consensus-attack.md the prompt that broke our own consensus
 ```
 
-**Local only, deliberately gitignored:** `docs/security-review.md`,
+**Local only, gitignored, keep it that way:** `docs/security-review.md`,
 `docs/multi-agent-review-2026-09-03.md`. They map attack paths into a live
-system. Mr. Salam had the security review force-pushed off the remote — keep
-that rule.
+system. The security review was force-pushed off the remote at his instruction.
+
+---
+
+## Standing doctrine (also in memory)
+
+- **No Anthropic spend cap.** Declined; never raise it again. No auto-reload is
+  the ceiling. Just report if credits run out.
+- **Standing permission** to edit the live Apps Script and Google Site without
+  asking. DNS is *not* covered — I broke the site with it once.
+- **Delegate first** to ChatGPT/Gemini/Groq, have them error-proof each other,
+  and **verify every claim against a primary source** before acting. Several
+  were wrong today.
+- **Batch questions** with time estimates. He is bottlenecked by availability,
+  not willingness.
