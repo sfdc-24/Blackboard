@@ -31,6 +31,12 @@ projects/sfdc24-bus-helper/
 # notes. Staged frames are working data, never repository content. Same lesson
 # as REQ-M6HZK4: git history cannot be scrubbed the way a Doc can.
 data/
+# Security review of the live system. It maps working attack paths into
+# sfdc24.com and the bus, so it stays local: Mr. Salam pulled it off the remote
+# on 2026-09-03 and it should not go back without him saying so. Same reasoning
+# as the entries above -- a push is not undoable the way a local delete is, and
+# a repo can change visibility later without anyone re-reading what is in it.
+docs/security-review.md
 # Python
 __pycache__/
 *.pyc
