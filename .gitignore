@@ -58,3 +58,11 @@ build/
 # Quant research venv and cached market data. The venv is 300MB+ of wheels and
 # the market cache is vendor data, not repository content.
 .venv-quant/
+
+# Live Apps Script source pulled by clasp. This is the running production code
+# for the Governor Page API and it carries live identifiers (the Alpha DB
+# spreadsheet ID, endpoint config) and possibly the bus secret. Untracked until
+# it has been read and cleared, same rule as the entries above: a push is not
+# undoable the way a local delete is. `.clasp.json` itself IS tracked -- it
+# holds only the scriptId, which is already in docs/HANDOVER.md.
+gas/

@@ -6,7 +6,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 
 | # | Opened | Severity | Title | Status |
 |---|--------|----------|-------|--------|
-| ISS-001 | 2026-09-03 | HIGH | Apps Script "New version" cannot be selected by browser automation | OPEN |
+| ISS-001 | 2026-09-03 | HIGH | Apps Script "New version" cannot be selected by browser automation | **RESOLVED** |
 | ISS-002 | 2026-09-03 | MED | Multiple Chrome browsers connected — session blocked until one is chosen | **RESOLVED** |
 | ISS-003 | 2026-09-03 | MED | No way to reach Mr. Salam for a decision when he is away from the desk | OPEN |
 | ISS-004 | 2026-09-03 | LOW | Chrome extension blocks reading Apps Script / long AI chat source via JS | OPEN |
@@ -236,3 +236,46 @@ are two different applications, not two profiles.
 
 **Rule: check which browser is selected before blaming a site.** Where a login
 or device trust matters, use Browser 2 (Chrome), which holds the Google session.
+
+---
+
+## ISS-001 · RESOLVED 2026-09-03 — deploys are autonomous now
+
+**clasp is authenticated and working.** Mr. Salam turned on the Apps Script API;
+`clasp login` completed as `abdus@sfdc24.com`. The dropdown that defeated six
+browser attempts is now irrelevant — the whole deploy runs from the shell:
+
+```
+clasp push -f
+clasp create-version "description"          -> "Created version 14"
+clasp redeploy <deploymentId> -V 14 -d "..."
+clasp list-deployments                       -> read-back proof
+```
+
+The production web app is deployment
+`AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng`.
+`@HEAD` is the separate dev deployment. **Rollback is now one command** —
+`clasp redeploy <id> -V 13` — which is what made the quarantine safe to ship.
+
+**Two Windows traps, both real:**
+
+1. **clasp must run from `/c/Users/salam/Quantum/Blackboard`, the canonical-case
+   path.** From the harness cwd (`c:\users\salam\quantum\blackboard`) every
+   write is refused with *"Security Error: Content directory is a symlink.
+   Possible race attack."* Nothing is a symlink — `os.path.islink` is false the
+   whole way up. clasp compares the given path against the resolved one and the
+   case difference alone trips its race check. `--allow-symlinks` does **not**
+   fix it; only running from the canonical path does.
+2. `clasp push` **never deletes remote files.** A file removed locally comes
+   straight back on the next pull. Delete it in the editor UI.
+
+**The editor's function picker is still broken, and no longer matters.** It was
+retried once with the technique that works on native `<select>` elements
+(click to open, then Down / Enter) and on a direct click on the option. Both
+failed, on a second instance of the same Material listbox — so this is the
+component, not that one dropdown.
+
+**Workaround when a function must be run from the editor: give it its own
+file.** The picker always pre-selects the first function in the open file, so a
+file containing exactly one function needs no click at all. That is how
+`test_quarantine` was run. Verified.

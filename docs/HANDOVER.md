@@ -61,6 +61,55 @@ bypasses cache entirely. See `docs/ISSUES.md` ISS-006 and ISS-008.
 
 ---
 
+## Deploys are autonomous now — clasp works (2026-09-03)
+
+Mr. Salam enabled the Apps Script API; `clasp login` completed as
+`abdus@sfdc24.com`. **The "New version" dropdown no longer matters.**
+
+```
+cd /c/Users/salam/Quantum/Blackboard      # canonical case, see below
+clasp push -f
+clasp create-version "what changed"
+clasp redeploy AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng -V <n> -d "..."
+clasp list-deployments                     # read-back: D-4 still applies
+```
+
+That deployment id is the **production web app**. `@HEAD` is a separate dev
+deployment. **Rollback is one command:** `clasp redeploy <id> -V 13`.
+
+**clasp must run from `/c/Users/salam/Quantum/Blackboard`.** From the harness
+cwd (lowercase `c:\users\salam\...`) every write is refused as *"Content directory is
+a symlink. Possible race attack."* Nothing is a symlink — the case difference
+alone trips its check, and `--allow-symlinks` does not help. Also: `clasp push`
+never deletes remote files; delete them in the editor UI.
+
+Live source is pulled to `gas/`, **gitignored** — it is production code and
+carries `ALPHA_ID`. It holds no secrets (`ANTHROPIC_KEY` and the governor
+passphrase are Script Properties). `.clasp.json` IS tracked; it only has the
+scriptId.
+
+---
+
+## Quarantine is LIVE — Version 14, verified 2026-09-03
+
+`logVisitor_` now delegates to `logVisitorQuarantined_`, so all six call sites
+reroute at once. Visitor text lands in `PUBLIC_INBOX`, never on the agent board.
+
+**Proved by running `test_quarantine` against the live sheets, not assumed:**
+
+```
+board  rows: 728 -> 728   (MUST NOT CHANGE)   PASS
+inbox  rows: 1 -> 2       (MUST +1)           PASS
+inbox last row: PI-56751A2D | ... | visitor | QUARANTINE ROUTING TEST ... |
+                EXTERNAL_UNTRUSTED | NONE | PUBLIC_RECEPTION | UNREVIEWED
+VERDICT: PASS - visitor text quarantined, board untouched
+```
+
+The test function was deliberately kept out of version 14 and deleted after.
+One test row sits in `PUBLIC_INBOX` as the evidence. Reception still serves 200.
+
+---
+
 ## What is live right now
 
 | Thing | State |
@@ -68,8 +117,8 @@ bypasses cache entirely. See `docs/ISSUES.md` ISS-006 and ISS-008.
 | Reception prompt | Humour removed, qualify-or-close in. Verified both directions. Now serving under **Version 13**. |
 | Homepage copy | **LIVE and verified.** sfdc24.com went from ~0 to **3,502 indexable characters**. |
 | Site title | `SFDC24` (was `Home`). Published. |
-| Exposed-function guards | **DEPLOYED — Version 13. Verified.** |
-| PUBLIC_INBOX quarantine | **Written in repo, inert, NOT in project.** See below. |
+| Exposed-function guards | **DEPLOYED — carried into Version 14. Verified.** |
+| PUBLIC_INBOX quarantine | **LIVE — Version 14. Verified against the real sheets.** |
 | Glasses capture loop | Running (`pythonw`, Startup shortcut). Untouched. |
 | Board worker | Not scheduled, not running. Dormant by design. |
 | Per-prompt log | Live via Stop hook. |
