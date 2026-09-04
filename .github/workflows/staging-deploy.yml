@@ -1,0 +1,133 @@
+name: Deploy Apps Script to STAGING
+
+# VM-CICD-001 · STEP_3. STAGING ONLY — this workflow never touches a
+# production deployment id. Production deploys remain manual until
+# Mr. Salam ratifies otherwise.
+#
+# Required repo secrets (see docs/CICD.md):
+#   CLASPRC_JSON          — contents of ~/.clasprc.json from an authenticated clasp login
+# Required repo variables (per project, created in STEP_2):
+#   STAGING_SCRIPT_ID_<PROJECT>       — Apps Script scriptId of the STAGING copy
+#   STAGING_DEPLOYMENT_ID_<PROJECT>   — the stable web-app deployment id on that copy
+#   STAGING_EXEC_URL_<PROJECT>        — the /exec URL of that deployment (for the HTTP assertion)
+#
+# Assertion doctrine (commandment 1 + 3): HTTP 200 and "ok" output are NOT
+# proof a deploy landed. Two independent read-backs:
+#   1. clasp list-deployments must show the deployment at the NEW version.
+#   2. The live GET must report that version via CONTRACT_VERSION (where the
+#      project exposes it — see docs/CICD.md; projects without it fail soft
+#      with a loud warning until the version field ships to staging).
+
+on:
+  push:
+    branches: [staging]
+    paths: ['apps-script/**']
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project dir under apps-script/ to deploy'
+        required: true
+        default: 'governor-page-api'
+        type: choice
+        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+
+concurrency:
+  group: staging-deploy-${{ github.event.inputs.project || 'push' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if project unchanged (push builds only)
+        if: github.event_name == 'push'
+        id: changed
+        run: |
+          if git diff --quiet ${{ github.event.before }} ${{ github.sha }} -- "apps-script/${{ matrix.project }}/"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.changed.outputs.skip != 'true'
+        with: { node-version: 20 }
+
+      - name: Install clasp
+        if: steps.changed.outputs.skip != 'true'
+        run: npm install -g @google/clasp
+
+      - name: Authenticate clasp
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          umask 077
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          test -s ~/.clasprc.json || { echo '::error::CLASPRC_JSON secret is empty — complete the OAuth halt in docs/CICD.md first'; exit 1; }
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+      - name: Resolve staging ids
+        if: steps.changed.outputs.skip != 'true'
+        id: ids
+        env:
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          KEY=$(echo "${{ matrix.project }}" | tr 'a-z-' 'A-Z_')
+          SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
+          DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
+          EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
+          if [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOY_ID" ]; then
+            echo "::error::STAGING_SCRIPT_ID_$KEY / STAGING_DEPLOYMENT_ID_$KEY repo variables not set — STEP_2 not completed for ${{ matrix.project }}"
+            exit 1
+          fi
+          { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
+
+      - name: Push source to STAGING project
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: apps-script/${{ matrix.project }}
+        run: |
+          printf '{"scriptId":"%s","rootDir":"."}\n' "${{ steps.ids.outputs.script_id }}" > .clasp.json
+          clasp push -f
+
+      - name: Create version and redeploy
+        if: steps.changed.outputs.skip != 'true'
+        id: ver
+        working-directory: apps-script/${{ matrix.project }}
+        run: |
+          OUT=$(clasp create-version "ci: ${{ github.sha }}")
+          echo "$OUT"
+          VERSION=$(echo "$OUT" | grep -oE '[0-9]+' | tail -1)
+          [ -n "$VERSION" ] || { echo '::error::could not parse version number from clasp create-version'; exit 1; }
+          clasp redeploy "${{ steps.ids.outputs.deploy_id }}" -V "$VERSION" -d "ci: ${{ github.sha }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 'ASSERT 1/2: deployment read-back shows the new version'
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: apps-script/${{ matrix.project }}
+        run: |
+          clasp list-deployments | tee deployments.txt
+          grep -F "${{ steps.ids.outputs.deploy_id }}" deployments.txt | grep -E "@${{ steps.ver.outputs.version }}\b" \
+            || { echo "::error::VERSION ASSERTION FAILED — deployment ${{ steps.ids.outputs.deploy_id }} is NOT at version ${{ steps.ver.outputs.version }}. The deploy did not land (the Version-12 failure mode). Roll back or investigate before trusting staging."; exit 1; }
+
+      - name: 'ASSERT 2/2: live HTTP endpoint reports the new version'
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          python3 scripts/gas_version_assert.py \
+            --url "${{ steps.ids.outputs.exec_url }}" \
+            --expect-version "${{ steps.ver.outputs.version }}" \
+            --retries 6 --delay 10
+
+      - name: Receipt
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          echo "DEPLOY RECEIPT — TESTED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- project: ${{ matrix.project }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- staging deployment: ${{ steps.ids.outputs.deploy_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- version: ${{ steps.ver.outputs.version }} (asserted by list-deployments read-back + live GET)" >> "$GITHUB_STEP_SUMMARY"

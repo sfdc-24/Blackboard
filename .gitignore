@@ -66,3 +66,4 @@ build/
 # undoable the way a local delete is. `.clasp.json` itself IS tracked -- it
 # holds only the scriptId, which is already in docs/HANDOVER.md.
 gas/
+.sf/

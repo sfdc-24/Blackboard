@@ -1,0 +1,80 @@
+name: Roll back STAGING deployment
+
+# VM-CICD-001 · "WRITE THE ROLLBACK JOB BEFORE YOU NEED IT."
+# Repoints the STAGING web-app deployment at a known-good prior version,
+# then runs the same two assertions as the deploy. STAGING ONLY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project dir under apps-script/'
+        required: true
+        type: choice
+        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+      version:
+        description: 'Known-good version number to roll back to'
+        required: true
+        type: string
+
+concurrency:
+  group: staging-deploy-${{ github.event.inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - name: Install clasp
+        run: npm install -g @google/clasp
+
+      - name: Authenticate clasp
+        run: |
+          umask 077
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          test -s ~/.clasprc.json || { echo '::error::CLASPRC_JSON secret is empty'; exit 1; }
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+      - name: Resolve staging ids
+        id: ids
+        env:
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          KEY=$(echo "${{ github.event.inputs.project }}" | tr 'a-z-' 'A-Z_')
+          SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
+          DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
+          EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
+          [ -n "$SCRIPT_ID" ] && [ -n "$DEPLOY_ID" ] || { echo "::error::staging ids not configured for ${{ github.event.inputs.project }}"; exit 1; }
+          { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
+
+      - name: Repoint deployment at requested version
+        working-directory: apps-script/${{ github.event.inputs.project }}
+        run: |
+          printf '{"scriptId":"%s","rootDir":"."}\n' "${{ steps.ids.outputs.script_id }}" > .clasp.json
+          clasp redeploy "${{ steps.ids.outputs.deploy_id }}" -V "${{ github.event.inputs.version }}" -d "ROLLBACK to v${{ github.event.inputs.version }} (${{ github.actor }})"
+
+      - name: 'ASSERT 1/2: deployment read-back shows the rollback version'
+        working-directory: apps-script/${{ github.event.inputs.project }}
+        run: |
+          clasp list-deployments | tee deployments.txt
+          grep -F "${{ steps.ids.outputs.deploy_id }}" deployments.txt | grep -E "@${{ github.event.inputs.version }}\b" \
+            || { echo '::error::ROLLBACK ASSERTION FAILED — deployment is not at the requested version.'; exit 1; }
+
+      - name: 'ASSERT 2/2: live HTTP endpoint reports the rollback version'
+        run: |
+          python3 scripts/gas_version_assert.py \
+            --url "${{ steps.ids.outputs.exec_url }}" \
+            --expect-version "${{ github.event.inputs.version }}" \
+            --retries 6 --delay 10
+
+      - name: Receipt
+        run: |
+          echo "ROLLBACK RECEIPT — TESTED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- project: ${{ github.event.inputs.project }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- deployment: ${{ steps.ids.outputs.deploy_id }} now at v${{ github.event.inputs.version }}" >> "$GITHUB_STEP_SUMMARY"

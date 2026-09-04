@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SFDC24</title>
+<style>
+:root{--bg:#0B0D10;--bg2:#12151A;--text:#E6EDF3;--mut:#8B949E;--faint:#6E7681;--line:#262C36;--acc:#00FFA6;--link:#58A6FF;--amber:#FFB224;--red:#F85149;--mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.65 var(--mono);-webkit-text-size-adjust:100%;overscroll-behavior:contain}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:820px;margin:0 auto;padding:18px 16px 24px;min-height:100%;display:flex;flex-direction:column}
+/* App shell. The tab bar is fixed in the thumb zone and respects the
+   iPhone home indicator via env(safe-area-inset-bottom); without that
+   the last row of controls sits under the gesture bar. */
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:20;display:none;background:rgba(11,13,16,.96);backdrop-filter:blur(10px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0px)}
+.tabbar .row{display:flex;max-width:820px;margin:0 auto}
+.tab{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px 7px;color:var(--faint);text-decoration:none;font-size:10.5px;letter-spacing:.03em;min-height:52px;justify-content:center}
+.tab .ic{font-size:17px;line-height:1}
+.tab.on{color:var(--acc)}
+.tab:hover{text-decoration:none;color:var(--text)}
+
+.nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:14px;font-size:13px}
+.nav .logo{color:var(--acc);font-weight:700;margin-right:8px;letter-spacing:.04em}
+.nav a{color:var(--mut)}
+.nav a:hover{color:var(--text);text-decoration:none}
+.nav a.on{color:var(--acc)}
+.nav .right{margin-left:auto;display:flex;gap:14px;align-items:baseline}
+.statusline{font-size:12.5px;color:var(--faint);margin:0 0 12px}
+.nav .who{color:var(--acc);font-size:12px}
+.apphead{display:none;align-items:center;justify-content:space-between;gap:10px;padding:2px 0 10px;margin-bottom:12px;border-bottom:1px solid var(--line)}
+.apphead .brand{color:var(--acc);font-weight:700;letter-spacing:.04em;font-size:15px}
+.apphead .idy{font-size:11.5px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:58%}
+.nav .clash{color:var(--amber);font-size:12px;border:1px solid var(--amber);border-radius:4px;padding:1px 6px}
+.nav a.signin{color:var(--acc)}
+.statusline .g{color:var(--acc)}
+
+.thread{flex:1 1 auto;min-height:96px}
+.msg{margin:0 0 14px;white-space:pre-wrap;word-wrap:break-word}
+.msg .tag{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+.msg.c .tag{color:var(--acc)}
+.msg.v .tag{color:var(--amber)}
+.msg.c{color:var(--text)}
+.msg.v{color:var(--mut)}
+.msg.sys{color:var(--faint);font-size:12.5px;border-left:2px solid var(--line);padding-left:10px}
+.cur{display:inline-block;width:7px;height:15px;background:var(--acc);vertical-align:-2px;animation:b 1s step-end infinite}
+@keyframes b{50%{opacity:0}}
+.dots{color:var(--faint)}
+
+.composer{border:1px solid var(--line);border-radius:8px;background:var(--bg2);padding:10px 12px;margin-top:18px}
+.composer.hot{border-color:var(--acc)}
+textarea{width:100%;background:transparent;border:none;color:var(--text);font:14px/1.6 var(--mono);resize:none;outline:none;padding:2px 0;max-height:150px}
+textarea::placeholder{color:var(--faint)}
+.crow{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
+button{font:600 13px var(--mono);background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
+button:hover:not(:disabled){border-color:var(--acc)}
+button:disabled{opacity:.4;cursor:default}
+button.primary{background:var(--acc);border-color:var(--acc);color:#04120C}
+button.rec{border-color:var(--red);color:var(--red)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+button.rec .dot{animation:b .8s step-end infinite}
+.hint{font-size:11.5px;color:var(--faint);margin-left:auto}
+.hearing{display:none;margin-top:9px;padding:8px 11px;border:1px dashed rgba(248,81,73,.5);border-radius:6px;font-size:12.5px;color:var(--mut)}
+.hearing.show{display:block}
+.hearing b{color:var(--red);font-weight:600}
+.hearing .iv{color:var(--faint);font-style:italic}
+.foot{border-top:1px solid var(--line);margin-top:26px;padding-top:11px;font-size:11.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+.foot a{color:var(--mut)}
+@media(max-width:640px){.tabbar{display:block}.nav{display:none}.apphead{display:flex}.nav .right{margin-left:0;width:100%}.hint{margin-left:0;width:100%;margin-top:2px}.wrap{padding:14px 13px calc(70px + env(safe-area-inset-bottom,0px))}.nav{gap:3px 12px;font-size:12.5px;padding-bottom:8px;margin-bottom:11px}.statusline{font-size:12px;margin-bottom:10px}.thread{min-height:72px}.composer{margin-top:14px;padding:9px 10px}textarea{font-size:16px;line-height:1.5}button{padding:10px 15px;min-height:44px}.foot{margin-top:18px;font-size:11px;gap:4px 12px}}
+</style></head><body>
+<div class="wrap">
+  <div class="apphead">
+    <span class="brand">sfdc24</span>
+    <span class="idy"><? if (visitorEmail) { ?><?= visitorEmail ?><? } else if (governorEmail) { ?><?= governorEmail ?><? } else { ?>a Salesforce problem, looked at properly<? } ?></span>
+  </div>
+  <div class="nav"><span class="logo">sfdc24</span>
+    <a href="https://www.sfdc24.com/" target="_top" class="on">home</a>
+    <? if (governorEmail) { ?><a href="https://www.sfdc24.com/governor" target="_top">my console</a><? } ?>
+    <a href="https://www.sfdc24.com/projects" target="_top">projects</a>
+    <span class="right">
+      <? if (visitorEmail) { ?>
+        <span class="who" title="signed in with Google">&#9679; <?= visitorEmail ?></span>
+        <? if (identityClash) { ?>
+          <span class="clash" title="Your browser is signed in to Google as the Governor. Governor pages show that account's data, not the account you signed in with here.">viewing as <?= governorEmail ?></span>
+        <? } ?>
+        <a href="<?= signedOutUrl ?>" target="_top">sign out</a>
+      <? } else if (governorEmail) { ?>
+        <span class="who" title="Google session">&#9679; <?= governorEmail ?></span>
+      <? } else if (authOn) { ?>
+        <a href="<?= authStart ?>" target="_top" class="signin">sign in with Google</a>
+      <? } ?>
+    </span>
+  </div>
+  <p class="statusline">status: <span class="g">online</span> · a Salesforce problem, looked at properly. A human still signs off.</p>
+
+  <div class="thread" id="thread"></div>
+
+  <div class="composer" id="composer">
+    <textarea id="box" rows="2" placeholder="type here — what do you want to solve?"></textarea>
+    <div class="crow">
+      <button class="primary" id="send" disabled>send</button>
+      <button id="mic"><span class="dot" id="micdot" style="display:none"></span><span id="miclabel">talk instead</span></button>
+      <span class="hint" id="hint"></span>
+    </div>
+    <div class="hearing" id="hearing"><b>hearing</b> — <span id="heard"></span><span class="iv" id="interim"></span></div>
+  </div>
+
+  <div class="foot"><span>© SFDC24 · conversations are saved</span><span>
+    <a href="https://www.sfdc24.com/privacy" target="_top">privacy</a>
+    <a href="https://www.sfdc24.com/terms" target="_top">terms</a>
+    <a href="mailto:abdus@sfdc24.com">abdus@sfdc24.com</a></span></div>
+</div>
+
+<!-- Bottom tab bar: phone only. Navigation by FUNCTION, not by marketing page.
+     Chat is the product, so it is the default and sits first. -->
+<nav class="tabbar">
+  <div class="row">
+    <a class="tab on" href="<?= appHome ?>" target="_top"><span class="ic">&#9679;</span>Chat</a>
+    <a class="tab" href="https://www.sfdc24.com/projects" target="_top"><span class="ic">&#9632;</span>Work</a>
+    <? if (visitorEmail) { ?>
+      <a class="tab" href="<?= signedOutUrl ?>" target="_top"><span class="ic">&#9670;</span>Sign out</a>
+    <? } else if (governorEmail) { ?>
+      <a class="tab" href="https://www.sfdc24.com/governor" target="_top"><span class="ic">&#9670;</span>Console</a>
+    <? } else { ?>
+      <a class="tab" href="<?= authStart ?>" target="_top"><span class="ic">&#9670;</span>Sign in</a>
+    <? } ?>
+  </div>
+</nav>
+
+<script>
+(function(){
+  var SELF_URL = "<?!= selfUrl ?>";
+  // Session token, rendered server-side. Sent with each turn so the
+  // reception can record WHO said it. Empty when signed out.
+  var SESSION = "<?!= sessionToken ?>";
+  var WANT_VOICE = "<?!= voice ?>" === "1";
+  // The microphone is only usable where the hosting frame's permissions policy allows it.
+  // Google Sites embeds and Apps Script's own sandbox frame both withhold it, so we detect
+  // rather than assume, and fall back to the device's own dictation.
+  var MIC_OK = (function(){
+    try {
+      if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) return false;
+      var pp = document.permissionsPolicy || document.featurePolicy;
+      if (pp && pp.allowsFeature) return !!pp.allowsFeature("microphone");
+      return true;
+    } catch(e){ return false }
+  })();
+
+  var $ = function(id){ return document.getElementById(id) };
+  var thread = $("thread"), box = $("box"), send = $("send"), mic = $("mic");
+  var history = [], busy = false, typing = false;
+
+  // ---- session id (per browser tab) ----
+  var sid = "";
+  try { sid = sessionStorage.getItem("sfdc_sid") || ""; } catch(e){}
+  if (!sid) { sid = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2,8); try { sessionStorage.setItem("sfdc_sid", sid) } catch(e){} }
+
+  // ---- rendering ----
+  function el(cls, tag, text){
+    var d = document.createElement("div"); d.className = "msg " + cls;
+    if (tag) { var t = document.createElement("span"); t.className = "tag"; t.textContent = tag; d.appendChild(t) }
+    var b = document.createElement("span"); b.textContent = text || ""; d.appendChild(b);
+    thread.appendChild(d); return b;
+  }
+  function bottom(){ try { window.scrollTo(0, document.body.scrollHeight) } catch(e){} }
+
+  // types text out one character at a time; click anywhere to skip
+  function type(node, text, done){
+    typing = true;
+    var i = 0, cur = document.createElement("span"); cur.className = "cur";
+    node.parentNode.appendChild(cur);
+    var timer = setInterval(step, 16);
+    function step(){
+      if (!typing) { node.textContent = text; finish(); return }
+      node.textContent = text.slice(0, i += 2);
+      if (i % 40 === 0) bottom();
+      if (i >= text.length) finish();
+    }
+    function finish(){ clearInterval(timer); typing = false; if (cur.parentNode) cur.parentNode.removeChild(cur); bottom(); if (done) done() }
+    return function(){ typing = false };
+  }
+  document.addEventListener("click", function(){ if (typing) typing = false });
+
+  // ---- greeting ----
+  var GREETING =
+    "you're talking to Claude.\n\n" +
+    "SFDC24 is where a Salesforce problem gets looked at properly. AI agents do the legwork; a human signs off on anything that matters.\n\n" +
+    "If you have ever opened a flow and found eleven decision nodes and not one description, we will get along.\n\n" +
+    "So what is going wrong? Or ask me what this is, if that is quicker.";
+
+  function start(){
+    var node = el("c", "claude", "");
+    type(node, GREETING, function(){
+      history.push({ role: "assistant", text: GREETING });
+      box.focus();
+      if (WANT_VOICE && VOICE_OK) { $("hint").textContent = "microphone ready — tap “talk instead”"; $("composer").className = "composer hot" }
+    });
+  }
+
+  // ---- sending ----
+  function canSend(){ return !busy && box.value.trim().length > 0 }
+  function sync(){ send.disabled = !canSend() }
+  box.addEventListener("input", function(){
+    box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight, 150) + "px"; sync();
+  });
+  box.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit() }
+  });
+  send.addEventListener("click", submit);
+
+  function submit(){
+    if (!canSend()) return;
+    var text = box.value.trim();
+    box.value = ""; box.style.height = "auto"; sync();
+    stopVoice();
+    el("v", "you", text);
+    history.push({ role: "user", text: text });
+    busy = true; sync();
+    var wait = el("c", "claude", "…"); wait.parentNode.className = "msg c dots";
+    var n = 0, tick = setInterval(function(){ wait.textContent = ["…","·…","··…","···"][++n % 4] }, 350);
+    bottom();
+
+    google.script.run
+      .withSuccessHandler(function(res){
+        clearInterval(tick);
+        var host = wait.parentNode; host.className = "msg c";
+        var reply = (res && res.reply) || "Something went wrong on my side. Your message is saved.";
+        wait.textContent = "";
+        type(wait, reply, function(){
+          history.push({ role: "assistant", text: reply });
+          busy = false; sync(); box.focus();
+        });
+        if (res && res.degraded) $("hint").textContent = "replying offline — your message is saved";
+      })
+      .withFailureHandler(function(err){
+        clearInterval(tick);
+        wait.parentNode.className = "msg sys";
+        wait.textContent = "couldn't reach the server: " + (err && err.message || err) + " — your message wasn't lost, try again.";
+        busy = false; sync();
+      })
+      .reception(sid, text, history.slice(0, -1), SESSION);
+  }
+
+  // ---- voice ----
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var VOICE_OK = MIC_OK;
+  var rec = null, listening = false, heard = "";
+
+  function setMic(on){
+    listening = on;
+    mic.className = on ? "rec" : "";
+    $("micdot").style.display = on ? "" : "none";
+    $("miclabel").textContent = on ? "stop" : "talk instead";
+    $("hearing").className = on ? "hearing show" : "hearing";
+  }
+  function stopVoice(){ if (rec && listening) { try { rec.stop() } catch(e){} } setMic(false); $("interim").textContent = "" }
+
+  mic.addEventListener("click", function(){
+    if (!MIC_OK) {                        // this page is not allowed a microphone — use the device's own
+      el("sys", "", "Voice isn't wired into this page yet. Your device can still do it: "
+        + "on a phone, tap the microphone on your keyboard; on Windows press Win+H; on a Mac press the dictation key. "
+        + "It types straight into the box below and you can watch it land.");
+      $("hint").textContent = "use your device's dictation — it types in the box";
+      box.focus(); bottom();
+      return;
+    }
+    if (listening) { stopVoice(); return }
+
+    rec = new SR();
+    rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
+    heard = box.value ? box.value.trim() + " " : "";
+    $("heard").textContent = heard; $("interim").textContent = "";
+    rec.onresult = function(ev){
+      var iv = "";
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var r = ev.results[i];
+        if (r.isFinal) { heard += r[0].transcript.trim() + " " } else { iv += r[0].transcript }
+      }
+      $("heard").textContent = heard;
+      $("interim").textContent = iv;
+      box.value = (heard + iv).trim();
+      sync();
+    };
+    rec.onerror = function(ev){
+      setMic(false);
+      $("hint").textContent = ev.error === "not-allowed"
+        ? "microphone blocked — allow it in the address bar, then try again"
+        : "microphone error: " + ev.error;
+    };
+    rec.onend = function(){ if (listening) setMic(false) };
+    try { rec.start(); setMic(true); $("hint").textContent = "listening — say it, then press send" }
+    catch(e){ $("hint").textContent = "couldn't start the microphone: " + e.message }
+  });
+
+  // ---- framed navigation ----
+  // The Google Sites embed iframe is sandboxed WITHOUT allow-top-navigation-by-user-activation,
+  // so every target="_top" link inside it is silently dead. Google Sites also refuses to be
+  // framed, so navigating this frame to a site page is refused too. Therefore, when framed:
+  //   · pages this app renders itself (home / governor / projects) swap in place;
+  //   · links it cannot reach are removed, because the site's own nav already lists them;
+  //   · anything left (sign-in) opens in a new tab, and if the browser blocks that we say so
+  //     rather than failing silently.
+  (function(){
+    var framed=false; try{ framed = window.top !== window.self }catch(e){ framed = true }
+    if(!framed) return;
+    var VIEWS = { "/":"?view=home", "/governor":"", "/projects":"?view=projects" };
+    function sitePath(href){
+      var m = /^https?:\/\/(?:www\.)?sfdc24\.com(\/[^?#]*)?/.exec(href||"");
+      return m ? ((m[1]||"/").replace(/\/$/,"") || "/") : null;
+    }
+    [].slice.call(document.querySelectorAll('a[target="_top"]')).forEach(function(a){
+      var p = sitePath(a.getAttribute("href"));
+      if (p !== null && !VIEWS.hasOwnProperty(p)) a.parentNode && a.parentNode.removeChild(a);
+    });
+    document.addEventListener("click", function(e){
+      var a = e.target && e.target.closest ? e.target.closest('a[target="_top"]') : null;
+      if(!a) return;
+      var href = a.getAttribute("href"); if(!href) return;
+      e.preventDefault(); e.stopPropagation();
+      var p = sitePath(href);
+      if (p !== null && typeof SELF_URL === "string" && SELF_URL && VIEWS.hasOwnProperty(p)) {
+        location.href = SELF_URL + VIEWS[p]; return;
+      }
+      var w=null; try{ w = window.open(href,"_blank","noopener") }catch(x){}
+      if(!w && !document.getElementById("popblock")){
+        var n=document.createElement("div"); n.id="popblock"; n.className="empty";
+        n.style.marginTop="10px";
+        n.innerHTML='<span class="c">//</span> your browser blocked the new tab.<br>'+
+          '<span class="kv">open this address directly:</span><br>'+esc(href);
+        (a.closest(".wrap")||document.body).appendChild(n);
+      }
+    }, true);
+  })();
+  // ---- boot ----
+  start();
+})();
+</script>
+</body></html>
