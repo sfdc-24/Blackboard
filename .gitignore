@@ -65,4 +65,11 @@ build/
 # it has been read and cleared, same rule as the entries above: a push is not
 # undoable the way a local delete is. `.clasp.json` itself IS tracked -- it
 # holds only the scriptId, which is already in docs/HANDOVER.md.
-gas/
+#
+# `gas/*` rather than `gas/` so the .gitkeep below can be un-ignored.
+# The directory has to exist on a fresh clone: .clasp.json sets
+# rootDir=gas, and `clasp push` resolves it before doing anything else,
+# so without the directory a clean checkout cannot push at all.
+# (vm-cli found this on AkatiaVM. Read commands are unaffected.)
+gas/*
+!gas/.gitkeep
