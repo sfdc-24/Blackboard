@@ -527,7 +527,7 @@ in HANDOVER.
 
 ---
 
-## ISS-015 · OPEN — the cutover took the site down in browsers, and only in browsers
+## ISS-015 · RESOLVED — the cutover took the site down in browsers, and only in browsers
 
 **2026-09-04, ~19:05 UTC onward. Self-inflicted, foreseeable, and not foreseen.**
 
@@ -576,5 +576,20 @@ moving a host that has ever served HTTPS, treat certificate issuance as part of
 the cutover, not as cleanup after it — the outage window is the gap between the
 two.
 
-**Closes when:** `https://www.sfdc24.com/` returns the content marker with no
-`Exception:` in the body, and `https_enforced` is true.
+**RESOLVED 2026-09-04 19:48 UTC**, about 45 minutes after the DNS change.
+Let's Encrypt issued `CN=www.sfdc24.com` (valid 4 Sep - 3 Dec), `https_enforced`
+is now true, and `http://` returns a 301 to `https://`. Verified three ways: the
+certificate subject from `openssl s_client`, the content marker in the body over
+https, and - per the correction above - **the actual page loading in Chrome**.
+
+**On the wait.** GitHub reported `is_https_eligible: true` and
+`https_error: peer_failed_verification` throughout, meaning DNS was correct and
+only issuance was outstanding. Re-asserting the custom domain via the API did
+nothing visible; removing and re-adding it was followed by issuance a couple of
+minutes later. Whether that caused it or the ordinary retry landed at the same
+moment is not something one observation can settle, so it is recorded as what
+was done, not as a remedy that works.
+
+**Cost of the window:** the site was unreachable in browsers for roughly 45
+minutes on a day with effectively no traffic. Cheap this time. It would not be
+cheap on a site anyone depends on.
