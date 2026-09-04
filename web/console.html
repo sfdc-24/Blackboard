@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SFDC24</title>
+<style>
+:root{--bg:#0B0D10;--bg2:#12151A;--panel:#141920;--text:#E6EDF3;--mut:#8B949E;--faint:#6E7681;--line:#262C36;--acc:#00FFA6;--link:#58A6FF;--amber:#FFB224;--red:#F85149;--mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 var(--mono);-webkit-text-size-adjust:100%;overscroll-behavior:contain}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:960px;margin:0 auto;padding:18px 16px 28px}
+.nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:16px;font-size:13px}
+.nav .logo{color:var(--acc);font-weight:700;margin-right:8px;letter-spacing:.04em}
+.nav a{color:var(--mut)}
+.nav a:hover{color:var(--text);text-decoration:none}
+.nav a.on{color:var(--acc)}
+.nav .right{margin-left:auto;display:flex;gap:14px;align-items:baseline}
+pre.banner{color:var(--acc);font-size:11px;line-height:1.25;margin:6px 0 2px;overflow-x:auto}
+h1{font-size:18px;font-weight:700;margin:14px 0 4px}
+h2{font-size:13px;font-weight:700;color:var(--text);margin:26px 0 8px}
+h2::before{content:"## ";color:var(--acc)}
+p{margin:6px 0;color:var(--mut)}
+p b,strong{color:var(--text)}
+.tagline{color:var(--mut);margin:0 0 14px}
+.statusline{font-size:12.5px;color:var(--faint);margin:10px 0 4px}
+.statusline .g{color:var(--acc)}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin:8px 0}
+th{color:var(--faint);text-align:left;font-weight:400;font-size:12px;border-bottom:1px solid var(--line);padding:6px 10px 6px 0}
+td{border-bottom:1px solid var(--line);padding:9px 10px 9px 0;vertical-align:top;color:var(--mut)}
+td:first-child,th:first-child{padding-left:0}
+td .t{color:var(--text);font-weight:700}
+tr.click{cursor:pointer}
+tr.click:hover td{background:var(--bg2)}
+.badge{display:inline-block;font-size:11px;padding:1px 8px;border:1px solid var(--line);border-radius:999px;color:var(--mut);white-space:nowrap}
+.badge.g{color:var(--acc);border-color:rgba(0,255,166,.4)}
+.badge.a{color:var(--amber);border-color:rgba(255,178,36,.4)}
+.badge.r{color:var(--red);border-color:rgba(248,81,73,.4)}
+.box{border:1px solid var(--line);border-radius:6px;background:var(--bg2);padding:14px 16px;margin:10px 0}
+.empty{border:1px dashed var(--line);border-radius:6px;padding:26px 16px;text-align:center;color:var(--faint);margin:10px 0;font-size:13px}
+.empty .c{color:var(--acc)}
+button,.btn{font:600 13px var(--mono);background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 14px;cursor:pointer}
+button:hover,.btn:hover{border-color:var(--acc);text-decoration:none}
+button.primary,.btn.primary{background:var(--acc);border-color:var(--acc);color:#04120C}
+button:disabled{opacity:.45;cursor:default}
+input[type=text],input[type=password],textarea{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--text);font:13.5px var(--mono);padding:8px 10px}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+.kv{color:var(--faint);font-size:12px}
+.foot{border-top:1px solid var(--line);margin-top:30px;padding-top:12px;font-size:12px;color:var(--faint);display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+.foot a{color:var(--mut)}
+@media(max-width:640px){.nav .right{margin-left:0;width:100%}.wrap{padding:14px 13px 20px}.nav{font-size:12.5px}input[type=text],input[type=password],textarea{font-size:16px}button{min-height:44px}}
+
+.who{display:inline-flex;align-items:baseline;gap:8px}
+.who .nm{color:var(--text)}
+.who .role{font-size:11px;color:var(--acc)}
+.who .role.guest{color:var(--faint)}
+.tabs{display:flex;flex-wrap:wrap;gap:4px 14px;margin:2px 0 12px;font-size:13px}
+.tabs a,.tabs button.tabb{background:none;border:none;padding:0;font:inherit;color:var(--mut);cursor:pointer}
+.tabs .tabb:hover{color:var(--text);border-color:transparent}
+.tabs .tabb.on{color:var(--acc)}
+.tabs .tabb .n{color:var(--amber)}
+.mission{color:var(--mut);margin:2px 0 8px}
+.mission b{color:var(--text)}
+.tl{border:1px solid var(--line);border-radius:6px;background:var(--bg2);padding:14px 8px 8px;margin:10px 0;overflow-x:auto}
+.tlrow{display:flex;min-width:640px}
+.tlnode{flex:1;display:flex;flex-direction:column;align-items:center;text-align:center;position:relative;min-width:86px}
+.tlnode::before,.tlnode::after{content:"";position:absolute;top:8px;height:2px;width:50%;background:var(--line)}
+.tlnode::before{left:0}.tlnode::after{right:0}
+.tlnode:first-child::before,.tlnode:last-child::after{display:none}
+.tlnode.done::before,.tlnode.done::after,.tlnode.now::before{background:var(--acc)}
+.tldot{width:15px;height:15px;border-radius:50%;border:2px solid var(--line);background:var(--bg);z-index:1}
+.tlnode.done .tldot{background:var(--acc);border-color:var(--acc)}
+.tlnode.now .tldot{background:var(--amber);border-color:var(--amber)}
+.tldate{font-size:10px;color:var(--faint);margin-top:7px}
+.tllabel{font-size:11px;line-height:1.3;margin-top:2px;max-width:110px;color:var(--mut)}
+.tlnode.now .tllabel{color:var(--amber)}
+.strip{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:26px}
+@media(max-width:860px){.cols{grid-template-columns:minmax(0,1fr)}}
+.pcard{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:6px;background:var(--bg2);padding:13px 15px;margin:0 0 10px;cursor:pointer}
+.pcard:hover{border-color:var(--acc)}
+.pcard.warn{border-left-color:var(--amber)}
+.pcard.crit{border-left-color:var(--red)}
+.phead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.pname{color:var(--text);font-weight:700;font-size:14px}
+.ptag{color:var(--faint);font-size:12px}
+.pmeta{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+.srow{display:flex;gap:10px;margin:5px 0 0;font-size:13px;line-height:1.55}
+.skey{color:var(--faint);flex:none;width:52px}
+.sval{color:var(--mut)}
+.srow.blocked .sval{color:var(--amber)}
+.stamp{font-size:11px;color:var(--faint);margin-top:8px}
+@media(max-width:640px){.pmeta{margin-left:0;width:100%}.srow{flex-direction:column;gap:0}.skey{width:auto}}
+.dcard{border:1px solid var(--line);border-radius:6px;background:var(--bg2);padding:13px 15px;margin:0 0 10px}
+.dcard.open{border-left:3px solid var(--amber)}
+.dcard.done{border-left:3px solid var(--acc)}
+.dtitle{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:14px}
+.did{color:var(--amber);font-size:12px}
+.dname{color:var(--text);font-weight:700}
+.dby{margin-left:auto;font-size:11px;color:var(--faint)}
+.ctx{margin:6px 0 8px;padding-left:16px;font-size:13px;color:var(--mut)}
+.ctx li{margin:2px 0}
+.opt{display:flex;gap:9px;align-items:flex-start;padding:8px 10px;border:1px solid var(--line);border-radius:6px;margin:5px 0;cursor:pointer;background:var(--bg)}
+.opt:hover{border-color:var(--acc)}
+.opt input{margin-top:3px;accent-color:var(--acc)}
+.opt .lab{color:var(--text);font-weight:700;font-size:13px}
+.opt .det{color:var(--mut);font-size:12.5px}
+.rec{color:var(--acc);font-size:10.5px;border:1px solid rgba(0,255,166,.4);border-radius:4px;padding:0 5px;margin-left:6px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.linklike{background:none;border:none;color:var(--link);font-size:12.5px;padding:0;cursor:pointer}
+.linklike:hover{text-decoration:underline;border-color:transparent}
+.explain{display:none;border:1px dashed rgba(0,255,166,.4);border-radius:6px;padding:10px 12px;margin:8px 0 4px;font-size:13px;color:var(--mut)}
+.explain.show{display:block}
+.exrow{display:flex;gap:14px;margin-top:8px;flex-wrap:wrap}
+.choice{color:var(--acc);font-weight:700;font-size:13px}
+.feed{list-style:none;margin:0;padding:0;font-size:12.5px}
+.feed li{padding:6px 0;border-bottom:1px solid var(--line);color:var(--mut)}
+.feed li:last-child{border-bottom:none}
+.feed .ts{color:var(--faint);font-size:11px;display:block}
+.feed .tag{color:var(--acc)}
+.progress{border:1px solid var(--line);border-radius:6px;background:var(--bg2);padding:9px 12px;margin:0 0 10px;font-size:12.5px;display:flex;justify-content:space-between;gap:10px;color:var(--mut)}
+.pbar{flex:1;align-self:center;height:6px;background:var(--bg);border-radius:999px;overflow:hidden;border:1px solid var(--line)}
+.pfill{height:100%;width:0;background:var(--acc);transition:width .3s}
+.passrow{display:none;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.passrow.show{display:flex}
+.passrow input{max-width:240px}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--acc);color:#04120C;padding:8px 16px;border-radius:6px;font:600 13px var(--mono);opacity:0;transition:opacity .25s;pointer-events:none;max-width:90vw;z-index:9}
+.toast.show{opacity:1}
+.rule{padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--faint)}
+.rule:last-child{border-bottom:none}
+.rule b{color:var(--mut)}
+.rule .n{color:var(--acc);margin-right:6px}
+</style></head><body>
+<div class="wrap">
+  <div class="nav">
+    <span class="logo">sfdc24</span>
+    <a href="https://www.sfdc24.com/" target="_top">home</a>
+    <a href="https://www.sfdc24.com/governor" target="_top" id="nav-gov">governor</a>
+    <a href="https://www.sfdc24.com/projects" target="_top" id="nav-proj">projects</a>
+    <a href="https://www.sfdc24.com/history" target="_top">history</a>
+    <a href="https://www.sfdc24.com/team" target="_top">team</a>
+    <a href="https://www.sfdc24.com/faq" target="_top">faq</a>
+    <span class="right"><span class="who" id="who"><span class="nm">…</span></span></span>
+  </div>
+  <p class="statusline" id="stamp">loading…</p>
+  <div class="box" id="banner" style="display:none;border-color:var(--red);color:var(--red)"></div>
+
+  <div id="projects" hidden>
+    <h1>projects</h1>
+    <p class="tagline" id="pintro"></p>
+    <div id="pwrap"></div>
+  </div>
+
+  <div id="console">
+  <div class="tabs" id="tabs"></div>
+  <div class="mission" id="mission"></div>
+  <div class="box" id="statecard" hidden></div>
+  <div class="tl" id="tl" hidden><div class="tlrow" id="tlrow"></div></div>
+  <div class="strip" id="strip"></div>
+
+  <div class="cols">
+    <main>
+      <h2>decision queue</h2>
+      <div class="progress" id="progress" hidden><span id="ptext-main"></span><span class="pbar"><span class="pfill" id="pfill"></span></span><span id="ptext-rem"></span></div>
+      <div id="decisions"><div class="empty">loading…</div></div>
+
+      <h2>message</h2>
+      <div class="dcard">
+        <textarea id="noteText" rows="2" placeholder="a direction, a note, or a new ask."></textarea>
+        <div class="row"><button class="primary" id="noteSend">send</button><span class="kv" id="noteHint"></span></div>
+        <div class="passrow" id="passrow"><input type="password" id="passInput" placeholder="governor passphrase (fallback)"><button id="passSave">use</button></div>
+      </div>
+    </main>
+    <aside>
+      <h2>activity</h2>
+      <div class="dcard" style="padding:6px 15px"><ul class="feed" id="feed"><li class="kv">loading…</li></ul></div>
+    </aside>
+  </div>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+(function(){
+  var SELF_URL = "<?!= selfUrl ?>";
+  var VIEW = "<?!= view ?>" || "console"; var VIEWSTART = VIEW;
+  var SIGNIN = "https://accounts.google.com/AccountChooser?continue=" + encodeURIComponent(SELF_URL || "");
+
+  var $=function(id){return document.getElementById(id)};
+  var esc=function(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})};
+  var fmt=function(ts){try{var d=new Date(ts);if(isNaN(d))return String(ts||"");return d.toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}catch(e){return ""}};
+  var toast=function(m){var t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(function(){t.classList.remove("show")},2600)};
+  var md=function(s){return esc(s).replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")};
+  var slug=function(s){return String(s||"").trim().toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"")};
+
+  function parseGov(payload){
+    if(!payload||payload.indexOf("GOV|")!==0)return null;
+    var o={};payload.slice(4).split("|").forEach(function(p){var i=p.indexOf("=");if(i>0)o[p.slice(0,i).trim()]=p.slice(i+1).trim()});
+    return o.kind?o:null;
+  }
+  function parseOptions(s){
+    return (s||"").split(";;").filter(Boolean).map(function(x){var a=x.split(":");return{key:a[0]||"",label:a[1]||a[0]||"",detail:a[2]||"",rec:(a[3]||"").toLowerCase()==="rec"}});
+  }
+  function blank(){return{mission:"",updated:"",now:"",next:"",blocked:"",stateBy:"",stateAt:"",milestones:[],chips:{},chipOrder:[],decisions:{},order:[],responses:{},feed:[]}}
+  function build(rows){
+    var projects={}, order=[], states={};
+    function proj(id){ if(!states[id]){states[id]=blank();} if(!projects[id]){projects[id]={id:id,name:id.replace(/-/g," ").replace(/\b\w/g,function(c){return c.toUpperCase()}),order:99};order.push(id);} return states[id]; }
+    rows.forEach(function(r){
+      var g=parseGov(r.payload);if(!g)return;
+      var at=g.at||r.ts||"";
+      if(g.kind==="reset"){projects={};order=[];states={};return}
+      if(g.kind==="project"){var pid=slug(g.id||g.name);if(!pid)return;proj(pid);projects[pid].name=g.name||projects[pid].name;projects[pid].order=+(g.order||99);projects[pid].tagline=g.tagline||"";if(g.state==="archived")projects[pid].archived=true;return}
+      var pid2=slug(g.project||"")||"board";
+      var st=proj(pid2);
+      switch(g.kind){
+        case "mission": st.mission=g.text||"";st.updated=g.updated||fmt(at);break;
+        case "milestone": st.milestones=st.milestones.filter(function(m){return m.label!==g.label});if(g.state!=="remove")st.milestones.push({date:g.date||"",label:g.label||"",state:g.state||"next"});break;
+        case "status": if(g.state==="remove"){delete st.chips[g.label];break} if(!st.chips[g.label])st.chipOrder.push(g.label);st.chips[g.label]={label:g.label,state:g.state||"good"};break;
+        case "decision": if(!st.decisions[g.id])st.order.push(g.id);st.decisions[g.id]={id:g.id,title:g.title||g.id,context:(g.context||"").split(";;").filter(Boolean),options:parseOptions(g.options),explain:g.explain||"",by:g.by||r.source||"",at:at,closed:(g.state||"")==="closed"};break;
+        case "response": st.responses[g.id]={choice:g.choice,comment:g.comment||"",at:at,by:g.by||"Governor"};break;
+        case "reopen": delete st.responses[g.id];break;
+        case "state": if(g.now!==undefined)st.now=g.now; if(g.next!==undefined)st.next=g.next; if(g.blocked!==undefined)st.blocked=g.blocked; st.stateBy=g.by||r.source||""; st.stateAt=at; break;
+        case "feed": st.feed.push({tag:g.tag||r.source||"",text:g.text||"",at:at});break;
+      }
+    });
+    var rank={done:0,now:1,next:2};
+    order.forEach(function(id){var st=states[id];st.milestones.sort(function(a,b){return (rank[a.state]||0)-(rank[b.state]||0)});st.feed.sort(function(a,b){return new Date(b.at)-new Date(a.at)});
+      st.open=st.order.filter(function(d){var x=st.decisions[d];return x&&!x.closed&&!st.responses[d]}).length;});
+    order.sort(function(a,b){return projects[a].order-projects[b].order||a.localeCompare(b)});
+    return {projects:projects,order:order,states:states};
+  }
+
+  var data=null, user=null, current=null, expanded={};
+  function ids(){return data.order.filter(function(id){return !data.projects[id].archived})}
+  function setView(v){VIEW=v;$("projects").hidden=(v!=="projects");$("console").hidden=(v==="projects");
+    var g=$("nav-gov"),p=$("nav-proj");if(g)g.className=(v==="projects")?"":"on";if(p)p.className=(v==="projects")?"on":"";}
+  function badge(state){return state==="good"?"g":state==="warn"?"a":state==="crit"?"r":""}
+  var SCOPED=false;
+  function emptyBoard(){
+    if(SCOPED)return '<div class="empty"><span class="c">//</span> project state is private.<br>'+
+      '<span class="kv">sign in with the Governor account to see it. </span>'+
+      '<a href="'+esc(SIGNIN)+'" target="_top" rel="noopener">sign in \u2192</a></div>';
+    return '<div class="empty"><span class="c">//</span> no projects yet.<br><span class="kv">check back soon.</span></div>';
+  }
+
+  function renderProjects(){
+    var list=ids();
+    $("pintro").textContent=list.length?(list.length+" project"+(list.length>1?"s":"")+" — click one to open its console."):"";
+    if(!list.length){$("pwrap").innerHTML=emptyBoard();return}
+    $("pwrap").innerHTML=list.map(function(id){
+      var p=data.projects[id],st=data.states[id],last=st.feed[0];
+      var tone=""; st.chipOrder.forEach(function(l){var c=st.chips[l]; if(!c)return;
+        if(c.state==="crit")tone="crit"; else if(c.state==="warn"&&tone!=="crit")tone="warn"});
+      var chips=st.chipOrder.filter(function(l){return st.chips[l]}).map(function(l){var c=st.chips[l];
+        return '<span class="badge '+badge(c.state)+'">'+esc(c.label)+'</span>'}).join("");
+      return '<div class="pcard '+tone+'" data-open="'+esc(id)+'">'+
+        '<div class="phead"><span class="pname">'+esc(p.name)+'</span><span class="ptag">'+esc(p.tagline||"")+'</span>'+
+          '<span class="pmeta">'+(st.open?'<span class="badge a">'+st.open+' to rule</span>':"")+chips+'</span></div>'+
+        (st.now?'<div class="srow"><span class="skey">now</span><span class="sval">'+esc(st.now)+'</span></div>':"")+
+        (st.next?'<div class="srow"><span class="skey">next</span><span class="sval">'+esc(st.next)+'</span></div>':"")+
+        (st.blocked?'<div class="srow blocked"><span class="skey">blocked</span><span class="sval">'+esc(st.blocked)+'</span></div>':"")+
+        (last?'<div class="stamp">'+esc(fmt(last.at))+' \u00b7 '+esc(last.tag)+'</div>':"")+
+        '</div>';
+    }).join("");
+  }
+  function renderTabs(){
+    var t=$("tabs"), list=ids();
+    if(!list.length){t.innerHTML="";return}
+    t.innerHTML=(VIEWSTART==="projects"?'<button class="tabb" data-back="1">← all projects</button>':"")+list.map(function(id){var p=data.projects[id],st=data.states[id];
+      return '<button class="tabb'+(id===current?" on":"")+'" data-proj="'+esc(id)+'">['+esc(p.name.toLowerCase())+(st.open?' <span class="n">'+st.open+'</span>':"")+']</button>'}).join("");
+  }
+  function renderProject(){
+    var has=!!(current&&data.states[current]);
+    var st=has?data.states[current]:blank();
+    $("mission").innerHTML=has?(st.mission?md(st.mission):'<span class="kv">no mission line posted for this project yet.</span>'):emptyBoard();
+    var sc=$("statecard"), hasState=!!(st.now||st.next||st.blocked);
+    sc.hidden=!hasState;
+    if(hasState)sc.innerHTML=
+      (st.now?'<div class="srow"><span class="skey">now</span><span class="sval">'+esc(st.now)+'</span></div>':"")+
+      (st.next?'<div class="srow"><span class="skey">next</span><span class="sval">'+esc(st.next)+'</span></div>':"")+
+      (st.blocked?'<div class="srow blocked"><span class="skey">blocked</span><span class="sval">'+esc(st.blocked)+'</span></div>':"")+
+      (st.stateAt?'<div class="stamp">updated '+esc(fmt(st.stateAt))+(st.stateBy?" \u00b7 "+esc(st.stateBy):"")+'</div>':"");
+    var ms=st.milestones;
+    $("tlrow").innerHTML=ms.map(function(m){return '<div class="tlnode '+esc(m.state)+'"><div class="tldot"></div><div class="tldate">'+esc(m.date)+'</div><div class="tllabel">'+esc(m.label)+'</div></div>'}).join("");
+    $("tl").hidden=!ms.length;
+    $("strip").innerHTML=st.chipOrder.filter(function(l){return st.chips[l]}).map(function(l){var c=st.chips[l];return '<span class="badge '+badge(c.state)+'">'+esc(c.label)+'</span>'}).join("");
+    renderDecisions();
+    $("feed").innerHTML=st.feed.length?st.feed.slice(0,12).map(function(f){return '<li><span class="ts">'+esc(fmt(f.at))+'</span><span class="tag">'+esc(f.tag)+'</span> '+esc(f.text)+'</li>'}).join(""):'<li class="kv">no activity yet.</li>';
+  }
+  function renderDecisions(){
+    var st=(current&&data.states[current])||blank(), host=$("decisions"), canAct=!!(user&&user.canAct);
+    var decs=st.order.map(function(id){return st.decisions[id]}).filter(function(d){return d&&!d.closed});
+    var total=decs.length, done=decs.filter(function(d){return st.responses[d.id]}).length;
+    var prog=$("progress");
+    if(total){prog.hidden=false;$("pfill").style.width=Math.round(done/total*100)+"%";
+      $("ptext-main").textContent=done+"/"+total+" decided";
+      $("ptext-rem").textContent=done===total?"all clear":(total-done)+" to go";}
+    else prog.hidden=true;
+    if(!decs.length){host.innerHTML='<div class="empty"><span class="c">//</span> no open decisions.</div>';return}
+    var sorted=decs.slice().sort(function(a,b){return (st.responses[a.id]?1:0)-(st.responses[b.id]?1:0)});
+    var html="";
+    sorted.forEach(function(d){
+      var r=st.responses[d.id];
+      var optsRO=d.options.map(function(o){return '<div class="opt" style="cursor:default;'+(r&&o.key===r.choice?"border-color:var(--acc)":"")+'"><span>'+(r&&o.key===r.choice?"✓":"·")+'</span><span><span class="lab">'+esc(o.label)+(o.rec?'<span class="rec">rec</span>':"")+'</span><br><span class="det">'+esc(o.detail)+'</span></span></div>'}).join("");
+      if(r&&expanded[d.id]){
+        var chosen=d.options.filter(function(o){return o.key===r.choice})[0];
+        html+='<div class="dcard done"><div class="dtitle" data-collapse="'+esc(d.id)+'" style="cursor:pointer"><span class="did">'+esc(d.id)+'</span><span class="dname">'+esc(d.title)+'</span><span class="dby">▾ collapse</span></div><ul class="ctx">'+d.context.map(function(c){return "<li>"+esc(c)+"</li>"}).join("")+'</ul>'+optsRO+'<div class="explain" id="ex-'+esc(d.id)+'"></div><div class="row"><span class="choice">✓ '+esc(chosen?chosen.label:r.choice)+'</span><span class="kv">'+esc(fmt(r.at))+(r.by?" · "+esc(r.by):"")+'</span>'+(r.comment?'<span class="kv">“'+esc(r.comment)+'”</span>':"")+'</div><div class="row"><button data-explain="'+esc(d.id)+'">explain</button>'+(canAct?'<button class="linklike" data-undo="'+esc(d.id)+'">change decision</button>':"")+'</div></div>';
+      }else if(r){
+        var ch=d.options.filter(function(o){return o.key===r.choice})[0];
+        html+='<div class="dcard done"><div class="dtitle" data-expand="'+esc(d.id)+'" style="cursor:pointer"><span class="did">'+esc(d.id)+'</span><span class="dname">'+esc(d.title)+'</span><span class="choice">✓ '+esc(ch?ch.label:r.choice)+'</span><span class="dby">▸ review</span></div></div>';
+      }else{
+        var opts=d.options.map(function(o){return '<label class="opt"><input type="radio" name="opt-'+esc(d.id)+'" value="'+esc(o.key)+'" '+(o.rec?"checked":"")+(canAct?"":" disabled")+'><span><span class="lab">'+esc(o.label)+(o.rec?'<span class="rec">rec</span>':"")+'</span><br><span class="det">'+esc(o.detail)+'</span></span></label>'}).join("");
+        html+='<div class="dcard open"><div class="dtitle"><span class="did">'+esc(d.id)+'</span><span class="dname">'+esc(d.title)+'</span>'+(d.by?'<span class="dby">by '+esc(d.by)+'</span>':"")+'</div><ul class="ctx">'+d.context.map(function(c){return "<li>"+esc(c)+"</li>"}).join("")+'</ul>'+opts+'<div class="explain" id="ex-'+esc(d.id)+'"></div>'+(canAct?'<input type="text" id="cmt-'+esc(d.id)+'" placeholder="optional note"><div class="row"><button class="primary" data-approve="'+esc(d.id)+'">confirm selection</button><button data-explain="'+esc(d.id)+'">explain</button></div>':'<div class="row"><button data-explain="'+esc(d.id)+'">explain</button><span class="kv">awaiting the governor.</span></div>')+'</div>';
+      }
+    });
+    host.innerHTML=html;
+  }
+  function renderWho(){
+    var w=$("who"); if(!user){w.innerHTML='<span class="nm">…</span>';return}
+    var name=user.name||(user.email?user.email.split("@")[0]:"guest");
+    if(user.canAct)w.innerHTML='<span class="nm">'+esc(name)+'</span><span class="role">governor</span>';
+    else w.innerHTML='<span class="nm">'+esc(name||"guest")+'</span><span class="role guest">'+(user.email?"viewer":"guest")+'</span> <a href="'+esc(SIGNIN)+'" target="_top" rel="noopener">sign in →</a>';
+    $("noteHint").textContent=user.canAct?"":"sign in with Google to act.";
+    $("passrow").className="passrow"+(user.canAct?"":" show");
+  }
+
+  var voices=[],vi=0;
+  function loadVoices(){try{var all=(speechSynthesis.getVoices()||[]).filter(function(v){return /^en/i.test(v.lang)});if(!all.length)return;all.sort(function(a,b){return rank(b)-rank(a)});voices=all.slice(0,6);var saved=null;try{saved=localStorage.getItem("gov_voice")}catch(e){}var i=-1;voices.forEach(function(v,k){if(v.voiceURI===saved)i=k});vi=i>=0?i:0}catch(e){}}
+  function rank(v){var n=v.name.toLowerCase(),s=0;if(/natural|neural|online|premium|enhanced/.test(n))s+=40;if(/aria|jenny|sonia|libby|samantha|karen|moira|tessa|serena|zira|susan|hazel|female|ava|allison|joanna|salli/.test(n))s+=30;if(/google/.test(n))s+=15;if(/^en/.test(v.lang))s+=10;if(/david|mark|guy|male|daniel|alex\b/.test(n))s-=50;return s}
+  loadVoices();try{speechSynthesis.onvoiceschanged=loadVoices}catch(e){}
+  function speak(text,btn){try{if(speechSynthesis.speaking){speechSynthesis.cancel();if(btn)btn.textContent="read aloud";return}var u=new SpeechSynthesisUtterance(text);if(voices[vi])u.voice=voices[vi];u.rate=1.03;u.pitch=1.05;u.onend=function(){if(btn)btn.textContent="read aloud"};if(btn)btn.textContent="stop";speechSynthesis.speak(u)}catch(e){toast("read-aloud not available")}}
+  function nextVoice(){if(!voices.length)loadVoices();if(!voices.length){toast("no alternate voices");return}vi=(vi+1)%voices.length;try{localStorage.setItem("gov_voice",voices[vi].voiceURI)}catch(e){}speechSynthesis.cancel();speak("Hello. I'm "+voices[vi].name.replace(/microsoft|google|online|\(natural\)/gi,"").trim()+".",null);toast("voice: "+voices[vi].name)}
+  function explain(id){var st=current&&data.states[current];var d=st&&st.decisions[id];if(!d)return;var box=$("ex-"+id);if(!box)return;if(box.classList.contains("show")){box.classList.remove("show");return}
+    var text=d.explain||"no plain-language note was posted with this one yet — ask in the message box below.";
+    box.innerHTML=esc(text)+'<div class="exrow"><button class="linklike" data-speak="'+esc(id)+'">read aloud</button><button class="linklike" data-voice="1">change voice</button><button class="linklike" data-exclose="'+esc(id)+'">close</button></div>';box.dataset.text=text;box.classList.add("show")}
+
+  var pass=""; try{pass=localStorage.getItem("gov_pass")||""}catch(e){}
+  function call(fn){var args=Array.prototype.slice.call(arguments,1);return new Promise(function(res,rej){var r=google.script.run.withSuccessHandler(res).withFailureHandler(function(e){rej(new Error(e&&e.message||String(e)))});r[fn].apply(r,args)})}
+  function post(payload){
+    if(!(user&&user.canAct)){toast("sign in with Google (or use the passphrase) to act");return Promise.reject(new Error("no auth"))}
+    if(current)payload+="|project="+current;
+    return call("postRow",payload,pass).then(function(j){if(!j||!j.ok)throw new Error((j&&j.error)||"write failed");return j});
+  }
+  function load(){
+    call("getState",pass).then(function(j){
+      if(!j||!j.ok)throw new Error((j&&j.error)||"bad response");
+      user=j.user||{}; user.canAct=!!(user.isGovernor||(pass&&j.passOk)); SCOPED=!!j.scoped;
+      data=build(j.rows||[]);
+      var list=ids();
+      if(current&&!data.states[current])current=null;
+      if(!current&&list.length){var saved=null;try{saved=localStorage.getItem("gov_proj")}catch(e){} current=(saved&&data.states[saved])?saved:list[0]}
+      renderWho();renderTabs();renderProject();renderProjects();setView(VIEW);
+      $("stamp").innerHTML=SCOPED
+        ? 'status: <span class="g">online</span> · project state is private — sign in as the Governor'
+        : 'status: <span class="g">online</span> · projects: <b style="color:var(--text)">'+list.length+"</b> · read "+esc(fmt(Date.now()));
+      $("banner").style.display="none";
+    }).catch(function(e){$("stamp").textContent="status: offline";$("banner").style.display="block";$("banner").textContent="could not load: "+e.message;});
+  }
+
+  document.addEventListener("click",function(e){
+    var t=e.target,c;
+    if(c=t.closest("[data-open]")){current=c.getAttribute("data-open");try{localStorage.setItem("gov_proj",current)}catch(x){}renderTabs();renderProject();setView("console");window.scrollTo(0,0);return}
+    if(c=t.closest("[data-back]")){setView("projects");window.scrollTo(0,0);return}
+    if(c=t.closest("[data-proj]")){current=c.getAttribute("data-proj");try{localStorage.setItem("gov_proj",current)}catch(x){}renderTabs();renderProject();return}
+    if(c=t.closest("[data-expand]")){expanded[c.getAttribute("data-expand")]=true;renderDecisions();return}
+    if(c=t.closest("[data-collapse]")){delete expanded[c.getAttribute("data-collapse")];renderDecisions();return}
+    if(c=t.closest("[data-explain]")){explain(c.getAttribute("data-explain"));return}
+    if(c=t.closest("[data-speak]")){var b=$("ex-"+c.getAttribute("data-speak"));speak(b?b.dataset.text||"":"",c);return}
+    if(t.closest("[data-voice]")){nextVoice();return}
+    if(c=t.closest("[data-exclose]")){try{speechSynthesis.cancel()}catch(x){}var bx=$("ex-"+c.getAttribute("data-exclose"));if(bx)bx.classList.remove("show");return}
+    if(c=t.closest("[data-approve]")){var id=c.getAttribute("data-approve");var sel=document.querySelector('input[name="opt-'+id+'"]:checked');if(!sel){toast("pick an option first");return}
+      var cmt=($("cmt-"+id)||{}).value||"";c.disabled=true;
+      post("GOV|kind=response|id="+id+"|choice="+sel.value+"|comment="+cmt.replace(/\|/g,"/").slice(0,500)+"|by=Governor").then(function(){toast(id+" recorded");setTimeout(load,600)}).catch(function(err){c.disabled=false;if(err.message!=="no auth")toast("save failed: "+err.message)});return}
+    if(c=t.closest("[data-undo]")){var uid=c.getAttribute("data-undo");post("GOV|kind=reopen|id="+uid+"|by=Governor").then(function(){toast(uid+" reopened");setTimeout(load,600)}).catch(function(err){if(err.message!=="no auth")toast("failed: "+err.message)});return}
+  });
+  $("noteSend").addEventListener("click",function(){var v=$("noteText").value.trim();if(!v){toast("nothing to send");return}
+    post("GOV|kind=feed|tag=GOVERNOR|text="+v.replace(/\|/g,"/").slice(0,2000)).then(function(){$("noteText").value="";toast("sent");setTimeout(load,600)}).catch(function(err){if(err.message!=="no auth")toast("send failed: "+err.message)})});
+  $("passSave").addEventListener("click",function(){pass=$("passInput").value.trim();try{localStorage.setItem("gov_pass",pass)}catch(e){}$("passInput").value="";load()});
+
+  // ---- framed navigation ----
+  // The Google Sites embed iframe is sandboxed WITHOUT allow-top-navigation-by-user-activation,
+  // so every target="_top" link inside it is silently dead. Google Sites also refuses to be
+  // framed, so navigating this frame to a site page is refused too. Therefore, when framed:
+  //   · pages this app renders itself (home / governor / projects) swap in place;
+  //   · links it cannot reach are removed, because the site's own nav already lists them;
+  //   · anything left (sign-in) opens in a new tab, and if the browser blocks that we say so
+  //     rather than failing silently.
+  (function(){
+    var framed=false; try{ framed = window.top !== window.self }catch(e){ framed = true }
+    if(!framed) return;
+    var VIEWS = { "/":"?view=home", "/governor":"", "/projects":"?view=projects" };
+    function sitePath(href){
+      var m = /^https?:\/\/(?:www\.)?sfdc24\.com(\/[^?#]*)?/.exec(href||"");
+      return m ? ((m[1]||"/").replace(/\/$/,"") || "/") : null;
+    }
+    [].slice.call(document.querySelectorAll('a[target="_top"]')).forEach(function(a){
+      var p = sitePath(a.getAttribute("href"));
+      if (p !== null && !VIEWS.hasOwnProperty(p)) a.parentNode && a.parentNode.removeChild(a);
+    });
+    document.addEventListener("click", function(e){
+      var a = e.target && e.target.closest ? e.target.closest('a[target="_top"]') : null;
+      if(!a) return;
+      var href = a.getAttribute("href"); if(!href) return;
+      e.preventDefault(); e.stopPropagation();
+      var p = sitePath(href);
+      if (p !== null && typeof SELF_URL === "string" && SELF_URL && VIEWS.hasOwnProperty(p)) {
+        location.href = SELF_URL + VIEWS[p]; return;
+      }
+      var w=null; try{ w = window.open(href,"_blank","noopener") }catch(x){}
+      if(!w && !document.getElementById("popblock")){
+        var n=document.createElement("div"); n.id="popblock"; n.className="empty";
+        n.style.marginTop="10px";
+        n.innerHTML='<span class="c">//</span> your browser blocked the new tab.<br>'+
+          '<span class="kv">open this address directly:</span><br>'+esc(href);
+        (a.closest(".wrap")||document.body).appendChild(n);
+      }
+    }, true);
+  })();
+  load();
+  setInterval(load,60000);
+})();
+</script>
+</body></html>
