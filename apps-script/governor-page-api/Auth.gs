@@ -115,11 +115,22 @@ function jwtClaims_(idToken) {
   try { return JSON.parse(b64urlDecode_(parts[1])); } catch (e) { return null; }
 }
 
+// Where a completed sign-in may send the visitor. A CLOSED LIST, looked up by
+// key, never a URL taken from the request -- otherwise ?back= would be an open
+// redirect that hands a live session token to whoever crafted the link.
+var AUTH_RETURNS = {
+  voice: 'https://www.sfdc24.com/voice/'
+};
+
 /** Build the Google consent URL and remember a one-time state nonce. */
-function authStartUrl_() {
+function authStartUrl_(back) {
   var clientId = PropertiesService.getScriptProperties().getProperty(AUTH_CLIENT_ID_KEY);
   var state = Utilities.getUuid();
-  CacheService.getScriptCache().put('authstate_' + state, '1', AUTH_STATE_TTL_SECS);
+  // The nonce doubles as the carrier for where to land afterwards. Google
+  // returns state to us untouched, and it is single use, so nothing about the
+  // destination is attacker-supplied by the time we read it back.
+  var val = AUTH_RETURNS.hasOwnProperty(String(back)) ? String(back) : '1';
+  CacheService.getScriptCache().put('authstate_' + state, val, AUTH_STATE_TTL_SECS);
 
   return 'https://accounts.google.com/o/oauth2/v2/auth'
     + '?client_id=' + encodeURIComponent(clientId)
@@ -142,7 +153,8 @@ function authCompleteCallback_(e) {
   // CSRF: the state must be one WE issued, and it is single use.
   var cache = CacheService.getScriptCache();
   var key = 'authstate_' + p.state;
-  if (!cache.get(key)) return { ok: false, error: 'state not recognised or expired - start again' };
+  var back = cache.get(key);
+  if (!back) return { ok: false, error: 'state not recognised or expired - start again' };
   cache.remove(key);
 
   var props = PropertiesService.getScriptProperties();
@@ -186,7 +198,8 @@ function authCompleteCallback_(e) {
     ok: true,
     token: mintSession_(claims),
     email: claims.email,
-    name: claims.name || ''
+    name: claims.name || '',
+    back: back
   };
 }
 
@@ -207,9 +220,9 @@ function whoAmI(token) {
 }
 
 /** The URL a page should send the top window to in order to sign in. */
-function signInUrl() {
+function signInUrl(back) {
   if (!authConfigured_()) return { ok: false, error: 'sign-in is not configured' };
-  return { ok: true, url: authStartUrl_() };
+  return { ok: true, url: authStartUrl_(back) };
 }
 
 /**
@@ -253,7 +266,14 @@ function authRedirectPage_(url) {
  * no client storage at all.
  */
 function authStorePage_(out) {
-  var dest = AUTH_REDIRECT_URI + '?view=home&s=' + encodeURIComponent(out.token);
+  // Off-site destinations take the token in the FRAGMENT, not the query. A
+  // fragment is never sent to the destination's server and never reaches its
+  // logs or a Referer header; the voice page reads it, stores it, and strips it
+  // from the address bar immediately.
+  var away = AUTH_RETURNS[String(out.back)];
+  var dest = away
+    ? (away + '#s=' + encodeURIComponent(out.token))
+    : (AUTH_REDIRECT_URI + '?view=home&s=' + encodeURIComponent(out.token));
   var safe = dest.replace(/"/g, '&quot;');
   var who = String(out.email).replace(/[<>&]/g, '');
   return authShell_('Signed in',
@@ -268,7 +288,7 @@ function authHandleGet_(e) {
   var p = (e && e.parameter) || {};
 
   if (p.auth === 'start') {
-    var r = signInUrl();
+    var r = signInUrl(p.back);
     if (!r.ok) {
       return authShell_('Sign-in unavailable',
         '<h1>sign-in is not configured yet</h1><p>' + r.error + '</p>');

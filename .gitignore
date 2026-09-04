@@ -76,3 +76,8 @@ gas/*
 
 # Salesforce CLI local state.
 .sf/
+
+# Machine-local Claude Code permission grants. These are per-surface decisions
+# (the VM has clasp authenticated; the laptop and vm-chrome may not), so they
+# must not travel with the repo to the other instances.
+.claude/settings.local.json

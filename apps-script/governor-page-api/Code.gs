@@ -46,6 +46,11 @@ function doGet(e) {
     return json_(cachedRows_());
   }
 
+  // Voice. Answered as JSONP because the caller is www.sfdc24.com, a different
+  // origin, and Apps Script sends no CORS headers. See voiceReply_ for why the
+  // voice UI cannot live in this page at all.
+  if (p.action === 'say') return voiceReply_(p);
+
   // Sign-in dance (start, and Google's redirect back). Returns null for any
   // request that is not part of it, so normal page loads fall straight through.
   var authPage = authHandleGet_(e);
@@ -127,6 +132,63 @@ function postRow(payload, pass) {
   var okPass = !!pass && !!stored && pass === stored;
   if (!who.isGovernor && !okPass) throw new Error('Not signed in as the Governor');
   return appendRow_(String(payload || ''), TARGET, who.isGovernor ? ('google-sso:' + who.email) : 'passphrase');
+}
+
+// ================= VOICE =================
+// MEASURED 2026-09-04, not assumed: an Apps Script web app renders its HTML
+// inside a sandbox iframe whose allow attribute grants accelerometer, autoplay,
+// clipboard-read, clipboard-write, encrypted-media, fullscreen, geolocation,
+// gyroscope, local-network-access, magnetometer, midi, payment,
+// picture-in-picture, screen-wake-lock, sync-xhr and web-share -- and NOT
+// microphone. No page served from here can ever hold a microphone. So the voice
+// UI lives at https://www.sfdc24.com/voice/, a top-level page on the site, and
+// talks to this endpoint across origins. Apps Script sends no CORS headers, so
+// the call shape is JSONP.
+//
+// This adds no new capability and no new exposure: it is the same reception(),
+// with the same session cap, the same daily cap, the same input ceiling and the
+// same quarantined logging. It only changes how a turn arrives.
+var VOICE_TURNS = 8;   // exchanges kept server-side, so the URL stays short
+
+function voiceReply_(p) {
+  // A callback name is echoed into executable JavaScript, so it is validated
+  // against a whitelist and dropped -- not sanitised -- if it does not match.
+  var cb = String(p.cb || '').slice(0, 40);
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cb)) cb = '';
+
+  // NOT p.sid. MEASURED 2026-09-04: Google's frontend rejects any /exec request
+  // carrying a `sid` query parameter with HTTP 400 before this script runs at
+  // all -- ?view=home&sid=x fails identically. `sid` is reserved. Use `vid`.
+  var sid  = String(p.vid || '').slice(0, 60);
+  var text = String(p.q || '').slice(0, CHAT_MAX_INPUT);
+
+  // History is held here rather than sent on every request: a GET carrying the
+  // whole conversation would blow the URL length open after a few turns.
+  var cache = CacheService.getScriptCache();
+  var hk = 'vh_' + sid;
+  var hist = [];
+  try { hist = JSON.parse(cache.get(hk) || '[]'); } catch (e) { hist = []; }
+  if (!(hist instanceof Array)) hist = [];
+
+  var out;
+  try {
+    out = reception(sid, text, hist, p.s);
+  } catch (err) {
+    out = { ok: false, reason: 'error' };
+  }
+
+  if (out && out.ok && text) {
+    hist.push({ role: 'user', text: text });
+    hist.push({ role: 'assistant', text: out.reply });
+    if (hist.length > VOICE_TURNS * 2) hist = hist.slice(-VOICE_TURNS * 2);
+    try { cache.put(hk, JSON.stringify(hist), 21600); } catch (e) {}
+  }
+
+  var payload = JSON.stringify(out || { ok: false, reason: 'no-result' });
+  if (!cb) return ContentService.createTextOutput(payload)
+                  .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(cb + '(' + payload + ');')
+                  .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 
 // ================= RECEPTION =================
