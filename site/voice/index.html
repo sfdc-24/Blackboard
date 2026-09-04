@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Talk &mdash; SFDC24</title>
+<meta name="description" content="Talk to SFDC24 out loud. Tap once, say what's on your mind, and hear the answer back.">
+<link rel="canonical" href="https://www.sfdc24.com/voice/">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0B0D10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Talk">
+<link rel="icon" href="../assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="../assets/icon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+/* A single-purpose screen: one control, in the thumb zone, and a transcript
+   above it. Everything here is sized for a phone held in one hand while
+   walking; the desktop case is the same layout with a ceiling on width. */
+html,body{height:100%}
+body{overflow:hidden}
+
+.app{
+  height:100dvh;height:100vh;
+  max-width:640px;margin:0 auto;
+  display:flex;flex-direction:column;
+  padding:0 var(--pad);
+}
+@supports (height:100dvh){ .app{height:100dvh} }
+
+.vbar{
+  flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;
+  gap:12px;padding:12px 0 6px;
+}
+.vbar a{font:500 14px/1 var(--sans);color:var(--muted);text-decoration:none;
+  min-height:44px;display:inline-flex;align-items:center}
+.vbar a:hover{color:var(--text)}
+.vbrand{font:600 17px/1 var(--mono);letter-spacing:.04em;color:var(--acc);
+  text-decoration:none}
+
+.who{
+  flex:0 0 auto;font:400 12px/1.5 var(--mono);color:var(--faint);
+  padding:0 2px 8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+}
+.who b{color:var(--muted);font-weight:500}
+.who a{color:var(--acc);text-decoration:none;border-bottom:1px solid rgba(0,255,166,.35)}
+
+/* transcript */
+.tape{
+  flex:1 1 auto;min-height:0;overflow-y:auto;
+  display:flex;flex-direction:column;gap:12px;
+  padding:6px 2px 14px;
+  -webkit-overflow-scrolling:touch;
+}
+.turn{max-width:92%;font-size:16px;line-height:1.55}
+.turn .lab{
+  display:block;font:500 11px/1 var(--mono);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:5px;
+}
+.turn.me{align-self:flex-end;text-align:right}
+.turn.me .body{color:var(--text)}
+.turn.it .body{color:#cfd8e3}
+.turn.sys{align-self:center;text-align:center;max-width:34ch;
+  font:400 13px/1.5 var(--sans);color:var(--faint)}
+.turn.live .body{color:var(--muted);font-style:italic}
+
+/* the one control */
+.pad{
+  flex:0 0 auto;
+  padding:10px 0 calc(18px + env(safe-area-inset-bottom));
+  display:flex;flex-direction:column;align-items:center;gap:12px;
+}
+.status{
+  font:500 12.5px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);min-height:14px;text-align:center;
+}
+.status.on{color:var(--acc)}
+
+.mic{
+  width:108px;height:108px;border-radius:50%;
+  border:1px solid var(--line);background:var(--surface);color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;-webkit-tap-highlight-color:transparent;
+  transition:transform .12s ease, border-color .2s ease, background .2s ease;
+}
+.mic:active{transform:scale(.96)}
+.mic svg{width:38px;height:38px;display:block}
+.mic .glyph{fill:var(--muted);transition:fill .2s ease}
+
+.mic.live{border-color:var(--acc);background:rgba(0,255,166,.08)}
+.mic.live .glyph{fill:var(--acc)}
+.mic.live::before{
+  content:"";position:absolute;width:108px;height:108px;border-radius:50%;
+  border:1px solid var(--acc);opacity:.55;animation:ring 1.6s ease-out infinite;
+}
+.micwrap{position:relative;display:flex;align-items:center;justify-content:center}
+@keyframes ring{
+  0%{transform:scale(1);opacity:.55}
+  100%{transform:scale(1.45);opacity:0}
+}
+.mic.think .glyph{fill:var(--muted)}
+.mic.talk{border-color:#4C8DFF;background:rgba(76,141,255,.10)}
+.mic.talk .glyph{fill:#8FB6FF}
+
+.tap{font:400 13px/1.4 var(--sans);color:var(--faint);text-align:center;
+  max-width:32ch}
+
+/* typed fallback, always available and never in the way */
+.typed{
+  flex:0 0 auto;display:flex;gap:8px;padding:0 0 8px;width:100%;
+}
+.typed input{
+  flex:1 1 auto;min-width:0;
+  background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  color:var(--text);font:400 16px/1.4 var(--sans);padding:11px 13px;
+}
+.typed input:focus{outline:none;border-color:#3A4450}
+.typed button{
+  flex:0 0 auto;background:var(--acc);color:#04120C;border:0;border-radius:10px;
+  font:600 14px/1 var(--sans);padding:0 16px;min-height:44px;cursor:pointer;
+}
+.typed button:disabled{opacity:.4;cursor:default}
+
+.warn{
+  flex:0 0 auto;border:1px solid var(--line);border-radius:10px;
+  background:var(--surface);padding:14px 15px;margin:0 0 10px;
+  font:400 14px/1.55 var(--sans);color:#cfd8e3;
+}
+.warn b{color:var(--text);font-weight:600}
+
+@media(max-width:400px){
+  .mic,.mic.live::before{width:96px;height:96px}
+  .turn{font-size:15.5px}
+}
+@media(prefers-reduced-motion:reduce){
+  .mic.live::before{animation:none;opacity:.4}
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <div class="vbar">
+    <a class="vbrand" href="../">sfdc24</a>
+    <a href="../">&larr; back to the site</a>
+  </div>
+
+  <div class="who" id="who"></div>
+
+  <div class="warn" id="warn" hidden></div>
+
+  <div class="tape" id="tape"></div>
+
+  <div class="pad">
+    <div class="micwrap">
+      <button class="mic" id="mic" aria-label="Start talking">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path class="glyph" d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 0 0-7 0v6A3.5 3.5 0 0 0 12 15z"/>
+          <path class="glyph" d="M18.5 11.5a.9.9 0 0 0-1.8 0 4.7 4.7 0 0 1-9.4 0 .9.9 0 0 0-1.8 0 6.5 6.5 0 0 0 5.6 6.4V21a.9.9 0 0 0 1.8 0v-3.1a6.5 6.5 0 0 0 5.6-6.4z"/>
+        </svg>
+      </button>
+    </div>
+    <div class="status" id="status">tap to talk</div>
+    <div class="tap" id="tap">One tap starts it. Say what&rsquo;s on your mind, pause, and you&rsquo;ll hear the answer.</div>
+  </div>
+
+  <div class="typed" id="typed">
+    <input id="box" type="text" inputmode="text" autocomplete="off"
+           placeholder="or type it here" aria-label="Type a message">
+    <button id="send" disabled>send</button>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // The chat backend. This page is on www.sfdc24.com and the backend is an
+  // Apps Script web app, so the call is cross-origin and Apps Script sends no
+  // CORS headers. JSONP is the shape that works; the endpoint validates the
+  // callback name against a whitelist before echoing it.
+  var EXEC = "https://script.google.com/macros/s/AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng/exec";
+  var SIGNIN = EXEC + "?auth=start&back=voice";
+
+  var $ = function(id){ return document.getElementById(id) };
+  var tape = $("tape"), mic = $("mic"), status = $("status"), tapNote = $("tap"),
+      box = $("box"), send = $("send"), warn = $("warn"), who = $("who");
+
+  // ---- identity -----------------------------------------------------------
+  // The token arrives in the fragment after sign-in, never the query string, so
+  // it is not sent to any server and never lands in a log. Read it once, keep
+  // it for the tab, and clear it out of the address bar immediately.
+  var TOKEN = "";
+  try {
+    var m = /[#&]s=([^&]+)/.exec(location.hash || "");
+    if (m) {
+      TOKEN = decodeURIComponent(m[1]);
+      sessionStorage.setItem("sfdc_tok", TOKEN);
+      history.replaceState(null, "", location.pathname);
+    } else {
+      TOKEN = sessionStorage.getItem("sfdc_tok") || "";
+    }
+  } catch(e){ TOKEN = TOKEN || "" }
+
+  function renderWho(){
+    if (TOKEN) {
+      who.innerHTML = '<b>signed in</b> · this conversation is filed under your name';
+    } else {
+      who.innerHTML = '<b>not signed in</b> · <a href="' + SIGNIN + '">sign in with Google</a> so Mr. Salam knows it was you';
+    }
+  }
+  renderWho();
+
+  // ---- conversation id ----------------------------------------------------
+  var sid = "";
+  try { sid = localStorage.getItem("sfdc_vsid") || "" } catch(e){}
+  if (!sid) {
+    sid = "v" + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+    try { localStorage.setItem("sfdc_vsid", sid) } catch(e){}
+  }
+
+  // ---- transcript ---------------------------------------------------------
+  function turn(kind, label, text){
+    var d = document.createElement("div");
+    d.className = "turn " + kind;
+    if (label) {
+      var l = document.createElement("span"); l.className = "lab";
+      l.textContent = label; d.appendChild(l);
+    }
+    var b = document.createElement("span"); b.className = "body";
+    b.textContent = text || ""; d.appendChild(b);
+    tape.appendChild(d);
+    tape.scrollTop = tape.scrollHeight;
+    return b;
+  }
+  function say_status(t, on){ status.textContent = t; status.className = on ? "status on" : "status" }
+
+  // ---- speaking out loud --------------------------------------------------
+  // Split on sentences before speaking. Both iOS and Chrome cut long utterances
+  // off partway; a queue of short ones is the only reliable way to hear a whole
+  // paragraph back.
+  var TTS = window.speechSynthesis || null;
+  function chunk(text){
+    var parts = String(text).replace(/\s+/g," ").match(/[^.!?]+[.!?]*/g) || [text];
+    var out = [], cur = "";
+    parts.forEach(function(p){
+      p = p.trim(); if (!p) return;
+      if ((cur + " " + p).trim().length > 180) { if (cur) out.push(cur.trim()); cur = p }
+      else { cur = (cur + " " + p).trim() }
+    });
+    if (cur) out.push(cur);
+    return out;
+  }
+  var primed = false;
+  function prime(){
+    // iOS will not speak at all unless the first utterance happens inside a
+    // real tap. Spend that tap on a silent one.
+    if (primed || !TTS) return;
+    try { var u = new SpeechSynthesisUtterance(" "); u.volume = 0; TTS.speak(u); primed = true } catch(e){}
+  }
+  function speak(text, done){
+    if (!TTS) { done(); return }
+    var queue = chunk(text), i = 0;
+    try { TTS.cancel() } catch(e){}
+    function next(){
+      if (i >= queue.length) { done(); return }
+      var u = new SpeechSynthesisUtterance(queue[i++]);
+      u.rate = 1.03; u.pitch = 1; u.lang = "en-US";
+      u.onend = next;
+      u.onerror = function(){ done() };
+      try { TTS.speak(u) } catch(e){ done() }
+    }
+    next();
+  }
+
+  // ---- asking the backend -------------------------------------------------
+  var seq = 0;
+  function ask(text, done){
+    var cb = "sfdcv" + (++seq) + Math.random().toString(36).slice(2,7);
+    var s = document.createElement("script");
+    var timer = null;
+    function cleanup(){
+      if (timer) clearTimeout(timer);
+      try { delete window[cb] } catch(e){ window[cb] = undefined }
+      if (s.parentNode) s.parentNode.removeChild(s);
+    }
+    window[cb] = function(res){ cleanup(); done(res) };
+    timer = setTimeout(function(){ cleanup(); done(null) }, 45000);
+    s.onerror = function(){ cleanup(); done(null) };
+    s.src = EXEC
+      + "?action=say&cb=" + encodeURIComponent(cb)
+      // `vid`, never `sid`: Google rejects /exec requests carrying a `sid`
+      // query parameter with HTTP 400 before the script is reached.
+      + "&vid=" + encodeURIComponent(sid)
+      + "&q=" + encodeURIComponent(text)
+      + (TOKEN ? "&s=" + encodeURIComponent(TOKEN) : "");
+    document.head.appendChild(s);
+  }
+
+  // ---- the loop -----------------------------------------------------------
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var mode = "off";          // off | listening | thinking | speaking
+  var rec = null, liveNode = null, finalText = "";
+
+  function setMode(m){
+    mode = m;
+    mic.className = "mic" + (m === "listening" ? " live" : m === "thinking" ? " think" : m === "speaking" ? " talk" : "");
+    mic.setAttribute("aria-label",
+      m === "off" ? "Start talking" : m === "speaking" ? "Stop and talk" : "Stop");
+    if (m === "off")        say_status("tap to talk", false);
+    if (m === "listening")  say_status("listening", true);
+    if (m === "thinking")   say_status("thinking", false);
+    if (m === "speaking")   say_status("tap to interrupt", false);
+  }
+
+  function listen(){
+    if (!SR) return;
+    finalText = "";
+    try { rec = new SR() } catch(e){ fail("This browser would not start the microphone."); return }
+    rec.lang = "en-US";
+    rec.interimResults = true;
+    rec.continuous = false;    // iOS ignores continuous; a natural pause ends the turn
+
+    rec.onresult = function(ev){
+      var iv = "";
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var r = ev.results[i];
+        if (r.isFinal) finalText += r[0].transcript + " ";
+        else iv += r[0].transcript;
+      }
+      var shown = (finalText + iv).trim();
+      if (shown) {
+        if (!liveNode) liveNode = turn("live", "you", "");
+        liveNode.textContent = shown;
+        tape.scrollTop = tape.scrollHeight;
+      }
+    };
+
+    rec.onerror = function(ev){
+      if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+        setMode("off");
+        fail("Your browser is blocking the microphone for this page. Allow it in the address bar or in Settings, then tap again.");
+      } else if (ev.error === "no-speech") {
+        // nothing said; onend restarts us
+      } else if (ev.error !== "aborted") {
+        say_status("microphone: " + ev.error, false);
+      }
+    };
+
+    rec.onend = function(){
+      var text = finalText.trim();
+      // drop the interim bubble; the final line is re-rendered by handle()
+      liveNode = null;
+      var last = tape.lastElementChild;
+      if (last && last.className.indexOf("live") >= 0) tape.removeChild(last);
+
+      if (mode !== "listening") return;      // user stopped us on purpose
+      if (!text) { try { rec.start() } catch(e){ setMode("off") } return }
+      handle(text);
+    };
+
+    try { rec.start(); setMode("listening") }
+    catch(e){ setMode("off"); say_status("could not start the microphone", false) }
+  }
+
+  function handle(text){
+    turn("me", "you", text);
+    setMode("thinking");
+    ask(text, function(res){
+      if (!res || !res.ok) {
+        var msg = "I couldn't reach the assistant just then. Your message wasn't lost — try again in a moment.";
+        turn("sys", "", msg);
+        setMode("off");
+        return;
+      }
+      turn("it", "sfdc24", res.reply);
+      setMode("speaking");
+      speak(res.reply, function(){
+        if (mode !== "speaking") return;     // interrupted
+        if (SR) listen(); else setMode("off");
+      });
+    });
+  }
+
+  function stopAll(){
+    try { if (rec) rec.abort() } catch(e){}
+    try { if (TTS) TTS.cancel() } catch(e){}
+    setMode("off");
+  }
+
+  function fail(msg){
+    warn.hidden = false;
+    warn.innerHTML = "<b>Microphone unavailable.</b> " + msg;
+  }
+
+  mic.addEventListener("click", function(){
+    prime();
+    if (mode === "off") {
+      if (!SR) {
+        fail("This browser doesn't do speech recognition. Safari on iPhone, Chrome on Android and Chrome on a computer all do. You can still type below and hear the answer read back.");
+        return;
+      }
+      warn.hidden = true;
+      listen();
+    } else {
+      stopAll();
+    }
+  });
+
+  // ---- typed fallback -----------------------------------------------------
+  function syncSend(){ send.disabled = !box.value.trim() || mode === "thinking" }
+  box.addEventListener("input", syncSend);
+  box.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && box.value.trim()) { e.preventDefault(); submitTyped() }
+  });
+  send.addEventListener("click", submitTyped);
+  function submitTyped(){
+    var t = box.value.trim(); if (!t) return;
+    prime();
+    box.value = ""; syncSend();
+    stopAll();
+    handle(t);
+  }
+
+  // ---- opening ------------------------------------------------------------
+  if (!SR) {
+    turn("sys", "", "Speech isn't available in this browser, but typing is — and the answer will still be read out loud.");
+  }
+  turn("it", "sfdc24",
+    "Hello. Tap the microphone and tell me what's going on — a process that keeps breaking, a report nobody trusts, whatever's on your mind. I'll answer out loud.");
+  setMode("off");
+  syncSend();
+})();
+</script>
+</body>
+</html>

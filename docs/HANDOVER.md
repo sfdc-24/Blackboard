@@ -31,8 +31,62 @@ scratchpad, copy from `site/`, push, delete. Keep `site/` here as the source and
 never edit the public repo directly, or the two drift.
 
 **Read ISS-015 before you touch DNS again.** The cutover took the site down in
-browsers for the length of the certificate wait, and every `curl` check I ran
-said it was fine.
+browsers for about 45 minutes while GitHub issued the certificate, and every
+`curl` check said it was fine. HTTPS is live now: `CN=www.sfdc24.com` from
+Let's Encrypt, `https_enforced` true, `http://` 301s to `https://`.
+
+---
+
+## VOICE IS LIVE — https://www.sfdc24.com/voice/ (2026-09-04, v28)
+
+Tap once, speak, hear the answer, and it starts listening again on its own.
+Typing works on the same screen and is read aloud too.
+
+**Why it is not in the chat, and never can be.** MEASURED, not assumed: an Apps
+Script web app renders your HTML inside a `sandboxFrame` whose `allow` attribute
+grants accelerometer, autoplay, clipboard-read, clipboard-write,
+encrypted-media, fullscreen, geolocation, gyroscope, local-network-access,
+magnetometer, midi, payment, picture-in-picture, screen-wake-lock, sync-xhr and
+web-share — **and not microphone**. `getUserMedia` and `SpeechRecognition` are
+unreachable there and no permission prompt will ever appear. That is why
+Reception.html has always fallen back to "use your keyboard dictation". Do not
+try to fix that; it is not fixable. Recorded as **L-89**.
+
+**The shape.** The voice UI is a top-level page on the site, so it can hold a
+microphone. It calls the Apps Script backend across origins, and Apps Script
+sends no CORS headers, so the call is **JSONP**:
+
+```
+GET <exec>?action=say&cb=<callback>&vid=<conversation id>&q=<text>[&s=<session token>]
+  -> cb({"ok":true,"reply":"..."});
+```
+
+`voiceReply_` in Code.js validates the callback name against
+`^[A-Za-z_$][A-Za-z0-9_$]*$` and **drops** it if it does not match, then calls
+the same `reception()` as the typed chat — same session cap, same daily cap,
+same 1000-character ceiling, same quarantined logging. It adds no new capability
+and no new exposure; it only changes how a turn arrives. Conversation history is
+kept server-side in CacheService under `vh_<vid>` so the URL stays short.
+
+**`vid`, never `sid`.** Google's frontend rejects any `/exec` request carrying a
+`sid` query parameter with **HTTP 400** before the script runs — `?view=home&sid=x`
+fails identically, so it is nothing to do with this app. The 400 body is a
+generic Google error page with no clue in it. Recorded as **L-88**. If an
+`/exec` call returns 400 with a Google error shell, suspect a reserved parameter
+name before you suspect your code.
+
+**Sign-in returns to the site now.** `?auth=start&back=voice` lands the visitor
+back at the voice page instead of the Apps Script app. `back` is looked up in
+`AUTH_RETURNS`, a closed list — never a URL from the request, or it would be an
+open redirect handing out live session tokens. The token comes back in the URL
+**fragment**, which is never sent to a server, and the page stores it and strips
+it from the address bar immediately.
+
+**Verified end to end in a real browser at the production origin**, not by curl:
+`isSecureContext` true, SpeechRecognition and speechSynthesis both present, and
+a full JSONP round trip returning a live reply. The reception also correctly
+refused an instruction embedded in the message, so the quarantine holds on this
+path too.
 
 ---
 
