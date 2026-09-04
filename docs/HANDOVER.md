@@ -203,6 +203,15 @@ carries `ALPHA_ID`. It holds no secrets (`ANTHROPIC_KEY` and the governor
 passphrase are Script Properties). `.clasp.json` IS tracked; it only has the
 scriptId.
 
+**On a machine that is not this laptop:** `.clasp.json` used to hardcode
+`rootDir: "C:/Users/salam/Quantum/Blackboard/gas"`, so every clasp command run
+from the repo root died with *"srcDir ... escapes project root"*. It is now the
+relative `"gas"`, confirmed working on AkatiaVM by vm-cli. One thing that does
+not follow from the fix: `gas/` is gitignored, so a fresh clone has only the
+`.gitkeep`. Read commands (`list-deployments`, `clone`) do not care, but
+**`clasp push` resolves `rootDir` first and will fail until you pull the source
+down** — run `clasp pull` before your first push on a new machine.
+
 ---
 
 ## Quarantine is LIVE — Version 14, verified 2026-09-03
