@@ -16,6 +16,7 @@ a:hover{text-decoration:underline}
 .nav .right{margin-left:auto;display:flex;gap:14px;align-items:baseline}
 .statusline{font-size:12.5px;color:var(--faint);margin:0 0 12px}
 .nav .who{color:var(--acc);font-size:12px}
+.nav .clash{color:var(--amber);font-size:12px;border:1px solid var(--amber);border-radius:4px;padding:1px 6px}
 .nav a.signin{color:var(--acc)}
 .statusline .g{color:var(--acc)}
 
@@ -63,7 +64,12 @@ button.rec .dot{animation:b .8s step-end infinite}
     <span class="right">
       <? if (visitorEmail) { ?>
         <span class="who" title="signed in with Google">&#9679; <?= visitorEmail ?></span>
+        <? if (identityClash) { ?>
+          <span class="clash" title="Your browser is signed in to Google as the Governor. Governor pages show that account's data, not the account you signed in with here.">viewing as <?= governorEmail ?></span>
+        <? } ?>
         <a href="<?= signedOutUrl ?>" target="_top">sign out</a>
+      <? } else if (governorEmail) { ?>
+        <span class="who" title="Google session">&#9679; <?= governorEmail ?></span>
       <? } else if (authOn) { ?>
         <a href="<?= authStart ?>" target="_top" class="signin">sign in with Google</a>
       <? } ?>

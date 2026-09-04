@@ -65,6 +65,20 @@ function doGet(e) {
   t.authOn = authConfigured_() ? '1' : '';
   t.authStart = AUTH_REDIRECT_URI + '?auth=start';
   t.signedOutUrl = AUTH_REDIRECT_URI + '?view=home';
+
+  // Two identity systems can be live at once and they are NOT the same thing:
+  // the Google session in the browser decides Governor access and what data is
+  // rendered, while the OAuth token above is only a name a visitor supplied.
+  // On 2026-09-04 Mr. Salam signed in as his personal Gmail while his browser
+  // was still Google-signed-in as the Governor, and the page cheerfully showed
+  // one identity while serving the other's data. Not an access-control bug --
+  // whoami_() never reads the token -- but it looks exactly like one, so the
+  // page must never again display a single unqualified "you".
+  var govWho = whoami_();
+  t.governorEmail = govWho.isGovernor ? govWho.email : '';
+  t.identityClash = (govWho.isGovernor && sess && sess.email &&
+                     String(sess.email).toLowerCase() !== String(govWho.email).toLowerCase())
+                    ? '1' : '';
   return t.evaluate()
     .setTitle('SFDC24')
     .addMetaTag('viewport', 'width=device-width,initial-scale=1')

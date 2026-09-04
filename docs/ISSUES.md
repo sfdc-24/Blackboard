@@ -15,6 +15,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
 | ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
 | ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
+| ISS-012 | 2026-09-04 | MED | Page displayed one identity while serving another account data | **RESOLVED** |
 | ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
@@ -380,3 +381,47 @@ different reasons.
 when it is finally right. Alerting logic needs the same read-back discipline
 (D-4) as writes — I declared this done before it had survived a single
 unattended cycle.
+
+---
+
+## ISS-012 · RESOLVED — the page showed one identity while serving another's data
+
+**Found by Mr. Salam within minutes of sign-in going live**, which is exactly
+the kind of thing a second pair of eyes catches and the author does not.
+
+He signed in through the new Google flow as his personal Gmail in one tab, then
+opened Projects — and saw **abdus@sfdc24.com's projects, addressed to "Mr.
+Salam"**, while the nav said he was signed in as the Gmail account.
+
+**Not an access-control bug, and worth being precise about why.** Two identity
+systems were live at once and they are unrelated:
+
+| | source | what it controls |
+|---|---|---|
+| `whoami_()` | the **browser's Google session** | Governor access, project rows, the name shown |
+| the OAuth session token | the **app-level sign-in** | nothing but provenance on a row |
+
+Signing in through our flow does not change which Google account the browser
+presents to `script.google.com`. His browser was still Google-signed-in as the
+Governor, so Governor data was correctly served to the Governor.
+
+Verified in code rather than asserted: `whoami_()` reads only
+`Session.getActiveUser()` and never touches the token; `getState()` gates on
+`whoami_().isGovernor` or `GOVERNOR_PASS`. `readSession_()` appears in exactly
+three places — rendering the signed-in name, tagging a quarantine row, and
+`whoAmI()` reporting itself. None of them grant anything. A stranger signing in
+with their own Google account on their own machine gets nothing.
+
+**But the display was genuinely wrong, and that matters commercially.** On his
+own laptop it is confusing. With a client on the other end, a page showing
+*their* name while rendering *someone else's* data is indistinguishable from a
+data leak, and no amount of "actually it's fine" undoes that impression.
+
+**Fix (v20).** The page can never again show a single unqualified "you":
+- signed in via OAuth, no Governor session -> shows that email
+- Governor session, no OAuth -> shows the Governor email
+- **both, and they differ** -> shows the visitor email PLUS an amber
+  `viewing as <governor email>` chip explaining whose data is on screen
+- anonymous -> sign-in link only, no identity of any kind
+
+Verified all three renderable states on the live deployment.
