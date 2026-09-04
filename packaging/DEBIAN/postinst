@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+if ! getent passwd blackboard-bus >/dev/null; then
+    adduser --system --group --no-create-home --home /var/lib/blackboard-bus blackboard-bus
+fi
+
+if [ ! -f /etc/blackboard-bus/env ]; then
+    # install atomically with final permissions - the secret file must never
+    # exist world-readable, even for an instant
+    umask 037
+    cp /etc/blackboard-bus/env.example /etc/blackboard-bus/env.tmp
+    chown root:blackboard-bus /etc/blackboard-bus/env.tmp
+    mv /etc/blackboard-bus/env.tmp /etc/blackboard-bus/env
+    echo "blackboard-bus: EDIT /etc/blackboard-bus/env and set BUS_SECRET, then:"
+    echo "  sudo systemctl enable --now blackboard-bus"
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    # on upgrade, pick up the new code - a green install must not leave the
+    # old daemon serving old bytes
+    if systemctl is-active --quiet blackboard-bus; then
+        systemctl restart blackboard-bus || true
+    fi
+fi
+
+exit 0

@@ -1,0 +1,43 @@
+[Unit]
+Description=SFDC24 Blackboard bus (self-hosted event bus)
+Documentation=file:/usr/share/doc/blackboard-bus/DEPLOY-GCP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blackboard-bus
+Group=blackboard-bus
+EnvironmentFile=/etc/blackboard-bus/env
+Environment=BUS_DB=/var/lib/blackboard-bus/bus.db
+ExecStart=/usr/bin/blackboard-bus serve
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+StateDirectory=blackboard-bus
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectClock=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/blackboard-bus
+
+# Resource containment: an unauthenticated flood must exhaust this service,
+# never the VM
+LimitNOFILE=4096
+TasksMax=256
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
