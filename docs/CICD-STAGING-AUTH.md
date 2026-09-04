@@ -141,10 +141,27 @@ Mr. Salam rules otherwise.
 Clearing this halt makes the endpoints reachable. It does **not** make the
 version assertion strict, and that gap should not be quietly inherited:
 
-`glasses-intake-uploader` exposes `CONTRACT_VERSION`, an API-contract number
-that will never equal a clasp version number, so `--expect-version <clasp
-version>` cannot pass strictly on any project as currently written. The honest
-fix is a CI-stamped build marker — the commit SHA written into a generated `.gs`
-before `clasp push` and echoed back by `doGet` — which is a source change to
-each project and must itself ride staging first. Raised here rather than left
-for whoever next reads a soft-pass warning and assumes it means "verified".
+Measured at `90880a6`, and it is worse than a gap — the assertion is wrong in
+both directions:
+
+- **3 of 4 projects expose no version field at all.** Only
+  `glasses-intake-uploader` has one. `gas_version_assert.py` SOFT-PASSES a
+  missing field (exit 0 with a `::warning::`), so on `governor-page-api`,
+  `blackboard-production` and `blackboard-bus-v1` the headline assertion is
+  currently a **no-op** — it proves the endpoint answered, nothing more.
+- **On the one project that has a field, the comparison is category-wrong.**
+  `Code.gs:45` sets `var CONTRACT_VERSION = 2` — a hand-maintained API-contract
+  number ("v1 upload only; v2 adds prune") that changes only when the contract
+  changes. The workflow passes the **clasp version number** to
+  `--expect-version`, and line 75 compares them as strings. Clasp versions
+  increment on every deploy. Glasses staging is at `@1` today, so a strict run
+  would report a **false mismatch** immediately; deploy it once more and `@2`
+  would **coincidentally match** `CONTRACT_VERSION = 2` and report a false
+  verification. A check that can be wrong in both directions is worse than no
+  check, because it looks like evidence.
+
+The honest fix is a CI-stamped build marker — the commit SHA written into a
+generated `.gs` before `clasp push` and echoed back by `doGet` — which is a
+source change to each project and must itself ride staging first. Raised here
+rather than left for whoever next reads a soft-pass warning and takes it to mean
+"verified".
