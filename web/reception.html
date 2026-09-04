@@ -56,7 +56,7 @@ button.rec .dot{animation:b .8s step-end infinite}
 <div class="wrap">
   <div class="nav"><span class="logo">sfdc24</span>
     <a href="https://www.sfdc24.com/" target="_top" class="on">home</a>
-    <a href="https://www.sfdc24.com/governor" target="_top">governor</a>
+    <? if (governorEmail) { ?><a href="https://www.sfdc24.com/governor" target="_top">my console</a><? } ?>
     <a href="https://www.sfdc24.com/projects" target="_top">projects</a>
     <a href="https://www.sfdc24.com/history" target="_top">history</a>
     <a href="https://www.sfdc24.com/team" target="_top">team</a>
@@ -75,7 +75,7 @@ button.rec .dot{animation:b .8s step-end infinite}
       <? } ?>
     </span>
   </div>
-  <p class="statusline">status: <span class="g">online</span> · a wholistic way to interact with AI agents — and get work done.</p>
+  <p class="statusline">status: <span class="g">online</span> · a Salesforce problem, looked at properly. A human still signs off.</p>
 
   <div class="thread" id="thread"></div>
 
@@ -152,11 +152,12 @@ button.rec .dot{animation:b .8s step-end infinite}
   // ---- greeting ----
   var GREETING =
     "you're talking to Claude.\n\n" +
-    "SFDC24 is a place to get real work done with AI agents — with a human making the calls that matter.\n\n" +
-    "Your time is the scarce thing here, so take whichever is faster:\n" +
+    "SFDC24 is where a Salesforce problem gets looked at properly. AI agents do the legwork; a human signs off on anything that matters.\n\n" +
+    "If you have ever opened a flow and found eleven decision nodes and not one description, we will get along.\n\n" +
+    "Two ways in, whichever is quicker:\n" +
     "  · ask what this is\n" +
-    "  · or tell me the problem you're trying to solve\n\n" +
-    "Be specific and I'll be specific back.";
+    "  · or just tell me what is broken\n\n" +
+    "Be specific and I will be specific back.";
 
   function start(){
     var node = el("c", "claude", "");

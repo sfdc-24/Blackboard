@@ -16,6 +16,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
 | ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
 | ISS-012 | 2026-09-04 | MED | Page displayed one identity while serving another account data | **RESOLVED** |
+| ISS-013 | 2026-09-04 | LOW | Three nav links present in source never render on the live page | OPEN |
 | ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
@@ -425,3 +426,23 @@ data leak, and no amount of "actually it's fine" undoes that impression.
 - anonymous -> sign-in link only, no identity of any kind
 
 Verified all three renderable states on the live deployment.
+
+---
+
+## ISS-013 · Three nav links never render — LOW, OPEN
+
+`history`, `team` and `faq` are present as plain anchors in `Reception.html`
+between `projects` and the right-hand block, and all three URLs return 200 with
+real content. On the live page the nav renders only `sfdc24 home projects`.
+
+**Not caused by the Sep 4 copy changes** — the same three are missing in
+screenshots taken before any edit that day, so it predates the sign-in work and
+the jargon pass.
+
+Not yet diagnosed. Ruled out so far: the pages themselves (all 200), the
+deployment being stale (other edits in the same file render), and width/wrapping
+(the nav uses `flex-wrap` and occupies about half the available width).
+
+`javascript_tool` cannot inspect the live DOM here — the extension blocks it on
+Apps Script pages (ISS-004) — so the next step is reading the rendered markup
+another way rather than guessing at CSS.
