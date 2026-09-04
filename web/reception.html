@@ -8,6 +8,16 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 .wrap{max-width:820px;margin:0 auto;padding:18px 16px 24px;min-height:100%;display:flex;flex-direction:column}
+/* App shell. The tab bar is fixed in the thumb zone and respects the
+   iPhone home indicator via env(safe-area-inset-bottom); without that
+   the last row of controls sits under the gesture bar. */
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:20;display:none;background:rgba(11,13,16,.96);backdrop-filter:blur(10px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0px)}
+.tabbar .row{display:flex;max-width:820px;margin:0 auto}
+.tab{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px 7px;color:var(--faint);text-decoration:none;font-size:10.5px;letter-spacing:.03em;min-height:52px;justify-content:center}
+.tab .ic{font-size:17px;line-height:1}
+.tab.on{color:var(--acc)}
+.tab:hover{text-decoration:none;color:var(--text)}
+
 .nav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:14px;font-size:13px}
 .nav .logo{color:var(--acc);font-weight:700;margin-right:8px;letter-spacing:.04em}
 .nav a{color:var(--mut)}
@@ -16,6 +26,9 @@ a:hover{text-decoration:underline}
 .nav .right{margin-left:auto;display:flex;gap:14px;align-items:baseline}
 .statusline{font-size:12.5px;color:var(--faint);margin:0 0 12px}
 .nav .who{color:var(--acc);font-size:12px}
+.apphead{display:none;align-items:center;justify-content:space-between;gap:10px;padding:2px 0 10px;margin-bottom:12px;border-bottom:1px solid var(--line)}
+.apphead .brand{color:var(--acc);font-weight:700;letter-spacing:.04em;font-size:15px}
+.apphead .idy{font-size:11.5px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:58%}
 .nav .clash{color:var(--amber);font-size:12px;border:1px solid var(--amber);border-radius:4px;padding:1px 6px}
 .nav a.signin{color:var(--acc)}
 .statusline .g{color:var(--acc)}
@@ -51,16 +64,17 @@ button.rec .dot{animation:b .8s step-end infinite}
 .hearing .iv{color:var(--faint);font-style:italic}
 .foot{border-top:1px solid var(--line);margin-top:26px;padding-top:11px;font-size:11.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
 .foot a{color:var(--mut)}
-@media(max-width:640px){.nav .right{margin-left:0;width:100%}.hint{margin-left:0;width:100%;margin-top:2px}.wrap{padding:14px 13px 18px}.nav{gap:3px 12px;font-size:12.5px;padding-bottom:8px;margin-bottom:11px}.statusline{font-size:12px;margin-bottom:10px}.thread{min-height:72px}.composer{margin-top:14px;padding:9px 10px}textarea{font-size:16px;line-height:1.5}button{padding:10px 15px;min-height:44px}.foot{margin-top:18px;font-size:11px;gap:4px 12px}}
+@media(max-width:640px){.tabbar{display:block}.nav{display:none}.apphead{display:flex}.nav .right{margin-left:0;width:100%}.hint{margin-left:0;width:100%;margin-top:2px}.wrap{padding:14px 13px calc(70px + env(safe-area-inset-bottom,0px))}.nav{gap:3px 12px;font-size:12.5px;padding-bottom:8px;margin-bottom:11px}.statusline{font-size:12px;margin-bottom:10px}.thread{min-height:72px}.composer{margin-top:14px;padding:9px 10px}textarea{font-size:16px;line-height:1.5}button{padding:10px 15px;min-height:44px}.foot{margin-top:18px;font-size:11px;gap:4px 12px}}
 </style></head><body>
 <div class="wrap">
+  <div class="apphead">
+    <span class="brand">sfdc24</span>
+    <span class="idy"><? if (visitorEmail) { ?><?= visitorEmail ?><? } else if (governorEmail) { ?><?= governorEmail ?><? } else { ?>a Salesforce problem, looked at properly<? } ?></span>
+  </div>
   <div class="nav"><span class="logo">sfdc24</span>
     <a href="https://www.sfdc24.com/" target="_top" class="on">home</a>
     <? if (governorEmail) { ?><a href="https://www.sfdc24.com/governor" target="_top">my console</a><? } ?>
     <a href="https://www.sfdc24.com/projects" target="_top">projects</a>
-    <a href="https://www.sfdc24.com/history" target="_top">history</a>
-    <a href="https://www.sfdc24.com/team" target="_top">team</a>
-    <a href="https://www.sfdc24.com/faq" target="_top">faq</a>
     <span class="right">
       <? if (visitorEmail) { ?>
         <span class="who" title="signed in with Google">&#9679; <?= visitorEmail ?></span>
@@ -94,6 +108,22 @@ button.rec .dot{animation:b .8s step-end infinite}
     <a href="https://www.sfdc24.com/terms" target="_top">terms</a>
     <a href="mailto:abdus@sfdc24.com">abdus@sfdc24.com</a></span></div>
 </div>
+
+<!-- Bottom tab bar: phone only. Navigation by FUNCTION, not by marketing page.
+     Chat is the product, so it is the default and sits first. -->
+<nav class="tabbar">
+  <div class="row">
+    <a class="tab on" href="<?= appHome ?>" target="_top"><span class="ic">&#9679;</span>Chat</a>
+    <a class="tab" href="https://www.sfdc24.com/projects" target="_top"><span class="ic">&#9632;</span>Work</a>
+    <? if (visitorEmail) { ?>
+      <a class="tab" href="<?= signedOutUrl ?>" target="_top"><span class="ic">&#9670;</span>Sign out</a>
+    <? } else if (governorEmail) { ?>
+      <a class="tab" href="https://www.sfdc24.com/governor" target="_top"><span class="ic">&#9670;</span>Console</a>
+    <? } else { ?>
+      <a class="tab" href="<?= authStart ?>" target="_top"><span class="ic">&#9670;</span>Sign in</a>
+    <? } ?>
+  </div>
+</nav>
 
 <script>
 (function(){

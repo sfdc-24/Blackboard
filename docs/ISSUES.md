@@ -16,7 +16,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
 | ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
 | ISS-012 | 2026-09-04 | MED | Page displayed one identity while serving another account data | **RESOLVED** |
-| ISS-013 | 2026-09-04 | LOW | Three nav links present in source never render on the live page | OPEN |
+| ISS-013 | 2026-09-04 | LOW | Three nav links present in source never render on the live page | **CLOSED (pages retired)** |
 | ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
@@ -446,3 +446,43 @@ deployment being stale (other edits in the same file render), and width/wrapping
 `javascript_tool` cannot inspect the live DOM here — the extension blocks it on
 Apps Script pages (ISS-004) — so the next step is reading the rendered markup
 another way rather than guessing at CSS.
+
+**ISS-013 CLOSED, not diagnosed.** Mr. Salam retired `history`, `team` and
+`faq` as "not going to be useful and look outdated", so the links were removed
+rather than fixed. Recording the distinction honestly: the render bug was never
+explained, so if a link ever silently fails to appear again, this is not a
+solved precedent to lean on.
+
+**The Sites pages themselves still exist**, now unlinked. They remain reachable
+by direct URL and indexable. Deleting them needs the Google Sites editor.
+
+---
+
+## Direction change — the site should feel like a mobile app (2026-09-04)
+
+Mr. Salam: *"keep the website focused on functionality specific navigation; the
+website should look like an APP ... on mobile it should give the feeling as if
+the user is using an APP."*
+
+**Shipped in v22:** a bottom tab bar in the thumb zone, replacing top text links
+on phones; navigation by FUNCTION (Chat / Work / Sign in) rather than by
+marketing page; a compact app header carrying identity; `env(safe-area-inset-
+bottom)` so the bar clears the iPhone home indicator; and the meta tags that
+make Add to Home Screen open without browser chrome
+(`apple-mobile-web-app-capable`, `viewport-fit=cover`, `theme-color`).
+
+Measured at 390x844, 390x667, 320x568 and 900x800: tab bar shows only on
+phones, the composer is never covered by it, and there is no horizontal
+overflow at any width.
+
+**One CSS bug caught before deploy:** the first attempt put `padding-bottom` on
+`.wrap` BEFORE a later `padding` shorthand in the same media query, which
+silently overrode it and would have let the tab bar sit on top of the composer.
+Source order in a media query is not a detail.
+
+**THE CEILING, and it is now the main thing.** Google Sites wraps every page in
+its own header and scroll, so a page served through it can never fully feel
+like an app. The shell above feels right on the direct Apps Script URL and when
+added to a home screen; through Sites it is still a page in a frame. Competing
+with Replit on feel means the site stops being served by Google Sites. That is
+a decision, not a task.

@@ -65,6 +65,7 @@ function doGet(e) {
   t.authOn = authConfigured_() ? '1' : '';
   t.authStart = AUTH_REDIRECT_URI + '?auth=start';
   t.signedOutUrl = AUTH_REDIRECT_URI + '?view=home';
+  t.appHome = AUTH_REDIRECT_URI + '?view=home' + (sess ? ('&s=' + encodeURIComponent(p.s)) : '');
 
   // Two identity systems can be live at once and they are NOT the same thing:
   // the Google session in the browser decides Governor access and what data is
@@ -81,7 +82,14 @@ function doGet(e) {
                     ? '1' : '';
   return t.evaluate()
     .setTitle('SFDC24')
-    .addMetaTag('viewport', 'width=device-width,initial-scale=1')
+    .addMetaTag('viewport', 'width=device-width,initial-scale=1,viewport-fit=cover')
+    // Added to a phone home screen this then opens without browser chrome,
+    // which is most of what makes a web page feel like an app.
+    .addMetaTag('apple-mobile-web-app-capable', 'yes')
+    .addMetaTag('apple-mobile-web-app-status-bar-style', 'black-translucent')
+    .addMetaTag('apple-mobile-web-app-title', 'SFDC24')
+    .addMetaTag('mobile-web-app-capable', 'yes')
+    .addMetaTag('theme-color', '#0B0D10')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
