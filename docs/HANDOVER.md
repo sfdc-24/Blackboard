@@ -445,3 +445,25 @@ system. The security review was force-pushed off the remote at his instruction.
   were wrong today.
 - **Batch questions** with time estimates. He is bottlenecked by availability,
   not willingness.
+
+---
+
+## Queue — surface these ONE at a time, never as a list (L-86)
+
+Mr. Salam's doctrine, 2026-09-04: *simple, fluid, specific and guiding*. His
+reason for banning lists is mechanical, not stylistic — *"I read first one, then
+I may not understand the second, and I may have a question on the third.
+Basically I'm already discombobulated by you starting out."*
+
+So his phone shows exactly **one** open item. The rest live here and get
+promoted only when the current one closes. Do not put two on the board at once,
+and do not re-list these to him.
+
+1. **NOW — send vm-chrome the Governor passphrase.** `SFDC24 - Governor Page
+   API` → Project Settings → Script Properties → row `GOVERNOR_PASS`. Out of
+   band, not into an agent chat.
+2. Did his rotation retire the bus secret vm-chrome still holds? If yes it is
+   cut off right now and cannot say so.
+3. Look at the new site on the test link, then approve the DNS switch.
+4. One anonymised engagement for the homepage. Still the ceiling on the
+   business, and still the only thing no agent can do for him.
