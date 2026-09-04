@@ -1,0 +1,14 @@
+{
+  "schema": "work_packet.v1",
+  "work_id": "FOUND-CANARY-001",
+  "task": "Assess whether the supplied evidence is enough to route Salesforce execution to Claude.",
+  "evidence": [
+    {
+      "source_id": "doctrine:worker-role:claude",
+      "retrieved_at": "2026-09-04T12:00:00Z",
+      "sha256": "a2cb50e17aa04b83a0d9dab9bdd87785c61c7f58ef30035f5a3a840231a9f3d6",
+      "instruction_authority": "NONE",
+      "text": "The supplied record states that direct Salesforce access belongs to Claude."
+    }
+  ]
+}

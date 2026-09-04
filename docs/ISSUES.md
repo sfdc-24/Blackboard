@@ -524,3 +524,72 @@ which is where they now live in the new static site.
 a deploy is verified by grepping the body for `Exception:` and for a known
 content marker. Status code alone is not evidence. Added to the deploy sequence
 in HANDOVER.
+
+---
+
+## ISS-015 · RESOLVED — the cutover took the site down in browsers, and only in browsers
+
+**2026-09-04, ~19:05 UTC onward. Self-inflicted, foreseeable, and not foreseen.**
+
+Moving `www.sfdc24.com` from Google Sites to GitHub Pages worked on every
+measure I had. The record changed cleanly, the zone read back correct at
+`ns1.dnsowl.com`, all four major public resolvers agreed within minutes, and
+`curl http://www.sfdc24.com/` returned the real page with the content marker in
+it. By my checks the cutover was done.
+
+**Then I opened it in Chrome and got an error page.**
+
+What the network log shows:
+
+```
+1. http://www.sfdc24.com/?probe=3    GET  503     <- Chrome's upgrade marker
+2. https://www.sfdc24.com/?probe=3   GET  pending <- never completes
+```
+
+Chrome will not use plain HTTP for this host. It rewrites the request to HTTPS
+and does not fall back. GitHub had not yet issued the certificate, so
+`openssl s_client` shows the host still presenting GitHub's default
+`CN=*.github.io`. Result: the site serves perfectly to `curl` and is unreachable
+to a human.
+
+**Root cause.** Google served this domain over HTTPS with HSTS for months, so
+every browser that has ever loaded sfdc24.com has the domain pinned to HTTPS
+locally, for months more. A certificate is therefore not a finishing touch after
+a cutover — between the DNS change and the new certificate, the site is *down*
+for anyone with a browser, however healthy it looks from the command line.
+
+**Why I missed it.** Every verification I ran was a `curl`. `curl` has no HSTS
+store, no upgrade behaviour and no memory of the old host, so it cannot
+reproduce what a visitor experiences. This is ISS-014's lesson one layer out: I
+checked the transport instead of the experience, and the check I chose was
+structurally incapable of showing the failure.
+
+**Not rolled back.** Reverting `www` to `ghs.googlehosted.com` restores the site
+within a minute, but GitHub can only issue a certificate while DNS points at
+GitHub — so a rollback guarantees a repeat of this same window on the next
+attempt. Mr. Salam was told the site was down, told rollback was available in
+about a minute, and said to keep going.
+
+**Standing correction.** For anything a visitor loads in a browser, `curl` is
+not verification. Load it in a real browser and read the network log. And when
+moving a host that has ever served HTTPS, treat certificate issuance as part of
+the cutover, not as cleanup after it — the outage window is the gap between the
+two.
+
+**RESOLVED 2026-09-04 19:48 UTC**, about 45 minutes after the DNS change.
+Let's Encrypt issued `CN=www.sfdc24.com` (valid 4 Sep - 3 Dec), `https_enforced`
+is now true, and `http://` returns a 301 to `https://`. Verified three ways: the
+certificate subject from `openssl s_client`, the content marker in the body over
+https, and - per the correction above - **the actual page loading in Chrome**.
+
+**On the wait.** GitHub reported `is_https_eligible: true` and
+`https_error: peer_failed_verification` throughout, meaning DNS was correct and
+only issuance was outstanding. Re-asserting the custom domain via the API did
+nothing visible; removing and re-adding it was followed by issuance a couple of
+minutes later. Whether that caused it or the ordinary retry landed at the same
+moment is not something one observation can settle, so it is recorded as what
+was done, not as a remedy that works.
+
+**Cost of the window:** the site was unreachable in browsers for roughly 45
+minutes on a day with effectively no traffic. Cheap this time. It would not be
+cheap on a site anyone depends on.

@@ -5,6 +5,133 @@ restarted session resumes without re-deriving anything.
 
 ---
 
+## sfdc24.com NO LONGER LIVES ON GOOGLE SITES — moved 2026-09-04
+
+**This supersedes every earlier statement in this file about Google Sites.**
+If you are about to edit a page in Sites, stop; nothing you do there reaches
+visitors any more.
+
+| | |
+|---|---|
+| Serves from | GitHub Pages, repo **`sfdc-24/sfdc24-site`**, branch `main`, path `/` |
+| Public source of truth | `site/` in this repo, mirrored to that public repo |
+| DNS | `www` **CNAME -> `sfdc-24.github.io`** at NameSilo |
+| Apex | three A records (45.77.75.133, 45.77.92.157, 207.246.78.75) + NameSilo 301 forwarder to `https://www.sfdc24.com`. **Untouched by the move, and `www` must never carry an A record (L-81).** |
+| Rollback | `www` CNAME back to `ghs.googlehosted.com`, TTL 3600. One edit, effective in minutes. |
+| The chat | Unchanged. Still the Governor Page API in an iframe on the home page, deployment `AKfycbx0D-5DAn...` at **@26**. The move did not touch Apps Script. |
+
+**Why it moved.** Sites wraps every page in its own header and scroll, so a page
+served through it can never feel like an app, and it has no field for a meta
+description — Google was writing our search snippet for us. Both were ceilings,
+not annoyances. Mr. Salam approved the move explicitly.
+
+**Deploying the site now** is a git push to `sfdc-24/sfdc24-site`; Pages rebuilds
+in about 20 seconds. There is no local clone of that repo — clone it to the
+scratchpad, copy from `site/`, push, delete. Keep `site/` here as the source and
+never edit the public repo directly, or the two drift.
+
+**Read ISS-015 before you touch DNS again.** The cutover took the site down in
+browsers for about 45 minutes while GitHub issued the certificate, and every
+`curl` check said it was fine. HTTPS is live now: `CN=www.sfdc24.com` from
+Let's Encrypt, `https_enforced` true, `http://` 301s to `https://`.
+
+---
+
+## READ docs/PRODUCT.md FIRST — it is the point of everything else
+
+Mr. Salam stated the thesis on 4 September and asked that every instance work
+from it. **The sale happens when the visitor already has a working thing in
+their hands, not when they are reading a quote.** Four beats: they talk and
+their idea assembles on screen in the simplest form (a Lego build, not a
+cathedral); we check we heard them right *without going deep*; we build it; then
+we ask them to pay to make it their own. Also rule **L-90**, and on the board as
+`PRODUCT-THESIS-001`. Cite the file, do not restate it.
+
+The failure mode to watch is drift back into ordinary consultancy-website
+behaviour — more copy, more pages, more explaining. It always looks reasonable
+one commit at a time.
+
+---
+
+## Mr. Salam is travelling from 2026-09-04 evening
+
+He is flying and unreachable. **`vm-cli` on AkatiaVM is the live instance while
+he is away** and was deliberately left running. Do not queue things for him;
+queue them here.
+
+**The one thing waiting on him, and only him:** Script Property `OPENAI_KEY` on
+`SFDC24 - Governor Page API`. Confirmed NOT set as of his departure. Without it
+`ttsConfigured_()` is false, `action=say` returns no `ak`, and the voice page
+falls back to the phone's own voice — **degraded, not broken**. Do not try to
+work around it and do not put a key anywhere yourself.
+
+---
+
+## VOICE IS LIVE — https://www.sfdc24.com/voice/ (2026-09-04, v29)
+
+Tap once, speak, hear the answer, and it starts listening again on its own.
+Typing works on the same screen and is read aloud too.
+
+**Why it is not in the chat, and never can be.** MEASURED, not assumed: an Apps
+Script web app renders your HTML inside a `sandboxFrame` whose `allow` attribute
+grants accelerometer, autoplay, clipboard-read, clipboard-write,
+encrypted-media, fullscreen, geolocation, gyroscope, local-network-access,
+magnetometer, midi, payment, picture-in-picture, screen-wake-lock, sync-xhr and
+web-share — **and not microphone**. `getUserMedia` and `SpeechRecognition` are
+unreachable there and no permission prompt will ever appear. That is why
+Reception.html has always fallen back to "use your keyboard dictation". Do not
+try to fix that; it is not fixable. Recorded as **L-89**.
+
+**The shape.** The voice UI is a top-level page on the site, so it can hold a
+microphone. It calls the Apps Script backend across origins, and Apps Script
+sends no CORS headers, so the call is **JSONP**:
+
+```
+GET <exec>?action=say&cb=<callback>&vid=<conversation id>&q=<text>[&s=<session token>]
+  -> cb({"ok":true,"reply":"..."});
+```
+
+`voiceReply_` in Code.js validates the callback name against
+`^[A-Za-z_$][A-Za-z0-9_$]*$` and **drops** it if it does not match, then calls
+the same `reception()` as the typed chat — same session cap, same daily cap,
+same 1000-character ceiling, same quarantined logging. It adds no new capability
+and no new exposure; it only changes how a turn arrives. Conversation history is
+kept server-side in CacheService under `vh_<vid>` so the URL stays short.
+
+**`vid`, never `sid`.** Google's frontend rejects any `/exec` request carrying a
+`sid` query parameter with **HTTP 400** before the script runs — `?view=home&sid=x`
+fails identically, so it is nothing to do with this app. The 400 body is a
+generic Google error page with no clue in it. Recorded as **L-88**. If an
+`/exec` call returns 400 with a Google error shell, suspect a reserved parameter
+name before you suspect your code.
+
+**Sign-in returns to the site now.** `?auth=start&back=voice` lands the visitor
+back at the voice page instead of the Apps Script app. `back` is looked up in
+`AUTH_RETURNS`, a closed list — never a URL from the request, or it would be an
+open redirect handing out live session tokens. The token comes back in the URL
+**fragment**, which is never sent to a server, and the page stores it and strips
+it from the address bar immediately.
+
+**The neural voice (v29).** Replies are spoken by `gpt-4o-mini-tts` when
+`OPENAI_KEY` is set, with the browser's own synthesiser as the fallback and as a
+deliberate choice ("Phone voice"). It is a TWO-STEP call on purpose: `action=say`
+returns the text immediately plus a short opaque key, and `action=tts&ak=...`
+returns the audio as base64. The endpoint **never takes text from the caller** —
+it only speaks what `say` just generated and cached — because a public GET that
+speaks arbitrary text is a free text-to-speech service billed to us. The key is
+single use; it is removed from the cache before the audio is rendered, so a loop
+on one key cannot spend money twice. Voice names are validated against a closed
+list. The visitor chooses the voice; we do not infer anything about them from how
+they sound.
+
+**Verified end to end in a real browser at the production origin**, not by curl:
+`isSecureContext` true, SpeechRecognition and speechSynthesis both present, and
+a full JSONP round trip returning a live reply. The reception also correctly
+refused an instruction embedded in the message, so the quarantine holds on this
+path too.
+
+---
+
 ## Security fix — DEPLOYED AND VERIFIED 2026-09-03
 
 **Version 13 is live.** The four editor utilities that any visitor could call

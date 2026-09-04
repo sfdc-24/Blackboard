@@ -51,6 +51,14 @@ code{font:0.92em var(--mono);color:var(--acc);background:rgba(0,255,166,.07);
 }
 .barnav a:hover{color:var(--text)}
 
+/* Voice is the one nav item that is a destination rather than a page, so it is
+   the only one that carries the accent. */
+.barnav a.go{color:var(--acc)}
+.barnav a.go:hover{color:var(--acc);text-decoration:underline}
+.voicelink{color:var(--acc);text-decoration:none;white-space:nowrap;
+  border-bottom:1px solid rgba(0,255,166,.35);margin-left:6px}
+.voicelink:hover{border-bottom-color:var(--acc)}
+
 /* ---- the chat, which is the product ----------------------------------- */
 .talk{max-width:1040px;margin:0 auto;padding:6px var(--pad) 8px}
 .talkhead{max-width:34ch}

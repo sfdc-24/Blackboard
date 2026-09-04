@@ -104,9 +104,25 @@ if ($SheetRowJson) {
   # cells space-joined into column A and columns B-G blank -- a silently malformed
   # row that the bus accepts and the read-back shows as "successful". This path had
   # never actually been exercised until today, which is why it survived since Aug 26.
-  # Use -InputObject (no pipeline) and unwrap defensively; ISSUE 010's lesson is that
-  # a wrong-shaped row must fail loudly, so assert the shape before sending.
-  $parsed = ConvertFrom-Json -InputObject $SheetRowJson
+  # Parse the array without pipeline enumeration and unwrap defensively; ISSUE
+  # 010's lesson is that a wrong-shaped row must fail loudly, so assert the shape
+  # before sending.
+  # ConvertFrom-Json in newer PowerShell versions eagerly turns ISO-8601 strings
+  # into DateTime values. Casting those values back to strings below drops the
+  # trailing Z and Google Sheets then interprets them in the spreadsheet's local
+  # timezone. The resulting cell is shifted when handleRead_ serializes it again
+  # (for example 06:53Z came back as 10:53Z). The sheetRow contract is a flat JSON
+  # array, so deserialize it explicitly as object[] to preserve date-looking cells
+  # as strings on both Windows PowerShell 5.1 and PowerShell 7.
+  Add-Type -AssemblyName System.Runtime.Serialization
+  $jsonBytes = [Text.Encoding]::UTF8.GetBytes($SheetRowJson)
+  $jsonStream = New-Object IO.MemoryStream(,$jsonBytes)
+  try {
+    $jsonReader = [System.Runtime.Serialization.Json.DataContractJsonSerializer]::new([object[]])
+    $parsed = $jsonReader.ReadObject($jsonStream)
+  } finally {
+    $jsonStream.Dispose()
+  }
   if (@($parsed).Count -eq 1 -and $parsed -isnot [string] -and @($parsed)[0] -is [System.Collections.IEnumerable] -and @($parsed)[0] -isnot [string]) {
     $parsed = @($parsed)[0]
   }
