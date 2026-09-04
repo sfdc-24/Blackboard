@@ -15,6 +15,8 @@ a:hover{text-decoration:underline}
 .nav a.on{color:var(--acc)}
 .nav .right{margin-left:auto;display:flex;gap:14px;align-items:baseline}
 .statusline{font-size:12.5px;color:var(--faint);margin:0 0 12px}
+.nav .who{color:var(--acc);font-size:12px}
+.nav a.signin{color:var(--acc)}
 .statusline .g{color:var(--acc)}
 
 .thread{flex:1 1 auto;min-height:96px}
@@ -58,6 +60,14 @@ button.rec .dot{animation:b .8s step-end infinite}
     <a href="https://www.sfdc24.com/history" target="_top">history</a>
     <a href="https://www.sfdc24.com/team" target="_top">team</a>
     <a href="https://www.sfdc24.com/faq" target="_top">faq</a>
+    <span class="right">
+      <? if (visitorEmail) { ?>
+        <span class="who" title="signed in with Google">&#9679; <?= visitorEmail ?></span>
+        <a href="<?= signedOutUrl ?>" target="_top">sign out</a>
+      <? } else if (authOn) { ?>
+        <a href="<?= authStart ?>" target="_top" class="signin">sign in with Google</a>
+      <? } ?>
+    </span>
   </div>
   <p class="statusline">status: <span class="g">online</span> · a wholistic way to interact with AI agents — and get work done.</p>
 
@@ -82,6 +92,9 @@ button.rec .dot{animation:b .8s step-end infinite}
 <script>
 (function(){
   var SELF_URL = "<?!= selfUrl ?>";
+  // Session token, rendered server-side. Sent with each turn so the
+  // reception can record WHO said it. Empty when signed out.
+  var SESSION = "<?!= sessionToken ?>";
   var WANT_VOICE = "<?!= voice ?>" === "1";
   // The microphone is only usable where the hosting frame's permissions policy allows it.
   // Google Sites embeds and Apps Script's own sandbox frame both withhold it, so we detect
@@ -189,7 +202,7 @@ button.rec .dot{animation:b .8s step-end infinite}
         wait.textContent = "couldn't reach the server: " + (err && err.message || err) + " — your message wasn't lost, try again.";
         busy = false; sync();
       })
-      .reception(sid, text, history.slice(0, -1));
+      .reception(sid, text, history.slice(0, -1), SESSION);
   }
 
   // ---- voice ----
