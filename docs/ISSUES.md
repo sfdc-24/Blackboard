@@ -17,6 +17,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
 | ISS-012 | 2026-09-04 | MED | Page displayed one identity while serving another account data | **RESOLVED** |
 | ISS-013 | 2026-09-04 | LOW | Three nav links present in source never render on the live page | **CLOSED (pages retired)** |
+| ISS-014 | 2026-09-04 | **HIGH** | I took the live chat down for ~1h with a disallowed meta tag, and my own check passed it | **RESOLVED** |
 | ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
@@ -486,3 +487,40 @@ like an app. The shell above feels right on the direct Apps Script URL and when
 added to a home screen; through Sites it is still a page in a frame. Competing
 with Replit on feel means the site stops being served by Google Sites. That is
 a decision, not a task.
+
+---
+
+## ISS-014 · RESOLVED — I took the live chat down for about an hour
+
+**Self-inflicted, and the check that should have caught it is one I had already
+written down.**
+
+v22 added PWA meta tags to `doGet` via `addMetaTag`. Apps Script whitelists a
+small set and **throws** on anything outside it:
+
+```
+Exception: The meta tag you specified is not allowed in this context. (line 89, file "Code")
+```
+
+That exception replaced the entire reception. The chat was dead on sfdc24.com
+from the v22 deploy until v24 — roughly an hour.
+
+**Why my verification missed it.** I checked `curl ... ?view=home` and got
+`http=200`, and treated that as a pass. **Apps Script serves its error page with
+HTTP 200.** My own memory already contains this lesson from Stooq: *"HTTP 200
+does not mean usable. Check payloads, never status codes."* I had the rule and
+checked the status anyway.
+
+**How it was actually found:** by looking at the rendered page while building
+the new static site. The error was sitting in the embedded frame in plain sight.
+No amount of further curl would have surfaced it.
+
+**Fix (v24).** Only `viewport` is passed to `addMetaTag` now. The PWA tags were
+in the wrong place regardless — a visitor adds the *site* to their home screen,
+never the embedded frame, so they belong in the top-level page's own `<head>`,
+which is where they now live in the new static site.
+
+**Standing correction to my own verification habit:** for any Apps Script page,
+a deploy is verified by grepping the body for `Exception:` and for a known
+content marker. Status code alone is not evidence. Added to the deploy sequence
+in HANDOVER.

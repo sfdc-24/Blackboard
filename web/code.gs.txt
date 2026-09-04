@@ -82,14 +82,13 @@ function doGet(e) {
                     ? '1' : '';
   return t.evaluate()
     .setTitle('SFDC24')
+    // ONLY viewport. addMetaTag whitelists a small set and THROWS on anything
+    // else -- "The meta tag you specified is not allowed in this context" --
+    // which takes the entire page down. v22 added PWA tags here and killed the
+    // reception; the curl check passed because Apps Script serves its error
+    // page with HTTP 200. Those tags belong on the top-level site anyway: a
+    // visitor adds the SITE to their home screen, never this embedded frame.
     .addMetaTag('viewport', 'width=device-width,initial-scale=1,viewport-fit=cover')
-    // Added to a phone home screen this then opens without browser chrome,
-    // which is most of what makes a web page feel like an app.
-    .addMetaTag('apple-mobile-web-app-capable', 'yes')
-    .addMetaTag('apple-mobile-web-app-status-bar-style', 'black-translucent')
-    .addMetaTag('apple-mobile-web-app-title', 'SFDC24')
-    .addMetaTag('mobile-web-app-capable', 'yes')
-    .addMetaTag('theme-color', '#0B0D10')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 

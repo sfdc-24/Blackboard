@@ -1,0 +1,146 @@
+/* SFDC24 — site styles
+   Palette and type follow the app (Reception.html) so the page and the chat
+   inside it read as one product rather than a page with a widget bolted on. */
+
+:root{
+  --ground:#0B0D10;
+  --surface:#12151A;
+  --line:#262C36;
+  --text:#E6EDF3;
+  --muted:#8B949E;
+  --faint:#6E7681;
+  --acc:#00FFA6;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  --pad:22px;
+}
+
+*{box-sizing:border-box}
+
+html,body{
+  margin:0;
+  background:var(--ground);
+  color:var(--text);
+  font:16px/1.65 var(--sans);
+  -webkit-text-size-adjust:100%;
+}
+
+a{color:var(--acc)}
+code{font:0.92em var(--mono);color:var(--acc);background:rgba(0,255,166,.07);
+  padding:1px 5px;border-radius:3px}
+
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:12px;top:12px;z-index:50;background:var(--acc);color:#04120C;
+  padding:9px 14px;border-radius:6px;font:600 14px var(--sans)}
+
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+
+/* ---- top bar ---------------------------------------------------------- */
+.bar{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  max-width:1040px;margin:0 auto;padding:16px var(--pad);
+}
+.brand{
+  font:600 17px/1 var(--mono);letter-spacing:.04em;color:var(--acc);
+  text-decoration:none;
+}
+.barnav{display:flex;gap:20px}
+.barnav a{
+  font:500 14px/1 var(--sans);color:var(--muted);text-decoration:none;
+  padding:8px 0;min-height:44px;display:inline-flex;align-items:center;
+}
+.barnav a:hover{color:var(--text)}
+
+/* ---- the chat, which is the product ----------------------------------- */
+.talk{max-width:1040px;margin:0 auto;padding:6px var(--pad) 8px}
+.talkhead{max-width:34ch}
+.talkhead h1{
+  font:600 clamp(27px,5.2vw,40px)/1.12 var(--sans);
+  letter-spacing:-.022em;margin:10px 0 12px;text-wrap:balance;max-width:19ch;
+}
+.talkhead p{color:var(--muted);margin:0 0 20px;font-size:17px;max-width:44ch}
+
+/* Height is set here, which is the thing Google Sites would never let us do:
+   its embed was a fixed box that left dead space under the conversation. */
+.frame{
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  background:var(--surface);
+  height:clamp(460px,66vh,640px);
+}
+.frame iframe{display:block;width:100%;height:100%;border:0}
+.framenote{
+  font:400 12.5px/1.5 var(--mono);color:var(--faint);
+  margin:10px 2px 0;
+}
+
+/* ---- prose ------------------------------------------------------------ */
+.prose{max-width:1040px;margin:0 auto;padding:16px var(--pad) 40px}
+.prose h2{
+  font:600 24px/1.25 var(--sans);letter-spacing:-.015em;
+  margin:56px 0 14px;text-wrap:balance;
+}
+.prose h2:first-child{margin-top:40px}
+.prose p{margin:0 0 15px;max-width:66ch;color:#cfd8e3}
+.prose p strong{color:#fff}
+
+/* Four related things, so they share one object: same edges, same padding,
+   same baseline. Not cards for decoration -- they are a set. */
+.grid{
+  display:grid;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+  margin:20px 0 8px;
+}
+.grid article{background:var(--ground);padding:22px 22px 20px}
+.grid h3{
+  font:600 16px/1.3 var(--sans);margin:0 0 9px;color:var(--acc);
+  text-wrap:balance;
+}
+.grid p{margin:0;font-size:15px;color:var(--muted);max-width:46ch}
+
+.cta{
+  display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;
+  margin-top:22px;font-size:16px;
+}
+.cta span{color:var(--faint);font-size:14px}
+.cta a{
+  display:inline-flex;align-items:center;min-height:44px;
+  font-weight:600;text-decoration:none;
+  border-bottom:1px solid rgba(0,255,166,.4);
+}
+.cta a:hover{border-bottom-color:var(--acc)}
+
+/* ---- footer ------------------------------------------------------------ */
+.foot{
+  max-width:1040px;margin:0 auto;padding:22px var(--pad) 40px;
+  border-top:1px solid var(--line);
+  display:flex;flex-wrap:wrap;gap:10px 22px;justify-content:space-between;
+  font:400 13px/1.6 var(--mono);color:var(--faint);
+}
+.foot nav{display:flex;flex-wrap:wrap;gap:10px 18px}
+.foot a{color:var(--muted);text-decoration:none;
+  min-height:44px;display:inline-flex;align-items:center}
+.foot a:hover{color:var(--text)}
+
+/* ---- legal pages ------------------------------------------------------- */
+.legal{max-width:720px;margin:0 auto;padding:10px var(--pad) 50px}
+.legal h1{font:600 30px/1.2 var(--sans);letter-spacing:-.02em;margin:20px 0 6px}
+.legal .updated{font:400 12.5px var(--mono);color:var(--faint);margin:0 0 30px}
+.legal h2{font:600 18px/1.3 var(--sans);margin:34px 0 10px}
+.legal p,.legal li{color:#cfd8e3;max-width:66ch}
+.legal ul{padding-left:20px}
+.legal li{margin-bottom:8px}
+
+@media(max-width:640px){
+  :root{--pad:16px}
+  .talkhead h1{margin-top:4px}
+  .talkhead p{font-size:16px;margin-bottom:16px}
+  .frame{height:clamp(420px,72vh,560px);border-radius:10px}
+  .prose h2{margin:44px 0 12px;font-size:21px}
+  .grid{border-radius:10px}
+  .foot{padding-bottom:34px}
+}
+
+@media(prefers-reduced-motion:reduce){
+  *{animation-duration:.01ms !important;transition-duration:.01ms !important}
+}
