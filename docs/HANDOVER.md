@@ -61,6 +61,86 @@ bypasses cache entirely. See `docs/ISSUES.md` ISS-006 and ISS-008.
 
 ---
 
+## Site work — Sep 3 evening (v16 live)
+
+**Mobile bug FIXED and measured.** Mr. Salam reported on iPhone 13: "the chat
+was down to half of the screen and the bottom was blank." Two causes:
+`.thread{min-height:210px}` forced a fixed empty block, and the page laid out
+top-down inside a fixed-height Sites iframe so leftover frame height rendered as
+dead background. Now the document owns the full height of its frame, the shell
+is a flex column, and `.thread` takes `flex:1` to absorb slack — so composer and
+footer pin to the bottom at any height.
+
+Measured in a local harness at five viewports (the screenshot tool renders at a
+fixed size and cannot show a phone layout):
+
+| frame | thread | dead space below footer | h-overflow | textarea | send btn |
+|---|---|---|---|---|---|
+| 390x844 | 518px | 18px | none | 16px | 44px |
+| 390x600 | 274px | 18px | none | 16px | 44px |
+| 390x420 | 94px | 18px | none | 16px | 44px |
+| 320x568 | 200px | 18px | none | 16px | 44px |
+
+The 18px is the wrap's own padding. **The 16px textarea is not cosmetic** — below
+16px iOS Safari zooms on focus and never zooms back. Buttons went 31px -> 44px
+(Apple minimum). Same treatment applied to the governor console.
+
+**Links: all clean.** Six nav links and both footer legal links return 200 with
+real content. Two greps suggested otherwise; both were false alarms (one matched
+Google's own JavaScript, one was grep escaping braces on a binary-detected
+file). Check rendered text, not grep counts.
+
+**Security posture held through v16.** All seven non-entry-point exposed
+functions are guarded by `requireGovernor_()`, including the two new ones
+(`monitorTick`, `setup_monitor`). Anonymous request to the Governor-only
+endpoint still returns `{"ok":false,"error":"not authorized"}`.
+
+---
+
+## Monitor — code LIVE, trigger NOT YET REGISTERED
+
+`gas/Monitor.js` ships in v16. It watches the public site (both hostnames plus a
+content marker), board silence, and ANDON rows, and emails on **state change
+only** with a daily cap and a `MONITOR_ENABLED=off` kill switch.
+
+**It is not running yet.** Registering the time-driven trigger needs one
+Google authorization click, and the consent popup opens outside the extension's
+tab group — the renderer froze when I retried. **To finish it (about 20
+seconds):** open the Apps Script project, select `ZSetupMonitor.gs`, press Run,
+click through "Review permissions". The function is idempotent — it deletes any
+existing `monitorTick` trigger first, so running it twice cannot create the kind
+of orphan duplicate that ISSUE 023 is. It also runs one pass immediately and
+logs the result, so you see it work rather than waiting 15 minutes.
+
+Delete `ZSetupMonitor.gs` once it is registered.
+
+**Why Apps Script and not a laptop task:** a Windows scheduled task dies with
+the laptop lid, and the point is to watch while nobody is at the desk.
+
+---
+
+## Google sign-in — NOT DONE, and here is the real blocker
+
+Mr. Salam asked for Google login for other users. It is not a quick change:
+
+1. The script has **no GCP project attached** (`clasp list-apis` -> "GCP project
+   ID is not set"). Google Identity Services needs an OAuth client ID, which
+   needs a standard Cloud project plus a configured consent screen.
+2. Apps Script's own identity is not a shortcut. `executeAs: USER_DEPLOYING`
+   does not return an external visitor's email; `executeAs: USER_ACCESSING`
+   does, but then the script runs as the visitor and **loses write access to the
+   Alpha DB spreadsheet**.
+3. GIS One Tap is blocked in cross-origin iframes, and the reception is embedded
+   in one from Google Sites. A popup (`ux_mode:'popup'`) flow would be needed.
+
+**Recommended path:** attach a standard GCP project, create a Web OAuth client
+with `https://www.sfdc24.com` and the googleusercontent origin authorised, then
+add a popup-mode "Sign in with Google" button that posts its ID token to a new
+guarded route for server-side verification. Identity must NOT confer authority —
+a signed-in visitor is still `instruction_authority=NONE`.
+
+---
+
 ## DO NOT BUILD THE UBUNTU PACKAGE — vm-cli leads it
 
 **Mr. Salam assigned this to `vm-cli` on 2026-09-03.** An Ubuntu package that
