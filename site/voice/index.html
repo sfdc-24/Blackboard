@@ -172,7 +172,7 @@ body{overflow:hidden}
 
   <div class="typed" id="typed">
     <input id="box" type="text" inputmode="text" autocomplete="off"
-           placeholder="or type it here" aria-label="Type a message">
+           placeholder="or type — your keyboard has a mic too" aria-label="Type a message">
     <button id="send" disabled>send</button>
   </div>
 
@@ -344,14 +344,28 @@ body{overflow:hidden}
     };
 
     rec.onerror = function(ev){
-      if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+      // Say what went wrong in words, and always leave a way to keep going.
+      if (ev.error === "not-allowed") {
         setMode("off");
-        fail("Your browser is blocking the microphone for this page. Allow it in the address bar or in Settings, then tap again.");
+        fail("This page isn't allowed to use the microphone yet. On an iPhone: tap the "
+           + "“AA” in the address bar, choose Website Settings, set Microphone to Allow. "
+           + "Then tap the circle again.", true);
+      } else if (ev.error === "service-not-allowed") {
+        setMode("off");
+        fail("Your phone's dictation service is switched off, so the browser has nothing to "
+           + "listen with. On an iPhone: Settings → General → Keyboard → turn on "
+           + "Enable Dictation. Then come back and tap the circle.", true);
       } else if (ev.error === "no-speech") {
         // nothing said; onend restarts us
+      } else if (ev.error === "network") {
+        setMode("off");
+        fail("Speech recognition needs a network connection to your browser's speech service "
+           + "and couldn't reach it.", true);
       } else if (ev.error !== "aborted") {
         say_status("microphone: " + ev.error, false);
+        lastError = ev.error;
       }
+      lastError = ev.error;
     };
 
     rec.onend = function(){
@@ -367,7 +381,11 @@ body{overflow:hidden}
     };
 
     try { rec.start(); setMode("listening") }
-    catch(e){ setMode("off"); say_status("could not start the microphone", false) }
+    catch(e){
+      setMode("off");
+      lastError = String(e && e.message || e);
+      fail("The browser refused to start the microphone: " + lastError, true);
+    }
   }
 
   function handle(text){
@@ -395,23 +413,56 @@ body{overflow:hidden}
     setMode("off");
   }
 
-  function fail(msg){
+  // Every failure ends in the same place: the typed box, focused, with the
+  // keyboard's own microphone still able to dictate into it. The answer is read
+  // out loud either way, so a blocked microphone costs the tap, not the feature.
+  function fail(msg, offerKeyboard){
     warn.hidden = false;
-    warn.innerHTML = "<b>Microphone unavailable.</b> " + msg;
+    var extra = offerKeyboard
+      ? " <br><br><b>In the meantime:</b> tap the box at the bottom and use the little "
+        + "microphone on your own keyboard — it types straight in, and the answer is "
+        + "still read out loud."
+      : "";
+    warn.innerHTML = "<b>Couldn't start listening.</b> " + msg + extra
+      + ' <br><br><a href="#" id="whylink">what does my browser support?</a>';
+    var wl = document.getElementById("whylink");
+    if (wl) wl.addEventListener("click", function(e){ e.preventDefault(); showDiag() });
+    try { box.focus() } catch(e){}
+  }
+
+  // One line he can read back to me. No guessing about which browser it was.
+  var lastError = "";
+  function showDiag(){
+    var ua = navigator.userAgent || "";
+    var name = /CriOS/.test(ua) ? "Chrome on iOS"
+             : /FxiOS/.test(ua) ? "Firefox on iOS"
+             : /EdgiOS/.test(ua) ? "Edge on iOS"
+             : (/iPhone|iPad/.test(ua) && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua)) ? "Safari on iOS"
+             : /Android/.test(ua) && /Chrome/.test(ua) ? "Chrome on Android"
+             : /Chrome/.test(ua) ? "Chrome" : /Safari/.test(ua) ? "Safari" : "this browser";
+    var standalone = (window.navigator.standalone === true) ||
+                     (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+    turn("sys", "", name
+      + " · speech-in " + (SR ? "yes" : "NO")
+      + " · speech-out " + (TTS ? "yes" : "NO")
+      + " · secure " + (window.isSecureContext ? "yes" : "NO")
+      + (standalone ? " · home-screen app" : "")
+      + (lastError ? " · last error: " + lastError : ""));
   }
 
   mic.addEventListener("click", function(){
-    prime();
-    if (mode === "off") {
-      if (!SR) {
-        fail("This browser doesn't do speech recognition. Safari on iPhone, Chrome on Android and Chrome on a computer all do. You can still type below and hear the answer read back.");
-        return;
-      }
-      warn.hidden = true;
-      listen();
-    } else {
-      stopAll();
+    if (mode !== "off") { stopAll(); return }
+    if (!SR) {
+      fail("This browser has no built-in speech recognition. On an iPhone that means "
+         + "Chrome, Firefox and Edge, and any page opened inside another app — they all "
+         + "borrow Safari's engine but not this part of it. Safari itself does have it.", true);
+      return;
     }
+    warn.hidden = true;
+    // Recognition FIRST, still inside this tap. Priming speech synthesis before
+    // it takes the audio session on iOS and recognition then fails to start.
+    listen();
+    prime();
   });
 
   // ---- typed fallback -----------------------------------------------------
@@ -431,7 +482,10 @@ body{overflow:hidden}
 
   // ---- opening ------------------------------------------------------------
   if (!SR) {
-    turn("sys", "", "Speech isn't available in this browser, but typing is — and the answer will still be read out loud.");
+    turn("sys", "", "This browser can't listen, but it can still talk. Type below — or use the "
+       + "microphone on your own keyboard — and the answer is read out loud. On an iPhone, "
+       + "opening this page in Safari gets you the one-tap version.");
+    try { box.focus() } catch(e){}
   }
   turn("it", "sfdc24",
     "Hello. Tap the microphone and tell me what's going on — a process that keeps breaking, a report nobody trusts, whatever's on your mind. I'll answer out loud.");
