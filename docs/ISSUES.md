@@ -14,6 +14,7 @@ for this on 2026-09-03 so blockers stop being buried in chat.
 | ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | **RESOLVED** |
 | ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
 | ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
+| ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
 | ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
 
 ---
@@ -339,3 +340,43 @@ points at rate limiting rather than a broken key.
 
 **Rule, filed as L-80:** always read back before retrying any bus write, and
 never assume the bus protects you the way the Governor API now does.
+
+---
+
+## ISS-011 · RESOLVED — the monitor cried wolf 13 minutes after going live
+
+**What happened.** `monitorTick` was registered at 21:35 and reported the site
+`up`. Its first scheduled run at 21:47 flipped `MONITOR_STATE` to
+`{"site":"down"}` while the site was demonstrably serving 200 on both
+hostnames with the homepage marker present, verified from the laptop with two
+different User-Agents including a Google one.
+
+**No alert reached Mr. Salam** — `mailCount` was 0 — but that was luck, not
+design. The very next state change would have emailed a false outage.
+
+**Two faults, both mine:**
+
+1. **One boolean for two hostnames.** `checkSite_` returned a single `ok`, so a
+   failure on the bare-domain leg condemned the whole site even though `www` —
+   where visitors actually land — was perfect. The apex rides NameSilo's Caddy
+   fleet with on-demand TLS, and I had already seen one transient handshake
+   failure from the laptop that hour (`schannel: SEC_E_INTERNAL_ERROR`), which
+   is almost certainly what it hit.
+2. **No debounce.** A single sample could flip the state. On a 15-minute cadence
+   one blip is not an outage.
+
+**Fix (v18).** `checkSite_` now returns `wwwOk` and `apexOk` independently and a
+detail string naming each. State flips only after `MON_FAIL_STRIKES = 2`
+consecutive agreeing checks. `www` down is a full alert; the bare domain failing
+while `www` is healthy gets a *different*, calmer message that says so, because
+the site is up for anyone typing the full address. Old single-field state
+migrates to `unknown` rather than inheriting a verdict the old logic reached for
+different reasons.
+
+**Verified after the fix:**
+`site: www=up apex=up (www 200 with marker | apex chain 200)`
+
+**The lesson worth keeping:** a monitor that cries wolf gets ignored exactly
+when it is finally right. Alerting logic needs the same read-back discipline
+(D-4) as writes — I declared this done before it had survived a single
+unattended cycle.
