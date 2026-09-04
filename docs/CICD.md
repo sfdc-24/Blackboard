@@ -53,15 +53,47 @@ version, same two assertions. Written before it was needed, as ordered.
    variables `STAGING_SCRIPT_ID_<KEY>`, `STAGING_DEPLOYMENT_ID_<KEY>`,
    `STAGING_EXEC_URL_<KEY>` (KEY = dir name upper-cased, `-` → `_`).
    Owned by the other vm-cli session (`blackboard-71`) via Drive `files.copy`.
-   This is now the only thing standing between the pipeline and a green run.
+   **CLEARED 2026-09-04 19:31Z:** all nine variables exist (verified by
+   `gh variable list`) and `clasp list-deployments` shows a real `@1` web-app
+   deployment on each staging project. This item used to read "the only thing
+   standing between the pipeline and a green run." That was wrong twice over —
+   see items 4 and 5, both measured 2026-09-04 23:10Z.
 3. ~~**The v1 bus baseline**~~ — **DONE.** It did not need a browser after all:
    the bus is container-bound but it *does* appear in `clasp list-scripts` and
    clones cleanly. It is at `apps-script/blackboard-bus-v1/`, byte-identical to
    the source pinned at the live deployment.
+4. **The staging web apps do not execute — for anyone.** All three `@1`
+   deployments answer HTTP 403, and all three `@HEAD` deployments answer with a
+   Google sign-in page, while every one of them reports
+   `access=ANYONE_ANONYMOUS, executeAs=USER_DEPLOYING` in the Apps Script API.
+   Config and reality disagree. Re-probed with the **owner's** own OAuth token:
+   still 403. So this is not an access-setting problem — the script has never
+   been authorized, which is exactly what a project born from Drive
+   `files.copy` looks like: code and manifest copy, the OAuth grant does not.
 
-Until item 2 clears, pushes to `staging` fail at the id-resolution step with an
-explicit error — that is intended behaviour, not breakage: a pipeline that
-silently skipped deploys would be theatre.
+   `python scripts/gas_deployment_audit.py` reports the current state and exits
+   non-zero while any deployment claims anonymous access it does not honour.
+
+   *Fix — needs a browser, once per staging project, so it is a real halt for a
+   headless lane:* open each staging project in the Apps Script editor as
+   `abdus@sfdc24.com`, run any function once, accept the OAuth consent, then
+   re-run the audit. Until then the pipeline's HTTP assertion is theatre of a
+   subtler kind than a skipped deploy: it would be asserting against a door
+   that opens for nobody.
+5. **The workflows are not registered with GitHub at all.** `gh workflow list
+   --all` returns only `Copilot`. Both YAML files live solely on
+   `session/vm-cicd`, and GitHub registers a `workflow_dispatch` workflow only
+   from the **default branch** (`main`). Two consequences are visible today:
+   nothing can dispatch a staging deploy, and **PR #2 can never show a check**
+   — which is precisely the "zero checks" codex flagged in `vseq=010`. It is
+   not a secrets or permissions problem; the workflows do not exist as far as
+   the Actions API is concerned. Landing them on the default branch is a
+   prerequisite to every remaining receipt, and it is a call for the acceptance
+   lane rather than a silent push from here.
+
+Until items 4 and 5 clear, pushes to `staging` fail at the id-resolution step
+with an explicit error — that is intended behaviour, not breakage: a pipeline
+that silently skipped deploys would be theatre.
 
 ## The source of truth for what is deployed — it exists now
 

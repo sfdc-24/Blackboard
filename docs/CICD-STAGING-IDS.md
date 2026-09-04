@@ -19,7 +19,9 @@ unblock in [CICD.md](CICD.md).
 
 ## Remaining to finish STEP_2 (needs the OAuth-holder / a browser)
 
-For each STAGING project, once clasp is authenticated:
+**This section is DONE — completed 2026-09-04 19:31Z**, after this file was
+written. The commands below are kept because they are the recipe if a staging
+project is ever rebuilt, but they no longer describe outstanding work:
 
 ```bash
 cd apps-script/<project>
@@ -31,8 +33,42 @@ gh variable set STAGING_DEPLOYMENT_ID_<KEY> --body "<deployment id>"
 gh variable set STAGING_EXEC_URL_<KEY>     --body "https://script.google.com/macros/s/<...>/exec"
 ```
 
-`STAGING_SCRIPT_ID_*` are set as repo variables already (see the table). KEY =
+All nine variables are set (`gh variable list`), and each staging project has
+one `@1` web-app deployment described `staging web app (VM-CICD-001)`. KEY =
 the project dir upper-cased, `-` → `_`.
+
+## The deployments exist and still do not work — verified 2026-09-04 23:10Z
+
+Creating the deployment was not the same as having a working endpoint, and the
+repo variables cannot tell the difference. Measured with
+`python scripts/gas_deployment_audit.py`:
+
+| Project | @1 anonymous | @HEAD anonymous | API says |
+|---|---|---|---|
+| governor-page-api | **403** | 200 Google sign-in page | `ANYONE_ANONYMOUS` |
+| blackboard-production | **403** | 200 Google sign-in page | `ANYONE_ANONYMOUS` |
+| glasses-intake-uploader | **403** | 200 Google sign-in page | `ANYONE_ANONYMOUS` |
+
+0 of 6 web-app deployments actually run. The same probe against the live v1 bus
+and glasses production endpoints returns their real JSON, so the probe is
+sound — these endpoints genuinely do not serve.
+
+Re-probed with the **owner's** OAuth token: still 403. The access setting is
+not the problem; the copied scripts have never been OAuth-authorized. A project
+created by Drive `files.copy` brings its code and its manifest but not its
+grant. Clearing it needs a browser once per project (see item 4 of
+[CICD.md](CICD.md)) — it cannot be done from a headless lane.
+
+Two traps worth keeping, both of which nearly produced a false "green" here:
+
+- **HTTP 200 is not the app.** Google's sign-in page and its Drive notice page
+  both arrive with 200. The first version of the audit counted three endpoints
+  as anonymous-ready on status alone; all three were Google pages. The checker
+  now requires that no Google interstitial appears in the body, and is
+  regression-checked against two endpoints known to serve anonymously.
+- **The manifest is not the deployment.** Every manifest here declares
+  `ANYONE_ANONYMOUS` and every endpoint refuses callers. Read the deployment
+  config from the API, then probe the URL, and treat disagreement as the finding.
 
 ## Caveats
 
