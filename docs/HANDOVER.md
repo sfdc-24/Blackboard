@@ -5,6 +5,37 @@ restarted session resumes without re-deriving anything.
 
 ---
 
+## sfdc24.com NO LONGER LIVES ON GOOGLE SITES — moved 2026-09-04
+
+**This supersedes every earlier statement in this file about Google Sites.**
+If you are about to edit a page in Sites, stop; nothing you do there reaches
+visitors any more.
+
+| | |
+|---|---|
+| Serves from | GitHub Pages, repo **`sfdc-24/sfdc24-site`**, branch `main`, path `/` |
+| Public source of truth | `site/` in this repo, mirrored to that public repo |
+| DNS | `www` **CNAME -> `sfdc-24.github.io`** at NameSilo |
+| Apex | three A records (45.77.75.133, 45.77.92.157, 207.246.78.75) + NameSilo 301 forwarder to `https://www.sfdc24.com`. **Untouched by the move, and `www` must never carry an A record (L-81).** |
+| Rollback | `www` CNAME back to `ghs.googlehosted.com`, TTL 3600. One edit, effective in minutes. |
+| The chat | Unchanged. Still the Governor Page API in an iframe on the home page, deployment `AKfycbx0D-5DAn...` at **@26**. The move did not touch Apps Script. |
+
+**Why it moved.** Sites wraps every page in its own header and scroll, so a page
+served through it can never feel like an app, and it has no field for a meta
+description — Google was writing our search snippet for us. Both were ceilings,
+not annoyances. Mr. Salam approved the move explicitly.
+
+**Deploying the site now** is a git push to `sfdc-24/sfdc24-site`; Pages rebuilds
+in about 20 seconds. There is no local clone of that repo — clone it to the
+scratchpad, copy from `site/`, push, delete. Keep `site/` here as the source and
+never edit the public repo directly, or the two drift.
+
+**Read ISS-015 before you touch DNS again.** The cutover took the site down in
+browsers for the length of the certificate wait, and every `curl` check I ran
+said it was fine.
+
+---
+
 ## Security fix — DEPLOYED AND VERIFIED 2026-09-03
 
 **Version 13 is live.** The four editor utilities that any visitor could call
