@@ -98,7 +98,11 @@ function doPost(e) {
     var pass = PropertiesService.getScriptProperties().getProperty('GOVERNOR_PASS');
     if (!pass) return json_({ ok: false, error: 'GOVERNOR_PASS not set in Script Properties' });
     if (String(req.pass || '') !== pass) return json_({ ok: false, error: 'bad passphrase' });
-    return json_(appendRow_(String(req.payload || ''), String(req.source || TARGET), 'passphrase'));
+    return json_(appendRow_(
+      String(req.payload || ''),
+      String(req.source || TARGET),
+      'passphrase',
+      { target: req.target, category: req.category, project: req.project }));
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
@@ -336,20 +340,35 @@ function recentDuplicate_(sh, hdr, payload, source) {
   return null;
 }
 
-function appendRow_(payload, source, auth) {
+/**
+ * @param opts optional {target, category, project} - lets a REMOTE writer place
+ *        a well-formed board row. Added 2026-09-04 for vm-chrome, whose surface
+ *        cannot write a schema-correct row through the v1 bus at all: that path
+ *        lands the timestamp in column A and the payload in column B, leaves
+ *        Source_Tag blank, and still returns ok:true. Such a row is invisible
+ *        to every tag- and timestamp-keyed scan (L-85), which is how a
+ *        colleague reply went unread for hours. Defaults preserve the previous
+ *        behaviour exactly, so existing callers are unaffected.
+ */
+function appendRow_(payload, source, auth, opts) {
   payload = payload.replace(/[\r\n]+/g, ' ').slice(0, 4000);
-  if (payload.indexOf('GOV|') !== 0) throw new Error('payload must start with GOV|');
+  // BCB| is the board work grammar (L-51); GOV| is the governor-page grammar.
+  // Both are allowed and nothing else is: this endpoint appends to the live
+  // operational board and must not become a general-purpose write surface.
+  if (payload.indexOf('GOV|') !== 0 && payload.indexOf('BCB|') !== 0)
+    throw new Error('payload must start with GOV| or BCB|');
+  opts = opts || {};
   var found = sheet_(), sh = found.sheet, hdr = found.hdr;
   var id = Utilities.getUuid(), ts = new Date().toISOString();
   var row = []; for (var i = 0; i < hdr.names.length; i++) row.push('');
   set_(row, hdr, 'Row_ID', id);
   set_(row, hdr, 'Timestamp', ts);
   set_(row, hdr, 'Source_Tag', String(source || TARGET).slice(0, 40));
-  set_(row, hdr, 'Target_Surface', TARGET);
+  set_(row, hdr, 'Target_Surface', String(opts.target || TARGET).slice(0, 40));
   set_(row, hdr, 'Action_Type', 'APPEND');
   set_(row, hdr, 'Payload', payload);
-  set_(row, hdr, 'Category', 'Governor');
-  set_(row, hdr, 'Project Tag', 'Blackboard');
+  set_(row, hdr, 'Category', String(opts.category || 'Governor').slice(0, 24));
+  set_(row, hdr, 'Project Tag', String(opts.project || 'Blackboard').slice(0, 40));
   set_(row, hdr, 'Gist', gist_(payload));
   set_(row, hdr, 'Sub-Gist', 'via governor-page · ' + auth);
 
