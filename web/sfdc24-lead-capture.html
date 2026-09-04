@@ -1,3 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Send a project request to the SFDC24 team.">
 <title>SFDC24 Intake</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -67,7 +73,7 @@
   .split{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}
   @media (max-width:880px){.split{grid-template-columns:1fr}}
 
-  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  .panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
   .panel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
   .panel-h .t{font-family:"Archivo";font-weight:700;font-size:15px}
   .panel-h .k{font-family:"IBM Plex Mono";font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em}
@@ -78,7 +84,7 @@
   .field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
   .field .hint{font-weight:400;color:var(--faint)}
   .field input,.field textarea,.field select{
-    width:100%;font:inherit;font-size:15px;color:var(--ink);background:var(--surface-2);
+    width:100%;font:inherit;font-size:16px;color:var(--ink);background:var(--surface-2);
     border:1px solid var(--line);border-radius:10px;padding:11px 13px;transition:border-color .15s,box-shadow .15s}
   .field textarea{min-height:92px;resize:vertical}
   .field input:focus,.field textarea:focus,.field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
@@ -150,6 +156,8 @@
   footer.legal{margin-top:30px;text-align:center;font-size:12px;color:var(--faint)}
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
+</head>
+<body>
 
 <div class="wrap">
   <header class="top">
@@ -160,7 +168,7 @@
         <div class="sub">Architecture &amp; engineering, staffed by agents</div>
       </div>
     </div>
-    <span class="chip"><span class="dot"></span> Salesforce backend · dev sandbox</span>
+    <span class="chip"><span class="dot"></span> Salesforce connected · SFDC 24</span>
   </header>
 
   <div class="lead-in">
@@ -173,35 +181,36 @@
     <!-- LEFT: the glass (customer-facing) -->
     <section class="panel" aria-labelledby="glass-t">
       <div class="panel-h"><span class="t" id="glass-t">Your request</span><span class="k">web-to-lead</span></div>
-      <form id="leadForm" novalidate
+      <form id="leadForm"
             action="https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8" method="POST">
         <!-- Salesforce Web-to-Lead required hidden fields -->
-        <input type="hidden" name="oid" id="oid" value="">
-        <input type="hidden" name="retURL" id="retURL" value="https://sfdc24.com/thanks">
+        <input type="hidden" name="oid" id="oid" value="00Dbm00000wK2ibEAC">
+        <input type="hidden" name="retURL" id="retURL" value="https://sfdc24-intake-omnistudio.astronautwannabe.chatgpt.site/?submitted=1">
         <input type="hidden" name="lead_source" value="sfdc24.com">
+        <input type="hidden" name="description" id="salesforceDescription" value="">
 
         <div class="field">
           <label for="description">What do you want to build or run? <span class="hint">— plain language</span></label>
-          <textarea id="description" name="description" placeholder="e.g. A children's app where folktales are told with animated characters, for about 5,000 users."></textarea>
+          <textarea id="description" maxlength="31000" placeholder="e.g. Our case intake has grown complicated. We need one clear process for customers and the service team."></textarea>
         </div>
         <div class="row2">
           <div class="field">
             <label for="first_name">First name</label>
-            <input id="first_name" name="first_name" autocomplete="given-name">
+            <input id="first_name" name="first_name" maxlength="40" autocomplete="given-name">
           </div>
           <div class="field">
             <label for="last_name">Last name</label>
-            <input id="last_name" name="last_name" autocomplete="family-name" required>
+            <input id="last_name" name="last_name" maxlength="80" autocomplete="family-name" required>
           </div>
         </div>
         <div class="row2">
           <div class="field">
             <label for="email">Work email</label>
-            <input id="email" name="email" type="email" autocomplete="email" required>
+            <input id="email" name="email" type="email" maxlength="80" autocomplete="email" required>
           </div>
           <div class="field">
             <label for="company">Company</label>
-            <input id="company" name="company" autocomplete="organization" required>
+            <input id="company" name="company" maxlength="255" autocomplete="organization" required>
           </div>
         </div>
         <div class="field">
@@ -211,22 +220,19 @@
             <label><input type="radio" name="rel" value="Supplier"><span class="box">Supplier / partner</span></label>
           </div>
         </div>
-        <button class="submit" type="submit" id="submitBtn">
+        <button class="submit" type="submit" id="submitBtn" disabled>
           <span>Send it to a success partner</span>
         </button>
-        <p class="consent">By sending, you agree we may contact you about your request. One record, one owner, lifetime support.</p>
+        <p class="consent">By sending, you agree we may contact you about your request.</p>
+        <noscript><p>JavaScript is required to include your request and relationship. Please enable it before submitting.</p></noscript>
       </form>
 
       <div class="done" id="doneState" aria-live="polite">
         <div class="seal" aria-hidden="true">
           <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
         </div>
-        <h3>We've got it.</h3>
-        <p>Your request is now a Lead in our Salesforce workspace. A success partner owns it from here — you'll hear back with a sketch, not a sales call.</p>
-        <div class="rec">
-          <div class="rk">Salesforce Lead</div>
-          <div class="rv" id="recId">00Qxx0000000000</div>
-        </div>
+        <h3>Submission sent.</h3>
+        <p>Thank you for your request. This page cannot confirm that Salesforce created a record. We'll contact you after reviewing your request.</p>
         <button class="textbtn" id="againBtn" type="button">Submit another request</button>
       </div>
     </section>
@@ -235,7 +241,7 @@
     <section class="panel" aria-labelledby="mach-t">
       <div class="panel-h"><span class="t" id="mach-t">Behind the glass</span><span class="k">salesforce pipeline</span></div>
       <div class="machine">
-        <p class="note">// the customer never sees this. what happens the moment they hit send:</p>
+        <p class="note">Intake is connected. Assignment, conversion, and ongoing support below describe the planned workflow.</p>
 
         <div class="stage" id="st1">
           <div class="rail"><div class="node">1</div><div class="wire"></div></div>
@@ -243,7 +249,7 @@
         </div>
         <div class="stage" id="st2">
           <div class="rail"><div class="node">2</div><div class="wire"></div></div>
-          <div class="body"><div class="s-t">Lead created</div><div class="s-d">Lands in the dev sandbox as a Lead, source = sfdc24.com.</div><div class="s-obj">object · Lead</div></div>
+          <div class="body"><div class="s-t">Lead intake</div><div class="s-d">Delivered to SFDC 24 (omnistudio-sandbox), source = sfdc24.com. Test delivery verified.</div><div class="s-obj">object · Lead</div></div>
         </div>
         <div class="stage" id="st3">
           <div class="rail"><div class="node">3</div><div class="wire"></div></div>
@@ -264,8 +270,7 @@
         </div>
 
         <div class="modebar" style="margin-top:14px">
-          <span id="modeText">Mode: DEMO (submit is visualized, nothing sent)</span>
-          <button class="toggle" id="modeToggle" type="button">show live-wiring</button>
+          <span id="modeText">Connected · submissions create real leads in the selected development org</span>
         </div>
       </div>
     </section>
@@ -273,15 +278,14 @@
 
   <div class="foot">
     <div class="card">
-      <h4>Go live in one step</h4>
-      <p>This prototype is real Salesforce <strong>Web-to-Lead</strong>. The only missing value is the dev org's id:</p>
-      <p>Set <code>CONFIG.oid</code> to the sandbox <code>Org ID</code> (Setup → Company Information, 15/18 chars — <em>not a secret</em>), flip <code>CONFIG.mode</code> to <code>"live"</code>, and every submit posts a real Lead into the sandbox.</p>
-      <p><span class="tag believed">Believed</span>Custom fields (relationship = supplier/customer) need their field ids from the org's generated Web-to-Lead form.</p>
+      <h4>Connected to your selected org</h4>
+      <p>Submissions use Salesforce <strong>Web-to-Lead</strong> and go to <strong>SFDC 24</strong>, the Developer Edition org saved as <code>omnistudio-sandbox</code>.</p>
+      <p>The customer or supplier relationship is saved with the request in the Lead's Description. No custom field is required.</p>
     </div>
     <div class="card">
       <h4>What this proves — honestly</h4>
-      <p><span class="tag demo">Demo</span>The pipeline animation and Lead id are illustrative. Web-to-Lead itself is production-grade and GA.</p>
-      <p>Stages 3–5 (assignment, conversion, lifetime support) are the <strong>target</strong> funnel — buildable on proven Salesforce parts, not yet wired in the sandbox.</p>
+      <p>A synthetic test submission was sent through this Web-to-Lead endpoint and read back from the selected org with its source, relationship, and request intact.</p>
+      <p>Stages 3–5 (assignment, conversion, lifetime support) are the <strong>planned</strong> funnel and are not verified by this intake test.</p>
       <p>Full write-up: <em>Salesforce Backend Brief (SFDC-BACKEND-001)</em> in the SFDC 24 Drive folder.</p>
     </div>
   </div>
@@ -290,127 +294,70 @@
 </div>
 
 <script>
-(function(){
+(function () {
   "use strict";
-  // ---- Configuration: the single edit that makes this live ----
-  var CONFIG = {
-    oid: "",                 // <-- dev sandbox Org ID (Setup > Company Information). Not a secret.
-    mode: "demo",            // "demo" = visualize only; "live" = POST to Salesforce Web-to-Lead
-    endpoint: "https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8",
-    retURL: "https://sfdc24.com/thanks"
-  };
-
   var form = document.getElementById("leadForm");
+  var done = document.getElementById("doneState");
   var payloadView = document.getElementById("payloadView");
-  var epLabel = document.getElementById("epLabel");
-  var doneState = document.getElementById("doneState");
-  var modeText = document.getElementById("modeText");
-  var modeToggle = document.getElementById("modeToggle");
-  var stages = ["st1","st2","st3","st4","st5"].map(function(id){return document.getElementById(id);});
-  document.getElementById("oid").value = CONFIG.oid;
-  document.getElementById("retURL").value = CONFIG.retURL;
-  epLabel.textContent = "POST · " + CONFIG.endpoint.replace(/^https?:\/\//,"").split("/")[0];
+  var submit = document.getElementById("submitBtn");
+  var request = document.getElementById("description");
+  var storedDescription = document.getElementById("salesforceDescription");
+  var names = ["first_name", "last_name", "email", "company"];
 
-  function esc(s){return String(s).replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
-
-  function readForm(){
-    var rel = form.querySelector('input[name="rel"]:checked');
-    return {
-      oid: CONFIG.oid || "«set CONFIG.oid»",
-      first_name: form.first_name.value.trim(),
-      last_name: form.last_name.value.trim(),
-      company: form.company.value.trim(),
-      email: form.email.value.trim(),
-      lead_source: "sfdc24.com",
-      description: form.description.value.trim(),
-      relationship: rel ? rel.value : "Customer"
-    };
-  }
-
-  function renderPayload(){
-    var d = readForm();
-    var order = ["oid","first_name","last_name","company","email","lead_source","description","relationship"];
-    var any = d.first_name||d.last_name||d.company||d.email||d.description;
-    if(!any){
-      payloadView.innerHTML = '<span class="empty">// start typing — the Salesforce lead assembles here in real time</span>';
-      return;
-    }
-    var lines = order.map(function(k){
-      var v = d[k];
-      var shown = v ? esc(v) : '<span class="empty">—</span>';
-      return '<span class="kk">'+k+'</span>=<span class="vv">'+shown+'</span>';
+  function updatePayload() {
+    var relationship = form.querySelector('input[name="rel"]:checked').value;
+    storedDescription.value = "[SFDC24 intake] Relationship: " + relationship + "\n\n" + request.value.trim();
+    var payload = {};
+    ["oid", "retURL", "lead_source"].concat(names).forEach(function (name) {
+      payload[name] = form.elements.namedItem(name).value.trim();
     });
-    payloadView.innerHTML = lines.join("\n");
+    payload.description = storedDescription.value;
+    payloadView.textContent = new URLSearchParams(payload).toString();
   }
 
-  form.addEventListener("input", renderPayload);
-  form.querySelectorAll('input[name="rel"]').forEach(function(r){r.addEventListener("change", renderPayload);});
-
-  function litSequence(done){
-    stages.forEach(function(s){s.classList.remove("lit","done-s");});
-    var i = 0;
-    (function step(){
-      if(i>0) stages[i-1].classList.add("done-s");
-      if(i<stages.length){
-        stages[i].classList.add("lit");
-        i++;
-        setTimeout(step, 260);
-      } else { done && done(); }
-    })();
-  }
-
-  function fakeLeadId(){
-    var s = "00Q";
-    var chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    for(var i=0;i<15;i++) s += chars[Math.floor((Date.parse(new Date().toISOString())/1000 + i*37) % 36)];
-    return s.slice(0,18);
-  }
-
-  form.addEventListener("submit", function(e){
-    // Demo mode: never actually navigate/post — visualize the pipeline.
-    if(CONFIG.mode !== "live" || !CONFIG.oid){
-      e.preventDefault();
-      if(!form.last_name.value.trim() || !form.email.value.trim() || !form.company.value.trim()){
-        form.reportValidity();
-        return;
-      }
-      renderPayload();
-      var btn = document.getElementById("submitBtn");
-      btn.disabled = true; btn.querySelector("span").textContent = "Sending to Salesforce…";
-      litSequence(function(){
-        document.getElementById("recId").textContent = fakeLeadId();
-        form.style.display = "none";
-        doneState.classList.add("show");
-        btn.disabled = false; btn.querySelector("span").textContent = "Send it to a success partner";
-      });
+  form.addEventListener("input", updatePayload);
+  form.addEventListener("change", updatePayload);
+  form.addEventListener("formdata", function (event) {
+    // Relationship is captured in Description; rel is not a Salesforce field.
+    event.formData.delete("rel");
+  });
+  form.addEventListener("submit", function (event) {
+    names.forEach(function (name) {
+      var field = form.elements.namedItem(name);
+      field.value = field.value.trim();
+    });
+    if (!form.reportValidity()) {
+      event.preventDefault();
       return;
     }
-    // Live mode: let the browser POST the real Web-to-Lead form to Salesforce.
-    // (retURL sends the visitor to the thank-you page; the Lead lands in the org.)
+    updatePayload();
+    submit.disabled = true;
+    submit.querySelector("span").textContent = "Sending to Salesforce…";
+    // Native form navigation handles the POST. Do not infer record creation
+    // from the redirect: Web-to-Lead does not return a Lead ID to this page.
   });
-
-  document.getElementById("againBtn").addEventListener("click", function(){
-    doneState.classList.remove("show");
-    form.reset(); form.style.display = "";
-    stages.forEach(function(s){s.classList.remove("lit","done-s");});
-    renderPayload();
+  window.addEventListener("pageshow", function () {
+    submit.disabled = false;
+    submit.querySelector("span").textContent = "Send it to a success partner";
   });
-
-  modeToggle.addEventListener("click", function(){
-    var live = modeToggle.getAttribute("data-live") === "1";
-    if(live){
-      modeToggle.setAttribute("data-live","0");
-      modeToggle.textContent = "show live-wiring";
-      modeText.textContent = "Mode: DEMO (submit is visualized, nothing sent)";
-      epLabel.textContent = "POST · " + CONFIG.endpoint.replace(/^https?:\/\//,"").split("/")[0];
-    } else {
-      modeToggle.setAttribute("data-live","1");
-      modeToggle.textContent = "hide live-wiring";
-      modeText.textContent = 'Live: set CONFIG.oid + mode="live" and this form POSTs real Leads';
-      epLabel.textContent = CONFIG.endpoint;
-    }
+  if (new URLSearchParams(window.location.search).get("submitted") === "1") {
+    form.hidden = true;
+    done.classList.add("show");
+  }
+  document.getElementById("againBtn").addEventListener("click", function () {
+    form.reset();
+    form.hidden = false;
+    done.classList.remove("show");
+    var url = new URL(window.location.href);
+    url.searchParams.delete("submitted");
+    window.history.replaceState(null, "", url);
+    updatePayload();
+    document.getElementById("description").focus();
   });
-
-  renderPayload();
+  updatePayload();
+  submit.disabled = false;
 })();
+
 </script>
+</body>
+</html>
