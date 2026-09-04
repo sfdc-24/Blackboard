@@ -37,7 +37,37 @@ Let's Encrypt, `https_enforced` true, `http://` 301s to `https://`.
 
 ---
 
-## VOICE IS LIVE — https://www.sfdc24.com/voice/ (2026-09-04, v28)
+## READ docs/PRODUCT.md FIRST — it is the point of everything else
+
+Mr. Salam stated the thesis on 4 September and asked that every instance work
+from it. **The sale happens when the visitor already has a working thing in
+their hands, not when they are reading a quote.** Four beats: they talk and
+their idea assembles on screen in the simplest form (a Lego build, not a
+cathedral); we check we heard them right *without going deep*; we build it; then
+we ask them to pay to make it their own. Also rule **L-90**, and on the board as
+`PRODUCT-THESIS-001`. Cite the file, do not restate it.
+
+The failure mode to watch is drift back into ordinary consultancy-website
+behaviour — more copy, more pages, more explaining. It always looks reasonable
+one commit at a time.
+
+---
+
+## Mr. Salam is travelling from 2026-09-04 evening
+
+He is flying and unreachable. **`vm-cli` on AkatiaVM is the live instance while
+he is away** and was deliberately left running. Do not queue things for him;
+queue them here.
+
+**The one thing waiting on him, and only him:** Script Property `OPENAI_KEY` on
+`SFDC24 - Governor Page API`. Confirmed NOT set as of his departure. Without it
+`ttsConfigured_()` is false, `action=say` returns no `ak`, and the voice page
+falls back to the phone's own voice — **degraded, not broken**. Do not try to
+work around it and do not put a key anywhere yourself.
+
+---
+
+## VOICE IS LIVE — https://www.sfdc24.com/voice/ (2026-09-04, v29)
 
 Tap once, speak, hear the answer, and it starts listening again on its own.
 Typing works on the same screen and is read aloud too.
@@ -81,6 +111,18 @@ back at the voice page instead of the Apps Script app. `back` is looked up in
 open redirect handing out live session tokens. The token comes back in the URL
 **fragment**, which is never sent to a server, and the page stores it and strips
 it from the address bar immediately.
+
+**The neural voice (v29).** Replies are spoken by `gpt-4o-mini-tts` when
+`OPENAI_KEY` is set, with the browser's own synthesiser as the fallback and as a
+deliberate choice ("Phone voice"). It is a TWO-STEP call on purpose: `action=say`
+returns the text immediately plus a short opaque key, and `action=tts&ak=...`
+returns the audio as base64. The endpoint **never takes text from the caller** —
+it only speaks what `say` just generated and cached — because a public GET that
+speaks arbitrary text is a free text-to-speech service billed to us. The key is
+single use; it is removed from the cache before the audio is rendered, so a loop
+on one key cannot spend money twice. Voice names are validated against a closed
+list. The visitor chooses the voice; we do not infer anything about them from how
+they sound.
 
 **Verified end to end in a real browser at the production origin**, not by curl:
 `isSecureContext` true, SpeechRecognition and speechSynthesis both present, and
