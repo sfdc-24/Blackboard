@@ -97,27 +97,35 @@ endpoint still returns `{"ok":false,"error":"not authorized"}`.
 
 ---
 
-## Monitor — code LIVE, trigger NOT YET REGISTERED
+## Monitor — LIVE AND RUNNING (v17)
 
-`gas/Monitor.js` ships in v16. It watches the public site (both hostnames plus a
-content marker), board silence, and ANDON rows, and emails on **state change
-only** with a daily cap and a `MONITOR_ENABLED=off` kill switch.
+`monitorTick` is registered as a time-based trigger firing every 15 minutes,
+verified in the Triggers panel: **"Showing 1 trigger"**, error rate `-`. Exactly
+one, so none of the orphan-duplicate trouble of ISSUE 023.
 
-**It is not running yet.** Registering the time-driven trigger needs one
-Google authorization click, and the consent popup opens outside the extension's
-tab group — the renderer froze when I retried. **To finish it (about 20
-seconds):** open the Apps Script project, select `ZSetupMonitor.gs`, press Run,
-click through "Review permissions". The function is idempotent — it deletes any
-existing `monitorTick` trigger first, so running it twice cannot create the kind
-of orphan duplicate that ISSUE 023 is. It also runs one pass immediately and
-logs the result, so you see it work rather than waiting 15 minutes.
+Registration log:
+```
+removed 0.0 existing monitorTick trigger(s)
+monitorTick triggers now: 1.0   (MUST be exactly 1)
+MONITOR_ENABLED = on
+alert email will go to: abdus@sfdc24.com
+--- running one pass now ---
+site: up (www 200 with marker present, apex chain resolves to 200)
+board: 820 rows, newest 0.0h ago
+Execution completed
+```
 
-Delete `ZSetupMonitor.gs` once it is registered.
+It watches the public site on **both** hostnames plus a content marker, board
+silence past 6h, and ANDON rows. Email fires on **state change only** — a site
+still down at 03:00 does not re-email; a recovery does — with a 12/day hard cap
+and `MONITOR_ENABLED=off` as an instant kill switch needing no deploy. It runs
+on Google infrastructure, so it keeps watching when the laptop lid is shut.
 
-**Why Apps Script and not a laptop task:** a Windows scheduled task dies with
-the laptop lid, and the point is to watch while nobody is at the desk.
+No email was sent on the first pass, which is correct: state moved from
+`unknown` to `up`, and unknown is not a change worth alerting on.
 
----
+`ZSetupMonitor.gs` was deleted after registration; the trigger points at
+`Monitor.gs` and is unaffected. v17 is the clean deployed version.
 
 ## Google sign-in — NOT DONE, and here is the real blocker
 
