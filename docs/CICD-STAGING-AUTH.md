@@ -104,13 +104,14 @@ does not make it the gateway.
 
 ## The source these hashes pin
 
-SHA-256 of the committed baseline at `90880a6`, so the person clicking consent
+SHA-256 of the committed baseline (governor-page-api re-synced to prod @29 on
+2026-09-05; the rest unchanged since `90880a6`), so the person clicking consent
 can confirm they are authorizing the code that was reviewed:
 
 ```
 governor-page-api/
   Auth.gs         1b7fa67196c3c904d3b389138ef8af4efec4e5612982d5134a88b3d82183dfb8
-  Code.gs         6d05d05a0cff75c23eaf32cf0bca28939107b9d58b20a45db102fbb7e5573aa5
+  Code.gs         06d68f97e26348ba0eccf3e1b5f986d32ecab377e82a38d4eeab86547f67684d   (v29)
   Index.html      fd4f5c9699b8ac09069b70accdf237461d0d23df019d5e5b4eac07a0e0a75c04
   Monitor.gs      61858c207798a4693acc089749927cd21c52931ab0ff1656f911cef18f21bd28
   PublicInbox.gs  a1a889db5594c63cbe56bff3e504bf96eaef1f15b6a52e35548b767e44f2aa69
@@ -128,6 +129,14 @@ blackboard-bus-v1/            (baseline only — no staging copy, nothing to aut
 ```
 
 Regenerate with `sha256sum apps-script/<project>/*`.
+
+One honest wrinkle for governor-page-api: the STAGING copy's HEAD `Code.gs` is
+still the v26-era source it was copied with (`afb4a45f…`), because no pipeline
+run has pushed to it yet. So the code you authorize in the editor today is that
+older copy, not v29. The scope set is the same — v29 only adds one more
+`UrlFetchApp` call (to `api.openai.com`, for the voice) under the
+`script.external_request` scope already listed above — so the consent you grant
+covers v29 when the pipeline pushes it.
 
 ## Staging only
 

@@ -50,6 +50,7 @@ function doGet(e) {
   // origin, and Apps Script sends no CORS headers. See voiceReply_ for why the
   // voice UI cannot live in this page at all.
   if (p.action === 'say') return voiceReply_(p);
+  if (p.action === 'tts') return ttsAudio_(p);
 
   // Sign-in dance (start, and Google's redirect back). Returns null for any
   // request that is not part of it, so normal page loads fall straight through.
@@ -184,11 +185,114 @@ function voiceReply_(p) {
     try { cache.put(hk, JSON.stringify(hist), 21600); } catch (e) {}
   }
 
-  var payload = JSON.stringify(out || { ok: false, reason: 'no-result' });
+  // The good voice is fetched on a SECOND request, not this one. Speech
+  // synthesis costs a couple of seconds and the reply should appear the moment
+  // it exists -- so this response hands back a key, the page renders the text
+  // immediately, and the audio arrives underneath it.
+  if (out && out.ok && out.reply && ttsConfigured_()) {
+    var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+    try { cache.put('tts_' + ak, out.reply, 900); out.ak = ak; } catch (e) {}
+  }
+
+  return jsonp_(cb, out || { ok: false, reason: 'no-result' });
+}
+
+/** JSONP or plain JSON, depending on whether a valid callback was supplied. */
+function jsonp_(cb, obj) {
+  var payload = JSON.stringify(obj);
   if (!cb) return ContentService.createTextOutput(payload)
                   .setMimeType(ContentService.MimeType.JSON);
   return ContentService.createTextOutput(cb + '(' + payload + ');')
                   .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+// ---------- the voice itself ----------
+// Browser speech synthesis sounds like a train announcement. This uses a real
+// neural voice instead and falls back to the browser's when it cannot.
+//
+// It NEVER takes text from the caller. `action=say` puts the reply it just
+// generated into the cache and returns a short opaque key; this reads that key.
+// That is the whole reason for the two-step: an endpoint that speaks arbitrary
+// text supplied over a public GET is a free text-to-speech service for anyone
+// who finds the URL, billed to us.
+var TTS_MODEL   = 'gpt-4o-mini-tts';
+var TTS_DEFAULT = 'sage';
+var TTS_MAX_CHARS = 900;
+
+// The visitor picks the voice; we do not guess anything about them from how
+// they sound. Guessing gender from audio is unreliable and lands badly when it
+// is wrong, and a visitor who wants a different voice can simply say so with
+// one tap. A closed list, because this value goes to a paid API.
+var TTS_VOICES = { sage: 1, alloy: 1, verse: 1, coral: 1, ash: 1, ballad: 1, onyx: 1, nova: 1, shimmer: 1, echo: 1 };
+
+function ttsVoice_(want) {
+  var props = PropertiesService.getScriptProperties();
+  want = String(want || '');
+  if (TTS_VOICES.hasOwnProperty(want)) return want;
+  var pref = props.getProperty('TTS_VOICE');
+  return TTS_VOICES.hasOwnProperty(String(pref)) ? pref : TTS_DEFAULT;
+}
+
+function ttsConfigured_() {
+  return !!PropertiesService.getScriptProperties().getProperty('OPENAI_KEY');
+}
+
+function ttsAudio_(p) {
+  var cb = String(p.cb || '').slice(0, 40);
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cb)) cb = '';
+
+  var ak = String(p.ak || '').slice(0, 24);
+  if (!/^ak[a-f0-9]{1,22}$/.test(ak)) return jsonp_(cb, { ok: false, reason: 'bad-key' });
+
+  var cache = CacheService.getScriptCache();
+  var text = cache.get('tts_' + ak);
+  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
+
+  var props = PropertiesService.getScriptProperties();
+  var key = props.getProperty('OPENAI_KEY');
+  if (!key) return jsonp_(cb, { ok: false, reason: 'no-key' });
+
+  // One audio render per key. Without this a loop on the key is a billing hole.
+  cache.remove('tts_' + ak);
+
+  var res;
+  try {
+    res = UrlFetchApp.fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + key },
+      payload: JSON.stringify({
+        model: TTS_MODEL,
+        voice: ttsVoice_(p.v),
+        input: String(text).slice(0, TTS_MAX_CHARS),
+        response_format: 'mp3',
+        instructions: props.getProperty('TTS_STYLE') || TTS_STYLE_()
+      })
+    });
+  } catch (err) {
+    return jsonp_(cb, { ok: false, reason: 'fetch-failed' });
+  }
+
+  if (res.getResponseCode() !== 200) {
+    // Never echo the provider's body: it can carry request details.
+    Logger.log('TTS HTTP ' + res.getResponseCode());
+    return jsonp_(cb, { ok: false, reason: 'tts-' + res.getResponseCode() });
+  }
+
+  return jsonp_(cb, { ok: true, mime: 'audio/mpeg', b64: Utilities.base64Encode(res.getContent()) });
+}
+
+/** How the voice should sound. Steering, not a script. */
+function TTS_STYLE_() {
+  return [
+    'Warm, unhurried and grounded. You are a experienced colleague thinking out loud,',
+    'not a receptionist and not an announcer.',
+    'Speak at a natural conversational pace with real pauses at commas and full stops.',
+    'Let the pitch move; a flat read is worse than a slow one.',
+    'Dry warmth is welcome. Never chirpy, never salesy, never breathless.',
+    'When you say something technical, slow down slightly rather than rushing it.'
+  ].join(' ');
 }
 
 // ================= RECEPTION =================

@@ -16,7 +16,7 @@ The source of truth is `apps-script/<project>/` in this repo:
 
 | Dir | Live project (scriptId) | Notes |
 |---|---|---|
-| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. Prod deployment `AKfycbx0D-5DAn…` (v25/v26 era). |
+| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. Prod deployment `AKfycbx0D-5DAn…` is pinned at **@29** ("v29 neural voice"); baseline re-synced to @29 on 2026-09-05. |
 | `apps-script/blackboard-production/` | `1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-` | The V2/Alpha gateway. |
 | `apps-script/glasses-intake-uploader/` | `1PBfO1sPQmGTXPHWrAAot2wCgSCPizO2uC8RUwUKQ5hn7A7dUq0U4_Q_2` | Already exposes `CONTRACT_VERSION` on GET — the model citizen. |
 | `apps-script/blackboard-bus-v1/` | `1meav8p2zkRt-8obarV_fB5Q2EyExCvAaoZa3ro9_fmo4OE_95FpWkfu9` | The v1 bus. Baselined 2026-09-04. Prod deployment `AKfycbwCLtG9…RcXrjQ` is pinned at **@1**. |
@@ -107,7 +107,33 @@ clasp list-deployments                       # which version is this URL serving
 python scripts/gas_get_version.py <id> <n> ./out   # what IS that version?
 ```
 
-### LANE_0 result — 2026-09-04, TESTED, not believed
+### LANE_0 re-run — 2026-09-05 01:45Z, TESTED — prod is @29 and the baseline matches it
+
+The laptop lane released v29 ("v29 neural voice") at ~20:47Z on 2026-09-04 and
+recorded it in `docs/HANDOVER.md` on `session/bus-clients-and-docs`, which is the
+condition `vseq=010` set for touching this baseline. Re-run of the read-back:
+
+- Apps Script API `projects.deployments.list` and `clasp list-deployments` both
+  show `AKfycbx0D-5DAn…` pinned at **@29**. Fetched version 29's actual source
+  with `scripts/gas_get_version.py`.
+- Against the v28 baseline (`5172231`) **only `Code.gs` differs** (+105/−1):
+  an `action=tts` route in `doGet`, `ttsAudio_`, `jsonp_`, `TTS_STYLE_` and the
+  `TTS_*` constants — the neural-voice path. Additive; no existing function
+  removed. `Auth.gs`, `Monitor.gs`, `PublicInbox.gs`, `Index.html`,
+  `Reception.html`, `appsscript.json` are byte-identical to v28.
+- **All four guards are present in @29**: `test_chat`, `post_reset`,
+  `test_read`, `seed_state` each call `requireGovernor_()` (Code.gs 641–657).
+- The repo baseline is now byte-identical to @29 across all seven files
+  (`diff -rq` against the fetched source is empty). `Code.gs` sha256 is
+  `06d68f97e26348ba…` (was `6d05d05a…` at v28).
+- The STAGING copy's HEAD `Code.gs` is still `afb4a45f…`, the v26-era source
+  it was born with at 18:44Z. The first pipeline run pushes v29 there; until
+  then staging is three prod versions behind, which is expected and harmless.
+- Version history of this baseline: @26 (04 Sep 15:00Z) → @28 (`5172231`) →
+  @29 (this commit). Re-check the pinned version before every claim; the
+  laptop deploys often.
+
+### LANE_0 result — 2026-09-04, TESTED (superseded by the re-run above; kept for the guard history)
 
 - Governor Page API prod deployment `AKfycbx0D-5DAn…` is pinned at **@26**
   ("v26 one at a time"). Fetched version 26's actual source.
