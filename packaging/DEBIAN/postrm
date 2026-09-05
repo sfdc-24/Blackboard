@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|purge)
+    # drop the enable symlink so a later reinstall does not come back
+    # silently enabled and no dangling .wants link survives
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --no-reload disable blackboard-bus 2>/dev/null || true
+    fi
+    rm -f /etc/systemd/system/multi-user.target.wants/blackboard-bus.service
+    ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/blackboard-bus
+    rm -f /etc/blackboard-bus/env
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

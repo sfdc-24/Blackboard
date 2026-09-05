@@ -81,3 +81,8 @@ gas/*
 # (the VM has clasp authenticated; the laptop and vm-chrome may not), so they
 # must not travel with the repo to the other instances.
 .claude/settings.local.json
+
+# Self-hosted bus package (blackboard-bus, added on main in 0919735). The
+# SQLite file holds live board rows, so it is working data, not repository
+# content -- same rule as data/ above.
+bus.db*
