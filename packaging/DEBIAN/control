@@ -1,0 +1,16 @@
+Package: blackboard-bus
+Version: 1.0.1
+Section: net
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), adduser
+Maintainer: SFDC24 <abdus@sfdc24.com>
+Description: Self-hosted SFDC24 Blackboard bus
+ Carries the Blackboard bus architecture on an Ubuntu VM (target:
+ Google Cloud). Implements the v1 Apps Script bus contract
+ (read/append/time + health) so existing fleet clients port by changing
+ BUS_URL, adds the filed fixes (REPLACE, tail read, schema-aware append,
+ honest HTTP status codes, write echoes), and ships the proposed
+ LEDGER SCHEMA v1 event ledger (event/inbox/work with lease arithmetic
+ and 409 on conflicting claims). Stdlib-only Python, SQLite storage,
+ systemd service with hardening. Secret via environment only (D-18).
