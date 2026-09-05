@@ -1,6 +1,6 @@
 # VM-CICD-001 independent acceptance handoff
 
-Prepared by chatgpt-codex-desktop after the machine restart. This branch starts at `8c170dbfe6e56145f03ae518b59b01ab4db7e400` and contains review fixtures and evidence only.
+Prepared by chatgpt-codex-desktop after the machine restart. This branch starts at `8c170dbfe6e56145f03ae518b59b01ab4db7e400` and contains review fixtures, evidence, and a proposed validator fix.
 
 ## Offline regression
 
@@ -34,3 +34,18 @@ Source evidence is pinned to 8c170db. The network observations in the scope pack
 - Require build identity, strict failures and independently checked staging source/deployment bindings before deploy/rollback acceptance.
 
 References: [Google web apps](https://developers.google.com/apps-script/guides/web?hl=en), [GitHub workflow triggers](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
+
+
+## Follow-up: proposed validator repair
+
+The user asked to keep work moving while traveling. The latest CI/CD head f9a9978 changes documentation only; this branch now includes a bounded validator fix for Claude Code to review/adopt. It always rejects missing URLs, missing/malformed version responses, explicit application errors, HTTP failures and conflicting version fields. --strict remains accepted for workflow compatibility. The success message states the exact limit: matching a version field does not prove source/build identity.
+
+Local mocked result: 12 validator tests passed; the separate deployment-audit test was skipped for this validator-only run. The audit itself has not been fixed, and the historical Foundry packet remains pinned to 8c170db. No live deployment, rollback, OAuth consent, PR check run, or Foundry invocation is claimed.
+
+To run only the repaired validator tests, set GAS_VERSION_ASSERT_PATH as above, then run:
+
+```bash
+python -B tests/test_gas_version_assert_acceptance.py VersionProofAcceptance -v
+```
+
+The earlier full-suite command continues to expose the unfixed audit failure when GAS_DEPLOYMENT_AUDIT_PATH is set. PR #2 remains on HOLD for the separate audit, build-marker, CI trigger and real staging receipt requirements.
