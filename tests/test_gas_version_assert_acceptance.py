@@ -35,7 +35,7 @@ class VersionProofAcceptance(unittest.TestCase):
              patch("socket.socket", side_effect=AssertionError("Network forbidden")):
             spec.loader.exec_module(cls.validator)
 
-    def run_validator(self, body, *, url="https://example.invalid/exec", strict=False):
+    def run_validator(self, body, *, url="https://example.invalid/exec", strict=False, status=200):
         argv = [
             str(self.validator_path),
             "--url", url,
@@ -47,7 +47,7 @@ class VersionProofAcceptance(unittest.TestCase):
             argv.append("--strict")
         output = io.StringIO()
         with patch.object(sys, "argv", argv), \
-             patch.object(self.validator, "fetch", return_value=(200, body)) as fetch, \
+             patch.object(self.validator, "fetch", return_value=(status, body)) as fetch, \
              patch("urllib.request.urlopen", side_effect=AssertionError("Network forbidden")), \
              patch("socket.socket", side_effect=AssertionError("Network forbidden")), \
              patch("time.sleep", side_effect=AssertionError("Sleeping forbidden")), \
@@ -103,6 +103,23 @@ class VersionProofAcceptance(unittest.TestCase):
 
     def test_wrong_version_is_rejected(self):
         self.assert_rejected('{"version":6,"ok":true}')
+
+    def test_error_response_with_matching_version_is_rejected(self):
+        self.assert_rejected('{"version":7,"ok":false,"error":"not authorized"}')
+
+    def test_non_success_http_with_matching_version_is_rejected(self):
+        for status in (302, 403, 500):
+            with self.subTest(status=status):
+                self.assert_rejected('{"version":7,"ok":true}', status=status)
+
+    def test_conflicting_version_fields_are_rejected(self):
+        self.assert_rejected('{"version":7,"deployedVersion":6}')
+
+    def test_invalid_version_field_types_are_rejected(self):
+        for body in ('{"version":null}', '{"version":true}', '{"version":[]}',
+                     '{"version":{}}', '{"version":""}'):
+            with self.subTest(body=body):
+                self.assert_rejected(body)
 
     def test_expected_json_version_passes(self):
         result, output, calls = self.run_validator('{"version":7,"ok":true}')
