@@ -1,51 +1,39 @@
-# VM-CICD-001 independent acceptance handoff
+# VM-CICD-001 acceptance repair for Claude Code
 
-Prepared by chatgpt-codex-desktop after the machine restart. This branch starts at `8c170dbfe6e56145f03ae518b59b01ab4db7e400` and contains review fixtures, evidence, and a proposed validator fix.
+The staging validator could exit successfully for missing URLs, sign-in pages and error responses. The inventory audit could certify arbitrary HTML or pass after finding no deployments. This branch proposes code fixes and a non-deploying PR check for those concrete failures.
 
-## Offline regression
+## Current validation
 
-`tests/test_gas_version_assert_acceptance.py` accepts the validator and optional deployment audit paths through environment variables. It blocks network and sleeps.
+30 offline tests pass with no skips. Responses and inventories are mocked; network access is guarded. Coverage includes missing/partial inventories, API errors, pagination, editor-only development URLs, oversized or truncated bodies, unknown HTML, wrong services, HTTP failures and invalid version JSON. Both valid-response controls and failure controls are included.
 
-PowerShell example from a checkout of this branch:
+From a checkout:
 
 ```powershell
 $env:GAS_VERSION_ASSERT_PATH = (Resolve-Path scripts/gas_version_assert.py).Path
 $env:GAS_DEPLOYMENT_AUDIT_PATH = (Resolve-Path scripts/gas_deployment_audit.py).Path
-python -B tests/test_gas_version_assert_acceptance.py -v
+python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
 ```
 
-Historical run: 9 test methods, 11 failures including subtests, exit 1. The valid-version controls pass and wrong versions fail. Red tests demonstrate missing-URL success, wrapper/sign-in soft passes, versionless JSON soft passes, uncontrolled scalar JSON errors, and an audit marker hidden after byte 400. This is deliberately a failing acceptance suite against the historical code, not a green build claim. The audit snapshot matches the audit subsequently committed in 8c170db.
+The new `.github/workflows/ci-acceptance.yml` runs this suite on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins both Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt.
 
-## Foundry
+## Application and build identity remain distinct
 
-`examples/foundry/vm-cicd-001-resume.work_packet.v1.json` passed the existing adapter's `load_work_packet` validation. It has 12 evidence items and canonical packet SHA-256 `44037384093665359db70c6f8ccfb507d48d76b788651a6eefd38a92729f6793`.
+The audit now needs a positive reviewed JSON health signature. Only the glasses uploader has an existing reviewed service signature (`sfdc24-glasses-uploader`). Governor HTML and the drafts-sweeper placeholder deliberately remain unverified until their owners establish suitable health contracts. The copied sweeper has no doGet.
 
-No live Foundry invocation or Foundry assessment occurred. azd and a configured endpoint identity are unavailable in this task. The packet is ready for the existing governed Foundry seam after its normal prerequisites and controlled non-production identity verification; evidence is data with instruction_authority=NONE. The calling orchestrator remains responsible for validation and any routing.
+A matching response version is still not proof of a deployed commit. CI-stamped build identity, exact pipeline-target binding, the complete estate scope, independently verified staging source, and real staging deploy/rollback receipts remain open. These changes do not authorize a public deployment, OAuth consent, Salesforce mutation or production promotion.
 
-Source evidence is pinned to 8c170db. The network observations in the scope packet are attributed to vm-cli, not independently repeated by this task. The three byte-hash mismatches for Index.html, PublicInbox.gs and Reception.html are explained by CRLF working files versus LF Git blobs. None establishes remote staging source identity.
+Development /dev URLs are inventoried separately and excluded from anonymous /exec readiness. Empty or incomplete versioned inventories fail the overall audit. API/list pagination failures invalidate that project's inventory instead of leaving a partial successful result.
 
-## Acceptance corrections for Claude Code
+## Scope and review
 
-- Keep the PR validation work moving while browser authorization is blocked. workflow_dispatch registration and pull_request checks are different triggers.
-- Do not execute `sweepDraftsToEndpointV2` for consent: it reads the real drafts folder, posts to the existing endpoint, and trashes files on HTTP 2xx. The committed copy has no doGet. Consent cannot create a web entry point.
-- Replace "run any harmless function" with an explicitly reviewed no-op; declare/hash any source change. Treat the proposed OAuth cause as a hypothesis until confirmed in the signed-in authorization/error state.
-- Classify development /dev URLs separately from versioned /exec targets; /dev requires editor access according to Google.
-- Make audit failure include missing deployments, API errors, and absent expected application identity. Blacklisting a few strings is not positive application proof.
-- Require build identity, strict failures and independently checked staging source/deployment bindings before deploy/rollback acceptance.
+This branch began at 8c170db. The latest reviewed CI/CD owner head is 1d091ee5cd65eb8670909369473e95f52b828569, which records the Governor @29 baseline. Its source reconciliation does not close the public-site P0s or validate staging. Integrate through a reviewed PR into session/vm-cicd; do not overwrite the active shared checkout.
+
+Before a browser owner uses the consent packet, replace its generic function-run instruction with an explicitly reviewed no-op. Do not run sweepDraftsToEndpointV2: it posts from the real drafts folder and trashes files on HTTP 2xx. Bind any code change to the actual staging source/version. The 403 cause remains a hypothesis until confirmed in the signed-in authorization/error state.
+
+## Historical Foundry evidence
+
+`examples/foundry/vm-cicd-001-resume.work_packet.v1.json` remains a historical packet pinned to 8c170db: 12 evidence items, canonical SHA-256 `44037384093665359db70c6f8ccfb507d48d76b788651a6eefd38a92729f6793`. Its old red-test transcript is evidence of the original defect, not the current repaired result.
+
+It passed local schema/evidence-hash validation only. No live Foundry invocation or assessment occurred. Readiness still requires the configured endpoint identity and the existing governed seam's prerequisite checks and controlled non-production identity proof. Regenerate a new packet for a future review; do not silently rewrite this historical evidence.
 
 References: [Google web apps](https://developers.google.com/apps-script/guides/web?hl=en), [GitHub workflow triggers](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
-
-
-## Follow-up: proposed validator repair
-
-The user asked to keep work moving while traveling. The latest CI/CD head f9a9978 changes documentation only; this branch now includes a bounded validator fix for Claude Code to review/adopt. It always rejects missing URLs, missing/malformed version responses, explicit application errors, HTTP failures and conflicting version fields. --strict remains accepted for workflow compatibility. The success message states the exact limit: matching a version field does not prove source/build identity.
-
-Local mocked result: 12 validator tests passed; the separate deployment-audit test was skipped for this validator-only run. The audit itself has not been fixed, and the historical Foundry packet remains pinned to 8c170db. No live deployment, rollback, OAuth consent, PR check run, or Foundry invocation is claimed.
-
-To run only the repaired validator tests, set GAS_VERSION_ASSERT_PATH as above, then run:
-
-```bash
-python -B tests/test_gas_version_assert_acceptance.py VersionProofAcceptance -v
-```
-
-The earlier full-suite command continues to expose the unfixed audit failure when GAS_DEPLOYMENT_AUDIT_PATH is set. PR #2 remains on HOLD for the separate audit, build-marker, CI trigger and real staging receipt requirements.
