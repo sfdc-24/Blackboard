@@ -11,6 +11,7 @@ param(
     [ValidateSet('Install', 'Status', 'Uninstall', 'Rollback')][string]$Action = 'Status',
     [ValidateSet('Observe', 'Execute')][string]$Mode = 'Observe',
     [string]$UserProfilePath = 'C:\Users\akatiawam',
+    [string]$WorkspacePath,
     [string]$EnvFile,
     [string]$StatePath,
     [string]$LogPath,
@@ -28,12 +29,21 @@ $ManagedMarker = 'managed-by=install_order_supervisor.ps1; schema=v1'
 $WindowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $RepoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $RunnerPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'order_supervisor.ps1'))
+$WorkspacePathWasExplicit = -not [string]::IsNullOrWhiteSpace($WorkspacePath)
+if ($WorkspacePathWasExplicit) {
+    if (-not [IO.Path]::IsPathRooted($WorkspacePath)) { throw 'workspace_path_must_be_absolute' }
+    $WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
+} else {
+    # Observe cannot invoke Claude, so retaining the release root preserves the
+    # prior read-only installation behavior. Execute is rejected in preflight.
+    $WorkspacePath = $RepoRoot
+}
 $MetadataRoot = Join-Path $env:ProgramData 'SFDC24\OrderSupervisor'
 $BackupXmlPath = Join-Path $MetadataRoot 'previous-task.xml'
 $BackupManifestPath = Join-Path $MetadataRoot 'previous-task.json'
 if (-not $StatePath) { $StatePath = Join-Path $MetadataRoot 'state.json' }
 if (-not $LogPath) { $LogPath = Join-Path $MetadataRoot 'events.jsonl' }
-if (-not $EnvFile) { $EnvFile = Join-Path $RepoRoot '.env' }
+if (-not $EnvFile) { $EnvFile = Join-Path $WorkspacePath '.env' }
 
 function Write-Utf8 {
     param([string]$Path, [string]$Text)
@@ -77,10 +87,18 @@ function Assert-MutationPreflight {
         }
     }
     if (-not (Test-Path -LiteralPath $UserProfilePath -PathType Container)) { throw 'user_profile_missing' }
+    if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) { throw 'workspace_path_missing' }
+    if ($Mode -ceq 'Execute') {
+        if (-not $WorkspacePathWasExplicit) { throw 'execute_requires_explicit_workspace_path' }
+        if (-not (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)) {
+            throw 'execute_workspace_git_directory_missing'
+        }
+    }
     if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { throw 'v1_bus_env_missing' }
     Assert-NoQuote -Name 'runner_path' -Value $RunnerPath
     Assert-NoQuote -Name 'repo_root' -Value $RepoRoot
     Assert-NoQuote -Name 'user_profile' -Value $UserProfilePath
+    Assert-NoQuote -Name 'workspace_path' -Value $WorkspacePath
     Assert-NoQuote -Name 'env_file' -Value $EnvFile
     Assert-NoQuote -Name 'state_path' -Value $StatePath
     Assert-NoQuote -Name 'log_path' -Value $LogPath
@@ -129,6 +147,7 @@ function Get-TaskArguments {
         '-Mode ' + $Mode,
         '-AllowedSourcesCsv "chat-mobile,codex"',
         '-UserProfilePath "' + $UserProfilePath + '"',
+        '-WorkspacePath "' + $WorkspacePath + '"',
         '-EnvFile "' + $EnvFile + '"',
         '-StatePath "' + $StatePath + '"',
         '-LogPath "' + $LogPath + '"',
@@ -138,7 +157,7 @@ function Get-TaskArguments {
 }
 
 function New-ExpectedDefinition {
-    $taskAction = New-ScheduledTaskAction -Id 'OrderSupervisor' -Execute $WindowsPowerShell -Argument (Get-TaskArguments) -WorkingDirectory $RepoRoot
+    $taskAction = New-ScheduledTaskAction -Id 'OrderSupervisor' -Execute $WindowsPowerShell -Argument (Get-TaskArguments) -WorkingDirectory $WorkspacePath
     $bootTrigger = New-ScheduledTaskTrigger -AtStartup
     $bootTrigger.Id = 'AtBoot'
     $intervalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(15) -RepetitionInterval (New-TimeSpan -Minutes 15)
@@ -161,7 +180,7 @@ function Compare-Definition {
     if (@($Task.Actions).Count -eq 1) {
         if ([string]$Task.Actions[0].Execute -cne $WindowsPowerShell) { $problems.Add('action_execute') }
         if ([string]$Task.Actions[0].Arguments -cne (Get-TaskArguments)) { $problems.Add('action_arguments') }
-        if ([string]$Task.Actions[0].WorkingDirectory -cne $RepoRoot) { $problems.Add('working_directory') }
+        if ([string]$Task.Actions[0].WorkingDirectory -cne $WorkspacePath) { $problems.Add('working_directory') }
     }
     $principalId = [string]$Task.Principal.UserId
     if (@('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains $principalId) { $problems.Add('principal') }
@@ -225,7 +244,14 @@ function Stop-ManagedTask {
 function Get-StatusObject {
     $task = Get-RootTask
     if (-not $task) {
-        return [pscustomobject][ordered]@{ status = 'ABSENT'; task_name = $TaskName; task_path = $TaskPath }
+        return [pscustomobject][ordered]@{
+            status = 'ABSENT'
+            task_name = $TaskName
+            task_path = $TaskPath
+            workspace_path = $WorkspacePath
+            workspace_exists = (Test-Path -LiteralPath $WorkspacePath -PathType Container)
+            workspace_git_directory_exists = (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
+        }
     }
     $drift = @(Compare-Definition $task)
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
@@ -257,6 +283,9 @@ function Get-StatusObject {
         mode = $Mode
         user_profile = $UserProfilePath
         user_profile_exists = (Test-Path -LiteralPath $UserProfilePath -PathType Container)
+        workspace_path = $WorkspacePath
+        workspace_exists = (Test-Path -LiteralPath $WorkspacePath -PathType Container)
+        workspace_git_directory_exists = (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
         runner_exists = (Test-Path -LiteralPath $RunnerPath -PathType Leaf)
         env_file_exists = (Test-Path -LiteralPath $EnvFile -PathType Leaf)
         state_path = $StatePath

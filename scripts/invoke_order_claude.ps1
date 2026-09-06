@@ -12,6 +12,7 @@ param(
     [Parameter(Mandatory = $true)][string]$SchemaPath,
     [Parameter(Mandatory = $true)][string]$StdoutPath,
     [Parameter(Mandatory = $true)][string]$StderrPath,
+    [Parameter(Mandatory = $true)][string]$WorkspacePath,
     [string]$ClaudeCommand = 'claude',
     [ValidateRange(0.01, 20.0)][double]$MaxBudgetUsd = 2.0
 )
@@ -21,6 +22,12 @@ Set-StrictMode -Version 2.0
 
 if (-not (Test-Path -LiteralPath $PromptPath)) { throw 'prompt_file_missing' }
 if (-not (Test-Path -LiteralPath $SchemaPath)) { throw 'schema_file_missing' }
+if (-not [IO.Path]::IsPathRooted($WorkspacePath)) { throw 'workspace_path_must_be_absolute' }
+if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) { throw 'workspace_path_missing' }
+$WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
+if (-not (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)) {
+    throw 'execute_workspace_git_directory_missing'
+}
 $resolved = Get-Command $ClaudeCommand -ErrorAction Stop
 $promptText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $PromptPath).Path, [Text.Encoding]::UTF8)
 $schemaText = ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $SchemaPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json) | ConvertTo-Json -Depth 12 -Compress
@@ -47,5 +54,12 @@ $arguments = @(
 
 # Native output is isolated in files. The parent validates structured_output and
 # never copies stderr or raw model output into its state or JSONL log.
-$promptText | & $resolved.Source @arguments 1> $StdoutPath 2> $StderrPath
-exit $LASTEXITCODE
+$exitCode = 0
+Push-Location -LiteralPath $WorkspacePath
+try {
+    $promptText | & $resolved.Source @arguments 1> $StdoutPath 2> $StderrPath
+    $exitCode = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+exit $exitCode

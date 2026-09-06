@@ -53,6 +53,123 @@ function Write-SupervisorResult {
     $Result | ConvertTo-Json -Depth 8 -Compress | Write-Output
 }
 
+function Get-VmReadinessState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Vm
+    )
+
+    $provisioningStatus = $Vm.Statuses |
+        Where-Object { [string]$_.Code -like 'ProvisioningState/*' } |
+        Select-Object -First 1
+    $powerStatus = $Vm.Statuses |
+        Where-Object { [string]$_.Code -like 'PowerState/*' } |
+        Select-Object -First 1
+
+    $agentStatus = $null
+    $vmAgentProperty = $Vm.PSObject.Properties['VMAgent']
+    if ($null -ne $vmAgentProperty -and $null -ne $vmAgentProperty.Value) {
+        $agentStatus = $vmAgentProperty.Value.Statuses |
+            Where-Object { [string]$_.Code -like 'ProvisioningState/*' } |
+            Select-Object -First 1
+    }
+
+    $provisioningState = if ($null -ne $provisioningStatus) { [string]$provisioningStatus.Code } else { '' }
+    $powerState = if ($null -ne $powerStatus) { [string]$powerStatus.Code } else { '' }
+    $guestAgentState = if ($null -ne $agentStatus) { [string]$agentStatus.Code } else { '' }
+
+    [pscustomobject][ordered]@{
+        ready = (
+            $powerState -ceq 'PowerState/running' -and
+            $provisioningState -ceq 'ProvisioningState/succeeded' -and
+            $guestAgentState -ceq 'ProvisioningState/succeeded'
+        )
+        power_state = $powerState
+        provisioning_state = $provisioningState
+        guest_agent_state = $guestAgentState
+    }
+}
+
+function Get-VmReadinessFailureStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Readiness
+    )
+
+    if ([string]$Readiness.power_state -cne 'PowerState/running') {
+        return 'VM_NOT_RUNNING'
+    }
+    if ([string]$Readiness.provisioning_state -cne 'ProvisioningState/succeeded') {
+        return 'VM_PROVISIONING_NOT_READY'
+    }
+    if ([string]$Readiness.guest_agent_state -cne 'ProvisioningState/succeeded') {
+        return 'VM_AGENT_NOT_READY'
+    }
+    return $null
+}
+
+function Test-GuestSupervisorResult {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object] $GuestJson,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ExpectedTaskName
+    )
+
+    if ($null -eq $GuestJson) {
+        return [pscustomobject][ordered]@{ valid = $false; reason = 'guest_json_missing'; status = '' }
+    }
+
+    $schemaProperty = $GuestJson.PSObject.Properties['schema_version']
+    if ($null -eq $schemaProperty -or
+        $schemaProperty.Value -isnot [string] -or
+        [string]$schemaProperty.Value -cne 'blackboard.worker-supervision.v0.1') {
+        return [pscustomobject][ordered]@{ valid = $false; reason = 'schema_version_invalid'; status = '' }
+    }
+
+    $taskNameProperty = $GuestJson.PSObject.Properties['task_name']
+    if ($null -eq $taskNameProperty -or
+        $taskNameProperty.Value -isnot [string] -or
+        [string]$taskNameProperty.Value -cne $ExpectedTaskName) {
+        return [pscustomobject][ordered]@{ valid = $false; reason = 'task_name_invalid'; status = '' }
+    }
+
+    $hostNameProperty = $GuestJson.PSObject.Properties['host_name']
+    if ($null -eq $hostNameProperty -or
+        $hostNameProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$hostNameProperty.Value)) {
+        return [pscustomobject][ordered]@{ valid = $false; reason = 'host_name_invalid'; status = '' }
+    }
+
+    $statusProperty = $GuestJson.PSObject.Properties['status']
+    $allowedStatuses = @(
+        'TASK_MISSING',
+        'TASK_AMBIGUOUS',
+        'TASK_UNMANAGED',
+        'TASK_DISABLED',
+        'TASK_RUNNING',
+        'TASK_HUNG',
+        'TASK_FAILED',
+        'TASK_HEALTHY',
+        'TASK_RECOVERY_STARTED',
+        'TASK_RECOVERED',
+        'TASK_RECOVERY_FAILED'
+    )
+    if ($null -eq $statusProperty -or
+        $statusProperty.Value -isnot [string] -or
+        $allowedStatuses -cnotcontains [string]$statusProperty.Value) {
+        return [pscustomobject][ordered]@{ valid = $false; reason = 'status_invalid'; status = '' }
+    }
+
+    return [pscustomobject][ordered]@{
+        valid = $true
+        reason = ''
+        status = [string]$statusProperty.Value
+    }
+}
+
 Disable-AzContextAutosave -Scope Process | Out-Null
 $identityContext = (Connect-AzAccount -Identity).Context
 $azureContext = Set-AzContext -SubscriptionId $SubscriptionId -DefaultProfile $identityContext
@@ -68,15 +185,32 @@ if ($powerState -ne 'PowerState/running') {
     $powerState = ($vm.Statuses | Where-Object Code -Like 'PowerState/*' | Select-Object -First 1).Code
 }
 
-if ($powerState -ne 'PowerState/running') {
+$vmReadyTimeoutSeconds = 180
+$vmReadyPollSeconds = 10
+$readinessDeadline = [DateTime]::UtcNow.AddSeconds($vmReadyTimeoutSeconds)
+$readiness = Get-VmReadinessState -Vm $vm
+while (-not $readiness.ready -and [DateTime]::UtcNow -lt $readinessDeadline) {
+    $remainingSeconds = [int][Math]::Ceiling(($readinessDeadline - [DateTime]::UtcNow).TotalSeconds)
+    if ($remainingSeconds -le 0) { break }
+    Start-Sleep -Seconds ([Math]::Min($vmReadyPollSeconds, $remainingSeconds))
+    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status -DefaultProfile $azureContext
+    $readiness = Get-VmReadinessState -Vm $vm
+}
+
+$powerState = [string]$readiness.power_state
+$readinessFailureStatus = Get-VmReadinessFailureStatus -Readiness $readiness
+if ($readinessFailureStatus) {
     Write-SupervisorResult -Result @{
         schema_version = 'blackboard.supervisor.v0.1'
-        status = 'VM_NOT_RUNNING'
+        status = $readinessFailureStatus
         vm_name = $VmName
         power_state = $powerState
+        provisioning_state = [string]$readiness.provisioning_state
+        guest_agent_state = [string]$readiness.guest_agent_state
         vm_start_attempted = $startedVm
+        readiness_timeout_seconds = $vmReadyTimeoutSeconds
     }
-    throw "VM '$VmName' did not reach the running state."
+    throw "VM '$VmName' did not become ready for Run Command: $readinessFailureStatus."
 }
 
 $escapedTaskName = $TaskName.Replace("'", "''")
@@ -286,10 +420,17 @@ foreach ($line in ($guestOutput -split "`r?`n")) {
     }
 }
 
-$guestStatus = if ($null -ne $guestJson) { [string]$guestJson.status } else { 'UNPARSEABLE' }
-$outerStatus = if ($guestStatus -in @('TASK_HEALTHY', 'TASK_RUNNING', 'TASK_RECOVERED')) {
+$guestValidation = Test-GuestSupervisorResult -GuestJson $guestJson -ExpectedTaskName $TaskName
+$guestStatus = if ($guestValidation.valid) {
+    [string]$guestValidation.status
+} elseif ($null -eq $guestJson) {
+    'UNPARSEABLE'
+} else {
+    'GUEST_SCHEMA_INVALID'
+}
+$outerStatus = if ($guestValidation.valid -and @('TASK_HEALTHY', 'TASK_RUNNING', 'TASK_RECOVERED') -ccontains $guestStatus) {
     'PASS'
-} elseif ($guestStatus -eq 'TASK_RECOVERY_STARTED') {
+} elseif ($guestValidation.valid -and $guestStatus -ceq 'TASK_RECOVERY_STARTED') {
     'RECOVERY_PENDING'
 } else {
     'FAIL'
@@ -302,6 +443,7 @@ Write-SupervisorResult -Result @{
     power_state = $powerState
     vm_start_attempted = $startedVm
     guest_status = $guestStatus
+    guest_validation_error = if ($guestValidation.valid) { $null } else { [string]$guestValidation.reason }
     guest = $guestJson
     raw_guest_output = if ($null -eq $guestJson) { $guestOutput } else { $null }
 }

@@ -9,7 +9,7 @@
     "parameters": {
       "SubscriptionId": "604c029c-c254-4bc4-b173-05d6e5c3cab0",
       "ResourceGroupName": "COPILOT-DEV-RG",
-      "VmName": "AkatiaVM-regular",
+      "VMName": "AkatiaVM-regular",
       "TaskName": "SFDC24 Blackboard Order Worker",
       "StaleAfterMinutes": "30",
       "HungAfterMinutes": "120"

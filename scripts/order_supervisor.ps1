@@ -13,6 +13,7 @@ param(
     [string]$LogPath,
     [string]$EnvFile,
     [string]$UserProfilePath,
+    [string]$WorkspacePath,
     [string]$BoardFixturePath,
     [string]$ClaudeCommand = 'claude',
     [ValidateRange(0.01, 20.0)][double]$MaxBudgetUsd = 2.0,
@@ -39,6 +40,28 @@ $currentWorkId = ''
 $currentRowId = ''
 $Mode = if ($Mode -ieq 'Execute') { 'Execute' } else { 'Observe' }
 $AllowedSources = @($AllowedSourcesCsv -split ',' | ForEach-Object { $_.Trim() })
+$releaseRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$workspacePathWasExplicit = -not [string]::IsNullOrWhiteSpace($WorkspacePath)
+
+if (-not $workspacePathWasExplicit) {
+    if ($Mode -ceq 'Execute') {
+        $preflightError = 'execute_requires_explicit_workspace_path'
+    } else {
+        # Observe has no Claude or board-write path, so the historic release-root
+        # default remains safe for existing read-only invocations.
+        $WorkspacePath = $releaseRoot
+    }
+} elseif (-not [IO.Path]::IsPathRooted($WorkspacePath)) {
+    $preflightError = 'workspace_path_must_be_absolute'
+} elseif (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) {
+    $preflightError = 'workspace_path_missing'
+} else {
+    $WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
+    if ($Mode -ceq 'Execute' -and
+        -not (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)) {
+        $preflightError = 'execute_workspace_git_directory_missing'
+    }
+}
 
 if ($UserProfilePath) {
     if (-not [IO.Path]::IsPathRooted($UserProfilePath)) {
@@ -58,7 +81,8 @@ if (-not $StatePath) {
 }
 if (-not $LogPath) { $LogPath = Join-Path (Split-Path -Parent $StatePath) 'events.jsonl' }
 if (-not $EnvFile) {
-    $EnvFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env'
+    $envRoot = if ([string]::IsNullOrWhiteSpace($WorkspacePath)) { $releaseRoot } else { $WorkspacePath }
+    $EnvFile = Join-Path $envRoot '.env'
 }
 
 function Read-Board {
@@ -245,12 +269,13 @@ AUTHORIZED_BCB_DATA_END
             '-StdoutPath', (Quote-ProcessArgument $stdoutPath),
             '-StderrPath', (Quote-ProcessArgument $stderrPath),
             '-ClaudeCommand', (Quote-ProcessArgument $ClaudeCommand),
+            '-WorkspacePath', (Quote-ProcessArgument $WorkspacePath),
             '-MaxBudgetUsd', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.00}', $MaxBudgetUsd))
         )
         $startArgs = @{
             FilePath = $engine
             ArgumentList = ($parts -join ' ')
-            WorkingDirectory = (Split-Path -Parent $PSScriptRoot)
+            WorkingDirectory = $WorkspacePath
             WindowStyle = 'Hidden'
             PassThru = $true
         }

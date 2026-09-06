@@ -43,7 +43,22 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    null `properties.parameters` object.
 5. Package the six guest files listed by
    `install_release_from_archive.ps1`. Deliver the digest-checked archive with
-   Azure Run Command and install the Windows task in `Observe` mode.
+   Azure Managed Run Command and install the Windows task in `Observe` mode.
+   Windows passes Run Command parameters on the guest process command line, so
+   do not pass the Base64 archive as one parameter: a release of this size can
+   exceed the Windows command-line limit before PowerShell starts. For this POC,
+   embed the non-secret Base64 release bytes in `source.script` and invoke the
+   installer internally, or use a bounded `scriptUri`; verify the archive digest
+   inside the guest before moving it into the immutable release directory.
+   Invoke the task installer with the checkout boundary stated explicitly:
+
+   ```powershell
+   -WorkspacePath 'C:\Users\akatiawam\Blackboard'
+   ```
+
+   `Execute` mode fails closed when this parameter is omitted, relative, missing,
+   or does not contain a `.git` directory. The immutable release directory is
+   executable plumbing and is never the Claude work workspace.
 6. Start the task once. Require the immutable release ID, SYSTEM identity,
    target profile, v1 bus read, tail-seeded cursor, zero board writes, and task
    result `0` on read-back.
@@ -68,6 +83,12 @@ during the evaluation. Do not run both coordinator tasks in Execute mode.
   a 409 busy response fails visibly as `RUN_COMMAND_BUSY` and is deferred to
   the next bounded schedule. Persistent contention therefore remains visible
   in job history without triggering overlapping retries.
+- A VM cloned from a specialized OS disk can inherit stale guest extension
+  handler state even when its ARM model has no extension child resources. Gate
+  acceptance on both VM provisioning and Guest Agent readiness. If the Windows
+  CRP transport certificate is invalid, follow the supported recovery order:
+  reapply first, then attach and remove one known empty data disk to force a new
+  goal state, and use VM redeploy only if that bounded refresh fails.
 - The current VM-scoped `Virtual Machine Contributor` assignment is acceptable
   for the POC but broader than the final product needs. Replace it with a
   custom read/start/run-command role before production hardening.
