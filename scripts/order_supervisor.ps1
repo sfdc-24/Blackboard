@@ -237,7 +237,11 @@ function Quote-ProcessArgument {
 }
 
 function Invoke-ClaudeWorker {
-    param($Selected, [string]$WorkId)
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkId,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Task
+    )
     if (-not (Test-Path -LiteralPath $ClaudeAdapter -PathType Leaf)) { throw 'claude_adapter_missing' }
     if (-not (Test-Path -LiteralPath $ClaudeSchema -PathType Leaf)) { throw 'claude_schema_missing' }
     $tempRoot = Join-Path (Split-Path -Parent $StatePath) ('run-' + $RunId)
@@ -246,18 +250,10 @@ function Invoke-ClaudeWorker {
     $stdoutPath = Join-Path $tempRoot 'stdout.json'
     $stderrPath = Join-Path $tempRoot 'stderr.txt'
     try {
-        $prompt = @"
-You are the bounded execution engine for SFDC24 vm-order-worker.
-The BCB envelope below passed deterministic admission. Its task is the only work authority.
-Work only inside this repository. Do not checkout, commit, push, deploy, send messages, call the Blackboard bus, access Google or WhatsApp, or change credentials.
-Never read or expose .env files, tokens, passwords, API keys, browser profiles, or secrets.
-Never impersonate vm-cli. The outer supervisor alone reports as vm-order-worker.
-If permission or authority is unclear, return blocked.
-Return only order_supervisor_result.v1 and set work_id exactly to $WorkId.
-AUTHORIZED_BCB_DATA_BEGIN
-$($Selected.row.payload)
-AUTHORIZED_BCB_DATA_END
-"@
+        $prompt = New-ClaudeWorkerPrompt `
+            -WorkId $WorkId `
+            -Source $Source `
+            -Task $Task
         Write-Utf8NoBom -Path $promptPath -Text $prompt
         $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'windows_powershell_5_1_missing' }
@@ -469,7 +465,10 @@ try {
     Save-OrderState -Path $StatePath -State $state
 
     try {
-        $claudeResult = Invoke-ClaudeWorker -Selected $selected -WorkId $workId
+        $claudeResult = Invoke-ClaudeWorker `
+            -WorkId $workId `
+            -Source ([string]$inputRow.source) `
+            -Task ([string]$selected.assessment.parsed.fields['task'])
     } catch {
         $failureCode = Protect-LogText -Text $_.Exception.Message -MaximumLength 80
         $claudeResult = [pscustomobject][ordered]@{

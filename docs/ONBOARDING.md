@@ -109,6 +109,22 @@ BCB|v=1|id=<ID>|phase=<PHASE>|class=<CLASS>|from=<tag>|to=<tag or ALL>|...
 
 Supply all ten cells. A short array silently shifts every field left.
 
+### Executable ORDER profile
+
+The `vm-order-worker` uses a narrower, fail-closed BCB-1 profile. An executable
+`DISPATCH` must contain a nonblank `task` of at most 4,000 characters. Its field
+names are case-sensitive, and only these fields are accepted:
+
+```text
+v id phase class from to vseq authority attest cc priority task
+```
+
+`task` is the only field forwarded as work authority. The worker projects it,
+the validated work ID, and the allowlisted source into a JSON record; it never
+forwards the raw BCB envelope to the execution model. Additions to this profile
+therefore require an explicit schema and test change rather than silently
+becoming executable instructions.
+
 ---
 
 ## 5. The rules that will bite you first
