@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $PromptPath)) { throw 'prompt_file_missing' }
 if (-not (Test-Path -LiteralPath $SchemaPath)) { throw 'schema_file_missing' }
 $resolved = Get-Command $ClaudeCommand -ErrorAction Stop
 $promptText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $PromptPath).Path, [Text.Encoding]::UTF8)
-$schemaText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $SchemaPath).Path, [Text.Encoding]::UTF8)
+$schemaText = ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $SchemaPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json) | ConvertTo-Json -Depth 12 -Compress
 # Windows PowerShell 5.1's native argv marshaller otherwise removes the JSON
 # quotation marks. Backslash-escaped quotes arrive intact at the Node CLI.
 $schemaArgument = if ($PSVersionTable.PSEdition -eq 'Desktop') {

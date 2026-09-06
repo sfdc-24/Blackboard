@@ -486,8 +486,12 @@ function New-OrderPhaseRow {
         ('correlates=' + (ConvertTo-BcbSafeValue ([string]$InputRow.row_id) 140)),
         ('run=' + (ConvertTo-BcbSafeValue $RunId 80)), ('status=' + (ConvertTo-BcbSafeValue $Status 40))
     )
-    if ($Summary) { $parts += 'summary=' + (ConvertTo-BcbSafeValue $Summary 500) }
-    if ($ErrorCode) { $parts += 'error_code=' + (ConvertTo-BcbSafeValue $ErrorCode 80) }
+    if ($Summary) {
+        $parts += 'summary=' + (ConvertTo-BcbSafeValue (Protect-LogText -Text $Summary -MaximumLength 500) 500)
+    }
+    if ($ErrorCode) {
+        $parts += 'error_code=' + (ConvertTo-BcbSafeValue (Protect-LogText -Text $ErrorCode -MaximumLength 80) 80)
+    }
     if ($OutputSha256) { $parts += 'output_sha256=' + (ConvertTo-BcbSafeValue $OutputSha256 64) }
     $row = @(
         $rowId,
@@ -659,7 +663,8 @@ function Test-ClaudeResult {
         if ($item -isnot [string] -or ([string]$item).Length -gt 500) { throw 'claude_result_evidence_invalid' }
     }
     if ($null -ne $Value.error_code -and
-        ($Value.error_code -isnot [string] -or ([string]$Value.error_code).Length -gt 80)) {
+        ($Value.error_code -isnot [string] -or
+         [string]$Value.error_code -cnotmatch '^[A-Z][A-Z0-9_.-]{0,79}$')) {
         throw 'claude_result_error_code_invalid'
     }
     return $Value
