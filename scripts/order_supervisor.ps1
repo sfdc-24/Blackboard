@@ -193,7 +193,16 @@ function Write-Phase {
     }
     $cells = @(New-OrderPhaseRow @phaseArgs)
     $readOperation = { Read-Board }
-    $appendOperation = { param($row) Append-Board -Cells @($row) }
+    $appendOperation = {
+        param($row)
+        $candidate = @($row)
+        if ($candidate.Count -eq 1 -and
+            $candidate[0] -is [Collections.IEnumerable] -and
+            $candidate[0] -isnot [string]) {
+            $candidate = @($candidate[0])
+        }
+        Append-Board -Cells $candidate
+    }
     return Invoke-IdempotentBoardAppend -Row $cells -ReadBoard $readOperation -AppendBoard $appendOperation
 }
 
@@ -250,7 +259,13 @@ AUTHORIZED_BCB_DATA_END
             & taskkill.exe /PID $process.Id /T /F 1>$null 2>$null
             throw 'claude_wall_timeout'
         }
-        if ($process.ExitCode -ne 0) { throw ('claude_exit_' + $process.ExitCode) }
+        if ($process.ExitCode -ne 0) {
+            $diagnostic = ''
+            if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                $diagnostic = (Get-StringSha256 -Text ([IO.File]::ReadAllText($stderrPath))).Substring(0, 16)
+            }
+            throw ('claude_exit_' + $process.ExitCode + '_stderr_sha256_' + $diagnostic)
+        }
         if (-not (Test-Path -LiteralPath $stdoutPath -PathType Leaf)) { throw 'claude_output_missing' }
         $outputInfo = Get-Item -LiteralPath $stdoutPath
         if ($outputInfo.Length -gt 1048576) { throw 'claude_output_too_large' }
@@ -402,7 +417,23 @@ try {
         $_.input_row_id -ceq $inputRow.row_id -and $_.work_id -ceq $workId -and $_.status -ceq 'invocation_started'
     }).Count -gt 0
     if ($alreadyStarted -or $priorReceipts.Count -gt 0) {
-        throw 'duplicate_invocation_suppressed'
+        $suppressed = Write-Phase -InputRow $inputRow -WorkId $workId -Phase RESULT -Status 'failed' -Summary 'A prior invocation has no confirmed result; duplicate execution was suppressed.' -ErrorCode 'DUPLICATE_INVOCATION_SUPPRESSED'
+        if (-not $suppressed.confirmed) { throw 'duplicate_suppression_result_unconfirmed' }
+        $state.cursor = $selection.advance_cursor
+        Set-Work -InputRowId $inputRow.row_id -WorkId $workId -Status 'duplicate_suppressed' -ResultStatus 'failed'
+        $state.last_poll.status = 'duplicate_suppressed'
+        $state.error = [pscustomobject][ordered]@{
+            at = Get-UtcStamp
+            code = 'DUPLICATE_INVOCATION_SUPPRESSED'
+            message = 'A prior receipt/start existed without a result; Claude was not invoked again.'
+            work_id = $workId
+            row_id = $inputRow.row_id
+        }
+        $state.counts.errors = [int]$state.counts.errors + 1
+        Save-OrderState -Path $StatePath -State $state
+        Write-OrderLog -Path $LogPath -Event 'duplicate_suppressed' -Level error -RunId $RunId -WorkId $workId -RowId $inputRow.row_id -Code 'DUPLICATE_INVOCATION_SUPPRESSED'
+        [pscustomobject]@{ ok = $false; status = 'duplicate_suppressed'; run_id = $RunId; work_id = $workId } | ConvertTo-Json -Compress
+        exit 30
     }
     $claim = Write-Phase -InputRow $inputRow -WorkId $workId -Phase CLAIM -Status 'claimed'
     if (-not $claim.confirmed) { throw 'claim_append_unconfirmed' }
@@ -433,7 +464,18 @@ try {
     Set-Work -InputRowId $inputRow.row_id -WorkId $workId -Status 'result_confirmed' -ResultStatus ([string]$claudeResult.status) -Digest $digest
     $state.last_poll.status = 'result_confirmed'
     $state.success = [pscustomobject][ordered]@{ at = Get-UtcStamp; event = 'result_confirmed'; work_id = $workId; row_id = $inputRow.row_id }
-    $state.counts.succeeded = [int]$state.counts.succeeded + 1
+    if ([string]$claudeResult.status -ceq 'failed') {
+        $state.error = [pscustomobject][ordered]@{
+            at = Get-UtcStamp
+            code = [string]$claudeResult.error_code
+            message = 'Claude returned failed status; the failure RESULT was read back.'
+            work_id = $workId
+            row_id = $inputRow.row_id
+        }
+        $state.counts.errors = [int]$state.counts.errors + 1
+    } else {
+        $state.counts.succeeded = [int]$state.counts.succeeded + 1
+    }
     Save-OrderState -Path $StatePath -State $state
     Write-OrderLog -Path $LogPath -Event 'result_confirmed' -RunId $RunId -WorkId $workId -RowId $inputRow.row_id -Details @{ status = $claudeResult.status; output_sha256 = $digest }
     [pscustomobject]@{ ok = ([string]$claudeResult.status -cne 'failed'); status = 'result_confirmed'; result_status = $claudeResult.status; run_id = $RunId; work_id = $workId; output_sha256 = $digest } | ConvertTo-Json -Compress

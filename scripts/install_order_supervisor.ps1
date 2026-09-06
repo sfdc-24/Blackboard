@@ -20,6 +20,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+$Mode = if ($Mode -ieq 'Execute') { 'Execute' } else { 'Observe' }
 
 $TaskName = 'SFDC24 Blackboard Order Worker'
 $TaskPath = '\'
@@ -76,6 +77,7 @@ function Assert-MutationPreflight {
         }
     }
     if (-not (Test-Path -LiteralPath $UserProfilePath -PathType Container)) { throw 'user_profile_missing' }
+    if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { throw 'v1_bus_env_missing' }
     Assert-NoQuote -Name 'runner_path' -Value $RunnerPath
     Assert-NoQuote -Name 'repo_root' -Value $RepoRoot
     Assert-NoQuote -Name 'user_profile' -Value $UserProfilePath
@@ -83,6 +85,18 @@ function Assert-MutationPreflight {
     Assert-NoQuote -Name 'state_path' -Value $StatePath
     Assert-NoQuote -Name 'log_path' -Value $LogPath
     Assert-NoQuote -Name 'claude_command' -Value $ClaudeCommand
+    if ($Mode -ceq 'Execute') {
+        if (-not [IO.Path]::IsPathRooted($ClaudeCommand) -or
+            -not (Test-Path -LiteralPath $ClaudeCommand -PathType Leaf)) {
+            throw 'execute_requires_absolute_claude_command'
+        }
+        $helpText = (& $ClaudeCommand --help 2>&1) -join [Environment]::NewLine
+        foreach ($requiredFlag in @('--json-schema', '--max-budget-usd', '--permission-mode', '--permission-prompts', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
+            if (-not $helpText.Contains($requiredFlag)) {
+                throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
+            }
+        }
+    }
 }
 
 function Get-TaskMatches {
