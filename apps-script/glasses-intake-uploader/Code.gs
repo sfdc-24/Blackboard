@@ -44,7 +44,16 @@ var DEFAULT_FOLDER_ID = '1skJIwAYenlwMovtW07BsdFOi18cFchlZ'; // "Glasses Intake"
  */
 var CONTRACT_VERSION = 2; // v1 upload only; v2 adds prune
 
-function doGet() {
+function doGet(e) {
+  var p = (e && e.parameter) || {};
+  // Public build metadata only; upload/prune and their authorization are unchanged.
+  if (p.health === 'build') {
+    if (typeof sfdc24BuildIdentity_ !== 'function') return json_({ ok: false, error: 'build identity unavailable' });
+    var build = sfdc24BuildIdentity_();
+    build.ok = true;
+    build.nonce = /^[0-9a-f]{32}$/.test(String(p.nonce || '')) ? String(p.nonce) : '';
+    return json_(build);
+  }
   return json_({
     ok: true,
     service: 'sfdc24-glasses-uploader',

@@ -4,7 +4,7 @@ The staging validator could exit successfully for missing URLs, sign-in pages an
 
 ## Current validation
 
-54 offline tests pass with no skips: 30 validator/audit tests, three staging-helper tests, 15 target/workflow tests, four Google callback tests and two pinned-clasp JSON contract tests. Responses and inventories are mocked; network access is guarded in the validator/audit suite. The shell suite executes workflow blocks with a fake clasp in disposable fixtures. The contract tests execute clasp 3.4.1's actual output formatters with fake project methods. No Google token exchange or deployment runs. Coverage includes missing/partial inventories, API errors, pagination, invalid response evidence, issuer lookalikes, absent/non-boolean email verification, source-copy cleanup, initial/missing push history, wrong staging targets, misleading deployment descriptions, invalid rollback input and failure before mutation.
+78 offline tests pass with no skips: 30 validator/audit tests, three staging-helper tests, 16 target/workflow tests, 15 immutable-build tests, eight health-route tests, four Google callback tests and two pinned-clasp JSON contract tests. Responses and inventories are mocked; network access is guarded in the validator/audit and build suites. The shell suite executes workflow blocks with a fake clasp in disposable fixtures, including failure before deploy/rollback mutation when source verification fails. The contract tests execute clasp 3.4.1's actual output formatters with fake project methods. No Google token exchange or deployment runs during tests.
 
 From a checkout:
 
@@ -13,8 +13,9 @@ $env:GAS_VERSION_ASSERT_PATH = (Resolve-Path scripts/gas_version_assert.py).Path
 $env:GAS_DEPLOYMENT_AUDIT_PATH = (Resolve-Path scripts/gas_deployment_audit.py).Path
 python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
 python -B -m unittest discover -s tests -p 'test_staging_*.py' -v
+python -B -m unittest discover -s tests -p 'test_build_identity.py' -v
 npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
-node --test tests/test_governor_auth.cjs tests/test_clasp_json_contract.cjs
+node --test tests/test_governor_auth.cjs tests/test_clasp_json_contract.cjs tests/test_build_health.cjs
 ```
 
 The new `.github/workflows/ci-acceptance.yml` runs these suites on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins its Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt. Node 22 and Python 3.12 are used in CI. Windows shell tests use Git Bash: set `TEST_BASH` to its `bash.exe` path if necessary.
@@ -33,9 +34,9 @@ All seven original Copilot findings on PR #2 are addressed: full checkout histor
 
 ## Application and build identity remain distinct
 
-The audit now needs a positive reviewed JSON health signature. Only the glasses uploader has an existing reviewed service signature (`sfdc24-glasses-uploader`). Governor HTML and the drafts-sweeper placeholder deliberately remain unverified until their owners establish suitable health contracts. The copied sweeper has no doGet.
+The estate audit requires a positive reviewed JSON health signature. Its existing root-URL probe recognizes the glasses uploader (`sfdc24-glasses-uploader`); it still cannot certify Governor HTML or the sweeper placeholder. The deployment workflows now use the separate [build identity protocol](CICD-BUILD-IDENTITY.md) for the Governor and glasses applications. That protocol checks all committed source at an immutable Apps Script version plus the live `?health=build` marker and fresh nonce. The copied sweeper has no doGet and is explicitly rejected by the builder.
 
-A matching response version is still not proof of a deployed commit. CI-stamped build identity, the complete estate scope, independently verified staging source, and real staging deploy/rollback receipts remain open. The target-binding code is tested offline; its live workflow receipt remains pending. The existing HTTP check still compares a response field to the deployment number, although an API contract version has different semantics. Owners must establish a reviewed build identity contract before accepting a release. Workflow summaries explicitly retain this limitation. These changes do not authorize a public deployment, OAuth consent, Salesforce mutation or production promotion.
+A matching response version is still not proof of a deployed commit. The legacy field validator remains for compatibility and its original regression tests; deployment workflows no longer call it or compare application contract versions with deployment numbers. The new source/build protocol is implemented and tested offline. Current source/scope evidence, complete estate coverage, current Governor reconciliation, owner review and actual staging deploy/rollback receipts remain open. These changes do not authorize a public deployment, OAuth consent, Salesforce mutation or production promotion.
 
 Development /dev URLs are inventoried separately and excluded from anonymous /exec readiness. Empty or incomplete versioned inventories fail the overall audit. API/list pagination failures invalidate that project's inventory instead of leaving a partial successful result.
 

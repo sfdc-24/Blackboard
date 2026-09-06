@@ -214,7 +214,7 @@ export GITHUB_OUTPUT="$PWD/outputs.txt"
         self.assertTrue((self.root / 'mutations.txt').exists())
 
     def test_create_version_invalid_json_stops_before_redeploy(self):
-        body = workflow_blocks('staging-deploy.yml')['Create version and redeploy']
+        body = workflow_blocks('staging-deploy.yml')['Create immutable version']
         for value in ('Created version 12 commit 99', '{"versionNumber":true}', '{"versionNumber":0}'):
             result = self.execute(body, TEST_CREATED=value)
             self.assertNotEqual(result.returncode, 0)
@@ -222,7 +222,23 @@ export GITHUB_OUTPUT="$PWD/outputs.txt"
         result = self.execute(body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('version=12', (self.root / 'outputs.txt').read_text())
-        self.assertIn(f"redeploy {REVIEWED['deploy_id']} -V 12", (self.root / 'calls.txt').read_text())
+        self.assertFalse((self.root / 'mutations.txt').exists())
+
+    def test_source_verification_failure_stops_deploy_and_rollback(self):
+        # Execute each workflow's source check followed by its actual redeploy
+        # block. A failed read-back must stop the shell before any clasp call.
+        checker = self.root / 'scripts/gas_build_identity.py'
+        checker.write_text('import sys\nsys.exit(7)\n', encoding='utf-8')
+        for filename, check_name, mutation_name in [
+            ('staging-deploy.yml', 'Verify immutable source before repointing deployment',
+             'Repoint staging deployment at verified source'),
+            ('staging-rollback.yml', 'Verify rollback candidate source before mutation',
+             'Repoint deployment at requested version'),
+        ]:
+            blocks = workflow_blocks(filename)
+            result = self.execute(blocks[check_name] + '\n' + blocks[mutation_name], EXPECTED_VERSION='12', ACTOR='fixture')
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((self.root / 'calls.txt').exists())
 
 
 if __name__ == '__main__':

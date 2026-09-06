@@ -38,6 +38,14 @@ var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and
 // ---------- web entry points ----------
 function doGet(e) {
   var p = (e && e.parameter) || {};
+  // Public build metadata only: no board read, secret access or provider call.
+  if (p.health === 'build') {
+    if (typeof sfdc24BuildIdentity_ !== 'function') return json_({ ok: false, error: 'build identity unavailable' });
+    var build = sfdc24BuildIdentity_();
+    build.ok = true;
+    build.nonce = /^[0-9a-f]{32}$/.test(String(p.nonce || '')) ? String(p.nonce) : '';
+    return json_(build);
+  }
   // Machine read is Governor-only. Board rows carry live project state, so this is
   // never served to an anonymous caller. A pass is deliberately NOT accepted in the
   // query string — secrets do not belong in URLs.
