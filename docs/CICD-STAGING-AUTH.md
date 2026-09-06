@@ -1,6 +1,8 @@
 # STAGING authorization packet — VM-CICD-001
 
 **Historical probe packet; authorization cause and live readiness remain open.**
+Use [the September 6 read-back](CICD-STAGING-READBACK-2026-09-06.md) for current
+remote version/HEAD hashes, source-derived scopes and browser-session evidence.
 The recorded STAGING versioned endpoints returned 403. A signed-in owner must
 inspect the actual authorization/deployment error before selecting a remedy.
 The source hashes below are historical and must be refreshed for reviewed code
@@ -136,13 +138,12 @@ blackboard-bus-v1/            (baseline only — no staging copy, nothing to aut
 
 Regenerate with `sha256sum apps-script/<project>/*`.
 
-One honest wrinkle for governor-page-api: the STAGING copy's HEAD `Code.gs` is
-still the v26-era source it was copied with (`afb4a45f…`), because no pipeline
-run has pushed to it yet. So the code you authorize in the editor today is that
-older copy, not v29. The scope set is the same — v29 only adds one more
-`UrlFetchApp` call (to `api.openai.com`, for the voice) under the
-`script.external_request` scope already listed above — so the consent you grant
-covers v29 when the pipeline pushes it.
+The previous paragraph in this packet inferred that authorizing an older staging
+copy would cover a later production-derived source. That inference is superseded.
+The September 6 read-back pins the actual staging v1 and HEAD source and compares
+them with the current review commit. Similar service families do not prove an
+existing or sufficient grant. Inspect the exact selected source and owner-visible
+scopes before authorization; do not use this historical packet as consent evidence.
 
 ## Staging only
 
