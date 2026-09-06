@@ -16,7 +16,9 @@ on:
       - 'tests/test_build_health.cjs'
       - 'apps-script/governor-page-api/Code.gs'
       - 'apps-script/governor-page-api/Monitor.gs'
+      - 'apps-script/governor-page-api/appsscript.json'
       - 'tests/test_governor_v30.cjs'
+      - 'tests/test_governor_v31.cjs'
       - 'apps-script/glasses-intake-uploader/Code.gs'
       - 'scripts/gas_staging_targets.json'
       - 'tests/test_staging_target.py'
@@ -64,4 +66,4 @@ jobs:
           test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
           node --test tests/test_clasp_json_contract.cjs
       - name: Test Google callback claims with mocked token exchange
-        run: node --test tests/test_governor_auth.cjs tests/test_governor_v30.cjs
+        run: node --test tests/test_governor_auth.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs

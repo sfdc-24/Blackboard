@@ -1,5 +1,8 @@
 # Governor v30 reconciliation — September 6, 2026
 
+Historical v30 observation. The later production source and its reconciliation
+are recorded in [CICD-GOVERNOR-V31.md](CICD-GOVERNOR-V31.md).
+
 A fresh, read-only Apps Script API deployment listing identified Governor production deployment `AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng` at immutable version **30**, in script `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp`. The API source was then fetched with `versionNumber=30` and its returned script ID checked. No Google mutation or function execution occurred.
 
 The content read-back contained seven files. Hashes below are SHA-256 over UTF-8 text with LF line endings; `appsscript.json` is canonical parsed JSON with sorted keys and compact separators. They describe the read-back baseline, not the proposed source after fixes.

@@ -221,9 +221,13 @@ function monitorTick() {
     var apexNow = site.apexOk ? 'up'
                 : (st.apexStrikes >= MON_FAIL_STRIKES ? 'down' : (st.apex || 'unknown'));
 
+    // Delivered-or-unchanged, the same rule as the board checks below. The
+    // strike counters above still advance either way: those are measurement,
+    // and only the notification state is allowed to lag a failed send.
+    var wwwSent = true, apexSent = true;
     if (st.www !== 'unknown' && st.www !== wwwNow) {
       if (wwwNow === 'down') {
-        monitorNotify_(st, 'SFDC24 ALERT: www.sfdc24.com is DOWN',
+        wwwSent = monitorNotify_(st, 'SFDC24 ALERT: www.sfdc24.com is DOWN',
           'The address visitors actually land on stopped serving correctly, on ' +
           MON_FAIL_STRIKES + ' consecutive checks 15 minutes apart.' + NL + NL +
           site.detail + NL + 'Time: ' + new Date().toString() + NL + NL +
@@ -234,7 +238,7 @@ function monitorTick() {
           'record, and the apex carries the forwarder A records.' + NL + NL +
           'You get one more email when it recovers, and nothing in between.');
       } else {
-        monitorNotify_(st, 'SFDC24: www.sfdc24.com is back up',
+        wwwSent = monitorNotify_(st, 'SFDC24: www.sfdc24.com is back up',
           'Serving correctly again.' + NL + NL + site.detail +
           NL + 'Time: ' + new Date().toString());
       }
@@ -243,14 +247,14 @@ function monitorTick() {
     // The bare domain is a redirect convenience, not the destination. Worth
     // knowing about; not worth the same alarm, and never while www is fine.
     if (st.apex !== 'unknown' && st.apex !== apexNow && wwwNow === 'up') {
-      monitorNotify_(st,
+      apexSent = monitorNotify_(st,
         'SFDC24: bare sfdc24.com ' + (apexNow === 'down' ? 'is not redirecting' : 'redirects again'),
         'www is healthy either way, so anyone typing the full address is fine.' +
         NL + NL + site.detail + NL + 'Time: ' + new Date().toString());
     }
 
-    st.www = wwwNow;
-    st.apex = apexNow;
+    if (wwwSent)  st.www  = wwwNow;
+    if (apexSent) st.apex = apexNow;
   } catch (e) { lines.push('site check threw: ' + e); }
 
   // ---- 2. board silence and ANDON ---------------------------------------
@@ -266,26 +270,30 @@ function monitorTick() {
     // the check is broken was reported as the all-clear.
     var quiet = (b.ageHours === null) ? 'unreadable'
               : (b.ageHours > MON_SILENCE_HOURS) ? 'silent' : 'active';
+    // Same rule as the ANDON below: a state only advances once the person who
+    // needs to know has actually been told. Undelivered means unchanged, so the
+    // next tick tries again. Retries are bounded by MON_MAX_EMAILS_PER_DAY.
+    var silenceSent = true;
     if (st.silence !== 'unknown' && st.silence !== quiet) {
       if (quiet === 'unreadable') {
-        monitorNotify_(st, 'SFDC24: the monitor cannot read the board clock',
+        silenceSent = monitorNotify_(st, 'SFDC24: the monitor cannot read the board clock',
           'No row in the last 60 carried a parseable timestamp, so board silence ' +
           'cannot be detected at all right now.' + NL + NL +
           'Unreadable timestamp cells in the window: ' + b.unreadableTs + NL + NL +
           'This is usually a writer putting the payload in the timestamp column. ' +
           'Until it clears, treat the board-silence check as OFF.');
       } else if (quiet === 'silent') {
-        monitorNotify_(st, 'SFDC24: the board has gone quiet',
+        silenceSent = monitorNotify_(st, 'SFDC24: the board has gone quiet',
           'No new row on Blackboard - Alpha DB for over ' + MON_SILENCE_HOURS + ' hours.' +
           NL + NL + 'Newest row: ' + b.newestTs + NL + NL +
           'That usually means the bus, the WhatsApp gateway or the agent fleet ' +
           'has stopped, rather than that nothing is happening.');
       } else {
-        monitorNotify_(st, 'SFDC24: the board is active again',
+        silenceSent = monitorNotify_(st, 'SFDC24: the board is active again',
           'Rows are landing again. Newest: ' + b.newestTs);
       }
     }
-    st.silence = quiet;
+    if (silenceSent) st.silence = quiet;
 
     // Dedup on identity, not on ordering. An ANDON whose timestamp cell is
     // unreadable sorts above every stored ISO stamp, so a `>` test would
@@ -293,12 +301,16 @@ function monitorTick() {
     // Equality reports each distinct alarm exactly once, and the board is
     // append-only so an older ANDON always leaves the window first -- it cannot
     // come back and re-trigger.
+    // ONLY remember the alarm once it has actually been delivered. The old line
+    // set lastAndonTs unconditionally, so an alert that FAILED to send was
+    // recorded as sent and never retried -- which is precisely how the
+    // send_mail outage stayed invisible from 3 September until 6 September.
     var andonKey = b.andon ? (b.andon.ts + ' :: ' + b.andon.text.slice(0, 120)) : '';
     if (andonKey && andonKey !== String(st.lastAndonTs || '')) {
-      monitorNotify_(st, 'SFDC24 ANDON raised by ' + b.andon.src,
+      var andonSent = monitorNotify_(st, 'SFDC24 ANDON raised by ' + b.andon.src,
         'An instance raised an ANDON on the board.' + NL + NL + b.andon.text +
         NL + NL + 'Raised: ' + b.andon.ts);
-      st.lastAndonTs = andonKey;
+      if (andonSent) st.lastAndonTs = andonKey;
     }
   } catch (e) { lines.push('board check threw: ' + e); }
 
