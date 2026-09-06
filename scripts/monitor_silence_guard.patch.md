@@ -11,11 +11,30 @@ release-lane hold this file originally asked for. Production read back as `@30`.
 
 **One thing this deploy did NOT settle.** The code fix is live; the *trigger's*
 liveness is still unproven, because reading the Triggers panel and
-`MONITOR_ENABLED` needs the editor and the deploying session had no browser. The
-free test: the board went from 21h silent to active the same evening, so a live
-trigger must email a board-recovered notice on its next tick. Silence there means
-a dead trigger or a flipped kill switch was the real cause and the
-malformed-timestamp bug was only a second defect. Check before closing this out.
+`MONITOR_ENABLED` needs the editor and the deploying session had no browser.
+
+**And the obvious test does not work — do not run it and draw a conclusion.**
+The idea was: the board went 21h silent then active again the same evening, so a
+live trigger owes a board-recovered email. It owes nothing. The monitor emails on
+**state change only**, and this file's own finding is that the malformed
+timestamp made the scan report *active* right through the silence. So
+`MONITOR_STATE.silence` was almost certainly already `active`, the board being
+genuinely active now is not a change, and a perfectly healthy trigger sends
+nothing. Absence of an email is consistent with both a live trigger and a dead
+one, so it distinguishes nothing. (Checked: no monitor mail in the last two days.
+That is the expected reading either way.)
+
+Two things actually settle it:
+
+- **The editor's Triggers panel** — one `monitorTick`, error rate `-`, plus
+  `MONITOR_ENABLED` and `MONITOR_STATE`. Needs a browser.
+- **Attach a standard GCP project to the script**, which turns on Cloud Logging
+  and makes `clasp tail-logs` show every `monitorTick` execution from the shell.
+  `clasp tail-logs` today answers *"GCP project ID is not set, unable to
+  continue."* Worth doing on its own merits: it is the same prerequisite the
+  Google sign-in work already needs (`docs/HANDOVER.md`), and it would replace
+  "ask someone with a browser" with a command for every future question of this
+  shape.
 
 ## What was observed
 
