@@ -176,7 +176,9 @@ exit /b 0
 
     $installerText = [IO.File]::ReadAllText($InstallerPath, [Text.Encoding]::UTF8)
     Assert-True 'installer exposes WorkspacePath parameter' ($installerText.Contains('[string]$WorkspacePath'))
-    Assert-True 'installer passes exact WorkspacePath argument' ($installerText.Contains('''-WorkspacePath "'' + $WorkspacePath + ''"'''))
+    Assert-True 'installer passes exact WorkspacePath argument' (
+        $installerText.Contains("('-WorkspacePath `"' + `$WorkspacePath + '`"')")
+    )
     Assert-True 'installer task starts in WorkspacePath' ($installerText.Contains('-WorkingDirectory $WorkspacePath'))
     Assert-True 'installer drift check reads back WorkspacePath' ($installerText.Contains('WorkingDirectory -cne $WorkspacePath'))
     Assert-True 'installer Status exposes workspace path' (
@@ -185,6 +187,101 @@ exit /b 0
     )
     Assert-True 'installer Execute requires explicit workspace' ($installerText.Contains('execute_requires_explicit_workspace_path'))
     Assert-True 'installer Execute requires git directory' ($installerText.Contains('execute_workspace_git_directory_missing'))
+
+    # Execute the installer's actual Task Scheduler argument serializer through
+    # powershell.exe. This catches PowerShell's comma/operator-precedence trap:
+    # unparenthesized concatenations inside @() become separate array elements,
+    # which inserts spaces inside quoted path values when the array is joined.
+    $installerTokens = $null
+    $installerErrors = $null
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile(
+        $InstallerPath,
+        [ref]$installerTokens,
+        [ref]$installerErrors
+    )
+    Assert-True 'installer parses before serializer extraction' (@($installerErrors).Count -eq 0)
+    $argumentFunction = @($installerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Get-TaskArguments'
+    }, $true))
+    Assert-True 'installer defines one task argument serializer' ($argumentFunction.Count -eq 1)
+    if ($argumentFunction.Count -eq 1) {
+        Invoke-Expression $argumentFunction[0].Extent.Text
+
+        $taskProbePath = Join-Path $tempRoot 'capture task arguments.ps1'
+        $taskProbeText = @'
+param(
+    [string]$Mode,
+    [string]$AllowedSourcesCsv,
+    [string]$UserProfilePath,
+    [string]$WorkspacePath,
+    [string]$EnvFile,
+    [string]$StatePath,
+    [string]$LogPath,
+    [string]$ClaudeCommand
+)
+[ordered]@{
+    mode = $Mode
+    allowed_sources = $AllowedSourcesCsv
+    user_profile = $UserProfilePath
+    workspace = $WorkspacePath
+    env_file = $EnvFile
+    state_path = $StatePath
+    log_path = $LogPath
+    claude_command = $ClaudeCommand
+} | ConvertTo-Json -Compress
+'@
+        [IO.File]::WriteAllText($taskProbePath, $taskProbeText, (New-Object Text.UTF8Encoding($false)))
+
+        $RunnerPath = $taskProbePath
+        $Mode = 'Observe'
+        $UserProfilePath = Join-Path $tempRoot 'Profile With Space'
+        $WorkspacePath = $workspace
+        $EnvFile = Join-Path $workspace 'bus config.env'
+        $StatePath = Join-Path $tempRoot 'task state.json'
+        $LogPath = Join-Path $tempRoot 'task events.jsonl'
+        $ClaudeCommand = 'C:\Program Files\Claude\claude.exe'
+        $serializedArguments = Get-TaskArguments
+
+        Assert-True 'task serializer keeps File path exact inside quotes' (
+            $serializedArguments.Contains('-File "' + $RunnerPath + '"')
+        )
+        Assert-True 'task serializer keeps profile path exact inside quotes' (
+            $serializedArguments.Contains('-UserProfilePath "' + $UserProfilePath + '"')
+        )
+
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $psi.Arguments = $serializedArguments
+        $psi.WorkingDirectory = $WorkspacePath
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $taskProbe = New-Object Diagnostics.Process
+        $taskProbe.StartInfo = $psi
+        $taskProbe.Start() | Out-Null
+        $taskProbeStdout = $taskProbe.StandardOutput.ReadToEnd()
+        $taskProbeStderr = $taskProbe.StandardError.ReadToEnd()
+        $taskProbe.WaitForExit()
+        Assert-True 'serialized task action starts successfully' (
+            $taskProbe.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($taskProbeStderr)
+        )
+        if ($taskProbe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($taskProbeStdout)) {
+            $captured = $taskProbeStdout | ConvertFrom-Json
+            Assert-True 'serialized task action preserves every value exactly' (
+                [string]$captured.mode -ceq $Mode -and
+                [string]$captured.allowed_sources -ceq 'chat-mobile,codex' -and
+                [string]$captured.user_profile -ceq $UserProfilePath -and
+                [string]$captured.workspace -ceq $WorkspacePath -and
+                [string]$captured.env_file -ceq $EnvFile -and
+                [string]$captured.state_path -ceq $StatePath -and
+                [string]$captured.log_path -ceq $LogPath -and
+                [string]$captured.claude_command -ceq $ClaudeCommand
+            )
+        }
+    }
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $tempRoot -PathType Container)) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force

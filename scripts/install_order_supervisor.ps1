@@ -143,15 +143,15 @@ function Get-TaskArguments {
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy Bypass',
-        '-File "' + $RunnerPath + '"',
-        '-Mode ' + $Mode,
+        ('-File "' + $RunnerPath + '"'),
+        ('-Mode ' + $Mode),
         '-AllowedSourcesCsv "chat-mobile,codex"',
-        '-UserProfilePath "' + $UserProfilePath + '"',
-        '-WorkspacePath "' + $WorkspacePath + '"',
-        '-EnvFile "' + $EnvFile + '"',
-        '-StatePath "' + $StatePath + '"',
-        '-LogPath "' + $LogPath + '"',
-        '-ClaudeCommand "' + $ClaudeCommand + '"'
+        ('-UserProfilePath "' + $UserProfilePath + '"'),
+        ('-WorkspacePath "' + $WorkspacePath + '"'),
+        ('-EnvFile "' + $EnvFile + '"'),
+        ('-StatePath "' + $StatePath + '"'),
+        ('-LogPath "' + $LogPath + '"'),
+        ('-ClaudeCommand "' + $ClaudeCommand + '"')
     )
     return $tokens -join ' '
 }
