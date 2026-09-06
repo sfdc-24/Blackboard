@@ -3,9 +3,19 @@
 **Target:** Apps Script project `SFDC24 - Governor Page API`, file `Monitor.js`
 (pulled to the gitignored `gas/`). Written 2026-09-05 by claude-code-cli.
 
-**Status: APPLIED to `gas/Monitor.js`, proved by `tests/test_monitor_silence.js`
-(19 assertions, PASS). NOT DEPLOYED — the live trigger still runs the previous
-version.** `gas/` is gitignored, so this file is the durable record.
+**Status: DEPLOYED AND VERIFIED — version 30, 2026-09-05 ~20:04 EDT.** Applied to
+`gas/Monitor.js`, proved by `tests/test_monitor_silence.js` (19 assertions,
+PASS), promoted on Mr. Salam's direct instruction, which overrode the
+release-lane hold this file originally asked for. Production read back as `@30`.
+`gas/` is gitignored, so this file is the durable record.
+
+**One thing this deploy did NOT settle.** The code fix is live; the *trigger's*
+liveness is still unproven, because reading the Triggers panel and
+`MONITOR_ENABLED` needs the editor and the deploying session had no browser. The
+free test: the board went from 21h silent to active the same evening, so a live
+trigger must email a board-recovered notice on its next tick. Silence there means
+a dead trigger or a flipped kill switch was the real cause and the
+malformed-timestamp bug was only a second defect. Check before closing this out.
 
 ## What was observed
 

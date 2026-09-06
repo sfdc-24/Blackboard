@@ -4,10 +4,18 @@
 (pulled to the gitignored `gas/`). Written 2026-09-05 by claude-code-cli against
 site P0 issue 2, command row `WRK-codex-site-p0-20260904T212005956Z`.
 
-**Status: APPLIED to `gas/Code.js`, proved by `tests/test_tts_guards.js`
-(38 assertions, PASS). NOT DEPLOYED — the command row says contain the issue
-before more voice work, with no paid canary and no production promotion. The
-Governor Page API is still serving the previous version.**
+**Status: DEPLOYED AND VERIFIED — version 30, 2026-09-05 ~20:04 EDT.** Applied to
+`gas/Code.js`, proved by `tests/test_tts_guards.js` (38 assertions, PASS), and
+promoted on Mr. Salam's direct instruction — which overrode the release-lane hold
+requested at the foot of this file. Production read back as `@30`; rollback is
+`clasp redeploy AKfycbx0D-5DAn... -V 29`.
+
+Verified live, and not by a status code: the direct `action=tts` path answers
+`no-key` for a well-formed but unminted key, so the guard refuses before any
+spend; a real `action=say` round trip returns a substantive reply carrying **no**
+`ak`, which is correct while `OPENAI_KEY` is unset; and anonymous `?format=json`
+still returns `not authorized`, so the Governor-only machine read survived the
+deploy.
 
 This file exists because `gas/` is gitignored, so the change itself cannot be
 committed. If the live source is ever lost or re-pulled over, reapply from here.
@@ -133,6 +141,14 @@ clasp list-deployments                    # read-back is the only proof (D-4)
 
 Rollback is `clasp redeploy <id> -V <previous>`.
 
-**Do not do this yet.** The command row's containment scope is the fix and the
-proofs. Promotion is the site release lane's call, and `OPENAI_KEY` is still
-unset in production, so the paid path is inert there regardless.
+~~**Do not do this yet.**~~ **Superseded 2026-09-05 ~20:02 EDT.** The hold was
+right when written — promotion was the site release lane's call. Mr. Salam
+directed the promotion himself, which outranks that lane, so this ran as version
+30. Recorded rather than deleted so the sequence stays readable: the containment
+scope codex set was honoured up to the promotion, and the promotion was the
+Governor's, not codex's.
+
+`OPENAI_KEY` is still unset in production, so the paid path remains inert there —
+which means the guards are deployed **ahead** of the spend they bound, rather
+than after it. That is the right order and it is also why the deploy could be
+verified without buying anything.
