@@ -77,6 +77,12 @@ requests are already denied. Keep the adapter's wall-clock timeout, budget,
 schema validation, safe mode, and disabled session/slash-command controls as a
 single compatibility contract.
 
+The structured-result schema deliberately declares the canonical JSON Schema
+Draft-07 identifier. Claude Code 2.1.241's `--json-schema` validator registers
+that meta-schema but rejects a Draft 2020-12 declaration before inference. All
+worker-result constraints use the shared Draft-07 subset, and the supervisor
+still performs its stricter independent result validation after Claude exits.
+
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task

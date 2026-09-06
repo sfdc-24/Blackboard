@@ -8,6 +8,7 @@ $ModulePath = Join-Path $RepoRoot 'scripts\OrderSupervisor.psm1'
 $RunnerPath = Join-Path $RepoRoot 'scripts\order_supervisor.ps1'
 $InstallerPath = Join-Path $RepoRoot 'scripts\install_order_supervisor.ps1'
 $AdapterPath = Join-Path $RepoRoot 'scripts\invoke_order_claude.ps1'
+$SchemaPath = Join-Path $RepoRoot 'scripts\order_supervisor_result.schema.json'
 $FixturePath = Join-Path $PSScriptRoot 'fixtures\order_supervisor_board.json'
 Import-Module $ModulePath -Force
 
@@ -169,6 +170,32 @@ $badResult = [pscustomobject]@{
     error_code = $null
 }
 Assert-Throws 'result enum is case exact' { Test-ClaudeResult -Value $badResult -ExpectedWorkId 'ORDER-A' } 'claude_result_status_invalid'
+$validResult = [pscustomobject][ordered]@{
+    schema = 'order_supervisor_result.v1'
+    work_id = 'ORDER-A'
+    status = 'completed'
+    summary = 'valid'
+    evidence = @()
+    error_code = $null
+}
+Assert-True 'valid result passes independent parent validation' ($null -ne (Test-ClaudeResult -Value $validResult -ExpectedWorkId 'ORDER-A'))
+$extraResult = $validResult | Select-Object *
+$extraResult | Add-Member -NotePropertyName extra -NotePropertyValue 'not allowed'
+Assert-Throws 'result rejects an extra property' { Test-ClaudeResult -Value $extraResult -ExpectedWorkId 'ORDER-A' } 'claude_result_properties_invalid'
+$missingResult = [pscustomobject][ordered]@{ schema = 'order_supervisor_result.v1'; work_id = 'ORDER-A'; status = 'completed'; summary = 'valid'; evidence = @() }
+Assert-Throws 'result rejects a missing property' { Test-ClaudeResult -Value $missingResult -ExpectedWorkId 'ORDER-A' } 'claude_result_properties_invalid'
+$wrongWorkResult = $validResult | Select-Object *
+$wrongWorkResult.work_id = 'ORDER-B'
+Assert-Throws 'result rejects mismatched work id' { Test-ClaudeResult -Value $wrongWorkResult -ExpectedWorkId 'ORDER-A' } 'claude_result_work_id_mismatch'
+$longSummaryResult = $validResult | Select-Object *
+$longSummaryResult.summary = 'x' * 2001
+Assert-Throws 'result rejects over-limit summary' { Test-ClaudeResult -Value $longSummaryResult -ExpectedWorkId 'ORDER-A' } 'claude_result_summary_invalid'
+$longEvidenceResult = $validResult | Select-Object *
+$longEvidenceResult.evidence = @(1..21 | ForEach-Object { 'e' })
+Assert-Throws 'result rejects over-limit evidence count' { Test-ClaudeResult -Value $longEvidenceResult -ExpectedWorkId 'ORDER-A' } 'claude_result_evidence_missing'
+$badErrorResult = $validResult | Select-Object *
+$badErrorResult.error_code = 'lowercase'
+Assert-Throws 'result rejects invalid error-code syntax' { Test-ClaudeResult -Value $badErrorResult -ExpectedWorkId 'ORDER-A' } 'claude_result_error_code_invalid'
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -219,6 +246,33 @@ foreach ($flag in @('--permission-mode', '''auto''', '--disallowedTools', '''Ask
     Assert-True ('adapter contains required flag ' + $flag) ($adapterText.Contains($flag))
 }
 Assert-True 'adapter avoids version-gated permission-prompts flag' (-not $adapterText.Contains('--permission-prompts'))
+$schemaText = [IO.File]::ReadAllText($SchemaPath, [Text.Encoding]::UTF8)
+$schemaDocument = $schemaText | ConvertFrom-Json
+$schemaDialect = $schemaDocument.PSObject.Properties['$schema']
+Assert-True 'result schema declares canonical draft-07 dialect' ($null -ne $schemaDialect -and [string]$schemaDialect.Value -ceq 'http://json-schema.org/draft-07/schema#')
+Assert-True 'result schema excludes unsupported 2020-12 dialect' (-not $schemaText.Contains('draft/2020-12'))
+$expectedResultProperties = @('schema', 'work_id', 'status', 'summary', 'evidence', 'error_code')
+$actualResultProperties = @($schemaDocument.properties.PSObject.Properties.Name)
+$actualRequiredProperties = @($schemaDocument.required)
+Assert-True 'result schema property set remains exact' ($actualResultProperties.Count -eq $expectedResultProperties.Count -and @($expectedResultProperties | Where-Object { $actualResultProperties -cnotcontains $_ }).Count -eq 0)
+Assert-True 'result schema required set remains exact' ($actualRequiredProperties.Count -eq $expectedResultProperties.Count -and @($expectedResultProperties | Where-Object { $actualRequiredProperties -cnotcontains $_ }).Count -eq 0)
+Assert-True 'result schema forbids extra properties' ($schemaDocument.additionalProperties -is [bool] -and -not [bool]$schemaDocument.additionalProperties)
+$expectedStatuses = @('completed', 'blocked', 'rejected', 'failed')
+$actualStatuses = @($schemaDocument.properties.status.enum)
+Assert-True 'result schema status enum remains exact' ($actualStatuses.Count -eq $expectedStatuses.Count -and @($expectedStatuses | Where-Object { $actualStatuses -cnotcontains $_ }).Count -eq 0)
+$errorCodeTypes = @($schemaDocument.properties.error_code.type)
+$constraintsPreserved = (
+    [string]$schemaDocument.properties.schema.const -ceq 'order_supervisor_result.v1' -and
+    [string]$schemaDocument.properties.work_id.type -ceq 'string' -and [int]$schemaDocument.properties.work_id.minLength -eq 1 -and [int]$schemaDocument.properties.work_id.maxLength -eq 120 -and
+    [string]$schemaDocument.properties.summary.type -ceq 'string' -and [int]$schemaDocument.properties.summary.minLength -eq 1 -and [int]$schemaDocument.properties.summary.maxLength -eq 2000 -and
+    [string]$schemaDocument.properties.evidence.type -ceq 'array' -and [int]$schemaDocument.properties.evidence.maxItems -eq 20 -and
+    [string]$schemaDocument.properties.evidence.items.type -ceq 'string' -and [int]$schemaDocument.properties.evidence.items.maxLength -eq 500 -and
+    $errorCodeTypes.Count -eq 2 -and $errorCodeTypes -ccontains 'string' -and $errorCodeTypes -ccontains 'null' -and
+    [int]$schemaDocument.properties.error_code.maxLength -eq 80
+)
+Assert-True 'result schema field constraints remain exact' $constraintsPreserved
+$unsupportedSchemaKeywords = @('$ref', '$defs', 'definitions', 'unevaluatedProperties', 'prefixItems', 'dependentRequired', 'dependentSchemas', '$dynamicRef', '$dynamicAnchor')
+Assert-True 'result schema stays in portable keyword subset' (@($unsupportedSchemaKeywords | Where-Object { $schemaText.Contains('"' + $_ + '"') }).Count -eq 0)
 
 $adapterTempRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-adapter-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $adapterTempRoot | Out-Null
@@ -233,10 +287,16 @@ try {
     $adapterArgv = Join-Path $adapterTempRoot 'argv.json'
     $fakeClaude = Join-Path $adapterTempRoot 'claude-legacy.ps1'
     [IO.File]::WriteAllText($adapterPrompt, 'offline compatibility test', [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText($adapterSchema, '{"type":"object"}', [Text.UTF8Encoding]::new($false))
+    Copy-Item -LiteralPath $SchemaPath -Destination $adapterSchema
     $fakeClaudeSource = @'
 $ErrorActionPreference = 'Stop'
 if ($args -contains '--permission-prompts') { exit 64 }
+$schemaIndex = [Array]::IndexOf([object[]]$args, '--json-schema')
+if ($schemaIndex -lt 0 -or $schemaIndex + 1 -ge $args.Count) { exit 65 }
+$schemaValue = ([string]$args[$schemaIndex + 1]).Replace('\"', '"')
+try { $parsedSchema = $schemaValue | ConvertFrom-Json } catch { exit 66 }
+$dialect = $parsedSchema.PSObject.Properties['$schema']
+if ($null -eq $dialect -or [string]$dialect.Value -cne 'http://json-schema.org/draft-07/schema#') { exit 67 }
 $capture = [ordered]@{ argv = @($args); working_directory = (Get-Location).Path }
 [IO.File]::WriteAllText($env:ORDER_SUPERVISOR_ARGV_CAPTURE, ($capture | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
 Write-Output '{"structured_output":{"schema":"order_supervisor_result.v1","work_id":"offline","status":"completed","summary":"offline","evidence":[],"error_code":null}}'
@@ -259,8 +319,10 @@ exit 0
     [object[]]$capturedArgv = $adapterCapture.argv
     $permissionModeIndex = [Array]::IndexOf($capturedArgv, '--permission-mode')
     $disallowedToolsIndex = [Array]::IndexOf($capturedArgv, '--disallowedTools')
+    $schemaArgumentIndex = [Array]::IndexOf($capturedArgv, '--json-schema')
     Assert-True 'adapter argv pairs permission mode with auto' ($permissionModeIndex -ge 0 -and $capturedArgv[$permissionModeIndex + 1] -ceq 'auto')
     Assert-True 'adapter argv pairs disallowed tools with AskUserQuestion' ($disallowedToolsIndex -ge 0 -and $capturedArgv[$disallowedToolsIndex + 1] -ceq 'AskUserQuestion')
+    Assert-True 'adapter passes canonical draft-07 schema' ($schemaArgumentIndex -ge 0 -and $schemaArgumentIndex + 1 -lt $capturedArgv.Count -and ([string]$capturedArgv[$schemaArgumentIndex + 1]).Contains('http://json-schema.org/draft-07/schema#') -and -not ([string]$capturedArgv[$schemaArgumentIndex + 1]).Contains('draft/2020-12'))
     foreach ($runtimeFlag in @('--print', '--json-schema', '--max-budget-usd', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
         Assert-True ('adapter runtime contains required flag ' + $runtimeFlag) ($capturedArgv -ccontains $runtimeFlag)
     }
