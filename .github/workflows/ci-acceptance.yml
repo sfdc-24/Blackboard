@@ -6,6 +6,12 @@ on:
       - 'scripts/gas_version_assert.py'
       - 'scripts/gas_deployment_audit.py'
       - 'tests/test_gas_*_acceptance.py'
+      - 'apps-script/governor-page-api/Auth.gs'
+      - 'scripts/gas_create_staging.sh'
+      - 'tests/test_governor_auth.cjs'
+      - 'tests/test_staging_helpers.py'
+      - '.github/workflows/staging-deploy.yml'
+      - '.github/workflows/staging-rollback.yml'
       - '.github/workflows/ci-acceptance.yml'
 
 permissions:
@@ -29,4 +35,8 @@ jobs:
           GAS_DEPLOYMENT_AUDIT_PATH: scripts/gas_deployment_audit.py
           PYTHONDONTWRITEBYTECODE: '1'
         run: python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
+      - name: Test staging helper and push change detection with local fixtures
+        run: python -B -m unittest discover -s tests -p 'test_staging_helpers.py' -v
+      - name: Test Google callback claims with mocked token exchange
+        run: node --test tests/test_governor_auth.cjs
 

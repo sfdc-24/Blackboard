@@ -50,7 +50,7 @@ jobs:
           SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
           DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
           EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
-          [ -n "$SCRIPT_ID" ] && [ -n "$DEPLOY_ID" ] || { echo "::error::staging ids not configured for ${{ github.event.inputs.project }}"; exit 1; }
+          [ -n "$SCRIPT_ID" ] && [ -n "$DEPLOY_ID" ] && [ -n "$EXEC_URL" ] || { echo "::error::staging ids/URL not configured for ${{ github.event.inputs.project }}"; exit 1; }
           { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
 
       - name: Repoint deployment at requested version

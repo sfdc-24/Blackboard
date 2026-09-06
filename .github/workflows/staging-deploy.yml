@@ -14,9 +14,9 @@ name: Deploy Apps Script to STAGING
 # Assertion doctrine (commandment 1 + 3): HTTP 200 and "ok" output are NOT
 # proof a deploy landed. Two independent read-backs:
 #   1. clasp list-deployments must show the deployment at the NEW version.
-#   2. The live GET must report that version via CONTRACT_VERSION (where the
-#      project exposes it — see docs/CICD.md; projects without it fail soft
-#      with a loud warning until the version field ships to staging).
+#   2. The live GET must report the expected version; missing or invalid proof
+#      fails closed. A contract version match is not source/build identity
+#      evidence; that separate release gate remains open (docs/CICD.md).
 
 on:
   push:
@@ -44,14 +44,26 @@ jobs:
         project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Skip if project unchanged (push builds only)
         if: github.event_name == 'push'
         id: changed
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          PROJECT: ${{ matrix.project }}
         run: |
-          if git diff --quiet ${{ github.event.before }} ${{ github.sha }} -- "apps-script/${{ matrix.project }}/"; then
+          # A first push has an all-zero before SHA; a force push can remove
+          # that commit from fetched history. In either case check every project.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BEFORE_SHA" "$AFTER_SHA" -- "apps-script/$PROJECT/"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            status=$?
+            [ "$status" -eq 1 ] || { echo '::error::project diff failed'; exit "$status"; }
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -82,8 +94,8 @@ jobs:
           SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
           DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
           EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
-          if [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOY_ID" ]; then
-            echo "::error::STAGING_SCRIPT_ID_$KEY / STAGING_DEPLOYMENT_ID_$KEY repo variables not set — STEP_2 not completed for ${{ matrix.project }}"
+          if [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOY_ID" ] || [ -z "$EXEC_URL" ]; then
+            echo "::error::STAGING_SCRIPT_ID_$KEY / STAGING_DEPLOYMENT_ID_$KEY / STAGING_EXEC_URL_$KEY repo variables not set — STEP_2 not completed for ${{ matrix.project }}"
             exit 1
           fi
           { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"

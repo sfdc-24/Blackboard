@@ -4,7 +4,7 @@ The staging validator could exit successfully for missing URLs, sign-in pages an
 
 ## Current validation
 
-30 offline tests pass with no skips. Responses and inventories are mocked; network access is guarded. Coverage includes missing/partial inventories, API errors, pagination, editor-only development URLs, oversized or truncated bodies, unknown HTML, wrong services, HTTP failures and invalid version JSON. Both valid-response controls and failure controls are included.
+37 offline tests pass with no skips: 30 validator/audit tests, three staging-helper tests and four Google callback tests. Responses and inventories are mocked; network access is guarded in the validator/audit suite. The shell suite uses a fake clasp in disposable fixtures. No Google token exchange or deployment runs. Coverage includes missing/partial inventories, API errors, pagination, development URLs, oversized/truncated bodies, unknown HTML, wrong services, invalid version JSON, issuer lookalikes, absent/non-boolean email verification, nested/hidden source copying, failure cleanup and initial/missing push history.
 
 From a checkout:
 
@@ -12,9 +12,13 @@ From a checkout:
 $env:GAS_VERSION_ASSERT_PATH = (Resolve-Path scripts/gas_version_assert.py).Path
 $env:GAS_DEPLOYMENT_AUDIT_PATH = (Resolve-Path scripts/gas_deployment_audit.py).Path
 python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
+python -B -m unittest discover -s tests -p 'test_staging_helpers.py' -v
+node --test tests/test_governor_auth.cjs
 ```
 
-The new `.github/workflows/ci-acceptance.yml` runs this suite on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins both Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt.
+The new `.github/workflows/ci-acceptance.yml` runs these suites on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins both Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt. Windows shell tests use Git Bash: set `TEST_BASH` to its `bash.exe` path if necessary.
+
+All seven original Copilot findings on PR #2 are addressed: full checkout history and explicit initial/missing-SHA handling; exact Google issuer allowlist; affirmative boolean email verification; staging helper cleanup with nested/dotfile copying; both PublicInbox.gs references; and the holistic wording correction. Both deployment workflows require the exec URL before mutating staging. Auth checks follow [Google's issuer and claim reference](https://developers.google.com/identity/openid-connect/reference).
 
 ## Application and build identity remain distinct
 
@@ -26,9 +30,9 @@ Development /dev URLs are inventoried separately and excluded from anonymous /ex
 
 ## Scope and review
 
-This branch began at 8c170db. The latest reviewed CI/CD owner head is 1d091ee5cd65eb8670909369473e95f52b828569, which records the Governor @29 baseline. Its source reconciliation does not close the public-site P0s or validate staging. Integrate through a reviewed PR into session/vm-cicd; do not overwrite the active shared checkout.
+The earlier acceptance branch began at 8c170db. This follow-up integrates it into `f82eca47fd6c0ad2d93113c0f49e40f8519d58a0` in an isolated checkout, preserving the Governor @29 baseline history. Auth.gs and Code.gs now contain proposed review fixes and are no longer byte-identical to that historical deployment. Historical hash tables are not current source evidence. Integrate through a reviewed PR into session/vm-cicd; do not overwrite the active shared checkout.
 
-Before a browser owner uses the consent packet, replace its generic function-run instruction with an explicitly reviewed no-op. Do not run sweepDraftsToEndpointV2: it posts from the real drafts folder and trashes files on HTTP 2xx. Bind any code change to the actual staging source/version. The 403 cause remains a hypothesis until confirmed in the signed-in authorization/error state.
+The consent packet now prohibits arbitrary function execution and explicitly calls out sweepDraftsToEndpointV2's writes/deletions. An explicitly reviewed no-op and actual staging source/version binding remain owner work. The 403 cause remains a hypothesis until confirmed in the signed-in authorization/error state.
 
 ## Historical Foundry evidence
 

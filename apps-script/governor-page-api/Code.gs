@@ -432,7 +432,7 @@ function SYSTEM_PROMPT_() {
 // ---------- reception ledger ----------
 function logVisitor_(sid, who, text) {
   // Visitor text is quarantined, not written to the operational board. See
-  // PublicInbox.js: it lands in PUBLIC_INBOX carrying trust_level
+  // PublicInbox.gs: it lands in PUBLIC_INBOX carrying trust_level
   // EXTERNAL_UNTRUSTED and instruction_authority NONE, and only a Governor can
   // promote a row from there. Rerouting here catches all six call sites at once.
   logVisitorQuarantined_(sid, who, text);
@@ -667,7 +667,7 @@ function seed_state() { requireGovernor_();
     "GOV|kind=mission|project=blackboard|text=**Close it so it sticks** — one thread from any instance triggers every instance. The backbone of SFDC24, not overhead on it.",
     "GOV|kind=mission|project=whatsapp|text=Seamless human-to-AI interaction on WhatsApp, as an agent of the board.",
     "GOV|kind=mission|project=zoom-agent|text=An agent that joins a live client call, knows the org, and leaves an evidence-backed finding.",
-    "GOV|kind=mission|project=sfdc24-site|text=**A wholistic way to interact with AI agents — and get work done.** Selling starts Mon Sep 21.",
+    "GOV|kind=mission|project=sfdc24-site|text=**A holistic way to interact with AI agents — and get work done.** Selling starts Mon Sep 21.",
     "GOV|kind=mission|project=glasses|text=Webcam capture staged into Drive so instances can see what you see.",
     "GOV|kind=state|project=blackboard|now=v1 bus is the working system; the V2 Alpha DB ledger runs alongside it as a POC. Board at 407 rows, four vendors writing.|next=gemini-architect M1/M2 batch — closed action_type set, work_id / wf / sub / planned_by / executed_by columns — then restore doGet.|blocked=doGet down since Aug 30 (REQ-K5J8ZX). No work_id column blocks two workstreams. ~20 rulings sitting with you.|by=claude-code-cli",
     "GOV|kind=state|project=whatsapp|now=Gateway LIVE, replying in 2-4s on Cloud API, Pipedream v254.|next=Thread and State Protocol v1 — WA grammar, wamid dedup, sticky routing, secrets moved to Pipedream env.|blocked=ISSUE 028 — five regressions open: dedup dead, hardcoded secret in v254, vendor errors leaking ids, webhook auth set to none, no grounding.|by=claude-code-cli",

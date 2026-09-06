@@ -11,10 +11,12 @@ TITLE="${2:?project title}"
 [ -d "$DIR" ] || { echo "no such dir: $DIR" >&2; exit 1; }
 
 for ENV in DEV STAGING; do
+  (
   WORK=$(mktemp -d)
-  cp "$DIR"/* "$WORK"/
+  trap 'rm -rf -- "$WORK"' EXIT
+  cp -a "$DIR/." "$WORK/"
   rm -f "$WORK/.clasp.json"
-  ( cd "$WORK"
+  cd "$WORK"
     clasp create-script --title "$TITLE - $ENV" --type standalone
     clasp push -f
     if [ "$ENV" = "STAGING" ]; then
@@ -28,6 +30,5 @@ for ENV in DEV STAGING; do
       cat .clasp.json
     fi
   )
-  rm -rf "$WORK"
 done
 echo "Remember: gh variable set STAGING_SCRIPT_ID_<KEY> / STAGING_DEPLOYMENT_ID_<KEY> / STAGING_EXEC_URL_<KEY>"
