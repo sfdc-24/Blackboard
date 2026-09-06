@@ -147,3 +147,82 @@ clasp list-deployments                    # read-back is the only proof (D-4)
 
 The trigger points at `Monitor.js` in the project, so a push plus version is
 enough for it; the redeploy is only needed to keep the web app on the same code.
+
+---
+
+# ADDENDUM — 2026-09-06 1:30 PM EDT · the watchdog was MUTE, and now is not
+
+Written by claude-code-cli after the fix above went live. The fail-open scan was
+real and is fixed, but it was **not** why Mr. Salam never got an alert. This is.
+
+## What was actually wrong
+
+The Apps Script execution log for the 1:02:59 PM `monitorTick` run, verbatim:
+
+```
+MONITOR: email failed: Exception: You do not have permission to call
+MailApp.sendEmail. Required permissions:
+https://www.googleapis.com/auth/script.send_mail
+```
+
+**Every alert the monitor has ever raised failed silently.** `monitorNotify_`
+catches the exception and returns false, so nothing surfaced anywhere. The
+handover's line *"alert email will go to: abdus@sfdc24.com"* was never true.
+
+**Proved it was the SCRIPT's grant, not the trigger's**, by running `monitorTick`
+by hand from the editor at 1:16:05 PM and watching it fail identically. That
+ruled out "just recreate the trigger", which was the cheaper hypothesis.
+
+**Cause, read from his Google account rather than guessed.** The project's
+granted scopes were: profile info, Sheets, run-when-you-are-not-present, connect
+to an external service — **granted September 3 at 2:36 AM**, before `Monitor.js`
+introduced `MailApp`. `appsscript.json` declared no `oauthScopes`, so the set was
+inferred once at first authorisation and never revisited. The editor does not
+re-prompt on its own.
+
+## The fix
+
+`appsscript.json` now declares `oauthScopes` explicitly: those four, plus
+`script.send_mail`. **A strict superset** — the list was derived by enumerating
+every Google service the code actually calls, and cross-checked against the
+granted list above, because an explicit list REPLACES inference and one missing
+scope would break the live web app. (`DriveApp` is not used; the `Drive` matches
+in `Code.js` are comment text.)
+
+`clasp push -f`, then the editor immediately said **"Authorization required"** —
+which is the proof the manifest was the missing piece. Mr. Salam clicked Allow.
+
+**Verified, not assumed:**
+
+```
+1:26:25 PM  MONITOR: emailed abdus@sfdc24.com - SFDC24 ANDON raised by claude-code-cli
+```
+
+and the message is in his inbox: subject *SFDC24 ANDON raised by claude-code-cli*,
+17:26:25Z. Site re-checked immediately after: `www` 200, `/voice/` 200, apex 200.
+The public web app serves **Version 30**, which carries its own manifest
+snapshot, so pushing to Head never put visitors at risk — only the trigger runs
+at Head.
+
+## Second defect, found while fixing the first
+
+Every state assignment advanced **whether or not the alert was delivered**:
+`st.lastAndonTs`, `st.silence`, `st.www`, `st.apex`. So a failed alert was
+recorded as sent and never retried — which is exactly how a three-day mail
+outage stayed invisible. All four now advance only on a successful send;
+undelivered means unchanged, so the next tick tries again. Retries stay bounded
+by `MON_MAX_EMAILS_PER_DAY = 12`.
+
+Strike counters (`wwwStrikes`, `apexStrikes`) still advance regardless — those
+are measurement, and only notification state is allowed to lag a failed send.
+
+Covered by `tests/test_monitor_silence.js` T8–T10, which make `MailApp` throw the
+real exception string: an undelivered alert does not advance state, it is retried
+once mail works, and a delivered one is not repeated.
+
+## Still open
+
+`MONITOR_STATE` currently reads `silence:"active"` with a healthy board, so the
+history of that field before today cannot be recovered — the fail-open scan and
+the mute mailer were both live at once, and either alone would have produced the
+same silence. Both are fixed; neither can be blamed retrospectively.

@@ -87,7 +87,16 @@ function makeRuntime(rows, opts) {
         setProperty: (k, v) => props.set(k, String(v))
       })
     },
-    MailApp: { sendEmail: (m) => sent.push(m) },
+    // Mail can be made to fail the way it really failed: Apps Script throws
+    // "You do not have permission to call MailApp.sendEmail" when the grant is
+    // missing the script.send_mail scope. monitorNotify_ catches that, so a
+    // failed alert is silent unless the state machine notices.
+    MailApp: {
+      sendEmail: (m) => {
+        if (opts.mailFails) throw new Error('You do not have permission to call MailApp.sendEmail.');
+        sent.push(m);
+      }
+    },
     Utilities: { formatDate: (d) => new Date(d).toISOString().slice(0, 10) },
     // scanBoard_ reaches for sheet_() and iso_() from Code.js; sheet_ is the
     // board binding and is stubbed, iso_ is real and is part of what is on trial.
@@ -231,7 +240,68 @@ section('T7 · LEGACY WITNESS — the old scan went blind on one malformed row')
   check('...and the caller read that null as healthy, so a 21h stoppage looked fine', true);
 }
 
+// T8 ------------------------------------------------------------------------
+section('T8 · an alert that FAILED to send is not recorded as sent');
+{
+  // The real failure, 2026-09-06: the OAuth grant predated MailApp, so every
+  // send threw and monitorNotify_ swallowed it -- while the state advanced as
+  // though the alert had landed. Three years of ticks would never retry.
+  const state = { www: 'up', apex: 'up', wwwStrikes: 0, apexStrikes: 0,
+                  silence: 'active', lastAndonTs: '', mailDay: '', mailCount: 0 };
+  const r = makeRuntime(QUIET_21H, { mailFails: true });
+  r.ctx.monitorState_ = () => state;
+  r.ctx.monitorSave_ = (st) => Object.assign(state, st);
+  r.ctx.checkSite_ = () => { throw new Error('skip'); };
+  r.ctx.monitorTick();
+  check('nothing was delivered', r.sent.length === 0, 'sent=' + r.sent.length);
+  check('silence state did NOT advance', state.silence === 'active', state.silence);
+}
+
+// T9 ------------------------------------------------------------------------
+section('T9 · once mail works again, the undelivered alert still goes out');
+{
+  const state = { www: 'up', apex: 'up', wwwStrikes: 0, apexStrikes: 0,
+                  silence: 'active', lastAndonTs: '', mailDay: '', mailCount: 0 };
+  const failing = makeRuntime(QUIET_21H, { mailFails: true });
+  failing.ctx.monitorState_ = () => state;
+  failing.ctx.monitorSave_ = (st) => Object.assign(state, st);
+  failing.ctx.checkSite_ = () => { throw new Error('skip'); };
+  failing.ctx.monitorTick();                       // grant missing: nothing sent
+
+  const working = makeRuntime(QUIET_21H);          // grant restored
+  working.ctx.monitorState_ = () => state;
+  working.ctx.monitorSave_ = (st) => Object.assign(state, st);
+  working.ctx.checkSite_ = () => { throw new Error('skip'); };
+  working.ctx.monitorTick();
+  const subjects = working.sent.map((m) => m.subject);
+  check('the alert is retried and lands', subjects.some((s) => /gone quiet/.test(s)), JSON.stringify(subjects));
+  check('and only now does the state advance', state.silence === 'silent', state.silence);
+}
+
+// T10 -----------------------------------------------------------------------
+section('T10 · an undelivered ANDON is retried, a delivered one is not');
+{
+  const rows = QUIET_21H.concat([row('2026-09-05T02:40:00.000Z', 'ANDON|the gateway is down', 'vm-cli')]);
+  const state = { www: 'up', apex: 'up', wwwStrikes: 0, apexStrikes: 0,
+                  silence: 'silent', lastAndonTs: '', mailDay: '', mailCount: 0 };
+  const failing = makeRuntime(rows, { mailFails: true });
+  failing.ctx.monitorState_ = () => state;
+  failing.ctx.monitorSave_ = (st) => Object.assign(state, st);
+  failing.ctx.checkSite_ = () => { throw new Error('skip'); };
+  failing.ctx.monitorTick();
+  check('the alarm was NOT marked as raised', state.lastAndonTs === '', JSON.stringify(state.lastAndonTs));
+
+  const working = makeRuntime(rows);
+  working.ctx.monitorState_ = () => state;
+  working.ctx.monitorSave_ = (st) => Object.assign(state, st);
+  working.ctx.checkSite_ = () => { throw new Error('skip'); };
+  working.ctx.monitorTick();
+  working.ctx.monitorTick();
+  const andons = working.sent.filter((m) => /ANDON/.test(m.subject));
+  check('it is delivered exactly once after recovery', andons.length === 1, 'sent=' + andons.length);
+}
+
 console.log('\n' + (failures === 0
-  ? 'VERDICT: PASS — board age is measured by parsed time, and an unreadable clock alerts instead of reading as calm.'
+  ? 'VERDICT: PASS — board age is measured by parsed time, an unreadable clock alerts instead of reading as calm, and an undelivered alert is retried rather than forgotten.'
   : 'VERDICT: FAIL — ' + failures + ' assertion(s) failed. Do not deploy.'));
 process.exit(failures === 0 ? 0 : 1);
