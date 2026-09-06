@@ -185,7 +185,7 @@
             action="https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8" method="POST">
         <!-- Salesforce Web-to-Lead required hidden fields -->
         <input type="hidden" name="oid" id="oid" value="00Dbm00000wK2ibEAC">
-        <input type="hidden" name="retURL" id="retURL" value="https://sfdc24-intake-omnistudio.astronautwannabe.chatgpt.site/?submitted=1">
+        <input type="hidden" name="retURL" id="retURL" value="">
         <input type="hidden" name="lead_source" value="sfdc24.com">
         <input type="hidden" name="description" id="salesforceDescription" value="">
 
@@ -249,7 +249,7 @@
         </div>
         <div class="stage" id="st2">
           <div class="rail"><div class="node">2</div><div class="wire"></div></div>
-          <div class="body"><div class="s-t">Lead intake</div><div class="s-d">Delivered to SFDC 24 (omnistudio-sandbox), source = sfdc24.com. Test delivery verified.</div><div class="s-obj">object · Lead</div></div>
+          <div class="body"><div class="s-t">Lead intake</div><div class="s-d">Requests are sent to SFDC 24 for review. This page cannot confirm record creation.</div><div class="s-obj">object · Lead</div></div>
         </div>
         <div class="stage" id="st3">
           <div class="rail"><div class="node">3</div><div class="wire"></div></div>
@@ -284,7 +284,7 @@
     </div>
     <div class="card">
       <h4>What this proves — honestly</h4>
-      <p>A synthetic test submission was sent through this Web-to-Lead endpoint and read back from the selected org with its source, relationship, and request intact.</p>
+      <p>The integration has a <a href="https://github.com/sfdc-24/Blackboard/pull/3#issuecomment-5547510371">documented historical test receipt</a>. Each new submission still requires confirmation from the team.</p>
       <p>Stages 3–5 (assignment, conversion, lifetime support) are the <strong>planned</strong> funnel and are not verified by this intake test.</p>
       <p>Full write-up: <em>Salesforce Backend Brief (SFDC-BACKEND-001)</em> in the SFDC 24 Drive folder.</p>
     </div>
@@ -303,8 +303,19 @@
   var request = document.getElementById("description");
   var storedDescription = document.getElementById("salesforceDescription");
   var names = ["first_name", "last_name", "email", "company"];
+  var returnUrl = new URL(window.location.href);
+  if (returnUrl.protocol !== "https:" && returnUrl.protocol !== "http:") {
+    submit.querySelector("span").textContent = "Open the hosted intake page to submit";
+    return;
+  }
+  // Stay on the current host and path. Do not send query strings or fragments
+  // (which may contain preview/session data) through Salesforce's redirect.
+  returnUrl.search = "?submitted=1";
+  returnUrl.hash = "";
 
   function updatePayload() {
+    // Reapply after form.reset(), which restores the empty markup default.
+    form.elements.namedItem("retURL").value = returnUrl.href;
     var relationship = form.querySelector('input[name="rel"]:checked').value;
     storedDescription.value = "[SFDC24 intake] Relationship: " + relationship + "\n\n" + request.value.trim();
     var payload = {};
