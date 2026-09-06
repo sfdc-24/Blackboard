@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "schedule": {
+      "name": "Blackboard-Supervisor-30"
+    },
+    "runbook": {
+      "name": "Blackboard-VM-Supervisor"
+    },
+    "parameters": {
+      "subscriptionid": "604c029c-c254-4bc4-b173-05d6e5c3cab0",
+      "resourcegroupname": "COPILOT-DEV-RG",
+      "vmname": "AkatiaVM-regular",
+      "taskname": "SFDC24 Blackboard Order Worker",
+      "staleafterminutes": "30",
+      "hungafterminutes": "120"
+    }
+  }
+}
