@@ -226,3 +226,21 @@ test("reception emits the nonce-bound application-ready message", () => {
   assert.match(reception, /nonce:\s*READY_NONCE/);
   assert.doesNotMatch(reception, /postMessage\([^)]*(visitorEmail|sessionToken|SESSION)/);
 });
+
+test("v30 TTS kill switch prevents minting paid-audio keys", () => {
+  const h = healthyHarness({ TTS_ENABLED: 'off' });
+  const result = decode(h.context.voiceReply_({ vid: 'session-one', q: 'Help with Salesforce' }));
+  assert.equal(result.ok, true);
+  assert.equal(result.ak, undefined);
+  assert.equal(h.ttsProviderCalls, 0);
+});
+
+test("v30 TTS kill switch also blocks keys issued before it was disabled", () => {
+  const h = healthyHarness();
+  const key = issueAudioKey(h);
+  h.properties.setProperty('TTS_ENABLED', 'off');
+  const result = decode(h.context.ttsAudio_({ ak: key }));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'no-key');
+  assert.equal(h.ttsProviderCalls, 0);
+});

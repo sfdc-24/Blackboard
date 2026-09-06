@@ -11,12 +11,10 @@ name: Deploy Apps Script to STAGING
 #   STAGING_DEPLOYMENT_ID_<PROJECT>   — the stable web-app deployment id on that copy
 #   STAGING_EXEC_URL_<PROJECT>        — the /exec URL of that deployment (for the HTTP assertion)
 #
-# Assertion doctrine (commandment 1 + 3): HTTP 200 and "ok" output are NOT
-# proof a deploy landed. Two independent read-backs:
-#   1. clasp list-deployments must show the deployment at the NEW version.
-#   2. The live GET must report that version via CONTRACT_VERSION (where the
-#      project exposes it — see docs/CICD.md; projects without it fail soft
-#      with a loud warning until the version field ships to staging).
+# Source proof: a build marker is generated from the selected commit. Before
+# redeploy, the new immutable version must match every prepared source file.
+# After redeploy, the API configuration, pinned source and fresh HTTP marker
+# must agree. An API contract version is never a deployment version.
 
 on:
   push:
@@ -31,37 +29,59 @@ on:
         type: choice
         options: [governor-page-api, blackboard-production, glasses-intake-uploader]
 
-concurrency:
-  group: staging-deploy-${{ github.event.inputs.project || 'push' }}
-  cancel-in-progress: false
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: staging-deploy-${{ matrix.project }}
+      cancel-in-progress: false
     strategy:
       max-parallel: 1
       matrix:
         project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Skip if project unchanged (push builds only)
         if: github.event_name == 'push'
         id: changed
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          PROJECT: ${{ matrix.project }}
         run: |
-          if git diff --quiet ${{ github.event.before }} ${{ github.sha }} -- "apps-script/${{ matrix.project }}/"; then
+          # A first push has an all-zero before SHA; a force push can remove
+          # that commit from fetched history. In either case check every project.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BEFORE_SHA" "$AFTER_SHA" -- "apps-script/$PROJECT/"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            status=$?
+            [ "$status" -eq 1 ] || { echo '::error::project diff failed'; exit "$status"; }
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/setup-node@v4
         if: steps.changed.outputs.skip != 'true'
-        with: { node-version: 20 }
+        with: { node-version: '22' }
 
       - name: Install clasp
         if: steps.changed.outputs.skip != 'true'
-        run: npm install -g @google/clasp
+        run: |
+          npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+          echo "$GITHUB_WORKSPACE/tooling/clasp/node_modules/.bin" >> "$GITHUB_PATH"
+          test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
 
       - name: Authenticate clasp
         if: steps.changed.outputs.skip != 'true'
@@ -72,62 +92,92 @@ jobs:
         env:
           CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
 
-      - name: Resolve staging ids
+      - name: Resolve reviewed staging target
         if: steps.changed.outputs.skip != 'true'
         id: ids
         env:
+          PROJECT: ${{ matrix.project }}
           VARS_JSON: ${{ toJSON(vars) }}
-        run: |
-          KEY=$(echo "${{ matrix.project }}" | tr 'a-z-' 'A-Z_')
-          SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
-          DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
-          EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
-          if [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOY_ID" ]; then
-            echo "::error::STAGING_SCRIPT_ID_$KEY / STAGING_DEPLOYMENT_ID_$KEY repo variables not set — STEP_2 not completed for ${{ matrix.project }}"
-            exit 1
-          fi
-          { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
+        run: python3 scripts/gas_staging_target.py resolve >> "$GITHUB_OUTPUT"
 
-      - name: Push source to STAGING project
+      - name: Verify deployment belongs to the staging project before mutation
         if: steps.changed.outputs.skip != 'true'
-        working-directory: apps-script/${{ matrix.project }}
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
         run: |
-          printf '{"scriptId":"%s","rootDir":"."}\n' "${{ steps.ids.outputs.script_id }}" > .clasp.json
-          clasp push -f
+          clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment
 
-      - name: Create version and redeploy
+      - name: Prepare committed source and build marker
+        if: steps.changed.outputs.skip != 'true'
+        id: build
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/gas_build_identity.py prepare --project "$PROJECT" --commit "$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Push prepared source to STAGING project
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: ${{ steps.build.outputs.path }}
+        run: clasp push -f
+
+      - name: Create immutable version
         if: steps.changed.outputs.skip != 'true'
         id: ver
-        working-directory: apps-script/${{ matrix.project }}
+        working-directory: ${{ steps.build.outputs.path }}
+        env:
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          OUT=$(clasp create-version "ci: ${{ github.sha }}")
-          echo "$OUT"
-          VERSION=$(echo "$OUT" | grep -oE '[0-9]+' | tail -1)
-          [ -n "$VERSION" ] || { echo '::error::could not parse version number from clasp create-version'; exit 1; }
-          clasp redeploy "${{ steps.ids.outputs.deploy_id }}" -V "$VERSION" -d "ci: ${{ github.sha }}"
+          VERSION=$(clasp --json create-version "ci: $COMMIT_SHA" |
+            python3 "$GITHUB_WORKSPACE/scripts/gas_staging_target.py" created-version)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: 'ASSERT 1/2: deployment read-back shows the new version'
+      - name: Verify immutable source before repointing deployment
         if: steps.changed.outputs.skip != 'true'
-        working-directory: apps-script/${{ matrix.project }}
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          clasp list-deployments | tee deployments.txt
-          grep -F "${{ steps.ids.outputs.deploy_id }}" deployments.txt | grep -E "@${{ steps.ver.outputs.version }}\b" \
-            || { echo "::error::VERSION ASSERTION FAILED — deployment ${{ steps.ids.outputs.deploy_id }} is NOT at version ${{ steps.ver.outputs.version }}. The deploy did not land (the Version-12 failure mode). Roll back or investigate before trusting staging."; exit 1; }
+          python3 scripts/gas_build_identity.py verify-source \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION"
 
-      - name: 'ASSERT 2/2: live HTTP endpoint reports the new version'
+      - name: Repoint staging deployment at verified source
         if: steps.changed.outputs.skip != 'true'
+        working-directory: ${{ steps.build.outputs.path }}
+        env:
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          python3 scripts/gas_version_assert.py \
-            --url "${{ steps.ids.outputs.exec_url }}" \
-            --expect-version "${{ steps.ver.outputs.version }}" \
-            --retries 6 --delay 10
+          clasp redeploy "$DEPLOY_ID" -V "$EXPECTED_VERSION" -d "ci: $COMMIT_SHA"
+
+      - name: Verify deployment configuration, pinned source and live build
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 scripts/gas_build_identity.py attest \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION" \
+            --receipt "$RUNNER_TEMP/staging-receipt-${PROJECT}.json"
+
+      - name: Preserve staging build receipt
+        if: steps.changed.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-${{ matrix.project }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/staging-receipt-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Receipt
         if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
         run: |
-          echo "DEPLOY RECEIPT — TESTED" >> "$GITHUB_STEP_SUMMARY"
-          echo "- project: ${{ matrix.project }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- staging deployment: ${{ steps.ids.outputs.deploy_id }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- version: ${{ steps.ver.outputs.version }} (asserted by list-deployments read-back + live GET)" >> "$GITHUB_STEP_SUMMARY"
+          echo 'STAGING BUILD RECEIPT — deployment, immutable source and live identity verified' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/staging-receipt-${PROJECT}.json" >> "$GITHUB_STEP_SUMMARY"
