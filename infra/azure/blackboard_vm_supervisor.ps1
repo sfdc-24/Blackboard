@@ -246,13 +246,27 @@ try {
 
 }
 catch {
+    $runCommandError = $_.Exception.Message
+    if ($runCommandError -match 'Run command extension execution is in progress' -or
+        $runCommandError -match '(?<!\d)409(?!\d)') {
+        Write-SupervisorResult -Result @{
+            schema_version = 'blackboard.supervisor.v0.1'
+            status = 'RECOVERY_PENDING'
+            vm_name = $VmName
+            power_state = $powerState
+            vm_start_attempted = $startedVm
+            guest_status = 'RUN_COMMAND_BUSY'
+            retry_policy = 'next_scheduled_run'
+        }
+        return
+    }
     Write-SupervisorResult -Result @{
         schema_version = 'blackboard.supervisor.v0.1'
         status = 'RUN_COMMAND_FAILED'
         vm_name = $VmName
         power_state = $powerState
         vm_start_attempted = $startedVm
-        error = $_.Exception.Message
+        error = $runCommandError
     }
     throw
 }
