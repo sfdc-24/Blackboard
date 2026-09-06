@@ -197,7 +197,15 @@ function voiceReply_(p) {
   // synthesis costs a couple of seconds and the reply should appear the moment
   // it exists -- so this response hands back a key, the page renders the text
   // immediately, and the audio arrives underneath it.
-  if (out && out.ok && out.reply && ttsConfigured_()) {
+  //
+  // `!out.degraded` is the cap. `offline_` returns ok:true with a canned note,
+  // so the old condition minted a paid render for every reply the chat budget
+  // had ALREADY refused: past the session cap, past the daily cap, with no
+  // Anthropic key, after an upstream error -- and with CHAT_ENABLED=off, which
+  // stopped the model and not the bill. The caps only bound cost if the paid
+  // path is bounded by the same decision, so a canned note is spoken by the
+  // browser's own synthesiser and never bought. (P0 issue 2, 2026-09-05.)
+  if (out && out.ok && out.reply && !out.degraded && ttsConfigured_()) {
     var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
     try { cache.put('tts_' + ak, out.reply, 900); out.ak = ak; } catch (e) {}
   }
@@ -241,8 +249,43 @@ function ttsVoice_(want) {
   return TTS_VOICES.hasOwnProperty(String(pref)) ? pref : TTS_DEFAULT;
 }
 
+// TTS_ENABLED=off turns the paid voice off on its own, without touching the
+// chat. CHAT_ENABLED=off already stops both (no model reply, so nothing to
+// speak), but there was no lever for "keep answering, stop spending on audio" --
+// and a kill switch you have to take the whole service down to pull is not one.
 function ttsConfigured_() {
-  return !!PropertiesService.getScriptProperties().getProperty('OPENAI_KEY');
+  var props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty('TTS_ENABLED') || '').toLowerCase() === 'off') return false;
+  return !!props.getProperty('OPENAI_KEY');
+}
+
+// ONE paid render per key -- actually, rather than by comment. `get` then
+// `remove` is not atomic: two requests carrying the same ak can both read the
+// text before either deletes it, and each pays for its own render, so the key
+// was single-use only in the absence of concurrency. The script lock makes the
+// claim exclusive: the first caller takes the text and deletes it inside the
+// critical section, every other caller sees `expired`.
+//
+// HONEST LIMIT: CacheService is eventually consistent (the same property that
+// forced the v15 idempotency fix to read the sheet instead of the cache), so
+// the lock closes the window from "any two concurrent callers" to "a cache
+// replica that has not yet observed the delete". It is a large reduction, not a
+// proof of exactly-once. It is proportionate because the mint side is now
+// bounded by the chat caps: the worst case is a small multiplier on at most
+// CHAT_SESSION_CAP renders per session, not an open-ended bill. A strongly
+// consistent claim would need a sheet write per render.
+function ttsClaim_(ak) {
+  var cache = CacheService.getScriptCache();
+  var lock  = LockService.getScriptLock();
+  try { lock.waitLock(10000); } catch (e) { return null; }
+  try {
+    var text = cache.get('tts_' + ak);
+    if (!text) return null;
+    cache.remove('tts_' + ak);
+    return text;
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
 }
 
 function ttsAudio_(p) {
@@ -252,16 +295,15 @@ function ttsAudio_(p) {
   var ak = String(p.ak || '').slice(0, 24);
   if (!/^ak[a-f0-9]{1,22}$/.test(ak)) return jsonp_(cb, { ok: false, reason: 'bad-key' });
 
-  var cache = CacheService.getScriptCache();
-  var text = cache.get('tts_' + ak);
-  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
-
   var props = PropertiesService.getScriptProperties();
+  if (!ttsConfigured_()) return jsonp_(cb, { ok: false, reason: 'no-key' });
   var key = props.getProperty('OPENAI_KEY');
-  if (!key) return jsonp_(cb, { ok: false, reason: 'no-key' });
 
-  // One audio render per key. Without this a loop on the key is a billing hole.
-  cache.remove('tts_' + ak);
+  // Claim the key BEFORE spending anything. Losing the race is `expired`, the
+  // same answer a stale key gets, because a caller cannot tell the difference
+  // and does not need to.
+  var text = ttsClaim_(ak);
+  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
 
   var res;
   try {
