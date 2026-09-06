@@ -28,11 +28,12 @@ completed silently republished Version 12 — the unfixed code — while reporti
 success. There is no outside way to tell what is live. So every staging deploy
 here must pass TWO independent read-backs before it is called done:
 
-1. `clasp list-deployments` shows the staging deployment id at the new version.
+1. `clasp --json list-deployments <stagingScriptId>` shows the exact staging
+   deployment id at the new integer version.
 2. The live `/exec` GET reports that version (`scripts/gas_version_assert.py`).
-   Projects that don't expose a version field yet soft-pass with a loud
-   warning; adding `CONTRACT_VERSION` to each `doGet` is the first change that
-   should ride this pipeline, after which the assertion goes `--strict`.
+   Missing or invalid version evidence fails closed. An API contract version
+   is not a deployment number or source identity; a reviewed build-identity
+   contract and independent source read-back remain release requirements.
 
 Rollback is `staging-rollback.yml` — repoint the deployment at a known-good
 version, same two assertions. Written before it was needed, as ordered.
@@ -75,10 +76,16 @@ version, same two assertions. Written before it was needed, as ordered.
    still requires a workflow on the default branch. That does not prevent
    ordinary `pull_request` checks: `ci-acceptance.yml` now runs offline tests
    without deployment credentials or first merging deployment workflows.
-   Historical zero-check observations predate this review branch. Exact clasp
-   tool pinning and real staging deploy/rollback receipts remain open.
+   Historical zero-check observations predate this review branch. Clasp 3.4.1
+   is now pinned with a dependency lock and JSON contract tests. Real staging
+   deploy/rollback and source-identity receipts remain open.
 
-Missing staging IDs/URLs now fail before mutation. A configured endpoint can
+Both workflows require the recorded staging IDs and an exact matching `/exec`
+URL, then verify the deployment belongs to that script before mutation.
+The reviewed inventory is `scripts/gas_staging_targets.json`; replacements
+must update it through review as well as updating repository variables.
+Deploy and rollback share one concurrency group per project.
+A configured endpoint can
 still fail the post-deploy assertion; a matching contract version is not proof
 of the reviewed build. Do not promote until the independent release gates pass.
 

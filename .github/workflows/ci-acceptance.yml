@@ -10,6 +10,11 @@ on:
       - 'scripts/gas_create_staging.sh'
       - 'tests/test_governor_auth.cjs'
       - 'tests/test_staging_helpers.py'
+      - 'scripts/gas_staging_target.py'
+      - 'scripts/gas_staging_targets.json'
+      - 'tests/test_staging_target.py'
+      - 'tests/test_clasp_json_contract.cjs'
+      - 'tooling/clasp/**'
       - '.github/workflows/staging-deploy.yml'
       - '.github/workflows/staging-rollback.yml'
       - '.github/workflows/ci-acceptance.yml'
@@ -29,6 +34,9 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
       - name: Run offline acceptance tests
         env:
           GAS_VERSION_ASSERT_PATH: scripts/gas_version_assert.py
@@ -37,6 +45,12 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
       - name: Test staging helper and push change detection with local fixtures
         run: python -B -m unittest discover -s tests -p 'test_staging_helpers.py' -v
+      - name: Test staging target binding and workflow mutation gates
+        run: python -B -m unittest discover -s tests -p 'test_staging_target.py' -v
+      - name: Verify locked clasp installation without deployment credentials
+        run: |
+          npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+          test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
+          node --test tests/test_clasp_json_contract.cjs
       - name: Test Google callback claims with mocked token exchange
         run: node --test tests/test_governor_auth.cjs
-

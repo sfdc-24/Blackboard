@@ -4,7 +4,7 @@ The staging validator could exit successfully for missing URLs, sign-in pages an
 
 ## Current validation
 
-37 offline tests pass with no skips: 30 validator/audit tests, three staging-helper tests and four Google callback tests. Responses and inventories are mocked; network access is guarded in the validator/audit suite. The shell suite uses a fake clasp in disposable fixtures. No Google token exchange or deployment runs. Coverage includes missing/partial inventories, API errors, pagination, development URLs, oversized/truncated bodies, unknown HTML, wrong services, invalid version JSON, issuer lookalikes, absent/non-boolean email verification, nested/hidden source copying, failure cleanup and initial/missing push history.
+54 offline tests pass with no skips: 30 validator/audit tests, three staging-helper tests, 15 target/workflow tests, four Google callback tests and two pinned-clasp JSON contract tests. Responses and inventories are mocked; network access is guarded in the validator/audit suite. The shell suite executes workflow blocks with a fake clasp in disposable fixtures. The contract tests execute clasp 3.4.1's actual output formatters with fake project methods. No Google token exchange or deployment runs. Coverage includes missing/partial inventories, API errors, pagination, invalid response evidence, issuer lookalikes, absent/non-boolean email verification, source-copy cleanup, initial/missing push history, wrong staging targets, misleading deployment descriptions, invalid rollback input and failure before mutation.
 
 From a checkout:
 
@@ -12,11 +12,22 @@ From a checkout:
 $env:GAS_VERSION_ASSERT_PATH = (Resolve-Path scripts/gas_version_assert.py).Path
 $env:GAS_DEPLOYMENT_AUDIT_PATH = (Resolve-Path scripts/gas_deployment_audit.py).Path
 python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
-python -B -m unittest discover -s tests -p 'test_staging_helpers.py' -v
-node --test tests/test_governor_auth.cjs
+python -B -m unittest discover -s tests -p 'test_staging_*.py' -v
+npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+node --test tests/test_governor_auth.cjs tests/test_clasp_json_contract.cjs
 ```
 
-The new `.github/workflows/ci-acceptance.yml` runs these suites on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins both Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt. Windows shell tests use Git Bash: set `TEST_BASH` to its `bash.exe` path if necessary.
+The new `.github/workflows/ci-acceptance.yml` runs these suites on `pull_request`, uses read-only contents permission, disables persisted checkout credentials, pins its Actions to exact commits, and references no repository deployment secrets. Its result is an offline code check, never a deployment receipt. Node 22 and Python 3.12 are used in CI. Windows shell tests use Git Bash: set `TEST_BASH` to its `bash.exe` path if necessary.
+
+## Exact staging configuration and tool contract
+
+Both staging workflows install clasp 3.4.1 from `tooling/clasp/package-lock.json` with `npm ci --ignore-scripts`, then verify its version. The lock includes transitive dependencies and registry integrity hashes. `npm audit --omit=dev` reported zero vulnerabilities on September 6, 2026. Local actionlint 1.7.12 validation passed for the three changed workflows (external shellcheck/pyflakes integrations disabled).
+
+`scripts/gas_staging_targets.json` records the three staging script IDs from the existing STEP_2 inventory and deployment IDs read from GitHub repository variables on September 6. All nine current variables matched this configuration. This configuration read is not a live Apps Script ownership or health receipt. Each workflow performs its own read-only `clasp --json list-deployments <scriptId>` before any push/redeploy and requires exactly one matching immutable deployment. Staging replacements require a reviewed inventory change plus matching repository variables; variables alone cannot redirect a run.
+
+The exec URL must be exactly `https://script.google.com/macros/s/<reviewed-deployment-id>/exec`, without query, fragment, credentials or a `/dev` substitution. Deployment read-back compares structured IDs and integer versions instead of finding substrings in human-readable descriptions. Version creation uses clasp's JSON output. Rollback validates its free-text input as a canonical positive integer before use; raw input is supplied through an environment variable, never inserted into shell code. Deploy and rollback use the same per-project concurrency group, including push-matrix jobs, and stop after 15 minutes.
+
+The JSON shapes are verified against the [clasp 3.4.1 package](https://www.npmjs.com/package/@google/clasp/v/3.4.1). The authoritative relationship checked before mutation is the [deployment list belonging to the selected script project](https://developers.google.com/apps-script/api/reference/rest/v1/projects.deployments/list).
 
 All seven original Copilot findings on PR #2 are addressed: full checkout history and explicit initial/missing-SHA handling; exact Google issuer allowlist; affirmative boolean email verification; staging helper cleanup with nested/dotfile copying; both PublicInbox.gs references; and the holistic wording correction. Both deployment workflows require the exec URL before mutating staging. Auth checks follow [Google's issuer and claim reference](https://developers.google.com/identity/openid-connect/reference).
 
@@ -24,7 +35,7 @@ All seven original Copilot findings on PR #2 are addressed: full checkout histor
 
 The audit now needs a positive reviewed JSON health signature. Only the glasses uploader has an existing reviewed service signature (`sfdc24-glasses-uploader`). Governor HTML and the drafts-sweeper placeholder deliberately remain unverified until their owners establish suitable health contracts. The copied sweeper has no doGet.
 
-A matching response version is still not proof of a deployed commit. CI-stamped build identity, exact pipeline-target binding, the complete estate scope, independently verified staging source, and real staging deploy/rollback receipts remain open. These changes do not authorize a public deployment, OAuth consent, Salesforce mutation or production promotion.
+A matching response version is still not proof of a deployed commit. CI-stamped build identity, the complete estate scope, independently verified staging source, and real staging deploy/rollback receipts remain open. The target-binding code is tested offline; its live workflow receipt remains pending. The existing HTTP check still compares a response field to the deployment number, although an API contract version has different semantics. Owners must establish a reviewed build identity contract before accepting a release. Workflow summaries explicitly retain this limitation. These changes do not authorize a public deployment, OAuth consent, Salesforce mutation or production promotion.
 
 Development /dev URLs are inventoried separately and excluded from anonymous /exec readiness. Empty or incomplete versioned inventories fail the overall audit. API/list pagination failures invalidate that project's inventory instead of leaving a partial successful result.
 

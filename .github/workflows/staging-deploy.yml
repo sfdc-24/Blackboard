@@ -31,13 +31,20 @@ on:
         type: choice
         options: [governor-page-api, blackboard-production, glasses-intake-uploader]
 
-concurrency:
-  group: staging-deploy-${{ github.event.inputs.project || 'push' }}
-  cancel-in-progress: false
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: staging-deploy-${{ matrix.project }}
+      cancel-in-progress: false
     strategy:
       max-parallel: 1
       matrix:
@@ -69,11 +76,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         if: steps.changed.outputs.skip != 'true'
-        with: { node-version: 20 }
+        with: { node-version: '22' }
 
       - name: Install clasp
         if: steps.changed.outputs.skip != 'true'
-        run: npm install -g @google/clasp
+        run: |
+          npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+          echo "$GITHUB_WORKSPACE/tooling/clasp/node_modules/.bin" >> "$GITHUB_PATH"
+          test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
 
       - name: Authenticate clasp
         if: steps.changed.outputs.skip != 'true'
@@ -84,21 +94,22 @@ jobs:
         env:
           CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
 
-      - name: Resolve staging ids
+      - name: Resolve reviewed staging target
         if: steps.changed.outputs.skip != 'true'
         id: ids
         env:
+          PROJECT: ${{ matrix.project }}
           VARS_JSON: ${{ toJSON(vars) }}
+        run: python3 scripts/gas_staging_target.py resolve >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployment belongs to the staging project before mutation
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
         run: |
-          KEY=$(echo "${{ matrix.project }}" | tr 'a-z-' 'A-Z_')
-          SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
-          DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
-          EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
-          if [ -z "$SCRIPT_ID" ] || [ -z "$DEPLOY_ID" ] || [ -z "$EXEC_URL" ]; then
-            echo "::error::STAGING_SCRIPT_ID_$KEY / STAGING_DEPLOYMENT_ID_$KEY / STAGING_EXEC_URL_$KEY repo variables not set — STEP_2 not completed for ${{ matrix.project }}"
-            exit 1
-          fi
-          { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
+          clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment
 
       - name: Push source to STAGING project
         if: steps.changed.outputs.skip != 'true'
@@ -111,21 +122,24 @@ jobs:
         if: steps.changed.outputs.skip != 'true'
         id: ver
         working-directory: apps-script/${{ matrix.project }}
+        env:
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          OUT=$(clasp create-version "ci: ${{ github.sha }}")
-          echo "$OUT"
-          VERSION=$(echo "$OUT" | grep -oE '[0-9]+' | tail -1)
-          [ -n "$VERSION" ] || { echo '::error::could not parse version number from clasp create-version'; exit 1; }
-          clasp redeploy "${{ steps.ids.outputs.deploy_id }}" -V "$VERSION" -d "ci: ${{ github.sha }}"
+          VERSION=$(clasp --json create-version "ci: $COMMIT_SHA" |
+            python3 "$GITHUB_WORKSPACE/scripts/gas_staging_target.py" created-version)
+          clasp redeploy "$DEPLOY_ID" -V "$VERSION" -d "ci: $COMMIT_SHA"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: 'ASSERT 1/2: deployment read-back shows the new version'
+      - name: 'ASSERT 1/2: exact staging deployment has the new version'
         if: steps.changed.outputs.skip != 'true'
-        working-directory: apps-script/${{ matrix.project }}
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          clasp list-deployments | tee deployments.txt
-          grep -F "${{ steps.ids.outputs.deploy_id }}" deployments.txt | grep -E "@${{ steps.ver.outputs.version }}\b" \
-            || { echo "::error::VERSION ASSERTION FAILED — deployment ${{ steps.ids.outputs.deploy_id }} is NOT at version ${{ steps.ver.outputs.version }}. The deploy did not land (the Version-12 failure mode). Roll back or investigate before trusting staging."; exit 1; }
+          clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment --expect-version "$EXPECTED_VERSION"
 
       - name: 'ASSERT 2/2: live HTTP endpoint reports the new version'
         if: steps.changed.outputs.skip != 'true'
@@ -138,7 +152,7 @@ jobs:
       - name: Receipt
         if: steps.changed.outputs.skip != 'true'
         run: |
-          echo "DEPLOY RECEIPT — TESTED" >> "$GITHUB_STEP_SUMMARY"
+          echo "STAGING CHECK RECEIPT — source/build identity remains unverified" >> "$GITHUB_STEP_SUMMARY"
           echo "- project: ${{ matrix.project }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- staging deployment: ${{ steps.ids.outputs.deploy_id }}" >> "$GITHUB_STEP_SUMMARY"
