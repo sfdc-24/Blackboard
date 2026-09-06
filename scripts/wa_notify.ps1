@@ -50,14 +50,39 @@ USAGE
   & .\scripts\wa_notify.ps1 -Text "blocked on X, need Y"
   & .\scripts\wa_notify.ps1 -TextFile msg.txt -Tag claude-code-cli
   & .\scripts\wa_notify.ps1 -Text "..." -DryRun     # prints the request, sends nothing
+
+ASKING HIM A QUESTION — use buttons, not prose
+  Mr. Salam asked for "voting options" so he can answer in one tap. WhatsApp's
+  NATIVE poll cannot be sent by the Cloud API at all, and cannot be a reply --
+  he found that himself. The API equivalent is an INTERACTIVE message, and it
+  works: -Buttons for up to 3 choices, -ListOptions for up to 10. His tap comes
+  back through the normal inbound path as the button's title text.
+
+  Interactive messages need the 24-hour customer-service window open, same as
+  free-form text. They are not available on a template.
+
+    & .\scripts\wa_notify.ps1 -Text "Land PR1 then PR2 on main?" -Buttons "Yes land it","Not yet","Tell me more"
+    & .\scripts\wa_notify.ps1 -Text "Which lane first?" -ListOptions "Salesforce","CI-CD","Site release" -ListButton "Choose lane"
+
+REPLYING TO ONE SPECIFIC MESSAGE — possible, and currently blocked on the board
+  The Cloud API quotes a message with context.message_id = <wamid>, which is
+  exactly the threaded reply he asked for. The CURRENT gateway does not put the
+  wamid on the board row -- rows carry WRK- ids only -- so no instance reading
+  the board can quote him. The older WA|wamid=..|from=.. format did carry it.
+  Pass -ReplyTo <wamid> if you have one from somewhere else; otherwise this is a
+  gateway fix, not a fix here.
 #>
 param(
   [string]$Text,
   [string]$TextFile,
   [string]$To,
   [string]$Tag = 'claude-code-cli',
-  [ValidateSet('BLOCKED', 'ANDON', 'STATUS', 'DONE')]
+  [ValidateSet('BLOCKED', 'ANDON', 'STATUS', 'DONE', 'ASK')]
   [string]$Kind = 'BLOCKED',
+  [string[]]$Buttons,        # up to 3 one-tap replies
+  [string[]]$ListOptions,    # up to 10, shown behind a menu button
+  [string]$ListButton = 'Choose',
+  [string]$ReplyTo,          # wamid to quote, when one is available
   [switch]$Raw,          # send $Text exactly as given, with no prefix line
   [switch]$DryRun,
   [string]$EnvFile
@@ -100,16 +125,60 @@ $Text = $Text.TrimEnd("`r", "`n")
 # The prefix exists so he can tell this apart from the gateway's stateless lane,
 # which answers his questions with "I don't carry state between messages". If he
 # cannot tell which Claude is talking, the channel is worth very little.
-$body = if ($Raw) { $Text } else { "[$Kind · $Tag]`n$Text" }
-if ($body.Length -gt $MAX_CHARS) { $body = $body.Substring(0, $MAX_CHARS - 3) + '...' }
+# ASCII separator on purpose. Windows PowerShell 5.1 reads this file as ANSI, so
+# a UTF-8 middle dot here leaves the machine as mojibake in his chat.
+$body = if ($Raw) { $Text } else { "[$Kind - $Tag]`n$Text" }
+# An interactive body is capped at 1024 by Meta, well below the 4096 for plain
+# text. Silently overrunning it returns a 400 and the question never reaches him.
+$cap = if ($Buttons -or $ListOptions) { 1000 } else { $MAX_CHARS }
+if ($body.Length -gt $cap) { $body = $body.Substring(0, $cap - 3) + '...' }
 
+if ($Buttons -and $ListOptions) { throw "give -Buttons or -ListOptions, not both" }
+
+# Meta's limits, enforced here rather than discovered as a 400 mid-conversation.
+# A truncated button title is still tappable; a rejected message is not, so the
+# titles are cut and the counts are refused.
 $payload = @{
   messaging_product = 'whatsapp'
   recipient_type    = 'individual'
   to                = $To
-  type              = 'text'
-  text              = @{ preview_url = $false; body = $body }
-} | ConvertTo-Json -Depth 6 -Compress
+}
+if ($ReplyTo) { $payload.context = @{ message_id = $ReplyTo } }
+
+if ($Buttons) {
+  if ($Buttons.Count -gt 3) { throw "WhatsApp allows at most 3 reply buttons; you gave $($Buttons.Count). Use -ListOptions for up to 10." }
+  $btn = @()
+  for ($i = 0; $i -lt $Buttons.Count; $i++) {
+    $title = [string]$Buttons[$i]
+    if ($title.Length -gt 20) { $title = $title.Substring(0, 20) }   # hard API limit
+    $btn += @{ type = 'reply'; reply = @{ id = "opt$($i + 1)"; title = $title } }
+  }
+  $payload.type = 'interactive'
+  $payload.interactive = @{
+    type   = 'button'
+    body   = @{ text = $body }
+    action = @{ buttons = $btn }
+  }
+} elseif ($ListOptions) {
+  if ($ListOptions.Count -gt 10) { throw "WhatsApp allows at most 10 list rows; you gave $($ListOptions.Count)." }
+  $rows = @()
+  for ($i = 0; $i -lt $ListOptions.Count; $i++) {
+    $title = [string]$ListOptions[$i]
+    if ($title.Length -gt 24) { $title = $title.Substring(0, 24) }   # hard API limit
+    $rows += @{ id = "opt$($i + 1)"; title = $title }
+  }
+  $lb = $ListButton; if ($lb.Length -gt 20) { $lb = $lb.Substring(0, 20) }
+  $payload.type = 'interactive'
+  $payload.interactive = @{
+    type   = 'list'
+    body   = @{ text = $body }
+    action = @{ button = $lb; sections = @(@{ title = 'Options'; rows = $rows }) }
+  }
+} else {
+  $payload.type = 'text'
+  $payload.text = @{ preview_url = $false; body = $body }
+}
+$payload = $payload | ConvertTo-Json -Depth 8 -Compress
 
 $uri = "https://graph.facebook.com/$GRAPH_VERSION/$($cfg.WA_PHONE_NUMBER_ID)/messages"
 
