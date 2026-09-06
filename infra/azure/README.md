@@ -65,9 +65,9 @@ during the evaluation. Do not run both coordinator tasks in Execute mode.
 
 - Azure Action Run Command permits only one active script and has a 90-minute
   timeout. Normal cold supervisor runs took about five minutes in this setup;
-  a 409 busy response is reported as `RECOVERY_PENDING` and deferred to the
-  next bounded schedule. Persistent contention must be investigated in job
-  history rather than triggering overlapping retries.
+  a 409 busy response fails visibly as `RUN_COMMAND_BUSY` and is deferred to
+  the next bounded schedule. Persistent contention therefore remains visible
+  in job history without triggering overlapping retries.
 - The current VM-scoped `Virtual Machine Contributor` assignment is acceptable
   for the POC but broader than the final product needs. Replace it with a
   custom read/start/run-command role before production hardening.

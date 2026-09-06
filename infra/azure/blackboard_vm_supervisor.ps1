@@ -251,14 +251,14 @@ catch {
         $runCommandError -match '(?<!\d)409(?!\d)') {
         Write-SupervisorResult -Result @{
             schema_version = 'blackboard.supervisor.v0.1'
-            status = 'RECOVERY_PENDING'
+            status = 'RUN_COMMAND_BUSY'
             vm_name = $VmName
             power_state = $powerState
             vm_start_attempted = $startedVm
             guest_status = 'RUN_COMMAND_BUSY'
             retry_policy = 'next_scheduled_run'
         }
-        return
+        throw
     }
     Write-SupervisorResult -Result @{
         schema_version = 'blackboard.supervisor.v0.1'
