@@ -419,6 +419,7 @@ Work only inside this repository. Do not checkout, commit, push, deploy, send me
 Never read or expose .env files, tokens, passwords, API keys, browser profiles, or secrets.
 Never impersonate vm-cli. The outer supervisor alone reports as vm-order-worker.
 If permission or authority is unclear, return blocked.
+If a tool is denied or would require human approval, do not retry it; return blocked.
 Return only order_supervisor_result.v1 and set work_id exactly to $WorkId.
 AUTHORIZED_ORDER_JSON_BEGIN
 $authorizedOrder

@@ -69,6 +69,14 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    executable path. Issue one fresh, harmless `codex` test order and verify its
    deterministic CLAIM, RECEIPT, and RESULT rows by reading the board back.
 
+The bounded adapter runs Claude Code in non-interactive `auto` mode, disables
+`AskUserQuestion`, and instructs the model not to retry a denied tool. It does
+not require `--permission-prompts none`, which was introduced only in Claude
+Code 2.1.259: in a `-p` process with no permission host, unresolved permission
+requests are already denied. Keep the adapter's wall-clock timeout, budget,
+schema validation, safe mode, and disabled session/slash-command controls as a
+single compatibility contract.
+
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task
@@ -91,6 +99,9 @@ during the evaluation. Do not run both coordinator tasks in Execute mode.
   goal state, and use VM redeploy only if that bounded refresh fails.
 - The current VM-scoped `Virtual Machine Contributor` assignment is acceptable
   for the POC but broader than the final product needs. Replace it with a
-  custom read/start/run-command role before production hardening.
+  custom read/start/run-command role before production hardening. Deleting and
+  recreating the VM also deletes this VM-scoped assignment: restore the exact
+  Automation managed-identity assignment, read it back, and require a fresh
+  manual supervisor PASS before enabling either schedule.
 - The Automation account provisioned as `Basic`. Schedules are bounded to the
   90-day evaluation window to keep the experiment finite.

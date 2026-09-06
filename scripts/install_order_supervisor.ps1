@@ -109,7 +109,7 @@ function Assert-MutationPreflight {
             throw 'execute_requires_absolute_claude_command'
         }
         $helpText = (& $ClaudeCommand --help 2>&1) -join [Environment]::NewLine
-        foreach ($requiredFlag in @('--json-schema', '--max-budget-usd', '--permission-mode', '--permission-prompts', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
+        foreach ($requiredFlag in @('--json-schema', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
             if (-not $helpText.Contains($requiredFlag)) {
                 throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
             }

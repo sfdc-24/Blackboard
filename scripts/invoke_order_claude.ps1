@@ -45,7 +45,7 @@ $arguments = @(
     '--output-format', 'json',
     '--json-schema', $schemaArgument,
     '--permission-mode', 'auto',
-    '--permission-prompts', 'none',
+    '--disallowedTools', 'AskUserQuestion',
     '--max-budget-usd', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.00}', $MaxBudgetUsd)),
     '--safe-mode',
     '--no-session-persistence',

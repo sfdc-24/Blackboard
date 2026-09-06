@@ -215,9 +215,63 @@ try {
 }
 
 $adapterText = [IO.File]::ReadAllText($AdapterPath, [Text.Encoding]::UTF8)
-foreach ($flag in @('--permission-mode', '''auto''', '--permission-prompts', '''none''', '--max-budget-usd', '--json-schema')) {
+foreach ($flag in @('--permission-mode', '''auto''', '--disallowedTools', '''AskUserQuestion''', '--max-budget-usd', '--json-schema')) {
     Assert-True ('adapter contains required flag ' + $flag) ($adapterText.Contains($flag))
 }
+Assert-True 'adapter avoids version-gated permission-prompts flag' (-not $adapterText.Contains('--permission-prompts'))
+
+$adapterTempRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-adapter-test-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $adapterTempRoot | Out-Null
+try {
+    $adapterWorkspace = Join-Path $adapterTempRoot 'workspace'
+    $adapterGitDirectory = Join-Path $adapterWorkspace '.git'
+    New-Item -ItemType Directory -Path $adapterGitDirectory -Force | Out-Null
+    $adapterPrompt = Join-Path $adapterTempRoot 'prompt.txt'
+    $adapterSchema = Join-Path $adapterTempRoot 'schema.json'
+    $adapterStdout = Join-Path $adapterTempRoot 'stdout.json'
+    $adapterStderr = Join-Path $adapterTempRoot 'stderr.txt'
+    $adapterArgv = Join-Path $adapterTempRoot 'argv.json'
+    $fakeClaude = Join-Path $adapterTempRoot 'claude-legacy.ps1'
+    [IO.File]::WriteAllText($adapterPrompt, 'offline compatibility test', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($adapterSchema, '{"type":"object"}', [Text.UTF8Encoding]::new($false))
+    $fakeClaudeSource = @'
+$ErrorActionPreference = 'Stop'
+if ($args -contains '--permission-prompts') { exit 64 }
+$capture = [ordered]@{ argv = @($args); working_directory = (Get-Location).Path }
+[IO.File]::WriteAllText($env:ORDER_SUPERVISOR_ARGV_CAPTURE, ($capture | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+Write-Output '{"structured_output":{"schema":"order_supervisor_result.v1","work_id":"offline","status":"completed","summary":"offline","evidence":[],"error_code":null}}'
+exit 0
+'@
+    [IO.File]::WriteAllText($fakeClaude, $fakeClaudeSource, [Text.UTF8Encoding]::new($false))
+    $oldArgvCapture = $env:ORDER_SUPERVISOR_ARGV_CAPTURE
+    $env:ORDER_SUPERVISOR_ARGV_CAPTURE = $adapterArgv
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $AdapterPath `
+            -PromptPath $adapterPrompt -SchemaPath $adapterSchema `
+            -StdoutPath $adapterStdout -StderrPath $adapterStderr `
+            -WorkspacePath $adapterWorkspace -ClaudeCommand $fakeClaude -MaxBudgetUsd 0.01
+        $adapterExitCode = $LASTEXITCODE
+    } finally {
+        $env:ORDER_SUPERVISOR_ARGV_CAPTURE = $oldArgvCapture
+    }
+    Assert-True 'legacy-compatible adapter invocation exits zero' ($adapterExitCode -eq 0)
+    $adapterCapture = [IO.File]::ReadAllText($adapterArgv, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    [object[]]$capturedArgv = $adapterCapture.argv
+    $permissionModeIndex = [Array]::IndexOf($capturedArgv, '--permission-mode')
+    $disallowedToolsIndex = [Array]::IndexOf($capturedArgv, '--disallowedTools')
+    Assert-True 'adapter argv pairs permission mode with auto' ($permissionModeIndex -ge 0 -and $capturedArgv[$permissionModeIndex + 1] -ceq 'auto')
+    Assert-True 'adapter argv pairs disallowed tools with AskUserQuestion' ($disallowedToolsIndex -ge 0 -and $capturedArgv[$disallowedToolsIndex + 1] -ceq 'AskUserQuestion')
+    foreach ($runtimeFlag in @('--print', '--json-schema', '--max-budget-usd', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
+        Assert-True ('adapter runtime contains required flag ' + $runtimeFlag) ($capturedArgv -ccontains $runtimeFlag)
+    }
+    Assert-True 'adapter runtime omits permission-prompts' ($capturedArgv -cnotcontains '--permission-prompts')
+    Assert-True 'adapter runs Claude inside exact workspace' ([IO.Path]::GetFullPath([string]$adapterCapture.working_directory) -ceq [IO.Path]::GetFullPath($adapterWorkspace))
+} finally {
+    if (-not $KeepArtifacts -and (Test-Path -LiteralPath $adapterTempRoot)) {
+        Remove-Item -LiteralPath $adapterTempRoot -Recurse -Force
+    }
+}
+
 $installerText = [IO.File]::ReadAllText($InstallerPath, [Text.Encoding]::UTF8)
 Assert-True 'installer names Azure-supervised task' ($installerText.Contains('SFDC24 Blackboard Order Worker'))
 Assert-True 'installer task defaults Observe' ($installerText.Contains('[string]$Mode = ''Observe'''))
@@ -225,6 +279,8 @@ Assert-True 'installer explicit allowlist includes codex' ($installerText.Contai
 Assert-True 'installer uses IgnoreNew' ($installerText.Contains('-MultipleInstances IgnoreNew'))
 Assert-True 'installer uses SYSTEM service account' ($installerText.Contains('-LogonType ServiceAccount'))
 Assert-True 'installer has boot and 15 minute triggers' ($installerText.Contains('-AtStartup') -and $installerText.Contains('-Minutes 15'))
+Assert-True 'installer preflight requires disallowedTools' ($installerText.Contains("'--disallowedTools'"))
+Assert-True 'installer preflight avoids permission-prompts' (-not $installerText.Contains('--permission-prompts'))
 
 Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
 if ($script:Failed -gt 0) { exit 1 }
