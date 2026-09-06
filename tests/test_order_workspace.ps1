@@ -55,7 +55,8 @@ function New-AdapterArguments {
         [Parameter(Mandatory = $true)][string]$WorkspacePath,
         [Parameter(Mandatory = $true)][string]$Prefix,
         [Parameter(Mandatory = $true)][string]$FakeClaudePath,
-        [Parameter(Mandatory = $true)][string]$TemporaryRoot
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot,
+        [Parameter(Mandatory = $true)][string]$EnvFile
     )
 
     return @(
@@ -63,14 +64,127 @@ function New-AdapterArguments {
         '-SchemaPath', $SchemaPath,
         '-StdoutPath', (Join-Path $TemporaryRoot ($Prefix + '-stdout.json')),
         '-StderrPath', (Join-Path $TemporaryRoot ($Prefix + '-stderr.txt')),
+        '-EnvFile', $EnvFile,
         '-WorkspacePath', $WorkspacePath,
         '-ClaudeCommand', $FakeClaudePath,
         '-MaxBudgetUsd', '0.01'
     )
 }
 
+function Write-TestEnvFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Invoke-AdapterCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$WorkspacePath,
+        [Parameter(Mandatory = $true)][string]$EnvFile,
+        [Parameter(Mandatory = $true)][string]$FakeClaudePath,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot,
+        [switch]$OmitEnvFile
+    )
+
+    $safeName = $Name -replace '[^A-Za-z0-9_-]', '-'
+    $prefix = 'case-' + $safeName
+    $markerPath = Join-Path $TemporaryRoot ($prefix + '-invoked.txt')
+    $priorMarkerPath = [Environment]::GetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', 'Process')
+    [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', $markerPath, 'Process')
+    try {
+        [object[]]$arguments = @(
+            New-AdapterArguments `
+                -WorkspacePath $WorkspacePath `
+                -Prefix $prefix `
+                -FakeClaudePath $FakeClaudePath `
+                -TemporaryRoot $TemporaryRoot `
+                -EnvFile $EnvFile
+        )
+        if ($OmitEnvFile) {
+            $withoutEnv = New-Object System.Collections.Generic.List[object]
+            for ($index = 0; $index -lt $arguments.Count; $index++) {
+                if ([string]$arguments[$index] -ceq '-EnvFile') {
+                    $index++
+                    continue
+                }
+                $withoutEnv.Add($arguments[$index])
+            }
+            [object[]]$arguments = $withoutEnv.ToArray()
+        }
+        $run = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments $arguments
+    } finally {
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', $priorMarkerPath, 'Process')
+    }
+
+    return [pscustomobject][ordered]@{
+        run = $run
+        invoked = (Test-Path -LiteralPath $markerPath -PathType Leaf)
+        stdout_path = Join-Path $TemporaryRoot ($prefix + '-stdout.json')
+        stderr_path = Join-Path $TemporaryRoot ($prefix + '-stderr.txt')
+    }
+}
+
+function Test-TextExcludesSentinels {
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][string[]]$Sentinels
+    )
+
+    $candidate = if ($null -eq $Text) { '' } else { [string]$Text }
+    return @($Sentinels | Where-Object { -not [string]::IsNullOrEmpty($_) -and $candidate.Contains($_) }).Count -eq 0
+}
+
+function Assert-AdapterRejected {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Case,
+        [Parameter(Mandatory = $true)][string]$ExpectedCode,
+        [Parameter(Mandatory = $true)][string[]]$SecretSentinels
+    )
+
+    Assert-True ($Name + ' returns expected error') (
+        $Case.run.exit_code -ne 0 -and $Case.run.output_text.Contains($ExpectedCode)
+    )
+    Assert-True ($Name + ' does not invoke fake Claude') (-not $Case.invoked)
+    Assert-True ($Name + ' error excludes secret sentinels') (
+        Test-TextExcludesSentinels -Text $Case.run.output_text -Sentinels $SecretSentinels
+    )
+    $stdoutSafe = -not (Test-Path -LiteralPath $Case.stdout_path -PathType Leaf) -or
+        (Get-Item -LiteralPath $Case.stdout_path).Length -eq 0
+    $stderrSafe = -not (Test-Path -LiteralPath $Case.stderr_path -PathType Leaf) -or
+        (Get-Item -LiteralPath $Case.stderr_path).Length -eq 0
+    Assert-True ($Name + ' creates no raw Claude output') ($stdoutSafe -and $stderrSafe)
+}
+
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-workspace-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
+$providerConflictNames = @(
+    'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+    'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+    'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
+    'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+    'ANTHROPIC_FOUNDRY_API_KEY', 'ANTHROPIC_FOUNDRY_AUTH_TOKEN',
+    'ANTHROPIC_FOUNDRY_BASE_URL', 'ANTHROPIC_FOUNDRY_RESOURCE',
+    'ANTHROPIC_BEDROCK_BASE_URL', 'ANTHROPIC_BEDROCK_MANTLE_BASE_URL',
+    'ANTHROPIC_VERTEX_BASE_URL', 'ANTHROPIC_VERTEX_PROJECT_ID',
+    'ANTHROPIC_AWS_BASE_URL', 'ANTHROPIC_AWS_WORKSPACE_ID'
+)
+$testEnvironmentNames = @(
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'BUS_SECRET', 'ALPHA_SECRET',
+    'OPENAI_API_KEY', 'ORDER_SUPERVISOR_DECOY', 'ORDER_ADAPTER_FAKE_MARKER_PATH',
+    'ORDER_ADAPTER_FAKE_EXIT_CODE', 'ORDER_ADAPTER_FAKE_VERSION',
+    'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE', 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB',
+    'CLAUDE_CODE_USE_POWERSHELL_TOOL'
+) + $providerConflictNames
+$testEnvironmentBackup = @{}
+foreach ($name in $testEnvironmentNames) {
+    $testEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
 try {
     $workspace = Join-Path $tempRoot 'Blackboard checkout'
     $gitDirectory = Join-Path $workspace '.git'
@@ -83,18 +197,107 @@ try {
         (New-Object Text.UTF8Encoding($false))
     )
 
-    $fakeClaudePath = Join-Path $tempRoot 'fake-claude.cmd'
-    $fakeClaude = @'
-@echo off
-powershell.exe -NoLogo -NoProfile -NonInteractive -Command "[Console]::Out.Write(([ordered]@{cwd=(Get-Location).Path} | ConvertTo-Json -Compress))"
-exit /b 0
+    $adapterEnvFile = Join-Path $tempRoot 'adapter config.env'
+    $adapterApiKey = 'test-api-key=preserves#characters'
+    $adapterModel = 'claude-test-model'
+    $adapterEnvText = @"
+ANTHROPIC_API_KEY="$adapterApiKey"
+ANTHROPIC_MODEL=$adapterModel
+BUS_SECRET=must-not-be-imported
+ALPHA_SECRET=must-not-be-imported
+OPENAI_API_KEY=must-not-be-imported
+ORDER_SUPERVISOR_DECOY=must-not-be-imported
+"@
+    [IO.File]::WriteAllText($adapterEnvFile, $adapterEnvText, (New-Object Text.UTF8Encoding($false)))
+
+    $fakeClaudePath = Join-Path $tempRoot 'fake-claude.ps1'
+$fakeClaude = @'
+if ($args.Count -eq 1 -and [string]$args[0] -ceq '--version') {
+    if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE)) {
+        exit ([int]$env:ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_VERSION)) {
+        Write-Output $env:ORDER_ADAPTER_FAKE_VERSION
+    } else {
+        Write-Output '2.1.241 (Claude Code)'
+    }
+    exit 0
+}
+if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_MARKER_PATH)) {
+    [IO.File]::WriteAllText($env:ORDER_ADAPTER_FAKE_MARKER_PATH, 'invoked', [Text.UTF8Encoding]::new($false))
+}
+$settingsIndexes = @(
+    for ($index = 0; $index -lt $args.Count; $index++) {
+        if ([string]$args[$index] -ceq '--settings') { $index }
+    }
+)
+$settingsPath = if ($settingsIndexes.Count -eq 1 -and $settingsIndexes[0] + 1 -lt $args.Count) {
+    [string]$args[$settingsIndexes[0] + 1]
+} else {
+    ''
+}
+$settingsExists = -not [string]::IsNullOrWhiteSpace($settingsPath) -and (Test-Path -LiteralPath $settingsPath -PathType Leaf)
+$settingsBytes = if ($settingsExists) { [IO.File]::ReadAllBytes($settingsPath) } else { [byte[]]@() }
+$settingsText = if ($settingsExists) { [Text.Encoding]::UTF8.GetString($settingsBytes) } else { '' }
+$settingsObject = if ($settingsExists) { $settingsText | ConvertFrom-Json } else { $null }
+$capture = [ordered]@{
+    cwd = (Get-Location).Path
+    api_key_match = ([string]$env:ANTHROPIC_API_KEY -ceq 'test-api-key=preserves#characters')
+    model_match = ([string]$env:ANTHROPIC_MODEL -ceq 'claude-test-model')
+    api_key_length = ([string]$env:ANTHROPIC_API_KEY).Length
+    model_length = ([string]$env:ANTHROPIC_MODEL).Length
+    bus_secret_absent = [string]::IsNullOrEmpty($env:BUS_SECRET)
+    alpha_secret_absent = [string]::IsNullOrEmpty($env:ALPHA_SECRET)
+    openai_key_absent = [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
+    decoy_absent = [string]::IsNullOrEmpty($env:ORDER_SUPERVISOR_DECOY)
+    subprocess_scrub_forced = ([string]$env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB -ceq '1')
+    powershell_tool_process_absent = [string]::IsNullOrEmpty($env:CLAUDE_CODE_USE_POWERSHELL_TOOL)
+    settings_argument_count = $settingsIndexes.Count
+    settings_path = $settingsPath
+    settings_exists_during_invoke = $settingsExists
+    settings_utf8_no_bom = ($settingsBytes.Length -gt 0 -and -not (
+        $settingsBytes.Length -ge 3 -and $settingsBytes[0] -eq 0xEF -and
+        $settingsBytes[1] -eq 0xBB -and $settingsBytes[2] -eq 0xBF
+    ))
+    settings_bytes = $settingsBytes.Length
+    settings_text = $settingsText
+    settings = $settingsObject
+    argv = @($args)
+}
+$capture | ConvertTo-Json -Depth 8 -Compress
+$requestedExitCode = 0
+if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_EXIT_CODE)) {
+    $requestedExitCode = [int]$env:ORDER_ADAPTER_FAKE_EXIT_CODE
+}
+exit $requestedExitCode
 '@
     [IO.File]::WriteAllText($fakeClaudePath, $fakeClaude, (New-Object Text.UTF8Encoding($false)))
 
-    $adapterRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
-        New-AdapterArguments -WorkspacePath $workspace -Prefix 'valid' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot
-    )
+    $env:ANTHROPIC_API_KEY = 'inherited-api-key-must-be-overridden'
+    $env:ANTHROPIC_MODEL = 'inherited-model-must-be-overridden'
+    $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '0'
+    $env:CLAUDE_CODE_USE_POWERSHELL_TOOL = '0'
+    try {
+        $adapterRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
+            New-AdapterArguments -WorkspacePath $workspace -Prefix 'valid' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
+        )
+        $parentAllowedEnvironmentPreserved = (
+            [string]$env:ANTHROPIC_API_KEY -ceq 'inherited-api-key-must-be-overridden' -and
+            [string]$env:ANTHROPIC_MODEL -ceq 'inherited-model-must-be-overridden' -and
+            [string]$env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB -ceq '0' -and
+            [string]$env:CLAUDE_CODE_USE_POWERSHELL_TOOL -ceq '0'
+        )
+    } finally {
+        [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('ANTHROPIC_MODEL', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('CLAUDE_CODE_USE_POWERSHELL_TOOL', $null, 'Process')
+    }
     Assert-True 'adapter accepts absolute existing git workspace' ($adapterRun.exit_code -eq 0)
+    Assert-True 'adapter child does not alter parent provider environment' $parentAllowedEnvironmentPreserved
+    Assert-True 'adapter host output excludes provider values' (
+        Test-TextExcludesSentinels -Text $adapterRun.output_text -Sentinels @($adapterApiKey, $adapterModel)
+    )
     $adapterOutputPath = Join-Path $tempRoot 'valid-stdout.json'
     Assert-True 'fake Claude output exists' (Test-Path -LiteralPath $adapterOutputPath -PathType Leaf)
     if ($adapterRun.exit_code -eq 0 -and
@@ -104,10 +307,350 @@ exit /b 0
         $actualWorkspace = [IO.Path]::GetFullPath([string]$adapterOutput.cwd).TrimEnd('\')
         $expectedWorkspace = [IO.Path]::GetFullPath($workspace).TrimEnd('\')
         Assert-True 'fake Claude executes from exact workspace' ($actualWorkspace -ceq $expectedWorkspace)
+        Assert-True 'adapter imports exact API key without emitting it' ($adapterOutput.api_key_match -is [bool] -and $adapterOutput.api_key_match)
+        Assert-True 'adapter imports exact pinned model' ($adapterOutput.model_match -is [bool] -and $adapterOutput.model_match)
+        Assert-True 'adapter forces credential scrub for Claude subprocesses' (
+            $adapterOutput.subprocess_scrub_forced -is [bool] -and $adapterOutput.subprocess_scrub_forced
+        )
+        Assert-True 'adapter makes settings own PowerShell enablement' (
+            $adapterOutput.powershell_tool_process_absent -is [bool] -and $adapterOutput.powershell_tool_process_absent
+        )
+        Assert-True 'adapter does not import unrelated env-file keys' (
+            $adapterOutput.bus_secret_absent -and $adapterOutput.alpha_secret_absent -and
+            $adapterOutput.openai_key_absent -and $adapterOutput.decoy_absent
+        )
+        $capturedArgvText = (@($adapterOutput.argv) -join "`n")
+        Assert-True 'provider values are absent from Claude argv' (
+            -not $capturedArgvText.Contains($adapterApiKey) -and -not $capturedArgvText.Contains($adapterModel)
+        )
+        Assert-True 'adapter EnvFile stays out of Claude argv' (-not $capturedArgvText.Contains($adapterEnvFile))
+        $capturedArgv = @($adapterOutput.argv | ForEach-Object { [string]$_ })
+        $settingsArgumentIndexes = @(for ($index = 0; $index -lt $capturedArgv.Count; $index++) {
+            if ($capturedArgv[$index] -ceq '--settings') { $index }
+        })
+        $toolsArgumentIndexes = @(for ($index = 0; $index -lt $capturedArgv.Count; $index++) {
+            if ($capturedArgv[$index] -ceq '--tools') { $index }
+        })
+        $permissionArgumentIndexes = @(for ($index = 0; $index -lt $capturedArgv.Count; $index++) {
+            if ($capturedArgv[$index] -ceq '--permission-mode') { $index }
+        })
+        $disallowedArgumentIndexes = @(for ($index = 0; $index -lt $capturedArgv.Count; $index++) {
+            if ($capturedArgv[$index] -ceq '--disallowedTools') { $index }
+        })
+        Assert-True 'adapter passes one exact ephemeral settings path' (
+            $settingsArgumentIndexes.Count -eq 1 -and
+            $settingsArgumentIndexes[0] + 1 -lt $capturedArgv.Count -and
+            [IO.Path]::IsPathRooted($capturedArgv[$settingsArgumentIndexes[0] + 1]) -and
+            [string]$adapterOutput.settings_path -ceq $capturedArgv[$settingsArgumentIndexes[0] + 1] -and
+            [IO.Path]::GetDirectoryName([string]$adapterOutput.settings_path) -ceq [IO.Path]::GetFullPath($tempRoot)
+        )
+        Assert-True 'ephemeral settings exists only during Claude invocation' (
+            $adapterOutput.settings_exists_during_invoke -is [bool] -and $adapterOutput.settings_exists_during_invoke -and
+            -not (Test-Path -LiteralPath ([string]$adapterOutput.settings_path))
+        )
+        Assert-True 'ephemeral settings is bounded UTF-8 without BOM' (
+            $adapterOutput.settings_utf8_no_bom -is [bool] -and $adapterOutput.settings_utf8_no_bom -and
+            [int64]$adapterOutput.settings_bytes -gt 0 -and [int64]$adapterOutput.settings_bytes -le 16384
+        )
+        $settingsTopNames = @($adapterOutput.settings.PSObject.Properties.Name | Sort-Object)
+        $settingsEnvNames = @($adapterOutput.settings.env.PSObject.Properties.Name | Sort-Object)
+        $settingsPermissionNames = @($adapterOutput.settings.permissions.PSObject.Properties.Name | Sort-Object)
+        Assert-True 'ephemeral settings has exact top-level shape' (
+            @(Compare-Object $settingsTopNames @('env', 'permissions')).Count -eq 0 -and
+            @(Compare-Object $settingsPermissionNames @('allow', 'deny')).Count -eq 0
+        )
+        Assert-True 'ephemeral settings owns exact scrub and PowerShell controls' (
+            @(Compare-Object $settingsEnvNames @('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB', 'CLAUDE_CODE_USE_POWERSHELL_TOOL')).Count -eq 0 -and
+            [string]$adapterOutput.settings.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB -ceq '1' -and
+            [string]$adapterOutput.settings.env.CLAUDE_CODE_USE_POWERSHELL_TOOL -ceq '1'
+        )
+        Assert-True 'ephemeral settings grants exactly three work tools' (
+            @(Compare-Object @($adapterOutput.settings.permissions.allow) @('Read', 'Edit', 'PowerShell')).Count -eq 0 -and
+            @($adapterOutput.settings.permissions.allow).Count -eq 3
+        )
+        $expectedEnvPermissionPath = ([IO.Path]::GetFullPath($adapterEnvFile) -replace '\\', '/')
+        $expectedEnvPermissionPath = '//' + $expectedEnvPermissionPath.Substring(0, 1).ToLowerInvariant() + $expectedEnvPermissionPath.Substring(2).TrimEnd('/')
+        Assert-True 'ephemeral settings denies the exact configured env file' (
+            @(Compare-Object @($adapterOutput.settings.permissions.deny) @(
+                ('Read(' + $expectedEnvPermissionPath + ')')
+                ('Edit(' + $expectedEnvPermissionPath + ')')
+            )).Count -eq 0 -and @($adapterOutput.settings.permissions.deny).Count -eq 2
+        )
+        Assert-True 'ephemeral settings contains no provider value or provider variable name' (
+            Test-TextExcludesSentinels -Text ([string]$adapterOutput.settings_text) -Sentinels @(
+                $adapterApiKey, $adapterModel, 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL'
+            )
+        )
+        Assert-True 'adapter passes exact restricted tool inventory' (
+            $toolsArgumentIndexes.Count -eq 1 -and
+            $capturedArgv[$toolsArgumentIndexes[0] + 1] -ceq 'Read,Edit,PowerShell'
+        )
+        Assert-True 'adapter requests explicit manual compatibility mode' (
+            $permissionArgumentIndexes.Count -eq 1 -and
+            $capturedArgv[$permissionArgumentIndexes[0] + 1] -ceq 'manual'
+        )
+        Assert-True 'adapter disallows Bash and AskUserQuestion exactly once' (
+            $disallowedArgumentIndexes.Count -eq 1 -and
+            $capturedArgv[$disallowedArgumentIndexes[0] + 1] -ceq 'Bash' -and
+            $capturedArgv[$disallowedArgumentIndexes[0] + 2] -ceq 'AskUserQuestion'
+        )
+        Assert-True 'adapter uses bare strict-MCP mode and removes safe mode' (
+            @($capturedArgv | Where-Object { $_ -ceq '--bare' }).Count -eq 1 -and
+            @($capturedArgv | Where-Object { $_ -ceq '--strict-mcp-config' }).Count -eq 1 -and
+            @($capturedArgv | Where-Object { $_ -ceq '--safe-mode' }).Count -eq 0
+        )
+    }
+
+    $env:ORDER_ADAPTER_FAKE_EXIT_CODE = '7'
+    try {
+        $nonzeroRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
+            New-AdapterArguments -WorkspacePath $workspace -Prefix 'nonzero' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
+        )
+    } finally {
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_EXIT_CODE', $null, 'Process')
+    }
+    $nonzeroOutputPath = Join-Path $tempRoot 'nonzero-stdout.json'
+    Assert-True 'adapter preserves a nonzero Claude exit code' ($nonzeroRun.exit_code -eq 7)
+    if (Test-Path -LiteralPath $nonzeroOutputPath -PathType Leaf) {
+        $nonzeroOutput = [IO.File]::ReadAllText($nonzeroOutputPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-True 'adapter deletes ephemeral settings after nonzero Claude exit' (
+            -not [string]::IsNullOrWhiteSpace([string]$nonzeroOutput.settings_path) -and
+            -not (Test-Path -LiteralPath ([string]$nonzeroOutput.settings_path))
+        )
+    } else {
+        Assert-True 'adapter deletes ephemeral settings after nonzero Claude exit' $false
+    }
+
+    $versionCaseSpecs = @(
+        [pscustomobject]@{ name = 'version-probe-failure'; variable = 'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE'; value = '9'; code = 'claude_cli_version_probe_failed' },
+        [pscustomobject]@{ name = 'unsupported-version'; variable = 'ORDER_ADAPTER_FAKE_VERSION'; value = '2.1.242 (Claude Code)'; code = 'claude_cli_version_unsupported' }
+    )
+    foreach ($versionCaseSpec in $versionCaseSpecs) {
+        [Environment]::SetEnvironmentVariable([string]$versionCaseSpec.variable, [string]$versionCaseSpec.value, 'Process')
+        try {
+            $versionCase = Invoke-AdapterCase `
+                -Name ([string]$versionCaseSpec.name) `
+                -WorkspacePath $workspace `
+                -EnvFile $adapterEnvFile `
+                -FakeClaudePath $fakeClaudePath `
+                -TemporaryRoot $tempRoot
+        } finally {
+            [Environment]::SetEnvironmentVariable([string]$versionCaseSpec.variable, $null, 'Process')
+        }
+        Assert-AdapterRejected `
+            -Name ('adapter ' + [string]$versionCaseSpec.name) `
+            -Case $versionCase `
+            -ExpectedCode ([string]$versionCaseSpec.code) `
+            -SecretSentinels @($adapterApiKey, $adapterModel)
+    }
+
+    $singleQuotedEnvFile = Join-Path $tempRoot 'single-quoted-provider.env'
+    Write-TestEnvFile -Path $singleQuotedEnvFile -Text @'
+ANTHROPIC_API_KEY='test-api-key=preserves#characters'
+ANTHROPIC_MODEL='claude-test-model'
+'@
+    $singleQuotedCase = Invoke-AdapterCase `
+        -Name 'single-quoted-values' `
+        -WorkspacePath $workspace `
+        -EnvFile $singleQuotedEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot
+    Assert-True 'adapter accepts one matched single-quote pair' (
+        $singleQuotedCase.run.exit_code -eq 0 -and $singleQuotedCase.invoked
+    )
+    if (Test-Path -LiteralPath $singleQuotedCase.stdout_path -PathType Leaf) {
+        $singleQuotedOutput = [IO.File]::ReadAllText($singleQuotedCase.stdout_path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-True 'single-quoted provider values arrive exactly' (
+            $singleQuotedOutput.api_key_match -is [bool] -and $singleQuotedOutput.api_key_match -and
+            $singleQuotedOutput.model_match -is [bool] -and $singleQuotedOutput.model_match
+        )
+    } else {
+        Assert-True 'single-quoted provider values arrive exactly' $false
+    }
+
+    $envCaseRoot = Join-Path $tempRoot 'env-cases'
+    New-Item -ItemType Directory -Path $envCaseRoot -Force | Out-Null
+    $missingEnvFile = Join-Path $envCaseRoot 'missing.env'
+    $directoryEnvFile = Join-Path $envCaseRoot 'directory.env'
+    New-Item -ItemType Directory -Path $directoryEnvFile | Out-Null
+
+    $tooLargeEnvFile = Join-Path $envCaseRoot 'too-large.env'
+    Write-TestEnvFile -Path $tooLargeEnvFile -Text (
+        'ANTHROPIC_API_KEY=file-size-secret-' + ('x' * 1048576) + "`nANTHROPIC_MODEL=$adapterModel"
+    )
+
+    $tooManyLinesEnvFile = Join-Path $envCaseRoot 'too-many-lines.env'
+    $tooManyLines = New-Object System.Collections.Generic.List[string]
+    for ($index = 0; $index -lt 4095; $index++) { $tooManyLines.Add('# padding') }
+    $tooManyLines.Add('ANTHROPIC_API_KEY=line-count-secret')
+    $tooManyLines.Add('ANTHROPIC_MODEL=' + $adapterModel)
+    [IO.File]::WriteAllLines($tooManyLinesEnvFile, $tooManyLines.ToArray(), (New-Object Text.UTF8Encoding($false)))
+
+    $malformedUtf8EnvFile = Join-Path $envCaseRoot 'malformed-utf8.env'
+    $invalidUtf8Bytes = New-Object System.Collections.Generic.List[byte]
+    $invalidUtf8Bytes.AddRange([Text.Encoding]::ASCII.GetBytes('ANTHROPIC_API_KEY=utf8-secret-'))
+    $invalidUtf8Bytes.Add([byte]0xC3)
+    $invalidUtf8Bytes.Add([byte]0x28)
+    $invalidUtf8Bytes.AddRange([Text.Encoding]::ASCII.GetBytes("`nANTHROPIC_MODEL=$adapterModel"))
+    [IO.File]::WriteAllBytes($malformedUtf8EnvFile, $invalidUtf8Bytes.ToArray())
+
+    $oversizedApiValue = 'oversized-api-secret-' + ('x' * 8192)
+    $oversizedModelValue = 'oversized-model-secret-' + ('x' * 8192)
+    $failureCaseSpecs = @(
+        [pscustomobject]@{ Name = 'mandatory-env-file'; File = $adapterEnvFile; Code = 'EnvFile'; Omit = $true },
+        [pscustomobject]@{ Name = 'relative-env-file'; File = '.\relative-provider.env'; Code = 'claude_env_file_path_must_be_absolute'; Omit = $false },
+        [pscustomobject]@{ Name = 'missing-env-file'; File = $missingEnvFile; Code = 'claude_env_file_missing'; Omit = $false },
+        [pscustomobject]@{ Name = 'directory-env-file'; File = $directoryEnvFile; Code = 'claude_env_file_missing'; Omit = $false },
+        [pscustomobject]@{ Name = 'oversized-env-file'; File = $tooLargeEnvFile; Code = 'claude_env_file_too_large'; Omit = $false },
+        [pscustomobject]@{ Name = 'excessive-env-lines'; File = $tooManyLinesEnvFile; Code = 'claude_env_file_too_many_lines'; Omit = $false },
+        [pscustomobject]@{ Name = 'malformed-utf8'; File = $malformedUtf8EnvFile; Code = 'claude_env_file_utf8_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'missing-api-key'; Text = "ANTHROPIC_MODEL=$adapterModel"; Code = 'anthropic_api_key_missing'; Omit = $false },
+        [pscustomobject]@{ Name = 'missing-model'; Text = 'ANTHROPIC_API_KEY=missing-model-secret'; Code = 'anthropic_model_missing'; Omit = $false },
+        [pscustomobject]@{ Name = 'blank-api-key'; Text = "ANTHROPIC_API_KEY=`"`"`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_value_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'blank-model'; Text = "ANTHROPIC_API_KEY=blank-model-secret`nANTHROPIC_MODEL='   '"; Code = 'claude_env_value_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'duplicate-api-key'; Text = "ANTHROPIC_API_KEY=duplicate-secret-one`nANTHROPIC_API_KEY=duplicate-secret-two`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_duplicate_key'; Omit = $false },
+        [pscustomobject]@{ Name = 'duplicate-model'; Text = "ANTHROPIC_API_KEY=duplicate-model-secret`nANTHROPIC_MODEL=model-one`nANTHROPIC_MODEL=model-two"; Code = 'claude_env_duplicate_key'; Omit = $false },
+        [pscustomobject]@{ Name = 'api-key-case'; Text = "Anthropic_API_KEY=case-secret`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_key_case_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'model-case'; Text = "ANTHROPIC_API_KEY=model-case-secret`nanthropic_model=$adapterModel"; Code = 'claude_env_key_case_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'malformed-api-key'; Text = "ANTHROPIC_API_KEY malformed-secret`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_line_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'malformed-model'; Text = "ANTHROPIC_API_KEY=malformed-model-secret`nANTHROPIC_MODEL malformed-model"; Code = 'claude_env_line_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'opening-quote-only'; Text = "ANTHROPIC_API_KEY=`"opening-quote-secret`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_quote_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'closing-quote-only'; Text = "ANTHROPIC_API_KEY=closing-quote-secret`"`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_quote_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'mixed-quotes'; Text = "ANTHROPIC_API_KEY='mixed-quote-secret`"`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_quote_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'control-character'; Text = "ANTHROPIC_API_KEY=control-secret`tvalue`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_value_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'oversized-api-value'; Text = "ANTHROPIC_API_KEY=$oversizedApiValue`nANTHROPIC_MODEL=$adapterModel"; Code = 'claude_env_value_invalid'; Omit = $false },
+        [pscustomobject]@{ Name = 'oversized-model-value'; Text = "ANTHROPIC_API_KEY=oversized-model-api-secret`nANTHROPIC_MODEL=$oversizedModelValue"; Code = 'claude_env_value_invalid'; Omit = $false }
+    )
+    $secretSentinels = @(
+        $adapterApiKey, 'must-not-be-imported', 'inherited-api-key-must-be-overridden',
+        'file-size-secret-', 'line-count-secret', 'missing-model-secret', 'blank-model-secret',
+        'utf8-secret-',
+        'duplicate-secret-', 'duplicate-model-secret', 'case-secret', 'model-case-secret',
+        'malformed-secret', 'malformed-model-secret', 'opening-quote-secret',
+        'closing-quote-secret', 'mixed-quote-secret', 'control-secret',
+        'oversized-api-secret-', 'oversized-model-secret-'
+    )
+
+    foreach ($spec in $failureCaseSpecs) {
+        $fileProperty = $spec.PSObject.Properties['File']
+        $caseEnvFile = if ($null -eq $fileProperty) { '' } else { [string]$fileProperty.Value }
+        if ([string]::IsNullOrWhiteSpace($caseEnvFile)) {
+            $caseEnvFile = Join-Path $envCaseRoot ([string]$spec.Name + '.env')
+            $textProperty = $spec.PSObject.Properties['Text']
+            Write-TestEnvFile -Path $caseEnvFile -Text ([string]$textProperty.Value)
+        }
+        $adapterCase = Invoke-AdapterCase `
+            -Name ([string]$spec.Name) `
+            -WorkspacePath $workspace `
+            -EnvFile $caseEnvFile `
+            -FakeClaudePath $fakeClaudePath `
+            -TemporaryRoot $tempRoot `
+            -OmitEnvFile:([bool]$spec.Omit)
+        Assert-AdapterRejected `
+            -Name ('adapter ' + [string]$spec.Name) `
+            -Case $adapterCase `
+            -ExpectedCode ([string]$spec.Code) `
+            -SecretSentinels $secretSentinels
+    }
+
+    foreach ($conflictName in $providerConflictNames) {
+        $conflictValue = 'provider-conflict-secret-' + $conflictName
+        [Environment]::SetEnvironmentVariable($conflictName, $conflictValue, 'Process')
+        try {
+            $conflictCase = Invoke-AdapterCase `
+                -Name ('conflict-' + $conflictName) `
+                -WorkspacePath $workspace `
+                -EnvFile $adapterEnvFile `
+                -FakeClaudePath $fakeClaudePath `
+                -TemporaryRoot $tempRoot
+        } finally {
+            [Environment]::SetEnvironmentVariable($conflictName, $null, 'Process')
+        }
+        Assert-AdapterRejected `
+            -Name ('adapter conflict ' + $conflictName) `
+            -Case $conflictCase `
+            -ExpectedCode 'claude_provider_environment_conflict' `
+            -SecretSentinels @($adapterApiKey, $conflictValue)
+    }
+
+    $maxFileSizeEnvFile = Join-Path $envCaseRoot 'max-file-size.env'
+    $maxFileSizePrefix = "ANTHROPIC_API_KEY=$adapterApiKey`nANTHROPIC_MODEL=$adapterModel`n#"
+    $maxFileSizeText = $maxFileSizePrefix + ('x' * (1048576 - $maxFileSizePrefix.Length))
+    Write-TestEnvFile -Path $maxFileSizeEnvFile -Text $maxFileSizeText
+    $maxFileSizeCase = Invoke-AdapterCase `
+        -Name 'max-file-size' `
+        -WorkspacePath $workspace `
+        -EnvFile $maxFileSizeEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot
+    Assert-True 'adapter accepts exactly 1048576-byte env file' (
+        (Get-Item -LiteralPath $maxFileSizeEnvFile).Length -eq 1048576 -and
+        $maxFileSizeCase.run.exit_code -eq 0 -and $maxFileSizeCase.invoked
+    )
+
+    $maxLineCountEnvFile = Join-Path $envCaseRoot 'max-line-count.env'
+    $maxLineCount = New-Object System.Collections.Generic.List[string]
+    for ($index = 0; $index -lt 4094; $index++) { $maxLineCount.Add('# padding') }
+    $maxLineCount.Add('ANTHROPIC_API_KEY=' + $adapterApiKey)
+    $maxLineCount.Add('ANTHROPIC_MODEL=' + $adapterModel)
+    Write-TestEnvFile -Path $maxLineCountEnvFile -Text ($maxLineCount.ToArray() -join "`n")
+    $maxLineCountCase = Invoke-AdapterCase `
+        -Name 'max-line-count' `
+        -WorkspacePath $workspace `
+        -EnvFile $maxLineCountEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot
+    Assert-True 'adapter accepts exactly 4096 env-file lines' (
+        ([IO.File]::ReadAllLines($maxLineCountEnvFile, [Text.Encoding]::UTF8)).Count -eq 4096 -and
+        $maxLineCountCase.run.exit_code -eq 0 -and $maxLineCountCase.invoked
+    )
+
+    $maxApiValueEnvFile = Join-Path $envCaseRoot 'max-api-value.env'
+    Write-TestEnvFile -Path $maxApiValueEnvFile -Text (
+        'ANTHROPIC_API_KEY=' + ('a' * 8192) + "`nANTHROPIC_MODEL=$adapterModel"
+    )
+    $maxApiValueCase = Invoke-AdapterCase `
+        -Name 'max-api-value' `
+        -WorkspacePath $workspace `
+        -EnvFile $maxApiValueEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot
+    Assert-True 'adapter accepts exactly 8192-character API key' (
+        $maxApiValueCase.run.exit_code -eq 0 -and $maxApiValueCase.invoked
+    )
+    if (Test-Path -LiteralPath $maxApiValueCase.stdout_path -PathType Leaf) {
+        $maxApiValueOutput = [IO.File]::ReadAllText($maxApiValueCase.stdout_path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-True 'fake Claude receives exactly 8192 API-key characters' (
+            [int]$maxApiValueOutput.api_key_length -eq 8192
+        )
+    } else {
+        Assert-True 'fake Claude receives exactly 8192 API-key characters' $false
+    }
+
+    $maxModelValueEnvFile = Join-Path $envCaseRoot 'max-model-value.env'
+    Write-TestEnvFile -Path $maxModelValueEnvFile -Text (
+        "ANTHROPIC_API_KEY=$adapterApiKey`nANTHROPIC_MODEL=" + ('m' * 8192)
+    )
+    $maxModelValueCase = Invoke-AdapterCase `
+        -Name 'max-model-value' `
+        -WorkspacePath $workspace `
+        -EnvFile $maxModelValueEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot
+    Assert-True 'adapter accepts exactly 8192-character model value' (
+        $maxModelValueCase.run.exit_code -eq 0 -and $maxModelValueCase.invoked
+    )
+    if (Test-Path -LiteralPath $maxModelValueCase.stdout_path -PathType Leaf) {
+        $maxModelValueOutput = [IO.File]::ReadAllText($maxModelValueCase.stdout_path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-True 'fake Claude receives exactly 8192 model characters' (
+            [int]$maxModelValueOutput.model_length -eq 8192
+        )
+    } else {
+        Assert-True 'fake Claude receives exactly 8192 model characters' $false
     }
 
     $relativeRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
-        New-AdapterArguments -WorkspacePath '.\relative' -Prefix 'relative' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot
+        New-AdapterArguments -WorkspacePath '.\relative' -Prefix 'relative' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
     )
     Assert-True 'adapter rejects relative workspace' (
         $relativeRun.exit_code -ne 0 -and $relativeRun.output_text.Contains('workspace_path_must_be_absolute')
@@ -115,22 +658,66 @@ exit /b 0
 
     $missingWorkspace = Join-Path $tempRoot 'missing-checkout'
     $missingRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
-        New-AdapterArguments -WorkspacePath $missingWorkspace -Prefix 'missing' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot
+        New-AdapterArguments -WorkspacePath $missingWorkspace -Prefix 'missing' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
     )
     Assert-True 'adapter rejects missing workspace' (
         $missingRun.exit_code -ne 0 -and $missingRun.output_text.Contains('workspace_path_missing')
     )
 
     $nonGitRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
-        New-AdapterArguments -WorkspacePath $nonGitWorkspace -Prefix 'nongit' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot
+        New-AdapterArguments -WorkspacePath $nonGitWorkspace -Prefix 'nongit' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
     )
     Assert-True 'adapter rejects workspace without git directory' (
         $nonGitRun.exit_code -ne 0 -and $nonGitRun.output_text.Contains('execute_workspace_git_directory_missing')
     )
 
+    $runnerSource = [IO.File]::ReadAllText($RunnerPath, [Text.Encoding]::UTF8)
+    $adapterSource = [IO.File]::ReadAllText($AdapterPath, [Text.Encoding]::UTF8)
+    $providerBlock = [regex]::Match(
+        $adapterSource,
+        '(?s)\$providerConflictNames\s*=\s*@\((?<body>.*?)\)'
+    )
+    $actualProviderConflictNames = @(
+        [regex]::Matches($providerBlock.Groups['body'].Value, "'(?<name>[A-Z][A-Z0-9_]*)'") |
+            ForEach-Object { [string]$_.Groups['name'].Value }
+    )
+    $providerContractMatches = $providerBlock.Success -and
+        $actualProviderConflictNames.Count -eq $providerConflictNames.Count
+    if ($providerContractMatches) {
+        for ($index = 0; $index -lt $providerConflictNames.Count; $index++) {
+            if ($actualProviderConflictNames[$index] -cne $providerConflictNames[$index]) {
+                $providerContractMatches = $false
+                break
+            }
+        }
+    }
+    Assert-True 'provider-conflict test table exactly matches adapter contract' $providerContractMatches
+
+    $allowedBlock = [regex]::Match(
+        $adapterSource,
+        '(?s)\$allowedEnvironmentNames\s*=\s*@\((?<body>.*?)\)'
+    )
+    $actualAllowedEnvironmentNames = @(
+        [regex]::Matches($allowedBlock.Groups['body'].Value, "'(?<name>[A-Z][A-Z0-9_]*)'") |
+            ForEach-Object { [string]$_.Groups['name'].Value }
+    )
+    Assert-True 'adapter allowlist remains exactly API key and model' (
+        $allowedBlock.Success -and $actualAllowedEnvironmentNames.Count -eq 2 -and
+        $actualAllowedEnvironmentNames[0] -ceq 'ANTHROPIC_API_KEY' -and
+        $actualAllowedEnvironmentNames[1] -ceq 'ANTHROPIC_MODEL'
+    )
+    Assert-True 'runner forwards exact EnvFile path to Claude adapter' (
+        $runnerSource.Contains("'-EnvFile', (Quote-ProcessArgument `$EnvFile)")
+    )
+    Assert-True 'runner never expands EnvFile contents into adapter argv' (
+        -not $runnerSource.Contains('[IO.File]::ReadAllText($EnvFile)') -and
+        -not $runnerSource.Contains('Get-Content -LiteralPath $EnvFile')
+    )
+
     $runnerBase = @(
         '-Mode', 'Execute',
         '-BoardFixturePath', $FixturePath,
+        '-EnvFile', $adapterEnvFile,
         '-StatePath', (Join-Path $tempRoot 'runner-state.json'),
         '-LogPath', (Join-Path $tempRoot 'runner-events.jsonl')
     )
@@ -283,6 +870,9 @@ param(
         }
     }
 } finally {
+    foreach ($name in $testEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable($name, $testEnvironmentBackup[$name], 'Process')
+    }
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $tempRoot -PathType Container)) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force
     }

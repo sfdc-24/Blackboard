@@ -65,17 +65,51 @@ bind every runbook parameter explicitly using the exact parameter-name case in
 7. Run the outer runbook manually and require exactly one terminal JSON record
    with the expected VM/task identity. Then require the same result from one
    scheduled invocation.
-8. Only then install the same task in `Execute` mode with an absolute Claude
+8. While the scheduled task is still in `Observe`, run the isolated SYSTEM
+   adapter smoke with the exact release, workspace, and Claude arguments. It
+   must prove the requested work-tool set `Read,Edit,PowerShell`, the effective
+   set `Read,Edit,PowerShell,StructuredOutput`, scrubbed child environment,
+   harmless Git execution, and unchanged protected fingerprints.
+9. Only then install the same task in `Execute` mode with an absolute Claude
    executable path. Issue one fresh, harmless `codex` test order and verify its
    deterministic CLAIM, RECEIPT, and RESULT rows by reading the board back.
+   Start the task a second time and prove the new poll occurred while lifecycle
+   counts remain exactly `1/1/1`.
 
-The bounded adapter runs Claude Code in non-interactive `auto` mode, disables
-`AskUserQuestion`, and instructs the model not to retry a denied tool. It does
-not require `--permission-prompts none`, which was introduced only in Claude
-Code 2.1.259: in a `-p` process with no permission host, unresolved permission
-requests are already denied. Keep the adapter's wall-clock timeout, budget,
-schema validation, safe mode, and disabled session/slash-command controls as a
-single compatibility contract.
+The bounded adapter targets the VM-pinned Claude Code 2.1.241 compatibility
+contract. With subprocess credential scrubbing enabled, that version forces its
+internal permission mode to `default`; the corresponding external CLI value is
+`manual`. The adapter therefore requests `manual` explicitly instead of asking
+for `auto` and silently accepting a downgrade. It uses `--bare`, strict MCP
+configuration, disables `Bash` and `AskUserQuestion`, and limits the requested
+work tools to `Read,Edit,PowerShell`. JSON-schema enforcement adds the only
+other model-visible tool, `StructuredOutput`. It does not require
+`--permission-prompts none`, which was introduced only in Claude Code 2.1.259.
+The installer and every adapter invocation require the exact tested version
+string `2.1.241 (Claude Code)` and fail closed on drift. Keep the adapter's
+wall-clock timeout, budget, schema validation, bare mode, strict MCP boundary,
+explicit tool list, and disabled session/slash-command controls as one
+version-pinned contract.
+
+In Execute mode the worker passes only the absolute `.env` file path to the
+short-lived Claude adapter. The adapter reads exactly `ANTHROPIC_API_KEY` and
+`ANTHROPIC_MODEL`, rejects competing Claude provider/authentication selectors,
+and places those two values only in the Claude child process environment. It
+does not import other `.env` entries or put provider values in argv, prompts,
+logs, state, or board rows. For every Claude launch, the adapter forces
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` and restores the inherited setting
+afterward. Claude retains the provider credential for its own API call, while
+Claude-launched shell tools, hooks, and stdio MCP servers do not inherit
+recognized credentials. This control is adapter-owned and is never imported
+from the workspace `.env` file. Each invocation also creates a bounded,
+secret-free UTF-8 settings file beside its other temporary artifacts. That file
+reasserts scrubbing, enables the native PowerShell tool, preauthorizes exactly
+`Read`, `Edit`, and `PowerShell`, and denies built-in `Read`/`Edit` access to the
+exact configured environment file; the adapter deletes it in `finally`, and the
+parent removes the entire run directory after timeout or forced termination.
+This release supports direct Anthropic inference only. Microsoft Foundry remains an
+explicit, separately tested worker/provider contract and must not be selected
+from ambient variables.
 
 The structured-result schema deliberately declares the canonical JSON Schema
 Draft-07 identifier. Claude Code 2.1.241's `--json-schema` validator registers
@@ -92,6 +126,14 @@ during the evaluation. Do not run both coordinator tasks in Execute mode.
 
 ## Known POC limits
 
+- This execution profile is for trusted, operator-authored `operator-direct`
+  POC orders on the admitted private surfaces. The `.env` rules constrain
+  Claude's built-in file tools only. Broad `PowerShell` runs as the same Windows
+  identity and can read same-identity files (including `.env`), start processes,
+  or access the network; subprocess environment scrubbing is not an OS sandbox
+  and this design does not claim adversarial prompt-injection resistance.
+  Production remains blocked on a separate restricted worker identity plus a
+  sanitized checkout, or a brokered/allowlisted command-execution boundary.
 - Azure Action Run Command permits only one active script and has a 90-minute
   timeout. Normal cold supervisor runs took about five minutes in this setup;
   a 409 busy response fails visibly as `RUN_COMMAND_BUSY` and is deferred to

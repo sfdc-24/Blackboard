@@ -665,7 +665,10 @@ function Invoke-IdempotentBoardAppend {
 }
 
 function Test-ClaudeResult {
-    param([Parameter(Mandatory = $true)]$Value, [Parameter(Mandatory = $true)][string]$ExpectedWorkId)
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkId
+    )
 
     if (-not $Value) { throw 'claude_result_empty' }
     $names = @($Value.PSObject.Properties.Name)
@@ -713,6 +716,89 @@ function Test-ClaudeResult {
     return $Value
 }
 
+function ConvertFrom-ClaudeResultEnvelope {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$JsonText,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkId
+    )
+
+    $trimmed = $JsonText.Trim()
+    if (-not $trimmed.StartsWith('{')) { throw 'CLAUDE_OUTER_ROOT_INVALID' }
+    try {
+        $outer = ConvertFrom-JsonPreserveStrings -Json $trimmed
+    } catch {
+        throw 'CLAUDE_OUTER_JSON_INVALID'
+    }
+    if ($null -eq $outer -or $outer -isnot [pscustomobject]) { throw 'CLAUDE_OUTER_ROOT_INVALID' }
+
+    $names = @($outer.PSObject.Properties.Name)
+    if ($names -ccontains 'type') {
+        if ($outer.type -isnot [string] -or [string]$outer.type -cne 'result') {
+            throw 'CLAUDE_OUTER_TYPE_INVALID'
+        }
+    }
+    if ($names -ccontains 'subtype') {
+        if ($outer.subtype -isnot [string] -or [string]$outer.subtype -cne 'success') {
+            throw 'CLAUDE_OUTER_SUBTYPE_INVALID'
+        }
+    }
+    if ($names -ccontains 'is_error') {
+        if ($outer.is_error -isnot [bool]) { throw 'CLAUDE_OUTER_IS_ERROR_TYPE_INVALID' }
+        if ([bool]$outer.is_error) {
+            $statusClass = 'STATUS_UNKNOWN'
+            if ($names -ccontains 'api_error_status') {
+                $statusValue = $outer.api_error_status
+                $statusIsIntegral = (
+                    $statusValue -is [byte] -or $statusValue -is [sbyte] -or
+                    $statusValue -is [int16] -or $statusValue -is [uint16] -or
+                    $statusValue -is [int32] -or $statusValue -is [uint32] -or
+                    $statusValue -is [int64] -or $statusValue -is [uint64]
+                )
+                if ($statusIsIntegral -and [int64]$statusValue -ge 100 -and [int64]$statusValue -le 599) {
+                    $statusCode = [int64]$statusValue
+                    $statusClass = switch ($statusCode) {
+                        400 { 'BAD_REQUEST'; break }
+                        401 { 'AUTHENTICATION'; break }
+                        403 { 'PERMISSION'; break }
+                        404 { 'NOT_FOUND'; break }
+                        409 { 'CONFLICT'; break }
+                        422 { 'UNPROCESSABLE'; break }
+                        429 { 'RATE_LIMIT'; break }
+                        default { if ($statusCode -ge 500) { 'SERVER_ERROR' } else { 'HTTP_ERROR' } }
+                    }
+                }
+            }
+
+            $reasonClass = 'REASON_UNKNOWN'
+            if ($names -ccontains 'terminal_reason' -and $outer.terminal_reason -is [string]) {
+                $knownReasons = @(
+                    'completed', 'api_error', 'max_turns', 'blocking_limit', 'rapid_refill_breaker',
+                    'prompt_too_long', 'image_error', 'model_error', 'aborted_streaming', 'aborted_tools',
+                    'stop_hook_prevented', 'hook_stopped', 'tool_deferred', 'malformed_tool_use_exhausted',
+                    'budget_exhausted', 'structured_output_retry_exhausted', 'tool_deferred_unavailable', 'turn_setup_failed'
+                )
+                if ($knownReasons -ccontains [string]$outer.terminal_reason) {
+                    $reasonClass = ([string]$outer.terminal_reason).ToUpperInvariant()
+                }
+            }
+            throw ('CLAUDE_REPORTED_ERROR_' + $statusClass + '_' + $reasonClass)
+        }
+    }
+
+    if ($names -ccontains 'structured_output') {
+        $value = $outer.structured_output
+    } elseif ($names -ccontains 'result' -and $outer.result -is [string]) {
+        try {
+            $value = ConvertFrom-JsonPreserveStrings -Json ([string]$outer.result)
+        } catch {
+            throw 'CLAUDE_RESULT_JSON_INVALID'
+        }
+    } else {
+        throw 'CLAUDE_STRUCTURED_OUTPUT_MISSING'
+    }
+    return Test-ClaudeResult -Value $value -ExpectedWorkId $ExpectedWorkId
+}
+
 Export-ModuleMember -Function @(
     'Get-UtcStamp', 'Get-StringSha256', 'Protect-LogText', 'Write-Utf8NoBom',
     'New-OrderState', 'Read-OrderState', 'Save-OrderState', 'Write-OrderLog',
@@ -720,5 +806,5 @@ Export-ModuleMember -Function @(
     'Test-AuthorityToken', 'Test-OrderRow', 'Get-OrderSelection', 'New-ClaudeWorkerPrompt',
     'Get-DeterministicPhaseRowId', 'New-OrderPhaseRow', 'Find-BoardRowById',
     'Test-ExistingPhaseRow', 'Test-PhaseRowIdentity',
-    'Invoke-IdempotentBoardAppend', 'Test-ClaudeResult'
+    'Invoke-IdempotentBoardAppend', 'Test-ClaudeResult', 'ConvertFrom-ClaudeResultEnvelope'
 )

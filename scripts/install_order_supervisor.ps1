@@ -74,6 +74,29 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Assert-ClaudeCliCompatibility {
+    param([Parameter(Mandatory = $true)][string]$CommandPath)
+
+    $versionOutput = @(& $CommandPath --version 2>&1)
+    $versionExitCode = $LASTEXITCODE
+    if ($versionExitCode -ne 0) { throw 'claude_cli_version_probe_failed' }
+    $versionText = (($versionOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+    if ($versionText -cne '2.1.241 (Claude Code)') { throw 'claude_cli_version_unsupported' }
+
+    $helpOutput = @(& $CommandPath --help 2>&1)
+    $helpExitCode = $LASTEXITCODE
+    if ($helpExitCode -ne 0) { throw 'claude_cli_help_probe_failed' }
+    $helpText = ($helpOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    foreach ($requiredFlag in @('--json-schema', '--settings', '--tools', '--strict-mcp-config', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--bare', '--no-session-persistence', '--disable-slash-commands')) {
+        if (-not $helpText.Contains($requiredFlag)) {
+            throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
+        }
+    }
+    if ($helpText -notmatch '(?s)--permission-mode\s+<mode>.*?\(choices:.*?"manual".*?\)') {
+        throw 'claude_cli_manual_mode_missing'
+    }
+}
+
 function Assert-MutationPreflight {
     if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
         throw 'mutations_require_windows_powershell_5_1'
@@ -94,6 +117,7 @@ function Assert-MutationPreflight {
             throw 'execute_workspace_git_directory_missing'
         }
     }
+    if (-not [IO.Path]::IsPathRooted($EnvFile)) { throw 'env_file_path_must_be_absolute' }
     if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { throw 'v1_bus_env_missing' }
     Assert-NoQuote -Name 'runner_path' -Value $RunnerPath
     Assert-NoQuote -Name 'repo_root' -Value $RepoRoot
@@ -108,12 +132,7 @@ function Assert-MutationPreflight {
             -not (Test-Path -LiteralPath $ClaudeCommand -PathType Leaf)) {
             throw 'execute_requires_absolute_claude_command'
         }
-        $helpText = (& $ClaudeCommand --help 2>&1) -join [Environment]::NewLine
-        foreach ($requiredFlag in @('--json-schema', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--safe-mode', '--no-session-persistence', '--disable-slash-commands')) {
-            if (-not $helpText.Contains($requiredFlag)) {
-                throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
-            }
-        }
+        Assert-ClaudeCliCompatibility -CommandPath $ClaudeCommand
     }
 }
 

@@ -84,6 +84,18 @@ if (-not $EnvFile) {
     $envRoot = if ([string]::IsNullOrWhiteSpace($WorkspacePath)) { $releaseRoot } else { $WorkspacePath }
     $EnvFile = Join-Path $envRoot '.env'
 }
+if (-not [IO.Path]::IsPathRooted($EnvFile)) {
+    if ([string]::IsNullOrWhiteSpace($preflightError)) {
+        $preflightError = 'env_file_path_must_be_absolute'
+    }
+} else {
+    $EnvFile = [IO.Path]::GetFullPath($EnvFile)
+    if ([string]::IsNullOrWhiteSpace($preflightError) -and
+        $Mode -ceq 'Execute' -and
+        -not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) {
+        $preflightError = 'execute_env_file_missing'
+    }
+}
 
 function Read-Board {
     if ($BoardFixturePath) {
@@ -264,6 +276,7 @@ function Invoke-ClaudeWorker {
             '-SchemaPath', (Quote-ProcessArgument $ClaudeSchema),
             '-StdoutPath', (Quote-ProcessArgument $stdoutPath),
             '-StderrPath', (Quote-ProcessArgument $stderrPath),
+            '-EnvFile', (Quote-ProcessArgument $EnvFile),
             '-ClaudeCommand', (Quote-ProcessArgument $ClaudeCommand),
             '-WorkspacePath', (Quote-ProcessArgument $WorkspacePath),
             '-MaxBudgetUsd', ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.00}', $MaxBudgetUsd))
@@ -291,15 +304,7 @@ function Invoke-ClaudeWorker {
         $outputInfo = Get-Item -LiteralPath $stdoutPath
         if ($outputInfo.Length -gt 1048576) { throw 'claude_output_too_large' }
         $jsonText = [IO.File]::ReadAllText($outputInfo.FullName, [Text.Encoding]::UTF8)
-        $outer = $jsonText | ConvertFrom-Json
-        if ($outer.PSObject.Properties.Name -contains 'structured_output') {
-            $value = $outer.structured_output
-        } elseif ($outer.PSObject.Properties.Name -contains 'result' -and $outer.result -is [string]) {
-            $value = ([string]$outer.result) | ConvertFrom-Json
-        } else {
-            throw 'claude_structured_output_missing'
-        }
-        return Test-ClaudeResult -Value $value -ExpectedWorkId $WorkId
+        return ConvertFrom-ClaudeResultEnvelope -JsonText $jsonText -ExpectedWorkId $WorkId
     } finally {
         if (Test-Path -LiteralPath $tempRoot -PathType Container) {
             Get-ChildItem -LiteralPath $tempRoot -Force | Remove-Item -Force -ErrorAction SilentlyContinue
