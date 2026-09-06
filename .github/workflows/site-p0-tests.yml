@@ -1,0 +1,22 @@
+name: site-p0-tests
+
+on:
+  pull_request:
+    paths:
+      - "apps-script/governor-page-api/**"
+      - "tests/test_governor_voice.cjs"
+      - ".github/workflows/site-p0-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  governor-voice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node --test tests/test_governor_voice.cjs
