@@ -303,6 +303,407 @@ BUS_SECRET=BUS_SECRET_CANARY
     }
 }
 
+function Invoke-ActualBusSecondRedirectCase {
+    $caseRoot = Join-Path $script:TestRoot 'actual-bus-second-redirect'
+    $fakeBin = Join-Path $caseRoot 'bin'
+    $fakeCurlPath = Join-Path $fakeBin 'curl.exe'
+    $envPath = Join-Path $caseRoot 'test.env'
+    $outPath = Join-Path $caseRoot 'response.txt'
+    $metadataPath = Join-Path $caseRoot 'metadata.json'
+    $expectedBody = '{"ok":true,"rows":[]}'
+    New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+
+    $fakeCurlSource = @'
+using System;
+using System.IO;
+using System.Text;
+
+public static class FakeSecondRedirectCurl {
+    public static int Main(string[] args) {
+        string root = Environment.GetEnvironmentVariable("ORDER_READ_REDIRECT_ROOT");
+        if (String.IsNullOrEmpty(root)) { return 90; }
+
+        string countPath = Path.Combine(root, "curl-count.txt");
+        int count = File.Exists(countPath) ? Int32.Parse(File.ReadAllText(countPath, Encoding.UTF8)) : 0;
+        count++;
+        File.WriteAllText(countPath, count.ToString(), new UTF8Encoding(false));
+        File.AppendAllText(
+            Path.Combine(root, "curl-arguments.txt"),
+            String.Join("\u001f", args) + Environment.NewLine,
+            new UTF8Encoding(false)
+        );
+
+        string headerPath = null;
+        for (int i = 0; i + 1 < args.Length; i++) {
+            if (args[i] == "-D") { headerPath = args[i + 1]; break; }
+        }
+        if (String.IsNullOrEmpty(headerPath)) { return 91; }
+
+        if (count == 1) {
+            File.WriteAllText(
+                headerPath,
+                "HTTP/1.1 302 Found\r\nLocation: https://ONE_SHOT_REDIRECT_CANARY.invalid/one-shot\r\n\r\n",
+                new UTF8Encoding(false)
+            );
+            return 0;
+        }
+        if (count == 2) {
+            string finalStatus = Environment.GetEnvironmentVariable("ORDER_READ_REDIRECT_FINAL_STATUS") ?? "200";
+            string finalHeader;
+            string finalBody;
+            if (finalStatus == "503") {
+                finalHeader = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n\r\n";
+                finalBody = "<html>FINAL_REDIRECT_BODY_CANARY</html>";
+            } else {
+                finalHeader = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n\r\n";
+                finalBody = "{\"ok\":true,\"rows\":[]}";
+            }
+            File.WriteAllText(
+                headerPath,
+                "HTTP/1.1 302 Found\r\nLocation: https://CANONICAL_REDIRECT_CANARY.invalid/exec\r\n\r\n" + finalHeader,
+                new UTF8Encoding(false)
+            );
+            Console.OutputEncoding = new UTF8Encoding(false);
+            Console.Write(finalBody);
+            return 0;
+        }
+        return 92;
+    }
+}
+'@
+    Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+    Write-TestUtf8 -Path $envPath -Text @'
+BUS_URL=https://BUS_URL_REDIRECT_CANARY.invalid/private
+BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
+'@
+
+    $failureRoot = Join-Path $script:TestRoot 'actual-bus-second-redirect-failure'
+    $failureOutPath = Join-Path $failureRoot 'response.txt'
+    $failureMetadataPath = Join-Path $failureRoot 'metadata.json'
+    New-Item -ItemType Directory -Path $failureRoot -Force | Out-Null
+
+    $variables = @('PATH', 'ORDER_READ_REDIRECT_ROOT', 'ORDER_READ_REDIRECT_FINAL_STATUS')
+    $previous = @{}
+    foreach ($name in $variables) {
+        $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        [Environment]::SetEnvironmentVariable('PATH', ($fakeBin + [IO.Path]::PathSeparator + $previous.PATH), 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_ROOT', $caseRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_FINAL_STATUS', '200', 'Process')
+        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -Action read `
+            -Title 'test board' `
+            -OutFile $outPath `
+            -EnvFile $envPath `
+            -ReadMetadataOutFile $metadataPath 2>&1)
+        $exitCode = $LASTEXITCODE
+
+        [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_ROOT', $failureRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_FINAL_STATUS', '503', 'Process')
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
+                -Action read `
+                -Title 'test board' `
+                -OutFile $failureOutPath `
+                -EnvFile $envPath `
+                -ReadMetadataOutFile $failureMetadataPath 2>&1)
+            $failureExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+    } finally {
+        foreach ($name in $variables) {
+            [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
+        }
+    }
+
+    $argumentPath = Join-Path $caseRoot 'curl-arguments.txt'
+    $countPath = Join-Path $caseRoot 'curl-count.txt'
+    $failureCountPath = Join-Path $failureRoot 'curl-count.txt'
+    $argumentLines = $(if (Test-Path -LiteralPath $argumentPath) {
+        @([IO.File]::ReadAllLines($argumentPath, [Text.Encoding]::UTF8))
+    } else { @() })
+    $firstCall = @()
+    $secondCall = @()
+    if ($argumentLines.Count -ge 1) { $firstCall = @([string]$argumentLines[0] -split ([char]0x1f)) }
+    if ($argumentLines.Count -ge 2) { $secondCall = @([string]$argumentLines[1] -split ([char]0x1f)) }
+    $callCount = $(if (Test-Path -LiteralPath $countPath) {
+        [int][IO.File]::ReadAllText($countPath, [Text.Encoding]::UTF8)
+    } else { 0 })
+    $failureCallCount = $(if (Test-Path -LiteralPath $failureCountPath) {
+        [int][IO.File]::ReadAllText($failureCountPath, [Text.Encoding]::UTF8)
+    } else { 0 })
+    $metadataText = [IO.File]::ReadAllText($metadataPath, [Text.Encoding]::UTF8)
+    $failureMetadataText = [IO.File]::ReadAllText($failureMetadataPath, [Text.Encoding]::UTF8)
+    return [pscustomobject][ordered]@{
+        exit_code = $exitCode
+        output = @($output)
+        call_count = $callCount
+        first_call = $firstCall
+        second_call = $secondCall
+        body = [IO.File]::ReadAllText($outPath, [Text.Encoding]::UTF8)
+        expected_body = $expectedBody
+        metadata_text = $metadataText
+        metadata = $metadataText | ConvertFrom-Json
+        failure_exit_code = $failureExitCode
+        failure_output = @($failureOutput)
+        failure_call_count = $failureCallCount
+        failure_metadata_text = $failureMetadataText
+        failure_metadata = $failureMetadataText | ConvertFrom-Json
+    }
+}
+
+function Invoke-ActualBusIwrFallbackCase {
+    $caseRoot = Join-Path $script:TestRoot 'actual-bus-iwr-fallback'
+    $emptyPath = Join-Path $caseRoot 'empty-path'
+    $wrapperPath = Join-Path $caseRoot 'invoke-iwr-fallback.ps1'
+    $envPath = Join-Path $caseRoot 'test.env'
+    New-Item -ItemType Directory -Path $emptyPath -Force | Out-Null
+
+    $wrapperSource = @'
+param(
+    [Parameter(Mandatory = $true)][string]$BusPath,
+    [Parameter(Mandatory = $true)][string]$EnvPath,
+    [Parameter(Mandatory = $true)][string]$OutPath,
+    [Parameter(Mandatory = $true)][string]$MetadataPath,
+    [Parameter(Mandatory = $true)][string]$TracePath,
+    [Parameter(Mandatory = $true)][string]$EmptyPath,
+    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location')][string]$Scenario
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+$global:OrderReadIwrFallbackCalls = New-Object System.Collections.Generic.List[object]
+
+function Invoke-WebRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$Method,
+        [AllowNull()]$Body,
+        [AllowNull()][string]$ContentType,
+        [int]$MaximumRedirection,
+        [switch]$UseBasicParsing,
+        [int]$TimeoutSec
+    )
+
+    $global:OrderReadIwrFallbackCalls.Add([pscustomobject][ordered]@{
+        method = $Method
+        maximum_redirection = $MaximumRedirection
+        uri_class = $(if ($Uri -like 'https://BUS_URL_IWR_CANARY.invalid/*') { 'bus' } else { 'redirect' })
+        body_present = ($null -ne $Body)
+    })
+    if ($Method -ceq 'Post') {
+        return [pscustomobject]@{
+            StatusCode = 302
+            Headers = @{
+                Location = $(if ($Scenario -ceq 'insecure-location') {
+                    'http://INSECURE_IWR_LOCATION_CANARY.invalid/one-shot'
+                } elseif ($Scenario -ceq 'empty-location') {
+                    '   '
+                } else {
+                    'https://ONE_SHOT_IWR_CANARY.invalid/one-shot'
+                })
+                'Content-Type' = 'text/html'
+            }
+            Content = ''
+        }
+    }
+    if ($Method -cne 'Get') { throw 'IWR_TEST_METHOD_INVALID' }
+    if ($Scenario -ceq 'network-failure') {
+        throw [System.Net.WebException]::new(
+            'RAW_IWR_EXCEPTION_CANARY https://ONE_SHOT_IWR_CANARY.invalid/one-shot'
+        )
+    }
+    if ($Scenario -ceq 'second-redirect') {
+        return [pscustomobject]@{
+            StatusCode = 302
+            Headers = @{
+                Location = 'http://IWR_DOWNGRADE_REDIRECT_CANARY.invalid/exec'
+                'Content-Type' = 'text/html'
+            }
+            Content = '<html>IWR_REDIRECT_BODY_CANARY</html>'
+        }
+    }
+    return [pscustomobject]@{
+        StatusCode = 200
+        Headers = @{ 'Content-Type' = 'application/json; charset=utf-8' }
+        Content = '{"ok":true,"rows":[]}'
+    }
+}
+
+$previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+$caught = $null
+try {
+    [Environment]::SetEnvironmentVariable('PATH', $EmptyPath, 'Process')
+    & $BusPath `
+        -Action read `
+        -Title 'test board' `
+        -OutFile $OutPath `
+        -EnvFile $EnvPath `
+        -ReadMetadataOutFile $MetadataPath
+} catch {
+    $caught = $_
+    throw
+} finally {
+    $trace = [ordered]@{
+        calls = $global:OrderReadIwrFallbackCalls.ToArray()
+        exception_type = $(if ($null -eq $caught) { $null } else { $caught.Exception.GetType().FullName })
+        exception_message = $(if ($null -eq $caught) { $null } else { [string]$caught.Exception.Message })
+    } | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText($TracePath, $trace, [Text.UTF8Encoding]::new($false))
+    Remove-Variable -Name OrderReadIwrFallbackCalls -Scope Global -Force -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
+}
+'@
+    Write-TestUtf8 -Path $wrapperPath -Text $wrapperSource
+    Write-TestUtf8 -Path $envPath -Text @'
+BUS_URL=https://BUS_URL_IWR_CANARY.invalid/private
+BUS_SECRET=BUS_SECRET_IWR_CANARY
+'@
+
+    $successRoot = Join-Path $caseRoot 'success'
+    New-Item -ItemType Directory -Path $successRoot -Force | Out-Null
+    $successOutPath = Join-Path $successRoot 'response.txt'
+    $successMetadataPath = Join-Path $successRoot 'metadata.json'
+    $successTracePath = Join-Path $successRoot 'trace.json'
+    $successOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File $wrapperPath `
+        -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+        -EnvPath $envPath `
+        -OutPath $successOutPath `
+        -MetadataPath $successMetadataPath `
+        -TracePath $successTracePath `
+        -EmptyPath $emptyPath `
+        -Scenario success 2>&1)
+    $successExitCode = $LASTEXITCODE
+
+    $failureRoot = Join-Path $caseRoot 'network-failure'
+    New-Item -ItemType Directory -Path $failureRoot -Force | Out-Null
+    $failureOutPath = Join-Path $failureRoot 'response.txt'
+    $failureMetadataPath = Join-Path $failureRoot 'metadata.json'
+    $failureTracePath = Join-Path $failureRoot 'trace.json'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $failureOutPath `
+            -MetadataPath $failureMetadataPath `
+            -TracePath $failureTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario network-failure 2>&1)
+        $failureExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $redirectRoot = Join-Path $caseRoot 'second-redirect'
+    New-Item -ItemType Directory -Path $redirectRoot -Force | Out-Null
+    $redirectOutPath = Join-Path $redirectRoot 'response.txt'
+    $redirectMetadataPath = Join-Path $redirectRoot 'metadata.json'
+    $redirectTracePath = Join-Path $redirectRoot 'trace.json'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $redirectOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $redirectOutPath `
+            -MetadataPath $redirectMetadataPath `
+            -TracePath $redirectTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario second-redirect 2>&1)
+        $redirectExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $insecureRoot = Join-Path $caseRoot 'insecure-location'
+    New-Item -ItemType Directory -Path $insecureRoot -Force | Out-Null
+    $insecureOutPath = Join-Path $insecureRoot 'response.txt'
+    $insecureMetadataPath = Join-Path $insecureRoot 'metadata.json'
+    $insecureTracePath = Join-Path $insecureRoot 'trace.json'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $insecureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $insecureOutPath `
+            -MetadataPath $insecureMetadataPath `
+            -TracePath $insecureTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario insecure-location 2>&1)
+        $insecureExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $emptyLocationRoot = Join-Path $caseRoot 'empty-location'
+    New-Item -ItemType Directory -Path $emptyLocationRoot -Force | Out-Null
+    $emptyLocationOutPath = Join-Path $emptyLocationRoot 'response.txt'
+    $emptyLocationMetadataPath = Join-Path $emptyLocationRoot 'metadata.json'
+    $emptyLocationTracePath = Join-Path $emptyLocationRoot 'trace.json'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $emptyLocationOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $emptyLocationOutPath `
+            -MetadataPath $emptyLocationMetadataPath `
+            -TracePath $emptyLocationTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario empty-location 2>&1)
+        $emptyLocationExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $successMetadataText = [IO.File]::ReadAllText($successMetadataPath, [Text.Encoding]::UTF8)
+    $failureMetadataText = [IO.File]::ReadAllText($failureMetadataPath, [Text.Encoding]::UTF8)
+    $redirectMetadataText = [IO.File]::ReadAllText($redirectMetadataPath, [Text.Encoding]::UTF8)
+    $insecureMetadataText = [IO.File]::ReadAllText($insecureMetadataPath, [Text.Encoding]::UTF8)
+    $emptyLocationMetadataText = [IO.File]::ReadAllText($emptyLocationMetadataPath, [Text.Encoding]::UTF8)
+    return [pscustomobject][ordered]@{
+        success_exit_code = $successExitCode
+        success_output = @($successOutput)
+        success_body = [IO.File]::ReadAllText($successOutPath, [Text.Encoding]::UTF8)
+        success_metadata = $successMetadataText | ConvertFrom-Json
+        success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        failure_exit_code = $failureExitCode
+        failure_output = @($failureOutput)
+        failure_metadata_text = $failureMetadataText
+        failure_metadata = $failureMetadataText | ConvertFrom-Json
+        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        redirect_exit_code = $redirectExitCode
+        redirect_output = @($redirectOutput)
+        redirect_metadata_text = $redirectMetadataText
+        redirect_metadata = $redirectMetadataText | ConvertFrom-Json
+        redirect_trace = [IO.File]::ReadAllText($redirectTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        insecure_exit_code = $insecureExitCode
+        insecure_output = @($insecureOutput)
+        insecure_metadata_text = $insecureMetadataText
+        insecure_metadata = $insecureMetadataText | ConvertFrom-Json
+        insecure_trace = [IO.File]::ReadAllText($insecureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        empty_location_exit_code = $emptyLocationExitCode
+        empty_location_output = @($emptyLocationOutput)
+        empty_location_metadata_text = $emptyLocationMetadataText
+        empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json
+        empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    }
+}
+
 $script:TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-read-resilience-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $script:TestRoot | Out-Null
 try {
@@ -311,8 +712,10 @@ try {
 
     $actualBusSidecar = Invoke-ActualBusMetadataCase
     Assert-True 'actual bus captures native curl exit and HTTP status as numbers' (
+        $null -ne $actualBusSidecar.metadata.PSObject.Properties['transport_exit'] -and
         $actualBusSidecar.metadata.transport_exit -isnot [string] -and
         [int]$actualBusSidecar.metadata.transport_exit -eq 7 -and
+        $null -ne $actualBusSidecar.metadata.PSObject.Properties['http_status'] -and
         $actualBusSidecar.metadata.http_status -isnot [string] -and
         [int]$actualBusSidecar.metadata.http_status -eq 503
     )
@@ -326,6 +729,155 @@ try {
         -not $actualBusSidecar.metadata_text.Contains('ACTUAL_BUS_BODY_CANARY') -and
         -not $actualBusSidecar.metadata_text.Contains('BUS_URL_CANARY') -and
         -not $actualBusSidecar.metadata_text.Contains('BUS_SECRET_CANARY')
+    )
+
+    $actualBusSecondRedirect = Invoke-ActualBusSecondRedirectCase
+    $hop2ProtoPair = $false
+    $hop2ProtoRedirectPair = $false
+    for ($argumentIndex = 0; $argumentIndex -lt ($actualBusSecondRedirect.second_call.Count - 1); $argumentIndex++) {
+        if ($actualBusSecondRedirect.second_call[$argumentIndex] -ceq '--proto' -and
+            $actualBusSecondRedirect.second_call[$argumentIndex + 1] -ceq '=https') {
+            $hop2ProtoPair = $true
+        }
+        if ($actualBusSecondRedirect.second_call[$argumentIndex] -ceq '--proto-redir' -and
+            $actualBusSecondRedirect.second_call[$argumentIndex + 1] -ceq '=https') {
+            $hop2ProtoRedirectPair = $true
+        }
+    }
+    Assert-True 'actual bus follows a bounded redirect only on the bodyless hop 2 GET' (
+        $actualBusSecondRedirect.exit_code -eq 0 -and
+        $actualBusSecondRedirect.call_count -eq 2 -and
+        @($actualBusSecondRedirect.first_call | Where-Object { $_ -ceq '-X' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.first_call | Where-Object { $_ -ceq 'POST' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.first_call | Where-Object { $_ -ceq '-L' }).Count -eq 0 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '-X' -or $_ -ceq 'POST' }).Count -eq 0 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '-L' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '--max-redirs' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '5' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '--proto' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '--proto-redir' }).Count -eq 1 -and
+        @($actualBusSecondRedirect.second_call | Where-Object { $_ -ceq '=https' }).Count -eq 2 -and
+        $hop2ProtoPair -and
+        $hop2ProtoRedirectPair
+    )
+    Assert-True 'actual bus retains only the final hop 2 response body and metadata' (
+        $actualBusSecondRedirect.body -ceq $actualBusSecondRedirect.expected_body -and
+        $null -ne $actualBusSecondRedirect.metadata.PSObject.Properties['transport_exit'] -and
+        $actualBusSecondRedirect.metadata.transport_exit -isnot [string] -and
+        [int]$actualBusSecondRedirect.metadata.transport_exit -eq 0 -and
+        $null -ne $actualBusSecondRedirect.metadata.PSObject.Properties['http_status'] -and
+        $actualBusSecondRedirect.metadata.http_status -isnot [string] -and
+        [int]$actualBusSecondRedirect.metadata.http_status -eq 200 -and
+        $actualBusSecondRedirect.metadata.content_type_class -ceq 'json'
+    )
+    Assert-True 'successful second redirect emits one bounded safe status line' (
+        @($actualBusSecondRedirect.output).Count -eq 1 -and
+        ([string]$actualBusSecondRedirect.output[0]).StartsWith('saved ') -and
+        -not ([string]$actualBusSecondRedirect.output[0]).Contains('ONE_SHOT_REDIRECT_CANARY') -and
+        -not ([string]$actualBusSecondRedirect.output[0]).Contains('CANONICAL_REDIRECT_CANARY') -and
+        -not ([string]$actualBusSecondRedirect.output[0]).Contains('BUS_SECRET_REDIRECT_CANARY')
+    )
+    $secondRedirectFailureText = @($actualBusSecondRedirect.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'failed final hop 2 preserves sanitized metadata before returning nonzero' (
+        $actualBusSecondRedirect.failure_exit_code -ne 0 -and
+        $actualBusSecondRedirect.failure_call_count -eq 2 -and
+        $null -ne $actualBusSecondRedirect.failure_metadata.PSObject.Properties['transport_exit'] -and
+        $actualBusSecondRedirect.failure_metadata.transport_exit -isnot [string] -and
+        [int]$actualBusSecondRedirect.failure_metadata.transport_exit -eq 0 -and
+        $null -ne $actualBusSecondRedirect.failure_metadata.PSObject.Properties['http_status'] -and
+        $actualBusSecondRedirect.failure_metadata.http_status -isnot [string] -and
+        [int]$actualBusSecondRedirect.failure_metadata.http_status -eq 503 -and
+        $actualBusSecondRedirect.failure_metadata.content_type_class -ceq 'html'
+    )
+    Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
+        $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
+        -not $secondRedirectFailureText.Contains('ONE_SHOT_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureText.Contains('CANONICAL_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureText.Contains('FINAL_REDIRECT_BODY_CANARY') -and
+        -not $secondRedirectFailureText.Contains('BUS_SECRET_REDIRECT_CANARY') -and
+        -not $actualBusSecondRedirect.failure_metadata_text.Contains('FINAL_REDIRECT_BODY_CANARY')
+    )
+
+    $actualBusIwrFallback = Invoke-ActualBusIwrFallbackCase
+    Assert-True 'IWR fallback keeps hop 1 POST no-follow and hop 2 GET no-follow' (
+        $actualBusIwrFallback.success_exit_code -eq 0 -and
+        @($actualBusIwrFallback.success_trace.calls).Count -eq 2 -and
+        $actualBusIwrFallback.success_trace.calls[0].method -ceq 'Post' -and
+        [int]$actualBusIwrFallback.success_trace.calls[0].maximum_redirection -eq 0 -and
+        [bool]$actualBusIwrFallback.success_trace.calls[0].body_present -and
+        $actualBusIwrFallback.success_trace.calls[1].method -ceq 'Get' -and
+        [int]$actualBusIwrFallback.success_trace.calls[1].maximum_redirection -eq 0 -and
+        -not [bool]$actualBusIwrFallback.success_trace.calls[1].body_present
+    )
+    Assert-True 'IWR fallback retains the final successful body and metadata' (
+        $actualBusIwrFallback.success_body -ceq '{"ok":true,"rows":[]}' -and
+        $null -ne $actualBusIwrFallback.success_metadata.PSObject.Properties['http_status'] -and
+        $actualBusIwrFallback.success_metadata.http_status -isnot [string] -and
+        [int]$actualBusIwrFallback.success_metadata.http_status -eq 200 -and
+        $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
+        $null -eq $actualBusIwrFallback.success_trace.exception_type
+    )
+    $iwrFailureOutputText = @($actualBusIwrFallback.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
+        $actualBusIwrFallback.failure_exit_code -ne 0 -and
+        @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
+        @($actualBusIwrFallback.failure_metadata.PSObject.Properties).Count -eq 0 -and
+        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.Net.WebException'
+    )
+    Assert-True 'IWR pre-response failure exposes only a fixed safe error' (
+        $actualBusIwrFallback.failure_trace.exception_message -ceq 'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrFailureOutputText.Contains('RAW_IWR_EXCEPTION_CANARY') -and
+        -not $iwrFailureOutputText.Contains('ONE_SHOT_IWR_CANARY') -and
+        -not $iwrFailureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
+        -not $actualBusIwrFallback.failure_metadata_text.Contains('302')
+    )
+    $iwrRedirectOutputText = @($actualBusIwrFallback.redirect_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback refuses a second redirect without accepting its body' (
+        $actualBusIwrFallback.redirect_exit_code -ne 0 -and
+        @($actualBusIwrFallback.redirect_trace.calls).Count -eq 2 -and
+        $actualBusIwrFallback.redirect_trace.calls[1].method -ceq 'Get' -and
+        [int]$actualBusIwrFallback.redirect_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -ne $actualBusIwrFallback.redirect_metadata.PSObject.Properties['http_status'] -and
+        [int]$actualBusIwrFallback.redirect_metadata.http_status -eq 302 -and
+        $actualBusIwrFallback.redirect_metadata.content_type_class -ceq 'html' -and
+        $actualBusIwrFallback.redirect_trace.exception_type -ceq 'System.Net.WebException'
+    )
+    Assert-True 'IWR second-redirect failure exposes only a fixed safe error' (
+        $actualBusIwrFallback.redirect_trace.exception_message -ceq 'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrRedirectOutputText.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
+        -not $iwrRedirectOutputText.Contains('IWR_REDIRECT_BODY_CANARY') -and
+        -not $iwrRedirectOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
+        -not $actualBusIwrFallback.redirect_metadata_text.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
+        -not $actualBusIwrFallback.redirect_metadata_text.Contains('IWR_REDIRECT_BODY_CANARY')
+    )
+    $iwrInsecureOutputText = @($actualBusIwrFallback.insecure_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback rejects an insecure initial hop 2 Location before transfer' (
+        $actualBusIwrFallback.insecure_exit_code -ne 0 -and
+        @($actualBusIwrFallback.insecure_trace.calls).Count -eq 1 -and
+        $actualBusIwrFallback.insecure_trace.calls[0].method -ceq 'Post' -and
+        $null -ne $actualBusIwrFallback.insecure_metadata.PSObject.Properties['http_status'] -and
+        [int]$actualBusIwrFallback.insecure_metadata.http_status -eq 302 -and
+        $actualBusIwrFallback.insecure_trace.exception_type -ceq 'System.InvalidOperationException'
+    )
+    Assert-True 'IWR insecure-Location failure exposes only a fixed safe error' (
+        $actualBusIwrFallback.insecure_trace.exception_message -ceq 'hop 2 Location must resolve to HTTPS. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrInsecureOutputText.Contains('INSECURE_IWR_LOCATION_CANARY') -and
+        -not $iwrInsecureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
+        -not $actualBusIwrFallback.insecure_metadata_text.Contains('INSECURE_IWR_LOCATION_CANARY')
+    )
+    $iwrEmptyLocationOutputText = @($actualBusIwrFallback.empty_location_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback rejects an empty hop 2 Location before transfer' (
+        $actualBusIwrFallback.empty_location_exit_code -ne 0 -and
+        @($actualBusIwrFallback.empty_location_trace.calls).Count -eq 1 -and
+        $actualBusIwrFallback.empty_location_trace.calls[0].method -ceq 'Post' -and
+        $null -ne $actualBusIwrFallback.empty_location_metadata.PSObject.Properties['http_status'] -and
+        [int]$actualBusIwrFallback.empty_location_metadata.http_status -eq 302 -and
+        $actualBusIwrFallback.empty_location_trace.exception_type -ceq 'System.InvalidOperationException'
+    )
+    Assert-True 'IWR empty-Location failure exposes only a fixed safe error' (
+        $actualBusIwrFallback.empty_location_trace.exception_message -ceq 'hop 2 Location or BUS_URL is empty. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrEmptyLocationOutputText.Contains('BUS_URL_IWR_CANARY') -and
+        -not $iwrEmptyLocationOutputText.Contains('BUS_SECRET_IWR_CANARY')
     )
 
     $validFirst = Invoke-ReadCase -Name 'valid-first' -Responses @($validEmpty, '<unused>')
