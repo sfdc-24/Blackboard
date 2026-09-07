@@ -59,18 +59,12 @@ build/
 # the market cache is vendor data, not repository content.
 .venv-quant/
 
-# Live Apps Script source pulled by clasp. This is the running production code
-# for the Governor Page API and it carries live identifiers (the Alpha DB
-# spreadsheet ID, endpoint config) and possibly the bus secret. Untracked until
-# it has been read and cleared, same rule as the entries above: a push is not
-# undoable the way a local delete is. `.clasp.json` itself IS tracked -- it
-# holds only the scriptId, which is already in docs/HANDOVER.md.
-#
-# `gas/*` rather than `gas/` so the .gitkeep below can be un-ignored.
-# The directory has to exist on a fresh clone: .clasp.json sets
-# rootDir=gas, and `clasp push` resolves it before doing anything else,
-# so without the directory a clean checkout cannot push at all.
-# (vm-cli found this on AkatiaVM. Read commands are unaffected.)
+# Legacy/scratch Apps Script exports. This directory is never a deploy input:
+# the tracked root .clasp.json points at
+# apps-script/governor-page-api/, the repository's reviewed source of truth.
+# A local gas/ snapshot may still be retained temporarily for read-only source
+# comparison or rollback evidence, so its contents remain ignored and must not
+# be deleted by repository cleanup. Keep the empty directory on fresh clones.
 gas/*
 !gas/.gitkeep
 
