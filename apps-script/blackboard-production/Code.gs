@@ -1,15 +1,15 @@
 function sweepDraftsToEndpointV2() {
-  const draftsFolderId = "1-WsSPriLK3SXuYwyH04kRZGZD1CFfMoO"; 
+  const draftsFolderId = "1-WsSPriLK3SXuYwyH04kRZGZD1CFfMoO";
   const blackboardEndpoint = "https://script.google.com/macros/s/AKfycby1JUlXWRzd_28epRKyyWjrU_TrrCWiueRaLATrKgDCgUie93s-1InplCiYWg_1sHbA/exec";
   const blackboardSecret = PropertiesService.getScriptProperties().getProperty("BLACKBOARDSECRET");
 
   const folder = DriveApp.getFolderById(draftsFolderId);
-  const files = folder.getFiles(); 
+  const files = folder.getFiles();
 
   while (files.hasNext()) {
     const file = files.next();
     let content = "";
-    
+
     // Handles both Google Docs and Plain Text files
     if (file.getMimeType() === MimeType.GOOGLE_DOCS) {
       content = DocumentApp.openById(file.getId()).getBody().getText();
@@ -24,7 +24,7 @@ function sweepDraftsToEndpointV2() {
       secret: blackboardSecret,
       action: "parse_blurb",
       source_tag: "gemini-bridge-voice",
-      title: "LIVE_SCRATCHPAD", 
+      title: "LIVE_SCRATCHPAD",
       payload: {
         file_name: fileName,
         raw_blurb: content,
@@ -48,7 +48,7 @@ function sweepDraftsToEndpointV2() {
       // Poka-Yoke Safety Check (D-4): Only trash if endpoint succeeds
       if (statusCode >= 200 && statusCode < 300) {
         Logger.log("Response:" + response.getContentText());
-        file.setTrashed(true); 
+        file.setTrashed(true);
       } else {
         Logger.log(`Failed to process ${fileName}. HTTP ${statusCode}: ${response.getContentText()}`);
       }
