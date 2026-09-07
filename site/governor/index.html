@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Governor &mdash; SFDC24</title>
+<meta name="description" content="The operator console for SFDC24. Sign-in required; there is nothing here for visitors.">
+<meta name="robots" content="noindex,nofollow">
+<link rel="canonical" href="https://www.sfdc24.com/governor/">
+<meta name="theme-color" content="#0B0D10">
+<link rel="icon" href="../assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="../assets/icon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+
+<!--
+  WHY THIS PAGE IS A REDIRECT AND NOT AN IFRAME
+    The console itself is an Apps Script web app and has to stay there: it reads
+    the board through getState, which is guarded by requireGovernor_(), and that
+    guard depends on the Google identity of whoever is asking. Framing it would
+    put it in the sandboxFrame that already costs us the microphone on /voice/
+    (L-89) and that steals keyboard focus mid-typing (ISS-007). A redirect keeps
+    it a top-level page with a real session and no borrowed problems.
+
+  WHY IT IS SAFE TO ROUTE PUBLICLY
+    Measured 2026-09-07, not assumed: an anonymous GET of ?view=governor returns
+    200 and leaks nothing — zero board rows, zero instance tags, zero payloads.
+    It renders a sign-in. The authorisation lives in the endpoint, not in the
+    obscurity of the URL, which is the same principle getState already carries in
+    its own comment: "scope enforced here, not by obscurity."
+
+  WHY IT IS noindex AND NOT IN THE NAV
+    Safe to reach is not the same as worth advertising. This is an operator
+    console; a visitor who lands here has taken a wrong turn, so the page says so
+    plainly and points back rather than pretending to be a feature.
+-->
+<meta http-equiv="refresh" content="3;url=https://script.google.com/macros/s/AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng/exec?view=governor">
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="../">sfdc24</a>
+  <nav class="barnav">
+    <a href="../projects/">Projects</a>
+    <a href="mailto:abdus@sfdc24.com">Contact</a>
+  </nav>
+</header>
+<main class="legal">
+<h1>Governor console</h1>
+<p>Taking you to the console now. If nothing happens,
+<a id="go" href="https://script.google.com/macros/s/AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng/exec?view=governor">open it directly</a>.</p>
+
+<p>This is the operator surface, not a visitor page. It asks who you are and
+shows nothing until it knows. If you were looking for what SFDC24 does, the
+<a href="../">home page</a> is the place, and you can start a conversation there
+or on the <a href="../voice/">voice page</a>.</p>
+</main>
+<footer class="foot">
+  <a href="../privacy/">Privacy</a> &middot; <a href="../terms/">Terms</a>
+</footer>
+</body>
+</html>
