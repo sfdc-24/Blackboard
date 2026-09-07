@@ -195,24 +195,50 @@ if ($curl) {
 if ($location) {
   if ($curl) {
     # Single request again -- the Location key is one-shot; a probe would spend it.
+    # HOP 2 FOLLOWS REDIRECTS. It did not, and that was a real defect.
+    #
+    # This used to throw "one-shot key consumed or expired" the moment hop 2
+    # answered with a Location. That diagnosis was usually WRONG: Google
+    # frequently answers the one-shot Location with a further 302 to the
+    # canonical /exec of the same script -- an ordinary extra hop, not a spent
+    # key. The giveaway is that retrying the identical read then succeeds, which
+    # a genuinely consumed key would never do.
+    #
+    # It cost real, confusing time on 2026-09-07 alone: a board read failed at
+    # session start and worked on retry; the WhatsApp watcher surfaced the
+    # resulting warning as a fake message from Mr. Salam; and codex's 15:54Z
+    # worker poll failed the same way and recovered on its own at 16:09Z. Three
+    # incidents, one cause, self-healing every time -- which is exactly why
+    # nobody had ever filed it.
+    #
+    # Following is SAFE HERE and only here. The 411 hazard that forbids `-L`
+    # applies to re-POSTing a body on hop 1; hop 2 is a bodyless GET, and
+    # alpha.ps1's own header already records that "READ is a GET with no body,
+    # so plain -L is safe and correct". Redirects are bounded so a loop cannot
+    # spin, and the verdict now comes from the FINAL status rather than from the
+    # presence of a Location header -- with -L the dump holds every hop's
+    # headers, so an early Location is expected and means nothing.
     $tmpHead2 = [IO.Path]::GetTempFileName()
     try {
-      $out2  = & $curl.Source -s -S -D $tmpHead2 --max-time 120 $location
+      $out2  = & $curl.Source -s -S -L --max-redirs 5 -D $tmpHead2 --max-time 120 $location
       $head2 = Get-Content -LiteralPath $tmpHead2 -ErrorAction SilentlyContinue
-      $loc2  = @($head2 | Where-Object { $_ -match '^\s*[Ll]ocation:' }) | Select-Object -First 1
-      if ($loc2) {
-        throw "hop 2 redirected again (to $(($loc2 -replace '^\s*[Ll]ocation:\s*','').Trim())) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
+      $codes = @($head2 | Where-Object { $_ -match '^HTTP/' })
+      $final = if ($codes.Count) { $codes[$codes.Count - 1] } else { '' }
+      if ($final -notmatch '\s2\d\d(\s|$)') {
+        throw "hop 2 ended on '$($final.Trim())' after following up to 5 redirects. The write, if any, may still have landed: READ BACK before deciding anything."
       }
       $content = ($out2 -join "`n")
     } finally { Remove-Item -LiteralPath $tmpHead2 -Force -ErrorAction SilentlyContinue }
   } else {
     try {
-      $r2 = Invoke-WebRequest -Uri $location -Method Get -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 120
+      # Same correction as the curl branch above: follow, bounded. A bodyless
+      # GET is safe to redirect and Google routinely adds one more hop.
+      $r2 = Invoke-WebRequest -Uri $location -Method Get -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 120
       $content = $r2.Content
     } catch [System.Net.WebException] {
       $resp = $_.Exception.Response
       if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
-        throw "hop 2 redirected again (to $($resp.Headers['Location'])) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
+        throw "hop 2 still redirecting after 5 hops (last to $($resp.Headers['Location'])). The write, if any, may still have landed: READ BACK before deciding anything."
       }
       throw
     }
