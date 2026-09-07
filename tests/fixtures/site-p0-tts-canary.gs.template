@@ -1,0 +1,357 @@
+var SITE_P0_RUN_ID_ = __RUN_ID_JSON__;
+var SITE_P0_COMMIT_ = __COMMIT_JSON__;
+var SITE_P0_SOURCE_SHA256_ = __SOURCE_SHA256_JSON__;
+var SITE_P0_FUNCTION_SHA256_ = __FUNCTION_SHA256_JSON__;
+var SITE_P0_PREFIX_ = __PROPERTY_PREFIX_JSON__;
+var SITE_P0_ACTIVE_ = SITE_P0_PREFIX_ + 'ACTIVE';
+var SITE_P0_SCENARIO_ = SITE_P0_PREFIX_ + 'SCENARIO';
+var SITE_P0_SLOT_PREFIX_ = SITE_P0_PREFIX_ + 'SLOT_';
+var SITE_P0_COUNT_ = SITE_P0_PREFIX_ + 'COUNT';
+var SITE_P0_BARRIER_READY_ = SITE_P0_PREFIX_ + 'BARRIER_READY';
+var SITE_P0_PROVIDER_IN_FLIGHT_ = SITE_P0_PREFIX_ + 'PROVIDER_IN_FLIGHT';
+var SITE_P0_LOSER_OBSERVED_ = SITE_P0_PREFIX_ + 'LOSER_OBSERVED';
+var SITE_P0_OVERLAP_WITNESS_ = SITE_P0_PREFIX_ + 'OVERLAP_WITNESS';
+var SITE_P0_SENTINEL_ = 'SITE_P0_NOT_A_CREDENTIAL';
+var SITE_P0_TEXT_ = 'Synthetic cardinality probe.';
+
+function siteP0CanaryPreflight(runId) {
+  if (!siteP0RunOk_(runId)) return { ok: false, reason: 'bad-run' };
+  var props = PropertiesService.getScriptProperties();
+  var names = props.getKeys().sort();
+  return {
+    ok: names.length === 0,
+    reason: names.length === 0 ? 'clean' : 'project-not-empty',
+    propertyCount: names.length,
+    propertyNameSha256: siteP0Sha256_(JSON.stringify(names)),
+    commit: SITE_P0_COMMIT_,
+    canonicalSourceSha256: SITE_P0_SOURCE_SHA256_,
+    criticalFunctionSha256: SITE_P0_FUNCTION_SHA256_,
+    sessionCap: ttsLimit_(props, 'TTS_SESSION_CAP', TTS_SESSION_DEFAULT, 50),
+    dailyCap: ttsLimit_(props, 'TTS_DAILY_CAP', TTS_DAILY_DEFAULT, 200)
+  };
+}
+
+function siteP0CanaryStart(runId) {
+  if (!siteP0RunOk_(runId)) return { ok: false, reason: 'bad-run' };
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var props = PropertiesService.getScriptProperties();
+    if (props.getKeys().length !== 0) return { ok: false, reason: 'project-not-empty' };
+    props.setProperty(SITE_P0_ACTIVE_, SITE_P0_RUN_ID_);
+    props.setProperty('OPENAI_KEY', SITE_P0_SENTINEL_);
+    return { ok: true, started: true };
+  } catch (err) {
+    return { ok: false, reason: 'start-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function siteP0CanaryPrepare(runId, scenario) {
+  if (!siteP0Authorized_(runId)) return { ok: false, reason: 'unavailable' };
+  scenario = String(scenario || '');
+  if (!/^(valid|replay|concurrent|session-cap|daily-cap)$/.test(scenario)) {
+    return { ok: false, reason: 'bad-scenario' };
+  }
+  var reset = siteP0ResetScenario_();
+  if (!reset.ok) return reset;
+  var props = PropertiesService.getScriptProperties();
+  var sessionCap = ttsLimit_(props, 'TTS_SESSION_CAP', TTS_SESSION_DEFAULT, 50);
+  var dailyCap = ttsLimit_(props, 'TTS_DAILY_CAP', TTS_DAILY_DEFAULT, 200);
+  if (sessionCap < 1 || dailyCap < 1) return { ok: false, reason: 'zero-cap' };
+  props.setProperty(SITE_P0_SCENARIO_, scenario);
+
+  if (scenario === 'session-cap' || scenario === 'daily-cap') {
+    var state = { day: ttsDay_(Date.now()), daily: 0, sessions: {} };
+    if (scenario === 'session-cap') {
+      state.sessions[ttsSessionHash_(siteP0Session_('same'))] = sessionCap - 1;
+    } else {
+      state.daily = dailyCap - 1;
+    }
+    props.setProperty(TTS_BUDGET_STATE, JSON.stringify(state));
+  }
+
+  var first = siteP0MintSlot_('one', scenario === 'daily-cap' ? 'first' : 'same');
+  if (!first) return { ok: false, reason: 'mint-refused' };
+  if (scenario === 'session-cap' || scenario === 'daily-cap') {
+    var second = siteP0MintSlot_('two', scenario === 'daily-cap' ? 'second' : 'same');
+    if (!second) return { ok: false, reason: 'mint-refused' };
+  }
+  return {
+    ok: true,
+    prepared: scenario,
+    keyCount: scenario === 'session-cap' || scenario === 'daily-cap' ? 2 : 1,
+    sessionCap: sessionCap,
+    dailyCap: dailyCap
+  };
+}
+
+function siteP0CanaryConsume(runId, scenario, slot, callerId) {
+  if (!siteP0Authorized_(runId)) return { ok: false, reason: 'unavailable' };
+  scenario = String(scenario || '');
+  slot = String(slot || '');
+  callerId = String(callerId || '');
+  if (!siteP0ConsumeArgsOk_(scenario, slot, callerId)) {
+    return { ok: false, reason: 'bad-consume' };
+  }
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty(SITE_P0_SCENARIO_) !== scenario) {
+    return { ok: false, reason: 'scenario-mismatch' };
+  }
+  var barrierReady = false;
+  if (scenario === 'concurrent') {
+    var barrier = siteP0AwaitBarrier_();
+    if (!barrier.ok) return barrier;
+    barrierReady = true;
+  }
+  var key = props.getProperty(SITE_P0_SLOT_PREFIX_ + slot);
+  if (!/^ak[a-f0-9]{16}$/.test(String(key || ''))) {
+    return { ok: false, reason: 'slot-empty', barrierReady: barrierReady };
+  }
+  var output = ttsAudio_({ ak: key, v: 'sage' });
+  var result;
+  try { result = JSON.parse(output.getContent()); } catch (err) { result = null; }
+  if (!result || typeof result !== 'object') {
+    return { ok: false, reason: 'invalid-audio-result', barrierReady: barrierReady };
+  }
+  if (scenario === 'concurrent' && result.ok !== true && result.reason === 'expired') {
+    siteP0ObserveLoser_();
+  }
+  return {
+    ok: result.ok === true,
+    reason: result.ok === true ? 'claimed' : siteP0Reason_(result.reason),
+    barrierReady: barrierReady
+  };
+}
+
+function siteP0CanarySnapshot(runId) {
+  if (!siteP0Authorized_(runId)) return { ok: false, reason: 'unavailable' };
+  var props = PropertiesService.getScriptProperties();
+  return {
+    ok: true,
+    providerAttempts: Math.max(0, Number(props.getProperty(SITE_P0_COUNT_)) || 0),
+    barrierReadyCount: Math.max(0, Number(props.getProperty(SITE_P0_BARRIER_READY_)) || 0),
+    loserObservedWhileProviderInFlight: props.getProperty(SITE_P0_OVERLAP_WITNESS_) === '1'
+  };
+}
+
+function siteP0CanaryCleanup(runId) {
+  if (!siteP0RunOk_(runId)) return { ok: false, reason: 'bad-run' };
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var props = PropertiesService.getScriptProperties();
+    var names = props.getKeys();
+    var tracked = [];
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].indexOf(SITE_P0_SLOT_PREFIX_) === 0) {
+        var key = props.getProperty(names[i]);
+        if (key) tracked.push(key);
+      }
+    }
+    var cache = CacheService.getScriptCache();
+    for (var j = 0; j < tracked.length; j++) {
+      cache.remove('tts_' + tracked[j]);
+      props.deleteProperty(TTS_KEY_PROP_PREFIX + tracked[j]);
+    }
+    for (var k = 0; k < names.length; k++) {
+      if (names[k].indexOf(SITE_P0_PREFIX_) === 0) props.deleteProperty(names[k]);
+    }
+    if (props.getProperty('OPENAI_KEY') === SITE_P0_SENTINEL_) props.deleteProperty('OPENAI_KEY');
+    var cacheRemaining = 0;
+    var claimRemaining = 0;
+    for (var n = 0; n < tracked.length; n++) {
+      if (cache.get('tts_' + tracked[n]) !== null) cacheRemaining += 1;
+      if (props.getProperty(TTS_KEY_PROP_PREFIX + tracked[n]) !== null) claimRemaining += 1;
+    }
+    var remaining = props.getKeys().sort();
+    return {
+      ok: remaining.length === 0 && cacheRemaining === 0 && claimRemaining === 0,
+      propertiesRemaining: remaining.length,
+      propertyNameSha256: siteP0Sha256_(JSON.stringify(remaining)),
+      trackedCacheEntriesRemaining: cacheRemaining,
+      trackedClaimPropertiesRemaining: claimRemaining
+    };
+  } catch (err) {
+    return { ok: false, reason: 'cleanup-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function siteP0RunOk_(runId) {
+  return typeof runId === 'string' && runId === SITE_P0_RUN_ID_ && /^[a-f0-9]{24}$/.test(runId);
+}
+
+function siteP0Authorized_(runId) {
+  if (!siteP0RunOk_(runId)) return false;
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty(SITE_P0_ACTIVE_) !== SITE_P0_RUN_ID_ ||
+      props.getProperty('OPENAI_KEY') !== SITE_P0_SENTINEL_) return false;
+  var names = props.getKeys();
+  for (var i = 0; i < names.length; i++) {
+    if (!siteP0PropertyNameOk_(names[i])) return false;
+  }
+  return true;
+}
+
+function siteP0PropertyNameOk_(name) {
+  if (name === 'OPENAI_KEY' || name === SITE_P0_ACTIVE_ || name === SITE_P0_SCENARIO_ ||
+      name === SITE_P0_COUNT_ || name === SITE_P0_BARRIER_READY_ ||
+      name === SITE_P0_PROVIDER_IN_FLIGHT_ || name === SITE_P0_LOSER_OBSERVED_ ||
+      name === SITE_P0_OVERLAP_WITNESS_ || name === TTS_BUDGET_STATE) return true;
+  if (name === SITE_P0_SLOT_PREFIX_ + 'one' || name === SITE_P0_SLOT_PREFIX_ + 'two') return true;
+  return new RegExp('^' + TTS_KEY_PROP_PREFIX + 'ak[a-f0-9]{16}$').test(name);
+}
+
+function siteP0Session_(suffix) {
+  return 'canary-' + SITE_P0_RUN_ID_ + '-' + suffix;
+}
+
+function siteP0MintSlot_(slot, sessionSuffix) {
+  var props = PropertiesService.getScriptProperties();
+  var key = mintTtsKey_(siteP0Session_(sessionSuffix), SITE_P0_TEXT_);
+  if (!key) return false;
+  try {
+    props.setProperty(SITE_P0_SLOT_PREFIX_ + slot, key);
+    return true;
+  } catch (err) {
+    CacheService.getScriptCache().remove('tts_' + key);
+    props.deleteProperty(TTS_KEY_PROP_PREFIX + key);
+    return false;
+  }
+}
+
+function siteP0ConsumeArgsOk_(scenario, slot, callerId) {
+  if (!/^(valid|replay|concurrent|session-cap|daily-cap)$/.test(scenario)) return false;
+  if (!/^(one|two)$/.test(slot)) return false;
+  if (scenario === 'concurrent') return slot === 'one' && /^(a|b)$/.test(callerId);
+  return callerId === 'main' && (slot === 'one' || /-cap$/.test(scenario));
+}
+
+function siteP0Reason_(reason) {
+  var allowed = { expired: 1, 'tts-session-cap': 1, 'tts-daily-cap': 1,
+    'tts-state-failed': 1, 'no-key': 1, 'fetch-failed': 1 };
+  return allowed[String(reason || '')] ? String(reason) : 'audio-failed';
+}
+
+function siteP0AwaitBarrier_() {
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var props = PropertiesService.getScriptProperties();
+    var ready = Math.max(0, Number(props.getProperty(SITE_P0_BARRIER_READY_)) || 0) + 1;
+    if (ready > 2) return { ok: false, reason: 'barrier-overflow' };
+    props.setProperty(SITE_P0_BARRIER_READY_, String(ready));
+  } catch (err) {
+    return { ok: false, reason: 'barrier-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+  var deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    if (Number(PropertiesService.getScriptProperties().getProperty(SITE_P0_BARRIER_READY_)) === 2) {
+      return { ok: true };
+    }
+    Utilities.sleep(50);
+  }
+  return { ok: false, reason: 'barrier-timeout' };
+}
+
+function siteP0ObserveLoser_() {
+  var deadline = Date.now() + 3000;
+  var props = PropertiesService.getScriptProperties();
+  while (Date.now() < deadline) {
+    if (props.getProperty(SITE_P0_PROVIDER_IN_FLIGHT_) === '1') {
+      props.setProperty(SITE_P0_LOSER_OBSERVED_, '1');
+      return;
+    }
+    Utilities.sleep(25);
+  }
+}
+
+function siteP0CanaryProviderFetch_(url, options) {
+  var props = PropertiesService.getScriptProperties();
+  var payload;
+  try { payload = JSON.parse(String(options && options.payload || '')); } catch (err) { payload = null; }
+  if (url !== 'https://api.openai.com/v1/audio/speech' || !options || options.method !== 'post' ||
+      options.contentType !== 'application/json' || options.muteHttpExceptions !== true ||
+      !options.headers || options.headers.Authorization !== 'Bearer ' + SITE_P0_SENTINEL_ ||
+      !payload || payload.model !== TTS_MODEL || payload.voice !== 'sage' ||
+      payload.input !== SITE_P0_TEXT_ || payload.response_format !== 'mp3' ||
+      payload.instructions !== TTS_STYLE_()) throw new Error('canary provider contract rejected');
+
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var count = Math.max(0, Number(props.getProperty(SITE_P0_COUNT_)) || 0) + 1;
+    props.setProperty(SITE_P0_COUNT_, String(count));
+    if (props.getProperty(SITE_P0_SCENARIO_) === 'concurrent') {
+      props.setProperty(SITE_P0_PROVIDER_IN_FLIGHT_, '1');
+    }
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+
+  if (props.getProperty(SITE_P0_SCENARIO_) === 'concurrent') {
+    var deadline = Date.now() + 6000;
+    while (Date.now() < deadline && props.getProperty(SITE_P0_LOSER_OBSERVED_) !== '1') {
+      Utilities.sleep(25);
+    }
+    if (props.getProperty(SITE_P0_LOSER_OBSERVED_) === '1') {
+      props.setProperty(SITE_P0_OVERLAP_WITNESS_, '1');
+    }
+    props.deleteProperty(SITE_P0_PROVIDER_IN_FLIGHT_);
+  }
+  return {
+    getResponseCode: function () { return 200; },
+    getContent: function () { return [73, 68, 51]; },
+    getContentText: function () { return ''; }
+  };
+}
+
+function siteP0ResetScenario_() {
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var props = PropertiesService.getScriptProperties();
+    var names = props.getKeys();
+    var cache = CacheService.getScriptCache();
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].indexOf(SITE_P0_SLOT_PREFIX_) === 0) {
+        var key = props.getProperty(names[i]);
+        if (key) {
+          cache.remove('tts_' + key);
+          props.deleteProperty(TTS_KEY_PROP_PREFIX + key);
+        }
+      }
+    }
+    for (var j = 0; j < names.length; j++) {
+      if (names[j].indexOf(SITE_P0_PREFIX_) === 0 && names[j] !== SITE_P0_ACTIVE_) {
+        props.deleteProperty(names[j]);
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: 'scenario-reset-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function siteP0Sha256_(value) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, String(value), Utilities.Charset.UTF_8);
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var n = (Number(bytes[i]) + 256) % 256;
+    out += ('0' + n.toString(16)).slice(-2);
+  }
+  return out;
+}
