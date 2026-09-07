@@ -43,9 +43,20 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    null `properties.parameters` object.
 5. Before changing the guest task, disable both Automation schedules and read
    them back as disabled. Wait until no Automation job, Azure Run Command, or
-   guest task instance is running. Stage `order_task_escrow.ps1` outside every
-   release directory, verify its transport hash on the guest, and require the
-   guest task to be exactly `Ready` or `Disabled` with no running or queued
+   guest task instance is running. Use
+   `build_order_escrow_transport_wrapper.ps1` to bind the exact hashes of
+   `stage_order_escrow_tool.ps1` and `order_task_escrow.ps1` into a BOM-free
+   Managed Run Command `source.script`. The generated wrapper carries the
+   non-secret Base64 in script source and invokes the stage driver in-process;
+   do not pass the escrow payload on the Windows command line. The driver
+   installs a never-overwritten, digest-qualified file only below
+   `%ProgramData%\SFDC24\OrderSupervisor\tools`, validates every existing
+   ancestor and the complete tools inventory, and returns the exact guest path
+   and digest. Historical versions may coexist only when every entry is a
+   regular digest-qualified file that matches its embedded hash; partial,
+   unrelated, corrupt, or reparse entries fail closed. Require that read-back
+   before invoking the escrow tool, then require the guest task to be exactly
+   `Ready` or `Disabled` with no running or queued
    instance. Then use the tool to
    create a new immutable escrow for the current known-good task. Read the
    escrow manifest back and independently verify the task XML digest, exact
@@ -57,14 +68,18 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    escrowed. `Validate` and `Restore` bind to the trusted map recorded in the
    escrow and do not accept a replacement map.
 6. Package the six guest files listed by
-   `install_release_from_archive.ps1`. Deliver the digest-checked archive with
-   Azure Managed Run Command, but do not change the Windows task yet.
+   `install_release_from_archive.ps1`. Use
+   `build_order_release_wrapper.ps1` with the full 40-hex release ID and the
+   independently computed archive and installer SHA-256 digests. The builder
+   rejects non-canonical archive inventory and emits a deterministic BOM-free
+   Managed Run Command `source.script`. Deliver that wrapper, but do not change
+   the Windows task yet.
    Windows passes Run Command parameters on the guest process command line, so
    do not pass the Base64 archive as one parameter: a release of this size can
-   exceed the Windows command-line limit before PowerShell starts. For this POC,
-   embed the non-secret Base64 release bytes in `source.script` and invoke the
-   installer internally, or use a bounded `scriptUri`; verify the archive digest
-   inside the guest before moving it into the immutable release directory.
+   exceed the Windows command-line limit before PowerShell starts. The generated
+   wrapper is the standard POC path for embedding those non-secret bytes and
+   invoking the installer internally. Verify the archive digest inside the guest
+   before moving it into the immutable release directory.
 7. Read the release manifest and all six guest files back. Require the full
    commit release ID, caller-bound archive digest, exact file inventory, and
    exact per-file hashes before changing the task definition. A manifest alone

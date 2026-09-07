@@ -13,11 +13,16 @@ on:
       - 'infra/azure/blackboard_vm_supervisor.ps1'
       - 'infra/azure/install_release_from_archive.ps1'
       - 'infra/azure/order_task_escrow.ps1'
+      - 'infra/azure/stage_order_escrow_tool.ps1'
+      - 'infra/azure/build_order_escrow_transport_wrapper.ps1'
+      - 'infra/azure/build_order_release_wrapper.ps1'
       - 'tests/test_order_read_resilience.ps1'
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
       - 'tests/test_order_release_installer.ps1'
       - 'tests/test_order_task_escrow.ps1'
+      - 'tests/test_order_escrow_transport.ps1'
+      - 'tests/test_order_deployment_wrappers.ps1'
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
       - 'tests/test_azure_vm_supervisor.ps1'
@@ -51,6 +56,12 @@ jobs:
       - name: Test ORDER independent task escrow
         shell: powershell
         run: .\tests\test_order_task_escrow.ps1
+      - name: Test ORDER escrow transport
+        shell: powershell
+        run: .\tests\test_order_escrow_transport.ps1
+      - name: Test ORDER deployment wrapper builders
+        shell: powershell
+        run: .\tests\test_order_deployment_wrappers.ps1
       - name: Test ORDER supervisor contracts
         shell: powershell
         run: .\tests\test_order_supervisor.ps1
