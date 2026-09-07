@@ -70,8 +70,13 @@ repair mode and cannot create, update, or delete Azure resources.
    is not drift by itself. Require the validator's authoritative individual
    `GET` of each exact link to match all six bindings.
 5. Before changing the guest task, disable both Automation schedules and read
-   them back as disabled. Wait until no Automation job, Azure Run Command, or
-   guest task instance is running. Use
+   them back as disabled. Wait until no Automation job, Action Run Command,
+   Managed Run Command, or guest task instance is running. Freeze the complete
+   board baseline and quiesce every eligible ORDER producer. Every Managed Run
+   Command in the remainder of this sequence uses a fresh immutable resource
+   name, a pre-create 404, source-script digest read-back, terminal
+   instance-view read-back, and an operation ID unique to that command.
+6. Use
    `build_order_escrow_transport_wrapper.ps1` to bind the exact hashes of
    `stage_order_escrow_tool.ps1` and `order_task_escrow.ps1` into a BOM-free
    Managed Run Command `source.script`. The generated wrapper carries the
@@ -83,9 +88,8 @@ repair mode and cannot create, update, or delete Azure resources.
    and digest. Historical versions may coexist only when every entry is a
    regular digest-qualified file that matches its embedded hash; partial,
    unrelated, corrupt, or reparse entries fail closed. Require that read-back
-   before invoking the escrow tool, then require the guest task to be exactly
-   `Ready` or `Disabled` with no running or queued
-   instance. Then use the tool to
+   before invoking the escrow tool, then require the enabled guest task to be
+   exactly `Ready` with no running or queued instance. Then use the tool to
    create a new immutable escrow for the current known-good task. Read the
    escrow manifest back and independently verify the task XML digest, exact
    current release action, and all six current-release file hashes. `Create`
@@ -95,7 +99,21 @@ repair mode and cannot create, update, or delete Azure resources.
    verified exact Git release/package, never from the guest directory being
    escrowed. `Validate` and `Restore` bind to the trusted map recorded in the
    escrow and do not accept a replacement map.
-6. Package the six guest files listed by
+7. Deliver the exact reviewed `order_cutover_phase.ps1` as a BOM-free Managed
+   Run Command source and read its source digest back. Use a new 32-lowercase-
+   hex `OperationId` for every action. The driver captures all child output and
+   is the sole receipt producer; every success or failure receipt is at most
+   3072 UTF-8 bytes. Run `ValidateEscrowAndDisable` against the known-good live
+   task. It must validate the exact escrow, require the task to be `Ready` with
+   result `0`, prove its enabled XML is the escrowed XML, disable it, and read
+   back `Disabled` with the state and append-only worker log unchanged. Never
+   stop a `Running` or `Queued` task as a normal cutover step. Every escrow and
+   installer child call rechecks its caller-pinned SHA-256 immediately before
+   execution; context construction alone is not accepted as lasting proof.
+   Before any state-preservation claim, parse and validate the exact current v1
+   state, including an array-valued `work` history, and require an existing log
+   prefix to end on an LF record boundary.
+8. Package the six guest files listed by
    `install_release_from_archive.ps1`. Use
    `build_order_release_wrapper.ps1` with the 40-character lowercase
    hexadecimal release ID and the independently computed archive and installer
@@ -109,47 +127,143 @@ repair mode and cannot create, update, or delete Azure resources.
    wrapper is the standard POC path for embedding those non-secret bytes and
    invoking the installer internally. Verify the archive digest inside the guest
    before moving it into the immutable release directory.
-7. Read the release manifest and all six guest files back. Require the full
+9. Read the release manifest and all six guest files back. Require the full
    commit release ID, caller-bound archive digest, exact file inventory, and
    exact per-file hashes before changing the task definition. A manifest alone
    is not deployment proof.
-8. Install the verified release's task in `Observe` mode with the checkout
-   boundary stated explicitly:
+10. Install the verified release's task in `Observe` mode, without `-Start`,
+    with the checkout boundary stated explicitly:
 
    ```powershell
    -WorkspacePath 'C:\Users\akatiawam\Blackboard'
    ```
 
-   `Execute` mode fails closed when this parameter is omitted, relative, missing,
-   or does not contain a `.git` directory. The immutable release directory is
-   executable plumbing and is never the Claude work workspace. Before starting
-   it, read the complete task definition back and require that the installer's
-   prior-task backup matches the independent known-good escrow.
-9. Start the task once. Require the immutable release ID, SYSTEM identity,
-   target profile, v1 bus read, tail-seeded cursor, zero board writes, and task
-   result `0` on read-back.
-10. Rehearse rollback while the candidate remains in `Observe`: restore the
-   independently escrowed task, verify its complete definition and known-good
-   release hashes, then require one natural 15-minute poll and one manual outer
-   supervisor `PASS`. Reinstall the same verified candidate in `Observe` only
-   after that end-to-end rehearsal passes, and repeat the task-definition and
-   one-poll read-backs from steps 8 and 9.
-11. Run the outer runbook manually and require exactly one terminal JSON record
-   with the expected VM/task identity while its schedules remain disabled.
-12. While the scheduled task is still in `Observe`, run the isolated SYSTEM
-   adapter smoke with the exact release, workspace, and Claude arguments. It
-   must prove the requested work-tool set `Read,Edit,PowerShell`, the effective
-   set `Read,Edit,PowerShell,StructuredOutput`, scrubbed child environment,
-   harmless Git execution, and unchanged protected fingerprints.
-13. Only then install the same task in `Execute` mode with an absolute Claude
-   executable path. Issue one fresh, harmless `codex` test order and verify its
-   deterministic CLAIM, RECEIPT, and RESULT rows by reading the board back.
-   Start the task a second time and prove the new poll occurred while lifecycle
-   counts remain exactly `1/1/1`. Re-enable both Automation schedules, read
-   them back, and require one scheduled supervisor `PASS` before declaring the
-   release accepted.
+    `Execute` mode fails closed when this parameter is omitted, relative,
+    missing, or does not contain a `.git` directory. The immutable release
+    directory is executable plumbing and is never the Claude work workspace.
+    Read the complete task definition back first. The initial installer's prior-task
+    backup must match the exact post-disable task XML from step 7; the independent
+    escrow remains the enabled rollback copy.
+11. Run `DrainObserve` inside one Managed Run Command. The preserved v1 state
+    must already be initialized; its baseline may record the preceding Execute
+    run because installation never rewrites state. Each bounded iteration must
+    advance Task Scheduler `LastRunTime`, produce a new worker `run_id`, finish
+    `Ready` with task result `0`, and append matching log evidence.
+    Bind the state poll timestamp to the same run's `poll_started` record and
+    the bounded run window; a future-dated state timestamp is not fresh proof.
+    `stale_order_ignored` is the only acceptable intermediate status. Success
+    requires a causally fresh final `no_eligible_order`. An observed candidate
+    cannot be skipped safely by the current Observe worker: the action fails
+    immediately with `OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION`, disables
+    future triggers without stopping an active instance, and requires the
+    candidate to be resolved externally. Because quarantine leaves Observe
+    `Disabled`, the bounded recovery path is `RestoreReady` from that Disabled
+    candidate followed by a fresh `InstallObserveAndDrain`; a plain
+    `DrainObserve` retry cannot satisfy its `Ready` precondition.
+    `tail_seeded`, `overlap_suppressed`, a reused run ID, or result `0` without
+    the matching state and log evidence is a failure. Observe must produce zero
+    board writes.
+12. Rehearse rollback with `RestoreReady`. It must validate the exact rollback
+    escrow and the exact current pinned candidate in either `Observe` or
+    `Execute`. The candidate must be quiescent and exactly `Ready` or `Disabled`:
+    `Ready` additionally requires result `0`, is stably reread, disabled, and
+    read back; `Disabled` is stably reread without a redundant mutation and may
+    retain the historical nonzero result that caused its quarantine. That result
+    is surfaced in the receipt. It then invokes the pinned escrow Restore and
+    accepts exactly one Restore receipt with `task_stopped:false`. It then reads
+    the enabled known-good task back as
+    `Ready`, result `0`, SYSTEM, and byte-identical to the escrow representation.
+    It also proves `state.json` and the append-only worker log did not change.
+    Never restore an older state file: releases share the v1 state, and rolling
+    its cursor backward can replay an ORDER. Any failure after candidate
+    authentication leaves the surviving exact candidate or restored task
+    disabled; a `Running` or `Queued` candidate is quarantined and never
+    stopped, restored over, or treated as rollback-ready.
+13. Require one causally fresh natural 15-minute poll from the restored task,
+    then run the outer runbook manually. The Automation job must be new, bind
+    the exact runbook and six parameters, finish `Completed`, and contain exactly
+    one terminal outer JSON record. Require the guest task `Ready`, result `0`,
+    an advanced `LastRunTime`, and zero board delta. `-Start` returning, a
+    Managed Run Command success state, or an outer `PASS` without those causal
+    read-backs is not completion proof.
+14. Run `InstallObserveAndDrain`. It first proves the restored enabled task and
+    escrow, disables it and proves that only the Enabled state changed, installs
+    the same immutable candidate in Observe without `-Start`, validates the
+    Install receipt, obtains a distinct exact `Status` readback, proves disable
+    and installation changed neither state nor log, checks the installer backup
+    against the exact post-disable XML, and performs the same bounded drain from
+    step 11. The independently validated enabled escrow remains the recovery
+    authority; the disabled installer backup is not a substitute for it.
+    Run the outer runbook manually again and require the same exact fresh job and
+    one-record acceptance while schedules remain disabled.
+15. While the scheduled task is still in `Observe`, run the isolated SYSTEM
+    adapter smoke with the exact release, workspace, and Claude arguments. It
+    must prove the requested work-tool set `Read,Edit,PowerShell`, the effective
+    set `Read,Edit,PowerShell,StructuredOutput`, scrubbed child environment,
+    harmless Git execution, and unchanged protected fingerprints.
+16. Run `InstallExecuteReady` with the same digest-qualified candidate installer
+    and absolute, digest-pinned Claude and Git executable paths. It requires the
+    exact candidate in `Observe`, `Ready`, result `0`, with enough time before the
+    natural trigger. Before mutation, it requires the trailing log run to match
+    the state `run_id`, validates exact `no_eligible_order` evidence, binds that
+    run to the current Scheduler `LastRunTime`, and rejects any later overlap or
+    other run. It captures the enabled Observe XML recovery digests; disables
+    and reads the task back; proves only Enabled changed and the state/log stayed
+    byte-identical; installs `Execute` without `-Start`; authenticates the
+    installer's backup as the exact post-disable XML; validates the Install
+    receipt; and obtains a distinct exact `Status` readback of the complete
+    `Execute`, SYSTEM, `Ready`, result-`0` definition. Independently require
+    enough trigger margin on that newly installed Execute task. The enabled
+    Observe XML digest evidence and immutable candidate remain available for
+    immediate recovery. `StartAndAwait` remains the only normal start path.
+    Then append exactly one fresh harmless order from the exact allowed source
+    `codex` and read that input row back.
+17. Run `StartAndAwait` for that exact row/work identity and expected result
+    status. It starts the already configured task once, waits within the natural-
+    trigger margin, and requires a new `LastRunTime`, worker `run_id`, exact
+    `result_confirmed` state, append-only log suffix, task result `0`, an exact
+    clean Git baseline with unchanged branch/HEAD, unchanged hooks, environment
+    file, immutable release, profile and workspace Claude configuration,
+    Claude/Git executables, and no isolation residue. The driver intentionally
+    has no bus access, so independently read
+    the full board and require exactly the canary DISPATCH plus one deterministic
+    CLAIM, RECEIPT, and RESULT.
+18. Run a second `StartAndAwait` for exact `no_eligible_order`. Require another
+    `LastRunTime` and run-ID advance, no new lifecycle rows, and global canary
+    counts still exactly `1/1/1`. Task result `0` alone is never acceptance.
+19. Re-enable both Automation schedules and read the complete schedule and
+    individual link resources back. Require a future next run and the first new
+    scheduled supervisor job to finish `Completed` with the exact six
+    parameters and exactly one terminal `PASS` JSON record. Finish with no
+    active jobs/commands and the Execute task `Ready` with result `0`.
 
-`order_system_adapter_smoke.ps1` is the reusable step-12 artifact. Stage its
+### Failure quarantine
+
+Normal cutover mutations remain `Ready`-only. After a phase has authenticated
+the exact task but then fails, the driver uses a narrower emergency quarantine:
+it disables scheduling immediately without calling `Stop-ScheduledTask` or any
+process-kill path, exports the task again, requires `Enabled=false`, and proves
+the definition differs only by that Enabled transition. It then waits for any
+existing `Running` or `Queued` instance to finish naturally within a bounded
+window and authenticates the final exact `Disabled` definition. A hung instance
+returns cleanup `FAILED` with `future_triggers_disabled:true` and
+`active_instance_status:PERSISTED`; it is never killed and no state snapshot is
+restored. Disable failure or definition drift fails closed and must not be
+reported as a successful quarantine.
+
+### Task XML digest representations
+
+The escrow manifest's `task_xml_sha256` hashes the actual `task.xml` file as
+UTF-16LE bytes including its BOM. The task installer's backup manifest
+`xml_sha256` hashes the UTF-8 encoding of the exported XML string, even though
+`previous-task.xml` itself is written as UTF-16LE with a BOM. Those two manifest
+fields are intentionally not directly comparable. Compare the XML text after a
+strict decode, or encode the same text into the representation named by the
+field. The cutover driver performs both checks and labels its pre/post task
+digests `*_xml_utf8_sha256`; its `escrow_xml_sha256` retains the escrow's
+UTF-16LE-with-BOM representation.
+
+`order_system_adapter_smoke.ps1` is the reusable step-15 artifact. Stage its
 reviewed bytes outside every immutable release and verify its transport hash
 before execution. Invoke it only through Windows PowerShell 5.1 as SYSTEM and
 pass the full 40-character lowercase hexadecimal release ID, the caller-bound

@@ -15,6 +15,7 @@ on:
       - 'infra/azure/order_system_adapter_smoke.ps1'
       - 'infra/azure/validate_order_job_schedule_links.ps1'
       - 'infra/azure/order_task_escrow.ps1'
+      - 'infra/azure/order_cutover_phase.ps1'
       - 'infra/azure/stage_order_escrow_tool.ps1'
       - 'infra/azure/build_order_escrow_transport_wrapper.ps1'
       - 'infra/azure/build_order_release_wrapper.ps1'
@@ -27,6 +28,7 @@ on:
       - 'tests/test_order_system_adapter_smoke.ps1'
       - 'tests/test_order_job_schedule_link_validator.ps1'
       - 'tests/test_order_task_escrow.ps1'
+      - 'tests/test_order_cutover_phase.ps1'
       - 'tests/test_order_escrow_transport.ps1'
       - 'tests/test_order_deployment_wrappers.ps1'
       - 'tests/test_order_supervisor.ps1'
@@ -68,6 +70,9 @@ jobs:
       - name: Test ORDER independent task escrow
         shell: powershell
         run: .\tests\test_order_task_escrow.ps1
+      - name: Test ORDER bounded guest cutover phases
+        shell: powershell
+        run: .\tests\test_order_cutover_phase.ps1
       - name: Test ORDER escrow transport
         shell: powershell
         run: .\tests\test_order_escrow_transport.ps1
