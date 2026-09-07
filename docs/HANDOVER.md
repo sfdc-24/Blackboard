@@ -14,21 +14,37 @@ visitors any more.
 | | |
 |---|---|
 | Serves from | GitHub Pages, repo **`sfdc-24/sfdc24-site`**, branch `main`, path `/` |
-| Public source of truth | `site/` in this repo, mirrored to that public repo |
+| Public source of truth | The complete `sfdc-24/sfdc24-site` repository. This Blackboard repo's `site/` directory is an incomplete historical/test copy, not a deployment source. |
 | DNS | `www` **CNAME -> `sfdc-24.github.io`** at NameSilo |
 | Apex | three A records (45.77.75.133, 45.77.92.157, 207.246.78.75) + NameSilo 301 forwarder to `https://www.sfdc24.com`. **Untouched by the move, and `www` must never carry an A record (L-81).** |
-| Rollback | `www` CNAME back to `ghs.googlehosted.com`, TTL 3600. One edit, effective in minutes. |
-| The chat | Unchanged. Still the Governor Page API in an iframe on the home page, deployment `AKfycbx0D-5DAn...` at **@26**. The move did not touch Apps Script. |
+| Site rollback | Revert the reviewed site change in `sfdc-24/sfdc24-site` and verify the resulting Pages deployment. Keep the existing domain configuration. Coupled backend/client releases follow `MULTITENANT-READINESS.md`. |
+| The chat | The Governor Page API is a separate Apps Script deployment embedded by the site. Read its current immutable version before a coupled release; the historical version numbers below are not current deployment evidence. |
 
 **Why it moved.** Sites wraps every page in its own header and scroll, so a page
 served through it can never feel like an app, and it has no field for a meta
 description — Google was writing our search snippet for us. Both were ceilings,
 not annoyances. Mr. Salam approved the move explicitly.
 
-**Deploying the site now** is a git push to `sfdc-24/sfdc24-site`; Pages rebuilds
-in about 20 seconds. There is no local clone of that repo — clone it to the
-scratchpad, copy from `site/`, push, delete. Keep `site/` here as the source and
-never edit the public repo directly, or the two drift.
+**Site source correction — 2026-09-07, SITE-MIRROR-DRIFT-001.** The previous
+instruction to copy this repo's `site/` into a public-repo clone is withdrawn.
+The deployed repository also contains `CNAME`, `.nojekyll`, `.github/`, `docs/`,
+`tests/`, and `tools/` which this directory does not mirror. Replacing the whole
+tree can remove the custom-domain binding and the publisher's controls.
+
+Work from a current clone of `sfdc-24/sfdc24-site`, create a review branch, and
+edit only the intended files there. Retain its domain configuration, workflows,
+publisher tools, tests, and existing routes. Run the relevant checks in that
+repository. A reviewed merge to its `main` branch triggers Pages; verify the
+completed deployment, changed page behavior, and the retained public routes in
+a browser. A successful push alone is not a deployment receipt.
+
+The canonical intake is `intake/index.html` in that repository, published from
+commit `0ed0ed1`. Its contract tests belong beside that file. Blackboard's old
+intake artifacts and `site/` pages are reference or fixture material only and
+must not be copied over the served tree. Do not delete them while another
+review or test still references them; retire those references in the owning
+review. Re-read remote heads before acting and preserve the existing paired
+Governor/client acceptance and rollback requirements.
 
 **Read ISS-015 before you touch DNS again.** The cutover took the site down in
 browsers for about 45 minutes while GitHub issued the certificate, and every

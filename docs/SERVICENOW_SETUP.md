@@ -69,7 +69,9 @@ anything worth losing:
 - **Treat the PDI as disposable.** Everything we create goes into a named
   **Update Set** and gets exported to XML in this repo, so a reclaimed instance
   is a re-provision plus an import, not a loss. This is the ServiceNow analogue
-  of "the source of truth is `site/`, not the live host".
+  of keeping reviewed source in its canonical repository. The public website's
+  canonical repository is `sfdc-24/sfdc24-site`; Blackboard's `site/` is not a
+  complete deployment tree (see `docs/HANDOVER.md`).
 - **Watch the clock, not the instance.** `monitorTick` already runs every 15
   minutes on Google infrastructure and already emails on state change with a
   12/day cap (`docs/HANDOVER.md`). Add a day-count check that emails at day 7 of
