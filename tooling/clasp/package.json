@@ -1,0 +1,7 @@
+{
+  "name": "blackboard-staging-clasp",
+  "private": true,
+  "version": "1.0.0",
+  "engines": { "node": ">=22.0.0" },
+  "dependencies": { "@google/clasp": "3.4.1" }
+}

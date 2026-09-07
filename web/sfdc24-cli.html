@@ -1,0 +1,554 @@
+<title>SFDC24 Terminal</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+  :root{
+    --ground:#0A0D0C;
+    --panel:#101513;
+    --panel-2:#151B19;
+    --edge:#1E2724;
+    --edge-hi:#2E3C37;
+    --ink:#DCE4E0;
+    --dim:#7A8882;
+    --faint:#4B5752;
+    --mint:#3DDC97;
+    --mint-dim:#2A8F63;
+    --amber:#E8A33D;
+    --cyan:#62B6D9;
+    --red:#E2574C;
+    --violet:#A98BE0;
+
+    --term:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --chrome:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+
+    --gutter:clamp(.9rem,3vw,1.6rem);
+  }
+
+  *{box-sizing:border-box}
+
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--term);
+    font-size:14px;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+    min-height:100vh;
+    min-height:100dvh;
+    display:flex;
+    flex-direction:column;
+  }
+
+  /* ---------------- window ---------------- */
+
+  .win{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    width:100%;
+    max-width:1120px;
+    margin:0 auto;
+    border-left:1px solid var(--edge);
+    border-right:1px solid var(--edge);
+    background:var(--panel);
+    min-height:0;
+  }
+
+  .bar{
+    display:flex;
+    align-items:center;
+    gap:.85rem;
+    padding:.6rem var(--gutter);
+    border-bottom:1px solid var(--edge);
+    background:var(--panel-2);
+    font-family:var(--chrome);
+    font-size:.72rem;
+    color:var(--dim);
+    flex-shrink:0;
+  }
+  .lights{display:flex;gap:.4rem}
+  .lights i{width:10px;height:10px;border-radius:50%;background:var(--edge-hi);display:block}
+  .lights i:first-child{background:#3E4B46}
+  .path{color:var(--dim)}
+  .path b{color:var(--ink);font-weight:500}
+  .chip{
+    margin-left:auto;
+    border:1px solid var(--edge-hi);
+    border-radius:2px;
+    padding:.1rem .45rem;
+    color:var(--mint-dim);
+    letter-spacing:.05em;
+  }
+
+  /* ---------------- scrollback ---------------- */
+
+  .scroll{
+    flex:1;
+    overflow-y:auto;
+    overflow-x:hidden;
+    padding:1.4rem var(--gutter) .6rem;
+    min-height:0;
+    scrollbar-width:thin;
+    scrollbar-color:var(--edge-hi) transparent;
+  }
+  .scroll::-webkit-scrollbar{width:9px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--edge-hi);border-radius:9px}
+  .scroll::-webkit-scrollbar-track{background:transparent}
+
+  .block{margin-bottom:1.15rem;max-width:78ch}
+  .block:last-child{margin-bottom:.4rem}
+
+  /* banner */
+  .banner{
+    border:1px solid var(--edge-hi);
+    border-radius:3px;
+    padding:.85rem 1rem;
+    margin-bottom:1.2rem;
+    max-width:78ch;
+  }
+  .banner .star{color:var(--mint);margin-right:.5rem}
+  .banner .lede{color:var(--ink);font-weight:500}
+  .banner .meta{
+    font-family:var(--chrome);
+    font-size:.72rem;
+    color:var(--faint);
+    margin-top:.45rem;
+    line-height:1.75;
+  }
+  .banner .meta span{color:var(--dim)}
+
+  /* speaker labels */
+  .who{
+    font-family:var(--chrome);
+    font-size:.68rem;
+    letter-spacing:.18em;
+    text-transform:uppercase;
+    margin-bottom:.22rem;
+  }
+  .who.claude{color:var(--mint)}
+  .who.you{color:var(--amber)}
+  .who.sys{color:var(--faint)}
+
+  .say{white-space:pre-wrap;word-break:break-word}
+  .say.user{color:var(--dim)}
+  .say.refuse{color:var(--ink)}
+  .say em{color:var(--mint);font-style:normal}
+
+  /* tool call block */
+  .tool{
+    border-left:2px solid var(--edge-hi);
+    padding:.15rem 0 .15rem .8rem;
+    margin:.15rem 0 .55rem;
+    font-family:var(--chrome);
+    font-size:.78rem;
+  }
+  .tool-head{
+    display:flex;
+    align-items:baseline;
+    gap:.5rem;
+    color:var(--dim);
+    cursor:pointer;
+    background:none;
+    border:0;
+    padding:0;
+    font:inherit;
+    text-align:left;
+    width:100%;
+  }
+  .tool-head:hover .name{color:var(--ink)}
+  .tool-head .dot{color:var(--cyan)}
+  .tool-head .name{color:var(--cyan);font-weight:500}
+  .tool-head .args{color:var(--faint);word-break:break-all}
+  .tool-head .ms{margin-left:auto;color:var(--faint);flex-shrink:0}
+  .tool-out{
+    margin-top:.35rem;
+    color:var(--faint);
+    white-space:pre-wrap;
+    border-left:1px solid var(--edge);
+    padding-left:.7rem;
+  }
+  .tool-out.hidden{display:none}
+
+  .think{
+    font-family:var(--chrome);
+    font-size:.78rem;
+    color:var(--violet);
+    margin-bottom:.5rem;
+  }
+  .think .t{color:var(--faint)}
+
+  /* ---------------- composer ---------------- */
+
+  .hints{
+    display:flex;
+    flex-wrap:wrap;
+    gap:.35rem;
+    padding:0 var(--gutter) .55rem;
+    flex-shrink:0;
+  }
+  .hints button{
+    font-family:var(--chrome);
+    font-size:.72rem;
+    color:var(--dim);
+    background:transparent;
+    border:1px solid var(--edge);
+    border-radius:2px;
+    padding:.16rem .5rem;
+    cursor:pointer;
+    transition:border-color .12s,color .12s;
+  }
+  .hints button:hover{border-color:var(--edge-hi);color:var(--mint)}
+
+  .composer{
+    display:flex;
+    align-items:flex-start;
+    gap:.6rem;
+    padding:.75rem var(--gutter);
+    border-top:1px solid var(--edge);
+    background:var(--panel-2);
+    flex-shrink:0;
+  }
+  .caret{color:var(--mint);font-weight:700;line-height:1.65;flex-shrink:0}
+  #line{
+    flex:1;
+    background:transparent;
+    border:0;
+    outline:none;
+    color:var(--ink);
+    font-family:var(--term);
+    font-size:14px;
+    line-height:1.65;
+    resize:none;
+    overflow:hidden;
+    min-height:1.65em;
+    max-height:8em;
+  }
+  #line::placeholder{color:var(--faint)}
+
+  .status{
+    display:flex;
+    flex-wrap:wrap;
+    gap:.35rem 1.1rem;
+    padding:.45rem var(--gutter);
+    border-top:1px solid var(--edge);
+    background:var(--panel);
+    font-family:var(--chrome);
+    font-size:.68rem;
+    color:var(--faint);
+    flex-shrink:0;
+  }
+  .status b{color:var(--dim);font-weight:400}
+  .status .ok{color:var(--mint-dim)}
+  .status .right{margin-left:auto}
+
+  .cursor{
+    display:inline-block;
+    width:.55em;
+    height:1em;
+    background:var(--mint);
+    vertical-align:-.15em;
+    animation:blink 1.1s step-end infinite;
+  }
+  @keyframes blink{50%{opacity:0}}
+
+  :focus-visible{outline:1px solid var(--mint);outline-offset:2px}
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+
+  @media (max-width:640px){
+    body{font-size:13px}
+    #line{font-size:16px}   /* stops iOS zoom-on-focus */
+    .status .right{margin-left:0}
+  }
+</style>
+
+<div class="win">
+
+  <div class="bar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <div class="path">~/<b>sfdc24</b></div>
+    <div class="chip">human sign-off: on</div>
+  </div>
+
+  <div class="scroll" id="scroll">
+    <div class="banner">
+      <div><span class="star">✻</span><span class="lede">SFDC24 — Salesforce operations, run by agents.</span></div>
+      <div class="meta">
+        <span>reception</span> · a human signs off on anything that matters<br>
+        type a problem, or <span>/help</span> for commands
+      </div>
+    </div>
+    <div id="out"></div>
+  </div>
+
+  <div class="hints" id="hints"></div>
+
+  <div class="composer">
+    <span class="caret">›</span>
+    <textarea id="line" rows="1" autocomplete="off" spellcheck="false"
+      placeholder="what do you want to solve?" aria-label="message"></textarea>
+  </div>
+
+  <div class="status">
+    <span><b>claude</b> · reception</span>
+    <span class="ok">● online</span>
+    <span>abdus@sfdc24.com</span>
+    <span class="right">prototype · scripted responses</span>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  var out    = document.getElementById('out');
+  var scroll = document.getElementById('scroll');
+  var line   = document.getElementById('line');
+  var hints  = document.getElementById('hints');
+
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var history = [], hIdx = -1, busy = false;
+
+  /* ---------- scrollback rendering ---------- */
+
+  function el(tag, cls, text){
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function toBottom(){ scroll.scrollTop = scroll.scrollHeight; }
+
+  function say(who, cls){
+    var b = el('div','block');
+    if (who) b.appendChild(el('div','who ' + cls, who));
+    out.appendChild(b);
+    return b;
+  }
+
+  function typeInto(node, text, done){
+    if (reduced){ node.textContent = text; toBottom(); if (done) done(); return; }
+    var i = 0;
+    (function step(){
+      // chunk a few characters per frame: fast enough to read, slow enough to feel live
+      i = Math.min(text.length, i + 3);
+      node.textContent = text.slice(0, i);
+      toBottom();
+      if (i < text.length) setTimeout(step, 12);
+      else if (done) done();
+    })();
+  }
+
+  /* ---------- tool-call theatre ---------- */
+
+  function toolBlock(parent, t){
+    var wrap = el('div','tool');
+    var head = el('button','tool-head');
+    head.type = 'button';
+    head.appendChild(el('span','dot','⏺'));
+    head.appendChild(el('span','name', t.name));
+    head.appendChild(el('span','args', '(' + t.args + ')'));
+    var ms = el('span','ms','running…');
+    head.appendChild(ms);
+
+    var body = el('div','tool-out hidden', t.out);
+    head.addEventListener('click', function(){ body.classList.toggle('hidden'); toBottom(); });
+
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    parent.appendChild(wrap);
+    toBottom();
+
+    return new Promise(function(res){
+      setTimeout(function(){
+        ms.textContent = t.ms + 'ms · ' + t.summary;
+        res();
+      }, reduced ? 0 : t.ms);
+    });
+  }
+
+  function thinking(parent, ms){
+    var n = el('div','think');
+    n.innerHTML = '✻ thinking <span class="t">0.0s</span>';
+    parent.appendChild(n);
+    toBottom();
+    var t0 = Date.now(), iv = setInterval(function(){
+      n.querySelector('.t').textContent = ((Date.now()-t0)/1000).toFixed(1) + 's';
+    }, 100);
+    return new Promise(function(res){
+      setTimeout(function(){ clearInterval(iv); n.remove(); res(); }, reduced ? 0 : ms);
+    });
+  }
+
+  /* ---------- what it knows ---------- *
+   * Scripted, on purpose. Nothing here invents pricing, timelines, client
+   * names or capability — the same limits the live reception runs under.     */
+
+  var OUT_OF_SCOPE = /wordpress|shopify|wix|squarespace|logo|brand(ing)?|seo|social media|mobile app|ios|android|game|crypto|resume|essay/i;
+
+  var KB = [
+    { m:/flow|automation|process builder|trigger/i,
+      tool:{ name:'recall', args:'topic="flow untangling"', out:'notes/flows.md — 9 matching\n  · record-triggered order is not guaranteed\n  · same-object updates re-enter the transaction\n  · the one nobody will touch is usually named Test', ms:520, summary:'9 notes' },
+      say:"Start with how many are record-triggered on the same object. More than one, and they run in an order Salesforce does not guarantee, which is where most \"it works sometimes\" bugs live.\n\nWhat object, and roughly how many automations are on it?" },
+
+    { m:/case|intake|ticket|log(ged)? .*(way|different)|14|fourteen/i,
+      tool:{ name:'recall', args:'topic="case intake"', out:'notes/intake.md — 6 matching\n  · web-to-case, email-to-case, phone, chat, walk-up\n  · each path usually sets a different Origin value\n  · reporting breaks at the merge, not the intake', ms:610, summary:'6 notes' },
+      say:"Fourteen paths usually means fourteen people each solved it once and nobody had the authority to pick. The reporting is the symptom, not the problem.\n\nWhat does intake actually look like today — web-to-case, email, phone, or all three?" },
+
+    { m:/migrat|duplicat|dedup|merge|import|legacy/i,
+      tool:{ name:'recall', args:'topic="migration + dedupe"', out:'notes/migration.md — 11 matching\n  · External ID + upsert is the whole trick when an ID exists\n  · without one: normalise, block, then score\n  · load order: accounts, then contacts, then everything else', ms:480, summary:'11 notes' },
+      say:"That is a data merge problem, and the approach depends entirely on what reliable identifier exists between the systems.\n\nIf both sides carry a stable external ID — tax number, legacy account code, anything that does not change — map it to a Salesforce External ID field and upsert. It updates the match or creates new, and duplicates never happen.\n\nIf there is no shared ID, you are matching on fuzzy criteria and you need a human review step. Which one is it?" },
+
+    { m:/report|dashboard|trust|number|metric/i,
+      tool:{ name:'recall', args:'topic="reporting"', out:'notes/reporting.md — 7 matching\n  · the dashboard everyone loves is usually filtered wrong\n  · disagreement is normally definition drift, not data', ms:440, summary:'7 notes' },
+      say:"When nobody trusts the reporting, it is almost never the report. It is that two teams have two definitions of the same word and both are in the data.\n\nWhich number is the one people argue about?" },
+
+    { m:/real person|human|are you (a )?bot|ai\??$|who are you/i,
+      say:"Claude. I work reception here.\n\nAbdus reads anything that matters and signs off on the work. That is the actual arrangement, not a disclaimer." },
+
+    { m:/price|pricing|cost|rate|quote|charge|how much/i,
+      say:"That is an Abdus question — abdus@sfdc24.com.\n\nHe will give you a real number instead of a range I invented." },
+
+    { m:/how long|timeline|when can|turnaround|deadline/i,
+      say:"Also an Abdus question — abdus@sfdc24.com. I am not going to guess at a date you would hold him to." }
+  ];
+
+  var COMMANDS = {
+    '/help': function(){
+      return "commands\n"
+        + "  /about      what SFDC24 is\n"
+        + "  /work       the kind of work that happens here\n"
+        + "  /pricing    what an engagement costs\n"
+        + "  /contact    reach a human\n"
+        + "  /clear      clear the session\n\n"
+        + "or just describe the problem. be specific and I will be specific back.";
+    },
+    '/about': function(){
+      return "SFDC24 is a working surface for getting real work done with AI agents — several models working the same projects, with a human making the consequential calls.\n\nRun by an independent consultant in the Toronto area. Background is Salesforce operations, Lean Six Sigma and Scrum.";
+    },
+    '/work': function(){
+      return "the shape of the work\n"
+        + "  · data migration and de-duplication\n"
+        + "  · consolidating how cases actually get logged\n"
+        + "  · untangling automation that fights itself\n"
+        + "  · reporting people will actually trust\n\n"
+        + "if yours is not on that list, say it anyway — it is a short list, not a boundary.";
+    },
+    '/pricing': function(){
+      return "That is an Abdus question — abdus@sfdc24.com.\n\nHe will give you a real number instead of a range I invented.";
+    },
+    '/contact': function(){
+      return "abdus@sfdc24.com — he answers.\n\nWorth an email if it involves pricing, timelines, access to your org, or anything with a contract attached to it.";
+    },
+    '/clear': function(){ return null; }
+  };
+
+  /* ---------- the reply path ---------- */
+
+  function respond(text){
+    var b = say('claude','who claude');
+
+    // out of scope: one line, then close. no referral, no consolation, no pivot.
+    if (OUT_OF_SCOPE.test(text)){
+      return thinking(b, 700).then(function(){
+        var n = el('div','say refuse');
+        b.appendChild(n);
+        return new Promise(function(res){
+          typeInto(n, "No — that is not what SFDC24 does. The work here is Salesforce operations and process implementation.\n\nThank you for visiting our page.", res);
+        });
+      });
+    }
+
+    var hit = null;
+    for (var i = 0; i < KB.length; i++){ if (KB[i].m.test(text)){ hit = KB[i]; break; } }
+
+    var chain = thinking(b, hit ? 900 : 650);
+    if (hit && hit.tool) chain = chain.then(function(){ return toolBlock(b, hit.tool); });
+
+    return chain.then(function(){
+      var n = el('div','say');
+      b.appendChild(n);
+      var reply = hit ? hit.say
+        : "I can work with that, but not yet — it is still too broad to say anything useful about.\n\nWhat is the part that is actually costing you time right now?";
+      return new Promise(function(res){ typeInto(n, reply, res); });
+    });
+  }
+
+  /* ---------- input ---------- */
+
+  function submit(raw){
+    var text = (raw == null ? line.value : raw).trim();
+    if (!text || busy) return;
+
+    line.value = '';
+    autosize();
+    history.unshift(text);
+    hIdx = -1;
+
+    var ub = say('you','who you');
+    ub.appendChild(el('div','say user', text));
+    toBottom();
+
+    var cmd = text.toLowerCase().split(/\s+/)[0];
+    if (COMMANDS[cmd]){
+      if (cmd === '/clear'){ out.innerHTML = ''; toBottom(); return; }
+      var b = say('claude','who claude');
+      var n = el('div','say');
+      b.appendChild(n);
+      busy = true;
+      typeInto(n, COMMANDS[cmd](), function(){ busy = false; });
+      return;
+    }
+
+    busy = true;
+    respond(text).then(function(){ busy = false; toBottom(); });
+  }
+
+  function autosize(){
+    line.style.height = 'auto';
+    line.style.height = Math.min(line.scrollHeight, 128) + 'px';
+  }
+
+  line.addEventListener('input', autosize);
+
+  line.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(); return; }
+    if (e.key === 'l' && e.ctrlKey){ e.preventDefault(); out.innerHTML = ''; return; }
+    if (e.key === 'ArrowUp' && !line.value.slice(0, line.selectionStart).includes('\n')){
+      if (hIdx + 1 < history.length){ hIdx++; line.value = history[hIdx]; autosize(); e.preventDefault(); }
+    }
+    if (e.key === 'ArrowDown'){
+      if (hIdx > 0){ hIdx--; line.value = history[hIdx]; autosize(); e.preventDefault(); }
+      else if (hIdx === 0){ hIdx = -1; line.value = ''; autosize(); e.preventDefault(); }
+    }
+  });
+
+  // typing anywhere on the page goes to the prompt, the way a terminal behaves
+  document.addEventListener('keydown', function(e){
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (document.activeElement === line) return;
+    if (e.key.length === 1 || e.key === 'Backspace') line.focus();
+  });
+
+  ['/help','/work','/pricing','/contact','our flows are a disaster','cases get logged 14 different ways']
+    .forEach(function(h){
+      var b = el('button', null, h);
+      b.type = 'button';
+      b.addEventListener('click', function(){ submit(h); line.focus(); });
+      hints.appendChild(b);
+    });
+
+  /* ---------- boot ---------- */
+
+  var greet = say('claude','who claude');
+  var gn = el('div','say');
+  greet.appendChild(gn);
+  typeInto(gn,
+    "You are talking to Claude.\n\n"
+  + "Your time is the scarce thing here, so take whichever is faster: ask what this is, or tell me the problem you are trying to solve.\n\n"
+  + "Be specific and I will be specific back.",
+    function(){ line.focus(); });
+})();
+</script>

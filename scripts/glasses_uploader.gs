@@ -1,0 +1,203 @@
+/**
+ * SFDC24 — Glasses Intake Uploader (STANDALONE Apps Script web app)
+ * claude-code-cli, 2026-09-02. wf=GLASSES-INTAKE sub=WEBCAM-CAPTURE.
+ *
+ * WHY THIS EXISTS RATHER THAN A PATCH TO THE BUS
+ *   The `upload` action was written for the v1 bus (scripts/codegs_upload_action.gs),
+ *   but on 2026-09-02 the bus's Apps Script PROJECT could not be located: the live
+ *   deployment (…GOP7G_RcXrjQ) answers requests and appends to Drive, yet it does
+ *   not appear in this account's script.google.com project list, and Drive returns
+ *   only two script projects (Governor Page API, Blackboard Production) — neither
+ *   of which is the bus. Until that is resolved the bus cannot be patched at all.
+ *
+ *   So this is a SEPARATE, single-purpose web app. It touches nothing the fleet
+ *   depends on, and it can be deleted the day the bus becomes patchable again.
+ *
+ * DEPLOY (about two minutes)
+ *   1. script.google.com → New project → name it "SFDC24 Glasses Intake Uploader".
+ *   2. Delete the myFunction stub, paste this whole file, Save.
+ *   3. Project Settings (gear) → Script Properties → Add script property:
+ *        UPLOAD_SECRET = <a long random value>
+ *      Do NOT reuse BUS_SECRET here. A fresh value means this endpoint's blast
+ *      radius is this one folder, not the whole board (D-18).
+ *      Optional: FOLDER_ID = 1skJIwAYenlwMovtW07BsdFOi18cFchlZ  (Glasses Intake)
+ *   4. Deploy → New deployment → type Web app → Execute as: Me →
+ *      Who has access: Anyone → Deploy → authorize.
+ *   5. Copy the Web app URL (it ENDS IN /exec) and hand it over with the secret.
+ *
+ * VERIFY (sends no file content)
+ *   GET  the /exec URL  -> {"ok":true,"service":"sfdc24-glasses-uploader",...}
+ *   POST {action:'upload', secret:'…'} with no base64
+ *                       -> {"ok":false,"error":"base64 content required …"}
+ *   Those two answers together mean it is live and correctly gated.
+ */
+
+var DEFAULT_FOLDER_ID = '1skJIwAYenlwMovtW07BsdFOi18cFchlZ'; // "Glasses Intake"
+
+/**
+ * BUMP THIS whenever you change what the script can do, and the unauthenticated
+ * GET becomes a deploy check: if the live URL does not report the version and
+ * actions you just pasted, the editor was saved but the DEPLOYMENT was not
+ * advanced (Manage deployments -> pencil -> Version: New version -> Deploy).
+ * That mistake has cost this project an hour twice; this makes it a one-glance
+ * diagnosis that needs no secret.
+ */
+var CONTRACT_VERSION = 2; // v1 upload only; v2 adds prune
+
+function doGet() {
+  return json_({
+    ok: true,
+    service: 'sfdc24-glasses-uploader',
+    version: CONTRACT_VERSION,
+    actions: ['upload', 'prune'],
+    time: new Date().toISOString()
+  });
+}
+
+function doPost(e) {
+  try {
+    var body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+
+    var secret = PropertiesService.getScriptProperties().getProperty('UPLOAD_SECRET');
+    if (!secret) {
+      return json_({ ok: false, error: 'UPLOAD_SECRET not set in Script Properties' });
+    }
+    // Fail closed, and give the same answer for missing and wrong — a probe must
+    // not be able to distinguish them.
+    if (String(body.secret || '') !== secret) {
+      return json_({ ok: false, error: 'Unauthorized' });
+    }
+    var action = String(body.action || 'upload');
+    if (action === 'prune') return prune_(body);
+    if (action !== 'upload') {
+      return json_({ ok: false, error: 'Unknown action: ' + action });
+    }
+
+    var filename = String(body.filename || '').trim();
+    if (!filename) return json_({ ok: false, error: 'filename required' });
+    if (filename.indexOf('/') !== -1 || filename.indexOf('\\') !== -1) {
+      return json_({ ok: false, error: 'filename must not contain a path separator' });
+    }
+
+    var b64 = body.base64;
+    if (typeof b64 !== 'string' || !b64) {
+      return json_({ ok: false, error: 'base64 content required (non-empty string)' });
+    }
+
+    var bytes;
+    try {
+      bytes = Utilities.base64Decode(b64);
+    } catch (err) {
+      return json_({ ok: false, error: 'base64 did not decode: ' + err });
+    }
+    // REQ-V8QD7R, the defect this codebase has paid for twice: never answer
+    // ok:true for a write that put nothing there.
+    if (!bytes || !bytes.length) {
+      return json_({ ok: false, error: 'decoded payload is empty — refusing to create a 0-byte file' });
+    }
+
+    var folderId = body.folderId
+      || PropertiesService.getScriptProperties().getProperty('FOLDER_ID')
+      || DEFAULT_FOLDER_ID;
+
+    var folder;
+    try {
+      folder = DriveApp.getFolderById(folderId);
+    } catch (err) {
+      return json_({ ok: false, error: 'folder not found or not accessible: ' + folderId });
+    }
+
+    var file = folder.createFile(
+      Utilities.newBlob(bytes, String(body.mimeType || 'application/octet-stream'), filename)
+    );
+
+    // Echo what was ACTUALLY written, so the caller can catch a size mismatch
+    // without a second round trip.
+    return json_({
+      ok: true,
+      fileId: file.getId(),
+      name: file.getName(),
+      bytes: file.getSize(),
+      folderId: folderId,
+      uploadedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    return json_({ ok: false, error: String(err) });
+  }
+}
+
+/**
+ * Retention: keep the N newest capture frames in the folder, TRASH the rest.
+ *
+ * Three deliberate limits, because this is the only destructive path here:
+ *   - only files whose name starts with "glasses_" -- the capture feeder's own
+ *     output. Anything else a human filed in that folder is untouchable.
+ *   - setTrashed, never setTrashed-and-purge: a mistake is recoverable from the
+ *     Drive bin for 30 days.
+ *   - keep must be a positive integer. A missing or zero keep does NOT mean
+ *     "delete everything"; it is rejected. Fail closed on destructive input.
+ */
+function prune_(body) {
+  var keep = Number(body.keep) || 0;
+  var maxAgeMin = Number(body.maxAgeMin) || 0;
+  // At least one cap must be a sane positive number. Absent that, this would
+  // mean "trash everything", which is never what a missing field should do.
+  if (keep < 1 && maxAgeMin < 1) {
+    return json_({ ok: false, error: 'keep or maxAgeMin must be a positive integer -- refusing to prune' });
+  }
+  if (keep < 0 || maxAgeMin < 0) {
+    return json_({ ok: false, error: 'keep and maxAgeMin must not be negative' });
+  }
+
+  var folderId = body.folderId
+    || PropertiesService.getScriptProperties().getProperty('FOLDER_ID')
+    || DEFAULT_FOLDER_ID;
+
+  var folder;
+  try {
+    folder = DriveApp.getFolderById(folderId);
+  } catch (err) {
+    return json_({ ok: false, error: 'folder not found or not accessible: ' + folderId });
+  }
+
+  var items = [];
+  var it = folder.getFiles();
+  while (it.hasNext()) {
+    var f = it.next();
+    if (f.getName().indexOf('glasses_') === 0) {
+      items.push({ file: f, at: f.getDateCreated().getTime() });
+    }
+  }
+  items.sort(function (a, b) { return b.at - a.at; }); // newest first
+
+  var cutoff = maxAgeMin > 0 ? (Date.now() - maxAgeMin * 60 * 1000) : null;
+  var trashed = [];
+  var agedOut = 0;
+  var freed = 0;
+
+  for (var i = 0; i < items.length; i++) {
+    var tooMany = keep > 0 && i >= keep;
+    var tooOld = cutoff !== null && items[i].at < cutoff;
+    if (!tooMany && !tooOld) continue;
+    if (tooOld) agedOut++;
+    freed += items[i].file.getSize();
+    trashed.push(items[i].file.getName());
+    items[i].file.setTrashed(true);
+  }
+
+  return json_({
+    ok: true,
+    kept: items.length - trashed.length,
+    trashed: trashed.length,
+    agedOut: agedOut,
+    bytesFreed: freed,
+    names: trashed.slice(0, 20),
+    prunedAt: new Date().toISOString()
+  });
+}
+
+function json_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}

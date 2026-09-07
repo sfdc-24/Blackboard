@@ -1,0 +1,381 @@
+{
+  "observedAt": "2026-09-06T23:38:49.342748+00:00",
+  "reviewCommit": "1d26dde2c40d25cbb95e529e449e5922dc778df0",
+  "representation": "UTF-8 LF JavaScript/HTML; strict sorted compact JSON manifest; sorted name/type/source records",
+  "projects": [
+    {
+      "project": "governor-page-api",
+      "scriptId": "1S4LQE0SQwnE9kngxMhRngyAmSNGhFtDRxoYQqIxSSH0UoQ5u7T84MKU1",
+      "deploymentId": "AKfycbwv61DuHXl-MlqUBf911ckuxjBMh0P6G6S8bUDZ5BlFR7Afv7YwjIDcxkwaL7OiB7TeBw",
+      "version": 1,
+      "entryPointConfig": {
+        "access": "ANYONE_ANONYMOUS",
+        "executeAs": "USER_DEPLOYING"
+      },
+      "anonymousHttp": 403,
+      "headEqualsPinned": true,
+      "reviewEqualsPinned": false,
+      "pinned": {
+        "sourceSha256": "d22fb74398957594f8c5952dccbfedabaa5be2df5f5cf46e5c6f975f46cff2a5",
+        "files": {
+          "Auth": "974b82b2dbb29fe7ad77ec34249b6868c7ee45760c3ea7036254ee5fb5a895c1",
+          "Code": "7b6295d7f58ffa3f8fdbe288c80d739a8b29c952606b0f6a102516e8b0bb740b",
+          "Index": "9e98b85129b127bc1aa6414b2e5242d917c7bc122baceaadd23d77016ef9aea7",
+          "Monitor": "61858c207798a4693acc089749927cd21c52931ab0ff1656f911cef18f21bd28",
+          "PublicInbox": "09d2301c595d54096ff819eb996c0196f0e8317ded14ec4e417ae678efb8fb6a",
+          "Reception": "2dce046fc9faacb0d06d0e81a24c86bcaea74fa7737b3f0d06abb6c1e6883181",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "ScriptApp.getService": [
+            "Auth.gs:32",
+            "Code.gs:57"
+          ],
+          "PropertiesService.getScriptProperties": [
+            "Auth.gs:45",
+            "Auth.gs:51",
+            "Auth.gs:120",
+            "Auth.gs:148",
+            "Code.gs:98",
+            "Code.gs:114",
+            "Code.gs:126",
+            "Code.gs:139",
+            "Code.gs:276",
+            "Code.gs:280",
+            "Code.gs:295",
+            "Code.gs:298",
+            "Code.gs:476",
+            "Monitor.gs:63",
+            "Monitor.gs:80",
+            "Monitor.gs:92",
+            "Monitor.gs:181"
+          ],
+          "Utilities.getUuid": [
+            "Auth.gs:54",
+            "Auth.gs:54",
+            "Auth.gs:121",
+            "Code.gs:366",
+            "PublicInbox.gs:83"
+          ],
+          "Utilities.base64EncodeWebSafe": [
+            "Auth.gs:61",
+            "Auth.gs:72"
+          ],
+          "Utilities.newBlob": [
+            "Auth.gs:67"
+          ],
+          "Utilities.base64DecodeWebSafe": [
+            "Auth.gs:67"
+          ],
+          "Utilities.computeHmacSha256Signature": [
+            "Auth.gs:71"
+          ],
+          "CacheService.getScriptCache": [
+            "Auth.gs:122",
+            "Auth.gs:143",
+            "Code.gs:155",
+            "Code.gs:408",
+            "Code.gs:414"
+          ],
+          "UrlFetchApp.fetch": [
+            "Auth.gs:151",
+            "Code.gs:175",
+            "Monitor.gs:114",
+            "Monitor.gs:131"
+          ],
+          "HtmlService.createHtmlOutput": [
+            "Auth.gs:231"
+          ],
+          "HtmlService.createTemplateFromFile": [
+            "Code.gs:56"
+          ],
+          "LockService.getScriptLock": [
+            "Code.gs:281",
+            "Code.gs:383"
+          ],
+          "Utilities.formatDate": [
+            "Code.gs:286",
+            "Monitor.gs:85"
+          ],
+          "Session.getActiveUser": [
+            "Code.gs:292"
+          ],
+          "Session.getEffectiveUser": [
+            "Code.gs:294",
+            "Monitor.gs:93"
+          ],
+          "SpreadsheetApp.flush": [
+            "Code.gs:391",
+            "Code.gs:395",
+            "PublicInbox.gs:101",
+            "PublicInbox.gs:141"
+          ],
+          "SpreadsheetApp.openById": [
+            "Code.gs:444",
+            "PublicInbox.gs:64"
+          ],
+          "ContentService.createTextOutput": [
+            "Code.gs:470"
+          ],
+          "MailApp.sendEmail": [
+            "Monitor.gs:94"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": true
+      },
+      "review": {
+        "sourceSha256": "dd4abb93cf52aa86050364082ff9e2d4602c8e093ccc40b8d3af5687b4598c48",
+        "files": {
+          "Auth": "a09c2d048cf2711ebc25a97a8c0df83457572aef4dd427b8b0bfbfcb914ea6e9",
+          "Code": "6ae6a4f1bf7cd76ddb766cdd05671e90e9e332f0599af02d43c0176a4ddd6c51",
+          "Index": "9e98b85129b127bc1aa6414b2e5242d917c7bc122baceaadd23d77016ef9aea7",
+          "Monitor": "20b28ee3fdcbf8d58043bd74afab512282f390d2f0a7e8aeb49fb3a6a7581ea1",
+          "PublicInbox": "09d2301c595d54096ff819eb996c0196f0e8317ded14ec4e417ae678efb8fb6a",
+          "Reception": "2dce046fc9faacb0d06d0e81a24c86bcaea74fa7737b3f0d06abb6c1e6883181",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "ScriptApp.getService": [
+            "Auth.gs:32",
+            "Code.gs:71"
+          ],
+          "PropertiesService.getScriptProperties": [
+            "Auth.gs:45",
+            "Auth.gs:51",
+            "Auth.gs:127",
+            "Auth.gs:160",
+            "Code.gs:112",
+            "Code.gs:128",
+            "Code.gs:140",
+            "Code.gs:245",
+            "Code.gs:257",
+            "Code.gs:298",
+            "Code.gs:355",
+            "Code.gs:492",
+            "Code.gs:496",
+            "Code.gs:511",
+            "Code.gs:514",
+            "Code.gs:692",
+            "Monitor.gs:63",
+            "Monitor.gs:80",
+            "Monitor.gs:92",
+            "Monitor.gs:200"
+          ],
+          "Utilities.getUuid": [
+            "Auth.gs:54",
+            "Auth.gs:54",
+            "Auth.gs:128",
+            "Code.gs:209",
+            "Code.gs:582",
+            "PublicInbox.gs:83"
+          ],
+          "Utilities.base64EncodeWebSafe": [
+            "Auth.gs:61",
+            "Auth.gs:72"
+          ],
+          "Utilities.newBlob": [
+            "Auth.gs:67"
+          ],
+          "Utilities.base64DecodeWebSafe": [
+            "Auth.gs:67"
+          ],
+          "Utilities.computeHmacSha256Signature": [
+            "Auth.gs:71"
+          ],
+          "CacheService.getScriptCache": [
+            "Auth.gs:133",
+            "Auth.gs:154",
+            "Code.gs:176",
+            "Code.gs:278",
+            "Code.gs:371",
+            "Code.gs:624",
+            "Code.gs:630"
+          ],
+          "UrlFetchApp.fetch": [
+            "Auth.gs:163",
+            "Code.gs:310",
+            "Code.gs:391",
+            "Monitor.gs:114",
+            "Monitor.gs:131"
+          ],
+          "HtmlService.createHtmlOutput": [
+            "Auth.gs:244"
+          ],
+          "HtmlService.createTemplateFromFile": [
+            "Code.gs:70"
+          ],
+          "ContentService.createTextOutput": [
+            "Code.gs:219",
+            "Code.gs:221",
+            "Code.gs:686"
+          ],
+          "LockService.getScriptLock": [
+            "Code.gs:279",
+            "Code.gs:497",
+            "Code.gs:599"
+          ],
+          "Utilities.base64Encode": [
+            "Code.gs:333"
+          ],
+          "Utilities.formatDate": [
+            "Code.gs:502",
+            "Monitor.gs:85"
+          ],
+          "Session.getActiveUser": [
+            "Code.gs:508"
+          ],
+          "Session.getEffectiveUser": [
+            "Code.gs:510",
+            "Monitor.gs:93"
+          ],
+          "SpreadsheetApp.flush": [
+            "Code.gs:607",
+            "Code.gs:611",
+            "PublicInbox.gs:101",
+            "PublicInbox.gs:141"
+          ],
+          "SpreadsheetApp.openById": [
+            "Code.gs:660",
+            "PublicInbox.gs:64"
+          ],
+          "MailApp.sendEmail": [
+            "Monitor.gs:94"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": true
+      }
+    },
+    {
+      "project": "blackboard-production",
+      "scriptId": "1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K",
+      "deploymentId": "AKfycbzRINRMcSjdPI-5wp1sAQE-685PSoQRUL5uTpWFqF9tTyXKN3g9RxkpJOTp9iojS29Q1g",
+      "version": 1,
+      "entryPointConfig": {
+        "access": "ANYONE_ANONYMOUS",
+        "executeAs": "USER_DEPLOYING"
+      },
+      "anonymousHttp": 403,
+      "headEqualsPinned": true,
+      "reviewEqualsPinned": true,
+      "pinned": {
+        "sourceSha256": "d63b36579c7c915cd62b0d49c59e34ea4dabb7b5181d42b4e4503770250b9b16",
+        "files": {
+          "Code": "891627fe60910cebd1c171a5911f9e3527bf42d51ae135a4daa673df1b10b316",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "PropertiesService.getScriptProperties": [
+            "Code.gs:4"
+          ],
+          "DriveApp.getFolderById": [
+            "Code.gs:6"
+          ],
+          "DocumentApp.openById": [
+            "Code.gs:15"
+          ],
+          "UrlFetchApp.fetch": [
+            "Code.gs:43"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": false
+      },
+      "review": {
+        "sourceSha256": "d63b36579c7c915cd62b0d49c59e34ea4dabb7b5181d42b4e4503770250b9b16",
+        "files": {
+          "Code": "891627fe60910cebd1c171a5911f9e3527bf42d51ae135a4daa673df1b10b316",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "PropertiesService.getScriptProperties": [
+            "Code.gs:4"
+          ],
+          "DriveApp.getFolderById": [
+            "Code.gs:6"
+          ],
+          "DocumentApp.openById": [
+            "Code.gs:15"
+          ],
+          "UrlFetchApp.fetch": [
+            "Code.gs:43"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": false
+      }
+    },
+    {
+      "project": "glasses-intake-uploader",
+      "scriptId": "1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI",
+      "deploymentId": "AKfycbx8DPl-T4OCc0rk65db483JQYZrEY4B9cLcz30gtbEeo0atWFZ_pDdoJIBwqQRvVaOGdA",
+      "version": 1,
+      "entryPointConfig": {
+        "access": "ANYONE_ANONYMOUS",
+        "executeAs": "USER_DEPLOYING"
+      },
+      "anonymousHttp": 403,
+      "headEqualsPinned": true,
+      "reviewEqualsPinned": false,
+      "pinned": {
+        "sourceSha256": "25f155ff05fb796c1a1e2fa886f52ecc082af50a6200cd01376724a3afde7abb",
+        "files": {
+          "Code": "d4dfd2eb076ebcef90d4f9db39207086bc3f638b0748502e87bf1470c7e3b3ee",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "PropertiesService.getScriptProperties": [
+            "Code.gs:61",
+            "Code.gs:100",
+            "Code.gs:153"
+          ],
+          "Utilities.base64Decode": [
+            "Code.gs:89"
+          ],
+          "DriveApp.getFolderById": [
+            "Code.gs:105",
+            "Code.gs:158"
+          ],
+          "Utilities.newBlob": [
+            "Code.gs:111"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": true
+      },
+      "review": {
+        "sourceSha256": "50c269c6781153857d0a18031b2f60fa7197b3e3670e6ad963ea7cc02235228b",
+        "files": {
+          "Code": "2d75d17cbbd08c9b2379a0a5f6a6300a1b63bdaed462d047d6a0973c91d7c818",
+          "appsscript": "6d4529b2eddb34c66f4b5452ec4c7d2631b5385d984c68aaa6b0281ffe9eb8ad"
+        },
+        "explicitOauthScopes": null,
+        "serviceCallSites": {
+          "PropertiesService.getScriptProperties": [
+            "Code.gs:70",
+            "Code.gs:109",
+            "Code.gs:162"
+          ],
+          "Utilities.base64Decode": [
+            "Code.gs:98"
+          ],
+          "DriveApp.getFolderById": [
+            "Code.gs:114",
+            "Code.gs:167"
+          ],
+          "Utilities.newBlob": [
+            "Code.gs:120"
+          ]
+        },
+        "hasBuildMarker": false,
+        "hasDoGet": true
+      }
+    }
+  ]
+}

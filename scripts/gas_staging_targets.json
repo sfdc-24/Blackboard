@@ -1,0 +1,14 @@
+{
+  "governor-page-api": {
+    "script_id": "1S4LQE0SQwnE9kngxMhRngyAmSNGhFtDRxoYQqIxSSH0UoQ5u7T84MKU1",
+    "deploy_id": "AKfycbwv61DuHXl-MlqUBf911ckuxjBMh0P6G6S8bUDZ5BlFR7Afv7YwjIDcxkwaL7OiB7TeBw"
+  },
+  "blackboard-production": {
+    "script_id": "1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K",
+    "deploy_id": "AKfycbzRINRMcSjdPI-5wp1sAQE-685PSoQRUL5uTpWFqF9tTyXKN3g9RxkpJOTp9iojS29Q1g"
+  },
+  "glasses-intake-uploader": {
+    "script_id": "1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI",
+    "deploy_id": "AKfycbx8DPl-T4OCc0rk65db483JQYZrEY4B9cLcz30gtbEeo0atWFZ_pDdoJIBwqQRvVaOGdA"
+  }
+}

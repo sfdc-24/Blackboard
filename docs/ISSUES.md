@@ -1,0 +1,595 @@
+# Issues log
+
+Roadblocks that stopped or slowed execution. Opened when I hit something I
+cannot solve alone; closed with the fix and how it was verified. Mr. Salam asked
+for this on 2026-09-03 so blockers stop being buried in chat.
+
+| # | Opened | Severity | Title | Status |
+|---|--------|----------|-------|--------|
+| ISS-001 | 2026-09-03 | HIGH | Apps Script "New version" cannot be selected by browser automation | **RESOLVED** |
+| ISS-002 | 2026-09-03 | MED | Multiple Chrome browsers connected — session blocked until one is chosen | **RESOLVED** |
+| ISS-003 | 2026-09-03 | MED | No way to reach Mr. Salam for a decision when he is away from the desk | OPEN |
+| ISS-004 | 2026-09-03 | LOW | Chrome extension blocks reading Apps Script / long AI chat source via JS | OPEN |
+| ISS-005 | 2026-09-03 | LOW | ChatGPT tab renderer freezes on long transcripts | OPEN |
+| ISS-006 | 2026-09-03 | **CRITICAL** | sfdc24.com DNS moved off Google to Vultr — site serving a redirect loop | **RESOLVED** |
+| ISS-007 | 2026-09-03 | MED | Google Sites iframe steals keyboard focus mid-typing | OPEN |
+| ISS-008 | 2026-09-03 | MED | NameSilo DNS form fails silently — blank hostname, native select ignores clicks | **RESOLVED** |
+| ISS-011 | 2026-09-03 | MED | Monitor false-positived within 13 min of going live | **RESOLVED** |
+| ISS-012 | 2026-09-04 | MED | Page displayed one identity while serving another account data | **RESOLVED** |
+| ISS-013 | 2026-09-04 | LOW | Three nav links present in source never render on the live page | **CLOSED (pages retired)** |
+| ISS-014 | 2026-09-04 | **HIGH** | I took the live chat down for ~1h with a disallowed meta tag, and my own check passed it | **RESOLVED** |
+| ISS-009 | 2026-09-03 | **HIGH** | Tag collision — three writers share `claude-code-cli`; caused the outage | OPEN |
+
+---
+
+## ISS-001 · Apps Script "New version" cannot be selected by automation — HIGH
+
+**Symptom.** In `SFDC24 - Governor Page API`, Deploy → Manage deployments →
+pencil → Version dropdown opens and lists "New version" correctly. Clicking it
+closes the list and leaves the previous version selected. Reproduced across two
+Chrome browsers, two viewport sizes, several click x-positions, and keyboard
+navigation.
+
+**Why it matters.** Saving code is not deploying it. Every fix I write sits
+inert until a human clicks that one option. It stopped a live security fix
+(`post_reset()` callable by any visitor) for an hour.
+
+**Worse.** The Deploy that then completes silently re-publishes the SAME version
+while reporting "Deployment successfully updated". That message is not proof —
+only the version number is.
+
+**Candidate fix: `clasp`.** Google's official Apps Script CLI. `clasp deploy`
+creates a new version and deploys it with no browser at all. Needs a one-time
+`clasp login` (browser OAuth) and the Apps Script API enabled for the account.
+This is the real unblock and is being attempted.
+
+**Fallback.** A different automation stack (Playwright via the
+`browser-automation` skill) dispatches real trusted events and may select the
+option where the extension cannot.
+
+---
+
+## ISS-002 · Multiple Chrome browsers connected — MED
+
+**Symptom.** A second Chrome connected mid-session. Every browser action then
+failed with "Multiple Chrome browsers are connected and none has been selected",
+and the tool requires asking Mr. Salam to pick rather than choosing myself.
+Selecting one also destroyed the session's tab group, losing all tab IDs.
+
+**Mitigation being built.** `list_connected_browsers` reports which is which
+before acting, so a stale session can re-select without a question. If names are
+ambiguous, the Glasses Intake capture frames show the actual screen and can
+identify which window holds the working tabs.
+
+---
+
+## ISS-003 · No channel to Mr. Salam when away from desk — MED
+
+**Symptom.** Work stops on any decision that needs him. WhatsApp is unusable for
+outbound to US numbers (verified) and I must not send messages on his behalf
+unprompted anyway.
+
+**Fix being built.** A mobile-first `?view=blockers` page on sfdc24.com showing
+open blockers and letting him answer from a phone. His answer lands on the board
+and I pick it up. See `docs/blockers-page.md`.
+
+---
+
+## ISS-004 · Extension blocks source reads via JS — LOW
+
+`javascript_tool` returns `[BLOCKED: Cookie/query string data]` for the Apps
+Script editor and for AI chat pages containing code with URLs. **Workaround that
+works:** screenshots are not blocked, and Monaco's Ctrl+F with regex gives exact
+match counts. Audit by searching, not extracting.
+
+---
+
+## ISS-005 · ChatGPT renderer freezes on long transcripts — LOW
+
+Screenshots time out and `get_page_text` returns ~99 chars. **Workaround:** click
+the conversation in the sidebar to force a re-render. Cheaper still: ask it to
+restate the answer briefly rather than extracting the long one.
+
+
+---
+
+## ISS-006 · sfdc24.com is down — DNS moved off Google — CRITICAL
+
+**Found** 2026-09-03 ~16:40Z while verifying a homepage edit. The verification
+caught it; nothing else would have.
+
+**Symptom.** `https://www.sfdc24.com` returns `301 Moved Permanently` from
+**nginx**, redirecting to itself — an infinite loop. The site is unreachable.
+
+**Diagnosis.** Both apex and www now resolve to `45.77.75.133`,
+`45.77.92.157`, `207.246.78.75`. Reverse DNS on those is
+**vultrusercontent.com**. `www` was a CNAME to `ghs.googlehosted.com` earlier
+today; it is now an A record set pointing at Vultr.
+
+**Everything else is healthy** — this is only the domain pointer:
+
+| | |
+|---|---|
+| Google Sites content | 200, 934 KB |
+| Reception app | 200, 25 KB |
+| Email (MX) | intact, `SMTP.GOOGLE.com` |
+
+**Almost certainly NameSilo's parking/forwarding layer.** The identical failure
+happened on 2026-09-02: re-saving NameSilo forwarding injected A records for
+both `@` and `www`, overriding the `www` CNAME. Note the apex now resolves,
+where it was NXDOMAIN a few hours ago — consistent with forwarding being
+(re)enabled.
+
+**Not caused by this session.** No DNS was touched. Work this session was Google
+Sites content and Apps Script only, neither of which can alter DNS records.
+
+**The fix, which worked last time.** In NameSilo: delete the A records for `@`
+and `www`, re-add `www` as a CNAME to `ghs.googlehosted.com`. Verify with
+`Server: ESF` in the response headers.
+
+**Why I did not just do it.** DNS is explicitly outside standing permission —
+Mr. Salam granted Apps Script and Google Sites only — and I broke this exact
+thing on 2026-09-02 by touching NameSilo forwarding. Raised instead as BLK-005
+on the blockers page with a one-tap "fix it now", which is the case that page
+was built for.
+
+---
+
+## ISS-007 · Google Sites iframe steals keyboard focus mid-typing — MED
+
+**Symptom.** While typing into a Sites text box on a page that embeds the
+reception app, focus jumps into the reception's chat input part-way through.
+Text intended for the page lands in the live chat, and pressing Enter **sends a
+real message**, spending tokens and creating junk rows.
+
+**Cause.** The reception page focuses its input on any keypress — the "type
+anywhere" affordance that makes the terminal UI feel right. In an editor iframe
+it is a hazard.
+
+**Happened twice**, costing a partial publish and two junk visitor messages.
+
+**Workaround that works.** Re-click into the text box before EVERY chunk and
+screenshot after each. Do not type more than one paragraph per click. Verified:
+three paragraphs typed this way all landed correctly.
+
+**Real fix, when reception is next deployed.** Gate the focus-steal on
+`window.self === window.top` so it never fires inside an iframe. One line, and it
+also stops the same thing happening to a real visitor embedding the page.
+
+---
+
+## ISS-006 · RESOLVED 2026-09-03 — sfdc24.com redirect loop
+
+**Root cause, found and proved.** NameSilo **Domain Forwarding was ON** with a
+301 to `https://www.sfdc24.com`. Its parking template had put the same three
+forwarding A records (`45.77.75.133`, `45.77.92.157`, `207.246.78.75`) on
+**both `@` and `www`**. The forwarding server 301s *everything it is asked for*
+to `www`. So `www` pointed at a server whose only job was to redirect to `www`.
+
+Proved directly rather than inferred, by pinning the Host header to the
+forwarding IP:
+
+```
+Host: sfdc24.com      -> 301 Location: https://www.sfdc24.com/   correct
+Host: www.sfdc24.com  -> 301 Location: https://www.sfdc24.com    ITSELF - the loop
+```
+
+The forwarding was never wrong. Having `www` among the records it answers for
+is what was wrong.
+
+**Fix applied.** Deleted all six A records. Re-added `www CNAME
+ghs.googlehosted.com` (Google Sites) and the three forwarding A records on
+**`@` only**. TTL dropped 7207 -> 3600 on everything touched. Domain Forwarding
+left ON and untouched — it is doing exactly the right job for the apex, which
+Google Sites cannot serve natively.
+
+**Final zone:** `www` CNAME -> Google. `@` A -> NameSilo forwarding -> 301 ->
+`https://www.sfdc24.com`. `www` carries no A record, so the loop cannot recur.
+All TXT / MX / DKIM / DMARC untouched throughout; email was never at risk.
+
+**Verified.** `www.sfdc24.com` returns **200 from Google** with the full
+homepage including the new offer section ("first piece of work looks like",
+"short document, not a slide deck").
+
+**Cost of the stale TTL.** The old records carried TTL 7207 (~2h), so resolvers
+and the local OS cache kept serving the dead nginx for a while after the zone
+was already correct. `curl` reported the loop from cache while `nslookup`
+against 1.1.1.1 already showed Google. **Flush before concluding a DNS fix
+failed** — and test with `curl --resolve` to bypass cache entirely.
+
+**The diagnostic that actually settled it:** `Get-DnsClientCache -Name
+'*sfdc24*'` listed the stale `www -> 45.77.x` A records still sitting in the
+Windows resolver cache while `nslookup` against 1.1.1.1 returned Google. Adding
+`-w '%{remote_ip}'` to curl showed it connecting to `207.246.78.75`, proving the
+loop was local, not live. Flushing with `Clear-DnsClientCache` gave 200 on both
+hostnames immediately. The cache repopulated stale once *after* an earlier
+flush, so a single passing test is not proof — check `remote_ip`.
+
+---
+
+## ISS-008 · RESOLVED — NameSilo DNS form fails silently — MED
+
+Three separate traps in one form, each of which cost a wasted cycle:
+
+**1. The hostname field must be `@` for the apex, not blank.** Blank is
+rejected — but on the first two submits the dialog simply closed and the record
+was never created, with no error shown. Only the third attempt surfaced "Should
+not be empty". **Two records I believed were saved did not exist.**
+
+**2. The native `<select>` for record Type ignores synthetic clicks on its
+options** — the same failure as ISS-001. It opens and lists correctly, the
+click closes it, the old value stays. **What works: click the select to open
+it, then Down / Down / Enter.** Worth retrying on ISS-001 with this technique.
+
+**3. `ctrl+a` inserts a literal `a`** into these inputs instead of selecting
+all — `ghs.googlehosted.com` was submitted as `aghs.googlehosted.com` and had
+to be caught by eye. Use triple-click then `Delete`.
+
+**The real lesson is the verification method, not the form.** Screenshots
+cannot show a 16-row record list, so "the dialog closed" got read as success
+three times. **`get_page_text` returns the entire NameSilo record table as
+plain text** and settled it in one call. On any list-shaped page, read the text,
+do not photograph it.
+
+---
+
+## ISS-002 · RESOLVED — it was not two Chromes
+
+I was driving **Microsoft Edge**, not Chrome. It surfaced only when NameSilo's
+device check flagged an unrecognised browser. The "two browsers" in the picker
+are two different applications, not two profiles.
+
+**Rule: check which browser is selected before blaming a site.** Where a login
+or device trust matters, use Browser 2 (Chrome), which holds the Google session.
+
+---
+
+## ISS-001 · RESOLVED 2026-09-03 — deploys are autonomous now
+
+**clasp is authenticated and working.** Mr. Salam turned on the Apps Script API;
+`clasp login` completed as `abdus@sfdc24.com`. The dropdown that defeated six
+browser attempts is now irrelevant — the whole deploy runs from the shell:
+
+```
+clasp push -f
+clasp create-version "description"          -> "Created version 14"
+clasp redeploy <deploymentId> -V 14 -d "..."
+clasp list-deployments                       -> read-back proof
+```
+
+The production web app is deployment
+`AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng`.
+`@HEAD` is the separate dev deployment. **Rollback is now one command** —
+`clasp redeploy <id> -V 13` — which is what made the quarantine safe to ship.
+
+**Two Windows traps, both real:**
+
+1. **clasp must run from `/c/Users/salam/Quantum/Blackboard`, the canonical-case
+   path.** From the harness cwd (`c:\users\salam\quantum\blackboard`) every
+   write is refused with *"Security Error: Content directory is a symlink.
+   Possible race attack."* Nothing is a symlink — `os.path.islink` is false the
+   whole way up. clasp compares the given path against the resolved one and the
+   case difference alone trips its race check. `--allow-symlinks` does **not**
+   fix it; only running from the canonical path does.
+2. `clasp push` **never deletes remote files.** A file removed locally comes
+   straight back on the next pull. Delete it in the editor UI.
+
+**The editor's function picker is still broken, and no longer matters.** It was
+retried once with the technique that works on native `<select>` elements
+(click to open, then Down / Enter) and on a direct click on the option. Both
+failed, on a second instance of the same Material listbox — so this is the
+component, not that one dropdown.
+
+**Workaround when a function must be run from the editor: give it its own
+file.** The picker always pre-selects the first function in the open file, so a
+file containing exactly one function needs no click at all. That is how
+`test_quarantine` was run. Verified.
+
+---
+
+## ISS-009 · Tag collision — three writers share `claude-code-cli` — HIGH
+
+**This caused the Sep 3 outage, and my earlier RCA was incomplete.** I reported
+the loop as leftover NameSilo parking from Sep 2. It was not. It was created at
+roughly 11:57 AM EDT **that same day, by another instance writing under my own
+tag**, and I had no way to see it.
+
+**The real sequence, reconciled from the board:**
+
+1. Sep 2 DNS edits auto-removed NameSilo Domain Forwarding, so the apex went
+   dark. (Board row 15:24:55Z — `ANDON` — apex A record GONE, www healthy.)
+2. ~11:57 AM EDT Sep 3 an instance tagged `claude-code-cli` re-enabled Domain
+   Forwarding to restore the apex, and filed **L-77**. (Board row 15:57:20Z —
+   `ANDON-CLEAR`.)
+3. Re-enabling forwarding made NameSilo **install its forwarder A records on
+   `www` as well as the apex, silently replacing the `www` CNAME**. The
+   ANDON-CLEAR line "www CNAME untouched throughout" was wrong.
+4. That forwarder 301s every host it answers for to `www`, so `www` began
+   redirecting to itself and the whole site went down — which is what I found
+   at ~1:20 PM and fixed by splitting the records.
+
+**So both RCAs were half right.** L-77 correctly identified that forwarding gets
+auto-removed; mine correctly identified the self-loop. Neither saw the join:
+**re-enabling forwarding destroys the `www` CNAME.** Filed as **L-81**, with
+**L-78**'s dismissal of L-77 explicitly withdrawn.
+
+**Why it happened.** At least three writers share the tag `claude-code-cli`:
+this laptop session, the glasses capture loop posting `ASSET` rows every five
+minutes, and whoever filed the noon ANDON-CLEAR. The check-in register exists to
+prevent exactly this — one instance sees another holding a file and waits — and
+it cannot work when three writers answer to one name. `REQ-R6WNT2` already says
+a tag is a claimed identity, not a machine; nothing enforces it.
+
+**Raised to Mr. Salam as BLK-008** with a concrete split: laptop keeps
+`claude-code-cli`, the VM takes `vm-cli`, the glasses loop takes
+`glasses-uploader`. Tag assignment is his call, not mine to take unilaterally.
+
+**Mitigation already shipped:** `DNS-COORD-001` is on the board addressed to
+ALL, carrying the trap, the correct end state, and the verification chain, so
+the next instance to touch this domain cannot repeat it by accident.
+
+---
+
+## ISS-010 · Bus writes return redirect artifacts that look like failures — MED
+
+Twice in ten minutes a bus append returned either `hop 2 redirected again --
+one-shot key consumed or expired` or a Google Drive "Page Not Found" HTML body.
+**Both writes had landed intact**, full payload, exactly once. A blind retry
+would have created duplicates — and the v15 idempotency fix does **not** protect
+these, because the bus is a different Apps Script with no dedup of its own.
+
+Reads degrade the same way under rapid use; a ~45s backoff cleared it, which
+points at rate limiting rather than a broken key.
+
+**Rule, filed as L-80:** always read back before retrying any bus write, and
+never assume the bus protects you the way the Governor API now does.
+
+---
+
+## ISS-011 · RESOLVED — the monitor cried wolf 13 minutes after going live
+
+**What happened.** `monitorTick` was registered at 21:35 and reported the site
+`up`. Its first scheduled run at 21:47 flipped `MONITOR_STATE` to
+`{"site":"down"}` while the site was demonstrably serving 200 on both
+hostnames with the homepage marker present, verified from the laptop with two
+different User-Agents including a Google one.
+
+**No alert reached Mr. Salam** — `mailCount` was 0 — but that was luck, not
+design. The very next state change would have emailed a false outage.
+
+**Two faults, both mine:**
+
+1. **One boolean for two hostnames.** `checkSite_` returned a single `ok`, so a
+   failure on the bare-domain leg condemned the whole site even though `www` —
+   where visitors actually land — was perfect. The apex rides NameSilo's Caddy
+   fleet with on-demand TLS, and I had already seen one transient handshake
+   failure from the laptop that hour (`schannel: SEC_E_INTERNAL_ERROR`), which
+   is almost certainly what it hit.
+2. **No debounce.** A single sample could flip the state. On a 15-minute cadence
+   one blip is not an outage.
+
+**Fix (v18).** `checkSite_` now returns `wwwOk` and `apexOk` independently and a
+detail string naming each. State flips only after `MON_FAIL_STRIKES = 2`
+consecutive agreeing checks. `www` down is a full alert; the bare domain failing
+while `www` is healthy gets a *different*, calmer message that says so, because
+the site is up for anyone typing the full address. Old single-field state
+migrates to `unknown` rather than inheriting a verdict the old logic reached for
+different reasons.
+
+**Verified after the fix:**
+`site: www=up apex=up (www 200 with marker | apex chain 200)`
+
+**The lesson worth keeping:** a monitor that cries wolf gets ignored exactly
+when it is finally right. Alerting logic needs the same read-back discipline
+(D-4) as writes — I declared this done before it had survived a single
+unattended cycle.
+
+---
+
+## ISS-012 · RESOLVED — the page showed one identity while serving another's data
+
+**Found by Mr. Salam within minutes of sign-in going live**, which is exactly
+the kind of thing a second pair of eyes catches and the author does not.
+
+He signed in through the new Google flow as his personal Gmail in one tab, then
+opened Projects — and saw **abdus@sfdc24.com's projects, addressed to "Mr.
+Salam"**, while the nav said he was signed in as the Gmail account.
+
+**Not an access-control bug, and worth being precise about why.** Two identity
+systems were live at once and they are unrelated:
+
+| | source | what it controls |
+|---|---|---|
+| `whoami_()` | the **browser's Google session** | Governor access, project rows, the name shown |
+| the OAuth session token | the **app-level sign-in** | nothing but provenance on a row |
+
+Signing in through our flow does not change which Google account the browser
+presents to `script.google.com`. His browser was still Google-signed-in as the
+Governor, so Governor data was correctly served to the Governor.
+
+Verified in code rather than asserted: `whoami_()` reads only
+`Session.getActiveUser()` and never touches the token; `getState()` gates on
+`whoami_().isGovernor` or `GOVERNOR_PASS`. `readSession_()` appears in exactly
+three places — rendering the signed-in name, tagging a quarantine row, and
+`whoAmI()` reporting itself. None of them grant anything. A stranger signing in
+with their own Google account on their own machine gets nothing.
+
+**But the display was genuinely wrong, and that matters commercially.** On his
+own laptop it is confusing. With a client on the other end, a page showing
+*their* name while rendering *someone else's* data is indistinguishable from a
+data leak, and no amount of "actually it's fine" undoes that impression.
+
+**Fix (v20).** The page can never again show a single unqualified "you":
+- signed in via OAuth, no Governor session -> shows that email
+- Governor session, no OAuth -> shows the Governor email
+- **both, and they differ** -> shows the visitor email PLUS an amber
+  `viewing as <governor email>` chip explaining whose data is on screen
+- anonymous -> sign-in link only, no identity of any kind
+
+Verified all three renderable states on the live deployment.
+
+---
+
+## ISS-013 · Three nav links never render — LOW, OPEN
+
+`history`, `team` and `faq` are present as plain anchors in `Reception.html`
+between `projects` and the right-hand block, and all three URLs return 200 with
+real content. On the live page the nav renders only `sfdc24 home projects`.
+
+**Not caused by the Sep 4 copy changes** — the same three are missing in
+screenshots taken before any edit that day, so it predates the sign-in work and
+the jargon pass.
+
+Not yet diagnosed. Ruled out so far: the pages themselves (all 200), the
+deployment being stale (other edits in the same file render), and width/wrapping
+(the nav uses `flex-wrap` and occupies about half the available width).
+
+`javascript_tool` cannot inspect the live DOM here — the extension blocks it on
+Apps Script pages (ISS-004) — so the next step is reading the rendered markup
+another way rather than guessing at CSS.
+
+**ISS-013 CLOSED, not diagnosed.** Mr. Salam retired `history`, `team` and
+`faq` as "not going to be useful and look outdated", so the links were removed
+rather than fixed. Recording the distinction honestly: the render bug was never
+explained, so if a link ever silently fails to appear again, this is not a
+solved precedent to lean on.
+
+**The Sites pages themselves still exist**, now unlinked. They remain reachable
+by direct URL and indexable. Deleting them needs the Google Sites editor.
+
+---
+
+## Direction change — the site should feel like a mobile app (2026-09-04)
+
+Mr. Salam: *"keep the website focused on functionality specific navigation; the
+website should look like an APP ... on mobile it should give the feeling as if
+the user is using an APP."*
+
+**Shipped in v22:** a bottom tab bar in the thumb zone, replacing top text links
+on phones; navigation by FUNCTION (Chat / Work / Sign in) rather than by
+marketing page; a compact app header carrying identity; `env(safe-area-inset-
+bottom)` so the bar clears the iPhone home indicator; and the meta tags that
+make Add to Home Screen open without browser chrome
+(`apple-mobile-web-app-capable`, `viewport-fit=cover`, `theme-color`).
+
+Measured at 390x844, 390x667, 320x568 and 900x800: tab bar shows only on
+phones, the composer is never covered by it, and there is no horizontal
+overflow at any width.
+
+**One CSS bug caught before deploy:** the first attempt put `padding-bottom` on
+`.wrap` BEFORE a later `padding` shorthand in the same media query, which
+silently overrode it and would have let the tab bar sit on top of the composer.
+Source order in a media query is not a detail.
+
+**THE CEILING, and it is now the main thing.** Google Sites wraps every page in
+its own header and scroll, so a page served through it can never fully feel
+like an app. The shell above feels right on the direct Apps Script URL and when
+added to a home screen; through Sites it is still a page in a frame. Competing
+with Replit on feel means the site stops being served by Google Sites. That is
+a decision, not a task.
+
+---
+
+## ISS-014 · RESOLVED — I took the live chat down for about an hour
+
+**Self-inflicted, and the check that should have caught it is one I had already
+written down.**
+
+v22 added PWA meta tags to `doGet` via `addMetaTag`. Apps Script whitelists a
+small set and **throws** on anything outside it:
+
+```
+Exception: The meta tag you specified is not allowed in this context. (line 89, file "Code")
+```
+
+That exception replaced the entire reception. The chat was dead on sfdc24.com
+from the v22 deploy until v24 — roughly an hour.
+
+**Why my verification missed it.** I checked `curl ... ?view=home` and got
+`http=200`, and treated that as a pass. **Apps Script serves its error page with
+HTTP 200.** My own memory already contains this lesson from Stooq: *"HTTP 200
+does not mean usable. Check payloads, never status codes."* I had the rule and
+checked the status anyway.
+
+**How it was actually found:** by looking at the rendered page while building
+the new static site. The error was sitting in the embedded frame in plain sight.
+No amount of further curl would have surfaced it.
+
+**Fix (v24).** Only `viewport` is passed to `addMetaTag` now. The PWA tags were
+in the wrong place regardless — a visitor adds the *site* to their home screen,
+never the embedded frame, so they belong in the top-level page's own `<head>`,
+which is where they now live in the new static site.
+
+**Standing correction to my own verification habit:** for any Apps Script page,
+a deploy is verified by grepping the body for `Exception:` and for a known
+content marker. Status code alone is not evidence. Added to the deploy sequence
+in HANDOVER.
+
+---
+
+## ISS-015 · RESOLVED — the cutover took the site down in browsers, and only in browsers
+
+**2026-09-04, ~19:05 UTC onward. Self-inflicted, foreseeable, and not foreseen.**
+
+Moving `www.sfdc24.com` from Google Sites to GitHub Pages worked on every
+measure I had. The record changed cleanly, the zone read back correct at
+`ns1.dnsowl.com`, all four major public resolvers agreed within minutes, and
+`curl http://www.sfdc24.com/` returned the real page with the content marker in
+it. By my checks the cutover was done.
+
+**Then I opened it in Chrome and got an error page.**
+
+What the network log shows:
+
+```
+1. http://www.sfdc24.com/?probe=3    GET  503     <- Chrome's upgrade marker
+2. https://www.sfdc24.com/?probe=3   GET  pending <- never completes
+```
+
+Chrome will not use plain HTTP for this host. It rewrites the request to HTTPS
+and does not fall back. GitHub had not yet issued the certificate, so
+`openssl s_client` shows the host still presenting GitHub's default
+`CN=*.github.io`. Result: the site serves perfectly to `curl` and is unreachable
+to a human.
+
+**Root cause.** Google served this domain over HTTPS with HSTS for months, so
+every browser that has ever loaded sfdc24.com has the domain pinned to HTTPS
+locally, for months more. A certificate is therefore not a finishing touch after
+a cutover — between the DNS change and the new certificate, the site is *down*
+for anyone with a browser, however healthy it looks from the command line.
+
+**Why I missed it.** Every verification I ran was a `curl`. `curl` has no HSTS
+store, no upgrade behaviour and no memory of the old host, so it cannot
+reproduce what a visitor experiences. This is ISS-014's lesson one layer out: I
+checked the transport instead of the experience, and the check I chose was
+structurally incapable of showing the failure.
+
+**Not rolled back.** Reverting `www` to `ghs.googlehosted.com` restores the site
+within a minute, but GitHub can only issue a certificate while DNS points at
+GitHub — so a rollback guarantees a repeat of this same window on the next
+attempt. Mr. Salam was told the site was down, told rollback was available in
+about a minute, and said to keep going.
+
+**Standing correction.** For anything a visitor loads in a browser, `curl` is
+not verification. Load it in a real browser and read the network log. And when
+moving a host that has ever served HTTPS, treat certificate issuance as part of
+the cutover, not as cleanup after it — the outage window is the gap between the
+two.
+
+**RESOLVED 2026-09-04 19:48 UTC**, about 45 minutes after the DNS change.
+Let's Encrypt issued `CN=www.sfdc24.com` (valid 4 Sep - 3 Dec), `https_enforced`
+is now true, and `http://` returns a 301 to `https://`. Verified three ways: the
+certificate subject from `openssl s_client`, the content marker in the body over
+https, and - per the correction above - **the actual page loading in Chrome**.
+
+**On the wait.** GitHub reported `is_https_eligible: true` and
+`https_error: peer_failed_verification` throughout, meaning DNS was correct and
+only issuance was outstanding. Re-asserting the custom domain via the API did
+nothing visible; removing and re-adding it was followed by issuance a couple of
+minutes later. Whether that caused it or the ordinary retry landed at the same
+moment is not something one observation can settle, so it is recorded as what
+was done, not as a remedy that works.
+
+**Cost of the window:** the site was unreachable in browsers for roughly 45
+minutes on a day with effectively no traffic. Cheap this time. It would not be
+cheap on a site anyone depends on.

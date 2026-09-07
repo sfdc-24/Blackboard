@@ -1,0 +1,270 @@
+<title>SFDC24 Blockers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+  :root{
+    --ground:#0B0E0D; --panel:#141917; --panel-2:#1B221F;
+    --edge:#202B27; --edge-hi:#2E3C37;
+    --ink:#E2E8E5; --dim:#8A968F; --faint:#5A6560;
+    --mint:#3DDC97; --amber:#F0A93B; --red:#E5574B;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{
+    background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:16px; line-height:1.5;
+    margin:0; padding:0; -webkit-font-smoothing:antialiased;
+    min-height:100vh; min-height:100dvh;
+  }
+  .wrap{max-width:560px;margin:0 auto;padding:1rem 1rem 4rem}
+
+  header{display:flex;align-items:baseline;gap:.6rem;padding:.4rem 0 1rem}
+  .brand{font-family:var(--mono);font-weight:700;letter-spacing:-.02em}
+  .brand .g{color:var(--mint)}
+  .sub{font-family:var(--mono);font-size:.7rem;color:var(--faint);
+       letter-spacing:.12em;text-transform:uppercase;margin-left:auto}
+
+  .status{
+    display:flex;gap:.5rem;align-items:center;
+    font-family:var(--mono);font-size:.75rem;color:var(--dim);
+    background:var(--panel);border:1px solid var(--edge);
+    border-radius:8px;padding:.6rem .8rem;margin-bottom:1rem;
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+  .dot.live{background:var(--mint)}
+  .dot.wait{background:var(--amber)}
+
+  .card{
+    background:var(--panel);border:1px solid var(--edge);
+    border-left:3px solid var(--edge-hi);
+    border-radius:10px;padding:.9rem 1rem 1rem;margin-bottom:.9rem;
+  }
+  .card.high{border-left-color:var(--red)}
+  .card.med{border-left-color:var(--amber)}
+  .card.low{border-left-color:var(--faint)}
+  .card.done{opacity:.55;border-left-color:var(--mint)}
+
+  .meta{display:flex;gap:.5rem;align-items:center;
+        font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;
+        text-transform:uppercase;color:var(--faint);margin-bottom:.4rem}
+  .sev{color:var(--red)} .sev.med{color:var(--amber)} .sev.low{color:var(--faint)}
+  .card.done .sev{color:var(--mint)}
+
+  h2{font-size:1.02rem;font-weight:600;margin:0 0 .35rem;line-height:1.3;
+     text-wrap:balance}
+  .why{color:var(--dim);font-size:.88rem;margin:0 0 .7rem}
+  .q{font-size:.95rem;margin:0 0 .8rem}
+
+  .opts{display:flex;flex-wrap:wrap;gap:.5rem}
+  button.opt{
+    flex:1 1 auto;min-width:44%;min-height:48px;
+    font-family:var(--sans);font-size:.92rem;font-weight:500;
+    color:var(--ink);background:var(--panel-2);
+    border:1px solid var(--edge-hi);border-radius:8px;
+    padding:.6rem .8rem;cursor:pointer;
+    transition:border-color .12s,background .12s;
+  }
+  button.opt:active{background:var(--edge)}
+  button.opt.go{border-color:var(--mint);color:var(--mint)}
+  button.opt.stop{border-color:var(--red);color:var(--red)}
+  button.opt:disabled{opacity:.4;cursor:default}
+
+  .answered{
+    font-family:var(--mono);font-size:.78rem;color:var(--mint);
+    display:flex;gap:.5rem;align-items:baseline;flex-wrap:wrap;
+  }
+  .answered .when{color:var(--faint);font-size:.7rem}
+
+  .note{margin-top:.7rem}
+  .note summary{font-family:var(--mono);font-size:.72rem;color:var(--faint);
+                cursor:pointer;list-style:none;padding:.3rem 0}
+  .note summary::-webkit-details-marker{display:none}
+  .note textarea{
+    width:100%;min-height:70px;margin-top:.4rem;
+    background:var(--ground);color:var(--ink);
+    border:1px solid var(--edge-hi);border-radius:8px;
+    padding:.6rem;font-family:var(--sans);font-size:16px;resize:vertical;
+  }
+  .note .savenote{
+    margin-top:.4rem;min-height:40px;width:100%;
+    background:transparent;border:1px solid var(--edge-hi);border-radius:8px;
+    color:var(--dim);font-family:var(--sans);font-size:.85rem;cursor:pointer;
+  }
+
+  .empty{text-align:center;color:var(--faint);padding:3rem 1rem;
+         font-family:var(--mono);font-size:.85rem;line-height:1.8}
+  .empty .big{font-size:1.6rem;display:block;margin-bottom:.6rem}
+
+  footer{margin-top:1.5rem;padding-top:1rem;border-top:1px solid var(--edge);
+         font-family:var(--mono);font-size:.68rem;color:var(--faint);line-height:1.7}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="brand"><span class="g">/</span>sfdc24</span>
+    <span class="sub">blockers</span>
+  </header>
+
+  <div class="status" id="status">
+    <span class="dot" id="dot"></span>
+    <span id="statusText">connecting...</span>
+  </div>
+
+  <div id="list"></div>
+
+  <footer>
+    Answers save instantly and Claude picks them up on its next cycle.<br>
+    One tap is enough. The note is optional.
+  </footer>
+</div>
+
+<script>
+(function(){
+  var listEl = document.getElementById('list');
+  var dotEl = document.getElementById('dot');
+  var statusEl = document.getElementById('statusText');
+  var db = null;
+  var docs = [];
+
+  function esc(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function ago(iso){
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    var s = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  }
+
+  function setStatus(cls, text){
+    dotEl.className = 'dot' + (cls ? ' ' + cls : '');
+    statusEl.textContent = text;
+  }
+
+  function rank(sev){
+    if (sev === 'high') return 0;
+    if (sev === 'med') return 1;
+    if (sev === 'low') return 2;
+    return 3;
+  }
+
+  function render(){
+    if (!docs.length){
+      listEl.innerHTML = '<div class="empty"><span class="big">&#10003;</span>'
+        + 'Nothing is blocked.<br>Claude is working.</div>';
+      return;
+    }
+
+    var sorted = docs.slice().sort(function(a, b){
+      var aDone = a.status === 'answered', bDone = b.status === 'answered';
+      if (aDone !== bDone) return aDone ? 1 : -1;
+      var r = rank(a.severity) - rank(b.severity);
+      if (r) return r;
+      return String(b.opened || '').localeCompare(String(a.opened || ''));
+    });
+
+    listEl.innerHTML = sorted.map(function(b){
+      var done = b.status === 'answered';
+      var sev = b.severity || 'low';
+      var opts = Array.isArray(b.options) ? b.options : [];
+      var body;
+
+      if (done){
+        body = '<div class="answered"><span>&#9656; ' + esc(b.answer) + '</span>'
+             + '<span class="when">' + esc(ago(b.answeredAt)) + '</span></div>'
+             + (b.note ? '<div class="why" style="margin-top:.5rem">' + esc(b.note) + '</div>' : '');
+      } else {
+        body = '<div class="opts">' + opts.map(function(o){
+              var kind = o.kind === 'go' ? ' go' : (o.kind === 'stop' ? ' stop' : '');
+              return '<button class="opt' + kind + '" data-id="' + esc(b.id)
+                   + '" data-answer="' + esc(o.label) + '">' + esc(o.label) + '</button>';
+            }).join('') + '</div>'
+             + '<details class="note"><summary>+ add a note</summary>'
+             + '<textarea placeholder="optional - anything Claude should know"></textarea>'
+             + '<button class="savenote" data-note="' + esc(b.id) + '">Save note only</button>'
+             + '</details>';
+      }
+
+      return '<div class="card ' + (done ? 'done' : esc(sev)) + '">'
+        + '<div class="meta"><span class="sev ' + esc(sev) + '">'
+        + (done ? 'answered' : esc(sev)) + '</span><span>' + esc(b.id) + '</span>'
+        + '<span style="margin-left:auto">' + esc(ago(b.opened)) + '</span></div>'
+        + '<h2>' + esc(b.title) + '</h2>'
+        + (b.why ? '<p class="why">' + esc(b.why) + '</p>' : '')
+        + (b.question && !done ? '<p class="q">' + esc(b.question) + '</p>' : '')
+        + body
+        + '</div>';
+    }).join('');
+  }
+
+  function disable(id, state){
+    var nodes = listEl.querySelectorAll('[data-id="' + id + '"]');
+    for (var i = 0; i < nodes.length; i++) nodes[i].disabled = state;
+  }
+
+  function answer(id, label, note){
+    if (!db) return;
+    disable(id, true);
+    db.doc('blockers/' + id).update({
+      status: 'answered',
+      answer: label,
+      note: note || '',
+      answeredAt: new Date().toISOString()
+    }).catch(function(e){
+      setStatus('wait', 'could not save - ' + (e && e.code ? e.code : 'error'));
+      disable(id, false);
+    });
+  }
+
+  listEl.addEventListener('click', function(e){
+    var opt = e.target.closest('button.opt');
+    if (opt){
+      var card = opt.closest('.card');
+      var ta = card ? card.querySelector('.note textarea') : null;
+      answer(opt.dataset.id, opt.dataset.answer, ta ? ta.value.trim() : '');
+      return;
+    }
+    var nb = e.target.closest('button[data-note]');
+    if (nb){
+      var t = nb.closest('.note').querySelector('textarea');
+      if (t && t.value.trim()) answer(nb.dataset.note, 'note only', t.value.trim());
+    }
+  });
+
+  render();
+  setStatus('', 'connecting...');
+
+  claude.use('db').then(function(d){
+    if (!d){
+      setStatus('wait', 'offline - cannot reach the blocker list');
+      return;
+    }
+    db = d;
+    db.collection('blockers').onSnapshot(function(snap){
+      docs = snap.docs.map(function(s){
+        var v = s.data() || {};
+        return {
+          id: s.id, title: v.title, why: v.why, question: v.question,
+          options: v.options, severity: v.severity, status: v.status,
+          answer: v.answer, note: v.note, answeredAt: v.answeredAt, opened: v.opened
+        };
+      });
+      var open = 0;
+      for (var i = 0; i < docs.length; i++) if (docs[i].status !== 'answered') open++;
+      setStatus(open ? 'wait' : 'live', open ? (open + ' waiting on you') : 'all clear');
+      render();
+    }, function(err){
+      setStatus('wait', 'connection lost - ' + (err && err.code ? err.code : 'error'));
+    });
+  });
+})();
+</script>
