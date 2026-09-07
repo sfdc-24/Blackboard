@@ -45,6 +45,19 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+
+# STDOUT IS RESERVED FOR HIS MESSAGES. Nothing else may appear on it.
+#
+# bus.ps1 raises a Write-Warning when a read comes back as a redirect artifact,
+# which is normal and self-healing. Warnings ride stream 3, not stream 2, so the
+# `2>$null` below never caught them and one surfaced as a notification on
+# 2026-09-07 looking exactly like a line from Mr. Salam. A watcher that reports
+# its own noise in his voice is the same defect as the gateway answering him
+# confidently with nothing -- and it is worse here, because it could bury a real
+# message in the middle of plausible chatter.
+$WarningPreference     = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
 $bus = Join-Path $PSScriptRoot 'bus.ps1'
 if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this script" }
 
@@ -56,7 +69,9 @@ function Read-Board {
   # A failed poll must never kill the watcher: the board is a network call and a
   # transient failure is normal. Return $null and try again next tick.
   try {
-    & $bus -Action read -Title "Blackboard - Alpha DB" -OutFile $tmp 2>$null | Out-Null
+    # Every stream the bus can write on is silenced here, not just stderr. Its
+    # own output is never news; only the rows it fetches are.
+    & $bus -Action read -Title "Blackboard - Alpha DB" -OutFile $tmp 2>$null 3>$null 4>$null 5>$null 6>$null | Out-Null
     return (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8 | ConvertFrom-Json)
   } catch { return $null }
 }
