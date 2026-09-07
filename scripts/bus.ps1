@@ -119,6 +119,33 @@ function Write-BusReadMetadata {
   [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Resolve-BusHttpsLocation {
+  param(
+    [Parameter(Mandatory = $true)][string]$Location,
+    [Parameter(Mandatory = $true)][string]$BaseUrl
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Location) -or [string]::IsNullOrWhiteSpace($BaseUrl)) {
+    throw [System.InvalidOperationException]::new(
+      'hop 2 Location or BUS_URL is empty. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.'
+    )
+  }
+  try {
+    $baseUri = [Uri]::new($BaseUrl)
+    $resolvedUri = [Uri]::new($baseUri, $Location)
+  } catch {
+    throw [System.InvalidOperationException]::new(
+      'hop 2 Location or BUS_URL is invalid. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.'
+    )
+  }
+  if (-not $resolvedUri.IsAbsoluteUri -or $resolvedUri.Scheme -cne [Uri]::UriSchemeHttps) {
+    throw [System.InvalidOperationException]::new(
+      'hop 2 Location must resolve to HTTPS. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.'
+    )
+  }
+  return $resolvedUri.AbsoluteUri
+}
+
 # ---- load credentials from .env (never from argv) ---------------------------
 if (-not $EnvFile) { $EnvFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env' }
 if (-not (Test-Path -LiteralPath $EnvFile)) {
@@ -270,40 +297,111 @@ if ($curl) {
 
 # ---- hop 2: plain GET on the one-shot Location -----------------------------
 if ($location) {
+  try {
+    # Validate before choosing a transport so the IWR fallback cannot issue its
+    # initial hop-2 request to a plaintext or non-web scheme.
+    $location = Resolve-BusHttpsLocation -Location ([string]$location) -BaseUrl ([string]$cfg.BUS_URL)
+  } catch {
+    Write-BusReadMetadata `
+      -Path $ReadMetadataOutFile `
+      -TransportExit $readTransportExit `
+      -HttpStatus $readHttpStatus `
+      -ContentTypeClass $readContentTypeClass
+    throw
+  }
   if ($curl) {
     # Single request again -- the Location key is one-shot; a probe would spend it.
+    # This leg is a bodyless GET, so redirects are safe to follow. Google may add
+    # another redirect from the one-shot URL to the canonical /exec endpoint; a
+    # Location header on this leg is therefore not evidence that the key expired.
+    $hop2MaxRedirects = 5
     $tmpHead2 = [IO.Path]::GetTempFileName()
     try {
-      $out2  = & $curl.Source -s -S -D $tmpHead2 --max-time 120 $location
+      # Keep both the server-supplied hop-2 URL and every redirect HTTPS-only.
+      # The leading '=' replaces curl's default protocol set; without it, 'https'
+      # would be added to (rather than replace) the protocols curl already allows.
+      $out2  = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
+                --proto '=https' --proto-redir '=https' `
+                -D $tmpHead2 --max-time 120 $location
       $hop2Exit = [int]$LASTEXITCODE
       if ($null -eq $readTransportExit -or $hop2Exit -ne 0) { $readTransportExit = $hop2Exit }
       $head2 = Get-Content -LiteralPath $tmpHead2 -ErrorAction SilentlyContinue
       $hop2Metadata = Get-BusHeaderMetadata -HeaderLines @($head2)
       $readHttpStatus = $hop2Metadata.http_status
       $readContentTypeClass = $hop2Metadata.content_type_class
-      $loc2  = @($head2 | Where-Object { $_ -match '^\s*[Ll]ocation:' }) | Select-Object -First 1
-      if ($loc2) {
-        throw "hop 2 redirected again (to $(($loc2 -replace '^\s*[Ll]ocation:\s*','').Trim())) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
+      if ($hop2Exit -ne 0 -or $null -eq $readHttpStatus -or
+          $readHttpStatus -lt 200 -or $readHttpStatus -ge 300) {
+        # Preserve the sanitized sidecar even though the standalone client fails.
+        # The supervisor uses it to distinguish a retryable transport/HTTP fault
+        # from a deterministic local-client error without logging response data.
+        Write-BusReadMetadata `
+          -Path $ReadMetadataOutFile `
+          -TransportExit $readTransportExit `
+          -HttpStatus $readHttpStatus `
+          -ContentTypeClass $readContentTypeClass
+        throw "hop 2 did not reach a successful final response after following up to $hop2MaxRedirects redirects. The write, if any, may still have landed: READ BACK before deciding anything."
       }
       $content = ($out2 -join "`n")
     } finally { Remove-Item -LiteralPath $tmpHead2 -Force -ErrorAction SilentlyContinue }
   } else {
+    # Do not carry hop 1's 302 metadata into a hop 2 failure that produced no
+    # response. A response-less WebException must remain a transport failure.
+    # WinPS 5.1/.NET Framework has no per-hop scheme policy for automatic
+    # redirects, so this fallback fails closed on any further redirect. The
+    # normal curl path above is the only path that follows the bounded HTTPS
+    # Google chain.
+    $readHttpStatus = $null
+    $readContentTypeClass = $null
+    $r2 = $null
     try {
       $r2 = Invoke-WebRequest -Uri $location -Method Get -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 120
-      $readHttpStatus = [int]$r2.StatusCode
-      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r2.Headers['Content-Type'])
-      $content = $r2.Content
     } catch [System.Net.WebException] {
       $resp = $_.Exception.Response
       if ($resp) {
         $readHttpStatus = [int]$resp.StatusCode
         $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$resp.Headers['Content-Type'])
       }
+      Write-BusReadMetadata `
+        -Path $ReadMetadataOutFile `
+        -TransportExit $readTransportExit `
+        -HttpStatus $readHttpStatus `
+        -ContentTypeClass $readContentTypeClass
       if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
-        throw "hop 2 redirected again (to $($resp.Headers['Location'])) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
+        throw [System.Net.WebException]::new(
+          'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+        )
       }
-      throw
+      throw [System.Net.WebException]::new(
+        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
+      )
+    } catch {
+      Write-BusReadMetadata `
+        -Path $ReadMetadataOutFile `
+        -TransportExit $readTransportExit `
+        -HttpStatus $readHttpStatus `
+        -ContentTypeClass $readContentTypeClass
+      throw [System.Net.WebException]::new(
+        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
+      )
     }
+    $readHttpStatus = [int]$r2.StatusCode
+    $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r2.Headers['Content-Type'])
+    if ($readHttpStatus -lt 200 -or $readHttpStatus -ge 300) {
+      Write-BusReadMetadata `
+        -Path $ReadMetadataOutFile `
+        -TransportExit $readTransportExit `
+        -HttpStatus $readHttpStatus `
+        -ContentTypeClass $readContentTypeClass
+      if ($readHttpStatus -ge 300 -and $readHttpStatus -lt 400) {
+        throw [System.Net.WebException]::new(
+          'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+        )
+      }
+      throw [System.Net.WebException]::new(
+        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
+      )
+    }
+    $content = $r2.Content
   }
 }
 
