@@ -82,6 +82,9 @@ param(
   [string[]]$Buttons,        # up to 3 one-tap replies
   [string[]]$ListOptions,    # up to 10, shown behind a menu button
   [string]$ListButton = 'Choose',
+  [string]$File,             # send an artefact: a page, an image, a recording
+  [ValidateSet('auto', 'document', 'image', 'audio', 'video')]
+  [string]$As = 'auto',
   [string]$ReplyTo,          # wamid to quote, when one is available
   [switch]$Raw,          # send $Text exactly as given, with no prefix line
   [switch]$DryRun,
@@ -110,6 +113,7 @@ foreach ($k in @('META_TOKEN', 'WA_PHONE_NUMBER_ID')) {
   if (-not $cfg[$k]) { throw "$k missing in $EnvFile" }
 }
 $token = $cfg.META_TOKEN -replace '^\s*[Bb]earer\s+', ''   # see GOTCHA above
+$tok = $token   # short alias used by the media upload below
 if (-not $To) { $To = $cfg.WA_TO }
 if (-not $To) { throw "no recipient: pass -To or set WA_TO in $EnvFile" }
 $To = ($To -replace '[^\d]', '')
@@ -135,6 +139,68 @@ if ($body.Length -gt $cap) { $body = $body.Substring(0, $cap - 3) + '...' }
 
 if ($Buttons -and $ListOptions) { throw "give -Buttons or -ListOptions, not both" }
 
+# ---- artefacts ---------------------------------------------------------------
+# Mr. Salam, 2026-09-07: show artefacts in the WhatsApp chat rather than making
+# him open another app to see them. He reads on a phone; a link to somewhere else
+# is a thing he will do later, and later usually means never.
+#
+# Two steps, because the API has no single-shot file send. Upload the bytes to
+# /media, which returns an id, then send a message referencing that id. The
+# upload is multipart, which Invoke-WebRequest on 5.1 builds badly, so curl.exe
+# does it -- the same reason bus.ps1 reaches for curl.
+#
+# A recording sent as `audio` arrives as a PLAYABLE voice note rather than an
+# attachment he has to download and find an app for. That distinction is the
+# entire point for the spoken walkthrough.
+$mediaId = $null
+# A DRY RUN MUST NOT UPLOAD. Found immediately after writing this: the upload sat
+# above the -DryRun check, so `-DryRun -File x` quietly pushed the bytes to Meta
+# and only skipped the send. A dry run with a side effect is not a dry run, and
+# this one spent bandwidth and left a media object behind while reporting that
+# nothing had been sent.
+if ($File -and $DryRun) {
+  if (-not (Test-Path -LiteralPath $File)) { throw "file not found: $File" }
+  $i = Get-Item -LiteralPath $File
+  Write-Output "DRY RUN - nothing sent, nothing uploaded"
+  Write-Output ("would upload: " + $i.Name + "  " + [math]::Round($i.Length/1KB,1) + " KB, as '" + $As + "'")
+  Write-Output ("then send it to " + $To)
+  return
+}
+if ($File) {
+  if (-not (Test-Path -LiteralPath $File)) { throw "file not found: $File" }
+  $item = Get-Item -LiteralPath $File
+  # 16MB is Meta's ceiling for documents and the smallest of the type limits;
+  # refusing here beats a 400 after the upload has already been paid for.
+  if ($item.Length -gt 16MB) { throw "$($item.Name) is $([math]::Round($item.Length/1MB,1))MB; WhatsApp's limit is 16MB" }
+
+  $ext  = $item.Extension.ToLowerInvariant()
+  $mime = switch ($ext) {
+    '.mp3'  { 'audio/mpeg' }    '.ogg'  { 'audio/ogg' }     '.m4a' { 'audio/mp4' }
+    '.png'  { 'image/png' }     '.jpg'  { 'image/jpeg' }    '.jpeg' { 'image/jpeg' }
+    '.mp4'  { 'video/mp4' }     '.pdf'  { 'application/pdf' }
+    '.html' { 'text/html' }     '.md'   { 'text/plain' }    '.txt' { 'text/plain' }
+    '.json' { 'application/json' }
+    default { 'application/octet-stream' }
+  }
+  if ($As -eq 'auto') {
+    $As = if ($mime -like 'audio/*') { 'audio' }
+          elseif ($mime -like 'image/*') { 'image' }
+          elseif ($mime -like 'video/*') { 'video' }
+          else { 'document' }
+  }
+
+  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+  if (-not $curl) { throw "curl.exe not found; it is required to upload media" }
+  $up = & $curl.Source -s -S --max-time 180 `
+          -H "Authorization: Bearer $tok" `
+          -F "messaging_product=whatsapp" `
+          -F "type=$mime" `
+          -F "file=@$($item.FullName);type=$mime" `
+          "https://graph.facebook.com/$GRAPH_VERSION/$($cfg.WA_PHONE_NUMBER_ID)/media"
+  try { $mediaId = ($up | ConvertFrom-Json).id } catch { $mediaId = $null }
+  if (-not $mediaId) { throw "media upload failed: $up" }
+}
+
 # Meta's limits, enforced here rather than discovered as a 400 mid-conversation.
 # A truncated button title is still tappable; a rejected message is not, so the
 # titles are cut and the counts are refused.
@@ -145,7 +211,16 @@ $payload = @{
 }
 if ($ReplyTo) { $payload.context = @{ message_id = $ReplyTo } }
 
-if ($Buttons) {
+if ($mediaId) {
+  # Caption rides with image, video and document. Audio takes none -- WhatsApp
+  # ignores it there -- so any words are sent as their own message first, rather
+  # than silently dropped.
+  $payload.type = $As
+  $node = @{ id = $mediaId }
+  if ($As -eq 'document') { $node.filename = (Get-Item -LiteralPath $File).Name }
+  if ($As -ne 'audio' -and $Text) { $node.caption = $body }
+  $payload[$As] = $node
+} elseif ($Buttons) {
   if ($Buttons.Count -gt 3) { throw "WhatsApp allows at most 3 reply buttons; you gave $($Buttons.Count). Use -ListOptions for up to 10." }
   $btn = @()
   for ($i = 0; $i -lt $Buttons.Count; $i++) {
