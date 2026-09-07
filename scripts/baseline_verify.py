@@ -16,12 +16,11 @@ change the bytes. So this imports the same canonical() the build-identity
 helper uses, rather than opening a second definition of the word.
 """
 import hashlib
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gas_build_identity import canonical  # noqa: E402  (path set above)
+from gas_build_identity import canonical, parse_json  # noqa: E402  (path set above)
 
 # Stems whose digest is taken over canonical JSON rather than raw bytes.
 JSON_STEMS = {"appsscript"}
@@ -66,7 +65,9 @@ for stem in sorted(DIGESTS_V31):
         # utf-8-sig: Apps Script may hand back a BOM, which is not drift either.
         with open(path, encoding="utf-8-sig") as fh:
             try:
-                parsed = json.load(fh)
+                # Apply the same input rules as immutable build verification:
+                # duplicate keys and nonstandard numbers are not valid evidence.
+                parsed = parse_json(fh.read())
             except ValueError as exc:
                 mismatches += 1
                 print(f"{stem:14} UNPARSEABLE ({fn}) - {exc}")
