@@ -125,6 +125,26 @@ section('T5 · it stays a sketch — Lego, not a cathedral');
 }
 
 // ---------------------------------------------------------------------------
+section('T5b · intent is inferred, never chosen by the visitor');
+{
+  // Mr. Salam: adapt to the customer rather than making them pick a template.
+  // So intent steers the page, which makes it worth attacking.
+  check('a valid intent survives', S({ intent: 'build', nodes: [{ id: 'a', label: 'x' }] }).intent === 'build');
+  check('each of the three is accepted',
+    ['fix', 'build', 'env'].every((i) => S({ intent: i, nodes: [{ id: 'a', label: 'x' }] }).intent === i));
+  check('a missing intent is unclear, not a guess',
+    S({ nodes: [{ id: 'a', label: 'x' }] }).intent === 'unclear');
+  check('an invented intent falls back rather than passing through',
+    S({ intent: 'admin', nodes: [{ id: 'a', label: 'x' }] }).intent === 'unclear');
+  check('a non-string intent cannot slip past',
+    S({ intent: { toString: 1 }, nodes: [{ id: 'a', label: 'x' }] }).intent === 'unclear');
+  check('prototype pollution names are not treated as valid intents',
+    S({ intent: 'constructor', nodes: [{ id: 'a', label: 'x' }] }).intent === 'unclear' &&
+    S({ intent: '__proto__', nodes: [{ id: 'a', label: 'x' }] }).intent === 'unclear',
+    'hasOwnProperty guard');
+}
+
+// ---------------------------------------------------------------------------
 section('T6 · a fenced reply is still accepted');
 {
   // Told not to fence, models fence anyway. Refusing would drop good sketches.

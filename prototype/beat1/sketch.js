@@ -38,6 +38,27 @@ var SKETCH_MAX_EDGES = 12;
 var SKETCH_MAX_LABEL = 40;
 var SKETCH_KINDS = { object: 1, step: 1, person: 1, system: 1, problem: 1 };
 
+// WHY THE SKETCH CARRIES AN INTENT
+//   Mr. Salam, 2026-09-07: visitors arrive wanting one of three things — an app
+//   or website built, a Salesforce environment stood up, or a specific technical
+//   problem fixed — and the interface should "adapt to cater to customers rather
+//   than having them select a templated design".
+//
+//   That last clause is the hard constraint and the easy thing to get wrong. The
+//   obvious build is three buttons: App / Salesforce / Fix something. That IS a
+//   templated design with extra steps, and it makes the visitor do the work of
+//   being understood, which PRODUCT.md forbids in as many words. So intent is
+//   INFERRED from what they say and never asked for.
+//
+//   It changes what the sketch is OF, which is the whole point:
+//     fix    — the process they already have, with the break in it
+//     build  — the thing they are describing, which does not exist yet
+//     env    — what would have to exist inside the environment they want
+//   Same grammar, same boxes, different subject. `unclear` is a real answer and
+//   the honest one early in a conversation; it draws nothing rather than
+//   guessing, because a confident sketch of the wrong intent is worse than none.
+var SKETCH_INTENTS = { fix: 1, build: 1, env: 1, unclear: 1 };
+
 /**
  * Ask the model for a blocky sketch of what the visitor is describing.
  * Returns a sketch object, or null when there is not enough to draw yet —
@@ -63,16 +84,31 @@ function sketchFrom_(history, latestText, apiKey, model) {
     said.join('\n').slice(0, 4000),
     'VISITOR_DESCRIPTION>>>',
     '',
-    'Draw the simplest possible sketch of the thing they are describing, as JSON.',
+    'First decide what they are actually asking for. One of:',
+    '  "fix"   - something they already have is broken or slow',
+    '  "build" - they want an app, a website or a tool made that does not exist yet',
+    '  "env"   - they want a Salesforce or similar environment stood up to work in',
+    '  "unclear" - they have not said enough yet to tell. This is a normal answer.',
+    'Infer it from their words. Never ask them to choose.',
+    '',
+    'Then draw the simplest possible sketch, as JSON. What you draw depends on it:',
+    '  fix   - the process they ALREADY HAVE, including the part that breaks',
+    '  build - the THING THEY WANT, its pieces and who uses it. It does not exist yet,',
+    '          so draw what they described wanting, not what they have.',
+    '  env   - what would need to EXIST INSIDE that environment: the records, the',
+    '          people, the steps they said they work with.',
     'Blocky and obvious, like a whiteboard sketch someone can point at and correct.',
     'Not a finished design. Not a data model. Fewer boxes is better.',
     '',
     'Reply with JSON only, no prose and no code fence:',
-    '{"title":"short name for the thing",',
+    '{"intent":"fix|build|env|unclear",',
+    ' "title":"short name for the thing",',
     ' "nodes":[{"id":"a","label":"short","kind":"object|step|person|system|problem"}],',
     ' "edges":[{"from":"a","to":"b","label":"short or empty"}]}',
     '',
     'At most ' + SKETCH_MAX_NODES + ' nodes. Labels at most ' + SKETCH_MAX_LABEL + ' characters.',
+    'Use the "problem" kind only for something they said is going wrong. A thing they',
+    'want built is not a problem.',
     'If they have not yet said enough to draw anything, reply exactly: null'
   ].join('\n');
 
@@ -111,8 +147,25 @@ function sketchFrom_(history, latestText, apiKey, model) {
  * remapped to a safe alphabet, and edges pointing at nodes that do not exist
  * are discarded rather than rendered as dangling arrows.
  */
+// Convert to string WITHOUT ever invoking user-supplied coercion.
+//
+// `String(v)` calls v.toString(), and JSON.parse can legally produce
+// {"toString": 1} — at which point String() throws "Cannot convert object to
+// primitive value" and takes the whole sketch path down. Found by a test
+// written to attack this function, on 2026-09-07, and it was reachable from
+// four separate call sites here.
+//
+// A trust boundary that can be made to throw is not a boundary. Only primitives
+// become text; an object or array is not a label and becomes empty, which the
+// callers already treat as "drop this".
+function str_(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return '' + v;
+  return '';
+}
+
 function sanitiseSketch_(raw) {
-  var text = String(raw || '').trim();
+  var text = str_(raw).trim();
   if (!text || text === 'null') return null;
 
   // Models add a fence even when told not to. Strip one if present.
@@ -124,7 +177,7 @@ function sanitiseSketch_(raw) {
   if (!obj || typeof obj !== 'object' || !(obj.nodes instanceof Array)) return null;
 
   function clean(s) {
-    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, SKETCH_MAX_LABEL);
+    return str_(s).replace(/\s+/g, ' ').trim().slice(0, SKETCH_MAX_LABEL);
   }
 
   var nodes = [], idMap = {}, n = 0;
@@ -134,11 +187,11 @@ function sanitiseSketch_(raw) {
     var label = clean(src.label);
     if (!label) continue;
     var safeId = 'n' + (n++);
-    idMap[String(src.id)] = safeId;
+    idMap[str_(src.id)] = safeId;
     nodes.push({
       id: safeId,
       label: label,
-      kind: SKETCH_KINDS.hasOwnProperty(String(src.kind)) ? String(src.kind) : 'object'
+      kind: SKETCH_KINDS.hasOwnProperty(str_(src.kind)) ? str_(src.kind) : 'object'
     });
   }
   if (!nodes.length) return null;
@@ -148,10 +201,18 @@ function sanitiseSketch_(raw) {
   for (var j = 0; j < rawEdges.length && edges.length < SKETCH_MAX_EDGES; j++) {
     var e = rawEdges[j];
     if (!e || typeof e !== 'object') continue;
-    var from = idMap[String(e.from)], to = idMap[String(e.to)];
+    var from = idMap[str_(e.from)], to = idMap[str_(e.to)];
     if (!from || !to || from === to) continue;      // dangling or self-loop: drop, do not draw
     edges.push({ from: from, to: to, label: clean(e.label) });
   }
 
-  return { title: clean(obj.title) || 'Your setup', nodes: nodes, edges: edges };
+  // Intent is validated against a closed set, never passed through. It steers
+  // what the page SAYS about the sketch, so a value invented by the model — or
+  // steered by a visitor writing "intent: admin" at it — would be a way to move
+  // the interface from outside. Anything unrecognised becomes `unclear`, which
+  // is the safe reading: it makes the page commit to nothing.
+  var intent = str_(obj.intent);
+  if (!SKETCH_INTENTS.hasOwnProperty(intent)) intent = 'unclear';
+
+  return { intent: intent, title: clean(obj.title) || 'Your setup', nodes: nodes, edges: edges };
 }
