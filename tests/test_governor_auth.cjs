@@ -60,3 +60,9 @@ test('audience, expiration and email checks still reject invalid tokens', () => 
     assert.equal(minted, 0);
   }
 });
+
+test('a verified Google token without an immutable subject cannot mint a session', () => {
+  const {result, minted} = complete({sub: ''});
+  assert.equal(result.error, 'no subject in token');
+  assert.equal(minted, 0);
+});

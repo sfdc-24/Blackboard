@@ -63,6 +63,11 @@ function makeRuntime(opts) {
   const scriptProperties = {
     getProperty: (k) => (props.has(k) ? props.get(k) : null),
     setProperty: (k, v) => { props.set(k, String(v)); return scriptProperties; },
+    setProperties: (values) => {
+      if (!lockHeld) throw new Error('chat budget write without script lock');
+      Object.entries(values).forEach(([k, v]) => props.set(k, String(v)));
+      return scriptProperties;
+    },
     deleteProperty: (k) => { props.delete(k); return scriptProperties; },
     getProperties: () => Object.fromEntries(props)
   };
@@ -116,7 +121,9 @@ function makeRuntime(opts) {
       base64Encode: (bytes) => Buffer.from(bytes).toString('base64'),
       computeDigest: (_algorithm, value) => Array.from(crypto.createHash('sha256').update(String(value)).digest())
         .map((byte) => byte > 127 ? byte - 256 : byte),
-      formatDate: (d) => d.toISOString().slice(0, 10).replace(/-/g, '')
+      formatDate: (d, _zone, pattern) => pattern === 'yyyyMMdd'
+        ? d.toISOString().slice(0, 10).replace(/-/g, '')
+        : d.toISOString().slice(0, 10)
     },
     UrlFetchApp: {
       fetch(url) {
@@ -145,7 +152,10 @@ function makeRuntime(opts) {
     // in sibling files this harness deliberately does not pull in. Quarantined
     // logging and session lookup are proved elsewhere; here they are noise.
     logVisitorQuarantined_() {},
-    readSession_() { return null; }
+    readSession_() { return null; },
+    conversationIdentity_() {
+      return { key: 'ca_' + 'a'.repeat(32), token: 'mock-conversation-token', session: null, kind: 'a' };
+    }
   };
 
   const ctx = vm.createContext(sandbox);

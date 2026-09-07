@@ -131,6 +131,9 @@ button.rec .dot{animation:b .8s step-end infinite}
   // Session token, rendered server-side. Sent with each turn so the
   // reception can record WHO said it. Empty when signed out.
   var SESSION = "<?!= sessionToken ?>";
+  // Server-signed conversation identity. It controls history and spend caps,
+  // but grants no authority. The server replaces an expired/cross-user token.
+  var CONVERSATION = "<?!= conversationToken ?>";
   var WANT_VOICE = "<?!= voice ?>" === "1";
   var READY_NONCE = "<?!= readyNonce ?>";
   // The microphone is only usable where the hosting frame's permissions policy allows it.
@@ -149,10 +152,12 @@ button.rec .dot{animation:b .8s step-end infinite}
   var thread = $("thread"), box = $("box"), send = $("send"), mic = $("mic");
   var history = [], busy = false, typing = false;
 
-  // ---- session id (per browser tab) ----
-  var sid = "";
-  try { sid = sessionStorage.getItem("sfdc_sid") || ""; } catch(e){}
-  if (!sid) { sid = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2,8); try { sessionStorage.setItem("sfdc_sid", sid) } catch(e){} }
+  // Reuse the last server-issued token where this sandbox origin permits it.
+  // An untrusted browser value is harmless: the signature is checked server-side.
+  try {
+    CONVERSATION = sessionStorage.getItem("sfdc_conv") || CONVERSATION;
+    if (CONVERSATION) sessionStorage.setItem("sfdc_conv", CONVERSATION);
+  } catch(e){}
 
   // ---- rendering ----
   function el(cls, tag, text){
@@ -222,6 +227,10 @@ button.rec .dot{animation:b .8s step-end infinite}
     google.script.run
       .withSuccessHandler(function(res){
         clearInterval(tick);
+        if (res && res.ct) {
+          CONVERSATION = res.ct;
+          try { sessionStorage.setItem("sfdc_conv", CONVERSATION) } catch(e){}
+        }
         var host = wait.parentNode; host.className = "msg c";
         var reply = (res && res.reply) || "Something went wrong on my side. Your message is saved.";
         wait.textContent = "";
@@ -237,7 +246,7 @@ button.rec .dot{animation:b .8s step-end infinite}
         wait.textContent = "couldn't reach the server: " + (err && err.message || err) + " — your message wasn't lost, try again.";
         busy = false; sync();
       })
-      .reception(sid, text, history.slice(0, -1), SESSION);
+      .reception(CONVERSATION, text, history.slice(0, -1), SESSION);
   }
 
   // ---- voice ----

@@ -82,13 +82,18 @@ unreachable there and no permission prompt will ever appear. That is why
 Reception.html has always fallen back to "use your keyboard dictation". Do not
 try to fix that; it is not fixable. Recorded as **L-89**.
 
+**Pending source contract, not production v31.** The `ct` contract below is the
+MULTITENANT-READINESS-001 repair and must ship with the companion
+`sfdc24-site` voice change. Production v31 still uses caller-chosen `vid`; see
+`docs/MULTITENANT-READINESS.md` for staging and rollback gates.
+
 **The shape.** The voice UI is a top-level page on the site, so it can hold a
 microphone. It calls the Apps Script backend across origins, and Apps Script
 sends no CORS headers, so the call is **JSONP**:
 
 ```
-GET <exec>?action=say&cb=<callback>&vid=<conversation id>&q=<text>[&s=<session token>]
-  -> cb({"ok":true,"reply":"..."});
+GET <exec>?action=say&cb=<callback>&ct=<signed conversation token>&q=<text>[&s=<session token>]
+  -> cb({"ok":true,"reply":"...","ct":"..."});
 ```
 
 `voiceReply_` in Code.js validates the callback name against
@@ -96,14 +101,17 @@ GET <exec>?action=say&cb=<callback>&vid=<conversation id>&q=<text>[&s=<session t
 the same `reception()` as the typed chat — same session cap, same daily cap,
 same 1000-character ceiling, same quarantined logging. It adds no new capability
 and no new exposure; it only changes how a turn arrives. Conversation history is
-kept server-side in CacheService under `vh_<vid>` so the URL stays short.
+kept server-side in CacheService under an opaque key derived from `ct`, so the
+URL stays short. The server returns `ct` on every reply; the client persists it
+and sends it with the next turn. Caller-chosen `vid` values are ignored.
 
-**`vid`, never `sid`.** Google's frontend rejects any `/exec` request carrying a
+**`ct`, never `sid`.** Google's frontend rejects any `/exec` request carrying a
 `sid` query parameter with **HTTP 400** before the script runs — `?view=home&sid=x`
-fails identically, so it is nothing to do with this app. The 400 body is a
-generic Google error page with no clue in it. Recorded as **L-88**. If an
-`/exec` call returns 400 with a Google error shell, suspect a reserved parameter
-name before you suspect your code.
+fails identically. `sid` remains reserved. The earlier `vid` workaround was
+caller-chosen and is no longer an identity. The 400 body is a generic Google
+error page with no clue in it. Recorded as **L-88**. If an `/exec` call returns
+400 with a Google error shell, suspect a reserved parameter name before you
+suspect your code.
 
 **Sign-in returns to the site now.** `?auth=start&back=voice` lands the visitor
 back at the voice page instead of the Apps Script app. `back` is looked up in

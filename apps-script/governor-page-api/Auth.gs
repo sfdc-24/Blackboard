@@ -40,6 +40,8 @@ var AUTH_CLIENT_SECRET_KEY = 'GOOGLE_CLIENT_SECRET';
 var AUTH_SIGNING_KEY       = 'AUTH_SIGNING_SECRET';
 var AUTH_SESSION_DAYS      = 14;
 var AUTH_STATE_TTL_SECS    = 600;
+var CONVERSATION_TOKEN_VERSION = 1;
+var CONVERSATION_TOKEN_DAYS    = 14;
 
 function authConfigured_() {
   var p = PropertiesService.getScriptProperties();
@@ -81,7 +83,25 @@ function safeEqual_(a, b) {
   return diff === 0;
 }
 
+/**
+ * Stable, non-reversible identifiers for cache/property keys. Google subjects
+ * and anonymous nonces must never be written to the visitor ledger verbatim.
+ */
+function conversationHash_(value) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(value || ''),
+    Utilities.Charset.UTF_8);
+  var out = '';
+  for (var i = 0; i < 16; i++) {
+    var n = (Number(bytes[i]) + 256) % 256;
+    out += ('0' + n.toString(16)).slice(-2);
+  }
+  return out;
+}
+
 function mintSession_(claims) {
+  if (!claims || !claims.email || !claims.sub) throw new Error('verified Google subject required');
   var payload = {
     email: claims.email,
     name:  claims.name || '',
@@ -100,10 +120,79 @@ function readSession_(token) {
     if (parts.length !== 2) return null;
     if (!safeEqual_(hmac_(parts[0]), parts[1])) return null;
     var claims = JSON.parse(b64urlDecode_(parts[0]));
-    if (!claims || !claims.email) return null;
+    if (!claims || !claims.email || !claims.sub) return null;
     if (!claims.exp || Date.now() > claims.exp) return null;
     return claims;
   } catch (e) { return null; }
+}
+
+/**
+ * Mint a conversation identity. A signed-in visitor is bound to Google's
+ * immutable `sub`, not an email address or a browser-provided id. Anonymous
+ * visitors receive a random server nonce. The token proves only that this
+ * service issued the conversation id; it grants no Governor authority.
+ */
+function mintConversation_(session) {
+  var signedIn = !!(session && session.sub);
+  var payload = {
+    v: CONVERSATION_TOKEN_VERSION,
+    k: signedIn ? 'g' : 'a',
+    id: signedIn
+      ? conversationHash_('google-sub:' + String(session.sub))
+      : Utilities.getUuid().replace(/-/g, '').toLowerCase(),
+    exp: Date.now() + CONVERSATION_TOKEN_DAYS * 86400000
+  };
+  var body = b64urlEncode_(JSON.stringify(payload));
+  return body + '.' + hmac_(body);
+}
+
+/**
+ * Verify a conversation token and bind Google-backed tokens to the current
+ * signed session. An anonymous token is deliberately invalid once a visitor
+ * signs in, and a Google-backed token is invalid without that same subject.
+ */
+function readConversation_(token, session) {
+  try {
+    if (!token || String(token).length > 512) return null;
+    var parts = String(token).split('.');
+    if (parts.length !== 2 || !safeEqual_(hmac_(parts[0]), parts[1])) return null;
+    var claims = JSON.parse(b64urlDecode_(parts[0]));
+    if (!claims || claims.v !== CONVERSATION_TOKEN_VERSION) return null;
+    if (claims.k !== 'g' && claims.k !== 'a') return null;
+    if (!/^[a-f0-9]{32}$/.test(String(claims.id || ''))) return null;
+    if (!claims.exp || Date.now() > claims.exp) return null;
+
+    if (claims.k === 'g') {
+      if (!session || !session.sub) return null;
+      var expected = conversationHash_('google-sub:' + String(session.sub));
+      if (!safeEqual_(claims.id, expected)) return null;
+    } else if (session) {
+      return null;
+    }
+    return claims;
+  } catch (e) { return null; }
+}
+
+/**
+ * Resolve the only identity accepted by chat/history/budget code. Missing,
+ * forged or cross-user tokens are replaced with a fresh server-issued token;
+ * no caller-provided sid/vid is ever accepted as a storage key.
+ */
+function conversationIdentity_(conversationToken, sessionToken) {
+  var session = readSession_(sessionToken);
+  var token = String(conversationToken || '');
+  var claims = readConversation_(token, session);
+  if (!claims) {
+    token = mintConversation_(session);
+    claims = readConversation_(token, session);
+  }
+  if (!claims) throw new Error('conversation identity unavailable');
+  return {
+    key: 'c' + claims.k + '_' + conversationHash_('conversation:' + claims.k + ':' + claims.id),
+    token: token,
+    session: session,
+    kind: claims.k
+  };
 }
 
 /** Read the payload of a JWT. The token came from Google's token endpoint over
@@ -193,6 +282,7 @@ function authCompleteCallback_(e) {
   if (!claims.exp || (claims.exp * 1000) < Date.now()) return { ok: false, error: 'token expired' };
   if (claims.email_verified !== true) return { ok: false, error: 'email not verified by Google' };
   if (!claims.email) return { ok: false, error: 'no email in token' };
+  if (!claims.sub) return { ok: false, error: 'no subject in token' };
 
   return {
     ok: true,

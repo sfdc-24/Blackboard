@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "apps-script/governor-page-api/**"
+      - "site/voice/index.html"
+      - "tests/test_governor_tenant_boundary.cjs"
       - "tests/test_governor_voice.cjs"
       - "tests/test_tts_guards.js"
       - ".github/workflows/site-p0-tests.yml"
@@ -23,5 +25,5 @@ jobs:
         with:
           node-version: 22
       - run: |
-          node --test tests/test_governor_voice.cjs
+          node --test tests/test_governor_voice.cjs tests/test_governor_tenant_boundary.cjs
           node tests/test_tts_guards.js

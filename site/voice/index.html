@@ -267,13 +267,11 @@ body{overflow:hidden}
   stateWho.innerHTML = TOKEN ? "signed in"
     : '<a href="' + SIGNIN + '">sign in</a>';
 
-  // ---- conversation id ----------------------------------------------------
-  var vid = "";
-  try { vid = localStorage.getItem("sfdc_vsid") || "" } catch(e){}
-  if (!vid) {
-    vid = "v" + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
-    try { localStorage.setItem("sfdc_vsid", vid) } catch(e){}
-  }
+  // ---- conversation identity ---------------------------------------------
+  // Issued and signed by the backend. A browser value cannot choose a cache or
+  // budget key; invalid/cross-user tokens are replaced in the response.
+  var CONVERSATION = "";
+  try { CONVERSATION = localStorage.getItem("sfdc_conv") || "" } catch(e){}
 
   // ---- which voice --------------------------------------------------------
   // The visitor picks. We deliberately do NOT try to work out who is speaking
@@ -533,7 +531,11 @@ body{overflow:hidden}
   function handle(text){
     turn("me", "you", text);
     setMode("thinking");
-    jsonp({ action:"say", vid:vid, q:text, s:TOKEN }, function(res){
+    jsonp({ action:"say", ct:CONVERSATION, q:text, s:TOKEN }, function(res){
+      if (res && res.ct) {
+        CONVERSATION = res.ct;
+        try { localStorage.setItem("sfdc_conv", CONVERSATION) } catch(e){}
+      }
       if (!res || !res.ok) {
         turn("sys", "", "I couldn’t reach the assistant just then. Your message wasn’t lost — try again in a moment.");
         setMode("off");
