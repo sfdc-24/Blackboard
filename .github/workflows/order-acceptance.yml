@@ -11,8 +11,13 @@ on:
       - 'scripts/invoke_order_claude.ps1'
       - 'scripts/order_supervisor_result.schema.json'
       - 'infra/azure/blackboard_vm_supervisor.ps1'
+      - 'infra/azure/install_release_from_archive.ps1'
+      - 'infra/azure/order_task_escrow.ps1'
       - 'tests/test_order_read_resilience.ps1'
       - 'tests/test_order_state_preservation.ps1'
+      - 'tests/test_order_installer_safety.ps1'
+      - 'tests/test_order_release_installer.ps1'
+      - 'tests/test_order_task_escrow.ps1'
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
       - 'tests/test_azure_vm_supervisor.ps1'
@@ -37,6 +42,15 @@ jobs:
       - name: Test ORDER state preservation
         shell: powershell
         run: .\tests\test_order_state_preservation.ps1
+      - name: Test ORDER task installer safety
+        shell: powershell
+        run: .\tests\test_order_installer_safety.ps1
+      - name: Test ORDER immutable release installer
+        shell: powershell
+        run: .\tests\test_order_release_installer.ps1
+      - name: Test ORDER independent task escrow
+        shell: powershell
+        run: .\tests\test_order_task_escrow.ps1
       - name: Test ORDER supervisor contracts
         shell: powershell
         run: .\tests\test_order_supervisor.ps1
