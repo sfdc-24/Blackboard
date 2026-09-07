@@ -132,6 +132,26 @@ function Get-SmokeIdentitySid {
 function Get-SmokeTaskEvidence
 '@
     $instrumented = [Text.RegularExpressions.Regex]::Replace($source, $identityPattern, $identityReplacement)
+
+    $releaseVerificationAnchor = "    Assert-SmokeSafeDirectory -Path `$Root -MissingCode 'RELEASE_ROOT_MISSING' -UnsafeCode 'RELEASE_ROOT_UNSAFE'"
+    if (($instrumented.Split(@($releaseVerificationAnchor), [StringSplitOptions]::None).Count - 1) -ne 1) {
+        throw 'release_verification_instrumentation_anchor_invalid'
+    }
+    $releaseVerificationReplacement = @'
+    $verificationCounter = Get-Variable -Name SmokeTestReleaseVerificationCount -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $verificationCounter) { $script:SmokeTestReleaseVerificationCount = 0 }
+    $script:SmokeTestReleaseVerificationCount++
+    if ($script:SmokeTestReleaseVerificationCount -gt 1) {
+        if ([string]$global:SmokeTestFixture.SecondPassReleaseFailure -ceq 'MANIFEST_READ') {
+            Throw-Smoke -Code 'RELEASE_MANIFEST_READ_FAILED'
+        }
+        if ([string]$global:SmokeTestFixture.SecondPassReleaseFailure -ceq 'UNEXPECTED') {
+            throw 'injected unexpected release verification failure'
+        }
+    }
+    Assert-SmokeSafeDirectory -Path $Root -MissingCode 'RELEASE_ROOT_MISSING' -UnsafeCode 'RELEASE_ROOT_UNSAFE'
+'@
+    $instrumented = $instrumented.Replace($releaseVerificationAnchor, $releaseVerificationReplacement.TrimEnd("`r", "`n"))
     Write-Utf8NoBom -Path $script:InstrumentedSmoke -Text $instrumented
 
     $cleanupAnchor = "            Remove-Item -LiteralPath `$full -Recurse -Force -ErrorAction Stop"
@@ -211,6 +231,7 @@ function New-DefaultFixture {
         TaskChange = $false
         MutatePath = ''
         TransientDirectory = ''
+        SecondPassReleaseFailure = ''
     }
 }
 
@@ -280,6 +301,22 @@ function Invoke-SmokeCase {
     }
 }
 
+function Test-ReceiptTelemetryContract {
+    param([Parameter(Mandatory = $true)]$Run)
+
+    if ($Run.lines.Count -ne 1 -or $null -eq $Run.receipt) { return $false }
+    $provider = $Run.receipt.PSObject.Properties['provider_boundary_status']
+    $mutation = $Run.receipt.PSObject.Properties['external_mutation_status']
+    if ($null -eq $provider -or $null -eq $mutation) { return $false }
+    return (
+        @('NOT_CHECKED', 'VERIFIED_NO_SELECTOR_LEAK', 'SELECTOR_LEAK_DETECTED') -ccontains [string]$provider.Value -and
+        @('NOT_CHECKED', 'NOT_DETECTED', 'DETECTED', 'VERIFICATION_FAILED') -ccontains [string]$mutation.Value -and
+        $null -eq $Run.receipt.PSObject.Properties['provider_inference_attempted'] -and
+        $null -eq $Run.receipt.PSObject.Properties['external_write_attempted'] -and
+        [Text.Encoding]::UTF8.GetByteCount([string]$Run.lines[0]) -le 3072
+    )
+}
+
 function Assert-FailureCase {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -289,7 +326,8 @@ function Assert-FailureCase {
     )
     $valid = $Run.exit_code -eq 1 -and $Run.lines.Count -eq 1 -and $null -ne $Run.receipt -and
         -not [bool]$Run.receipt.pass -and [string]$Run.receipt.failure_code -ceq $Code -and
-        [string]$Run.receipt.cleanup_status -ceq $CleanupStatus -and [string]::IsNullOrEmpty($Run.stderr)
+        [string]$Run.receipt.cleanup_status -ceq $CleanupStatus -and [string]::IsNullOrEmpty($Run.stderr) -and
+        (Test-ReceiptTelemetryContract -Run $Run)
     Test-Case -Name $Name -Condition $valid -Detail ($Run.stdout + ' STDERR=' + $Run.stderr)
 }
 
@@ -430,6 +468,23 @@ try {
         $productionSourceText.Contains('if ($receiptByteCount -gt 3072)') -and
         -not $productionSourceText.Contains('if ($receiptJson.Length -gt 16384)')
     )
+    Test-Case -Name 'production receipt uses factual status telemetry and removes misleading booleans' -Condition (
+        $productionSourceText.Contains("provider_boundary_status = 'NOT_CHECKED'") -and
+        $productionSourceText.Contains("external_mutation_status = 'NOT_CHECKED'") -and
+        $productionSourceText.Contains("'VERIFICATION_FAILED'") -and
+        -not $productionSourceText.Contains('provider_inference_attempted') -and
+        -not $productionSourceText.Contains('external_write_attempted')
+    )
+    $readmeText = [IO.File]::ReadAllText((Join-Path $script:RepoRoot 'infra\azure\README.md'), [Text.Encoding]::UTF8)
+    Test-Case -Name 'README requires a lowercase hexadecimal release id and exact telemetry states' -Condition (
+        [Text.RegularExpressions.Regex]::Matches($readmeText, '40-character lowercase(?: |\r?\n\s*)hexadecimal release ID').Count -eq 2 -and
+        -not $readmeText.Contains('40-hex release ID') -and
+        $readmeText.Contains('provider_boundary_status:VERIFIED_NO_SELECTOR_LEAK') -and
+        $readmeText.Contains('external_mutation_status:NOT_DETECTED') -and
+        $readmeText.Contains('`VERIFICATION_FAILED`') -and
+        -not $readmeText.Contains('provider_inference_attempted:false') -and
+        -not $readmeText.Contains('external_write_attempted:false')
+    )
 
     # Behavioral cases are below. Each case starts from a rebuilt six-file release.
     $parameters = New-DefaultParameters
@@ -458,10 +513,11 @@ try {
         [bool]$success.receipt.adapter_boundary_verified -and [bool]$success.receipt.settings_verified -and
         [bool]$success.receipt.environment_scrub_verified -and [bool]$success.receipt.structured_output_verified -and
         [bool]$success.receipt.harmless_git_verified -and [bool]$success.receipt.protected_fingerprints_unchanged -and
-        -not [bool]$success.receipt.provider_inference_attempted -and -not [bool]$success.receipt.external_write_attempted -and
+        [string]$success.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$success.receipt.external_mutation_status -ceq 'NOT_DETECTED' -and
         [string]$success.receipt.environment_restore_status -ceq 'SUCCEEDED' -and
         [string]$success.receipt.cleanup_status -ceq 'SUCCEEDED' -and $null -eq $success.receipt.failure_code -and
-        [string]::IsNullOrEmpty($success.stderr)
+        [string]::IsNullOrEmpty($success.stderr) -and (Test-ReceiptTelemetryContract -Run $success)
     Test-Case -Name 'provider-free SYSTEM smoke emits one passing receipt' -Condition $successFlags -Detail ($success.stdout + ' STDERR=' + $success.stderr)
     Test-Case -Name 'requested and effective tool sets are exact' -Condition (
         (@($success.receipt.requested_tools) -join '|') -ceq 'Read|Edit|PowerShell' -and
@@ -482,6 +538,10 @@ try {
     $parameters.ReleaseId = 'abcdef0'
     $run = Invoke-SmokeCase -Name 'short-release' -Parameters $parameters -Fixture (New-DefaultFixture)
     Assert-FailureCase -Name 'short release id is rejected before mutation' -Run $run -Code 'RELEASE_ID_INVALID' -CleanupStatus 'NOT_CREATED'
+    Test-Case -Name 'early failure reports both telemetry facts as not checked' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'NOT_CHECKED' -and
+        [string]$run.receipt.external_mutation_status -ceq 'NOT_CHECKED'
+    ) -Detail $run.stdout
 
     Reset-TestRelease
     $parameters = New-DefaultParameters
@@ -675,6 +735,10 @@ try {
     $fixture.TaskChange = $true
     $run = Invoke-SmokeCase -Name 'task-change' -Parameters (New-DefaultParameters) -Fixture $fixture
     Assert-FailureCase -Name 'task definition change during smoke is detected' -Run $run -Code 'TASK_CHANGED_DURING_SMOKE'
+    Test-Case -Name 'task mismatch records verified provider boundary and detected external mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'DETECTED'
+    ) -Detail $run.stdout
 
     Reset-TestRelease
     $parameters = New-DefaultParameters
@@ -700,6 +764,10 @@ try {
     $fixture.MutatePath = $script:StatePath
     $run = Invoke-SmokeCase -Name 'protected-mutation' -Parameters (New-DefaultParameters) -Fixture $fixture
     Assert-FailureCase -Name 'protected-file mutation is detected by before-after fingerprint' -Run $run -Code 'PROTECTED_FINGERPRINT_CHANGED'
+    Test-Case -Name 'protected-file mismatch records detected external mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'DETECTED'
+    ) -Detail $run.stdout
     Write-Utf8NoBom -Path $script:StatePath -Text '{"cursor":1}'
 
     Reset-TestRelease
@@ -707,12 +775,69 @@ try {
     $fixture.TransientDirectory = Join-Path $script:ProfilePath '.claude'
     $run = Invoke-SmokeCase -Name 'protected-transient-mutation' -Parameters (New-DefaultParameters) -Fixture $fixture
     Assert-FailureCase -Name 'transient protected-tree write-delete is detected' -Run $run -Code 'PROTECTED_FINGERPRINT_CHANGED'
+    Test-Case -Name 'transient protected-tree mutation records detected external mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'DETECTED'
+    ) -Detail $run.stdout
 
     Reset-TestRelease
     $fixture = New-DefaultFixture
     $fixture.MutatePath = Join-Path $script:ReleasePath 'scripts\bus.ps1'
     $run = Invoke-SmokeCase -Name 'release-mutation' -Parameters (New-DefaultParameters) -Fixture $fixture
     Assert-FailureCase -Name 'unused release-file mutation during smoke cannot false-green' -Run $run -Code 'RELEASE_FILE_HASH_MISMATCH'
+    Test-Case -Name 'second-pass release hash failure records detected external mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'DETECTED'
+    ) -Detail $run.stdout
+
+    Reset-TestRelease
+    $fixture = New-DefaultFixture
+    $fixture.MutatePath = Join-Path $script:ReleasePath 'rogue.txt'
+    $run = Invoke-SmokeCase -Name 'release-inventory-mutation' -Parameters (New-DefaultParameters) -Fixture $fixture
+    Assert-FailureCase -Name 'second-pass release inventory mutation cannot false-green' -Run $run -Code 'RELEASE_INVENTORY_INVALID'
+    Test-Case -Name 'second-pass release inventory failure records detected external mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'DETECTED'
+    ) -Detail $run.stdout
+
+    Reset-TestRelease
+    $fixture = New-DefaultFixture
+    $fixture.SecondPassReleaseFailure = 'MANIFEST_READ'
+    $run = Invoke-SmokeCase -Name 'release-read-failure' -Parameters (New-DefaultParameters) -Fixture $fixture
+    Assert-FailureCase -Name 'second-pass release read failure cannot false-green' -Run $run -Code 'RELEASE_MANIFEST_READ_FAILED'
+    Test-Case -Name 'second-pass release read failure is not mislabeled as detected mutation' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'VERIFICATION_FAILED'
+    ) -Detail $run.stdout
+
+    Reset-TestRelease
+    $fixture = New-DefaultFixture
+    $fixture.SecondPassReleaseFailure = 'UNEXPECTED'
+    $run = Invoke-SmokeCase -Name 'release-verifier-unexpected' -Parameters (New-DefaultParameters) -Fixture $fixture
+    Assert-FailureCase -Name 'unexpected second-pass verifier failure cannot false-green' -Run $run -Code 'UNEXPECTED_SMOKE_FAILURE'
+    Test-Case -Name 'unexpected second-pass verifier failure remains factually indeterminate' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'VERIFIED_NO_SELECTOR_LEAK' -and
+        [string]$run.receipt.external_mutation_status -ceq 'VERIFICATION_FAILED'
+    ) -Detail $run.stdout
+
+    Reset-TestRelease
+    $adapterPath = Join-Path $script:ReleasePath 'scripts\invoke_order_claude.ps1'
+    $adapterText = [IO.File]::ReadAllText($adapterPath, [Text.Encoding]::UTF8)
+    $selectorAnchor = "[Environment]::SetEnvironmentVariable(`$subprocessScrubName, '1', 'Process')"
+    $changed = $adapterText.Replace(
+        $selectorAnchor,
+        $selectorAnchor + [Environment]::NewLine +
+            "    [Environment]::SetEnvironmentVariable('CLAUDE_CODE_USE_FOUNDRY', '1', 'Process')"
+    )
+    if ($changed -ceq $adapterText) { throw 'provider_selector_leak_anchor_missing' }
+    Write-Utf8NoBom -Path $adapterPath -Text $changed
+    Update-TestReleaseTrust
+    $run = Invoke-SmokeCase -Name 'provider-selector-leak' -Parameters (New-DefaultParameters) -Fixture (New-DefaultFixture)
+    Assert-FailureCase -Name 'provider selector leak into fake child is rejected' -Run $run -Code 'FAKE_PROVIDER_SELECTOR_LEAK'
+    Test-Case -Name 'provider selector leak is recorded before failure without claiming an external check' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'SELECTOR_LEAK_DETECTED' -and
+        [string]$run.receipt.external_mutation_status -ceq 'NOT_CHECKED'
+    ) -Detail $run.stdout
 
     Reset-TestRelease
     $adapterPath = Join-Path $script:ReleasePath 'scripts\invoke_order_claude.ps1'
@@ -746,6 +871,10 @@ try {
     Update-TestReleaseTrust
     $run = Invoke-SmokeCase -Name 'adapter-scrub' -Parameters (New-DefaultParameters) -Fixture (New-DefaultFixture)
     Assert-FailureCase -Name 'subprocess-scrub regression cannot false-green' -Run $run -Code 'FAKE_ENVIRONMENT_BOUNDARY_INVALID'
+    Test-Case -Name 'provider boundary is not called verified when another fake-env proof fails' -Condition (
+        [string]$run.receipt.provider_boundary_status -ceq 'NOT_CHECKED' -and
+        [string]$run.receipt.external_mutation_status -ceq 'NOT_CHECKED'
+    ) -Detail $run.stdout
 
     Reset-TestRelease
     $adapterPath = Join-Path $script:ReleasePath 'scripts\invoke_order_claude.ps1'

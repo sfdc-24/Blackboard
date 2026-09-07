@@ -69,8 +69,9 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    escrow and do not accept a replacement map.
 6. Package the six guest files listed by
    `install_release_from_archive.ps1`. Use
-   `build_order_release_wrapper.ps1` with the full 40-hex release ID and the
-   independently computed archive and installer SHA-256 digests. The builder
+   `build_order_release_wrapper.ps1` with the 40-character lowercase
+   hexadecimal release ID and the independently computed archive and installer
+   SHA-256 digests. The builder
    rejects non-canonical archive inventory and emits a deterministic BOM-free
    Managed Run Command `source.script`. Deliver that wrapper, but do not change
    the Windows task yet.
@@ -123,7 +124,8 @@ bind every runbook parameter explicitly using the exact parameter-name case in
 `order_system_adapter_smoke.ps1` is the reusable step-12 artifact. Stage its
 reviewed bytes outside every immutable release and verify its transport hash
 before execution. Invoke it only through Windows PowerShell 5.1 as SYSTEM and
-pass the full 40-character release ID, the caller-bound archive SHA-256, and
+pass the full 40-character lowercase hexadecimal release ID, the caller-bound
+archive SHA-256, and
 `ExpectedFileHashesBase64`: Base64 of a BOM-free UTF-8 JSON object containing
 exactly the same six canonical `scripts\...` keys and independently computed
 lowercase SHA-256 values used by the escrow gate. Also pass the release root,
@@ -142,9 +144,15 @@ invoked only with `--version`, and Git is limited to a prompt-free, lock-free
 `rev-parse --is-inside-work-tree` with hooks and inherited Git configuration
 disabled. Accept only one terminal
 `blackboard.order-system-adapter-smoke.v1` JSON receipt with `pass:true`, every
-proof flag true, `provider_inference_attempted:false`,
-`external_write_attempted:false`, environment restoration `SUCCEEDED`, and
-temporary cleanup `SUCCEEDED`. The smoke caps that sole receipt at 3,072 UTF-8
+proof flag true, `provider_boundary_status:VERIFIED_NO_SELECTOR_LEAK`,
+`external_mutation_status:NOT_DETECTED`, environment restoration `SUCCEEDED`,
+and temporary cleanup `SUCCEEDED`. Before the applicable proof finishes, each
+status remains `NOT_CHECKED`; a detected selector leak or protected/task/release
+mutation is reported explicitly and fails the smoke. If a second-pass release
+read, enumeration, or digest operation cannot complete, the external status is
+`VERIFICATION_FAILED` and the smoke fails without claiming that mutation was
+observed. The smoke caps that sole
+receipt at 3,072 UTF-8
 bytes so it remains below Managed Run Command's retained-output boundary; an
 unparseable or truncated receipt is a failed smoke regardless of execution
 state or exit code.

@@ -661,21 +661,26 @@ function Invoke-SmokeBoundedProcess {
             -PassThru `
             -ErrorAction Stop
     } catch { Throw-Smoke -Code ($FailurePrefix + '_START_FAILED') }
-    if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
-        $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-        try { & $taskkill /PID $process.Id /T /F 1>$null 2>$null } catch {}
-        try { $null = $process.WaitForExit(15000) } catch {}
-        Throw-Smoke -Code ($FailurePrefix + '_TIMEOUT')
+    try {
+        if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
+            $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+            try { & $taskkill /PID $process.Id /T /F 1>$null 2>$null } catch {}
+            try { $null = $process.WaitForExit(15000) } catch {}
+            Throw-Smoke -Code ($FailurePrefix + '_TIMEOUT')
+        }
+        $process.WaitForExit()
+        $process.Refresh()
+        $processExitCode = [int]$process.ExitCode
+    } finally {
+        $process.Dispose()
     }
-    $process.WaitForExit()
-    $process.Refresh()
     foreach ($path in @($stdoutPath, $stderrPath)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path -Force).Length -gt 1048576) {
             Throw-Smoke -Code ($FailurePrefix + '_OUTPUT_INVALID')
         }
     }
     return [pscustomobject][ordered]@{
-        exit_code = [int]$process.ExitCode
+        exit_code = $processExitCode
         stdout_path = $stdoutPath
         stderr_path = $stderrPath
     }
@@ -718,8 +723,8 @@ $receipt = [ordered]@{
     structured_output_verified = $false
     harmless_git_verified = $false
     protected_fingerprints_unchanged = $false
-    provider_inference_attempted = $false
-    external_write_attempted = $false
+    provider_boundary_status = 'NOT_CHECKED'
+    external_mutation_status = 'NOT_CHECKED'
     environment_restore_status = 'NOT_REQUIRED'
     cleanup_status = 'NOT_CREATED'
     failure_code = $null
@@ -1120,9 +1125,17 @@ public static class BlackboardOrderSystemSmokeFakeClaude {
     $fakeCwd = Read-SmokeBoundedUtf8Text -Path $captureCwd -MaximumBytes 2048 -Code 'FAKE_CWD_INVALID'
     if ([IO.Path]::GetFullPath($fakeCwd) -cne $resolvedWorkspace) { Throw-Smoke -Code 'FAKE_CWD_INVALID' }
     $fakeEnvironment = @([IO.File]::ReadAllLines($captureEnvironment, (New-Object Text.UTF8Encoding($false, $true))))
-    if ($fakeEnvironment.Count -ne 12 -or @($fakeEnvironment | Where-Object { $_ -cne 'True' }).Count -ne 0) {
+    if ($fakeEnvironment.Count -ne 12) {
         Throw-Smoke -Code 'FAKE_ENVIRONMENT_BOUNDARY_INVALID'
     }
+    if ($fakeEnvironment[5] -ceq 'False') {
+        $receipt.provider_boundary_status = 'SELECTOR_LEAK_DETECTED'
+        Throw-Smoke -Code 'FAKE_PROVIDER_SELECTOR_LEAK'
+    }
+    if (@($fakeEnvironment | Where-Object { $_ -cne 'True' }).Count -ne 0) {
+        Throw-Smoke -Code 'FAKE_ENVIRONMENT_BOUNDARY_INVALID'
+    }
+    $receipt.provider_boundary_status = 'VERIFIED_NO_SELECTOR_LEAK'
     foreach ($name in $isolationNames) {
         if ($null -ne [Environment]::GetEnvironmentVariable($name, 'Process')) {
             Throw-Smoke -Code 'PARENT_ENVIRONMENT_CHANGED_BY_ADAPTER'
@@ -1158,7 +1171,10 @@ public static class BlackboardOrderSystemSmokeFakeClaude {
         -LogFile $resolvedLog `
         -ClaudeFile $resolvedClaude `
         -GitFile $resolvedGit
-    if ($protectedAfter -cne $protectedBefore) { Throw-Smoke -Code 'PROTECTED_FINGERPRINT_CHANGED' }
+    if ($protectedAfter -cne $protectedBefore) {
+        $receipt.external_mutation_status = 'DETECTED'
+        Throw-Smoke -Code 'PROTECTED_FINGERPRINT_CHANGED'
+    }
     $receipt.protected_fingerprints_unchanged = $true
     $taskAfter = Get-SmokeTaskEvidence `
         -Name $TaskName `
@@ -1170,21 +1186,62 @@ public static class BlackboardOrderSystemSmokeFakeClaude {
         -ExpectedLog $resolvedLog `
         -ExpectedClaude $resolvedClaude `
         -MinimumQuietSeconds $QuietWindowSeconds
-    if ([string]$taskAfter.fingerprint -cne [string]$taskBefore.fingerprint) { Throw-Smoke -Code 'TASK_CHANGED_DURING_SMOKE' }
+    if ([string]$taskAfter.fingerprint -cne [string]$taskBefore.fingerprint) {
+        $receipt.external_mutation_status = 'DETECTED'
+        Throw-Smoke -Code 'TASK_CHANGED_DURING_SMOKE'
+    }
     $receipt.task_unchanged = $true
-    $releaseAfter = Get-SmokeVerifiedRelease `
-        -Root $resolvedReleaseRoot `
-        -Id $ReleaseId `
-        -ExpectedArchive $ArchiveSha256 `
-        -ExpectedHashes $expectedHashes
+    try {
+        $releaseAfter = Get-SmokeVerifiedRelease `
+            -Root $resolvedReleaseRoot `
+            -Id $ReleaseId `
+            -ExpectedArchive $ArchiveSha256 `
+            -ExpectedHashes $expectedHashes
+    } catch {
+        $releaseVerificationMessage = [string]$_.Exception.Message
+        $positiveReleaseDriftCodes = @(
+            'RELEASE_ROOT_MISSING',
+            'RELEASE_ROOT_UNSAFE',
+            'RELEASE_PATH_OUTSIDE_ROOT',
+            'RELEASE_MISSING',
+            'RELEASE_UNSAFE',
+            'RELEASE_SCRIPTS_MISSING',
+            'RELEASE_INVENTORY_INVALID',
+            'RELEASE_MANIFEST_MISSING',
+            'RELEASE_MANIFEST_SIZE_INVALID',
+            'RELEASE_MANIFEST_ENCODING_INVALID',
+            'RELEASE_MANIFEST_JSON_INVALID',
+            'RELEASE_MANIFEST_DUPLICATE_KEY',
+            'RELEASE_MANIFEST_SHAPE_INVALID',
+            'RELEASE_MANIFEST_TYPE_INVALID',
+            'RELEASE_MANIFEST_VALUE_INVALID',
+            'RELEASE_MANIFEST_TIMESTAMP_INVALID',
+            'RELEASE_MANIFEST_HASHES_SHAPE_INVALID',
+            'RELEASE_FILE_OUTSIDE_ROOT',
+            'RELEASE_FILE_MISSING',
+            'RELEASE_MANIFEST_HASH_MISMATCH',
+            'RELEASE_FILE_HASH_MISMATCH'
+        )
+        $releaseVerificationCode = if ($releaseVerificationMessage -cmatch '^SMOKE:(?<code>[A-Z0-9_]{1,80})$') {
+            [string]$matches['code']
+        } else { '' }
+        $receipt.external_mutation_status = if ($positiveReleaseDriftCodes -ccontains $releaseVerificationCode) {
+            'DETECTED'
+        } else {
+            'VERIFICATION_FAILED'
+        }
+        throw
+    }
     if ([string]$releaseAfter.path -cne [string]$release.path -or
         [string]$releaseAfter.adapter_path -cne [string]$release.adapter_path -or
         [string]$releaseAfter.schema_path -cne [string]$release.schema_path -or
         [string]$releaseAfter.expected_hashes_sha256 -cne [string]$release.expected_hashes_sha256 -or
         [string]$releaseAfter.manifest_sha256 -cne [string]$release.manifest_sha256) {
+        $receipt.external_mutation_status = 'DETECTED'
         Throw-Smoke -Code 'RELEASE_CHANGED_DURING_SMOKE'
     }
     $receipt.release_unchanged = $true
+    $receipt.external_mutation_status = 'NOT_DETECTED'
 } catch {
     $message = [string]$_.Exception.Message
     if ($message -cmatch '^SMOKE:(?<code>[A-Z0-9_]{1,80})$') { $primaryCode = [string]$matches['code'] }
@@ -1211,7 +1268,13 @@ $receipt.observed_at_utc = [DateTime]::UtcNow.ToString(
 $receiptJson = $receipt | ConvertTo-Json -Depth 8 -Compress
 $receiptByteCount = [Text.Encoding]::UTF8.GetByteCount($receiptJson)
 if ($receiptByteCount -gt 3072) {
-    $receiptJson = '{"schema":"blackboard.order-system-adapter-smoke.v1","pass":false,"failure_code":"RECEIPT_TOO_LARGE"}'
+    $receiptJson = ([ordered]@{
+        schema = 'blackboard.order-system-adapter-smoke.v1'
+        pass = $false
+        provider_boundary_status = [string]$receipt.provider_boundary_status
+        external_mutation_status = [string]$receipt.external_mutation_status
+        failure_code = 'RECEIPT_TOO_LARGE'
+    } | ConvertTo-Json -Compress)
     $primaryCode = 'RECEIPT_TOO_LARGE'
 }
 Write-Output $receiptJson
