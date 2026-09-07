@@ -124,7 +124,26 @@ async function reply(history, latest) {
 // ---- server ----------------------------------------------------------------
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript' };
 
-http.createServer((req, res) => {
+// Voice turns arrive as separate JSONP GETs, so the conversation cannot ride in
+// the request the way the typed path posts it -- the URL would grow without
+// bound. Held server-side per vid, exactly as CacheService holds `vh_<vid>` in
+// the real Governor Page API, so the client change proved here is the one that
+// would ship.
+const voiceHistory = Object.create(null);
+
+const server = http.createServer((req, res) => {
+  // One malformed request must not take the prototype down. It did: a missing
+  // declaration threw inside the handler, node had no listener for it, and the
+  // process exited while the page sat there looking merely slow. A demo that
+  // dies silently is worse than one that errors loudly.
+  try { handle(req, res); } catch (err) {
+    console.error('request failed:', err && err.message);
+    try { res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{"ok":false,"reply":"Something broke on my side."}'); } catch (e) {}
+  }
+});
+
+function handle(req, res) {
   if (req.method === 'POST' && req.url === '/api/turn') {
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 20000) req.destroy(); });
@@ -189,6 +208,14 @@ http.createServer((req, res) => {
   if (!full.startsWith(HERE) || !fs.existsSync(full)) { res.writeHead(404); res.end('not found'); return; }
   res.writeHead(200, { 'content-type': TYPES[path.extname(full)] || 'application/octet-stream' });
   res.end(fs.readFileSync(full));
-}).listen(PORT, '127.0.0.1', () => {
+}
+
+// An async rejection inside a handler is the other way this process dies
+// quietly. Log it and stay up; the page already degrades gracefully.
+process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e && e.message));
+
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`beat1 prototype on http://127.0.0.1:${PORT}  (model ${MODEL})`);
+  console.log(`  typed : http://127.0.0.1:${PORT}/`);
+  console.log(`  voice : http://127.0.0.1:${PORT}/voice.html`);
 });
