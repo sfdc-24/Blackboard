@@ -254,25 +254,34 @@ No email was sent on the first pass, which is correct: state moved from
 `ZSetupMonitor.gs` was deleted after registration; the trigger points at
 `Monitor.gs` and is unaffected. v17 is the clean deployed version.
 
-## Google sign-in — NOT DONE, and here is the real blocker
+## Google sign-in — DONE. This section used to say the opposite.
 
-Mr. Salam asked for Google login for other users. It is not a quick change:
+**Corrected 2026-09-07 by claude-code-cli, measured not assumed.** What stood
+here listed three reasons visitor sign-in could not work — no GCP project,
+`executeAs` trade-offs, and GIS One Tap being blocked in cross-origin iframes.
+It is solved, and leaving the old text in place had people planning around a
+problem that no longer exists.
 
-1. The script has **no GCP project attached** (`clasp list-apis` -> "GCP project
-   ID is not set"). Google Identity Services needs an OAuth client ID, which
-   needs a standard Cloud project plus a configured consent screen.
-2. Apps Script's own identity is not a shortcut. `executeAs: USER_DEPLOYING`
-   does not return an external visitor's email; `executeAs: USER_ACCESSING`
-   does, but then the script runs as the visitor and **loses write access to the
-   Alpha DB spreadsheet**.
-3. GIS One Tap is blocked in cross-origin iframes, and the reception is embedded
-   in one from Google Sites. A popup (`ux_mode:'popup'`) flow would be needed.
+`gas/Auth.js` implements the whole flow: `authStartUrl_`, `authCompleteCallback_`,
+`jwtClaims_`, `mintSession_` and `readSession_`, with HMAC-signed tokens compared
+by `safeEqual_` and `AUTH_SESSION_DAYS = 14`. `GOOGLE_CLIENT_ID` and
+`GOOGLE_CLIENT_SECRET` are both present in the live Script Properties, read
+directly from the editor. `?auth=start&back=voice` serves 200.
 
-**Recommended path:** attach a standard GCP project, create a Web OAuth client
-with `https://www.sfdc24.com` and the googleusercontent origin authorised, then
-add a popup-mode "Sign in with Google" button that posts its ID token to a new
-guarded route for server-side verification. Identity must NOT confer authority —
-a signed-in visitor is still `instruction_authority=NONE`.
+**A visitor can sign in with their own Google account today.**
+
+**What did NOT change, and must not:** identity is not authority. A signed-in
+visitor is still `instruction_authority=NONE`, their text is still quarantined
+to `PUBLIC_INBOX`, and sign-in changes provenance only — it records *who* asked,
+never *what they may command*. Multi-tenancy is not a reason to relax that.
+
+**The real limit on other people testing is budget, not identity.**
+`CHAT_DAILY_DEFAULT` is 150 replies per UTC day for the whole site and
+`CHAT_SESSION_CAP` is 12 per session. Ten testers is fifteen turns each. Those
+numbers are the only spending limit that exists, because a provider spend cap
+was declined deliberately. Beat 1 roughly doubles cost per turn — one call for
+the reply, one for the sketch — so size the caps against two calls, not one.
+See board row `MULTITENANT-READINESS-001`.
 
 ---
 

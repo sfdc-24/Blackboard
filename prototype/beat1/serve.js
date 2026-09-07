@@ -153,6 +153,37 @@ http.createServer((req, res) => {
     return;
   }
 
+  // JSONP, because the real voice page reaches Apps Script that way and this
+  // prototype must exercise the page as it actually is. Same contract as
+  // action=say, plus `sketch` -- so the client change proved here is the same
+  // one that would ship.
+  if (req.method === 'GET' && req.url.indexOf('/api/say') === 0) {
+    const q = new URL(req.url, 'http://127.0.0.1').searchParams;
+    const cb = String(q.get('cb') || '');
+    const text = String(q.get('q') || '').slice(0, 1000);
+    // Callback names are validated, never sanitised -- the same rule voiceReply_
+    // follows, because this value is echoed into executable JavaScript.
+    const safeCb = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cb) ? cb : '';
+    const vid = String(q.get('vid') || 'v');
+    voiceHistory[vid] = voiceHistory[vid] || [];
+    const hist = voiceHistory[vid];
+
+    Promise.all([reply(hist, text).catch(() => null), makeSketch(hist, text).catch(() => null)])
+      .then(([text_, sketch]) => {
+        if (text_) { hist.push({ role: 'user', text }); hist.push({ role: 'assistant', text: text_ }); }
+        while (hist.length > 16) hist.shift();
+        const out = JSON.stringify({
+          ok: !!text_,
+          reply: text_ || "I couldn't reach the assistant just then. Your message wasn't lost — try again in a moment.",
+          degraded: text_ ? undefined : 'upstream',
+          sketch: sketch || null
+        });
+        res.writeHead(200, { 'content-type': safeCb ? 'text/javascript' : 'application/json' });
+        res.end(safeCb ? safeCb + '(' + out + ');' : out);
+      });
+    return;
+  }
+
   const file = req.url === '/' || req.url === '' ? '/index.html' : req.url.split('?')[0];
   const full = path.join(HERE, path.normalize(file).replace(/^([/\\])+/, ''));
   if (!full.startsWith(HERE) || !fs.existsSync(full)) { res.writeHead(404); res.end('not found'); return; }
