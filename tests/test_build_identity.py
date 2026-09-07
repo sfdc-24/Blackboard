@@ -49,6 +49,14 @@ class FakeReader:
             return self.health_reply
         return {'ok': True, **expected['identity'], 'nonce': nonce}
 
+    def preflight_health(self, expected, nonce):
+        self.calls.append(('preflight_health', nonce))
+        if self.health_reply is not None:
+            return self.health_reply
+        if expected['identity']['project'] == 'governor-page-api':
+            return {'ok': False, 'error': 'not authorized'}
+        return {'ok': True, **expected['identity'], 'nonce': nonce}
+
 
 class BuildProof(unittest.TestCase):
     @classmethod
@@ -183,6 +191,44 @@ class BuildProof(unittest.TestCase):
                 identity.attest(self.expected, '12', self.reader, retries=1, delay=0)
             self.assertEqual(self.reader.calls, [('deployment', None)])
 
+    def test_preflight_accepts_exact_unstamped_or_stamped_app_health(self):
+        self.assertEqual(identity.preflight(self.expected, '12', self.reader), '12')
+        self.assertEqual([call[0] for call in self.reader.calls], ['deployment', 'preflight_health'])
+
+        glasses = copy.deepcopy(self.expected)
+        glasses['identity']['project'] = 'glasses-intake-uploader'
+        reader = FakeReader(glasses)
+        reader.health_reply = {'ok': True, 'service': 'sfdc24-glasses-uploader', 'version': 2,
+                               'actions': ['upload', 'prune'], 'time': '2026-09-07T02:01:57.494Z'}
+        self.assertEqual(identity.preflight(glasses, '12', reader), '12')
+
+        self.reader.calls = []
+        self.reader.health_reply = {'ok': False, 'error': 'not authorized'}
+        self.assertEqual(identity.preflight(self.expected, '12', self.reader), '12')
+        self.assertEqual([call[0] for call in self.reader.calls], ['deployment', 'preflight_health'])
+
+    def test_preflight_rejects_interstitials_and_health_lookalikes(self):
+        wrong_project = {'ok': True, **self.expected['identity'], 'project': 'other', 'nonce': 'stale'}
+        for actual in (
+                '<html>Google sign in</html>',
+                {'ok': False, 'error': 'build identity unavailable'},
+                {'ok': False, 'error': 'build identity unavailable', 'nonce': 'extra'},
+                {'ok': True, 'service': 'sfdc24-glasses-uploader', 'version': 2,
+                 'actions': ['upload', 'prune'], 'time': 'not-a-time'},
+                {'ok': True, **self.expected['identity'], 'nonce': 'stale'},
+                wrong_project):
+            self.reader.calls = []
+            self.reader.health_reply = actual
+            with self.subTest(actual=actual), self.assertRaises(ValueError):
+                identity.preflight(self.expected, '12', self.reader)
+            self.assertEqual([call[0] for call in self.reader.calls], ['deployment', 'preflight_health'])
+
+    def test_preflight_checks_exact_deployment_before_http(self):
+        self.reader.deployment_data['entryPoints'][0]['webApp']['entryPointConfig']['access'] = 'MYSELF'
+        with self.assertRaises(ValueError):
+            identity.preflight(self.expected, '12', self.reader)
+        self.assertEqual(self.reader.calls, [('deployment', None)])
+
     def test_only_matching_live_build_with_fresh_nonce_gets_receipt(self):
         receipt = identity.attest(self.expected, '12', self.reader, retries=1, delay=0)
         self.assertEqual(receipt['commit'], self.commit)
@@ -235,6 +281,11 @@ class BuildProof(unittest.TestCase):
             reader.health(self.expected, 'a' * 32)
         request = read.call_args.args[0]
         self.assertIsNone(request.get_header('Authorization'))
+        with mock.patch.object(identity, 'read_json', return_value={}) as read:
+            reader.preflight_health(self.expected, 'a' * 32)
+        preflight_request = read.call_args.args[0]
+        self.assertTrue(preflight_request.full_url.endswith('?format=json'))
+        self.assertIsNone(preflight_request.get_header('Authorization'))
         redirect = identity.HealthRedirect()
         for url in ('https://accounts.google.com/signin', 'http://script.googleusercontent.com/x',
                     'https://script.googleusercontent.com.evil.invalid/x', 'https://user@script.googleusercontent.com/x'):

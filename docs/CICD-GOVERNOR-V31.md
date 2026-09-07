@@ -44,13 +44,16 @@ delta: failed ANDON delivery and subsequent deduplication, www and apex outage
 debounce/retry, three board-silence/clock transitions, daily-cap rollover, and
 manifest scope preservation. The mail mock throws the permission error reported
 by the real monitor. No email, board, provider or cloud API is called by tests.
-CI includes the manifest and test file in its path filter. The combined CI/CD
-suite now has 90 tests; PR #4 adds nine voice/readiness tests.
+CI includes the manifest and test file in its path filter. At the v31
+reconciliation point the combined CI/CD suite had 90 tests and PR #4 added nine
+voice/readiness tests; later staging safety coverage is counted in
+[SITE-P0-INTEGRATION.md](SITE-P0-INTEGRATION.md).
 
 The board's report of a successful September 6 17:26:25 UTC ANDON email was also
 confirmed by a bounded Gmail read of that exact subject and date. That proves
 one alert arrived; it does not establish ongoing trigger liveness. Production
-consent and v31 do not clear the separate staging v1/403 condition recorded in
-CICD-STAGING-READBACK-2026-09-06.md. The latter report's comparison commit is
-historical; a selected new staging build must regenerate source/scope evidence.
-Actual staging deploy/rollback and application acceptance remain open.
+consent and v31 did not clear the separate staging v1/403 condition recorded in
+CICD-STAGING-READBACK-2026-09-06.md at that time. Owner consent was subsequently
+completed on September 7 and is recorded in CICD-STAGING-AUTH.md, but a selected
+new staging build must still regenerate source/build evidence. Actual staging
+deploy/rollback and application acceptance remain open.

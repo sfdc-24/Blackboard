@@ -181,6 +181,18 @@ class Reader:
         return read_json(urllib.request.Request(url, headers={'Cache-Control': 'no-cache'}),
                          limit=16 * 1024, health=True)
 
+    def preflight_health(self, expected, nonce):
+        # Governor's first staging version predates health=build. Its existing
+        # anonymous machine-read denial is exact JSON and runs no board/provider
+        # action, so it is the safe bootstrap identity. Glasses already exposes
+        # a public health payload and later stamped versions answer health=build.
+        project = expected['identity']['project']
+        query = ('?format=json' if project == 'governor-page-api'
+                 else '?health=build&nonce=' + nonce)
+        return read_json(urllib.request.Request(expected['execUrl'] + query,
+                                                headers={'Cache-Control': 'no-cache'}),
+                         limit=16 * 1024, health=True)
+
 
 def verify_source(expected, version, reader):
     version = positive_version(version)
@@ -209,6 +221,47 @@ def verify_deployment(expected, version, data):
         raise ValueError('wrong web-app URL')
     if web[0].get('entryPointConfig') != {'access': 'ANYONE_ANONYMOUS', 'executeAs': 'USER_DEPLOYING'}:
         raise ValueError('unexpected staging web-app access configuration')
+
+
+def preflight(expected, version, reader):
+    """Prove the currently deployed app answers before any staging mutation.
+
+    The first reviewed build is necessarily unstamped, so it cannot return the
+    final build receipt yet. An exact, side-effect-free bootstrap response still
+    proves that the reviewed Apps Script app ran; a Google sign-in/interstitial
+    page or an HTTP 403 cannot satisfy the JSON contract. Later stamped builds
+    must echo a fresh nonce and a well-formed identity for the same project.
+    """
+    version = positive_version(version)
+    verify_deployment(expected, version, reader.deployment(expected))
+    nonce = secrets.token_hex(16)
+    actual = reader.preflight_health(expected, nonce)
+    project = expected['identity']['project']
+    if (project == 'governor-page-api'
+            and actual == {'ok': False, 'error': 'not authorized'}):
+        return version
+    if (project == 'glasses-intake-uploader' and isinstance(actual, dict)
+            and set(actual) == {'actions', 'ok', 'service', 'time', 'version'}
+            and actual.get('ok') is True
+            and actual.get('service') == 'sfdc24-glasses-uploader'
+            and actual.get('version') == 2
+            and actual.get('actions') == ['upload', 'prune']
+            and isinstance(actual.get('time'), str)
+            and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z', actual['time'])):
+        return version
+    if not isinstance(actual, dict) or set(actual) != {
+            'ok', 'schema', 'service', 'project', 'commit', 'sourceSha256', 'nonce'}:
+        raise ValueError('current staging app did not return its reviewed health contract')
+    if (actual.get('ok') is not True or actual.get('schema') != 1
+            or actual.get('service') != 'sfdc24-build'
+            or actual.get('project') != project
+            or not isinstance(actual.get('commit'), str)
+            or not re.fullmatch(r'[0-9a-f]{40}', actual['commit'])
+            or not isinstance(actual.get('sourceSha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', actual['sourceSha256'])
+            or actual.get('nonce') != nonce):
+        raise ValueError('current staging app did not return its reviewed health contract')
+    return version
 
 
 def attest(expected, version, reader, retries=6, delay=10):
@@ -241,7 +294,7 @@ def attest(expected, version, reader, retries=6, delay=10):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('prepare', 'verify-source', 'attest'))
+    parser.add_argument('command', choices=('prepare', 'preflight', 'verify-source', 'attest'))
     parser.add_argument('--project', required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--version')
@@ -256,7 +309,10 @@ def main():
         else:
             version = positive_version(args.version)
             reader = Reader()
-            if args.command == 'verify-source':
+            if args.command == 'preflight':
+                preflight(expected, version, reader)
+                print('Current staging app returned its reviewed health contract; mutation may proceed.')
+            elif args.command == 'verify-source':
                 verify_source(expected, version, reader)
                 print('Pinned source matches the committed build, including its generated marker.')
             else:

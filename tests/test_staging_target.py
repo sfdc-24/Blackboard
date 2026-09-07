@@ -148,6 +148,18 @@ class WorkflowSupplyChain(unittest.TestCase):
                 )
                 self.assertIn('persist-credentials: false', workflow)
 
+    def test_only_projects_with_reviewed_http_health_are_selectable(self):
+        for filename in ('staging-deploy.yml', 'staging-rollback.yml'):
+            workflow = (ROOT / '.github/workflows' / filename).read_text()
+            with self.subTest(filename=filename):
+                self.assertIn('governor-page-api', workflow)
+                self.assertIn('glasses-intake-uploader', workflow)
+                self.assertNotIn('blackboard-production', workflow)
+
+        deploy = (ROOT / '.github/workflows/staging-deploy.yml').read_text()
+        self.assertLess(deploy.index('Verify current staging app is reachable before mutation'),
+                        deploy.index('Push prepared source to STAGING project'))
+
 
 class WorkflowGates(unittest.TestCase):
     def setUp(self):
@@ -231,6 +243,14 @@ export GITHUB_OUTPUT="$PWD/outputs.txt"
         result = self.execute(body + '\nclasp push -f\n')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / 'mutations.txt').exists())
+
+    def test_unreachable_runtime_stops_before_source_push(self):
+        checker = self.root / 'scripts/gas_build_identity.py'
+        checker.write_text('import sys\nsys.exit(7)\n', encoding='utf-8')
+        body = workflow_blocks('staging-deploy.yml')['Verify current staging app is reachable before mutation']
+        result = self.execute(body + '\nclasp push -f\n', CURRENT_VERSION='1')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / 'mutations.txt').exists())
 
     def test_create_version_invalid_json_stops_before_redeploy(self):
         body = workflow_blocks('staging-deploy.yml')['Create immutable version']

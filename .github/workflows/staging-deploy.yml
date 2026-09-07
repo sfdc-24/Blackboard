@@ -27,7 +27,7 @@ on:
         required: true
         default: 'governor-page-api'
         type: choice
-        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+        options: [governor-page-api, glasses-intake-uploader]
 
 permissions:
   contents: read
@@ -46,7 +46,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
+        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","glasses-intake-uploader"]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -103,12 +103,24 @@ jobs:
 
       - name: Verify deployment belongs to the staging project before mutation
         if: steps.changed.outputs.skip != 'true'
+        id: current
         env:
           SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
           DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
         run: |
-          clasp --json list-deployments "$SCRIPT_ID" |
-            python3 scripts/gas_staging_target.py deployment
+          VERSION=$(clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify current staging app is reachable before mutation
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          python3 scripts/gas_build_identity.py preflight \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$CURRENT_VERSION"
 
       - name: Prepare committed source and build marker
         if: steps.changed.outputs.skip != 'true'

@@ -1,6 +1,22 @@
 # STAGING authorization packet — VM-CICD-001
 
-**Historical probe packet; authorization cause and live readiness remain open.**
+## Current disposition — 2026-09-07
+
+- `glasses-intake-uploader` is authorized and its versioned staging `/exec`
+  returns HTTP 200 with the reviewed health signature.
+- `governor-page-api` owner consent is also complete. Its versioned endpoint
+  now returns the exact anonymous, side-effect-free `format=json` denial that
+  identifies the reviewed app; the first stamped deploy/receipt remains open.
+- `blackboard-production` is a drafts sweeper with no `doGet` or `doPost`. It is
+  not a web app, is excluded from deploy/rollback/readiness targets, and must
+  not be authorized by running `sweepDraftsToEndpointV2`; that function performs
+  real board writes and Drive trash operations.
+
+The deployment workflow now checks that the current app returns its reviewed
+health contract before `clasp push`, so an incomplete consent fails without a
+source, version or deployment mutation.
+
+**Historical probe packet; do not treat the measurements below as current.**
 Use [the September 6 read-back](CICD-STAGING-READBACK-2026-09-06.md) for current
 remote version/HEAD hashes, source-derived scopes and browser-session evidence.
 The recorded STAGING versioned endpoints returned 403. A signed-in owner must
@@ -60,8 +76,10 @@ Signed in as `abdus@sfdc24.com`:
 | Project | STAGING scriptId | Editor |
 |---|---|---|
 | governor-page-api | `1S4LQE0SQwnE9kngxMhRngyAmSNGhFtDRxoYQqIxSSH0UoQ5u7T84MKU1` | https://script.google.com/d/1S4LQE0SQwnE9kngxMhRngyAmSNGhFtDRxoYQqIxSSH0UoQ5u7T84MKU1/edit |
-| blackboard-production | `1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K` | https://script.google.com/d/1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K/edit |
 | glasses-intake-uploader | `1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI` | https://script.google.com/d/1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI/edit |
+
+The drafts-sweeper copy remains in the historical inventory below for
+forensics only. It is deliberately absent from this authorization table.
 
 Then rerun the audit. A health-signature match establishes only the reviewed
 application response. Source/build identity and actual deploy/rollback receipts
@@ -90,7 +108,7 @@ one. If you would rather not grant it on a staging copy, say so on the board:
 the alternative is to stub `Monitor.gs`'s mail call in the staging source, which
 is a source change that must itself ride the pipeline.
 
-### blackboard-production
+### blackboard-production — historical scope record; do not authorize for HTTP readiness
 
 | Service | Scope | Notes |
 |---|---|---|
@@ -101,7 +119,8 @@ is a source change that must itself ride the pipeline.
 
 Reminder from [CICD-STAGING-IDS.md](CICD-STAGING-IDS.md): this project's HEAD is
 only the drafts sweeper, **not** the live V2/WhatsApp gateway. Authorizing it
-does not make it the gateway.
+does not make it the gateway or add a `doGet`; running its only function causes
+real external writes and Drive trash operations.
 
 ### glasses-intake-uploader
 

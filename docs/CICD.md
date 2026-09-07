@@ -16,8 +16,8 @@ The source of truth is `apps-script/<project>/` in this repo:
 
 | Dir | Live project (scriptId) | Notes |
 |---|---|---|
-| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. Prod deployment `AKfycbx0D-5DAn…` is pinned at **@29** ("v29 neural voice"); baseline re-synced to @29 on 2026-09-05. |
-| `apps-script/blackboard-production/` | `1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-` | The V2/Alpha gateway. |
+| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. Production reached **@31** on 2026-09-06; reviewed health/issuer changes in the repo still require staging before a later release. |
+| `apps-script/blackboard-production/` | `1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-` | Drafts sweeper only, not the live V2/Alpha gateway. It has no HTTP entry point and is excluded from web-app staging deploy/rollback. |
 | `apps-script/glasses-intake-uploader/` | `1PBfO1sPQmGTXPHWrAAot2wCgSCPizO2uC8RUwUKQ5hn7A7dUq0U4_Q_2` | Already exposes `CONTRACT_VERSION` on GET — the model citizen. |
 | `apps-script/blackboard-bus-v1/` | `1meav8p2zkRt-8obarV_fB5Q2EyExCvAaoZa3ro9_fmo4OE_95FpWkfu9` | The v1 bus. Baselined 2026-09-04. Prod deployment `AKfycbwCLtG9…RcXrjQ` is pinned at **@1**. |
 
@@ -62,15 +62,18 @@ two reviewed stamped builds to exercise the automated rollback gate.
    the bus is container-bound but it *does* appear in `clasp list-scripts` and
    clones cleanly. It is at `apps-script/blackboard-bus-v1/`, byte-identical to
    the source pinned at the live deployment.
-4. **Staging readiness remains unverified.** The historical three versioned
-   `@1` probes returned HTTP 403, including an owner-token probe. The cause
-   remains unconfirmed. `/dev` sign-in pages are editor-only and separate from
-   anonymous `/exec` readiness. Follow [the corrected owner inspection packet](CICD-STAGING-AUTH.md).
-   Do not run arbitrary functions for consent: `sweepDraftsToEndpointV2` posts
-   real drafts and trashes files. A reviewed no-op, current source/scope hashes,
-   and signed-in error evidence are prerequisites to an owner authorization step.
-   The audit now requires complete inventory and a reviewed positive health
-   signature. It does not certify source/build identity.
+4. ~~**Web-app staging owner consent**~~ — **CLEARED 2026-09-07.** The owner
+   authorized both actual HTTP apps. Glasses `@1` returns HTTP 200 with its
+   reviewed public health signature; Governor `@1` returns its exact anonymous,
+   side-effect-free `format=json` denial rather than a Google interstitial. The
+   first stamped deploy/receipt is still pending, so consent clearance is not a
+   release receipt. The drafts sweeper has no `doGet` or `doPost` and is not an
+   HTTP application: do not authorize or run
+   `sweepDraftsToEndpointV2` to make a denominator increase. It is excluded from
+   the web-app deploy, rollback and default audit targets. Follow
+   [the corrected owner inspection packet](CICD-STAGING-AUTH.md). The audit
+   requires complete inventory and a reviewed positive health signature; it
+   does not certify source/build identity.
 5. **Manual deployment and PR checks have separate triggers.** Manual dispatch
    still requires a workflow on the default branch. That does not prevent
    ordinary `pull_request` checks: `ci-acceptance.yml` now runs offline tests
@@ -81,7 +84,10 @@ two reviewed stamped builds to exercise the automated rollback gate.
    identity implementation has offline regression coverage.
 
 Both workflows require the recorded staging IDs and an exact matching `/exec`
-URL, then verify the deployment belongs to that script before mutation.
+URL, then verify the deployment belongs to that script before mutation. Deploy
+also requires the current app to return its exact reviewed health contract
+before `clasp push`; a 403 or Google interstitial therefore stops without a
+source push, immutable version or deployment change.
 The reviewed inventory is `scripts/gas_staging_targets.json`; replacements
 must update it through review as well as updating repository variables.
 Deploy and rollback share one concurrency group per project.

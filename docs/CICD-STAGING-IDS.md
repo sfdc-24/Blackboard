@@ -1,5 +1,16 @@
 # STEP_2 — DEV / STAGING project ids (VM-CICD-001)
 
+## Current web-app readiness — 2026-09-07
+
+Glasses staging now answers anonymously with its reviewed health signature;
+Governor staging now returns its exact anonymous, side-effect-free machine-read
+denial. Both owner authorizations are complete, while the first stamped
+deploy/receipt remains pending.
+The `blackboard-production` copy is retained below as historical project
+inventory only. Its source is a drafts sweeper with no `doGet`/`doPost`, so it
+is excluded from the deploy, rollback and default web-app audit target sets.
+Do not run or authorize the sweeper merely to make an HTTP-readiness count rise.
+
 Created 2026-09-04 by vm-cli via Drive `files.copy` (no clasp OAuth required).
 Each copy is a byte-exact duplicate of its production project's HEAD — the
 Governor STAGING copy's `Code.gs` sha256 was verified equal to the committed
