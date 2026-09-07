@@ -125,6 +125,14 @@ forwards the raw BCB envelope to the execution model. Additions to this profile
 therefore require an explicit schema and test change rather than silently
 becoming executable instructions.
 
+One executable ORDER covers exactly one evidence domain. For example, inspect
+repository source, measure a public endpoint or DNS state, or evaluate a
+vendor-documented mechanism in separate ORDERs; do not bundle those domains into
+one research task. By default, the installer pins a 720-second inference deadline
+below the 15-minute trigger interval, leaving time for result append and read-back.
+Split work that cannot produce a decision within that boundary rather than
+increasing the deadline or combining multiple reviews.
+
 ---
 
 ## 5. The rules that will bite you first

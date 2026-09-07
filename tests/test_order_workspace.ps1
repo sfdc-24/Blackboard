@@ -1132,14 +1132,28 @@ ANTHROPIC_MODEL='claude-test-model'
 
     $installerText = [IO.File]::ReadAllText($InstallerPath, [Text.Encoding]::UTF8)
     Assert-True 'installer exposes WorkspacePath parameter' ($installerText.Contains('[string]$WorkspacePath'))
+    Assert-True 'installer pins a bounded 720 second wall timeout' (
+        $installerText.Contains('[ValidateRange(30, 840)][int]$WallTimeoutSeconds = 720')
+    )
     Assert-True 'installer passes exact WorkspacePath argument' (
         $installerText.Contains("('-WorkspacePath `"' + `$WorkspacePath + '`"')")
+    )
+    Assert-True 'installer passes explicit invariant wall timeout argument' (
+        $installerText.Contains("('-WallTimeoutSeconds ' + [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', `$WallTimeoutSeconds))")
     )
     Assert-True 'installer task starts in WorkspacePath' ($installerText.Contains('-WorkingDirectory $WorkspacePath'))
     Assert-True 'installer drift check reads back WorkspacePath' ($installerText.Contains('WorkingDirectory -cne $WorkspacePath'))
     Assert-True 'installer Status exposes workspace path' (
         $installerText.Contains('workspace_path = $WorkspacePath') -and
         $installerText.Contains('workspace_exists =')
+    )
+    Assert-True 'installer Status exposes timeout configuration and exact readback' (
+        $installerText.Contains('wall_timeout_seconds = $WallTimeoutSeconds') -and
+        $installerText.Contains('wall_timeout_readback = $wallTimeoutReadback')
+    )
+    Assert-True 'installer drift check rejects an unconfirmed timeout argument' (
+        $installerText.Contains("`$problems.Add('wall_timeout_seconds')") -and
+        $installerText.Contains('Get-WallTimeoutReadback -Arguments ([string]$Task.Actions[0].Arguments)')
     )
     Assert-True 'installer Execute requires explicit workspace' ($installerText.Contains('execute_requires_explicit_workspace_path'))
     Assert-True 'installer Execute requires git directory' ($installerText.Contains('execute_workspace_git_directory_missing'))
@@ -1165,6 +1179,16 @@ ANTHROPIC_MODEL='claude-test-model'
     if ($argumentFunction.Count -eq 1) {
         Invoke-Expression $argumentFunction[0].Extent.Text
 
+        $timeoutReadbackFunction = @($installerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Get-WallTimeoutReadback'
+        }, $true))
+        Assert-True 'installer defines one timeout readback validator' ($timeoutReadbackFunction.Count -eq 1)
+        if ($timeoutReadbackFunction.Count -eq 1) {
+            Invoke-Expression $timeoutReadbackFunction[0].Extent.Text
+        }
+
         $taskProbePath = Join-Path $tempRoot 'capture task arguments.ps1'
         $taskProbeText = @'
 param(
@@ -1175,6 +1199,7 @@ param(
     [string]$EnvFile,
     [string]$StatePath,
     [string]$LogPath,
+    [int]$WallTimeoutSeconds,
     [string]$ClaudeCommand
 )
 [ordered]@{
@@ -1185,6 +1210,7 @@ param(
     env_file = $EnvFile
     state_path = $StatePath
     log_path = $LogPath
+    wall_timeout_seconds = $WallTimeoutSeconds
     claude_command = $ClaudeCommand
 } | ConvertTo-Json -Compress
 '@
@@ -1197,6 +1223,7 @@ param(
         $EnvFile = Join-Path $workspace 'bus config.env'
         $StatePath = Join-Path $tempRoot 'task state.json'
         $LogPath = Join-Path $tempRoot 'task events.jsonl'
+        $WallTimeoutSeconds = 720
         $ClaudeCommand = 'C:\Program Files\Claude\claude.exe'
         $serializedArguments = Get-TaskArguments
 
@@ -1234,10 +1261,38 @@ param(
                 [string]$captured.env_file -ceq $EnvFile -and
                 [string]$captured.state_path -ceq $StatePath -and
                 [string]$captured.log_path -ceq $LogPath -and
+                [int]$captured.wall_timeout_seconds -eq $WallTimeoutSeconds -and
                 [string]$captured.claude_command -ceq $ClaudeCommand
             )
         }
+
+        if ($timeoutReadbackFunction.Count -eq 1) {
+            $exactTimeout = Get-WallTimeoutReadback -Arguments $serializedArguments
+            $wrongTimeout = Get-WallTimeoutReadback -Arguments ($serializedArguments.Replace('-WallTimeoutSeconds 720', '-WallTimeoutSeconds 300'))
+            $duplicateTimeout = Get-WallTimeoutReadback -Arguments ($serializedArguments + ' -WallTimeoutSeconds 720')
+            $wrongCaseTimeout = Get-WallTimeoutReadback -Arguments ($serializedArguments.Replace('-WallTimeoutSeconds 720', '-walltimeoutseconds 720'))
+            Assert-True 'timeout readback confirms one exact configured value' (
+                [bool]$exactTimeout.confirmed -and
+                [string]$exactTimeout.expected -ceq '720' -and
+                [string]$exactTimeout.actual -ceq '720' -and
+                [int]$exactTimeout.occurrence_count -eq 1
+            )
+            Assert-True 'timeout readback rejects wrong duplicate and case-changed arguments' (
+                -not [bool]$wrongTimeout.confirmed -and
+                -not [bool]$duplicateTimeout.confirmed -and
+                -not [bool]$wrongCaseTimeout.confirmed
+            )
+        }
     }
+
+    $onboardingText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'docs\ONBOARDING.md'), [Text.Encoding]::UTF8)
+    Assert-True 'ORDER protocol requires one evidence domain per task' (
+        $onboardingText.Contains('One executable ORDER covers exactly one evidence domain.') -and
+        $onboardingText.Contains('do not bundle those domains') -and
+        $onboardingText.Contains('one research task.') -and
+        $onboardingText.Contains('vendor-documented mechanism') -and
+        $onboardingText.Contains('By default, the installer pins a 720-second inference deadline')
+    )
 } finally {
     foreach ($name in $testEnvironmentNames) {
         if ($null -eq $testEnvironmentBackup[$name]) {

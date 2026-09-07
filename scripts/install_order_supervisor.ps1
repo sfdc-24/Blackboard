@@ -15,6 +15,7 @@ param(
     [string]$EnvFile,
     [string]$StatePath,
     [string]$LogPath,
+    [ValidateRange(30, 840)][int]$WallTimeoutSeconds = 720,
     [string]$ClaudeCommand = 'claude',
     [switch]$Start
 )
@@ -333,9 +334,32 @@ function Get-TaskArguments {
         ('-EnvFile "' + $EnvFile + '"'),
         ('-StatePath "' + $StatePath + '"'),
         ('-LogPath "' + $LogPath + '"'),
+        ('-WallTimeoutSeconds ' + [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $WallTimeoutSeconds)),
         ('-ClaudeCommand "' + $ClaudeCommand + '"')
     )
     return $tokens -join ' '
+}
+
+function Get-WallTimeoutReadback {
+    param([AllowEmptyString()][string]$Arguments)
+
+    $expected = [string]::Format(
+        [Globalization.CultureInfo]::InvariantCulture,
+        '{0}',
+        $WallTimeoutSeconds
+    )
+    $matches = [Text.RegularExpressions.Regex]::Matches(
+        $Arguments,
+        '(?<!\S)-WallTimeoutSeconds\s+(?<value>\S+)(?=\s|$)',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    $actual = if ($matches.Count -eq 1) { [string]$matches[0].Groups['value'].Value } else { '' }
+    return [pscustomobject][ordered]@{
+        expected = $expected
+        actual = $actual
+        occurrence_count = $matches.Count
+        confirmed = ($matches.Count -eq 1 -and $actual -ceq $expected)
+    }
 }
 
 function New-ExpectedDefinition {
@@ -363,6 +387,8 @@ function Compare-Definition {
         if ([string]$Task.Actions[0].Execute -cne $WindowsPowerShell) { $problems.Add('action_execute') }
         if ([string]$Task.Actions[0].Arguments -cne (Get-TaskArguments)) { $problems.Add('action_arguments') }
         if ([string]$Task.Actions[0].WorkingDirectory -cne $WorkspacePath) { $problems.Add('working_directory') }
+        $timeoutReadback = Get-WallTimeoutReadback -Arguments ([string]$Task.Actions[0].Arguments)
+        if (-not [bool]$timeoutReadback.confirmed) { $problems.Add('wall_timeout_seconds') }
     }
     $principalId = [string]$Task.Principal.UserId
     if (@('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains $principalId) { $problems.Add('principal') }
@@ -433,9 +459,13 @@ function Get-StatusObject {
             workspace_path = $WorkspacePath
             workspace_exists = (Test-Path -LiteralPath $WorkspacePath -PathType Container)
             workspace_git_directory_exists = (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
+            wall_timeout_seconds = $WallTimeoutSeconds
+            wall_timeout_readback = (Get-WallTimeoutReadback -Arguments '')
         }
     }
     $drift = @(Compare-Definition $task)
+    $taskArguments = if (@($task.Actions).Count -eq 1) { [string]$task.Actions[0].Arguments } else { '' }
+    $wallTimeoutReadback = Get-WallTimeoutReadback -Arguments $taskArguments
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
     $unsigned = [int64]$info.LastTaskResult -band 0xffffffff
     $resultHex = '0x' + [Convert]::ToString($unsigned, 16).PadLeft(8, '0')
@@ -468,6 +498,8 @@ function Get-StatusObject {
         workspace_path = $WorkspacePath
         workspace_exists = (Test-Path -LiteralPath $WorkspacePath -PathType Container)
         workspace_git_directory_exists = (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
+        wall_timeout_seconds = $WallTimeoutSeconds
+        wall_timeout_readback = $wallTimeoutReadback
         runner_exists = (Test-Path -LiteralPath $RunnerPath -PathType Leaf)
         env_file_exists = (Test-Path -LiteralPath $EnvFile -PathType Leaf)
         state_path = $StatePath
