@@ -3,8 +3,8 @@
 Install, inspect, uninstall, or roll back the SYSTEM scheduled task for the
 one-shot Blackboard ORDER worker. Status is the non-mutating default.
 
-Rollback restores only the prior Task Scheduler definition. The runner files
-remain the version present in this checkout.
+Rollback restores only the prior Task Scheduler definition. It does not copy or
+delete runner files, so the referenced prior immutable runner must still exist.
 #>
 [CmdletBinding()]
 param(
@@ -22,6 +22,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+$Action = switch ($Action.ToLowerInvariant()) {
+    'install' { 'Install' }
+    'status' { 'Status' }
+    'uninstall' { 'Uninstall' }
+    'rollback' { 'Rollback' }
+}
 $Mode = if ($Mode -ieq 'Execute') { 'Execute' } else { 'Observe' }
 
 $TaskName = 'SFDC24 Blackboard Order Worker'
@@ -32,8 +38,14 @@ $RepoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $RunnerPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'order_supervisor.ps1'))
 $WorkspacePathWasExplicit = -not [string]::IsNullOrWhiteSpace($WorkspacePath)
 if ($WorkspacePathWasExplicit) {
-    if (-not [IO.Path]::IsPathRooted($WorkspacePath)) { throw 'workspace_path_must_be_absolute' }
-    $WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
+    # Only Install consumes the candidate workspace. Recovery actions must be
+    # able to operate even when that candidate checkout is gone or unusable.
+    if ($Action -ceq 'Install' -and -not [IO.Path]::IsPathRooted($WorkspacePath)) {
+        throw 'workspace_path_must_be_absolute'
+    }
+    if ([IO.Path]::IsPathRooted($WorkspacePath)) {
+        $WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
+    }
 } else {
     # Observe cannot invoke Claude, so retaining the release root preserves the
     # prior read-only installation behavior. Execute is rejected in preflight.
@@ -261,11 +273,15 @@ function Test-ClaudeCliCompatibilityRequired {
     return $Action -ceq 'Install' -and $Mode -ceq 'Execute'
 }
 
-function Assert-MutationPreflight {
+function Assert-MutationAuthorityPreflight {
     if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
         throw 'mutations_require_windows_powershell_5_1'
     }
     if (-not (Test-Administrator)) { throw 'administrator_required_for_system_task' }
+}
+
+function Assert-InstallPreflight {
+    Assert-MutationAuthorityPreflight
     if (-not (Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf)) { throw 'windows_powershell_missing' }
     if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) { throw 'runner_missing' }
     foreach ($dependency in @('OrderSupervisor.psm1', 'invoke_order_claude.ps1', 'order_supervisor_result.schema.json', 'bus.ps1')) {
@@ -273,6 +289,7 @@ function Assert-MutationPreflight {
             throw ('runner_dependency_missing_' + $dependency)
         }
     }
+    if (-not [IO.Path]::IsPathRooted($UserProfilePath)) { throw 'user_profile_path_must_be_absolute' }
     if (-not (Test-Path -LiteralPath $UserProfilePath -PathType Container)) { throw 'user_profile_missing' }
     if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) { throw 'workspace_path_missing' }
     if ($Mode -ceq 'Execute') {
@@ -416,36 +433,178 @@ function Save-PreviousTask {
     Write-Utf8 -Path $BackupManifestPath -Text ($manifest | ConvertTo-Json)
 }
 
+function Read-ValidatedRollbackBackup {
+    if (-not (Test-Path -LiteralPath $BackupManifestPath -PathType Leaf)) {
+        throw 'rollback_manifest_missing'
+    }
+
+    try {
+        $manifestText = [IO.File]::ReadAllText($BackupManifestPath, [Text.Encoding]::UTF8)
+        $manifest = $manifestText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw 'rollback_manifest_invalid'
+    }
+
+    if ($null -eq $manifest -or $manifest -isnot [pscustomobject]) {
+        throw 'rollback_manifest_invalid'
+    }
+    $expectedProperties = @('schema', 'previous_existed', 'xml_sha256', 'created_at')
+    $actualProperties = @($manifest.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($actualProperties.Count -ne $expectedProperties.Count -or
+        @($actualProperties | Where-Object { $expectedProperties -cnotcontains $_ }).Count -ne 0 -or
+        @($expectedProperties | Where-Object { $actualProperties -cnotcontains $_ }).Count -ne 0) {
+        throw 'rollback_manifest_invalid'
+    }
+    if ($manifest.schema -isnot [string] -or
+        [string]$manifest.schema -cne 'order_supervisor_task_backup.v1' -or
+        $manifest.previous_existed -isnot [bool] -or
+        $manifest.xml_sha256 -isnot [string] -or
+        $manifest.created_at -isnot [string] -or
+        [string]$manifest.created_at -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$') {
+        throw 'rollback_manifest_invalid'
+    }
+
+    if (-not [bool]$manifest.previous_existed) {
+        if ([string]$manifest.xml_sha256 -cne '') { throw 'rollback_manifest_invalid' }
+        return [pscustomobject][ordered]@{
+            previous_existed = $false
+            xml = ''
+            xml_sha256 = ''
+            runner_path = ''
+        }
+    }
+
+    if ([string]$manifest.xml_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'rollback_manifest_invalid'
+    }
+    if (-not (Test-Path -LiteralPath $BackupXmlPath -PathType Leaf)) {
+        throw 'rollback_xml_missing'
+    }
+    try {
+        $xml = [IO.File]::ReadAllText($BackupXmlPath, [Text.Encoding]::Unicode)
+    } catch {
+        throw 'rollback_xml_unreadable'
+    }
+    if ((Get-Sha256 $xml) -cne [string]$manifest.xml_sha256) {
+        throw 'rollback_xml_digest_mismatch'
+    }
+
+    try {
+        $document = New-Object Xml.XmlDocument
+        $document.PreserveWhitespace = $true
+        $document.XmlResolver = $null
+        $document.LoadXml($xml)
+    } catch {
+        throw 'rollback_xml_invalid'
+    }
+    $taskNamespace = 'http://schemas.microsoft.com/windows/2004/02/mit/task'
+    if ($null -eq $document.DocumentElement -or
+        $document.DocumentElement.LocalName -cne 'Task' -or
+        $document.DocumentElement.NamespaceURI -cne $taskNamespace) {
+        throw 'rollback_xml_identity_invalid'
+    }
+    $namespaceManager = New-Object Xml.XmlNamespaceManager($document.NameTable)
+    $namespaceManager.AddNamespace('t', $taskNamespace)
+
+    $descriptions = @($document.SelectNodes('/t:Task/t:RegistrationInfo/t:Description', $namespaceManager))
+    $uris = @($document.SelectNodes('/t:Task/t:RegistrationInfo/t:URI', $namespaceManager))
+    $principals = @($document.SelectNodes('/t:Task/t:Principals/t:Principal', $namespaceManager))
+    $actions = @($document.SelectNodes('/t:Task/t:Actions/*', $namespaceManager))
+    $execActions = @($document.SelectNodes('/t:Task/t:Actions/t:Exec', $namespaceManager))
+    if ($descriptions.Count -ne 1 -or
+        -not ([string]$descriptions[0].InnerText).Contains($ManagedMarker) -or
+        $uris.Count -ne 1 -or [string]$uris[0].InnerText -cne ('\' + $TaskName) -or
+        $principals.Count -ne 1 -or
+        $actions.Count -ne 1 -or $execActions.Count -ne 1 -or
+        [string]$execActions[0].GetAttribute('id') -cne 'OrderSupervisor') {
+        throw 'rollback_xml_identity_invalid'
+    }
+    $userIdNode = $principals[0].SelectSingleNode('t:UserId', $namespaceManager)
+    $logonTypeNode = $principals[0].SelectSingleNode('t:LogonType', $namespaceManager)
+    if ($null -eq $userIdNode -or
+        @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains [string]$userIdNode.InnerText -or
+        $null -eq $logonTypeNode -or [string]$logonTypeNode.InnerText -cne 'ServiceAccount') {
+        throw 'rollback_xml_identity_invalid'
+    }
+
+    $commandNodes = @($execActions[0].SelectNodes('t:Command', $namespaceManager))
+    $argumentNodes = @($execActions[0].SelectNodes('t:Arguments', $namespaceManager))
+    if ($commandNodes.Count -ne 1 -or [string]$commandNodes[0].InnerText -cne $WindowsPowerShell -or
+        $argumentNodes.Count -ne 1) {
+        throw 'rollback_xml_identity_invalid'
+    }
+    $runnerMatches = [Text.RegularExpressions.Regex]::Matches(
+        [string]$argumentNodes[0].InnerText,
+        '(?<!\S)-File\s+"(?<path>[^"]+)"(?=\s|$)',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if ($runnerMatches.Count -ne 1) { throw 'rollback_xml_runner_invalid' }
+    $rollbackRunnerPath = [string]$runnerMatches[0].Groups['path'].Value
+    try {
+        if (-not [IO.Path]::IsPathRooted($rollbackRunnerPath)) { throw 'invalid' }
+        $rollbackRunnerPath = [IO.Path]::GetFullPath($rollbackRunnerPath)
+    } catch {
+        throw 'rollback_xml_runner_invalid'
+    }
+    if (-not (Test-Path -LiteralPath $rollbackRunnerPath -PathType Leaf)) {
+        throw 'rollback_runner_missing'
+    }
+
+    return [pscustomobject][ordered]@{
+        previous_existed = $true
+        xml = $xml
+        xml_sha256 = [string]$manifest.xml_sha256
+        runner_path = $rollbackRunnerPath
+    }
+}
+
 function Restore-PreviousTask {
-    if (-not (Test-Path -LiteralPath $BackupManifestPath -PathType Leaf)) { throw 'rollback_manifest_missing' }
-    $manifest = [IO.File]::ReadAllText($BackupManifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
-    if ($manifest.schema -cne 'order_supervisor_task_backup.v1') { throw 'rollback_manifest_invalid' }
+    # Fully authenticate the rollback material before observing or mutating the
+    # current task. A corrupt backup must leave the live definition untouched.
+    $backup = Read-ValidatedRollbackBackup
     $current = Get-RootTask
     if ($current) {
         if (-not (Test-Managed $current)) { throw 'refusing_to_replace_unmanaged_task' }
+    }
+    if ([bool]$backup.previous_existed) {
+        if ($current) { Stop-ManagedTask $current }
+        # -Force replaces in place; deliberately avoid an unregister gap.
+        Register-ScheduledTask -Xml ([string]$backup.xml) -TaskName $TaskName -TaskPath $TaskPath -Force -ErrorAction Stop | Out-Null
+        $restored = Get-RootTask
+        if (-not $restored -or -not (Test-Managed $restored)) { throw 'rollback_restore_not_visible' }
+        try {
+            $readbackXml = Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+        } catch {
+            throw 'rollback_restore_readback_failed'
+        }
+        if ((Get-Sha256 ([string]$readbackXml)) -cne [string]$backup.xml_sha256) {
+            throw 'rollback_restore_definition_mismatch'
+        }
+        return
+    }
+
+    if ($current) {
+        Stop-ManagedTask $current
         Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
     }
-    if ([bool]$manifest.previous_existed) {
-        if (-not (Test-Path -LiteralPath $BackupXmlPath -PathType Leaf)) { throw 'rollback_xml_missing' }
-        $xml = [IO.File]::ReadAllText($BackupXmlPath, [Text.Encoding]::Unicode)
-        if ((Get-Sha256 $xml) -cne [string]$manifest.xml_sha256) { throw 'rollback_xml_digest_mismatch' }
-        Register-ScheduledTask -Xml $xml -TaskName $TaskName -TaskPath $TaskPath -Force -ErrorAction Stop | Out-Null
-        if (-not (Get-RootTask)) { throw 'rollback_restore_not_visible' }
-    } elseif (Get-RootTask) {
+    if (Get-RootTask) {
         throw 'rollback_remove_not_verified'
     }
 }
 
 function Stop-ManagedTask {
     param($Task)
-    if ($Task.State -eq 'Running') {
+    if ([string]$Task.State -ceq 'Running') {
         Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
         $deadline = [DateTime]::UtcNow.AddSeconds(30)
         do {
             Start-Sleep -Milliseconds 250
             $Task = Get-RootTask
-        } while ($Task -and $Task.State -eq 'Running' -and [DateTime]::UtcNow -lt $deadline)
-        if ($Task -and $Task.State -eq 'Running') { throw 'task_stop_timeout' }
+        } while ($Task -and [string]$Task.State -ceq 'Running' -and [DateTime]::UtcNow -lt $deadline)
+        if ($Task -and [string]$Task.State -ceq 'Running') { throw 'task_stop_timeout' }
+    }
+    if ($Task -and @('Ready', 'Disabled') -cnotcontains [string]$Task.State) {
+        throw 'task_not_quiescent'
     }
 }
 
@@ -463,7 +622,46 @@ function Get-StatusObject {
             wall_timeout_readback = (Get-WallTimeoutReadback -Arguments '')
         }
     }
-    $drift = @(Compare-Definition $task)
+    $windowsPowerShellExists = Test-Path -LiteralPath $WindowsPowerShell -PathType Leaf
+    $userProfilePathIsAbsolute = [IO.Path]::IsPathRooted($UserProfilePath)
+    $userProfileExists = $userProfilePathIsAbsolute -and (Test-Path -LiteralPath $UserProfilePath -PathType Container)
+    $workspacePathIsAbsolute = [IO.Path]::IsPathRooted($WorkspacePath)
+    $workspaceExists = $workspacePathIsAbsolute -and (Test-Path -LiteralPath $WorkspacePath -PathType Container)
+    $workspaceGitDirectoryExists = $workspaceExists -and (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
+    $runnerExists = Test-Path -LiteralPath $RunnerPath -PathType Leaf
+    $envFilePathIsAbsolute = [IO.Path]::IsPathRooted($EnvFile)
+    $envFileExists = $envFilePathIsAbsolute -and (Test-Path -LiteralPath $EnvFile -PathType Leaf)
+    $claudeCommandReady = $Mode -cne 'Execute' -or (
+        [IO.Path]::IsPathRooted($ClaudeCommand) -and
+        (Test-Path -LiteralPath $ClaudeCommand -PathType Leaf)
+    )
+    $driftList = New-Object System.Collections.Generic.List[string]
+    foreach ($problem in @(Compare-Definition $task)) { $driftList.Add([string]$problem) }
+    foreach ($readinessProblem in @(
+        $(if (-not $windowsPowerShellExists) { 'windows_powershell_missing' }),
+        $(if (-not $userProfilePathIsAbsolute) { 'user_profile_path_must_be_absolute' }),
+        $(if ($userProfilePathIsAbsolute -and -not $userProfileExists) { 'user_profile_missing' }),
+        $(if (-not $workspacePathIsAbsolute) { 'workspace_path_must_be_absolute' }),
+        $(if ($workspacePathIsAbsolute -and -not $workspaceExists) { 'workspace_path_missing' }),
+        $(if ($Mode -ceq 'Execute' -and -not $WorkspacePathWasExplicit) { 'execute_requires_explicit_workspace_path' }),
+        $(if ($Mode -ceq 'Execute' -and -not $workspaceGitDirectoryExists) { 'workspace_git_directory_missing' }),
+        $(if (-not $runnerExists) { 'runner_missing' }),
+        $(if (-not $envFilePathIsAbsolute) { 'env_file_path_must_be_absolute' }),
+        $(if ($envFilePathIsAbsolute -and -not $envFileExists) { 'v1_bus_env_missing' }),
+        $(if (-not $claudeCommandReady) { 'execute_requires_absolute_claude_command' })
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$readinessProblem) -and
+            -not $driftList.Contains([string]$readinessProblem)) {
+            $driftList.Add([string]$readinessProblem)
+        }
+    }
+    $runnerDirectory = Split-Path -Parent $RunnerPath
+    foreach ($dependency in @('OrderSupervisor.psm1', 'invoke_order_claude.ps1', 'order_supervisor_result.schema.json', 'bus.ps1')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $runnerDirectory $dependency) -PathType Leaf)) {
+            $driftList.Add('runner_dependency_missing_' + $dependency)
+        }
+    }
+    $drift = @($driftList.ToArray())
     $taskArguments = if (@($task.Actions).Count -eq 1) { [string]$task.Actions[0].Arguments } else { '' }
     $wallTimeoutReadback = Get-WallTimeoutReadback -Arguments $taskArguments
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
@@ -487,21 +685,27 @@ function Get-StatusObject {
         }
     }
     return [pscustomobject][ordered]@{
-        status = $(if ($drift.Count) { 'DRIFTED' } elseif ($task.State -eq 'Running') { 'RUNNING' } elseif ($task.State -eq 'Disabled') { 'DISABLED' } else { 'READY' })
+        status = $(
+            if ($drift.Count) { 'DRIFTED' }
+            elseif ([string]$task.State -ceq 'Running') { 'RUNNING' }
+            elseif ([string]$task.State -ceq 'Disabled') { 'DISABLED' }
+            elseif ([string]$task.State -ceq 'Ready') { 'READY' }
+            else { 'NOT_READY' }
+        )
         task_name = $TaskName
         task_path = $TaskPath
         state = [string]$task.State
         drift = @($drift)
         mode = $Mode
         user_profile = $UserProfilePath
-        user_profile_exists = (Test-Path -LiteralPath $UserProfilePath -PathType Container)
+        user_profile_exists = $userProfileExists
         workspace_path = $WorkspacePath
-        workspace_exists = (Test-Path -LiteralPath $WorkspacePath -PathType Container)
-        workspace_git_directory_exists = (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)
+        workspace_exists = $workspaceExists
+        workspace_git_directory_exists = $workspaceGitDirectoryExists
         wall_timeout_seconds = $WallTimeoutSeconds
         wall_timeout_readback = $wallTimeoutReadback
-        runner_exists = (Test-Path -LiteralPath $RunnerPath -PathType Leaf)
-        env_file_exists = (Test-Path -LiteralPath $EnvFile -PathType Leaf)
+        runner_exists = $runnerExists
+        env_file_exists = $envFileExists
         state_path = $StatePath
         log_path = $LogPath
         last_run_time = $info.LastRunTime
@@ -513,20 +717,14 @@ function Get-StatusObject {
     }
 }
 
-if ($Action -ceq 'Status') {
-    Get-StatusObject | ConvertTo-Json -Depth 10
-    exit 0
-}
-
-Assert-MutationPreflight
-if ($Action -ceq 'Install') {
+function Invoke-InstallAction {
+    Assert-InstallPreflight
     $existing = Get-RootTask
     if ($existing -and -not (Test-Managed $existing)) { throw 'refusing_to_overwrite_unmanaged_task' }
     $expected = New-ExpectedDefinition
     if ($existing -and @(Compare-Definition $existing).Count -eq 0) {
         if ($Start) { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop }
-        Get-StatusObject | ConvertTo-Json -Depth 10
-        exit 0
+        return (Get-StatusObject)
     }
     Save-PreviousTask -Existing $existing
     try {
@@ -536,27 +734,48 @@ if ($Action -ceq 'Install') {
         $problems = @(Compare-Definition $registered)
         if ($problems.Count) { throw ('task_readback_drift:' + ($problems -join ',')) }
     } catch {
-        try { Restore-PreviousTask } catch {}
-        throw
+        $installFailure = $_
+        try {
+            Restore-PreviousTask
+        } catch {
+            throw 'task_install_failed_and_rollback_failed'
+        }
+        throw $installFailure
     }
     if ($Start) { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop }
-    Get-StatusObject | ConvertTo-Json -Depth 10
-    exit 0
+    return (Get-StatusObject)
 }
 
-if ($Action -ceq 'Uninstall') {
+function Invoke-UninstallAction {
+    Assert-MutationAuthorityPreflight
     $existing = Get-RootTask
-    if (-not $existing) { Get-StatusObject | ConvertTo-Json -Depth 10; exit 0 }
+    if (-not $existing) { return (Get-StatusObject) }
     if (-not (Test-Managed $existing)) { throw 'refusing_to_remove_unmanaged_task' }
     Stop-ManagedTask $existing
     Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
     if (Get-RootTask) { throw 'uninstall_not_verified' }
+    return (Get-StatusObject)
+}
+
+function Invoke-RollbackAction {
+    Assert-MutationAuthorityPreflight
+    Restore-PreviousTask
+    return (Get-StatusObject)
+}
+
+if ($Action -ceq 'Status') {
     Get-StatusObject | ConvertTo-Json -Depth 10
     exit 0
 }
-
+if ($Action -ceq 'Install') {
+    Invoke-InstallAction | ConvertTo-Json -Depth 10
+    exit 0
+}
+if ($Action -ceq 'Uninstall') {
+    Invoke-UninstallAction | ConvertTo-Json -Depth 10
+    exit 0
+}
 if ($Action -ceq 'Rollback') {
-    Restore-PreviousTask
-    Get-StatusObject | ConvertTo-Json -Depth 10
+    Invoke-RollbackAction | ConvertTo-Json -Depth 10
     exit 0
 }

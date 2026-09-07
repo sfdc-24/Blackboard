@@ -41,16 +41,36 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    the two JSON resources in this directory.
 4. Read the individual job-schedule resources back. Do not accept an empty or
    null `properties.parameters` object.
-5. Package the six guest files listed by
+5. Before changing the guest task, disable both Automation schedules and read
+   them back as disabled. Wait until no Automation job, Azure Run Command, or
+   guest task instance is running. Stage `order_task_escrow.ps1` outside every
+   release directory, verify its transport hash on the guest, and require the
+   guest task to be exactly `Ready` or `Disabled` with no running or queued
+   instance. Then use the tool to
+   create a new immutable escrow for the current known-good task. Read the
+   escrow manifest back and independently verify the task XML digest, exact
+   current release action, and all six current-release file hashes. `Create`
+   requires `-TrustedFileHashesBase64`: Base64 of a BOM-free UTF-8 JSON object
+   containing exactly the six canonical `scripts\...` keys in release order
+   and their lowercase SHA-256 values. Generate that map from the independently
+   verified exact Git release/package, never from the guest directory being
+   escrowed. `Validate` and `Restore` bind to the trusted map recorded in the
+   escrow and do not accept a replacement map.
+6. Package the six guest files listed by
    `install_release_from_archive.ps1`. Deliver the digest-checked archive with
-   Azure Managed Run Command and install the Windows task in `Observe` mode.
+   Azure Managed Run Command, but do not change the Windows task yet.
    Windows passes Run Command parameters on the guest process command line, so
    do not pass the Base64 archive as one parameter: a release of this size can
    exceed the Windows command-line limit before PowerShell starts. For this POC,
    embed the non-secret Base64 release bytes in `source.script` and invoke the
    installer internally, or use a bounded `scriptUri`; verify the archive digest
    inside the guest before moving it into the immutable release directory.
-   Invoke the task installer with the checkout boundary stated explicitly:
+7. Read the release manifest and all six guest files back. Require the full
+   commit release ID, caller-bound archive digest, exact file inventory, and
+   exact per-file hashes before changing the task definition. A manifest alone
+   is not deployment proof.
+8. Install the verified release's task in `Observe` mode with the checkout
+   boundary stated explicitly:
 
    ```powershell
    -WorkspacePath 'C:\Users\akatiawam\Blackboard'
@@ -58,23 +78,32 @@ bind every runbook parameter explicitly using the exact parameter-name case in
 
    `Execute` mode fails closed when this parameter is omitted, relative, missing,
    or does not contain a `.git` directory. The immutable release directory is
-   executable plumbing and is never the Claude work workspace.
-6. Start the task once. Require the immutable release ID, SYSTEM identity,
+   executable plumbing and is never the Claude work workspace. Before starting
+   it, read the complete task definition back and require that the installer's
+   prior-task backup matches the independent known-good escrow.
+9. Start the task once. Require the immutable release ID, SYSTEM identity,
    target profile, v1 bus read, tail-seeded cursor, zero board writes, and task
    result `0` on read-back.
-7. Run the outer runbook manually and require exactly one terminal JSON record
-   with the expected VM/task identity. Then require the same result from one
-   scheduled invocation.
-8. While the scheduled task is still in `Observe`, run the isolated SYSTEM
+10. Rehearse rollback while the candidate remains in `Observe`: restore the
+   independently escrowed task, verify its complete definition and known-good
+   release hashes, then require one natural 15-minute poll and one manual outer
+   supervisor `PASS`. Reinstall the same verified candidate in `Observe` only
+   after that end-to-end rehearsal passes, and repeat the task-definition and
+   one-poll read-backs from steps 8 and 9.
+11. Run the outer runbook manually and require exactly one terminal JSON record
+   with the expected VM/task identity while its schedules remain disabled.
+12. While the scheduled task is still in `Observe`, run the isolated SYSTEM
    adapter smoke with the exact release, workspace, and Claude arguments. It
    must prove the requested work-tool set `Read,Edit,PowerShell`, the effective
    set `Read,Edit,PowerShell,StructuredOutput`, scrubbed child environment,
    harmless Git execution, and unchanged protected fingerprints.
-9. Only then install the same task in `Execute` mode with an absolute Claude
+13. Only then install the same task in `Execute` mode with an absolute Claude
    executable path. Issue one fresh, harmless `codex` test order and verify its
    deterministic CLAIM, RECEIPT, and RESULT rows by reading the board back.
    Start the task a second time and prove the new poll occurred while lifecycle
-   counts remain exactly `1/1/1`.
+   counts remain exactly `1/1/1`. Re-enable both Automation schedules, read
+   them back, and require one scheduled supervisor `PASS` before declaring the
+   release accepted.
 
 The bounded adapter targets the VM-pinned Claude Code 2.1.241 compatibility
 contract. With subprocess credential scrubbing enabled, that version forces its
@@ -120,9 +149,13 @@ still performs its stricter independent result validation after Claude exits.
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task
-installer preserves the prior task definition and supports `-Action Rollback`.
-The original Spot VM and pre-migration snapshot are intentionally retained
-during the evaluation. Do not run both coordinator tasks in Execute mode.
+installer preserves and validates the prior definition and supports
+`-Action Rollback`, but a controlled release also requires an independent
+`order_task_escrow.ps1` bundle outside the candidate release. Validate the
+escrow completely before stopping or replacing a task, and never accept a
+suppressed or unverified restore. The original Spot VM and pre-migration
+snapshot are intentionally retained during the evaluation. Do not run both
+coordinator tasks in Execute mode.
 
 ## Known POC limits
 
