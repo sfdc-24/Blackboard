@@ -1,0 +1,4 @@
+# These are historical records, preserved byte-for-byte. Never normalise them.
+# The repo has core.autocrlf=true; without this the CRs would be stripped on
+# commit and the sha256 proof in the preservation PR would silently stop holding.
+* -text
