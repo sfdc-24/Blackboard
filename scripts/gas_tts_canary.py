@@ -276,7 +276,8 @@ def _exact_keys(value, keys):
 
 
 def validate_receipt(value, expected_script_id, expected_bundle,
-                     expected_version, expected_deployment_id):
+                     expected_version, expected_deployment_id,
+                     expected_session_cap, expected_daily_cap):
     if not SCRIPT_ID.fullmatch(str(expected_script_id or '')):
         raise ValueError('a reviewed canary script id is required')
     if (not isinstance(expected_bundle, dict)
@@ -286,6 +287,11 @@ def validate_receipt(value, expected_script_id, expected_bundle,
     if (type(expected_version) is not int or expected_version < 1
             or not SCRIPT_ID.fullmatch(str(expected_deployment_id or ''))):
         raise ValueError('validated deployment identity is required')
+    if (type(expected_session_cap) is not int or expected_session_cap < 1
+            or expected_session_cap > 50
+            or type(expected_daily_cap) is not int or expected_daily_cap < 1
+            or expected_daily_cap > 200):
+        raise ValueError('validated clean-preflight caps are required')
     root_keys = {'schema', 'repository', 'commit', 'canonicalCodeSha256',
                  'canonicalSourceSha256', 'criticalFunctionSha256',
                  'preparedSourceSha256', 'canaryScriptId', 'canaryVersion',
@@ -306,8 +312,8 @@ def validate_receipt(value, expected_script_id, expected_bundle,
             or value.get('preparedSourceSha256') != expected_bundle['preparedSourceSha256']):
         raise ValueError('invalid receipt identity')
     caps = value.get('effectiveCaps')
-    if not _exact_keys(caps, ('session', 'daily')) or any(type(caps[k]) is not int or caps[k] < 1
-                                                          for k in caps):
+    if (not _exact_keys(caps, ('session', 'daily'))
+            or caps != {'session': expected_session_cap, 'daily': expected_daily_cap}):
         raise ValueError('invalid effective caps')
     scenarios = value.get('scenarios')
     if not _exact_keys(scenarios, ('valid', 'replay', 'concurrency', 'sessionCap', 'dailyCap')):
@@ -355,6 +361,8 @@ def main():
     receipt.add_argument('--run-id', required=True)
     receipt.add_argument('--version', required=True, type=int)
     receipt.add_argument('--deployment-id', required=True)
+    receipt.add_argument('--preflight-session-cap', required=True, type=int)
+    receipt.add_argument('--preflight-daily-cap', required=True, type=int)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     try:
@@ -363,7 +371,8 @@ def main():
             expected = build_from_commit(repo, args.commit, args.run_id)
             validate_receipt(parse_json(Path(args.receipt).read_text(encoding='utf-8')),
                              target['script_id'], expected, args.version,
-                             args.deployment_id)
+                             args.deployment_id, args.preflight_session_cap,
+                             args.preflight_daily_cap)
             print('receipt=valid')
             return 0
         if args.command == 'inspect':

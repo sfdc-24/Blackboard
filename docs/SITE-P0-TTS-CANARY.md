@@ -103,11 +103,14 @@ prerequisites below are not yet proven. Its driver must perform this sequence:
    zero tracked claim markers. Delete the temporary deployment and read back
    its absence. Restore and re-read the exact original HEAD.
 10. Validate the allowlisted receipt with `gas_tts_canary.py validate-receipt`
-    and required `--commit`, `--run-id`, `--version`, and `--deployment-id`
-    values independently obtained from the dispatch and deployment read-back.
-    The validator rebuilds the expected bundle and exact-matches every source
-    digest. Suppress the PASS receipt if any identity, cleanup, or read-back
-    check fails.
+    and required `--commit`, `--run-id`, `--version`, `--deployment-id`,
+    `--preflight-session-cap`, and `--preflight-daily-cap` values independently
+    obtained from the dispatch, clean preflight, and deployment read-back. The
+    validator rebuilds the expected bundle, exact-matches every source digest,
+    exact-matches both receipt caps to the independently read preflight, and
+    rejects values outside the canonical runtime maxima of 50 session attempts
+    and 200 daily attempts. Suppress the PASS receipt if any identity, cap,
+    cleanup, or read-back check fails.
 
 One immutable version remains after each run because the Apps Script REST API
 does not provide version deletion. The driver must version-cap gate before

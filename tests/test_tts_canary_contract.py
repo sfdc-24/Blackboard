@@ -190,7 +190,7 @@ class CanaryReceiptContract(unittest.TestCase):
 
     def test_only_exact_pass_receipt_is_accepted(self):
         self.assertIs(canary.validate_receipt(
-            self.receipt, 'C' * 24, self.bundle, 1, 'D' * 24), self.receipt)
+            self.receipt, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60), self.receipt)
         mutations = [
             lambda r: r.update(verdict='HOLD'),
             lambda r: r['scenarios']['replay'].update(attemptDelta=1),
@@ -204,10 +204,10 @@ class CanaryReceiptContract(unittest.TestCase):
             value = copy.deepcopy(self.receipt)
             mutate(value)
             with self.subTest(value=value), self.assertRaises(ValueError):
-                canary.validate_receipt(value, 'C' * 24, self.bundle, 1, 'D' * 24)
+                canary.validate_receipt(value, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60)
 
         with self.assertRaises(ValueError):
-            canary.validate_receipt(self.receipt, 'X' * 24, self.bundle, 1, 'D' * 24)
+            canary.validate_receipt(self.receipt, 'X' * 24, self.bundle, 1, 'D' * 24, 8, 60)
 
     def test_stale_commit_digests_version_or_deployment_are_rejected(self):
         fields = ('commit', 'canonicalCodeSha256', 'canonicalSourceSha256',
@@ -216,21 +216,37 @@ class CanaryReceiptContract(unittest.TestCase):
             changed = copy.deepcopy(self.receipt)
             changed[field] = ('f' * 40 if field == 'commit' else 'f' * 64)
             with self.subTest(field=field), self.assertRaises(ValueError):
-                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
+                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60)
         for version, deployment in ((2, 'D' * 24), (1, 'E' * 24)):
             with self.subTest(version=version, deployment=deployment), self.assertRaises(ValueError):
                 canary.validate_receipt(
-                    self.receipt, 'C' * 24, self.bundle, version, deployment)
+                    self.receipt, 'C' * 24, self.bundle, version, deployment, 8, 60)
+
+    def test_effective_caps_are_bound_to_clean_preflight_and_runtime_maxima(self):
+        for field, value in (('session', 9), ('daily', 61),
+                             ('session', 999999999), ('daily', 999999999)):
+            changed = copy.deepcopy(self.receipt)
+            changed['effectiveCaps'][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                canary.validate_receipt(
+                    changed, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60)
+
+        for session_cap, daily_cap in ((0, 60), (51, 60), (8, 0), (8, 201),
+                                       (True, 60), (8, True)):
+            with self.subTest(session=session_cap, daily=daily_cap), self.assertRaises(ValueError):
+                canary.validate_receipt(
+                    self.receipt, 'C' * 24, self.bundle, 1, 'D' * 24,
+                    session_cap, daily_cap)
 
     def test_stale_run_or_expected_bundle_is_rejected(self):
         changed = copy.deepcopy(self.receipt)
         changed['runId'] = 'f' * 24
         with self.assertRaises(ValueError):
-            canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
+            canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60)
         stale = copy.deepcopy(self.bundle)
         stale['commit'] = 'f' * 40
         with self.assertRaises(ValueError):
-            canary.validate_receipt(self.receipt, 'C' * 24, stale, 1, 'D' * 24)
+            canary.validate_receipt(self.receipt, 'C' * 24, stale, 1, 'D' * 24, 8, 60)
 
     def test_receipt_rejects_keys_text_and_authorization_material(self):
         for field, value in [('repository', 'Bearer private'),
@@ -239,7 +255,7 @@ class CanaryReceiptContract(unittest.TestCase):
             changed = copy.deepcopy(self.receipt)
             changed[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
-                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
+                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24, 8, 60)
 
     def test_cli_failure_is_generic_and_does_not_echo_environment(self):
         with mock.patch.object(sys, 'argv', ['gas_tts_canary.py', 'prepare', '--commit', 'HEAD',
