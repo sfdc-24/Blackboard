@@ -1,0 +1,184 @@
+name: Deploy Apps Script to STAGING
+
+# VM-CICD-001 · STEP_3. STAGING ONLY — this workflow never touches a
+# production deployment id. Production deploys remain manual until
+# Mr. Salam ratifies otherwise.
+#
+# Required repo secrets (see docs/CICD.md):
+#   CLASPRC_JSON          — contents of ~/.clasprc.json from an authenticated clasp login
+# Required repo variables (per project, created in STEP_2):
+#   STAGING_SCRIPT_ID_<PROJECT>       — Apps Script scriptId of the STAGING copy
+#   STAGING_DEPLOYMENT_ID_<PROJECT>   — the stable web-app deployment id on that copy
+#   STAGING_EXEC_URL_<PROJECT>        — the /exec URL of that deployment (for the HTTP assertion)
+#
+# Source proof: a build marker is generated from the selected commit. Before
+# redeploy, the new immutable version must match every prepared source file.
+# After redeploy, the API configuration, pinned source and fresh HTTP marker
+# must agree. An API contract version is never a deployment version.
+
+on:
+  push:
+    branches: [staging]
+    paths: ['apps-script/**']
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project dir under apps-script/ to deploy'
+        required: true
+        default: 'governor-page-api'
+        type: choice
+        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: staging-deploy-${{ matrix.project }}
+      cancel-in-progress: false
+    strategy:
+      max-parallel: 1
+      matrix:
+        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Skip if project unchanged (push builds only)
+        if: github.event_name == 'push'
+        id: changed
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          PROJECT: ${{ matrix.project }}
+        run: |
+          # A first push has an all-zero before SHA; a force push can remove
+          # that commit from fetched history. In either case check every project.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BEFORE_SHA" "$AFTER_SHA" -- "apps-script/$PROJECT/"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            [ "$status" -eq 1 ] || { echo '::error::project diff failed'; exit "$status"; }
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.changed.outputs.skip != 'true'
+        with: { node-version: '22' }
+
+      - name: Install clasp
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+          echo "$GITHUB_WORKSPACE/tooling/clasp/node_modules/.bin" >> "$GITHUB_PATH"
+          test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
+
+      - name: Authenticate clasp
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          umask 077
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          test -s ~/.clasprc.json || { echo '::error::CLASPRC_JSON secret is empty — complete the OAuth halt in docs/CICD.md first'; exit 1; }
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+
+      - name: Resolve reviewed staging target
+        if: steps.changed.outputs.skip != 'true'
+        id: ids
+        env:
+          PROJECT: ${{ matrix.project }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: python3 scripts/gas_staging_target.py resolve >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployment belongs to the staging project before mutation
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+        run: |
+          clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment
+
+      - name: Prepare committed source and build marker
+        if: steps.changed.outputs.skip != 'true'
+        id: build
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/gas_build_identity.py prepare --project "$PROJECT" --commit "$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Push prepared source to STAGING project
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: ${{ steps.build.outputs.path }}
+        run: clasp push -f
+
+      - name: Create immutable version
+        if: steps.changed.outputs.skip != 'true'
+        id: ver
+        working-directory: ${{ steps.build.outputs.path }}
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          VERSION=$(clasp --json create-version "ci: $COMMIT_SHA" |
+            python3 "$GITHUB_WORKSPACE/scripts/gas_staging_target.py" created-version)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify immutable source before repointing deployment
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 scripts/gas_build_identity.py verify-source \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION"
+
+      - name: Repoint staging deployment at verified source
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: ${{ steps.build.outputs.path }}
+        env:
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          clasp redeploy "$DEPLOY_ID" -V "$EXPECTED_VERSION" -d "ci: $COMMIT_SHA"
+
+      - name: Verify deployment configuration, pinned source and live build
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
+          COMMIT_SHA: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 scripts/gas_build_identity.py attest \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION" \
+            --receipt "$RUNNER_TEMP/staging-receipt-${PROJECT}.json"
+
+      - name: Preserve staging build receipt
+        if: steps.changed.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-${{ matrix.project }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/staging-receipt-${{ matrix.project }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Receipt
+        if: steps.changed.outputs.skip != 'true'
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          echo 'STAGING BUILD RECEIPT — deployment, immutable source and live identity verified' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/staging-receipt-${PROJECT}.json" >> "$GITHUB_STEP_SUMMARY"
