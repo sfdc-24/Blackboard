@@ -1288,8 +1288,10 @@ param(
     $onboardingText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'docs\ONBOARDING.md'), [Text.Encoding]::UTF8)
     Assert-True 'ORDER protocol requires one evidence domain per task' (
         $onboardingText.Contains('One executable ORDER covers exactly one evidence domain.') -and
-        $onboardingText.Contains('do not bundle those domains into one') -and
-        $onboardingText.Contains('research task.')
+        $onboardingText.Contains('do not bundle those domains') -and
+        $onboardingText.Contains('one research task.') -and
+        $onboardingText.Contains('vendor-documented mechanism') -and
+        $onboardingText.Contains('By default, the installer pins a 720-second inference deadline')
     )
 } finally {
     foreach ($name in $testEnvironmentNames) {
