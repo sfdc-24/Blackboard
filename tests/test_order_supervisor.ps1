@@ -564,16 +564,31 @@ try {
     $adapterStdout = Join-Path $adapterTempRoot 'stdout.json'
     $adapterStderr = Join-Path $adapterTempRoot 'stderr.txt'
     $adapterArgv = Join-Path $adapterTempRoot 'argv.json'
+    $adapterConfigCapture = Join-Path $adapterTempRoot 'config.jsonl'
+    $adapterAmbientConfig = Join-Path $adapterTempRoot 'ambient-config'
     $fakeClaude = Join-Path $adapterTempRoot 'claude-legacy.ps1'
+    New-Item -ItemType Directory -Path $adapterAmbientConfig | Out-Null
+    [IO.File]::WriteAllText((Join-Path $adapterAmbientConfig 'must-survive.txt'), 'ambient', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($adapterPrompt, 'offline compatibility test', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($adapterEnv, "ANTHROPIC_API_KEY=offline-unit-test-key`nANTHROPIC_MODEL=offline-unit-test-model`n", [Text.UTF8Encoding]::new($false))
     Copy-Item -LiteralPath $SchemaPath -Destination $adapterSchema
-    $fakeClaudeSource = @'
+$fakeClaudeSource = @'
 $ErrorActionPreference = 'Stop'
+function Write-ConfigCapture([string]$Phase) {
+    $configPath = [string]$env:CLAUDE_CONFIG_DIR
+    $exists = -not [string]::IsNullOrWhiteSpace($configPath) -and (Test-Path -LiteralPath $configPath -PathType Container)
+    if ($exists) {
+        [IO.File]::WriteAllText((Join-Path $configPath ('marker-' + $Phase + '.txt')), 'marker', [Text.UTF8Encoding]::new($false))
+    }
+    $record = [ordered]@{ phase = $Phase; config_path = $configPath; config_exists = $exists }
+    [IO.File]::AppendAllText($env:ORDER_SUPERVISOR_CONFIG_CAPTURE, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+}
 if ($args.Count -eq 1 -and [string]$args[0] -ceq '--version') {
+    Write-ConfigCapture -Phase 'version'
     Write-Output '2.1.241 (Claude Code)'
     exit 0
 }
+Write-ConfigCapture -Phase 'inference'
 if ($args -contains '--permission-prompts') { exit 64 }
 $schemaIndex = [Array]::IndexOf([object[]]$args, '--json-schema')
 if ($schemaIndex -lt 0 -or $schemaIndex + 1 -ge $args.Count) { exit 65 }
@@ -586,6 +601,8 @@ $capture = [ordered]@{
     working_directory = (Get-Location).Path
     anthropic_api_key_present = -not [string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)
     anthropic_model = $env:ANTHROPIC_MODEL
+    config_path = [string]$env:CLAUDE_CONFIG_DIR
+    config_exists = (Test-Path -LiteralPath ([string]$env:CLAUDE_CONFIG_DIR) -PathType Container)
 }
 [IO.File]::WriteAllText($env:ORDER_SUPERVISOR_ARGV_CAPTURE, ($capture | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
 Write-Output '{"structured_output":{"schema":"order_supervisor_result.v1","work_id":"offline","status":"completed","summary":"offline","evidence":[],"error_code":null}}'
@@ -593,7 +610,11 @@ exit 0
 '@
     [IO.File]::WriteAllText($fakeClaude, $fakeClaudeSource, [Text.UTF8Encoding]::new($false))
     $oldArgvCapture = $env:ORDER_SUPERVISOR_ARGV_CAPTURE
+    $oldConfigCapture = $env:ORDER_SUPERVISOR_CONFIG_CAPTURE
+    $oldClaudeConfigDirectory = $env:CLAUDE_CONFIG_DIR
     $env:ORDER_SUPERVISOR_ARGV_CAPTURE = $adapterArgv
+    $env:ORDER_SUPERVISOR_CONFIG_CAPTURE = $adapterConfigCapture
+    $env:CLAUDE_CONFIG_DIR = $adapterAmbientConfig
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $AdapterPath `
             -PromptPath $adapterPrompt -SchemaPath $adapterSchema `
@@ -603,6 +624,8 @@ exit 0
         $adapterExitCode = $LASTEXITCODE
     } finally {
         $env:ORDER_SUPERVISOR_ARGV_CAPTURE = $oldArgvCapture
+        $env:ORDER_SUPERVISOR_CONFIG_CAPTURE = $oldConfigCapture
+        $env:CLAUDE_CONFIG_DIR = $oldClaudeConfigDirectory
     }
     Assert-True 'legacy-compatible adapter invocation exits zero' ($adapterExitCode -eq 0)
     $adapterCapture = [IO.File]::ReadAllText($adapterArgv, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -637,9 +660,243 @@ exit 0
         [bool]$adapterCapture.anthropic_api_key_present -and
         [string]$adapterCapture.anthropic_model -ceq 'offline-unit-test-model'
     )
+    $configCaptures = @(
+        [IO.File]::ReadAllLines($adapterConfigCapture, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json }
+    )
+    $isolatedConfigPath = if ($configCaptures.Count -gt 0) { [string]$configCaptures[0].config_path } else { '' }
+    Assert-True 'legacy-compatible version and inference share an existing isolated config directory' (
+        $configCaptures.Count -eq 2 -and
+        @($configCaptures | Where-Object { -not [bool]$_.config_exists }).Count -eq 0 -and
+        @($configCaptures | Select-Object -ExpandProperty config_path -Unique).Count -eq 1 -and
+        [string]$adapterCapture.config_path -ceq $isolatedConfigPath -and
+        [bool]$adapterCapture.config_exists
+    )
+    Assert-True 'legacy-compatible adapter removes only its isolated config directory' (
+        [IO.Path]::IsPathRooted($isolatedConfigPath) -and
+        [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($isolatedConfigPath)).TrimEnd('\') -ceq [IO.Path]::GetFullPath($adapterTempRoot).TrimEnd('\') -and
+        [IO.Path]::GetFileName($isolatedConfigPath) -cmatch '^claude-config-[0-9a-f]{32}$' -and
+        -not (Test-Path -LiteralPath $isolatedConfigPath) -and
+        (Test-Path -LiteralPath (Join-Path $adapterAmbientConfig 'must-survive.txt') -PathType Leaf)
+    )
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $adapterTempRoot)) {
         Remove-Item -LiteralPath $adapterTempRoot -Recurse -Force
+    }
+}
+
+# Exercise the exact supervisor timeout path with a real child process. The fake
+# adapter leaves nested residue under the owned run directory before blocking;
+# the worker must kill the process tree and recursively remove only that run.
+$runnerTokens = $null
+$runnerErrors = $null
+$runnerAst = [Management.Automation.Language.Parser]::ParseFile(
+    $RunnerPath,
+    [ref]$runnerTokens,
+    [ref]$runnerErrors
+)
+Assert-True 'runner parses before timeout-path extraction' (@($runnerErrors).Count -eq 0)
+foreach ($functionName in @('Quote-ProcessArgument', 'Invoke-TaskkillTree', 'Test-RunTreeContainsReparsePoint', 'Remove-OwnedRunDirectory', 'Invoke-ClaudeWorker')) {
+    $definitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq $functionName
+    }, $true))
+    Assert-True ('runner defines one executable ' + $functionName) ($definitions.Count -eq 1)
+    if ($definitions.Count -eq 1) { Invoke-Expression $definitions[0].Extent.Text }
+}
+
+$timeoutRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-timeout-test-' + [Guid]::NewGuid().ToString('N'))
+$timeoutOwner = Join-Path $timeoutRoot 'owner'
+$timeoutWorkspace = Join-Path $timeoutRoot 'workspace'
+$timeoutFakeAdapter = Join-Path $timeoutRoot 'fake-adapter.ps1'
+$timeoutCapture = Join-Path $timeoutOwner 'adapter-started.txt'
+$timeoutParentPid = Join-Path $timeoutOwner 'adapter-pid.txt'
+$timeoutDescendantPid = Join-Path $timeoutOwner 'descendant-pid.txt'
+$timeoutDescendantMarker = Join-Path $timeoutOwner 'descendant-delayed-marker.txt'
+$timeoutSibling = Join-Path $timeoutOwner 'must-survive.txt'
+$timeoutRunId = 'a' * 32
+$timeoutRunPath = Join-Path $timeoutOwner ('run-' + $timeoutRunId)
+New-Item -ItemType Directory -Path $timeoutOwner, $timeoutWorkspace -Force | Out-Null
+[IO.File]::WriteAllText($timeoutSibling, 'outside-owned-run', [Text.UTF8Encoding]::new($false))
+$timeoutAdapterSource = @'
+param(
+    [string]$PromptPath,
+    [string]$SchemaPath,
+    [string]$StdoutPath,
+    [string]$StderrPath,
+    [string]$EnvFile,
+    [string]$ClaudeCommand,
+    [string]$WorkspacePath,
+    [double]$MaxBudgetUsd
+)
+$ErrorActionPreference = 'Stop'
+$runRoot = Split-Path -Parent $PromptPath
+$residue = Join-Path $runRoot ('claude-config-' + ('b' * 32) + '\nested')
+New-Item -ItemType Directory -Path $residue -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $residue 'marker.txt'), 'nested-residue', [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID, [string]$PID, [Text.UTF8Encoding]::new($false))
+if ([string]$env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT -ceq '1') {
+    $descendantSource = @(
+        '$pidPath = [Environment]::GetEnvironmentVariable(''ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID'', ''Process'')'
+        '$markerPath = [Environment]::GetEnvironmentVariable(''ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER'', ''Process'')'
+        '[IO.File]::WriteAllText($pidPath, [string]$PID, [Text.UTF8Encoding]::new($false))'
+        'Start-Sleep -Seconds 8'
+        '[IO.File]::WriteAllText($markerPath, ''survived'', [Text.UTF8Encoding]::new($false))'
+    ) -join [Environment]::NewLine
+    $encodedDescendant = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($descendantSource))
+    $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $engine -ArgumentList ('-NoLogo -NoProfile -NonInteractive -EncodedCommand ' + $encodedDescendant) -WindowStyle Hidden | Out-Null
+    $descendantDeadline = [DateTime]::UtcNow.AddSeconds(1)
+    while (-not (Test-Path -LiteralPath $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $descendantDeadline) {
+        Start-Sleep -Milliseconds 25
+    }
+    if (-not (Test-Path -LiteralPath $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID -PathType Leaf)) {
+        throw 'descendant_start_not_observed'
+    }
+}
+[IO.File]::WriteAllText($env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE, 'started', [Text.UTF8Encoding]::new($false))
+Start-Sleep -Seconds 60
+exit 0
+'@
+[IO.File]::WriteAllText($timeoutFakeAdapter, $timeoutAdapterSource, [Text.UTF8Encoding]::new($false))
+$oldTimeoutCapture = $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE
+$oldTimeoutParentPid = $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID
+$oldTimeoutSpawnDescendant = $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT
+$oldTimeoutDescendantPid = $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID
+$oldTimeoutDescendantMarker = $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER
+try {
+    $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $timeoutCapture
+    $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID = $timeoutParentPid
+    $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT = '1'
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID = $timeoutDescendantPid
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER = $timeoutDescendantMarker
+    $ClaudeAdapter = $timeoutFakeAdapter
+    $ClaudeSchema = $SchemaPath
+    $RunId = $timeoutRunId
+    $StatePath = Join-Path $timeoutOwner 'state.json'
+    $EnvFile = Join-Path $timeoutRoot 'unused.env'
+    $WorkspacePath = $timeoutWorkspace
+    $ClaudeCommand = 'unused-claude'
+    $MaxBudgetUsd = 0.01
+    $WallTimeoutSeconds = 5
+    $timeoutError = ''
+    try {
+        $null = Invoke-ClaudeWorker -WorkId 'offline-timeout' -Source 'codex' -Task 'offline timeout cleanup test'
+    } catch {
+        $timeoutError = [string]$_.Exception.Message
+    }
+    Assert-True 'worker reaches fake adapter before timeout' (Test-Path -LiteralPath $timeoutCapture -PathType Leaf)
+    Assert-True 'worker reports exact wall-timeout classification' ($timeoutError -ceq 'claude_wall_timeout') $timeoutError
+    Assert-True 'timeout cleanup recursively removes exact owned run directory' (-not (Test-Path -LiteralPath $timeoutRunPath))
+    Assert-True 'timeout cleanup preserves sibling outside owned run directory' (Test-Path -LiteralPath $timeoutSibling -PathType Leaf)
+    $descendantProcessId = 0
+    if (Test-Path -LiteralPath $timeoutDescendantPid -PathType Leaf) {
+        [void][int]::TryParse([IO.File]::ReadAllText($timeoutDescendantPid, [Text.Encoding]::UTF8), [ref]$descendantProcessId)
+    }
+    Assert-True 'taskkill terminates the real descendant process' (
+        $descendantProcessId -gt 0 -and $null -eq (Get-Process -Id $descendantProcessId -ErrorAction SilentlyContinue)
+    )
+    Start-Sleep -Seconds 5
+    Assert-True 'terminated descendant cannot perform its delayed outside write' (
+        -not (Test-Path -LiteralPath $timeoutDescendantMarker)
+    )
+
+    function Invoke-TaskkillTree {
+        param([Parameter(Mandatory = $true)][int]$ProcessId)
+        return 9
+    }
+    $failedKillCapture = Join-Path $timeoutOwner 'failed-kill-adapter-started.txt'
+    $failedKillParentPid = Join-Path $timeoutOwner 'failed-kill-adapter-pid.txt'
+    $failedKillRunId = 'e' * 32
+    $failedKillRunPath = Join-Path $timeoutOwner ('run-' + $failedKillRunId)
+    $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $failedKillCapture
+    $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID = $failedKillParentPid
+    $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT = '0'
+    $RunId = $failedKillRunId
+    $StatePath = Join-Path $timeoutOwner 'state.json'
+    $failedKillError = ''
+    try {
+        $null = Invoke-ClaudeWorker -WorkId 'offline-failed-kill' -Source 'codex' -Task 'preserve quarantine after failed tree kill'
+    } catch {
+        $failedKillError = [string]$_.Exception.Message
+    }
+    Assert-True 'nonzero taskkill fails closed with exact termination classification' (
+        $failedKillError -ceq 'claude_termination_failed'
+    ) $failedKillError
+    Assert-True 'nonzero taskkill preserves the exact owned run as quarantine' (
+        (Test-Path -LiteralPath $failedKillCapture -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $failedKillRunPath ('claude-config-' + ('b' * 32) + '\nested\marker.txt')) -PathType Leaf)
+    )
+    $failedKillProcessId = 0
+    if (Test-Path -LiteralPath $failedKillParentPid -PathType Leaf) {
+        [void][int]::TryParse([IO.File]::ReadAllText($failedKillParentPid, [Text.Encoding]::UTF8), [ref]$failedKillProcessId)
+    }
+    $realTaskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    if ($failedKillProcessId -gt 0) {
+        & $realTaskkill /PID $failedKillProcessId /T /F 1>$null 2>$null
+        $manualKillExitCode = $LASTEXITCODE
+        $manualKillDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        while ($null -ne (Get-Process -Id $failedKillProcessId -ErrorAction SilentlyContinue) -and
+            [DateTime]::UtcNow -lt $manualKillDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+    } else {
+        $manualKillExitCode = -1
+    }
+    Assert-True 'test teardown independently terminates quarantined fake adapter' (
+        $manualKillExitCode -eq 0 -and
+        $null -eq (Get-Process -Id $failedKillProcessId -ErrorAction SilentlyContinue)
+    )
+    if ($manualKillExitCode -eq 0 -and
+        $null -eq (Get-Process -Id $failedKillProcessId -ErrorAction SilentlyContinue)) {
+        Remove-OwnedRunDirectory -Path $failedKillRunPath -ParentPath $timeoutOwner -ExpectedName ('run-' + $failedKillRunId)
+    }
+    Assert-True 'quarantined run is removable only after independent termination proof' (
+        -not (Test-Path -LiteralPath $failedKillRunPath)
+    )
+
+    $reparseTarget = Join-Path $timeoutRoot 'reparse-target'
+    $reparseParent = Join-Path $timeoutRoot 'reparse-parent'
+    $reparseCapture = Join-Path $timeoutRoot 'reparse-adapter-started.txt'
+    New-Item -ItemType Directory -Path $reparseTarget | Out-Null
+    [IO.File]::WriteAllText((Join-Path $reparseTarget 'must-survive.txt'), 'target', [Text.UTF8Encoding]::new($false))
+    New-Item -ItemType Junction -Path $reparseParent -Target $reparseTarget | Out-Null
+    $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $reparseCapture
+    $RunId = 'd' * 32
+    $StatePath = Join-Path $reparseParent 'state.json'
+    $reparseError = ''
+    try {
+        $null = Invoke-ClaudeWorker -WorkId 'offline-reparse' -Source 'codex' -Task 'reject reparse-backed owner'
+    } catch {
+        $reparseError = [string]$_.Exception.Message
+    }
+    Assert-True 'worker rejects reparse-backed run parent before starting adapter' (
+        $reparseError -ceq 'claude_run_directory_unsafe' -and
+        -not (Test-Path -LiteralPath $reparseCapture) -and
+        -not (Test-Path -LiteralPath (Join-Path $reparseTarget ('run-' + $RunId))) -and
+        (Test-Path -LiteralPath (Join-Path $reparseTarget 'must-survive.txt') -PathType Leaf)
+    ) $reparseError
+    [IO.Directory]::Delete($reparseParent)
+} finally {
+    $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $oldTimeoutCapture
+    $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID = $oldTimeoutParentPid
+    $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT = $oldTimeoutSpawnDescendant
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID = $oldTimeoutDescendantPid
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER = $oldTimeoutDescendantMarker
+    foreach ($pidPath in @($timeoutParentPid, (Join-Path $timeoutOwner 'failed-kill-adapter-pid.txt'))) {
+        if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+            $processId = 0
+            [void][int]::TryParse([IO.File]::ReadAllText($pidPath, [Text.Encoding]::UTF8), [ref]$processId)
+            if ($processId -gt 0 -and $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+                & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $processId /T /F 1>$null 2>$null
+            }
+        }
+    }
+    if (-not $KeepArtifacts -and (Test-Path -LiteralPath $timeoutRoot)) {
+        Remove-Item -LiteralPath $timeoutRoot -Recurse -Force
     }
 }
 
@@ -649,6 +906,9 @@ Assert-True 'installer task defaults Observe' ($installerText.Contains('[string]
 Assert-True 'installer explicit allowlist includes codex' ($installerText.Contains('-AllowedSourcesCsv "chat-mobile,codex"'))
 Assert-True 'installer uses IgnoreNew' ($installerText.Contains('-MultipleInstances IgnoreNew'))
 Assert-True 'installer uses SYSTEM service account' ($installerText.Contains('-LogonType ServiceAccount'))
+Assert-True 'runner owns recursive timeout cleanup for isolated Claude config residue' (
+    ([IO.File]::ReadAllText($RunnerPath, [Text.Encoding]::UTF8)).Contains('Remove-OwnedRunDirectory -Path $tempRoot -ParentPath $runParent -ExpectedName $runDirectoryName')
+)
 Assert-True 'installer has boot and 15 minute triggers' ($installerText.Contains('-AtStartup') -and $installerText.Contains('-Minutes 15'))
 Assert-True 'installer preflight requires disallowedTools' ($installerText.Contains("'--disallowedTools'"))
 foreach ($requiredInstallerFlag in @('--settings', '--tools', '--strict-mcp-config', '--bare')) {
@@ -665,27 +925,73 @@ $installerAst = [Management.Automation.Language.Parser]::ParseFile(
     [ref]$installerErrors
 )
 Assert-True 'installer parses before CLI compatibility extraction' (@($installerErrors).Count -eq 0)
-$compatibilityFunctions = @($installerAst.FindAll({
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-    $node.Name -ceq 'Assert-ClaudeCliCompatibility'
-}, $true))
-Assert-True 'installer defines one executable CLI compatibility gate' ($compatibilityFunctions.Count -eq 1)
-if ($compatibilityFunctions.Count -eq 1) {
-    Invoke-Expression $compatibilityFunctions[0].Extent.Text
+$installerFunctionNames = @(
+    'Test-InstallerReparsePoint',
+    'Restore-InstallerProcessEnvironmentVariable',
+    'Assert-InstallerOwnedDirectory',
+    'Test-InstallerTreeContainsReparsePoint',
+    'Remove-InstallerOwnedDirectory',
+    'Assert-ClaudeCliCompatibility',
+    'Test-ClaudeCliCompatibilityRequired'
+)
+$installerFunctionsReady = $true
+foreach ($installerFunctionName in $installerFunctionNames) {
+    $installerFunctions = @($installerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq $installerFunctionName
+    }, $true))
+    Assert-True ('installer defines one executable ' + $installerFunctionName) ($installerFunctions.Count -eq 1)
+    if ($installerFunctions.Count -eq 1) {
+        Invoke-Expression $installerFunctions[0].Extent.Text
+    } else {
+        $installerFunctionsReady = $false
+    }
+}
+if ($installerFunctionsReady) {
     $cliProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-installer-cli-test-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $cliProbeRoot | Out-Null
+    $oldInstallerConfig = [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
+    $oldInstallerCapture = [Environment]::GetEnvironmentVariable('ORDER_INSTALLER_CONFIG_CAPTURE', 'Process')
+    $oldInstallerReparseTarget = [Environment]::GetEnvironmentVariable('ORDER_INSTALLER_CONFIG_REPARSE_TARGET', 'Process')
     try {
         $fakeCliSource = @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Remaining)
 $mode = [IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path)
+function Write-IsolationCapture([string]$Phase) {
+    $configPath = [string]$env:CLAUDE_CONFIG_DIR
+    $configExists = -not [string]::IsNullOrWhiteSpace($configPath) -and
+        (Test-Path -LiteralPath $configPath -PathType Container)
+    if ($configExists) {
+        $nested = Join-Path $configPath ('nested-' + $Phase)
+        New-Item -ItemType Directory -Path $nested -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $nested 'marker.txt'), 'marker', [Text.UTF8Encoding]::new($false))
+        if ($mode -ceq 'cleanup-reparse' -and
+            -not [string]::IsNullOrWhiteSpace($env:ORDER_INSTALLER_CONFIG_REPARSE_TARGET)) {
+            $escape = Join-Path $configPath 'escape'
+            if (-not (Test-Path -LiteralPath $escape)) {
+                New-Item -ItemType Junction -Path $escape -Target $env:ORDER_INSTALLER_CONFIG_REPARSE_TARGET | Out-Null
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ORDER_INSTALLER_CONFIG_CAPTURE)) {
+        $record = [ordered]@{ phase = $Phase; config_path = $configPath; config_exists = $configExists }
+        [IO.File]::AppendAllText(
+            $env:ORDER_INSTALLER_CONFIG_CAPTURE,
+            (($record | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+}
 if ($Remaining.Count -ne 1) { exit 90 }
 if ($Remaining[0] -ceq '--version') {
+    Write-IsolationCapture -Phase 'version'
     if ($mode -ceq 'version-fail') { exit 91 }
     if ($mode -ceq 'bad-version') { Write-Output '2.1.242 (Claude Code)' } else { Write-Output '2.1.241 (Claude Code)' }
     exit 0
 }
 if ($Remaining[0] -ceq '--help') {
+    Write-IsolationCapture -Phase 'help'
     if ($mode -ceq 'help-fail') { exit 92 }
     $flags = @('--json-schema', '--settings', '--tools', '--strict-mcp-config', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--bare', '--no-session-persistence', '--disable-slash-commands')
     if ($mode -ceq 'missing-flag') { $flags = @($flags | Where-Object { $_ -cne '--strict-mcp-config' }) }
@@ -696,11 +1002,19 @@ if ($Remaining[0] -ceq '--help') {
 exit 93
 '@
         $fakePaths = @{}
-        foreach ($mode in @('good', 'version-fail', 'bad-version', 'help-fail', 'missing-flag', 'missing-manual')) {
+        foreach ($mode in @('good', 'version-fail', 'bad-version', 'help-fail', 'missing-flag', 'missing-manual', 'cleanup-reparse')) {
             $fakePath = Join-Path $cliProbeRoot ($mode + '.ps1')
             [IO.File]::WriteAllText($fakePath, $fakeCliSource, [Text.UTF8Encoding]::new($false))
             $fakePaths[$mode] = $fakePath
         }
+
+        $installerAmbient = Join-Path $cliProbeRoot 'ambient-config'
+        $installerAmbientMarker = Join-Path $installerAmbient 'must-survive.txt'
+        New-Item -ItemType Directory -Path $installerAmbient | Out-Null
+        [IO.File]::WriteAllText($installerAmbientMarker, 'ambient', [Text.UTF8Encoding]::new($false))
+        $setCapture = Join-Path $cliProbeRoot 'set-config.jsonl'
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $installerAmbient, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_INSTALLER_CONFIG_CAPTURE', $setCapture, 'Process')
         $goodCompatibility = $false
         try {
             Assert-ClaudeCliCompatibility -CommandPath $fakePaths['good']
@@ -709,6 +1023,57 @@ exit 93
             $goodCompatibility = $false
         }
         Assert-True 'installer executable gate accepts exact pinned CLI contract' $goodCompatibility
+        Assert-True 'installer restores a set ambient config in the same process' (
+            [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process') -ceq $installerAmbient
+        )
+        $setRecords = @(
+            [IO.File]::ReadAllLines($setCapture, [Text.Encoding]::UTF8) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { [string]$_ | ConvertFrom-Json }
+        )
+        $setConfigPath = if ($setRecords.Count -gt 0) { [string]$setRecords[0].config_path } else { '' }
+        Assert-True 'installer version and help children see one existing isolated config directory' (
+            $setRecords.Count -eq 2 -and
+            [string]$setRecords[0].phase -ceq 'version' -and
+            [string]$setRecords[1].phase -ceq 'help' -and
+            @($setRecords | Where-Object { -not [bool]$_.config_exists }).Count -eq 0 -and
+            @($setRecords | Select-Object -ExpandProperty config_path -Unique).Count -eq 1 -and
+            [IO.Path]::GetFileName($setConfigPath) -cmatch '^claude-config-[0-9a-f]{32}$' -and
+            [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($setConfigPath)) -cmatch '^order-supervisor-cli-[0-9a-f]{32}$'
+        )
+        Assert-True 'installer removes nested probe markers and preserves ambient config' (
+            -not (Test-Path -LiteralPath $setConfigPath) -and
+            -not (Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($setConfigPath)) -PathType Container) -and
+            (Test-Path -LiteralPath $installerAmbientMarker -PathType Leaf)
+        )
+
+        $unsetCapture = Join-Path $cliProbeRoot 'unset-config.jsonl'
+        Remove-Item -LiteralPath 'Env:\CLAUDE_CONFIG_DIR' -Force -ErrorAction SilentlyContinue
+        [Environment]::SetEnvironmentVariable('ORDER_INSTALLER_CONFIG_CAPTURE', $unsetCapture, 'Process')
+        $unsetCompatibility = $false
+        $unsetCompatibilityError = ''
+        try {
+            Assert-ClaudeCliCompatibility -CommandPath $fakePaths['good']
+            $unsetCompatibility = $true
+        } catch {
+            $unsetCompatibilityError = [string]$_.Exception.Message
+        }
+        $unsetRecords = @(
+            [IO.File]::ReadAllLines($unsetCapture, [Text.Encoding]::UTF8) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { [string]$_ | ConvertFrom-Json }
+        )
+        Assert-True 'installer compatibility succeeds from an unset ambient config' `
+            $unsetCompatibility $unsetCompatibilityError
+        Assert-True 'installer restores an unset ambient config in the same process' (
+            $null -eq [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
+        )
+        Assert-True 'installer cleans isolated config created from an unset ambient state' (
+            $unsetRecords.Count -eq 2 -and
+            -not (Test-Path -LiteralPath ([string]$unsetRecords[0].config_path))
+        )
+
+        [Environment]::SetEnvironmentVariable('ORDER_INSTALLER_CONFIG_CAPTURE', $null, 'Process')
         Assert-Throws 'installer rejects version-probe failure' {
             Assert-ClaudeCliCompatibility -CommandPath $fakePaths['version-fail']
         } 'claude_cli_version_probe_failed'
@@ -724,7 +1089,116 @@ exit 93
         Assert-Throws 'installer rejects missing manual compatibility mode' {
             Assert-ClaudeCliCompatibility -CommandPath $fakePaths['missing-manual']
         } 'claude_cli_manual_mode_missing'
+
+        $collisionToken = [Guid]::NewGuid().ToString('N')
+        $collisionParent = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-cli-' + $collisionToken)
+        $collisionMarker = Join-Path $collisionParent 'must-survive.txt'
+        New-Item -ItemType Directory -Path $collisionParent | Out-Null
+        [IO.File]::WriteAllText($collisionMarker, 'collision', [Text.UTF8Encoding]::new($false))
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $installerAmbient, 'Process')
+        $collisionError = ''
+        try {
+            Assert-ClaudeCliCompatibility -CommandPath $fakePaths['good'] -IsolationToken $collisionToken
+        } catch {
+            $collisionError = [string]$_.Exception.Message
+        }
+        Assert-True 'installer refuses and preserves a pre-existing isolation parent collision' (
+            $collisionError -ceq 'claude_cli_isolation_parent_collision' -and
+            (Test-Path -LiteralPath $collisionMarker -PathType Leaf) -and
+            [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process') -ceq $installerAmbient
+        ) $collisionError
+        Remove-Item -LiteralPath $collisionParent -Recurse -Force
+
+        $reparseToken = [Guid]::NewGuid().ToString('N')
+        $reparseTarget = Join-Path $cliProbeRoot 'installer-reparse-target'
+        $reparseParent = Join-Path ([IO.Path]::GetTempPath()) ('order-supervisor-cli-' + $reparseToken)
+        New-Item -ItemType Directory -Path $reparseTarget | Out-Null
+        [IO.File]::WriteAllText((Join-Path $reparseTarget 'must-survive.txt'), 'target', [Text.UTF8Encoding]::new($false))
+        New-Item -ItemType Junction -Path $reparseParent -Target $reparseTarget | Out-Null
+        $reparseError = ''
+        try {
+            Assert-ClaudeCliCompatibility -CommandPath $fakePaths['good'] -IsolationToken $reparseToken
+        } catch {
+            $reparseError = [string]$_.Exception.Message
+        }
+        Assert-True 'installer rejects a reparse-point isolation parent without deletion' (
+            $reparseError -ceq 'claude_cli_isolation_directory_unsafe' -and
+            (Test-Path -LiteralPath (Join-Path $reparseTarget 'must-survive.txt') -PathType Leaf) -and
+            [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process') -ceq $installerAmbient
+        ) $reparseError
+        [IO.Directory]::Delete($reparseParent)
+
+        $cleanupReparseTarget = Join-Path $cliProbeRoot 'cleanup-reparse-target'
+        $cleanupReparseCapture = Join-Path $cliProbeRoot 'cleanup-reparse.jsonl'
+        New-Item -ItemType Directory -Path $cleanupReparseTarget | Out-Null
+        [IO.File]::WriteAllText((Join-Path $cleanupReparseTarget 'must-survive.txt'), 'target', [Text.UTF8Encoding]::new($false))
+        [Environment]::SetEnvironmentVariable('ORDER_INSTALLER_CONFIG_CAPTURE', $cleanupReparseCapture, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_INSTALLER_CONFIG_REPARSE_TARGET', $cleanupReparseTarget, 'Process')
+        $cleanupReparseError = ''
+        try {
+            Assert-ClaudeCliCompatibility -CommandPath $fakePaths['cleanup-reparse']
+        } catch {
+            $cleanupReparseError = [string]$_.Exception.Message
+        }
+        $cleanupReparseRecords = @(
+            [IO.File]::ReadAllLines($cleanupReparseCapture, [Text.Encoding]::UTF8) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { [string]$_ | ConvertFrom-Json }
+        )
+        $cleanupReparseConfig = if ($cleanupReparseRecords.Count -gt 0) { [string]$cleanupReparseRecords[0].config_path } else { '' }
+        Assert-True 'installer cleanup failure is fixed, restores ambient, and retains unsafe residue' (
+            $cleanupReparseError -ceq 'claude_cli_isolation_cleanup_failed' -and
+            $cleanupReparseRecords.Count -eq 2 -and
+            (Test-Path -LiteralPath (Join-Path $cleanupReparseConfig 'escape') -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $cleanupReparseTarget 'must-survive.txt') -PathType Leaf) -and
+            [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process') -ceq $installerAmbient
+        ) $cleanupReparseError
+        if (-not [string]::IsNullOrWhiteSpace($cleanupReparseConfig) -and
+            (Test-Path -LiteralPath (Join-Path $cleanupReparseConfig 'escape'))) {
+            [IO.Directory]::Delete((Join-Path $cleanupReparseConfig 'escape'))
+            Remove-Item -LiteralPath ([IO.Path]::GetDirectoryName($cleanupReparseConfig)) -Recurse -Force
+        }
+
+        $originalActionVariable = Get-Variable -Name Action -ErrorAction SilentlyContinue
+        $originalModeVariable = Get-Variable -Name Mode -ErrorAction SilentlyContinue
+        try {
+            $compatibilityGateResults = @{}
+            foreach ($gateSpec in @(
+                [pscustomobject]@{ key = 'install_execute'; action = 'Install'; mode = 'Execute' },
+                [pscustomobject]@{ key = 'install_observe'; action = 'Install'; mode = 'Observe' },
+                [pscustomobject]@{ key = 'uninstall_execute'; action = 'Uninstall'; mode = 'Execute' },
+                [pscustomobject]@{ key = 'rollback_execute'; action = 'Rollback'; mode = 'Execute' },
+                [pscustomobject]@{ key = 'status_execute'; action = 'Status'; mode = 'Execute' }
+            )) {
+                $Action = [string]$gateSpec.action
+                $Mode = [string]$gateSpec.mode
+                $compatibilityGateResults[[string]$gateSpec.key] = [bool](Test-ClaudeCliCompatibilityRequired)
+            }
+        } finally {
+            if ($null -ne $originalActionVariable) { $Action = $originalActionVariable.Value }
+            else { Remove-Variable -Name Action -ErrorAction SilentlyContinue }
+            if ($null -ne $originalModeVariable) { $Mode = $originalModeVariable.Value }
+            else { Remove-Variable -Name Mode -ErrorAction SilentlyContinue }
+        }
+        Assert-True 'only Install Execute can create the CLI compatibility isolation' (
+            [bool]$compatibilityGateResults['install_execute'] -and
+            -not [bool]$compatibilityGateResults['install_observe'] -and
+            -not [bool]$compatibilityGateResults['uninstall_execute'] -and
+            -not [bool]$compatibilityGateResults['rollback_execute'] -and
+            -not [bool]$compatibilityGateResults['status_execute']
+        )
     } finally {
+        foreach ($restoreSpec in @(
+            [pscustomobject]@{ name = 'CLAUDE_CONFIG_DIR'; value = $oldInstallerConfig },
+            [pscustomobject]@{ name = 'ORDER_INSTALLER_CONFIG_CAPTURE'; value = $oldInstallerCapture },
+            [pscustomobject]@{ name = 'ORDER_INSTALLER_CONFIG_REPARSE_TARGET'; value = $oldInstallerReparseTarget }
+        )) {
+            if ($null -eq $restoreSpec.value) {
+                Remove-Item -LiteralPath ('Env:\' + [string]$restoreSpec.name) -Force -ErrorAction SilentlyContinue
+            } else {
+                [Environment]::SetEnvironmentVariable([string]$restoreSpec.name, [string]$restoreSpec.value, 'Process')
+            }
+        }
         if (-not $KeepArtifacts -and (Test-Path -LiteralPath $cliProbeRoot -PathType Container)) {
             Remove-Item -LiteralPath $cliProbeRoot -Recurse -Force
         }

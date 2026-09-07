@@ -248,6 +248,65 @@ function Quote-ProcessArgument {
     return '"' + $Value + '"'
 }
 
+function Invoke-TaskkillTree {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $taskkillPath = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\taskkill.exe'))
+    if (-not (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) { return -1 }
+    & $taskkillPath /PID $ProcessId /T /F 1>$null 2>$null
+    return [int]$LASTEXITCODE
+}
+
+function Test-RunTreeContainsReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pending = New-Object System.Collections.Generic.Stack[string]
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
+            $attributes = [IO.File]::GetAttributes($entryPath)
+            if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            if (([int]$attributes -band [int][IO.FileAttributes]::Directory) -ne 0) {
+                $pending.Push($entryPath)
+            }
+        }
+    }
+    return $false
+}
+
+function Remove-OwnedRunDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParentPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+
+    if ($ExpectedName -cnotmatch '^run-[0-9a-f]{32}$') { throw 'claude_run_directory_not_owned' }
+    $parentFullPath = [IO.Path]::GetFullPath($ParentPath).TrimEnd('\')
+    $ownedPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ([IO.Path]::GetDirectoryName($ownedPath).TrimEnd('\') -cne $parentFullPath -or
+        [IO.Path]::GetFileName($ownedPath) -cne $ExpectedName) {
+        throw 'claude_run_directory_not_owned'
+    }
+    if (-not (Test-Path -LiteralPath $parentFullPath -PathType Container)) {
+        throw 'claude_run_directory_unsafe'
+    }
+    $parentItem = Get-Item -LiteralPath $parentFullPath -Force -ErrorAction Stop
+    if ((([int]$parentItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'claude_run_directory_unsafe'
+    }
+    if (-not (Test-Path -LiteralPath $ownedPath)) { return }
+    $item = Get-Item -LiteralPath $ownedPath -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        (Test-RunTreeContainsReparsePoint -Path $ownedPath)) {
+        throw 'claude_run_directory_unsafe'
+    }
+    Remove-Item -LiteralPath $ownedPath -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $ownedPath) { throw 'claude_run_directory_cleanup_failed' }
+}
+
 function Invoke-ClaudeWorker {
     param(
         [Parameter(Mandatory = $true)][string]$WorkId,
@@ -256,11 +315,25 @@ function Invoke-ClaudeWorker {
     )
     if (-not (Test-Path -LiteralPath $ClaudeAdapter -PathType Leaf)) { throw 'claude_adapter_missing' }
     if (-not (Test-Path -LiteralPath $ClaudeSchema -PathType Leaf)) { throw 'claude_schema_missing' }
-    $tempRoot = Join-Path (Split-Path -Parent $StatePath) ('run-' + $RunId)
-    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+    $runParent = [IO.Path]::GetFullPath((Split-Path -Parent $StatePath)).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $runParent -PathType Container)) { throw 'claude_run_directory_unsafe' }
+    $runParentItem = Get-Item -LiteralPath $runParent -Force -ErrorAction Stop
+    if ((([int]$runParentItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'claude_run_directory_unsafe'
+    }
+    $runDirectoryName = 'run-' + $RunId
+    $tempRoot = [IO.Path]::GetFullPath((Join-Path $runParent $runDirectoryName))
+    if ([IO.Path]::GetDirectoryName($tempRoot).TrimEnd('\') -cne $runParent -or
+        [IO.Path]::GetFileName($tempRoot) -cne $runDirectoryName -or
+        $runDirectoryName -cnotmatch '^run-[0-9a-f]{32}$' -or
+        (Test-Path -LiteralPath $tempRoot)) {
+        throw 'claude_run_directory_not_owned'
+    }
+    New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop | Out-Null
     $promptPath = Join-Path $tempRoot 'prompt.txt'
     $stdoutPath = Join-Path $tempRoot 'stdout.json'
     $stderrPath = Join-Path $tempRoot 'stderr.txt'
+    $cleanupOwnedRun = $true
     try {
         $prompt = New-ClaudeWorkerPrompt `
             -WorkId $WorkId `
@@ -289,10 +362,26 @@ function Invoke-ClaudeWorker {
             PassThru = $true
         }
         $process = Start-Process @startArgs
-        if (-not $process.WaitForExit($WallTimeoutSeconds * 1000)) {
-            & taskkill.exe /PID $process.Id /T /F 1>$null 2>$null
+        $cleanupOwnedRun = $false
+        $completedWithinLimit = $process.WaitForExit($WallTimeoutSeconds * 1000)
+        if (-not $completedWithinLimit) {
+            $taskkillExitCode = -1
+            try { $taskkillExitCode = Invoke-TaskkillTree -ProcessId $process.Id } catch {}
+            if ($taskkillExitCode -ne 0) { throw 'claude_termination_failed' }
+            $terminationObserved = $false
+            try {
+                $terminationObserved = $process.WaitForExit(15000)
+                if ($terminationObserved) { $process.WaitForExit() }
+            } catch {
+                $terminationObserved = $false
+            }
+            if (-not $terminationObserved) { throw 'claude_termination_failed' }
+            $cleanupOwnedRun = $true
             throw 'claude_wall_timeout'
         }
+        $process.WaitForExit()
+        $process.Refresh()
+        $cleanupOwnedRun = $true
         if ($process.ExitCode -ne 0) {
             $diagnostic = ''
             if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
@@ -306,9 +395,8 @@ function Invoke-ClaudeWorker {
         $jsonText = [IO.File]::ReadAllText($outputInfo.FullName, [Text.Encoding]::UTF8)
         return ConvertFrom-ClaudeResultEnvelope -JsonText $jsonText -ExpectedWorkId $WorkId
     } finally {
-        if (Test-Path -LiteralPath $tempRoot -PathType Container) {
-            Get-ChildItem -LiteralPath $tempRoot -Force | Remove-Item -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $tempRoot -Force -ErrorAction SilentlyContinue
+        if ($cleanupOwnedRun) {
+            Remove-OwnedRunDirectory -Path $tempRoot -ParentPath $runParent -ExpectedName $runDirectoryName
         }
     }
 }

@@ -93,8 +93,11 @@ function Invoke-AdapterCase {
     $safeName = $Name -replace '[^A-Za-z0-9_-]', '-'
     $prefix = 'case-' + $safeName
     $markerPath = Join-Path $TemporaryRoot ($prefix + '-invoked.txt')
+    $configCapturePath = Join-Path $TemporaryRoot ($prefix + '-config.jsonl')
     $priorMarkerPath = [Environment]::GetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', 'Process')
+    $priorConfigCapturePath = [Environment]::GetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', 'Process')
     [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', $markerPath, 'Process')
+    [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $configCapturePath, 'Process')
     try {
         [object[]]$arguments = @(
             New-AdapterArguments `
@@ -118,6 +121,7 @@ function Invoke-AdapterCase {
         $run = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments $arguments
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_MARKER_PATH', $priorMarkerPath, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $priorConfigCapturePath, 'Process')
     }
 
     return [pscustomobject][ordered]@{
@@ -125,6 +129,111 @@ function Invoke-AdapterCase {
         invoked = (Test-Path -LiteralPath $markerPath -PathType Leaf)
         stdout_path = Join-Path $TemporaryRoot ($prefix + '-stdout.json')
         stderr_path = Join-Path $TemporaryRoot ($prefix + '-stderr.txt')
+        config_capture_path = $configCapturePath
+    }
+}
+
+function Get-ConfigCaptureRecords {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    return @(
+        [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json }
+    )
+}
+
+function Test-ConfigCapturesCleaned {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Records,
+        [Parameter(Mandatory = $true)][string]$ExpectedParent
+    )
+    $parent = [IO.Path]::GetFullPath($ExpectedParent).TrimEnd('\')
+    foreach ($record in $Records) {
+        $path = [string]$record.config_path
+        if (-not [bool]$record.config_exists -or -not [IO.Path]::IsPathRooted($path) -or
+            [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($path)).TrimEnd('\') -cne $parent -or
+            [IO.Path]::GetFileName($path) -cnotmatch '^claude-config-[0-9a-f]{32}$' -or
+            (Test-Path -LiteralPath $path)) {
+            return $false
+        }
+    }
+    if (Test-Path -LiteralPath $parent -PathType Container) {
+        $leftovers = @(
+            Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop |
+                Where-Object { $_.Name -cmatch '^claude-config-[0-9a-f]{32}$' }
+        )
+        if ($leftovers.Count -ne 0) { return $false }
+    }
+    return $true
+}
+
+function Invoke-AdapterConfigRestorationCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$WorkspacePath,
+        [Parameter(Mandatory = $true)][string]$EnvFile,
+        [Parameter(Mandatory = $true)][string]$FakeClaudePath,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot,
+        [AllowNull()][string]$AmbientConfigDirectory,
+        [string]$FailureVariable = '',
+        [string]$FailureValue = ''
+    )
+
+    $capturePath = Join-Path $TemporaryRoot ('restore-' + $Name + '-config.jsonl')
+    $priorConfig = [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
+    $priorCapture = [Environment]::GetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', 'Process')
+    $priorFailure = if ([string]::IsNullOrWhiteSpace($FailureVariable)) { $null } else {
+        [Environment]::GetEnvironmentVariable($FailureVariable, 'Process')
+    }
+    if ($null -eq $AmbientConfigDirectory) {
+        Remove-Item -LiteralPath 'Env:\CLAUDE_CONFIG_DIR' -Force -ErrorAction SilentlyContinue
+    } else {
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $AmbientConfigDirectory, 'Process')
+    }
+    [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $capturePath, 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($FailureVariable)) {
+        [Environment]::SetEnvironmentVariable($FailureVariable, $FailureValue, 'Process')
+    }
+    $pipeline = [PowerShell]::Create()
+    $invokeError = ''
+    try {
+        $prefix = 'restore-' + $Name
+        $null = $pipeline.AddCommand($AdapterPath)
+        $null = $pipeline.AddParameter('PromptPath', (Join-Path $TemporaryRoot 'prompt.txt'))
+        $null = $pipeline.AddParameter('SchemaPath', $SchemaPath)
+        $null = $pipeline.AddParameter('StdoutPath', (Join-Path $TemporaryRoot ($prefix + '-stdout.json')))
+        $null = $pipeline.AddParameter('StderrPath', (Join-Path $TemporaryRoot ($prefix + '-stderr.txt')))
+        $null = $pipeline.AddParameter('EnvFile', $EnvFile)
+        $null = $pipeline.AddParameter('WorkspacePath', $WorkspacePath)
+        $null = $pipeline.AddParameter('ClaudeCommand', $FakeClaudePath)
+        $null = $pipeline.AddParameter('MaxBudgetUsd', 0.01)
+        try { $null = @($pipeline.Invoke()) }
+        catch { $invokeError = [string]$_.Exception.Message }
+        if ([string]$pipeline.InvocationStateInfo.State -ceq 'Failed' -and
+            $null -ne $pipeline.InvocationStateInfo.Reason) {
+            $invokeError = [string]$pipeline.InvocationStateInfo.Reason.Message
+        }
+        if ([string]::IsNullOrWhiteSpace($invokeError) -and $pipeline.Streams.Error.Count -gt 0) {
+            $invokeError = [string]$pipeline.Streams.Error[$pipeline.Streams.Error.Count - 1].Exception.Message
+        }
+        $observedAfter = [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
+    } finally {
+        $pipeline.Dispose()
+        if ($null -eq $priorConfig) { Remove-Item -LiteralPath 'Env:\CLAUDE_CONFIG_DIR' -Force -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $priorConfig, 'Process') }
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $priorCapture, 'Process')
+        if (-not [string]::IsNullOrWhiteSpace($FailureVariable)) {
+            [Environment]::SetEnvironmentVariable($FailureVariable, $priorFailure, 'Process')
+        }
+    }
+    return [pscustomobject][ordered]@{
+        restored = $(
+            if ($null -eq $AmbientConfigDirectory) { $null -eq $observedAfter }
+            else { [string]::Equals([string]$observedAfter, $AmbientConfigDirectory, [StringComparison]::Ordinal) }
+        )
+        records = @(Get-ConfigCaptureRecords -Path $capturePath)
+        error = $invokeError
     }
 }
 
@@ -158,6 +267,10 @@ function Assert-AdapterRejected {
     $stderrSafe = -not (Test-Path -LiteralPath $Case.stderr_path -PathType Leaf) -or
         (Get-Item -LiteralPath $Case.stderr_path).Length -eq 0
     Assert-True ($Name + ' creates no raw Claude output') ($stdoutSafe -and $stderrSafe)
+    $configRecords = @(Get-ConfigCaptureRecords -Path ([string]$Case.config_capture_path))
+    Assert-True ($Name + ' removes any isolated config created before rejection') (
+        Test-ConfigCapturesCleaned -Records $configRecords -ExpectedParent ([IO.Path]::GetDirectoryName([string]$Case.config_capture_path))
+    )
 }
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-workspace-test-' + [Guid]::NewGuid().ToString('N'))
@@ -177,13 +290,15 @@ $testEnvironmentNames = @(
     'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'BUS_SECRET', 'ALPHA_SECRET',
     'OPENAI_API_KEY', 'ORDER_SUPERVISOR_DECOY', 'ORDER_ADAPTER_FAKE_MARKER_PATH',
     'ORDER_ADAPTER_FAKE_EXIT_CODE', 'ORDER_ADAPTER_FAKE_VERSION',
-    'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE', 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB',
-    'CLAUDE_CODE_USE_POWERSHELL_TOOL'
+    'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE', 'ORDER_ADAPTER_FAKE_THROW',
+    'ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', 'ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET',
+    'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB',
+    'CLAUDE_CODE_USE_POWERSHELL_TOOL', 'CLAUDE_CONFIG_DIR'
 ) + $providerConflictNames
 $testEnvironmentBackup = @{}
 foreach ($name in $testEnvironmentNames) {
     $testEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    Remove-Item -LiteralPath ('Env:\' + $name) -Force -ErrorAction SilentlyContinue
 }
 try {
     $workspace = Join-Path $tempRoot 'Blackboard checkout'
@@ -210,9 +325,31 @@ ORDER_SUPERVISOR_DECOY=must-not-be-imported
 "@
     [IO.File]::WriteAllText($adapterEnvFile, $adapterEnvText, (New-Object Text.UTF8Encoding($false)))
 
-    $fakeClaudePath = Join-Path $tempRoot 'fake-claude.ps1'
+$fakeClaudePath = Join-Path $tempRoot 'fake-claude.ps1'
 $fakeClaude = @'
+function Write-ConfigCapture([string]$Phase) {
+    $configPath = [string]$env:CLAUDE_CONFIG_DIR
+    $configExists = -not [string]::IsNullOrWhiteSpace($configPath) -and (Test-Path -LiteralPath $configPath -PathType Container)
+    if ($configExists) {
+        [IO.File]::WriteAllText((Join-Path $configPath ('fake-marker-' + $Phase + '.txt')), 'marker', [Text.UTF8Encoding]::new($false))
+        if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET)) {
+            $escapePath = Join-Path $configPath 'escape'
+            if (-not (Test-Path -LiteralPath $escapePath)) {
+                New-Item -ItemType Junction -Path $escapePath -Target $env:ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET | Out-Null
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH)) {
+        $record = [ordered]@{ phase = $Phase; config_path = $configPath; config_exists = $configExists }
+        [IO.File]::AppendAllText(
+            $env:ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH,
+            (($record | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+}
 if ($args.Count -eq 1 -and [string]$args[0] -ceq '--version') {
+    Write-ConfigCapture -Phase 'version'
     if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE)) {
         exit ([int]$env:ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE)
     }
@@ -223,9 +360,11 @@ if ($args.Count -eq 1 -and [string]$args[0] -ceq '--version') {
     }
     exit 0
 }
+Write-ConfigCapture -Phase 'inference'
 if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_MARKER_PATH)) {
     [IO.File]::WriteAllText($env:ORDER_ADAPTER_FAKE_MARKER_PATH, 'invoked', [Text.UTF8Encoding]::new($false))
 }
+if ([string]$env:ORDER_ADAPTER_FAKE_THROW -ceq '1') { throw 'fake inference failure' }
 $settingsIndexes = @(
     for ($index = 0; $index -lt $args.Count; $index++) {
         if ([string]$args[$index] -ceq '--settings') { $index }
@@ -252,6 +391,8 @@ $capture = [ordered]@{
     decoy_absent = [string]::IsNullOrEmpty($env:ORDER_SUPERVISOR_DECOY)
     subprocess_scrub_forced = ([string]$env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB -ceq '1')
     powershell_tool_process_absent = [string]::IsNullOrEmpty($env:CLAUDE_CODE_USE_POWERSHELL_TOOL)
+    config_path = [string]$env:CLAUDE_CONFIG_DIR
+    config_exists_during_invoke = (Test-Path -LiteralPath ([string]$env:CLAUDE_CONFIG_DIR) -PathType Container)
     settings_argument_count = $settingsIndexes.Count
     settings_path = $settingsPath
     settings_exists_during_invoke = $settingsExists
@@ -277,6 +418,11 @@ exit $requestedExitCode
     $env:ANTHROPIC_MODEL = 'inherited-model-must-be-overridden'
     $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '0'
     $env:CLAUDE_CODE_USE_POWERSHELL_TOOL = '0'
+    $ambientConfigDirectory = Join-Path $tempRoot 'ambient-claude-config'
+    $validConfigCapturePath = Join-Path $tempRoot 'valid-config.jsonl'
+    New-Item -ItemType Directory -Path $ambientConfigDirectory | Out-Null
+    $env:CLAUDE_CONFIG_DIR = $ambientConfigDirectory
+    $env:ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH = $validConfigCapturePath
     try {
         $adapterRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
             New-AdapterArguments -WorkspacePath $workspace -Prefix 'valid' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
@@ -285,13 +431,16 @@ exit $requestedExitCode
             [string]$env:ANTHROPIC_API_KEY -ceq 'inherited-api-key-must-be-overridden' -and
             [string]$env:ANTHROPIC_MODEL -ceq 'inherited-model-must-be-overridden' -and
             [string]$env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB -ceq '0' -and
-            [string]$env:CLAUDE_CODE_USE_POWERSHELL_TOOL -ceq '0'
+            [string]$env:CLAUDE_CODE_USE_POWERSHELL_TOOL -ceq '0' -and
+            [string]$env:CLAUDE_CONFIG_DIR -ceq $ambientConfigDirectory
         )
     } finally {
         [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', $null, 'Process')
         [Environment]::SetEnvironmentVariable('ANTHROPIC_MODEL', $null, 'Process')
         [Environment]::SetEnvironmentVariable('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB', $null, 'Process')
         [Environment]::SetEnvironmentVariable('CLAUDE_CODE_USE_POWERSHELL_TOOL', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $null, 'Process')
     }
     Assert-True 'adapter accepts absolute existing git workspace' ($adapterRun.exit_code -eq 0)
     Assert-True 'adapter child does not alter parent provider environment' $parentAllowedEnvironmentPreserved
@@ -314,6 +463,18 @@ exit $requestedExitCode
         )
         Assert-True 'adapter makes settings own PowerShell enablement' (
             $adapterOutput.powershell_tool_process_absent -is [bool] -and $adapterOutput.powershell_tool_process_absent
+        )
+        $validConfigRecords = @(Get-ConfigCaptureRecords -Path $validConfigCapturePath)
+        Assert-True 'version and inference both see one isolated existing Claude config directory' (
+            $validConfigRecords.Count -eq 2 -and
+            @($validConfigRecords | Where-Object { -not [bool]$_.config_exists }).Count -eq 0 -and
+            @($validConfigRecords | Select-Object -ExpandProperty config_path -Unique).Count -eq 1 -and
+            [string]$adapterOutput.config_path -ceq [string]$validConfigRecords[0].config_path -and
+            [bool]$adapterOutput.config_exists_during_invoke
+        )
+        Assert-True 'isolated Claude config overrides ambient and is removed with child markers' (
+            [string]$adapterOutput.config_path -cne $ambientConfigDirectory -and
+            (Test-ConfigCapturesCleaned -Records $validConfigRecords -ExpectedParent $tempRoot)
         )
         Assert-True 'adapter does not import unrelated env-file keys' (
             $adapterOutput.bus_secret_absent -and $adapterOutput.alpha_secret_absent -and
@@ -402,15 +563,23 @@ exit $requestedExitCode
     }
 
     $env:ORDER_ADAPTER_FAKE_EXIT_CODE = '7'
+    $nonzeroConfigCapturePath = Join-Path $tempRoot 'nonzero-config.jsonl'
+    $env:ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH = $nonzeroConfigCapturePath
     try {
         $nonzeroRun = Invoke-PowerShellChild -ScriptPath $AdapterPath -Arguments (
             New-AdapterArguments -WorkspacePath $workspace -Prefix 'nonzero' -FakeClaudePath $fakeClaudePath -TemporaryRoot $tempRoot -EnvFile $adapterEnvFile
         )
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_EXIT_CODE', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_CONFIG_CAPTURE_PATH', $null, 'Process')
     }
     $nonzeroOutputPath = Join-Path $tempRoot 'nonzero-stdout.json'
     Assert-True 'adapter preserves a nonzero Claude exit code' ($nonzeroRun.exit_code -eq 7)
+    $nonzeroConfigRecords = @(Get-ConfigCaptureRecords -Path $nonzeroConfigCapturePath)
+    Assert-True 'adapter removes isolated config and markers after nonzero Claude exit' (
+        $nonzeroConfigRecords.Count -eq 2 -and
+        (Test-ConfigCapturesCleaned -Records $nonzeroConfigRecords -ExpectedParent $tempRoot)
+    )
     if (Test-Path -LiteralPath $nonzeroOutputPath -PathType Leaf) {
         $nonzeroOutput = [IO.File]::ReadAllText($nonzeroOutputPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
         Assert-True 'adapter deletes ephemeral settings after nonzero Claude exit' (
@@ -420,6 +589,26 @@ exit $requestedExitCode
     } else {
         Assert-True 'adapter deletes ephemeral settings after nonzero Claude exit' $false
     }
+
+    $env:ORDER_ADAPTER_FAKE_THROW = '1'
+    try {
+        $inferenceFailureCase = Invoke-AdapterCase `
+            -Name 'inference-failure' `
+            -WorkspacePath $workspace `
+            -EnvFile $adapterEnvFile `
+            -FakeClaudePath $fakeClaudePath `
+            -TemporaryRoot $tempRoot
+    } finally {
+        [Environment]::SetEnvironmentVariable('ORDER_ADAPTER_FAKE_THROW', $null, 'Process')
+    }
+    $inferenceFailureConfigRecords = @(Get-ConfigCaptureRecords -Path ([string]$inferenceFailureCase.config_capture_path))
+    Assert-True 'adapter inference failure is nonzero after fake child invocation' (
+        $inferenceFailureCase.run.exit_code -ne 0 -and $inferenceFailureCase.invoked
+    )
+    Assert-True 'adapter removes isolated config and markers after inference failure' (
+        $inferenceFailureConfigRecords.Count -eq 2 -and
+        (Test-ConfigCapturesCleaned -Records $inferenceFailureConfigRecords -ExpectedParent $tempRoot)
+    )
 
     $versionCaseSpecs = @(
         [pscustomobject]@{ name = 'version-probe-failure'; variable = 'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE'; value = '9'; code = 'claude_cli_version_probe_failed' },
@@ -442,6 +631,70 @@ exit $requestedExitCode
             -Case $versionCase `
             -ExpectedCode ([string]$versionCaseSpec.code) `
             -SecretSentinels @($adapterApiKey, $adapterModel)
+    }
+
+    $restoreAmbientRoot = Join-Path $tempRoot 'restore-ambient'
+    New-Item -ItemType Directory -Path $restoreAmbientRoot | Out-Null
+    $restoreAmbientMarker = Join-Path $restoreAmbientRoot 'must-survive.txt'
+    [IO.File]::WriteAllText($restoreAmbientMarker, 'ambient', (New-Object Text.UTF8Encoding($false)))
+    $restorationSpecs = @(
+        [pscustomobject]@{ Name = 'success'; Ambient = $restoreAmbientRoot; Variable = ''; Value = ''; RecordCount = 2 },
+        [pscustomobject]@{ Name = 'nonzero'; Ambient = $null; Variable = 'ORDER_ADAPTER_FAKE_EXIT_CODE'; Value = '7'; RecordCount = 2 },
+        [pscustomobject]@{ Name = 'version-preflight'; Ambient = $restoreAmbientRoot; Variable = 'ORDER_ADAPTER_FAKE_VERSION_EXIT_CODE'; Value = '9'; RecordCount = 1 },
+        [pscustomobject]@{ Name = 'inference-failure'; Ambient = $null; Variable = 'ORDER_ADAPTER_FAKE_THROW'; Value = '1'; RecordCount = 2 }
+    )
+    foreach ($restoreSpec in $restorationSpecs) {
+        $restoreCase = Invoke-AdapterConfigRestorationCase `
+            -Name ([string]$restoreSpec.Name) `
+            -WorkspacePath $workspace `
+            -EnvFile $adapterEnvFile `
+            -FakeClaudePath $fakeClaudePath `
+            -TemporaryRoot $tempRoot `
+            -AmbientConfigDirectory $restoreSpec.Ambient `
+            -FailureVariable ([string]$restoreSpec.Variable) `
+            -FailureValue ([string]$restoreSpec.Value)
+        Assert-True ('adapter restores ambient CLAUDE_CONFIG_DIR after ' + [string]$restoreSpec.Name) ([bool]$restoreCase.restored)
+        Assert-True ('adapter cleans isolated config after ' + [string]$restoreSpec.Name) (
+            @($restoreCase.records).Count -eq [int]$restoreSpec.RecordCount -and
+            (Test-ConfigCapturesCleaned -Records @($restoreCase.records) -ExpectedParent $tempRoot) -and
+            @($restoreCase.records | Where-Object { [string]$_.config_path -ceq [string]$restoreSpec.Ambient }).Count -eq 0
+        )
+    }
+    Assert-True 'adapter never removes ambient Claude config directory' (
+        (Test-Path -LiteralPath $restoreAmbientRoot -PathType Container) -and
+        (Test-Path -LiteralPath $restoreAmbientMarker -PathType Leaf)
+    )
+
+    $adapterReparseTarget = Join-Path $tempRoot 'adapter-config-reparse-target'
+    New-Item -ItemType Directory -Path $adapterReparseTarget | Out-Null
+    [IO.File]::WriteAllText((Join-Path $adapterReparseTarget 'must-survive.txt'), 'target', (New-Object Text.UTF8Encoding($false)))
+    $adapterCleanupFailure = Invoke-AdapterConfigRestorationCase `
+        -Name 'cleanup-reparse' `
+        -WorkspacePath $workspace `
+        -EnvFile $adapterEnvFile `
+        -FakeClaudePath $fakeClaudePath `
+        -TemporaryRoot $tempRoot `
+        -AmbientConfigDirectory $restoreAmbientRoot `
+        -FailureVariable 'ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET' `
+        -FailureValue $adapterReparseTarget
+    $adapterCleanupRecords = @($adapterCleanupFailure.records)
+    $adapterUnsafeConfig = if ($adapterCleanupRecords.Count -gt 0) { [string]$adapterCleanupRecords[0].config_path } else { '' }
+    Assert-True 'adapter returns fixed isolation cleanup failure after child reparse injection' (
+        [string]$adapterCleanupFailure.error -ceq 'claude_isolation_cleanup_failed'
+    ) ([string]$adapterCleanupFailure.error)
+    Assert-True 'adapter restores ambient config and retains unsafe owned residue' (
+        [bool]$adapterCleanupFailure.restored -and
+        $adapterCleanupRecords.Count -eq 2 -and
+        (Test-Path -LiteralPath (Join-Path $adapterUnsafeConfig 'escape') -PathType Container)
+    )
+    Assert-True 'adapter reparse refusal never deletes outside target' (
+        (Test-Path -LiteralPath (Join-Path $adapterReparseTarget 'must-survive.txt') -PathType Leaf) -and
+        (Test-Path -LiteralPath $restoreAmbientMarker -PathType Leaf)
+    )
+    if (-not [string]::IsNullOrWhiteSpace($adapterUnsafeConfig) -and
+        (Test-Path -LiteralPath (Join-Path $adapterUnsafeConfig 'escape'))) {
+        [IO.Directory]::Delete((Join-Path $adapterUnsafeConfig 'escape'))
+        Remove-Item -LiteralPath $adapterUnsafeConfig -Recurse -Force
     }
 
     $singleQuotedEnvFile = Join-Path $tempRoot 'single-quoted-provider.env'
@@ -673,6 +926,53 @@ ANTHROPIC_MODEL='claude-test-model'
 
     $runnerSource = [IO.File]::ReadAllText($RunnerPath, [Text.Encoding]::UTF8)
     $adapterSource = [IO.File]::ReadAllText($AdapterPath, [Text.Encoding]::UTF8)
+    $adapterTokens = $null
+    $adapterErrors = $null
+    $adapterAst = [Management.Automation.Language.Parser]::ParseFile(
+        $AdapterPath,
+        [ref]$adapterTokens,
+        [ref]$adapterErrors
+    )
+    Assert-True 'adapter parses before config ownership extraction' (@($adapterErrors).Count -eq 0)
+    foreach ($adapterFunctionName in @('Test-ReparsePoint', 'Assert-OwnedClaudeConfigDirectory', 'Test-TreeContainsReparsePoint', 'Remove-OwnedClaudeConfigDirectory')) {
+        $adapterFunctions = @($adapterAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq $adapterFunctionName
+        }, $true))
+        Assert-True ('adapter defines one executable ' + $adapterFunctionName) ($adapterFunctions.Count -eq 1)
+        if ($adapterFunctions.Count -eq 1) { Invoke-Expression $adapterFunctions[0].Extent.Text }
+    }
+    $adapterHelperParent = Join-Path $tempRoot 'adapter-helper-parent'
+    $adapterHelperOutside = Join-Path $tempRoot ('claude-config-' + ('d' * 32))
+    New-Item -ItemType Directory -Path $adapterHelperParent, $adapterHelperOutside | Out-Null
+    [IO.File]::WriteAllText((Join-Path $adapterHelperOutside 'must-survive.txt'), 'outside', (New-Object Text.UTF8Encoding($false)))
+    $adapterOutsideRejected = $false
+    try {
+        $null = Assert-OwnedClaudeConfigDirectory -Path $adapterHelperOutside -ParentPath $adapterHelperParent
+    } catch {
+        $adapterOutsideRejected = [string]$_.Exception.Message -ceq 'claude_config_directory_not_owned'
+    }
+    Assert-True 'adapter ownership helper rejects and preserves an outside directory' (
+        $adapterOutsideRejected -and
+        (Test-Path -LiteralPath (Join-Path $adapterHelperOutside 'must-survive.txt') -PathType Leaf)
+    )
+    $adapterHelperTarget = Join-Path $tempRoot 'adapter-helper-target'
+    $adapterHelperJunction = Join-Path $adapterHelperParent ('claude-config-' + ('e' * 32))
+    New-Item -ItemType Directory -Path $adapterHelperTarget | Out-Null
+    [IO.File]::WriteAllText((Join-Path $adapterHelperTarget 'must-survive.txt'), 'target', (New-Object Text.UTF8Encoding($false)))
+    New-Item -ItemType Junction -Path $adapterHelperJunction -Target $adapterHelperTarget | Out-Null
+    $adapterJunctionRejected = $false
+    try {
+        $null = Assert-OwnedClaudeConfigDirectory -Path $adapterHelperJunction -ParentPath $adapterHelperParent
+    } catch {
+        $adapterJunctionRejected = [string]$_.Exception.Message -ceq 'claude_config_directory_unsafe'
+    }
+    Assert-True 'adapter ownership helper rejects a config junction without target deletion' (
+        $adapterJunctionRejected -and
+        (Test-Path -LiteralPath (Join-Path $adapterHelperTarget 'must-survive.txt') -PathType Leaf)
+    )
+    [IO.Directory]::Delete($adapterHelperJunction)
     $providerBlock = [regex]::Match(
         $adapterSource,
         '(?s)\$providerConflictNames\s*=\s*@\((?<body>.*?)\)'
@@ -713,6 +1013,75 @@ ANTHROPIC_MODEL='claude-test-model'
         -not $runnerSource.Contains('[IO.File]::ReadAllText($EnvFile)') -and
         -not $runnerSource.Contains('Get-Content -LiteralPath $EnvFile')
     )
+    Assert-True 'runner waits for tree termination and recursively cleans the owned run directory' (
+        $runnerSource.Contains('$process.WaitForExit(15000)') -and
+        $runnerSource.Contains('Remove-OwnedRunDirectory -Path $tempRoot -ParentPath $runParent -ExpectedName $runDirectoryName')
+    )
+    Assert-True 'adapter never adopts a pre-existing config-directory collision for cleanup' (
+        $adapterSource.Contains('$configDirectoryCreated = $false') -and
+        $adapterSource.Contains('$configDirectoryCreated = $true') -and
+        $adapterSource.Contains('if ($configDirectoryCreated) {')
+    )
+
+    $runnerTokens = $null
+    $runnerErrors = $null
+    $runnerAst = [Management.Automation.Language.Parser]::ParseFile(
+        $RunnerPath,
+        [ref]$runnerTokens,
+        [ref]$runnerErrors
+    )
+    Assert-True 'runner parses before owned cleanup extraction' (@($runnerErrors).Count -eq 0)
+    foreach ($cleanupFunctionName in @('Test-RunTreeContainsReparsePoint', 'Remove-OwnedRunDirectory')) {
+        $cleanupFunctions = @($runnerAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq $cleanupFunctionName
+        }, $true))
+        Assert-True ('runner defines one ' + $cleanupFunctionName + ' helper') ($cleanupFunctions.Count -eq 1)
+        if ($cleanupFunctions.Count -eq 1) { Invoke-Expression $cleanupFunctions[0].Extent.Text }
+    }
+    $cleanupParent = Join-Path $tempRoot 'owned-run-cleanup'
+    $ownedRunName = 'run-' + ('a' * 32)
+    $ownedRunPath = Join-Path $cleanupParent $ownedRunName
+    $nestedRunPath = Join-Path $ownedRunPath 'claude-config-test\nested'
+    New-Item -ItemType Directory -Path $nestedRunPath -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $nestedRunPath 'marker.txt'), 'marker', (New-Object Text.UTF8Encoding($false)))
+    Remove-OwnedRunDirectory -Path $ownedRunPath -ParentPath $cleanupParent -ExpectedName $ownedRunName
+    Assert-True 'owned run cleanup removes nested timeout residue recursively' (-not (Test-Path -LiteralPath $ownedRunPath))
+
+    $outsideRunPath = Join-Path $tempRoot 'outside-run-must-survive'
+    New-Item -ItemType Directory -Path $outsideRunPath | Out-Null
+    [IO.File]::WriteAllText((Join-Path $outsideRunPath 'marker.txt'), 'marker', (New-Object Text.UTF8Encoding($false)))
+    $outsideRejected = $false
+    try {
+        Remove-OwnedRunDirectory -Path $outsideRunPath -ParentPath $cleanupParent -ExpectedName ('run-' + ('b' * 32))
+    } catch {
+        $outsideRejected = [string]$_.Exception.Message -ceq 'claude_run_directory_not_owned'
+    }
+    Assert-True 'owned run cleanup rejects and preserves an outside sibling' (
+        $outsideRejected -and (Test-Path -LiteralPath (Join-Path $outsideRunPath 'marker.txt') -PathType Leaf)
+    )
+
+    $junctionTarget = Join-Path $tempRoot 'junction-target'
+    $junctionParent = Join-Path $tempRoot 'junction-parent'
+    $junctionRunName = 'run-' + ('c' * 32)
+    $junctionRunPath = Join-Path $junctionTarget $junctionRunName
+    New-Item -ItemType Directory -Path $junctionRunPath -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $junctionRunPath 'marker.txt'), 'marker', (New-Object Text.UTF8Encoding($false)))
+    New-Item -ItemType Junction -Path $junctionParent -Target $junctionTarget | Out-Null
+    $junctionRejected = $false
+    try {
+        Remove-OwnedRunDirectory `
+            -Path (Join-Path $junctionParent $junctionRunName) `
+            -ParentPath $junctionParent `
+            -ExpectedName $junctionRunName
+    } catch {
+        $junctionRejected = [string]$_.Exception.Message -ceq 'claude_run_directory_unsafe'
+    }
+    Assert-True 'owned run cleanup rejects a reparse-point parent without traversing it' (
+        $junctionRejected -and (Test-Path -LiteralPath (Join-Path $junctionRunPath 'marker.txt') -PathType Leaf)
+    )
+    [IO.Directory]::Delete($junctionParent)
 
     $runnerBase = @(
         '-Mode', 'Execute',
@@ -871,7 +1240,11 @@ param(
     }
 } finally {
     foreach ($name in $testEnvironmentNames) {
-        [Environment]::SetEnvironmentVariable($name, $testEnvironmentBackup[$name], 'Process')
+        if ($null -eq $testEnvironmentBackup[$name]) {
+            Remove-Item -LiteralPath ('Env:\' + $name) -Force -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $testEnvironmentBackup[$name], 'Process')
+        }
     }
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $tempRoot -PathType Container)) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force

@@ -74,27 +74,190 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Assert-ClaudeCliCompatibility {
-    param([Parameter(Mandatory = $true)][string]$CommandPath)
+function Test-InstallerReparsePoint {
+    param([Parameter(Mandatory = $true)]$Item)
+    return ([int]$Item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0
+}
 
-    $versionOutput = @(& $CommandPath --version 2>&1)
-    $versionExitCode = $LASTEXITCODE
-    if ($versionExitCode -ne 0) { throw 'claude_cli_version_probe_failed' }
-    $versionText = (($versionOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
-    if ($versionText -cne '2.1.241 (Claude Code)') { throw 'claude_cli_version_unsupported' }
+function Restore-InstallerProcessEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()]$Value
+    )
 
-    $helpOutput = @(& $CommandPath --help 2>&1)
-    $helpExitCode = $LASTEXITCODE
-    if ($helpExitCode -ne 0) { throw 'claude_cli_help_probe_failed' }
-    $helpText = ($helpOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    foreach ($requiredFlag in @('--json-schema', '--settings', '--tools', '--strict-mcp-config', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--bare', '--no-session-persistence', '--disable-slash-commands')) {
-        if (-not $helpText.Contains($requiredFlag)) {
-            throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
+    if ($null -eq $Value) {
+        $environmentPath = 'Env:\' + $Name
+        if (Test-Path -LiteralPath $environmentPath) {
+            Remove-Item -LiteralPath $environmentPath -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $environmentPath) { throw 'process_environment_restore_failed' }
+        return
+    }
+    [Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
+    if ([Environment]::GetEnvironmentVariable($Name, 'Process') -cne [string]$Value) {
+        throw 'process_environment_restore_failed'
+    }
+}
+
+function Assert-InstallerOwnedDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParentPath,
+        [Parameter(Mandatory = $true)][string]$NamePattern
+    )
+
+    $parentFullPath = [IO.Path]::GetFullPath($ParentPath).TrimEnd('\')
+    $candidateFullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ([IO.Path]::GetDirectoryName($candidateFullPath).TrimEnd('\') -cne $parentFullPath -or
+        [IO.Path]::GetFileName($candidateFullPath) -cnotmatch $NamePattern) {
+        throw 'claude_cli_isolation_directory_not_owned'
+    }
+    if (-not (Test-Path -LiteralPath $parentFullPath -PathType Container)) {
+        throw 'claude_cli_isolation_directory_unsafe'
+    }
+    $parentItem = Get-Item -LiteralPath $parentFullPath -Force -ErrorAction Stop
+    if (-not $parentItem.PSIsContainer -or (Test-InstallerReparsePoint -Item $parentItem)) {
+        throw 'claude_cli_isolation_directory_unsafe'
+    }
+    if (Test-Path -LiteralPath $candidateFullPath) {
+        $candidateItem = Get-Item -LiteralPath $candidateFullPath -Force -ErrorAction Stop
+        if (-not $candidateItem.PSIsContainer -or (Test-InstallerReparsePoint -Item $candidateItem)) {
+            throw 'claude_cli_isolation_directory_unsafe'
         }
     }
-    if ($helpText -notmatch '(?s)--permission-mode\s+<mode>.*?\(choices:.*?"manual".*?\)') {
-        throw 'claude_cli_manual_mode_missing'
+    return $candidateFullPath
+}
+
+function Test-InstallerTreeContainsReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pending = New-Object System.Collections.Generic.Stack[string]
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
+            $attributes = [IO.File]::GetAttributes($entryPath)
+            if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            if (([int]$attributes -band [int][IO.FileAttributes]::Directory) -ne 0) {
+                $pending.Push($entryPath)
+            }
+        }
     }
+    return $false
+}
+
+function Remove-InstallerOwnedDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParentPath,
+        [Parameter(Mandatory = $true)][string]$NamePattern
+    )
+
+    $ownedPath = Assert-InstallerOwnedDirectory -Path $Path -ParentPath $ParentPath -NamePattern $NamePattern
+    if (-not (Test-Path -LiteralPath $ownedPath)) { return }
+    if (Test-InstallerTreeContainsReparsePoint -Path $ownedPath) {
+        throw 'claude_cli_isolation_directory_unsafe'
+    }
+    Remove-Item -LiteralPath $ownedPath -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $ownedPath) { throw 'claude_cli_isolation_directory_cleanup_failed' }
+}
+
+function Assert-ClaudeCliCompatibility {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandPath,
+        [string]$IsolationToken = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IsolationToken)) {
+        $IsolationToken = [Guid]::NewGuid().ToString('N')
+    } elseif ($IsolationToken -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'claude_cli_isolation_token_invalid'
+    }
+    $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $parentName = 'order-supervisor-cli-' + $IsolationToken
+    $parentPath = Assert-InstallerOwnedDirectory `
+        -Path (Join-Path $temporaryBase $parentName) `
+        -ParentPath $temporaryBase `
+        -NamePattern '^order-supervisor-cli-[0-9a-f]{32}$'
+    $configName = 'claude-config-' + $IsolationToken
+    $configPath = [IO.Path]::GetFullPath((Join-Path $parentPath $configName))
+    $configEnvironmentBackup = [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
+    $parentCreated = $false
+    $configCreated = $false
+    try {
+        if (Test-Path -LiteralPath $parentPath) { throw 'claude_cli_isolation_parent_collision' }
+        New-Item -ItemType Directory -Path $parentPath -ErrorAction Stop | Out-Null
+        $parentCreated = $true
+        $parentPath = Assert-InstallerOwnedDirectory `
+            -Path $parentPath `
+            -ParentPath $temporaryBase `
+            -NamePattern '^order-supervisor-cli-[0-9a-f]{32}$'
+        $configPath = Assert-InstallerOwnedDirectory `
+            -Path $configPath `
+            -ParentPath $parentPath `
+            -NamePattern '^claude-config-[0-9a-f]{32}$'
+        if (Test-Path -LiteralPath $configPath) { throw 'claude_cli_isolation_config_collision' }
+        New-Item -ItemType Directory -Path $configPath -ErrorAction Stop | Out-Null
+        $configCreated = $true
+        $configPath = Assert-InstallerOwnedDirectory `
+            -Path $configPath `
+            -ParentPath $parentPath `
+            -NamePattern '^claude-config-[0-9a-f]{32}$'
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $configPath, 'Process')
+
+        $versionOutput = @(& $CommandPath --version 2>&1)
+        $versionExitCode = $LASTEXITCODE
+        if ($versionExitCode -ne 0) { throw 'claude_cli_version_probe_failed' }
+        $versionText = (($versionOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+        if ($versionText -cne '2.1.241 (Claude Code)') { throw 'claude_cli_version_unsupported' }
+
+        $helpOutput = @(& $CommandPath --help 2>&1)
+        $helpExitCode = $LASTEXITCODE
+        if ($helpExitCode -ne 0) { throw 'claude_cli_help_probe_failed' }
+        $helpText = ($helpOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        foreach ($requiredFlag in @('--json-schema', '--settings', '--tools', '--strict-mcp-config', '--max-budget-usd', '--permission-mode', '--disallowedTools', '--bare', '--no-session-persistence', '--disable-slash-commands')) {
+            if (-not $helpText.Contains($requiredFlag)) {
+                throw ('claude_cli_missing_flag_' + $requiredFlag.TrimStart('-'))
+            }
+        }
+        if ($helpText -notmatch '(?s)--permission-mode\s+<mode>.*?\(choices:.*?"manual".*?\)') {
+            throw 'claude_cli_manual_mode_missing'
+        }
+    } finally {
+        $cleanupFailed = $false
+        try { Restore-InstallerProcessEnvironmentVariable -Name 'CLAUDE_CONFIG_DIR' -Value $configEnvironmentBackup }
+        catch { $cleanupFailed = $true }
+        if ($configCreated) {
+            try {
+                Remove-InstallerOwnedDirectory `
+                    -Path $configPath `
+                    -ParentPath $parentPath `
+                    -NamePattern '^claude-config-[0-9a-f]{32}$'
+            } catch {
+                $cleanupFailed = $true
+            }
+        }
+        if ($parentCreated) {
+            try {
+                $ownedParent = Assert-InstallerOwnedDirectory `
+                    -Path $parentPath `
+                    -ParentPath $temporaryBase `
+                    -NamePattern '^order-supervisor-cli-[0-9a-f]{32}$'
+                if (@([IO.Directory]::EnumerateFileSystemEntries($ownedParent)).Count -ne 0) {
+                    throw 'claude_cli_isolation_parent_not_empty'
+                }
+                Remove-Item -LiteralPath $ownedParent -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $ownedParent) { throw 'claude_cli_isolation_directory_cleanup_failed' }
+            } catch {
+                $cleanupFailed = $true
+            }
+        }
+        if ($cleanupFailed) { throw 'claude_cli_isolation_cleanup_failed' }
+    }
+}
+
+function Test-ClaudeCliCompatibilityRequired {
+    return $Action -ceq 'Install' -and $Mode -ceq 'Execute'
 }
 
 function Assert-MutationPreflight {
@@ -127,7 +290,7 @@ function Assert-MutationPreflight {
     Assert-NoQuote -Name 'state_path' -Value $StatePath
     Assert-NoQuote -Name 'log_path' -Value $LogPath
     Assert-NoQuote -Name 'claude_command' -Value $ClaudeCommand
-    if ($Mode -ceq 'Execute') {
+    if (Test-ClaudeCliCompatibilityRequired) {
         if (-not [IO.Path]::IsPathRooted($ClaudeCommand) -or
             -not (Test-Path -LiteralPath $ClaudeCommand -PathType Leaf)) {
             throw 'execute_requires_absolute_claude_command'

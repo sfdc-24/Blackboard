@@ -21,8 +21,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-if (-not (Test-Path -LiteralPath $PromptPath)) { throw 'prompt_file_missing' }
-if (-not (Test-Path -LiteralPath $SchemaPath)) { throw 'schema_file_missing' }
+if (-not (Test-Path -LiteralPath $PromptPath -PathType Leaf)) { throw 'prompt_file_missing' }
+if (-not (Test-Path -LiteralPath $SchemaPath -PathType Leaf)) { throw 'schema_file_missing' }
+$resolvedPromptPath = (Resolve-Path -LiteralPath $PromptPath).Path
+$invocationRoot = [IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($resolvedPromptPath)).TrimEnd('\')
 if (-not [IO.Path]::IsPathRooted($EnvFile)) { throw 'claude_env_file_path_must_be_absolute' }
 if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { throw 'claude_env_file_missing' }
 $EnvFile = [IO.Path]::GetFullPath($EnvFile)
@@ -33,6 +35,89 @@ if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) { throw 'w
 $WorkspacePath = [IO.Path]::GetFullPath($WorkspacePath)
 if (-not (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Container)) {
     throw 'execute_workspace_git_directory_missing'
+}
+
+function Test-ReparsePoint {
+    param([Parameter(Mandatory = $true)]$Item)
+    return ([int]$Item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
+function Restore-ProcessEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowNull()]$Value
+    )
+
+    if ($null -eq $Value) {
+        $environmentPath = 'Env:\' + $Name
+        if (Test-Path -LiteralPath $environmentPath) {
+            Remove-Item -LiteralPath $environmentPath -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $environmentPath) { throw 'process_environment_restore_failed' }
+        return
+    }
+    [Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
+    if ([Environment]::GetEnvironmentVariable($Name, 'Process') -cne [string]$Value) {
+        throw 'process_environment_restore_failed'
+    }
+}
+
+function Assert-OwnedClaudeConfigDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParentPath
+    )
+
+    $parentFullPath = [IO.Path]::GetFullPath($ParentPath).TrimEnd('\')
+    $candidateFullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $candidateName = [IO.Path]::GetFileName($candidateFullPath)
+    if ([IO.Path]::GetDirectoryName($candidateFullPath).TrimEnd('\') -cne $parentFullPath -or
+        $candidateName -cnotmatch '^claude-config-[0-9a-f]{32}$') {
+        throw 'claude_config_directory_not_owned'
+    }
+
+    $parentItem = Get-Item -LiteralPath $parentFullPath -Force -ErrorAction Stop
+    if (-not $parentItem.PSIsContainer -or (Test-ReparsePoint -Item $parentItem)) {
+        throw 'claude_invocation_root_unsafe'
+    }
+    if (Test-Path -LiteralPath $candidateFullPath) {
+        $candidateItem = Get-Item -LiteralPath $candidateFullPath -Force -ErrorAction Stop
+        if (-not $candidateItem.PSIsContainer -or (Test-ReparsePoint -Item $candidateItem)) {
+            throw 'claude_config_directory_unsafe'
+        }
+    }
+    return $candidateFullPath
+}
+
+function Test-TreeContainsReparsePoint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pending = New-Object System.Collections.Generic.Stack[string]
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
+            $attributes = [IO.File]::GetAttributes($entryPath)
+            if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            if (([int]$attributes -band [int][IO.FileAttributes]::Directory) -ne 0) {
+                $pending.Push($entryPath)
+            }
+        }
+    }
+    return $false
+}
+
+function Remove-OwnedClaudeConfigDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ParentPath
+    )
+
+    $ownedPath = Assert-OwnedClaudeConfigDirectory -Path $Path -ParentPath $ParentPath
+    if (-not (Test-Path -LiteralPath $ownedPath)) { return }
+    if (Test-TreeContainsReparsePoint -Path $ownedPath) { throw 'claude_config_directory_reparse_point' }
+    Remove-Item -LiteralPath $ownedPath -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $ownedPath) { throw 'claude_config_directory_cleanup_failed' }
 }
 
 $providerConflictNames = @(
@@ -99,10 +184,24 @@ $subprocessScrubName = 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB'
 $subprocessScrubBackup = [Environment]::GetEnvironmentVariable($subprocessScrubName, 'Process')
 $powershellToolName = 'CLAUDE_CODE_USE_POWERSHELL_TOOL'
 $powershellToolBackup = [Environment]::GetEnvironmentVariable($powershellToolName, 'Process')
+$configDirectoryEnvironmentName = 'CLAUDE_CONFIG_DIR'
+$configDirectoryEnvironmentBackup = [Environment]::GetEnvironmentVariable($configDirectoryEnvironmentName, 'Process')
 $settingsPath = $null
+$configDirectoryCreated = $false
+$configDirectoryPath = Assert-OwnedClaudeConfigDirectory `
+    -Path (Join-Path $invocationRoot ('claude-config-' + [Guid]::NewGuid().ToString('N'))) `
+    -ParentPath $invocationRoot
 
 $exitCode = 0
 try {
+    if (Test-Path -LiteralPath $configDirectoryPath) { throw 'claude_config_directory_collision' }
+    try {
+        New-Item -ItemType Directory -Path $configDirectoryPath -ErrorAction Stop | Out-Null
+        $configDirectoryCreated = $true
+        $configDirectoryPath = Assert-OwnedClaudeConfigDirectory -Path $configDirectoryPath -ParentPath $invocationRoot
+    } catch {
+        throw 'claude_config_directory_create_failed'
+    }
     foreach ($name in $allowedEnvironmentNames) {
         [Environment]::SetEnvironmentVariable($name, [string]$configuredEnvironment[$name], 'Process')
     }
@@ -115,6 +214,10 @@ try {
     # document. Clear any ambient value so the child cannot appear configured
     # when that document was ignored or malformed.
     [Environment]::SetEnvironmentVariable($powershellToolName, $null, 'Process')
+    # Direct API-key authentication does not require Claude's persistent user
+    # profile. Isolate all CLI configuration/state inside this invocation so
+    # --no-session-persistence cannot still mutate ~/.claude or ~/.claude.json.
+    [Environment]::SetEnvironmentVariable($configDirectoryEnvironmentName, $configDirectoryPath, 'Process')
 
     $resolved = Get-Command $ClaudeCommand -ErrorAction Stop
     $versionOutput = @(& $resolved.Source --version 2>&1)
@@ -122,7 +225,6 @@ try {
     if ($versionExitCode -ne 0) { throw 'claude_cli_version_probe_failed' }
     $versionText = (($versionOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
     if ($versionText -cne '2.1.241 (Claude Code)') { throw 'claude_cli_version_unsupported' }
-    $resolvedPromptPath = (Resolve-Path -LiteralPath $PromptPath).Path
     $promptText = [IO.File]::ReadAllText($resolvedPromptPath, [Text.Encoding]::UTF8)
     $schemaText = ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $SchemaPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json) | ConvertTo-Json -Depth 12 -Compress
     # Windows PowerShell 5.1's native argv marshaller otherwise removes the JSON
@@ -156,7 +258,6 @@ try {
     }
     $settingsText = $settingsDocument | ConvertTo-Json -Depth 8
     if ($settingsText.Length -gt 16384) { throw 'claude_settings_too_large' }
-    $invocationRoot = [IO.Path]::GetDirectoryName($resolvedPromptPath)
     $settingsPath = Join-Path $invocationRoot ('claude-settings-' + [Guid]::NewGuid().ToString('N') + '.json')
     [IO.File]::WriteAllText($settingsPath, $settingsText, (New-Object Text.UTF8Encoding($false)))
 
@@ -185,13 +286,34 @@ try {
         Pop-Location
     }
 } finally {
+    $cleanupFailed = $false
     foreach ($name in $allowedEnvironmentNames) {
-        [Environment]::SetEnvironmentVariable($name, $environmentBackup[$name], 'Process')
+        try { Restore-ProcessEnvironmentVariable -Name $name -Value $environmentBackup[$name] }
+        catch { $cleanupFailed = $true }
     }
-    [Environment]::SetEnvironmentVariable($subprocessScrubName, $subprocessScrubBackup, 'Process')
-    [Environment]::SetEnvironmentVariable($powershellToolName, $powershellToolBackup, 'Process')
-    if (-not [string]::IsNullOrWhiteSpace($settingsPath) -and (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
-        Remove-Item -LiteralPath $settingsPath -Force -ErrorAction Stop
+    try { Restore-ProcessEnvironmentVariable -Name $subprocessScrubName -Value $subprocessScrubBackup }
+    catch { $cleanupFailed = $true }
+    try { Restore-ProcessEnvironmentVariable -Name $powershellToolName -Value $powershellToolBackup }
+    catch { $cleanupFailed = $true }
+    try { Restore-ProcessEnvironmentVariable -Name $configDirectoryEnvironmentName -Value $configDirectoryEnvironmentBackup }
+    catch { $cleanupFailed = $true }
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($settingsPath) -and (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $settingsPath -Force -ErrorAction Stop
+        }
+        if (-not [string]::IsNullOrWhiteSpace($settingsPath) -and (Test-Path -LiteralPath $settingsPath)) {
+            throw 'claude_settings_cleanup_failed'
+        }
+    } catch {
+        $cleanupFailed = $true
     }
+    try {
+        if ($configDirectoryCreated) {
+            Remove-OwnedClaudeConfigDirectory -Path $configDirectoryPath -ParentPath $invocationRoot
+        }
+    } catch {
+        $cleanupFailed = $true
+    }
+    if ($cleanupFailed) { throw 'claude_isolation_cleanup_failed' }
 }
 exit $exitCode
