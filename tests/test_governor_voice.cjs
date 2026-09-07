@@ -50,6 +50,7 @@ function createHarness(initialProperties = {}) {
     chatCalls: 0,
     ttsProviderCalls: 0,
     chatDailyUsed: 0,
+    chatSessionUsed: 0,
     failChat: false,
     uuid: 0,
     onTtsFetch: null,
@@ -97,9 +98,23 @@ function createHarness(initialProperties = {}) {
   vm.createContext(context);
   vm.runInContext(CODE, context, { filename: CODE_PATH });
   context.readSession_ = () => null;
+  context.conversationIdentity_ = () => ({
+    key: "ca_" + "a".repeat(32),
+    token: "mock-conversation-token",
+    session: null,
+    kind: "a"
+  });
   context.logVisitor_ = () => {};
   context.dailyCount_ = () => harness.chatDailyUsed;
-  context.bumpDaily_ = () => { harness.chatDailyUsed += 1; };
+  context.reserveChatBudget_ = () => {
+    const raw = harness.properties.getProperty("CHAT_DAILY_CAP");
+    const dailyCap = raw === null ? 150 : Number.parseInt(raw, 10);
+    if (harness.chatDailyUsed >= dailyCap) return { ok: false, reason: "daily-cap" };
+    if (harness.chatSessionUsed >= 12) return { ok: false, reason: "session-cap" };
+    harness.chatDailyUsed += 1;
+    harness.chatSessionUsed += 1;
+    return { ok: true };
+  };
   harness.context = context;
   return harness;
 }
@@ -136,7 +151,7 @@ test("degraded chat branches never mint a paid-audio key", () => {
     {
       name: "session cap",
       properties: { ANTHROPIC_KEY: "mock", OPENAI_KEY: "mock" },
-      prepare: (h) => h.cache.put("rc_session-one", "12")
+      prepare: (h) => { h.chatSessionUsed = 12; }
     },
     {
       name: "daily cap",

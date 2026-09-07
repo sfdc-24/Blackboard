@@ -11,8 +11,12 @@ on:
       - 'scripts/gas_deployment_audit.py'
       - 'tests/test_gas_*_acceptance.py'
       - 'apps-script/governor-page-api/Auth.gs'
+      - 'apps-script/governor-page-api/Reception.html'
+      - 'apps-script/governor-page-api/PublicInbox.gs'
+      - 'site/voice/index.html'
       - 'scripts/gas_create_staging.sh'
       - 'tests/test_governor_auth.cjs'
+      - 'tests/test_governor_tenant_boundary.cjs'
       - 'tests/test_staging_helpers.py'
       - 'scripts/gas_staging_target.py'
       - 'scripts/gas_build_identity.py'
@@ -96,4 +100,4 @@ jobs:
           test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
           node --test tests/test_clasp_json_contract.cjs
       - name: Test Google callback claims with mocked token exchange
-        run: node --test tests/test_governor_auth.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs
+        run: node --test tests/test_governor_auth.cjs tests/test_governor_tenant_boundary.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs
