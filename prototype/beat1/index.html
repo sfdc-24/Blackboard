@@ -65,6 +65,8 @@
   button{font:600 15px/1 inherit;padding:11px 17px;border:0;border-radius:9px;background:var(--ink);color:#fff;cursor:pointer}
   button[disabled]{opacity:.45;cursor:default}
   .hint{font-size:13px;color:var(--muted);margin-top:9px;min-height:1.2em}
+  #make{align-self:flex-start;margin-top:14px;background:var(--accent);font-size:14px;padding:10px 15px}
+  #make[disabled]{opacity:.5}
 </style>
 </head>
 <body>
@@ -75,6 +77,14 @@
     <p class="stitle" id="stitle" hidden></p>
     <p class="empty" id="empty">Tell me what keeps breaking. It gets drawn here as you talk &mdash; then tell me what I got wrong.</p>
     <svg id="svg" viewBox="0 0 420 300" preserveAspectRatio="xMidYMid meet" hidden></svg>
+    <!--
+      Beat 3 appears only once there is something to build from, and it is
+      phrased as theirs to take rather than as a call to action. Nothing is
+      asked for in return: PRODUCT.md is explicit that money comes after they
+      have the working thing, and putting a form here would turn the page back
+      into the quote-comparison mode this is meant to replace.
+    -->
+    <button id="make" hidden>Turn this into a page I can send &rarr;</button>
   </section>
 
   <section class="talk">
@@ -97,6 +107,7 @@
 <script>
 (function(){
   var history = [];
+  var lastSketch = null;
   var thread = document.getElementById("thread");
   var hint = document.getElementById("hint");
   var svg = document.getElementById("svg");
@@ -211,7 +222,7 @@
       turn(res.ok ? "it" : "sys", res.ok ? "sfdc24" : "", res.reply);
       history.push({role:"user", text:text});
       history.push({role:"assistant", text:res.reply});
-      if (res.sketch) { draw(res.sketch); hint.textContent = "Got it wrong? Say so — that's the fastest way to fix it."; }
+      if (res.sketch) { lastSketch = res.sketch; draw(res.sketch); document.getElementById("make").hidden = false; hint.textContent = "Got it wrong? Say so — that's the fastest way to fix it."; }
       else { hint.textContent = res.ok ? "Not enough to draw yet — keep going." : "The sketch is unavailable, but I'm still listening."; }
     })
     .catch(function(){
@@ -220,6 +231,26 @@
     })
     .finally(function(){ send.disabled = false; box.focus(); });
   });
+  // Beat 3. Opens the finished page in a new tab as a real document they own --
+  // not a preview, not a modal, not something that lives on our site and can be
+  // taken away. They can save it, print it or forward it without us.
+  document.getElementById("make").addEventListener("click", function(){
+    var b = document.getElementById("make");
+    b.disabled = true; b.textContent = "Building…";
+    fetch("/api/build", { method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ sketch: lastSketch, history: history }) })
+    .then(function(r){ return r.json() })
+    .then(function(res){
+      if (!res.ok || !res.html) { hint.textContent = "Couldn't build it just then — your conversation is still here."; return }
+      var w = window.open("", "_blank");
+      if (!w) { hint.textContent = "Your browser blocked the new tab — allow pop-ups and try again."; return }
+      w.document.open(); w.document.write(res.html); w.document.close();
+      hint.textContent = "That page is yours. Save it, print it, send it on.";
+    })
+    .catch(function(){ hint.textContent = "Couldn't build it just then — your conversation is still here." })
+    .finally(function(){ b.disabled = false; b.textContent = "Turn this into a page I can send →" });
+  });
+
 })();
 </script>
 </body>
