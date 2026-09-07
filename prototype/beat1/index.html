@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Beat 1 &mdash; SFDC24 prototype</title>
+<!--
+  BEAT 1: they talk, and their thing assembles in front of them.
+
+  The layout is the argument. The sketch is not below the conversation and not
+  behind a tab: it sits BESIDE it and stays visible while they type, because
+  PRODUCT.md is explicit that talking must never cost them sight of the detail.
+  On a phone it goes above the conversation rather than below, for the same
+  reason — the thing being built has to be the thing they are looking at.
+
+  It is drawn deliberately rough. Hand-ish borders, no gradients, no icons, no
+  auto-layout cleverness. Blocky signals "this is a sketch, tell me what is
+  wrong with it", which is exactly the correction beat 2 needs. A polished
+  diagram invites agreement instead, and agreement is not information.
+-->
+<style>
+  :root{
+    --ink:#0B0D10; --paper:#FBFAF7; --line:#0B0D10; --muted:#6B7280;
+    --accent:#2F6FEB; --warm:#F3EFE7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font:16px/1.55 "IBM Plex Sans",-apple-system,Segoe UI,system-ui,sans-serif}
+  .wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);
+        gap:0;min-height:100vh}
+  @media (max-width:860px){ .wrap{grid-template-columns:1fr;grid-template-rows:auto 1fr} }
+
+  /* ---- the sketch side ---- */
+  .stage{background:var(--warm);border-right:1px solid #E3DED2;padding:22px;
+         display:flex;flex-direction:column;min-height:280px;order:0}
+  @media (max-width:860px){ .stage{border-right:0;border-bottom:1px solid #E3DED2;min-height:230px} }
+  .stage h2{margin:0 0 2px;font-size:13px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  .stitle{margin:0 0 14px;font-size:20px;font-weight:600}
+  .empty{margin:auto;text-align:center;color:var(--muted);max-width:26ch;font-size:15px}
+  svg{width:100%;flex:1;min-height:180px;overflow:visible}
+  .box rect{fill:#fff;stroke:var(--line);stroke-width:2}
+  .box text{font:600 13px/1 "IBM Plex Sans",system-ui,sans-serif;fill:var(--ink)}
+  .box .kind{font:500 10px/1 "IBM Plex Mono",ui-monospace,monospace;fill:var(--muted);letter-spacing:.08em}
+  .box.problem rect{fill:#FFF4F2;stroke:#C2410C}
+  .box.person  rect{fill:#F2F7FF}
+  .box.system  rect{fill:#F6F3FF}
+  .edge{stroke:var(--line);stroke-width:2;fill:none}
+  .edge-label{font:500 11px/1 "IBM Plex Mono",ui-monospace,monospace;fill:var(--muted)}
+  .pop{opacity:0;animation:pop .34s ease-out forwards}
+  @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion:reduce){ .pop{animation:none;opacity:1} }
+
+  /* ---- the conversation side ---- */
+  .talk{display:flex;flex-direction:column;padding:22px;min-height:0}
+  .brand{font:600 14px/1 "IBM Plex Mono",monospace;letter-spacing:.06em;color:var(--muted);margin-bottom:14px}
+  .thread{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding-right:4px}
+  .msg{max-width:52ch}
+  .msg.you{align-self:flex-end;text-align:right}
+  .who{font:600 10px/1 "IBM Plex Mono",monospace;letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
+  .msg p{margin:5px 0 0}
+  .msg.sys p{color:#B45309}
+  form{display:flex;gap:9px;margin-top:16px;border-top:1px solid #E7E3DA;padding-top:14px}
+  input[type=text]{flex:1;font:16px/1.4 inherit;padding:11px 13px;border:1px solid #D6D1C6;border-radius:9px;background:#fff}
+  input[type=text]:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  button{font:600 15px/1 inherit;padding:11px 17px;border:0;border-radius:9px;background:var(--ink);color:#fff;cursor:pointer}
+  button[disabled]{opacity:.45;cursor:default}
+  .hint{font-size:13px;color:var(--muted);margin-top:9px;min-height:1.2em}
+  #make{align-self:flex-start;margin-top:14px;background:var(--accent);font-size:14px;padding:10px 15px}
+  #make[disabled]{opacity:.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section class="stage" aria-live="polite">
+    <h2>What I think you have</h2>
+    <p class="stitle" id="stitle" hidden></p>
+    <p class="empty" id="empty">Tell me what keeps breaking. It gets drawn here as you talk &mdash; then tell me what I got wrong.</p>
+    <svg id="svg" viewBox="0 0 420 300" preserveAspectRatio="xMidYMid meet" hidden></svg>
+    <!--
+      Beat 3 appears only once there is something to build from, and it is
+      phrased as theirs to take rather than as a call to action. Nothing is
+      asked for in return: PRODUCT.md is explicit that money comes after they
+      have the working thing, and putting a form here would turn the page back
+      into the quote-comparison mode this is meant to replace.
+    -->
+    <button id="make" hidden>Turn this into a page I can send &rarr;</button>
+  </section>
+
+  <section class="talk">
+    <div class="brand">sfdc24 &middot; beat 1 prototype</div>
+    <div class="thread" id="thread">
+      <div class="msg">
+        <span class="who">sfdc24</span>
+        <p>What&rsquo;s the thing that keeps coming back? Describe it however it comes out &mdash; I&rsquo;ll sketch it beside you as you go.</p>
+      </div>
+    </div>
+    <form id="form">
+      <input type="text" id="box" placeholder="e.g. leads come in from three places and two of them skip assignment" autocomplete="off">
+      <button id="send">Send</button>
+    </form>
+    <div class="hint" id="hint"></div>
+  </section>
+
+</div>
+
+<script src="/history.js"></script>
+<script>
+(function(){
+  var RUNTIME_TOKEN = "__BEAT1_TOKEN__";
+  var history = [];
+  var lastSketch = null;
+  var thread = document.getElementById("thread");
+  var hint = document.getElementById("hint");
+  var svg = document.getElementById("svg");
+  var empty = document.getElementById("empty");
+  var stitle = document.getElementById("stitle");
+  var box = document.getElementById("box");
+  var send = document.getElementById("send");
+
+  function turn(who, label, text){
+    var d = document.createElement("div");
+    d.className = "msg " + who;
+    d.innerHTML = '<span class="who"></span><p></p>';
+    d.querySelector(".who").textContent = label;
+    d.querySelector("p").textContent = text;
+    thread.appendChild(d);
+    thread.scrollTop = thread.scrollHeight;
+    return d;
+  }
+
+  // Layout is a plain column-by-depth walk. No physics, no force-directed
+  // library: a sketch with eight boxes does not need one, and reaching for one
+  // is the first step toward the cathedral.
+  function draw(sk){
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var N = sk.nodes, E = sk.edges;
+    var depth = {}, indeg = {};
+    N.forEach(function(n){ depth[n.id] = 0; indeg[n.id] = 0; });
+    E.forEach(function(e){ indeg[e.to] = (indeg[e.to]||0) + 1; });
+    for (var pass = 0; pass < N.length; pass++)
+      E.forEach(function(e){ if (depth[e.to] <= depth[e.from]) depth[e.to] = depth[e.from] + 1; });
+
+    var cols = {};
+    N.forEach(function(n){ (cols[depth[n.id]] = cols[depth[n.id]] || []).push(n); });
+    var keys = Object.keys(cols).sort(function(a,b){ return a-b });
+    var W = 150, H = 48, GAPX = 46, GAPY = 22, PAD = 12;
+    var pos = {};
+    keys.forEach(function(k, ci){
+      cols[k].forEach(function(n, ri){
+        pos[n.id] = { x: PAD + ci*(W+GAPX), y: PAD + ri*(H+GAPY) };
+      });
+    });
+    var maxRow = Math.max.apply(null, keys.map(function(k){ return cols[k].length }));
+    svg.setAttribute("viewBox", "0 0 " + (PAD*2 + keys.length*(W+GAPX) - GAPX) + " " + (PAD*2 + maxRow*(H+GAPY) - GAPY));
+
+    var ns = "http://www.w3.org/2000/svg";
+    E.forEach(function(e, i){
+      var a = pos[e.from], b = pos[e.to];
+      if (!a || !b) return;                    // belt and braces; the server already dropped these
+      var x1 = a.x + W, y1 = a.y + H/2, x2 = b.x, y2 = b.y + H/2;
+      var mid = (x1 + x2) / 2;
+      var p = document.createElementNS(ns, "path");
+      p.setAttribute("class", "edge pop");
+      p.setAttribute("d", "M"+x1+","+y1+" C"+mid+","+y1+" "+mid+","+y2+" "+(x2-7)+","+y2);
+      p.style.animationDelay = (0.05*i) + "s";
+      svg.appendChild(p);
+      var head = document.createElementNS(ns, "path");
+      head.setAttribute("class", "edge pop");
+      head.setAttribute("d", "M"+(x2-8)+","+(y2-4)+" L"+x2+","+y2+" L"+(x2-8)+","+(y2+4));
+      head.style.animationDelay = (0.05*i) + "s";
+      svg.appendChild(head);
+      if (e.label){
+        var t = document.createElementNS(ns, "text");
+        t.setAttribute("class", "edge-label pop");
+        t.setAttribute("x", mid); t.setAttribute("y", (y1+y2)/2 - 6);
+        t.setAttribute("text-anchor", "middle");
+        t.textContent = e.label;
+        svg.appendChild(t);
+      }
+    });
+
+    N.forEach(function(n, i){
+      var p = pos[n.id];
+      var g = document.createElementNS(ns, "g");
+      g.setAttribute("class", "box " + n.kind + " pop");
+      g.style.animationDelay = (0.06*i) + "s";
+      var r = document.createElementNS(ns, "rect");
+      r.setAttribute("x", p.x); r.setAttribute("y", p.y);
+      r.setAttribute("width", W); r.setAttribute("height", H); r.setAttribute("rx", 7);
+      g.appendChild(r);
+      var k = document.createElementNS(ns, "text");
+      k.setAttribute("class", "kind");
+      k.setAttribute("x", p.x + 11); k.setAttribute("y", p.y + 17);
+      k.textContent = n.kind.toUpperCase();
+      g.appendChild(k);
+      var t = document.createElementNS(ns, "text");
+      t.setAttribute("x", p.x + 11); t.setAttribute("y", p.y + 34);
+      t.textContent = n.label.length > 20 ? n.label.slice(0,19) + "…" : n.label;
+      g.appendChild(t);
+      svg.appendChild(g);
+    });
+
+    empty.hidden = true; svg.hidden = false;
+    stitle.hidden = !sk.title; stitle.textContent = sk.title || "";
+  }
+
+  document.getElementById("form").addEventListener("submit", function(ev){
+    ev.preventDefault();
+    var text = box.value.trim();
+    if (!text) return;
+    box.value = ""; send.disabled = true;
+    turn("you", "you", text);
+    var priorHistory = Beat1History.acceptUser(history, text);
+    hint.textContent = "thinking, and re-drawing…";
+
+    fetch("/api/turn", {
+      method: "POST", headers: {"content-type":"application/json", "x-beat1-token":RUNTIME_TOKEN},
+      body: JSON.stringify({ text: text, history: priorHistory })
+    })
+    .then(function(r){ return r.json() })
+    .then(function(res){
+      // The reply and the sketch fail independently. Losing the picture must
+      // never cost them the conversation, so each is handled on its own.
+      turn(res.ok ? "it" : "sys", res.ok ? "sfdc24" : "", res.reply);
+      if (res.ok) Beat1History.acceptReply(history, res.reply);
+      if (res.sketch) { lastSketch = res.sketch; draw(res.sketch); document.getElementById("make").hidden = false; hint.textContent = "Got it wrong? Say so — that's the fastest way to fix it."; }
+      else { hint.textContent = res.ok ? "Not enough to draw yet — keep going." : "The sketch is unavailable, but I'm still listening."; }
+    })
+    .catch(function(){
+      turn("sys", "", "That didn't reach me. Your message wasn't lost — try again in a moment.");
+      hint.textContent = "";
+    })
+    .finally(function(){ send.disabled = false; box.focus(); });
+  });
+  // Beat 3. Opens the finished page in a new tab as a real document they own --
+  // not a preview, not a modal, not something that lives on our site and can be
+  // taken away. They can save it, print it or forward it without us.
+  document.getElementById("make").addEventListener("click", function(){
+    var b = document.getElementById("make");
+    b.disabled = true; b.textContent = "Building…";
+    fetch("/api/build", { method:"POST", headers:{"content-type":"application/json", "x-beat1-token":RUNTIME_TOKEN},
+      body: JSON.stringify({ sketch: lastSketch }) })
+    .then(function(r){ return r.json() })
+    .then(function(res){
+      if (!res.ok || !res.html) { hint.textContent = "Couldn't build it just then — your conversation is still here."; return }
+      var w = window.open("", "_blank");
+      if (!w) { hint.textContent = "Your browser blocked the new tab — allow pop-ups and try again."; return }
+      try { w.opener = null } catch(e){}
+      w.document.open(); w.document.write(res.html); w.document.close();
+      hint.textContent = "That page is yours. Save it, print it, send it on.";
+    })
+    .catch(function(){ hint.textContent = "Couldn't build it just then — your conversation is still here." })
+    .finally(function(){ b.disabled = false; b.textContent = "Turn this into a page I can send →" });
+  });
+
+})();
+</script>
+</body>
+</html>
