@@ -686,11 +686,12 @@ function readChatBudget_(props, now) {
   var parsed = JSON.parse(String(encoded));
   if (!parsed || typeof parsed !== 'object' || parsed instanceof Array ||
       Object.keys(parsed).sort().join(',') !== 'daily,day,sessions' ||
-      !/^\d{8}$/.test(String(parsed.day || '')) ||
+      typeof parsed.day !== 'string' || !/^\d{8}$/.test(parsed.day) ||
       typeof parsed.daily !== 'number' || !isFinite(parsed.daily) ||
       parsed.daily < 0 || Math.floor(parsed.daily) !== parsed.daily ||
       !parsed.sessions || typeof parsed.sessions !== 'object' ||
-      parsed.sessions instanceof Array) {
+      parsed.sessions instanceof Array ||
+      Object.keys(parsed.sessions).length > CHAT_MAX_ACTIVE_SESSIONS) {
     throw new Error('invalid chat budget state');
   }
   if (parsed.day === day) state.daily = Math.max(state.daily, parsed.daily);

@@ -306,10 +306,15 @@ test('present malformed budget or cap state fails closed before the provider', (
     '{',
     '[]',
     JSON.stringify({ day: '20260907', daily: 0, sessions: [], extra: true }),
+    JSON.stringify({ day: 20260907, daily: 149, sessions: {} }),
     JSON.stringify({ day: '20260907', daily: -1, sessions: {} }),
     JSON.stringify({ day: '20260907', daily: 0, sessions: { attacker: [1, Date.now() + 60000] } }),
     JSON.stringify({ day: '20260907', daily: 0,
       sessions: { ['ca_' + 'a'.repeat(32)]: ['1', Date.now() + 60000] } }),
+    JSON.stringify({ day: '20260907', daily: 0,
+      sessions: Object.fromEntries(Array.from({ length: 97 }, (_, index) => [
+        'ca_' + index.toString(16).padStart(32, '0'), [1, Date.now() + 60000],
+      ])) }),
   ];
   for (const encoded of malformedStates) {
     const h = createHarness({ CHAT_BUDGET_V1: encoded });
