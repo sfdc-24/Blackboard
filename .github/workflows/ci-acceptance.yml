@@ -16,7 +16,13 @@ on:
       - 'tests/test_staging_helpers.py'
       - 'scripts/gas_staging_target.py'
       - 'scripts/gas_build_identity.py'
+      - 'scripts/gas_tts_canary.py'
+      - 'scripts/gas_tts_canary_target.json'
       - 'tests/test_build_identity.py'
+      - 'tests/test_tts_canary_contract.py'
+      - 'tests/fixtures/site-p0-tts-canary.gs.template'
+      - 'tests/test_governor_voice.cjs'
+      - 'docs/SITE-P0-TTS-CANARY.md'
       - 'tests/test_build_health.cjs'
       - 'apps-script/governor-page-api/Code.gs'
       - 'apps-script/governor-page-api/Monitor.gs'
@@ -75,6 +81,10 @@ jobs:
         run: |
           python -B -m unittest discover -s tests -p 'test_build_identity.py' -v
           node --test tests/test_build_health.cjs
+      - name: Test isolated TTS canary build, target and receipt contracts
+        run: |
+          python -B -m unittest discover -s tests -p 'test_tts_canary_contract.py' -v
+          node --test tests/test_governor_voice.cjs
       - name: Verify locked clasp installation without deployment credentials
         run: |
           npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund

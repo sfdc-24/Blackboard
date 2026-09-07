@@ -219,6 +219,25 @@ test("a simultaneous second consumer cannot pass the deleted claim", () => {
   assert.equal(h.ttsProviderCalls, 1);
 });
 
+test("provider-count observer detects a legacy non-consuming claim twice", () => {
+  const h = healthyHarness();
+  const ak = issueAudioKey(h);
+  h.context.claimTts_ = (key) => {
+    const raw = h.properties.getProperty(h.context.TTS_KEY_PROP_PREFIX + key);
+    const marker = raw && JSON.parse(raw);
+    const text = h.cache.get("tts_" + key);
+    if (!marker || !text) return { ok: false, reason: "expired" };
+    const budget = h.context.ttsBudget_(h.properties, marker.session, Date.now(), true);
+    if (!budget.ok) return budget;
+    budget.text = text;
+    return budget;
+  };
+
+  assert.equal(decode(h.context.ttsAudio_({ ak })).ok, true);
+  assert.equal(decode(h.context.ttsAudio_({ ak })).ok, true);
+  assert.equal(h.ttsProviderCalls, 2);
+});
+
 test("reception emits the nonce-bound application-ready message", () => {
   const reception = readFileSync(RECEPTION_PATH, "utf8");
   assert.match(CODE, /readyNonce\s*=\s*\/\^\[A-Za-z0-9_-/);
