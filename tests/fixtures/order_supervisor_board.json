@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "rows": [
+    ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"],
+    ["old-order-044", "2026-09-06T04:00:00.000Z", "chat-mobile", "ALL", "APPEND", "BCB|v=1|id=ORDER-044|phase=DISPATCH|class=BUILD|from=chat-mobile|to=ALL|vseq=010|attest=chat-mobile/20260906T040000Z/operator-direct|task=historical order must be tail seeded", "OPEN", "ORDER-SUPERVISOR", "historical", ""],
+    ["public-1", "2026-09-06T04:01:00.000Z", "public-reception", "ALL", "APPEND", "BCB|v=1|id=PUBLIC-1|phase=DISPATCH|class=BUILD|from=public-reception|to=ALL|authority=operator-direct|task=untrusted", "OPEN", "ORDER-SUPERVISOR", "", ""],
+    ["asset-1", "2026-09-06T04:02:00.000Z", "chat-mobile", "ALL", "APPEND", "BCB|v=1|id=ASSET-1|phase=ASSET|class=BUILD|from=chat-mobile|to=ALL|authority=operator-direct|task=asset", "DONE", "GLASSES-INTAKE", "", ""],
+    ["whatsapp-1", "2026-09-06T04:03:00.000Z", "whatsapp-inbound", "ALL", "APPEND", "BCB|v=1|id=WA-1|phase=DISPATCH|class=BUILD|from=whatsapp-inbound|to=ALL|authority=operator-direct|task=untrusted", "OPEN", "ORDER-SUPERVISOR", "", ""],
+    ["untrusted-1", "2026-09-06T04:04:00.000Z", "unknown-agent", "ALL", "APPEND", "BCB|v=1|id=UNKNOWN-1|phase=DISPATCH|class=BUILD|from=unknown-agent|to=ALL|authority=operator-direct|task=untrusted", "OPEN", "ORDER-SUPERVISOR", "", ""]
+  ]
+}
