@@ -10,7 +10,8 @@ const plain = value => JSON.parse(JSON.stringify(value));
 function inbound() {
   const requests = [], saved = new Map(), exports = {};
   let response = { ok: true, json: async () => ({ result: 'success', rowId: 'WRK-fixture' }) };
-  const env = { ALPHA_URL: 'https://example.invalid/board', ALPHA_SECRET: 'fixture', META_APP_SECRET: 'mock-app-secret' };
+  const env = { ALPHA_URL: 'https://example.invalid/board', ALPHA_SECRET: 'fixture',
+    META_VERIFY_TOKEN: 'mock-verify-token', META_APP_SECRET: 'mock-app-secret' };
   const context = load('pipedream_wa_inbound.js', env, async (_url, options) => {
     requests.push(JSON.parse(options.body));
     return response;
@@ -31,6 +32,16 @@ function inbound() {
       return exports.summary;
     },
   };
+}
+
+async function handshake(env, query) {
+  const responses = [], exits = [];
+  const context = load('pipedream_wa_inbound.js', env);
+  const result = await context.component.run.call({}, { steps: { trigger: { event: { method: 'GET', query } } }, $: {
+    respond: async value => { responses.push(plain(value)); }, export: () => {},
+    flow: { exit: reason => { exits.push(reason); return reason; } },
+  } });
+  return { response: responses.at(-1), result, exits };
 }
 
 function snapshot(rows) {
@@ -118,6 +129,39 @@ test('configured signature verification fails closed on absent raw bytes or malf
   }
 });
 
+test('webhook GET verification uses the environment token and validates the challenge', async () => {
+  const valid = await handshake({ META_VERIFY_TOKEN: 'fixture-token' }, {
+    'hub.verify_token': 'fixture-token', 'hub.challenge': '123456789',
+  });
+  assert.deepEqual(valid.response, { status: 200, body: '123456789' });
+  assert.match(valid.result, /verification handshake/);
+
+  const invalid = await handshake({ META_VERIFY_TOKEN: 'fixture-token' }, {
+    'hub.verify_token': 'wrong-token', 'hub.challenge': '123456789',
+  });
+  assert.equal(invalid.response.status, 403);
+
+  const invalidChallenge = await handshake({ META_VERIFY_TOKEN: 'fixture-token' }, {
+    'hub.verify_token': 'fixture-token', 'hub.challenge': '<not-reflected>',
+  });
+  assert.equal(invalidChallenge.response.status, 403);
+
+  const unconfigured = await handshake({}, {
+    'hub.verify_token': 'anything', 'hub.challenge': '123456789',
+  });
+  assert.deepEqual(unconfigured.response, { status: 500, body: 'Verification unavailable' });
+});
+
+test('signature header lookup is case-insensitive', async () => {
+  const a = inbound();
+  const result = await a.run([textMessage('signed text')], {}, event => {
+    const signature = event.headers['x-hub-signature-256'];
+    event.headers = { 'X-Hub-Signature-256': signature };
+  });
+  assert.equal(result.signature, 'valid');
+  assert.equal(result.messages[0].text, 'signed text');
+});
+
 test('authenticated processing uses the signed body when the parsed event diverges', async () => {
   const a = inbound();
   const result = await a.run([textMessage('signed text')], {}, e => { e.body = { entry: [] }; });
@@ -170,6 +214,9 @@ test('addressed CLI messages get a labelled gateway acknowledgement without invo
   assert.equal(jobs[0].callModel, false);
   assert.equal(jobs[0].target, 'claude-code-cli');
   assert.match(jobs[0].response.text.body, /^\[STATUS \| gateway\]/);
+  assert.match(jobs[0].response.text.body, /Blackboard gateway accepted it/);
+  assert.match(jobs[0].response.text.body, /not independently read the row back/);
+  assert.doesNotMatch(jobs[0].response.text.body, /was submitted to Blackboard/);
   assert.match(jobs[0].response.text.body, /no acknowledgement from that instance yet/);
   assert.equal(jobs[0].response.context.message_id, 'wamid.fixture');
   const renderer = load('pipedream_wa_reply.js').component;

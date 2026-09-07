@@ -12,8 +12,8 @@
 //     they are counted and exported for a future statuses lane.
 //   - no extractable text -> THROW (fail loud, Doctrine #9). Never append
 //     "undefined" or "[object Object]".
-// ENV (per DOCTRINE D-18 — secrets never in code): ALPHA_URL, ALPHA_SECRET.
-// Optional: META_APP_SECRET to enable signature validation.
+// ENV (per DOCTRINE D-18 — secrets never in code): ALPHA_URL, ALPHA_SECRET,
+// META_VERIFY_TOKEN. Optional: META_APP_SECRET to enable signature validation.
 // Attach the required "db" Data Store. Its get/set pair is NOT atomic; serialize
 // this workflow and retain board read-back before any uncertain-write replay.
 
@@ -77,6 +77,22 @@ function boardPayload(message) {
   return prefix + '|text=' + message.text;
 }
 
+function sameSecret(actual, expected) {
+  if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+  const actualBytes = Buffer.from(actual, 'utf8');
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  return actualBytes.length === expectedBytes.length && crypto.timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function headerValue(headers, wantedName) {
+  if (!headers || typeof headers !== 'object') return undefined;
+  if (typeof headers.get === 'function') return headers.get(wantedName) ?? undefined;
+  const matches = Object.entries(headers).filter(([name]) => name.toLowerCase() === wantedName.toLowerCase());
+  if (matches.length > 1) throw new Error(`duplicate ${wantedName} header`);
+  const value = matches[0]?.[1];
+  return Array.isArray(value) && value.length === 1 ? value[0] : value;
+}
+
 export default defineComponent({
   props: {
     // Pipedream rejects optional:true on data_store props ("UserError: optional
@@ -90,6 +106,7 @@ export default defineComponent({
     $.export("env_ok", {
       ALPHA_URL: !!process.env.ALPHA_URL,
       ALPHA_SECRET: !!process.env.ALPHA_SECRET,
+      META_VERIFY_TOKEN: !!process.env.META_VERIFY_TOKEN,
     });
 
     // --- Meta webhook GET verification handshake (kept from previous node) ---
@@ -97,8 +114,14 @@ export default defineComponent({
     if (event.method === "GET") {
       const verify = q["hub.verify_token"] || q["hub_verify_token"];
       const challenge = q["hub.challenge"] || q["hub_challenge"];
-      if (verify === "sfdc24_verify_2024") {
-        await $.respond({ status: 200, body: challenge });
+      const expectedVerify = process.env.META_VERIFY_TOKEN;
+      if (!expectedVerify) {
+        await $.respond({ status: 500, body: "Verification unavailable" });
+        return $.flow.exit("GET while META_VERIFY_TOKEN is not configured");
+      }
+      const challengeText = typeof challenge === 'number' ? String(challenge) : challenge;
+      if (sameSecret(verify, expectedVerify) && typeof challengeText === 'string' && /^\d{1,32}$/.test(challengeText)) {
+        await $.respond({ status: 200, body: challengeText });
         return $.flow.exit("webhook verification handshake");
       }
       await $.respond({ status: 403, body: "Forbidden" });
@@ -123,12 +146,13 @@ export default defineComponent({
     }
 
     // Signature validation (plan Phase 1): enable by setting META_APP_SECRET.
-    // Uses the raw body when the trigger exposes it; skips (and says so) when not.
+    // Header names are case-insensitive. Uses the raw body when the trigger
+    // exposes it; skips (and says so) when not.
     const appSecret = process.env.META_APP_SECRET;
-    const sigHeader = event.headers?.["x-hub-signature-256"];
     const rawBody = event.raw_body ?? event.body_raw;
     let signature = "not checked (META_APP_SECRET unset)";
     if (appSecret) {
+      const sigHeader = headerValue(event.headers, 'x-hub-signature-256');
       if (typeof rawBody !== 'string' || !rawBody) {
         throw new Error('raw webhook body unavailable; cannot verify configured signature');
       } else if (!sigHeader) {

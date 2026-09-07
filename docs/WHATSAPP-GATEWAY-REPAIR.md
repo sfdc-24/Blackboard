@@ -53,9 +53,11 @@ Use one coordinated staging change in `SFDC 24 - WhatsApp to Blackboard`:
    weaken acknowledgement checks to accept arbitrary HTML or HTTP 200.
 2. Replace the inbound code with the reviewed component. Bind its required Data
    Store and retain `ALPHA_URL`, `ALPHA_SECRET`, `META_APP_SECRET` through the
-   existing environment configuration. The trigger must expose the original
-   raw body. The private context step will refuse `signature != valid`, even
-   though the legacy inbound-only mode can still run without an app secret.
+   existing environment configuration. Configure a fresh `META_VERIFY_TOKEN`;
+   the legacy literal was removed from source and should not be reused. The
+   trigger must expose the original raw body. The private context step will
+   refuse `signature != valid`, even though the legacy inbound-only mode can
+   still run without an app secret.
 3. Add a read-only Google Sheets step for the already-authorized Alpha DB, tab
    Sheet1 (sheetId 0). Read the six headers and a bounded tail containing the
    newest used row and newest VIEWPORT, at most 500 rows. Determine the newest
@@ -120,14 +122,17 @@ Do not replay today's historical production events as test fixtures.
 The offline suite (`node --test tests/test_whatsapp_gateway.cjs`) exercises the
 actual component code with mocked I/O. It covers button/list identity, Unicode
 and delimiter preservation, quoted IDs, duplicate and status-only deliveries,
-append failures, signature boundaries, operator isolation, bounded context,
-gateway labels and per-message response correlation.
+append failures, environment-only GET verification, case-insensitive signature
+headers, operator isolation, bounded context, gateway labels and per-message
+response correlation.
 
 Live staging still needs a fresh text message, a button tap, a list choice and
 a quoted reply. For each, compare the received Meta event ID and choice ID with
 the exact board row and prepared response's `context.message_id`; confirm one
 correctly labelled response reaches the operator. A CLI-addressed request must
-not claim a worker started. Test failed appends and stale context against safe
+not claim a worker started or that gateway acceptance is sheet read-back. Verify
+the GET handshake with the freshly configured token before reconnecting Meta.
+Test failed appends and stale context against safe
 fixtures, and verify they create no misleading processed receipt or blank reply.
 Record the deployed component hashes, bindings and delivery evidence before
 retiring the old branch. No live interactive-input or delivery repair is claimed

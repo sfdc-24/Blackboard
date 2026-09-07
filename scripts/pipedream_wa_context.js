@@ -104,7 +104,7 @@ export default defineComponent({
       if (addressed) {
         const target = addressed[1].toLowerCase();
         return { wamid: message.wamid, target, callModel: false,
-          response: replyPayload(message, 'gateway', `Mr. Salam, your message is addressed to ${target} and was submitted to Blackboard. I have no acknowledgement from that instance yet.`) };
+          response: replyPayload(message, 'gateway', `Mr. Salam, your message is addressed to ${target}, and the Blackboard gateway accepted it. I have not independently read the row back, and I have no acknowledgement from that instance yet.`) };
       }
       return { wamid: message.wamid, callModel: true, system: modelSystem(this.lane),
         input: { board: context, message },
