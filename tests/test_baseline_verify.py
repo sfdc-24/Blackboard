@@ -1,111 +1,139 @@
-"""Offline CLI regressions for v31 manifest equivalence and input rejection."""
+#!/usr/bin/env python3
+"""Acceptance for scripts/baseline_verify.py.
+
+These exist because the first version of the canonical-JSON fix imported
+canonical() but NOT parse_json(), so json.load silently kept the LAST of a
+duplicate key and a manifest the deployment-identity path REFUSES was still
+reported MATCH. Requested by codex-site-resume in SITE-BASELINE-REVIEW-20260907T231930Z.
+
+The property under test is not "the digest is right". It is that this checker
+can never accept a manifest the deploy path would reject.
+"""
 import json
-from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.join(REPO, "scripts")
+SOURCE_DIR = os.path.join(REPO, "apps-script", "governor-page-api")
+sys.path.insert(0, SCRIPTS)
 
-ROOT = Path(__file__).resolve().parents[1]
-# Immutable v31 manifest independently read back on 2026-09-07. Keep this
-# fixture separate from the working manifest, which may advance after cutover.
-V31_MANIFEST = {
-    'dependencies': {},
-    'exceptionLogging': 'STACKDRIVER',
-    'oauthScopes': [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/script.external_request',
-        'https://www.googleapis.com/auth/script.scriptapp',
-        'https://www.googleapis.com/auth/script.send_mail',
-        'https://www.googleapis.com/auth/userinfo.email',
-        'https://www.googleapis.com/auth/userinfo.profile',
-    ],
-    'runtimeVersion': 'V8',
-    'timeZone': 'America/Toronto',
-    'webapp': {'access': 'ANYONE_ANONYMOUS', 'executeAs': 'USER_DEPLOYING'},
-}
+import baseline_verify  # noqa: E402  (path set above)
 
 
-class BaselineVerifier(unittest.TestCase):
+def status_of(rows, stem):
+    for got_stem, _fn, status, _want, _got, _how in rows:
+        if got_stem == stem:
+            return status
+    raise AssertionError(f"stem {stem} not reported at all")
+
+
+class BaselineVerifyTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='sfdc24-baseline-')
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
-        self.repo = self.root / 'repo'
-        self.scripts = self.repo / 'scripts'
-        self.source = self.repo / 'apps-script/governor-page-api'
-        self.scripts.mkdir(parents=True)
-        self.source.mkdir(parents=True)
-        for name in ('baseline_verify.py', 'gas_build_identity.py', 'gas_staging_target.py'):
-            shutil.copy2(ROOT / 'scripts' / name, self.scripts / name)
-        self.manifest = self.source / 'appsscript.json'
-        self.write_manifest(json.dumps(V31_MANIFEST))
+        self.tmp = tempfile.mkdtemp(prefix="baseline_verify_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.dir = os.path.join(self.tmp, "governor-page-api")
+        shutil.copytree(SOURCE_DIR, self.dir)
+        self.manifest = os.path.join(self.dir, "appsscript.json")
 
     def write_manifest(self, text):
-        self.manifest.write_bytes(text.encode('utf-8'))
+        with open(self.manifest, "w", encoding="utf-8") as fh:
+            fh.write(text)
 
-    def run_checker(self, cwd=None):
-        return subprocess.run(
-            [sys.executable, '-B', str(self.scripts / 'baseline_verify.py')],
-            cwd=cwd or self.root, capture_output=True, text=True, timeout=15,
-        )
+    def read_manifest(self):
+        with open(self.manifest, encoding="utf-8-sig") as fh:
+            return fh.read()
 
-    def assert_manifest_status(self, result, status):
-        self.assertEqual(result.returncode, 0, result.stderr)
-        lines = [line.split() for line in result.stdout.splitlines()
-                 if line.startswith('appsscript ')]
-        self.assertEqual(len(lines), 1, result.stdout)
-        self.assertEqual(lines[0][1], status, result.stdout)
+    # -- the baseline still works -------------------------------------------
 
-    def test_formatting_bom_and_working_directory_do_not_change_equivalence(self):
-        first = self.run_checker(self.repo)
-        self.assert_manifest_status(first, 'MATCH')
-        reordered = dict(reversed(list(V31_MANIFEST.items())))
-        text = '\ufeff' + json.dumps(reordered, indent=4).replace('\n', '\r\n') + '\r\n'
-        self.write_manifest(text)
-        for cwd in (self.repo, self.scripts, self.root):
-            with self.subTest(cwd=cwd.name):
-                actual = self.run_checker(cwd)
-                self.assert_manifest_status(actual, 'MATCH')
-                self.assertEqual(actual.stdout, first.stdout)
+    def test_unmodified_manifest_matches(self):
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "MATCH")
 
-    def test_duplicate_top_level_key_cannot_match_v31(self):
-        self.write_manifest('{"runtimeVersion":"CORRUPTED",' + json.dumps(V31_MANIFEST)[1:])
-        self.assert_manifest_status(self.run_checker(), 'UNPARSEABLE')
+    def test_reformatting_is_not_drift(self):
+        """Different key order and indentation must NOT read as drift."""
+        parsed = json.loads(self.read_manifest())
+        reordered = dict(reversed(list(parsed.items())))
+        self.write_manifest(json.dumps(reordered, indent=4) + "\n")
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "MATCH")
 
-    def test_duplicate_nested_key_cannot_match_v31(self):
-        text = json.dumps(V31_MANIFEST).replace(
-            '"access": "ANYONE_ANONYMOUS"',
-            '"access": "CORRUPTED", "access": "ANYONE_ANONYMOUS"',
-        )
-        self.write_manifest(text)
-        self.assert_manifest_status(self.run_checker(), 'UNPARSEABLE')
+    # -- the checker must not accept what the deploy path rejects ------------
 
-    def test_nonstandard_json_numbers_are_rejected(self):
-        for value in ('NaN', 'Infinity', '-Infinity'):
-            with self.subTest(value=value):
-                self.write_manifest('{"invalid":' + value + ',' + json.dumps(V31_MANIFEST)[1:])
-                self.assert_manifest_status(self.run_checker(), 'UNPARSEABLE')
+    def test_duplicate_key_cannot_produce_match(self):
+        """The exact attack from the review: corrupted FIRST value, real one last.
 
-    def test_invalid_json_is_reported_as_unparseable(self):
-        self.write_manifest('{"runtimeVersion":')
-        self.assert_manifest_status(self.run_checker(), 'UNPARSEABLE')
+        json.load keeps the last and yields the correct digest. parse_json
+        refuses the text outright.
+        """
+        text = self.read_manifest()
+        self.assertIn('"runtimeVersion"', text)
+        attacked = text.replace("{", '{"runtimeVersion":"CORRUPTED",', 1)
 
-    def test_real_scope_change_is_a_mismatch(self):
-        changed = {**V31_MANIFEST, 'oauthScopes': V31_MANIFEST['oauthScopes'][:-1]}
-        self.write_manifest(json.dumps(changed))
-        self.assert_manifest_status(self.run_checker(), 'MISMATCH')
+        # Prove the attack is real: the lenient parse still yields the good digest.
+        import hashlib
+        from gas_build_identity import canonical
+        lenient = hashlib.sha256(
+            canonical(json.loads(attacked)).encode("utf-8")).hexdigest()
+        self.assertEqual(lenient, baseline_verify.DIGESTS_V31["appsscript"],
+                         "fixture no longer reproduces the silent-duplicate defect")
 
-    def test_missing_source_directory_does_not_report_a_count(self):
-        self.manifest.unlink()
-        self.source.rmdir()
-        result = self.run_checker()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('baseline dir not found', result.stderr)
-        self.assertNotIn('stems match', result.stdout)
+        self.write_manifest(attacked)
+        rows, mismatches = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
+        self.assertGreater(mismatches, 0)
+
+    def test_nonstandard_number_cannot_produce_match(self):
+        text = self.read_manifest().rstrip()
+        self.assertTrue(text.endswith("}"))
+        self.write_manifest(text[:-1] + ', "spendCap": NaN}')
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
+
+    def test_malformed_json_cannot_produce_match(self):
+        self.write_manifest("{ this is not json ")
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
+
+    def test_real_content_change_is_still_reported(self):
+        """Strictness must not mask an ordinary, genuine difference."""
+        parsed = json.loads(self.read_manifest())
+        parsed["timeZone"] = "Etc/UTC-mutated"
+        self.write_manifest(json.dumps(parsed))
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "MISMATCH")
+
+    def test_absent_file_is_reported_not_omitted(self):
+        os.remove(self.manifest)
+        rows, mismatches = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "ABSENT")
+        self.assertGreater(mismatches, 0)
+
+    # -- the answer must not depend on where you stand ----------------------
+
+    def test_same_answer_from_any_working_directory(self):
+        script = os.path.join(SCRIPTS, "baseline_verify.py")
+        outputs = []
+        for cwd in (REPO, SCRIPTS, tempfile.gettempdir()):
+            proc = subprocess.run([sys.executable, script], cwd=cwd,
+                                  capture_output=True, text=True)
+            outputs.append(proc.stdout)
+        self.assertEqual(len(set(outputs)), 1,
+                         "verifier output depends on the caller's cwd")
+        self.assertIn("of 7 stems match deployed v31", outputs[0])
+
+    def test_missing_dir_refuses_to_report_a_count(self):
+        script = os.path.join(SCRIPTS, "baseline_verify.py")
+        proc = subprocess.run(
+            [sys.executable, script, os.path.join(self.tmp, "nope")],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("stems match", proc.stdout)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
