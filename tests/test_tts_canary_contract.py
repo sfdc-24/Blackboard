@@ -155,14 +155,16 @@ class CanaryTargetContract(unittest.TestCase):
 
 class CanaryReceiptContract(unittest.TestCase):
     def setUp(self):
+        self.bundle = CanaryBuildContract.bundle
         self.receipt = {
             'schema': 'site-p0-tts-canary.v1',
             'repository': 'sfdc-24/Blackboard',
-            'commit': 'c' * 40,
-            'canonicalCodeSha256': '1' * 64,
-            'canonicalSourceSha256': '2' * 64,
-            'criticalFunctionSha256': '3' * 64,
-            'preparedSourceSha256': '4' * 64,
+            'commit': self.bundle['commit'],
+            'runId': self.bundle['runId'],
+            'canonicalCodeSha256': self.bundle['canonicalCodeSha256'],
+            'canonicalSourceSha256': self.bundle['canonicalSourceSha256'],
+            'criticalFunctionSha256': self.bundle['criticalFunctionSha256'],
+            'preparedSourceSha256': self.bundle['preparedSourceSha256'],
             'canaryScriptId': 'C' * 24,
             'canaryVersion': 1,
             'apiDeploymentId': 'D' * 24,
@@ -187,7 +189,8 @@ class CanaryReceiptContract(unittest.TestCase):
         }
 
     def test_only_exact_pass_receipt_is_accepted(self):
-        self.assertIs(canary.validate_receipt(self.receipt, 'C' * 24), self.receipt)
+        self.assertIs(canary.validate_receipt(
+            self.receipt, 'C' * 24, self.bundle, 1, 'D' * 24), self.receipt)
         mutations = [
             lambda r: r.update(verdict='HOLD'),
             lambda r: r['scenarios']['replay'].update(attemptDelta=1),
@@ -201,10 +204,33 @@ class CanaryReceiptContract(unittest.TestCase):
             value = copy.deepcopy(self.receipt)
             mutate(value)
             with self.subTest(value=value), self.assertRaises(ValueError):
-                canary.validate_receipt(value, 'C' * 24)
+                canary.validate_receipt(value, 'C' * 24, self.bundle, 1, 'D' * 24)
 
         with self.assertRaises(ValueError):
-            canary.validate_receipt(self.receipt, 'X' * 24)
+            canary.validate_receipt(self.receipt, 'X' * 24, self.bundle, 1, 'D' * 24)
+
+    def test_stale_commit_digests_version_or_deployment_are_rejected(self):
+        fields = ('commit', 'canonicalCodeSha256', 'canonicalSourceSha256',
+                  'criticalFunctionSha256', 'preparedSourceSha256')
+        for field in fields:
+            changed = copy.deepcopy(self.receipt)
+            changed[field] = ('f' * 40 if field == 'commit' else 'f' * 64)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
+        for version, deployment in ((2, 'D' * 24), (1, 'E' * 24)):
+            with self.subTest(version=version, deployment=deployment), self.assertRaises(ValueError):
+                canary.validate_receipt(
+                    self.receipt, 'C' * 24, self.bundle, version, deployment)
+
+    def test_stale_run_or_expected_bundle_is_rejected(self):
+        changed = copy.deepcopy(self.receipt)
+        changed['runId'] = 'f' * 24
+        with self.assertRaises(ValueError):
+            canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
+        stale = copy.deepcopy(self.bundle)
+        stale['commit'] = 'f' * 40
+        with self.assertRaises(ValueError):
+            canary.validate_receipt(self.receipt, 'C' * 24, stale, 1, 'D' * 24)
 
     def test_receipt_rejects_keys_text_and_authorization_material(self):
         for field, value in [('repository', 'Bearer private'),
@@ -213,7 +239,7 @@ class CanaryReceiptContract(unittest.TestCase):
             changed = copy.deepcopy(self.receipt)
             changed[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
-                canary.validate_receipt(changed, 'C' * 24)
+                canary.validate_receipt(changed, 'C' * 24, self.bundle, 1, 'D' * 24)
 
     def test_cli_failure_is_generic_and_does_not_echo_environment(self):
         with mock.patch.object(sys, 'argv', ['gas_tts_canary.py', 'prepare', '--commit', 'HEAD',

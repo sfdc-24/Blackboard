@@ -275,28 +275,35 @@ def _exact_keys(value, keys):
     return isinstance(value, dict) and set(value) == set(keys)
 
 
-def validate_receipt(value, expected_script_id):
+def validate_receipt(value, expected_script_id, expected_bundle,
+                     expected_version, expected_deployment_id):
     if not SCRIPT_ID.fullmatch(str(expected_script_id or '')):
         raise ValueError('a reviewed canary script id is required')
+    if (not isinstance(expected_bundle, dict)
+            or not RUN_ID.fullmatch(str(expected_bundle.get('runId', '')))
+            or not FULL_SHA.fullmatch(str(expected_bundle.get('commit', '')))):
+        raise ValueError('an immutable expected bundle is required')
+    if (type(expected_version) is not int or expected_version < 1
+            or not SCRIPT_ID.fullmatch(str(expected_deployment_id or ''))):
+        raise ValueError('validated deployment identity is required')
     root_keys = {'schema', 'repository', 'commit', 'canonicalCodeSha256',
                  'canonicalSourceSha256', 'criticalFunctionSha256',
                  'preparedSourceSha256', 'canaryScriptId', 'canaryVersion',
-                 'apiDeploymentId', 'providerKind', 'effectiveCaps', 'scenarios',
+                 'apiDeploymentId', 'runId', 'providerKind', 'effectiveCaps', 'scenarios',
                  'privacy', 'cleanup', 'verdict'}
     if not _exact_keys(value, root_keys) or value.get('schema') != 'site-p0-tts-canary.v1':
         raise ValueError('invalid receipt schema')
-    for key in ('commit',):
-        if not FULL_SHA.fullmatch(str(value.get(key, ''))):
-            raise ValueError('invalid receipt commit')
-    for key in ('canonicalCodeSha256', 'canonicalSourceSha256',
-                'criticalFunctionSha256', 'preparedSourceSha256'):
-        if not re.fullmatch(r'[a-f0-9]{64}', str(value.get(key, ''))):
-            raise ValueError('invalid receipt digest')
     if (value.get('repository') != 'sfdc-24/Blackboard' or value.get('verdict') != 'PASS'
             or value.get('providerKind') != 'credential-free synthetic admission counter'
             or value.get('canaryScriptId') != expected_script_id
-            or type(value.get('canaryVersion')) is not int or value['canaryVersion'] < 1
-            or not SCRIPT_ID.fullmatch(str(value.get('apiDeploymentId', '')))):
+            or value.get('canaryVersion') != expected_version
+            or value.get('apiDeploymentId') != expected_deployment_id
+            or value.get('runId') != expected_bundle['runId']
+            or value.get('commit') != expected_bundle['commit']
+            or value.get('canonicalCodeSha256') != expected_bundle['canonicalCodeSha256']
+            or value.get('canonicalSourceSha256') != expected_bundle['canonicalSourceSha256']
+            or value.get('criticalFunctionSha256') != expected_bundle['criticalFunctionSha256']
+            or value.get('preparedSourceSha256') != expected_bundle['preparedSourceSha256']):
         raise ValueError('invalid receipt identity')
     caps = value.get('effectiveCaps')
     if not _exact_keys(caps, ('session', 'daily')) or any(type(caps[k]) is not int or caps[k] < 1
@@ -344,13 +351,19 @@ def main():
     prep.add_argument('--run-id', required=True)
     receipt = sub.add_parser('validate-receipt')
     receipt.add_argument('--receipt', required=True)
+    receipt.add_argument('--commit', required=True)
+    receipt.add_argument('--run-id', required=True)
+    receipt.add_argument('--version', required=True, type=int)
+    receipt.add_argument('--deployment-id', required=True)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     try:
         if args.command == 'validate-receipt':
             target = resolve_target(repo)
+            expected = build_from_commit(repo, args.commit, args.run_id)
             validate_receipt(parse_json(Path(args.receipt).read_text(encoding='utf-8')),
-                             target['script_id'])
+                             target['script_id'], expected, args.version,
+                             args.deployment_id)
             print('receipt=valid')
             return 0
         if args.command == 'inspect':
