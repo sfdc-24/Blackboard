@@ -133,6 +133,41 @@ below the 15-minute trigger interval, leaving time for result append and read-ba
 Split work that cannot produce a decision within that boundary rather than
 increasing the deadline or combining multiple reviews.
 
+The worker's durable provider boundary is `order_supervisor_result.v2`. The
+single-line `summary` is the complete result: it must contain every completion
+fact and reference requested by the ORDER, must already be BCB-safe, and is
+limited to 500 characters. `evidence` must be exactly `[]`; it is retained in
+the JSON shape only to make accidental out-of-band evidence fail closed. If a
+complete answer cannot fit, the provider returns `blocked` with
+`RESULT_TOO_LARGE` and the ORDER must be split. The supervisor never truncates
+or sanitizes an accepted RESULT summary, and rejects control/line separators,
+Basic/Bearer Authorization headers, or structured assignment, JSON-property,
+and query-parameter shapes. Quoted properties and Markdown-backtick name/value
+wrappers use the same full-identifier test. Exact `key`, `token`, `secret`, and
+`password` identifiers are sensitive, as is every segmented identifier ending
+in `token`, `secret`, or `password`, including `GITHUB_TOKEN`, `FOO_TOKEN`,
+`BUS_SECRET`, and `FOO_SECRET`. A terminal `key` is sensitive only when exact or
+accompanied by a credential/provider qualifier such as `api`, `auth`, `access`,
+`private`, `client`, `secret`, `GITHUB`, `AZURE`, `AWS`, `OPENAI`, `DB`, or
+`BUS` (with `_`/`-` forms supported). Thus `api_key` and provider-qualified
+keys are rejected, while `sort_key`, `cache_key`, `public_key`, an unknown
+`FOO_KEY`, cache `key=value` notation, and ordinary discussion remain valid.
+For a deterministic boundary, an unquoted exact `KEY:`, `TOKEN:`, `SECRET:`,
+or `PASSWORD:` is always rejected as a credential-shaped mapping, even when
+the intended text is prose. Write `Token rotation completed` or `Key status is
+green` instead of using those colon forms.
+New RESULT board rows declare `result_schema=order_supervisor_result.v2`; on a
+later run the supervisor reconstructs that durable result and verifies its
+digest before suppressing execution. Older unmarked, digest-bearing v1 rows are
+validated against their exact historical serializer field, length, and
+projection rules—including characters that historical projection preserved—
+without v2 Unicode/credential rules, v2 digest reconstruction, or v2 uppercase
+error-code rules. A
+digestless v1 row is accepted only when it is the exact historical
+duplicate-suppression RESULT; every other digestless shape fails closed. CLAIM
+and RECEIPT recovery may ignore only the prior run identifier, while a newly
+appended row must read back byte-exactly.
+
 ---
 
 ## 5. The rules that will bite you first

@@ -1020,7 +1020,7 @@ public static class BlackboardOrderSystemSmokeFakeClaude {
         }, new UTF8Encoding(false));
         string stdin = Console.In.ReadToEnd();
         WriteText("ORDER_SMOKE_STDIN_PATH", stdin);
-        Console.WriteLine("{\"structured_output\":{\"schema\":\"order_supervisor_result.v1\",\"work_id\":\"SYSTEM-SMOKE\",\"status\":\"blocked\",\"summary\":\"provider-free fake adapter probe\",\"evidence\":[],\"error_code\":\"ASK_USER_QUESTION_DISABLED\"},\"num_turns\":1,\"is_error\":false}");
+        Console.WriteLine("{\"structured_output\":{\"schema\":\"order_supervisor_result.v2\",\"work_id\":\"SYSTEM-SMOKE\",\"status\":\"blocked\",\"summary\":\"provider-free fake adapter probe\",\"evidence\":[],\"error_code\":\"ASK_USER_QUESTION_DISABLED\"},\"num_turns\":1,\"is_error\":false}");
         return 0;
     }
 }
@@ -1151,7 +1151,7 @@ public static class BlackboardOrderSystemSmokeFakeClaude {
     $outer = Read-SmokeStrictJsonProcessFile -Path $fakeStdout -Prefix 'FAKE_OUTPUT' -MaximumBytes 65536
     Assert-SmokeExactProperties -Object $outer -Expected @('structured_output', 'num_turns', 'is_error') -Code 'FAKE_OUTPUT_SHAPE_INVALID'
     Assert-SmokeExactProperties -Object $outer.structured_output -Expected @('schema', 'work_id', 'status', 'summary', 'evidence', 'error_code') -Code 'FAKE_STRUCTURED_OUTPUT_SHAPE_INVALID'
-    if ([string]$outer.structured_output.schema -cne 'order_supervisor_result.v1' -or
+    if ([string]$outer.structured_output.schema -cne 'order_supervisor_result.v2' -or
         [string]$outer.structured_output.work_id -cne 'SYSTEM-SMOKE' -or
         [string]$outer.structured_output.status -cne 'blocked' -or
         [string]$outer.structured_output.error_code -cne 'ASK_USER_QUESTION_DISABLED' -or

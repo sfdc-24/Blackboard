@@ -3,13 +3,13 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "schema": { "const": "order_supervisor_result.v1" },
+    "schema": { "const": "order_supervisor_result.v2" },
     "work_id": { "type": "string", "minLength": 1, "maxLength": 120 },
     "status": { "enum": ["completed", "blocked", "rejected", "failed"] },
-    "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
     "evidence": {
       "type": "array",
-      "maxItems": 20,
+      "maxItems": 0,
       "items": { "type": "string", "maxLength": 500 }
     },
     "error_code": { "type": ["string", "null"], "maxLength": 80 }

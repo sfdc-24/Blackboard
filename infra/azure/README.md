@@ -226,6 +226,37 @@ that meta-schema but rejects a Draft 2020-12 declaration before inference. All
 worker-result constraints use the shared Draft-07 subset, and the supervisor
 still performs its stricter independent result validation after Claude exits.
 
+`order_supervisor_result.v2` is a compact durable-result contract. Its summary
+is the complete board-visible answer, is limited to 500 characters, and must
+already be single-line BCB-safe/redaction-safe text; `evidence` must be exactly
+empty. A provider response that would require truncation, sanitization, or
+discarding evidence becomes one fixed `RESULT_CONTRACT_INVALID` failure RESULT.
+If the requested facts cannot fit, a compliant provider returns `blocked` with
+`RESULT_TOO_LARGE` so the ORDER can be split. Each new RESULT row carries
+`result_schema=order_supervisor_result.v2`, and append confirmation compares the
+exact expected payload. A marked v2 row is accepted for duplicate suppression
+only after its durable fields reproduce its stored digest. Historical unmarked
+v1 rows are never rewritten or re-executed; digest-bearing rows are checked
+against the historical serializer's exact field, safety, and length contract
+including characters that its projection preserved, without newer v2 Unicode
+or credential rules, v2 digest recomputation, or v2 uppercase error-code rules,
+while the only permitted digestless shape is the exact historical
+`DUPLICATE_INVOCATION_SUPPRESSED` RESULT. Pre-existing CLAIM/RECEIPT recovery
+tolerates a different run identifier but no other semantic drift, and the
+read-back after a current append remains exact. New-v2 summaries reject
+Basic/Bearer Authorization headers and structured assignment, JSON, or query
+shapes, including quoted and Markdown-backtick-wrapped names. The identifier
+policy treats exact `key`, `token`, `secret`, and `password` as sensitive;
+every segmented identifier ending in `token`, `secret`, or `password` is also
+sensitive. A terminal `key` requires a credential/provider qualifier such as
+`api`, `auth`, `access`, `private`, `client`, `secret`, `GITHUB`, `AZURE`,
+`AWS`, `OPENAI`, `DB`, or `BUS`. Consequently `FOO_TOKEN` and `FOO_SECRET`
+are rejected, while `sort_key`, `cache_key`, `public_key`, and an unknown
+`FOO_KEY` are not classified merely by their suffix.
+An unquoted exact `KEY:`, `TOKEN:`, `SECRET:`, or `PASSWORD:` is always a
+rejected mapping shape; ordinary prose must omit that colon, for example
+`Token rotation completed` or `Key status is green`.
+
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task

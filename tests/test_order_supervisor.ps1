@@ -138,10 +138,87 @@ $runnerSource = [IO.File]::ReadAllText($RunnerPath, [Text.Encoding]::UTF8)
 Assert-True 'runner never forwards raw BCB payload to Claude' (-not $runnerSource.Contains('$Selected.row.payload') -and -not $runnerSource.Contains('param($Selected') -and $runnerSource.Contains('New-ClaudeWorkerPrompt'))
 
 $input = $rows[0]
+$orderInput = $input
 $phase = @(New-OrderPhaseRow -InputRow $input -WorkId 'ORDER-A' -Phase CLAIM -RunId 'run-test' -Status claimed)
 Assert-True 'phase row has exactly ten cells' ($phase.Count -eq 10)
 Assert-True 'phase row uses dedicated source tag' ($phase[2] -ceq 'vm-order-worker')
 Assert-True 'phase row never impersonates vm-cli' ($phase -cnotcontains 'vm-cli')
+$differentRunPhase = @(New-OrderPhaseRow -InputRow $input -WorkId 'ORDER-A' -Phase CLAIM -RunId 'run-other' -Status claimed)
+$preExistingClaimRows = To-ParsedRows @([pscustomobject]@{ Cells = $phase })
+$script:claimRecoveryAppendCalls = 0
+$claimRecovery = Invoke-IdempotentBoardAppend `
+    -Row $differentRunPhase `
+    -ReadBoard { return @($preExistingClaimRows) } `
+    -AppendBoard { param($candidate) $script:claimRecoveryAppendCalls++ }
+Assert-True 'same deterministic CLAIM from a prior run is recovered without append' (
+    $claimRecovery.confirmed -and
+    -not $claimRecovery.appended -and
+    $claimRecovery.outcome -ceq 'already_present' -and
+    $script:claimRecoveryAppendCalls -eq 0
+)
+$script:alteredClaimAfterAppendRows = New-Object System.Collections.Generic.List[object]
+Assert-Throws 'current CLAIM append readback rejects a changed run' {
+    Invoke-IdempotentBoardAppend `
+        -Row $phase `
+        -ReadBoard { return $script:alteredClaimAfterAppendRows.ToArray() } `
+        -AppendBoard {
+            param($candidate)
+            $candidateCells = @($candidate)
+            if ($candidateCells.Count -eq 1 -and
+                $candidateCells[0] -is [Collections.IEnumerable] -and
+                $candidateCells[0] -isnot [string]) {
+                $candidateCells = @($candidateCells[0])
+            }
+            $candidateCells[5] = ([string]$candidateCells[5]).Replace('run=run-test', 'run=run-altered')
+            $changedRows = To-ParsedRows @([pscustomobject]@{ Cells = $candidateCells })
+            $script:alteredClaimAfterAppendRows.Add($changedRows[0])
+        }
+} 'phase_row_id_collision'
+
+$maximumSummary = 's' * 500
+$maximumSummaryResult = [pscustomobject][ordered]@{
+    schema = 'order_supervisor_result.v2'
+    work_id = 'ORDER-A'
+    status = 'failed'
+    summary = $maximumSummary
+    evidence = @()
+    error_code = 'EXPECTED_FAILURE'
+}
+$maximumSummaryCanonical = ConvertTo-CanonicalOrderResultJson `
+    -Value $maximumSummaryResult `
+    -ExpectedWorkId 'ORDER-A'
+$maximumSummaryDigest = Get-StringSha256 -Text $maximumSummaryCanonical
+$resultPhase = @(New-OrderPhaseRow `
+    -InputRow $input `
+    -WorkId 'ORDER-A' `
+    -Phase RESULT `
+    -RunId ('a' * 32) `
+    -Status failed `
+    -Summary $maximumSummary `
+    -ErrorCode 'EXPECTED_FAILURE' `
+    -OutputSha256 $maximumSummaryDigest)
+$resultPayload = ConvertFrom-BcbPayload -Payload ([string]$resultPhase[5])
+Assert-True 'RESULT row persists the exact maximum-length summary without truncation' (
+    [string]$resultPayload.fields['summary'] -ceq $maximumSummary
+)
+Assert-True 'RESULT row declares the compact v2 result contract' (
+    [string]$resultPayload.fields['result_schema'] -ceq 'order_supervisor_result.v2'
+)
+foreach ($invalidRunId in @('run-test', ('A' * 32), ('g' * 32), ('a' * 31), ('a' * 33))) {
+    Assert-Throws 'RESULT serializer rejects invalid run identity' {
+        New-OrderPhaseRow `
+            -InputRow $orderInput `
+            -WorkId 'ORDER-A' `
+            -Phase RESULT `
+            -RunId $invalidRunId `
+            -Status completed `
+            -Summary 'valid' `
+            -OutputSha256 ('b' * 64)
+    } 'phase_result_run_invalid'
+}
+Assert-Throws 'RESULT serializer rejects oversized summary instead of truncating' {
+    New-OrderPhaseRow -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT -RunId ('a' * 32) -Status completed -Summary ('x' * 501) -OutputSha256 ('b' * 64)
+} 'phase_result_summary_invalid'
 
 $board = New-Object System.Collections.Generic.List[object]
 $appendCalls = 0
@@ -176,6 +253,134 @@ Assert-True 'ambiguous append attempted once' ($appendCalls -eq 1)
 $again = Invoke-IdempotentBoardAppend -Row $phase -ReadBoard $read -AppendBoard $appendAmbiguous
 Assert-True 'duplicate phase invocation is read-only' ($again.confirmed -and -not $again.appended -and $appendCalls -eq 1)
 
+$parsedResultPhase = To-ParsedRows @([pscustomobject]@{ Cells = $resultPhase })
+Assert-True 'exact RESULT payload readback is accepted' (
+    Test-ExistingPhaseRow -Rows $parsedResultPhase -ExpectedRow $resultPhase
+)
+foreach ($resultMutation in @(
+    [pscustomobject]@{ name = 'summary'; from = ('summary=' + $maximumSummary); to = 'summary=lost' },
+    [pscustomobject]@{ name = 'error code'; from = 'error_code=EXPECTED_FAILURE'; to = 'error_code=OTHER_FAILURE' },
+    [pscustomobject]@{ name = 'status'; from = 'status=failed'; to = 'status=completed' },
+    [pscustomobject]@{ name = 'run'; from = ('run=' + ('a' * 32)); to = ('run=' + ('c' * 32)) },
+    [pscustomobject]@{ name = 'class'; from = 'class=BUILD'; to = 'class=FINDING' }
+)) {
+    $mutatedCells = @($resultPhase)
+    $mutatedCells[5] = ([string]$mutatedCells[5]).Replace($resultMutation.from, $resultMutation.to)
+    $mutatedRows = To-ParsedRows @([pscustomobject]@{ Cells = $mutatedCells })
+    Assert-Throws ('RESULT readback rejects altered ' + $resultMutation.name) {
+        Test-ExistingPhaseRow -Rows $mutatedRows -ExpectedRow $resultPhase
+    } 'phase_row_id_collision'
+}
+Assert-True 'v2 RESULT identity is structurally valid' (
+    Test-PhaseRowIdentity -Row $parsedResultPhase[0] -InputRow $input -WorkId 'ORDER-A' -Phase RESULT
+)
+$legacyCells = @($resultPhase)
+$legacyCells[5] = ([string]$legacyCells[5]).Replace('|result_schema=order_supervisor_result.v2', '')
+$legacyRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyCells })
+Assert-True 'historical unmarked v1 RESULT still suppresses re-execution' (
+    Test-PhaseRowIdentity -Row $legacyRows[0] -InputRow $input -WorkId 'ORDER-A' -Phase RESULT
+)
+$legacyLowercaseErrorCells = @($legacyCells)
+$legacyLowercaseErrorCells[5] = ([string]$legacyLowercaseErrorCells[5]).Replace(
+    'error_code=EXPECTED_FAILURE',
+    'error_code=claude_wall_timeout'
+)
+$legacyLowercaseErrorRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyLowercaseErrorCells })
+Assert-True 'historical digest-bearing v1 RESULT accepts legacy lowercase internal error code' (
+    Test-PhaseRowIdentity -Row $legacyLowercaseErrorRows[0] -InputRow $input -WorkId 'ORDER-A' -Phase RESULT
+)
+foreach ($historicallyPreservedCharacter in @(
+    [pscustomobject]@{ name = 'U+007F'; value = [char]0x007f },
+    [pscustomobject]@{ name = 'U+0085'; value = [char]0x0085 },
+    [pscustomobject]@{ name = 'U+2028'; value = [char]0x2028 },
+    [pscustomobject]@{ name = 'U+2029'; value = [char]0x2029 }
+)) {
+    $historicalCharacterCells = @($legacyLowercaseErrorCells)
+    $historicalCharacterCells[5] = ([string]$historicalCharacterCells[5]).Replace(
+        ('summary=' + $maximumSummary),
+        ('summary=legacy' + $historicallyPreservedCharacter.value + 'value')
+    )
+    $historicalCharacterRows = To-ParsedRows @([pscustomobject]@{ Cells = $historicalCharacterCells })
+    Assert-True ('historical digest-bearing v1 RESULT preserves ' + $historicallyPreservedCharacter.name) (
+        Test-PhaseRowIdentity -Row $historicalCharacterRows[0] -InputRow $input -WorkId 'ORDER-A' -Phase RESULT
+    )
+}
+$legacyDelimiterCells = @($legacyLowercaseErrorCells)
+$legacyDelimiterCells[5] = ([string]$legacyDelimiterCells[5]).Replace(
+    ('summary=' + $maximumSummary),
+    'summary=legacy|unsafe'
+)
+$legacyDelimiterRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyDelimiterCells })
+Assert-Throws 'historical digest-bearing v1 RESULT rejects unsafe delimiter shape' {
+    Test-PhaseRowIdentity -Row $legacyDelimiterRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_payload_invalid'
+$legacyControlCells = @($legacyLowercaseErrorCells)
+$legacyControlCells[5] = ([string]$legacyControlCells[5]).Replace(
+    ('summary=' + $maximumSummary),
+    ('summary=legacy' + [char]1 + 'unsafe')
+)
+$legacyControlRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyControlCells })
+Assert-Throws 'historical digest-bearing v1 RESULT rejects unsafe control shape' {
+    Test-PhaseRowIdentity -Row $legacyControlRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_id_collision'
+$legacyOversizeCells = @($legacyLowercaseErrorCells)
+$legacyOversizeCells[5] = ([string]$legacyOversizeCells[5]).Replace(
+    ('summary=' + $maximumSummary),
+    ('summary=' + ('o' * 501))
+)
+$legacyOversizeRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyOversizeCells })
+Assert-Throws 'historical digest-bearing v1 RESULT rejects oversized summary shape' {
+    Test-PhaseRowIdentity -Row $legacyOversizeRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_id_collision'
+$legacyExtraFieldCells = @($legacyLowercaseErrorCells)
+$legacyExtraFieldCells[5] = [string]$legacyExtraFieldCells[5] + '|unexpected=field'
+$legacyExtraFieldRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacyExtraFieldCells })
+Assert-Throws 'historical digest-bearing v1 RESULT rejects extra durable field' {
+    Test-PhaseRowIdentity -Row $legacyExtraFieldRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_id_collision'
+$legacySuppressionSummary = 'A prior invocation has no confirmed result; duplicate execution was suppressed.'
+$legacySuppressionCells = @(New-OrderPhaseRow `
+    -InputRow $input `
+    -WorkId 'ORDER-A' `
+    -Phase RESULT `
+    -RunId ('d' * 32) `
+    -Status failed `
+    -Summary $legacySuppressionSummary `
+    -ErrorCode 'DUPLICATE_INVOCATION_SUPPRESSED' `
+    -OutputSha256 ('e' * 64))
+$legacySuppressionCells[5] = ([string]$legacySuppressionCells[5]).Replace('|result_schema=order_supervisor_result.v2', '')
+$legacySuppressionCells[5] = ([string]$legacySuppressionCells[5]).Replace('|output_sha256=' + ('e' * 64), '')
+$legacySuppressionRows = To-ParsedRows @([pscustomobject]@{ Cells = $legacySuppressionCells })
+Assert-True 'exact historical digestless duplicate-suppression RESULT remains accepted' (
+    Test-PhaseRowIdentity -Row $legacySuppressionRows[0] -InputRow $input -WorkId 'ORDER-A' -Phase RESULT
+)
+$arbitraryDigestlessLegacyCells = @($legacyCells)
+$arbitraryDigestlessLegacyCells[5] = ([string]$arbitraryDigestlessLegacyCells[5]).Replace('|output_sha256=' + $maximumSummaryDigest, '')
+$arbitraryDigestlessLegacyRows = To-ParsedRows @([pscustomobject]@{ Cells = $arbitraryDigestlessLegacyCells })
+Assert-Throws 'arbitrary historical digestless RESULT fails closed' {
+    Test-PhaseRowIdentity -Row $arbitraryDigestlessLegacyRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_id_collision'
+foreach ($identityMutation in @(
+    [pscustomobject]@{ name = 'invalid status'; from = 'status=failed'; to = 'status=unknown' },
+    [pscustomobject]@{ name = 'blank summary'; from = ('summary=' + $maximumSummary); to = 'summary=' },
+    [pscustomobject]@{ name = 'invalid digest'; from = ('output_sha256=' + $maximumSummaryDigest); to = ('output_sha256=' + ('B' * 64)) },
+    [pscustomobject]@{ name = 'wrong lowercase digest'; from = ('output_sha256=' + $maximumSummaryDigest); to = ('output_sha256=' + ('0' * 64)) },
+    [pscustomobject]@{ name = 'wrong result schema'; from = 'result_schema=order_supervisor_result.v2'; to = 'result_schema=order_supervisor_result.v1' }
+)) {
+    $identityCells = @($resultPhase)
+    $identityCells[5] = ([string]$identityCells[5]).Replace($identityMutation.from, $identityMutation.to)
+    $identityRows = To-ParsedRows @([pscustomobject]@{ Cells = $identityCells })
+    Assert-Throws ('RESULT identity rejects ' + $identityMutation.name) {
+        Test-PhaseRowIdentity -Row $identityRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+    } 'phase_row_id_collision'
+}
+$extraV2FieldCells = @($resultPhase)
+$extraV2FieldCells[5] = [string]$extraV2FieldCells[5] + '|unexpected=field'
+$extraV2FieldRows = To-ParsedRows @([pscustomobject]@{ Cells = $extraV2FieldCells })
+Assert-Throws 'marked v2 RESULT rejects fields outside its durable set' {
+    Test-PhaseRowIdentity -Row $extraV2FieldRows[0] -InputRow $orderInput -WorkId 'ORDER-A' -Phase RESULT
+} 'phase_row_id_collision'
+
 $emptyBoard = { return @() }
 $missingCalls = 0
 $appendMissing = { param($candidate) $script:missingCalls++ }
@@ -184,7 +389,7 @@ Assert-True 'unconfirmed append is failure' (-not $unconfirmed.confirmed)
 Assert-True 'unconfirmed append is never blind retried' ($missingCalls -eq 1)
 
 $badResult = [pscustomobject]@{
-    schema = 'order_supervisor_result.v1'
+    schema = 'order_supervisor_result.v2'
     work_id = 'ORDER-A'
     status = 'COMPLETED'
     summary = 'bad case'
@@ -193,7 +398,7 @@ $badResult = [pscustomobject]@{
 }
 Assert-Throws 'result enum is case exact' { Test-ClaudeResult -Value $badResult -ExpectedWorkId 'ORDER-A' } 'claude_result_status_invalid'
 $validResult = [pscustomobject][ordered]@{
-    schema = 'order_supervisor_result.v1'
+    schema = 'order_supervisor_result.v2'
     work_id = 'ORDER-A'
     status = 'completed'
     summary = 'valid'
@@ -204,17 +409,129 @@ Assert-True 'valid result passes independent parent validation' ($null -ne (Test
 $extraResult = $validResult | Select-Object *
 $extraResult | Add-Member -NotePropertyName extra -NotePropertyValue 'not allowed'
 Assert-Throws 'result rejects an extra property' { Test-ClaudeResult -Value $extraResult -ExpectedWorkId 'ORDER-A' } 'claude_result_properties_invalid'
-$missingResult = [pscustomobject][ordered]@{ schema = 'order_supervisor_result.v1'; work_id = 'ORDER-A'; status = 'completed'; summary = 'valid'; evidence = @() }
+$missingResult = [pscustomobject][ordered]@{ schema = 'order_supervisor_result.v2'; work_id = 'ORDER-A'; status = 'completed'; summary = 'valid'; evidence = @() }
 Assert-Throws 'result rejects a missing property' { Test-ClaudeResult -Value $missingResult -ExpectedWorkId 'ORDER-A' } 'claude_result_properties_invalid'
 $wrongWorkResult = $validResult | Select-Object *
 $wrongWorkResult.work_id = 'ORDER-B'
 Assert-Throws 'result rejects mismatched work id' { Test-ClaudeResult -Value $wrongWorkResult -ExpectedWorkId 'ORDER-A' } 'claude_result_work_id_mismatch'
 $longSummaryResult = $validResult | Select-Object *
-$longSummaryResult.summary = 'x' * 2001
+$longSummaryResult.summary = 'x' * 501
 Assert-Throws 'result rejects over-limit summary' { Test-ClaudeResult -Value $longSummaryResult -ExpectedWorkId 'ORDER-A' } 'claude_result_summary_invalid'
 $longEvidenceResult = $validResult | Select-Object *
-$longEvidenceResult.evidence = @(1..21 | ForEach-Object { 'e' })
-Assert-Throws 'result rejects over-limit evidence count' { Test-ClaudeResult -Value $longEvidenceResult -ExpectedWorkId 'ORDER-A' } 'claude_result_evidence_missing'
+$longEvidenceResult.evidence = @('one item is already too many')
+Assert-Throws 'result rejects nonempty evidence' { Test-ClaudeResult -Value $longEvidenceResult -ExpectedWorkId 'ORDER-A' } 'claude_result_evidence_not_empty'
+$exactMaximumResult = $validResult | Select-Object *
+$exactMaximumResult.summary = 'm' * 500
+Assert-True 'result accepts an exact 500-character summary' (
+    $null -ne (Test-ClaudeResult -Value $exactMaximumResult -ExpectedWorkId 'ORDER-A')
+)
+foreach ($unsafeSummaryCase in @(
+    [pscustomobject]@{ name = 'leading whitespace'; value = ' leading' },
+    [pscustomobject]@{ name = 'trailing whitespace'; value = 'trailing ' },
+    [pscustomobject]@{ name = 'pipe'; value = 'left|right' },
+    [pscustomobject]@{ name = 'newline'; value = "left`nright" },
+    [pscustomobject]@{ name = 'tab'; value = "left`tright" },
+    [pscustomobject]@{ name = 'control character'; value = ('left' + [char]1 + 'right') },
+    [pscustomobject]@{ name = 'delete control character'; value = ('left' + [char]0x7f + 'right') },
+    [pscustomobject]@{ name = 'C1 control character'; value = ('left' + [char]0x85 + 'right') },
+    [pscustomobject]@{ name = 'Unicode line separator'; value = ('left' + [char]0x2028 + 'right') },
+    [pscustomobject]@{ name = 'Unicode paragraph separator'; value = ('left' + [char]0x2029 + 'right') },
+    [pscustomobject]@{ name = 'secret-like assignment'; value = 'API_KEY=must-not-land' },
+    [pscustomobject]@{ name = 'secret-like query'; value = 'https://example.invalid/?token=must-not-land' }
+)) {
+    $unsafeSummaryResult = $validResult | Select-Object *
+    $unsafeSummaryResult.summary = $unsafeSummaryCase.value
+    Assert-Throws ('result rejects summary requiring mutation: ' + $unsafeSummaryCase.name) {
+        Test-ClaudeResult -Value $unsafeSummaryResult -ExpectedWorkId 'ORDER-A'
+    } 'claude_result_summary_unsafe'
+}
+$credentialShapeCases = @(
+    [pscustomobject]@{ name = 'exact key assignment'; value = 'key=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'exact token assignment'; value = 'token=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'exact secret assignment'; value = 'secret=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'exact password assignment'; value = 'password=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'OPENAI_API_KEY assignment'; value = 'OPENAI_API_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AWS_SECRET_ACCESS_KEY assignment'; value = 'AWS_SECRET_ACCESS_KEY: CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'GITHUB_TOKEN assignment'; value = 'GITHUB_TOKEN=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AZURE_OPENAI_API_KEY assignment'; value = 'AZURE_OPENAI_API_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AZURE_CLIENT_SECRET assignment'; value = 'AZURE_CLIENT_SECRET=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AWS_SESSION_TOKEN assignment'; value = 'AWS_SESSION_TOKEN=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'BUS_SECRET assignment'; value = 'BUS_SECRET=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'unknown-prefix secret assignment'; value = 'FOO_SECRET=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'unknown-prefix token assignment'; value = 'FOO_TOKEN=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'PRIVATE_KEY assignment'; value = 'PRIVATE_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'known-provider key assignment'; value = 'GITHUB_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AZURE provider key assignment'; value = 'AZURE_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'AWS provider key assignment'; value = 'AWS_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'OPENAI provider key assignment'; value = 'OPENAI_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'DB credential key assignment'; value = 'DB_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'BUS credential key assignment'; value = 'BUS_KEY=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'ACCESS_TOKEN assignment'; value = 'ACCESS_TOKEN=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'CLIENT_SECRET assignment'; value = 'CLIENT_SECRET=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'DB_PASSWORD assignment'; value = 'DB_PASSWORD=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'api_key query'; value = 'https://example.invalid/?api_key=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'api-key query'; value = 'https://example.invalid/?api-key=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'access_token query'; value = 'https://example.invalid/?access_token=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'client_secret query'; value = 'https://example.invalid/?client_secret=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'password query'; value = 'https://example.invalid/?password=CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'token JSON property'; value = '{"token":"CANARY_ONLY"}'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'api_key JSON property'; value = '{"api_key":"CANARY_ONLY"}'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'double-quoted equals assignment'; value = '"GITHUB_TOKEN"="CANARY_ONLY"'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'single-quoted equals assignment'; value = "'GITHUB_TOKEN'='CANARY_ONLY'"; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'whole-expression Markdown wrapper'; value = '`GITHUB_TOKEN=CANARY_ONLY`'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'Markdown-wrapped equals assignment'; value = '`GITHUB_TOKEN`=`CANARY_ONLY`'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'exact token colon mapping'; value = 'token: CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'token colon prose'; value = 'Token: rotation completed successfully.'; canary = 'rotation completed' },
+    [pscustomobject]@{ name = 'key colon prose'; value = 'KEY: green means pass.'; canary = 'green means pass' },
+    [pscustomobject]@{ name = 'exact secret colon mapping'; value = 'secret: CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'exact password colon mapping'; value = 'password: CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'Authorization Bearer header'; value = 'Authorization: Bearer CANARY_ONLY'; canary = 'CANARY_ONLY' },
+    [pscustomobject]@{ name = 'Authorization Basic header'; value = 'Authorization: Basic CANARY_ONLY'; canary = 'CANARY_ONLY' }
+)
+foreach ($credentialShapeCase in $credentialShapeCases) {
+    $credentialShapeResult = $validResult | Select-Object *
+    $credentialShapeResult.summary = $credentialShapeCase.value
+    Assert-ThrowsFixedNoLeak ('result rejects credential shape: ' + $credentialShapeCase.name) {
+        Test-ClaudeResult -Value $credentialShapeResult -ExpectedWorkId 'ORDER-A'
+    } 'claude_result_summary_unsafe' $credentialShapeCase.canary
+}
+$ordinaryCredentialProseCases = @(
+    'The access token design uses short-lived grants.',
+    'The password field is described without assigning a value.',
+    'Authorization using Basic or Bearer is documented without a header value.',
+    'sort_key=name',
+    'cache_key=name',
+    'public_key=fingerprint-only',
+    'FOO_KEY=display-name',
+    '"sort_key"="name"',
+    '`sort_key`=`name`',
+    'https://example.invalid/?sort_key=name',
+    'The cache key=value mapping remains stable.',
+    'Key status is green.',
+    'Token rotation completed successfully.',
+    '{"sort_key":"name"}'
+)
+foreach ($ordinaryCredentialProse in $ordinaryCredentialProseCases) {
+    $ordinaryCredentialProseResult = $validResult | Select-Object *
+    $ordinaryCredentialProseResult.summary = $ordinaryCredentialProse
+    Assert-True ('result permits ordinary credential prose: ' + $ordinaryCredentialProse) (
+        $null -ne (Test-ClaudeResult -Value $ordinaryCredentialProseResult -ExpectedWorkId 'ORDER-A')
+    )
+}
+$reorderedResult = [pscustomobject][ordered]@{
+    error_code = $null
+    evidence = @()
+    summary = 'valid'
+    status = 'completed'
+    work_id = 'ORDER-A'
+    schema = 'order_supervisor_result.v2'
+}
+$canonicalOrdered = ConvertTo-CanonicalOrderResultJson -Value $validResult -ExpectedWorkId 'ORDER-A'
+$canonicalReordered = ConvertTo-CanonicalOrderResultJson -Value $reorderedResult -ExpectedWorkId 'ORDER-A'
+Assert-True 'canonical result digest projection ignores provider property order' (
+    $canonicalOrdered -ceq $canonicalReordered -and
+    (Get-StringSha256 -Text $canonicalOrdered) -ceq (Get-StringSha256 -Text $canonicalReordered)
+)
 $badErrorResult = $validResult | Select-Object *
 $badErrorResult.error_code = 'lowercase'
 Assert-Throws 'result rejects invalid error-code syntax' { Test-ClaudeResult -Value $badErrorResult -ExpectedWorkId 'ORDER-A' } 'claude_result_error_code_invalid'
@@ -229,7 +546,7 @@ $validStructuredEnvelopeJson = ([ordered]@{
 } | ConvertTo-Json -Depth 8 -Compress)
 $structuredEnvelopeResult = ConvertFrom-ClaudeResultEnvelope -JsonText $validStructuredEnvelopeJson -ExpectedWorkId 'ORDER-A'
 Assert-True 'Claude envelope accepts valid structured output' (
-    $structuredEnvelopeResult.schema -ceq 'order_supervisor_result.v1' -and
+    $structuredEnvelopeResult.schema -ceq 'order_supervisor_result.v2' -and
     $structuredEnvelopeResult.work_id -ceq 'ORDER-A' -and
     $structuredEnvelopeResult.status -ceq 'completed' -and
     $structuredEnvelopeResult.summary -ceq 'valid' -and
@@ -245,7 +562,7 @@ $validFallbackEnvelopeJson = ([ordered]@{
 } | ConvertTo-Json -Depth 8 -Compress)
 $fallbackEnvelopeResult = ConvertFrom-ClaudeResultEnvelope -JsonText $validFallbackEnvelopeJson -ExpectedWorkId 'ORDER-A'
 Assert-True 'Claude envelope accepts valid result JSON fallback' (
-    $fallbackEnvelopeResult.schema -ceq 'order_supervisor_result.v1' -and
+    $fallbackEnvelopeResult.schema -ceq 'order_supervisor_result.v2' -and
     $fallbackEnvelopeResult.work_id -ceq 'ORDER-A' -and
     $fallbackEnvelopeResult.status -ceq 'completed'
 )
@@ -459,7 +776,7 @@ $existingShapeCases = @(
     [pscustomobject]@{ name = 'missing property'; value = $missingResult; expected = 'claude_result_properties_invalid' },
     [pscustomobject]@{ name = 'work id'; value = $wrongWorkResult; expected = 'claude_result_work_id_mismatch' },
     [pscustomobject]@{ name = 'summary limit'; value = $longSummaryResult; expected = 'claude_result_summary_invalid' },
-    [pscustomobject]@{ name = 'evidence count'; value = $longEvidenceResult; expected = 'claude_result_evidence_missing' },
+    [pscustomobject]@{ name = 'nonempty evidence'; value = $longEvidenceResult; expected = 'claude_result_evidence_not_empty' },
     [pscustomobject]@{ name = 'error code syntax'; value = $badErrorResult; expected = 'claude_result_error_code_invalid' }
 )
 foreach ($existingShapeCase in $existingShapeCases) {
@@ -540,10 +857,10 @@ $actualStatuses = @($schemaDocument.properties.status.enum)
 Assert-True 'result schema status enum remains exact' ($actualStatuses.Count -eq $expectedStatuses.Count -and @($expectedStatuses | Where-Object { $actualStatuses -cnotcontains $_ }).Count -eq 0)
 $errorCodeTypes = @($schemaDocument.properties.error_code.type)
 $constraintsPreserved = (
-    [string]$schemaDocument.properties.schema.const -ceq 'order_supervisor_result.v1' -and
+    [string]$schemaDocument.properties.schema.const -ceq 'order_supervisor_result.v2' -and
     [string]$schemaDocument.properties.work_id.type -ceq 'string' -and [int]$schemaDocument.properties.work_id.minLength -eq 1 -and [int]$schemaDocument.properties.work_id.maxLength -eq 120 -and
-    [string]$schemaDocument.properties.summary.type -ceq 'string' -and [int]$schemaDocument.properties.summary.minLength -eq 1 -and [int]$schemaDocument.properties.summary.maxLength -eq 2000 -and
-    [string]$schemaDocument.properties.evidence.type -ceq 'array' -and [int]$schemaDocument.properties.evidence.maxItems -eq 20 -and
+    [string]$schemaDocument.properties.summary.type -ceq 'string' -and [int]$schemaDocument.properties.summary.minLength -eq 1 -and [int]$schemaDocument.properties.summary.maxLength -eq 500 -and
+    [string]$schemaDocument.properties.evidence.type -ceq 'array' -and [int]$schemaDocument.properties.evidence.maxItems -eq 0 -and
     [string]$schemaDocument.properties.evidence.items.type -ceq 'string' -and [int]$schemaDocument.properties.evidence.items.maxLength -eq 500 -and
     $errorCodeTypes.Count -eq 2 -and $errorCodeTypes -ccontains 'string' -and $errorCodeTypes -ccontains 'null' -and
     [int]$schemaDocument.properties.error_code.maxLength -eq 80
@@ -605,7 +922,7 @@ $capture = [ordered]@{
     config_exists = (Test-Path -LiteralPath ([string]$env:CLAUDE_CONFIG_DIR) -PathType Container)
 }
 [IO.File]::WriteAllText($env:ORDER_SUPERVISOR_ARGV_CAPTURE, ($capture | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-Write-Output '{"structured_output":{"schema":"order_supervisor_result.v1","work_id":"offline","status":"completed","summary":"offline","evidence":[],"error_code":null}}'
+Write-Output '{"structured_output":{"schema":"order_supervisor_result.v2","work_id":"offline","status":"completed","summary":"offline","evidence":[],"error_code":null}}'
 exit 0
 '@
     [IO.File]::WriteAllText($fakeClaude, $fakeClaudeSource, [Text.UTF8Encoding]::new($false))
@@ -1202,6 +1519,479 @@ exit 93
         if (-not $KeepArtifacts -and (Test-Path -LiteralPath $cliProbeRoot -PathType Container)) {
             Remove-Item -LiteralPath $cliProbeRoot -Recurse -Force
         }
+    }
+}
+
+function Write-ResultFidelityUtf8 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
+}
+
+function New-ResultFidelityBoardJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$InputRowId,
+        [Parameter(Mandatory = $true)][string]$WorkId
+    )
+
+    $header = @(
+        'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
+        'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist'
+    )
+    $order = @(
+        $InputRowId,
+        [DateTime]::UtcNow.AddMinutes(-1).ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture),
+        'codex',
+        'vm-order-worker',
+        'APPEND',
+        ('BCB|v=1|id=' + $WorkId + '|phase=DISPATCH|class=BUILD|from=codex|to=vm-order-worker|authority=operator-direct|task=return the requested bounded fixture facts'),
+        'OPEN',
+        'ORDER-SUPERVISOR',
+        '',
+        ''
+    )
+    return ([ordered]@{ ok = $true; rows = @($header, $order) } | ConvertTo-Json -Depth 8 -Compress)
+}
+
+$resultFidelityBusSource = @'
+param(
+    [string]$Action,
+    [string]$Title,
+    [string]$OutFile,
+    [string]$EnvFile,
+    [string]$SheetRowJson,
+    [string]$ReadMetadataOutFile
+)
+$ErrorActionPreference = 'Stop'
+$root = [string]$env:ORDER_RESULT_FIDELITY_TEST_ROOT
+if ([string]::IsNullOrWhiteSpace($root)) { throw 'result_fidelity_test_root_missing' }
+$boardPath = Join-Path $root 'board.json'
+$actionsPath = Join-Path $root 'bus-actions.txt'
+[IO.File]::AppendAllText(
+    $actionsPath,
+    ([string]$Action + [Environment]::NewLine),
+    [Text.UTF8Encoding]::new($false)
+)
+if ($Action -ceq 'read') {
+    $response = [IO.File]::ReadAllText($boardPath, [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText($OutFile, $response, [Text.UTF8Encoding]::new($false))
+    if ($ReadMetadataOutFile) {
+        [IO.File]::WriteAllText(
+            $ReadMetadataOutFile,
+            '{"transport_exit":0,"http_status":200,"content_type_class":"json"}',
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    return
+}
+if ($Action -cne 'append') { throw 'unexpected_result_fidelity_bus_action' }
+if ([string]::IsNullOrWhiteSpace($SheetRowJson)) { throw 'result_fidelity_sheet_row_missing' }
+Add-Type -AssemblyName System.Web.Extensions
+$serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+$deserialized = $serializer.DeserializeObject($SheetRowJson)
+$cells = @()
+foreach ($cell in $deserialized) { $cells += $(if ($null -eq $cell) { '' } else { [string]$cell }) }
+if ($cells.Count -ne 10) { throw 'result_fidelity_sheet_row_invalid' }
+$board = [IO.File]::ReadAllText($boardPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+$rows = New-Object System.Collections.Generic.List[object]
+foreach ($existing in @($board.rows)) { $rows.Add(@($existing)) }
+$rows.Add(@($cells))
+$updated = [ordered]@{ ok = $true; rows = $rows.ToArray() } | ConvertTo-Json -Depth 10 -Compress
+[IO.File]::WriteAllText($boardPath, $updated, [Text.UTF8Encoding]::new($false))
+Write-Output '{"ok":true}'
+'@
+
+$resultFidelityAdapterSource = @'
+param(
+    [string]$PromptPath,
+    [string]$SchemaPath,
+    [string]$StdoutPath,
+    [string]$StderrPath,
+    [string]$EnvFile,
+    [string]$ClaudeCommand,
+    [string]$WorkspacePath,
+    [double]$MaxBudgetUsd
+)
+$ErrorActionPreference = 'Stop'
+$root = [string]$env:ORDER_RESULT_FIDELITY_TEST_ROOT
+$mode = [string]$env:ORDER_RESULT_FIDELITY_TEST_MODE
+if ([string]::IsNullOrWhiteSpace($root)) { throw 'result_fidelity_test_root_missing' }
+$countPath = Join-Path $root 'provider-invocations.txt'
+$count = 0
+if (Test-Path -LiteralPath $countPath -PathType Leaf) {
+    $count = [int][IO.File]::ReadAllText($countPath, [Text.Encoding]::UTF8)
+}
+$count++
+[IO.File]::WriteAllText($countPath, [string]$count, [Text.UTF8Encoding]::new($false))
+$prompt = [IO.File]::ReadAllText($PromptPath, [Text.Encoding]::UTF8)
+$match = [regex]::Match($prompt, '"work_id":"(?<id>[^"]+)"')
+if (-not $match.Success) { throw 'result_fidelity_work_id_missing' }
+$workId = [string]$match.Groups['id'].Value
+if ($mode -cin @('retry-status-unknown', 'retry-authentication', 'reported-authentication-api-error')) {
+    $retryCanary = switch ($mode) {
+        'retry-status-unknown' { 'RETRY_STATUS_UNKNOWN_PROVIDER_CANARY'; break }
+        'retry-authentication' { 'RETRY_AUTHENTICATION_PROVIDER_CANARY'; break }
+        default { 'REPORTED_AUTHENTICATION_PROVIDER_CANARY' }
+    }
+    $outer = [ordered]@{
+        type = 'result'
+        subtype = 'success'
+        is_error = $true
+        terminal_reason = $(if ($mode -ceq 'reported-authentication-api-error') {
+            'api_error'
+        } else { 'structured_output_retry_exhausted' })
+        result = $retryCanary
+        errors = @($retryCanary)
+    }
+    if ($mode -cin @('retry-authentication', 'reported-authentication-api-error')) {
+        $outer['api_error_status'] = 401
+    }
+    [IO.File]::WriteAllText(
+        $StdoutPath,
+        ($outer | ConvertTo-Json -Depth 8 -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    [IO.File]::WriteAllText($StderrPath, '', [Text.UTF8Encoding]::new($false))
+    exit 0
+}
+$summary = 'v' * 500
+$evidence = @()
+if ($mode -ceq 'invalid-summary') {
+    $summary = 'INVALID_SUMMARY_CANARY_' + ('x' * 500)
+} elseif ($mode -ceq 'invalid-evidence') {
+    $summary = 'provider supplied forbidden evidence'
+    $evidence = @('INVALID_EVIDENCE_CANARY')
+} elseif ($mode -cne 'valid') {
+    throw 'result_fidelity_mode_invalid'
+}
+$structured = [pscustomobject][ordered]@{
+    schema = 'order_supervisor_result.v2'
+    work_id = $workId
+    status = 'completed'
+    summary = $summary
+    evidence = $evidence
+    error_code = $null
+}
+$outer = [pscustomobject][ordered]@{
+    type = 'result'
+    subtype = 'success'
+    is_error = $false
+    structured_output = $structured
+}
+[IO.File]::WriteAllText(
+    $StdoutPath,
+    ($outer | ConvertTo-Json -Depth 8 -Compress),
+    [Text.UTF8Encoding]::new($false)
+)
+[IO.File]::WriteAllText($StderrPath, '', [Text.UTF8Encoding]::new($false))
+exit 0
+'@
+
+function New-ResultFidelityState {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $state = New-OrderState -Mode Execute
+    $state.initialized = $true
+    $state.cursor.timestamp = '2026-01-01T00:00:00.0000000Z'
+    $state.cursor.row_id = 'before-result-fidelity-order'
+    Save-OrderState -Path $Path -State $state
+}
+
+function Invoke-ResultFidelityRunner {
+    param(
+        [Parameter(Mandatory = $true)][string]$CaseRoot,
+        [Parameter(Mandatory = $true)][ValidateSet(
+            'valid', 'invalid-summary', 'invalid-evidence', 'retry-status-unknown',
+            'retry-authentication', 'reported-authentication-api-error'
+        )][string]$Mode
+    )
+
+    $previousRoot = [Environment]::GetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_ROOT', 'Process')
+    $previousMode = [Environment]::GetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_MODE', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_ROOT', $CaseRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_MODE', $Mode, 'Process')
+        $arguments = @(
+            '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $CaseRoot 'release\scripts\order_supervisor.ps1'),
+            '-Mode', 'Execute',
+            '-StatePath', (Join-Path $CaseRoot 'state.json'),
+            '-LogPath', (Join-Path $CaseRoot 'events.jsonl'),
+            '-EnvFile', (Join-Path $CaseRoot 'test.env'),
+            '-WorkspacePath', (Join-Path $CaseRoot 'workspace'),
+            '-ClaudeCommand', 'unused-fake-command',
+            '-WallTimeoutSeconds', '60'
+        )
+        $output = @(& powershell.exe @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        [Environment]::SetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_ROOT', $previousRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_MODE', $previousMode, 'Process')
+    }
+    $jsonLine = @(
+        $output |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_.TrimStart().StartsWith('{') } |
+            Select-Object -Last 1
+    )
+    return [pscustomobject][ordered]@{
+        exit_code = $exitCode
+        output_text = @($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        result = $(if ($jsonLine.Count -eq 1) { $jsonLine[0] | ConvertFrom-Json } else { $null })
+    }
+}
+
+function New-ResultFidelityCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$InputRowId,
+        [Parameter(Mandatory = $true)][string]$WorkId
+    )
+
+    $caseRoot = Join-Path $Root $Name
+    $scriptsRoot = Join-Path $caseRoot 'release\scripts'
+    $workspace = Join-Path $caseRoot 'workspace'
+    New-Item -ItemType Directory -Path $scriptsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $workspace '.git') -Force | Out-Null
+    Copy-Item -LiteralPath $RunnerPath -Destination (Join-Path $scriptsRoot 'order_supervisor.ps1')
+    Copy-Item -LiteralPath $ModulePath -Destination (Join-Path $scriptsRoot 'OrderSupervisor.psm1')
+    Copy-Item -LiteralPath $SchemaPath -Destination (Join-Path $scriptsRoot 'order_supervisor_result.schema.json')
+    Write-ResultFidelityUtf8 -Path (Join-Path $scriptsRoot 'bus.ps1') -Text $resultFidelityBusSource
+    Write-ResultFidelityUtf8 -Path (Join-Path $scriptsRoot 'invoke_order_claude.ps1') -Text $resultFidelityAdapterSource
+    Write-ResultFidelityUtf8 -Path (Join-Path $caseRoot 'board.json') -Text (
+        New-ResultFidelityBoardJson -InputRowId $InputRowId -WorkId $WorkId
+    )
+    Write-ResultFidelityUtf8 -Path (Join-Path $caseRoot 'test.env') -Text 'TEST_ONLY=1'
+    New-ResultFidelityState -Path (Join-Path $caseRoot 'state.json')
+    return $caseRoot
+}
+
+function Get-ResultFidelityRows {
+    param([Parameter(Mandatory = $true)][string]$CaseRoot)
+
+    $json = [IO.File]::ReadAllText((Join-Path $CaseRoot 'board.json'), [Text.Encoding]::UTF8)
+    return @(Get-BoardRowsFromJson -Json $json)
+}
+
+function Get-ResultFidelityPhaseRows {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [Parameter(Mandatory = $true)][string]$Phase
+    )
+
+    return @($Rows | Where-Object {
+        if (-not $_.valid) { return $false }
+        $parsed = ConvertFrom-BcbPayload -Payload ([string]$_.payload)
+        return @($parsed.errors).Count -eq 0 -and
+            $parsed.fields.ContainsKey('phase') -and
+            [string]$parsed.fields['phase'] -ceq $Phase
+    })
+}
+
+$resultFidelityRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-result-fidelity-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $resultFidelityRoot | Out-Null
+try {
+    $validCase = New-ResultFidelityCase `
+        -Root $resultFidelityRoot `
+        -Name 'valid' `
+        -InputRowId 'result-fidelity-valid-input' `
+        -WorkId 'ORDER-RESULT-FIDELITY-VALID'
+    $validRun = Invoke-ResultFidelityRunner -CaseRoot $validCase -Mode valid
+    $validRows = Get-ResultFidelityRows -CaseRoot $validCase
+    $validResults = @(Get-ResultFidelityPhaseRows -Rows $validRows -Phase RESULT)
+    $validClaims = @(Get-ResultFidelityPhaseRows -Rows $validRows -Phase CLAIM)
+    $validReceipts = @(Get-ResultFidelityPhaseRows -Rows $validRows -Phase RECEIPT)
+    $validPayload = if ($validResults.Count -eq 1) {
+        ConvertFrom-BcbPayload -Payload ([string]$validResults[0].payload)
+    } else { $null }
+    $validState = Read-OrderState -Path (Join-Path $validCase 'state.json') -Mode Execute
+    $validInvocationCount = [int][IO.File]::ReadAllText(
+        (Join-Path $validCase 'provider-invocations.txt'),
+        [Text.Encoding]::UTF8
+    )
+    $validResidue = @(Get-ChildItem -LiteralPath $validCase -Directory -Filter 'run-*' -Force)
+    Assert-True 'end-to-end valid provider result completes once' (
+        $validRun.exit_code -eq 0 -and
+        $validRun.result -and
+        [string]$validRun.result.status -ceq 'result_confirmed' -and
+        $validInvocationCount -eq 1
+    ) $validRun.output_text
+    Assert-True 'end-to-end valid provider result has exact 1/1/1 board phases' (
+        $validClaims.Count -eq 1 -and $validReceipts.Count -eq 1 -and $validResults.Count -eq 1
+    )
+    Assert-True 'end-to-end valid 500-character summary is durable in full' (
+        $validPayload -and
+        [string]$validPayload.fields['result_schema'] -ceq 'order_supervisor_result.v2' -and
+        [string]$validPayload.fields['status'] -ceq 'completed' -and
+        ([string]$validPayload.fields['summary']).Length -eq 500 -and
+        [string]$validPayload.fields['summary'] -ceq ('v' * 500) -and
+        [string]$validPayload.fields['output_sha256'] -cmatch '^[0-9a-f]{64}$' -and
+        [string]$validState.work[0].output_sha256 -ceq [string]$validPayload.fields['output_sha256']
+    )
+    Assert-True 'end-to-end valid run removes provider stdout directory' ($validResidue.Count -eq 0)
+
+    $validRowCountBeforeReplay = $validRows.Count
+    New-ResultFidelityState -Path (Join-Path $validCase 'state.json')
+    $duplicateRun = Invoke-ResultFidelityRunner -CaseRoot $validCase -Mode valid
+    $duplicateRows = Get-ResultFidelityRows -CaseRoot $validCase
+    $duplicateInvocationCount = [int][IO.File]::ReadAllText(
+        (Join-Path $validCase 'provider-invocations.txt'),
+        [Text.Encoding]::UTF8
+    )
+    Assert-True 'historical RESULT suppresses replay without a second inference or write' (
+        $duplicateRun.exit_code -eq 0 -and
+        $duplicateRun.result -and
+        [string]$duplicateRun.result.status -ceq 'duplicate_suppressed' -and
+        $duplicateInvocationCount -eq 1 -and
+        $duplicateRows.Count -eq $validRowCountBeforeReplay -and
+        @(Get-ResultFidelityPhaseRows -Rows $duplicateRows -Phase RESULT).Count -eq 1
+    ) $duplicateRun.output_text
+
+    $suppressedCase = New-ResultFidelityCase `
+        -Root $resultFidelityRoot `
+        -Name 'prior-invocation-started' `
+        -InputRowId 'result-fidelity-suppressed-input' `
+        -WorkId 'ORDER-RESULT-FIDELITY-SUPPRESSED'
+    $suppressedStatePath = Join-Path $suppressedCase 'state.json'
+    $suppressedSeedState = Read-OrderState -Path $suppressedStatePath -Mode Execute
+    $suppressedSeedState.work = @([pscustomobject][ordered]@{
+        input_row_id = 'result-fidelity-suppressed-input'
+        work_id = 'ORDER-RESULT-FIDELITY-SUPPRESSED'
+        status = 'invocation_started'
+        result_status = ''
+        output_sha256 = ''
+        updated_at = '2026-01-01T00:00:00.000Z'
+    })
+    Save-OrderState -Path $suppressedStatePath -State $suppressedSeedState
+    $suppressedRun = Invoke-ResultFidelityRunner -CaseRoot $suppressedCase -Mode valid
+    $suppressedRows = Get-ResultFidelityRows -CaseRoot $suppressedCase
+    $suppressedResults = @(Get-ResultFidelityPhaseRows -Rows $suppressedRows -Phase RESULT)
+    $suppressedPayload = if ($suppressedResults.Count -eq 1) {
+        ConvertFrom-BcbPayload -Payload ([string]$suppressedResults[0].payload)
+    } else { $null }
+    $suppressedState = Read-OrderState -Path $suppressedStatePath -Mode Execute
+    $suppressedWork = @($suppressedState.work | Where-Object {
+        [string]$_.input_row_id -ceq 'result-fidelity-suppressed-input' -and
+        [string]$_.work_id -ceq 'ORDER-RESULT-FIDELITY-SUPPRESSED'
+    })
+    Assert-True 'prior invocation state publishes one suppression RESULT without provider inference' (
+        $suppressedRun.exit_code -eq 30 -and
+        $suppressedRun.result -and
+        [string]$suppressedRun.result.status -ceq 'duplicate_suppressed' -and
+        $suppressedResults.Count -eq 1 -and
+        -not (Test-Path -LiteralPath (Join-Path $suppressedCase 'provider-invocations.txt'))
+    ) $suppressedRun.output_text
+    Assert-True 'duplicate-suppression board digest is persisted identically in state' (
+        $suppressedPayload -and
+        $suppressedWork.Count -eq 1 -and
+        [string]$suppressedPayload.fields['output_sha256'] -cmatch '^[0-9a-f]{64}$' -and
+        [string]$suppressedWork[0].output_sha256 -ceq [string]$suppressedPayload.fields['output_sha256']
+    )
+
+    $fixedFailureDigests = @()
+    foreach ($invalidMode in @(
+        'invalid-summary', 'invalid-evidence', 'retry-status-unknown', 'retry-authentication'
+    )) {
+        $invalidCase = New-ResultFidelityCase `
+            -Root $resultFidelityRoot `
+            -Name $invalidMode `
+            -InputRowId ('result-fidelity-' + $invalidMode + '-input') `
+            -WorkId 'ORDER-RESULT-FIDELITY-INVALID'
+        $invalidRun = Invoke-ResultFidelityRunner -CaseRoot $invalidCase -Mode $invalidMode
+        $invalidRows = Get-ResultFidelityRows -CaseRoot $invalidCase
+        $invalidResults = @(Get-ResultFidelityPhaseRows -Rows $invalidRows -Phase RESULT)
+        $invalidPayload = if ($invalidResults.Count -eq 1) {
+            ConvertFrom-BcbPayload -Payload ([string]$invalidResults[0].payload)
+        } else { $null }
+        $invalidBoardText = [IO.File]::ReadAllText((Join-Path $invalidCase 'board.json'), [Text.Encoding]::UTF8)
+        $invalidLogText = [IO.File]::ReadAllText((Join-Path $invalidCase 'events.jsonl'), [Text.Encoding]::UTF8)
+        $invalidLogEntries = @(
+            $invalidLogText -split '\r?\n' |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                ForEach-Object { [string]$_ | ConvertFrom-Json }
+        )
+        $contractLogEntries = @($invalidLogEntries | Where-Object {
+            [string]$_.event -ceq 'result_contract_invalid'
+        })
+        $invalidState = Read-OrderState -Path (Join-Path $invalidCase 'state.json') -Mode Execute
+        $invalidResidue = @(Get-ChildItem -LiteralPath $invalidCase -Directory -Filter 'run-*' -Force)
+        $invalidCanary = switch ($invalidMode) {
+            'invalid-summary' { 'INVALID_SUMMARY_CANARY'; break }
+            'invalid-evidence' { 'INVALID_EVIDENCE_CANARY'; break }
+            'retry-status-unknown' { 'RETRY_STATUS_UNKNOWN_PROVIDER_CANARY'; break }
+            default { 'RETRY_AUTHENTICATION_PROVIDER_CANARY' }
+        }
+        $expectedContractReason = $(if ($invalidMode -in @('invalid-summary', 'invalid-evidence')) {
+            'RESULT_VALIDATION'
+        } else { 'STRUCTURED_OUTPUT_RETRY_EXHAUSTED' })
+        if ($invalidPayload) { $fixedFailureDigests += [string]$invalidPayload.fields['output_sha256'] }
+        Assert-True ($invalidMode + ' produces one fixed failed RESULT without reinvocation') (
+            $invalidRun.exit_code -eq 31 -and
+            $invalidRun.result -and
+            [string]$invalidRun.result.result_status -ceq 'failed' -and
+            $invalidResults.Count -eq 1 -and
+            [int][IO.File]::ReadAllText((Join-Path $invalidCase 'provider-invocations.txt'), [Text.Encoding]::UTF8) -eq 1
+        ) $invalidRun.output_text
+        Assert-True ($invalidMode + ' publishes only the complete deterministic contract failure') (
+            $invalidPayload -and
+            [string]$invalidPayload.fields['result_schema'] -ceq 'order_supervisor_result.v2' -and
+            [string]$invalidPayload.fields['status'] -ceq 'failed' -and
+            [string]$invalidPayload.fields['error_code'] -ceq 'RESULT_CONTRACT_INVALID' -and
+            [string]$invalidPayload.fields['summary'] -ceq 'The provider result violated the durable RESULT contract; no partial completion facts were published.' -and
+            [string]$invalidState.error.code -ceq 'RESULT_CONTRACT_INVALID' -and
+            -not $invalidBoardText.Contains($invalidCanary) -and
+            -not $invalidLogText.Contains($invalidCanary)
+        )
+        Assert-True ($invalidMode + ' logs only its allowlisted internal contract reason') (
+            $contractLogEntries.Count -eq 1 -and
+            [string]$contractLogEntries[0].code -ceq 'RESULT_CONTRACT_INVALID' -and
+            [string]$contractLogEntries[0].details.contract_reason -ceq $expectedContractReason -and
+            -not ([string]$contractLogEntries[0].message).Contains($invalidCanary)
+        )
+        Assert-True ($invalidMode + ' removes raw provider stdout with its run directory') ($invalidResidue.Count -eq 0)
+    }
+    Assert-True 'all provider contract violations use one deterministic canonical failure digest' (
+        $fixedFailureDigests.Count -eq 4 -and
+        @($fixedFailureDigests | Select-Object -Unique).Count -eq 1
+    )
+
+    $genericReportedCase = New-ResultFidelityCase `
+        -Root $resultFidelityRoot `
+        -Name 'reported-authentication-api-error' `
+        -InputRowId 'result-fidelity-generic-reported-input' `
+        -WorkId 'ORDER-RESULT-FIDELITY-GENERIC-REPORTED'
+    $genericReportedRun = Invoke-ResultFidelityRunner `
+        -CaseRoot $genericReportedCase `
+        -Mode reported-authentication-api-error
+    $genericReportedRows = Get-ResultFidelityRows -CaseRoot $genericReportedCase
+    $genericReportedResults = @(Get-ResultFidelityPhaseRows -Rows $genericReportedRows -Phase RESULT)
+    $genericReportedPayload = if ($genericReportedResults.Count -eq 1) {
+        ConvertFrom-BcbPayload -Payload ([string]$genericReportedResults[0].payload)
+    } else { $null }
+    $genericReportedLog = [IO.File]::ReadAllText(
+        (Join-Path $genericReportedCase 'events.jsonl'),
+        [Text.Encoding]::UTF8
+    )
+    Assert-True 'non-contract reported provider error retains generic invocation-failure classification' (
+        $genericReportedRun.exit_code -eq 31 -and
+        $genericReportedPayload -and
+        [string]$genericReportedPayload.fields['status'] -ceq 'failed' -and
+        [string]$genericReportedPayload.fields['error_code'] -ceq 'CLAUDE_REPORTED_ERROR_AUTHENTICATION_API_ERROR' -and
+        [string]$genericReportedPayload.fields['summary'] -ceq 'The bounded Claude invocation failed; consult the local structured error code.' -and
+        -not $genericReportedLog.Contains('result_contract_invalid') -and
+        -not $genericReportedLog.Contains('REPORTED_AUTHENTICATION_PROVIDER_CANARY')
+    ) $genericReportedRun.output_text
+} finally {
+    if (-not $KeepArtifacts -and (Test-Path -LiteralPath $resultFidelityRoot -PathType Container)) {
+        Remove-Item -LiteralPath $resultFidelityRoot -Recurse -Force
     }
 }
 
