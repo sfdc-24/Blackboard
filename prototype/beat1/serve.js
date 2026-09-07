@@ -163,6 +163,67 @@ const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 
 // would ship.
 const voiceHistory = Object.create(null);
 
+// ---- the spoken walkthrough -------------------------------------------------
+// Mr. Salam asked to be able to LISTEN to a summary as a walkthrough. beat 3
+// already writes the four pieces it needs, so the words exist and only need a
+// voice.
+//
+// THE SHAPE IS NOT NEGOTIABLE, and it is the shape for one reason: an endpoint
+// that speaks text handed to it by the caller is a free text-to-speech service
+// billed to us. That is precisely SITE-P0-TTS-001, which I closed in production
+// twenty hours ago. So the page never sends text to be spoken. The server keeps
+// the summary it generated, hands back an opaque key, and only speaks what it
+// already wrote. Reintroducing my own bug the day after fixing it would be a
+// poor way to spend the lesson.
+const spoken = Object.create(null);          // key -> { text, at }
+
+function mintSpeech(text) {
+  const key = 's' + crypto.randomBytes(16).toString('hex');
+  spoken[key] = { text: String(text).slice(0, 1800), at: Date.now() };
+  // Bounded so a long session cannot grow this without limit.
+  const keys = Object.keys(spoken);
+  if (keys.length > 40) delete spoken[keys[0]];
+  return key;
+}
+
+// The walkthrough reads in the order a person would want it: what this is, then
+// what is happening, then where it breaks, then what to do. Missing parts are
+// skipped rather than narrated as absent.
+function walkthroughText(sketch, parts) {
+  const bits = [];
+  if (sketch && sketch.title) bits.push('Here is ' + sketch.title + '.');
+  ['headline', 'whatsHappening', 'whereItBreaks', 'firstMove'].forEach((k) => {
+    if (parts && parts[k]) bits.push(parts[k]);
+  });
+  if (!bits.length) return '';
+  bits.push('If any of that is wrong, say so and it changes.');
+  return bits.join(' ');
+}
+
+async function speak(text) {
+  const body = JSON.stringify({
+    model: 'gpt-4o-mini-tts', voice: 'sage', input: String(text).slice(0, 1800),
+    response_format: 'mp3',
+    instructions: 'Warm, unhurried and grounded. A colleague thinking out loud, not an announcer. Real pauses at full stops.'
+  });
+  const key = env.OPENAI_API_KEY;
+  if (!key) return null;
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.openai.com', path: '/v1/audio/speech', method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key.replace(/^\s*[Bb]earer\s+/, ''),
+                 'content-length': Buffer.byteLength(body) }
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', () => resolve(null));
+    req.write(body); req.end();
+  });
+}
+
 const server = http.createServer((req, res) => {
   // One malformed request must not take the prototype down. It did: a missing
   // declaration threw inside the handler, node had no listener for it, and the
@@ -258,6 +319,21 @@ function handle(req, res) {
     return;
   }
 
+  if (req.method === 'GET' && req.url.indexOf('/api/speak') === 0) {
+    const key = String(new URL(req.url, 'http://127.0.0.1').searchParams.get('k') || '');
+    const held = spoken[key];
+    // One render per key. The page cannot ask for arbitrary text to be spoken,
+    // and cannot re-spend a key by asking twice.
+    delete spoken[key];
+    if (!held) { res.writeHead(404, { 'content-type': 'application/json' }); res.end('{"ok":false}'); return; }
+    speak(held.text).then((mp3) => {
+      if (!mp3) { res.writeHead(502, { 'content-type': 'application/json' }); res.end('{"ok":false}'); return; }
+      res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': mp3.length });
+      res.end(mp3);
+    });
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/api/build') {
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 40000) req.destroy(); });
@@ -272,8 +348,9 @@ function handle(req, res) {
       const parts = await buildParts(Array.isArray(body.history) ? body.history : [], sketch).catch(() => ({}));
       const stamp = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
       const html = ctx.buildPage_(sketch, parts, stamp);
+      const speech = walkthroughText(sketch, parts);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, html: html }));
+      res.end(JSON.stringify({ ok: true, html: html, speak: speech ? mintSpeech(speech) : null }));
     });
     return;
   }
