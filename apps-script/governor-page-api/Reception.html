@@ -132,6 +132,7 @@ button.rec .dot{animation:b .8s step-end infinite}
   // reception can record WHO said it. Empty when signed out.
   var SESSION = "<?!= sessionToken ?>";
   var WANT_VOICE = "<?!= voice ?>" === "1";
+  var READY_NONCE = "<?!= readyNonce ?>";
   // The microphone is only usable where the hosting frame's permissions policy allows it.
   // Google Sites embeds and Apps Script's own sandbox frame both withhold it, so we detect
   // rather than assume, and fall back to the device's own dictation.
@@ -331,6 +332,18 @@ button.rec .dot{animation:b .8s step-end infinite}
   })();
   // ---- boot ----
   start();
+  // The parent ignores iframe load events because Google error documents load too.
+  // This nonce came from the parent and contains no identity or capability, so it
+  // is safe to send to the top-level page even through Google's nested wrappers.
+  if (/^[A-Za-z0-9_-]{16,64}$/.test(READY_NONCE)) {
+    try {
+      window.top.postMessage({
+        type: "sfdc24:assistant-ready",
+        version: 1,
+        nonce: READY_NONCE
+      }, "*");
+    } catch(e) {}
+  }
 })();
 </script>
 </body></html>

@@ -60,6 +60,12 @@ function makeRuntime(opts) {
   const cacheStore = new Map();
   let lockHeld = false;
   let lockContentionSeen = 0;
+  const scriptProperties = {
+    getProperty: (k) => (props.has(k) ? props.get(k) : null),
+    setProperty: (k, v) => { props.set(k, String(v)); return scriptProperties; },
+    deleteProperty: (k) => { props.delete(k); return scriptProperties; },
+    getProperties: () => Object.fromEntries(props)
+  };
 
   // One script-wide lock, and NOT re-entrant. A real LockService lock is held
   // by an execution, so a second concurrent execution asking for it waits and
@@ -99,17 +105,17 @@ function makeRuntime(opts) {
       getEffectiveUser: () => ({ getEmail: () => 'owner@example.invalid' })
     },
     PropertiesService: {
-      getScriptProperties: () => ({
-        getProperty: (k) => (props.has(k) ? props.get(k) : null),
-        setProperty: (k, v) => props.set(k, String(v)),
-        deleteProperty: (k) => props.delete(k)
-      })
+      getScriptProperties: () => scriptProperties
     },
     CacheService: { getScriptCache: () => cache },
     LockService: { getScriptLock: () => lock },
     Utilities: {
+      Charset: { UTF_8: 'UTF_8' },
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
       getUuid: () => crypto.randomUUID(),
       base64Encode: (bytes) => Buffer.from(bytes).toString('base64'),
+      computeDigest: (_algorithm, value) => Array.from(crypto.createHash('sha256').update(String(value)).digest())
+        .map((byte) => byte > 127 ? byte - 256 : byte),
       formatDate: (d) => d.toISOString().slice(0, 10).replace(/-/g, '')
     },
     UrlFetchApp: {
@@ -123,6 +129,7 @@ function makeRuntime(opts) {
         }
         if (String(url).indexOf('api.openai.com') >= 0) {
           calls.openai++;                       // <- the number this file exists to hold down
+          if (opts.onTtsFetch) opts.onTtsFetch();
           return response(200, 'fake-mp3-bytes');
         }
         throw new Error('unexpected outbound call to ' + url);
@@ -156,12 +163,12 @@ function makeRuntime(opts) {
   // two together. Restored verbatim in shape so the witness tests describe the
   // code that actually shipped.
   if (opts.legacyClaim) {
-    ctx.ttsClaim_ = function (ak) {
+    ctx.claimTts_ = function (ak) {
       const c = ctx.CacheService.getScriptCache();
       const t = c.get('tts_' + ak);
-      if (!t) return null;
+      if (!t) return { ok: false, reason: 'expired' };
       c.remove('tts_' + ak);
-      return t;
+      return { ok: true, text: t, dailyUsed: 1, dailyCap: 60, sessionUsed: 1, sessionCap: 8 };
     };
   }
 
@@ -274,15 +281,14 @@ section('T7 · replaying a key sequentially buys nothing the second time');
 // T8 ------------------------------------------------------------------------
 section('T8 · two callers racing one key buy exactly one render');
 {
-  // The race is expressed by re-entering ttsAudio_ from inside the cache read,
-  // which is precisely the instant the old code was exposed: the text has been
-  // read and not yet deleted.
+  // Re-enter after the winning caller has atomically deleted the property claim
+  // and released the lock, but while its provider request is still in flight.
   let reentered = false;
   let inner = null;
   const r = makeRuntime({
     props: Object.assign({}, HEALTHY),
-    onCacheGet(key) {
-      if (reentered || key.indexOf('tts_') !== 0) return;
+    onTtsFetch() {
+      if (reentered) return;
       reentered = true;
       inner = JSON.parse(r.ctx.ttsAudio_({ cb: '', ak: pendingAk }).getContent());
     }
@@ -290,7 +296,6 @@ section('T8 · two callers racing one key buy exactly one render');
   var pendingAk = r.say({ vid: 's8', q: 'hello' }).ak;
   const outer = JSON.parse(r.ctx.ttsAudio_({ cb: '', ak: pendingAk }).getContent());
   check('the race was actually exercised', reentered === true);
-  check('the second caller was blocked on the lock', r.lockContention() >= 1, 'contention=' + r.lockContention());
   check('one caller wins', (outer.ok === true) !== (inner && inner.ok === true), 'outer=' + outer.ok + ' inner=' + (inner && inner.ok));
   check('the loser sees expired', (outer.ok ? inner.reason : outer.reason) === 'expired');
   check('exactly 1 provider call', r.calls.openai === 1, 'openai=' + r.calls.openai);
