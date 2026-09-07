@@ -65,7 +65,8 @@ function ConvertFrom-JsonPreserveStrings {
 function Write-AtomicJson {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Value
+        [Parameter(Mandatory = $true)]$Value,
+        [switch]$CreateNewOnly
     )
 
     $parent = Split-Path -Parent $Path
@@ -76,7 +77,10 @@ function Write-AtomicJson {
     $backup = Join-Path $parent ('.{0}.{1}.bak' -f ([IO.Path]::GetFileName($Path)), [Guid]::NewGuid().ToString('N'))
     try {
         Write-Utf8NoBom -Path $temp -Text ($Value | ConvertTo-Json -Depth 12)
-        if (Test-Path -LiteralPath $Path) {
+        if ($CreateNewOnly) {
+            # The two-argument move fails if Path appeared concurrently; it never replaces.
+            [IO.File]::Move($temp, $Path)
+        } elseif (Test-Path -LiteralPath $Path) {
             [IO.File]::Replace($temp, $Path, $backup, $true)
             if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
         } else {
@@ -116,20 +120,29 @@ function Read-OrderState {
 
     if (-not (Test-Path -LiteralPath $Path)) { return New-OrderState -Mode $Mode }
     $text = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).Path, [Text.Encoding]::UTF8)
-    $state = ConvertFrom-JsonPreserveStrings -Json $text
-    if (-not $state -or $state.schema -cne 'order_supervisor_state.v1') {
+    try {
+        $state = ConvertFrom-JsonPreserveStrings -Json $text
+    } catch {
+        throw [IO.InvalidDataException]::new('STATE_JSON_INVALID')
+    }
+    if ($null -eq $state -or $state.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
         throw 'state_schema_invalid'
     }
-    if ($state.source_tag -cne $script:WorkerSourceTag) {
+    $stateProperties = @($state.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($stateProperties -cnotcontains 'schema' -or $state.schema -cne 'order_supervisor_state.v1') {
+        throw 'state_schema_invalid'
+    }
+    if ($stateProperties -cnotcontains 'source_tag' -or $state.source_tag -cne $script:WorkerSourceTag) {
         throw 'state_source_tag_invalid'
     }
-    if (-not ($state.PSObject.Properties.Name -contains 'initialized')) {
+    if ($stateProperties -cnotcontains 'initialized') {
         $state | Add-Member -NotePropertyName initialized -NotePropertyValue $false
     }
-    if ($state.initialized -isnot [bool] -or -not $state.cursor -or
+    if ($stateProperties -cnotcontains 'cursor' -or $stateProperties -cnotcontains 'counts' -or
+        $stateProperties -cnotcontains 'work' -or $state.initialized -isnot [bool] -or -not $state.cursor -or
         -not ($state.cursor.PSObject.Properties.Name -contains 'timestamp') -or
         -not ($state.cursor.PSObject.Properties.Name -contains 'row_id') -or
-        -not $state.counts -or -not ($state.PSObject.Properties.Name -contains 'work')) {
+        -not $state.counts) {
         throw 'state_shape_invalid'
     }
     return $state
@@ -138,9 +151,10 @@ function Read-OrderState {
 function Save-OrderState {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$State
+        [Parameter(Mandatory = $true)]$State,
+        [switch]$CreateNewOnly
     )
-    Write-AtomicJson -Path $Path -Value $State
+    Write-AtomicJson -Path $Path -Value $State -CreateNewOnly:$CreateNewOnly
 }
 
 function Write-OrderLog {
