@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Describe what you want built, stood up, or fixed. It reaches a person, not a queue.">
+<title>Tell us what you need &mdash; SFDC24</title>
+<link rel="canonical" href="https://www.sfdc24.com/intake/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="SFDC24">
+<meta property="og:url" content="https://www.sfdc24.com/intake/">
+<meta property="og:title" content="Tell us what you need — SFDC24">
+<meta property="og:description" content="Describe what you want built or fixed. It reaches a person, not a queue.">
+<meta property="og:image" content="https://www.sfdc24.com/assets/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="../assets/icon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root{
+    --paper:#eef2f7; --surface:#ffffff; --surface-2:#f6f9fc;
+    --ink:#0b1f33; --muted:#54657a; --faint:#8798a8;
+    --line:#cdd9e5; --line-strong:#aebecd;
+    --accent:#0a6db0; --accent-ink:#ffffff; --accent-soft:#e2f0fa;
+    --good:#1a854f; --good-soft:#e0f2e8;
+    --grid:rgba(11,31,51,.05);
+    --shadow:0 1px 2px rgba(11,31,51,.06),0 8px 24px rgba(11,31,51,.06);
+    --radius:14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#0a141e; --surface:#11202e; --surface-2:#0d1a26;
+      --ink:#e7eff6; --muted:#93a6b6; --faint:#6a7d8d;
+      --line:#23384a; --line-strong:#345067;
+      --accent:#3fa9e6; --accent-ink:#04121d; --accent-soft:#0f2b3f;
+      --good:#38b979; --good-soft:#0f2c1f;
+      --grid:rgba(255,255,255,.04);
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0a141e; --surface:#11202e; --surface-2:#0d1a26;
+    --ink:#e7eff6; --muted:#93a6b6; --faint:#6a7d8d;
+    --line:#23384a; --line-strong:#345067;
+    --accent:#3fa9e6; --accent-ink:#04121d; --accent-soft:#0f2b3f;
+    --good:#38b979; --good-soft:#0f2c1f;
+    --grid:rgba(255,255,255,.04);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 30px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    line-height:1.5;
+    background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:26px 26px;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:22px clamp(16px,4vw,40px) 64px}
+  a{color:var(--accent)}
+  .mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  /* header */
+  header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:6px 0 22px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .mark{width:38px;height:38px;border-radius:9px;background:var(--ink);color:var(--paper);
+    display:grid;place-items:center;font-family:"Archivo";font-weight:800;font-size:15px;letter-spacing:.5px}
+  :root[data-theme="dark"] .mark,:root:not([data-theme="light"]) .mark{background:var(--accent);color:var(--accent-ink)}
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .mark{background:var(--accent);color:var(--accent-ink)}}
+  .brand h1{font-family:"Archivo";font-weight:800;font-size:19px;margin:0;letter-spacing:-.2px}
+  .brand .sub{font-size:12px;color:var(--muted);margin-top:1px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;
+    padding:7px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px var(--good-soft)}
+
+  .lead-in{max-width:64ch;margin:0 0 26px}
+  .eyebrow{font-family:"IBM Plex Mono";font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+  .lead-in h2{font-family:"Archivo";font-weight:700;font-size:clamp(26px,4vw,38px);line-height:1.08;margin:10px 0 8px;text-wrap:balance;letter-spacing:-.5px}
+  .lead-in p{color:var(--muted);font-size:16px;margin:0}
+
+  /* split */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}
+  @media (max-width:880px){.split{grid-template-columns:1fr}}
+
+  .panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  .panel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
+  .panel-h .t{font-family:"Archivo";font-weight:700;font-size:15px}
+  .panel-h .k{font-family:"IBM Plex Mono";font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em}
+
+  /* form (the glass) */
+  form{padding:20px}
+  .field{margin-bottom:15px}
+  .field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+  .field .hint{font-weight:400;color:var(--faint)}
+  .field input,.field textarea,.field select{
+    width:100%;font:inherit;font-size:16px;color:var(--ink);background:var(--surface-2);
+    border:1px solid var(--line);border-radius:10px;padding:11px 13px;transition:border-color .15s,box-shadow .15s}
+  .field textarea{min-height:92px;resize:vertical}
+  .field input:focus,.field textarea:focus,.field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:460px){.row2{grid-template-columns:1fr}}
+  .seg{display:flex;gap:8px}
+  .seg label{flex:1;position:relative;cursor:pointer;margin:0}
+  .seg input{position:absolute;opacity:0;inset:0;cursor:pointer}
+  .seg .box{border:1px solid var(--line);border-radius:10px;padding:11px 12px;text-align:center;font-size:14px;font-weight:600;color:var(--muted);background:var(--surface-2);transition:.15s}
+  .seg input:checked+.box{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+  .seg input:focus-visible+.box{box-shadow:0 0 0 3px var(--accent-soft)}
+  .submit{width:100%;margin-top:6px;font:inherit;font-weight:700;font-size:15px;cursor:pointer;
+    background:var(--accent);color:var(--accent-ink);border:none;border-radius:11px;padding:14px;
+    display:flex;align-items:center;justify-content:center;gap:9px;transition:filter .15s,transform .05s}
+  .submit:hover{filter:brightness(1.06)}.submit:active{transform:translateY(1px)}
+  .submit:disabled{opacity:.7;cursor:default}
+  .consent{font-size:12px;color:var(--faint);margin:12px 2px 0;text-align:center}
+
+  /* success overlay inside form panel */
+  .done{padding:34px 24px;text-align:center;display:none}
+  .done.show{display:block;animation:rise .4s ease both}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .done .seal{width:56px;height:56px;border-radius:50%;background:var(--good-soft);color:var(--good);display:grid;place-items:center;margin:0 auto 14px}
+  .done h3{font-family:"Archivo";font-weight:700;font-size:20px;margin:0 0 6px}
+  .done p{color:var(--muted);margin:0 auto;max-width:40ch}
+  .done .rec{margin-top:18px;text-align:left;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .done .rec .rk{font-family:"IBM Plex Mono";font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
+  .done .rec .rv{font-family:"IBM Plex Mono";font-size:14px;font-weight:600;word-break:break-all}
+  .textbtn{background:none;border:none;color:var(--accent);font:inherit;font-weight:600;cursor:pointer;margin-top:16px;padding:6px}
+
+  /* pipeline (behind the glass) */
+  .machine{padding:18px 20px 20px}
+  .machine .note{font-size:12.5px;color:var(--muted);margin:0 0 16px;font-family:"IBM Plex Mono"}
+  .stage{display:grid;grid-template-columns:26px 1fr;gap:12px;position:relative;padding-bottom:16px}
+  .stage:last-child{padding-bottom:0}
+  .stage .rail{display:flex;flex-direction:column;align-items:center}
+  .stage .node{width:22px;height:22px;border-radius:50%;border:2px solid var(--line-strong);background:var(--surface);
+    display:grid;place-items:center;font-family:"IBM Plex Mono";font-size:11px;font-weight:600;color:var(--faint);flex:none;transition:.3s;z-index:1}
+  .stage .wire{flex:1;width:2px;background:var(--line);margin:2px 0}
+  .stage:last-child .wire{display:none}
+  .stage.lit .node{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+  .stage.done-s .node{border-color:var(--good);background:var(--good);color:var(--surface)}
+  .stage .body .s-t{font-weight:600;font-size:14px}
+  .stage .body .s-d{font-size:12.5px;color:var(--muted);margin-top:2px}
+  .stage .body .s-obj{font-family:"IBM Plex Mono";font-size:11px;color:var(--faint);margin-top:3px;text-transform:uppercase;letter-spacing:.06em}
+
+  .payload{margin-top:18px;border:1px dashed var(--line-strong);border-radius:10px;background:var(--surface-2);overflow:hidden}
+  .payload .ph{display:flex;justify-content:space-between;align-items:center;padding:9px 13px;border-bottom:1px dashed var(--line-strong)}
+  .payload .ph .lbl{font-family:"IBM Plex Mono";font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .payload .ph .ep{font-family:"IBM Plex Mono";font-size:11px;color:var(--accent);max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .payload pre{margin:0;padding:13px;font-family:"IBM Plex Mono";font-size:12px;line-height:1.6;color:var(--ink);overflow-x:auto}
+  .payload .kk{color:var(--accent)}
+  .payload .vv{color:var(--ink)}
+  .payload .empty{color:var(--faint)}
+
+  /* config / honesty footer */
+  .foot{margin-top:26px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:880px){.foot{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{font-family:"Archivo";font-weight:700;font-size:13px;margin:0 0 8px;letter-spacing:.02em}
+  .card p{margin:0 0 8px;font-size:13px;color:var(--muted)}
+  .card code{font-family:"IBM Plex Mono";font-size:12px;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+  .tag{display:inline-block;font-family:"IBM Plex Mono";font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:3px 7px;border-radius:5px;margin-right:6px}
+  .tag.believed{color:#8a6d0b;background:#fbf3d6}.tag.demo{color:var(--accent);background:var(--accent-soft)}
+  :root[data-theme="dark"] .tag.believed,:root:not([data-theme="light"]) .tag.believed{color:#e8c65a;background:#2c2510}
+  @media(prefers-color-scheme:dark){:root:not([data-theme="light"]) .tag.believed{color:#e8c65a;background:#2c2510}}
+  .modebar{display:flex;align-items:center;gap:9px;font-family:"IBM Plex Mono";font-size:11px;color:var(--faint)}
+  .toggle{cursor:pointer;border:1px solid var(--line);background:var(--surface-2);border-radius:999px;padding:4px 10px;font:inherit;font-size:11px;color:var(--muted)}
+  footer.legal{margin-top:30px;text-align:center;font-size:12px;color:var(--faint)}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="mark">S24</div>
+      <div>
+        <h1>SFDC24</h1>
+        <div class="sub">Architecture &amp; engineering, staffed by agents</div>
+      </div>
+    </div>
+    <span class="chip"><span class="dot"></span> Salesforce connected · SFDC 24</span>
+  </header>
+
+  <div class="lead-in">
+    <div class="eyebrow">Start here · Gate 1</div>
+    <h2>Tell us what you want to build.</h2>
+    <p>Describe it in plain language. We turn it into a sketch, a prototype, and a quote — and your details land straight in our Salesforce workspace, where a success partner picks it up. No account to create, nothing to install.</p>
+  </div>
+
+  <div class="split">
+    <!-- LEFT: the glass (customer-facing) -->
+    <section class="panel" aria-labelledby="glass-t">
+      <div class="panel-h"><span class="t" id="glass-t">Your request</span><span class="k">web-to-lead</span></div>
+      <form id="leadForm"
+            action="https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8" method="POST">
+        <!-- Salesforce Web-to-Lead required hidden fields -->
+        <input type="hidden" name="oid" id="oid" value="00Dbm00000wK2ibEAC">
+        <input type="hidden" name="retURL" id="retURL" value="">
+        <input type="hidden" name="lead_source" value="sfdc24.com">
+        <input type="hidden" name="description" id="salesforceDescription" value="">
+
+        <div class="field">
+          <label for="description">What do you want to build or run? <span class="hint">— plain language</span></label>
+          <textarea id="description" maxlength="31000" placeholder="e.g. Our case intake has grown complicated. We need one clear process for customers and the service team."></textarea>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="first_name">First name</label>
+            <input id="first_name" name="first_name" maxlength="40" autocomplete="given-name">
+          </div>
+          <div class="field">
+            <label for="last_name">Last name</label>
+            <input id="last_name" name="last_name" maxlength="80" autocomplete="family-name" required>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="email">Work email</label>
+            <input id="email" name="email" type="email" maxlength="80" autocomplete="email" required>
+          </div>
+          <div class="field">
+            <label for="company">Company</label>
+            <input id="company" name="company" maxlength="255" autocomplete="organization" required>
+          </div>
+        </div>
+        <div class="field">
+          <label>You are a…</label>
+          <div class="seg" role="radiogroup" aria-label="Relationship">
+            <label><input type="radio" name="rel" value="Customer" checked><span class="box">Customer</span></label>
+            <label><input type="radio" name="rel" value="Supplier"><span class="box">Supplier / partner</span></label>
+          </div>
+        </div>
+        <button class="submit" type="submit" id="submitBtn" disabled>
+          <span>Send it to a success partner</span>
+        </button>
+        <p class="consent">By sending, you agree we may contact you about your request.</p>
+        <noscript><p>JavaScript is required to include your request and relationship. Please enable it before submitting.</p></noscript>
+      </form>
+
+      <div class="done" id="doneState" aria-live="polite">
+        <div class="seal" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+        </div>
+        <h3>Submission sent.</h3>
+        <p>Thank you for your request. This page cannot confirm that Salesforce created a record. We'll contact you after reviewing your request.</p>
+        <button class="textbtn" id="againBtn" type="button">Submit another request</button>
+      </div>
+    </section>
+
+    <!-- RIGHT: behind the glass (the machinery) -->
+    <section class="panel" aria-labelledby="mach-t">
+      <div class="panel-h"><span class="t" id="mach-t">Behind the glass</span><span class="k">salesforce pipeline</span></div>
+      <div class="machine">
+        <p class="note">Intake is connected. Assignment, conversion, and ongoing support below describe the planned workflow.</p>
+
+        <div class="stage" id="st1">
+          <div class="rail"><div class="node">1</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Capture on sfdc24.com</div><div class="s-d">Form posts to Salesforce Web-to-Lead — no middleware, no login.</div><div class="s-obj">endpoint · webto.salesforce.com</div></div>
+        </div>
+        <div class="stage" id="st2">
+          <div class="rail"><div class="node">2</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Lead intake</div><div class="s-d">Requests are sent to SFDC 24 for review. This page cannot confirm record creation.</div><div class="s-obj">object · Lead</div></div>
+        </div>
+        <div class="stage" id="st3">
+          <div class="rail"><div class="node">3</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Assigned to a success partner</div><div class="s-d">Assignment rule routes it; an Agentforce agent drafts the first reply.</div><div class="s-obj">rule · Lead Assignment + Agentforce</div></div>
+        </div>
+        <div class="stage" id="st4">
+          <div class="rail"><div class="node">4</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Converts to a relationship</div><div class="s-d">On sign-off, Lead → Account (customer or supplier) + Contact + Opportunity.</div><div class="s-obj">objects · Account · Contact · Opportunity</div></div>
+        </div>
+        <div class="stage" id="st5">
+          <div class="rail"><div class="node">5</div></div>
+          <div class="body"><div class="s-t">Lifetime support</div><div class="s-d">Service Cloud entitlements + Data Cloud profile = the "success partner" for life.</div><div class="s-obj">clouds · Service · Data 360</div></div>
+        </div>
+
+        <div class="payload">
+          <div class="ph"><span class="lbl">Live payload</span><span class="ep mono" id="epLabel">POST · webto.salesforce.com</span></div>
+          <pre id="payloadView"><span class="empty">// start typing — the Salesforce lead assembles here in real time</span></pre>
+        </div>
+
+        <div class="modebar" style="margin-top:14px">
+          <span id="modeText">Connected · submissions create real leads in the selected development org</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot">
+    <div class="card">
+      <h4>Connected to your selected org</h4>
+      <p>Submissions use Salesforce <strong>Web-to-Lead</strong> and go to <strong>SFDC 24</strong>, the Developer Edition org saved as <code>omnistudio-sandbox</code>.</p>
+      <p>The customer or supplier relationship is saved with the request in the Lead's Description. No custom field is required.</p>
+    </div>
+    <div class="card">
+      <h4>What this proves — honestly</h4>
+      <p>The integration has a . Each new submission still requires confirmation from the team.</p>
+      <p>Stages 3–5 (assignment, conversion, lifetime support) are the <strong>planned</strong> funnel and are not verified by this intake test.</p>
+      <p>Full write-up: <em>Salesforce Backend Brief (SFDC-BACKEND-001)</em> in the SFDC 24 Drive folder.</p>
+    </div>
+  </div>
+
+  <footer class="legal">SFDC24 · intake prototype · leads flow to Salesforce, not a spreadsheet</footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var form = document.getElementById("leadForm");
+  var done = document.getElementById("doneState");
+  var payloadView = document.getElementById("payloadView");
+  var submit = document.getElementById("submitBtn");
+  var request = document.getElementById("description");
+  var storedDescription = document.getElementById("salesforceDescription");
+  var names = ["first_name", "last_name", "email", "company"];
+  var returnUrl = new URL(window.location.href);
+  if (returnUrl.protocol !== "https:" && returnUrl.protocol !== "http:") {
+    submit.querySelector("span").textContent = "Open the hosted intake page to submit";
+    return;
+  }
+  // Stay on the current host and path. Do not send query strings or fragments
+  // (which may contain preview/session data) through Salesforce's redirect.
+  returnUrl.search = "?submitted=1";
+  returnUrl.hash = "";
+
+  function updatePayload() {
+    // Reapply after form.reset(), which restores the empty markup default.
+    form.elements.namedItem("retURL").value = returnUrl.href;
+    var relationship = form.querySelector('input[name="rel"]:checked').value;
+    storedDescription.value = "[SFDC24 intake] Relationship: " + relationship + "\n\n" + request.value.trim();
+    var payload = {};
+    ["oid", "retURL", "lead_source"].concat(names).forEach(function (name) {
+      payload[name] = form.elements.namedItem(name).value.trim();
+    });
+    payload.description = storedDescription.value;
+    payloadView.textContent = new URLSearchParams(payload).toString();
+  }
+
+  form.addEventListener("input", updatePayload);
+  form.addEventListener("change", updatePayload);
+  form.addEventListener("formdata", function (event) {
+    // Relationship is captured in Description; rel is not a Salesforce field.
+    event.formData.delete("rel");
+  });
+  form.addEventListener("submit", function (event) {
+    names.forEach(function (name) {
+      var field = form.elements.namedItem(name);
+      field.value = field.value.trim();
+    });
+    if (!form.reportValidity()) {
+      event.preventDefault();
+      return;
+    }
+    updatePayload();
+    submit.disabled = true;
+    submit.querySelector("span").textContent = "Sending to Salesforce…";
+    // Native form navigation handles the POST. Do not infer record creation
+    // from the redirect: Web-to-Lead does not return a Lead ID to this page.
+  });
+  window.addEventListener("pageshow", function () {
+    submit.disabled = false;
+    submit.querySelector("span").textContent = "Send it to a success partner";
+  });
+  if (new URLSearchParams(window.location.search).get("submitted") === "1") {
+    form.hidden = true;
+    done.classList.add("show");
+  }
+  document.getElementById("againBtn").addEventListener("click", function () {
+    form.reset();
+    form.hidden = false;
+    done.classList.remove("show");
+    var url = new URL(window.location.href);
+    url.searchParams.delete("submitted");
+    window.history.replaceState(null, "", url);
+    updatePayload();
+    document.getElementById("description").focus();
+  });
+  updatePayload();
+  submit.disabled = false;
+})();
+
+</script>
+</body>
+</html>
