@@ -7,6 +7,9 @@ $script:BoardHeader = @(
     'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist'
 )
 $script:WorkerSourceTag = 'vm-order-worker'
+$script:OrderResultSchema = 'order_supervisor_result.v2'
+$script:OrderResultSummaryMaximumLength = 500
+$script:LegacyDuplicateSuppressionSummary = 'A prior invocation has no confirmed result; duplicate execution was suppressed.'
 
 function Get-UtcStamp {
     return [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
@@ -455,7 +458,10 @@ Never read or expose .env files, tokens, passwords, API keys, browser profiles, 
 Never impersonate vm-cli. The outer supervisor alone reports as vm-order-worker.
 If permission or authority is unclear, return blocked.
 If a tool is denied or would require human approval, do not retry it; return blocked.
-Return only order_supervisor_result.v1 and set work_id exactly to $WorkId.
+Return only order_supervisor_result.v2 and set work_id exactly to $WorkId.
+The RESULT row is the only durable output. Put every completion fact and reference required by the task in summary.
+Summary must be 1 to 500 characters, single-line, and already BCB-safe: no pipe, control/line separator, leading or trailing whitespace, credential assignment/JSON/query shape (including quote or Markdown-backtick wrappers), or Basic/Bearer Authorization header. Exact key/token/secret/password identifiers, every segmented identifier ending token/secret/password, and key identifiers with credential/provider qualifiers are sensitive. An unquoted exact key/token/secret/password followed by a colon is always a rejected mapping; rephrase ordinary prose without that colon. Noncredential identifiers such as sort_key, cache_key, public_key, and unknown FOO_KEY are allowed. Evidence must be exactly [].
+If the required completion facts cannot fit, return blocked with error_code RESULT_TOO_LARGE and a complete short summary asking for this ORDER to be split. Never omit facts and report completed.
 AUTHORIZED_ORDER_JSON_BEGIN
 $authorizedOrder
 AUTHORIZED_ORDER_JSON_END
@@ -545,6 +551,131 @@ function ConvertTo-BcbSafeValue {
     return $safe
 }
 
+function Test-OrderResultCredentialIdentifier {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $normalized = $Name.ToLowerInvariant().Replace('-', '_')
+    $segments = @($normalized -split '_' | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($segments.Count -eq 0) { return $false }
+    if ($segments.Count -eq 1) {
+        return [string]$segments[0] -cin @('key', 'token', 'secret', 'password')
+    }
+
+    $terminal = [string]$segments[$segments.Count - 1]
+    if ($terminal -cin @('token', 'secret', 'password')) { return $true }
+    if ($terminal -cne 'key') { return $false }
+
+    # KEY is overloaded in ordinary data models. Require an exact KEY or a
+    # recognized credential/provider qualifier; do not classify sort_key,
+    # cache_key, public_key, or an unknown foo_key merely by suffix.
+    $sensitiveKeyQualifiers = @(
+        'api', 'auth', 'access', 'private', 'client', 'secret', 'token', 'password',
+        'session', 'shared', 'bearer', 'github', 'azure', 'aws', 'openai', 'db', 'bus'
+    )
+    foreach ($qualifier in @($segments[0..($segments.Count - 2)])) {
+        if ([string]$qualifier -cin $sensitiveKeyQualifiers) { return $true }
+    }
+    return $false
+}
+
+function Test-OrderResultCredentialShape {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    if ($Text -cmatch '(?i)\bAuthorization\s*:\s*(?:Basic|Bearer)\b') { return $true }
+
+    foreach ($wrappedProperty in [regex]::Matches(
+        $Text,
+        '(?<wrapper>["''`])(?<name>[A-Za-z][A-Za-z0-9_-]{0,127})\k<wrapper>\s*[=:]'
+    )) {
+        if (Test-OrderResultCredentialIdentifier -Name ([string]$wrappedProperty.Groups['name'].Value)) {
+            return $true
+        }
+    }
+
+    foreach ($queryParameter in [regex]::Matches(
+        $Text,
+        '(?i)[?&](?<name>[A-Za-z][A-Za-z0-9_-]{0,127})='
+    )) {
+        if (Test-OrderResultCredentialIdentifier -Name ([string]$queryParameter.Groups['name'].Value)) {
+            return $true
+        }
+    }
+
+    foreach ($assignment in [regex]::Matches(
+        $Text,
+        '(?i)(?<![A-Za-z0-9_-])(?<name>[A-Za-z][A-Za-z0-9_-]{0,127})\s*='
+    )) {
+        $name = [string]$assignment.Groups['name'].Value
+        if (-not (Test-OrderResultCredentialIdentifier -Name $name)) { continue }
+        $normalized = $name.ToLowerInvariant().Replace('-', '_')
+        if ($normalized -cne 'key') { return $true }
+
+        $before = $assignment.Index - 1
+        while ($before -ge 0 -and [char]::IsWhiteSpace($Text[$before])) { $before-- }
+        if ($before -lt 0 -or -not [char]::IsLetterOrDigit($Text[$before])) { return $true }
+        $contextEnd = $before
+        while ($before -ge 0 -and [char]::IsLetterOrDigit($Text[$before])) { $before-- }
+        $context = $Text.Substring($before + 1, $contextEnd - $before).ToLowerInvariant()
+        if ($context -cnotin @('cache', 'sort', 'public')) { return $true }
+    }
+
+    foreach ($mappingProperty in [regex]::Matches(
+        $Text,
+        '(?i)(?<![A-Za-z0-9_-])(?<name>[A-Za-z][A-Za-z0-9_-]{0,127})\s*:'
+    )) {
+        $name = [string]$mappingProperty.Groups['name'].Value
+        if (Test-OrderResultCredentialIdentifier -Name $name) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-ExactOrderResultSummary {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][string]$ErrorPrefix
+    )
+
+    if ($Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$Value) -or
+        ([string]$Value).Length -gt $script:OrderResultSummaryMaximumLength) {
+        throw ($ErrorPrefix + '_invalid')
+    }
+    $summary = [string]$Value
+    if ($summary -cmatch '[\p{Cc}\p{Zl}\p{Zp}]' -or
+        (Test-OrderResultCredentialShape -Text $summary)) {
+        throw ($ErrorPrefix + '_unsafe')
+    }
+    $projected = ConvertTo-BcbSafeValue $summary $script:OrderResultSummaryMaximumLength
+    if (-not [string]::Equals($summary, $projected, [StringComparison]::Ordinal)) {
+        throw ($ErrorPrefix + '_unsafe')
+    }
+    return $summary
+}
+
+function Get-ExactLegacyOrderResultValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 500)][int]$MaximumLength,
+        [Parameter(Mandatory = $true)][string]$ErrorPrefix
+    )
+
+    if ($Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$Value) -or
+        ([string]$Value).Length -gt $MaximumLength) {
+        throw ($ErrorPrefix + '_invalid')
+    }
+    $text = [string]$Value
+    $projected = ConvertTo-BcbSafeValue `
+        (Protect-LogText -Text $text -MaximumLength $MaximumLength) `
+        $MaximumLength
+    if (-not [string]::Equals($text, $projected, [StringComparison]::Ordinal)) {
+        throw ($ErrorPrefix + '_unsafe')
+    }
+    return $text
+}
+
 function New-OrderPhaseRow {
     param(
         [Parameter(Mandatory = $true)]$InputRow,
@@ -564,7 +695,23 @@ function New-OrderPhaseRow {
         ('correlates=' + (ConvertTo-BcbSafeValue ([string]$InputRow.row_id) 140)),
         ('run=' + (ConvertTo-BcbSafeValue $RunId 80)), ('status=' + (ConvertTo-BcbSafeValue $Status 40))
     )
-    if ($Summary) {
+    if ($Phase -eq 'RESULT') {
+        if ($RunId -cnotmatch '^[0-9a-f]{32}$') {
+            throw 'phase_result_run_invalid'
+        }
+        if ($Status -cnotin @('completed', 'blocked', 'rejected', 'failed')) {
+            throw 'phase_result_status_invalid'
+        }
+        if ($OutputSha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'phase_result_digest_invalid'
+        }
+        if ($ErrorCode -and $ErrorCode -cnotmatch '^[A-Z][A-Z0-9_.-]{0,79}$') {
+            throw 'phase_result_error_code_invalid'
+        }
+        $exactSummary = Get-ExactOrderResultSummary -Value $Summary -ErrorPrefix 'phase_result_summary'
+        $parts += 'result_schema=' + $script:OrderResultSchema
+        $parts += 'summary=' + $exactSummary
+    } elseif ($Summary) {
         $parts += 'summary=' + (ConvertTo-BcbSafeValue (Protect-LogText -Text $Summary -MaximumLength 500) 500)
     }
     if ($ErrorCode) {
@@ -600,7 +747,8 @@ function Find-BoardRowById {
 function Test-ExistingPhaseRow {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
-        [Parameter(Mandatory = $true)][object[]]$ExpectedRow
+        [Parameter(Mandatory = $true)][object[]]$ExpectedRow,
+        [switch]$AllowPreExistingRunDifference
     )
     $matches = @(Find-BoardRowById -Rows $Rows -RowId ([string]$ExpectedRow[0]))
     if ($matches.Count -eq 0) { return $false }
@@ -617,6 +765,34 @@ function Test-ExistingPhaseRow {
     if (@($want.errors).Count -gt 0 -or @($got.errors).Count -gt 0) {
         throw 'phase_row_payload_invalid'
     }
+    $payloadExact = [string]::Equals(
+        [string]$ExpectedRow[5],
+        [string]$actual.payload,
+        [StringComparison]::Ordinal
+    )
+    if (-not $payloadExact) {
+        if (-not $AllowPreExistingRunDifference -or
+            -not $want.fields.ContainsKey('phase') -or
+            [string]$want.fields['phase'] -cnotin @('CLAIM', 'RECEIPT') -or
+            @($want.fields.Keys).Count -ne @($got.fields.Keys).Count) {
+            throw 'phase_row_id_collision'
+        }
+        foreach ($key in @($want.fields.Keys)) {
+            if (-not $got.fields.ContainsKey([string]$key)) { throw 'phase_row_id_collision' }
+            if ([string]$key -ceq 'run') { continue }
+            if (-not [string]::Equals(
+                [string]$want.fields[[string]$key],
+                [string]$got.fields[[string]$key],
+                [StringComparison]::Ordinal
+            )) {
+                throw 'phase_row_id_collision'
+            }
+        }
+        if (-not $got.fields.ContainsKey('run') -or
+            [string]::IsNullOrWhiteSpace([string]$got.fields['run'])) {
+            throw 'phase_row_id_collision'
+        }
+    }
     foreach ($key in @('id', 'phase', 'from', 'to', 'correlates', 'status')) {
         if (-not $want.fields.ContainsKey($key) -or
             -not $got.fields.ContainsKey($key) -or
@@ -629,6 +805,25 @@ function Test-ExistingPhaseRow {
             -not [string]::Equals([string]$want.fields['output_sha256'], [string]$got.fields['output_sha256'], [StringComparison]::Ordinal)) {
             throw 'phase_row_id_collision'
         }
+    }
+    return $true
+}
+
+function Test-BcbFieldSet {
+    param(
+        [Parameter(Mandatory = $true)]$Fields,
+        [Parameter(Mandatory = $true)][string[]]$Required,
+        [string[]]$Optional = @()
+    )
+
+    $allowed = @($Required) + @($Optional)
+    $keys = @($Fields.Keys)
+    if ($keys.Count -lt $Required.Count -or $keys.Count -gt $allowed.Count) { return $false }
+    foreach ($name in $Required) {
+        if (-not $Fields.ContainsKey($name)) { return $false }
+    }
+    foreach ($name in $keys) {
+        if ($allowed -cnotcontains [string]$name) { return $false }
     }
     return $true
 }
@@ -662,6 +857,92 @@ function Test-PhaseRowIdentity {
             throw 'phase_row_id_collision'
         }
     }
+    if ($Phase -eq 'RESULT') {
+        try {
+            foreach ($requiredKey in @('v', 'class', 'run', 'status', 'summary')) {
+                if (-not $parsed.fields.ContainsKey($requiredKey)) { throw 'phase_row_id_collision' }
+            }
+            if ([string]$parsed.fields['v'] -cne '1' -or
+                [string]$parsed.fields['class'] -cne 'BUILD' -or
+                [string]$parsed.fields['run'] -cnotmatch '^[0-9a-f]{32}$' -or
+                @('completed', 'blocked', 'rejected', 'failed') -cnotcontains [string]$parsed.fields['status']) {
+                throw 'phase_row_id_collision'
+            }
+            if ($parsed.fields.ContainsKey('result_schema')) {
+                if ([string]$parsed.fields['result_schema'] -cne $script:OrderResultSchema -or
+                    -not (Test-BcbFieldSet `
+                        -Fields $parsed.fields `
+                        -Required @(
+                            'v', 'id', 'phase', 'class', 'from', 'to', 'correlates', 'run',
+                            'status', 'result_schema', 'summary', 'output_sha256'
+                        ) `
+                        -Optional @('error_code'))) {
+                    throw 'phase_row_id_collision'
+                }
+                if ([string]$parsed.fields['output_sha256'] -cnotmatch '^[0-9a-f]{64}$') {
+                    throw 'phase_row_id_collision'
+                }
+                $durableResult = [pscustomobject][ordered]@{
+                    schema = $script:OrderResultSchema
+                    work_id = [string]$parsed.fields['id']
+                    status = [string]$parsed.fields['status']
+                    summary = [string]$parsed.fields['summary']
+                    evidence = @()
+                    error_code = $(if ($parsed.fields.ContainsKey('error_code')) {
+                        [string]$parsed.fields['error_code']
+                    } else { $null })
+                }
+                $canonical = ConvertTo-CanonicalOrderResultJson `
+                    -Value $durableResult `
+                    -ExpectedWorkId $WorkId
+                $expectedDigest = Get-StringSha256 -Text $canonical
+                if (-not [string]::Equals(
+                    [string]$parsed.fields['output_sha256'],
+                    $expectedDigest,
+                    [StringComparison]::Ordinal
+                )) {
+                    throw 'phase_row_id_collision'
+                }
+            } else {
+                $null = Get-ExactLegacyOrderResultValue `
+                    -Value ([string]$parsed.fields['summary']) `
+                    -MaximumLength 500 `
+                    -ErrorPrefix 'phase_row_legacy_result_summary'
+                if ($parsed.fields.ContainsKey('output_sha256')) {
+                    if (-not (Test-BcbFieldSet `
+                            -Fields $parsed.fields `
+                            -Required @(
+                                'v', 'id', 'phase', 'class', 'from', 'to', 'correlates', 'run',
+                                'status', 'summary', 'output_sha256'
+                            ) `
+                            -Optional @('error_code')) -or
+                        [string]$parsed.fields['output_sha256'] -cnotmatch '^[0-9a-f]{64}$') {
+                        throw 'phase_row_id_collision'
+                    }
+                    if ($parsed.fields.ContainsKey('error_code')) {
+                        $null = Get-ExactLegacyOrderResultValue `
+                            -Value ([string]$parsed.fields['error_code']) `
+                            -MaximumLength 80 `
+                            -ErrorPrefix 'phase_row_legacy_result_error_code'
+                    }
+                } else {
+                    if (-not (Test-BcbFieldSet `
+                            -Fields $parsed.fields `
+                            -Required @(
+                                'v', 'id', 'phase', 'class', 'from', 'to', 'correlates', 'run',
+                                'status', 'summary', 'error_code'
+                            )) -or
+                        [string]$parsed.fields['status'] -cne 'failed' -or
+                        [string]$parsed.fields['summary'] -cne $script:LegacyDuplicateSuppressionSummary -or
+                        [string]$parsed.fields['error_code'] -cne 'DUPLICATE_INVOCATION_SUPPRESSED') {
+                        throw 'phase_row_id_collision'
+                    }
+                }
+            }
+        } catch {
+            throw 'phase_row_id_collision'
+        }
+    }
     return $true
 }
 
@@ -675,7 +956,10 @@ function Invoke-IdempotentBoardAppend {
     if (@($Row).Count -ne 10) { throw 'append_row_requires_exactly_10_cells' }
     $rowId = [string]$Row[0]
     $before = @(& $ReadBoard)
-    if (Test-ExistingPhaseRow -Rows $before -ExpectedRow $Row) {
+    if (Test-ExistingPhaseRow `
+            -Rows $before `
+            -ExpectedRow $Row `
+            -AllowPreExistingRunDifference) {
         return [pscustomobject]@{ confirmed = $true; appended = $false; outcome = 'already_present'; row_id = $rowId }
     }
 
@@ -712,7 +996,7 @@ function Test-ClaudeResult {
     foreach ($name in $required) {
         if ($names -cnotcontains $name) { throw 'claude_result_properties_invalid' }
     }
-    if ($Value.schema -isnot [string] -or [string]$Value.schema -cne 'order_supervisor_result.v1') {
+    if ($Value.schema -isnot [string] -or [string]$Value.schema -cne $script:OrderResultSchema) {
         throw 'claude_result_schema_invalid'
     }
     if ($Value.work_id -isnot [string] -or
@@ -729,26 +1013,37 @@ function Test-ClaudeResult {
         }
     }
     if (-not $statusOkay) { throw 'claude_result_status_invalid' }
-    if ($Value.summary -isnot [string] -or
-        [string]::IsNullOrWhiteSpace([string]$Value.summary) -or
-        ([string]$Value.summary).Length -gt 2000) {
-        throw 'claude_result_summary_invalid'
-    }
+    $null = Get-ExactOrderResultSummary -Value $Value.summary -ErrorPrefix 'claude_result_summary'
     if ($null -eq $Value.evidence -or
         $Value.evidence -is [string] -or
-        $Value.evidence -isnot [Collections.IEnumerable] -or
-        @($Value.evidence).Count -gt 20) {
+        $Value.evidence -isnot [Collections.IEnumerable]) {
         throw 'claude_result_evidence_missing'
     }
-    foreach ($item in @($Value.evidence)) {
-        if ($item -isnot [string] -or ([string]$item).Length -gt 500) { throw 'claude_result_evidence_invalid' }
-    }
+    if (@($Value.evidence).Count -ne 0) { throw 'claude_result_evidence_not_empty' }
     if ($null -ne $Value.error_code -and
         ($Value.error_code -isnot [string] -or
          [string]$Value.error_code -cnotmatch '^[A-Z][A-Z0-9_.-]{0,79}$')) {
         throw 'claude_result_error_code_invalid'
     }
     return $Value
+}
+
+function ConvertTo-CanonicalOrderResultJson {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkId
+    )
+
+    $validated = Test-ClaudeResult -Value $Value -ExpectedWorkId $ExpectedWorkId
+    $canonical = [pscustomobject][ordered]@{
+        schema = $script:OrderResultSchema
+        work_id = [string]$validated.work_id
+        status = [string]$validated.status
+        summary = [string]$validated.summary
+        evidence = @()
+        error_code = $(if ($null -eq $validated.error_code) { $null } else { [string]$validated.error_code })
+    }
+    return ($canonical | ConvertTo-Json -Depth 4 -Compress)
 }
 
 function ConvertFrom-ClaudeResultEnvelope {
@@ -841,5 +1136,6 @@ Export-ModuleMember -Function @(
     'Test-AuthorityToken', 'Test-OrderRow', 'Get-OrderSelection', 'New-ClaudeWorkerPrompt',
     'Get-DeterministicPhaseRowId', 'New-OrderPhaseRow', 'Find-BoardRowById',
     'Test-ExistingPhaseRow', 'Test-PhaseRowIdentity',
-    'Invoke-IdempotentBoardAppend', 'Test-ClaudeResult', 'ConvertFrom-ClaudeResultEnvelope'
+    'Invoke-IdempotentBoardAppend', 'Test-ClaudeResult', 'ConvertFrom-ClaudeResultEnvelope',
+    'ConvertTo-CanonicalOrderResultJson'
 )

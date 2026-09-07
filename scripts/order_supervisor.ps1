@@ -551,6 +551,51 @@ function Write-Phase {
     return Invoke-IdempotentBoardAppend -Row $cells -ReadBoard $readOperation -AppendBoard $appendOperation
 }
 
+function ConvertTo-OrderResultErrorCode {
+    param([AllowNull()][string]$Value)
+
+    $code = Protect-LogText -Text $Value -MaximumLength 80
+    $code = ($code -replace '[^A-Za-z0-9_.-]', '_').ToUpperInvariant()
+    if ($code.Length -gt 80) { $code = $code.Substring(0, 80) }
+    if (-not $code -or $code -cnotmatch '^[A-Z][A-Z0-9_.-]{0,79}$') {
+        return 'ORDER_SUPERVISOR_ERROR'
+    }
+    return $code
+}
+
+function Get-OrderResultContractFailureReason {
+    param([AllowNull()][string]$Code)
+
+    if ([string]::IsNullOrWhiteSpace($Code)) { return '' }
+    if ($Code -cmatch '^claude_result_') { return 'RESULT_VALIDATION' }
+    if ($Code -cmatch '^CLAUDE_OUTER_') { return 'OUTER_ENVELOPE_INVALID' }
+    if ($Code -ceq 'CLAUDE_STRUCTURED_OUTPUT_MISSING') { return 'STRUCTURED_OUTPUT_MISSING' }
+    if ($Code -ceq 'CLAUDE_RESULT_JSON_INVALID') { return 'RESULT_JSON_INVALID' }
+    if ($Code -cmatch '^CLAUDE_REPORTED_ERROR_(?:STATUS_UNKNOWN|BAD_REQUEST|AUTHENTICATION|PERMISSION|NOT_FOUND|CONFLICT|UNPROCESSABLE|RATE_LIMIT|HTTP_ERROR|SERVER_ERROR)_STRUCTURED_OUTPUT_RETRY_EXHAUSTED$') {
+        return 'STRUCTURED_OUTPUT_RETRY_EXHAUSTED'
+    }
+    return ''
+}
+
+function New-LocalOrderResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkId,
+        [Parameter(Mandatory = $true)][ValidateSet('completed', 'blocked', 'rejected', 'failed')][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [AllowNull()][string]$ErrorCode
+    )
+
+    $result = [pscustomobject][ordered]@{
+        schema = 'order_supervisor_result.v2'
+        work_id = $WorkId
+        status = $Status
+        summary = $Summary
+        evidence = @()
+        error_code = $ErrorCode
+    }
+    return Test-ClaudeResult -Value $result -ExpectedWorkId $WorkId
+}
+
 function Quote-ProcessArgument {
     param([Parameter(Mandatory = $true)][string]$Value)
     if ($Value.Contains('"')) { throw 'process_argument_contains_quote' }
@@ -840,10 +885,31 @@ try {
         $_.input_row_id -ceq $inputRow.row_id -and $_.work_id -ceq $workId -and $_.status -ceq 'invocation_started'
     }).Count -gt 0
     if ($alreadyStarted -or $priorReceipts.Count -gt 0) {
-        $suppressed = Write-Phase -InputRow $inputRow -WorkId $workId -Phase RESULT -Status 'failed' -Summary 'A prior invocation has no confirmed result; duplicate execution was suppressed.' -ErrorCode 'DUPLICATE_INVOCATION_SUPPRESSED'
+        $suppressedResult = New-LocalOrderResult `
+            -WorkId $workId `
+            -Status failed `
+            -Summary 'A prior invocation has no confirmed result; duplicate execution was suppressed.' `
+            -ErrorCode 'DUPLICATE_INVOCATION_SUPPRESSED'
+        $suppressedCanonical = ConvertTo-CanonicalOrderResultJson `
+            -Value $suppressedResult `
+            -ExpectedWorkId $workId
+        $suppressedDigest = Get-StringSha256 -Text $suppressedCanonical
+        $suppressed = Write-Phase `
+            -InputRow $inputRow `
+            -WorkId $workId `
+            -Phase RESULT `
+            -Status ([string]$suppressedResult.status) `
+            -Summary ([string]$suppressedResult.summary) `
+            -ErrorCode ([string]$suppressedResult.error_code) `
+            -Digest $suppressedDigest
         if (-not $suppressed.confirmed) { throw 'duplicate_suppression_result_unconfirmed' }
         $state.cursor = $selection.advance_cursor
-        Set-Work -InputRowId $inputRow.row_id -WorkId $workId -Status 'duplicate_suppressed' -ResultStatus 'failed'
+        Set-Work `
+            -InputRowId $inputRow.row_id `
+            -WorkId $workId `
+            -Status 'duplicate_suppressed' `
+            -ResultStatus 'failed' `
+            -Digest $suppressedDigest
         $state.last_poll.status = 'duplicate_suppressed'
         $state.error = [pscustomobject][ordered]@{
             at = Get-UtcStamp
@@ -872,17 +938,34 @@ try {
             -Source ([string]$inputRow.source) `
             -Task ([string]$selected.assessment.parsed.fields['task'])
     } catch {
-        $failureCode = Protect-LogText -Text $_.Exception.Message -MaximumLength 80
-        $claudeResult = [pscustomobject][ordered]@{
-            schema = 'order_supervisor_result.v1'
-            work_id = $workId
-            status = 'failed'
-            summary = 'The bounded Claude invocation failed; consult the local structured error code.'
-            evidence = @()
-            error_code = $failureCode
+        $failureReason = [string]$_.Exception.Message
+        $contractFailureReason = Get-OrderResultContractFailureReason -Code $failureReason
+        if ($contractFailureReason) {
+            $claudeResult = New-LocalOrderResult `
+                -WorkId $workId `
+                -Status failed `
+                -Summary 'The provider result violated the durable RESULT contract; no partial completion facts were published.' `
+                -ErrorCode 'RESULT_CONTRACT_INVALID'
+            Write-OrderLog `
+                -Path $LogPath `
+                -Event 'result_contract_invalid' `
+                -Level error `
+                -RunId $RunId `
+                -WorkId $workId `
+                -RowId $inputRow.row_id `
+                -Code 'RESULT_CONTRACT_INVALID' `
+                -Message 'Provider output was replaced by the fixed local contract-failure RESULT.' `
+                -Details @{ contract_reason = $contractFailureReason }
+        } else {
+            $failureCode = ConvertTo-OrderResultErrorCode -Value $failureReason
+            $claudeResult = New-LocalOrderResult `
+                -WorkId $workId `
+                -Status failed `
+                -Summary 'The bounded Claude invocation failed; consult the local structured error code.' `
+                -ErrorCode $failureCode
         }
     }
-    $canonical = $claudeResult | ConvertTo-Json -Depth 8 -Compress
+    $canonical = ConvertTo-CanonicalOrderResultJson -Value $claudeResult -ExpectedWorkId $workId
     $digest = Get-StringSha256 -Text $canonical
     $result = Write-Phase -InputRow $inputRow -WorkId $workId -Phase RESULT -Status ([string]$claudeResult.status) -Summary ([string]$claudeResult.summary) -ErrorCode ([string]$claudeResult.error_code) -Digest $digest
     if (-not $result.confirmed) { throw 'result_append_unconfirmed' }
