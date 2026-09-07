@@ -70,6 +70,23 @@ function Get-LowerSha256 {
     finally { $sha.Dispose(); $stream.Dispose() }
 }
 
+function Get-PowerShellParseDiagnostics {
+    param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+    $diagnostics = @()
+    foreach ($path in $Paths) {
+        $fileErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$fileErrors)
+        foreach ($fileError in @($fileErrors)) {
+            $diagnostics += [pscustomobject]@{
+                Path = $path
+                Message = [string]$fileError.Message
+            }
+        }
+    }
+    return @($diagnostics)
+}
+
 function New-TestClaudeExecutable {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -396,11 +413,16 @@ try {
     Write-Utf8NoBom -Path $script:WrapperPath -Text $wrapper
     Reset-TestRelease
 
-    $parseErrors = $null
-    foreach ($path in @($script:SourceSmoke, $script:InstrumentedSmoke, $script:CleanupFaultSmoke, $script:WrapperPath)) {
-        [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$parseErrors)
-    }
-    Test-Case -Name 'PowerShell parser accepts source and harnesses' -Condition (@($parseErrors).Count -eq 0) -Detail (@($parseErrors | ForEach-Object Message) -join '; ')
+    $parseErrors = @(Get-PowerShellParseDiagnostics -Paths @($script:SourceSmoke, $script:InstrumentedSmoke, $script:CleanupFaultSmoke, $script:WrapperPath))
+    Test-Case -Name 'PowerShell parser accepts source and harnesses' -Condition ($parseErrors.Count -eq 0) -Detail (@($parseErrors | ForEach-Object { $_.Path + ': ' + $_.Message }) -join '; ')
+
+    $invalidParserProbe = Join-Path $script:SuiteRoot 'parser-probe-invalid.ps1'
+    $validParserProbe = Join-Path $script:SuiteRoot 'parser-probe-valid.ps1'
+    Write-Utf8NoBom -Path $invalidParserProbe -Text 'function Invoke-Broken {'
+    Write-Utf8NoBom -Path $validParserProbe -Text 'function Invoke-Clean { return 0 }'
+    $parserProbeErrors = @(Get-PowerShellParseDiagnostics -Paths @($invalidParserProbe, $validParserProbe))
+    $invalidProbeErrors = @($parserProbeErrors | Where-Object { $_.Path -eq $invalidParserProbe })
+    Test-Case -Name 'parser diagnostics retain an earlier-file error when a later file is clean' -Condition ($invalidProbeErrors.Count -gt 0) -Detail (@($parserProbeErrors | ForEach-Object { $_.Path + ': ' + $_.Message }) -join '; ')
 
     # Behavioral cases are below. Each case starts from a rebuilt six-file release.
     $parameters = New-DefaultParameters
