@@ -5,6 +5,8 @@ on:
     paths:
       - 'scripts/gas_version_assert.py'
       - 'scripts/gas_deployment_audit.py'
+      - 'scripts/baseline_verify.py'
+      - 'tests/test_baseline_verify.py'
       - 'tests/test_gas_*_acceptance.py'
       - 'apps-script/governor-page-api/Auth.gs'
       - 'scripts/gas_create_staging.sh'
@@ -52,6 +54,9 @@ jobs:
           GAS_DEPLOYMENT_AUDIT_PATH: scripts/gas_deployment_audit.py
           PYTHONDONTWRITEBYTECODE: '1'
         run: python -B -m unittest discover -s tests -p 'test_gas_*_acceptance.py' -v
+      - name: Test that the baseline verifier cannot accept a manifest the deploy path rejects
+        run: python -B -m unittest discover -s tests -p 'test_baseline_verify.py' -v
+
       - name: Test staging helper and push change detection with local fixtures
         run: python -B -m unittest discover -s tests -p 'test_staging_helpers.py' -v
       - name: Test staging target binding and workflow mutation gates
