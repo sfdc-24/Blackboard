@@ -90,8 +90,16 @@ foreach ($k in 'SNOW_INSTANCE', 'SNOW_USER', 'SNOW_PASS') {
     throw "$k missing in $EnvFile. No instance is provisioned yet -- see docs/SERVICENOW_SETUP.md, section 'Provisioning'."
   }
 }
-$base = $cfg.SNOW_INSTANCE.TrimEnd('/')
-if ($base -notmatch '^https://') { throw "SNOW_INSTANCE must be https:// -- refusing to send credentials over $base" }
+try { $instanceUri = [Uri]([string]$cfg.SNOW_INSTANCE) }
+catch { throw "SNOW_INSTANCE is not a valid absolute URI" }
+if (-not $instanceUri.IsAbsoluteUri -or $instanceUri.Scheme -ne 'https' -or
+    $instanceUri.UserInfo -or $instanceUri.Query -or $instanceUri.Fragment -or
+    $instanceUri.AbsolutePath -ne '/' -or
+    $instanceUri.DnsSafeHost -notmatch '^[A-Za-z0-9-]+\.service-now\.com$' -or
+    (-not $instanceUri.IsDefaultPort -and $instanceUri.Port -ne 443)) {
+  throw "SNOW_INSTANCE must be an HTTPS service-now.com instance origin with no path, query, fragment or credentials"
+}
+$base = $instanceUri.GetLeftPart([UriPartial]::Authority)
 
 # ---- the write gate, checked BEFORE any network call ------------------------
 # Deliberately ahead of Get-AuthHeader: on the OAuth path that function spends a

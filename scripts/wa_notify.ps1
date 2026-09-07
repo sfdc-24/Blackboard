@@ -35,9 +35,10 @@ THE 24-HOUR WINDOW, which decides whether a send is even legal
   code" and Canada is not covered. Utility/service traffic to this number is
   fine once a template exists.
 
-CREDENTIALS (DOCTRINE D-18 — never on a command line, never in Drive)
-  .env supplies META_TOKEN, WA_PHONE_NUMBER_ID and WA_TO. Nothing is accepted
-  from argv.
+CREDENTIALS AND RECIPIENT SCOPE (DOCTRINE D-18 — never on a command line, never in Drive)
+  .env supplies META_TOKEN, WA_PHONE_NUMBER_ID and WA_TO. The recipient is
+  intentionally not an argument: this operator-alert tool may only address the
+  configured Governor number.
 
   GOTCHA, cost 20 minutes on 2026-09-06: the stored META_TOKEN begins with the
   literal text "Bearer ". Sending it as `Bearer $token` produces
@@ -75,7 +76,6 @@ REPLYING TO ONE SPECIFIC MESSAGE — possible, and currently blocked on the boar
 param(
   [string]$Text,
   [string]$TextFile,
-  [string]$To,
   [string]$Tag = 'claude-code-cli',
   [ValidateSet('BLOCKED', 'ANDON', 'STATUS', 'DONE', 'ASK')]
   [string]$Kind = 'BLOCKED',
@@ -83,7 +83,6 @@ param(
   [string[]]$ListOptions,    # up to 10, shown behind a menu button
   [string]$ListButton = 'Choose',
   [string]$ReplyTo,          # wamid to quote, when one is available
-  [switch]$Raw,          # send $Text exactly as given, with no prefix line
   [switch]$DryRun,
   [string]$EnvFile
 )
@@ -106,13 +105,17 @@ foreach ($line in (Get-Content -LiteralPath $EnvFile)) {
     $cfg[$matches[1]] = $matches[2].Trim('"').Trim("'")
   }
 }
-foreach ($k in @('META_TOKEN', 'WA_PHONE_NUMBER_ID')) {
+foreach ($k in @('META_TOKEN', 'WA_PHONE_NUMBER_ID', 'WA_TO')) {
   if (-not $cfg[$k]) { throw "$k missing in $EnvFile" }
 }
 $token = $cfg.META_TOKEN -replace '^\s*[Bb]earer\s+', ''   # see GOTCHA above
-if (-not $To) { $To = $cfg.WA_TO }
-if (-not $To) { throw "no recipient: pass -To or set WA_TO in $EnvFile" }
-$To = ($To -replace '[^\d]', '')
+if (-not $token.Trim()) { throw "META_TOKEN is empty after removing the optional Bearer prefix" }
+$recipient = ([string]$cfg.WA_TO -replace '[^\d]', '')
+$phoneNumberId = ([string]$cfg.WA_PHONE_NUMBER_ID).Trim()
+if ($recipient -notmatch '^\d{6,20}$') { throw "WA_TO must contain one 6-20 digit operator number" }
+if ($phoneNumberId -notmatch '^\d{5,30}$') { throw "WA_PHONE_NUMBER_ID must contain digits only" }
+if ($Tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "Tag contains unsupported characters" }
+if ($ReplyTo -and $ReplyTo -notmatch '^wamid\.[A-Za-z0-9+/=_-]{1,500}$') { throw "ReplyTo is not a valid WhatsApp message ID" }
 
 # ---- the message ------------------------------------------------------------
 if ($TextFile) {
@@ -127,7 +130,7 @@ $Text = $Text.TrimEnd("`r", "`n")
 # cannot tell which Claude is talking, the channel is worth very little.
 # ASCII separator on purpose. Windows PowerShell 5.1 reads this file as ANSI, so
 # a UTF-8 middle dot here leaves the machine as mojibake in his chat.
-$body = if ($Raw) { $Text } else { "[$Kind - $Tag]`n$Text" }
+$body = "[$Kind - $Tag]`n$Text"
 # An interactive body is capped at 1024 by Meta, well below the 4096 for plain
 # text. Silently overrunning it returns a 400 and the question never reaches him.
 $cap = if ($Buttons -or $ListOptions) { 1000 } else { $MAX_CHARS }
@@ -141,7 +144,7 @@ if ($Buttons -and $ListOptions) { throw "give -Buttons or -ListOptions, not both
 $payload = @{
   messaging_product = 'whatsapp'
   recipient_type    = 'individual'
-  to                = $To
+  to                = $recipient
 }
 if ($ReplyTo) { $payload.context = @{ message_id = $ReplyTo } }
 
@@ -180,12 +183,12 @@ if ($Buttons) {
 }
 $payload = $payload | ConvertTo-Json -Depth 8 -Compress
 
-$uri = "https://graph.facebook.com/$GRAPH_VERSION/$($cfg.WA_PHONE_NUMBER_ID)/messages"
+$uri = "https://graph.facebook.com/$GRAPH_VERSION/$phoneNumberId/messages"
 
 if ($DryRun) {
   Write-Output "DRY RUN - nothing sent"
   Write-Output "POST $uri"
-  Write-Output "to: $To   body chars: $($body.Length)"
+  Write-Output "operator recipient configured; body chars: $($body.Length)"
   Write-Output $body
   return
 }

@@ -39,7 +39,9 @@ USAGE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\wa_watch.ps1 -PollSeconds 90 -Backfill 3
 #>
 param(
+  [ValidateRange(5, 3600)]
   [int]$PollSeconds = 60,
+  [ValidateRange(0, 100)]
   [int]$Backfill = 0,      # print this many existing messages at start, for context
   [switch]$Once
 )
@@ -61,41 +63,45 @@ function Read-Board {
   } catch { return $null }
 }
 
-while ($true) {
-  $board = Read-Board
-  if ($board -and $board.rows) {
-    $rows = $board.rows
-    $fresh = @()
-    for ($i = 1; $i -lt $rows.Count; $i++) {
-      $r = $rows[$i]
-      if ([string]$r[2] -ne 'whatsapp') { continue }
-      $id = [string]$r[0]
-      if ($seen.ContainsKey($id)) { continue }
-      $seen[$id] = $true
-      $fresh += ,$r
-    }
+try {
+  while ($true) {
+    $board = Read-Board
+    if ($board -and $board.rows) {
+      $rows = $board.rows
+      $fresh = @()
+      for ($i = 1; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        if ([string]$r[2] -ne 'whatsapp') { continue }
+        $id = [string]$r[0]
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        $fresh += ,$r
+      }
 
-    if (-not $primed) {
-      # First pass establishes the watermark. Without this every existing message
-      # fires at once and the session is buried in history it has already read.
-      $primed = $true
-      if ($Backfill -gt 0 -and $fresh.Count -gt 0) {
-        $tail = $fresh[[Math]::Max(0, $fresh.Count - $Backfill)..($fresh.Count - 1)]
-        foreach ($r in $tail) {
+      if (-not $primed) {
+        # First pass establishes the watermark. Without this every existing message
+        # fires at once and the session is buried in history it has already read.
+        $primed = $true
+        if ($Backfill -gt 0 -and $fresh.Count -gt 0) {
+          $tail = $fresh[[Math]::Max(0, $fresh.Count - $Backfill)..($fresh.Count - 1)]
+          foreach ($r in $tail) {
+            $t = ([string]$r[5]) -replace '\s+', ' '
+            Write-Output ("WA (recent) [" + $r[1] + "] " + $t.Trim())
+          }
+        }
+        Write-Output ("WA watch armed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                      " - " + $fresh.Count + " existing messages ignored, polling every " + $PollSeconds + "s")
+      } else {
+        foreach ($r in $fresh) {
           $t = ([string]$r[5]) -replace '\s+', ' '
-          Write-Output ("WA (recent) [" + $r[1] + "] " + $t.Trim())
+          Write-Output ("WA FROM MR SALAM [" + $r[1] + "] " + $t.Trim())
         }
       }
-      Write-Output ("WA watch armed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                    " - " + $fresh.Count + " existing messages ignored, polling every " + $PollSeconds + "s")
-    } else {
-      foreach ($r in $fresh) {
-        $t = ([string]$r[5]) -replace '\s+', ' '
-        Write-Output ("WA FROM MR SALAM [" + $r[1] + "] " + $t.Trim())
-      }
     }
-  }
 
-  if ($Once) { break }
-  Start-Sleep -Seconds $PollSeconds
+    if ($Once) { break }
+    Start-Sleep -Seconds $PollSeconds
+  }
+} finally {
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }

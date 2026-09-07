@@ -24,11 +24,15 @@ PREREQUISITES (the "architectural finishing" this harness forces):
       board only, never sent to Graph API (no WhatsApp spam, no per-message billing).
   P4  wamid dedup restored (ISSUE 028) so retries do not double-count trials.
 USAGE
-  python scripts/pudding_harness.py --bank data/pudding_bank_v1.tsv --tier S --n 10 --block 1
-  python scripts/pudding_harness.py --bank data/pudding_bank_v1.tsv --all --block 1 --post-board
+  python scripts/pudding_harness.py --bank data/pudding_bank_v1.tsv --tier S --n 10 --block 1 --execute-live
+  python scripts/pudding_harness.py --bank data/pudding_bank_v1.tsv --all --block 1 --post-board --execute-live
   python scripts/pudding_harness.py --stats-only results/pudding_trials.jsonl
+
+Live trials make paid model calls and post synthetic events to the configured
+Pipedream endpoint. They require both WEBHOOK_URL and the explicit
+--execute-live acknowledgement. No live endpoint is embedded in this file.
 """
-import argparse, csv, json, math, os, random, re, subprocess, sys, tempfile, time, urllib.request
+import argparse, csv, json, math, os, random, re, subprocess, sys, tempfile, time, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -79,16 +83,27 @@ def arm_a(question):
 
 # ---------- Arm B: the blackboard gateway ----------
 def read_board():
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f: tmp = f.name
-    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BUS_PS1),
-                    "-Action", "read", "-Title", "Blackboard - Alpha DB", "-OutFile", tmp],
-                   capture_output=True, timeout=180)
-    raw = Path(tmp).read_text(encoding="utf-8"); Path(tmp).unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f: tmp = Path(f.name)
+    try:
+        proc = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BUS_PS1),
+                               "-Action", "read", "-Title", "Blackboard - Alpha DB", "-OutFile", str(tmp)],
+                              capture_output=True, timeout=180, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"board read failed with exit {proc.returncode}")
+        raw = tmp.read_text(encoding="utf-8")
+    finally:
+        tmp.unlink(missing_ok=True)
     data = json.loads(raw)
     return data.get("rows") or data.get("data") or []
 
 def arm_b(question, qid, block):
-    url = ENV.get("WEBHOOK_URL", "https://eoykh6zqr7ibsuw.m.pipedream.net/")
+    url = ENV.get("WEBHOOK_URL")
+    if not url:
+        raise RuntimeError("WEBHOOK_URL is required; no live gateway is embedded in source")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.hostname or \
+            not parsed.hostname.endswith(".m.pipedream.net"):
+        raise RuntimeError("WEBHOOK_URL must be an HTTPS Pipedream endpoint with no embedded credentials")
     wamid = f"wamid.PUD-{qid}-B{block}-{int(time.time())}"
     payload = {"object": "whatsapp_business_account", "entry": [{"id": "TEST", "changes": [{"field": "messages",
         "value": {"messaging_product": "whatsapp", "metadata": {"phone_number_id": "TEST"},
@@ -97,7 +112,13 @@ def arm_b(question, qid, block):
                                 "type": "text", "text": {"body": question}}]}}]}]}
     t0 = time.time()
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=30).read()
+    webhook_error = None
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception as exc:
+        # The POST may have landed even when the client timed out. Poll for the
+        # unique wamid and never replay the same synthetic event blindly.
+        webhook_error = f"{type(exc).__name__}: {exc}"
     # poll the board for the WAR row answering this wamid (P2 contract)
     for _ in range(30):
         time.sleep(3)
@@ -112,7 +133,8 @@ def arm_b(question, qid, block):
                         "t_s": round(time.time() - t0, 2), "cost": cost_usd(model, tok_in, tok_out),
                         "lane": f.get("by", "?"), "wamid": wamid}
     return {"text": "", "model": "TIMEOUT", "tok_in": None, "tok_out": None,
-            "t_s": round(time.time() - t0, 2), "cost": float("nan"), "lane": "none", "wamid": wamid}
+            "t_s": round(time.time() - t0, 2), "cost": float("nan"), "lane": "none", "wamid": wamid,
+            "gateway_error": webhook_error}
 
 # ---------- Blinded judging ----------
 JUDGE_RUBRIC = ("Score each answer 0-3 for the question, using the reference points as ground truth: "
@@ -199,11 +221,15 @@ def main():
     ap.add_argument("--n", type=int, default=10); ap.add_argument("--block", type=int, default=1)
     ap.add_argument("--post-board", action="store_true", help="append one BCB v=3 summary row (never per-trial spam)")
     ap.add_argument("--stats-only", help="recompute stats from an existing trials JSONL")
+    ap.add_argument("--execute-live", action="store_true",
+                    help="required acknowledgement for paid model calls and live webhook traffic")
     args = ap.parse_args()
 
     if args.stats_only:
         trials = [json.loads(l) for l in Path(args.stats_only).read_text(encoding="utf-8").splitlines()]
         print(json.dumps(run_stats(trials), indent=2)); return
+    if not args.execute_live:
+        ap.error("--execute-live is required for paid model calls and live gateway traffic")
 
     bank = list(csv.DictReader(Path(REPO / args.bank).open(encoding="utf-8"), delimiter="\t"))
     pick = [q for q in bank if args.all or q["tier"] == args.tier]
@@ -228,13 +254,29 @@ def main():
     (RESULTS_DIR / f"pudding_summary_block{args.block}.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
     if args.post_board:
-        summary = (f"BCB|v=3|id=PUD-B{args.block}|phase=VERIFY|class=EXPERIMENT|from=claude-code-cli"
+        result_id = f"PUD-B{args.block}-{uuid.uuid4().hex[:12]}"
+        summary = (f"BCB|v=3|id={result_id}|phase=VERIFY|class=EXPERIMENT|from=claude-code-cli"
                    f"|task=PUDDING block {args.block} n={len(trials)} - " +
                    " - ".join(f"{k}: cost {v['cost_verdict']} / quality {v['quality_verdict']}" for k, v in stats.items()))
-        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ALPHA_PS1),
-                        "-Action", "append", "-SourceTag", "claude-code-cli",
-                        "-TargetSurface", "Blackboard Alpha DB", "-Payload", summary], timeout=180)
-        print("summary row appended - READ IT BACK before trusting (L-1)")
+        append_timed_out = False
+        try:
+            proc = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ALPHA_PS1),
+                                   "-Action", "append", "-SourceTag", "claude-code-cli",
+                                   "-TargetSurface", "Blackboard Alpha DB", "-Payload", summary],
+                                  capture_output=True, timeout=180, text=True)
+        except subprocess.TimeoutExpired:
+            proc = None
+            append_timed_out = True
+        rows = read_board()
+        landed = [row for row in rows if len(row) > 5 and str(row[5]) == summary]
+        if len(landed) != 1:
+            timeout_note = " after an uncertain client timeout" if append_timed_out else ""
+            raise RuntimeError(f"board append read-back found {len(landed)} exact rows{timeout_note}; do not retry blindly")
+        if append_timed_out:
+            print("append client timed out, but authoritative read-back found the exact row")
+        elif proc.returncode != 0:
+            print(f"append client exited {proc.returncode}, but authoritative read-back found the exact row")
+        print(f"summary row read back exactly once: {landed[0][0]}")
 
 if __name__ == "__main__":
     main()
