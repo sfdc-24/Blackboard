@@ -179,9 +179,14 @@ test('Google subject, not email or caller id, is the stable conversation boundar
   assert.equal(h.context.readConversation_(a1.token, h.context.readSession_(bob)), null);
 
   const tokenPayload = JSON.parse(Buffer.from(a1.token.split('.')[0], 'base64url').toString('utf8'));
-  assert.deepEqual(Object.keys(tokenPayload).sort(), ['exp', 'id', 'k', 'v']);
+  assert.deepEqual(Object.keys(tokenPayload).sort(), ['exp', 'id', 'k', 'p', 'v']);
+  assert.equal(tokenPayload.p, 'blackboard.conversation.v1');
   assert.equal(JSON.stringify(tokenPayload).includes('google-subject-alice'), false);
   assert.equal(a1.key.includes('google-subject-alice'), false);
+  assert.equal(h.context.readConversation_(alice, h.context.readSession_(alice)), null,
+    'an auth-session token must not verify as a conversation token');
+  assert.equal(h.context.readSession_(a1.token), null,
+    'a conversation token must not verify as an auth-session token');
 });
 
 test('anonymous identity is a signed server nonce and forged tokens cannot select a key', () => {

@@ -30,9 +30,11 @@ Google sign-in was working, but sign-in alone was not a tenant boundary.
 
 The repaired contract is:
 
-1. The server issues an HMAC-signed conversation token. For a signed-in visitor,
-   its stable key is derived from Google's immutable `sub`, never the email or a
-   browser id. For an anonymous visitor it contains a random server nonce.
+1. The server issues a purpose-labelled, domain-separated HMAC conversation
+   token. It cannot be replayed as the separately shaped Google auth-session
+   token or vice versa. For a signed-in visitor, its stable key is derived from
+   Google's immutable `sub`, never the email or a browser id. For an anonymous
+   visitor it contains a random server nonce.
 2. The server verifies the token on every turn and derives an opaque 128-bit
    cache/property key. Google-backed tokens must match the current signed
    session. Anonymous tokens are invalid after sign-in, and Google-backed tokens

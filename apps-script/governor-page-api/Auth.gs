@@ -42,6 +42,7 @@ var AUTH_SESSION_DAYS      = 14;
 var AUTH_STATE_TTL_SECS    = 600;
 var CONVERSATION_TOKEN_VERSION = 1;
 var CONVERSATION_TOKEN_DAYS    = 14;
+var CONVERSATION_TOKEN_PURPOSE = 'blackboard.conversation.v1';
 
 function authConfigured_() {
   var p = PropertiesService.getScriptProperties();
@@ -72,6 +73,11 @@ function b64urlDecode_(str) {
 function hmac_(msg) {
   var raw = Utilities.computeHmacSha256Signature(msg, authSigningKey_());
   return Utilities.base64EncodeWebSafe(raw).replace(/=+$/, '');
+}
+
+/** Domain-separated MAC: an auth-session token cannot verify as conversation state. */
+function conversationHmac_(body) {
+  return hmac_(CONVERSATION_TOKEN_PURPOSE + '|' + String(body || ''));
 }
 
 /** Constant-time-ish comparison. Avoids leaking position of first difference. */
@@ -136,6 +142,7 @@ function mintConversation_(session) {
   var signedIn = !!(session && session.sub);
   var payload = {
     v: CONVERSATION_TOKEN_VERSION,
+    p: CONVERSATION_TOKEN_PURPOSE,
     k: signedIn ? 'g' : 'a',
     id: signedIn
       ? conversationHash_('google-sub:' + String(session.sub))
@@ -143,7 +150,7 @@ function mintConversation_(session) {
     exp: Date.now() + CONVERSATION_TOKEN_DAYS * 86400000
   };
   var body = b64urlEncode_(JSON.stringify(payload));
-  return body + '.' + hmac_(body);
+  return body + '.' + conversationHmac_(body);
 }
 
 /**
@@ -155,9 +162,11 @@ function readConversation_(token, session) {
   try {
     if (!token || String(token).length > 512) return null;
     var parts = String(token).split('.');
-    if (parts.length !== 2 || !safeEqual_(hmac_(parts[0]), parts[1])) return null;
+    if (parts.length !== 2 || !safeEqual_(conversationHmac_(parts[0]), parts[1])) return null;
     var claims = JSON.parse(b64urlDecode_(parts[0]));
-    if (!claims || claims.v !== CONVERSATION_TOKEN_VERSION) return null;
+    if (!claims || Object.keys(claims).sort().join(',') !== 'exp,id,k,p,v') return null;
+    if (claims.v !== CONVERSATION_TOKEN_VERSION ||
+        claims.p !== CONVERSATION_TOKEN_PURPOSE) return null;
     if (claims.k !== 'g' && claims.k !== 'a') return null;
     if (!/^[a-f0-9]{32}$/.test(String(claims.id || ''))) return null;
     if (!claims.exp || Date.now() > claims.exp) return null;
