@@ -12,10 +12,10 @@
 //     they are counted and exported for a future statuses lane.
 //   - no extractable text -> THROW (fail loud, Doctrine #9). Never append
 //     "undefined" or "[object Object]".
-// ENV (per DOCTRINE D-18 — secrets never in code): ALPHA_URL, ALPHA_SECRET.
-// Optional: META_APP_SECRET to enable signature validation.
-// OPTIONAL PROP: attach a Data Store as "db" for wamid dedup — Meta retries
-// deliveries, and without the store a retry appends a duplicate row.
+// ENV (per DOCTRINE D-18 — secrets never in code): ALPHA_URL, ALPHA_SECRET,
+// META_VERIFY_TOKEN. Optional: META_APP_SECRET to enable signature validation.
+// Attach the required "db" Data Store. Its get/set pair is NOT atomic; serialize
+// this workflow and retain board read-back before any uncertain-write replay.
 
 import crypto from "crypto";
 
@@ -23,8 +23,8 @@ function extractText(msg) {
   switch (msg.type) {
     case "text":        return msg.text?.body ?? null;
     case "button":      return msg.button?.text ?? null;
-    case "interactive": return msg.interactive?.button_reply?.title
-                            ?? msg.interactive?.list_reply?.title ?? null;
+    case "interactive": return ['button_reply', 'list_reply'].includes(msg.interactive?.type)
+                          ? msg.interactive[msg.interactive.type]?.title ?? null : null;
     case "reaction":    return msg.reaction?.emoji
                           ? `reacted ${msg.reaction.emoji} to wamid=${msg.reaction.message_id}` : null;
     case "image": case "video": case "audio": case "document": case "sticker":
@@ -34,6 +34,63 @@ function extractText(msg) {
     case "contacts":    return "[contact card received]";
     default:            return null; // unknown type -> caller throws, visibly
   }
+}
+
+function normalizedMessage(msg) {
+  const id = /^wamid\.[A-Za-z0-9+/=_-]{1,500}$/;
+  if (!msg || typeof msg.id !== 'string' || !id.test(msg.id) ||
+      typeof msg.from !== 'string' || !/^\d{6,20}$/.test(msg.from)) {
+    throw new Error('missing or invalid WhatsApp message identity');
+  }
+  const text = extractText(msg);
+  if (typeof text !== 'string' || !text.trim() || text.length > 16000) {
+    throw new Error('missing, invalid or oversized WhatsApp message text');
+  }
+  const replyTo = msg.context?.id ?? null;
+  if (replyTo !== null && (typeof replyTo !== 'string' || !id.test(replyTo))) {
+    throw new Error('invalid quoted WhatsApp message identity');
+  }
+  let selection = null;
+  if (msg.type === 'interactive') {
+    const kind = msg.interactive?.type;
+    if (!['button_reply', 'list_reply'].includes(kind)) throw new Error('unsupported interactive response');
+    const choice = msg.interactive[kind];
+    if (!choice || typeof choice.id !== 'string' || !choice.id.trim() || choice.id.length > 512) {
+      throw new Error('interactive response has no valid option identity');
+    }
+    selection = { kind, id: choice.id, title: text };
+  } else if (msg.type === 'button') {
+    if (typeof msg.button?.payload !== 'string' || !msg.button.payload.trim() || msg.button.payload.length > 512) {
+      throw new Error('button response has no option identity');
+    }
+    selection = { kind: 'button', id: msg.button.payload, title: text };
+  }
+  return { wamid: msg.id, from: msg.from, type: msg.type, text, replyTo, selection };
+}
+
+function boardPayload(message) {
+  let prefix = `WA|wamid=${message.wamid}|from=${message.from}|type=${message.type}`;
+  if (message.replyTo) prefix += `|reply_to=${message.replyTo}`;
+  if (message.selection) prefix += `|choice_id=${encodeURIComponent(message.selection.id)}`;
+  // Keep text last and unchanged for existing WA|wamid= readers; downstream
+  // routing uses the structured message export, never a split of visitor text.
+  return prefix + '|text=' + message.text;
+}
+
+function sameSecret(actual, expected) {
+  if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+  const actualBytes = Buffer.from(actual, 'utf8');
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  return actualBytes.length === expectedBytes.length && crypto.timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function headerValue(headers, wantedName) {
+  if (!headers || typeof headers !== 'object') return undefined;
+  if (typeof headers.get === 'function') return headers.get(wantedName) ?? undefined;
+  const matches = Object.entries(headers).filter(([name]) => name.toLowerCase() === wantedName.toLowerCase());
+  if (matches.length > 1) throw new Error(`duplicate ${wantedName} header`);
+  const value = matches[0]?.[1];
+  return Array.isArray(value) && value.length === 1 ? value[0] : value;
 }
 
 export default defineComponent({
@@ -49,6 +106,7 @@ export default defineComponent({
     $.export("env_ok", {
       ALPHA_URL: !!process.env.ALPHA_URL,
       ALPHA_SECRET: !!process.env.ALPHA_SECRET,
+      META_VERIFY_TOKEN: !!process.env.META_VERIFY_TOKEN,
     });
 
     // --- Meta webhook GET verification handshake (kept from previous node) ---
@@ -56,8 +114,14 @@ export default defineComponent({
     if (event.method === "GET") {
       const verify = q["hub.verify_token"] || q["hub_verify_token"];
       const challenge = q["hub.challenge"] || q["hub_challenge"];
-      if (verify === "sfdc24_verify_2024") {
-        await $.respond({ status: 200, body: challenge });
+      const expectedVerify = process.env.META_VERIFY_TOKEN;
+      if (!expectedVerify) {
+        await $.respond({ status: 500, body: "Verification unavailable" });
+        return $.flow.exit("GET while META_VERIFY_TOKEN is not configured");
+      }
+      const challengeText = typeof challenge === 'number' ? String(challenge) : challenge;
+      if (sameSecret(verify, expectedVerify) && typeof challengeText === 'string' && /^\d{1,32}$/.test(challengeText)) {
+        await $.respond({ status: 200, body: challengeText });
         return $.flow.exit("webhook verification handshake");
       }
       await $.respond({ status: 403, body: "Forbidden" });
@@ -77,29 +141,37 @@ export default defineComponent({
     if (!url || !secret) {
       throw new Error("ALPHA_URL / ALPHA_SECRET env vars missing (D-18: secrets live in env, never in code)");
     }
+    if (!this.db || typeof this.db.get !== 'function' || typeof this.db.set !== 'function') {
+      throw new Error('WhatsApp deduplication Data Store is not configured');
+    }
 
     // Signature validation (plan Phase 1): enable by setting META_APP_SECRET.
-    // Uses the raw body when the trigger exposes it; skips (and says so) when not.
+    // Header names are case-insensitive. Uses the raw body when the trigger
+    // exposes it; skips (and says so) when not.
     const appSecret = process.env.META_APP_SECRET;
-    const sigHeader = event.headers?.["x-hub-signature-256"];
     const rawBody = event.raw_body ?? event.body_raw;
     let signature = "not checked (META_APP_SECRET unset)";
     if (appSecret) {
-      if (!rawBody) {
-        signature = "SKIPPED - raw body not exposed by trigger; enable raw body in trigger config";
+      const sigHeader = headerValue(event.headers, 'x-hub-signature-256');
+      if (typeof rawBody !== 'string' || !rawBody) {
+        throw new Error('raw webhook body unavailable; cannot verify configured signature');
       } else if (!sigHeader) {
         throw new Error("X-Hub-Signature-256 header missing - refusing unsigned webhook");
       } else {
         const expected = "sha256=" + crypto.createHmac("sha256", appSecret).update(rawBody, "utf8").digest("hex");
-        if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHeader))) {
+        if (typeof sigHeader !== 'string' || sigHeader.length !== expected.length ||
+            !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHeader))) {
           throw new Error("X-Hub-Signature-256 mismatch - dropping payload");
         }
         signature = "valid";
       }
     }
 
-    const body = event.body ?? {};
+    // When authenticated, consume exactly the signed bytes, not an independently
+    // supplied parsed object that could have diverged in an earlier step.
+    const body = signature === 'valid' ? JSON.parse(rawBody) : event.body ?? {};
     const results = [];
+    const messages = [];
     let statusEvents = 0;
 
     for (const entry of body.entry ?? []) {
@@ -110,11 +182,8 @@ export default defineComponent({
         if (Array.isArray(value.statuses)) statusEvents += value.statuses.length;
 
         for (const msg of value.messages ?? []) {
-          const wamid = msg.id;
-          if (!wamid) {
-            throw new Error("message with no wamid - refusing to append an unkeyed row: " +
-              JSON.stringify(msg).slice(0, 200));
-          }
+          const message = normalizedMessage(msg);
+          const wamid = message.wamid;
 
           // Idempotency (Doctrine #3): Meta retries; consumers must not see dupes.
           if (this.db && await this.db.get(wamid)) {
@@ -122,14 +191,7 @@ export default defineComponent({
             continue;
           }
 
-          const text = extractText(msg);
-          if (!text) {
-            // Fail loud (Doctrine #9). This surfaces in Pipedream as a visible
-            // error with the offending type — the dead-letter lane's raw input.
-            throw new Error(`no extractable text: wamid=${wamid} type=${msg.type} - not appending`);
-          }
-
-          const payload = `WA|wamid=${wamid}|from=${msg.from}|type=${msg.type}|text=${text}`;
+          const payload = boardPayload(message);
 
           // Apps Script answers 302; fetch converts the redirected POST to a
           // body-less GET automatically — the same two-hop pattern as the
@@ -144,11 +206,19 @@ export default defineComponent({
               action_type: "APPEND",
               payload,
             }),
+            signal: AbortSignal.timeout(30000),
           });
-          const gatewayReply = (await res.text()).slice(0, 200);
+          let gatewayReply;
+          try { gatewayReply = await res.json(); }
+          catch { throw new Error('board append returned invalid JSON; read back before replay'); }
+          if (!res.ok || gatewayReply?.result !== 'success' || gatewayReply.error ||
+              typeof gatewayReply.rowId !== 'string' || !/^WRK-[A-Za-z0-9-]+$/.test(gatewayReply.rowId)) {
+            throw new Error('board append was not acknowledged; read back before replay');
+          }
 
-          if (this.db) await this.db.set(wamid, new Date().toISOString());
-          results.push({ wamid, from: msg.from, type: msg.type, appended: true, gatewayReply });
+          await this.db.set(wamid, { rowId: gatewayReply.rowId, acceptedAt: new Date().toISOString() });
+          messages.push(message);
+          results.push({ wamid, appendAcknowledged: true, rowId: gatewayReply.rowId });
         }
       }
     }
@@ -156,10 +226,12 @@ export default defineComponent({
     // D-4 caveat, encoded: the gateway reply is NOT proof the row landed.
     // Read-back on the sheet remains the arbiter; this export is diagnostics.
     $.export("summary", {
+      schema: 2,
       signature,
-      messagesAppended: results.filter(r => r.appended).length,
+      messagesAcknowledged: messages.length,
       duplicatesSkipped: results.filter(r => r.skipped).length,
       statusEventsIgnored: statusEvents,
+      messages,
       results,
     });
   },
