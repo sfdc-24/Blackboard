@@ -120,6 +120,32 @@ bind every runbook parameter explicitly using the exact parameter-name case in
    them back, and require one scheduled supervisor `PASS` before declaring the
    release accepted.
 
+`order_system_adapter_smoke.ps1` is the reusable step-12 artifact. Stage its
+reviewed bytes outside every immutable release and verify its transport hash
+before execution. Invoke it only through Windows PowerShell 5.1 as SYSTEM and
+pass the full 40-character release ID, the caller-bound archive SHA-256, and
+`ExpectedFileHashesBase64`: Base64 of a BOM-free UTF-8 JSON object containing
+exactly the same six canonical `scripts\...` keys and independently computed
+lowercase SHA-256 values used by the escrow gate. Also pass the release root,
+exact task name, and absolute profile, workspace, environment, state, log, and
+Claude and Git executable paths, plus independently verified lowercase SHA-256
+values for those exact executables. The smoke requires the root task to be
+`Ready`, in `Observe`, last result `0`, and outside the configured quiet
+window; it never waits for or starts the task.
+
+The smoke hashes the real environment file for its protected before/after
+fingerprint but never parses, imports, or passes that file to a child. It
+exercises the production adapter with a generated local fake executable and a
+synthetic non-secret environment file, so it performs no provider inference
+and no Blackboard or other external write. The real Claude executable is
+invoked only with `--version`, and Git is limited to a prompt-free, lock-free
+`rev-parse --is-inside-work-tree` with hooks and inherited Git configuration
+disabled. Accept only one terminal
+`blackboard.order-system-adapter-smoke.v1` JSON receipt with `pass:true`, every
+proof flag true, `provider_inference_attempted:false`,
+`external_write_attempted:false`, environment restoration `SUCCEEDED`, and
+temporary cleanup `SUCCEEDED`.
+
 The bounded adapter targets the VM-pinned Claude Code 2.1.241 compatibility
 contract. With subprocess credential scrubbing enabled, that version forces its
 internal permission mode to `default`; the corresponding external CLI value is

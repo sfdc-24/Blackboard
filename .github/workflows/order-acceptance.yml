@@ -12,6 +12,7 @@ on:
       - 'scripts/order_supervisor_result.schema.json'
       - 'infra/azure/blackboard_vm_supervisor.ps1'
       - 'infra/azure/install_release_from_archive.ps1'
+      - 'infra/azure/order_system_adapter_smoke.ps1'
       - 'infra/azure/order_task_escrow.ps1'
       - 'infra/azure/stage_order_escrow_tool.ps1'
       - 'infra/azure/build_order_escrow_transport_wrapper.ps1'
@@ -20,6 +21,7 @@ on:
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
       - 'tests/test_order_release_installer.ps1'
+      - 'tests/test_order_system_adapter_smoke.ps1'
       - 'tests/test_order_task_escrow.ps1'
       - 'tests/test_order_escrow_transport.ps1'
       - 'tests/test_order_deployment_wrappers.ps1'
@@ -53,6 +55,9 @@ jobs:
       - name: Test ORDER immutable release installer
         shell: powershell
         run: .\tests\test_order_release_installer.ps1
+      - name: Test provider-free ORDER SYSTEM adapter smoke
+        shell: powershell
+        run: .\tests\test_order_system_adapter_smoke.ps1
       - name: Test ORDER independent task escrow
         shell: powershell
         run: .\tests\test_order_task_escrow.ps1
