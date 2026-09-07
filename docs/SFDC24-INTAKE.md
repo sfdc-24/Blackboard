@@ -18,6 +18,10 @@ The old simulated pipeline completion and generated Lead ID were removed.
 The return page acknowledges submission without asserting record creation:
 Web-to-Lead returns a redirect, not an authenticated Lead receipt. The form is
 disabled until its script initializes and disables repeat clicks during submit.
+The return URL is derived from the hosted page's current origin and pathname,
+with only `?submitted=1`; unrelated query parameters and fragments are removed.
+Resetting the form restores this URL before another submission. Local `file:`
+previews remain disabled because Salesforce cannot return visitors to them.
 
 Private review URL: https://sfdc24-intake-omnistudio.astronautwannabe.chatgpt.site
 This is a separate owner-only review deployment. The public www.sfdc24.com
@@ -25,9 +29,14 @@ deployment and DNS were not changed.
 
 ## Verification
 
-One synthetic Web-to-Lead request was sent on September 4, 2026, then queried
-directly from the explicitly selected org. HTTP 200 alone was not treated as
-delivery evidence.
+Historical receipt: Codex desktop task `01a06e94-ed45-7c02-aa97-df325f2d6ccb`
+authored the connection and executed one synthetic Web-to-Lead request on
+September 4, 2026, then queried the explicitly selected org. The
+[executor's attributed receipt](https://github.com/sfdc-24/Blackboard/pull/3#issuecomment-5547510371)
+records the result below. VM Claude preserved those changes in this PR but did
+not execute that test. HTTP 200 alone was not treated as delivery evidence.
+This is historical evidence, not a fresh org check or a guarantee for later
+submissions; independent Salesforce-lane acceptance remains pending.
 
 - Marker: `SFDC24-VERIFY-20260904T224843Z`
 - Created Lead: `00Qbm00000pJLZdEAO`
@@ -38,8 +47,9 @@ delivery evidence.
 - Description read-back preserved `Relationship: Supplier` and the test text.
 - Email uses `example.invalid`; no customer email address was used.
 
-The test record remains in the org as evidence. No existing records or org
-settings were changed. The older test Lead `00Qbm00000pISjdEAG` was preserved.
+At the time of the receipt, the test record was left in the org as evidence.
+No existing records or org settings were changed. The older test Lead
+`00Qbm00000pISjdEAG` was preserved. The review fixes did not repeat the submission.
 
 Regression check: `node tests/sfdc24-intake.cjs`. It verifies the selected org,
 form contract, validation guard, relationship serialization, literal handling
