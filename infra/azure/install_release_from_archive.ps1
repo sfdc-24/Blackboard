@@ -72,8 +72,46 @@ if ($resolvedSystemTemp.Length -gt $systemTempVolume.Length) {
     )
 }
 $temporaryRoot = Join-Path $resolvedSystemTemp ('blackboard-release-' + [Guid]::NewGuid().ToString('N'))
-$archivePath = Join-Path $temporaryRoot 'release.zip'
-$unpackPath = Join-Path $temporaryRoot 'unpacked'
+
+function Get-ValidatedTemporaryCleanupPath {
+    param(
+        [Parameter(Mandatory = $true)][string] $TemporaryRoot,
+        [Parameter(Mandatory = $true)][string] $SystemTemp
+    )
+
+    $resolvedTemporary = [IO.Path]::GetFullPath($TemporaryRoot)
+    $resolvedTempBase = [IO.Path]::GetFullPath($SystemTemp)
+    $temporaryVolume = [IO.Path]::GetPathRoot($resolvedTemporary)
+    $tempBaseVolume = [IO.Path]::GetPathRoot($resolvedTempBase)
+    if ($resolvedTemporary.Length -gt $temporaryVolume.Length) {
+        $resolvedTemporary = $resolvedTemporary.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+    }
+    if ($resolvedTempBase.Length -gt $tempBaseVolume.Length) {
+        $resolvedTempBase = $resolvedTempBase.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+    }
+
+    $systemTempPrefix = $resolvedTempBase
+    if (
+        -not $systemTempPrefix.EndsWith([string][IO.Path]::DirectorySeparatorChar) -and
+        -not $systemTempPrefix.EndsWith([string][IO.Path]::AltDirectorySeparatorChar)
+    ) {
+        $systemTempPrefix += [IO.Path]::DirectorySeparatorChar
+    }
+    if (
+        $resolvedTemporary -ceq $resolvedTempBase -or
+        -not $resolvedTemporary.StartsWith($systemTempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolvedTemporary) -cnotmatch '^blackboard-release-[0-9a-f]{32}$'
+    ) {
+        throw 'temporary_cleanup_scope_invalid'
+    }
+    return $resolvedTemporary
+}
 
 function Get-BytesSha256 {
     param([Parameter(Mandatory = $true)][byte[]] $Bytes)
@@ -479,10 +517,17 @@ function Assert-ExistingRelease {
     }
 }
 
-Assert-ReleaseRootAncestorsSafe -Root $resolvedReleaseRoot
+$resolvedTemporaryRoot = Get-ValidatedTemporaryCleanupPath `
+    -TemporaryRoot $temporaryRoot `
+    -SystemTemp $resolvedSystemTemp
+$archivePath = Join-Path $resolvedTemporaryRoot 'release.zip'
+$unpackPath = Join-Path $resolvedTemporaryRoot 'unpacked'
+
 $result = $null
+$operationError = $null
 try {
-    New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+    Assert-ReleaseRootAncestorsSafe -Root $resolvedReleaseRoot
+    New-Item -ItemType Directory -Path $resolvedTemporaryRoot | Out-Null
     New-Item -ItemType Directory -Path $unpackPath | Out-Null
 
     try {
@@ -584,28 +629,32 @@ try {
         }
     }
 
-    $result | ConvertTo-Json -Compress
 }
-finally {
-    if (Test-Path -LiteralPath $temporaryRoot) {
-        $resolvedTemporary = [IO.Path]::GetFullPath($temporaryRoot).TrimEnd(
-            [IO.Path]::DirectorySeparatorChar,
-            [IO.Path]::AltDirectorySeparatorChar
-        )
-        $systemTempPrefix = $resolvedSystemTemp
-        if (
-            -not $systemTempPrefix.EndsWith([string][IO.Path]::DirectorySeparatorChar) -and
-            -not $systemTempPrefix.EndsWith([string][IO.Path]::AltDirectorySeparatorChar)
-        ) {
-            $systemTempPrefix += [IO.Path]::DirectorySeparatorChar
-        }
-        if (
-            $resolvedTemporary -ceq $resolvedSystemTemp -or
-            -not $resolvedTemporary.StartsWith($systemTempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-            -not ([IO.Path]::GetFileName($resolvedTemporary) -match '^blackboard-release-[0-9a-f]{32}$')
-        ) {
-            throw 'temporary_cleanup_scope_invalid'
-        }
-        Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force -ErrorAction Stop
+catch {
+    $operationError = $_
+}
+
+$cleanupStatus = 'SUCCEEDED'
+$cleanupCode = $null
+try {
+    if (Test-Path -LiteralPath $resolvedTemporaryRoot) {
+        $cleanupPath = Get-ValidatedTemporaryCleanupPath `
+            -TemporaryRoot $resolvedTemporaryRoot `
+            -SystemTemp $resolvedSystemTemp
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction Stop
     }
 }
+catch {
+    $cleanupStatus = 'FAILED'
+    $cleanupCode = 'TEMPORARY_CLEANUP_FAILED'
+}
+
+if ($null -ne $operationError) {
+    throw $operationError
+}
+if ($null -eq $result) {
+    throw 'installer_result_missing'
+}
+$result['cleanup_status'] = $cleanupStatus
+$result['cleanup_code'] = $cleanupCode
+$result | ConvertTo-Json -Compress
