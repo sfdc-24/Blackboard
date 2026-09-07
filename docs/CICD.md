@@ -10,13 +10,21 @@ production deployment id, DNS, or the theme.
 |---|---|---|
 | DEV | A separate Apps Script *copy* of each project. Anyone breaks it freely. | `clasp push` straight from a working tree, or the editor. No ceremony. |
 | STAGING | A separate Apps Script copy per project with ONE stable web-app deployment. | **GitHub Actions only** — `.github/workflows/staging-deploy.yml` on push to the `staging` branch (or manual dispatch). |
-| PROD | The existing live projects/deployments. | **Manual, by a human, unchanged tonight.** Automating prod is a separate ruling. |
+| PROD | The existing live projects/deployments. | **Manual, from reviewed tracked source.** Automating prod is a separate ruling. |
 
 The source of truth is `apps-script/<project>/` in this repo:
 
+For the Governor project, the tracked root `.clasp.json` binds the production
+script directly to `apps-script/governor-page-api/`. `gas/` is ignored scratch
+space only and is never a deploy input. Never run `clasp pull` from the repo
+root: after the single-source migration it would overwrite reviewed files.
+Read a pinned deployment version into a separate scratch directory with
+`scripts/gas_get_version.py` instead. Changing this source binding does not
+push, version, redeploy, or otherwise mutate Apps Script.
+
 | Dir | Live project (scriptId) | Notes |
 |---|---|---|
-| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. Prod deployment `AKfycbx0D-5DAn…` is pinned at **@29** ("v29 neural voice"); baseline re-synced to @29 on 2026-09-05. |
+| `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. The latest source read-back in this repo is immutable **v31**; see `CICD-GOVERNOR-V31.md`. Re-read the pinned production version before every release. |
 | `apps-script/blackboard-production/` | `1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-` | The V2/Alpha gateway. |
 | `apps-script/glasses-intake-uploader/` | `1PBfO1sPQmGTXPHWrAAot2wCgSCPizO2uC8RUwUKQ5hn7A7dUq0U4_Q_2` | Already exposes `CONTRACT_VERSION` on GET — the model citizen. |
 | `apps-script/blackboard-bus-v1/` | `1meav8p2zkRt-8obarV_fB5Q2EyExCvAaoZa3ro9_fmo4OE_95FpWkfu9` | The v1 bus. Baselined 2026-09-04. Prod deployment `AKfycbwCLtG9…RcXrjQ` is pinned at **@1**. |

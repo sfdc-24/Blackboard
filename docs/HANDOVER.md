@@ -303,13 +303,21 @@ thing to keep an eye on, not the package itself.
 
 ---
 
-## Deploys are autonomous now — clasp works (2026-09-03)
+## Governor production has one deploy source (updated 2026-09-07)
 
 Mr. Salam enabled the Apps Script API; `clasp login` completed as
-`abdus@sfdc24.com`. **The "New version" dropdown no longer matters.**
+`abdus@sfdc24.com`. The tracked root `.clasp.json` binds that production
+project directly to `apps-script/governor-page-api/`. That tracked directory is
+the only deploy source; ignored `gas/` content is scratch evidence only.
+
+Production remains a separately authorized manual release. Record the reviewed
+commit and require a clean worktree, including no untracked files, before a
+push. The layout change itself is not a deployment.
 
 ```
 cd /c/Users/salam/Quantum/Blackboard      # canonical case, see below
+git status --porcelain=v1 --untracked-files=all   # must be empty
+git rev-parse HEAD                                # record the reviewed commit
 clasp push -f
 clasp create-version "what changed"
 clasp redeploy AKfycbx0D-5DAnMqOm9YbN3iKDwuiBApEi_xex60f6pwdvObEyQBF5jcOK715pl1mN-Nzn6gng -V <n> -d "..."
@@ -317,7 +325,8 @@ clasp list-deployments                     # read-back: D-4 still applies
 ```
 
 That deployment id is the **production web app**. `@HEAD` is a separate dev
-deployment. **Rollback is one command:** `clasp redeploy <id> -V 13`.
+deployment. Runtime rollback repoints the stable deployment to the immutable
+version established by the pre-release read-back; it does not push `gas/`.
 
 **clasp must run from `/c/Users/salam/Quantum/Blackboard`.** From the harness
 cwd (lowercase `c:\users\salam\...`) every write is refused as *"Content directory is
@@ -325,19 +334,19 @@ a symlink. Possible race attack."* Nothing is a symlink — the case difference
 alone trips its check, and `--allow-symlinks` does not help. Also: `clasp push`
 never deletes remote files; delete them in the editor UI.
 
-Live source is pulled to `gas/`, **gitignored** — it is production code and
-carries `ALPHA_ID`. It holds no secrets (`ANTHROPIC_KEY` and the governor
-passphrase are Script Properties). `.clasp.json` IS tracked; it only has the
-scriptId.
+**Never run `clasp pull` from the repo root.** It follows `.clasp.json` and would
+overwrite the reviewed source of truth. To inspect what an immutable deployment
+actually contains, first read its pinned version, then export that exact version
+to a separate temporary directory:
 
-**On a machine that is not this laptop:** `.clasp.json` used to hardcode
-`rootDir: "C:/Users/salam/Quantum/Blackboard/gas"`, so every clasp command run
-from the repo root died with *"srcDir ... escapes project root"*. It is now the
-relative `"gas"`, confirmed working on AkatiaVM by vm-cli. One thing that does
-not follow from the fix: `gas/` is gitignored, so a fresh clone has only the
-`.gitkeep`. Read commands (`list-deployments`, `clone`) do not care, but
-**`clasp push` resolves `rootDir` first and will fail until you pull the source
-down** — run `clasp pull` before your first push on a new machine.
+```
+clasp list-deployments
+python scripts/gas_get_version.py <scriptId> <versionNumber> <scratchDir>
+```
+
+Compare the scratch export with the candidate commit and leave it untracked.
+Existing local `gas/` snapshots may be retained for evidence, but they are not
+proof of what is currently deployed and must never be pushed.
 
 ---
 

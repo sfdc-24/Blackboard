@@ -30,9 +30,8 @@
  * RUN
  *   node tests/test_tts_guards.js
  *
- * REQUIRES gas/Code.js, which is gitignored (it is live production source
- * pulled by clasp). On a fresh clone run `clasp pull` first; without it this
- * exits 2 and says so rather than reporting a pass it did not earn.
+ * Loads the tracked Governor source of truth. This is offline evidence about
+ * the reviewed source; production still needs immutable-version read-back.
  */
 'use strict';
 
@@ -41,10 +40,10 @@ const path = require('path');
 const vm = require('vm');
 const crypto = require('crypto');
 
-const CODE_PATH = path.join(__dirname, '..', 'gas', 'Code.js');
+const CODE_PATH = path.join(__dirname, '..', 'apps-script', 'governor-page-api', 'Code.gs');
 if (!fs.existsSync(CODE_PATH)) {
   console.error('SKIP-AS-FAILURE: ' + CODE_PATH + ' not found.');
-  console.error('gas/ is gitignored; run `clasp pull` from the repo root first.');
+  console.error('The tracked Governor source tree is incomplete.');
   process.exit(2);
 }
 const SOURCE = fs.readFileSync(CODE_PATH, 'utf8');
@@ -151,7 +150,7 @@ function makeRuntime(opts) {
   if (opts.legacyMint && src === SOURCE) {
     throw new Error('legacy-mint rewrite matched nothing -- the guard under test has moved; fix this harness before trusting it');
   }
-  vm.runInContext(src, ctx, { filename: 'gas/Code.js' });
+  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Code.gs' });
 
   // The pre-fix claim: read, then delete, with nothing in between holding the
   // two together. Restored verbatim in shape so the witness tests describe the

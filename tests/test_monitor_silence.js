@@ -30,8 +30,8 @@
  * RUN
  *   node tests/test_monitor_silence.js
  *
- * REQUIRES gas/Monitor.js and gas/Code.js (for iso_ and sheet_), both gitignored.
- * Run `clasp pull` first on a fresh clone; this exits 2 rather than passing.
+ * Loads tracked Monitor.gs and Code.gs from the Governor source of truth. This
+ * is offline evidence; production still needs immutable-version read-back.
  */
 'use strict';
 
@@ -39,10 +39,10 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const GAS = path.join(__dirname, '..', 'gas');
-for (const f of ['Monitor.js', 'Code.js']) {
-  if (!fs.existsSync(path.join(GAS, f))) {
-    console.error('SKIP-AS-FAILURE: gas/' + f + ' not found. gas/ is gitignored; run `clasp pull` first.');
+const GOVERNOR = path.join(__dirname, '..', 'apps-script', 'governor-page-api');
+for (const f of ['Monitor.gs', 'Code.gs']) {
+  if (!fs.existsSync(path.join(GOVERNOR, f))) {
+    console.error('SKIP-AS-FAILURE: tracked Governor source ' + f + ' not found.');
     process.exit(2);
   }
 }
@@ -98,7 +98,7 @@ function makeRuntime(rows, opts) {
       }
     },
     Utilities: { formatDate: (d) => new Date(d).toISOString().slice(0, 10) },
-    // scanBoard_ reaches for sheet_() and iso_() from Code.js; sheet_ is the
+    // scanBoard_ reaches for sheet_() and iso_() from Code.gs; sheet_ is the
     // board binding and is stubbed, iso_ is real and is part of what is on trial.
     sheet_: () => ({ sheet, hdr: { row: 1, names: HEADER, idx: HEADER.reduce((a, n, i) => (a[n] = i, a), {}) } }),
     requireGovernor_: () => {},
@@ -106,14 +106,14 @@ function makeRuntime(rows, opts) {
   };
 
   const ctx = vm.createContext(sandbox);
-  // iso_ lives in Code.js. Pull in just that one line rather than the whole
+  // iso_ lives in Code.gs. Pull in just that one line rather than the whole
   // file, which would drag the reception stack in with it.
-  const isoLine = fs.readFileSync(path.join(GAS, 'Code.js'), 'utf8')
+  const isoLine = fs.readFileSync(path.join(GOVERNOR, 'Code.gs'), 'utf8')
     .split('\n').find((l) => l.indexOf('function iso_(') === 0);
-  if (!isoLine) throw new Error('iso_ not found in gas/Code.js -- fix this harness before trusting it');
-  vm.runInContext(isoLine, ctx, { filename: 'gas/Code.js#iso_' });
+  if (!isoLine) throw new Error('iso_ not found in tracked Code.gs -- fix this harness before trusting it');
+  vm.runInContext(isoLine, ctx, { filename: 'apps-script/governor-page-api/Code.gs#iso_' });
 
-  let src = fs.readFileSync(path.join(GAS, 'Monitor.js'), 'utf8');
+  let src = fs.readFileSync(path.join(GOVERNOR, 'Monitor.gs'), 'utf8');
   if (opts.legacyScan) {
     const before = src;
     src = src.replace(
@@ -127,7 +127,7 @@ function makeRuntime(rows, opts) {
        if (!isNaN(_ms)) res.ageHours = _ms / 3600000;`);
     if (src === before) throw new Error('legacy-scan rewrite matched nothing -- scanBoard_ has moved; fix this harness');
   }
-  vm.runInContext(src, ctx, { filename: 'gas/Monitor.js' });
+  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Monitor.gs' });
 
   return { ctx, sent, props, scan: () => ctx.scanBoard_() };
 }

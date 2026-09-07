@@ -98,7 +98,7 @@ def fetch_version(script_id: str, version: int, dest: Path) -> None:
     """Pull one deployed version through clasp into an isolated directory.
 
     Isolated on purpose: `clasp pull` writes into rootDir, so running it in the
-    repo would overwrite gas/ — the live working source — with an older version.
+    repo would overwrite the tracked reviewed source with an older version.
     """
     dest.mkdir(parents=True, exist_ok=True)
     (dest / ".clasp.json").write_text(
