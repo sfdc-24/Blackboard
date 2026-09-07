@@ -113,11 +113,13 @@ function Invoke-Installer {
         [Parameter(Mandatory = $true)] $Archive,
         [Parameter(Mandatory = $true)][string] $ReleaseId,
         [string] $Digest = '',
-        [string] $TargetReleaseRoot = ''
+        [string] $TargetReleaseRoot = '',
+        [string] $InstallerUnderTest = ''
     )
 
     if ([string]::IsNullOrEmpty($Digest)) { $Digest = [string]$Archive.sha256 }
     if ([string]::IsNullOrEmpty($TargetReleaseRoot)) { $TargetReleaseRoot = $script:ReleaseRoot }
+    if ([string]::IsNullOrEmpty($InstallerUnderTest)) { $InstallerUnderTest = $InstallerPath }
     $previousErrorActionPreference = $ErrorActionPreference
     $previousTemp = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
     $previousTmp = [Environment]::GetEnvironmentVariable('TMP', 'Process')
@@ -127,7 +129,7 @@ function Invoke-Installer {
         [Environment]::SetEnvironmentVariable('TMP', $script:InstallerTempRoot, 'Process')
         $lines = @(
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
-                -File $InstallerPath `
+                -File $InstallerUnderTest `
                 -Payload ([string]$Archive.payload) `
                 -ArchiveSha256 $Digest `
                 -ReleaseId $ReleaseId `
@@ -143,6 +145,92 @@ function Invoke-Installer {
     return [pscustomobject]@{
         exit_code = $installerExitCode
         output = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+    }
+}
+
+function New-FaultInjectedInstaller {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('CleanupFailure', 'CleanupScopePreflight')]
+        [string] $Mode
+    )
+
+    $source = [IO.File]::ReadAllText($InstallerPath, [Text.Encoding]::UTF8)
+    if ($Mode -ceq 'CleanupFailure') {
+        $needle = '        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction Stop'
+        $replacement = "        throw 'test_cleanup_failure'"
+    }
+    else {
+        $needle = `
+            '$temporaryRoot = Join-Path $resolvedSystemTemp (' +
+            "'blackboard-release-' + [Guid]::NewGuid().ToString('N'))"
+        $replacement = '$temporaryRoot = $resolvedSystemTemp'
+    }
+    $firstMatch = $source.IndexOf($needle, [StringComparison]::Ordinal)
+    if (
+        $firstMatch -lt 0 -or
+        $firstMatch -ne $source.LastIndexOf($needle, [StringComparison]::Ordinal)
+    ) {
+        throw ('test_fault_injection_anchor_invalid:' + $Mode)
+    }
+
+    $instrumentedPath = Join-Path `
+        $script:TestRoot `
+        ('install_release_from_archive.' + $Mode.ToLowerInvariant() + '.ps1')
+    Write-TestUtf8 `
+        -Path $instrumentedPath `
+        -Text $source.Replace($needle, $replacement)
+    return $instrumentedPath
+}
+
+function Get-TestInstallerTempArtifacts {
+    return @(
+        Get-ChildItem -LiteralPath $script:InstallerTempRoot -Force -ErrorAction SilentlyContinue
+    )
+}
+
+function Test-IsSingleBoundedInstallerTempArtifact {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Items)
+
+    if ($Items.Count -ne 1) { return $false }
+    $item = $Items[0]
+    $resolvedInstallerTemp = [IO.Path]::GetFullPath($script:InstallerTempRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $installerTempPrefix = $resolvedInstallerTemp + [IO.Path]::DirectorySeparatorChar
+    $resolvedItem = [IO.Path]::GetFullPath($item.FullName).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    return (
+        $resolvedItem.StartsWith($installerTempPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+        $item.PSIsContainer -and
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+        [IO.Path]::GetFileName($resolvedItem) -cmatch '^blackboard-release-[0-9a-f]{32}$'
+    )
+}
+
+function Remove-TestInstallerTempArtifacts {
+    $resolvedInstallerTemp = [IO.Path]::GetFullPath($script:InstallerTempRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $installerTempPrefix = $resolvedInstallerTemp + [IO.Path]::DirectorySeparatorChar
+    foreach ($item in @(Get-TestInstallerTempArtifacts)) {
+        $resolvedItem = [IO.Path]::GetFullPath($item.FullName).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+        if (
+            -not $resolvedItem.StartsWith($installerTempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [IO.Path]::GetFileName($resolvedItem) -cnotmatch '^blackboard-release-[0-9a-f]{32}$'
+        ) {
+            throw 'test_installer_temp_cleanup_scope_invalid'
+        }
+        Remove-Item -LiteralPath $resolvedItem -Recurse -Force -ErrorAction Stop
     }
 }
 
@@ -175,6 +263,8 @@ function Get-TestRelativeInventory {
 try {
     New-Item -ItemType Directory -Path $script:TestRoot | Out-Null
     New-Item -ItemType Directory -Path $script:InstallerTempRoot | Out-Null
+    $cleanupFailureInstaller = New-FaultInjectedInstaller -Mode 'CleanupFailure'
+    $cleanupScopePreflightInstaller = New-FaultInjectedInstaller -Mode 'CleanupScopePreflight'
     $archiveA = New-TestArchive -Name 'valid-a' -Variant 'A'
     $archiveB = New-TestArchive -Name 'valid-b' -Variant 'B'
     $missingArchive = New-TestArchive `
@@ -237,6 +327,111 @@ try {
         }
     }
     Assert-True 'manifest per-file hashes match installed bytes' $validHashesMatch
+
+    $validOutputLines = @(
+        $validInstall.output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    Assert-True 'successful receipt is emitted once after explicit cleanup success' (
+        $validOutputLines.Count -eq 1 -and
+        (($validResult.PSObject.Properties.Name) -join '|') -ceq
+            'status|release_id|archive_sha256|destination|required_file_count|cleanup_status|cleanup_code' -and
+        $validResult.cleanup_status -ceq 'SUCCEEDED' -and
+        $null -eq $validResult.cleanup_code
+    ) $validInstall.output
+
+    $cleanupFaultReleaseId = ('21' * 20)
+    $cleanupFaultInstall = Invoke-Installer `
+        -Archive $archiveA `
+        -ReleaseId $cleanupFaultReleaseId `
+        -InstallerUnderTest $cleanupFailureInstaller
+    $cleanupFaultInstallResult = Read-ResultJson -Text $cleanupFaultInstall.output
+    $cleanupFaultInstallLines = @(
+        $cleanupFaultInstall.output -split "`r?`n" |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $cleanupFaultDestination = Join-Path $script:ReleaseRoot $cleanupFaultReleaseId
+    $cleanupFaultInstallResidue = @(Get-TestInstallerTempArtifacts)
+    Assert-True 'installed release returns one bounded success receipt when cleanup fails' (
+        $cleanupFaultInstall.exit_code -eq 0 -and
+        $cleanupFaultInstallLines.Count -eq 1 -and
+        $cleanupFaultInstallResult -and
+        $cleanupFaultInstallResult.status -ceq 'INSTALLED' -and
+        $cleanupFaultInstallResult.cleanup_status -ceq 'FAILED' -and
+        $cleanupFaultInstallResult.cleanup_code -ceq 'TEMPORARY_CLEANUP_FAILED' -and
+        (Test-Path -LiteralPath $cleanupFaultDestination -PathType Container) -and
+        (Test-IsSingleBoundedInstallerTempArtifact -Items $cleanupFaultInstallResidue)
+    ) $cleanupFaultInstall.output
+    Remove-TestInstallerTempArtifacts
+
+    $cleanupFaultManifestPath = Join-Path $cleanupFaultDestination '.release.json'
+    $cleanupFaultManifestBeforeReplay = [Convert]::ToBase64String(
+        [IO.File]::ReadAllBytes($cleanupFaultManifestPath)
+    )
+    $cleanupFaultReplay = Invoke-Installer `
+        -Archive $archiveA `
+        -ReleaseId $cleanupFaultReleaseId `
+        -InstallerUnderTest $cleanupFailureInstaller
+    $cleanupFaultReplayResult = Read-ResultJson -Text $cleanupFaultReplay.output
+    $cleanupFaultReplayLines = @(
+        $cleanupFaultReplay.output -split "`r?`n" |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $cleanupFaultManifestAfterReplay = [Convert]::ToBase64String(
+        [IO.File]::ReadAllBytes($cleanupFaultManifestPath)
+    )
+    $cleanupFaultReplayResidue = @(Get-TestInstallerTempArtifacts)
+    Assert-True 'validated replay returns one bounded success receipt when cleanup fails' (
+        $cleanupFaultReplay.exit_code -eq 0 -and
+        $cleanupFaultReplayLines.Count -eq 1 -and
+        $cleanupFaultReplayResult -and
+        $cleanupFaultReplayResult.status -ceq 'ALREADY_INSTALLED' -and
+        $cleanupFaultReplayResult.cleanup_status -ceq 'FAILED' -and
+        $cleanupFaultReplayResult.cleanup_code -ceq 'TEMPORARY_CLEANUP_FAILED' -and
+        $cleanupFaultManifestAfterReplay -ceq $cleanupFaultManifestBeforeReplay -and
+        (Test-IsSingleBoundedInstallerTempArtifact -Items $cleanupFaultReplayResidue)
+    ) $cleanupFaultReplay.output
+    Remove-TestInstallerTempArtifacts
+
+    $preflightCleanupReleaseId = ('24' * 20)
+    $preflightCleanupResult = Invoke-Installer `
+        -Archive $archiveA `
+        -ReleaseId $preflightCleanupReleaseId `
+        -InstallerUnderTest $cleanupScopePreflightInstaller
+    $preflightCleanupJsonLines = @(
+        $preflightCleanupResult.output -split "`r?`n" | Where-Object { $_ -match '^\{.*\}$' }
+    )
+    Assert-True 'cleanup scope preflight fails before destination mutation' (
+        $preflightCleanupResult.exit_code -ne 0 -and
+        $preflightCleanupResult.output -match 'temporary_cleanup_scope_invalid' -and
+        $preflightCleanupJsonLines.Count -eq 0 -and
+        @(Get-TestInstallerTempArtifacts).Count -eq 0 -and
+        -not (Test-Path -LiteralPath (Join-Path $script:ReleaseRoot $preflightCleanupReleaseId))
+    ) $preflightCleanupResult.output
+
+    $primaryCleanupReleaseId = ('23' * 20)
+    $primaryCleanupWrongDigest = ('0' * 64)
+    if ($primaryCleanupWrongDigest -ceq $archiveA.sha256) {
+        $primaryCleanupWrongDigest = ('f' * 64)
+    }
+    $primaryCleanupResult = Invoke-Installer `
+        -Archive $archiveA `
+        -ReleaseId $primaryCleanupReleaseId `
+        -Digest $primaryCleanupWrongDigest `
+        -InstallerUnderTest $cleanupFailureInstaller
+    $primaryCleanupJsonLines = @(
+        $primaryCleanupResult.output -split "`r?`n" | Where-Object { $_ -match '^\{.*\}$' }
+    )
+    $primaryCleanupResidue = @(Get-TestInstallerTempArtifacts)
+    Assert-True 'primary error record survives a simultaneous cleanup failure' (
+        $primaryCleanupResult.exit_code -ne 0 -and
+        $primaryCleanupResult.output -match 'archive_digest_mismatch' -and
+        $primaryCleanupResult.output -match 'FullyQualifiedErrorId\s*:\s*archive_digest_mismatch' -and
+        $primaryCleanupResult.output -notmatch 'test_cleanup_failure' -and
+        $primaryCleanupJsonLines.Count -eq 0 -and
+        (Test-IsSingleBoundedInstallerTempArtifact -Items $primaryCleanupResidue) -and
+        -not (Test-Path -LiteralPath (Join-Path $script:ReleaseRoot $primaryCleanupReleaseId))
+    ) $primaryCleanupResult.output
+    Remove-TestInstallerTempArtifacts
 
     $shortReleaseId = 'abcdef0'
     $shortReleaseResult = Invoke-Installer -Archive $archiveA -ReleaseId $shortReleaseId
