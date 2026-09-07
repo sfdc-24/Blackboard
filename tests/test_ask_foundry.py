@@ -138,6 +138,105 @@ class PacketContractTests(unittest.TestCase):
 
 
 class EndpointAndCliTests(unittest.TestCase):
+    def test_safe_config_read_skips_api_key_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / ".foundry.env"
+            path.write_text(
+                "FOUNDRY_PROJECT_ENDPOINT=https://unit.services.ai.azure.com/api/projects/blackboard\n"
+                "FOUNDRY_API_KEY=must-not-be-loaded\n"
+                "FOUNDRY_AUTH_MODE=entra\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(foundry, "ENV_FILES", (path,)):
+                safe = foundry.load_config(include_api_key=False)
+                full = foundry.load_config(include_api_key=True)
+        self.assertNotIn("FOUNDRY_API_KEY", safe)
+        self.assertEqual(safe["FOUNDRY_AUTH_MODE"], "entra")
+        self.assertEqual(full["FOUNDRY_API_KEY"], "must-not-be-loaded")
+
+    def test_entra_token_uses_static_azure_cli_request(self) -> None:
+        completed = foundry.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="short-lived-token\n", stderr=""
+        )
+        with (
+            mock.patch.object(foundry.shutil, "which", return_value="az"),
+            mock.patch.object(foundry.subprocess, "run", return_value=completed) as run,
+        ):
+            token = foundry.acquire_entra_token(120)
+        self.assertEqual(token, "short-lived-token")
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["az", "account", "get-access-token"])
+        self.assertIn(foundry.ENTRA_RESOURCE, command)
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertFalse(run.call_args.kwargs["check"])
+
+    def test_entra_token_failure_does_not_echo_cli_output(self) -> None:
+        completed = foundry.subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="sensitive cli diagnostics"
+        )
+        with (
+            mock.patch.object(foundry.shutil, "which", return_value="az"),
+            mock.patch.object(foundry.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaises(foundry.AdapterError) as caught:
+                foundry.acquire_entra_token(120)
+        rendered = json.dumps(caught.exception.artifact())
+        self.assertEqual(caught.exception.code, "ENTRA_TOKEN_UNAVAILABLE")
+        self.assertNotIn("sensitive", rendered)
+
+    def test_entra_request_uses_bearer_header_only(self) -> None:
+        captured: dict = {}
+
+        def fake_open(request, timeout):
+            captured["headers"] = dict(request.header_items())
+            captured["timeout"] = timeout
+            return FakeResponse({"value": []})
+
+        with mock.patch.object(foundry.HTTP_OPENER, "open", side_effect=fake_open):
+            foundry.request_json(
+                "https://unit.services.ai.azure.com/api/projects/blackboard/agents",
+                "short-lived-token",
+                auth_mode="entra",
+            )
+        headers = {key.lower(): value for key, value in captured["headers"].items()}
+        self.assertEqual(headers["authorization"], "Bearer short-lived-token")
+        self.assertNotIn("api-key", headers)
+
+    def test_explicit_entra_main_never_loads_api_key(self) -> None:
+        remote = {
+            "id": "resp-entra-1",
+            "status": "completed",
+            "model": "reported-model",
+            "output_text": "OK",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+        config_calls: list[bool] = []
+
+        def safe_config(*, include_api_key=True):
+            config_calls.append(include_api_key)
+            if include_api_key:
+                raise AssertionError("Entra mode must not load the API key")
+            return {
+                "FOUNDRY_PROJECT_ENDPOINT": (
+                    "https://unit.services.ai.azure.com/api/projects/blackboard"
+                )
+            }
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(foundry, "load_config", side_effect=safe_config),
+            mock.patch.object(foundry, "acquire_entra_token", return_value="token"),
+            mock.patch.object(foundry.HTTP_OPENER, "open", return_value=FakeResponse(remote)),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = foundry.main(
+                ["--auth", "entra", "--prompt", "smoke", "--model", "reported-model"]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(config_calls, [False])
+        self.assertEqual(stdout.getvalue(), "OK\n")
+
     def test_accepts_expected_project_hosts(self) -> None:
         endpoints = [
             "https://project.services.ai.azure.com/api/projects/blackboard",
