@@ -21,6 +21,8 @@
  *   CHAT_MODEL        model id                 (default below)
  *   CHAT_ENABLED      set to "off" to kill reception replies instantly
  *   CHAT_DAILY_CAP    max AI replies per UTC day (default 150)
+ *   TTS_SESSION_CAP   max paid speech attempts per voice session (default 8)
+ *   TTS_DAILY_CAP     max paid speech attempts per UTC day, whole site (default 60)
  */
 var ALPHA_ID   = '120_71KaF4JKGPGz0qUz4phqWRljSqEzSRRm_0zXC_oY';
 var TARGET     = 'governor-page';
@@ -34,6 +36,12 @@ var CHAT_MAX_TURNS     = 12;     // history sent to the model
 var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
 var CHAT_DAILY_DEFAULT = 150;    // AI replies per UTC day, whole site
 var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and cap cost
+
+var TTS_SESSION_DEFAULT = 8;     // provider attempts per voice session
+var TTS_DAILY_DEFAULT   = 60;    // provider attempts per UTC day, whole site
+var TTS_KEY_TTL_SECS    = 900;
+var TTS_KEY_PROP_PREFIX = 'TTS_KEY_V1_';
+var TTS_BUDGET_STATE    = 'TTS_BUDGET_V1';
 
 // ---------- web entry points ----------
 function doGet(e) {
@@ -71,6 +79,11 @@ function doGet(e) {
   t.selfUrl = ScriptApp.getService().getUrl();
   t.view = view;
   t.voice = p.voice === '1' ? '1' : '';
+  // Echoed only into a postMessage ready signal. The parent created this nonce;
+  // it is not authentication and grants no capability.
+  t.readyNonce = /^[A-Za-z0-9_-]{16,64}$/.test(String(p.ready_nonce || ''))
+    ? String(p.ready_nonce)
+    : '';
   // Signed-in state is rendered server-side from the token in the URL. An
   // absent or tampered token simply renders as signed out.
   var sess = readSession_(p.s);
@@ -197,17 +210,9 @@ function voiceReply_(p) {
   // synthesis costs a couple of seconds and the reply should appear the moment
   // it exists -- so this response hands back a key, the page renders the text
   // immediately, and the audio arrives underneath it.
-  //
-  // `!out.degraded` is the cap. `offline_` returns ok:true with a canned note,
-  // so the old condition minted a paid render for every reply the chat budget
-  // had ALREADY refused: past the session cap, past the daily cap, with no
-  // Anthropic key, after an upstream error -- and with CHAT_ENABLED=off, which
-  // stopped the model and not the bill. The caps only bound cost if the paid
-  // path is bounded by the same decision, so a canned note is spoken by the
-  // browser's own synthesiser and never bought. (P0 issue 2, 2026-09-05.)
   if (out && out.ok && out.reply && !out.degraded && ttsConfigured_()) {
-    var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
-    try { cache.put('tts_' + ak, out.reply, 900); out.ak = ak; } catch (e) {}
+    var ak = mintTtsKey_(sid, out.reply);
+    if (ak) out.ak = ak;
   }
 
   return jsonp_(cb, out || { ok: false, reason: 'no-result' });
@@ -259,32 +264,163 @@ function ttsConfigured_() {
   return !!props.getProperty('OPENAI_KEY');
 }
 
-// ONE paid render per key -- actually, rather than by comment. `get` then
-// `remove` is not atomic: two requests carrying the same ak can both read the
-// text before either deletes it, and each pays for its own render, so the key
-// was single-use only in the absence of concurrency. The script lock makes the
-// claim exclusive: the first caller takes the text and deletes it inside the
-// critical section, every other caller sees `expired`.
-//
-// HONEST LIMIT: CacheService is eventually consistent (the same property that
-// forced the v15 idempotency fix to read the sheet instead of the cache), so
-// the lock closes the window from "any two concurrent callers" to "a cache
-// replica that has not yet observed the delete". It is a large reduction, not a
-// proof of exactly-once. It is proportionate because the mint side is now
-// bounded by the chat caps: the worst case is a small multiplier on at most
-// CHAT_SESSION_CAP renders per session, not an open-ended bill. A strongly
-// consistent claim would need a sheet write per render.
-function ttsClaim_(ak) {
-  var cache = CacheService.getScriptCache();
-  var lock  = LockService.getScriptLock();
-  try { lock.waitLock(10000); } catch (e) { return null; }
+// Property-backed claims below replace v30's cache-only claim.
+function ttsDay_(now) {
+  return Utilities.formatDate(new Date(now), 'GMT', 'yyyy-MM-dd');
+}
+
+function ttsSessionHash_(sid) {
   try {
-    var text = cache.get('tts_' + ak);
-    if (!text) return null;
-    cache.remove('tts_' + ak);
-    return text;
+    var bytes = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(sid || ''),
+      Utilities.Charset.UTF_8);
+    var out = '';
+    for (var i = 0; i < 16; i++) {
+      var n = (Number(bytes[i]) + 256) % 256;
+      out += ('0' + n.toString(16)).slice(-2);
+    }
+    return out;
+  } catch (e) {
+    // Collision here can only make two sessions share a stricter cap. It cannot
+    // increase the whole-site budget.
+    return String(sid || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'empty';
+  }
+}
+
+function ttsLimit_(props, name, fallback, maximum) {
+  var raw = props.getProperty(name);
+  if (raw === null || raw === '') return fallback;
+  var value = Number(raw);
+  if (!isFinite(value) || value < 0) return fallback;
+  return Math.min(Math.floor(value), maximum);
+}
+
+/**
+ * Read or reserve the two paid-speech budgets. The caller must hold the script
+ * lock. One JSON property keeps the current UTC day and its bounded session map;
+ * a day rollover replaces the whole value, so per-session counters do not leak
+ * into permanent Script Properties.
+ */
+function ttsBudget_(props, sessionHash, now, reserve) {
+  var day = ttsDay_(now);
+  var state = { day: day, daily: 0, sessions: {} };
+  try {
+    var parsed = JSON.parse(props.getProperty(TTS_BUDGET_STATE) || '{}');
+    if (parsed && parsed.day === day) {
+      state.daily = Math.max(0, Number(parsed.daily) || 0);
+      state.sessions = parsed.sessions && typeof parsed.sessions === 'object'
+        ? parsed.sessions
+        : {};
+    }
+  } catch (e) {}
+
+  var dailyCap = ttsLimit_(props, 'TTS_DAILY_CAP', TTS_DAILY_DEFAULT, 200);
+  var sessionCap = ttsLimit_(props, 'TTS_SESSION_CAP', TTS_SESSION_DEFAULT, 50);
+  var sessionUsed = Math.max(0, Number(state.sessions[sessionHash]) || 0);
+
+  if (state.daily >= dailyCap) return { ok: false, reason: 'tts-daily-cap' };
+  if (sessionUsed >= sessionCap) return { ok: false, reason: 'tts-session-cap' };
+
+  if (reserve) {
+    state.daily += 1;
+    sessionUsed += 1;
+    state.sessions[sessionHash] = sessionUsed;
+    // If this write fails, the caller fails closed and never reaches the provider.
+    props.setProperty(TTS_BUDGET_STATE, JSON.stringify(state));
+  }
+  return {
+    ok: true,
+    dailyUsed: state.daily,
+    dailyCap: dailyCap,
+    sessionUsed: sessionUsed,
+    sessionCap: sessionCap
+  };
+}
+
+function purgeExpiredTtsKeys_(props, now) {
+  var all = props.getProperties();
+  var names = Object.keys(all);
+  var removed = 0;
+  for (var i = 0; i < names.length && removed < 50; i++) {
+    var name = names[i];
+    if (name.indexOf(TTS_KEY_PROP_PREFIX) !== 0) continue;
+    var expiry = 0;
+    try { expiry = Number(JSON.parse(all[name] || '{}').expires) || 0; } catch (e) {}
+    if (!expiry || expiry <= now) { props.deleteProperty(name); removed += 1; }
+  }
+}
+
+function mintTtsKey_(sid, text) {
+  sid = String(sid || '').slice(0, 60);
+  text = String(text || '').slice(0, TTS_MAX_CHARS);
+  if (!sid || !text) return '';
+
+  var props = PropertiesService.getScriptProperties();
+  var cache = CacheService.getScriptCache();
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  var cacheKey = '';
+  try {
+    lock.waitLock(10000); locked = true;
+    var now = Date.now();
+    purgeExpiredTtsKeys_(props, now);
+    var sessionHash = ttsSessionHash_(sid);
+    if (!ttsBudget_(props, sessionHash, now, false).ok) return '';
+
+    var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+    cacheKey = 'tts_' + ak;
+    cache.put(cacheKey, text, TTS_KEY_TTL_SECS);
+    props.setProperty(TTS_KEY_PROP_PREFIX + ak, JSON.stringify({
+      expires: now + TTS_KEY_TTL_SECS * 1000,
+      session: sessionHash
+    }));
+    return ak;
+  } catch (err) {
+    if (cacheKey) try { cache.remove(cacheKey); } catch (e) {}
+    return '';
   } finally {
-    try { lock.releaseLock(); } catch (e2) {}
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/**
+ * Atomically consume a key and reserve its budgets before a paid provider call.
+ * Text stays in expiring CacheService; the authoritative one-use claim and the
+ * budgets live in Script Properties under one script lock.
+ */
+function claimTts_(ak) {
+  var props = PropertiesService.getScriptProperties();
+  var cache = CacheService.getScriptCache();
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var markerName = TTS_KEY_PROP_PREFIX + ak;
+    var raw = props.getProperty(markerName);
+    if (!raw) return { ok: false, reason: 'expired' };
+
+    // This deletion is the claim. Every later caller is serialized by the same
+    // lock and sees no marker, even while the first provider request is in flight.
+    props.deleteProperty(markerName);
+
+    var marker;
+    try { marker = JSON.parse(raw); } catch (e) { marker = null; }
+    var cacheKey = 'tts_' + ak;
+    var text = cache.get(cacheKey);
+    cache.remove(cacheKey);
+    var now = Date.now();
+    if (!marker || Number(marker.expires) <= now || !marker.session || !text)
+      return { ok: false, reason: 'expired' };
+
+    var budget = ttsBudget_(props, String(marker.session), now, true);
+    if (!budget.ok) return budget;
+    budget.text = String(text).slice(0, TTS_MAX_CHARS);
+    return budget;
+  } catch (err) {
+    return { ok: false, reason: 'tts-state-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
   }
 }
 
@@ -299,11 +435,11 @@ function ttsAudio_(p) {
   if (!ttsConfigured_()) return jsonp_(cb, { ok: false, reason: 'no-key' });
   var key = props.getProperty('OPENAI_KEY');
 
-  // Claim the key BEFORE spending anything. Losing the race is `expired`, the
-  // same answer a stale key gets, because a caller cannot tell the difference
-  // and does not need to.
-  var text = ttsClaim_(ak);
-  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
+  var claim = claimTts_(ak);
+  if (!claim.ok) return jsonp_(cb, { ok: false, reason: claim.reason });
+
+  Logger.log('TTS provider attempt: daily ' + claim.dailyUsed + '/' + claim.dailyCap +
+             ', session ' + claim.sessionUsed + '/' + claim.sessionCap);
 
   var res;
   try {
@@ -315,7 +451,7 @@ function ttsAudio_(p) {
       payload: JSON.stringify({
         model: TTS_MODEL,
         voice: ttsVoice_(p.v),
-        input: String(text).slice(0, TTS_MAX_CHARS),
+        input: claim.text,
         response_format: 'mp3',
         instructions: props.getProperty('TTS_STYLE') || TTS_STYLE_()
       })
