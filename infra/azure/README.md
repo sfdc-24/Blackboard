@@ -144,7 +144,10 @@ disabled. Accept only one terminal
 `blackboard.order-system-adapter-smoke.v1` JSON receipt with `pass:true`, every
 proof flag true, `provider_inference_attempted:false`,
 `external_write_attempted:false`, environment restoration `SUCCEEDED`, and
-temporary cleanup `SUCCEEDED`.
+temporary cleanup `SUCCEEDED`. The smoke caps that sole receipt at 3,072 UTF-8
+bytes so it remains below Managed Run Command's retained-output boundary; an
+unparseable or truncated receipt is a failed smoke regardless of execution
+state or exit code.
 
 The bounded adapter targets the VM-pinned Claude Code 2.1.241 compatibility
 contract. With subprocess credential scrubbing enabled, that version forces its

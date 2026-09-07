@@ -1209,7 +1209,8 @@ $receipt.observed_at_utc = [DateTime]::UtcNow.ToString(
     [Globalization.CultureInfo]::InvariantCulture
 )
 $receiptJson = $receipt | ConvertTo-Json -Depth 8 -Compress
-if ($receiptJson.Length -gt 16384) {
+$receiptByteCount = [Text.Encoding]::UTF8.GetByteCount($receiptJson)
+if ($receiptByteCount -gt 3072) {
     $receiptJson = '{"schema":"blackboard.order-system-adapter-smoke.v1","pass":false,"failure_code":"RECEIPT_TOO_LARGE"}'
     $primaryCode = 'RECEIPT_TOO_LARGE'
 }

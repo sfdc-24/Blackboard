@@ -424,6 +424,13 @@ try {
     $invalidProbeErrors = @($parserProbeErrors | Where-Object { $_.Path -eq $invalidParserProbe })
     Test-Case -Name 'parser diagnostics retain an earlier-file error when a later file is clean' -Condition ($invalidProbeErrors.Count -gt 0) -Detail (@($parserProbeErrors | ForEach-Object { $_.Path + ': ' + $_.Message }) -join '; ')
 
+    $productionSourceText = [IO.File]::ReadAllText($script:SourceSmoke, [Text.Encoding]::UTF8)
+    Test-Case -Name 'production receipt guard uses the 3072-byte Managed Run Command transport bound' -Condition (
+        $productionSourceText.Contains('$receiptByteCount = [Text.Encoding]::UTF8.GetByteCount($receiptJson)') -and
+        $productionSourceText.Contains('if ($receiptByteCount -gt 3072)') -and
+        -not $productionSourceText.Contains('if ($receiptJson.Length -gt 16384)')
+    )
+
     # Behavioral cases are below. Each case starts from a rebuilt six-file release.
     $parameters = New-DefaultParameters
     $fixture = New-DefaultFixture
@@ -461,7 +468,7 @@ try {
         (@($success.receipt.effective_tools) -join '|') -ceq 'Read|Edit|PowerShell|StructuredOutput'
     )
     Test-Case -Name 'receipt is bounded and excludes protected/sentinel material' -Condition (
-        $success.stdout.Length -lt 16384 -and
+        [Text.Encoding]::UTF8.GetByteCount($success.stdout) -le 3072 -and
         -not $success.stdout.Contains('real-file-must-never-be-read') -and
         -not $success.stdout.Contains('must-not-reach-fake-or-receipt') -and
         -not $success.stdout.Contains($script:EnvPath) -and
