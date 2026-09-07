@@ -11,7 +11,7 @@ on:
         description: 'Project dir under apps-script/'
         required: true
         type: choice
-        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+        options: [governor-page-api, glasses-intake-uploader]
       version:
         description: 'Known-good version number to roll back to'
         required: true

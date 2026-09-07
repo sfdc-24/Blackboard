@@ -11,6 +11,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 HEALTH = json.dumps({"ok": True, "service": "sfdc24-glasses-uploader", "version": 2})
+GOVERNOR_HEALTH = json.dumps({"ok": True, "schema": 1, "service": "sfdc24-build",
+                              "project": "governor-page-api", "commit": "a" * 40,
+                              "sourceSha256": "b" * 64, "nonce": ""})
 SCRIPT_ID = "stage-script"
 
 
@@ -49,6 +52,16 @@ class AuditAcceptance(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(calls, 1)
 
+    def test_default_estate_contains_only_reviewed_http_apps(self):
+        self.assertEqual(set(self.audit.ESTATE), {"governor-page-api", "glasses-intake-uploader"})
+
+    def test_governor_uses_its_build_health_contract(self):
+        result, _, calls = self.run_audit(
+            [{"deployments": [deployment()]}], response=GOVERNOR_HEALTH,
+            estate={"governor-page-api": SCRIPT_ID})
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, 1)
+
     def test_empty_inventory_fails(self):
         self.assertNotEqual(self.run_audit([{"deployments": []}])[0], 0)
 
@@ -78,7 +91,7 @@ class AuditAcceptance(unittest.TestCase):
 
     def test_projects_without_reviewed_health_contract_fail(self):
         self.assertNotEqual(self.run_audit([{"deployments": [deployment()]}],
-            estate={"governor-page-api": SCRIPT_ID})[0], 0)
+            estate={"unknown-project": SCRIPT_ID})[0], 0)
 
     def test_non_anonymous_configuration_fails_even_with_healthy_response(self):
         self.assertNotEqual(self.run_audit([{"deployments": [deployment(access="MYSELF")]}])[0], 0)
@@ -129,7 +142,8 @@ class AuditAcceptance(unittest.TestCase):
         with patch("urllib.request.build_opener", return_value=opener), \
              patch("socket.socket", side_effect=AssertionError("Network forbidden")):
             status, body = self.audit.probe_anonymous("https://example.invalid/exec")
-        self.assertTrue(self.audit.app_answered(status, body, "sfdc24-glasses-uploader"))
+        self.assertTrue(self.audit.app_answered(
+            status, body, {"service": "sfdc24-glasses-uploader"}))
 
     def test_oversized_response_is_unverified(self):
         response, opener = MagicMock(), MagicMock()

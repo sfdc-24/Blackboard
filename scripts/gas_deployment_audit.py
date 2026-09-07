@@ -29,7 +29,6 @@ import urllib.request
 # production mutation by making prod one typo away.
 ESTATE = {
     "governor-page-api": "1S4LQE0SQwnE9kngxMhRngyAmSNGhFtDRxoYQqIxSSH0UoQ5u7T84MKU1",
-    "blackboard-production": "1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K",
     "glasses-intake-uploader": "1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI",
 }
 
@@ -54,23 +53,30 @@ GOOGLE_INTERSTITIALS = (
 )
 
 
-# Only the glasses app currently has a reviewed machine-readable health
-# signature. Other projects stay unverified until their owners add one.
-# This is application identity evidence, not a source/build hash assertion.
-EXPECTED_SERVICES = {"glasses-intake-uploader": "sfdc24-glasses-uploader"}
+# Only actual HTTP applications with reviewed positive health contracts belong
+# in the default audit. The drafts sweeper has no doGet/doPost and is excluded;
+# granting it Drive scope cannot make a web-app endpoint exist. This evidence
+# proves application identity only, not immutable source/build identity.
+EXPECTED_HEALTH = {
+    "governor-page-api": {
+        "service": "sfdc24-build", "project": "governor-page-api", "query": "?health=build"
+    },
+    "glasses-intake-uploader": {"service": "sfdc24-glasses-uploader"},
+}
 MAX_RESPONSE_BYTES = 256 * 1024
 
 
-def app_answered(status, body, expected_service=None):
+def app_answered(status, body, expected=None):
     """Require a positive JSON health signature; unknown HTML never proves it."""
-    if status != 200 or not body or not expected_service:
+    if status != 200 or not body or not isinstance(expected, dict):
         return False
     try:
         data = json.loads(body)
     except (ValueError, RecursionError):
         return False
+    required = {key: value for key, value in expected.items() if key != "query"}
     return (isinstance(data, dict) and data.get("ok") is True
-            and data.get("service") == expected_service
+            and all(data.get(key) == value for key, value in required.items())
             and data.get("error") in (None, ""))
 
 
@@ -180,14 +186,15 @@ def audit(name, script_id, tok):
                 raise ValueError("invalid versioned deployment identity")
             print(f"    - {dep_id[:28]}… @{version}  access={access}  executeAs={execute_as}")
             print(f"      {desc}")
-            status, body = probe_anonymous(url)
-            expected_service = EXPECTED_SERVICES.get(name)
-            anon_ok = app_answered(status, body, expected_service)
+            expected_health = EXPECTED_HEALTH.get(name)
+            probe_url = url + (expected_health or {}).get("query", "")
+            status, body = probe_anonymous(probe_url)
+            anon_ok = app_answered(status, body, expected_health)
             intercepted = any(m in (body or "") for m in GOOGLE_INTERSTITIALS)
             verdict = "expected health signature matched (build unverified)" if anon_ok else (
                 "Google interstitial, NOT the app" if intercepted else "NOT ANONYMOUS-READY")
             print(f"      anonymous GET -> {status} — {verdict}")
-            if not expected_service:
+            if not expected_health:
                 print("      missing reviewed JSON health contract for this project")
             findings.append({
                 "project": name, "deploymentId": dep_id, "version": version,
