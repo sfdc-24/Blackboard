@@ -12,6 +12,7 @@ on:
       - 'scripts/order_supervisor_result.schema.json'
       - 'infra/azure/blackboard_vm_supervisor.ps1'
       - 'tests/test_order_read_resilience.ps1'
+      - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
       - 'tests/test_azure_vm_supervisor.ps1'
@@ -33,6 +34,9 @@ jobs:
       - name: Test bounded ORDER board-read resilience
         shell: powershell
         run: .\tests\test_order_read_resilience.ps1
+      - name: Test ORDER state preservation
+        shell: powershell
+        run: .\tests\test_order_state_preservation.ps1
       - name: Test ORDER supervisor contracts
         shell: powershell
         run: .\tests\test_order_supervisor.ps1

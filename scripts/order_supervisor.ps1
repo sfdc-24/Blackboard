@@ -456,21 +456,23 @@ function Set-LocalError {
         try { Save-OrderState -Path $StatePath -State $state } catch {}
     } else {
         try {
-            $state = New-OrderState -Mode $Mode
-            $state.last_poll = [pscustomobject][ordered]@{
+            $freshState = New-OrderState -Mode $Mode
+            $freshState.last_poll = [pscustomobject][ordered]@{
                 at = Get-UtcStamp
                 run_id = $RunId
                 status = 'error'
             }
-            $state.error = [pscustomobject][ordered]@{
+            $freshState.error = [pscustomobject][ordered]@{
                 at = Get-UtcStamp
                 code = $Code
                 message = $safe
                 work_id = $WorkId
                 row_id = $RowId
             }
-            $state.counts.errors = 1
-            Save-OrderState -Path $StatePath -State $state
+            $freshState.counts.errors = 1
+            Save-OrderState -Path $StatePath -State $freshState -CreateNewOnly
+        } catch [IO.IOException] {
+            # Another writer or an unreadable existing state owns this path. Preserve it.
         } catch {}
     }
     try {
