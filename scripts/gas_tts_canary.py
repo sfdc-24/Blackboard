@@ -353,13 +353,14 @@ def main():
                              target['script_id'])
             print('receipt=valid')
             return 0
-        bundle = build_from_commit(repo, args.commit, args.run_id)
         if args.command == 'inspect':
+            bundle = build_from_commit(repo, args.commit, args.run_id)
             print(canonical({key: bundle[key] for key in (
                 'commit', 'canonicalCodeSha256', 'canonicalSourceSha256',
                 'criticalFunctionSha256', 'preparedSourceSha256')}))
             return 0
         target = resolve_target(repo)
+        bundle = build_from_commit(repo, args.commit, args.run_id)
         output = prepare(bundle, target['script_id'], os.environ.get('RUNNER_TEMP'))
         print('path=' + output.as_posix())
         print('prepared_source_sha256=' + bundle['preparedSourceSha256'])

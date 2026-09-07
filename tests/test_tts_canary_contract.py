@@ -106,8 +106,11 @@ class CanaryBuildContract(unittest.TestCase):
                              {'Code.gs', 'appsscript.json', '.clasp.json'})
             binding = json.loads((output / '.clasp.json').read_text(encoding='utf-8'))
             self.assertEqual(binding, {'rootDir': '.', 'scriptId': 'A' * 24})
-            subprocess.run(['node', '--check'], input=(output / 'Code.gs').read_text(encoding='utf-8'),
-                           check=True, capture_output=True, text=True)
+            check_path = Path(parent) / 'generated-canary.js'
+            check_path.write_text((output / 'Code.gs').read_text(encoding='utf-8'),
+                                  encoding='utf-8', newline='\n')
+            subprocess.run(['node', '--check', str(check_path)], check=True,
+                           capture_output=True, text=True)
 
 
 class CanaryTargetContract(unittest.TestCase):
