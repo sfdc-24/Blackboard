@@ -25,17 +25,17 @@ The source of truth is `apps-script/<project>/` in this repo:
 
 On 2026-09-03 a security fix was "deployed" six times; the one deploy that
 completed silently republished Version 12 — the unfixed code — while reporting
-success. There is no outside way to tell what is live. So every staging deploy
-here must pass TWO independent read-backs before it is called done:
-
-1. `clasp list-deployments` shows the staging deployment id at the new version.
-2. The live `/exec` GET reports that version (`scripts/gas_version_assert.py`).
-   Projects that don't expose a version field yet soft-pass with a loud
-   warning; adding `CONTRACT_VERSION` to each `doGet` is the first change that
-   should ride this pipeline, after which the assertion goes `--strict`.
+success. Every staging deploy now verifies the exact API deployment binding,
+the complete immutable source against a selected Git commit, and a live build
+marker with a fresh nonce. The source read-back runs before repointing as well
+as afterward. Application `CONTRACT_VERSION` is never treated as the deployment
+number. The protocol and normalization rules are in
+[CICD-BUILD-IDENTITY.md](CICD-BUILD-IDENTITY.md).
 
 Rollback is `staging-rollback.yml` — repoint the deployment at a known-good
-version, same two assertions. Written before it was needed, as ordered.
+version and its full known-good commit SHA, then run the same build checks.
+Historical unstamped versions are rejected; initial staging adoption needs
+two reviewed stamped builds to exercise the automated rollback gate.
 
 ## What blocks full activation (the honest list)
 
@@ -62,38 +62,31 @@ version, same two assertions. Written before it was needed, as ordered.
    the bus is container-bound but it *does* appear in `clasp list-scripts` and
    clones cleanly. It is at `apps-script/blackboard-bus-v1/`, byte-identical to
    the source pinned at the live deployment.
-4. **The staging web apps do not execute — for anyone.** All three `@1`
-   deployments answer HTTP 403, and all three `@HEAD` deployments answer with a
-   Google sign-in page, while every one of them reports
-   `access=ANYONE_ANONYMOUS, executeAs=USER_DEPLOYING` in the Apps Script API.
-   Config and reality disagree. Re-probed with the **owner's** own OAuth token:
-   still 403. So this is not an access-setting problem — the script has never
-   been authorized, which is exactly what a project born from Drive
-   `files.copy` looks like: code and manifest copy, the OAuth grant does not.
+4. **Staging readiness remains unverified.** The historical three versioned
+   `@1` probes returned HTTP 403, including an owner-token probe. The cause
+   remains unconfirmed. `/dev` sign-in pages are editor-only and separate from
+   anonymous `/exec` readiness. Follow [the corrected owner inspection packet](CICD-STAGING-AUTH.md).
+   Do not run arbitrary functions for consent: `sweepDraftsToEndpointV2` posts
+   real drafts and trashes files. A reviewed no-op, current source/scope hashes,
+   and signed-in error evidence are prerequisites to an owner authorization step.
+   The audit now requires complete inventory and a reviewed positive health
+   signature. It does not certify source/build identity.
+5. **Manual deployment and PR checks have separate triggers.** Manual dispatch
+   still requires a workflow on the default branch. That does not prevent
+   ordinary `pull_request` checks: `ci-acceptance.yml` now runs offline tests
+   without deployment credentials or first merging deployment workflows.
+   Historical zero-check observations predate this review branch. Clasp 3.4.1
+   is now pinned with a dependency lock and JSON contract tests. Real staging
+   deploy/rollback and live source-identity receipts remain open; the build
+   identity implementation has offline regression coverage.
 
-   `python scripts/gas_deployment_audit.py` reports the current state and exits
-   non-zero while any deployment claims anonymous access it does not honour.
-
-   *Fix — needs a browser, once per staging project, so it is a real halt for a
-   headless lane:* open each staging project in the Apps Script editor as
-   `abdus@sfdc24.com`, run any function once, accept the OAuth consent, then
-   re-run the audit. Until then the pipeline's HTTP assertion is theatre of a
-   subtler kind than a skipped deploy: it would be asserting against a door
-   that opens for nobody.
-5. **The workflows are not registered with GitHub at all.** `gh workflow list
-   --all` returns only `Copilot`. Both YAML files live solely on
-   `session/vm-cicd`, and GitHub registers a `workflow_dispatch` workflow only
-   from the **default branch** (`main`). Two consequences are visible today:
-   nothing can dispatch a staging deploy, and **PR #2 can never show a check**
-   — which is precisely the "zero checks" codex flagged in `vseq=010`. It is
-   not a secrets or permissions problem; the workflows do not exist as far as
-   the Actions API is concerned. Landing them on the default branch is a
-   prerequisite to every remaining receipt, and it is a call for the acceptance
-   lane rather than a silent push from here.
-
-Until items 4 and 5 clear, pushes to `staging` fail at the id-resolution step
-with an explicit error — that is intended behaviour, not breakage: a pipeline
-that silently skipped deploys would be theatre.
+Both workflows require the recorded staging IDs and an exact matching `/exec`
+URL, then verify the deployment belongs to that script before mutation.
+The reviewed inventory is `scripts/gas_staging_targets.json`; replacements
+must update it through review as well as updating repository variables.
+Deploy and rollback share one concurrency group per project.
+A configured endpoint can still fail the source or live-build assertion.
+Do not promote until the independent application/release gates pass.
 
 ## The source of truth for what is deployed — it exists now
 

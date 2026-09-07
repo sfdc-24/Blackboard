@@ -2,7 +2,7 @@ name: Roll back STAGING deployment
 
 # VM-CICD-001 · "WRITE THE ROLLBACK JOB BEFORE YOU NEED IT."
 # Repoints the STAGING web-app deployment at a known-good prior version,
-# then runs the same two assertions as the deploy. STAGING ONLY.
+# then verifies configuration, immutable source and live build. STAGING ONLY.
 
 on:
   workflow_dispatch:
@@ -16,22 +16,39 @@ on:
         description: 'Known-good version number to roll back to'
         required: true
         type: string
+      commit:
+        description: 'Full source commit SHA from the known-good staging receipt (must include build-health support)'
+        required: true
+        type: string
 
-concurrency:
-  group: staging-deploy-${{ github.event.inputs.project }}
-  cancel-in-progress: false
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   rollback:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: staging-deploy-${{ github.event.inputs.project }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: '22' }
 
       - name: Install clasp
-        run: npm install -g @google/clasp
+        run: |
+          npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
+          echo "$GITHUB_WORKSPACE/tooling/clasp/node_modules/.bin" >> "$GITHUB_PATH"
+          test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
 
       - name: Authenticate clasp
         run: |
@@ -41,40 +58,64 @@ jobs:
         env:
           CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
 
-      - name: Resolve staging ids
+      - name: Resolve reviewed staging target and validate rollback version
         id: ids
         env:
+          PROJECT: ${{ github.event.inputs.project }}
           VARS_JSON: ${{ toJSON(vars) }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
         run: |
-          KEY=$(echo "${{ github.event.inputs.project }}" | tr 'a-z-' 'A-Z_')
-          SCRIPT_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_SCRIPT_ID_$KEY',''))")
-          DEPLOY_ID=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_DEPLOYMENT_ID_$KEY',''))")
-          EXEC_URL=$(printf '%s' "$VARS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('STAGING_EXEC_URL_$KEY',''))")
-          [ -n "$SCRIPT_ID" ] && [ -n "$DEPLOY_ID" ] || { echo "::error::staging ids not configured for ${{ github.event.inputs.project }}"; exit 1; }
-          { echo "script_id=$SCRIPT_ID"; echo "deploy_id=$DEPLOY_ID"; echo "exec_url=$EXEC_URL"; } >> "$GITHUB_OUTPUT"
+          VERSION=$(python3 scripts/gas_staging_target.py version)
+          python3 scripts/gas_staging_target.py resolve >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployment belongs to the staging project before mutation
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+        run: |
+          clasp --json list-deployments "$SCRIPT_ID" |
+            python3 scripts/gas_staging_target.py deployment
+
+      - name: Verify rollback candidate source before mutation
+        env:
+          PROJECT: ${{ github.event.inputs.project }}
+          COMMIT_SHA: ${{ github.event.inputs.commit }}
+          EXPECTED_VERSION: ${{ steps.ids.outputs.version }}
+        run: |
+          python3 scripts/gas_build_identity.py verify-source \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION"
 
       - name: Repoint deployment at requested version
         working-directory: apps-script/${{ github.event.inputs.project }}
+        env:
+          SCRIPT_ID: ${{ steps.ids.outputs.script_id }}
+          DEPLOY_ID: ${{ steps.ids.outputs.deploy_id }}
+          REQUESTED_VERSION: ${{ steps.ids.outputs.version }}
+          ACTOR: ${{ github.actor }}
         run: |
-          printf '{"scriptId":"%s","rootDir":"."}\n' "${{ steps.ids.outputs.script_id }}" > .clasp.json
-          clasp redeploy "${{ steps.ids.outputs.deploy_id }}" -V "${{ github.event.inputs.version }}" -d "ROLLBACK to v${{ github.event.inputs.version }} (${{ github.actor }})"
+          printf '{"scriptId":"%s","rootDir":"."}\n' "$SCRIPT_ID" > .clasp.json
+          clasp redeploy "$DEPLOY_ID" -V "$REQUESTED_VERSION" -d "ROLLBACK to v$REQUESTED_VERSION ($ACTOR)"
 
-      - name: 'ASSERT 1/2: deployment read-back shows the rollback version'
-        working-directory: apps-script/${{ github.event.inputs.project }}
+      - name: Verify rollback configuration, pinned source and live build
+        env:
+          PROJECT: ${{ github.event.inputs.project }}
+          COMMIT_SHA: ${{ github.event.inputs.commit }}
+          EXPECTED_VERSION: ${{ steps.ids.outputs.version }}
         run: |
-          clasp list-deployments | tee deployments.txt
-          grep -F "${{ steps.ids.outputs.deploy_id }}" deployments.txt | grep -E "@${{ github.event.inputs.version }}\b" \
-            || { echo '::error::ROLLBACK ASSERTION FAILED — deployment is not at the requested version.'; exit 1; }
+          python3 scripts/gas_build_identity.py attest \
+            --project "$PROJECT" --commit "$COMMIT_SHA" --version "$EXPECTED_VERSION" \
+            --receipt "$RUNNER_TEMP/staging-rollback-receipt.json"
 
-      - name: 'ASSERT 2/2: live HTTP endpoint reports the rollback version'
-        run: |
-          python3 scripts/gas_version_assert.py \
-            --url "${{ steps.ids.outputs.exec_url }}" \
-            --expect-version "${{ github.event.inputs.version }}" \
-            --retries 6 --delay 10
+      - name: Preserve rollback build receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-rollback-${{ github.event.inputs.project }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/staging-rollback-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Receipt
         run: |
-          echo "ROLLBACK RECEIPT — TESTED" >> "$GITHUB_STEP_SUMMARY"
-          echo "- project: ${{ github.event.inputs.project }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- deployment: ${{ steps.ids.outputs.deploy_id }} now at v${{ github.event.inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo 'STAGING ROLLBACK RECEIPT — deployment, immutable source and live identity verified' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/staging-rollback-receipt.json" >> "$GITHUB_STEP_SUMMARY"

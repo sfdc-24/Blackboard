@@ -1,13 +1,15 @@
 # STAGING authorization packet — VM-CICD-001
 
-**This is the handoff for the one thing the headless lane cannot do.** The
-STAGING Apps Script projects exist, their web-app deployments exist, and every
-one of them refuses to run. Clearing that needs a browser signed in as
-`abdus@sfdc24.com`, once per project, and then never again.
+**Historical probe packet; authorization cause and live readiness remain open.**
+Use [the September 6 read-back](CICD-STAGING-READBACK-2026-09-06.md) for current
+remote version/HEAD hashes, source-derived scopes and browser-session evidence.
+The recorded STAGING versioned endpoints returned 403. A signed-in owner must
+inspect the actual authorization/deployment error before selecting a remedy.
+The source hashes below are historical and must be refreshed for reviewed code
+and compared with the exact remote staging version before any authorization.
 
 Prepared by vm-cli, 2026-09-04 23:15Z, at commit `90880a6`. Everything below is
-measured, not assumed; the commands to re-measure are included so nobody has to
-take this on trust.
+records measurements from that time; later corrections are distinguished below.
 
 ## The halt, stated precisely
 
@@ -17,16 +19,13 @@ take this on trust.
 | blackboard-production | **403** | 200 + Google sign-in page | `ANYONE_ANONYMOUS` / `USER_DEPLOYING` |
 | glasses-intake-uploader | **403** | 200 + Google sign-in page | `ANYONE_ANONYMOUS` / `USER_DEPLOYING` |
 
-0 of 6 web-app deployments serve their app. The same probe against the live v1
-bus and glasses **production** endpoints returns their real JSON, so the probe
-is sound and these endpoints genuinely do not serve.
+The three recorded versioned `/exec` probes did not prove application readiness.
+The three `/dev` probes are editor-only and must be classified separately;
+their sign-in pages do not establish an anonymous `/exec` configuration defect.
 
-Re-probed with the **owner's own OAuth token**: still 403. That is the finding
-that settles the cause. If this were the `access` setting, the owner would get
-through. Nobody gets through, so the script itself is unauthorized: a project
-created by Drive `files.copy` brings its code and its manifest, but not the
-OAuth grant. An `executeAs: USER_DEPLOYING` web app cannot run for anyone until
-its owner authorizes it once.
+Re-probed with the **owner's own OAuth token**: still 403. This confirms a failed
+probe, not its cause. Missing scope grants remain a hypothesis until the owner
+records the signed-in error and checks the exact staging source/configuration.
 
 Independently reached by two sessions on this machine from different tooling
 (this lane via `scripts/gas_deployment_audit.py`; the VS Code twin via its own
@@ -39,17 +38,24 @@ anonymous access it does not honour:
 python scripts/gas_deployment_audit.py
 ```
 
-## What to do — 2 minutes per project, in a browser
+## Owner inspection and bounded authorization
 
 Signed in as `abdus@sfdc24.com`:
 
 1. Open the STAGING project in the Apps Script editor (link below).
-2. Run any function once (`Run` ▸ pick anything harmless).
-3. Accept the OAuth consent when Google asks. Read the next section first —
-   one of these asks for permission to send email as you.
-4. That is all. Do **not** create a new deployment; the `@1` deployment already
-   exists and is wired to the repo variables. Creating another one silently
-   orphans the pipeline's `STAGING_DEPLOYMENT_ID_*`.
+2. Record the actual authorization/deployment error and compare the remote
+   source with reviewed, representation-labelled hashes and scopes.
+3. Do not run an arbitrary function. In particular, do not run
+   `sweepDraftsToEndpointV2`: it reads the real drafts folder, posts to the
+   existing board endpoint and trashes files on HTTP 2xx. The committed copy
+   also lacks `doGet`; granting scopes cannot create a GET entry point.
+4. If consent is needed, first prepare and review an explicit no-op with no
+   data, network or provider actions, then bind that source to staging and
+   refresh the scope/hash evidence. Authorize only those reviewed staging
+   scopes through the existing owner process. No no-op execution is claimed here.
+5. Preserve the configured deployment IDs. Any source/version update needs
+   its own read-back; creating an unrelated deployment does not repair the
+   pipeline's `STAGING_DEPLOYMENT_ID_*` binding.
 
 | Project | STAGING scriptId | Editor |
 |---|---|---|
@@ -57,7 +63,9 @@ Signed in as `abdus@sfdc24.com`:
 | blackboard-production | `1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K` | https://script.google.com/d/1IxPEx_5gT7HGEMwOFSB7wcO6qPUTMLr32qAzDykGYJ5KdrxscQeoZC1K/edit |
 | glasses-intake-uploader | `1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI` | https://script.google.com/d/1ElMYYzbdCsKfnhN30Gxt47TUoSFZg7ixGNTEdZNJORolpsS9eXVaYWuI/edit |
 
-Then re-run the audit. When it exits 0, this halt is cleared.
+Then rerun the audit. A health-signature match establishes only the reviewed
+application response. Source/build identity and actual deploy/rollback receipts
+are separate release gates; an audit exit code alone does not clear them.
 
 ## Exactly what you will be consenting to
 
@@ -130,13 +138,12 @@ blackboard-bus-v1/            (baseline only — no staging copy, nothing to aut
 
 Regenerate with `sha256sum apps-script/<project>/*`.
 
-One honest wrinkle for governor-page-api: the STAGING copy's HEAD `Code.gs` is
-still the v26-era source it was copied with (`afb4a45f…`), because no pipeline
-run has pushed to it yet. So the code you authorize in the editor today is that
-older copy, not v29. The scope set is the same — v29 only adds one more
-`UrlFetchApp` call (to `api.openai.com`, for the voice) under the
-`script.external_request` scope already listed above — so the consent you grant
-covers v29 when the pipeline pushes it.
+The previous paragraph in this packet inferred that authorizing an older staging
+copy would cover a later production-derived source. That inference is superseded.
+The September 6 read-back pins the actual staging v1 and HEAD source and compares
+them with the current review commit. Similar service families do not prove an
+existing or sufficient grant. Inspect the exact selected source and owner-visible
+scopes before authorization; do not use this historical packet as consent evidence.
 
 ## Staging only
 
@@ -145,10 +152,11 @@ id or `/exec` URL appears here, and nothing in this packet asks anyone to touch
 a production deployment, DNS, or the theme. Production deploys stay manual until
 Mr. Salam rules otherwise.
 
-## After the consent — the assertion still is not strict
+## Historical validator defect and remaining build-identity gate
 
-Clearing this halt makes the endpoints reachable. It does **not** make the
-version assertion strict, and that gap should not be quietly inherited:
+Authorization alone does not prove endpoint readiness. The review-followups
+branch now rejects missing/invalid version evidence and incomplete inventories;
+the historical defects below explain why source/build identity is still required.
 
 Measured at `90880a6`, and it is worse than a gap — the assertion is wrong in
 both directions:

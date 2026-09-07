@@ -38,6 +38,14 @@ var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and
 // ---------- web entry points ----------
 function doGet(e) {
   var p = (e && e.parameter) || {};
+  // Public build metadata only: no board read, secret access or provider call.
+  if (p.health === 'build') {
+    if (typeof sfdc24BuildIdentity_ !== 'function') return json_({ ok: false, error: 'build identity unavailable' });
+    var build = sfdc24BuildIdentity_();
+    build.ok = true;
+    build.nonce = /^[0-9a-f]{32}$/.test(String(p.nonce || '')) ? String(p.nonce) : '';
+    return json_(build);
+  }
   // Machine read is Governor-only. Board rows carry live project state, so this is
   // never served to an anonymous caller. A pass is deliberately NOT accepted in the
   // query string — secrets do not belong in URLs.
@@ -189,7 +197,15 @@ function voiceReply_(p) {
   // synthesis costs a couple of seconds and the reply should appear the moment
   // it exists -- so this response hands back a key, the page renders the text
   // immediately, and the audio arrives underneath it.
-  if (out && out.ok && out.reply && ttsConfigured_()) {
+  //
+  // `!out.degraded` is the cap. `offline_` returns ok:true with a canned note,
+  // so the old condition minted a paid render for every reply the chat budget
+  // had ALREADY refused: past the session cap, past the daily cap, with no
+  // Anthropic key, after an upstream error -- and with CHAT_ENABLED=off, which
+  // stopped the model and not the bill. The caps only bound cost if the paid
+  // path is bounded by the same decision, so a canned note is spoken by the
+  // browser's own synthesiser and never bought. (P0 issue 2, 2026-09-05.)
+  if (out && out.ok && out.reply && !out.degraded && ttsConfigured_()) {
     var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
     try { cache.put('tts_' + ak, out.reply, 900); out.ak = ak; } catch (e) {}
   }
@@ -233,8 +249,43 @@ function ttsVoice_(want) {
   return TTS_VOICES.hasOwnProperty(String(pref)) ? pref : TTS_DEFAULT;
 }
 
+// TTS_ENABLED=off turns the paid voice off on its own, without touching the
+// chat. CHAT_ENABLED=off already stops both (no model reply, so nothing to
+// speak), but there was no lever for "keep answering, stop spending on audio" --
+// and a kill switch you have to take the whole service down to pull is not one.
 function ttsConfigured_() {
-  return !!PropertiesService.getScriptProperties().getProperty('OPENAI_KEY');
+  var props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty('TTS_ENABLED') || '').toLowerCase() === 'off') return false;
+  return !!props.getProperty('OPENAI_KEY');
+}
+
+// ONE paid render per key -- actually, rather than by comment. `get` then
+// `remove` is not atomic: two requests carrying the same ak can both read the
+// text before either deletes it, and each pays for its own render, so the key
+// was single-use only in the absence of concurrency. The script lock makes the
+// claim exclusive: the first caller takes the text and deletes it inside the
+// critical section, every other caller sees `expired`.
+//
+// HONEST LIMIT: CacheService is eventually consistent (the same property that
+// forced the v15 idempotency fix to read the sheet instead of the cache), so
+// the lock closes the window from "any two concurrent callers" to "a cache
+// replica that has not yet observed the delete". It is a large reduction, not a
+// proof of exactly-once. It is proportionate because the mint side is now
+// bounded by the chat caps: the worst case is a small multiplier on at most
+// CHAT_SESSION_CAP renders per session, not an open-ended bill. A strongly
+// consistent claim would need a sheet write per render.
+function ttsClaim_(ak) {
+  var cache = CacheService.getScriptCache();
+  var lock  = LockService.getScriptLock();
+  try { lock.waitLock(10000); } catch (e) { return null; }
+  try {
+    var text = cache.get('tts_' + ak);
+    if (!text) return null;
+    cache.remove('tts_' + ak);
+    return text;
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
 }
 
 function ttsAudio_(p) {
@@ -244,16 +295,15 @@ function ttsAudio_(p) {
   var ak = String(p.ak || '').slice(0, 24);
   if (!/^ak[a-f0-9]{1,22}$/.test(ak)) return jsonp_(cb, { ok: false, reason: 'bad-key' });
 
-  var cache = CacheService.getScriptCache();
-  var text = cache.get('tts_' + ak);
-  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
-
   var props = PropertiesService.getScriptProperties();
+  if (!ttsConfigured_()) return jsonp_(cb, { ok: false, reason: 'no-key' });
   var key = props.getProperty('OPENAI_KEY');
-  if (!key) return jsonp_(cb, { ok: false, reason: 'no-key' });
 
-  // One audio render per key. Without this a loop on the key is a billing hole.
-  cache.remove('tts_' + ak);
+  // Claim the key BEFORE spending anything. Losing the race is `expired`, the
+  // same answer a stale key gets, because a caller cannot tell the difference
+  // and does not need to.
+  var text = ttsClaim_(ak);
+  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
 
   var res;
   try {
@@ -432,7 +482,7 @@ function SYSTEM_PROMPT_() {
 // ---------- reception ledger ----------
 function logVisitor_(sid, who, text) {
   // Visitor text is quarantined, not written to the operational board. See
-  // PublicInbox.js: it lands in PUBLIC_INBOX carrying trust_level
+  // PublicInbox.gs: it lands in PUBLIC_INBOX carrying trust_level
   // EXTERNAL_UNTRUSTED and instruction_authority NONE, and only a Governor can
   // promote a row from there. Rerouting here catches all six call sites at once.
   logVisitorQuarantined_(sid, who, text);
@@ -667,7 +717,7 @@ function seed_state() { requireGovernor_();
     "GOV|kind=mission|project=blackboard|text=**Close it so it sticks** — one thread from any instance triggers every instance. The backbone of SFDC24, not overhead on it.",
     "GOV|kind=mission|project=whatsapp|text=Seamless human-to-AI interaction on WhatsApp, as an agent of the board.",
     "GOV|kind=mission|project=zoom-agent|text=An agent that joins a live client call, knows the org, and leaves an evidence-backed finding.",
-    "GOV|kind=mission|project=sfdc24-site|text=**A wholistic way to interact with AI agents — and get work done.** Selling starts Mon Sep 21.",
+    "GOV|kind=mission|project=sfdc24-site|text=**A holistic way to interact with AI agents — and get work done.** Selling starts Mon Sep 21.",
     "GOV|kind=mission|project=glasses|text=Webcam capture staged into Drive so instances can see what you see.",
     "GOV|kind=state|project=blackboard|now=v1 bus is the working system; the V2 Alpha DB ledger runs alongside it as a POC. Board at 407 rows, four vendors writing.|next=gemini-architect M1/M2 batch — closed action_type set, work_id / wf / sub / planned_by / executed_by columns — then restore doGet.|blocked=doGet down since Aug 30 (REQ-K5J8ZX). No work_id column blocks two workstreams. ~20 rulings sitting with you.|by=claude-code-cli",
     "GOV|kind=state|project=whatsapp|now=Gateway LIVE, replying in 2-4s on Cloud API, Pipedream v254.|next=Thread and State Protocol v1 — WA grammar, wamid dedup, sticky routing, secrets moved to Pipedream env.|blocked=ISSUE 028 — five regressions open: dedup dead, hardcoded secret in v254, vendor errors leaking ids, webhook auth set to none, no grounding.|by=claude-code-cli",

@@ -21,7 +21,7 @@
  * THE RULE THAT MATTERS MOST
  *   IDENTITY IS NOT AUTHORITY. Knowing a visitor is alice@acme.com does not let
  *   alice instruct the fleet. Signed-in visitor text is still quarantined with
- *   instruction_authority=NONE exactly like anonymous text (see PublicInbox.js
+ *   instruction_authority=NONE exactly like anonymous text (see PublicInbox.gs
  *   and L-81's neighbours). The only thing sign-in changes is that we know who
  *   said it. Governor authority remains whoami_().isGovernor and nothing here
  *   touches it.
@@ -189,9 +189,9 @@ function authCompleteCallback_(e) {
   // The checks that actually matter.
   var wantAud = props.getProperty(AUTH_CLIENT_ID_KEY);
   if (claims.aud !== wantAud) return { ok: false, error: 'token audience mismatch' };
-  if (String(claims.iss).indexOf('accounts.google.com') < 0) return { ok: false, error: 'unexpected issuer' };
+  if (claims.iss !== 'accounts.google.com' && claims.iss !== 'https://accounts.google.com') return { ok: false, error: 'unexpected issuer' };
   if (!claims.exp || (claims.exp * 1000) < Date.now()) return { ok: false, error: 'token expired' };
-  if (claims.email_verified === false) return { ok: false, error: 'email not verified by Google' };
+  if (claims.email_verified !== true) return { ok: false, error: 'email not verified by Google' };
   if (!claims.email) return { ok: false, error: 'no email in token' };
 
   return {
