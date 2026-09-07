@@ -609,6 +609,13 @@ body{overflow:hidden}
         setMode("off");
         return;
       }
+      // Adopt the id the SERVER minted. The one this page generates is only a
+      // first-contact placeholder; the server ignores ids it did not issue, so
+      // a caller cannot pick their own conversation or reset their own budget.
+      if (res.vid && res.vid !== vid) {
+        vid = res.vid;
+        try { localStorage.setItem("sfdc_vsid", vid) } catch(e){}
+      }
       if (res.sketch) { try { drawSketch(res.sketch) } catch(e){} }
       var node = turn("it", "sfdc24", res.reply);
       node.className = "turn it now";

@@ -37,6 +37,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const vm = require('vm');
+const crypto = require('crypto');
 
 const HERE = __dirname;
 const REPO = path.join(HERE, '..', '..');
@@ -214,8 +215,30 @@ function handle(req, res) {
     // Callback names are validated, never sanitised -- the same rule voiceReply_
     // follows, because this value is echoed into executable JavaScript.
     const safeCb = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cb) ? cb : '';
-    const vid = String(q.get('vid') || 'v');
-    voiceHistory[vid] = voiceHistory[vid] || [];
+    // The conversation id is MINTED HERE and never trusted from the caller.
+    //
+    // This used to be `String(q.get('vid') || 'v')` -- caller-supplied, keyed
+    // straight into the history map, with everyone who sent no id sharing one
+    // bucket called 'v'. That is the same defect codex found in production v31
+    // on 2026-09-07 (SITE-TENANT-BOUNDARY-001): trusting a caller-chosen id for
+    // history and for spend lets someone reset their own budget by rotating it,
+    // and steer into someone else's conversation by guessing it.
+    //
+    // I wrote that defect here AFTER criticising it there, which is the whole
+    // reason this comment is long: the prototype is destined for gas/, so
+    // leaving it would have reintroduced the exact bug they had just removed.
+    //
+    // The rule now: an id the server did not mint is not honoured -- a fresh
+    // conversation is started instead. 128 bits of randomness, so guessing a
+    // live one is not a strategy. Weaker than the signed domain-separated token
+    // production now uses, and deliberately so: this holds no money and no
+    // identity, only a local transcript. Anything that outlives the prototype
+    // takes the production token, not this.
+    let vid = String(q.get('vid') || '');
+    if (!Object.prototype.hasOwnProperty.call(voiceHistory, vid)) {
+      vid = 'c' + crypto.randomBytes(16).toString('hex');
+      voiceHistory[vid] = [];
+    }
     const hist = voiceHistory[vid];
 
     Promise.all([reply(hist, text).catch(() => null), makeSketch(hist, text).catch(() => null)])
@@ -224,6 +247,7 @@ function handle(req, res) {
         while (hist.length > 16) hist.shift();
         const out = JSON.stringify({
           ok: !!text_,
+          vid: vid,          // the client adopts this; it cannot choose its own
           reply: text_ || "I couldn't reach the assistant just then. Your message wasn't lost — try again in a moment.",
           degraded: text_ ? undefined : 'upstream',
           sketch: sketch || null
