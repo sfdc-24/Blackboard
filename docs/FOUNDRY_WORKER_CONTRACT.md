@@ -28,10 +28,23 @@ Governed packet mode defaults to `FOUNDRY_MODEL` and may fall back to
 `FOUNDRY_AGENT_NAME`. Governed agent execution requires a version pin through
 `--agent-version` or the optional local `FOUNDRY_AGENT_VERSION` setting.
 
-Configuration remains local in `.foundry.env` first and `.env` second. Required
-names are `FOUNDRY_PROJECT_ENDPOINT` and `FOUNDRY_API_KEY`; target selection uses
-`FOUNDRY_MODEL` or `FOUNDRY_AGENT_NAME`. Never pass credential values as command
-arguments or write them into packets.
+Configuration remains local in `.foundry.env` first and `.env` second. The
+project endpoint is `FOUNDRY_PROJECT_ENDPOINT`; target selection uses
+`FOUNDRY_MODEL` or `FOUNDRY_AGENT_NAME`.
+
+Authentication has two explicit modes:
+
+- `--auth entra` (or `FOUNDRY_AUTH_MODE=entra`) obtains a short-lived bearer
+  token from the already authenticated Azure CLI for `https://ai.azure.com`.
+  This mode does not load or use `FOUNDRY_API_KEY` as adapter configuration.
+- `--auth api-key` (the backward-compatible default) requires
+  `FOUNDRY_API_KEY` from the local ignored configuration.
+
+Never pass credential values as command arguments or write them into packets.
+Entra mode is the recommended operator path; API-key mode remains available for
+headless environments that already manage the key in an approved secret store.
+The bearer-token scope and project-endpoint contract follow Microsoft's
+[Foundry REST authentication reference](https://learn.microsoft.com/en-us/azure/ai-foundry/reference/foundry-project).
 
 ## `work_packet.v1`
 

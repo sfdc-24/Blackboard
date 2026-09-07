@@ -28,6 +28,9 @@ on:
       - 'tests/test_staging_target.py'
       - 'tests/test_clasp_json_contract.cjs'
       - 'tests/test_deploy_source_contract.py'
+      - 'docs/FOUNDRY_WORKER_CONTRACT.md'
+      - 'scripts/ask_foundry.py'
+      - 'tests/test_ask_foundry.py'
       - 'tooling/clasp/**'
       - 'scripts/claude_board_worker.ps1'
       - 'scripts/pudding_harness.py'
@@ -71,6 +74,8 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_operator_script_guards.py' -v
       - name: Test single production deploy source contract
         run: python -B -m unittest discover -s tests -p 'test_deploy_source_contract.py' -v
+      - name: Test governed Foundry evaluator contract
+        run: python -B -m unittest discover -s tests -p 'test_ask_foundry.py' -v
       - name: Test immutable source and runtime build proof without live APIs
         run: |
           python -B -m unittest discover -s tests -p 'test_build_identity.py' -v

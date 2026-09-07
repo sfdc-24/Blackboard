@@ -8,13 +8,16 @@ assessment, validates every evidence reference, and emits a provenance-rich
 this adapter; the calling orchestrator owns routing and any eventual write.
 The separate ``--prompt`` smoke path is model-deployment-only and disables tools.
 
-Credentials are read from the git-ignored ``.foundry.env`` first and ``.env``
-second. They are never accepted as command-line arguments or included in
-receipts and error artifacts.
+Configuration is read from the git-ignored ``.foundry.env`` first and ``.env``
+second. API-key mode loads its credential there. Entra mode obtains a short-lived
+token from the already authenticated Azure CLI and does not load the configured
+API key into adapter configuration. Credential values are never accepted as
+command-line arguments or included in receipts and error artifacts.
 
 Examples:
     python scripts/ask_foundry.py --agents
     python scripts/ask_foundry.py --models
+    python scripts/ask_foundry.py --auth entra --models
     python scripts/ask_foundry.py --prompt "Return exactly: OK"
     python scripts/ask_foundry.py --packet examples/foundry/work_packet.v1.example.json
     python scripts/ask_foundry.py --packet packet.json --agent NAME --agent-version 2
@@ -28,7 +31,9 @@ import hashlib
 import json
 import pathlib
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -56,6 +61,8 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_TOKENS = 1_600
 MAX_OUTPUT_TOKENS_LIMIT = 8_192
 MAX_TIMEOUT_SECONDS = 600
+ENTRA_RESOURCE = "https://ai.azure.com"
+AUTH_MODES = ("api-key", "entra")
 
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -212,8 +219,8 @@ def emit_json(stream: Any, value: Any, *, pretty: bool = False) -> None:
     emit_text(stream, render_json(value, pretty=pretty))
 
 
-def load_config() -> dict[str, str]:
-    """Load only FOUNDRY_* values without logging their contents."""
+def load_config(*, include_api_key: bool = True) -> dict[str, str]:
+    """Load only requested FOUNDRY_* values without logging their contents."""
     config: dict[str, str] = {}
     for path in ENV_FILES:
         if not path.exists():
@@ -224,9 +231,86 @@ def load_config() -> dict[str, str]:
                 continue
             key, raw = value.split("=", 1)
             key = key.strip()
+            if key == "FOUNDRY_API_KEY" and not include_api_key:
+                continue
             if key.startswith("FOUNDRY_") and key not in config:
                 config[key] = raw.strip().strip('"').strip("'")
     return config
+
+
+def resolve_auth_mode(requested: str | None, config: dict[str, str]) -> str:
+    mode = (requested or config.get("FOUNDRY_AUTH_MODE") or "api-key").strip().lower()
+    if mode not in AUTH_MODES:
+        raise AdapterError(
+            "CONFIG",
+            "INVALID_AUTH_MODE",
+            "Foundry authentication mode must be api-key or entra.",
+            exit_code=3,
+            details={"mode": mode},
+        )
+    return mode
+
+
+def acquire_entra_token(timeout: int) -> str:
+    """Acquire a short-lived token without exposing Azure CLI output."""
+    az = shutil.which("az")
+    if not az:
+        raise AdapterError(
+            "CONFIG",
+            "AZURE_CLI_MISSING",
+            "Entra mode requires the Azure CLI.",
+            exit_code=3,
+        )
+    try:
+        result = subprocess.run(
+            [
+                az,
+                "account",
+                "get-access-token",
+                "--resource",
+                ENTRA_RESOURCE,
+                "--query",
+                "accessToken",
+                "--output",
+                "tsv",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=min(timeout, 60),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AdapterError(
+            "CONFIG",
+            "ENTRA_TOKEN_UNAVAILABLE",
+            "Azure CLI could not provide a Foundry Entra token.",
+            exit_code=3,
+            retryable=True,
+        ) from error
+    token = result.stdout.strip() if result.returncode == 0 else ""
+    if (
+        not token
+        or len(token) > 65536
+        or any(character.isspace() for character in token)
+    ):
+        raise AdapterError(
+            "CONFIG",
+            "ENTRA_TOKEN_UNAVAILABLE",
+            "Azure CLI could not provide a Foundry Entra token.",
+            exit_code=3,
+            retryable=True,
+        )
+    return token
+
+
+def resolve_credential(
+    auth_mode: str, config: dict[str, str], *, timeout: int
+) -> str:
+    if auth_mode == "entra":
+        return acquire_entra_token(timeout)
+    return require(config, "FOUNDRY_API_KEY")
 
 
 def require(config: dict[str, str], name: str) -> str:
@@ -734,16 +818,27 @@ def build_prompt_payload(
 
 def request_json(
     url: str,
-    api_key: str,
+    credential: str,
     payload: dict[str, Any] | None = None,
     timeout: int = 120,
+    auth_mode: str = "api-key",
 ) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {
-        "api-key": api_key,
         "Accept": "application/json",
         "User-Agent": "sfdc24-blackboard-foundry/0.2",
     }
+    if auth_mode == "entra":
+        headers["Authorization"] = "Bearer " + credential
+    elif auth_mode == "api-key":
+        headers["api-key"] = credential
+    else:
+        raise AdapterError(
+            "CONFIG",
+            "INVALID_AUTH_MODE",
+            "Foundry authentication mode must be api-key or entra.",
+            exit_code=3,
+        )
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
@@ -1167,8 +1262,15 @@ def write_json_artifact(path: pathlib.Path, artifact: dict[str, Any]) -> None:
         ) from error
 
 
-def list_agents(endpoint: str, api_key: str, timeout: int) -> dict[str, Any]:
-    response = request_json(f"{endpoint}/agents?api-version=v1", api_key, timeout=timeout)
+def list_agents(
+    endpoint: str, credential: str, timeout: int, auth_mode: str = "api-key"
+) -> dict[str, Any]:
+    response = request_json(
+        f"{endpoint}/agents?api-version=v1",
+        credential,
+        timeout=timeout,
+        auth_mode=auth_mode,
+    )
     agents = response.get("value") or response.get("data") or []
     summaries: list[dict[str, Any]] = []
     for summary in agents:
@@ -1178,8 +1280,9 @@ def list_agents(endpoint: str, api_key: str, timeout: int) -> dict[str, Any]:
         quoted = urllib.parse.quote(str(name), safe="")
         detail = request_json(
             f"{endpoint}/agents/{quoted}?api-version=v1",
-            api_key,
+            credential,
             timeout=timeout,
+            auth_mode=auth_mode,
         )
         versions = detail.get("versions") if isinstance(detail.get("versions"), dict) else {}
         latest = versions.get("latest") if isinstance(versions.get("latest"), dict) else {}
@@ -1196,9 +1299,14 @@ def list_agents(endpoint: str, api_key: str, timeout: int) -> dict[str, Any]:
     return {"schema": "foundry_agents.v1", "count": len(summaries), "agents": summaries}
 
 
-def list_models(endpoint: str, api_key: str, timeout: int) -> dict[str, Any]:
+def list_models(
+    endpoint: str, credential: str, timeout: int, auth_mode: str = "api-key"
+) -> dict[str, Any]:
     response = request_json(
-        f"{endpoint}/deployments?api-version=v1", api_key, timeout=timeout
+        f"{endpoint}/deployments?api-version=v1",
+        credential,
+        timeout=timeout,
+        auth_mode=auth_mode,
     )
     deployments = response.get("value") or response.get("data") or []
     models = [
@@ -1236,6 +1344,11 @@ def build_parser() -> StructuredArgumentParser:
     )
     parser.add_argument(
         "--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    parser.add_argument(
+        "--auth",
+        choices=AUTH_MODES,
+        help="authentication mode; defaults to FOUNDRY_AUTH_MODE or api-key",
     )
     parser.add_argument("--out", type=pathlib.Path, help="write the result artifact")
     parser.add_argument(
@@ -1316,15 +1429,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         _validate_cli(args)
-        config = load_config()
+        safe_config = load_config(include_api_key=False)
+        auth_mode = resolve_auth_mode(args.auth, safe_config)
+        config = (
+            load_config(include_api_key=True)
+            if auth_mode == "api-key"
+            else safe_config
+        )
         endpoint = validate_endpoint(require(config, "FOUNDRY_PROJECT_ENDPOINT"))
-        api_key = require(config, "FOUNDRY_API_KEY")
+        credential = resolve_credential(auth_mode, config, timeout=args.timeout)
 
         if args.agents:
-            emit_json(sys.stdout, list_agents(endpoint, api_key, args.timeout), pretty=True)
+            emit_json(
+                sys.stdout,
+                list_agents(endpoint, credential, args.timeout, auth_mode),
+                pretty=True,
+            )
             return 0
         if args.models:
-            emit_json(sys.stdout, list_models(endpoint, api_key, args.timeout), pretty=True)
+            emit_json(
+                sys.stdout,
+                list_models(endpoint, credential, args.timeout, auth_mode),
+                pretty=True,
+            )
             return 0
 
         governed = args.packet_file is not None
@@ -1348,9 +1475,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             started = time.monotonic()
             response = request_json(
                 f"{endpoint}/openai/v1/responses",
-                api_key,
+                credential,
                 payload,
                 timeout=args.timeout,
+                auth_mode=auth_mode,
             )
             elapsed_ms = int((time.monotonic() - started) * 1000)
             identity = validate_response_identity(response, target)
@@ -1397,9 +1525,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.monotonic()
         response = request_json(
             f"{endpoint}/openai/v1/responses",
-            api_key,
+            credential,
             payload,
             timeout=args.timeout,
+            auth_mode=auth_mode,
         )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         identity = validate_response_identity(response, target)
