@@ -33,14 +33,42 @@ so the two schedules are offset by 30 minutes. Their job-schedule links must
 bind every runbook parameter explicitly using the exact parameter-name case in
 `job-schedule-00.json` and `job-schedule-30.json`.
 
+## Job-schedule link validation
+
+`validate_order_job_schedule_links.ps1` is the reusable, read-only validation
+boundary for those two links. It uses only `az rest --method get` with
+Automation API `2023-11-01` and returns one bounded JSON receipt describing
+canonical or drifted state.
+
+```powershell
+.\validate_order_job_schedule_links.ps1
+```
+
+The collection `LIST` response is discovery-only. Azure can legitimately
+project stale identity fields or `properties.parameters` as `null` there even
+when the resource is fully bound. The validator therefore uses case-insensitive
+schedule-name hints only to map exactly two unique target IDs from `LIST`, then
+individually `GET`s each link. Only those individual resource bodies decide the
+exact schedule, runbook, resource identity, absent/null `runOn`, and six
+case-sensitive parameter bindings in the checked-in canonical JSON files. It
+never infers identity or parameter drift from the collection projection.
+
+A canonical result emits `VALID` and exits `0`. Any missing resource, identity,
+cardinality, or binding mismatch emits `DRIFT` and exits `2`, so callers cannot
+mistake drift for a successful validation. Transport, malformed JSON, or local
+canonical-input failures emit `FAILED` and exit `1`. The validator has no
+repair mode and cannot create, update, or delete Azure resources.
+
 ## Deployment order
 
 1. Parse and test the local PowerShell files under Windows PowerShell 5.1.
 2. Publish `blackboard_vm_supervisor.ps1` and turn verbose logging off.
 3. Create the two hourly schedules with a finite expiry, then link them using
    the two JSON resources in this directory.
-4. Read the individual job-schedule resources back. Do not accept an empty or
-   null `properties.parameters` object.
+4. Run `validate_order_job_schedule_links.ps1` and require `VALID` with exit
+   code `0`. A collection `LIST` response may project `parameters: null`; that
+   is not drift by itself. Require the validator's authoritative individual
+   `GET` of each exact link to match all six bindings.
 5. Before changing the guest task, disable both Automation schedules and read
    them back as disabled. Wait until no Automation job, Azure Run Command, or
    guest task instance is running. Use
