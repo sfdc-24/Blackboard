@@ -275,7 +275,9 @@ def _exact_keys(value, keys):
     return isinstance(value, dict) and set(value) == set(keys)
 
 
-def validate_receipt(value):
+def validate_receipt(value, expected_script_id):
+    if not SCRIPT_ID.fullmatch(str(expected_script_id or '')):
+        raise ValueError('a reviewed canary script id is required')
     root_keys = {'schema', 'repository', 'commit', 'canonicalCodeSha256',
                  'canonicalSourceSha256', 'criticalFunctionSha256',
                  'preparedSourceSha256', 'canaryScriptId', 'canaryVersion',
@@ -292,7 +294,7 @@ def validate_receipt(value):
             raise ValueError('invalid receipt digest')
     if (value.get('repository') != 'sfdc-24/Blackboard' or value.get('verdict') != 'PASS'
             or value.get('providerKind') != 'credential-free synthetic admission counter'
-            or not SCRIPT_ID.fullmatch(str(value.get('canaryScriptId', '')))
+            or value.get('canaryScriptId') != expected_script_id
             or type(value.get('canaryVersion')) is not int or value['canaryVersion'] < 1
             or not SCRIPT_ID.fullmatch(str(value.get('apiDeploymentId', '')))):
         raise ValueError('invalid receipt identity')
@@ -346,7 +348,9 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     try:
         if args.command == 'validate-receipt':
-            validate_receipt(parse_json(Path(args.receipt).read_text(encoding='utf-8')))
+            target = resolve_target(repo)
+            validate_receipt(parse_json(Path(args.receipt).read_text(encoding='utf-8')),
+                             target['script_id'])
             print('receipt=valid')
             return 0
         bundle = build_from_commit(repo, args.commit, args.run_id)

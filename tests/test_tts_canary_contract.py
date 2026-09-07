@@ -184,7 +184,7 @@ class CanaryReceiptContract(unittest.TestCase):
         }
 
     def test_only_exact_pass_receipt_is_accepted(self):
-        self.assertIs(canary.validate_receipt(self.receipt), self.receipt)
+        self.assertIs(canary.validate_receipt(self.receipt, 'C' * 24), self.receipt)
         mutations = [
             lambda r: r.update(verdict='HOLD'),
             lambda r: r['scenarios']['replay'].update(attemptDelta=1),
@@ -198,7 +198,10 @@ class CanaryReceiptContract(unittest.TestCase):
             value = copy.deepcopy(self.receipt)
             mutate(value)
             with self.subTest(value=value), self.assertRaises(ValueError):
-                canary.validate_receipt(value)
+                canary.validate_receipt(value, 'C' * 24)
+
+        with self.assertRaises(ValueError):
+            canary.validate_receipt(self.receipt, 'X' * 24)
 
     def test_receipt_rejects_keys_text_and_authorization_material(self):
         for field, value in [('repository', 'Bearer private'),
@@ -207,7 +210,7 @@ class CanaryReceiptContract(unittest.TestCase):
             changed = copy.deepcopy(self.receipt)
             changed[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
-                canary.validate_receipt(changed)
+                canary.validate_receipt(changed, 'C' * 24)
 
     def test_cli_failure_is_generic_and_does_not_echo_environment(self):
         with mock.patch.object(sys, 'argv', ['gas_tts_canary.py', 'prepare', '--commit', 'HEAD',
