@@ -130,6 +130,25 @@ def workflow_blocks(name):
     return blocks
 
 
+class WorkflowSupplyChain(unittest.TestCase):
+    def test_secret_bearing_workflows_pin_actions_and_drop_checkout_credentials(self):
+        expected = (
+            'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683',
+            'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+            'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+        )
+        for filename in ('staging-deploy.yml', 'staging-rollback.yml'):
+            workflow = (ROOT / '.github/workflows' / filename).read_text()
+            with self.subTest(filename=filename):
+                for action in expected:
+                    self.assertIn(action, workflow)
+                self.assertNotRegex(
+                    workflow,
+                    r'uses:\s+actions/(?:checkout|setup-node|upload-artifact)@v\d',
+                )
+                self.assertIn('persist-credentials: false', workflow)
+
+
 class WorkflowGates(unittest.TestCase):
     def setUp(self):
         self.bash = os.environ.get('TEST_BASH') or shutil.which('bash')
