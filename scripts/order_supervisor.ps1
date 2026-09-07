@@ -97,6 +97,190 @@ if (-not [IO.Path]::IsPathRooted($EnvFile)) {
     }
 }
 
+function New-BoardReadFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [AllowNull()][Exception]$InnerException,
+        [AllowNull()][string]$RawContent,
+        [AllowNull()]$TransportExit,
+        [AllowNull()][string]$HttpStatus,
+        [AllowNull()][string]$ContentTypeClass
+    )
+
+    $failure = if ($InnerException) {
+        [IO.InvalidDataException]::new($Code, $InnerException)
+    } else {
+        [IO.InvalidDataException]::new($Code)
+    }
+    if ($PSBoundParameters.ContainsKey('RawContent')) {
+        $content = if ($null -eq $RawContent) { '' } else { [string]$RawContent }
+        $failure.Data['content_length'] = [Text.Encoding]::UTF8.GetByteCount($content)
+        $failure.Data['content_sha256'] = Get-StringSha256 -Text $content
+    }
+    if ($null -ne $TransportExit -and [string]$TransportExit -cmatch '^-?\d{1,10}$') {
+        $failure.Data['transport_exit'] = [string]$TransportExit
+    }
+    if ($HttpStatus -cmatch '^[1-5]\d{2}$') {
+        $failure.Data['http_status'] = $HttpStatus
+    }
+    if (@('json', 'html', 'text', 'binary', 'other') -ccontains $ContentTypeClass) {
+        $failure.Data['content_type_class'] = $ContentTypeClass
+    }
+    return $failure
+}
+
+function Get-BoardTransportFailureMetadata {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $transportExit = ''
+    $status = ''
+    $contentType = ''
+    $contentTypeClass = ''
+    $current = $ErrorRecord.Exception
+    for ($depth = 0; $null -ne $current -and $depth -lt 5; $depth++) {
+        if ([string]::IsNullOrWhiteSpace($transportExit) -and
+            $current.Data.Contains('transport_exit') -and
+            [string]$current.Data['transport_exit'] -cmatch '^-?\d{1,10}$') {
+            $transportExit = [string]$current.Data['transport_exit']
+        }
+        if ([string]::IsNullOrWhiteSpace($status) -and
+            $current.Data.Contains('http_status') -and
+            [string]$current.Data['http_status'] -cmatch '^[1-5]\d{2}$') {
+            $status = [string]$current.Data['http_status']
+        }
+        if ([string]::IsNullOrWhiteSpace($contentType) -and $current.Data.Contains('content_type')) {
+            $contentType = [string]$current.Data['content_type']
+        }
+        if ([string]::IsNullOrWhiteSpace($contentTypeClass) -and
+            $current.Data.Contains('content_type_class') -and
+            @('json', 'html', 'text', 'binary', 'other') -ccontains [string]$current.Data['content_type_class']) {
+            $contentTypeClass = [string]$current.Data['content_type_class']
+        }
+        $responseProperty = $current.PSObject.Properties['Response']
+        if ($responseProperty -and $responseProperty.Value) {
+            $response = $responseProperty.Value
+            $statusProperty = $response.PSObject.Properties['StatusCode']
+            if ($statusProperty -and $null -ne $statusProperty.Value) {
+                try {
+                    $statusCandidate = [int]$statusProperty.Value
+                    if ($statusCandidate -ge 100 -and $statusCandidate -le 599) {
+                        $status = [string]$statusCandidate
+                    }
+                } catch {}
+            }
+            $contentTypeProperty = $response.PSObject.Properties['ContentType']
+            if ($contentTypeProperty -and $null -ne $contentTypeProperty.Value) {
+                $contentType = [string]$contentTypeProperty.Value
+            }
+            break
+        }
+        $current = $current.InnerException
+    }
+    if ([string]::IsNullOrWhiteSpace($contentTypeClass) -and -not [string]::IsNullOrWhiteSpace($contentType)) {
+        $mediaType = @($contentType -split ';', 2)[0].Trim().ToLowerInvariant()
+        $contentTypeClass = switch -Regex ($mediaType) {
+            '^application/(?:[a-z0-9.+-]+\+)?json$' { 'json'; break }
+            '^text/html$' { 'html'; break }
+            '^text/' { 'text'; break }
+            '^application/octet-stream$' { 'binary'; break }
+            default { 'other' }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        transport_exit = $transportExit
+        http_status = $status
+        content_type_class = $contentTypeClass
+    }
+}
+
+function Read-BoardTransportMetadata {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $empty = [pscustomobject][ordered]@{
+        transport_exit = ''
+        http_status = ''
+        content_type_class = ''
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $empty }
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Length -eq 0) { return $empty }
+    if ($item.Length -gt 1024) { throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR') }
+
+    try {
+        $metadata = [IO.File]::ReadAllText($item.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    } catch {
+        throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR', $_.Exception)
+    }
+    if ($null -eq $metadata -or
+        $metadata.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
+        throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR')
+    }
+    $allowed = @('transport_exit', 'http_status', 'content_type_class')
+    foreach ($name in @($metadata.PSObject.Properties | ForEach-Object { [string]$_.Name })) {
+        if ($allowed -cnotcontains [string]$name) {
+            throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR')
+        }
+    }
+
+    $result = [ordered]@{
+        transport_exit = ''
+        http_status = ''
+        content_type_class = ''
+    }
+    $transportProperty = $metadata.PSObject.Properties['transport_exit']
+    if ($transportProperty) {
+        if ($transportProperty.Value -is [bool] -or $transportProperty.Value -is [string] -or
+            [string]$transportProperty.Value -cnotmatch '^-?\d{1,10}$') {
+            throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR')
+        }
+        $result.transport_exit = [string]$transportProperty.Value
+    }
+    $statusProperty = $metadata.PSObject.Properties['http_status']
+    if ($statusProperty) {
+        if ($statusProperty.Value -is [bool] -or $statusProperty.Value -is [string] -or
+            [string]$statusProperty.Value -cnotmatch '^[1-5]\d{2}$') {
+            throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR')
+        }
+        $result.http_status = [string]$statusProperty.Value
+    }
+    $contentTypeProperty = $metadata.PSObject.Properties['content_type_class']
+    if ($contentTypeProperty) {
+        if ($contentTypeProperty.Value -isnot [string] -or
+            @('json', 'html', 'text', 'binary', 'other') -cnotcontains [string]$contentTypeProperty.Value) {
+            throw [IO.InvalidDataException]::new('BOARD_READ_CLIENT_ERROR')
+        }
+        $result.content_type_class = [string]$contentTypeProperty.Value
+    }
+    return [pscustomobject]$result
+}
+
+function Test-BoardNetworkException {
+    param([AllowNull()][Exception]$Exception)
+
+    $current = $Exception
+    for ($depth = 0; $null -ne $current -and $depth -lt 5; $depth++) {
+        if ($current -is [Net.WebException] -or
+            $current -is [TimeoutException] -or
+            $current.GetType().FullName -ceq 'System.Net.Http.HttpRequestException') {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Add-BoardTransportMetadata {
+    param(
+        [Parameter(Mandatory = $true)][Exception]$Exception,
+        [Parameter(Mandatory = $true)]$Metadata
+    )
+
+    foreach ($key in @('transport_exit', 'http_status', 'content_type_class')) {
+        $value = [string]$Metadata.$key
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $Exception.Data[$key] = $value }
+    }
+}
+
 function Read-Board {
     if ($BoardFixturePath) {
         if (-not (Test-Path -LiteralPath $BoardFixturePath -PathType Leaf)) { throw 'board_fixture_missing' }
@@ -106,18 +290,134 @@ function Read-Board {
     if (-not (Test-Path -LiteralPath $BusScript -PathType Leaf)) { throw 'v1_bus_script_missing' }
     if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { throw 'v1_bus_env_missing' }
     $temporary = [IO.Path]::GetTempFileName()
+    $metadataTemporary = [IO.Path]::GetTempFileName()
     try {
         $busArgs = @{
             Action = 'read'
             Title = $BoardTitle
             OutFile = $temporary
             EnvFile = $EnvFile
+            ReadMetadataOutFile = $metadataTemporary
         }
-        & $BusScript @busArgs | Out-Null
+        try {
+            & $BusScript @busArgs | Out-Null
+        } catch {
+            $busError = $_
+            $raw = if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+                [IO.File]::ReadAllText($temporary, [Text.Encoding]::UTF8)
+            } else { '' }
+            $transport = Read-BoardTransportMetadata -Path $metadataTemporary
+            $isNetworkException = Test-BoardNetworkException -Exception $busError.Exception
+            if ($isNetworkException) {
+                $exceptionMetadata = Get-BoardTransportFailureMetadata -ErrorRecord $busError
+                foreach ($key in @('transport_exit', 'http_status', 'content_type_class')) {
+                    if ([string]::IsNullOrWhiteSpace([string]$transport.$key) -and
+                        -not [string]::IsNullOrWhiteSpace([string]$exceptionMetadata.$key)) {
+                        $transport.$key = [string]$exceptionMetadata.$key
+                    }
+                }
+            }
+            $hasTransportFailure = -not [string]::IsNullOrWhiteSpace([string]$transport.transport_exit) -and
+                [string]$transport.transport_exit -cne '0'
+            $hasHttpFailure = -not [string]::IsNullOrWhiteSpace([string]$transport.http_status) -and
+                ([int]$transport.http_status -lt 200 -or [int]$transport.http_status -ge 300)
+            $code = if ($hasTransportFailure) {
+                'BOARD_READ_TRANSPORT_ERROR'
+            } elseif ($hasHttpFailure) {
+                'BOARD_READ_HTTP_ERROR'
+            } elseif ($isNetworkException) {
+                'BOARD_READ_TRANSPORT_ERROR'
+            } else {
+                'BOARD_READ_CLIENT_ERROR'
+            }
+            $failure = New-BoardReadFailure `
+                -Code $code `
+                -InnerException $busError.Exception `
+                -RawContent $raw `
+                -TransportExit ([string]$transport.transport_exit) `
+                -HttpStatus ([string]$transport.http_status) `
+                -ContentTypeClass ([string]$transport.content_type_class)
+            throw $failure
+        }
         $raw = [IO.File]::ReadAllText($temporary, [Text.Encoding]::UTF8)
-        return @(Get-BoardRowsFromJson -Json $raw)
+        $transport = Read-BoardTransportMetadata -Path $metadataTemporary
+        $hasTransportFailure = -not [string]::IsNullOrWhiteSpace([string]$transport.transport_exit) -and
+            [string]$transport.transport_exit -cne '0'
+        $hasHttpFailure = -not [string]::IsNullOrWhiteSpace([string]$transport.http_status) -and
+            ([int]$transport.http_status -lt 200 -or [int]$transport.http_status -ge 300)
+        if ($hasTransportFailure -or $hasHttpFailure) {
+            $code = if ($hasTransportFailure) { 'BOARD_READ_TRANSPORT_ERROR' } else { 'BOARD_READ_HTTP_ERROR' }
+            throw (New-BoardReadFailure `
+                -Code $code `
+                -RawContent $raw `
+                -TransportExit ([string]$transport.transport_exit) `
+                -HttpStatus ([string]$transport.http_status) `
+                -ContentTypeClass ([string]$transport.content_type_class))
+        }
+        try {
+            return @(Get-BoardRowsFromJson -Json $raw)
+        } catch {
+            Add-BoardTransportMetadata -Exception $_.Exception -Metadata $transport
+            throw
+        }
     } finally {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $metadataTemporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-TransientBoardReadFailure {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $code = [string]$ErrorRecord.Exception.Message
+    if (@('BOARD_READ_TRANSPORT_ERROR', 'BOARD_READ_RESPONSE_EMPTY', 'BOARD_READ_JSON_INVALID') -ccontains $code) {
+        return $true
+    }
+    if ($code -cne 'BOARD_READ_HTTP_ERROR' -or -not $ErrorRecord.Exception.Data.Contains('http_status')) {
+        return $false
+    }
+    $statusText = [string]$ErrorRecord.Exception.Data['http_status']
+    if ($statusText -cnotmatch '^[1-5]\d{2}$') { return $false }
+    $status = [int]$statusText
+    return $status -in @(408, 425, 429) -or ($status -ge 500 -and $status -le 599)
+}
+
+function Read-BoardPreAdmission {
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            return @(Read-Board)
+        } catch {
+            $timer.Stop()
+            $code = [string]$_.Exception.Message
+            $isTransient = Test-TransientBoardReadFailure -ErrorRecord $_
+            $_.Exception.Data['attempt'] = [string]$attempt
+            $_.Exception.Data['elapsed_ms'] = [string][Math]::Round($timer.Elapsed.TotalMilliseconds, 2)
+            if ($attempt -ge 2 -or -not $isTransient) { throw }
+
+            $details = @{
+                attempt = $attempt
+                code = $code
+                elapsed_ms = [Math]::Round($timer.Elapsed.TotalMilliseconds, 2)
+            }
+            foreach ($key in @('transport_exit', 'http_status', 'content_type_class', 'content_length', 'content_sha256')) {
+                if ($_.Exception.Data.Contains($key)) {
+                    $details[$key] = [string]$_.Exception.Data[$key]
+                }
+            }
+            try {
+                Write-OrderLog `
+                    -Path $LogPath `
+                    -Event 'board_read_retry' `
+                    -Level warning `
+                    -RunId $RunId `
+                    -Code $code `
+                    -Message 'A transient pre-admission board read failed; retrying once.' `
+                    -Details $details
+            } catch {}
+        } finally {
+            if ($timer.IsRunning) { $timer.Stop() }
+        }
     }
 }
 
@@ -135,7 +435,13 @@ function Append-Board {
 }
 
 function Set-LocalError {
-    param([string]$Code, [string]$Message, [string]$WorkId = '', [string]$RowId = '')
+    param(
+        [string]$Code,
+        [string]$Message,
+        [string]$WorkId = '',
+        [string]$RowId = '',
+        [hashtable]$Details
+    )
     $safe = Protect-LogText -Text $Message -MaximumLength 500
     if ($state) {
         $state.error = [pscustomobject][ordered]@{
@@ -178,6 +484,7 @@ function Set-LocalError {
             Code = $Code
             Message = $safe
         }
+        if ($Details -and $Details.Count -gt 0) { $logArgs.Details = $Details }
         Write-OrderLog @logArgs
     } catch {}
 }
@@ -443,7 +750,7 @@ try {
     Save-OrderState -Path $StatePath -State $state
     Write-OrderLog -Path $LogPath -Event 'poll_started' -RunId $RunId -Details @{ mode = $Mode }
 
-    $rows = @(Read-Board)
+    $rows = @(Read-BoardPreAdmission)
     $selection = Get-OrderSelection -Rows $rows -Cursor $state.cursor -AllowedSources $AllowedSources -RequiredAuthorityToken $RequiredAuthorityToken
     if ($selection.newest_seen) {
         $state.seen = [pscustomobject][ordered]@{
@@ -603,7 +910,18 @@ try {
     $code = ($message -replace '[^A-Za-z0-9_.-]', '_').ToUpperInvariant()
     if ($code.Length -gt 80) { $code = $code.Substring(0, 80) }
     if (-not $code) { $code = 'ORDER_SUPERVISOR_ERROR' }
-    Set-LocalError -Code $code -Message $message -WorkId $currentWorkId -RowId $currentRowId
+    $errorDetails = @{}
+    foreach ($key in @('attempt', 'transport_exit', 'http_status', 'content_type_class', 'content_length', 'content_sha256', 'elapsed_ms')) {
+        if ($_.Exception.Data.Contains($key)) {
+            $errorDetails[$key] = [string]$_.Exception.Data[$key]
+        }
+    }
+    Set-LocalError `
+        -Code $code `
+        -Message $message `
+        -WorkId $currentWorkId `
+        -RowId $currentRowId `
+        -Details $errorDetails
     [pscustomobject]@{ ok = $false; status = 'error'; run_id = $RunId; error_code = $code } | ConvertTo-Json -Compress
     exit 20
 } finally {

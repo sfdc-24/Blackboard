@@ -1,0 +1,44 @@
+name: ORDER acceptance (offline)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/order-acceptance.yml'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/bus.ps1'
+      - 'scripts/install_order_supervisor.ps1'
+      - 'scripts/invoke_order_claude.ps1'
+      - 'scripts/order_supervisor_result.schema.json'
+      - 'infra/azure/blackboard_vm_supervisor.ps1'
+      - 'tests/test_order_read_resilience.ps1'
+      - 'tests/test_order_supervisor.ps1'
+      - 'tests/test_order_workspace.ps1'
+      - 'tests/test_azure_vm_supervisor.ps1'
+      - 'tests/fixtures/order_supervisor_board.json'
+      - 'docs/ONBOARDING.md'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: ORDER and Azure contracts on Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test bounded ORDER board-read resilience
+        shell: powershell
+        run: .\tests\test_order_read_resilience.ps1
+      - name: Test ORDER supervisor contracts
+        shell: powershell
+        run: .\tests\test_order_supervisor.ps1
+      - name: Test ORDER workspace and task contracts
+        shell: powershell
+        run: .\tests\test_order_workspace.ps1
+      - name: Test Azure supervisor contracts
+        shell: powershell
+        run: .\tests\test_azure_vm_supervisor.ps1

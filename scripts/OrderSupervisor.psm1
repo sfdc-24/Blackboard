@@ -232,13 +232,34 @@ function ConvertFrom-BcbPayload {
 function Get-BoardRowsFromJson {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Json)
 
-    $response = ConvertFrom-JsonPreserveStrings -Json $Json
-    if (-not $response) { throw 'board_response_empty' }
-    if (-not ($response.PSObject.Properties.Name -contains 'ok') -or
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        $failure = [IO.InvalidDataException]::new('BOARD_READ_RESPONSE_EMPTY')
+        $failure.Data['content_length'] = [Text.Encoding]::UTF8.GetByteCount($Json)
+        $failure.Data['content_sha256'] = Get-StringSha256 -Text $Json
+        throw $failure
+    }
+    try {
+        $response = ConvertFrom-JsonPreserveStrings -Json $Json
+    } catch {
+        $failure = [IO.InvalidDataException]::new('BOARD_READ_JSON_INVALID', $_.Exception)
+        $failure.Data['content_length'] = [Text.Encoding]::UTF8.GetByteCount($Json)
+        $failure.Data['content_sha256'] = Get-StringSha256 -Text $Json
+        throw $failure
+    }
+    if ($null -eq $response -or
+        ($response.GetType().FullName -cne 'System.Management.Automation.PSCustomObject' -and
+         $response -isnot [Collections.IDictionary])) {
+        $failure = [IO.InvalidDataException]::new('BOARD_READ_RESPONSE_SHAPE_INVALID')
+        $failure.Data['content_length'] = [Text.Encoding]::UTF8.GetByteCount($Json)
+        $failure.Data['content_sha256'] = Get-StringSha256 -Text $Json
+        throw $failure
+    }
+    $responseNames = @($response.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($responseNames -cnotcontains 'ok' -or
         $response.ok -isnot [bool] -or -not [bool]$response.ok) {
         throw 'board_read_refused'
     }
-    if (-not ($response.PSObject.Properties.Name -contains 'rows')) {
+    if ($responseNames -cnotcontains 'rows') {
         throw 'board_rows_missing'
     }
 

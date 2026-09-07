@@ -49,11 +49,75 @@ param(
   [switch]$Force,
   [switch]$NoSeparator,
   [string]$OutFile,
-  [string]$EnvFile
+  [string]$EnvFile,
+  [string]$ReadMetadataOutFile
 )
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if ($ReadMetadataOutFile -and $Action -cne 'read') {
+  throw 'ReadMetadataOutFile is available only for Action read'
+}
+
+function ConvertTo-BusContentTypeClass {
+  param([AllowNull()][string]$ContentType)
+
+  if ([string]::IsNullOrWhiteSpace($ContentType)) { return $null }
+  $mediaType = @($ContentType -split ';', 2)[0].Trim().ToLowerInvariant()
+  return $(switch -Regex ($mediaType) {
+    '^application/(?:[a-z0-9.+-]+\+)?json$' { 'json'; break }
+    '^text/html$' { 'html'; break }
+    '^text/' { 'text'; break }
+    '^application/octet-stream$' { 'binary'; break }
+    default { 'other' }
+  })
+}
+
+function Get-BusHeaderMetadata {
+  param([AllowNull()][object[]]$HeaderLines)
+
+  $status = $null
+  $contentTypeClass = $null
+  foreach ($line in @($HeaderLines)) {
+    $text = [string]$line
+    if ($text -match '^\s*HTTP/\S+\s+([1-5]\d{2})(?:\s|$)') {
+      $status = [int]$matches[1]
+      $contentTypeClass = $null
+      continue
+    }
+    if ($text -match '^\s*[Cc]ontent-[Tt]ype\s*:\s*(.+)$') {
+      $contentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$matches[1])
+    }
+  }
+  return [pscustomobject][ordered]@{
+    http_status = $status
+    content_type_class = $contentTypeClass
+  }
+}
+
+function Write-BusReadMetadata {
+  param(
+    [AllowNull()][string]$Path,
+    [AllowNull()]$TransportExit,
+    [AllowNull()]$HttpStatus,
+    [AllowNull()][string]$ContentTypeClass
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  $metadata = [ordered]@{}
+  if ($null -ne $TransportExit -and [string]$TransportExit -cmatch '^-?\d{1,10}$') {
+    $metadata.transport_exit = [int]$TransportExit
+  }
+  if ($null -ne $HttpStatus -and [string]$HttpStatus -cmatch '^[1-5]\d{2}$') {
+    $metadata.http_status = [int]$HttpStatus
+  }
+  if (@('json', 'html', 'text', 'binary', 'other') -ccontains $ContentTypeClass) {
+    $metadata.content_type_class = $ContentTypeClass
+  }
+  $metadataPath = if ([IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path (Get-Location).Path $Path }
+  $metadataJson = $metadata | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
+}
 
 # ---- load credentials from .env (never from argv) ---------------------------
 if (-not $EnvFile) { $EnvFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env' }
@@ -155,6 +219,9 @@ $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 $location = $null
 $content  = $null
 $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+$readTransportExit = $null
+$readHttpStatus = $null
+$readContentTypeClass = $null
 
 if ($curl) {
   # ONE request only. -D dumps headers to a file while the body goes to stdout, so
@@ -168,7 +235,11 @@ if ($curl) {
     [IO.File]::WriteAllBytes($tmpBody, $bytes)
     $out  = & $curl.Source -s -S -D $tmpHead --max-time 120 -X POST $cfg.BUS_URL `
               -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$tmpBody"
+    $readTransportExit = [int]$LASTEXITCODE
     $head = Get-Content -LiteralPath $tmpHead -ErrorAction SilentlyContinue
+    $hop1Metadata = Get-BusHeaderMetadata -HeaderLines @($head)
+    $readHttpStatus = $hop1Metadata.http_status
+    $readContentTypeClass = $hop1Metadata.content_type_class
     $loc  = @($head | Where-Object { $_ -match '^\s*[Ll]ocation:' }) | Select-Object -First 1
     if ($loc) { $location = ($loc -replace '^\s*[Ll]ocation:\s*', '').Trim() }
     else      { $content  = ($out -join "`n") }
@@ -181,10 +252,16 @@ if ($curl) {
     $r1 = Invoke-WebRequest -Uri $cfg.BUS_URL -Method Post -Body $bytes `
           -ContentType 'application/json; charset=utf-8' -MaximumRedirection 0 `
           -UseBasicParsing -TimeoutSec 120
+    $readHttpStatus = [int]$r1.StatusCode
+    $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r1.Headers['Content-Type'])
     if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) { $location = $r1.Headers['Location'] }
     else { $content = $r1.Content }
   } catch [System.Net.WebException] {
     $resp = $_.Exception.Response
+    if ($resp) {
+      $readHttpStatus = [int]$resp.StatusCode
+      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$resp.Headers['Content-Type'])
+    }
     if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
       $location = $resp.Headers['Location']
     } else { throw }
@@ -198,7 +275,12 @@ if ($location) {
     $tmpHead2 = [IO.Path]::GetTempFileName()
     try {
       $out2  = & $curl.Source -s -S -D $tmpHead2 --max-time 120 $location
+      $hop2Exit = [int]$LASTEXITCODE
+      if ($null -eq $readTransportExit -or $hop2Exit -ne 0) { $readTransportExit = $hop2Exit }
       $head2 = Get-Content -LiteralPath $tmpHead2 -ErrorAction SilentlyContinue
+      $hop2Metadata = Get-BusHeaderMetadata -HeaderLines @($head2)
+      $readHttpStatus = $hop2Metadata.http_status
+      $readContentTypeClass = $hop2Metadata.content_type_class
       $loc2  = @($head2 | Where-Object { $_ -match '^\s*[Ll]ocation:' }) | Select-Object -First 1
       if ($loc2) {
         throw "hop 2 redirected again (to $(($loc2 -replace '^\s*[Ll]ocation:\s*','').Trim())) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
@@ -208,9 +290,15 @@ if ($location) {
   } else {
     try {
       $r2 = Invoke-WebRequest -Uri $location -Method Get -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 120
+      $readHttpStatus = [int]$r2.StatusCode
+      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r2.Headers['Content-Type'])
       $content = $r2.Content
     } catch [System.Net.WebException] {
       $resp = $_.Exception.Response
+      if ($resp) {
+        $readHttpStatus = [int]$resp.StatusCode
+        $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$resp.Headers['Content-Type'])
+      }
       if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
         throw "hop 2 redirected again (to $($resp.Headers['Location'])) -- one-shot key consumed or expired. The write, if any, may still have landed: READ BACK before deciding anything."
       }
@@ -218,6 +306,12 @@ if ($location) {
     }
   }
 }
+
+Write-BusReadMetadata `
+  -Path $ReadMetadataOutFile `
+  -TransportExit $readTransportExit `
+  -HttpStatus $readHttpStatus `
+  -ContentTypeClass $readContentTypeClass
 
 if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
 # [string]$null is $null in WinPS 5.1, not '' -- coalesce before calling a method on it.
