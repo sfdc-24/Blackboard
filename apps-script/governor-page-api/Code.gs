@@ -648,8 +648,12 @@ function logVisitor_(sid, who, text) {
 function chatDailyCap_(props) {
   var raw = props.getProperty('CHAT_DAILY_CAP');
   if (raw === null || raw === '') return CHAT_DAILY_DEFAULT;
-  var cap = parseInt(raw, 10);
-  return isFinite(cap) && cap >= 0 ? cap : CHAT_DAILY_DEFAULT;
+  raw = String(raw);
+  if (!/^\d+$/.test(raw)) throw new Error('invalid chat daily cap');
+  var cap = Number(raw);
+  if (!isFinite(cap) || cap < 0 || Math.floor(cap) !== cap)
+    throw new Error('invalid chat daily cap');
+  return cap;
 }
 
 function dailyKey_(now) {
@@ -665,30 +669,44 @@ function dailyKey_(now) {
 function readChatBudget_(props, now) {
   var dayKey = dailyKey_(now);
   var day = dayKey.slice('CHAT_COUNT_'.length);
-  var legacy = parseInt(props.getProperty(dayKey) || '0', 10);
-  if (!isFinite(legacy) || legacy < 0) legacy = 0;
+  var legacyRaw = props.getProperty(dayKey);
+  var legacy = 0;
+  if (legacyRaw !== null && legacyRaw !== '') {
+    legacyRaw = String(legacyRaw);
+    if (!/^\d+$/.test(legacyRaw)) throw new Error('invalid legacy daily counter');
+    legacy = Number(legacyRaw);
+    if (!isFinite(legacy) || legacy < 0 || Math.floor(legacy) !== legacy)
+      throw new Error('invalid legacy daily counter');
+  }
 
   var state = { day: day, daily: legacy, sessions: {} };
-  try {
-    var parsed = JSON.parse(props.getProperty(CHAT_BUDGET_STATE) || '{}');
-    if (parsed && typeof parsed === 'object' && !(parsed instanceof Array)) {
-      if (parsed.day === day) {
-        var priorDaily = Math.max(0, parseInt(parsed.daily, 10) || 0);
-        state.daily = Math.max(state.daily, priorDaily);
-      }
-      var priorSessions = parsed.sessions;
-      if (priorSessions && typeof priorSessions === 'object' && !(priorSessions instanceof Array)) {
-        Object.keys(priorSessions).forEach(function (key) {
-          if (!/^c[ga]_[a-f0-9]{32}$/.test(key)) return;
-          var entry = priorSessions[key];
-          if (!(entry instanceof Array) || entry.length !== 2) return;
-          var used = Math.max(0, parseInt(entry[0], 10) || 0);
-          var expires = Number(entry[1]) || 0;
-          if (expires > now) state.sessions[key] = [used, expires];
-        });
-      }
+  var encoded = props.getProperty(CHAT_BUDGET_STATE);
+  if (encoded === null || encoded === '') return state; // v31 migration
+
+  var parsed = JSON.parse(String(encoded));
+  if (!parsed || typeof parsed !== 'object' || parsed instanceof Array ||
+      Object.keys(parsed).sort().join(',') !== 'daily,day,sessions' ||
+      !/^\d{8}$/.test(String(parsed.day || '')) ||
+      typeof parsed.daily !== 'number' || !isFinite(parsed.daily) ||
+      parsed.daily < 0 || Math.floor(parsed.daily) !== parsed.daily ||
+      !parsed.sessions || typeof parsed.sessions !== 'object' ||
+      parsed.sessions instanceof Array) {
+    throw new Error('invalid chat budget state');
+  }
+  if (parsed.day === day) state.daily = Math.max(state.daily, parsed.daily);
+  Object.keys(parsed.sessions).forEach(function (key) {
+    if (!/^c[ga]_[a-f0-9]{32}$/.test(key))
+      throw new Error('invalid chat budget session key');
+    var entry = parsed.sessions[key];
+    if (!(entry instanceof Array) || entry.length !== 2 ||
+        typeof entry[0] !== 'number' || !isFinite(entry[0]) || entry[0] < 0 ||
+        Math.floor(entry[0]) !== entry[0] ||
+        typeof entry[1] !== 'number' || !isFinite(entry[1]) || entry[1] < 0 ||
+        Math.floor(entry[1]) !== entry[1]) {
+      throw new Error('invalid chat budget session entry');
     }
-  } catch (e) {}
+    if (entry[1] > now) state.sessions[key] = [entry[0], entry[1]];
+  });
   return state;
 }
 

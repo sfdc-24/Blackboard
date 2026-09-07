@@ -50,8 +50,10 @@ The repaired contract is:
    cannot forget spend already reserved by this version.
 6. Active session state is bounded to 96 entries in one property. Expired
    entries are purged; active entries are never evicted to admit more spend.
-   Capacity or property/lock failure returns an offline response before any
-   provider request.
+   An absent state property is accepted only for migration from v31. A present
+   malformed state, malformed legacy counter or malformed cap fails closed;
+   counters are never silently reset. Capacity, parse, property or lock failure
+   returns an offline response before any provider request.
 7. Visitor rows still land only in `PUBLIC_INBOX` as
    `EXTERNAL_UNTRUSTED / instruction_authority=NONE / PUBLIC_RECEPTION /
    UNREVIEWED`. The signed token identifies a conversation; it confers no

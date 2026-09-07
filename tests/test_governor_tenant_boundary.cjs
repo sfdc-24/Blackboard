@@ -301,6 +301,40 @@ test('a failed provider attempt remains reserved and a retry cannot overspend', 
   assert.equal(h.providerCalls, 1);
 });
 
+test('present malformed budget or cap state fails closed before the provider', () => {
+  const malformedStates = [
+    '{',
+    '[]',
+    JSON.stringify({ day: '20260907', daily: 0, sessions: [], extra: true }),
+    JSON.stringify({ day: '20260907', daily: -1, sessions: {} }),
+    JSON.stringify({ day: '20260907', daily: 0, sessions: { attacker: [1, Date.now() + 60000] } }),
+    JSON.stringify({ day: '20260907', daily: 0,
+      sessions: { ['ca_' + 'a'.repeat(32)]: ['1', Date.now() + 60000] } }),
+  ];
+  for (const encoded of malformedStates) {
+    const h = createHarness({ CHAT_BUDGET_V1: encoded });
+    const identity = h.context.conversationIdentity_('', '');
+    const result = h.context.reception(identity.token, 'must not spend', [], '');
+    assert.equal(result.degraded, 'budget-unavailable');
+    assert.equal(h.providerCalls, 0);
+  }
+
+  for (const cap of ['not-a-number', '-1', '12junk']) {
+    const h = createHarness({ CHAT_DAILY_CAP: cap });
+    const identity = h.context.conversationIdentity_('', '');
+    const result = h.context.reception(identity.token, 'must not spend', [], '');
+    assert.equal(result.degraded, 'budget-unavailable');
+    assert.equal(h.providerCalls, 0);
+  }
+
+  const legacy = createHarness();
+  legacy.values.set(legacy.context.dailyKey_(), 'corrupt');
+  const identity = legacy.context.conversationIdentity_('', '');
+  const result = legacy.context.reception(identity.token, 'must not spend', [], '');
+  assert.equal(result.degraded, 'budget-unavailable');
+  assert.equal(legacy.providerCalls, 0);
+});
+
 test('active-session state is bounded and new spend fails closed without eviction', () => {
   const h = createHarness();
   const admitted = [];
