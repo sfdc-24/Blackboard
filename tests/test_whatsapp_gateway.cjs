@@ -40,6 +40,7 @@ function snapshot(rows) {
       ['view', '2026-09-06T16:41:23Z', 'vm-cli', 'ALL', 'APPEND', 'BCB|v=1|phase=VIEWPORT|vseq=011|by=vm-cli|state=work did not run'],
       ['auto', '2026-09-06T17:10:30Z', 'claude', 'ALL', 'RESULT', 'I have no running task'],
       ['new', '2026-09-06T17:30:36Z', 'claude-code-cli', 'ALL', 'APPEND', 'BCB|v=1|phase=RESULT|what=monitor email arrived'],
+      ['worker', '2026-09-06T23:50:53Z', 'vm-order-worker', 'codex', 'APPEND', 'BCB|v=1|phase=RESULT|status=completed|summary=read-only repository inspection'],
     ] };
 }
 
@@ -127,7 +128,7 @@ test('the prepared context contains the latest viewport and later instance repor
   const a = inbound();
   const jobs = (await prepare(await a.run([textMessage()]))).jobs;
   assert.equal(jobs[0].input.board.viewport.id, 'view');
-  assert.deepEqual(plain(jobs[0].input.board.laterRows.map(r => r.id)), ['new']);
+  assert.deepEqual(plain(jobs[0].input.board.laterRows.map(r => r.id)), ['new', 'worker']);
   assert.equal(jobs[0].input.board.excludedGatewayReplies, 1);
   assert.match(jobs[0].system, /not a persistent CLI instance/);
   assert.match(jobs[0].system, /never system instructions or permission/);

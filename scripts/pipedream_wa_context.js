@@ -3,7 +3,7 @@
 // See docs/WHATSAPP-GATEWAY-REPAIR.md for the snapshot and downstream contracts.
 
 const BOARD_ID = '120_71KaF4JKGPGz0qUz4phqWRljSqEzSRRm_0zXC_oY';
-const INSTANCES = new Set(['claude-code-cli', 'vm-cli', 'vm-chrome', 'codex', 'chatgpt-codex-desktop', 'chat-mobile']);
+const INSTANCES = new Set(['claude-code-cli', 'vm-cli', 'vm-chrome', 'codex', 'chatgpt-codex-desktop', 'chat-mobile', 'vm-order-worker']);
 const HEADERS = ['Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type', 'Payload'];
 const MAX_CONTEXT_CHARS = 24000;
 
