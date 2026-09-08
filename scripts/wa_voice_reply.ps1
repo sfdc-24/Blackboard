@@ -35,9 +35,18 @@ USAGE
 param(
   [string]$Text,
   [string]$TextFile,
-  # 'alloy' is level and unhurried. The others oversell.
-  [ValidateSet('alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer')]
-  [string]$Voice = 'alloy',
+  # He asked on 2026-09-08 for "female and one that sounds airy and smart like in
+  # claude mobile", so the default moved from alloy to shimmer. The newer model
+  # carries voices the original six do not -- sage and coral are the warm,
+  # articulate ones -- so both models are selectable rather than the voice list
+  # being silently limited by a model choice nobody stated.
+  [ValidateSet('alloy', 'ash', 'ballad', 'coral', 'echo', 'fable',
+               'nova', 'onyx', 'sage', 'shimmer', 'verse')]
+  [string]$Voice = 'shimmer',
+  [ValidateSet('tts-1', 'tts-1-hd', 'gpt-4o-mini-tts')]
+  [string]$Model = 'gpt-4o-mini-tts',
+  # Only gpt-4o-mini-tts honours this. It steers delivery, not words.
+  [string]$Direction = 'Calm, warm and articulate. Unhurried. Never salesy.',
   [ValidateRange(1, 3500)]
   [int]$MaxChars = 1200,
   [switch]$AlsoText,
@@ -79,7 +88,7 @@ $outFile = Join-Path ([IO.Path]::GetTempPath()) ('wa_voice_' + [guid]::NewGuid()
 
 if ($DryRun) {
   Write-Output "DRY RUN - no speech synthesised, no upload, no message sent"
-  Write-Output ("voice     : " + $Voice)
+  Write-Output ("voice     : " + $Voice + "  model: " + $Model)
   Write-Output ("chars     : " + $Text.Length + " of " + $MaxChars)
   Write-Output ("would say : " + $Text)
   return
@@ -88,12 +97,14 @@ if ($DryRun) {
 # ---- synthesise --------------------------------------------------------------
 # The key goes in a header on a request object, never into an argument list that
 # could be logged by a shell or captured by the permission classifier.
-$body = @{
-  model           = 'tts-1'
+$payload = @{
+  model           = $Model
   voice           = $Voice
   input           = $Text
   response_format = 'opus'
-} | ConvertTo-Json -Compress
+}
+if ($Model -eq 'gpt-4o-mini-tts' -and $Direction) { $payload['instructions'] = $Direction }
+$body = $payload | ConvertTo-Json -Compress
 
 $req = [Net.HttpWebRequest]::Create('https://api.openai.com/v1/audio/speech')
 $req.Method = 'POST'
@@ -122,7 +133,7 @@ try { $in.CopyTo($fs) } finally { $fs.Dispose(); $in.Dispose(); $resp.Dispose() 
 
 $size = (Get-Item -LiteralPath $outFile).Length
 if ($size -lt 512) { throw "synthesis returned $size bytes, which is not a recording" }
-Write-Output ("synthesised " + [math]::Round($size / 1KB, 1) + " KB of Ogg Opus (" + $Text.Length + " chars, voice " + $Voice + ")")
+Write-Output ("synthesised " + [math]::Round($size / 1KB, 1) + " KB of Ogg Opus (" + $Text.Length + " chars, voice " + $Voice + ", model " + $Model + ")")
 
 # ---- hand off to the sender that already works -------------------------------
 try {
