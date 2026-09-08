@@ -4,6 +4,12 @@
 Built 2026-09-03 after Mr. Salam pointed out that work stops whenever a decision
 needs him and he is away from the desk.
 
+**Live URL:** https://claude.ai/code/artifact/f4c3d1a0-4de7-43b7-9cf9-c99b0a17a44b
+
+Recorded here on 2026-09-08 because it was written down nowhere in the repo, so
+reaching the channel meant listing every published artifact first. A channel you
+have to go looking for is a channel that does not get used when it matters.
+
 ## What it is
 
 A phone-first console listing what Claude is blocked on. Each blocker is one
