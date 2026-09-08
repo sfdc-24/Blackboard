@@ -11,8 +11,19 @@ identifiers (see `.gitignore`). So the change lives here, in the same form as
 - **Tests:** `node tests/test_thread_view.js` — 24 assertions, all passing. The
   test lifts `threadRows` and `who` out of the page rather than copying them, so
   it fails if the page changes and the test does not.
-- **Deploy:** `clasp push` then a new version, per `docs/HANDOVER.md`. Do **not**
-  copy `site/` — see SITE-MIRROR-DRIFT-001.
+- **Deploy — READ THIS FIRST, corrected 2026-09-08:** do **NOT** `clasp push`
+  from `gas/`. That directory is **diverged, not merely behind**: `Code.js` is
+  760 lines against canonical's 1034 and lacks the server-signed conversation
+  identity; `Auth.gs` is 310 against 409; `Reception.html` is v31-based. Only
+  `Index.html` matches canonical, which is why this patch is safe *as a patch*
+  and lethal *as a push* — `clasp push` ships the whole `rootDir`, so it would
+  put a stale backend over the tenant-boundary work.
+
+  The route is: apply this to `apps-script/governor-page-api/Index.html` on
+  `main`, open a PR, and let the coupled backend/client release carry it. See
+  `docs/MULTITENANT-READINESS.md`; that sequence is codex's.
+
+  Also do **not** copy `site/` — see SITE-MIRROR-DRIFT-001.
 
 ## Why
 
