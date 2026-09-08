@@ -227,12 +227,85 @@ console.log('\nproviders parse a real-shaped response');
   check('reads registrable, not available', cf[0].available === true);
   check('coerces the STRING registration_cost to a number', cf[0].price === 10.11, String(cf[0].price));
   check('reads the currency from pricing', cf[0].currency === 'USD');
+  // success:true is required here now. The first version of this fixture omitted
+  // it and the new envelope check rejected it -- which is the validation working:
+  // my own hand-written fixture was not a shape the provider would ever send.
   check('an unregistrable domain reads false',
-    D.providers.cloudflare.parse(JSON.stringify({ result: { domains: [
+    D.providers.cloudflare.parse(JSON.stringify({ success: true, result: { domains: [
       { name: 'taken.com', registrable: false, pricing: {} } ] } }))[0].available === false);
-  check('the old invented shape now yields nothing',
+  // The shape I invented has no success flag and a result that is not an object
+  // with a domains array, so it is now REFUSED rather than silently parsed to
+  // nothing. Refusing is the stronger outcome: an unrecognised envelope must not
+  // be reported as a completed check.
+  let inventedRefused = false;
+  try {
     D.providers.cloudflare.parse(JSON.stringify({
-      result: [{ name: 'acme.dev', available: true, price: 10.44 }] })).length === 0);
+      result: [{ name: 'acme.dev', available: true, price: 10.44 }] }));
+  } catch (e) { inventedRefused = e.envelope === true; }
+  check('the old invented shape is refused, not silently emptied', inventedRefused);
+}
+
+console.log('\na provider ERROR is not an empty result');
+{
+  // codex, PR34 follow-up. The transport-throws path was guarded; the path where
+  // the provider answers with an error envelope was not. lookup reported
+  // checked:true with zero rows -- a failed check dressed as a successful one in
+  // which nothing happened to be available. Reproduced before repairing.
+  let threw = false;
+  try { D.providers.cloudflare.parse(JSON.stringify({ success: false, errors: [{ code: 1003, message: 'Invalid account' }], result: null })); }
+  catch (e) { threw = e.envelope === true; }
+  check('cloudflare success:false throws an envelope error', threw);
+
+  let nsThrew = false;
+  try { D.providers.namesilo.parse(JSON.stringify({ reply: { code: 110, detail: 'invalid api key' } })); }
+  catch (e) { nsThrew = e.envelope === true; }
+  check('namesilo with no result node throws an envelope error', nsThrew);
+
+  check('a success envelope with an empty domain list is still a valid check',
+    D.providers.cloudflare.parse(JSON.stringify({ success: true, result: { domains: [] } })).length === 0);
+
+  const cfErr = JSON.stringify({ success: false, errors: [{ code: 1003, message: 'Invalid account' }], result: null });
+  const r = await D.lookup('roofing company', {
+    provider: 'cloudflare', tlds: ['com'],
+    config: { apiToken: 't'.repeat(20), accountId: 'a' },
+    transport: async () => cfErr
+  });
+  check('lookup reports checked:FALSE on an error envelope', r.checked === false, JSON.stringify(r));
+  check('and names the provider reason', /Invalid account/.test(r.reason), r.reason);
+  check('and claims no results', r.results.length === 0);
+  check('but still offers the candidates', r.suggestions.length > 0);
+}
+
+console.log('\nthe documented 20-domain request limit is enforced');
+{
+  check('the constant matches the published limit', D.MAX_PER_REQUEST === 20);
+  const many = [];
+  for (let i = 0; i < 21; i++) many.push('name' + i + '.com');
+  for (const who of ['namesilo', 'cloudflare']) {
+    let threw = false;
+    try {
+      D.providers[who].buildRequest(many, { apiKey: 'k'.repeat(12), apiToken: 't'.repeat(20), accountId: 'a' });
+    } catch (e) { threw = /exceeds the 20/.test(e.message); }
+    check(who + ' refuses 21 domains in one request', threw);
+  }
+  let ok20 = true;
+  try { D.providers.cloudflare.buildRequest(many.slice(0, 20), { apiToken: 't'.repeat(20), accountId: 'a' }); }
+  catch (e) { ok20 = false; }
+  check('20 is accepted', ok20);
+  let empty = false;
+  try { D.providers.namesilo.buildRequest([], { apiKey: 'k'.repeat(12) }); } catch (e) { empty = true; }
+  check('an empty batch is refused', empty);
+}
+
+console.log('\naccents survive tokenisation, not just labelling');
+{
+  // The accent fix lived in toLabel and never reached the code that decides what
+  // the WORDS are, so it looked complete while the user-facing path stayed broken.
+  const m = D.suggestLabels('Montréal bakery');
+  check('Montreal is not truncated to montr', m.indexOf('montreal') !== -1, JSON.stringify(m));
+  check('and the pair reads correctly', m.indexOf('montreal-bakery') !== -1, JSON.stringify(m));
+  const c = D.suggestLabels('café roasters');
+  check('cafe is not truncated to caf', c.indexOf('cafe') !== -1, JSON.stringify(c));
 }
 
 console.log('\n"could not check" is never reported as "not available"');

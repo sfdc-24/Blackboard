@@ -46,6 +46,12 @@ const TLDS = ['com', 'ca', 'io', 'dev', 'app', 'net', 'org', 'co'];
 // form, and we do not mint punycode ourselves, so it is rejected on input.
 const MAX_LABEL = 63;
 
+// DOCUMENTED: "This endpoint accepts up to 20 domains per request" (Cloudflare
+// domain-check). NameSilo publishes no equivalent number that I have read, so the
+// same ceiling is applied there as a SELF-IMPOSED bound rather than a quoted one
+// -- said plainly so nobody later cites this comment as a NameSilo fact.
+const MAX_PER_REQUEST = 20;
+
 function str_(v) {
   // String(x) throws on an object whose toString is not callable. A visitor's
   // JSON body can carry {"description":{"toString":1}}. Found by a test written
@@ -111,8 +117,15 @@ const STOP = new Set([
  */
 function suggestLabels(description, opts) {
   const limit = (opts && opts.limit) || 8;
+  // Fold accents BEFORE splitting. codex, PR34 follow-up: this tokenised the raw
+  // string on /[^a-z0-9]+/, so an accented letter was a SPLIT POINT rather than a
+  // letter -- "Montreal bakery" with the accent produced montrbakery, and a cafe
+  // became caf. The accent fix already existed in toLabel and never reached the
+  // path that decides what the words are, so it looked done and was not.
+  // Reproduced before repairing.
   const words = str_(description)
     .toLowerCase()
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .split(/[^a-z0-9]+/)
     .map((w) => w.trim())
     .filter((w) => w.length > 2 && w.length < 20 && !STOP.has(w));
@@ -210,6 +223,13 @@ function bindToRequested_(rows, requested) {
  * key, and so a provider can be swapped when the ownership decision lands.
  * ------------------------------------------------------------------------- */
 
+function assertBatch_(domains, who) {
+  if (!Array.isArray(domains) || !domains.length) throw new Error(who + ': no domains');
+  if (domains.length > MAX_PER_REQUEST) {
+    throw new Error(who + ': ' + domains.length + ' domains exceeds the ' + MAX_PER_REQUEST + ' per-request limit');
+  }
+}
+
 const namesilo = {
   name: 'namesilo',
   buildRequest(domains, cfg) {
@@ -218,6 +238,7 @@ const namesilo = {
     // Each domain has already been rebuilt by toLabel + candidates. Assert it
     // again here rather than trust the caller: this is the string that becomes
     // part of a URL carrying our key.
+    assertBatch_(domains, 'namesilo');
     for (const d of domains) assertSendable_(d, 'namesilo');
     return {
       method: 'GET',
@@ -231,6 +252,21 @@ const namesilo = {
   parse(body) {
     const j = JSON.parse(str_(body));
     const reply = (j && j.reply) || {};
+    // POSITIVE EVIDENCE OF A CHECK, not absence of an error. codex, PR34
+    // follow-up: an error envelope parsed to zero rows and lookup then reported
+    // checked:true -- a failed check dressed as a successful one with nothing
+    // available. That is the precise failure this module's own test section is
+    // named after, and I had only guarded the throw path.
+    //
+    // Rather than encode NameSilo's numeric codes, which I have not read, this
+    // requires one of the two result nodes to be present. An envelope that
+    // carries neither cannot have answered the question.
+    if (!reply.available && !reply.unavailable) {
+      const detail = str_(reply.detail) || str_(reply.code) || 'provider returned no result node';
+      const e = new Error('namesilo: ' + detail.slice(0, 200));
+      e.envelope = true;
+      throw e;
+    }
     const rows = [];
     const take = (node, available) => {
       if (!node) return;
@@ -279,6 +315,7 @@ const cloudflare = {
     // real reason to prefer this provider -- but the domains still go out under
     // our credential, so they are asserted exactly as NameSilo's are. The first
     // version validated nothing at all on this path.
+    assertBatch_(domains, 'cloudflare');
     for (const d of domains) assertSendable_(d, 'cloudflare');
     return {
       method: 'POST',
@@ -295,7 +332,19 @@ const cloudflare = {
   },
   parse(body) {
     const j = JSON.parse(str_(body));
-    const list = (j && j.result && j.result.domains) || [];
+    // Same rule as NameSilo: success must be asserted, not assumed. Cloudflare's
+    // envelope carries success plus an errors array; success:false with a null
+    // result previously parsed to zero rows and was reported as a completed check.
+    if (!j || j.success !== true || !j.result || !Array.isArray(j.result.domains)) {
+      const errs = (j && Array.isArray(j.errors)) ? j.errors : [];
+      const detail = errs.length
+        ? errs.map((e) => str_(e && e.message) || str_(e && e.code)).filter(Boolean).join('; ')
+        : 'provider did not report success';
+      const e = new Error('cloudflare: ' + str_(detail).slice(0, 200));
+      e.envelope = true;
+      throw e;
+    }
+    const list = j.result.domains;
     return (Array.isArray(list) ? list : []).map((r) => {
       const pricing = (r && r.pricing) || {};
       const cost = Number(pricing.registration_cost);
@@ -325,7 +374,10 @@ async function lookup(description, opts) {
   if (!provider) return { ok: false, checked: false, reason: 'unknown provider', results: [] };
 
   const labels = suggestLabels(description, { limit: o.limit || 6 });
-  const domains = candidates(labels, o.tlds, o.cap || 12);
+  // The caller's cap cannot exceed what a provider will accept in one request.
+  // Previously `cap` was passed straight through and a caller asking for 40 built
+  // 40 and sent them.
+  const domains = candidates(labels, o.tlds, Math.min(o.cap || 12, MAX_PER_REQUEST));
   if (!domains.length) {
     // Not an error. Some descriptions genuinely contain no usable word, and
     // saying so beats offering a name nobody asked for.
@@ -379,7 +431,7 @@ function shouldOfferNames(sketch) {
 }
 
 module.exports = {
-  TLDS, toLabel, suggestLabels, candidates, redact, lookup, shouldOfferNames,
-  assertSendable_, bindToRequested_,
+  TLDS, MAX_PER_REQUEST, toLabel, suggestLabels, candidates, redact, lookup,
+  shouldOfferNames, assertSendable_, bindToRequested_, assertBatch_,
   providers: PROVIDERS, _str: str_
 };

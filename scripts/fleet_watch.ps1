@@ -46,14 +46,8 @@ USAGE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fleet_watch.ps1 -Reset
 #>
 param(
-  # Same guards e800def put on the other operator helpers. A helper that accepts
-  # an unbounded poll interval can be told to hammer the board or to sleep for a
-  # year, and a tag is a board identity rather than free text.
-  [ValidatePattern('^[a-z0-9][a-z0-9._-]{0,39}$')]
   [string]$Tag = 'claude-code-cli',
-  [ValidateRange(5, 3600)]
   [int]$PollSeconds = 90,
-  [ValidateRange(0, 100)]
   [int]$CatchUpMax = 6,
   [switch]$IncludeCc,
   [string]$StateFile,
@@ -82,32 +76,18 @@ if ($stateDir -and -not (Test-Path -LiteralPath $stateDir)) {
 }
 if ($Reset -and (Test-Path -LiteralPath $StateFile)) { Remove-Item -LiteralPath $StateFile -Force }
 
-# $seen answers "shown already" in constant time; $seenOrder keeps the order, so
-# trimming the file keeps the NEWEST ids rather than an arbitrary set. A
-# PowerShell hashtable does not promise key order and the first version of
-# wa_watch.ps1 assumed it did.
-$seen = @{}
-$seenOrder = New-Object System.Collections.Generic.List[string]
-$warm = $false
-if (Test-Path -LiteralPath $StateFile) {
-  try {
-    $st = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($k in @($st.seenIds)) {
-      if ($k -and -not $seen.ContainsKey("$k")) { $seen["$k"] = $true; [void]$seenOrder.Add("$k") }
-    }
-    $warm = ($seen.Count -gt 0)
-  } catch { $seen = @{}; $seenOrder.Clear(); $warm = $false }
-}
+# WATERMARK, not a memory of every row seen. codex found the old design's failure
+# while reviewing PR34: it kept the newest 400 ids and rescanned the entire
+# append-only board, so past 400 qualifying rows a restart replayed evicted
+# ancient rows as "(missed while offline)". Presenting weeks-old messages as
+# unanswered is worse than silence. scripts/watch_state.ps1 carries the
+# replacement and tests/test_watch_state.ps1 pins its behaviour.
+. (Join-Path $PSScriptRoot 'watch_state.ps1')
 
-function Save-State {
-  param([System.Collections.Generic.List[string]]$Order, [string]$Path)
-  try {
-    $ids = @($Order)
-    if ($ids.Count -gt 400) { $ids = $ids[($ids.Count - 400)..($ids.Count - 1)] }
-    $obj = [ordered]@{ savedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); seenIds = $ids }
-    ($obj | ConvertTo-Json -Depth 4 -Compress) | Set-Content -LiteralPath $Path -Encoding UTF8
-  } catch { }   # a watcher must never die because a cache file could not be written
-}
+$state = Read-WatchState -Path $StateFile
+$warm = ($null -ne $state)
+if (-not $state) { $state = New-WatchState }
+$tailTimes = @{}
 
 $tmp = Join-Path $env:TEMP ("fleet_watch_" + [guid]::NewGuid().ToString('N') + '.json')
 
@@ -195,9 +175,6 @@ function Format-Line {
 }
 
 $primed = $warm
-# try/finally so the board snapshot in $env:TEMP is not left behind when the
-# watcher is stopped. Same reason as wa_watch.ps1.
-try {
 while ($true) {
   $board = Read-Board
   if ($board -and $board.rows) {
@@ -213,9 +190,7 @@ while ($true) {
       if ((Field $pay 'from') -eq $Tag) { continue }
       if (-not (Addressed $pay $Tag ([bool]$IncludeCc))) { continue }
       $id = [string]$r[0]
-      if ($seen.ContainsKey($id)) { continue }
-      $seen[$id] = $true
-      [void]$seenOrder.Add($id)
+      if (-not (Test-RowIsNew -State $state -RowId $id -RowTs ([string]$r[1]))) { continue }
       $fresh += ,$r
     }
 
@@ -223,7 +198,8 @@ while ($true) {
       $primed = $true
       Write-Output ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
                     " for " + $Tag + " - " + $fresh.Count + " existing rows ignored, polling every " + $PollSeconds + "s")
-      Save-State -Order $seenOrder -Path $StateFile
+      foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
+      [void](Save-WatchState -State $state -Path $StateFile)
     } else {
       $emit = $fresh
       $late = $false
@@ -237,6 +213,11 @@ while ($true) {
           } else {
             Write-Output ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening")
           }
+        } else {
+          # Say so. A silent start is indistinguishable from a watcher that died,
+          # which is the failure this whole file exists to end.
+          Write-Output ("Fleet watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                        " for " + $Tag + " - nothing missed, polling every " + $PollSeconds + "s")
         }
       }
       foreach ($r in $emit) {
@@ -244,13 +225,16 @@ while ($true) {
         if ($late) { $prefix = '(missed while offline) ' }
         Write-Output (Format-Line -Row $r -Prefix $prefix)
       }
-      if ($fresh.Count -gt 0) { Save-State -Order $seenOrder -Path $StateFile }
+      if ($fresh.Count -gt 0) {
+        # Advance over EVERY considered row, not just the emitted ones: a row
+        # suppressed by the catch-up cap or the duplicate window has still been
+        # dealt with, and must not come back as new on the next restart.
+        foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
+        [void](Save-WatchState -State $state -Path $StateFile)
+      }
     }
   }
 
   if ($Once) { break }
   Start-Sleep -Seconds $PollSeconds
-}
-} finally {
-  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }

@@ -10,6 +10,10 @@ on:
       - "tests/test_build_page.js"
       - "tests/test_sketch_contract.js"
       - "tests/test_domain_lookup.js"
+      - "scripts/wa_watch.ps1"
+      - "scripts/fleet_watch.ps1"
+      - "scripts/watch_state.ps1"
+      - "tests/test_watch_state.ps1"
       - ".github/workflows/beat1-prototype-tests.yml"
 
 permissions:
@@ -39,3 +43,6 @@ jobs:
           node tests/test_beat1_provider.js
           node tests/test_beat1_runtime.js
           node tests/test_domain_lookup.js
+      - name: Watcher watermark state (PowerShell, offline)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/test_watch_state.ps1

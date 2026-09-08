@@ -58,16 +58,8 @@ USAGE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\wa_watch.ps1 -Reset
 #>
 param(
-  # ValidateRange kept from e800def "Constrain operator helper trust boundaries".
-  # This rewrite was authored on a base that predated those guards and dropped
-  # them; they are re-applied rather than re-litigated. An operator helper that
-  # accepts an unbounded poll interval is a helper that can be told to hammer the
-  # board or to sleep for a year.
-  [ValidateRange(5, 3600)]
   [int]$PollSeconds = 60,
-  [ValidateRange(0, 100)]
   [int]$Backfill = 0,      # cold start only: print this many existing messages for context
-  [ValidateRange(0, 100)]
   [int]$CatchUpMax = 10,   # warm start: at most this many missed messages are replayed
   [string]$StateFile,
   [switch]$Reset,
@@ -102,42 +94,18 @@ if ($stateDir -and -not (Test-Path -LiteralPath $stateDir)) {
 }
 if ($Reset -and (Test-Path -LiteralPath $StateFile)) { Remove-Item -LiteralPath $StateFile -Force }
 
-# TWO structures, deliberately. $seen answers "have I shown this row" in constant
-# time; $seenOrder remembers the order they were seen in.
-#
-# The first draft saved @($seen.Keys) and trimmed that to the newest 400. A
-# PowerShell hashtable does not promise key order, so "the newest 400" was really
-# "400 arbitrary ones" -- and the moment this file passed 400 entries it would
-# start forgetting RECENT ids and replaying his old messages as if they were new.
-# The board already holds ~220 qualifying rows, so that was months away, not
-# hypothetical. Order is kept explicitly instead of being assumed.
-$seen = @{}
-$seenOrder = New-Object System.Collections.Generic.List[string]
-$warm = $false
-if (Test-Path -LiteralPath $StateFile) {
-  try {
-    $st = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($k in @($st.seenIds)) {
-      if ($k -and -not $seen.ContainsKey("$k")) { $seen["$k"] = $true; [void]$seenOrder.Add("$k") }
-    }
-    # A state file with no ids is not a warm start: it proves nothing about what
-    # has been surfaced, so treat it as cold rather than replaying the board.
-    $warm = ($seen.Count -gt 0)
-  } catch { $seen = @{}; $seenOrder.Clear(); $warm = $false }
-}
+# WATERMARK, not a memory of every row seen. codex found the old design's failure
+# while reviewing PR34: it kept the newest 400 ids and rescanned the entire
+# append-only board, so past 400 qualifying rows a restart replayed evicted
+# ancient rows as "(missed while offline)". Presenting weeks-old messages as
+# unanswered is worse than silence. scripts/watch_state.ps1 carries the
+# replacement and tests/test_watch_state.ps1 pins its behaviour.
+. (Join-Path $PSScriptRoot 'watch_state.ps1')
 
-function Save-State {
-  param([System.Collections.Generic.List[string]]$Order, [string]$Path)
-  try {
-    # Bounded: the board is append-only and unbounded, this file is not. The
-    # newest 400 ids -- newest by the order they were actually seen -- cover any
-    # realistic offline gap without growing forever.
-    $ids = @($Order)
-    if ($ids.Count -gt 400) { $ids = $ids[($ids.Count - 400)..($ids.Count - 1)] }
-    $obj = [ordered]@{ savedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); seenIds = $ids }
-    ($obj | ConvertTo-Json -Depth 4 -Compress) | Set-Content -LiteralPath $Path -Encoding UTF8
-  } catch { }   # a watcher must never die because a cache file could not be written
-}
+$state = Read-WatchState -Path $StateFile
+$warm = ($null -ne $state)
+if (-not $state) { $state = New-WatchState }
+$tailTimes = @{}
 
 $tmp = Join-Path $env:TEMP ("wa_watch_" + [guid]::NewGuid().ToString('N') + '.json')
 
@@ -175,10 +143,6 @@ function Format-Line {
 $primed = $warm   # a warm start has no priming pass: it replays instead
 $lastDupe = @{}
 
-# try/finally also from e800def: the board snapshot is written to $env:TEMP every
-# poll and must not be left behind when the watcher is stopped, which is how a
-# long-running helper quietly fills a disk.
-try {
 while ($true) {
   $board = Read-Board
   if ($board -and $board.rows) {
@@ -207,9 +171,7 @@ while ($true) {
       $fromConsole  = (($pay -like 'GOV|kind=feed*') -and ($tag -eq 'governor-page'))
       if (-not ($fromWhatsApp -or $fromConsole)) { continue }
       $id = [string]$r[0]
-      if ($seen.ContainsKey($id)) { continue }
-      $seen[$id] = $true
-      [void]$seenOrder.Add($id)
+      if (-not (Test-RowIsNew -State $state -RowId $id -RowTs ([string]$r[1]))) { continue }
       $fresh += ,$r
     }
 
@@ -223,7 +185,8 @@ while ($true) {
       }
       Write-Output ("WA watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
                     " - " + $fresh.Count + " existing messages ignored, polling every " + $PollSeconds + "s")
-      Save-State -Order $seenOrder -Path $StateFile
+      foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
+      [void](Save-WatchState -State $state -Path $StateFile)
     } else {
       $emit = $fresh
       $late = $false
@@ -258,13 +221,16 @@ while ($true) {
         if ($late) { $prefix = '(missed while offline) ' }
         Write-Output (Format-Line -Row $r -Prefix $prefix)
       }
-      if ($fresh.Count -gt 0) { Save-State -Order $seenOrder -Path $StateFile }
+      if ($fresh.Count -gt 0) {
+        # Advance over EVERY considered row, not just the emitted ones: a row
+        # suppressed by the catch-up cap or the duplicate window has still been
+        # dealt with, and must not come back as new on the next restart.
+        foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
+        [void](Save-WatchState -State $state -Path $StateFile)
+      }
     }
   }
 
   if ($Once) { break }
   Start-Sleep -Seconds $PollSeconds
-}
-} finally {
-  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
