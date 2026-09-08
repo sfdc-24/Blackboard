@@ -76,8 +76,17 @@ if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this s
 # The cursor lives outside the working tree on purpose. It is machine state, not
 # project content, and a state file inside the repo is one `git add -A` away from
 # being published.
-if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA ('sfdc24leet_watch.' + $Tag + '.state.json') }
-if ($Reset -and (Test-Path -LiteralPath $StateFile)) { Remove-Item -LiteralPath $StateFile -Force }
+if (-not $StateFile) { $StateFile = Get-DefaultStatePath -Leaf ('fleet_watch.' + $Tag + '.state.json') }
+
+if ($Reset) {
+  # A reset is a deliberate act with a receipt. Silently starting fresh is what
+  # made the original 22-hour gap invisible, so it is announced and dated.
+  if (Test-Path -LiteralPath (Resolve-StatePath $StateFile)) {
+    Remove-Item -LiteralPath (Resolve-StatePath $StateFile) -Force
+  }
+  Write-Output ("Fleet watch RESET at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                " - the previous cursor was discarded on request. Anything that arrived before this point will NOT be replayed.")
+}
 
 $loaded = Read-WatchState -Path $StateFile
 $state = $loaded.state
@@ -125,9 +134,9 @@ function Addressed {
 
 function Test-RowQualifies {
   # Rows somebody chose to address to this tag. NOT cc=ALL, which is most of the
-  # board and would bury the addressed rows exactly the way a notification stream
-  # must never do; -IncludeCc opts into that. Rows written BY this tag are
-  # skipped, because a watcher that reports our own writes back to us is the
+  # board and would bury the addressed rows exactly the way a notification
+  # stream must never do; -IncludeCc opts into that. Rows written BY this tag
+  # are skipped, because a watcher that reports our own writes back to us is the
   # session talking to itself -- wa_watch.ps1 shipped with that bug and it looked
   # exactly like real traffic.
   param($Row, [string]$Tag, [bool]$WithCc)
@@ -194,56 +203,85 @@ function Format-Line {
 # try/finally restored. It was added in e800def, and my own state-block rewrite
 # on 2026-09-08 cut out the `try` its `finally` depended on -- silently removing
 # temp cleanup from both watchers and leaving 25 stray board snapshots, 26MB, in
-# TEMP. codex caught it. The commit that removed it claimed to have preserved it.
+# TEMP, while the commit message claimed the guard was preserved.
 try {
   while ($true) {
     $board = Read-Board
     if ($board -and $board.rows) {
       $rows = $board.rows
       $boardId = [string]$board.fileId
-
-      $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
-      if (-not $cont.ok) {
-        # Fail LOUDLY and re-prime explicitly. The forbidden outcome is carrying
-        # on as though catch-up were intact: that is indistinguishable from
-        # working, and is how both earlier designs hid their defects.
-        Write-Output ("Fleet watch CANNOT RESUME - " + $cont.reason +
-                      ". Re-priming from the end of the board; anything in the gap is NOT replayed.")
-        $state = $null
-        $warm = $false
-        $cont = Test-BoardContinuity -State $null -Rows $rows -BoardId $boardId
-      }
-      if (-not $state) { $state = New-WatchState }
-
       $lastData = @($rows).Count - 1
 
+      # ---- 1. a retained outbox is replayed FIRST, and announced -------------
+      # Exactly-once is impossible without a consumer ACK and there is none here,
+      # so this is explicit at-least-once. A repeat that announces itself is
+      # recoverable; a silent gap is not.
+      if (Test-HasOutbox -State $state) {
+        Write-Output ("Fleet watch POSSIBLE REPLAY - the previous run persisted " +
+                      @($state.pendingLines).Count + " line(s) and may have exited before showing them. " +
+                      "Repeating them now; anything you have already seen is a duplicate, not a new message.")
+        foreach ($line in @($state.pendingLines)) { Write-Output $line }
+        $state = Complete-WatchOutbox -State $state -BoardId $boardId
+        $rc = Save-WatchState -State $state -Path $StateFile
+        if (-not $rc.ok) {
+          throw ("Fleet watch COULD NOT COMMIT AFTER REPLAY - " + $rc.reason +
+                 ". The outbox is retained, so the next start replays the same lines rather than skipping them.")
+        }
+      }
+
+      # ---- 2. continuity, and NEVER an automatic re-prime --------------------
+      $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
+      if (-not $cont.ok) {
+        throw ("Fleet watch CANNOT RESUME - " + $cont.reason +
+               ". Nothing was reported and the cursor was not moved, so nothing has been skipped yet. " +
+               "Re-prime deliberately with -Reset once you have decided what to do about the gap.")
+      }
+      if (-not $state) { $state = New-WatchState }
+      $state.boardId = $boardId
+
       if ($cont.prime) {
-        # COLD START. Establish the cursor at the end of the board and emit
-        # nothing but context, because there is no honest way to know which of
-        # the existing rows were already dealt with.
-        Write-Output ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                      " - cursor set at row " + $lastData + " for " + $Tag + ", polling every " + $PollSeconds + "s")
+        # ---- 3a. cold start: commit first, then speak ------------------------
+        # No notifications exist to lose here, so this needs no outbox: the
+        # cursor is durable before anything claims to be armed.
+        $lines = @()
+        $lines += ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                   " - cursor set at row " + $lastData + " for " + $Tag + ", polling every " + $PollSeconds + "s")
+        $state = Set-WatchOutbox -State $state -Rows $rows -Index $lastData -Lines @() -RowIds @()
+        $state = Complete-WatchOutbox -State $state -BoardId $boardId
+        $sc = Save-WatchState -State $state -Path $StateFile
+        if (-not $sc.ok) { throw ("Fleet watch CANNOT ARM - " + $sc.reason + ". Nothing was reported.") }
+        foreach ($line in $lines) { Write-Output $line }
       } else {
+        # ---- 3b. resume: stage, persist, emit, commit ------------------------
         $fresh = @()
         for ($i = $cont.startIndex; $i -le $lastData; $i++) {
           if (Test-RowQualifies -Row $rows[$i] -Tag $Tag -WithCc ([bool]$IncludeCc)) { $fresh += ,$rows[$i] }
         }
 
+        $lines = @()
+        $ids = @()
         $emit = $fresh
         $late = $false
         if ($warm) {
           $warm = $false
           if ($fresh.Count -gt 0) {
             $late = $true
-            if ($fresh.Count -gt $CatchUpMax) {
-              Write-Output ("Fleet watch resumed - " + $fresh.Count + " messages arrived while nothing was listening, showing the newest " + $CatchUpMax)
+            if ($CatchUpMax -le 0) {
+              # -CatchUpMax 0 means "advance without replaying". PowerShell's
+              # range operator counts DOWN when the start exceeds the end, so
+              # $fresh[$n..($n-1)] silently emitted a row: zero has to be its own
+              # branch rather than an arithmetic edge.
+              $lines += ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening; -CatchUpMax 0 so none are replayed")
+              $emit = @()
+            } elseif ($fresh.Count -gt $CatchUpMax) {
+              $lines += ("Fleet watch resumed - " + $fresh.Count + " addressed rows arrived while nothing was listening, showing the newest " + $CatchUpMax)
               $emit = $fresh[($fresh.Count - $CatchUpMax)..($fresh.Count - 1)]
             } else {
-              Write-Output ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening")
+              $lines += ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening")
             }
           } else {
-            Write-Output ("Fleet watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                          " for " + $Tag + " - nothing missed, polling every " + $PollSeconds + "s")
+            $lines += ("Fleet watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                       " for " + $Tag + " - nothing missed, polling every " + $PollSeconds + "s")
           }
         }
 
@@ -253,18 +291,28 @@ try {
           $state = Set-WatchEmitted -State $state -Key $key -RowTs ([string]$r[1])
           $prefix = ''
           if ($late) { $prefix = '(missed while offline) ' }
-          Write-Output (Format-Line -Row $r -Prefix $prefix)
+          $lines += (Format-Line -Row $r -Prefix $prefix)
+          $ids += [string]$r[0]
         }
-      }
 
-      # Advance over EVERY row examined, not just the emitted ones: a row
-      # suppressed by the catch-up cap or the duplicate window has still been
-      # dealt with and must not return as new after a restart.
-      $state = Set-WatchPosition -State $state -Rows $rows -Index $lastData -BoardId $boardId
-      $saved = Save-WatchState -State $state -Path $StateFile
-      if (-not $saved.ok) {
-        Write-Output ("Fleet watch WARNING - " + $saved.reason +
-                      ". Restart coverage is NOT in effect; a restart will re-prime and skip the gap.")
+        # A tick producing no output still has to commit: the cursor moved past
+        # rows that did not qualify, and leaving that uncommitted means
+        # re-examining them forever.
+        if ($lines.Count -gt 0 -or $lastData -ne [int]$state.lastIndex) {
+          $state = Set-WatchOutbox -State $state -Rows $rows -Index $lastData -Lines $lines -RowIds $ids
+          $ps = Save-WatchState -State $state -Path $StateFile
+          if (-not $ps.ok) {
+            throw ("Fleet watch COULD NOT STAGE ITS OUTBOX - " + $ps.reason +
+                   ". Nothing was reported and the cursor did not move, so the next start re-reads exactly this.")
+          }
+          foreach ($line in $lines) { Write-Output $line }
+          $state = Complete-WatchOutbox -State $state -BoardId $boardId
+          $cs = Save-WatchState -State $state -Path $StateFile
+          if (-not $cs.ok) {
+            throw ("Fleet watch COULD NOT COMMIT - " + $cs.reason +
+                   ". The outbox is retained, so the next start replays those lines rather than skipping them.")
+          }
+        }
       }
     }
 
