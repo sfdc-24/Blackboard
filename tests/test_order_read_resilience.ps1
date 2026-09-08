@@ -131,7 +131,8 @@ function Invoke-ReadCase {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Responses,
         [ValidateSet('Observe', 'Execute')][string]$Mode = 'Execute',
-        [hashtable]$FailureByAttempt = @{}
+        [hashtable]$FailureByAttempt = @{},
+        [object[]]$InitialWork = @()
     )
 
     $caseRoot = Join-Path $script:TestRoot $Name
@@ -163,6 +164,7 @@ function Invoke-ReadCase {
     $state.initialized = $true
     $state.cursor.timestamp = '2026-09-07T08:00:00.0000000Z'
     $state.cursor.row_id = 'cursor-before-read'
+    $state.work = @($InitialWork)
     Save-OrderState -Path $statePath -State $state
 
     $previousRoot = [Environment]::GetEnvironmentVariable('ORDER_READ_TEST_ROOT', 'Process')
@@ -952,7 +954,98 @@ try {
     )
     Assert-True 'HTTP retry logs no raw body' (-not $httpThenValid.log_text.Contains('HTTP_BODY_CANARY'))
 
-    foreach ($permanentStatus in @(401, 403)) {
+    $notFoundThenValidCanary = '<html>NOT_FOUND_THEN_VALID_BODY_CANARY</html>'
+    $notFoundThenValid = Invoke-ReadCase `
+        -Name 'http-404-then-valid' `
+        -Responses @($notFoundThenValidCanary, $validEmpty) `
+        -FailureByAttempt @{ 1 = [ordered]@{
+            transport_exit = 0
+            http_status = 404
+            content_type_class = 'html'
+        } }
+    $notFoundRetry = @($notFoundThenValid.events | Where-Object event -ceq 'board_read_retry')
+    $notFoundRetryDetailNames = @($notFoundRetry[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedNotFoundRetryDetailNames = @(
+        'attempt', 'code', 'content_length', 'content_sha256', 'content_type_class',
+        'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'HTTP 404 retries one whole read then completes normally with no eligible order' (
+        $notFoundThenValid.exit_code -eq 0 -and
+        $notFoundThenValid.result -and
+        $notFoundThenValid.result.status -ceq 'no_eligible_order' -and
+        $notFoundThenValid.state.last_poll.status -ceq 'no_eligible_order' -and
+        $notFoundThenValid.read_count -eq 2 -and
+        @($notFoundThenValid.actions).Count -eq 2 -and
+        @($notFoundThenValid.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $notFoundThenValid.claude_called
+    )
+    Assert-True 'HTTP 404 recovery emits one safe retry warning' (
+        $notFoundRetry.Count -eq 1 -and
+        $notFoundRetry[0].level -ceq 'warning' -and
+        $notFoundRetry[0].code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundRetry[0].work_id -ceq '' -and
+        $notFoundRetry[0].row_id -ceq '' -and
+        $notFoundRetry[0].details.attempt -ceq '1' -and
+        $notFoundRetry[0].details.code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundRetry[0].details.transport_exit -ceq '0' -and
+        $notFoundRetry[0].details.http_status -ceq '404' -and
+        $notFoundRetry[0].details.content_type_class -ceq 'html' -and
+        [int]$notFoundRetry[0].details.content_length -gt 0 -and
+        [string]$notFoundRetry[0].details.content_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        -not [string]::IsNullOrWhiteSpace([string]$notFoundRetry[0].details.elapsed_ms) -and
+        $notFoundRetryDetailNames.Count -eq $expectedNotFoundRetryDetailNames.Count -and
+        @($expectedNotFoundRetryDetailNames | Where-Object { $notFoundRetryDetailNames -cnotcontains $_ }).Count -eq 0 -and
+        -not $notFoundThenValid.log_text.Contains('NOT_FOUND_THEN_VALID_BODY_CANARY')
+    )
+
+    $preservedWork = [pscustomobject][ordered]@{
+        input_row_id = 'preserved-input-row'
+        work_id = 'PRESERVED-WORK'
+        status = 'claim_confirmed'
+        result_status = ''
+        output_sha256 = ''
+        updated_at = '2026-09-07T08:01:00.0000000Z'
+    }
+    $preservedWorkJson = $preservedWork | ConvertTo-Json -Compress
+    $notFoundTwiceCanaryOne = '<html>NOT_FOUND_TWICE_FIRST_BODY_CANARY</html>'
+    $notFoundTwiceCanaryTwo = '<html>NOT_FOUND_TWICE_SECOND_BODY_CANARY</html>'
+    $notFoundTwice = Invoke-ReadCase `
+        -Name 'http-404-twice' `
+        -Responses @($notFoundTwiceCanaryOne, $notFoundTwiceCanaryTwo) `
+        -FailureByAttempt @{
+            1 = [ordered]@{ transport_exit = 0; http_status = 404; content_type_class = 'html' }
+            2 = [ordered]@{ transport_exit = 0; http_status = 404; content_type_class = 'html' }
+        } `
+        -InitialWork (, $preservedWork)
+    $notFoundTwiceRetries = @($notFoundTwice.events | Where-Object event -ceq 'board_read_retry')
+    $notFoundTwiceRunErrors = @($notFoundTwice.events | Where-Object event -ceq 'run_error')
+    Assert-True 'two HTTP 404 responses stop after the existing one-retry bound' (
+        $notFoundTwice.exit_code -eq 20 -and
+        $notFoundTwice.result -and
+        $notFoundTwice.result.status -ceq 'error' -and
+        $notFoundTwice.result.error_code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwice.state.error.code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwice.read_count -eq 2 -and
+        $notFoundTwiceRetries.Count -eq 1 -and
+        $notFoundTwiceRunErrors.Count -eq 1 -and
+        $notFoundTwiceRunErrors[0].code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwiceRunErrors[0].details.attempt -ceq '2' -and
+        $notFoundTwiceRunErrors[0].details.http_status -ceq '404'
+    )
+    Assert-True 'two HTTP 404 responses preserve cursor and work with no write or inference' (
+        [bool]$notFoundTwice.state.initialized -and
+        $notFoundTwice.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $notFoundTwice.state.cursor.row_id -ceq 'cursor-before-read' -and
+        @($notFoundTwice.state.work).Count -eq 1 -and
+        (@($notFoundTwice.state.work)[0] | ConvertTo-Json -Compress) -ceq $preservedWorkJson -and
+        @($notFoundTwice.actions).Count -eq 2 -and
+        @($notFoundTwice.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $notFoundTwice.claude_called -and
+        -not $notFoundTwice.log_text.Contains('NOT_FOUND_TWICE_FIRST_BODY_CANARY') -and
+        -not $notFoundTwice.log_text.Contains('NOT_FOUND_TWICE_SECOND_BODY_CANARY')
+    )
+
+    foreach ($permanentStatus in @(401, 403, 418)) {
         $permanentHttp = Invoke-ReadCase `
             -Name ('http-' + $permanentStatus + '-no-retry') `
             -Responses @('<html>PERMANENT_HTTP_BODY_CANARY</html>', $validEmpty) `

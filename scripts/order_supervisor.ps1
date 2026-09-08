@@ -379,7 +379,7 @@ function Test-TransientBoardReadFailure {
     $statusText = [string]$ErrorRecord.Exception.Data['http_status']
     if ($statusText -cnotmatch '^[1-5]\d{2}$') { return $false }
     $status = [int]$statusText
-    return $status -in @(408, 425, 429) -or ($status -ge 500 -and $status -le 599)
+    return $status -in @(404, 408, 425, 429) -or ($status -ge 500 -and $status -le 599)
 }
 
 function Read-BoardPreAdmission {
