@@ -35,6 +35,23 @@ WHAT SCHEMA 5 ADDS
 
   The state file is also validated strictly rather than projected: exact property
   set, real JSON types, and every size bounded BEFORE the content is materialised.
+
+WHAT THE RECOVERY REWRITE ADDS, to CODEX-PR34-CD05-RECOVERY-GO
+  A save used to delete its rollback asset with -ErrorAction SilentlyContinue and
+  then return ok=$true unconditionally. So an ordinary AV, indexer or backup
+  handle produced a save that reported clean success while leaving an asset that
+  made the NEXT watcher start refuse -- success and startup contradicting each
+  other, presenting as an unexplained outage.
+
+  The asset now CARRIES ITS OWN EVIDENCE: its name holds the full SHA256 of the
+  candidate and the full SHA256 of the prior (or PRIOR_ABSENT), so startup can
+  prove which side of the replace the disk is on instead of guessing. One state
+  machine, Resolve-PendingTransition, is used by save, reset and startup alike.
+
+  ok=$true with cleanup_pending=$true means the data is committed and correct AND
+  that no further transition may begin. Callers must surface it and stop, via
+  Get-SaveStopReason -- a watcher that kept polling would have every later save
+  refused and would look hung rather than stopped.
 #>
 
 $script:WATCH_SCHEMA = 5
@@ -321,67 +338,262 @@ function Get-BytesHash {
   finally { $sha.Dispose() }
 }
 
-function Get-StateBackupPath { param([string]$Path) return ($Path + '.rollback') }
+# ---- test seam ---------------------------------------------------------------
+# Deterministic injection for the recovery regressions. IN-PROCESS ONLY: a test
+# that dot-sources this file sets $script:WatchTestHook to a scriptblock and the
+# hook fires; production never sets it, so it stays $null and every call is
+# inert. It is deliberately NOT read from the environment -- an env-controlled
+# hook is a production switch wearing a test's clothes, and the one thing this
+# module must not ship is a way for the outside world to steer a state write.
+$script:WatchTestHook = $null
 
-function Test-PendingTransition {
-  <#
-    A rollback asset left on disk means a transition was interrupted and we
-    cannot know whether the destination is the new good state or a casualty.
-    FAIL CLOSED and KEEP THE ASSET; deleting the only recoverable copy to tidy up
-    is how the evidence disappears.
-  #>
+function Invoke-WatchTestHook {
+  param([string]$Name, $Context)
+  $h = $script:WatchTestHook
+  if ($null -eq $h) { return }
+  & $h $Name $Context
+}
+
+# ---- the transaction asset ---------------------------------------------------
+# ONE asset per transition. Its NAME carries both proofs -- the full SHA256 of
+# the candidate and the full SHA256 of the prior (or the PRIOR_ABSENT sentinel)
+# -- and its BYTES are the prior. Name and bytes become durable together,
+# because the file is created with that name, so there is no window in which the
+# evidence exists without the thing it describes.
+#
+# No truncated digests: a shortened hash saves sixty characters of path and
+# gives up the only property that makes this a proof.
+$script:WATCH_PRIOR_ABSENT = 'PRIOR_ABSENT'
+$script:WATCH_TX_MARKER    = '.rollback'
+
+function Get-TxAssetPath {
+  param([string]$Path, [string]$CandidateHash, [string]$PriorHash)
+  return ($Path + $script:WATCH_TX_MARKER + '.' + $CandidateHash + '.' + $PriorHash)
+}
+
+function Get-TxAssets {
+  # Every asset beside this state file, INCLUDING malformed ones and a bare
+  # `.rollback` left by the previous scheme. Ignoring what we cannot parse is how
+  # an interrupted transition becomes invisible, so they are all returned and the
+  # caller refuses on anything it cannot read.
   param([string]$Path)
-  $bak = Get-StateBackupPath (Resolve-StatePath $Path)
-  if (Test-Path -LiteralPath $bak) {
-    return @{ pending = $true
-              reason = ('an interrupted state transition left a rollback asset at ' + $bak +
-                        '. The destination cannot be trusted until someone decides which copy is correct. The asset has been kept.') }
+  $dir  = Split-Path -Parent $Path
+  $leaf = Split-Path -Leaf $Path
+  if (-not $dir) { $dir = '.' }
+  if (-not (Test-Path -LiteralPath $dir)) { return @() }
+  $prefix = $leaf + $script:WATCH_TX_MARKER
+  return @(Get-ChildItem -LiteralPath $dir -Force -File -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name.StartsWith($prefix, [System.StringComparison]::Ordinal) } |
+           Sort-Object -Property Name)
+}
+
+function Read-TxAssetName {
+  param([string]$Path, [string]$AssetName)
+  $prefix = (Split-Path -Leaf $Path) + $script:WATCH_TX_MARKER
+  if (-not $AssetName.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+    return @{ ok = $false; reason = 'the name does not belong to this state file' }
   }
-  return @{ pending = $false; reason = '' }
+  $rest = $AssetName.Substring($prefix.Length)
+  if (-not $rest.StartsWith('.', [System.StringComparison]::Ordinal)) {
+    return @{ ok = $false; reason = 'the name carries no transaction evidence at all' }
+  }
+  $parts = $rest.Substring(1).Split('.')
+  if ($parts.Count -ne 2) {
+    return @{ ok = $false; reason = 'the name is not <candidate>.<prior>' }
+  }
+  $cand  = [string]$parts[0]
+  $prior = [string]$parts[1]
+  if ($cand -cnotmatch '^[0-9A-F]{64}$') {
+    return @{ ok = $false; reason = 'the candidate digest is not a full SHA256' }
+  }
+  if (($prior -cne $script:WATCH_PRIOR_ABSENT) -and ($prior -cnotmatch '^[0-9A-F]{64}$')) {
+    return @{ ok = $false; reason = 'the prior digest is neither a full SHA256 nor the PRIOR_ABSENT sentinel' }
+  }
+  return @{ ok = $true; candidateHash = $cand; priorHash = $prior
+            priorAbsent = ($prior -ceq $script:WATCH_PRIOR_ABSENT); reason = '' }
+}
+
+function Remove-TxAsset {
+  # Deleting the evidence is the LAST step and it is verified by reading the path
+  # back. A blocked delete is NOT unknown -- we know exactly what happened -- but
+  # it does bar the next transition, because a second asset sitting beside the
+  # first is precisely the ambiguity this design exists to refuse.
+  param($Asset, [string]$Status, [string]$Because)
+  try { Remove-Item -LiteralPath $Asset.FullName -Force -ErrorAction Stop } catch { }
+  if (Test-Path -LiteralPath $Asset.FullName) {
+    return @{ status = 'cleanup_pending'; canProceed = $false; assetPath = ([string]$Asset.FullName)
+              reason = ($Because + ', but its transaction asset could not be removed. The state on disk is ' +
+                        'correct and nothing is lost; no further transition may begin until ' +
+                        $Asset.FullName + ' is gone.') }
+  }
+  return @{ status = $Status; canProceed = $true; assetPath = ''; reason = $Because }
+}
+
+function Resolve-PendingTransition {
+  <#
+    THE single recovery state machine. Save, reset and startup all come through
+    here, so there is no second writer that can recover state a different way.
+
+    It answers one question -- what is on disk, and is it safe to proceed? -- and
+    it deletes evidence only AFTER the disk has proved which branch it is on.
+
+    status is exactly one of:
+      clean            no asset; nothing was interrupted
+      completed        the destination hashes to the candidate; asset removed
+      not_applied      the destination is still the prior, or still absent
+      rolled_back      neither side matched, so the prior was restored from the
+                       asset and verified
+      cleanup_pending  the outcome is KNOWN and the state is correct, but the
+                       asset survived, so no further transition may begin
+      unknown          the disk proves nothing; every file is preserved
+  #>
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $Path = Resolve-StatePath $Path
+  $assets = Get-TxAssets -Path $Path
+
+  if ($assets.Count -eq 0) { return @{ status = 'clean'; canProceed = $true; reason = ''; assetPath = '' } }
+  if ($assets.Count -gt 1) {
+    return @{ status = 'unknown'; canProceed = $false; assetPath = ([string]$assets[0].FullName)
+              reason = ('found ' + $assets.Count + ' transaction assets beside ' + $Path +
+                        '. Two interrupted transitions cannot be ordered from the disk, so nothing has been deleted.') }
+  }
+
+  $asset = $assets[0]
+  $name  = Read-TxAssetName -Path $Path -AssetName $asset.Name
+  if (-not $name.ok) {
+    return @{ status = 'unknown'; canProceed = $false; assetPath = ([string]$asset.FullName)
+              reason = ('the transaction asset ' + $asset.Name + ' is malformed (' + $name.reason +
+                        '), so it proves nothing about the destination. Nothing has been deleted.') }
+  }
+
+  $destBytes = $null
+  if (Test-Path -LiteralPath $Path) {
+    try { $destBytes = [System.IO.File]::ReadAllBytes($Path) } catch { $destBytes = $null }
+  }
+  $destHash = ''
+  if ($null -ne $destBytes) { $destHash = Get-BytesHash -Bytes $destBytes }
+
+  # 1. the destination already IS the candidate -> the transition completed.
+  if ($destHash -ceq $name.candidateHash) {
+    return (Remove-TxAsset -Asset $asset -Status 'completed' `
+              -Because 'the transition completed: the destination hashes to the recorded candidate')
+  }
+
+  # 2. the destination is still the prior -> it was never applied.
+  if ((-not $name.priorAbsent) -and ($destHash -ceq $name.priorHash)) {
+    return (Remove-TxAsset -Asset $asset -Status 'not_applied' `
+              -Because 'the transition was never applied: the destination is still the recorded prior')
+  }
+
+  # 3. there was no prior and there is no destination -> never applied.
+  if (($null -eq $destBytes) -and $name.priorAbsent) {
+    return (Remove-TxAsset -Asset $asset -Status 'not_applied' `
+              -Because 'the transition was never applied: there was no prior and there is no destination')
+  }
+
+  # 4. the asset itself still proves the prior -> restore it and verify.
+  if (-not $name.priorAbsent) {
+    $assetBytes = $null
+    try { $assetBytes = [System.IO.File]::ReadAllBytes($asset.FullName) } catch { $assetBytes = $null }
+    if (($null -ne $assetBytes) -and ((Get-BytesHash -Bytes $assetBytes) -ceq $name.priorHash)) {
+      try {
+        [System.IO.File]::WriteAllBytes($Path, $assetBytes)
+        if (Test-BytesEqual -A ([System.IO.File]::ReadAllBytes($Path)) -B $assetBytes) {
+          return (Remove-TxAsset -Asset $asset -Status 'rolled_back' `
+                    -Because 'the destination matched neither side, so the prior was restored from the asset and verified')
+        }
+      } catch { }
+      return @{ status = 'unknown'; canProceed = $false; assetPath = ([string]$asset.FullName)
+                reason = ('the prior could not be restored from ' + $asset.Name +
+                          '. Nothing has been deleted and the asset still holds it.') }
+    }
+  }
+
+  return @{ status = 'unknown'; canProceed = $false; assetPath = ([string]$asset.FullName)
+            reason = ('the destination matches neither the candidate nor the prior recorded in ' + $asset.Name +
+                      ', and the asset does not hash to that prior either. Nothing has been deleted.') }
+}
+
+function Get-SaveStopReason {
+  # '' means the caller may continue. A committed save whose asset survived is
+  # NOT a clean success: the state is correct, but every later save is refused,
+  # so a watcher that kept polling would look hung instead of stopped.
+  param($Result)
+  if (-not $Result.ok) { return [string]$Result.reason }
+  if ($Result.cleanup_pending) { return [string]$Result.reason }
+  return ''
+}
+
+function New-SaveResult {
+  param([bool]$Ok, [bool]$Committed, [bool]$CleanupPending, [bool]$Unknown, [string]$Reason)
+  return @{ ok = $Ok; committed = $Committed; cleanup_pending = $CleanupPending
+            unknown = $Unknown; reason = $Reason }
 }
 
 function Save-StateBytes {
   <#
     THE one verified atomic state transition. Everything that writes state calls
-    this; reset recovery included, so there is no second, weaker writer.
+    this -- reset included -- so there is no second, weaker writer.
 
     Order, and why each step is there:
-      1  the candidate is serialized ONCE, to bounded raw bytes with a hash;
-      2  it is written to a unique temp and read back THROUGH THE SAME HANDLE, so
-         what is verified is what was written rather than whatever the path holds
-         a moment later;
-      3  the prior destination is preserved as a rollback asset BEFORE anything
-         is replaced;
+      1  no new transition may begin while an old one is unresolved;
+      2  the candidate goes to a temp and is read back THROUGH THE SAME HANDLE;
+      3  the transaction asset is created with the two proofs in its name and the
+         prior in its bytes, flushed, and read back through ITS own handle,
+         BEFORE the destination is touched;
       4  the atomic replace happens;
       5  the destination raw bytes are compared to the exact candidate;
-      6  on ANY mismatch or error after the replace, the prior is restored and
-         byte-verified -- or its ABSENCE is restored when there was no prior;
-      7  UNKNOWN is reported only when the rollback itself cannot be verified,
-         and the asset is retained.
+      6  any mismatch is reconciled by the ONE state machine, not by a private
+         recovery path here;
+      7  success is only clean once the asset has been deleted AND read back
+         absent. If it survives, the state is still committed and correct, and
+         the result says so with cleanup_pending -- not reported as a failure,
+         and not reported as a clean success either.
 
-    Note on what step 2 does NOT prove: holding the temp handle open does not pin
-    identity through a path-based rename, because another process could rename
-    the held file away and create a new one at the same leaf. chatgpt-codex-desktop
-    corrected me on that. The guarantee here comes from step 5 - comparing the
-    DESTINATION bytes after the fact - and from step 6 making every failure
-    recoverable, not from the handle.
+    What step 2 does NOT prove: holding the temp handle does not pin identity
+    through a path-based rename -- another process can rename the held file away
+    and create a new one at the same leaf. chatgpt-codex-desktop corrected me on
+    that. The guarantee comes from step 5 comparing the DESTINATION, and from the
+    asset making every failure recoverable.
   #>
   param([Parameter(Mandatory = $true)][byte[]]$Bytes, [Parameter(Mandatory = $true)][string]$Path)
   $Path = Resolve-StatePath $Path
-  $bak = Get-StateBackupPath $Path
-  $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
   $ErrorActionPreference = 'Stop'
+
   if ($Bytes.Length -gt $script:WATCH_MAX_BYTES) {
-    return @{ ok = $false; unknown = $false; reason = ('candidate state is ' + $Bytes.Length + ' bytes, over the bound') }
+    return (New-SaveResult -Ok $false -Committed $false -CleanupPending $false -Unknown $false `
+              -Reason ('candidate state is ' + $Bytes.Length + ' bytes, over the bound'))
   }
-  $want = Get-BytesHash -Bytes $Bytes
-  $hadPrior = $false
-  $prior = $null
+
+  # 1. refuse to stack a transition on an unresolved one
+  $pre = Resolve-PendingTransition -Path $Path
+  if (-not $pre.canProceed) {
+    return (New-SaveResult -Ok $false -Committed $false `
+              -CleanupPending ($pre.status -eq 'cleanup_pending') -Unknown ($pre.status -eq 'unknown') `
+              -Reason ('refusing to start a transition: ' + $pre.reason))
+  }
+
+  $candHash   = Get-BytesHash -Bytes $Bytes
+  $tmp        = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+  $priorBytes = $null
+  $priorHash  = $script:WATCH_PRIOR_ABSENT
+  $hadPrior   = $false
+  $assetPath  = ''
+
   try {
     $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+    }
 
-    # 2. write and verify through the same handle
+    if (Test-Path -LiteralPath $Path) {
+      $hadPrior   = $true
+      $priorBytes = [System.IO.File]::ReadAllBytes($Path)
+      $priorHash  = Get-BytesHash -Bytes $priorBytes
+    }
+    $assetPath = Get-TxAssetPath -Path $Path -CandidateHash $candHash -PriorHash $priorHash
+
+    # 2. candidate to temp, verified through the SAME handle
     $fs = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
     try {
@@ -396,20 +608,34 @@ function Save-StateBytes {
         $read += $n
       }
       if ($read -ne $Bytes.Length -or -not (Test-BytesEqual -A $back -B $Bytes) -or $fs.Length -ne $Bytes.Length) {
-        return @{ ok = $false; unknown = $false; reason = 'the candidate did not read back from its own handle; the destination is untouched' }
+        return (New-SaveResult -Ok $false -Committed $false -CleanupPending $false -Unknown $false `
+                  -Reason 'the candidate did not read back from its own handle; the destination is untouched')
       }
     } finally { $fs.Dispose() }
 
-    # 3. preserve the prior as a recoverable asset
-    if (Test-Path -LiteralPath $Path) {
-      $hadPrior = $true
-      $prior = [System.IO.File]::ReadAllBytes($Path)
-      [System.IO.File]::WriteAllBytes($bak, $prior)
-      if (-not (Test-BytesEqual -A ([System.IO.File]::ReadAllBytes($bak)) -B $prior)) {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        return @{ ok = $false; unknown = $false; reason = 'could not preserve the previous cursor before replacing it; nothing was changed' }
+    # 3. the transaction asset: name and bytes durable together, before the replace
+    $afs = New-Object System.IO.FileStream($assetPath, [System.IO.FileMode]::CreateNew,
+             [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+      $want = $null
+      if ($hadPrior) { $want = $priorBytes } else { $want = (New-Object byte[] 0) }
+      if ($want.Length -gt 0) { $afs.Write($want, 0, $want.Length) }
+      $afs.Flush($true)
+      $afs.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+      $aback = New-Object byte[] $want.Length
+      $aread = 0
+      while ($aread -lt $want.Length) {
+        $n = $afs.Read($aback, $aread, $want.Length - $aread)
+        if ($n -le 0) { break }
+        $aread += $n
       }
-    }
+      if ($aread -ne $want.Length -or -not (Test-BytesEqual -A $aback -B $want) -or $afs.Length -ne $want.Length) {
+        return (New-SaveResult -Ok $false -Committed $false -CleanupPending $false -Unknown $false `
+                  -Reason 'the transaction asset did not read back from its own handle; the destination is untouched')
+      }
+    } finally { $afs.Dispose() }
+
+    Invoke-WatchTestHook -Name 'BeforeReplace' -Context @{ TempPath = $tmp; DestinationPath = $Path; AssetPath = $assetPath }
 
     # 4. replace
     if ($hadPrior) {
@@ -421,44 +647,34 @@ function Save-StateBytes {
 
     # 5. bind the destination to the exact candidate bytes
     $got = [System.IO.File]::ReadAllBytes($Path)
-    if ((Test-BytesEqual -A $got -B $Bytes) -and ((Get-BytesHash -Bytes $got) -eq $want)) {
-      if ($hadPrior) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
-      return @{ ok = $true; unknown = $false; reason = '' }
+    if (Test-BytesEqual -A $got -B $Bytes) {
+      # 7. committed. a clean success requires the asset gone AND read back gone.
+      Invoke-WatchTestHook -Name 'BeforeAssetCleanup' -Context @{ AssetPath = $assetPath; DestinationPath = $Path }
+      try { Remove-Item -LiteralPath $assetPath -Force -ErrorAction Stop } catch { }
+      if (Test-Path -LiteralPath $assetPath) {
+        return (New-SaveResult -Ok $true -Committed $true -CleanupPending $true -Unknown $false `
+                  -Reason ('the state was committed and verified, but its transaction asset could not be removed. ' +
+                           'Nothing is lost; no further transition may begin until ' + $assetPath + ' is gone.'))
+      }
+      return (New-SaveResult -Ok $true -Committed $true -CleanupPending $false -Unknown $false -Reason '')
     }
-    return (Restore-PriorState -Path $Path -Backup $bak -HadPrior $hadPrior -Prior $prior `
-              -Because 'the destination did not match the exact candidate bytes after replacement')
+
+    # 6. mismatch -> reconcile through the ONE state machine
+    $r = Resolve-PendingTransition -Path $Path
+    return (New-SaveResult -Ok $false -Committed $false `
+              -CleanupPending ($r.status -eq 'cleanup_pending') -Unknown ($r.status -eq 'unknown') `
+              -Reason ('the destination did not match the exact candidate bytes after replacement; ' + $r.reason))
+
   } catch {
     $why = 'could not persist state: ' + $_.Exception.Message
     try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
-    if (-not $hadPrior -and -not (Test-Path -LiteralPath $Path)) {
-      return @{ ok = $false; unknown = $false; reason = $why }
+    if ($assetPath -and (Test-Path -LiteralPath $assetPath)) {
+      $r = Resolve-PendingTransition -Path $Path
+      return (New-SaveResult -Ok $false -Committed ($r.status -eq 'completed') `
+                -CleanupPending ($r.status -eq 'cleanup_pending') -Unknown ($r.status -eq 'unknown') `
+                -Reason ($why + '; ' + $r.reason))
     }
-    return (Restore-PriorState -Path $Path -Backup $bak -HadPrior $hadPrior -Prior $prior -Because $why)
-  }
-}
-
-function Restore-PriorState {
-  # Put back exactly what was there, or put back its ABSENCE, and prove it. The
-  # rollback asset is only removed once the restore has been verified.
-  param([string]$Path, [string]$Backup, [bool]$HadPrior, [byte[]]$Prior, [string]$Because)
-  try {
-    if ($HadPrior) {
-      [System.IO.File]::WriteAllBytes($Path, $Prior)
-      if (Test-BytesEqual -A ([System.IO.File]::ReadAllBytes($Path)) -B $Prior) {
-        Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
-        return @{ ok = $false; unknown = $false; reason = ($Because + '; the previous cursor was restored and verified byte for byte') }
-      }
-      return @{ ok = $false; unknown = $true
-                reason = ($Because + '; the previous cursor could NOT be verified after restore: state UNKNOWN. The rollback asset is retained at ' + $Backup) }
-    }
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
-    if (Test-Path -LiteralPath $Path) {
-      return @{ ok = $false; unknown = $true; reason = ($Because + '; there was no previous cursor and the new one could not be removed: state UNKNOWN') }
-    }
-    return @{ ok = $false; unknown = $false; reason = ($Because + '; there was no previous cursor, and its absence was restored') }
-  } catch {
-    return @{ ok = $false; unknown = $true
-              reason = ($Because + '; rolling back also failed (' + $_.Exception.Message + '): state UNKNOWN. Any rollback asset is retained.') }
+    return (New-SaveResult -Ok $false -Committed $false -CleanupPending $false -Unknown $false -Reason $why)
   }
 }
 
@@ -466,7 +682,10 @@ function Save-WatchState {
   # Serializes ONCE, then delegates to the single verified transition.
   param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$Path)
   $bad = Test-StateInvariants -State $State
-  if ($bad) { return @{ ok = $false; unknown = $false; reason = ('refusing to persist an invalid state: ' + $bad) } }
+  if ($bad) {
+    return (New-SaveResult -Ok $false -Committed $false -CleanupPending $false -Unknown $false `
+              -Reason ('refusing to persist an invalid state: ' + $bad))
+  }
   $obj = [ordered]@{
     schema = $script:WATCH_SCHEMA
     savedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')

@@ -333,6 +333,56 @@ for ($tick = 1; $tick -le 4; $tick++) {
   if ($rd.out -match 'STRADDLING TEXT') { $seenStraddle = $true }
 }
 Assert-True 'the straddling repeated key is reported on some tick, not dropped' $seenStraddle ''
+Write-Output ''
+Write-Output '=== a blocked cleanup stops a REAL watcher, and a later start self-heals ==='
+# The defect this replaces: the save deleted its rollback asset with
+# -ErrorAction SilentlyContinue and returned ok=true regardless, so an ordinary
+# AV / indexer / backup handle produced a clean-looking save whose next start
+# refused. Everything below drives the real entrypoint, not the module.
+. (Join-Path $sdir 'watch_state.ps1')
+
+$hb = Join-Path $root 'heal.json'
+New-BoardFile -Path $hb -Count 3
+$hs = Join-Path $root 'heal.state.json'
+
+$h1 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @() -BoardFile $hb -StatePath $hs
+Assert-True 'the watcher primes normally' ($h1.exit -eq 0) $h1.out
+$priorBytes = [System.IO.File]::ReadAllBytes($hs)
+
+New-BoardFile -Path $hb -Count 5
+$h2 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $hb -StatePath $hs
+Assert-True 'and advances on the next tick' ($h2.exit -eq 0) $h2.out
+$candBytes = [System.IO.File]::ReadAllBytes($hs)
+Assert-True 'the cursor really moved' `
+  (([System.BitConverter]::ToString($candBytes)) -ne ([System.BitConverter]::ToString($priorBytes)))
+
+# Exactly the shape a blocked cleanup leaves: the destination IS the candidate,
+# and the asset naming that transition survived.
+$asset = Get-TxAssetPath -Path $hs -CandidateHash (Get-BytesHash -Bytes $candBytes) `
+                         -PriorHash (Get-BytesHash -Bytes $priorBytes)
+[System.IO.File]::WriteAllBytes($asset, $priorBytes)
+
+$held = New-Object System.IO.FileStream($asset, [System.IO.FileMode]::Open,
+          [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+try {
+  $h3 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $hb -StatePath $hs
+  Assert-True 'while the asset is locked the real watcher REFUSES to start' ($h3.exit -ne 0) $h3.out
+  Assert-True 'and says so rather than failing silently' ($h3.out -match 'CANNOT START') $h3.out
+  Assert-True 'and it did not delete the evidence' (Test-Path -LiteralPath $asset)
+} finally { $held.Dispose() }
+
+$h4 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $hb -StatePath $hs
+Assert-True 'once the block is released the real watcher self-heals' ($h4.exit -eq 0) $h4.out
+Assert-True 'and reports the recovery instead of hiding it' ($h4.out -match 'RECOVERED') $h4.out
+Assert-True 'the asset is gone' (-not (Test-Path -LiteralPath $asset))
+# NOT a byte comparison: the recovered start also runs a normal tick and re-saves,
+# so the bytes are expected to differ. What must never happen is the cursor going
+# BACKWARD, which is what a rewind would look like.
+$candIndex  = ([System.Text.Encoding]::UTF8.GetString($candBytes) | ConvertFrom-Json).lastIndex
+$afterIndex = (Read-WatchState -Path $hs).state.lastIndex
+Assert-True 'and the cursor was NOT rewound by the recovery' `
+  ([int]$afterIndex -ge [int]$candIndex) ('after=' + $afterIndex + ' cand=' + $candIndex)
+
 } finally {
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

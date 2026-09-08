@@ -408,68 +408,236 @@ $afterBytes = Get-Content -LiteralPath $keepPath -Raw
 Assert-True 'an unrelated failed save did not disturb the good file' ($before -eq $afterBytes)
 Assert-True 'and it still reads back' ((Read-WatchState -Path $keepPath).state.lastIndex -eq 4)
 Write-Output ''
-Write-Output 'CASE 20 - the save binds the destination to the EXACT candidate bytes'
-# The old check compared a SEMANTIC digest that deliberately excludes savedAt, so
-# changing only savedAt on disk compared equal. "These exact bytes are on disk"
-# was not what it proved.
-$xp = Join-Path $tmpDir 'exact.json'
-$stX = Commit-At -Rows $board2 -Index 4
-$svX = Save-WatchState -State $stX -Path $xp
-Assert-True 'a normal save succeeds' ($svX.ok -eq $true) $svX.reason
-$onDisk = [System.IO.File]::ReadAllBytes($xp)
-$svX2 = Save-WatchState -State $stX -Path $xp
-Assert-True 'saving over an existing file succeeds' ($svX2.ok -eq $true) $svX2.reason
-Assert-True 'no rollback asset is left behind on success' (-not (Test-Path -LiteralPath (Get-StateBackupPath $xp)))
-Assert-True 'and no .tmp is left behind' (@(Get-ChildItem -Path $tmpDir -Filter '*.tmp' -ErrorAction SilentlyContinue).Count -eq 0)
+Write-Output 'RECOVERY - deterministic interrupted-save reconciliation (CODEX-PR34-CD05-RECOVERY-GO)'
+# Every case below builds a REAL on-disk situation and asks the one state machine
+# what it proves. The old suite asserted only that a rollback file was detected,
+# which is why a save could report clean success while leaving the next start
+# unable to run: nothing tested what happened AFTER the asset survived.
 
-Write-Output ''
-Write-Output 'CASE 21 - a failed transition preserves the prior bytes and proves it'
-# The destination is held open with no sharing, so the replace cannot land. The
-# prior must come back byte for byte and the outcome must say so.
-$fp = Join-Path $tmpDir 'fail.json'
-$before = Commit-At -Rows $board2 -Index 2
-[void](Save-WatchState -State $before -Path $fp)
-$priorBytes = [System.IO.File]::ReadAllBytes($fp)
-$hold = New-Object System.IO.FileStream($fp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
-try {
-  $after = Commit-At -Rows $board2 -Index 6
-  $svF = Save-WatchState -State $after -Path $fp
-  Assert-True 'a blocked replace reports failure' ($svF.ok -eq $false) $svF.reason
-} finally { $hold.Dispose() }
-$nowBytes = [System.IO.File]::ReadAllBytes($fp)
-Assert-True 'the prior cursor survives byte for byte' `
-  (([System.BitConverter]::ToString($nowBytes)) -eq ([System.BitConverter]::ToString($priorBytes)))
-Assert-True 'and it still reads back as the original cursor' ((Read-WatchState -Path $fp).state.lastIndex -eq 2)
+$rxDir = Join-Path $tmpDir 'recovery'
+New-Item -ItemType Directory -Path $rxDir -Force | Out-Null
 
-Write-Output ''
-Write-Output 'CASE 22 - with NO prior, a failed transition restores ABSENCE'
-$np = Join-Path $tmpDir 'noprior.json'
-$tooBig = Commit-At -Rows $board2 -Index 3
-$tooBig.anchorId = ('a' * 500)   # over the field bound: refused before any write
-$svN = Save-WatchState -State $tooBig -Path $np
-Assert-True 'an invalid candidate is refused' ($svN.ok -eq $false) $svN.reason
-Assert-True 'and nothing was created' (-not (Test-Path -LiteralPath $np))
-
-Write-Output ''
-Write-Output 'CASE 23 - an interrupted transition fails closed and keeps the asset'
-$ip = Join-Path $tmpDir 'interrupted.json'
-[void](Save-WatchState -State (Commit-At -Rows $board2 -Index 5) -Path $ip)
-Assert-True 'a clean state reports no pending transition' (-not (Test-PendingTransition -Path $ip).pending)
-Set-Content -LiteralPath (Get-StateBackupPath $ip) -Value 'leftover' -Encoding UTF8
-$pt = Test-PendingTransition -Path $ip
-Assert-True 'a retained rollback asset is detected' ($pt.pending -eq $true)
-Assert-True 'and says the asset was kept' ($pt.reason -match 'kept') $pt.reason
-Assert-True 'and the asset is NOT deleted by the check' (Test-Path -LiteralPath (Get-StateBackupPath $ip))
-Remove-Item -LiteralPath (Get-StateBackupPath $ip) -Force -ErrorAction SilentlyContinue
-
-Write-Output ''
-Write-Output 'CASE 24 - both watchers refuse to start on a retained rollback asset'
-foreach ($f in @('scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
-  $src = Get-Content -LiteralPath (Join-Path $RepoRoot $f) -Raw
-  Assert-True ($f + ' checks for an interrupted transition') ($src -match 'Test-PendingTransition') ''
-  Assert-True ($f + ' reset uses the shared verified transition') `
-    (-not ($src -match 'WriteAllBytes\(\$StateFile')) ''
+function New-RawState {
+  param([int]$Index, [string]$Anchor = '')
+  if (-not $Anchor) { $Anchor = 'r' + $Index }
+  $j = '{"schema":5,"savedAt":"2026-09-08T00:00:00Z","boardId":"b","lastIndex":' + $Index +
+       ',"anchorId":"' + $Anchor + '","lastEmitKey":"","lastEmitTs":"","pendingIndex":0,"pendingAnchor":"",' +
+       '"pendingLines":[],"pendingRowIds":[],"planFrom":0,"planMode":"","planLimit":0,"planEmitKey":"",' +
+       '"planEmitTs":"","resetAt":""}'
+  return [System.Text.Encoding]::UTF8.GetBytes($j)
 }
+function New-Scenario {
+  # dest = bytes or $null (absent); asset named for (candidate, prior)
+  param([string]$Name, $DestBytes, $CandBytes, $PriorBytes, [switch]$PriorAbsent, [byte[]]$AssetBytes)
+  $path = Join-Path $rxDir ($Name + '.json')
+  Get-ChildItem -LiteralPath $rxDir -Force -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name.StartsWith((Split-Path -Leaf $path), [System.StringComparison]::Ordinal) } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+  if ($null -ne $DestBytes) { [System.IO.File]::WriteAllBytes($path, $DestBytes) }
+  $priorHash = if ($PriorAbsent) { 'PRIOR_ABSENT' } else { Get-BytesHash -Bytes $PriorBytes }
+  $asset = Get-TxAssetPath -Path $path -CandidateHash (Get-BytesHash -Bytes $CandBytes) -PriorHash $priorHash
+  # Assign inside the branches. An empty array returned FROM an if-expression is
+  # unrolled to nothing and lands as $null, which is a PowerShell trap this suite
+  # walked into on its first run.
+  $body = $null
+  if ($null -ne $AssetBytes) { $body = $AssetBytes }
+  elseif ($PriorAbsent)      { $body = (New-Object byte[] 0) }
+  else                       { $body = $PriorBytes }
+  [System.IO.File]::WriteAllBytes($asset, $body)
+  return @{ path = $path; asset = $asset }
+}
+
+$prior1 = New-RawState 1
+$cand3  = New-RawState 3
+$other7 = New-RawState 7
+
+Write-Output ''
+Write-Output 'CASE 20 - interrupted AFTER the replace: the destination proves it completed'
+$s20 = New-Scenario -Name 'after' -DestBytes $cand3 -CandBytes $cand3 -PriorBytes $prior1
+$r20 = Resolve-PendingTransition -Path $s20.path
+Assert-True 'status is completed' ($r20.status -eq 'completed') ([string]$r20.status)
+Assert-True 'and the watcher may proceed' ($r20.canProceed -eq $true)
+Assert-True 'the asset is gone' (-not (Test-Path -LiteralPath $s20.asset))
+Assert-True 'the destination is still the candidate' ((Read-WatchState -Path $s20.path).state.lastIndex -eq 3)
+
+Write-Output ''
+Write-Output 'CASE 21 - interrupted BEFORE the replace: the destination proves it never applied'
+$s21 = New-Scenario -Name 'before' -DestBytes $prior1 -CandBytes $cand3 -PriorBytes $prior1
+$r21 = Resolve-PendingTransition -Path $s21.path
+Assert-True 'status is not_applied' ($r21.status -eq 'not_applied') ([string]$r21.status)
+Assert-True 'and the watcher may proceed' ($r21.canProceed -eq $true)
+Assert-True 'the asset is gone' (-not (Test-Path -LiteralPath $s21.asset))
+Assert-True 'the destination is still the prior' ((Read-WatchState -Path $s21.path).state.lastIndex -eq 1)
+
+Write-Output ''
+Write-Output 'CASE 22 - destination matches NEITHER side: the prior is restored from the asset'
+$s22 = New-Scenario -Name 'neither' -DestBytes $other7 -CandBytes $cand3 -PriorBytes $prior1
+$r22 = Resolve-PendingTransition -Path $s22.path
+Assert-True 'status is rolled_back' ($r22.status -eq 'rolled_back') ([string]$r22.status)
+Assert-True 'the asset is gone' (-not (Test-Path -LiteralPath $s22.asset))
+Assert-True 'the prior came back byte for byte' `
+  (([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($s22.path))) -eq ([System.BitConverter]::ToString($prior1)))
+
+Write-Output ''
+Write-Output 'CASE 23 - PRIOR_ABSENT, both branches'
+$s23a = New-Scenario -Name 'absent_none' -DestBytes $null -CandBytes $cand3 -PriorAbsent
+$r23a = Resolve-PendingTransition -Path $s23a.path
+Assert-True 'no prior and no destination proves it never applied' ($r23a.status -eq 'not_applied') ([string]$r23a.status)
+Assert-True 'and the asset is gone' (-not (Test-Path -LiteralPath $s23a.asset))
+Assert-True 'and the absent destination was NOT invented' (-not (Test-Path -LiteralPath $s23a.path))
+
+$s23b = New-Scenario -Name 'absent_done' -DestBytes $cand3 -CandBytes $cand3 -PriorAbsent
+$r23b = Resolve-PendingTransition -Path $s23b.path
+Assert-True 'no prior but the candidate landed proves it completed' ($r23b.status -eq 'completed') ([string]$r23b.status)
+Assert-True 'and the asset is gone' (-not (Test-Path -LiteralPath $s23b.asset))
+
+$s23c = New-Scenario -Name 'absent_other' -DestBytes $other7 -CandBytes $cand3 -PriorAbsent
+$r23c = Resolve-PendingTransition -Path $s23c.path
+Assert-True 'no prior and an UNRECOGNISED destination is UNKNOWN' ($r23c.status -eq 'unknown') ([string]$r23c.status)
+Assert-True 'and nothing was deleted' (Test-Path -LiteralPath $s23c.asset)
+
+Write-Output ''
+Write-Output 'CASE 24 - evidence that proves nothing is UNKNOWN, and NOTHING is deleted'
+# a) a bare .rollback from the previous scheme carries no proof at all
+$p24 = Join-Path $rxDir 'legacy.json'
+[System.IO.File]::WriteAllBytes($p24, $cand3)
+$legacy = $p24 + '.rollback'
+Set-Content -LiteralPath $legacy -Value 'old scheme' -Encoding UTF8
+$r24a = Resolve-PendingTransition -Path $p24
+Assert-True 'a legacy bare .rollback is UNKNOWN, not ignored' ($r24a.status -eq 'unknown') ([string]$r24a.status)
+Assert-True 'and it is kept' (Test-Path -LiteralPath $legacy)
+Remove-Item -LiteralPath $legacy -Force
+
+# b) a TRUNCATED digest is refused - the whole point is that it is a full SHA256
+$p24b = Join-Path $rxDir 'short.json'
+[System.IO.File]::WriteAllBytes($p24b, $cand3)
+$short = $p24b + '.rollback.' + ((Get-BytesHash -Bytes $cand3).Substring(0, 32)) + '.' + (Get-BytesHash -Bytes $prior1)
+[System.IO.File]::WriteAllBytes($short, $prior1)
+$r24b = Resolve-PendingTransition -Path $p24b
+Assert-True 'a truncated candidate digest is UNKNOWN' ($r24b.status -eq 'unknown') ([string]$r24b.status)
+Assert-True 'and it is kept' (Test-Path -LiteralPath $short)
+Remove-Item -LiteralPath $short -Force
+
+# c) TWO assets cannot be ordered from the disk
+$s24c = New-Scenario -Name 'two' -DestBytes $cand3 -CandBytes $cand3 -PriorBytes $prior1
+$second = Get-TxAssetPath -Path $s24c.path -CandidateHash (Get-BytesHash -Bytes $other7) -PriorHash (Get-BytesHash -Bytes $prior1)
+[System.IO.File]::WriteAllBytes($second, $prior1)
+$r24c = Resolve-PendingTransition -Path $s24c.path
+Assert-True 'two assets are UNKNOWN' ($r24c.status -eq 'unknown') ([string]$r24c.status)
+Assert-True 'and BOTH are kept' ((Test-Path -LiteralPath $s24c.asset) -and (Test-Path -LiteralPath $second))
+Remove-Item -LiteralPath $second -Force
+Remove-Item -LiteralPath $s24c.asset -Force
+
+# d) an asset whose BYTES do not match the prior it claims
+$s24d = New-Scenario -Name 'corrupt' -DestBytes $other7 -CandBytes $cand3 -PriorBytes $prior1 -AssetBytes ([System.Text.Encoding]::UTF8.GetBytes('truncated'))
+$r24d = Resolve-PendingTransition -Path $s24d.path
+Assert-True 'a corrupt asset is UNKNOWN' ($r24d.status -eq 'unknown') ([string]$r24d.status)
+Assert-True 'and it is kept' (Test-Path -LiteralPath $s24d.asset)
+Assert-True 'and the destination was NOT overwritten' `
+  (([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($s24d.path))) -eq ([System.BitConverter]::ToString($other7)))
+
+Write-Output ''
+Write-Output 'CASE 25 - the status enum is exactly the documented set'
+$allowed = @('clean', 'completed', 'not_applied', 'rolled_back', 'cleanup_pending', 'unknown')
+$seen = @($r20.status, $r21.status, $r22.status, $r23a.status, $r23b.status, $r23c.status,
+          $r24a.status, $r24b.status, $r24c.status, $r24d.status)
+$stray = @($seen | Where-Object { $allowed -notcontains $_ })
+Assert-True 'every status observed is in the enum' ($stray.Count -eq 0) ($stray -join ',')
+$cleanPath = Join-Path $rxDir 'clean.json'
+[System.IO.File]::WriteAllBytes($cleanPath, $cand3)
+Assert-True 'no asset means clean' ((Resolve-PendingTransition -Path $cleanPath).status -eq 'clean')
+
+Write-Output ''
+Write-Output 'CASE 26 - the candidate substituted AFTER its handle closed, BEFORE the rename'
+# This is the case the previous commit message claimed was covered and was not.
+# The guarantee does not come from holding the temp handle - a path rename cannot
+# pin identity - it comes from comparing the DESTINATION afterwards.
+$p26 = Join-Path $rxDir 'swap.json'
+[System.IO.File]::WriteAllBytes($p26, $prior1)
+$script:WatchTestHook = {
+  param($Name, $Ctx)
+  if ($Name -eq 'BeforeReplace') {
+    # a DIFFERENT but perfectly valid schema-5 state, so nothing downstream
+    # would refuse it on its own merits
+    [System.IO.File]::WriteAllBytes($Ctx.TempPath, (New-RawState 9))
+  }
+}
+try {
+  $r26 = Save-StateBytes -Bytes $cand3 -Path $p26
+} finally { $script:WatchTestHook = $null }
+Assert-True 'the substituted candidate is REFUSED' ($r26.ok -eq $false) ([string]$r26.reason)
+Assert-True 'and it did not report a commit' ($r26.committed -eq $false)
+Assert-True 'the prior was restored byte for byte' `
+  (([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($p26))) -eq ([System.BitConverter]::ToString($prior1)))
+Assert-True 'and no evidence was left behind' (@(Get-TxAssets -Path $p26).Count -eq 0)
+
+Write-Output ''
+Write-Output 'CASE 27 - a blocked cleanup is COMMITTED, not clean, and bars the next transition'
+$p27 = Join-Path $rxDir 'cleanup.json'
+[System.IO.File]::WriteAllBytes($p27, $prior1)
+$script:HeldAsset = $null
+$script:WatchTestHook = {
+  param($Name, $Ctx)
+  if ($Name -eq 'BeforeAssetCleanup') {
+    # an ordinary AV / indexer / backup handle: open with no sharing
+    $script:HeldAsset = New-Object System.IO.FileStream($Ctx.AssetPath,
+      [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+  }
+}
+try {
+  $r27 = Save-StateBytes -Bytes $cand3 -Path $p27
+} finally { $script:WatchTestHook = $null }
+
+Assert-True 'the save reports the data IS committed' ($r27.committed -eq $true) ([string]$r27.reason)
+Assert-True 'ok is true, because nothing was lost' ($r27.ok -eq $true)
+Assert-True 'but it is NOT a clean success' ($r27.cleanup_pending -eq $true)
+Assert-True 'and the reason is not empty' ([bool]$r27.reason)
+Assert-True 'the caller is told to stop' ([bool](Get-SaveStopReason $r27))
+Assert-True 'the destination really does hold the candidate' ((Read-WatchState -Path $p27).state.lastIndex -eq 3)
+$r27b = Save-StateBytes -Bytes $other7 -Path $p27
+Assert-True 'a SECOND transition is refused while the asset survives' ($r27b.ok -eq $false) ([string]$r27b.reason)
+Assert-True 'and the refusal names the unresolved transition' ($r27b.reason -match 'refusing to start a transition')
+Assert-True 'the destination was not touched by the refused save' ((Read-WatchState -Path $p27).state.lastIndex -eq 3)
+
+# release the handle: startup now self-heals, because the destination PROVES it
+if ($script:HeldAsset) { $script:HeldAsset.Dispose(); $script:HeldAsset = $null }
+$r27c = Resolve-PendingTransition -Path $p27
+Assert-True 'once released, recovery proves it completed' ($r27c.status -eq 'completed') ([string]$r27c.status)
+Assert-True 'and the watcher may proceed' ($r27c.canProceed -eq $true)
+Assert-True 'and the asset is finally gone' (@(Get-TxAssets -Path $p27).Count -eq 0)
+$r27d = Save-StateBytes -Bytes $other7 -Path $p27
+Assert-True 'and a normal save works again' ($r27d.ok -eq $true) ([string]$r27d.reason)
+Assert-True 'cleanly this time' ($r27d.cleanup_pending -eq $false)
+
+Write-Output ''
+Write-Output 'CASE 28 - a clean save leaves no evidence, and the name carries FULL digests'
+$p28 = Join-Path $rxDir 'names.json'
+[System.IO.File]::WriteAllBytes($p28, $prior1)
+$captured = ''
+$script:WatchTestHook = { param($Name, $Ctx) if ($Name -eq 'BeforeReplace') { $script:CapturedAsset = $Ctx.AssetPath } }
+try { $r28 = Save-StateBytes -Bytes $cand3 -Path $p28 } finally { $script:WatchTestHook = $null }
+$captured = Split-Path -Leaf ([string]$script:CapturedAsset)
+Assert-True 'the save is clean' (($r28.ok -eq $true) -and ($r28.cleanup_pending -eq $false)) ([string]$r28.reason)
+Assert-True 'no asset survives a clean save' (@(Get-TxAssets -Path $p28).Count -eq 0)
+Assert-True 'no .tmp survives either' (@(Get-ChildItem -LiteralPath $rxDir -Filter '*.tmp' -ErrorAction SilentlyContinue).Count -eq 0)
+$parsed = Read-TxAssetName -Path $p28 -AssetName $captured
+Assert-True 'the asset name parses' ($parsed.ok -eq $true) ([string]$parsed.reason)
+Assert-True 'the candidate digest is a FULL sha256' ($parsed.candidateHash -cmatch '^[0-9A-F]{64}$')
+Assert-True 'the prior digest is a FULL sha256' ($parsed.priorHash -cmatch '^[0-9A-F]{64}$')
+Assert-True 'and it named the real candidate' ($parsed.candidateHash -ceq (Get-BytesHash -Bytes $cand3))
+Assert-True 'and the real prior' ($parsed.priorHash -ceq (Get-BytesHash -Bytes $prior1))
+
+Write-Output ''
+Write-Output 'CASE 29 - the test seam is inert in production and never reads the environment'
+Assert-True 'the hook is null unless a test sets it' ($null -eq $script:WatchTestHook)
+$modSrc = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts/watch_state.ps1') -Raw
+Assert-True 'the module never takes a hook from the environment' (-not ($modSrc -match '\$env:[A-Za-z_]*(HOOK|TEST|INJECT)'))
+Assert-True 'and both watchers go through the one state machine' `
+  ((@('scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1') | Where-Object {
+      $t = Get-Content -LiteralPath (Join-Path $RepoRoot $_) -Raw
+      ($t -match 'Resolve-PendingTransition') -and ($t -notmatch 'Test-PendingTransition') -and ($t -match 'Get-SaveStopReason')
+   }).Count -eq 2)
+
 Write-Output ''
 Write-Output 'the PowerShell 7 / 5.1 JSON type difference is absorbed'
 $isoText = '2026-09-08T08:00:00.000Z'

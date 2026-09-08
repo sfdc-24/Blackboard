@@ -57,10 +57,18 @@ if (-not $lock.ok) { throw ("WA watch CANNOT START - " + $lock.reason) }
 $ResetRequested = [bool]$Reset
 $ResetDone = $false
 
-$pendingTx = Test-PendingTransition -Path $StateFile
-if ($pendingTx.pending) {
+# Startup uses the SAME state machine as every save. It may self-heal, but only
+# by proving which side of the replace the disk is on and then proving the asset
+# is gone; anything it cannot prove stops the watcher with every file preserved.
+# It used to refuse on the mere PRESENCE of a rollback file, which turned a
+# blocked cleanup after a perfectly good save into an unexplained outage.
+$tx = Resolve-PendingTransition -Path $StateFile
+if (-not $tx.canProceed) {
   Exit-WatchLock $lock
-  throw ("WA watch CANNOT START - " + $pendingTx.reason)
+  throw ("WA watch CANNOT START - " + $tx.reason)
+}
+if ($tx.status -ne 'clean') {
+  Write-Output ("WA watch RECOVERED an interrupted state transition [" + $tx.status + "] - " + $tx.reason + ".")
 }
 
 $loaded = Read-WatchState -Path $StateFile
@@ -175,8 +183,10 @@ try {
       $fresh.resetAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
       $fresh = Set-CommittedCursor -State $fresh -Rows $rows -Index $lastData
       $rs = Save-WatchState -State $fresh -Path $StateFile
-      if (-not $rs.ok) {
-        throw ("WA watch RESET FAILED - " + $rs.reason + ".")
+      $rsStop = Get-SaveStopReason $rs
+      if ($rsStop) {
+        if ($rs.committed) { throw ("WA watch RESET COMMITTED BUT CANNOT CONTINUE - " + $rsStop) }
+        throw ("WA watch RESET FAILED - " + $rsStop + ".")
       }
       $state = $fresh
       $ResetDone = $true
@@ -217,8 +227,13 @@ try {
       }
       $state = Complete-WatchOutbox -State $state -EmitKey $mk -EmitTs $mt
       $rc = Save-WatchState -State $state -Path $StateFile
-      if (-not $rc.ok) {
-        throw ("WA watch COULD NOT COMMIT AFTER REPLAY - " + $rc.reason +
+      $rcStop = Get-SaveStopReason $rc
+      if ($rcStop) {
+        if ($rc.committed) {
+          throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $rcStop +
+                 " The replayed lines above were reported and the cursor did advance, so nothing is lost.")
+        }
+        throw ("WA watch COULD NOT COMMIT AFTER REPLAY - " + $rcStop +
                ". The outbox is retained, so the next start replays the same lines rather than skipping them.")
       }
       $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
@@ -263,11 +278,23 @@ try {
     if ($staged.Count -eq 0) {
       $state = Set-CommittedCursor -State $state -Rows $rows -Index $lastData
       $sv = Save-WatchState -State $state -Path $StateFile
-      if (-not $sv.ok) { throw ("WA watch COULD NOT COMMIT - " + $sv.reason + ". Nothing was reported.") }
+      $svStop = Get-SaveStopReason $sv
+      if ($svStop) {
+        if ($sv.committed) { throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $svStop + " Nothing was reported.") }
+        throw ("WA watch COULD NOT COMMIT - " + $svStop + ". Nothing was reported.")
+      }
     } else {
       $ps = Save-WatchState -State $state -Path $StateFile
-      if (-not $ps.ok) {
-        throw ("WA watch COULD NOT STAGE ITS OUTBOX - " + $ps.reason +
+      $psStop = Get-SaveStopReason $ps
+      if ($psStop) {
+        if ($ps.committed) {
+          # The outbox IS durable. Stop BEFORE emitting: the commit that would
+          # follow is guaranteed to be refused, and replaying from a durable
+          # outbox costs a duplicate, which the contract already allows.
+          throw ("WA watch STAGED ITS OUTBOX THEN STOPPED - " + $psStop +
+                 " Nothing was reported yet, and the next start replays those lines rather than losing them.")
+        }
+        throw ("WA watch COULD NOT STAGE ITS OUTBOX - " + $psStop +
                ". Nothing was reported and the cursor did not move, so the next start re-reads exactly this.")
       }
       # ---- EMIT, from the caller, after the durable save --------------------
@@ -276,8 +303,13 @@ try {
       $last = $staged[$staged.Count - 1]
       $state = Complete-WatchOutbox -State $state -EmitKey ([string]$last.key) -EmitTs ([string]$last.ts)
       $cs = Save-WatchState -State $state -Path $StateFile
-      if (-not $cs.ok) {
-        throw ("WA watch COULD NOT COMMIT - " + $cs.reason +
+      $csStop = Get-SaveStopReason $cs
+      if ($csStop) {
+        if ($cs.committed) {
+          throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $csStop +
+                 " The lines above were reported and the cursor did advance, so nothing is lost and nothing is replayed.")
+        }
+        throw ("WA watch COULD NOT COMMIT - " + $csStop +
                ". The outbox is retained, so the next start replays those lines rather than skipping them.")
       }
       if ($r.remaining -gt 0) {
