@@ -38,6 +38,7 @@ const http = require('http');
 const https = require('https');
 const vm = require('vm');
 const crypto = require('crypto');
+const domains = require('./domains.js');
 
 const HERE = __dirname;
 const REPO = path.join(HERE, '..', '..');
@@ -52,6 +53,51 @@ for (const line of fs.readFileSync(path.join(REPO, '.env'), 'utf8').split('\n'))
 const KEY = env.ANTHROPIC_API_KEY;
 const MODEL = env.ANTHROPIC_MODEL || 'claude-sonnet-4-5';
 if (!KEY) { console.error('ANTHROPIC_API_KEY missing from .env'); process.exit(2); }
+
+// ---- domain names ----------------------------------------------------------
+// Only for the BUILD intent. Someone whose Apex trigger is misfiring did not
+// come here to be sold a domain, and offering one would be the exact tone-deaf
+// upsell PRODUCT.md exists to avoid: the sale happens when they already hold a
+// working thing. `fix` and `env` get no names at all.
+//
+// With no key configured this still runs and still returns candidates -- it
+// just reports checked:false. That distinction is the whole point: an
+// unchecked name must never be presented as an available one.
+const DOMAIN_PROVIDER = env.CLOUDFLARE_API_TOKEN ? 'cloudflare'
+                      : (env.NAMESILO_KEY ? 'namesilo' : null);
+
+function domainTransport(url, headers) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method: 'GET', headers: headers || {} }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; if (body.length > 200000) req.destroy(); });
+      res.on('end', () => {
+        if (res.statusCode >= 400) return reject(new Error('HTTP ' + res.statusCode));
+        resolve(body);
+      });
+    });
+    req.setTimeout(6000, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function namesFor(sketch, latest) {
+  if (!domains.shouldOfferNames(sketch)) return null;
+  const source = [sketch.title, latest].filter(Boolean).join(' ');
+  return domains.lookup(source, {
+    provider: DOMAIN_PROVIDER || 'namesilo',
+    tlds: ['com', 'ca'],
+    limit: 4,
+    cap: 8,
+    transport: DOMAIN_PROVIDER ? domainTransport : null,
+    config: {
+      apiKey: env.NAMESILO_KEY,
+      apiToken: env.CLOUDFLARE_API_TOKEN,
+      accountId: env.CLOUDFLARE_ACCOUNT_ID
+    }
+  });
+}
 
 // ---- one blocking HTTPS POST, shaped like Apps Script's UrlFetchApp ---------
 // Apps Script's fetch is synchronous and the tested code is written against
@@ -254,12 +300,18 @@ function handle(req, res) {
         makeSketch(history, text).catch(() => null)
       ]);
 
+      // Third independent concern, settled after the sketch because it needs
+      // the intent. Same rule as the other two: it fails on its own and costs
+      // the visitor nothing when it does.
+      const names = await namesFor(sketch, text).catch(() => null);
+
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         ok: !!text_,
         reply: text_ || "I couldn't reach the assistant just then. Your message wasn't lost — try again in a moment.",
         degraded: text_ ? undefined : 'upstream',
-        sketch: sketch || null
+        sketch: sketch || null,
+        names: names || null
       }));
     });
     return;

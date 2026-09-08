@@ -65,6 +65,18 @@
   button{font:600 15px/1 inherit;padding:11px 17px;border:0;border-radius:9px;background:var(--ink);color:#fff;cursor:pointer}
   button[disabled]{opacity:.45;cursor:default}
   .hint{font-size:13px;color:var(--muted);margin-top:9px;min-height:1.2em}
+  /* Names appear only for the BUILD intent, and only once there is a sketch.
+     Availability is stated or it is not stated -- there is no third rendering
+     that lets an unchecked name look free. */
+  .names{margin:14px 0 0;border-top:1px solid var(--line);padding-top:12px}
+  .names h3{margin:0 0 3px;font-size:13px;font-weight:600;letter-spacing:.02em}
+  .names .lede{margin:0 0 9px;font-size:12.5px;color:var(--muted)}
+  .names ul{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:6px}
+  .names li{border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:13px;
+    display:flex;align-items:baseline;gap:7px;background:var(--paper)}
+  .names li.free{background:var(--warm)}
+  .names li.taken{opacity:.45;text-decoration:line-through}
+  .names .price{font-size:11.5px;color:var(--muted)}
   #make{align-self:flex-start;margin-top:14px;background:var(--accent);font-size:14px;padding:10px 15px}
   #hear{align-self:flex-start;margin-top:9px;background:transparent;color:var(--ink);
         border:1px solid #D6D1C6;font-size:14px;padding:9px 14px}
@@ -87,6 +99,7 @@
       have the working thing, and putting a form here would turn the page back
       into the quote-comparison mode this is meant to replace.
     -->
+    <div class="names" id="names" hidden></div>
     <button id="make" hidden>Turn this into a page I can send &rarr;</button>
     <!--
       The walkthrough appears only once a page exists to walk through, and it is
@@ -139,6 +152,33 @@
   }
 
   // Layout is a plain column-by-depth walk. No physics, no force-directed
+  // Names. Two states and no blurring between them: either availability was
+  // actually checked, or it was not and the list is labelled as ideas only.
+  // Presenting an unchecked name as free is the one failure worth designing
+  // against here -- somebody would go and tell their partner they had the name.
+  function drawNames(n) {
+    var el = document.getElementById("names");
+    if (!el) return;
+    if (!n || (!n.results.length && !(n.suggestions || []).length)) { el.hidden = true; return; }
+    var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>\"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+    var rows;
+    if (n.checked && n.results.length) {
+      rows = n.results.map(function (r) {
+        var price = (r.available && r.price != null)
+          ? '<span class="price">$' + esc(r.price.toFixed(2)) + '</span>' : "";
+        return '<li class="' + (r.available ? "free" : "taken") + '">' + esc(r.domain) + price + "</li>";
+      }).join("");
+    } else {
+      rows = (n.suggestions || []).map(function (d) { return "<li>" + esc(d) + "</li>"; }).join("");
+    }
+    el.innerHTML = "<h3>Names for it</h3><p class=\"lede\">"
+      + (n.checked ? "Checked just now. Struck through means taken."
+                   : "Ideas only — availability not checked.")
+      + "</p><ul>" + rows + "</ul>";
+    el.hidden = false;
+  }
+
   // library: a sketch with eight boxes does not need one, and reaching for one
   // is the first step toward the cathedral.
   function draw(sk){
@@ -235,6 +275,10 @@
       history.push({role:"assistant", text:res.reply});
       if (res.sketch) { lastSketch = res.sketch; draw(res.sketch); document.getElementById("make").hidden = false; hint.textContent = "Got it wrong? Say so — that's the fastest way to fix it."; }
       else { hint.textContent = res.ok ? "Not enough to draw yet — keep going." : "The sketch is unavailable, but I'm still listening."; }
+      // Settled independently on the server, so it is drawn independently here:
+      // no names must never blank the sketch, and no sketch must never blank
+      // the names.
+      drawNames(res.names);
     })
     .catch(function(){
       turn("sys", "", "That didn't reach me. Your message wasn't lost — try again in a moment.");

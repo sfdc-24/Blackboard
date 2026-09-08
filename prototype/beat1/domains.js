@@ -297,7 +297,22 @@ async function lookup(description, opts) {
   }
 }
 
+/**
+ * Should this visitor be offered domain names at all?
+ *
+ * Only the BUILD intent. Someone whose Apex trigger is misfiring did not come
+ * here to be sold a domain, and someone standing up a Salesforce environment
+ * already has one. Offering names to either is the tone-deaf upsell PRODUCT.md
+ * exists to avoid: the sale happens when they already hold a working thing.
+ *
+ * This lives here rather than in the server so it can be tested as the policy
+ * it is, instead of being an `if` buried in a request handler.
+ */
+function shouldOfferNames(sketch) {
+  return !!(sketch && sketch.intent === 'build');
+}
+
 module.exports = {
-  TLDS, toLabel, suggestLabels, candidates, redact, lookup,
+  TLDS, toLabel, suggestLabels, candidates, redact, lookup, shouldOfferNames,
   providers: PROVIDERS, _str: str_
 };
