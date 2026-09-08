@@ -799,6 +799,20 @@ try {
 
     $rows = @(Read-BoardPreAdmission)
     $selection = Get-OrderSelection -Rows $rows -Cursor $state.cursor -AllowedSources $AllowedSources -RequiredAuthorityToken $RequiredAuthorityToken
+    if ([int]$selection.exact_duplicate_row_count -gt 0) {
+        # Emit at most one warning for the poll. Dynamic data is deliberately
+        # counts-only: no duplicated Row_ID, tuple, cell, or payload is logged.
+        Write-OrderLog `
+            -Path $LogPath `
+            -Event 'board_duplicate_rows_collapsed' `
+            -Level warning `
+            -RunId $RunId `
+            -Code 'BOARD_CURSOR_DUPLICATES_COLLAPSED' `
+            -Details @{
+                exact_duplicate_group_count = [int]$selection.exact_duplicate_group_count
+                exact_duplicate_row_count = [int]$selection.exact_duplicate_row_count
+            }
+    }
     if ($selection.newest_seen) {
         $state.seen = [pscustomobject][ordered]@{
             at = Get-UtcStamp
