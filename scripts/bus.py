@@ -14,8 +14,7 @@ import urllib.parse
 import urllib.request
 
 # Derived from this file's location, never hardcoded. An absolute machine path
-# here is what makes a client work for exactly one checkout on exactly one box —
-# the same defect that has made the tracked .clasp.json unusable on this VM.
+# here would make the client work for exactly one checkout on exactly one box.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.environ.get("BLACKBOARD_ENV") or os.path.join(ROOT, ".env")
 
@@ -71,13 +70,29 @@ def _fetch_once(url, data=None):
         raise
 
 
-def fetch(url, data=None, tries=5):
-    """The googleusercontent redirect target intermittently 404s. Retry.
+def fetch(url, data=None, tries=None):
+    """Fetch through the Apps Script redirect without ever replaying an append.
 
-    Safe for reads (idempotent). For an append the CALLER must read back:
-    the v1 bus does not dedup, so a retry after a request that actually
-    landed would double the row.
+    Reads are idempotent and default to five bounded attempts because the
+    googleusercontent redirect target intermittently returns HTTP 404. Appends
+    are different: the first POST may already have committed before its response
+    fails, so the reusable transport enforces exactly one attempt. The caller
+    must resolve an ambiguous append with a full-sheet read-back count.
     """
+    # The v1 bus defaults a POST with no action field to append, so absence is
+    # write-like rather than safe-to-retry. Treat any non-dict POST body the same
+    # way; an invalid request must never become a replayed write attempt.
+    if isinstance(data, dict):
+        action = str(data.get("action") or "append").lower()
+    else:
+        action = "append" if data is not None else None
+    if tries is None:
+        tries = 1 if action == "append" else 5
+    if not isinstance(tries, int) or isinstance(tries, bool) or tries < 1:
+        raise ValueError("tries must be a positive integer")
+    if action == "append" and tries != 1:
+        raise ValueError("append requests require exactly one transport attempt")
+
     last = None
     for attempt in range(tries):
         try:
@@ -85,7 +100,8 @@ def fetch(url, data=None, tries=5):
         except urllib.error.HTTPError as e:
             last = e
             print(f"[fetch attempt {attempt+1}] HTTP {e.code}", file=sys.stderr)
-            time.sleep(2 * (attempt + 1))
+            if attempt + 1 < tries:
+                time.sleep(2 * (attempt + 1))
     raise last
 
 

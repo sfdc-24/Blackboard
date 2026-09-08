@@ -19,20 +19,22 @@ def main():
     if len(sys.argv) < 2:
         raise SystemExit(
             "usage: python scripts/append.py <row.json>\n"
-            "The JSON object needs: row_id, payload, and optionally source_tag,\n"
+            "The JSON object needs: row_id, source_tag, payload, and optionally\n"
             "target_surface, action_type, category, project_tag, gist, subgist."
         )
     env = load_env()
     with open(sys.argv[1], encoding="utf-8") as fh:
         spec = json.load(fh)
-    for required in ("row_id", "payload"):
-        if not spec.get(required):
-            raise SystemExit(f"{sys.argv[1]} is missing required field: {required}")
+    if not isinstance(spec, dict):
+        raise SystemExit(f"{sys.argv[1]} must contain one JSON object")
+    for required in ("row_id", "source_tag", "payload"):
+        if not isinstance(spec.get(required), str) or not spec[required].strip():
+            raise SystemExit(f"{sys.argv[1]} needs non-empty string field: {required}")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     row = [
         spec["row_id"],
         ts,
-        spec.get("source_tag", "vm-cli"),
+        spec["source_tag"],
         spec.get("target_surface", "ALL"),
         spec.get("action_type", "APPEND"),
         spec["payload"],
@@ -41,11 +43,11 @@ def main():
         spec.get("gist", ""),
         spec.get("subgist", ""),
     ]
-    # tries=1 is load-bearing. fetch() defaults to 5 attempts, which is right for
-    # reads and WRONG here: the v1 bus does not dedup, and a googleusercontent 404
-    # on the redirect hop is raised client-side AFTER the row has already landed.
-    # On 2026-09-08 the default retry doubled WRK-vmccc-xray-blocker-20260908T1630Z
-    # on the live board — two 404s, three appends, one intended row. Never let an
+    # tries=1 is deliberately explicit even though fetch() now enforces the same
+    # rule for every append. The v1 bus does not dedup, and a googleusercontent
+    # 404 on the redirect hop can be raised client-side AFTER the row has already
+    # landed. On 2026-09-08 the old transport default replayed
+    # WRK-vmccc-xray-blocker-20260908T1630Z onto the live board. Never let an
     # append retry itself; the read-back below is what closes the loop.
     try:
         body = fetch(
