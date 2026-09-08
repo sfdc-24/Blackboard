@@ -83,7 +83,24 @@ while ($true) {
     $fresh = @()
     for ($i = 1; $i -lt $rows.Count; $i++) {
       $r = $rows[$i]
-      if ([string]$r[2] -ne 'whatsapp') { continue }
+      # He speaks to us from TWO places now, and both should wake a session.
+      #
+      # WhatsApp arrives tagged `whatsapp`. The governor console on sfdc24.com
+      # writes through postRow, which is governor-guarded, and lands a payload
+      # starting `GOV|kind=feed` under a source tag naming how he authenticated
+      # -- google-sso:<his email>, or `passphrase`. Both are him; neither could
+      # have been written by a visitor, because postRow refuses anyone who is not
+      # the Governor.
+      #
+      # He asked to be able to talk to us on the governor page the way he talks
+      # to us here. The console could already SEND. What was missing is that
+      # nothing was listening -- the same wake gap that produced 12h51m of fleet
+      # silence. This closes the listening half, and it needs no deploy.
+      $tag = [string]$r[2]
+      $pay = [string]$r[5]
+      $fromWhatsApp = ($tag -eq 'whatsapp')
+      $fromConsole  = ($pay -like 'GOV|kind=feed*')
+      if (-not ($fromWhatsApp -or $fromConsole)) { continue }
       $id = [string]$r[0]
       if ($seen.ContainsKey($id)) { continue }
       $seen[$id] = $true
@@ -98,7 +115,7 @@ while ($true) {
         $tail = $fresh[[Math]::Max(0, $fresh.Count - $Backfill)..($fresh.Count - 1)]
         foreach ($r in $tail) {
           $t = ([string]$r[5]) -replace '\s+', ' '
-          Write-Output ("WA (recent) [" + $r[1] + "] " + $t.Trim())
+          Write-Output ("(recent) [" + $r[1] + "] " + $t.Trim())
         }
       }
       Write-Output ("WA watch armed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
@@ -106,7 +123,21 @@ while ($true) {
     } else {
       foreach ($r in $fresh) {
         $t = ([string]$r[5]) -replace '\s+', ' '
-        Write-Output ("WA FROM MR SALAM [" + $r[1] + "] " + $t.Trim())
+        # Say WHERE he said it. A reply belongs in the channel he chose, and a
+        # governor-page note answered only on WhatsApp would look like silence
+        # to someone sitting on the page waiting.
+        #
+        # Decided FROM THIS ROW, not from the filter loop's variable. The first
+        # draft reused $fromConsole across loops, so every emitted line would
+        # have carried the channel of whichever row the FILTER happened to look
+        # at last -- mislabelling where he spoke, which is the one thing this
+        # line exists to get right.
+        if (([string]$r[5]) -like 'GOV|kind=feed*') {
+          $t = $t -replace '^GOV\|kind=feed\|tag=GOVERNOR\|text=', ''
+          Write-Output ("GOVERNOR PAGE - MR SALAM [" + $r[1] + "] " + $t.Trim())
+        } else {
+          Write-Output ("WA FROM MR SALAM [" + $r[1] + "] " + $t.Trim())
+        }
       }
     }
   }
