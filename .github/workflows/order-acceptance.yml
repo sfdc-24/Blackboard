@@ -1,0 +1,90 @@
+name: ORDER acceptance (offline)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/order-acceptance.yml'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/bus.ps1'
+      - 'scripts/install_order_supervisor.ps1'
+      - 'scripts/invoke_order_claude.ps1'
+      - 'scripts/order_supervisor_result.schema.json'
+      - 'infra/azure/blackboard_vm_supervisor.ps1'
+      - 'infra/azure/install_release_from_archive.ps1'
+      - 'infra/azure/order_system_adapter_smoke.ps1'
+      - 'infra/azure/validate_order_job_schedule_links.ps1'
+      - 'infra/azure/order_task_escrow.ps1'
+      - 'infra/azure/order_cutover_phase.ps1'
+      - 'infra/azure/stage_order_escrow_tool.ps1'
+      - 'infra/azure/build_order_escrow_transport_wrapper.ps1'
+      - 'infra/azure/build_order_release_wrapper.ps1'
+      - 'infra/azure/job-schedule-00.json'
+      - 'infra/azure/job-schedule-30.json'
+      - 'tests/test_order_read_resilience.ps1'
+      - 'tests/test_order_state_preservation.ps1'
+      - 'tests/test_order_installer_safety.ps1'
+      - 'tests/test_order_release_installer.ps1'
+      - 'tests/test_order_system_adapter_smoke.ps1'
+      - 'tests/test_order_job_schedule_link_validator.ps1'
+      - 'tests/test_order_task_escrow.ps1'
+      - 'tests/test_order_cutover_phase.ps1'
+      - 'tests/test_order_escrow_transport.ps1'
+      - 'tests/test_order_deployment_wrappers.ps1'
+      - 'tests/test_order_supervisor.ps1'
+      - 'tests/test_order_workspace.ps1'
+      - 'tests/test_azure_vm_supervisor.ps1'
+      - 'tests/fixtures/order_supervisor_board.json'
+      - 'docs/ONBOARDING.md'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: ORDER and Azure contracts on Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test bounded ORDER board-read resilience
+        shell: powershell
+        run: .\tests\test_order_read_resilience.ps1
+      - name: Test ORDER state preservation
+        shell: powershell
+        run: .\tests\test_order_state_preservation.ps1
+      - name: Test ORDER task installer safety
+        shell: powershell
+        run: .\tests\test_order_installer_safety.ps1
+      - name: Test ORDER immutable release installer
+        shell: powershell
+        run: .\tests\test_order_release_installer.ps1
+      - name: Test provider-free ORDER SYSTEM adapter smoke
+        shell: powershell
+        run: .\tests\test_order_system_adapter_smoke.ps1
+      - name: Test ORDER Azure job-schedule link validation
+        shell: powershell
+        run: .\tests\test_order_job_schedule_link_validator.ps1
+      - name: Test ORDER independent task escrow
+        shell: powershell
+        run: .\tests\test_order_task_escrow.ps1
+      - name: Test ORDER bounded guest cutover phases
+        shell: powershell
+        run: .\tests\test_order_cutover_phase.ps1
+      - name: Test ORDER escrow transport
+        shell: powershell
+        run: .\tests\test_order_escrow_transport.ps1
+      - name: Test ORDER deployment wrapper builders
+        shell: powershell
+        run: .\tests\test_order_deployment_wrappers.ps1
+      - name: Test ORDER supervisor contracts
+        shell: powershell
+        run: .\tests\test_order_supervisor.ps1
+      - name: Test ORDER workspace and task contracts
+        shell: powershell
+        run: .\tests\test_order_workspace.ps1
+      - name: Test Azure supervisor contracts
+        shell: powershell
+        run: .\tests\test_azure_vm_supervisor.ps1

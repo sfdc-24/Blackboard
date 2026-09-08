@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# Stop the running service before its files are removed or replaced.
+if [ -d /run/systemd/system ] && [ "$1" = "remove" ]; then
+    systemctl stop blackboard-bus 2>/dev/null || true
+fi
+
+exit 0

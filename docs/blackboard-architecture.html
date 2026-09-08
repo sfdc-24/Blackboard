@@ -1,0 +1,314 @@
+<title>Blackboard Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  :root{
+    --ink:#111110;
+    --ink-2:#3a3a37;
+    --ink-3:#6b6b66;
+    --sheet:#ffffff;
+    --t1:#f4f4f2;
+    --t2:#e6e6e2;
+    --t3:#d2d2cd;
+    --t4:#b9b9b3;
+    --surround:#8e8e88;
+    --surround-ink:#f4f4f2;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){ --surround:#232320; --surround-ink:#c9c9c3; }
+  }
+  :root[data-theme="dark"]{ --surround:#232320; --surround-ink:#c9c9c3; }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--surround);
+    color:var(--surround-ink);
+    font-family:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif;
+    padding:28px 20px 44px;
+  }
+  .wrap{max-width:1180px;margin:0 auto;}
+  .screen-note{
+    font-size:12px;letter-spacing:.09em;text-transform:uppercase;
+    font-family:"IBM Plex Sans Condensed","IBM Plex Sans",Arial,sans-serif;
+    font-weight:600;margin:0 0 12px;opacity:.75;
+  }
+  figure{margin:0;}
+  .sheet{
+    background:var(--sheet);
+    box-shadow:0 1px 2px rgba(0,0,0,.22),0 12px 34px rgba(0,0,0,.28);
+    overflow-x:auto;
+  }
+  svg.plan{display:block;width:100%;height:auto;color:var(--ink);}
+  figcaption{
+    margin-top:12px;font-size:12.5px;line-height:1.5;max-width:64ch;opacity:.8;
+  }
+
+  /* ---- drawing type roles ---- */
+  .cond{font-family:"IBM Plex Sans Condensed","IBM Plex Sans",Arial,sans-serif;}
+  .mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;}
+  .eyebrow{font-size:13px;font-weight:700;letter-spacing:.13em;fill:var(--ink-3);}
+  .wordmark{font-size:41px;font-weight:700;letter-spacing:-.012em;fill:var(--ink);}
+  .deck{font-size:14px;font-weight:400;fill:var(--ink-2);}
+  .boxtitle{font-size:17px;font-weight:700;letter-spacing:.02em;fill:var(--ink);}
+  .boxtitle-sm{font-size:14.5px;font-weight:700;letter-spacing:.05em;fill:var(--ink);}
+  .role{font-size:13.5px;font-weight:600;font-style:italic;fill:var(--ink-2);}
+  .body{font-size:14px;font-weight:400;fill:var(--ink-2);}
+  .fine{font-size:13px;font-weight:400;fill:var(--ink-3);}
+  .flowlabel{font-size:13px;font-weight:600;letter-spacing:.06em;fill:var(--ink);}
+  .cols{font-size:14px;font-weight:500;fill:var(--ink);letter-spacing:.01em;}
+  .stamp{font-size:14px;font-weight:700;letter-spacing:.1em;fill:var(--ink);}
+
+  /* ---- drawing shape roles ---- */
+  .band{fill:none;stroke:var(--t3);stroke-width:1;}
+  .box{fill:var(--t1);stroke:var(--ink);stroke-width:1.1;}
+  .box-quiet{fill:#fff;stroke:var(--ink);stroke-width:1;}
+  .box-key{fill:#fff;stroke:var(--ink);stroke-width:2.4;}
+  .cell{fill:var(--t2);stroke:var(--ink);stroke-width:.9;}
+  .cell-lock{fill:var(--t4);stroke:var(--ink);stroke-width:1.6;}
+  .strip{fill:var(--t2);stroke:var(--ink);stroke-width:1.1;}
+  .rule{stroke:var(--ink);stroke-width:1;}
+  .hair{stroke:var(--t3);stroke-width:1;}
+  .flow{stroke:var(--ink);stroke-width:1.5;fill:none;}
+  .flow-human{stroke:var(--ink);stroke-width:1.4;fill:none;stroke-dasharray:7 5;}
+  .flow-async{stroke:var(--ink-3);stroke-width:1.3;fill:none;stroke-dasharray:2 4;}
+  .lead{stroke:var(--ink-3);stroke-width:.9;fill:none;}
+
+  @media print{
+    @page{ size:letter landscape; margin:.34in; }
+    html,body{background:#fff !important;color:#111 !important;padding:0;margin:0;}
+    .screen-note,figcaption{display:none !important;}
+    .sheet{box-shadow:none !important;overflow:visible !important;}
+    svg.plan{width:100% !important;height:auto !important;}
+  }
+</style>
+
+<div class="wrap">
+  <p class="screen-note">One landscape sheet &middot; grayscale &middot; print at 100%, no scaling</p>
+
+  <figure>
+    <div class="sheet">
+      <svg class="plan" viewBox="0 0 1320 1000" role="img"
+           aria-label="Architecture of Blackboard: trigger surfaces emit events into a validating gateway; two agent populations, human-attended surface instances and program-spawned API workers, read and write through that gateway into a single append-only event ledger whose current state is computed from the highest-sequence event; an asynchronous clerk and a human-readable projection consume the ledger; findings flow through a human approval gate to a client deliverable.">
+
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+          </marker>
+          <marker id="ah-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b6b66"/>
+          </marker>
+        </defs>
+
+        <rect x="0" y="0" width="1320" height="1000" fill="#ffffff"/>
+
+        <!-- ================= TITLE BLOCK ================= -->
+        <text class="cond wordmark" x="22" y="60">BLACKBOARD</text>
+        <text class="deck" x="22" y="84">A multi&#8209;agent coordination kernel. It makes many</text>
+        <text class="deck" x="22" y="103">memory&#8209;less AI instances behave as one continuous team.</text>
+        <line class="rule" x1="22" y1="118" x2="310" y2="118"/>
+
+        <!-- ================= ARROW KEY ================= -->
+        <text class="cond eyebrow" x="1298" y="40" text-anchor="end">ARROW KEY</text>
+        <line class="flow" x1="1046" y1="60" x2="1086" y2="60" marker-end="url(#ah)"/>
+        <text class="fine" x="1096" y="64">automatic &#183; triggered by software</text>
+        <line class="flow-human" x1="1046" y1="82" x2="1086" y2="82" marker-end="url(#ah)"/>
+        <text class="fine" x="1096" y="86">human&#8209;initiated only</text>
+        <line class="flow-async" x1="1046" y1="104" x2="1086" y2="104" marker-end="url(#ah-o)"/>
+        <text class="fine" x="1096" y="108">asynchronous &#183; off the write path</text>
+
+        <!-- ================= LAYER 1 — TRIGGER SURFACES ================= -->
+        <text class="cond eyebrow" x="340" y="40">1 &#8212; TRIGGER SURFACES</text>
+
+        <rect class="box" x="340" y="50" width="158" height="68"/>
+        <text class="cond boxtitle-sm" x="356" y="76">ZOOM RTMS</text>
+        <text class="fine" x="356" y="96">live transcript,</text>
+        <text class="fine" x="356" y="111">screen share, audio</text>
+
+        <rect class="box" x="510" y="50" width="158" height="68"/>
+        <text class="cond boxtitle-sm" x="526" y="76">WEBHOOK</text>
+        <text class="fine" x="526" y="96">HTTP doorbell,</text>
+        <text class="fine" x="526" y="111">secret&#8209;gated</text>
+
+        <rect class="box" x="680" y="50" width="158" height="68"/>
+        <text class="cond boxtitle-sm" x="696" y="76">SCHEDULER</text>
+        <text class="fine" x="696" y="96">cron,</text>
+        <text class="fine" x="696" y="111">night shift</text>
+
+        <rect class="box" x="850" y="50" width="158" height="68"/>
+        <text class="cond boxtitle-sm" x="866" y="76">HUMAN THREAD</text>
+        <text class="fine" x="866" y="96">a person typing in</text>
+        <text class="fine" x="866" y="111">any chat window</text>
+
+        <line class="flow" x1="419" y1="118" x2="419" y2="148" marker-end="url(#ah)"/>
+        <line class="flow" x1="589" y1="118" x2="589" y2="148" marker-end="url(#ah)"/>
+        <line class="flow" x1="759" y1="118" x2="759" y2="148" marker-end="url(#ah)"/>
+        <line class="flow" x1="929" y1="118" x2="929" y2="148" marker-end="url(#ah)"/>
+        <text class="cond flowlabel" x="676" y="140" text-anchor="middle">EVENTS</text>
+
+        <!-- ================= LAYER 2 — POPULATIONS ================= -->
+        <text class="cond eyebrow" x="22" y="172">2 &#8212; THE TWO POPULATIONS</text>
+
+        <rect class="box" x="22" y="182" width="288" height="176"/>
+        <text class="cond boxtitle" x="38" y="210">SURFACE INSTANCES</text>
+        <text class="role" x="38" y="231">the brain trust</text>
+        <line class="hair" x1="38" y1="243" x2="294" y2="243"/>
+        <text class="body" x="38" y="264">Human&#8209;attended. Rich tools.</text>
+        <text class="body" x="38" y="283">Deep reasoning and judgment.</text>
+        <text class="fine" x="38" y="308">Claude &#183; ChatGPT &#183; Gemini</text>
+        <text class="fine" x="38" y="334">Not addressable by software.</text>
+        <text class="fine" x="38" y="349">A person is the only trigger.</text>
+
+        <rect class="box" x="1010" y="182" width="288" height="176"/>
+        <text class="cond boxtitle" x="1026" y="210">API WORKER POOL</text>
+        <text class="role" x="1026" y="231">the labor</text>
+        <line class="hair" x1="1026" y1="243" x2="1282" y2="243"/>
+        <text class="body" x="1026" y="264">Program&#8209;spawned. Unattended.</text>
+        <text class="body" x="1026" y="283">Elastic. Disposable.</text>
+        <text class="fine" x="1026" y="308">Born with no memory, no tools.</text>
+        <text class="fine" x="1026" y="334">All context arrives from the ledger.</text>
+        <text class="fine" x="1026" y="349">One bounded job, then it ends.</text>
+
+        <!-- ================= LAYER 3 — GATEWAY ================= -->
+        <text class="cond eyebrow" x="340" y="172">3 &#8212; THE GATEWAY</text>
+        <rect class="box-key" x="340" y="182" width="650" height="176"/>
+        <text class="cond boxtitle" x="356" y="210">SINGLE WRITE PATH</text>
+        <text class="fine" x="974" y="210" text-anchor="end">many read paths</text>
+
+        <rect class="cell" x="356" y="226" width="152" height="86"/>
+        <text class="cond stamp" x="432" y="248" text-anchor="middle">VALIDATES</text>
+        <text class="fine" x="432" y="270" text-anchor="middle">empty payload,</text>
+        <text class="fine" x="432" y="285" text-anchor="middle">missing author,</text>
+        <text class="fine" x="432" y="300" text-anchor="middle">unknown type</text>
+
+        <rect class="cell" x="518" y="226" width="152" height="86"/>
+        <text class="cond stamp" x="594" y="248" text-anchor="middle">STAMPS</text>
+        <text class="fine" x="594" y="270" text-anchor="middle">event id,</text>
+        <text class="fine" x="594" y="285" text-anchor="middle">sequence number,</text>
+        <text class="fine" x="594" y="300" text-anchor="middle">server clock</text>
+
+        <rect class="cell-lock" x="680" y="226" width="152" height="86"/>
+        <text class="cond stamp" x="756" y="248" text-anchor="middle">LOCKS</text>
+        <text class="fine" x="756" y="270" text-anchor="middle">refuses a claim on</text>
+        <text class="fine" x="756" y="285" text-anchor="middle">work already held</text>
+        <text class="fine" x="756" y="300" text-anchor="middle">under a live lease</text>
+
+        <rect class="cell" x="842" y="226" width="152" height="86"/>
+        <text class="cond stamp" x="918" y="248" text-anchor="middle">SERVES</text>
+        <text class="fine" x="918" y="270" text-anchor="middle">each agent only</text>
+        <text class="fine" x="918" y="285" text-anchor="middle">its own open work,</text>
+        <text class="fine" x="918" y="300" text-anchor="middle">nothing else</text>
+
+        <line class="lead" x1="756" y1="312" x2="756" y2="332"/>
+        <text class="body" x="756" y="348" text-anchor="middle">The only mechanism in the system that can refuse.</text>
+
+        <line class="flow-human" x1="312" y1="270" x2="336" y2="270" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line class="flow" x1="1006" y1="270" x2="994" y2="270" marker-end="url(#ah)"/>
+        <line class="flow" x1="994" y1="292" x2="1006" y2="292" marker-end="url(#ah)"/>
+
+        <!-- ================= KEY FLOWS ================= -->
+        <line class="hair" x1="22" y1="382" x2="1298" y2="382"/>
+        <text class="cond eyebrow" x="22" y="406">KEY FLOWS</text>
+        <text class="cond flowlabel" x="152" y="406">WAKE</text>
+        <text class="body" x="212" y="406">agent asks for its own open work &#8212; about 500 characters, not the whole history</text>
+        <text class="cond flowlabel" x="152" y="428">CLAIM</text>
+        <text class="body" x="212" y="428">a lease is granted, or the claim is refused because someone already holds it</text>
+        <text class="cond flowlabel" x="740" y="428">FAN&#8209;OUT</text>
+        <text class="body" x="812" y="428">one event addressed to everyone wakes the whole fleet in parallel</text>
+        <line class="hair" x1="22" y1="444" x2="1298" y2="444"/>
+
+        <line class="flow" x1="665" y1="358" x2="665" y2="466" marker-end="url(#ah)"/>
+        <line class="flow" x1="687" y1="466" x2="687" y2="358" marker-end="url(#ah)"/>
+
+        <!-- ================= LAYER 4 — LEDGER ================= -->
+        <text class="cond eyebrow" x="22" y="490">4 &#8212; THE EVENT LEDGER</text>
+        <rect class="box-key" x="22" y="500" width="1276" height="128"/>
+        <text class="cond boxtitle" x="42" y="530">APPEND&#8209;ONLY EVENT LOG</text>
+        <text class="body" x="42" y="552">One row is one EVENT, never a state.</text>
+        <text class="fine" x="42" y="576">Nothing is edited.</text>
+        <text class="fine" x="42" y="592">Nothing is deleted.</text>
+
+        <rect class="strip" x="300" y="524" width="700" height="46"/>
+        <text class="mono cols" x="650" y="552" text-anchor="middle">event_id &#183; seq &#183; work_id &#183; type &#183; actor &#183; assigned_to</text>
+        <text class="mono cols" x="650" y="596" text-anchor="middle">status &#183; lease_until &#183; payload &#183; evidence_ref &#183; project</text>
+
+        <line class="hair" x1="1020" y1="524" x2="1020" y2="606"/>
+        <text class="cond boxtitle-sm" x="1042" y="538">CURRENT STATE IS COMPUTED,</text>
+        <text class="cond boxtitle-sm" x="1042" y="556">NEVER STORED.</text>
+        <text class="body" x="1042" y="580">A work item&#8217;s state is simply</text>
+        <text class="body" x="1042" y="599">its highest&#8209;sequence event.</text>
+
+        <!-- ================= LAYER 5 — CONSUMERS ================= -->
+        <line class="flow-async" x1="380" y1="628" x2="380" y2="662" marker-end="url(#ah-o)"/>
+        <line class="flow" x1="984" y1="628" x2="984" y2="662" marker-end="url(#ah)"/>
+
+        <text class="cond eyebrow" x="120" y="686">5 &#8212; WHO READS THE LEDGER</text>
+
+        <rect class="box-quiet" x="120" y="696" width="540" height="84"/>
+        <text class="cond boxtitle-sm" x="138" y="722">ENRICHMENT CLERK</text>
+        <text class="role" x="316" y="722">asynchronous</text>
+        <text class="fine" x="138" y="744">Reads new rows, writes summary and index fields back.</text>
+        <text class="fine" x="138" y="763">An index for finding work &#8212; never a source of truth.</text>
+
+        <rect class="box-quiet" x="690" y="696" width="608" height="84"/>
+        <text class="cond boxtitle-sm" x="708" y="722">HUMAN&#8209;READABLE PROJECTION</text>
+        <text class="fine" x="708" y="744">Work queue &#183; issue journal &#183; doctrine &#183; per&#8209;agent logs.</text>
+        <text class="fine" x="708" y="763">What people read. Not what machines read.</text>
+
+        <!-- ================= LAYER 6 — OUTPUT ================= -->
+        <polyline class="flow" points="66,628 66,830 96,830" marker-end="url(#ah)"/>
+
+        <text class="cond eyebrow" x="120" y="812">6 &#8212; PRODUCT OUTPUT</text>
+
+        <rect class="box" x="100" y="812" width="112" height="38"/>
+        <text class="cond fine" x="156" y="836" text-anchor="middle">Observation</text>
+        <rect class="box" x="221" y="812" width="112" height="38"/>
+        <text class="cond fine" x="277" y="836" text-anchor="middle">Evidence</text>
+        <rect class="box" x="342" y="812" width="112" height="38"/>
+        <text class="cond fine" x="398" y="836" text-anchor="middle">Impact</text>
+        <rect class="box" x="463" y="812" width="112" height="38"/>
+        <text class="cond fine" x="519" y="836" text-anchor="middle">Recommendation</text>
+        <rect class="box" x="584" y="812" width="112" height="38"/>
+        <text class="cond fine" x="640" y="836" text-anchor="middle">Effort</text>
+        <rect class="box" x="705" y="812" width="112" height="38"/>
+        <text class="cond fine" x="761" y="836" text-anchor="middle">Confidence</text>
+
+        <line class="flow" x1="212" y1="831" x2="219" y2="831"/>
+        <line class="flow" x1="333" y1="831" x2="340" y2="831"/>
+        <line class="flow" x1="454" y1="831" x2="461" y2="831"/>
+        <line class="flow" x1="575" y1="831" x2="582" y2="831"/>
+        <line class="flow" x1="696" y1="831" x2="703" y2="831"/>
+        <line class="flow" x1="817" y1="831" x2="866" y2="831" marker-end="url(#ah)"/>
+
+        <text class="cond eyebrow" x="100" y="872">A FINDING, ALWAYS IN THIS FORM</text>
+
+        <polygon class="box-key" points="930,783 1002,831 930,879 858,831"/>
+        <text class="cond boxtitle-sm" x="930" y="826" text-anchor="middle">HUMAN</text>
+        <text class="cond boxtitle-sm" x="930" y="844" text-anchor="middle">APPROVAL</text>
+
+        <line class="flow" x1="1002" y1="831" x2="1056" y2="831" marker-end="url(#ah)"/>
+        <text class="cond boxtitle" x="1068" y="827">CLIENT DELIVERABLE</text>
+        <text class="fine" x="1068" y="848">Required for anything consequential.</text>
+
+        <!-- ================= PRINCIPLES ================= -->
+        <line class="rule" x1="22" y1="908" x2="1298" y2="908"/>
+        <text class="cond eyebrow" x="22" y="932">DESIGN PRINCIPLES</text>
+        <text class="body" x="200" y="932">Deterministic outside, intelligent inside.</text>
+        <text class="body" x="560" y="932">Truth lives outside the model.</text>
+        <text class="body" x="880" y="932">Evidence before assertion.</text>
+        <text class="body" x="200" y="956">Current state is computed, never stored.</text>
+        <text class="body" x="560" y="956">Read&#8209;back is the only proof of a write.</text>
+        <text class="body" x="880" y="956">A human approves anything consequential.</text>
+        <line class="hair" x1="22" y1="972" x2="1298" y2="972"/>
+      </svg>
+    </div>
+
+    <figcaption>
+      Every trigger becomes an event; every event passes one validating gateway; the ledger keeps
+      the events and never the conclusions. Current state is derived on read, which is what lets a
+      dozen instances with no shared memory agree on what is true.
+    </figcaption>
+  </figure>
+</div>

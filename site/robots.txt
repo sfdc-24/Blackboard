@@ -1,0 +1,5 @@
+# www.sfdc24.com
+User-agent: *
+Allow: /
+
+Sitemap: https://www.sfdc24.com/sitemap.xml

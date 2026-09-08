@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "updated": "2026-09-03",
+  "note": "Stack-neutral. Consumed by whatever runtime hosts reception. Order is deliberate; see README.md before changing it.",
+
+  "required_for_record": ["core_problem", "org_context", "definition_of_done", "contact"],
+
+  "fields": [
+    {
+      "id": "core_problem",
+      "order": 1,
+      "required": true,
+      "ask": "What's the problem you're trying to solve?",
+      "why": "They came here to say this. Asking anything before it is an interruption. It is also the field that decides fit, so it has to be first.",
+      "probe": "That could mean a few different things. What actually happens, and what should happen instead?",
+      "infer_from": "Almost always already present in their opening message. Do not re-ask it.",
+      "populates": "core_problem",
+      "keep_verbatim": true,
+      "never": "Do not tidy their words away. Store what they actually said as well as your summary — playing back a client's own language is worth more than a neat paraphrase."
+    },
+
+    {
+      "id": "org_context",
+      "order": 2,
+      "required": true,
+      "ask": "What does the org look like — edition, roughly how many users, and who looks after it day to day?",
+      "why": "Cheap, factual, and it changes the answer to almost everything else. A 40-user org with one part-time admin and a 4,000-user org with a platform team are different engagements even with an identical problem.",
+      "probe": "Even rough numbers help. Is it tens of users or thousands, and is there a named admin?",
+      "infer_from": "Often partly given. If they said 'Enterprise, 400 users', ask only about who administers it.",
+      "populates": "org_context",
+      "keep_verbatim": false,
+      "never": "Never ask for org IDs, URLs, credentials or a login. SFDC24 does not need access to scope work."
+    },
+
+    {
+      "id": "cost_of_status_quo",
+      "order": 3,
+      "required": false,
+      "ask": "What is this costing you at the moment — time, money, or something that's going to break?",
+      "why": "The single most useful question in the set. It converts a complaint into a business case, in the client's own words, which is what makes them act. It also sizes the engagement honestly: nobody funds a fix that costs less than the problem.",
+      "probe": "A rough number is fine. Hours a week, deals lost, people working around it — whatever you actually notice.",
+      "infer_from": null,
+      "populates": "cost_of_status_quo",
+      "keep_verbatim": true,
+      "never": "Do not editorialise the number upward. If they say two hours a week, it is two hours a week."
+    },
+
+    {
+      "id": "already_tried",
+      "order": 4,
+      "required": false,
+      "ask": "What have you already tried?",
+      "why": "Prevents proposing something that has already failed, which is the fastest way to lose a technical buyer. It also reveals how sophisticated they are, which should change how the rest of the conversation is pitched.",
+      "probe": null,
+      "infer_from": null,
+      "populates": "already_tried",
+      "keep_verbatim": true,
+      "never": "Never imply the previous attempt was stupid. It was usually the right call with the information they had."
+    },
+
+    {
+      "id": "definition_of_done",
+      "order": 5,
+      "required": true,
+      "ask": "If this were fixed, how would you know? What would be true that isn't true now?",
+      "why": "This is the question that turns a conversation into a project. Without it there is no way to agree the work is finished, and a solo consultancy cannot afford an engagement that cannot end.",
+      "probe": "Try to make it something you could check. 'Reporting is better' is hard to finish; 'the pipeline number matches the finance number' is not.",
+      "infer_from": null,
+      "populates": "definition_of_done",
+      "keep_verbatim": true,
+      "never": "Do not accept an adjective as a success criterion. Push once for something observable, then take what comes."
+    },
+
+    {
+      "id": "out_of_scope",
+      "order": 6,
+      "required": false,
+      "ask": "Is there anything nearby that you specifically do NOT want touched in this piece of work?",
+      "why": "Almost no intake asks this and it is the one that protects both sides. Scope creep is what turns a profitable engagement into a loss for a one-person consultancy, and clients usually have a strong opinion here — an integration nobody dares touch, a process mid-migration.",
+      "probe": null,
+      "infer_from": null,
+      "populates": "out_of_scope",
+      "keep_verbatim": true,
+      "never": "Do not present this as protecting yourself. It reads to the client as protecting them, because it is."
+    },
+
+    {
+      "id": "decision_path",
+      "order": 7,
+      "required": false,
+      "ask": "If this goes ahead, who else needs to agree — and is there a date it needs to be done by?",
+      "why": "Qualification, asked late on purpose. Asking who signs the cheque before demonstrating any value is the move that makes prospects leave. By question seven they have had real answers and the question reads as planning rather than screening.",
+      "probe": null,
+      "infer_from": null,
+      "populates": "decision_path",
+      "keep_verbatim": false,
+      "never": "Not a disqualifier. Someone with no budget authority is frequently the person who becomes the champion. Record it, never act cooler because of it."
+    },
+
+    {
+      "id": "contact",
+      "order": 8,
+      "required": true,
+      "ask": "Who should Abdus reply to, and at what address?",
+      "why": "Last, always. The live prompt already forbids chasing contact details, and that instinct is right — asking early converts a conversation into a lead-capture form and people leave. By this point they have a reason to answer.",
+      "probe": null,
+      "infer_from": "If they volunteered an email earlier, use it and confirm rather than asking again.",
+      "populates": "contact",
+      "keep_verbatim": false,
+      "never": "Ask once. If they decline, thank them and offer abdus@sfdc24.com so the door stays open from their side."
+    }
+  ],
+
+  "close_politely_when": [
+    {
+      "id": "out_of_scope_work",
+      "test": "The work is not Salesforce operations or process implementation.",
+      "action": "One line saying so, then: Thank you for visiting our page. No referral, no substitute, no fishing for a different problem."
+    },
+    {
+      "id": "no_real_problem",
+      "test": "After one sharpening question there is still nothing concrete — browsing, benchmarking, or curiosity with no situation behind it.",
+      "action": "Answer what they asked in two sentences and close. Do not start the interview."
+    },
+    {
+      "id": "will_not_do",
+      "test": "They are asking for something SFDC24 would not do — working around their own security review, anything requiring credentials, anything misrepresented to a third party.",
+      "action": "Decline in one line without a lecture, then close."
+    }
+  ],
+
+  "never_disqualify_on": [
+    "seniority or job title",
+    "not holding budget authority",
+    "a small org or a small problem",
+    "not knowing Salesforce terminology"
+  ]
+}

@@ -1,0 +1,4 @@
+# These peer notes are historical records preserved as LF-only source bytes.
+# Disable text conversion for the evidence files only; keep normal Markdown
+# handling for README.md and any future documentation in this directory.
+PEER-NOTE-*.md -text

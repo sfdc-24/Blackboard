@@ -4,6 +4,47 @@ logs/
 # Env
 .env
 .env.*
+# Backup copies of .env made by hand during rotations. These hold LIVE
+# credentials in cleartext and the patterns above do not catch them --
+# ".env-OLD.txt" matches neither ".env" nor ".env.*". Appeared 2026-09-03.
+# This is exactly the shape of REQ-M6HZK4: one `git add -A` from permanent
+# history, and git history cannot be scrubbed the way a Doc can.
+.env-*
+*.env
+env.bak
+.env.bak
+# Credential-bearing one-shot clients -- see Issue Journal REQ-M6HZK4.
+# These four scripts and the helper below hardcode the live BUS_SECRET in
+# cleartext. They are untracked today; without these lines a single
+# `git add -A` would commit the secret into history permanently, and git
+# history cannot be swapped the way a Doc can. Ignoring them is a guard,
+# NOT the fix -- the values still need scrubbing or the files deleting,
+# and that is Mr. Salam's call under REQ-M6HZK4.
+establish_inbox.py
+onboard_gemini.py
+send_dispatch.py
+send_chatgpt_drill.py
+projects/sfdc24-bus-helper/
+# Glasses Intake capture frames (wf=GLASSES-INTAKE). The webcam faces the desk,
+# so these JPEGs contain whatever is on screen and on the sticky notes below the
+# monitor -- observed 2026-09-02 to include an email address and handwritten
+# notes. Staged frames are working data, never repository content. Same lesson
+# as REQ-M6HZK4: git history cannot be scrubbed the way a Doc can.
+data/
+# Security review of the live system. It maps working attack paths into
+# sfdc24.com and the bus, so it stays local: Mr. Salam pulled it off the remote
+# on 2026-09-03 and it should not go back without him saying so. Same reasoning
+# as the entries above -- a push is not undoable the way a local delete is, and
+# a repo can change visibility later without anyone re-reading what is in it.
+docs/security-review.md
+# Same rule, same reason: the multi-agent review repeats the confirmed findings
+# (the google.script.run exposure, the visitor-text-into-the-agent-board
+# crossing) and is therefore an attack map too. Local only until Mr. Salam says
+# otherwise.
+docs/multi-agent-review-2026-09-03.md
+# Python
+__pycache__/
+*.pyc
 # OS / Editor
 .DS_Store
 Thumbs.db
@@ -13,6 +54,32 @@ Thumbs.db
 node_modules/
 dist/
 build/
+
+# Quant research venv and cached market data. The venv is 300MB+ of wheels and
+# the market cache is vendor data, not repository content.
+.venv-quant/
+
+# Legacy/scratch Apps Script exports. This directory is never a deploy input:
+# the tracked root .clasp.json points at
+# apps-script/governor-page-api/, the repository's reviewed source of truth.
+# A local gas/ snapshot may still be retained temporarily for read-only source
+# comparison or rollback evidence, so its contents remain ignored and must not
+# be deleted by repository cleanup. Keep the empty directory on fresh clones.
+gas/*
+!gas/.gitkeep
+
+# Salesforce CLI local state.
+.sf/
+
+# Machine-local Claude Code permission grants. These are per-surface decisions
+# (the VM has clasp authenticated; the laptop and vm-chrome may not), so they
+# must not travel with the repo to the other instances.
+.claude/settings.local.json
+
+# Self-hosted bus package (blackboard-bus, added on main in 0919735). The
+# SQLite file holds live board rows, so it is working data, not repository
+# content -- same rule as data/ above.
+bus.db*
 
 # Zoom agent OAuth tokens — never commit
 zoom-agent/.tokens.json
