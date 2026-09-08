@@ -70,14 +70,18 @@ function New-Row {
         Cells = @($Id, $Timestamp, $Source, $Target, 'APPEND', $payload, 'OPEN', 'ORDER-SUPERVISOR', '', '')
     }
 }
-function To-ParsedRows {
+function ConvertTo-BoardJson {
     param([object[]]$DataRows)
     $header = @('Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type', 'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist')
     $nested = New-Object System.Collections.Generic.List[object]
     $nested.Add($header)
     foreach ($rowSpec in @($DataRows)) { $nested.Add(@($rowSpec.Cells)) }
     $response = [ordered]@{ ok = $true; rows = $nested.ToArray() }
-    return @(Get-BoardRowsFromJson -Json ($response | ConvertTo-Json -Depth 8 -Compress))
+    return ($response | ConvertTo-Json -Depth 8 -Compress)
+}
+function To-ParsedRows {
+    param([object[]]$DataRows)
+    return @(Get-BoardRowsFromJson -Json (ConvertTo-BoardJson -DataRows $DataRows))
 }
 
 $rows = To-ParsedRows @(
@@ -90,6 +94,121 @@ Assert-True 'cursor contains timestamp' ($selection.advance_cursor.timestamp -ce
 Assert-True 'cursor contains row id' ($selection.advance_cursor.row_id -ceq 'ORDER-A')
 $selection2 = Get-OrderSelection -Rows $rows -Cursor $selection.advance_cursor -AllowedSources @('chat-mobile', 'codex')
 Assert-True 'second reused-vseq row remains pending' ($selection2.selected.assessment.work_id -ceq 'ORDER-B')
+
+$currentRealId = 'WRK-vmccc-xray-blocker-20260908T1630Z'
+$currentRealTimestamp = '2026-09-08T16:23:30.4337200Z'
+$currentRealPayload = 'BCB|v=1|id=WRK-vmccc-xray-blocker-20260908T1630Z|phase=RESULT|status=BLOCKED'
+$currentRealSpec = [pscustomobject]@{ Cells = @(
+    $currentRealId, $currentRealTimestamp, 'vm-claude-code-cli', 'cowork-chrome', 'APPEND',
+    $currentRealPayload, 'ORDER', 'ORDER-SUPERVISOR', 'compact real-pair fixture', ''
+) }
+$currentRealRows = To-ParsedRows @($currentRealSpec, $currentRealSpec)
+$currentRealBefore = ConvertTo-Json -InputObject @($currentRealRows) -Depth 8 -Compress
+$currentRealSelection = Get-OrderSelection -Rows $currentRealRows -Cursor $null -AllowedSources @('chat-mobile', 'codex')
+$currentRealAfter = ConvertTo-Json -InputObject @($currentRealRows) -Depth 8 -Compress
+Assert-True 'current real identical pair collapses to one logical row' (
+    $currentRealSelection.valid_count -eq 2 -and
+    $currentRealSelection.canonical_valid_count -eq 1 -and
+    $currentRealSelection.after_cursor_count -eq 1 -and
+    $currentRealSelection.exact_duplicate_group_count -eq 1 -and
+    $currentRealSelection.exact_duplicate_row_count -eq 1
+)
+Assert-True 'current real pair is assessed once as source not allowlisted' (
+    $null -eq $currentRealSelection.selected -and
+    @($currentRealSelection.diagnostics).Count -eq 1 -and
+    $currentRealSelection.diagnostics[0].reason -ceq 'source_not_allowlisted'
+)
+Assert-True 'current real pair collapse does not mutate parsed input rows' ($currentRealAfter -ceq $currentRealBefore)
+
+$eligibleDuplicateSpec = New-Row `
+    -Id 'ORDER-DUPLICATE-ELIGIBLE' `
+    -Timestamp '2026-09-08T16:25:00.0000000Z' `
+    -Source 'codex' `
+    -Target 'vm-order-worker'
+$nonAdjacentMiddleSpec = New-Row `
+    -Id 'ORDER-DUPLICATE-MIDDLE' `
+    -Timestamp '2026-09-08T16:26:00.0000000Z' `
+    -Source 'unknown'
+$eligibleDuplicateCopy = [pscustomobject]@{ Cells = @($eligibleDuplicateSpec.Cells) }
+$nonAdjacentRows = To-ParsedRows @($eligibleDuplicateSpec, $nonAdjacentMiddleSpec, $eligibleDuplicateCopy)
+$nonAdjacentBefore = ConvertTo-Json -InputObject @($nonAdjacentRows) -Depth 8 -Compress
+$nonAdjacentSelection = Get-OrderSelection -Rows $nonAdjacentRows -Cursor $null -AllowedSources @('codex')
+$nonAdjacentAgain = Get-OrderSelection -Rows $nonAdjacentRows -Cursor $nonAdjacentSelection.advance_cursor -AllowedSources @('codex')
+$nonAdjacentAfter = ConvertTo-Json -InputObject @($nonAdjacentRows) -Depth 8 -Compress
+Assert-True 'nonadjacent identical tuple copies collapse across the full scanned window' (
+    $nonAdjacentSelection.valid_count -eq 3 -and
+    $nonAdjacentSelection.canonical_valid_count -eq 2 -and
+    $nonAdjacentSelection.exact_duplicate_group_count -eq 1 -and
+    $nonAdjacentSelection.exact_duplicate_row_count -eq 1
+)
+Assert-True 'collapsed eligible tuple is selected only once' (
+    $nonAdjacentSelection.selected.assessment.work_id -ceq 'ORDER-DUPLICATE-ELIGIBLE' -and
+    $null -eq $nonAdjacentAgain.selected -and
+    $nonAdjacentAgain.after_cursor_count -eq 1
+)
+Assert-True 'nonadjacent collapse does not reorder or mutate input row objects' ($nonAdjacentAfter -ceq $nonAdjacentBefore)
+
+$collisionEarlier = New-Row `
+    -Id 'ORDER-BEFORE-COLLISION' `
+    -Timestamp '2026-09-08T16:20:00.0000000Z' `
+    -Source 'codex' `
+    -Target 'vm-order-worker'
+$collisionFirst = New-Row `
+    -Id 'ORDER-COLLISION' `
+    -Timestamp '2026-09-08T16:30:00.0000000Z' `
+    -Source 'codex' `
+    -Target 'vm-order-worker'
+$collisionSecond = [pscustomobject]@{ Cells = @($collisionFirst.Cells) }
+$collisionSecond.Cells[8] = 'DIFFERING_TUPLE_CELL_CANARY'
+$collisionRows = To-ParsedRows @($collisionFirst, $collisionEarlier, $collisionSecond)
+$collisionBefore = ConvertTo-Json -InputObject @($collisionRows) -Depth 8 -Compress
+$collisionMessage = ''
+try {
+    $null = Get-OrderSelection -Rows $collisionRows -Cursor $null -AllowedSources @('codex')
+} catch {
+    $collisionMessage = [string]$_.Exception.Message
+}
+$collisionAfter = ConvertTo-Json -InputObject @($collisionRows) -Depth 8 -Compress
+Assert-True 'differing cells at one cursor tuple fail with fixed collision classification' (
+    $collisionMessage -ceq 'board_cursor_tuple_collision'
+)
+Assert-True 'full-window collision is detected before an earlier eligible row can be selected' (
+    $collisionMessage -ceq 'board_cursor_tuple_collision'
+)
+Assert-True 'collision detection does not mutate parsed input rows' ($collisionAfter -ceq $collisionBefore)
+
+$sep4First = New-Row `
+    -Id 'WRK-vmcli-cicd-s1' `
+    -Timestamp '2026-09-04T18:41:53.0000000Z' `
+    -Source 'codex' `
+    -Target 'vm-order-worker'
+$sep4First.Cells[5] = 'BCB|v=1|id=WRK-vmcli-cicd-s1|phase=DISPATCH|from=codex|to=vm-order-worker|authority=operator-direct|task=status DONE-WITH-GAPS'
+$sep4Second = New-Row `
+    -Id 'WRK-vmcli-cicd-s1' `
+    -Timestamp '2026-09-04T18:44:00.0000000Z' `
+    -Source 'codex' `
+    -Target 'vm-order-worker'
+$sep4Second.Cells[5] = 'BCB|v=1|id=WRK-vmcli-cicd-s1|phase=DISPATCH|from=codex|to=vm-order-worker|authority=operator-direct|task=status LANDED-PARTIAL'
+$sep4Rows = To-ParsedRows @($sep4Second, $sep4First)
+$sep4FirstSelection = Get-OrderSelection -Rows $sep4Rows -Cursor $null -AllowedSources @('codex')
+$sep4SecondSelection = Get-OrderSelection -Rows $sep4Rows -Cursor $sep4FirstSelection.advance_cursor -AllowedSources @('codex')
+Assert-True 'Sep4 reused row id at distinct timestamps remains two ordered rows' (
+    $sep4FirstSelection.after_cursor_count -eq 2 -and
+    $sep4FirstSelection.selected.row.timestamp -ceq '2026-09-04T18:41:53.0000000Z' -and
+    $sep4FirstSelection.selected.row.payload.Contains('DONE-WITH-GAPS') -and
+    $sep4SecondSelection.after_cursor_count -eq 1 -and
+    $sep4SecondSelection.selected.row.timestamp -ceq '2026-09-04T18:44:00.0000000Z' -and
+    $sep4SecondSelection.selected.row.payload.Contains('LANDED-PARTIAL') -and
+    $sep4FirstSelection.exact_duplicate_group_count -eq 0 -and
+    $sep4FirstSelection.exact_duplicate_row_count -eq 0
+)
+$cursorProperties = @($sep4FirstSelection.advance_cursor.PSObject.Properties | ForEach-Object { [string]$_.Name })
+Assert-True 'cursor remains exact timestamp and row id tuple with no positional index' (
+    $cursorProperties.Count -eq 2 -and
+    $cursorProperties -ccontains 'timestamp' -and
+    $cursorProperties -ccontains 'row_id' -and
+    $cursorProperties -cnotcontains 'index'
+)
 
 $rejectRows = To-ParsedRows @(
     (New-Row -Id 'PUBLIC-X' -Timestamp '2026-09-06T15:02:00.000Z' -Source 'public-reception'),
@@ -813,6 +932,133 @@ try {
     Assert-True 'observe state has structured health fields' ($saved.last_poll -and $saved.seen -and $saved.success -and $saved.PSObject.Properties.Name -contains 'error')
     $logText = [IO.File]::ReadAllText($logPath, [Text.Encoding]::UTF8)
     Assert-True 'observe made no claim receipt or result' ($logText -notmatch 'claim_confirmed|receipt_confirmed|result_confirmed')
+
+    $duplicateFixturePath = Join-Path $tempRoot 'duplicate-board.json'
+    $duplicateStatePath = Join-Path $tempRoot 'duplicate-state.json'
+    $duplicateLogPath = Join-Path $tempRoot 'duplicate-events.jsonl'
+    $runnerEligibleSpec = New-Row `
+        -Id 'ORDER-DUPLICATE-RUNNER' `
+        -Timestamp '2026-09-08T16:25:00.0000000Z' `
+        -Source 'codex' `
+        -Target 'vm-order-worker'
+    $runnerEligibleCopy = [pscustomobject]@{ Cells = @($runnerEligibleSpec.Cells) }
+    $duplicateFixtureJson = ConvertTo-BoardJson -DataRows @(
+        $currentRealSpec,
+        $runnerEligibleSpec,
+        $currentRealSpec,
+        $runnerEligibleCopy
+    )
+    [IO.File]::WriteAllText($duplicateFixturePath, $duplicateFixtureJson, (New-Object Text.UTF8Encoding($false)))
+    $duplicateState = New-OrderState -Mode Observe
+    $duplicateState.initialized = $true
+    $duplicateState.cursor.timestamp = '2026-09-08T16:00:00.0000000Z'
+    $duplicateState.cursor.row_id = 'cursor-before-duplicate'
+    Save-OrderState -Path $duplicateStatePath -State $duplicateState
+    $duplicateArgs = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $RunnerPath,
+        '-Mode', 'Observe',
+        '-AllowedSourcesCsv', 'codex',
+        '-BoardFixturePath', $duplicateFixturePath,
+        '-StatePath', $duplicateStatePath,
+        '-LogPath', $duplicateLogPath,
+        '-ReplayHistorical'
+    )
+    $duplicateOutput = @(& powershell.exe @duplicateArgs)
+    $duplicateExitCode = $LASTEXITCODE
+    $duplicateResultLine = @($duplicateOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $duplicateResult = if ($duplicateResultLine.Count -eq 1) { $duplicateResultLine[0] | ConvertFrom-Json } else { $null }
+    $duplicateSaved = Read-OrderState -Path $duplicateStatePath -Mode Observe
+    $duplicateEvents = @([IO.File]::ReadAllLines($duplicateLogPath, [Text.Encoding]::UTF8) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ | ConvertFrom-Json })
+    $collapseWarnings = @($duplicateEvents | Where-Object event -ceq 'board_duplicate_rows_collapsed')
+    $candidateEvents = @($duplicateEvents | Where-Object event -ceq 'candidate_observed')
+    Assert-True 'runner admits one logical eligible row after exact duplicate collapse' (
+        $duplicateExitCode -eq 0 -and
+        $duplicateResult.status -ceq 'candidate_observed' -and
+        $duplicateResult.work_id -ceq 'ORDER-DUPLICATE-RUNNER' -and
+        $duplicateSaved.counts.seen -eq 2 -and
+        $duplicateSaved.counts.ignored -eq 1 -and
+        $duplicateSaved.counts.selected -eq 1 -and
+        $candidateEvents.Count -eq 1
+    )
+    Assert-True 'runner emits at most one counts-only duplicate warning per poll' (
+        $collapseWarnings.Count -eq 1 -and
+        $collapseWarnings[0].level -ceq 'warning' -and
+        $collapseWarnings[0].code -ceq 'BOARD_CURSOR_DUPLICATES_COLLAPSED' -and
+        $collapseWarnings[0].work_id -ceq '' -and
+        $collapseWarnings[0].row_id -ceq '' -and
+        $collapseWarnings[0].message -ceq '' -and
+        @($collapseWarnings[0].details.PSObject.Properties).Count -eq 2 -and
+        [int]$collapseWarnings[0].details.exact_duplicate_group_count -eq 2 -and
+        [int]$collapseWarnings[0].details.exact_duplicate_row_count -eq 2
+    )
+    $collapseWarningText = $collapseWarnings[0] | ConvertTo-Json -Depth 6 -Compress
+    Assert-True 'duplicate warning exposes no tuple row or payload data' (
+        -not $collapseWarningText.Contains($currentRealId) -and
+        -not $collapseWarningText.Contains($currentRealTimestamp) -and
+        -not $collapseWarningText.Contains($currentRealPayload) -and
+        -not $collapseWarningText.Contains('ORDER-DUPLICATE-RUNNER')
+    )
+    $duplicateCursorProperties = @($duplicateSaved.cursor.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    Assert-True 'duplicate collapse preserves persisted cursor tuple representation' (
+        $duplicateSaved.cursor.timestamp -ceq '2026-09-08T16:00:00.0000000Z' -and
+        $duplicateSaved.cursor.row_id -ceq 'cursor-before-duplicate' -and
+        $duplicateCursorProperties.Count -eq 2 -and
+        $duplicateCursorProperties -ccontains 'timestamp' -and
+        $duplicateCursorProperties -ccontains 'row_id' -and
+        $duplicateCursorProperties -cnotcontains 'index'
+    )
+    Assert-True 'duplicate collapse causes no claim receipt result or Claude side effect' (
+        @($duplicateEvents | Where-Object { $_.event -in @('claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+    )
+
+    $collisionFixturePath = Join-Path $tempRoot 'collision-board.json'
+    $collisionStatePath = Join-Path $tempRoot 'collision-state.json'
+    $collisionLogPath = Join-Path $tempRoot 'collision-events.jsonl'
+    $collisionFixtureJson = ConvertTo-BoardJson -DataRows @($collisionFirst, $collisionEarlier, $collisionSecond)
+    [IO.File]::WriteAllText($collisionFixturePath, $collisionFixtureJson, (New-Object Text.UTF8Encoding($false)))
+    $collisionState = New-OrderState -Mode Observe
+    $collisionState.initialized = $true
+    $collisionState.cursor.timestamp = '2026-09-08T16:00:00.0000000Z'
+    $collisionState.cursor.row_id = 'cursor-before-collision'
+    Save-OrderState -Path $collisionStatePath -State $collisionState
+    $collisionArgs = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $RunnerPath,
+        '-Mode', 'Observe',
+        '-AllowedSourcesCsv', 'codex',
+        '-BoardFixturePath', $collisionFixturePath,
+        '-StatePath', $collisionStatePath,
+        '-LogPath', $collisionLogPath,
+        '-ReplayHistorical'
+    )
+    $collisionOutput = @(& powershell.exe @collisionArgs)
+    $collisionExitCode = $LASTEXITCODE
+    $collisionResultLine = @($collisionOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $collisionResult = if ($collisionResultLine.Count -eq 1) { $collisionResultLine[0] | ConvertFrom-Json } else { $null }
+    $collisionSaved = Read-OrderState -Path $collisionStatePath -Mode Observe
+    $collisionLogText = [IO.File]::ReadAllText($collisionLogPath, [Text.Encoding]::UTF8)
+    $collisionEvents = @([IO.File]::ReadAllLines($collisionLogPath, [Text.Encoding]::UTF8) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ | ConvertFrom-Json })
+    $collisionCursorProperties = @($collisionSaved.cursor.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    Assert-True 'runner fails closed on differing same-tuple cells before selection' (
+        $collisionExitCode -eq 20 -and
+        $collisionResult.status -ceq 'error' -and
+        $collisionResult.error_code -ceq 'BOARD_CURSOR_TUPLE_COLLISION' -and
+        $collisionSaved.error.code -ceq 'BOARD_CURSOR_TUPLE_COLLISION' -and
+        $collisionSaved.counts.selected -eq 0
+    )
+    Assert-True 'collision preserves cursor and emits no admission or duplicate-collapse event' (
+        $collisionSaved.cursor.timestamp -ceq '2026-09-08T16:00:00.0000000Z' -and
+        $collisionSaved.cursor.row_id -ceq 'cursor-before-collision' -and
+        $collisionCursorProperties.Count -eq 2 -and
+        $collisionCursorProperties -cnotcontains 'index' -and
+        @($collisionEvents | Where-Object { $_.event -in @('board_duplicate_rows_collapsed', 'row_ignored', 'candidate_observed', 'claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+    )
+    Assert-True 'collision log keeps differing cell value private' (-not $collisionLogText.Contains('DIFFERING_TUPLE_CELL_CANARY'))
 
     $missingState = Join-Path $tempRoot 'missing-state.json'
     $missingLog = Join-Path $tempRoot 'missing-events.jsonl'
