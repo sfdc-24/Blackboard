@@ -264,11 +264,38 @@ button.rec .dot{animation:b .8s step-end infinite}
   function stopVoice(){ if (rec && listening) { try { rec.stop() } catch(e){} } setMic(false); $("interim").textContent = "" }
 
   mic.addEventListener("click", function(){
-    if (!MIC_OK) {                        // this page is not allowed a microphone — use the device's own
-      el("sys", "", "Voice isn't wired into this page yet. Your device can still do it: "
-        + "on a phone, tap the microphone on your keyboard; on Windows press Win+H; on a Mac press the dictation key. "
-        + "It types straight into the box below and you can watch it land.");
-      $("hint").textContent = "use your device's dictation — it types in the box";
+    if (!MIC_OK) {
+      // This page genuinely cannot hold a microphone: Apps Script serves it
+      // inside a sandboxFrame whose `allow` attribute omits microphone, so
+      // SpeechRecognition is unreachable and no permission prompt will ever
+      // appear (L-89). That part is unfixable here and always was.
+      //
+      // What WAS wrong is what we did about it. This used to tell the visitor
+      // to use their keyboard's dictation -- advice written before
+      // sfdc24.com/voice/ existed. It exists now, it is a top-level page, and
+      // it holds a microphone perfectly well. So the answer to "I want to talk"
+      // is a door to the room where talking works, not a workaround.
+      //
+      // Reported by Mr. Salam on 2026-09-07 after hitting it himself: he asked
+      // to talk and was handed a keyboard shortcut. The dictation tip stays as
+      // the second option, because it is still the fastest route for someone
+      // who would rather not change page.
+      var m = el("sys", "", "This box can't hear you — but the voice page can. ");
+      try {
+        var a = document.createElement("a");
+        a.href = "https://www.sfdc24.com/voice/";
+        a.target = "_top";                       // we are in a frame; open the real page, not inside it
+        a.rel = "noopener";
+        a.textContent = "Open it and just talk →";
+        a.style.cssText = "color:inherit;font-weight:600";
+        m.appendChild(a);
+        m.appendChild(document.createTextNode(
+          " Or dictate straight into the box below: tap the microphone on your phone's keyboard, "
+          + "press Win+H on Windows, or the dictation key on a Mac."));
+      } catch (e) {
+        m.textContent = "This box can't hear you. Open https://www.sfdc24.com/voice/ and just talk.";
+      }
+      $("hint").textContent = "voice lives on its own page — or dictate into the box";
       box.focus(); bottom();
       return;
     }
