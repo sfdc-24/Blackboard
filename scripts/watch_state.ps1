@@ -164,17 +164,21 @@ function Resolve-StatePath {
 function Read-WatchState {
   <# @{ state; reason }. A reason is present whenever the caller must speak. #>
   param([string]$Path)
-  if (-not $Path) { return @{ state = $null; reason = 'no state path' } }
+  if (-not $Path) { return @{ state = $null; disposition = 'unusable'; reason = 'no state path' } }
   $Path = Resolve-StatePath $Path
-  if (-not (Test-Path -LiteralPath $Path)) { return @{ state = $null; reason = '' } }
+  # ABSENT is not the same event as UNUSABLE. A missing file means this watcher
+  # has never run here and priming is honest. A file that exists and cannot be
+  # used means we HAD a cursor and lost it, and priming past the gap would hide
+  # exactly what this whole mechanism exists to surface.
+  if (-not (Test-Path -LiteralPath $Path)) { return @{ state = $null; disposition = 'absent'; reason = '' } }
   try {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    if (-not $raw -or -not $raw.Trim()) { return @{ state = $null; reason = 'state file was empty' } }
+    if (-not $raw -or -not $raw.Trim()) { return @{ state = $null; disposition = 'unusable'; reason = 'state file was empty' } }
     $o = $raw | ConvertFrom-Json
     $schema = 0
     if ($o.PSObject.Properties.Name -contains 'schema') { $schema = [int]$o.schema }
     if ($schema -ne $script:WATCH_SCHEMA) {
-      return @{ state = $null; reason = ('state schema ' + $schema + ' is not ' + $script:WATCH_SCHEMA) }
+      return @{ state = $null; disposition = 'unusable'; reason = ('state schema ' + $schema + ' is not ' + $script:WATCH_SCHEMA) }
     }
     $s = New-WatchState
     $s.boardId = [string]$o.boardId
@@ -194,13 +198,13 @@ function Read-WatchState {
     # carrying only a staged outbox has no committed row yet and is still valid;
     # requiring an anchor there made the first save of a fresh watcher fail its
     # own read-back verification.
-    if (-not $s.boardId) { return @{ state = $null; reason = 'state file is missing its board identity' } }
+    if (-not $s.boardId) { return @{ state = $null; disposition = 'unusable'; reason = 'state file is missing its board identity' } }
     if ($s.lastIndex -ge 1 -and -not $s.anchorId) {
-      return @{ state = $null; reason = 'state file has a cursor but no anchor' }
+      return @{ state = $null; disposition = 'unusable'; reason = 'state file has a cursor but no anchor' }
     }
-    return @{ state = $s; reason = '' }
+    return @{ state = $s; disposition = 'ok'; reason = '' }
   } catch {
-    return @{ state = $null; reason = 'state file could not be parsed' }
+    return @{ state = $null; disposition = 'unusable'; reason = 'state file could not be parsed' }
   }
 }
 
@@ -255,11 +259,16 @@ function Save-WatchState {
 
     # READ IT BACK. D-4: read-back is the only proof of a write, and this
     # function's entire contract is that ok=$true means the state survives.
+    #
+    # Compared by CANONICAL DIGEST over every contract field. The first version
+    # compared lastIndex, pendingIndex and a line COUNT, so a pending line whose
+    # text was corrupted in transit read back as a successful save -- and those
+    # lines are the exact words that get shown to Mr. Salam on replay.
     $v = Read-WatchState -Path $Path
     if (-not $v.state) { return @{ ok = $false; reason = ('state did not read back at ' + $Path + ': ' + $v.reason) } }
-    if ([int]$v.state.lastIndex -ne [int]$State.lastIndex -or
-        [int]$v.state.pendingIndex -ne [int]$State.pendingIndex -or
-        @($v.state.pendingLines).Count -ne @($State.pendingLines).Count) {
+    $want = Get-WatchStateDigest -State $State
+    $got  = Get-WatchStateDigest -State $v.state
+    if ($want -ne $got) {
       return @{ ok = $false; reason = ('state read back differently at ' + $Path) }
     }
     return @{ ok = $true; reason = '' }
@@ -267,6 +276,69 @@ function Save-WatchState {
     try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
     return @{ ok = $false; reason = ('could not persist state: ' + $_.Exception.Message) }
   }
+}
+
+# Digest separators, built rather than typed. They must be characters that
+# cannot occur in board text, and they must not appear as literal control
+# BYTES in this source: a stray 0x0C in a path string is the defect that made
+# every save fail silently, and tests/test_watch_state.ps1 now scans these
+# files for exactly that. The invariant stays absolute, so the characters are
+# constructed here instead of embedded.
+$script:WATCH_SEP_UNIT = [string][char]31
+$script:WATCH_SEP_REC  = [string][char]30
+
+function Get-WatchStateDigest {
+  # Canonical, order-fixed rendering of every field that carries meaning.
+  # savedAt is deliberately excluded: it changes on every write and is a receipt,
+  # not part of the contract.
+  param([Parameter(Mandatory = $true)]$State)
+  $parts = @(
+    'b=' + [string]$State.boardId
+    'i=' + [string][int]$State.lastIndex
+    'a=' + [string]$State.anchorId
+    'k=' + [string]$State.lastEmitKey
+    't=' + [string]$State.lastEmitTs
+    'pi=' + [string][int]$State.pendingIndex
+    'pa=' + [string]$State.pendingAnchor
+    'r=' + (@($State.pendingRowIds) -join $script:WATCH_SEP_UNIT)
+    'l=' + (@($State.pendingLines) -join $script:WATCH_SEP_UNIT)
+    'x=' + [string]$State.resetAt
+  )
+  return ($parts -join $script:WATCH_SEP_REC)
+}
+
+function Test-PendingIsValid {
+  <#
+    Is a retained outbox still meaningful against the board in front of us?
+
+    Called BEFORE anything is replayed. The previous order emitted first and
+    validated afterwards, so a stale outbox from another board reached Mr. Salam
+    as though it were current.
+  #>
+  param($State, $Rows, [string]$BoardId)
+  if (-not (Test-HasOutbox -State $State)) { return @{ ok = $true; reason = '' } }
+  if (-not $BoardId) { return @{ ok = $false; reason = 'board read carried no identity' } }
+  if ($State.boardId -and ($State.boardId -ne $BoardId)) {
+    return @{ ok = $false; reason = ('retained outbox belongs to board ' + $State.boardId + ' but this is ' + $BoardId) }
+  }
+  $lastData = @($Rows).Count - 1
+  $pi = [int]$State.pendingIndex
+  if ($pi -lt 1 -or $pi -gt $lastData) {
+    return @{ ok = $false; reason = ('retained outbox points at row ' + $pi + ', outside the ' + $lastData + ' rows now present') }
+  }
+  if ($State.pendingAnchor -and ([string]@($Rows)[$pi][0] -ne $State.pendingAnchor)) {
+    return @{ ok = $false; reason = ('retained outbox anchor moved at row ' + $pi + ': expected ' + $State.pendingAnchor + ', found ' + [string]@($Rows)[$pi][0]) }
+  }
+  # The rows those lines were built from must still be where they were.
+  $have = @{}
+  $from = [Math]::Max(1, [int]$State.lastIndex + 1)
+  for ($i = $from; $i -le $pi; $i++) { $have[[string]@($Rows)[$i][0]] = $true }
+  foreach ($id in @($State.pendingRowIds)) {
+    if ($id -and -not $have.ContainsKey($id)) {
+      return @{ ok = $false; reason = ('retained outbox refers to row ' + $id + ' which is no longer between ' + $from + ' and ' + $pi) }
+    }
+  }
+  return @{ ok = $true; reason = '' }
 }
 
 function Test-BoardContinuity {
@@ -324,9 +396,19 @@ function Set-WatchOutbox {
 }
 
 function Complete-WatchOutbox {
-  # The lines are out. Move the staged cursor to committed and clear the outbox.
-  param([Parameter(Mandatory = $true)]$State, [string]$BoardId)
-  if ($BoardId) { $State.boardId = $BoardId }
+  <#
+    The lines are out. Move the staged cursor to committed and clear the outbox.
+
+    THIS FUNCTION MAY NOT TOUCH IDENTITY, and it used to. It took a -BoardId and
+    assigned it, so replaying a retained outbox from board-A while pointed at
+    board-B silently rewrote the stored id to board-B -- after which the identity
+    check that should have refused returned ok. The replay disarmed the guard
+    meant to stop it. Reproduced with chatgpt-codex-desktop's exact scenario.
+
+    Identity is established once, at prime, from a validated board, and is never
+    written again.
+  #>
+  param([Parameter(Mandatory = $true)]$State)
   if ($State.pendingIndex -ge 1) {
     $State.lastIndex = $State.pendingIndex
     if ($State.pendingAnchor) { $State.anchorId = $State.pendingAnchor }

@@ -66,7 +66,7 @@ function Commit-At {
   $s = New-WatchState
   $s.boardId = $Id
   $s = Set-WatchOutbox -State $s -Rows $Rows -Index $Index -Lines @() -RowIds @()
-  return (Complete-WatchOutbox -State $s -BoardId $Id)
+  return (Complete-WatchOutbox -State $s)
 }
 
 try {
@@ -180,7 +180,7 @@ Assert-True 'the next start sees a retained outbox' (Test-HasOutbox -State $afte
 Assert-True 'carrying the EXACT lines that were never shown' `
   ((@($after.pendingLines) -join '|') -eq 'line one|line two') (@($after.pendingLines) -join '|')
 Assert-True 'and the committed cursor did NOT advance' ($after.lastIndex -eq 0) ([string]$after.lastIndex)
-$done = Complete-WatchOutbox -State $after -BoardId $BoardFileId
+$done = Complete-WatchOutbox -State $after
 Assert-True 'committing advances the cursor to the staged index' ($done.lastIndex -eq 501) ([string]$done.lastIndex)
 Assert-True 'and clears the outbox' (-not (Test-HasOutbox -State $done))
 $cs = Save-WatchState -State $done -Path $p10
@@ -241,6 +241,100 @@ $n = 5
 $rangeCount = @(($n - 0)..($n - 1)).Count
 Assert-True 'and the arithmetic really does produce 2 indices, not 0' ($rangeCount -eq 2) ('count=' + $rangeCount)
 
+Write-Output ''
+Write-Output 'CASE 15 - ABSENT is not UNUSABLE, and only ABSENT may prime'
+# The repair for chatgpt-codex-desktop's e7440a8 finding 1. A corrupt file used
+# to yield a NOTICE and then a cold prime, silently skipping every row in the
+# gap -- the exact failure this whole mechanism exists to end.
+$dp = Join-Path $tmpDir 'disp.json'
+$abs = Read-WatchState -Path (Join-Path $tmpDir 'never-written.json')
+Assert-True 'a missing file reports ABSENT' ($abs.disposition -eq 'absent') ([string]$abs.disposition)
+Assert-True 'and carries no alarm' (-not $abs.reason)
+Set-Content -LiteralPath $dp -Value '{"schema":3,"boardId":"b","lastIndex":1' -Encoding UTF8
+$un = Read-WatchState -Path $dp
+Assert-True 'a truncated file reports UNUSABLE' ($un.disposition -eq 'unusable') ([string]$un.disposition)
+Assert-True 'and carries a reason to print' ([bool]$un.reason) $un.reason
+Set-Content -LiteralPath $dp -Value '{"seenIds":["a"]}' -Encoding UTF8
+Assert-True 'an old-schema file is UNUSABLE, not absent' ((Read-WatchState -Path $dp).disposition -eq 'unusable')
+$okState = Commit-At -Rows $board2 -Index 3
+[void](Save-WatchState -State $okState -Path $dp)
+Assert-True 'a good file reports ok' ((Read-WatchState -Path $dp).disposition -eq 'ok')
+foreach ($f in @('scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
+  $src = Get-Content -LiteralPath (Join-Path $RepoRoot $f) -Raw
+  Assert-True ($f + ' refuses to start on an unusable cursor') ($src -match "disposition -eq 'unusable'") ''
+  Assert-True ($f + ' still allows -Reset to recover it') ($src -match 'and -not \$ResetRequested') ''
+}
+
+Write-Output ''
+Write-Output 'CASE 16 - a retained outbox is validated BEFORE it is replayed'
+# finding 2: the replay ran first and Complete-WatchOutbox then overwrote the
+# stored board id, disarming the identity check that should have refused it.
+$cross = New-WatchState
+$cross.boardId = 'board-A'
+$cross.lastIndex = 1; $cross.anchorId = 'r1'
+$cross = Set-WatchOutbox -State $cross -Rows $board2 -Index 2 -Lines @('board-A line') -RowIds @('r2')
+$pv1 = Test-PendingIsValid -State $cross -Rows $board2 -BoardId 'board-B'
+Assert-True 'an outbox from another board is refused' ($pv1.ok -eq $false)
+Assert-True 'and names the board it belongs to' ($pv1.reason -match 'board-A') $pv1.reason
+$pv2 = Test-PendingIsValid -State $cross -Rows $board2 -BoardId ''
+Assert-True 'an unidentified board refuses the replay too' ($pv2.ok -eq $false) $pv2.reason
+$moved = Test-PendingIsValid -State $cross -Rows (New-Board -Count 600 -Prefix 'q') -BoardId 'board-A'
+Assert-True 'a moved pending anchor is refused' ($moved.ok -eq $false)
+Assert-True 'and names the anchor move' ($moved.reason -match 'anchor moved') $moved.reason
+$oob = New-WatchState; $oob.boardId = 'board-A'
+$oob = Set-WatchOutbox -State $oob -Rows $board2 -Index 2 -Lines @('x') -RowIds @('r2')
+$oob.pendingIndex = 9999
+Assert-True 'an out-of-bounds pending index is refused' ((Test-PendingIsValid -State $oob -Rows $board2 -BoardId 'board-A').ok -eq $false)
+$ghost = New-WatchState; $ghost.boardId = 'board-A'
+$ghost = Set-WatchOutbox -State $ghost -Rows $board2 -Index 3 -Lines @('x') -RowIds @('no-such-row')
+$gv = Test-PendingIsValid -State $ghost -Rows $board2 -BoardId 'board-A'
+Assert-True 'pending lines referring to a vanished row are refused' ($gv.ok -eq $false) $gv.reason
+$good = New-WatchState; $good.boardId = $BoardFileId
+$good = Set-WatchOutbox -State $good -Rows $board2 -Index 3 -Lines @('x') -RowIds @('r2','r3')
+Assert-True 'a valid outbox for this board passes' ((Test-PendingIsValid -State $good -Rows $board2 -BoardId $BoardFileId).ok -eq $true)
+
+Write-Output ''
+Write-Output 'CASE 17 - Complete-WatchOutbox cannot touch identity'
+$idt = New-WatchState; $idt.boardId = 'board-A'
+$idt = Set-WatchOutbox -State $idt -Rows $board2 -Index 2 -Lines @('l') -RowIds @('r2')
+$after2 = Complete-WatchOutbox -State $idt
+Assert-True 'the stored identity is unchanged by committing' ($after2.boardId -eq 'board-A') $after2.boardId
+foreach ($f in @('scripts/watch_state.ps1', 'scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
+  $src = Get-Content -LiteralPath (Join-Path $RepoRoot $f) -Raw
+  Assert-True ($f + ' never passes a BoardId to Complete-WatchOutbox') `
+    (-not ($src -match 'Complete-WatchOutbox[^\r\n]*-BoardId')) ''
+}
+
+Write-Output ''
+Write-Output 'CASE 18 - read-back compares every field, not counts and indexes'
+# A pending line whose TEXT was corrupted used to read back as a successful
+# save, and those lines are the exact words shown to Mr. Salam on replay.
+$d1 = New-WatchState; $d1.boardId = 'b'; $d1.lastIndex = 2; $d1.anchorId = 'a'
+$d1 = Set-WatchOutbox -State $d1 -Rows $board2 -Index 3 -Lines @('the real line') -RowIds @('r3')
+$d2 = New-WatchState; $d2.boardId = 'b'; $d2.lastIndex = 2; $d2.anchorId = 'a'
+$d2 = Set-WatchOutbox -State $d2 -Rows $board2 -Index 3 -Lines @('a DIFFERENT line') -RowIds @('r3')
+Assert-True 'same counts and indexes but different text yields a different digest' `
+  ((Get-WatchStateDigest -State $d1) -ne (Get-WatchStateDigest -State $d2))
+Assert-True 'and an identical state yields an identical digest' `
+  ((Get-WatchStateDigest -State $d1) -eq (Get-WatchStateDigest -State $d1))
+$d3 = Set-WatchEmitted -State (Commit-At -Rows $board2 -Index 3) -Key 'k' -RowTs '2026-09-08T00:00:00Z'
+Assert-True 'lastEmitKey is part of the contract' `
+  ((Get-WatchStateDigest -State $d3) -ne (Get-WatchStateDigest -State (Commit-At -Rows $board2 -Index 3)))
+
+Write-Output ''
+Write-Output 'CASE 19 - a failed save leaves the previous bytes intact'
+# Reset is a transition, not a delete: the old cursor must survive a failed
+# attempt to write the new one.
+$keepPath = Join-Path $tmpDir 'keep.json'
+$orig = Commit-At -Rows $board2 -Index 4
+[void](Save-WatchState -State $orig -Path $keepPath)
+$before = Get-Content -LiteralPath $keepPath -Raw
+$huge = Commit-At -Rows $board2 -Index 5
+$huge.anchorId = ('x' * 10)
+[void](Save-WatchState -State $huge -Path (Join-Path $blocker 'cannot.json'))
+$afterBytes = Get-Content -LiteralPath $keepPath -Raw
+Assert-True 'an unrelated failed save did not disturb the good file' ($before -eq $afterBytes)
+Assert-True 'and it still reads back' ((Read-WatchState -Path $keepPath).state.lastIndex -eq 4)
 Write-Output ''
 Write-Output 'the PowerShell 7 / 5.1 JSON type difference is absorbed'
 $isoText = '2026-09-08T08:00:00.000Z'

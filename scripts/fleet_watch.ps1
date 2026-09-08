@@ -78,24 +78,25 @@ if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this s
 # being published.
 if (-not $StateFile) { $StateFile = Get-DefaultStatePath -Leaf ('fleet_watch.' + $Tag + '.state.json') }
 
-if ($Reset) {
-  # A reset is a deliberate act with a receipt. Silently starting fresh is what
-  # made the original 22-hour gap invisible, so it is announced and dated.
-  if (Test-Path -LiteralPath (Resolve-StatePath $StateFile)) {
-    Remove-Item -LiteralPath (Resolve-StatePath $StateFile) -Force
-  }
-  Write-Output ("Fleet watch RESET at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                " - the previous cursor was discarded on request. Anything that arrived before this point will NOT be replayed.")
-}
+# A reset is a STATE TRANSITION, not a delete. The previous version removed
+# the file first, so if the fresh cursor then failed to persist, the old one
+# was already gone and the watcher had nothing to fall back to. The old bytes
+# now survive until a new cold cursor for a VALIDATED board has been written
+# and read back, and the receipt is printed only after that succeeds.
+$ResetRequested = [bool]$Reset
+$ResetDone = $false
 
 $loaded = Read-WatchState -Path $StateFile
-$state = $loaded.state
-if ($loaded.reason) {
-  # Never silent. A state file that could not be used means the catch-up this
-  # watcher exists to provide is not in effect for whatever it missed.
-  Write-Output ("Fleet watch NOTICE - " + $loaded.reason)
+# A LOST CURSOR IS NOT THE SAME EVENT AS NO CURSOR. The previous version
+# printed a NOTICE for an unreadable state file and then let the null state
+# fall through to a cold prime -- silently skipping every row in the gap,
+# which is precisely the failure this watcher exists to end. Only a genuinely
+# ABSENT file may prime; an UNUSABLE one stops before any output or overwrite.
+if ($loaded.disposition -eq 'unusable' -and -not $ResetRequested) {
+  throw ("Fleet watch CANNOT START - " + $loaded.reason + ". A cursor existed and cannot be read, so priming would skip whatever arrived since it was written. Nothing has been reported and nothing has been overwritten. Re-prime deliberately with -Reset once you have decided what to do about the gap.")
 }
-$warm = ($null -ne $state)
+$state = $loaded.state
+$warm = ($loaded.disposition -eq 'ok')
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("fleet_watch_" + [guid]::NewGuid().ToString('N') + '.json')
 
@@ -212,32 +213,64 @@ try {
       $boardId = [string]$board.fileId
       $lastData = @($rows).Count - 1
 
-      # ---- 1. a retained outbox is replayed FIRST, and announced -------------
-      # Exactly-once is impossible without a consumer ACK and there is none here,
-      # so this is explicit at-least-once. A repeat that announces itself is
-      # recoverable; a silent gap is not.
-      if (Test-HasOutbox -State $state) {
-        Write-Output ("Fleet watch POSSIBLE REPLAY - the previous run persisted " +
-                      @($state.pendingLines).Count + " line(s) and may have exited before showing them. " +
-                      "Repeating them now; anything you have already seen is a duplicate, not a new message.")
-        foreach ($line in @($state.pendingLines)) { Write-Output $line }
-        $state = Complete-WatchOutbox -State $state -BoardId $boardId
-        $rc = Save-WatchState -State $state -Path $StateFile
-        if (-not $rc.ok) {
-          throw ("Fleet watch COULD NOT COMMIT AFTER REPLAY - " + $rc.reason +
-                 ". The outbox is retained, so the next start replays the same lines rather than skipping them.")
-        }
+      # ---- 1. identity, reset, and validation BEFORE any external effect ----
+      # The previous order replayed the outbox first and validated afterwards,
+      # so a retained outbox from another board reached Mr. Salam as though it
+      # were current -- and Complete-WatchOutbox then rewrote the stored board
+      # id, disarming the very check that should have refused it.
+      if (-not $boardId) {
+        throw ("Fleet watch CANNOT PROCEED - the board read carried no identity, so there is no way to know this is the same board the cursor belongs to. Nothing was reported.")
       }
 
-      # ---- 2. continuity, and NEVER an automatic re-prime --------------------
+      if ($ResetRequested -and -not $ResetDone) {
+        $fresh = New-WatchState
+        $fresh.boardId = $boardId
+        $fresh.resetAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $fresh = Set-WatchOutbox -State $fresh -Rows $rows -Index $lastData -Lines @() -RowIds @()
+        $fresh = Complete-WatchOutbox -State $fresh
+        $rs = Save-WatchState -State $fresh -Path $StateFile
+        if (-not $rs.ok) {
+          throw ("Fleet watch RESET FAILED - " + $rs.reason + ". The previous cursor was NOT removed and is intact.")
+        }
+        $state = $fresh
+        $ResetDone = $true
+        $warm = $false
+        Write-Output ("Fleet watch RESET at " + $fresh.resetAt + " - cursor re-primed at row " + $lastData + " for board " + $boardId + ". Anything that arrived before this point will NOT be replayed.")
+        if ($Once) { break }
+        Start-Sleep -Seconds $PollSeconds
+        continue
+      }
+
+      $pv = Test-PendingIsValid -State $state -Rows $rows -BoardId $boardId
+      if (-not $pv.ok) {
+        throw ("Fleet watch RETAINED OUTBOX IS STALE - " + $pv.reason + ". Nothing was replayed and nothing was overwritten, so those lines are still on disk. Decide what to do about them, then -Reset.")
+      }
       $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
       if (-not $cont.ok) {
-        throw ("Fleet watch CANNOT RESUME - " + $cont.reason +
-               ". Nothing was reported and the cursor was not moved, so nothing has been skipped yet. " +
-               "Re-prime deliberately with -Reset once you have decided what to do about the gap.")
+        throw ("Fleet watch CANNOT RESUME - " + $cont.reason + ". Nothing was reported and the cursor was not moved, so nothing has been skipped yet. Re-prime deliberately with -Reset once you have decided what to do about the gap.")
       }
-      if (-not $state) { $state = New-WatchState }
-      $state.boardId = $boardId
+
+      # ---- 2. only now may a validated outbox be replayed -------------------
+      if (Test-HasOutbox -State $state) {
+        Write-Output ("Fleet watch POSSIBLE REPLAY - the previous run persisted " + @($state.pendingLines).Count + " line(s) and may have exited before showing them. Repeating them now; anything you have already seen is a duplicate, not a new message.")
+        foreach ($line in @($state.pendingLines)) { Write-Output $line }
+        $state = Complete-WatchOutbox -State $state
+        $rc = Save-WatchState -State $state -Path $StateFile
+        if (-not $rc.ok) {
+          throw ("Fleet watch COULD NOT COMMIT AFTER REPLAY - " + $rc.reason + ". The outbox is retained, so the next start replays the same lines rather than skipping them.")
+        }
+        # The committed cursor moved, so where to resume moved with it.
+        $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
+        if (-not $cont.ok) {
+          throw ("Fleet watch CANNOT RESUME AFTER REPLAY - " + $cont.reason + ".")
+        }
+      }
+      if (-not $state) {
+        # The one legitimate assignment of identity: a genuinely absent cursor,
+        # priming against a board whose id has just been checked as non-empty.
+        $state = New-WatchState
+        $state.boardId = $boardId
+      }
 
       if ($cont.prime) {
         # ---- 3a. cold start: commit first, then speak ------------------------
@@ -247,7 +280,7 @@ try {
         $lines += ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
                    " - cursor set at row " + $lastData + " for " + $Tag + ", polling every " + $PollSeconds + "s")
         $state = Set-WatchOutbox -State $state -Rows $rows -Index $lastData -Lines @() -RowIds @()
-        $state = Complete-WatchOutbox -State $state -BoardId $boardId
+        $state = Complete-WatchOutbox -State $state
         $sc = Save-WatchState -State $state -Path $StateFile
         if (-not $sc.ok) { throw ("Fleet watch CANNOT ARM - " + $sc.reason + ". Nothing was reported.") }
         foreach ($line in $lines) { Write-Output $line }
@@ -306,7 +339,7 @@ try {
                    ". Nothing was reported and the cursor did not move, so the next start re-reads exactly this.")
           }
           foreach ($line in $lines) { Write-Output $line }
-          $state = Complete-WatchOutbox -State $state -BoardId $boardId
+          $state = Complete-WatchOutbox -State $state
           $cs = Save-WatchState -State $state -Path $StateFile
           if (-not $cs.ok) {
             throw ("Fleet watch COULD NOT COMMIT - " + $cs.reason +
