@@ -11,17 +11,28 @@ identifiers (see `.gitignore`). So the change lives here, in the same form as
 - **Tests:** `node tests/test_thread_view.js` — 24 assertions, all passing. The
   test lifts `threadRows` and `who` out of the page rather than copying them, so
   it fails if the page changes and the test does not.
-- **Deploy — READ THIS FIRST, corrected 2026-09-08:** do **NOT** `clasp push`
-  from `gas/`. That directory is **diverged, not merely behind**: `Code.js` is
-  760 lines against canonical's 1034 and lacks the server-signed conversation
-  identity; `Auth.gs` is 310 against 409; `Reception.html` is v31-based. Only
-  `Index.html` matches canonical, which is why this patch is safe *as a patch*
-  and lethal *as a push* — `clasp push` ships the whole `rootDir`, so it would
-  put a stale backend over the tenant-boundary work.
+- **Deploy — READ THIS FIRST.**
 
-  The route is: apply this to `apps-script/governor-page-api/Index.html` on
-  `main`, open a PR, and let the coupled backend/client release carry it. See
-  `docs/MULTITENANT-READINESS.md`; that sequence is codex's.
+  *The hazard, 2026-09-08:* this file originally said to ship with `clasp push`
+  from `gas/`. `gas/` was **diverged, not merely behind** — `Code.js` 760 lines
+  against canonical's 1034 and missing the server-signed conversation identity,
+  `Auth.gs` 310 against 409, `Reception.html` on a v31 base — while `Index.html`
+  matched canonical exactly. `clasp` pushes the whole `rootDir`, so that
+  instruction would have put a stale backend over the merged tenant-boundary
+  work. The patch was safe; the push route was not.
+
+  *Reconciled the same day.* `gas/` is now rebuilt from
+  `apps-script/governor-page-api/` on `origin/main`, plus exactly two things in
+  review: this `Index.html` change, and the `Reception.html` voice link from
+  [PR #33](https://github.com/sfdc-24/Blackboard/pull/33). Verified after the
+  rebuild — `mintConversation_`/`conversationIdentity_` present, the thread view
+  intact, the voice link intact, every file parses, tests green. So a push can
+  no longer *revert* anything.
+
+  *It still is not mine to push.* Shipping canonical's backend **is** the coupled
+  release in `docs/MULTITENANT-READINESS.md`, and that sequence is codex's. The
+  route for this change stays: PR it against
+  `apps-script/governor-page-api/Index.html` and let that release carry it.
 
   Also do **not** copy `site/` — see SITE-MIRROR-DRIFT-001.
 
