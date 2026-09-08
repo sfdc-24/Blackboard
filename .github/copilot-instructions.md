@@ -1,6 +1,6 @@
 # Working in this repository
 
-You are one of several AI agents working SFDC24 alongside one accountable human,
+You are one of several AI agents working on SFDC24 alongside one accountable human,
 Mr. Salam. This file is the context you cannot get from the code. Read it before
 reviewing or changing anything here.
 
@@ -58,9 +58,13 @@ and `tools/` that `site/` does not mirror — replacing that tree can drop the
 custom-domain binding and the publisher's controls. Site changes are made on a
 review branch **in that repository**. See `docs/HANDOVER.md`.
 
-**`apps-script/` mirrors deployed Google Apps Script.** These are baselines of
-what is actually running, kept byte-comparable to the live source so drift can be
-detected. They are not a codebase to modernise. `appsscript.json` manifests are
+**`apps-script/` is reviewed canonical source for Google Apps Script, not a
+scratchpad.** It is the source a release is cut *from*, and it may legitimately be
+**ahead of** what is deployed — production runs immutable versions, so the repo
+leading production is the normal state between releases, not drift. Do not read a
+difference from a live endpoint as a defect on its own; compare against the pinned
+deployed version. These files are also not a codebase to modernise: their shape
+tracks what has been reviewed and deployed. `appsscript.json` manifests are
 compared as canonical JSON, and the strict parser rejects duplicate keys on
 purpose.
 
@@ -84,10 +88,13 @@ immediately and do not quote the value.
 Two traps that have cost this project real hours and will look like other
 problems to you:
 
-- **A `workflow_dispatch` workflow only registers from the default branch.** A
-  workflow that exists solely on a feature branch is invisible to
-  `gh workflow list` and its PR can never show a check. That looks exactly like a
-  broken secret and is not.
+- **`workflow_dispatch` and `schedule` register only from the default branch.** A
+  manually-dispatchable or cron workflow that exists solely on a feature branch is
+  invisible to `gh workflow list` and cannot be triggered until it reaches `main`.
+  That looks exactly like a broken secret and is not.
+  **This does not apply to `pull_request` checks** — a `pull_request`-triggered
+  workflow added on a feature branch does run on that branch's PR. Keep the two
+  apart: "no check appeared" means different things depending on the trigger.
 - **HTTP 200 is not proof an Apps Script web app answered.** Google serves both a
   Drive notice page and a full sign-in page with status 200. Any health check must
   inspect the body for interstitial markers, not the status code.
@@ -109,3 +116,14 @@ Apply it to your own findings:
 
 Ordinary code-quality feedback is welcome too; the above is about the
 project-specific traps, not a restriction on what you may comment on.
+
+## 5. This file does not follow you to the other repository
+
+`sfdc-24/sfdc24-site` is the repository that actually serves `www.sfdc24.com`,
+and instructions here do not propagate there. It needs its own
+`.github/copilot-instructions.md`, covering its publisher tooling
+(`tools/prototype_publisher.py` and its tests), its `CNAME` and `.nojekyll` — both
+of which a careless tree replacement can drop — and the rule that a merge to its
+`main` triggers Pages, so a push is not a deployment receipt.
+
+Until that file exists, treat a site-repo review as unbriefed and say so.
