@@ -1045,6 +1045,141 @@ try {
         -not $notFoundTwice.log_text.Contains('NOT_FOUND_TWICE_SECOND_BODY_CANARY')
     )
 
+    $missingRowsJson = '{"ok":true}'
+    $missingRowsThenEmpty = Invoke-ReadCase `
+        -Name 'missing-rows-then-empty' `
+        -Responses @($missingRowsJson, $validEmpty)
+    $missingRowsEmptyRetries = @($missingRowsThenEmpty.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsEmptyPropertyNames = @($missingRowsEmptyRetries[0].PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missingRowsEmptyDetailNames = @($missingRowsEmptyRetries[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedRetryPropertyNames = @(
+        'at', 'code', 'details', 'event', 'level', 'message', 'row_id', 'run_id', 'work_id'
+    )
+    $expectedMissingRowsDetailNames = @(
+        'attempt', 'code', 'content_type_class', 'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'missing rows retries one whole read then completes normally with no eligible order' (
+        $missingRowsThenEmpty.exit_code -eq 0 -and
+        $missingRowsThenEmpty.result -and
+        $missingRowsThenEmpty.result.status -ceq 'no_eligible_order' -and
+        $missingRowsThenEmpty.state.last_poll.status -ceq 'no_eligible_order' -and
+        $missingRowsThenEmpty.read_count -eq 2 -and
+        @($missingRowsThenEmpty.actions).Count -eq 2
+    )
+    Assert-True 'missing rows recovery emits one exact lowercase safe retry warning' (
+        $missingRowsEmptyRetries.Count -eq 1 -and
+        $missingRowsEmptyRetries[0].level -ceq 'warning' -and
+        $missingRowsEmptyRetries[0].code -ceq 'board_rows_missing' -and
+        $missingRowsEmptyRetries[0].message -ceq 'A transient pre-admission board read failed; retrying once.' -and
+        $missingRowsEmptyRetries[0].work_id -ceq '' -and
+        $missingRowsEmptyRetries[0].row_id -ceq '' -and
+        $missingRowsEmptyRetries[0].details.attempt -ceq '1' -and
+        $missingRowsEmptyRetries[0].details.code -ceq 'board_rows_missing' -and
+        $missingRowsEmptyRetries[0].details.transport_exit -ceq '0' -and
+        $missingRowsEmptyRetries[0].details.http_status -ceq '200' -and
+        $missingRowsEmptyRetries[0].details.content_type_class -ceq 'json' -and
+        -not [string]::IsNullOrWhiteSpace([string]$missingRowsEmptyRetries[0].details.elapsed_ms) -and
+        $missingRowsEmptyPropertyNames.Count -eq $expectedRetryPropertyNames.Count -and
+        @($expectedRetryPropertyNames | Where-Object { $missingRowsEmptyPropertyNames -cnotcontains $_ }).Count -eq 0 -and
+        $missingRowsEmptyDetailNames.Count -eq $expectedMissingRowsDetailNames.Count -and
+        @($expectedMissingRowsDetailNames | Where-Object { $missingRowsEmptyDetailNames -cnotcontains $_ }).Count -eq 0
+    )
+    Assert-True 'missing rows recovery logs no raw response and has no write or inference side effect' (
+        -not $missingRowsThenEmpty.log_text.Contains($missingRowsJson) -and
+        @($missingRowsThenEmpty.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $missingRowsThenEmpty.claude_called
+    )
+
+    $missingRowsThenEligible = Invoke-ReadCase `
+        -Name 'missing-rows-then-eligible-observe' `
+        -Responses @($missingRowsJson, $eligible) `
+        -Mode Observe
+    $missingRowsEligibleRetries = @($missingRowsThenEligible.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsCandidates = @($missingRowsThenEligible.events | Where-Object event -ceq 'candidate_observed')
+    Assert-True 'missing rows then eligible Observe admits the candidate exactly once' (
+        $missingRowsThenEligible.exit_code -eq 0 -and
+        $missingRowsThenEligible.result -and
+        $missingRowsThenEligible.result.status -ceq 'candidate_observed' -and
+        $missingRowsThenEligible.result.work_id -ceq 'ORDER-READ-RETRY' -and
+        $missingRowsThenEligible.state.last_poll.status -ceq 'candidate_observed' -and
+        [int]$missingRowsThenEligible.state.counts.selected -eq 1 -and
+        $missingRowsThenEligible.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $missingRowsThenEligible.state.cursor.row_id -ceq 'cursor-before-read' -and
+        $missingRowsThenEligible.read_count -eq 2 -and
+        $missingRowsEligibleRetries.Count -eq 1 -and
+        $missingRowsCandidates.Count -eq 1
+    )
+    Assert-True 'missing rows then eligible Observe performs no synthesis, write, or inference' (
+        $missingRowsEligibleRetries[0].code -ceq 'board_rows_missing' -and
+        @($missingRowsThenEligible.state.work).Count -eq 0 -and
+        @($missingRowsThenEligible.actions).Count -eq 2 -and
+        @($missingRowsThenEligible.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        @($missingRowsThenEligible.events | Where-Object {
+            @('claim_confirmed', 'receipt_confirmed', 'invocation_started', 'result_confirmed') -ccontains [string]$_.event
+        }).Count -eq 0 -and
+        -not $missingRowsThenEligible.log_text.Contains($missingRowsJson) -and
+        -not $missingRowsThenEligible.claude_called
+    )
+
+    $missingRowsBodyCanary = 'ROWS_MISSING_BODY_CANARY'
+    $missingRowsCanaryJson = '{"ok":true,"diagnostic":"' + $missingRowsBodyCanary + '"}'
+    $missingRowsTwice = Invoke-ReadCase `
+        -Name 'missing-rows-twice' `
+        -Responses @($missingRowsCanaryJson, $missingRowsJson) `
+        -InitialWork (, $preservedWork)
+    $missingRowsTwiceRetries = @($missingRowsTwice.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsTwiceRunErrors = @($missingRowsTwice.events | Where-Object event -ceq 'run_error')
+    $missingRowsTwiceRetryDetailNames = @($missingRowsTwiceRetries[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missingRowsTwiceRunErrorDetailNames = @($missingRowsTwiceRunErrors[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedMissingRowsRunErrorDetailNames = @(
+        'attempt', 'content_type_class', 'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'two missing rows envelopes stop after the existing one-retry bound with the public code' (
+        $missingRowsTwice.exit_code -eq 20 -and
+        $missingRowsTwice.result -and
+        $missingRowsTwice.result.status -ceq 'error' -and
+        $missingRowsTwice.result.error_code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwice.state.error.code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwice.read_count -eq 2 -and
+        $missingRowsTwiceRetries.Count -eq 1 -and
+        $missingRowsTwiceRunErrors.Count -eq 1
+    )
+    Assert-True 'missing rows retry stays lowercase while terminal run_error stays public uppercase' (
+        $missingRowsTwiceRetries[0].code -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRetries[0].details.attempt -ceq '1' -and
+        $missingRowsTwiceRetries[0].details.code -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRetries[0].message -ceq 'A transient pre-admission board read failed; retrying once.' -and
+        $missingRowsTwiceRetryDetailNames.Count -eq $expectedMissingRowsDetailNames.Count -and
+        @($expectedMissingRowsDetailNames | Where-Object { $missingRowsTwiceRetryDetailNames -cnotcontains $_ }).Count -eq 0 -and
+        $missingRowsTwiceRunErrors[0].code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwiceRunErrors[0].message -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRunErrors[0].details.attempt -ceq '2' -and
+        $missingRowsTwiceRunErrors[0].details.http_status -ceq '200' -and
+        $missingRowsTwiceRunErrors[0].details.content_type_class -ceq 'json' -and
+        $missingRowsTwiceRunErrorDetailNames.Count -eq $expectedMissingRowsRunErrorDetailNames.Count -and
+        @($expectedMissingRowsRunErrorDetailNames | Where-Object {
+            $missingRowsTwiceRunErrorDetailNames -cnotcontains $_
+        }).Count -eq 0
+    )
+    Assert-True 'two missing rows envelopes preserve the exact cursor and work record' (
+        [bool]$missingRowsTwice.state.initialized -and
+        $missingRowsTwice.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $missingRowsTwice.state.cursor.row_id -ceq 'cursor-before-read' -and
+        [int]$missingRowsTwice.state.counts.selected -eq 0 -and
+        @($missingRowsTwice.state.work).Count -eq 1 -and
+        (@($missingRowsTwice.state.work)[0] | ConvertTo-Json -Compress) -ceq $preservedWorkJson
+    )
+    Assert-True 'two missing rows envelopes expose no raw canary and cause no write or inference' (
+        @($missingRowsTwice.actions).Count -eq 2 -and
+        @($missingRowsTwice.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        @($missingRowsTwice.events | Where-Object {
+            @('candidate_observed', 'poll_complete') -ccontains [string]$_.event
+        }).Count -eq 0 -and
+        -not $missingRowsTwice.log_text.Contains($missingRowsBodyCanary) -and
+        -not $missingRowsTwice.log_text.Contains($missingRowsJson) -and
+        -not $missingRowsTwice.claude_called
+    )
+
     foreach ($permanentStatus in @(401, 403, 418)) {
         $permanentHttp = Invoke-ReadCase `
             -Name ('http-' + $permanentStatus + '-no-retry') `
@@ -1160,7 +1295,8 @@ try {
 
     foreach ($logicalCase in @(
         [pscustomobject]@{ name = 'logical-refusal'; response = '{"ok":false,"rows":[]}'; code = 'BOARD_READ_REFUSED' },
-        [pscustomobject]@{ name = 'schema-missing-rows'; response = '{"ok":true}'; code = 'BOARD_ROWS_MISSING' }
+        [pscustomobject]@{ name = 'header-missing'; response = '{"ok":true,"rows":[]}'; code = 'BOARD_HEADER_MISSING' },
+        [pscustomobject]@{ name = 'header-invalid'; response = '{"ok":true,"rows":[["bad"]]}'; code = 'BOARD_HEADER_INVALID' }
     )) {
         $logical = Invoke-ReadCase `
             -Name $logicalCase.name `
@@ -1185,6 +1321,29 @@ try {
         ([regex]::Matches($runnerSource, '\$rows\s*=\s*@\(Read-BoardPreAdmission\)')).Count -eq 1 -and
         $runnerSource.Contains('$current = @(Read-Board)') -and
         $runnerSource.Contains('$readOperation = { Read-Board }')
+    )
+    $runnerTokens = $null
+    $runnerParseErrors = $null
+    $runnerAst = [Management.Automation.Language.Parser]::ParseFile($RunnerPath, [ref]$runnerTokens, [ref]$runnerParseErrors)
+    $classifierDefinitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Test-TransientBoardReadFailure'
+    }, $true))
+    if ($classifierDefinitions.Count -eq 1) { Invoke-Expression $classifierDefinitions[0].Extent.Text }
+    $lowercaseRowsMissingError = try { throw 'board_rows_missing' } catch { $_ }
+    $uppercaseRowsMissingError = try { throw 'BOARD_ROWS_MISSING' } catch { $_ }
+    $refusedError = try { throw 'board_read_refused' } catch { $_ }
+    $headerMissingError = try { throw 'board_header_missing' } catch { $_ }
+    $headerInvalidError = try { throw 'board_header_invalid' } catch { $_ }
+    Assert-True 'transient classifier adds only the exact lowercase real-parser missing-rows message' (
+        @($runnerParseErrors).Count -eq 0 -and
+        $classifierDefinitions.Count -eq 1 -and
+        [bool](Test-TransientBoardReadFailure -ErrorRecord $lowercaseRowsMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $uppercaseRowsMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $refusedError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerInvalidError)
     )
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $script:TestRoot -PathType Container)) {

@@ -370,7 +370,7 @@ function Test-TransientBoardReadFailure {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     $code = [string]$ErrorRecord.Exception.Message
-    if (@('BOARD_READ_TRANSPORT_ERROR', 'BOARD_READ_RESPONSE_EMPTY', 'BOARD_READ_JSON_INVALID') -ccontains $code) {
+    if (@('BOARD_READ_TRANSPORT_ERROR', 'BOARD_READ_RESPONSE_EMPTY', 'BOARD_READ_JSON_INVALID', 'board_rows_missing') -ccontains $code) {
         return $true
     }
     if ($code -cne 'BOARD_READ_HTTP_ERROR' -or -not $ErrorRecord.Exception.Data.Contains('http_status')) {
