@@ -370,7 +370,7 @@ function Test-TransientBoardReadFailure {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     $code = [string]$ErrorRecord.Exception.Message
-    if (@('BOARD_READ_TRANSPORT_ERROR', 'BOARD_READ_RESPONSE_EMPTY', 'BOARD_READ_JSON_INVALID') -ccontains $code) {
+    if (@('BOARD_READ_TRANSPORT_ERROR', 'BOARD_READ_RESPONSE_EMPTY', 'BOARD_READ_JSON_INVALID', 'board_rows_missing') -ccontains $code) {
         return $true
     }
     if ($code -cne 'BOARD_READ_HTTP_ERROR' -or -not $ErrorRecord.Exception.Data.Contains('http_status')) {
@@ -379,7 +379,7 @@ function Test-TransientBoardReadFailure {
     $statusText = [string]$ErrorRecord.Exception.Data['http_status']
     if ($statusText -cnotmatch '^[1-5]\d{2}$') { return $false }
     $status = [int]$statusText
-    return $status -in @(408, 425, 429) -or ($status -ge 500 -and $status -le 599)
+    return $status -in @(404, 408, 425, 429) -or ($status -ge 500 -and $status -le 599)
 }
 
 function Read-BoardPreAdmission {
@@ -799,6 +799,20 @@ try {
 
     $rows = @(Read-BoardPreAdmission)
     $selection = Get-OrderSelection -Rows $rows -Cursor $state.cursor -AllowedSources $AllowedSources -RequiredAuthorityToken $RequiredAuthorityToken
+    if ([int]$selection.exact_duplicate_row_count -gt 0) {
+        # Emit at most one warning for the poll. Dynamic data is deliberately
+        # counts-only: no duplicated Row_ID, tuple, cell, or payload is logged.
+        Write-OrderLog `
+            -Path $LogPath `
+            -Event 'board_duplicate_rows_collapsed' `
+            -Level warning `
+            -RunId $RunId `
+            -Code 'BOARD_CURSOR_DUPLICATES_COLLAPSED' `
+            -Details @{
+                exact_duplicate_group_count = [int]$selection.exact_duplicate_group_count
+                exact_duplicate_row_count = [int]$selection.exact_duplicate_row_count
+            }
+    }
     if ($selection.newest_seen) {
         $state.seen = [pscustomobject][ordered]@{
             at = Get-UtcStamp

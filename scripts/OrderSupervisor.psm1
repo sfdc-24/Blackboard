@@ -476,30 +476,63 @@ function Get-OrderSelection {
         [string]$RequiredAuthorityToken = 'operator-direct'
     )
 
-    $valid = @($Rows | Where-Object { $_.valid })
-    for ($i = 1; $i -lt $valid.Count; $i++) {
-        $item = $valid[$i]
+    $scannedValid = @($Rows | Where-Object { $_.valid })
+    for ($i = 1; $i -lt $scannedValid.Count; $i++) {
+        $item = $scannedValid[$i]
         $j = $i - 1
         while ($j -ge 0) {
-            if ([Int64]$valid[$j].timestamp_ticks -lt [Int64]$item.timestamp_ticks) {
+            if ([Int64]$scannedValid[$j].timestamp_ticks -lt [Int64]$item.timestamp_ticks) {
                 $cmp = -1
-            } elseif ([Int64]$valid[$j].timestamp_ticks -gt [Int64]$item.timestamp_ticks) {
+            } elseif ([Int64]$scannedValid[$j].timestamp_ticks -gt [Int64]$item.timestamp_ticks) {
                 $cmp = 1
             } else {
-                $cmp = [string]::CompareOrdinal([string]$valid[$j].row_id, [string]$item.row_id)
+                $cmp = [string]::CompareOrdinal([string]$scannedValid[$j].row_id, [string]$item.row_id)
             }
             if ($cmp -le 0) { break }
-            $valid[$j + 1] = $valid[$j]
+            $scannedValid[$j + 1] = $scannedValid[$j]
             $j--
         }
-        $valid[$j + 1] = $item
+        $scannedValid[$j + 1] = $item
     }
-    for ($i = 1; $i -lt $valid.Count; $i++) {
-        if ([Int64]$valid[$i - 1].timestamp_ticks -eq [Int64]$valid[$i].timestamp_ticks -and
-            [string]::Equals([string]$valid[$i - 1].row_id, [string]$valid[$i].row_id, [StringComparison]::Ordinal)) {
-            throw 'board_cursor_tuple_duplicate'
+
+    # A board read can contain the same physical row more than once. Resolve every
+    # cursor-tuple group across the complete scanned window before admission so an
+    # earlier eligible row cannot hide a later collision. Only cell-for-cell
+    # ordinal-identical sets of all ten strings collapse. Reuse of one
+    # Row_ID at a different timestamp remains a distinct cursor tuple.
+    $canonical = New-Object System.Collections.Generic.List[object]
+    $exactDuplicateGroupCount = 0
+    $exactDuplicateRowCount = 0
+    for ($i = 0; $i -lt $scannedValid.Count;) {
+        $first = $scannedValid[$i]
+        $firstCells = @($first.cells)
+        $groupCount = 1
+        $next = $i + 1
+        while ($next -lt $scannedValid.Count -and
+               [Int64]$scannedValid[$next].timestamp_ticks -eq [Int64]$first.timestamp_ticks -and
+               [string]::Equals([string]$scannedValid[$next].row_id, [string]$first.row_id, [StringComparison]::Ordinal)) {
+            $candidateCells = @($scannedValid[$next].cells)
+            $cellsEqual = $firstCells.Count -eq 10 -and $candidateCells.Count -eq 10
+            if ($cellsEqual) {
+                for ($column = 0; $column -lt 10; $column++) {
+                    if (-not [string]::Equals([string]$firstCells[$column], [string]$candidateCells[$column], [StringComparison]::Ordinal)) {
+                        $cellsEqual = $false
+                        break
+                    }
+                }
+            }
+            if (-not $cellsEqual) { throw 'board_cursor_tuple_collision' }
+            $groupCount++
+            $next++
         }
+        $canonical.Add($first)
+        if ($groupCount -gt 1) {
+            $exactDuplicateGroupCount++
+            $exactDuplicateRowCount += $groupCount - 1
+        }
+        $i = $next
     }
+    $valid = @($canonical.ToArray())
     $after = @($valid | Where-Object { Test-CursorAfter -Row $_ -Cursor $Cursor })
     $diagnostics = New-Object System.Collections.Generic.List[object]
     $selected = $null
@@ -525,9 +558,12 @@ function Get-OrderSelection {
         newest_seen = $(if ($valid.Count -gt 0) {
             [pscustomobject][ordered]@{ timestamp = $valid[$valid.Count - 1].timestamp; row_id = $valid[$valid.Count - 1].row_id }
         } else { $null })
-        valid_count = $valid.Count
+        valid_count = $scannedValid.Count
+        canonical_valid_count = $valid.Count
         malformed_count = @($Rows | Where-Object { -not $_.valid }).Count
         after_cursor_count = $after.Count
+        exact_duplicate_group_count = $exactDuplicateGroupCount
+        exact_duplicate_row_count = $exactDuplicateRowCount
         diagnostics = $diagnostics.ToArray()
     }
 }
