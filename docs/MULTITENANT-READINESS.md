@@ -101,6 +101,9 @@ immutable source hashes and site commit as the rollback pair. Refresh this
 evidence if either target moves. Store the complete pair in the release receipt
 before executing the cutover; an absent binding, hash or site commit means the
 rollback prerequisites are incomplete. This plan is not that release receipt.
+Verify before cutover that the recorded site commit serves `/voice/` when the
+recorded backend's Reception links there; an incompatible pair cannot be used
+as the accepted rollback target.
 The v33 read-back here is a reference, not permission to overwrite a later
 production release.
 
