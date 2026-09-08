@@ -268,7 +268,8 @@ button.rec .dot{animation:b .8s step-end infinite}
       // This page genuinely cannot hold a microphone: Apps Script serves it
       // inside a sandboxFrame whose `allow` attribute omits microphone, so
       // SpeechRecognition is unreachable and no permission prompt will ever
-      // appear (L-89). That part is unfixable here and always was.
+      // appear. That part is unfixable here and always was.
+      // (L-89 is the board's rule ID for this finding, not a line number here.)
       //
       // What WAS wrong is what we did about it. This used to tell the visitor
       // to use their keyboard's dictation -- advice written before
@@ -287,7 +288,12 @@ button.rec .dot{animation:b .8s step-end infinite}
         a.target = "_top";                       // we are in a frame; open the real page, not inside it
         a.rel = "noopener";
         a.textContent = "Open it and just talk →";
-        a.style.cssText = "color:inherit;font-weight:600";
+        // It must LOOK like a link. Inheriting the colour with no underline
+        // rendered it as bold text inside a sentence, so the one control that
+        // solves the visitor's problem was invisible -- Copilot caught this on
+        // PR33. The underline is what makes it unmistakable on any background,
+        // which matters because this block renders on the sys style, not ours.
+        a.style.cssText = "color:inherit;font-weight:600;text-decoration:underline;text-underline-offset:2px";
         m.appendChild(a);
         m.appendChild(document.createTextNode(
           " Or dictate straight into the box below: tap the microphone on your phone's keyboard, "
