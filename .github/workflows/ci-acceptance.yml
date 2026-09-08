@@ -22,6 +22,7 @@ on:
       - 'scripts/gas_build_identity.py'
       - 'scripts/baseline_verify.py'
       - 'tests/test_baseline_verify.py'
+      - 'tests/fixtures/governor-v31-manifest.json'
       - 'scripts/gas_tts_canary.py'
       - 'scripts/gas_tts_canary_target.json'
       - 'tests/test_build_identity.py'

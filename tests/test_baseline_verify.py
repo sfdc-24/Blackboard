@@ -20,6 +20,9 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
 SOURCE_DIR = os.path.join(REPO, "apps-script", "governor-page-api")
+# Independently read immutable v31 source on 2026-09-07. The production working
+# manifest may advance after cutover; it must not redefine this baseline fixture.
+V31_MANIFEST = os.path.join(REPO, "tests", "fixtures", "governor-v31-manifest.json")
 sys.path.insert(0, SCRIPTS)
 
 import baseline_verify  # noqa: E402  (path set above)
@@ -39,9 +42,10 @@ class BaselineVerifyTest(unittest.TestCase):
         self.dir = os.path.join(self.tmp, "governor-page-api")
         shutil.copytree(SOURCE_DIR, self.dir)
         self.manifest = os.path.join(self.dir, "appsscript.json")
+        shutil.copyfile(V31_MANIFEST, self.manifest)
 
     def write_manifest(self, text):
-        with open(self.manifest, "w", encoding="utf-8") as fh:
+        with open(self.manifest, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
 
     def read_manifest(self):
@@ -54,11 +58,11 @@ class BaselineVerifyTest(unittest.TestCase):
         rows, _ = baseline_verify.verify(self.dir)
         self.assertEqual(status_of(rows, "appsscript"), "MATCH")
 
-    def test_reformatting_is_not_drift(self):
-        """Different key order and indentation must NOT read as drift."""
+    def test_reformatting_bom_and_line_endings_are_not_drift(self):
+        """Different key order, indentation, BOM and CRLF must NOT read as drift."""
         parsed = json.loads(self.read_manifest())
         reordered = dict(reversed(list(parsed.items())))
-        self.write_manifest(json.dumps(reordered, indent=4) + "\n")
+        self.write_manifest("\ufeff" + json.dumps(reordered, indent=4).replace("\n", "\r\n") + "\r\n")
         rows, _ = baseline_verify.verify(self.dir)
         self.assertEqual(status_of(rows, "appsscript"), "MATCH")
 
@@ -87,12 +91,23 @@ class BaselineVerifyTest(unittest.TestCase):
         self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
         self.assertGreater(mismatches, 0)
 
+    def test_nested_duplicate_key_cannot_produce_match(self):
+        text = self.read_manifest()
+        self.assertIn('"access": "ANYONE_ANONYMOUS"', text)
+        self.write_manifest(text.replace(
+            '"access": "ANYONE_ANONYMOUS"',
+            '"access": "CORRUPTED", "access": "ANYONE_ANONYMOUS"'))
+        rows, _ = baseline_verify.verify(self.dir)
+        self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
+
     def test_nonstandard_number_cannot_produce_match(self):
         text = self.read_manifest().rstrip()
         self.assertTrue(text.endswith("}"))
-        self.write_manifest(text[:-1] + ', "spendCap": NaN}')
-        rows, _ = baseline_verify.verify(self.dir)
-        self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                self.write_manifest(text[:-1] + ', "spendCap": ' + value + '}')
+                rows, _ = baseline_verify.verify(self.dir)
+                self.assertEqual(status_of(rows, "appsscript"), "UNPARSEABLE")
 
     def test_malformed_json_cannot_produce_match(self):
         self.write_manifest("{ this is not json ")
