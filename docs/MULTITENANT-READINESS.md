@@ -91,14 +91,18 @@ immutable production read-back verified **version 33**, with file-set SHA-256
 `03bf71ee87f1ee2fae6efec5adb1e387fa9bea682691969088bc6b43ad1ad3d7`.
 Its `Code.gs` and the other five non-Reception files are unchanged from v31;
 its Reception adds the link to the top-level `/voice/` page. Returning to v31
-would remove that visitor fix. PR33 ports it into the canonical source; include
+would remove that visitor fix. [PR33](https://github.com/sfdc-24/Blackboard/pull/33)
+ports that no-microphone branch into the canonical source; include
 the accepted port in the next candidate instead of copying the older live
 Reception over the signed-token client.
 
 Before each cutover, record the then-current production deployment binding,
 immutable source hashes and site commit as the rollback pair. Refresh this
-evidence if either target moves. The v33 read-back here is a reference, not
-permission to overwrite a later production release.
+evidence if either target moves. Store the complete pair in the release receipt
+before executing the cutover; an absent binding, hash or site commit means the
+rollback prerequisites are incomplete. This plan is not that release receipt.
+The v33 read-back here is a reference, not permission to overwrite a later
+production release.
 
 1. Merge neither repository until both PRs are green and reviewed together.
 2. Deploy the Apps Script source to the production-distinct Governor staging
@@ -114,9 +118,9 @@ permission to overwrite a later production release.
    client immediately after. The backend remains spend-bounded for old clients,
    but old clients do not retain anonymous history.
 7. Roll back the site to the recorded pre-cutover immutable commit first, then
-   repoint Apps Script to the recorded pre-cutover immutable version (v33 at
-   the read-back above). Its unchanged v31 `Code.gs` reads the legacy daily
-   counter maintained by the repaired version. Revalidate that compatibility
+   repoint Apps Script to the recorded pre-cutover immutable version. The v33
+   `Code.gs`, unchanged from v31, reads the legacy daily counter maintained by
+   the repaired version. Revalidate that compatibility
    if the recorded baseline has changed. Read back both targets and verify the
    public reception, its `/voice/` fallback and the voice page in a browser.
 
