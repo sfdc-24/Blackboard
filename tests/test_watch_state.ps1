@@ -408,6 +408,69 @@ $afterBytes = Get-Content -LiteralPath $keepPath -Raw
 Assert-True 'an unrelated failed save did not disturb the good file' ($before -eq $afterBytes)
 Assert-True 'and it still reads back' ((Read-WatchState -Path $keepPath).state.lastIndex -eq 4)
 Write-Output ''
+Write-Output 'CASE 20 - the save binds the destination to the EXACT candidate bytes'
+# The old check compared a SEMANTIC digest that deliberately excludes savedAt, so
+# changing only savedAt on disk compared equal. "These exact bytes are on disk"
+# was not what it proved.
+$xp = Join-Path $tmpDir 'exact.json'
+$stX = Commit-At -Rows $board2 -Index 4
+$svX = Save-WatchState -State $stX -Path $xp
+Assert-True 'a normal save succeeds' ($svX.ok -eq $true) $svX.reason
+$onDisk = [System.IO.File]::ReadAllBytes($xp)
+$svX2 = Save-WatchState -State $stX -Path $xp
+Assert-True 'saving over an existing file succeeds' ($svX2.ok -eq $true) $svX2.reason
+Assert-True 'no rollback asset is left behind on success' (-not (Test-Path -LiteralPath (Get-StateBackupPath $xp)))
+Assert-True 'and no .tmp is left behind' (@(Get-ChildItem -Path $tmpDir -Filter '*.tmp' -ErrorAction SilentlyContinue).Count -eq 0)
+
+Write-Output ''
+Write-Output 'CASE 21 - a failed transition preserves the prior bytes and proves it'
+# The destination is held open with no sharing, so the replace cannot land. The
+# prior must come back byte for byte and the outcome must say so.
+$fp = Join-Path $tmpDir 'fail.json'
+$before = Commit-At -Rows $board2 -Index 2
+[void](Save-WatchState -State $before -Path $fp)
+$priorBytes = [System.IO.File]::ReadAllBytes($fp)
+$hold = New-Object System.IO.FileStream($fp, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+try {
+  $after = Commit-At -Rows $board2 -Index 6
+  $svF = Save-WatchState -State $after -Path $fp
+  Assert-True 'a blocked replace reports failure' ($svF.ok -eq $false) $svF.reason
+} finally { $hold.Dispose() }
+$nowBytes = [System.IO.File]::ReadAllBytes($fp)
+Assert-True 'the prior cursor survives byte for byte' `
+  (([System.BitConverter]::ToString($nowBytes)) -eq ([System.BitConverter]::ToString($priorBytes)))
+Assert-True 'and it still reads back as the original cursor' ((Read-WatchState -Path $fp).state.lastIndex -eq 2)
+
+Write-Output ''
+Write-Output 'CASE 22 - with NO prior, a failed transition restores ABSENCE'
+$np = Join-Path $tmpDir 'noprior.json'
+$tooBig = Commit-At -Rows $board2 -Index 3
+$tooBig.anchorId = ('a' * 500)   # over the field bound: refused before any write
+$svN = Save-WatchState -State $tooBig -Path $np
+Assert-True 'an invalid candidate is refused' ($svN.ok -eq $false) $svN.reason
+Assert-True 'and nothing was created' (-not (Test-Path -LiteralPath $np))
+
+Write-Output ''
+Write-Output 'CASE 23 - an interrupted transition fails closed and keeps the asset'
+$ip = Join-Path $tmpDir 'interrupted.json'
+[void](Save-WatchState -State (Commit-At -Rows $board2 -Index 5) -Path $ip)
+Assert-True 'a clean state reports no pending transition' (-not (Test-PendingTransition -Path $ip).pending)
+Set-Content -LiteralPath (Get-StateBackupPath $ip) -Value 'leftover' -Encoding UTF8
+$pt = Test-PendingTransition -Path $ip
+Assert-True 'a retained rollback asset is detected' ($pt.pending -eq $true)
+Assert-True 'and says the asset was kept' ($pt.reason -match 'kept') $pt.reason
+Assert-True 'and the asset is NOT deleted by the check' (Test-Path -LiteralPath (Get-StateBackupPath $ip))
+Remove-Item -LiteralPath (Get-StateBackupPath $ip) -Force -ErrorAction SilentlyContinue
+
+Write-Output ''
+Write-Output 'CASE 24 - both watchers refuse to start on a retained rollback asset'
+foreach ($f in @('scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
+  $src = Get-Content -LiteralPath (Join-Path $RepoRoot $f) -Raw
+  Assert-True ($f + ' checks for an interrupted transition') ($src -match 'Test-PendingTransition') ''
+  Assert-True ($f + ' reset uses the shared verified transition') `
+    (-not ($src -match 'WriteAllBytes\(\$StateFile')) ''
+}
+Write-Output ''
 Write-Output 'the PowerShell 7 / 5.1 JSON type difference is absorbed'
 $isoText = '2026-09-08T08:00:00.000Z'
 $asDate = [datetime]::Parse($isoText, [System.Globalization.CultureInfo]::InvariantCulture,

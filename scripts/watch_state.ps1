@@ -175,7 +175,14 @@ function Test-StateInvariants {
   # compares a string to an int -- "7" -gt 400 is TRUE as a string comparison, so
   # every ordinary board id failed this check. Caught by the harness, not by
   # reading it.
-  if (([string]$State.boardId).Length -gt $script:WATCH_MAX_FIELD) { return 'board identity is too long' }
+  # EVERY bounded string the reader checks, checked here too. The writer bounded
+  # only boardId, so a 500-character anchorId saved cleanly and then read back as
+  # UNUSABLE -- the writer persisting something its own reader refuses, which
+  # traps the next start behind a -Reset for no reason. Writer and reader have to
+  # agree on what is valid. Found by a test asserting the save would refuse it.
+  foreach ($f in @('boardId','anchorId','lastEmitKey','lastEmitTs','pendingAnchor','planMode','planEmitKey','planEmitTs','resetAt')) {
+    if (([string]$State.$f).Length -gt $script:WATCH_MAX_FIELD) { return ($f + ' exceeds its length bound') }
+  }
   if ([int]$State.lastIndex -ge 1 -and -not $State.anchorId) { return 'state has a cursor but no anchor' }
   $lines = @($State.pendingLines); $ids = @($State.pendingRowIds)
   if ([int]$State.pendingIndex -ge 1) {
@@ -299,61 +306,189 @@ function Enter-WatchLock {
 }
 function Exit-WatchLock { param($Lock) if ($Lock -and $Lock.handle) { try { $Lock.handle.Dispose() } catch { } } }
 
-function Save-WatchState {
-  # ok=$true means these exact bytes are on disk and were read back. The temp is
-  # verified BEFORE the replace so a mismatch can never destroy good bytes.
-  param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$Path)
+function Test-BytesEqual {
+  param([byte[]]$A, [byte[]]$B)
+  if ($null -eq $A -or $null -eq $B) { return $false }
+  if ($A.Length -ne $B.Length) { return $false }
+  for ($i = 0; $i -lt $A.Length; $i++) { if ($A[$i] -ne $B[$i]) { return $false } }
+  return $true
+}
+
+function Get-BytesHash {
+  param([byte[]]$Bytes)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '') }
+  finally { $sha.Dispose() }
+}
+
+function Get-StateBackupPath { param([string]$Path) return ($Path + '.rollback') }
+
+function Test-PendingTransition {
+  <#
+    A rollback asset left on disk means a transition was interrupted and we
+    cannot know whether the destination is the new good state or a casualty.
+    FAIL CLOSED and KEEP THE ASSET; deleting the only recoverable copy to tidy up
+    is how the evidence disappears.
+  #>
+  param([string]$Path)
+  $bak = Get-StateBackupPath (Resolve-StatePath $Path)
+  if (Test-Path -LiteralPath $bak) {
+    return @{ pending = $true
+              reason = ('an interrupted state transition left a rollback asset at ' + $bak +
+                        '. The destination cannot be trusted until someone decides which copy is correct. The asset has been kept.') }
+  }
+  return @{ pending = $false; reason = '' }
+}
+
+function Save-StateBytes {
+  <#
+    THE one verified atomic state transition. Everything that writes state calls
+    this; reset recovery included, so there is no second, weaker writer.
+
+    Order, and why each step is there:
+      1  the candidate is serialized ONCE, to bounded raw bytes with a hash;
+      2  it is written to a unique temp and read back THROUGH THE SAME HANDLE, so
+         what is verified is what was written rather than whatever the path holds
+         a moment later;
+      3  the prior destination is preserved as a rollback asset BEFORE anything
+         is replaced;
+      4  the atomic replace happens;
+      5  the destination raw bytes are compared to the exact candidate;
+      6  on ANY mismatch or error after the replace, the prior is restored and
+         byte-verified -- or its ABSENCE is restored when there was no prior;
+      7  UNKNOWN is reported only when the rollback itself cannot be verified,
+         and the asset is retained.
+
+    Note on what step 2 does NOT prove: holding the temp handle open does not pin
+    identity through a path-based rename, because another process could rename
+    the held file away and create a new one at the same leaf. chatgpt-codex-desktop
+    corrected me on that. The guarantee here comes from step 5 - comparing the
+    DESTINATION bytes after the fact - and from step 6 making every failure
+    recoverable, not from the handle.
+  #>
+  param([Parameter(Mandatory = $true)][byte[]]$Bytes, [Parameter(Mandatory = $true)][string]$Path)
   $Path = Resolve-StatePath $Path
+  $bak = Get-StateBackupPath $Path
   $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
   $ErrorActionPreference = 'Stop'
-  $bad = Test-StateInvariants -State $State
-  if ($bad) { return @{ ok = $false; reason = ('refusing to persist an invalid state: ' + $bad) } }
+  if ($Bytes.Length -gt $script:WATCH_MAX_BYTES) {
+    return @{ ok = $false; unknown = $false; reason = ('candidate state is ' + $Bytes.Length + ' bytes, over the bound') }
+  }
+  $want = Get-BytesHash -Bytes $Bytes
+  $hadPrior = $false
+  $prior = $null
   try {
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
-    $obj = [ordered]@{
-      schema = $script:WATCH_SCHEMA
-      savedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-      boardId = [string]$State.boardId
-      lastIndex = [int]$State.lastIndex
-      anchorId = [string]$State.anchorId
-      lastEmitKey = [string]$State.lastEmitKey
-      lastEmitTs = [string]$State.lastEmitTs
-      pendingIndex = [int]$State.pendingIndex
-      pendingAnchor = [string]$State.pendingAnchor
-      pendingLines = @($State.pendingLines)
-      pendingRowIds = @($State.pendingRowIds)
-      planFrom = [int]$State.planFrom
-      planMode = [string]$State.planMode
-      planLimit = [int]$State.planLimit
-      planEmitKey = [string]$State.planEmitKey
-      planEmitTs = [string]$State.planEmitTs
-      resetAt = [string]$State.resetAt
-    }
-    $json = $obj | ConvertTo-Json -Depth 5 -Compress
-    $stream = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try { $b = [System.Text.Encoding]::UTF8.GetBytes($json); $stream.Write($b, 0, $b.Length); $stream.Flush($true) }
-    finally { $stream.Dispose() }
 
-    $pre = Read-WatchState -Path $tmp
-    $want = Get-WatchStateDigest -State $State
-    if (-not $pre.state -or (Get-WatchStateDigest -State $pre.state) -ne $want) {
-      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-      return @{ ok = $false; reason = ('the written state did not verify (' + $pre.reason + '); the previous cursor is untouched') }
-    }
+    # 2. write and verify through the same handle
+    $fs = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+      $fs.Write($Bytes, 0, $Bytes.Length)
+      $fs.Flush($true)
+      $fs.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+      $back = New-Object byte[] $Bytes.Length
+      $read = 0
+      while ($read -lt $Bytes.Length) {
+        $n = $fs.Read($back, $read, $Bytes.Length - $read)
+        if ($n -le 0) { break }
+        $read += $n
+      }
+      if ($read -ne $Bytes.Length -or -not (Test-BytesEqual -A $back -B $Bytes) -or $fs.Length -ne $Bytes.Length) {
+        return @{ ok = $false; unknown = $false; reason = 'the candidate did not read back from its own handle; the destination is untouched' }
+      }
+    } finally { $fs.Dispose() }
+
+    # 3. preserve the prior as a recoverable asset
     if (Test-Path -LiteralPath $Path) {
+      $hadPrior = $true
+      $prior = [System.IO.File]::ReadAllBytes($Path)
+      [System.IO.File]::WriteAllBytes($bak, $prior)
+      if (-not (Test-BytesEqual -A ([System.IO.File]::ReadAllBytes($bak)) -B $prior)) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return @{ ok = $false; unknown = $false; reason = 'could not preserve the previous cursor before replacing it; nothing was changed' }
+      }
+    }
+
+    # 4. replace
+    if ($hadPrior) {
       if ($script:WATCH_IS_WINDOWS) { [Sfdc24.AtomicFile]::ReplaceAtomic($tmp, $Path) }
       else { [System.IO.File]::Move($tmp, $Path, $true) }
-    } else { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
+    } else {
+      Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    }
 
-    $post = Read-WatchState -Path $Path
-    if (-not $post.state) { return @{ ok = $false; reason = ('state did not read back: ' + $post.reason) } }
-    if ((Get-WatchStateDigest -State $post.state) -ne $want) { return @{ ok = $false; reason = 'state read back differently' }  }
-    return @{ ok = $true; reason = '' }
+    # 5. bind the destination to the exact candidate bytes
+    $got = [System.IO.File]::ReadAllBytes($Path)
+    if ((Test-BytesEqual -A $got -B $Bytes) -and ((Get-BytesHash -Bytes $got) -eq $want)) {
+      if ($hadPrior) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+      return @{ ok = $true; unknown = $false; reason = '' }
+    }
+    return (Restore-PriorState -Path $Path -Backup $bak -HadPrior $hadPrior -Prior $prior `
+              -Because 'the destination did not match the exact candidate bytes after replacement')
   } catch {
+    $why = 'could not persist state: ' + $_.Exception.Message
     try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
-    return @{ ok = $false; reason = ('could not persist state: ' + $_.Exception.Message) }
+    if (-not $hadPrior -and -not (Test-Path -LiteralPath $Path)) {
+      return @{ ok = $false; unknown = $false; reason = $why }
+    }
+    return (Restore-PriorState -Path $Path -Backup $bak -HadPrior $hadPrior -Prior $prior -Because $why)
   }
+}
+
+function Restore-PriorState {
+  # Put back exactly what was there, or put back its ABSENCE, and prove it. The
+  # rollback asset is only removed once the restore has been verified.
+  param([string]$Path, [string]$Backup, [bool]$HadPrior, [byte[]]$Prior, [string]$Because)
+  try {
+    if ($HadPrior) {
+      [System.IO.File]::WriteAllBytes($Path, $Prior)
+      if (Test-BytesEqual -A ([System.IO.File]::ReadAllBytes($Path)) -B $Prior) {
+        Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+        return @{ ok = $false; unknown = $false; reason = ($Because + '; the previous cursor was restored and verified byte for byte') }
+      }
+      return @{ ok = $false; unknown = $true
+                reason = ($Because + '; the previous cursor could NOT be verified after restore: state UNKNOWN. The rollback asset is retained at ' + $Backup) }
+    }
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    if (Test-Path -LiteralPath $Path) {
+      return @{ ok = $false; unknown = $true; reason = ($Because + '; there was no previous cursor and the new one could not be removed: state UNKNOWN') }
+    }
+    return @{ ok = $false; unknown = $false; reason = ($Because + '; there was no previous cursor, and its absence was restored') }
+  } catch {
+    return @{ ok = $false; unknown = $true
+              reason = ($Because + '; rolling back also failed (' + $_.Exception.Message + '): state UNKNOWN. Any rollback asset is retained.') }
+  }
+}
+
+function Save-WatchState {
+  # Serializes ONCE, then delegates to the single verified transition.
+  param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$Path)
+  $bad = Test-StateInvariants -State $State
+  if ($bad) { return @{ ok = $false; unknown = $false; reason = ('refusing to persist an invalid state: ' + $bad) } }
+  $obj = [ordered]@{
+    schema = $script:WATCH_SCHEMA
+    savedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    boardId = [string]$State.boardId
+    lastIndex = [int]$State.lastIndex
+    anchorId = [string]$State.anchorId
+    lastEmitKey = [string]$State.lastEmitKey
+    lastEmitTs = [string]$State.lastEmitTs
+    pendingIndex = [int]$State.pendingIndex
+    pendingAnchor = [string]$State.pendingAnchor
+    pendingLines = @($State.pendingLines)
+    pendingRowIds = @($State.pendingRowIds)
+    planFrom = [int]$State.planFrom
+    planMode = [string]$State.planMode
+    planLimit = [int]$State.planLimit
+    planEmitKey = [string]$State.planEmitKey
+    planEmitTs = [string]$State.planEmitTs
+    resetAt = [string]$State.resetAt
+  }
+  $json = $obj | ConvertTo-Json -Depth 5 -Compress
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+  return (Save-StateBytes -Bytes $bytes -Path $Path)
 }
 
 function Test-BoardContinuity {

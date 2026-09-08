@@ -81,6 +81,12 @@ if (-not $lock.ok) { throw ("Fleet watch CANNOT START - " + $lock.reason) }
 $ResetRequested = [bool]$Reset
 $ResetDone = $false
 
+$pendingTx = Test-PendingTransition -Path $StateFile
+if ($pendingTx.pending) {
+  Exit-WatchLock $lock
+  throw ("Fleet watch CANNOT START - " + $pendingTx.reason)
+}
+
 $loaded = Read-WatchState -Path $StateFile
 if ($loaded.disposition -eq 'unusable' -and -not $ResetRequested) {
   Exit-WatchLock $lock
@@ -249,31 +255,18 @@ try {
     }
 
     if ($ResetRequested -and -not $ResetDone) {
-      # A TRANSITION. Prior bytes are kept until the new cursor lands, and the
-      # restore outcome is computed as DATA. The previous version used thrown
-      # exceptions as branch control inside the recovery block, and a .NET IO
-      # failure is wrapped in RuntimeException -- so the rethrow branch swallowed
-      # it and the UNKNOWN receipt was unreachable.
-      $prior = $null
-      try { if (Test-Path -LiteralPath $StateFile) { $prior = [System.IO.File]::ReadAllBytes($StateFile) } } catch { $prior = $null }
+      # Reset uses THE SAME verified transition as every other write. It used
+      # to hand-roll its own WriteAllBytes restore, which was a second and weaker
+      # writer, and its recovery branch used thrown exceptions as control flow so
+      # a .NET IO failure took the rethrow path and the UNKNOWN receipt was
+      # unreachable. Save-StateBytes preserves and restores the prior itself.
       $fresh = New-WatchState
       $fresh.boardId = $boardId
       $fresh.resetAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
       $fresh = Set-CommittedCursor -State $fresh -Rows $rows -Index $lastData
       $rs = Save-WatchState -State $fresh -Path $StateFile
       if (-not $rs.ok) {
-        $verdict = 'there was no previous cursor to lose'
-        if ($null -ne $prior) {
-          $verdict = 'the previous cursor could NOT be verified after restore: state UNKNOWN'
-          try {
-            [System.IO.File]::WriteAllBytes($StateFile, $prior)
-            $check = [System.IO.File]::ReadAllBytes($StateFile)
-            $same = ($check.Length -eq $prior.Length)
-            if ($same) { for ($k = 0; $k -lt $check.Length; $k++) { if ($check[$k] -ne $prior[$k]) { $same = $false; break } } }
-            if ($same) { $verdict = 'the previous cursor was restored and verified byte for byte' }
-          } catch { $verdict = 'restoring the previous cursor also failed: state UNKNOWN' }
-        }
-        throw ("Fleet watch RESET FAILED - " + $rs.reason + ". " + $verdict + ".")
+        throw ("Fleet watch RESET FAILED - " + $rs.reason + ".")
       }
       $state = $fresh
       $ResetDone = $true
