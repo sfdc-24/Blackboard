@@ -7,7 +7,10 @@ from bus import load_env, read_board
 
 
 def field(payload, key):
-    m = re.search(r"\|" + key + r"=([^|]*)", payload)
+    # Sheet cells are not guaranteed to be strings: an empty payload comes back
+    # as None and a numeric-looking one as a float, both of which make re.search
+    # raise TypeError and take the whole summary down over one odd row.
+    m = re.search(r"\|" + key + r"=([^|]*)", str(payload or ""))
     return (m.group(1).strip() if m else "")[:90]
 
 

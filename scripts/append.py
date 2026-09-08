@@ -16,8 +16,18 @@ TITLE = "Blackboard - Alpha DB"
 
 
 def main():
+    if len(sys.argv) < 2:
+        raise SystemExit(
+            "usage: python scripts/append.py <row.json>\n"
+            "The JSON object needs: row_id, payload, and optionally source_tag,\n"
+            "target_surface, action_type, category, project_tag, gist, subgist."
+        )
     env = load_env()
-    spec = json.load(open(sys.argv[1], encoding="utf-8"))
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        spec = json.load(fh)
+    for required in ("row_id", "payload"):
+        if not spec.get(required):
+            raise SystemExit(f"{sys.argv[1]} is missing required field: {required}")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     row = [
         spec["row_id"],
