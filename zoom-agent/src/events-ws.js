@@ -17,6 +17,7 @@ export class ZoomEventSocket {
     this.recycleTimer = null;
     this.attempts = 0;
     this.intentionalClose = false;
+    this.recycling = false;
   }
 
   async connect() {
@@ -27,24 +28,46 @@ export class ZoomEventSocket {
     const url = `${base}${base.includes('?') ? '&' : '?'}access_token=${token}`;
 
     this.intentionalClose = false;
-    this.ws = new WebSocket(url);
+    const ws = new WebSocket(url);
+    this.ws = ws;
 
-    this.ws.on('open', () => {
+    ws.on('open', () => {
+      if (ws !== this.ws) return;
       this.attempts = 0;
       console.log('[events] connected to Zoom event socket');
       this.startPing();
       this.scheduleTokenRecycle();
     });
 
-    this.ws.on('message', (raw) => this.handleMessage(raw));
+    ws.on('message', (raw) => {
+      if (ws !== this.ws) return;
+      this.handleMessage(raw);
+    });
 
-    this.ws.on('close', (code, reason) => {
+    ws.on('close', (code, reason) => {
+      // A superseded socket must not touch shared state. Without this guard the
+      // OLD socket's close handler runs after connect() has already installed a
+      // NEW socket, and stopTimers() then kills the NEW keep-alive and recycle
+      // timers while scheduleReconnect() opens a second connection.
+      if (ws !== this.ws) return;
       console.log(`[events] closed: ${code} ${reason?.toString() ?? ''}`);
       this.stopTimers();
+
+      if (this.recycling) {
+        // Planned token recycle: reconnect now that the socket is genuinely
+        // closed, rather than racing its close event.
+        this.recycling = false;
+        this.connect().catch((err) => {
+          console.error('[events] token-recycle reconnect failed:', err.message);
+          this.scheduleReconnect();
+        });
+        return;
+      }
       if (!this.intentionalClose) this.scheduleReconnect();
     });
 
-    this.ws.on('error', (err) => {
+    ws.on('error', (err) => {
+      if (ws !== this.ws) return;
       console.error('[events] socket error:', err.message);
       // 'close' fires next; reconnect is handled there.
     });
@@ -105,12 +128,11 @@ export class ZoomEventSocket {
     clearTimeout(this.recycleTimer);
     this.recycleTimer = setTimeout(() => {
       console.log('[events] recycling connection with a fresh access token');
+      // Hand the reconnect to the close handler. Calling connect() here races
+      // the old socket's close event and produces two sockets with no timers.
+      this.recycling = true;
       this.intentionalClose = true;
       this.ws?.close(1000);
-      this.connect().catch((err) => {
-        console.error('[events] reconnect failed:', err.message);
-        this.scheduleReconnect();
-      });
     }, TOKEN_RECYCLE_MS);
   }
 
@@ -127,6 +149,9 @@ export class ZoomEventSocket {
 
   close() {
     this.intentionalClose = true;
+    // Clear a pending recycle too, or SIGINT during the recycle window would
+    // close the socket and then dutifully reconnect it on the way out.
+    this.recycling = false;
     this.stopTimers();
     this.ws?.close(1000);
   }

@@ -12,16 +12,16 @@ import { handleZoomEvent } from './rtms.js';
 
 const socket = new ZoomEventSocket(handleZoomEvent);
 
-let connecting = false;
-async function connectEventSocket() {
-  if (connecting) return;
-  connecting = true;
-  try {
-    await socket.connect();
-  } catch (err) {
-    connecting = false;
-    throw err;
-  }
+// A promise guard, not a boolean. The boolean version was set on entry and only
+// cleared on failure, so after the first SUCCESSFUL connect it stayed true
+// forever and every later call returned silently — including the one the OAuth
+// callback makes after a re-authorization. Concurrent callers still share one
+// attempt; sequential callers can retry.
+let connecting = null;
+function connectEventSocket() {
+  if (connecting) return connecting;
+  connecting = socket.connect().finally(() => { connecting = null; });
+  return connecting;
 }
 
 startOAuthServer(() => {

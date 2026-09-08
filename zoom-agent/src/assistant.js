@@ -64,7 +64,14 @@ function detectTrigger(line, session) {
   const hit = config.wakeWords.find((w) => lower.includes(w));
   if (hit) {
     // Strip the wake word so the question reads naturally to the backend.
-    const question = line.replace(new RegExp(hit, 'i'), '').replace(/^[\s,:.–—-]+/, '').trim();
+    // Deliberately NOT a RegExp: wake words are operator-supplied, and one
+    // containing a metacharacter would either mis-match ("sfdc24.com" matching
+    // "sfdc24Xcom") or throw and take transcript processing down with it.
+    // indexOf/slice cannot do either.
+    const at = lower.indexOf(hit);
+    const question = (line.slice(0, at) + line.slice(at + hit.length))
+      .replace(/^[\s,:.–—-]+/, '')
+      .trim();
     return { kind: 'wake', question: question || line };
   }
 
