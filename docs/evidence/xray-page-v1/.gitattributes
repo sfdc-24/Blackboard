@@ -1,4 +1,4 @@
-# index.html here is a byte-exact copy of a file delivered by another surface and
+# index.html here is a byte-exact copy of a file built by another surface and
 # attested by sha256 (see docs/SITE-XRAY-PAGE.md). Disable text conversion so the
 # committed blob keeps the LF-only bytes the digest was taken over; core.autocrlf
 # must not rewrite it on checkout or on a later re-commit.
