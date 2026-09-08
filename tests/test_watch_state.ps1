@@ -573,15 +573,25 @@ Assert-True 'and no evidence was left behind' (@(Get-TxAssets -Path $p26).Count 
 
 Write-Output ''
 Write-Output 'CASE 27 - a blocked cleanup is COMMITTED, not clean, and bars the next transition'
-$p27 = Join-Path $rxDir 'cleanup.json'
+# The delete has to be refused BY THE OS, and the two platforms refuse it in
+# different ways. On Windows an open handle with FileShare::None blocks it. On
+# POSIX an open handle does NOT - unlink on an open file is legal - so the
+# directory is made unwritable instead. Using only the Windows mechanism is how
+# this case passed here and failed on the ubuntu leg of CI.
+$blockDir = Join-Path $rxDir 'blocked'
+New-Item -ItemType Directory -Path $blockDir -Force | Out-Null
+$p27 = Join-Path $blockDir 'cleanup.json'
 [System.IO.File]::WriteAllBytes($p27, $prior1)
 $script:HeldAsset = $null
 $script:WatchTestHook = {
   param($Name, $Ctx)
   if ($Name -eq 'BeforeAssetCleanup') {
-    # an ordinary AV / indexer / backup handle: open with no sharing
-    $script:HeldAsset = New-Object System.IO.FileStream($Ctx.AssetPath,
-      [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    if ($script:WATCH_IS_WINDOWS) {
+      $script:HeldAsset = New-Object System.IO.FileStream($Ctx.AssetPath,
+        [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    } else {
+      & chmod 'a-w' (Split-Path -Parent $Ctx.AssetPath) | Out-Null
+    }
   }
 }
 try {
@@ -599,8 +609,9 @@ Assert-True 'a SECOND transition is refused while the asset survives' ($r27b.ok 
 Assert-True 'and the refusal names the unresolved transition' ($r27b.reason -match 'refusing to start a transition')
 Assert-True 'the destination was not touched by the refused save' ((Read-WatchState -Path $p27).state.lastIndex -eq 3)
 
-# release the handle: startup now self-heals, because the destination PROVES it
+# release the block: startup now self-heals, because the destination PROVES it
 if ($script:HeldAsset) { $script:HeldAsset.Dispose(); $script:HeldAsset = $null }
+if (-not $script:WATCH_IS_WINDOWS) { & chmod 'u+w' $blockDir | Out-Null }
 $r27c = Resolve-PendingTransition -Path $p27
 Assert-True 'once released, recovery proves it completed' ($r27c.status -eq 'completed') ([string]$r27c.status)
 Assert-True 'and the watcher may proceed' ($r27c.canProceed -eq $true)

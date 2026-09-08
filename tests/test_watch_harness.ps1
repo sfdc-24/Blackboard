@@ -343,7 +343,12 @@ Write-Output '=== a blocked cleanup stops a REAL watcher, and a later start self
 
 $hb = Join-Path $root 'heal.json'
 New-BoardFile -Path $hb -Count 3
-$hs = Join-Path $root 'heal.state.json'
+# Its OWN directory: the POSIX way to refuse a delete is to make the containing
+# directory unwritable, and $root also holds the harness's stdout redirect files
+# and the stub board, which must stay writable.
+$healDir = Join-Path $root 'heal'
+New-Item -ItemType Directory -Path $healDir -Force | Out-Null
+$hs = Join-Path $healDir 'heal.state.json'
 
 $h1 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @() -BoardFile $hb -StatePath $hs
 Assert-True 'the watcher primes normally' ($h1.exit -eq 0) $h1.out
@@ -362,14 +367,28 @@ $asset = Get-TxAssetPath -Path $hs -CandidateHash (Get-BytesHash -Bytes $candByt
                          -PriorHash (Get-BytesHash -Bytes $priorBytes)
 [System.IO.File]::WriteAllBytes($asset, $priorBytes)
 
-$held = New-Object System.IO.FileStream($asset, [System.IO.FileMode]::Open,
-          [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+# Windows refuses the unlink through an open handle with no sharing; POSIX does
+# not, because unlink on an open file is legal there, so the directory is made
+# unwritable instead. The watcher must still be able to TAKE its lock, and
+# opening an EXISTING file in an unwritable directory is allowed, so the lock is
+# pre-created before the permission is removed.
+$held = $null
+if ($script:WATCH_IS_WINDOWS) {
+  $held = New-Object System.IO.FileStream($asset, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+} else {
+  $lockPath = $hs + '.lock'
+  if (-not (Test-Path -LiteralPath $lockPath)) { New-Item -ItemType File -Path $lockPath | Out-Null }
+  & chmod 'a-w' $healDir | Out-Null
+}
 try {
   $h3 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $hb -StatePath $hs
-  Assert-True 'while the asset is locked the real watcher REFUSES to start' ($h3.exit -ne 0) $h3.out
+  Assert-True 'while the asset cannot be deleted the real watcher REFUSES to start' ($h3.exit -ne 0) $h3.out
   Assert-True 'and says so rather than failing silently' ($h3.out -match 'CANNOT START') $h3.out
   Assert-True 'and it did not delete the evidence' (Test-Path -LiteralPath $asset)
-} finally { $held.Dispose() }
+} finally {
+  if ($held) { $held.Dispose() } else { & chmod 'u+w' $healDir | Out-Null }
+}
 
 $h4 = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $hb -StatePath $hs
 Assert-True 'once the block is released the real watcher self-heals' ($h4.exit -eq 0) $h4.out
