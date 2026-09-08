@@ -46,8 +46,14 @@ USAGE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fleet_watch.ps1 -Reset
 #>
 param(
+  # Same guards e800def put on the other operator helpers. A helper that accepts
+  # an unbounded poll interval can be told to hammer the board or to sleep for a
+  # year, and a tag is a board identity rather than free text.
+  [ValidatePattern('^[a-z0-9][a-z0-9._-]{0,39}$')]
   [string]$Tag = 'claude-code-cli',
+  [ValidateRange(5, 3600)]
   [int]$PollSeconds = 90,
+  [ValidateRange(0, 100)]
   [int]$CatchUpMax = 6,
   [switch]$IncludeCc,
   [string]$StateFile,
@@ -189,6 +195,9 @@ function Format-Line {
 }
 
 $primed = $warm
+# try/finally so the board snapshot in $env:TEMP is not left behind when the
+# watcher is stopped. Same reason as wa_watch.ps1.
+try {
 while ($true) {
   $board = Read-Board
   if ($board -and $board.rows) {
@@ -241,4 +250,7 @@ while ($true) {
 
   if ($Once) { break }
   Start-Sleep -Seconds $PollSeconds
+}
+} finally {
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
