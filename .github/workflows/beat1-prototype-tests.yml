@@ -14,6 +14,7 @@ on:
       - "scripts/fleet_watch.ps1"
       - "scripts/watch_state.ps1"
       - "tests/test_watch_state.ps1"
+      - "tests/test_watch_harness.ps1"
       - ".github/workflows/beat1-prototype-tests.yml"
 
 permissions:
@@ -46,3 +47,6 @@ jobs:
       - name: Watcher watermark state (PowerShell, offline)
         shell: pwsh
         run: pwsh -NoProfile -File tests/test_watch_state.ps1
+      - name: Real watcher entrypoints against a stub bus (PowerShell, offline)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/test_watch_harness.ps1

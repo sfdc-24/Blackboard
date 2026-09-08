@@ -65,8 +65,20 @@ function Commit-At {
   param($Rows, [int]$Index, [string]$Id = $BoardFileId)
   $s = New-WatchState
   $s.boardId = $Id
-  $s = Set-WatchOutbox -State $s -Rows $Rows -Index $Index -Lines @() -RowIds @()
-  return (Complete-WatchOutbox -State $s)
+  return (Set-CommittedCursor -State $s -Rows $Rows -Index $Index)
+}
+function Stage-At {
+  # Stage an outbox the way a watcher does: a plan of line/rowIndex/rowId.
+  param($Rows, [int]$Index, [string[]]$Lines, [string[]]$RowIds, [string]$Id = $BoardFileId, [int]$From = 0)
+  $s = New-WatchState
+  $s.boardId = $Id
+  if ($From -ge 1) { $s = Set-CommittedCursor -State $s -Rows $Rows -Index $From }
+  $plan = @()
+  for ($i = 0; $i -lt @($Lines).Count; $i++) {
+    $plan += ,@{ line = $Lines[$i]; rowIndex = $Index; rowId = @($RowIds)[$i] }
+  }
+  $r = Set-WatchOutbox -State $s -Rows $Rows -Plan $plan -FallbackIndex $Index
+  return $r.state
 }
 
 try {
@@ -112,7 +124,7 @@ Assert-True 'and says the identity was missing' ($c7.reason -match 'no identity'
 Write-Output ''
 Write-Output 'CASE 5 - corrupt, empty, truncated and stale-schema state'
 $bad = Join-Path $tmpDir 'bad.json'
-Set-Content -LiteralPath $bad -Value '{"schema":3,"lastIndex":5' -Encoding UTF8
+Set-Content -LiteralPath $bad -Value '{"schema":4,"lastIndex":5' -Encoding UTF8
 $r1 = Read-WatchState -Path $bad
 Assert-True 'a truncated file yields no state, with a reason' (($null -eq $r1.state) -and $r1.reason) $r1.reason
 Set-Content -LiteralPath $bad -Value '' -Encoding UTF8
@@ -121,8 +133,8 @@ Set-Content -LiteralPath $bad -Value '{"seenIds":["a","b"]}' -Encoding UTF8
 $r3 = Read-WatchState -Path $bad
 Assert-True 'the v0 id-set format is refused, not misread' ($null -eq $r3.state)
 Assert-True 'and reported as a schema difference' ($r3.reason -match 'schema') $r3.reason
-Set-Content -LiteralPath $bad -Value '{"schema":2,"boardId":"b","lastIndex":3,"anchorId":"a"}' -Encoding UTF8
-Assert-True 'the v2 format is refused too' ($null -eq (Read-WatchState -Path $bad).state)
+Set-Content -LiteralPath $bad -Value '{"schema":3,"boardId":"b","lastIndex":3,"anchorId":"a"}' -Encoding UTF8
+Assert-True 'the v3 format is refused too' ($null -eq (Read-WatchState -Path $bad).state)
 $r5 = Read-WatchState -Path (Join-Path $tmpDir 'absent.json')
 Assert-True 'a missing file is simply a cold start, with no alarm' (($null -eq $r5.state) -and (-not $r5.reason))
 
@@ -168,9 +180,7 @@ Assert-True 'an undateable row is never collapsed' `
 
 Write-Output ''
 Write-Output 'CASE 10 - the OUTBOX: a crash between persist and emit loses nothing'
-$ob = New-WatchState
-$ob.boardId = $BoardFileId
-$ob = Set-WatchOutbox -State $ob -Rows $board2 -Index 501 -Lines @('line one','line two') -RowIds @('r501','late')
+$ob = Stage-At -Rows $board2 -Index 501 -Lines @('line one','line two') -RowIds @('r501','r500')
 $p10 = Join-Path $tmpDir 'c10.json'
 $stage = Save-WatchState -State $ob -Path $p10
 Assert-True 'staging the outbox reports success' ($stage.ok -eq $true) $stage.reason
@@ -190,7 +200,7 @@ Assert-True 'a second start after a clean commit replays nothing' `
 
 Write-Output ''
 Write-Output 'CASE 10b - a failed COMMIT retains the outbox rather than dropping it'
-$keep = Set-WatchOutbox -State (Commit-At -Rows $board2 -Index 500) -Rows $board2 -Index 501 -Lines @('kept') -RowIds @('r501')
+$keep = Stage-At -Rows $board2 -Index 501 -Lines @('kept') -RowIds @('r501') -From 500
 $bad2 = Save-WatchState -State $keep -Path (Join-Path $blocker 'nope.json')
 Assert-True 'the failed save reports ok=false' ($bad2.ok -eq $false) $bad2.reason
 Assert-True 'and the in-memory outbox is still present to retry' (Test-HasOutbox -State $keep)
@@ -242,6 +252,26 @@ $rangeCount = @(($n - 0)..($n - 1)).Count
 Assert-True 'and the arithmetic really does produce 2 indices, not 0' ($rangeCount -eq 2) ('count=' + $rangeCount)
 
 Write-Output ''
+Write-Output 'CASE 14b - a hollow pending block is UNUSABLE, not merely ignored'
+# A schema state with pendingIndex 5, no anchor and empty arrays used to read as
+# ok, replay nothing, and then advance the cursor to row 5 leaving the anchor
+# blank -- skipping five rows and unanchoring the cursor. The invariants are now
+# enforced at the read boundary rather than by each caller remembering.
+$hollow = Join-Path $tmpDir 'hollow.json'
+Set-Content -LiteralPath $hollow -Value '{"schema":4,"boardId":"b","lastIndex":0,"anchorId":"","lastEmitKey":"","lastEmitTs":"","pendingIndex":5,"pendingAnchor":"","pendingLines":[],"pendingRowIds":[],"resetAt":""}' -Encoding UTF8
+$hv = Read-WatchState -Path $hollow
+Assert-True 'a hollow pending block is refused' ($hv.disposition -eq 'unusable') ([string]$hv.disposition)
+Assert-True 'and names the missing anchor' ($hv.reason -match 'anchor') $hv.reason
+
+Write-Output ''
+Write-Output 'CASE 14c - a safe-leaf allowlist, for every caller'
+foreach ($bad4 in @('a/b', '..', 'x..y', ('C:' + [System.IO.Path]::DirectorySeparatorChar + 'w'))) {
+  $t = Test-SafeLeaf -Leaf $bad4
+  Assert-True ('rejects leaf ' + $bad4) ($t.ok -eq $false) $t.reason
+}
+Assert-True 'accepts a plain safe name' ((Test-SafeLeaf -Leaf 'fleet_watch.claude-code-cli.state.json').ok -eq $true)
+
+Write-Output ''
 Write-Output 'CASE 15 - ABSENT is not UNUSABLE, and only ABSENT may prime'
 # The repair for chatgpt-codex-desktop's e7440a8 finding 1. A corrupt file used
 # to yield a NOTICE and then a cold prime, silently skipping every row in the
@@ -269,10 +299,7 @@ Write-Output ''
 Write-Output 'CASE 16 - a retained outbox is validated BEFORE it is replayed'
 # finding 2: the replay ran first and Complete-WatchOutbox then overwrote the
 # stored board id, disarming the identity check that should have refused it.
-$cross = New-WatchState
-$cross.boardId = 'board-A'
-$cross.lastIndex = 1; $cross.anchorId = 'r1'
-$cross = Set-WatchOutbox -State $cross -Rows $board2 -Index 2 -Lines @('board-A line') -RowIds @('r2')
+$cross = Stage-At -Rows $board2 -Index 2 -Lines @('board-A line') -RowIds @('r2') -Id 'board-A' -From 1
 $pv1 = Test-PendingIsValid -State $cross -Rows $board2 -BoardId 'board-B'
 Assert-True 'an outbox from another board is refused' ($pv1.ok -eq $false)
 Assert-True 'and names the board it belongs to' ($pv1.reason -match 'board-A') $pv1.reason
@@ -281,22 +308,18 @@ Assert-True 'an unidentified board refuses the replay too' ($pv2.ok -eq $false) 
 $moved = Test-PendingIsValid -State $cross -Rows (New-Board -Count 600 -Prefix 'q') -BoardId 'board-A'
 Assert-True 'a moved pending anchor is refused' ($moved.ok -eq $false)
 Assert-True 'and names the anchor move' ($moved.reason -match 'anchor moved') $moved.reason
-$oob = New-WatchState; $oob.boardId = 'board-A'
-$oob = Set-WatchOutbox -State $oob -Rows $board2 -Index 2 -Lines @('x') -RowIds @('r2')
+$oob = Stage-At -Rows $board2 -Index 2 -Lines @('x') -RowIds @('r2') -Id 'board-A' -From 1
 $oob.pendingIndex = 9999
 Assert-True 'an out-of-bounds pending index is refused' ((Test-PendingIsValid -State $oob -Rows $board2 -BoardId 'board-A').ok -eq $false)
-$ghost = New-WatchState; $ghost.boardId = 'board-A'
-$ghost = Set-WatchOutbox -State $ghost -Rows $board2 -Index 3 -Lines @('x') -RowIds @('no-such-row')
+$ghost = Stage-At -Rows $board2 -Index 3 -Lines @('x') -RowIds @('no-such-row') -Id 'board-A' -From 1
 $gv = Test-PendingIsValid -State $ghost -Rows $board2 -BoardId 'board-A'
 Assert-True 'pending lines referring to a vanished row are refused' ($gv.ok -eq $false) $gv.reason
-$good = New-WatchState; $good.boardId = $BoardFileId
-$good = Set-WatchOutbox -State $good -Rows $board2 -Index 3 -Lines @('x') -RowIds @('r2','r3')
+$good = Stage-At -Rows $board2 -Index 3 -Lines @('x','y') -RowIds @('r2','r3') -From 1
 Assert-True 'a valid outbox for this board passes' ((Test-PendingIsValid -State $good -Rows $board2 -BoardId $BoardFileId).ok -eq $true)
 
 Write-Output ''
 Write-Output 'CASE 17 - Complete-WatchOutbox cannot touch identity'
-$idt = New-WatchState; $idt.boardId = 'board-A'
-$idt = Set-WatchOutbox -State $idt -Rows $board2 -Index 2 -Lines @('l') -RowIds @('r2')
+$idt = Stage-At -Rows $board2 -Index 2 -Lines @('l') -RowIds @('r2') -Id 'board-A' -From 1
 $after2 = Complete-WatchOutbox -State $idt
 Assert-True 'the stored identity is unchanged by committing' ($after2.boardId -eq 'board-A') $after2.boardId
 foreach ($f in @('scripts/watch_state.ps1', 'scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
@@ -309,12 +332,22 @@ Write-Output ''
 Write-Output 'CASE 18 - read-back compares every field, not counts and indexes'
 # A pending line whose TEXT was corrupted used to read back as a successful
 # save, and those lines are the exact words shown to Mr. Salam on replay.
-$d1 = New-WatchState; $d1.boardId = 'b'; $d1.lastIndex = 2; $d1.anchorId = 'a'
-$d1 = Set-WatchOutbox -State $d1 -Rows $board2 -Index 3 -Lines @('the real line') -RowIds @('r3')
-$d2 = New-WatchState; $d2.boardId = 'b'; $d2.lastIndex = 2; $d2.anchorId = 'a'
-$d2 = Set-WatchOutbox -State $d2 -Rows $board2 -Index 3 -Lines @('a DIFFERENT line') -RowIds @('r3')
+$d1 = Stage-At -Rows $board2 -Index 3 -Lines @('the real line') -RowIds @('r3') -Id 'b' -From 2
+$d2 = Stage-At -Rows $board2 -Index 3 -Lines @('a DIFFERENT line') -RowIds @('r3') -Id 'b' -From 2
 Assert-True 'same counts and indexes but different text yields a different digest' `
   ((Get-WatchStateDigest -State $d1) -ne (Get-WatchStateDigest -State $d2))
+# The previous digest joined with a separator, so ONE element containing that
+# character hashed identically to TWO elements, and one empty string hashed
+# identically to an empty array. Length prefixes remove both collisions.
+$col1 = Stage-At -Rows $board2 -Index 3 -Lines @(('left' + [char]31 + 'right')) -RowIds @('r3') -Id 'b' -From 2
+$col2 = Stage-At -Rows $board2 -Index 3 -Lines @('left','right') -RowIds @('r3','r3') -Id 'b' -From 2
+Assert-True 'one element containing the old separator no longer collides with two' `
+  ((Get-WatchStateDigest -State $col1) -ne (Get-WatchStateDigest -State $col2))
+$e1 = Commit-At -Rows $board2 -Index 3
+$e2 = Commit-At -Rows $board2 -Index 3
+$e2.pendingLines = @()
+Assert-True 'an empty array is not confused with an empty string' `
+  ((Get-WatchStateDigest -State $e1) -eq (Get-WatchStateDigest -State $e2))
 Assert-True 'and an identical state yields an identical digest' `
   ((Get-WatchStateDigest -State $d1) -eq (Get-WatchStateDigest -State $d1))
 $d3 = Set-WatchEmitted -State (Commit-At -Rows $board2 -Index 3) -Key 'k' -RowTs '2026-09-08T00:00:00Z'
@@ -330,7 +363,6 @@ $orig = Commit-At -Rows $board2 -Index 4
 [void](Save-WatchState -State $orig -Path $keepPath)
 $before = Get-Content -LiteralPath $keepPath -Raw
 $huge = Commit-At -Rows $board2 -Index 5
-$huge.anchorId = ('x' * 10)
 [void](Save-WatchState -State $huge -Path (Join-Path $blocker 'cannot.json'))
 $afterBytes = Get-Content -LiteralPath $keepPath -Raw
 Assert-True 'an unrelated failed save did not disturb the good file' ($before -eq $afterBytes)

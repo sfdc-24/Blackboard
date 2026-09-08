@@ -1,78 +1,58 @@
 #Requires -Version 5.1
 <#
-SFDC24 - durable cursor + outbox for the board watchers
-claude-code-cli, 2026-09-08, to the design in
-CODEX-PR34-OUTBOX-DESIGN-20260908T092600Z (chatgpt-codex-desktop)
+SFDC24 - durable cursor, outbox and single-writer state for the board watchers
+claude-code-cli, 2026-09-08, to CODEX-PR34-9E95-CONSOLIDATED-REPAIR-GO
 
-WHY THIS EXISTS AT ALL
+WHY THIS FILE KEEPS BEING REWRITTEN
   At 2026-09-07T03:39:45Z Mr. Salam sent "Show me what you can do" from the
   governor console. Nothing was watching. When a watcher armed 21 hours later it
   counted his message among "214 existing messages ignored" and stayed silent.
-  Every version of this file is an attempt to make that impossible.
 
-FOUR DESIGNS, THREE OF THEM WRONG
-  v0  newest 400 row ids, whole-board rescan. Past 400 qualifying rows the
-      oldest were evicted and a restart replayed ancient rows as "(missed while
-      offline)" -- crying wolf at him with weeks-old messages.
-  v1  timestamp watermark plus a skew window. A TIMESTAMP IS NOT AN APPEND
-      CURSOR: a row appended later but stamped more than the window behind is
-      skipped forever. The original defect in a new costume.
-  v2  positional cursor, which is right, but it emitted BEFORE persisting and
-      then warned-and-continued when the save failed. External effect and
-      durable state disagree, so a restart either replays from a stale cursor or
-      cold-primes over the gap. Silent again.
-  v3  this file.
+  Four designs since then have been wrong, and every one passed its own tests:
 
-THE FACT THE DESIGN STARTS FROM
-  Exactly-once external notification is impossible without a consumer ACK. There
-  is no ACK here: stdout goes to a Monitor task and then to a person. So the
-  honest choice is explicit AT-LEAST-ONCE with no silent loss, which means a
-  durable outbox:
+    v0  newest-400 id set          -> evicted ids replayed ancient rows as new
+    v1  timestamp watermark        -> a late row stamped behind the mark was
+                                      skipped forever
+    v2  positional cursor          -> emitted before persisting, then warned and
+                                      carried on when the save failed
+    v3  outbox                     -> truncated silently at the cap, accepted a
+                                      hollow pending block, verified after
+                                      replacing, and had no writer lock
 
-    1. persist the exact lines to be emitted, atomically, BEFORE emitting;
-    2. emit them;
-    3. atomically commit the cursor and clear the outbox.
+  The common shape is not carelessness about the happy path. It is that each
+  version could not tell a failure from a success, so it reported success.
 
-  A crash anywhere leaves the outbox on disk. The next start says plainly that
-  what follows may be a repeat, replays the EXACT persisted lines, and commits.
-  A repeat that announces itself is recoverable; a silent gap is not.
-
-FAIL CLOSED, AND NEVER AUTO-REPRIME
-  - outbox save fails  -> nothing is emitted, exit non-zero. No external effect
-                          happened, so there is nothing ambiguous to reconcile.
-  - commit save fails  -> exit non-zero with the outbox RETAINED, so the next
-                          start replays rather than skips.
-  - corrupt state, board reset, shrink, anchor mismatch -> refuse and exit. The
-    operator re-primes deliberately with -Reset, which is itself persisted and
-    receipted. Automatic re-priming is how a watcher silently skips a gap while
-    looking healthy, and it is banned here.
+WHAT THIS VERSION HOLDS TO
+  - ABSENT and UNUSABLE are different events. Only absent may prime.
+  - Nothing is emitted that was not first persisted, and the cursor never
+    advances past output that was not staged.
+  - ok=$true from Save-WatchState means these exact bytes are on disk and were
+    read back. It is proven by a length-prefixed digest, not by the absence of
+    an exception and not by a delimiter join that two different arrays can share.
+  - One writer per state file, enforced by a lock held for the process lifetime.
+  - Every refusal names itself. Silence is never a result.
 #>
 
-$script:WATCH_SCHEMA = 3
-# Duplicate collapse compares ROW timestamps, never processing time. Comparing
-# processing time meant two identical messages sent hours apart were replayed
-# back-to-back after a restart and the second was dropped -- a de-duplication
-# that had become message loss.
+$script:WATCH_SCHEMA = 4
+# Duplicate collapse compares ROW timestamps, never processing time: two
+# identical messages sent hours apart are two messages, and comparing wall clock
+# turned de-duplication into message loss.
 $script:WATCH_DUPE_SECONDS = 90
-# The outbox is bounded. A watcher that has been down for a week must not try to
-# persist thousands of lines in one atomic write.
+# The outbox is bounded, and the bound CHUNKS rather than truncates. Staging 200
+# of 250 lines while emitting all 250 loses the first 50 on a crash and commits
+# past rows whose output was never durable.
 $script:WATCH_OUTBOX_MAX = 200
 
-# An ACTUALLY atomic replace, which took three attempts, all measured:
-#   Move-Item -Force      PowerShell overwrites by delete-then-move, so the
-#                         destination briefly does not exist. Assumed atomic.
-#   [IO.File]::Replace    does not work on this build at all -- "The path is not
-#                         of a legal form" on WinPS 5.1 / CLR 4.0.30319,
-#                         reproduced with a normalised 42-character path, so not
-#                         a long-path problem.
-#   MoveFileEx            the Win32 call under both, with
-#                         MOVEFILE_REPLACE_EXISTING. On NTFS, same volume, a
-#                         genuine atomic replace.
 # $IsWindows exists in PowerShell 6+; on Windows PowerShell 5.1 it is undefined,
 # and 5.1 only runs on Windows, so undefined means Windows.
 $script:WATCH_IS_WINDOWS = $true
 if (Test-Path variable:global:IsWindows) { $script:WATCH_IS_WINDOWS = [bool]$IsWindows }
 
+# MoveFileEx is the Win32 call underneath both Move-Item and File.Replace, with
+# MOVEFILE_REPLACE_EXISTING. On NTFS, same volume, a genuine atomic replace.
+# [IO.File]::Replace does not work on this build at all ("The path is not of a
+# legal form", reproduced with a normalised 42-character path). On POSIX,
+# rename(2) is atomic and File.Move(src,dst,overwrite) is that call.
 if ($script:WATCH_IS_WINDOWS -and -not ('Sfdc24.AtomicFile' -as [type])) {
   Add-Type -Namespace 'Sfdc24' -Name 'AtomicFile' -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
@@ -91,10 +71,9 @@ public static void ReplaceAtomic(string source, string destination) {
 
 function ConvertTo-WatchTime {
   # Accepts a string or a [datetime]. PowerShell 7's ConvertFrom-Json turns an
-  # ISO-8601 string into a [datetime] while 5.1 leaves it a string, so the same
-  # file yields different types per shell; casting the datetime to string then
-  # renders it in the CURRENT CULTURE. CI printed "09/08/2026 08:00:00" when this
-  # was wrong. bus.ps1 documents the same trap.
+  # ISO-8601 string into a [datetime] while 5.1 leaves it a string; casting the
+  # datetime to string then renders it in the CURRENT CULTURE. CI printed
+  # "09/08/2026 08:00:00" when this was wrong.
   param($Value)
   if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
   $Value = [string]$Value
@@ -108,24 +87,32 @@ function ConvertTo-WatchTime {
   return $null
 }
 
-function Get-DefaultStatePath {
+function Test-SafeLeaf {
   <#
-    Build the default state path.
+    An ALLOWLIST, for every caller, not a blocklist for one.
 
-    This exists because of a real defect: fleet_watch.ps1 carried a literal 0x0C
-    FORM FEED in its default leaf -- an escape that survived a source transform
-    and ate a character. WinPS 5.1 rejected the path, so every save failed and
-    every restart was cold. Every test passed an explicit -StateFile, so nothing
-    ever exercised the default. chatgpt-codex-desktop found it by reading bytes.
+    Two defects came through this door. A literal 0x0C form feed in a leaf made
+    WinPS reject the path so every save failed silently. And an unvalidated
+    fleet -Tag was concatenated into a leaf, where three levels of dot-dot reach
+    AppData\Local and five reach the profile root -- measured, not supposed.
 
-    The leaf is validated, not trusted.
+    Rejecting only control characters, or only the Tag, leaves the hole open for
+    the next caller who builds a leaf out of input.
   #>
-  param([Parameter(Mandatory = $true)][string]$Leaf)
-  foreach ($ch in $Leaf.ToCharArray()) {
-    if ([int]$ch -lt 32 -or [int]$ch -eq 127) {
-      throw ('state file name contains control character 0x' + ('{0:X2}' -f [int]$ch) + '; refusing to build a path from it')
-    }
+  param([string]$Leaf)
+  if (-not $Leaf) { return @{ ok = $false; reason = 'state file name is empty' } }
+  if ($Leaf.Length -gt 120) { return @{ ok = $false; reason = 'state file name is too long' } }
+  if ($Leaf -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+    return @{ ok = $false; reason = ('state file name ' + $Leaf + ' is not a plain safe name') }
   }
+  if ($Leaf -match '\.\.') { return @{ ok = $false; reason = 'state file name contains a traversal segment' } }
+  return @{ ok = $true; reason = '' }
+}
+
+function Get-DefaultStatePath {
+  param([Parameter(Mandatory = $true)][string]$Leaf)
+  $safe = Test-SafeLeaf -Leaf $Leaf
+  if (-not $safe.ok) { throw $safe.reason }
   $base = $env:LOCALAPPDATA
   if (-not $base) { $base = $env:XDG_STATE_HOME }
   if (-not $base) { $base = $env:HOME }
@@ -133,27 +120,7 @@ function Get-DefaultStatePath {
   return (Join-Path (Join-Path $base 'sfdc24') $Leaf)
 }
 
-function New-WatchState {
-  return [pscustomobject]@{
-    schema        = $script:WATCH_SCHEMA
-    boardId       = ''
-    lastIndex     = 0      # committed cursor: index of the last row fully dealt with
-    anchorId      = ''     # Row_ID expected at lastIndex
-    lastEmitKey   = ''
-    lastEmitTs    = ''
-    pendingIndex  = 0      # outbox: the cursor these lines WOULD commit
-    pendingAnchor = ''
-    pendingLines  = @()    # the exact strings to emit
-    pendingRowIds = @()
-    resetAt       = ''     # receipt for a deliberate -Reset
-  }
-}
-
 function Resolve-StatePath {
-  # The Win32 call understands nothing about PowerShell's location stack or
-  # forward slashes. Join-Path must NOT be used unconditionally: given an
-  # already-rooted path it produces "C:\repo\C:\Users\..." which is exactly the
-  # "path is not of a legal form" error this first produced.
   param([string]$Path)
   try {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
@@ -161,15 +128,96 @@ function Resolve-StatePath {
   } catch { return $Path }
 }
 
+function New-WatchState {
+  return [pscustomobject]@{
+    schema        = $script:WATCH_SCHEMA
+    boardId       = ''
+    lastIndex     = 0
+    anchorId      = ''
+    lastEmitKey   = ''
+    lastEmitTs    = ''
+    pendingIndex  = 0
+    pendingAnchor = ''
+    pendingLines  = @()
+    pendingRowIds = @()
+    resetAt       = ''
+  }
+}
+
+function Get-WatchStateDigest {
+  <#
+    LENGTH-PREFIXED, then SHA256.
+
+    The previous digest joined arrays with a separator character, so one element
+    containing that character hashed identically to two elements, and a single
+    empty string hashed identically to an empty array. Two materially different
+    outboxes therefore verified as equal -- defeating the exact property the
+    digest was added to prove. Board text is arbitrary and may contain anything,
+    so no delimiter is safe; a length prefix needs none.
+  #>
+  param([Parameter(Mandatory = $true)]$State)
+  $sb = New-Object System.Text.StringBuilder
+  function Add-Field { param($v)
+    $t = [string]$v
+    [void]$sb.Append($t.Length); [void]$sb.Append(':'); [void]$sb.Append($t); [void]$sb.Append(';')
+  }
+  function Add-Array { param($a)
+    $arr = @($a)
+    [void]$sb.Append($arr.Count); [void]$sb.Append('#')
+    foreach ($e in $arr) { Add-Field $e }
+  }
+  Add-Field ([string]$State.boardId)
+  Add-Field ([string][int]$State.lastIndex)
+  Add-Field ([string]$State.anchorId)
+  Add-Field ([string]$State.lastEmitKey)
+  Add-Field ([string]$State.lastEmitTs)
+  Add-Field ([string][int]$State.pendingIndex)
+  Add-Field ([string]$State.pendingAnchor)
+  Add-Array $State.pendingRowIds
+  Add-Array $State.pendingLines
+  Add-Field ([string]$State.resetAt)
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($sb.ToString())
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
+  finally { $sha.Dispose() }
+}
+
+function Test-StateInvariants {
+  <#
+    Structural invariants, enforced at the READ boundary so an invalid shape is
+    UNUSABLE rather than something every caller must remember to reject.
+
+    A schema-3 file with pendingIndex 5, an empty anchor and empty arrays used to
+    read as ok, validate, replay nothing, and then advance the cursor to row 5
+    leaving the anchor blank -- skipping five rows and unanchoring the cursor.
+  #>
+  param($State)
+  if ([int]$State.lastIndex -lt 0) { return 'lastIndex is negative' }
+  if ([int]$State.pendingIndex -lt 0) { return 'pendingIndex is negative' }
+  if (-not $State.boardId) { return 'state has no board identity' }
+  if ([int]$State.lastIndex -ge 1 -and -not $State.anchorId) { return 'state has a cursor but no anchor' }
+  $lines = @($State.pendingLines); $ids = @($State.pendingRowIds)
+  if ([int]$State.pendingIndex -ge 1) {
+    if (-not $State.pendingAnchor) { return 'staged outbox has no anchor' }
+    if ($lines.Count -lt 1) { return 'staged outbox has no lines' }
+    if ($ids.Count -lt 1) { return 'staged outbox has no row identities' }
+    if ([int]$State.pendingIndex -le [int]$State.lastIndex) { return 'staged outbox does not advance the cursor' }
+  } else {
+    if ($lines.Count -gt 0 -or $ids.Count -gt 0) { return 'lines are staged with no cursor to commit them to' }
+    if ($State.pendingAnchor) { return 'a staged anchor with no staged cursor' }
+  }
+  if ($lines.Count -gt $script:WATCH_OUTBOX_MAX) { return 'staged outbox exceeds its bound' }
+  return ''
+}
+
 function Read-WatchState {
-  <# @{ state; reason }. A reason is present whenever the caller must speak. #>
+  <# @{ state; disposition = absent|ok|unusable; reason } #>
   param([string]$Path)
   if (-not $Path) { return @{ state = $null; disposition = 'unusable'; reason = 'no state path' } }
   $Path = Resolve-StatePath $Path
-  # ABSENT is not the same event as UNUSABLE. A missing file means this watcher
-  # has never run here and priming is honest. A file that exists and cannot be
-  # used means we HAD a cursor and lost it, and priming past the gap would hide
-  # exactly what this whole mechanism exists to surface.
+  # ABSENT is not UNUSABLE. A missing file means this watcher never ran here and
+  # priming is honest. A file that exists and cannot be used means we HAD a
+  # cursor and lost it, and priming past the gap hides what this exists to show.
   if (-not (Test-Path -LiteralPath $Path)) { return @{ state = $null; disposition = 'absent'; reason = '' } }
   try {
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
@@ -187,44 +235,83 @@ function Read-WatchState {
     $s.lastEmitKey = [string]$o.lastEmitKey
     $t = ConvertTo-WatchTime $o.lastEmitTs
     $s.lastEmitTs = $(if ($t) { $t.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { '' })
-    $s.resetAt = [string]$o.resetAt
-    if ($o.PSObject.Properties.Name -contains 'pendingIndex') { $s.pendingIndex = [int]$o.pendingIndex }
+    # NORMALISED EXACTLY LIKE lastEmitTs, and for exactly the same reason.
+    # pwsh's ConvertFrom-Json hands an ISO string back as a [datetime]; a bare
+    # cast then renders it in the current culture ("09/08/2026 10:30:00"), the
+    # digest differs from what was written, and every save carrying a resetAt
+    # fails its own verification. In the previous design that check ran AFTER the
+    # destination had been replaced, so a pwsh -Reset destroyed the old cursor
+    # and then reported "the previous cursor was NOT removed and is intact" --
+    # a false receipt over lost bytes. I normalised lastEmitTs and missed the
+    # field beside it; chatgpt-codex-desktop found it on the real watcher.
+    $rt = ConvertTo-WatchTime $o.resetAt
+    $s.resetAt = $(if ($rt) { $rt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') } else { '' })
+    $s.pendingIndex = [int]$o.pendingIndex
     $s.pendingAnchor = [string]$o.pendingAnchor
     $lines = @(); foreach ($l in @($o.pendingLines)) { if ($null -ne $l) { $lines += [string]$l } }
     $ids = @();   foreach ($l in @($o.pendingRowIds)) { if ($null -ne $l) { $ids += [string]$l } }
     $s.pendingLines = $lines
     $s.pendingRowIds = $ids
-    # An anchor is only meaningful once something has been COMMITTED. A state
-    # carrying only a staged outbox has no committed row yet and is still valid;
-    # requiring an anchor there made the first save of a fresh watcher fail its
-    # own read-back verification.
-    if (-not $s.boardId) { return @{ state = $null; disposition = 'unusable'; reason = 'state file is missing its board identity' } }
-    if ($s.lastIndex -ge 1 -and -not $s.anchorId) {
-      return @{ state = $null; disposition = 'unusable'; reason = 'state file has a cursor but no anchor' }
-    }
+    $bad = Test-StateInvariants -State $s
+    if ($bad) { return @{ state = $null; disposition = 'unusable'; reason = $bad } }
     return @{ state = $s; disposition = 'ok'; reason = '' }
   } catch {
     return @{ state = $null; disposition = 'unusable'; reason = 'state file could not be parsed' }
   }
 }
 
+function Enter-WatchLock {
+  <#
+    ONE WRITER PER STATE FILE, held for the process lifetime.
+
+    Two Save-WatchState calls against one path both returned ok=true while only
+    the second survived, so "ok" meant "my bytes were the last ones I looked at"
+    rather than "my state survives a restart". A lock states the invariant
+    directly; CAS would only detect its violation afterwards.
+  #>
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $Path = Resolve-StatePath $Path
+  $dir = Split-Path -Parent $Path
+  try {
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+    $lockPath = $Path + '.lock'
+    $fs = New-Object System.IO.FileStream($lockPath, [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    return @{ ok = $true; handle = $fs; reason = '' }
+  } catch {
+    return @{ ok = $false; handle = $null
+              reason = ('another watcher already holds the cursor at ' + $Path + ' (' + $_.Exception.Message + ')') }
+  }
+}
+
+function Exit-WatchLock {
+  param($Lock)
+  if ($Lock -and $Lock.handle) { try { $Lock.handle.Dispose() } catch { } }
+}
+
 function Save-WatchState {
-  <# @{ ok; reason }. ok=$true means the state survives a restart, and that is
-     proven by reading it back, not inferred from the absence of an exception. #>
+  <#
+    ok=$true means these exact bytes are on disk and were read back.
+
+    Order matters and got it wrong twice: the temp is now verified BEFORE the
+    destination is replaced, so a mismatch can never destroy good bytes; and the
+    destination is read back afterwards, because the replace itself can fail in
+    ways the write did not.
+  #>
   param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$Path)
   $Path = Resolve-StatePath $Path
-  $tmp = $Path + '.tmp'
-  # LOCAL, and it matters. The watchers run with $ErrorActionPreference =
-  # 'Continue', so a non-terminating cmdlet error inside this try never reached
-  # the catch: Move-Item failed, wrote nothing, and this returned ok=$true. A
-  # persistence guard that reports success when it silently failed is worse than
-  # no guard. Found by pointing the cursor at a path whose parent is a file.
+  # A UNIQUE temp, created new. A fixed sibling .tmp is shared by every writer
+  # and a leftover is unattributable.
+  $tmp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+  # LOCAL. The watchers run with $ErrorActionPreference='Continue', so a
+  # non-terminating cmdlet error never reached the catch: Move-Item failed,
+  # wrote nothing, and this returned ok=$true.
   $ErrorActionPreference = 'Stop'
+  $bad = Test-StateInvariants -State $State
+  if ($bad) { return @{ ok = $false; reason = ('refusing to persist an invalid state: ' + $bad) } }
   try {
     $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-      New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
-    }
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
     $obj = [ordered]@{
       schema        = $script:WATCH_SCHEMA
       savedAt       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -239,36 +326,34 @@ function Save-WatchState {
       pendingRowIds = @($State.pendingRowIds)
       resetAt       = [string]$State.resetAt
     }
-    ($obj | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
-    if (Test-Path -LiteralPath $Path) {
-      # PLATFORM-AWARE. MoveFileEx is a kernel32 P/Invoke, so on pwsh/Linux every
-      # replace throws DllNotFoundException -- and the first version of the test
-      # asserted only that the destination existed, so CI would have stayed green
-      # while no save ever succeeded there. chatgpt-codex-desktop found that.
-      #
-      # On POSIX, rename(2) is itself atomic and replaces, and .NET Core's
-      # File.Move(src, dst, overwrite:true) is that call. On Windows PowerShell
-      # 5.1 the three-argument overload does not exist, hence the split.
-      if ($script:WATCH_IS_WINDOWS) {
-        [Sfdc24.AtomicFile]::ReplaceAtomic($tmp, $Path)
-      } else {
-        [System.IO.File]::Move($tmp, $Path, $true)
-      }
-    }
-    else { Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop }
+    $json = $obj | ConvertTo-Json -Depth 5 -Compress
+    $stream = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Flush($true)
+    } finally { $stream.Dispose() }
 
-    # READ IT BACK. D-4: read-back is the only proof of a write, and this
-    # function's entire contract is that ok=$true means the state survives.
-    #
-    # Compared by CANONICAL DIGEST over every contract field. The first version
-    # compared lastIndex, pendingIndex and a line COUNT, so a pending line whose
-    # text was corrupted in transit read back as a successful save -- and those
-    # lines are the exact words that get shown to Mr. Salam on replay.
-    $v = Read-WatchState -Path $Path
-    if (-not $v.state) { return @{ ok = $false; reason = ('state did not read back at ' + $Path + ': ' + $v.reason) } }
+    # VERIFY THE TEMP FIRST. Replacing and then discovering a mismatch destroys
+    # the previous cursor and leaves nothing to fall back to.
+    $pre = Read-WatchState -Path $tmp
     $want = Get-WatchStateDigest -State $State
-    $got  = Get-WatchStateDigest -State $v.state
-    if ($want -ne $got) {
+    if (-not $pre.state -or (Get-WatchStateDigest -State $pre.state) -ne $want) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+      return @{ ok = $false; reason = 'the written state did not verify; the previous cursor is untouched' }
+    }
+
+    if (Test-Path -LiteralPath $Path) {
+      if ($script:WATCH_IS_WINDOWS) { [Sfdc24.AtomicFile]::ReplaceAtomic($tmp, $Path) }
+      else { [System.IO.File]::Move($tmp, $Path, $true) }
+    } else {
+      Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    }
+
+    $post = Read-WatchState -Path $Path
+    if (-not $post.state) { return @{ ok = $false; reason = ('state did not read back at ' + $Path + ': ' + $post.reason) } }
+    if ((Get-WatchStateDigest -State $post.state) -ne $want) {
       return @{ ok = $false; reason = ('state read back differently at ' + $Path) }
     }
     return @{ ok = $true; reason = '' }
@@ -278,91 +363,20 @@ function Save-WatchState {
   }
 }
 
-# Digest separators, built rather than typed. They must be characters that
-# cannot occur in board text, and they must not appear as literal control
-# BYTES in this source: a stray 0x0C in a path string is the defect that made
-# every save fail silently, and tests/test_watch_state.ps1 now scans these
-# files for exactly that. The invariant stays absolute, so the characters are
-# constructed here instead of embedded.
-$script:WATCH_SEP_UNIT = [string][char]31
-$script:WATCH_SEP_REC  = [string][char]30
-
-function Get-WatchStateDigest {
-  # Canonical, order-fixed rendering of every field that carries meaning.
-  # savedAt is deliberately excluded: it changes on every write and is a receipt,
-  # not part of the contract.
-  param([Parameter(Mandatory = $true)]$State)
-  $parts = @(
-    'b=' + [string]$State.boardId
-    'i=' + [string][int]$State.lastIndex
-    'a=' + [string]$State.anchorId
-    'k=' + [string]$State.lastEmitKey
-    't=' + [string]$State.lastEmitTs
-    'pi=' + [string][int]$State.pendingIndex
-    'pa=' + [string]$State.pendingAnchor
-    'r=' + (@($State.pendingRowIds) -join $script:WATCH_SEP_UNIT)
-    'l=' + (@($State.pendingLines) -join $script:WATCH_SEP_UNIT)
-    'x=' + [string]$State.resetAt
-  )
-  return ($parts -join $script:WATCH_SEP_REC)
-}
-
-function Test-PendingIsValid {
-  <#
-    Is a retained outbox still meaningful against the board in front of us?
-
-    Called BEFORE anything is replayed. The previous order emitted first and
-    validated afterwards, so a stale outbox from another board reached Mr. Salam
-    as though it were current.
-  #>
-  param($State, $Rows, [string]$BoardId)
-  if (-not (Test-HasOutbox -State $State)) { return @{ ok = $true; reason = '' } }
-  if (-not $BoardId) { return @{ ok = $false; reason = 'board read carried no identity' } }
-  if ($State.boardId -and ($State.boardId -ne $BoardId)) {
-    return @{ ok = $false; reason = ('retained outbox belongs to board ' + $State.boardId + ' but this is ' + $BoardId) }
-  }
-  $lastData = @($Rows).Count - 1
-  $pi = [int]$State.pendingIndex
-  if ($pi -lt 1 -or $pi -gt $lastData) {
-    return @{ ok = $false; reason = ('retained outbox points at row ' + $pi + ', outside the ' + $lastData + ' rows now present') }
-  }
-  if ($State.pendingAnchor -and ([string]@($Rows)[$pi][0] -ne $State.pendingAnchor)) {
-    return @{ ok = $false; reason = ('retained outbox anchor moved at row ' + $pi + ': expected ' + $State.pendingAnchor + ', found ' + [string]@($Rows)[$pi][0]) }
-  }
-  # The rows those lines were built from must still be where they were.
-  $have = @{}
-  $from = [Math]::Max(1, [int]$State.lastIndex + 1)
-  for ($i = $from; $i -le $pi; $i++) { $have[[string]@($Rows)[$i][0]] = $true }
-  foreach ($id in @($State.pendingRowIds)) {
-    if ($id -and -not $have.ContainsKey($id)) {
-      return @{ ok = $false; reason = ('retained outbox refers to row ' + $id + ' which is no longer between ' + $from + ' and ' + $pi) }
-    }
-  }
-  return @{ ok = $true; reason = '' }
-}
-
 function Test-BoardContinuity {
-  <#
-    @{ ok; prime; startIndex; reason }
-      prime      nothing to resume from; the caller establishes the cursor
-      ok=$false  the cursor cannot be trusted. The caller MUST print the reason
-                 and EXIT. Automatic re-priming is banned: it is how a watcher
-                 skips a gap while looking healthy.
-  #>
+  <# @{ ok; prime; startIndex; reason } -- ok=$false means the caller must print
+     the reason and EXIT. Automatic re-priming is banned: it is how a watcher
+     skips a gap while looking healthy. #>
   param($State, $Rows, [string]$BoardId)
   $count = 0
   if ($Rows) { $count = @($Rows).Count }
   if ($count -lt 1) { return @{ ok = $false; prime = $false; startIndex = 0; reason = 'board read returned no rows' } }
   $lastData = $count - 1
-  if (-not $State) { return @{ ok = $true; prime = $true; startIndex = ($lastData + 1); reason = '' } }
-  # FAIL CLOSED ON AN UNKNOWN BOARD. The first version only compared when BOTH
-  # ids were truthy, so a read that returned no fileId skipped the check entirely
-  # and the watcher carried on as though identity had been confirmed. Not
-  # knowing which board this is, is exactly the case that must stop.
   if (-not $BoardId) {
     return @{ ok = $false; prime = $false; startIndex = 0
               reason = 'board read carried no identity; refusing to resume against an unidentified board' }
   }
+  if (-not $State) { return @{ ok = $true; prime = $true; startIndex = ($lastData + 1); reason = '' } }
   if ($State.boardId -and ($State.boardId -ne $BoardId)) {
     return @{ ok = $false; prime = $false; startIndex = 0
               reason = ('board identity changed (' + $State.boardId + ' -> ' + $BoardId + ')') }
@@ -381,33 +395,88 @@ function Test-BoardContinuity {
   return @{ ok = $true; prime = $false; startIndex = ($State.lastIndex + 1); reason = '' }
 }
 
+function Test-PendingIsValid {
+  # Called BEFORE anything is replayed. The previous order emitted first and
+  # validated afterwards, so a stale outbox from another board reached Mr. Salam
+  # as though it were current.
+  param($State, $Rows, [string]$BoardId)
+  if (-not (Test-HasOutbox -State $State)) { return @{ ok = $true; reason = '' } }
+  if (-not $BoardId) { return @{ ok = $false; reason = 'board read carried no identity' } }
+  if ($State.boardId -and ($State.boardId -ne $BoardId)) {
+    return @{ ok = $false; reason = ('retained outbox belongs to board ' + $State.boardId + ' but this is ' + $BoardId) }
+  }
+  $lastData = @($Rows).Count - 1
+  $pi = [int]$State.pendingIndex
+  if ($pi -lt 1 -or $pi -gt $lastData) {
+    return @{ ok = $false; reason = ('retained outbox points at row ' + $pi + ', outside the ' + $lastData + ' rows now present') }
+  }
+  if ([string]@($Rows)[$pi][0] -ne $State.pendingAnchor) {
+    return @{ ok = $false; reason = ('retained outbox anchor moved at row ' + $pi + ': expected ' + $State.pendingAnchor + ', found ' + [string]@($Rows)[$pi][0]) }
+  }
+  $have = @{}
+  $from = [Math]::Max(1, [int]$State.lastIndex + 1)
+  for ($i = $from; $i -le $pi; $i++) { $have[[string]@($Rows)[$i][0]] = $true }
+  foreach ($id in @($State.pendingRowIds)) {
+    if ($id -and -not $have.ContainsKey($id)) {
+      return @{ ok = $false; reason = ('retained outbox refers to row ' + $id + ' which is no longer between ' + $from + ' and ' + $pi) }
+    }
+  }
+  return @{ ok = $true; reason = '' }
+}
+
 function Set-WatchOutbox {
-  # Stage the exact lines that are about to be emitted, with the cursor they
-  # would commit. Persisted BEFORE anything reaches stdout.
-  param([Parameter(Mandatory = $true)]$State, $Rows, [int]$Index, [string[]]$Lines, [string[]]$RowIds)
-  $l = @($Lines); $r = @($RowIds)
-  if ($l.Count -gt $script:WATCH_OUTBOX_MAX) { $l = $l[($l.Count - $script:WATCH_OUTBOX_MAX)..($l.Count - 1)] }
-  if ($r.Count -gt $script:WATCH_OUTBOX_MAX) { $r = $r[($r.Count - $script:WATCH_OUTBOX_MAX)..($r.Count - 1)] }
-  $State.pendingLines = $l
-  $State.pendingRowIds = $r
-  $State.pendingIndex = $Index
-  if ($Rows -and $Index -ge 1 -and $Index -lt @($Rows).Count) { $State.pendingAnchor = [string]@($Rows)[$Index][0] }
-  return $State
+  <#
+    Stage a CHUNK. $Plan is an ordered array of @{ line; rowIndex; rowId }.
+
+    The bound used to truncate: 250 planned lines staged the last 200 while the
+    watcher emitted all 250 and committed past all of them, so a crash lost the
+    first 50 and the cursor had moved beyond rows whose output was never durable.
+    Now the first N are staged, only those are emitted, and the cursor advances
+    only through the last FULLY represented source row. The remainder is the next
+    tick's work.
+
+    Returns @{ state; staged; nextFrom } where staged is the exact set to emit.
+  #>
+  param([Parameter(Mandatory = $true)]$State, $Rows, $Plan, [int]$FallbackIndex)
+  $plan = @($Plan)
+  $max = $script:WATCH_OUTBOX_MAX
+  $take = [Math]::Min($plan.Count, $max)
+  $chunk = @()
+  if ($take -gt 0) { $chunk = $plan[0..($take - 1)] }
+
+  # If the chunk stops mid-way, do not commit through a row whose later lines are
+  # still unstaged.
+  $commitIndex = $FallbackIndex
+  if ($take -lt $plan.Count) {
+    $lastStagedRow = 0
+    foreach ($e in $chunk) { if ([int]$e.rowIndex -gt $lastStagedRow) { $lastStagedRow = [int]$e.rowIndex } }
+    $nextRow = [int]$plan[$take].rowIndex
+    if ($nextRow -eq $lastStagedRow) { $lastStagedRow = $lastStagedRow - 1 }
+    $commitIndex = $lastStagedRow
+  }
+
+  $lines = @(); $ids = @()
+  foreach ($e in $chunk) { $lines += [string]$e.line; if ($e.rowId) { $ids += [string]$e.rowId } }
+
+  $State.pendingLines = $lines
+  $State.pendingRowIds = $ids
+  if ($lines.Count -gt 0) {
+    $State.pendingIndex = $commitIndex
+    if ($Rows -and $commitIndex -ge 1 -and $commitIndex -lt @($Rows).Count) {
+      $State.pendingAnchor = [string]@($Rows)[$commitIndex][0]
+    }
+  } else {
+    $State.pendingIndex = 0
+    $State.pendingAnchor = ''
+  }
+  return @{ state = $State; staged = $chunk; remaining = ($plan.Count - $take) }
 }
 
 function Complete-WatchOutbox {
-  <#
-    The lines are out. Move the staged cursor to committed and clear the outbox.
-
-    THIS FUNCTION MAY NOT TOUCH IDENTITY, and it used to. It took a -BoardId and
-    assigned it, so replaying a retained outbox from board-A while pointed at
-    board-B silently rewrote the stored id to board-B -- after which the identity
-    check that should have refused returned ok. The replay disarmed the guard
-    meant to stop it. Reproduced with chatgpt-codex-desktop's exact scenario.
-
-    Identity is established once, at prime, from a validated board, and is never
-    written again.
-  #>
+  <# THIS MAY NOT TOUCH IDENTITY, and it used to: it took a -BoardId and assigned
+     it, so replaying a retained outbox from board-A while pointed at board-B
+     rewrote the stored id to board-B, after which the identity check returned
+     ok. The replay disarmed the guard meant to stop it. #>
   param([Parameter(Mandatory = $true)]$State)
   if ($State.pendingIndex -ge 1) {
     $State.lastIndex = $State.pendingIndex
@@ -420,16 +489,26 @@ function Complete-WatchOutbox {
   return $State
 }
 
+function Set-CommittedCursor {
+  # A transition with NO external effect: no lines were produced, so there is
+  # nothing to stage and the cursor commits directly.
+  param([Parameter(Mandatory = $true)]$State, $Rows, [int]$Index)
+  if ($Index -ge 1 -and $Rows -and $Index -lt @($Rows).Count) {
+    $State.lastIndex = $Index
+    $State.anchorId = [string]@($Rows)[$Index][0]
+  }
+  return $State
+}
+
 function Test-HasOutbox {
   param($State)
   return ($State -and (@($State.pendingLines).Count -gt 0 -or [int]$State.pendingIndex -ge 1))
 }
 
 function Test-RowIsDuplicate {
-  # Compared on the ROWS' OWN timestamps. The console double-posted identical
-  # notes one to two seconds apart, and answering a man twice because his browser
-  # sent twice is a bad look -- but two identical messages sent HOURS apart are
-  # two messages, and a processing-time comparison threw the second away.
+  # Compared on the ROWS' OWN timestamps. Comparing processing time meant two
+  # identical messages sent hours apart were replayed together after a restart
+  # and the second was dropped.
   param($State, [string]$Key, [string]$RowTs)
   if (-not $State -or -not $State.lastEmitKey) { return $false }
   if ($State.lastEmitKey -ne $Key) { return $false }
