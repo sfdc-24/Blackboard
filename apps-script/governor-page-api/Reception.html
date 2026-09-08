@@ -362,13 +362,31 @@ button.rec .dot{animation:b .8s step-end infinite}
       if (p !== null && typeof SELF_URL === "string" && SELF_URL && VIEWS.hasOwnProperty(p)) {
         location.href = SELF_URL + VIEWS[p]; return;
       }
-      var w=null; try{ w = window.open(href,"_blank","noopener") }catch(x){}
-      if(!w && !document.getElementById("popblock")){
-        var n=document.createElement("div"); n.id="popblock"; n.className="empty";
-        n.style.marginTop="10px";
-        n.innerHTML='<span class="c">//</span> your browser blocked the new tab.<br>'+
-          '<span class="kv">open this address directly:</span><br>'+esc(href);
-        (a.closest(".wrap")||document.body).appendChild(n);
+      // window.open with "noopener" returns null BY SPECIFICATION -- on success
+      // as much as on failure -- so the handle proves nothing about navigation.
+      // The old code read null as "blocked" and then called esc(), which is not
+      // defined in this scope, so a link that had WORKED threw ReferenceError.
+      // Found by vm-chatgpt in a live browser: the voice tab opened and the
+      // reception threw anyway. Two cases, and only one of them is knowable:
+      //   threw -> the open definitely failed, so say so;
+      //   null  -> unknowable, so offer the address without claiming anything.
+      // The return value is deliberately discarded to make that explicit.
+      var threw = false;
+      try { window.open(href, "_blank", "noopener"); } catch (x) { threw = true; }
+      if (!document.getElementById("popblock")) {
+        var n = document.createElement("div");
+        n.id = "popblock"; n.className = "empty"; n.style.marginTop = "10px";
+        var lead = document.createElement("span");
+        lead.className = "kv";
+        lead.textContent = threw
+          ? "Your browser blocked the new tab. Open this address directly:"
+          : "If the new tab did not open, open this address directly:";
+        var addr = document.createElement("div");
+        // textContent, never innerHTML: the address is data, and this block used
+        // to build markup out of it through a helper that did not exist here.
+        addr.textContent = href;
+        n.appendChild(lead); n.appendChild(addr);
+        (a.closest(".wrap") || document.body).appendChild(n);
       }
     }, true);
   })();
