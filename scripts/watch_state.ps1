@@ -45,7 +45,17 @@ function ConvertTo-WatchTime {
   # A row timestamp that cannot be parsed must not be silently treated as epoch
   # zero -- that would make it permanently "old" and permanently skipped. Return
   # $null and let the caller decide.
-  param([string]$Value)
+  #
+  # NOT [string]$Value on the parameter. PowerShell 7's ConvertFrom-Json eagerly
+  # deserialises an ISO-8601 string into a [datetime], while Windows PowerShell
+  # 5.1 leaves it a string -- so the same state file yields different types on
+  # the laptop and on the Linux CI runner. Casting a [datetime] to string then
+  # renders it in the CURRENT CULTURE ("09/08/2026 08:00:00"), which no longer
+  # round-trips and compares wrongly. bus.ps1 already carries a comment about
+  # this exact trap and I walked into it anyway; CI caught it.
+  param($Value)
+  if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime() }
+  $Value = [string]$Value
   if (-not $Value) { return $null }
   $parsed = [datetime]::MinValue
   $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor `
@@ -72,12 +82,14 @@ function Read-WatchState {
     $o = $raw | ConvertFrom-Json
     $ids = @()
     foreach ($k in @($o.tailIds)) { if ($k) { $ids += [string]$k } }
-    $ts = [string]$o.lastTs
+    # Normalise to a canonical ISO-8601 UTC STRING here, whatever the JSON
+    # deserialiser handed back, so every consumer downstream sees one type on
+    # every platform.
+    $when = ConvertTo-WatchTime $o.lastTs
     # A state file with no watermark proves nothing about what has been shown.
     # Treat it as absent rather than as "everything is new".
-    if (-not $ts) { return $null }
-    if (-not (ConvertTo-WatchTime $ts)) { return $null }
-    return [pscustomobject]@{ lastTs = $ts; tailIds = $ids }
+    if (-not $when) { return $null }
+    return [pscustomobject]@{ lastTs = $when.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'); tailIds = $ids }
   } catch {
     # Corrupt state used to become a silent cold start, which looks identical to
     # a first run and quietly loses the catch-up. Still fail closed to cold --

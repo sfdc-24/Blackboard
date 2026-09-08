@@ -131,6 +131,32 @@ Assert-True 'an unparseable watermark is treated as absent' `
 Assert-True 'a missing file is absent' ($null -eq (Read-WatchState -Path (Join-Path $tmpDir 'nope.json')))
 
 Write-Output ''
+Write-Output 'the PowerShell 7 / 5.1 JSON type difference is absorbed'
+# PowerShell 7's ConvertFrom-Json deserialises an ISO-8601 string into a
+# [datetime]; 5.1 leaves it a string. The same state file therefore yields
+# different TYPES on the laptop and on the Linux CI runner, and a naive [string]
+# cast of the datetime renders in the current culture -- CI reported exactly
+# "09/08/2026 08:00:00" as the failure detail. This assertion runs on 5.1 too, so
+# the difference stays covered wherever the suite is executed.
+$isoText = '2026-09-08T08:00:00.000Z'
+$asDate = [datetime]::Parse($isoText, [System.Globalization.CultureInfo]::InvariantCulture,
+  [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+Assert-True 'a string and a datetime watermark resolve identically' `
+  ((ConvertTo-WatchTime $isoText) -eq (ConvertTo-WatchTime $asDate)) `
+  ((ConvertTo-WatchTime $asDate).ToString('o'))
+Assert-True 'and neither depends on the current culture' `
+  ((ConvertTo-WatchTime $asDate).ToString('o') -eq (ConvertTo-WatchTime $isoText).ToString('o'))
+
+$dtPath = Join-Path $tmpDir 'dt.json'
+Set-Content -LiteralPath $dtPath -Value ('{"lastTs":"' + $isoText + '","tailIds":["k"]}') -Encoding UTF8
+$dtLoaded = Read-WatchState -Path $dtPath
+Assert-True 'a loaded watermark is always a canonical ISO string' `
+  ($dtLoaded -and ($dtLoaded.lastTs -is [string]) -and $dtLoaded.lastTs.EndsWith('Z')) ([string]$dtLoaded.lastTs)
+Assert-True 'and it still decides freshness correctly after the round trip' `
+  ((-not (Test-RowIsNew -State $dtLoaded -RowId 'old' -RowTs '2026-09-07T00:00:00Z')) -and
+   (Test-RowIsNew -State $dtLoaded -RowId 'new' -RowTs '2026-09-08T09:00:00Z'))
+
+Write-Output ''
 Write-Output 'the write is atomic'
 $s = New-WatchState
 $times = @{}
@@ -151,5 +177,11 @@ Remove-Item -LiteralPath ($path + '.tmp') -Force -ErrorAction SilentlyContinue
 
 Write-Output ''
 if ($script:Failed -eq 0) { Write-Output ('ALL PASS (' + $script:Passed + ')') }
-else { Write-Output ($script:Failed + ' FAILURE(S) of ' + ($script:Passed + $script:Failed)) }
+else {
+  # [string] casts, because $script:Failed is an int and PowerShell resolves
+  # int + string by trying to convert the STRING to an int. On the first failing
+  # CI run this threw instead of reporting -- a test harness that crashes when a
+  # test fails hides the failure it exists to show.
+  Write-Output ([string]$script:Failed + ' FAILURE(S) of ' + [string]($script:Passed + $script:Failed))
+}
 exit $(if ($script:Failed -eq 0) { 0 } else { 1 })
