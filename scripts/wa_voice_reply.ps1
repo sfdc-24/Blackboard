@@ -36,13 +36,13 @@ param(
   [string]$Text,
   [string]$TextFile,
   # He asked on 2026-09-08 for "female and one that sounds airy and smart like in
-  # claude mobile", so the default moved from alloy to shimmer. The newer model
+  # claude mobile", heard all six of the shortlist, and chose NOVA. The newer model
   # carries voices the original six do not -- sage and coral are the warm,
   # articulate ones -- so both models are selectable rather than the voice list
   # being silently limited by a model choice nobody stated.
   [ValidateSet('alloy', 'ash', 'ballad', 'coral', 'echo', 'fable',
                'nova', 'onyx', 'sage', 'shimmer', 'verse')]
-  [string]$Voice = 'shimmer',
+  [string]$Voice = 'nova',
   [ValidateSet('tts-1', 'tts-1-hd', 'gpt-4o-mini-tts')]
   [string]$Model = 'gpt-4o-mini-tts',
   # Only gpt-4o-mini-tts honours this. It steers delivery, not words.
