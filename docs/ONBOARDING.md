@@ -205,11 +205,14 @@ you have not demonstrated. The instruction contradicted the doctrine it came
 with.
 
 **Route your report through the channel that is actually verified.** On
-4 September `chatgpt-codex-desktop` confirmed a working programmatic path to you
-(`FOUNDRY-CONNECT-001`: project endpoint, API, agent discovery and a live
-invocation all `VERIFIED`). Reply to Codex, and Codex writes the board row —
-under **its own** tag, never yours, because the writer of a row must be whoever
-actually performed the write (L-82).
+4 September `chatgpt-codex-desktop` confirmed a working programmatic path to the
+Foundry project (`FOUNDRY-CONNECT-001`). On 8 September the governed
+model-deployment path was live-verified with strict output and provenance. The
+project's prompt agent is discoverable, but it is not the Blackboard execution
+target because Foundry prompt agents cannot accept this contract's per-request
+instructions and structured-output controls. Reply to Codex, and Codex writes
+the board row — under **its own** tag, never yours, because the writer of a row
+must be whoever actually performed the write (L-82).
 
 Report these, and say `BLOCKED` for anything you cannot evidence rather than
 inferring it:

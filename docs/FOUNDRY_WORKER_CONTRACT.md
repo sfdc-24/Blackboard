@@ -1,7 +1,8 @@
 # Microsoft Foundry worker contract
 
-Status: local governed seam, version 1. It does not grant Foundry direct access
-to the Blackboard, Google Drive, Salesforce, Apps Script, Meta, or Pipedream.
+Status: governed seam version 1; the model-deployment path was live-canary
+verified on 2026-09-08. It does not grant Foundry direct access to the
+Blackboard, Google Drive, Salesforce, Apps Script, Meta, or Pipedream.
 
 The orchestrator constructs and validates a `work_packet.v1`, invokes Foundry,
 validates the model's `work_assessment.v1`, and emits one canonical
@@ -15,22 +16,23 @@ remains the CI/CD and infrastructure lead.
 ```powershell
 python -B scripts/ask_foundry.py `
   --packet examples/foundry/work_packet.v1.example.json `
+  --model gpt-4o `
   --out result.json
 ```
 
 `--file` is retained as an alias for `--packet`, but it now means a validated
 UTF-8 `work_packet.v1` JSON file. `--prompt` remains available only for an
-unstructured, model-deployment smoke test. Prompt mode rejects `--agent` and
-`--agent-version`, never falls back to `FOUNDRY_AGENT_NAME`, and requires
-`--model` or `FOUNDRY_MODEL`.
-
-Governed packet mode defaults to `FOUNDRY_MODEL` and may fall back to
-`FOUNDRY_AGENT_NAME`. Governed agent execution requires a version pin through
-`--agent-version` or the optional local `FOUNDRY_AGENT_VERSION` setting.
+unstructured, model-deployment smoke test. Both packet and prompt execution are
+model-deployment-only and require `--model` or `FOUNDRY_MODEL`. `--agents`
+remains a read-only inventory command. `--agent` and `--agent-version` are
+retained only so older callers receive the structured
+`GOVERNED_AGENT_UNSUPPORTED` failure instead of silently losing controls.
 
 Configuration remains local in `.foundry.env` first and `.env` second. The
 project endpoint is `FOUNDRY_PROJECT_ENDPOINT`; target selection uses
-`FOUNDRY_MODEL` or `FOUNDRY_AGENT_NAME`.
+`FOUNDRY_MODEL`. `FOUNDRY_AGENT_NAME` and `FOUNDRY_AGENT_VERSION` do not select
+an execution target. If no model is configured, an agent-only configuration
+fails before credential acquisition or an HTTP request.
 
 Authentication has two explicit modes:
 
@@ -45,6 +47,25 @@ Entra mode is the recommended operator path; API-key mode remains available for
 headless environments that already manage the key in an approved secret store.
 The bearer-token scope and project-endpoint contract follow Microsoft's
 [Foundry REST authentication reference](https://learn.microsoft.com/en-us/azure/ai-foundry/reference/foundry-project).
+
+### Why governed execution is model-only
+
+On 2026-09-08, a live pinned prompt-agent canary isolated two mutually exclusive
+request controls: Foundry rejected top-level `instructions` when
+`agent_reference` was present, then rejected `text` after `instructions` was
+removed. Removing both made the prompt-agent request complete, but would also
+remove the adapter's fixed trust boundary and strict JSON Schema enforcement.
+The same packet completed through the project's model deployment with both
+controls intact.
+
+This behavior matches Microsoft's model: a
+[prompt agent stores its instructions and tools in its versioned definition](https://learn.microsoft.com/en-us/azure/foundry/agents/quickstarts/prompt-agent),
+while direct Responses API calls keep the ephemeral agent definition in
+application code. Microsoft's structured-output documentation also states that
+[structured outputs are not supported with Agents Service](https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/structured-outputs).
+Blackboard therefore standardizes its injected-evidence evaluator on the direct
+model-deployment path. A future persisted-agent contract would require its own
+design and acceptance evidence; it must not weaken this one in place.
 
 ## `work_packet.v1`
 
@@ -93,8 +114,7 @@ Governed execution always sends:
 - `metadata.work_id`, packet digest, and contract version;
 - `tool_choice: none` and no external retrieval;
 - truncation disabled so missing context cannot be silent;
-- strict JSON Schema output;
-- the exact agent version when agent mode is selected.
+- strict JSON Schema output.
 
 The unstructured model smoke mode also sends `store: false`, a bounded
 `max_output_tokens`, `tool_choice: none`, `parallel_tool_calls: false`, and
@@ -159,14 +179,14 @@ artifact downstream workers consume:
     "response_status": "completed",
     "response_model": "required model reported by Foundry",
     "requested_target": {
-      "type": "model_deployment or agent",
-      "name": "requested deployment or agent",
-      "version": "pinned agent version or null"
+      "type": "model_deployment",
+      "name": "requested deployment",
+      "version": null
     },
     "reported_target": {
-      "type": "response_model or agent",
-      "name": "reported model or agent",
-      "version": "reported agent version or null"
+      "type": "response_model",
+      "name": "reported model",
+      "version": null
     },
     "usage": {
       "input_tokens": 0,
@@ -192,8 +212,7 @@ Foundry response ID and model, requested target and version, independently
 reported target and version, token usage, elapsed milliseconds, and ISO UTC
 completion timestamp are therefore available to every downstream validator.
 Missing response identity or model fails with exit 6 before an artifact is
-written. For agent runs, the reported agent name and version must exactly match
-the pinned request or the result is rejected.
+written.
 
 The result path may not be the same as the packet path, preventing an output
 write from destroying its own input evidence.
