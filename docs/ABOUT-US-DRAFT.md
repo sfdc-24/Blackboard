@@ -1,8 +1,15 @@
 # About — draft copy
 
-Written 2026-09-07 by claude-code-cli at Mr. Salam's request. **Not published, and
-not for publishing until he has read it.** It is about him, so he gets the last
-word on every line.
+Written 2026-09-07 by claude-code-cli at Mr. Salam's request, restructured
+2026-09-08 on his instruction: *"do not personify me too much... stage the
+integration as a capability."* **Not published, and not for publishing until he
+has read it.**
+
+The page now leads with the capability and puts the person after it. His own
+reasoning for that is worth keeping visible to whoever edits this next: there are
+people in the market with longer records, so a page that competes on one
+consultant's credentials is competing where he is not strongest. The workforce is
+the differentiator, and it is verifiable rather than asserted.
 
 Facts about him come from his public LinkedIn profile, which he pointed me to.
 Everything about how the site was built comes from this repository's own record.
@@ -13,21 +20,41 @@ rather than given invented numbers. No unverified claim remains.
 
 ---
 
-## Who you are dealing with
+## What this is
 
-**Abdus Salam. Principal Consultant, SFDC 24. Mississauga, Ontario.**
+**A Salesforce-integrated AI workforce.** Not one assistant answering questions —
+several, from different companies, working on the same shared record, checking
+each other's work, with one human accountable for what ships.
 
-Fourteen years in enterprise consulting, and since 2022 doing it as one person
-rather than as part of an agency. Salesforce Certified Platform Administrator and
-Sales Cloud Consultant. Certified ScrumMaster. Six Sigma Black Belt. More
-recently, certifications in generative AI applications and in internet security —
-which is the part that matters most for what this site is, and why the AI work
+**Beyond Claude, deliberately.** Anthropic's Claude does most of the building.
+OpenAI's ChatGPT, working as Codex, reviews it and holds independent authority to
+reject — and uses it. Google's Gemini takes a third angle on architecture. Meta's
+and Groq's models do the fast, cheap work. They disagree with each other in
+writing, on a shared board, and the disagreements are kept rather than tidied
+away.
+
+That last part is the capability, not the model list. Any of these can be hired
+by anyone. What is harder is making them argue in public, in a form somebody can
+audit six months later — and then having a human who decides.
+
+---
+
+## Who is accountable
+
+**Abdus Salam. Principal Consultant, SFDC 24. Mississauga, Ontario.** Fourteen
+years in enterprise consulting; since 2022, doing it as one person rather than as
+part of an agency. Salesforce Platform Administrator and Sales Cloud Consultant,
+Certified ScrumMaster, Six Sigma Black Belt, and more recently certified in
+generative AI applications and in internet security — which is why the AI work
 here is bounded rather than enthusiastic.
 
-The work has not been theoretical. A professional identification portal designed
-and implemented across Salesforce and WordPress. Two years on Access Haiti's
-supply chain implementation in Salesforce. The kind of engagements where the
-system has to keep working after the consultant leaves.
+The engagements have been the kind where the system has to keep working after the
+consultant leaves: a professional identification portal across Salesforce and
+WordPress, and two years on Access Haiti's supply chain implementation.
+
+None of that is the pitch. There are people with longer records and louder
+credentials. The pitch is the workforce above, and the fact that one person
+carries the decision rather than a rotating bench.
 
 ---
 
