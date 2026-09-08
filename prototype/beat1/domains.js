@@ -165,6 +165,42 @@ function redact(text, secrets) {
   return s;
 }
 
+/**
+ * The second boundary. toLabel() built these strings; this proves it, on the
+ * string that is about to be put in front of a credential.
+ *
+ * codex, reviewing PR34, found the first version of this was decorative: it read
+ * /^[a-z0-9-]{1,63}\.[a-z]{2,24}$/, which accepts -abc.com, abc-.com and
+ * xn--80ak6aa92e.com -- every single thing toLabel exists to reject. A second
+ * boundary weaker than the first is not a second boundary, it is a comment that
+ * looks like one. Confirmed by running it before repairing it.
+ */
+function assertSendable_(domain, who) {
+  var d = str_(domain);
+  var dot = d.lastIndexOf('.');
+  if (dot < 1) throw new Error(who + ': refusing to send an unsafe domain');
+  var label = d.slice(0, dot);
+  var tld = d.slice(dot + 1);
+  // The label is re-derived, not pattern-matched: if toLabel would not have
+  // produced it, it does not go out.
+  if (toLabel(label) !== label) throw new Error(who + ': refusing to send an unsafe domain');
+  if (!/^[a-z]{2,24}$/.test(tld)) throw new Error(who + ': refusing to send an unsafe domain');
+  if (d.length > 253) throw new Error(who + ': refusing to send an unsafe domain');
+  return d;
+}
+
+/**
+ * Providers answer about the domains they were asked about, and nothing else.
+ * A row naming a domain we never requested is dropped rather than shown: it is
+ * either a provider bug or somebody else's answer, and either way presenting it
+ * as a result for this visitor would be inventing information.
+ */
+function bindToRequested_(rows, requested) {
+  var want = {};
+  (requested || []).forEach(function (d) { want[d] = true; });
+  return (rows || []).filter(function (r) { return r && r.domain && want[r.domain]; });
+}
+
 /* ---------------------------------------------------------------------------
  * Providers.
  *
@@ -182,12 +218,9 @@ const namesilo = {
     // Each domain has already been rebuilt by toLabel + candidates. Assert it
     // again here rather than trust the caller: this is the string that becomes
     // part of a URL carrying our key.
-    for (const d of domains) {
-      if (!/^[a-z0-9-]{1,63}\.[a-z]{2,24}$/.test(d)) {
-        throw new Error('namesilo: refusing to send an unsafe domain');
-      }
-    }
+    for (const d of domains) assertSendable_(d, 'namesilo');
     return {
+      method: 'GET',
       url: 'https://www.namesilo.com/api/checkRegisterAvailability'
         + '?version=1&type=json&key=' + encodeURIComponent(key)
         + '&domains=' + encodeURIComponent(domains.join(',')),
@@ -223,29 +256,56 @@ const namesilo = {
 
 const cloudflare = {
   name: 'cloudflare',
+  // MEASURED AGAINST THE PUBLISHED REFERENCE, 2026-09-08, after codex found the
+  // first version of this adapter was invented. It used
+  //   GET /registrar/domains/check?domains=...   ->  result[].available/price
+  // which appears nowhere in Cloudflare's documentation. I had read the overview
+  // page, seen the four endpoints named, and written a plausible REST shape from
+  // memory. The tests then encoded that invention, so 61 green assertions proved
+  // only that the code agreed with itself.
+  //
+  // The documented contract is:
+  //   POST /accounts/{account_id}/registrar/domain-check
+  //   body    {"domains":["acmecorp.dev"]}
+  //   result  { domains: [ { name, registrable, tier,
+  //                          pricing: { currency, registration_cost,
+  //                                     renewal_cost } } ] }
+  // registration_cost is a STRING in the documented example ("10.11").
   buildRequest(domains, cfg) {
     const token = str_(cfg && cfg.apiToken);
     const account = str_(cfg && cfg.accountId);
     if (!token || !account) throw new Error('cloudflare: no apiToken/accountId');
-    // The token rides in a header here, not the query string. That is the whole
-    // reason to prefer this provider once there is an account for it.
+    // The token rides in a header here rather than the query string, which is the
+    // real reason to prefer this provider -- but the domains still go out under
+    // our credential, so they are asserted exactly as NameSilo's are. The first
+    // version validated nothing at all on this path.
+    for (const d of domains) assertSendable_(d, 'cloudflare');
     return {
+      method: 'POST',
       url: 'https://api.cloudflare.com/client/v4/accounts/'
-        + encodeURIComponent(account) + '/registrar/domains/check?domains='
-        + encodeURIComponent(domains.join(',')),
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+        + encodeURIComponent(account) + '/registrar/domain-check',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify({ domains: domains }),
       secrets: [token]
     };
   },
   parse(body) {
     const j = JSON.parse(str_(body));
-    const list = (j && j.result) || [];
-    return (Array.isArray(list) ? list : []).map((r) => ({
-      domain: str_(r && r.name),
-      available: !!(r && r.available),
-      price: (r && Number.isFinite(Number(r.price))) ? Number(r.price) : null,
-      currency: str_(r && r.currency) || 'USD'
-    })).filter((r) => r.domain);
+    const list = (j && j.result && j.result.domains) || [];
+    return (Array.isArray(list) ? list : []).map((r) => {
+      const pricing = (r && r.pricing) || {};
+      const cost = Number(pricing.registration_cost);
+      return {
+        domain: str_(r && r.name),
+        available: !!(r && r.registrable),
+        price: Number.isFinite(cost) ? cost : null,
+        currency: str_(pricing.currency) || 'USD'
+      };
+    }).filter((r) => r.domain);
   }
 };
 
@@ -285,8 +345,14 @@ async function lookup(description, opts) {
   }
 
   try {
-    const body = await o.transport(req.url, req.headers);
-    const results = provider.parse(body);
+    // The transport takes an init object now, because one provider is a GET with
+    // the query carrying everything and the other is a POST with a JSON body.
+    const body = await o.transport(req.url, {
+      method: req.method || 'GET', headers: req.headers, body: req.body || null
+    });
+    // Bound to what was asked. A provider answering about a domain we never sent
+    // is not a result, it is noise or somebody else's answer.
+    const results = bindToRequested_(provider.parse(body), domains);
     return { ok: true, checked: true, provider: provider.name, suggestions: domains, results };
   } catch (e) {
     return {
@@ -297,7 +363,23 @@ async function lookup(description, opts) {
   }
 }
 
+/**
+ * Should this visitor be offered domain names at all?
+ *
+ * Only the BUILD intent. Someone whose Apex trigger is misfiring did not come
+ * here to be sold a domain, and someone standing up a Salesforce environment
+ * already has one. Offering names to either is the tone-deaf upsell PRODUCT.md
+ * exists to avoid: the sale happens when they already hold a working thing.
+ *
+ * This lives here rather than in the server so it can be tested as the policy
+ * it is, instead of being an `if` buried in a request handler.
+ */
+function shouldOfferNames(sketch) {
+  return !!(sketch && sketch.intent === 'build');
+}
+
 module.exports = {
-  TLDS, toLabel, suggestLabels, candidates, redact, lookup,
+  TLDS, toLabel, suggestLabels, candidates, redact, lookup, shouldOfferNames,
+  assertSendable_, bindToRequested_,
   providers: PROVIDERS, _str: str_
 };

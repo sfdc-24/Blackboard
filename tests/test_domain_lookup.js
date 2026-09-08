@@ -145,6 +145,56 @@ console.log('\nthe provider refuses to send anything it did not build');
   const cf = D.providers.cloudflare.buildRequest(['acme.com'], { apiToken: 't'.repeat(20), accountId: 'acc1' });
   check('cloudflare carries the token in a header, not the query',
     cf.url.indexOf('t'.repeat(20)) === -1 && /^Bearer /.test(cf.headers.Authorization), cf.url);
+
+  // codex, PR34: the cloudflare path validated NOTHING. The domains go out under
+  // our credential whether that credential sits in the URL or in a header.
+  let cfThrew = false;
+  try { D.providers.cloudflare.buildRequest(['-evil.com'], { apiToken: 't'.repeat(20), accountId: 'a' }); }
+  catch (e) { cfThrew = true; }
+  check('cloudflare also refuses an unsafe domain', cfThrew);
+}
+
+console.log('\nthe second boundary is not weaker than the first');
+{
+  // codex, PR34: the original boundary read /^[a-z0-9-]{1,63}\.[a-z]{2,24}$/, which
+  // accepts every single thing toLabel exists to reject. A second boundary weaker
+  // than the first is a comment that looks like a check.
+  const unsafe = ['-abc.com', 'abc-.com', 'xn--80ak6aa92e.com', 'a--b.com',
+                  'no-dot', '.com', 'ok.', 'UPPER.com', 'a b.com', 'a.b.com'];
+  for (const d of unsafe) {
+    let threw = false;
+    try { D.assertSendable_(d, 'test'); } catch (e) { threw = true; }
+    check('refuses ' + JSON.stringify(d), threw);
+  }
+  check('accepts a domain toLabel would actually produce',
+    D.assertSendable_('acme-roofing.com', 'test') === 'acme-roofing.com');
+  check('accepts .ca', D.assertSendable_('acme.ca', 'test') === 'acme.ca');
+}
+
+console.log('\nresults are bound to the domains we asked about');
+{
+  const rows = [
+    { domain: 'asked.com', available: true, price: 9.95, currency: 'USD' },
+    { domain: 'never-asked.com', available: true, price: 1, currency: 'USD' }
+  ];
+  const bound = D.bindToRequested_(rows, ['asked.com']);
+  check('a domain we never sent is dropped',
+    bound.length === 1 && bound[0].domain === 'asked.com', JSON.stringify(bound));
+  check('an empty request set yields nothing', D.bindToRequested_(rows, []).length === 0);
+  check('null rows do not throw', D.bindToRequested_(null, ['a.com']).length === 0);
+}
+
+console.log('\nthe cloudflare request matches the published contract');
+{
+  const r = D.providers.cloudflare.buildRequest(['acmecorp.dev'],
+    { apiToken: 't'.repeat(20), accountId: 'acc1' });
+  check('POST, not GET', r.method === 'POST', String(r.method));
+  check('path is /accounts/{id}/registrar/domain-check',
+    /\/client\/v4\/accounts\/acc1\/registrar\/domain-check$/.test(r.url), r.url);
+  check('no domains in the query string', r.url.indexOf('?') === -1, r.url);
+  check('domains travel in a JSON body',
+    JSON.stringify(JSON.parse(r.body)) === JSON.stringify({ domains: ['acmecorp.dev'] }), r.body);
+  check('content-type is set for the body', r.headers['Content-Type'] === 'application/json');
 }
 
 console.log('\nproviders parse a real-shaped response');
@@ -161,11 +211,28 @@ console.log('\nproviders parse a real-shaped response');
   check('price is a number when given', ns[0].price === 9.95);
   check('price is null rather than 0 when absent', ns[1].price === null, JSON.stringify(ns[1]));
 
+  // THE DOCUMENTED RESPONSE, copied from Cloudflare's published example rather
+  // than imagined. The previous fixture used result[].available/price, a shape
+  // that exists nowhere in their docs -- so this suite passed 61/61 while the
+  // adapter could not have worked against the live API for a moment. codex found
+  // it. A fixture invented alongside the code it tests proves only that the
+  // author was consistent with themselves.
   const cf = D.providers.cloudflare.parse(JSON.stringify({
-    result: [{ name: 'acme.dev', available: true, price: 10.44, currency: 'USD' }]
+    success: true, errors: [], messages: [],
+    result: { domains: [ { name: 'acmecorp.dev', registrable: true, tier: 'standard',
+      pricing: { currency: 'USD', registration_cost: '10.11', renewal_cost: '10.11' } } ] }
   }));
-  check('cloudflare parses to the same shape',
-    cf.length === 1 && cf[0].domain === 'acme.dev' && cf[0].available === true);
+  check('cloudflare parses the documented envelope', cf.length === 1, JSON.stringify(cf));
+  check('reads result.domains[].name', cf[0].domain === 'acmecorp.dev');
+  check('reads registrable, not available', cf[0].available === true);
+  check('coerces the STRING registration_cost to a number', cf[0].price === 10.11, String(cf[0].price));
+  check('reads the currency from pricing', cf[0].currency === 'USD');
+  check('an unregistrable domain reads false',
+    D.providers.cloudflare.parse(JSON.stringify({ result: { domains: [
+      { name: 'taken.com', registrable: false, pricing: {} } ] } }))[0].available === false);
+  check('the old invented shape now yields nothing',
+    D.providers.cloudflare.parse(JSON.stringify({
+      result: [{ name: 'acme.dev', available: true, price: 10.44 }] })).length === 0);
 }
 
 console.log('\n"could not check" is never reported as "not available"');
@@ -200,6 +267,20 @@ console.log('\n"could not check" is never reported as "not available"');
   const empty = await D.lookup('a the it is', { transport: async () => '{}' });
   check('an unusable description does not call out at all',
     empty.checked === false && /no usable name/.test(empty.reason), empty.reason);
+}
+
+console.log('\nnames are only offered to someone who came here to build something');
+{
+  check('build intent is offered names', D.shouldOfferNames({ intent: 'build' }) === true);
+  // The judgement worth protecting: a broken Apex trigger is not a sales lead for
+  // a domain, and someone standing up an org already has one. PRODUCT.md is
+  // explicit that the sale comes after they hold a working thing.
+  check('a fix is NOT offered names', D.shouldOfferNames({ intent: 'fix' }) === false);
+  check('an environment is NOT offered names', D.shouldOfferNames({ intent: 'env' }) === false);
+  check('an unclear intent is NOT offered names', D.shouldOfferNames({ intent: 'unclear' }) === false);
+  check('no sketch at all is not offered names', D.shouldOfferNames(null) === false);
+  check('a near-miss intent string is not offered names',
+    D.shouldOfferNames({ intent: 'build ' }) === false && D.shouldOfferNames({ intent: 'BUILD' }) === false);
 }
 
 console.log('\nthe transport is never handed a URL built from raw visitor text');

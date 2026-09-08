@@ -9,6 +9,7 @@ on:
       - "tests/test_beat1_runtime.js"
       - "tests/test_build_page.js"
       - "tests/test_sketch_contract.js"
+      - "tests/test_domain_lookup.js"
       - ".github/workflows/beat1-prototype-tests.yml"
 
 permissions:
@@ -27,6 +28,7 @@ jobs:
           node-version: "22"
       - name: Run Beat-1 offline contract and runtime tests
         run: |
+          node --check prototype/beat1/domains.js
           node --check prototype/beat1/serve.js
           node --check prototype/beat1/sketch.js
           node --check prototype/beat1/build.js
@@ -36,3 +38,4 @@ jobs:
           node tests/test_beat1_history.js
           node tests/test_beat1_provider.js
           node tests/test_beat1_runtime.js
+          node tests/test_domain_lookup.js
