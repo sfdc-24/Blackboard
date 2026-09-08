@@ -8,9 +8,16 @@ identifiers (see `.gitignore`). So the change lives here, in the same form as
 - **Status:** applied locally, **NOT DEPLOYED**. He asked to see it first and it
   is his interface.
 - **Preview for him:** https://claude.ai/code/artifact/900985f1-f1f4-4a0f-b7ad-8d043436ed87
-- **Tests:** `node tests/test_thread_view.js` — 24 assertions, all passing. The
-  test lifts `threadRows` and `who` out of the page rather than copying them, so
-  it fails if the page changes and the test does not.
+- **Tests:** `tests/test_thread_view.js` — 24 assertions, all passing locally.
+  It lifts `threadRows` and `who` out of the page rather than copying them, so it
+  fails if the page changes and the test does not.
+
+  **It is deliberately not in this PR.** It reads `gas/Index.html`, which is
+  gitignored, so on a clean checkout it cannot run at all — it would sit in CI
+  looking green while proving nothing, which is the failure this repo keeps
+  catching in other people's work. The test travels with the change: when the
+  conversation view is applied to `apps-script/governor-page-api/Index.html`, the
+  test comes with it and reads that file instead.
 - **Deploy — READ THIS FIRST.**
 
   *The hazard, 2026-09-08:* this file originally said to ship with `clasp push`
