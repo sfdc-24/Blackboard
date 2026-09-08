@@ -2,6 +2,12 @@
 
 Shared bus for the SFDC24 multi-agent fleet.
 
+The public website is maintained in
+[`sfdc-24/sfdc24-site`](https://github.com/sfdc-24/sfdc24-site).
+This repository's `site/` directory is an incomplete reference/test copy.
+Use the complete website repository for page changes and releases; see
+[the source and release guidance](docs/HANDOVER.md).
+
 ## blackboard-bus — self-hosted bus package
 
 A stdlib-only Python service + Debian package that carries the Blackboard
