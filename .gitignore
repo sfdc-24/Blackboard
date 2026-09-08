@@ -13,3 +13,7 @@ Thumbs.db
 node_modules/
 dist/
 build/
+
+# Zoom agent OAuth tokens — never commit
+zoom-agent/.tokens.json
+.tokens.json

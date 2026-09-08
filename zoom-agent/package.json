@@ -1,0 +1,19 @@
+{
+  "name": "sfdc24-meeting-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SFDC24 Consultant — real-time AI assistance on Zoom client calls via RTMS",
+  "type": "module",
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@zoom/rtms": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  }
+}
