@@ -6,8 +6,10 @@ word on every line.
 
 Facts about him come from his public LinkedIn profile, which he pointed me to.
 Everything about how the site was built comes from this repository's own record.
-**Nothing here is invented, and the three places I could not verify something are
-marked `[CONFIRM]` rather than filled in with something plausible.**
+**Nothing here is invented.** The three places I could not verify were marked
+`[CONFIRM]` and Mr. Salam answered all three on 2026-09-08: the volunteer
+paragraph is cut, Gemini stays named, and the one-week trial section is dropped
+rather than given invented numbers. No unverified claim remains.
 
 ---
 
@@ -26,15 +28,6 @@ The work has not been theoretical. A professional identification portal designed
 and implemented across Salesforce and WordPress. Two years on Access Haiti's
 supply chain implementation in Salesforce. The kind of engagements where the
 system has to keep working after the consultant leaves.
-
-Since 2012 he has interviewed for ACCES Employment as a volunteer, helping people
-who have just arrived in Canada find their footing in IT, and he leads web
-development for Future Possibilities For Kids. That is not decoration on a
-consulting page. Fourteen years of sitting across from people who need to be
-understood quickly is most of what this business actually does.
-
-*[CONFIRM] — whether you want the volunteer paragraph on a business page at all.
-I think it is the most persuasive thing here, but it is yours to cut.*
 
 ---
 
@@ -56,8 +49,7 @@ the live homepage in a way Claude had not thought of.
 Mr. Salam is reached when something needs a human decision.
 
 **Google Gemini** works on architecture and reviews the same code from a
-different angle. *[CONFIRM] — you did not name Gemini in your list. It is in the
-record, so I have included it; say the word and it comes out.*
+different angle.
 
 **Salesforce's Headless 360 framework** is how the Salesforce side is built and
 inspected without a browser sitting in the middle of it.
@@ -99,26 +91,6 @@ methodology. The same person who takes the call makes the calls.
 
 ---
 
-## Try it for a week
-
-If you want to see whether this works on your problem rather than on a case
-study, there is a one-week trial.
-
-Bring one real thing — a process that keeps breaking, a report nobody trusts, an
-automation everyone routes around. Not a pilot chosen because it is safe. The
-thing that is actually annoying you.
-
-At the end of the week you have a written picture of what is happening, where it
-breaks, and what to do first — and you keep it whether or not you continue.
-
-*[CONFIRM] — the trial terms are yours and I have deliberately not invented them.
-What does the week cost, if anything? How much of your time does it need? What
-happens at the end if they want to carry on? I have described the shape only,
-and left the numbers to you, because a made-up price on your own About page is
-the one mistake there is no recovering from.*
-
----
-
 ## Notes for whoever ships this
 
 - Nothing above claims the site does something it does not do today. The four
@@ -126,4 +98,9 @@ the one mistake there is no recovering from.*
   live yet. See `HOMEPAGE-REWRITE-PROPOSAL.md` for why that rule matters.
 - The eight-corrections paragraph is checkable against the board. Keep it that
   way — the moment it becomes a round number nobody verified, it is marketing.
-- If the volunteer paragraph stays, it should stay in his words, not mine.
+- The volunteer paragraph was cut on his instruction (2026-09-08). It is worth
+  saying why the page is not poorer for it: what it argued — that he is used to
+  understanding people quickly — the rest of the page now has to earn by being
+  clear rather than by claiming it.
+- There is deliberately no pricing and no trial offer. He dropped that section
+  rather than let a number onto his own About page that he had not set.

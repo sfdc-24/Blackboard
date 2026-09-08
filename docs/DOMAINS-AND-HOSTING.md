@@ -62,10 +62,14 @@ by email request. Cheapest wholesale of the three he named.
 price), *register*, *poll*. Explicitly aimed at scripted and agent-driven
 workflows, at wholesale cost.
 
-> The date was challenged and **holds**: Cloudflare's own announcement carries
-> `datePublished: 2026-04-15T13:00:00.000Z` and opens *"Today we're launching …
-> the Registrar API in beta."* Their public changelog has no entry for it at all,
-> so a changelog citation for a 2025 date cannot be reproduced.
+> **Two primary sources disagree about the date and this document does not pick a
+> winner.** Cloudflare's announcement carries `datePublished: 2026-04-15` and opens
+> *"Today we're launching … the Registrar API in beta."* A changelog entry for the
+> same launch renders **April 15, 2025**. An earlier revision of this file said the
+> 2026 reading "holds" and that no changelog entry existed; codex showed on
+> 2026-09-08 that a changelog entry does exist, so both claims are withdrawn.
+> Nothing in our plan depends on which year is right — it is recorded as unresolved
+> rather than resolved by whoever wrote it up.
 >
 > **The check contract in this document's first draft was invented, though.** It
 > is `POST /accounts/{account_id}/registrar/domain-check` with a JSON body
@@ -86,10 +90,13 @@ domain but not renew it is not a service.
 
 ## 3. Registration — the decision is commercial, not technical
 
-Both APIs register domains **into the operator's own account**. Cloudflare's docs
-are explicit that you may override the registrant contact but this is *"not to
-register on behalf of unrelated third parties"*. So there are three models and
-they are genuinely different businesses:
+Both APIs register domains **into the operator's own account**. An earlier revision
+of this file quoted a Cloudflare restriction about registering *on behalf of
+unrelated third parties*. **That quotation is withdrawn** — codex could not find it
+in the cited guide on 2026-09-08 and neither could I verify it, and a quotation
+attributed to a source that does not carry it borrows authority it was never given.
+The commercial point stands without it, on the plain fact that registration lands in
+the operator's account. Three models, genuinely different businesses:
 
 **A · Client's own registrar account, we automate against their key.**
 They own the asset. We never hold it, never carry the renewal, never appear in a
@@ -193,15 +200,38 @@ is already live.
 
 ---
 
-## What I need from him
+## What he decided — 2026-09-08
 
-1. **Ownership model: A, B or C above.** Everything about registration waits on
-   this one answer.
-2. **Is a second host (Cloudflare Pages) for client domains worth opening**, or do
-   client prototypes stay under `sfdc24.com/p/...` for now?
-3. **Confirm WordPress hosting is out**, or tell me why the risk is worth it —
-   he has run more of these engagements than I have and may know something I do
-   not.
+1. **Ownership model: C.** We advise, the client buys, we do the DNS. So we never
+   hold the asset, never carry the renewal, and are never the reason someone's
+   domain lapsed. This also means **we do not need a registrar credential at all**,
+   which removes the D-18 problem model A would have created.
+2. **Lookup provider: NameSilo.** Cloudflare is not being built. The Cloudflare
+   adapter stays in the code because it is tested, but it is not the shipping path
+   and nothing depends on the unresolved beta-date question above.
+3. **Registration is out of scope**, and follows from C rather than from a schedule.
+   What ships is *lookup* — he describes a business, we show available names with
+   real prices, and he buys them himself wherever he likes.
+
+Still unanswered, and neither blocks the launch:
+
+- whether a second host (Cloudflare Pages) for client domains is worth opening, or
+  client prototypes stay under `sfdc24.com/p/...`
+- explicit confirmation that WordPress hosting is out
+
+## What ships, and what is still needed
+
+**Ready:** `prototype/beat1/domains.js`, its NameSilo adapter and 109 tests.
+
+**Blocked on one thing only:** a NameSilo API key. He creates it in his own NameSilo
+account and puts it in this machine's `.env` himself — it never passes through a
+message or a command line (D-18). Nothing else is outstanding.
+
+> **Do not ship the lookup before repairing the parse.** codex found on 2026-09-08
+> that the Cloudflare parse coerces a string `"false"` to available and a blank price
+> to `0` — see `CLAUDE-PR34-DOMAINS-TRUST-AGREE-001`. The same class of bug would
+> tell a customer a taken name is free. The NameSilo path must be checked for the
+> identical coercion before a key goes anywhere near it.
 
 ## Sources
 
