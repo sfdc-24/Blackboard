@@ -57,42 +57,45 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-# STDOUT IS THE EVENT STREAM. Only addressed rows may appear on it; the bus's own
-# warnings ride stream 3 and once surfaced as a notification that read like a
-# real message (2026-09-07). Silence every stream it can write on.
+# STDOUT IS RESERVED FOR HIS MESSAGES AND FOR THINGS THIS WATCHER CANNOT DO.
+#
+# bus.ps1 raises a Write-Warning when a read comes back as a redirect artifact,
+# which is normal and self-healing. Warnings ride stream 3, not stream 2, so a
+# `2>$null` never caught them and one surfaced as a notification on 2026-09-07
+# looking exactly like a line from Mr. Salam. A watcher that reports its own
+# noise in his voice is the same defect as the gateway answering him confidently
+# with nothing.
 $WarningPreference     = 'SilentlyContinue'
 $InformationPreference = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
 
 $bus = Join-Path $PSScriptRoot 'bus.ps1'
 if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this script" }
-
-# Machine state, not project content: a state file inside the repo is one
-# `git add -A` away from being published.
-if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA ('sfdc24\fleet_watch.' + $Tag + '.state.json') }
-$stateDir = Split-Path -Parent $StateFile
-if ($stateDir -and -not (Test-Path -LiteralPath $stateDir)) {
-  New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
-}
-if ($Reset -and (Test-Path -LiteralPath $StateFile)) { Remove-Item -LiteralPath $StateFile -Force }
-
-# WATERMARK, not a memory of every row seen. codex found the old design's failure
-# while reviewing PR34: it kept the newest 400 ids and rescanned the entire
-# append-only board, so past 400 qualifying rows a restart replayed evicted
-# ancient rows as "(missed while offline)". Presenting weeks-old messages as
-# unanswered is worse than silence. scripts/watch_state.ps1 carries the
-# replacement and tests/test_watch_state.ps1 pins its behaviour.
 . (Join-Path $PSScriptRoot 'watch_state.ps1')
 
-$state = Read-WatchState -Path $StateFile
-$warm = ($null -ne $state)
-if (-not $state) { $state = New-WatchState }
-$tailTimes = @{}
+# The cursor lives outside the working tree on purpose. It is machine state, not
+# project content, and a state file inside the repo is one `git add -A` away from
+# being published.
+if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA ('sfdc24leet_watch.' + $Tag + '.state.json') }
+if ($Reset -and (Test-Path -LiteralPath $StateFile)) { Remove-Item -LiteralPath $StateFile -Force }
 
-$tmp = Join-Path $env:TEMP ("fleet_watch_" + [guid]::NewGuid().ToString('N') + '.json')
+$loaded = Read-WatchState -Path $StateFile
+$state = $loaded.state
+if ($loaded.reason) {
+  # Never silent. A state file that could not be used means the catch-up this
+  # watcher exists to provide is not in effect for whatever it missed.
+  Write-Output ("Fleet watch NOTICE - " + $loaded.reason)
+}
+$warm = ($null -ne $state)
+
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("fleet_watch_" + [guid]::NewGuid().ToString('N') + '.json')
 
 function Read-Board {
+  # A failed poll must never kill the watcher: the board is a network call and a
+  # transient failure is normal. Return $null and try again next tick.
   try {
+    # Every stream the bus can write on is silenced here, not just stderr. Its
+    # own output is never news; only the rows it fetches are.
     & $bus -Action read -Title "Blackboard - Alpha DB" -OutFile $tmp 2>$null 3>$null 4>$null 5>$null 6>$null | Out-Null
     return (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8 | ConvertFrom-Json)
   } catch { return $null }
@@ -118,6 +121,21 @@ function Addressed {
     if ($cc -contains $Tag) { return $true }
   }
   return $false
+}
+
+function Test-RowQualifies {
+  # Rows somebody chose to address to this tag. NOT cc=ALL, which is most of the
+  # board and would bury the addressed rows exactly the way a notification stream
+  # must never do; -IncludeCc opts into that. Rows written BY this tag are
+  # skipped, because a watcher that reports our own writes back to us is the
+  # session talking to itself -- wa_watch.ps1 shipped with that bug and it looked
+  # exactly like real traffic.
+  param($Row, [string]$Tag, [bool]$WithCc)
+  $pay = [string]$Row[5]
+  if ($pay -notlike 'BCB|*') { return $false }
+  if (([string]$Row[2]) -eq $Tag) { return $false }
+  if ((Field $pay 'from') -eq $Tag) { return $false }
+  return (Addressed $pay $Tag $WithCc)
 }
 
 function Format-Line {
@@ -173,68 +191,86 @@ function Format-Line {
   $head += " " + $phase + " " + $id
   return ($head + " :: " + ($ask -replace '\s+', ' '))
 }
+# try/finally restored. It was added in e800def, and my own state-block rewrite
+# on 2026-09-08 cut out the `try` its `finally` depended on -- silently removing
+# temp cleanup from both watchers and leaving 25 stray board snapshots, 26MB, in
+# TEMP. codex caught it. The commit that removed it claimed to have preserved it.
+try {
+  while ($true) {
+    $board = Read-Board
+    if ($board -and $board.rows) {
+      $rows = $board.rows
+      $boardId = [string]$board.fileId
 
-$primed = $warm
-while ($true) {
-  $board = Read-Board
-  if ($board -and $board.rows) {
-    $rows = $board.rows
-    $fresh = @()
-    for ($i = 1; $i -lt $rows.Count; $i++) {
-      $r = $rows[$i]
-      $pay = [string]$r[5]
-      if ($pay -notlike 'BCB|*') { continue }
-      # Our own writes are not news. wa_watch.ps1 shipped without this test and
-      # echoed this session's replies back as if a person had sent them.
-      if (([string]$r[2]) -eq $Tag) { continue }
-      if ((Field $pay 'from') -eq $Tag) { continue }
-      if (-not (Addressed $pay $Tag ([bool]$IncludeCc))) { continue }
-      $id = [string]$r[0]
-      if (-not (Test-RowIsNew -State $state -RowId $id -RowTs ([string]$r[1]))) { continue }
-      $fresh += ,$r
-    }
-
-    if (-not $primed) {
-      $primed = $true
-      Write-Output ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                    " for " + $Tag + " - " + $fresh.Count + " existing rows ignored, polling every " + $PollSeconds + "s")
-      foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
-      [void](Save-WatchState -State $state -Path $StateFile)
-    } else {
-      $emit = $fresh
-      $late = $false
-      if ($warm) {
+      $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
+      if (-not $cont.ok) {
+        # Fail LOUDLY and re-prime explicitly. The forbidden outcome is carrying
+        # on as though catch-up were intact: that is indistinguishable from
+        # working, and is how both earlier designs hid their defects.
+        Write-Output ("Fleet watch CANNOT RESUME - " + $cont.reason +
+                      ". Re-priming from the end of the board; anything in the gap is NOT replayed.")
+        $state = $null
         $warm = $false
-        if ($fresh.Count -gt 0) {
-          $late = $true
-          if ($fresh.Count -gt $CatchUpMax) {
-            Write-Output ("Fleet watch resumed - " + $fresh.Count + " addressed rows arrived while nothing was listening, showing the newest " + $CatchUpMax)
-            $emit = $fresh[($fresh.Count - $CatchUpMax)..($fresh.Count - 1)]
+        $cont = Test-BoardContinuity -State $null -Rows $rows -BoardId $boardId
+      }
+      if (-not $state) { $state = New-WatchState }
+
+      $lastData = @($rows).Count - 1
+
+      if ($cont.prime) {
+        # COLD START. Establish the cursor at the end of the board and emit
+        # nothing but context, because there is no honest way to know which of
+        # the existing rows were already dealt with.
+        Write-Output ("Fleet watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                      " - cursor set at row " + $lastData + " for " + $Tag + ", polling every " + $PollSeconds + "s")
+      } else {
+        $fresh = @()
+        for ($i = $cont.startIndex; $i -le $lastData; $i++) {
+          if (Test-RowQualifies -Row $rows[$i] -Tag $Tag -WithCc ([bool]$IncludeCc)) { $fresh += ,$rows[$i] }
+        }
+
+        $emit = $fresh
+        $late = $false
+        if ($warm) {
+          $warm = $false
+          if ($fresh.Count -gt 0) {
+            $late = $true
+            if ($fresh.Count -gt $CatchUpMax) {
+              Write-Output ("Fleet watch resumed - " + $fresh.Count + " messages arrived while nothing was listening, showing the newest " + $CatchUpMax)
+              $emit = $fresh[($fresh.Count - $CatchUpMax)..($fresh.Count - 1)]
+            } else {
+              Write-Output ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening")
+            }
           } else {
-            Write-Output ("Fleet watch resumed - " + $fresh.Count + " addressed row(s) arrived while nothing was listening")
+            Write-Output ("Fleet watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                          " for " + $Tag + " - nothing missed, polling every " + $PollSeconds + "s")
           }
-        } else {
-          # Say so. A silent start is indistinguishable from a watcher that died,
-          # which is the failure this whole file exists to end.
-          Write-Output ("Fleet watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                        " for " + $Tag + " - nothing missed, polling every " + $PollSeconds + "s")
+        }
+
+        foreach ($r in $emit) {
+          $key = ([string]$r[2]) + '::' + (([string]$r[5]) -replace '\s+', ' ')
+          if (Test-RowIsDuplicate -State $state -Key $key -RowTs ([string]$r[1])) { continue }
+          $state = Set-WatchEmitted -State $state -Key $key -RowTs ([string]$r[1])
+          $prefix = ''
+          if ($late) { $prefix = '(missed while offline) ' }
+          Write-Output (Format-Line -Row $r -Prefix $prefix)
         }
       }
-      foreach ($r in $emit) {
-        $prefix = ''
-        if ($late) { $prefix = '(missed while offline) ' }
-        Write-Output (Format-Line -Row $r -Prefix $prefix)
-      }
-      if ($fresh.Count -gt 0) {
-        # Advance over EVERY considered row, not just the emitted ones: a row
-        # suppressed by the catch-up cap or the duplicate window has still been
-        # dealt with, and must not come back as new on the next restart.
-        foreach ($r in $fresh) { $state = Update-WatchState -State $state -RowId ([string]$r[0]) -RowTs ([string]$r[1]) -TailTimes $tailTimes }
-        [void](Save-WatchState -State $state -Path $StateFile)
+
+      # Advance over EVERY row examined, not just the emitted ones: a row
+      # suppressed by the catch-up cap or the duplicate window has still been
+      # dealt with and must not return as new after a restart.
+      $state = Set-WatchPosition -State $state -Rows $rows -Index $lastData -BoardId $boardId
+      $saved = Save-WatchState -State $state -Path $StateFile
+      if (-not $saved.ok) {
+        Write-Output ("Fleet watch WARNING - " + $saved.reason +
+                      ". Restart coverage is NOT in effect; a restart will re-prime and skip the gap.")
       }
     }
-  }
 
-  if ($Once) { break }
-  Start-Sleep -Seconds $PollSeconds
+    if ($Once) { break }
+    Start-Sleep -Seconds $PollSeconds
+  }
+} finally {
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
