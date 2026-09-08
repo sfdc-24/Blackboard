@@ -46,14 +46,27 @@ param(
   [switch]$Reset,     # set the cursor to the newest row and print nothing
   [int]$Last = 0,     # ignore the cursor, show the last N addressed rows
   [switch]$Mine,      # include rows this tag wrote (default: exclude own noise)
-  [string]$EnvFile    # passed through to bus.ps1; defaults to ..\.env
+  [string]$EnvFile,   # passed through to bus.ps1; defaults to ..\.env
+  [string]$BusScript  # explicit path to bus.ps1, for checkouts that lack it
 )
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot  = Split-Path -Parent $scriptDir
-$busPs1    = Join-Path $scriptDir 'bus.ps1'
-if (-not (Test-Path -LiteralPath $busPs1)) { throw "bus.ps1 not found beside this script: $busPs1" }
+# bus.ps1 is NOT on main -- main carries only scripts/.gitkeep -- so a checkout
+# of the default branch does not have it beside this file. Look in the obvious
+# places and then say plainly what to pass, rather than failing with a path.
+$candidates = @()
+if ($BusScript)          { $candidates += $BusScript }
+if ($env:SFDC24_BUS_PS1) { $candidates += $env:SFDC24_BUS_PS1 }
+$candidates += (Join-Path $scriptDir 'bus.ps1')
+$candidates += (Join-Path $repoRoot 'scripts/bus.ps1')
+$busPs1 = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $busPs1) {
+  throw ("bus.ps1 not found. Looked in:`n  " + ($candidates -join "`n  ") +
+         "`nPass -BusScript <path>, or set SFDC24_BUS_PS1. " +
+         "bus.ps1 currently lives only on branch session/bus-clients-and-docs, not on main.")
+}
 
 # Cursor lives beside the repo, not in it -- it is per-machine state, not source.
 $stateDir = Join-Path $env:LOCALAPPDATA 'sfdc24-board'
