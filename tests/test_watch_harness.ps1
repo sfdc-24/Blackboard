@@ -133,7 +133,7 @@ foreach ($w in @(@{ s = 'wa_watch.ps1'; n = 'WA watch' }, @{ s = 'fleet_watch.ps
 
   # ---- a corrupt cursor refuses, and does not prime over the gap ---------
   $corrupt = Join-Path $root ($w.s + '.corrupt.json')
-  Set-Content -LiteralPath $corrupt -Value '{"schema":4,"boardId":"board-A","lastIndex":3' -Encoding UTF8
+  Set-Content -LiteralPath $corrupt -Value '{"schema":5,"boardId":"board-A","lastIndex":3' -Encoding UTF8
   $before = [System.IO.File]::ReadAllBytes($corrupt)
   $r4 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $board -StatePath $corrupt
   Assert-True ($name + ' a corrupt cursor exits NON-zero') ($r4.exit -ne 0) ("exit=" + $r4.exit)
@@ -150,9 +150,10 @@ foreach ($w in @(@{ s = 'wa_watch.ps1'; n = 'WA watch' }, @{ s = 'fleet_watch.ps
   # ---- a cross-board retained outbox refuses, emitting none of it --------
   $cross = Join-Path $root ($w.s + '.cross.json')
   $payload = [ordered]@{
-    schema = 4; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-OTHER'; lastIndex = 1; anchorId = 'r1'
+    schema = 5; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-OTHER'; lastIndex = 1; anchorId = 'r1'
     lastEmitKey = ''; lastEmitTs = ''; pendingIndex = 2; pendingAnchor = 'r2'
-    pendingLines = @('SECRET LINE FROM ANOTHER BOARD'); pendingRowIds = @('r2'); resetAt = ''
+    pendingLines = @('SECRET LINE FROM ANOTHER BOARD'); pendingRowIds = @('r2')
+    planFrom = 2; planMode = 'steady'; planLimit = 0; planEmitKey = ''; planEmitTs = ''; resetAt = ''
   }
   ($payload | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $cross -Encoding UTF8
   $r6 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $board -StatePath $cross
@@ -162,9 +163,10 @@ foreach ($w in @(@{ s = 'wa_watch.ps1'; n = 'WA watch' }, @{ s = 'fleet_watch.ps
   # ---- a moved pending anchor refuses ------------------------------------
   $moved = Join-Path $root ($w.s + '.moved.json')
   $payload2 = [ordered]@{
-    schema = 4; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
+    schema = 5; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
     lastEmitKey = ''; lastEmitTs = ''; pendingIndex = 2; pendingAnchor = 'NOT-THE-ROW-THERE'
-    pendingLines = @('STALE LINE'); pendingRowIds = @('r2'); resetAt = ''
+    pendingLines = @('STALE LINE'); pendingRowIds = @('r2')
+    planFrom = 2; planMode = 'steady'; planLimit = 0; planEmitKey = ''; planEmitTs = ''; resetAt = ''
   }
   ($payload2 | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $moved -Encoding UTF8
   $r7 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $board -StatePath $moved
@@ -174,9 +176,10 @@ foreach ($w in @(@{ s = 'wa_watch.ps1'; n = 'WA watch' }, @{ s = 'fleet_watch.ps
   # ---- a pending row that no longer exists refuses ------------------------
   $ghost = Join-Path $root ($w.s + '.ghost.json')
   $payload3 = [ordered]@{
-    schema = 4; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
+    schema = 5; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
     lastEmitKey = ''; lastEmitTs = ''; pendingIndex = 2; pendingAnchor = 'r2'
-    pendingLines = @('GHOST LINE'); pendingRowIds = @('row-that-vanished'); resetAt = ''
+    pendingLines = @('GHOST LINE'); pendingRowIds = @('row-that-vanished')
+    planFrom = 2; planMode = 'steady'; planLimit = 0; planEmitKey = ''; planEmitTs = ''; resetAt = ''
   }
   ($payload3 | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $ghost -Encoding UTF8
   $r8 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $board -StatePath $ghost
@@ -184,14 +187,30 @@ foreach ($w in @(@{ s = 'wa_watch.ps1'; n = 'WA watch' }, @{ s = 'fleet_watch.ps
   Assert-True ($name + ' and emits none of it') (-not ($r8.out -match 'GHOST LINE')) $r8.out
 
   # ---- a retained outbox for THIS board is replayed and labelled ---------
+  # Per-watcher board and row: fleet only qualifies BCB rows addressed to its
+  # tag, so a whatsapp fixture makes the recompute yield nothing and the guard
+  # refuses -- correctly. The fixture has to be valid for the watcher under test.
+  $replayBoard = $board
+  $replayRow = 'r2'
+  if ($w.s -eq 'fleet_watch.ps1') {
+    $replayBoard = Join-Path $root 'fleetboard.json'
+    $frows = @( ,@('Row_ID','Timestamp','Source_Tag','Target_Surface','Action_Type','Payload','Category','Project','Gist','Sub') )
+    for ($i = 1; $i -le 12; $i++) {
+      $frows += ,@(('r' + $i), ('2026-09-01T00:00:' + ('{0:d2}' -f $i) + '.000Z'), 'vm-cli', 'ALL', 'APPEND',
+                   ('BCB|v=1|id=X' + $i + '|from=vm-cli|to=claude-code-cli|ask=please look at item ' + $i), '', '', '', '')
+    }
+    ([ordered]@{ ok = $true; fileId = 'board-A'; title = 't'; rows = $frows } | ConvertTo-Json -Depth 6 -Compress) |
+      Set-Content -LiteralPath $replayBoard -Encoding UTF8
+  }
   $replay = Join-Path $root ($w.s + '.replay.json')
   $payload4 = [ordered]@{
-    schema = 4; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
+    schema = 5; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 1; anchorId = 'r1'
     lastEmitKey = ''; lastEmitTs = ''; pendingIndex = 2; pendingAnchor = 'r2'
-    pendingLines = @('LINE THAT WAS NEVER SHOWN'); pendingRowIds = @('r2'); resetAt = ''
+    pendingLines = @('LINE THAT WAS NEVER SHOWN'); pendingRowIds = @('r2')
+    planFrom = 2; planMode = 'steady'; planLimit = 0; planEmitKey = ''; planEmitTs = ''; resetAt = ''
   }
   ($payload4 | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $replay -Encoding UTF8
-  $r9 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $board -StatePath $replay
+  $r9 = Invoke-Watcher -Script $w.s -ExtraArgs @() -BoardFile $replayBoard -StatePath $replay
   Assert-True ($name + ' a valid retained outbox replays') ($r9.out -match 'LINE THAT WAS NEVER SHOWN') $r9.out
   Assert-True ($name + ' and says it may be a repeat') ($r9.out -match 'POSSIBLE REPLAY') $r9.out
   Assert-True ($name + ' and exits 0') ($r9.exit -eq 0) ("exit=" + $r9.exit)
@@ -240,6 +259,80 @@ Assert-True 'the cursor did not jump to the end of the board in one go' `
   ([int]$st.lastIndex -le 260) ('lastIndex=' + [string]$st.lastIndex)
 Assert-True 'and the outbox is empty after a clean commit' (@($st.pendingLines).Count -eq 0)
 
+
+# ---- the staged lines must actually REACH stdout ----------------------
+Write-Output ''
+Write-Output '=== cold -Backfill emits the exact lines, in order ==='
+# The stage function used to write to the success stream AND return a count, so
+# the caller's assignment captured both and NOTHING reached stdout: the lines
+# were staged, swallowed, then cleared by the commit. The old cold case used
+# -Backfill 0 and planned nothing, so it could not see this.
+$bf = Join-Path $root 'backfill.state.json'
+$rb = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-Backfill', '3') -BoardFile $board -StatePath $bf
+Assert-True 'cold -Backfill 3 exits 0' ($rb.exit -eq 0) ('exit=' + $rb.exit + ' ' + $rb.out)
+$recent = @(($rb.out -split "`n") | Where-Object { $_ -match '\(recent\)' })
+Assert-True 'exactly three recent lines reach stdout' ($recent.Count -eq 3) ('count=' + $recent.Count + ' out=' + $rb.out)
+Assert-True 'they are the three newest rows, in board order' `
+  (($recent[0] -match 'hello from him 10') -and ($recent[1] -match 'hello from him 11') -and ($recent[2] -match 'hello from him 12')) `
+  ($recent -join ' | ')
+$lines = @(($rb.out -split "`n") | Where-Object { $_.Trim() })
+Assert-True 'the armed line comes after the row-derived lines' `
+  (($lines[$lines.Count - 1]) -match 'armed COLD') ($lines[$lines.Count - 1])
+
+Write-Output ''
+Write-Output '=== a warm catch-up emits its lines too ==='
+$wf = Join-Path $root 'warm.state.json'
+New-BoardFile -Path (Join-Path $root 'small2.json') -Count 2
+[void](Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @() -BoardFile (Join-Path $root 'small2.json') -StatePath $wf)
+$rw = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '5') -BoardFile $board -StatePath $wf
+Assert-True 'a warm catch-up exits 0' ($rw.exit -eq 0) ('exit=' + $rw.exit)
+$missed = @(($rw.out -split "`n") | Where-Object { $_ -match 'missed while offline' })
+Assert-True 'the missed lines reach stdout' ($missed.Count -ge 1) ('count=' + $missed.Count + ' out=' + $rw.out)
+
+Write-Output ''
+Write-Output '=== an INCOMPLETE staged plan is refused before any output ==='
+# One line for r2 with pendingIndex 12 used to pass an interval check, replay the
+# single line, and commit the cursor to 12 -- silently skipping r3 to r12.
+$inc = Join-Path $root 'incomplete.state.json'
+$pi = [ordered]@{
+  schema = 5; savedAt = '2026-09-08T00:00:00Z'; boardId = 'board-A'; lastIndex = 0; anchorId = ''
+  lastEmitKey = ''; lastEmitTs = ''; pendingIndex = 12; pendingAnchor = 'r12'
+  pendingLines = @('ONLY R2 LINE'); pendingRowIds = @('r2')
+  planFrom = 1; planMode = 'steady'; planLimit = 0; planEmitKey = ''; planEmitTs = ''; resetAt = ''
+}
+($pi | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $inc -Encoding UTF8
+$ri = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @() -BoardFile $board -StatePath $inc
+Assert-True 'an incomplete staged plan exits NON-zero' ($ri.exit -ne 0) ('exit=' + $ri.exit)
+Assert-True 'and emits none of it' (-not ($ri.out -match 'ONLY R2 LINE')) $ri.out
+Assert-True 'and says the plan does not match' ($ri.out -match 'recomputed plan|yields') $ri.out
+
+Write-Output ''
+Write-Output '=== a repeated key straddling the 200 bound is not lost ==='
+# The dedupe marker used to advance through EVERY planned candidate before the
+# chunk was cut at 200, so the saved marker described a row that was never
+# staged and the next scan dropped a real message against it.
+$dupBoard = Join-Path $root 'dupboard.json'
+$rows2 = @( ,@('Row_ID','Timestamp','Source_Tag','Target_Surface','Action_Type','Payload','Category','Project','Gist','Sub') )
+for ($i = 1; $i -le 260; $i++) {
+  $pay = if ($i -eq 202 -or $i -eq 260) { 'STRADDLING TEXT' } else { ('unique ' + $i) }
+  $sec = if ($i -eq 202) { 0 } elseif ($i -eq 260) { 58 } else { ($i % 50) }
+  $ts = (Get-Date '2026-09-03T00:00:00Z').ToUniversalTime().AddSeconds($sec).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+  $rows2 += ,@(('d' + $i), $ts, 'whatsapp', 'ALL', 'APPEND', $pay, '', '', '', '')
+}
+([ordered]@{ ok = $true; fileId = 'board-A'; title = 't'; rows = $rows2 } | ConvertTo-Json -Depth 6 -Compress) |
+  Set-Content -LiteralPath $dupBoard -Encoding UTF8
+$dupState = Join-Path $root 'dup.state.json'
+$seed = Join-Path $root 'dupseed.json'
+([ordered]@{ ok = $true; fileId = 'board-A'; title = 't'; rows = @($rows2[0], $rows2[1]) } | ConvertTo-Json -Depth 6 -Compress) |
+  Set-Content -LiteralPath $seed -Encoding UTF8
+[void](Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @() -BoardFile $seed -StatePath $dupState)
+$seenStraddle = $false
+for ($tick = 1; $tick -le 4; $tick++) {
+  $rd = Invoke-Watcher -Script 'wa_watch.ps1' -ExtraArgs @('-CatchUpMax', '100') -BoardFile $dupBoard -StatePath $dupState
+  if ($rd.exit -ne 0) { Assert-True ('dup tick ' + $tick + ' exits 0') $false $rd.out; break }
+  if ($rd.out -match 'STRADDLING TEXT') { $seenStraddle = $true }
+}
+Assert-True 'the straddling repeated key is reported on some tick, not dropped' $seenStraddle ''
 } finally {
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

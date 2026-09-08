@@ -77,7 +77,8 @@ function Stage-At {
   for ($i = 0; $i -lt @($Lines).Count; $i++) {
     $plan += ,@{ line = $Lines[$i]; rowIndex = $Index; rowId = @($RowIds)[$i] }
   }
-  $r = Set-WatchOutbox -State $s -Rows $Rows -Plan $plan -FallbackIndex $Index
+  $r = Set-WatchOutbox -State $s -Rows $Rows -Plan $plan -FallbackIndex $Index `
+         -Mode 'steady' -Limit 0 -From $(if ($From -ge 1) { $From } else { 1 })
   return $r.state
 }
 
@@ -258,10 +259,30 @@ Write-Output 'CASE 14b - a hollow pending block is UNUSABLE, not merely ignored'
 # blank -- skipping five rows and unanchoring the cursor. The invariants are now
 # enforced at the read boundary rather than by each caller remembering.
 $hollow = Join-Path $tmpDir 'hollow.json'
-Set-Content -LiteralPath $hollow -Value '{"schema":4,"boardId":"b","lastIndex":0,"anchorId":"","lastEmitKey":"","lastEmitTs":"","pendingIndex":5,"pendingAnchor":"","pendingLines":[],"pendingRowIds":[],"resetAt":""}' -Encoding UTF8
+# A COMPLETE schema-5 property set, so the refusal is about the hollow block and
+# not about a missing field. The first version of this case omitted savedAt and
+# was therefore passing for the wrong reason.
+Set-Content -LiteralPath $hollow -Value '{"schema":5,"savedAt":"2026-09-08T00:00:00Z","boardId":"b","lastIndex":0,"anchorId":"","lastEmitKey":"","lastEmitTs":"","pendingIndex":5,"pendingAnchor":"","pendingLines":[],"pendingRowIds":[],"planFrom":1,"planMode":"steady","planLimit":0,"planEmitKey":"","planEmitTs":"","resetAt":""}' -Encoding UTF8
 $hv = Read-WatchState -Path $hollow
 Assert-True 'a hollow pending block is refused' ($hv.disposition -eq 'unusable') ([string]$hv.disposition)
 Assert-True 'and names the missing anchor' ($hv.reason -match 'anchor') $hv.reason
+
+Write-Output ''
+Write-Output 'CASE 14d - the strict schema gate'
+$sg = Join-Path $tmpDir 'strict.json'
+function Read-Strict { param([string]$Json) Set-Content -LiteralPath $sg -Value $Json -Encoding UTF8; return (Read-WatchState -Path $sg) }
+$full = '{"schema":5,"savedAt":"2026-09-08T00:00:00Z","boardId":"b","lastIndex":0,"anchorId":"","lastEmitKey":"","lastEmitTs":"","pendingIndex":0,"pendingAnchor":"","pendingLines":[],"pendingRowIds":[],"planFrom":0,"planMode":"","planLimit":0,"planEmitKey":"","planEmitTs":"","resetAt":""}'
+Assert-True 'a complete, well-typed state reads ok' ((Read-Strict $full).disposition -eq 'ok') (Read-Strict $full).reason
+Assert-True 'only schema and boardId is refused' ((Read-Strict '{"schema":5,"boardId":"b"}').disposition -eq 'unusable')
+Assert-True 'an unexpected extra property is refused' `
+  ((Read-Strict ($full.Substring(0, $full.Length - 1) + ',"surprise":1}')).disposition -eq 'unusable')
+Assert-True 'a numeric field sent as a string is refused' `
+  ((Read-Strict ($full -replace '"lastIndex":0', '"lastIndex":"0"')).disposition -eq 'unusable')
+Assert-True 'an array sent as a scalar is refused' `
+  ((Read-Strict ($full -replace '"pendingLines":\[\]', '"pendingLines":"nope"')).disposition -eq 'unusable')
+$overLine = '"' + ('x' * 5000) + '"'
+Assert-True 'an over-long staged line is refused' `
+  ((Read-Strict ($full -replace '"pendingLines":\[\]', ('"pendingLines":[' + $overLine + ']'))).disposition -eq 'unusable')
 
 Write-Output ''
 Write-Output 'CASE 14c - a safe-leaf allowlist, for every caller'
@@ -297,27 +318,46 @@ foreach ($f in @('scripts/wa_watch.ps1', 'scripts/fleet_watch.ps1')) {
 
 Write-Output ''
 Write-Output 'CASE 16 - a retained outbox is validated BEFORE it is replayed'
-# finding 2: the replay ran first and Complete-WatchOutbox then overwrote the
-# stored board id, disarming the identity check that should have refused it.
+# schema 5 replaced the interval check with a full plan recomputation. The
+# interval version only proved the supplied ids were SOMEWHERE in range, so a
+# block holding one line for r2 with pendingIndex 12 passed, replayed once, and
+# committed the cursor to 12 -- silently skipping r3 to r12.
+# The recompute stub below stands in for the watcher's pure planner: every row
+# in the interval is eligible.
+$recomputeAll = { param($from, $to, $mode, $limit, $k, $t)
+  $out = @(); for ($i = $from; $i -le $to; $i++) { $out += ('r' + $i) }; return $out }
+
 $cross = Stage-At -Rows $board2 -Index 2 -Lines @('board-A line') -RowIds @('r2') -Id 'board-A' -From 1
-$pv1 = Test-PendingIsValid -State $cross -Rows $board2 -BoardId 'board-B'
+$pv1 = Test-PendingMatchesPlan -State $cross -Rows $board2 -BoardId 'board-B' -Recompute $recomputeAll
 Assert-True 'an outbox from another board is refused' ($pv1.ok -eq $false)
 Assert-True 'and names the board it belongs to' ($pv1.reason -match 'board-A') $pv1.reason
-$pv2 = Test-PendingIsValid -State $cross -Rows $board2 -BoardId ''
+$pv2 = Test-PendingMatchesPlan -State $cross -Rows $board2 -BoardId '' -Recompute $recomputeAll
 Assert-True 'an unidentified board refuses the replay too' ($pv2.ok -eq $false) $pv2.reason
-$moved = Test-PendingIsValid -State $cross -Rows (New-Board -Count 600 -Prefix 'q') -BoardId 'board-A'
+
+$moved = Test-PendingMatchesPlan -State $cross -Rows (New-Board -Count 600 -Prefix 'q') -BoardId 'board-A' -Recompute $recomputeAll
 Assert-True 'a moved pending anchor is refused' ($moved.ok -eq $false)
 Assert-True 'and names the anchor move' ($moved.reason -match 'anchor moved') $moved.reason
+
 $oob = Stage-At -Rows $board2 -Index 2 -Lines @('x') -RowIds @('r2') -Id 'board-A' -From 1
 $oob.pendingIndex = 9999
-Assert-True 'an out-of-bounds pending index is refused' ((Test-PendingIsValid -State $oob -Rows $board2 -BoardId 'board-A').ok -eq $false)
-$ghost = Stage-At -Rows $board2 -Index 3 -Lines @('x') -RowIds @('no-such-row') -Id 'board-A' -From 1
-$gv = Test-PendingIsValid -State $ghost -Rows $board2 -BoardId 'board-A'
-Assert-True 'pending lines referring to a vanished row are refused' ($gv.ok -eq $false) $gv.reason
-$good = Stage-At -Rows $board2 -Index 3 -Lines @('x','y') -RowIds @('r2','r3') -From 1
-Assert-True 'a valid outbox for this board passes' ((Test-PendingIsValid -State $good -Rows $board2 -BoardId $BoardFileId).ok -eq $true)
+Assert-True 'an out-of-bounds pending index is refused' `
+  ((Test-PendingMatchesPlan -State $oob -Rows $board2 -BoardId 'board-A' -Recompute $recomputeAll).ok -eq $false)
 
-Write-Output ''
+# THE SKIP: one staged line claiming a twelve-row advance.
+$short = Stage-At -Rows $board2 -Index 12 -Lines @('ONLY R2') -RowIds @('r2') -Id 'board-A' -From 1
+$sv3 = Test-PendingMatchesPlan -State $short -Rows $board2 -BoardId 'board-A' -Recompute $recomputeAll
+Assert-True 'an INCOMPLETE plan is refused' ($sv3.ok -eq $false) $sv3.reason
+Assert-True 'and says how many rows the board yields' ($sv3.reason -match 'yields') $sv3.reason
+
+# REORDERED, same cardinality.
+$reorder = Stage-At -Rows $board2 -Index 3 -Lines @('a','b') -RowIds @('r3','r2') -Id 'board-A' -From 2
+$rv = Test-PendingMatchesPlan -State $reorder -Rows $board2 -BoardId 'board-A' -Recompute $recomputeAll
+Assert-True 'a REORDERED plan is refused' ($rv.ok -eq $false) $rv.reason
+Assert-True 'and names the position it differs at' ($rv.reason -match 'position') $rv.reason
+
+$good = Stage-At -Rows $board2 -Index 3 -Lines @('a','b') -RowIds @('r2','r3') -Id 'board-A' -From 2
+Assert-True 'an exact matching plan passes' `
+  ((Test-PendingMatchesPlan -State $good -Rows $board2 -BoardId 'board-A' -Recompute $recomputeAll).ok -eq $true)
 Write-Output 'CASE 17 - Complete-WatchOutbox cannot touch identity'
 $idt = Stage-At -Rows $board2 -Index 2 -Lines @('l') -RowIds @('r2') -Id 'board-A' -From 1
 $after2 = Complete-WatchOutbox -State $idt
