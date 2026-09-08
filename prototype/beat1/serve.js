@@ -66,9 +66,10 @@ if (!KEY) { console.error('ANTHROPIC_API_KEY missing from .env'); process.exit(2
 const DOMAIN_PROVIDER = env.CLOUDFLARE_API_TOKEN ? 'cloudflare'
                       : (env.NAMESILO_KEY ? 'namesilo' : null);
 
-function domainTransport(url, headers) {
+function domainTransport(url, init) {
+  const opts = init || {};
   return new Promise((resolve, reject) => {
-    const req = https.request(url, { method: 'GET', headers: headers || {} }, (res) => {
+    const req = https.request(url, { method: opts.method || 'GET', headers: opts.headers || {} }, (res) => {
       let body = '';
       res.on('data', (c) => { body += c; if (body.length > 200000) req.destroy(); });
       res.on('end', () => {
@@ -78,6 +79,9 @@ function domainTransport(url, headers) {
     });
     req.setTimeout(6000, () => req.destroy(new Error('timeout')));
     req.on('error', reject);
+    // Cloudflare's domain-check is a POST with a JSON body; NameSilo's is a GET
+    // with everything in the query. One transport, both shapes.
+    if (opts.body) req.write(opts.body);
     req.end();
   });
 }

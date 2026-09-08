@@ -44,14 +44,34 @@ that is not: the client's *own* domain, and a CMS they can edit themselves.
 Two credible options, both with real availability + pricing APIs.
 
 **NameSilo** — `checkRegisterAvailability`, simple key-in-URL API, sandbox access
-by email request. Registration is paid from prepaid **account funds**; there is no
-minimum deposit, and no card/PayPal at the API. Cheapest wholesale of the three
-he named.
+by email request. Cheapest wholesale of the three he named.
+
+> **Corrected 2026-09-08** after codex checked this against the primary docs. The
+> first draft said registration is paid from account funds with "no card/PayPal at
+> the API". That is wrong for the endpoint that matters. `registerDomain` takes an
+> optional `payment_id` — *"The ID number for the verified credit card to use for
+> the transaction. If you do not specify a payment_id, we will attempt to process
+> the transaction using your account funds."* So a verified card on file **can**
+> pay, and account funds are the fallback rather than the only option. The
+> funds-only rule I quoted applies to the drop-catch endpoint, not to ordinary
+> registration. It changes the answer to "how do we pay for this" and it came from
+> a search summary rather than the reference page.
 
 **Cloudflare Registrar API** — went to **beta on 2026-04-15**. Four endpoints:
 *search* (generates candidate names from keywords), *check* (live availability and
 price), *register*, *poll*. Explicitly aimed at scripted and agent-driven
 workflows, at wholesale cost.
+
+> The date was challenged and **holds**: Cloudflare's own announcement carries
+> `datePublished: 2026-04-15T13:00:00.000Z` and opens *"Today we're launching …
+> the Registrar API in beta."* Their public changelog has no entry for it at all,
+> so a changelog citation for a 2025 date cannot be reproduced.
+>
+> **The check contract in this document's first draft was invented, though.** It
+> is `POST /accounts/{account_id}/registrar/domain-check` with a JSON body
+> `{"domains":[…]}`, answering `result.domains[].registrable` and
+> `pricing.registration_cost` (a *string*). Not a GET with a query string. See
+> `prototype/beat1/domains.js`.
 
 **Recommendation: build lookup against Cloudflare's `search` + `check`.** The
 `search` endpoint turns a description into candidate names, which fits the beat-1
