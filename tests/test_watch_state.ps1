@@ -27,7 +27,9 @@ RUN
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path $RepoRoot 'scripts\watch_state.ps1')
+# Forward slash: this resolved on the Linux runner by luck rather than contract,
+# and a path separator is not worth relying on luck for.
+. (Join-Path $RepoRoot 'scripts/watch_state.ps1')
 
 $script:Passed = 0
 $script:Failed = 0
@@ -37,7 +39,11 @@ function Assert-True {
   else { $script:Failed++; Write-Output ('  FAIL  ' + $Name + $(if ($Detail) { '  --> ' + $Detail } else { '' })) }
 }
 
-$tmpDir = Join-Path $env:TEMP ('watchstate_' + [guid]::NewGuid().ToString('N'))
+# NOT $env:TEMP. CI runs this on ubuntu-24.04 under pwsh, where that variable does
+# not exist, and Join-Path threw "Cannot bind argument to parameter 'Path'
+# because it is null" on the very first CI run. The watchers themselves are
+# Windows operator helpers, but their tests must run wherever CI runs.
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ('watchstate_' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 try {
