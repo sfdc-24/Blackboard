@@ -87,6 +87,15 @@ export const config = {
   // acknowledgement. A connection that hangs mid-upgrade emits neither open nor
   // close, so nothing else would ever notice it.
   connectTimeoutMs: num('CONNECT_TIMEOUT_MS', 20_000),
+
+  // Bounds the Zoom token endpoint. connect() awaits it BEFORE the socket and
+  // its connect bound exist, so without this the advertised connect timeout is
+  // simply bypassed by a stalled refresh.
+  tokenTimeoutMs: num('TOKEN_TIMEOUT_MS', 15_000),
+
+  // Injectable for the same reason wsEndpoint is: a bound that cannot be
+  // pointed at a stalling server is a bound nothing can prove.
+  tokenUrl: process.env.ZOOM_TOKEN_URL || 'https://zoom.us/oauth/token',
   // Client conversations. Off by default so a transcript is not sprayed into a
   // terminal log by accident.
   logTranscript: optional('LOG_TRANSCRIPT', 'false') === 'true',

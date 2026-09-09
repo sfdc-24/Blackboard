@@ -981,3 +981,116 @@ test('P2: a stale backoff does not tear down the healthy socket it was meant to 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test('P2: the mutation lock admits exactly one LIVE holder under a real race', async () => {
+  // THE DEFECT THIS REPLACES was check-then-write: read the lock, see nobody,
+  // write. Two harnesses starting together both passed the read before either
+  // reached the write, so both "held" it and both mutated the same tree — the
+  // corruption the lock exists to prevent, rebuilt one layer down.
+  //
+  // Simulating that with fake timers would test a story about the code. This
+  // starts twelve real processes on a shared start line and counts winners.
+  //
+  // THE FIRST VERSION OF THIS TEST WAS WRONG, AND WRONG USEFULLY. Its racers
+  // exited the instant they acquired, so every lock was stale a millisecond
+  // later and the next process correctly reclaimed it: 5 of 12 "won" and the
+  // lock looked broken. It was not. The invariant is not "one process ever
+  // acquires" — a dead holder's lock MUST be reclaimable or a crashed run
+  // wedges the gate forever. The invariant is ONE LIVE HOLDER AT A TIME, so
+  // the winner here stays alive while the others contend.
+  const { lockPathFor, livingHolder } = await import('./lockfile.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lock-race-'));
+  const lock = lockPathFor(dir);
+  fs.rmSync(lock, { force: true });
+
+  const racer = path.join(dir, 'racer.mjs');
+  const lockMod = new URL('./lockfile.mjs', import.meta.url).href;
+  fs.writeFileSync(racer, `
+    import { acquireLock } from ${JSON.stringify(lockMod)};
+    // Line up on a shared wall-clock instant so these genuinely contend rather
+    // than starting whenever node happens to become ready.
+    const at = Number(process.argv[3]);
+    while (Date.now() < at) { /* spin to the start line */ }
+    const held = acquireLock(process.argv[2]) === null;
+    console.log(held ? 'WON' : 'LOST');
+    // A winner HOLDS it while the rest contend. Exiting immediately would make
+    // the lock legitimately stale and hand it to the next racer.
+    if (held) { const until = Date.now() + 1500; while (Date.now() < until); }
+  `);
+
+  const { spawn } = await import('node:child_process');
+  const RACERS = 12;
+  const startAt = Date.now() + 500;
+  const results = await Promise.all(
+    Array.from({ length: RACERS }, () => new Promise((resolve) => {
+      const child = spawn(process.execPath, [racer, lock, String(startAt)]);
+      let out = '';
+      child.stdout.on('data', (d) => { out += d; });
+      child.on('close', () => resolve(out.trim()));
+    })),
+  );
+
+  try {
+    const won = results.filter((r) => r === 'WON').length;
+    const lost = results.filter((r) => r === 'LOST').length;
+    assert.equal(won, 1,
+      `${won} of ${RACERS} processes held the same lock at once. Two harnesses then snapshot and `
+      + "mutate one working tree, and the second restores the first's mutation as pristine "
+      + 'source — the exact corruption the lock exists to stop');
+    assert.equal(lost, RACERS - 1, `every other racer must be told it lost (got ${lost})`);
+
+    // The other half of the contract, and the half the broken first version of
+    // this test accidentally proved: once the holder is gone the lock must NOT
+    // read as live, or a crashed run locks everyone out permanently.
+    assert.equal(livingHolder(lock), null,
+      'the winner has exited, so its lock must read as stale and be reclaimable');
+    const { acquireLock } = await import('./lockfile.mjs');
+    assert.equal(acquireLock(lock), null,
+      'and a fresh run must be able to take it, rather than wedging on a dead pid');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(lock, { force: true });
+  }
+});
+
+test('P2: a token request that stalls is aborted, not left to hang the connect path', async () => {
+  // connect() awaits getAccessToken() BEFORE the WebSocket exists, so the
+  // connect bound — widened over two review rounds to cover TCP, the upgrade
+  // and the ack — does not cover the one call that runs first. A token endpoint
+  // that accepts and stalls left the agent disconnected with no socket, no
+  // close event, no rejection and nothing scheduling a retry.
+  const srv = net.createServer((sock) => {
+    // Accept the TCP connection, read the request, and answer nothing at all.
+    sock.on('data', () => { /* deliberately silent */ });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-tok-'));
+  const prevUrl = config.tokenUrl;
+  const prevTimeout = config.tokenTimeoutMs;
+  config.tokenFile = path.join(dir, 'tokens.json');
+  config.tokenUrl = `http://127.0.0.1:${srv.address().port}/oauth/token`;
+  config.tokenTimeoutMs = 400;
+
+  const { exchangeCode } = await import('../src/oauth.js');
+  try {
+    const began = Date.now();
+    const err = await Promise.race([
+      exchangeCode('any-code').then(() => null, (e) => e),
+      new Promise((r) => setTimeout(() => r('PENDING'), 5000)),
+    ]);
+    assert.notEqual(err, 'PENDING',
+      'the token request never settled — connect() is blocked here with no socket, so nothing '
+      + 'rejects and nothing schedules a retry; the agent is simply gone until fetch decides');
+    assert.ok(err instanceof Error, 'it must reject');
+    assert.match(err.message, /did not answer within/,
+      'and must name the bound that was hit, so a caller can tell a stall from a refusal');
+    assert.ok(Date.now() - began < 3000, 'it must abort near its own bound, not much later');
+  } finally {
+    config.tokenUrl = prevUrl;
+    config.tokenTimeoutMs = prevTimeout;
+    srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

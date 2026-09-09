@@ -88,16 +88,50 @@ export function authorizeUrl() {
   return url.toString();
 }
 
+/**
+ * Every call to Zoom's token endpoint, bounded.
+ *
+ * THE HOLE THIS CLOSES IS IN A TIMER THAT ALREADY EXISTS.
+ *   connect() awaits getAccessToken() BEFORE it constructs the WebSocket, and
+ *   the connect bound is armed on that socket. So a token endpoint that accepts
+ *   the request and then stalls blocks connect() in a window nothing is
+ *   watching: no socket, therefore no close event, therefore no rejection and
+ *   no scheduled retry. The agent sits disconnected until whatever the fetch
+ *   implementation's own default happens to be — which for undici is minutes,
+ *   and is not a promise anyone here made.
+ *
+ *   Two rounds of this PR went into making the connect timer cover TCP and the
+ *   upgrade as well as the ack, on exactly this reasoning. The await that runs
+ *   before all of it was still unguarded: the bound was widened up to the edge
+ *   of the call that can hang first.
+ *
+ * Worst case is now tokenTimeoutMs + connectTimeoutMs, both finite. A bound you
+ * can add up is the whole point.
+ */
 async function tokenRequest(params) {
   const basic = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64');
-  const res = await fetch('https://zoom.us/oauth/token', {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${basic}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams(params),
-  });
+  let res;
+  try {
+    res = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${basic}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams(params),
+      signal: AbortSignal.timeout(config.tokenTimeoutMs),
+    });
+  } catch (err) {
+    // Say which bound was hit. A caller that cannot tell a stall from a refusal
+    // cannot decide whether retrying is sensible.
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error(
+        `Zoom token request did not answer within ${config.tokenTimeoutMs}ms — `
+        + 'aborted so the connect path can retry rather than hang',
+      );
+    }
+    throw err;
+  }
   if (!res.ok) {
     throw new Error(`Zoom token request failed (${res.status}): ${await res.text()}`);
   }

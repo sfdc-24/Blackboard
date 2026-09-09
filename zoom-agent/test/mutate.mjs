@@ -28,13 +28,13 @@
 // Run: npm run mutate
 
 import fs from 'node:fs';
-import os from 'node:os';
-import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { lockPathFor, acquireLock, releaseLock } from './lockfile.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const LOCK = lockPathFor(ROOT);
 
 const MUTATIONS = [
   {
@@ -232,6 +232,23 @@ const MUTATIONS = [
   },
 
   {
+    blocker: '11-lock',
+    name: 'the lock goes back to check-then-write, so two harnesses both hold it',
+    file: 'test/lockfile.mjs',
+    from: "      const fd = fs.openSync(lock, 'wx');   // create-or-fail, one syscall\n      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }\n      return null;",
+    to: "      if (livingHolder(lock) === null) { fs.writeFileSync(lock, String(process.pid)); return null; }\n      throw Object.assign(new Error('exists'), { code: 'EEXIST' });",
+    expect: /exactly one LIVE holder under a real race/,
+  },
+  {
+    blocker: '11-token',
+    name: 'the token request loses its abort, bypassing the connect bound',
+    file: 'src/oauth.js',
+    from: '      signal: AbortSignal.timeout(config.tokenTimeoutMs),',
+    to: '      /* unbounded */',
+    expect: /token request that stalls is aborted/,
+  },
+
+  {
     blocker: '10-stale',
     name: 'a stale backoff survives a successful ack and tears the socket down',
     file: 'src/events-ws.js',
@@ -282,28 +299,10 @@ const MUTATIONS = [
 // is how: not by failing to restore, but by restoring the wrong thing. A
 // snapshot is only a safe baseline if nothing else is writing.
 
-const LOCK = path.join(
-  os.tmpdir(),
-  `zoom-agent-mutate-${crypto.createHash('sha256').update(ROOT).digest('hex').slice(0, 12)}.lock`,
-);
-
-function lockHolder() {
-  try {
-    const pid = Number(fs.readFileSync(LOCK, 'utf8').trim());
-    if (!Number.isInteger(pid) || pid <= 0) return null;
-    process.kill(pid, 0);     // signal 0 tests for existence, sends nothing
-    return pid;               // alive, and holding it
-  } catch (err) {
-    // ENOENT: no lock. ESRCH: the holder died without cleaning up — stale, take it.
-    if (err?.code === 'ESRCH') { try { fs.unlinkSync(LOCK); } catch { /* raced */ } }
-    return null;
-  }
-}
-
-const holder = lockHolder();
+const holder = acquireLock(LOCK);
 if (holder !== null) {
   console.error(
-    `\nREFUSING TO RUN — pid ${holder} is already mutating this checkout.\n`
+    `\nREFUSING TO RUN — ${holder > 0 ? `pid ${holder}` : 'another process'} is already mutating this checkout.\n`
     + '\nTwo harnesses cannot share a working tree. The second one snapshots the\n'
     + "first one's mutations as pristine source and restores THOSE, which silently\n"
     + 'reverts a real fix inside a diff that looks intentional.\n'
@@ -311,13 +310,6 @@ if (holder !== null) {
   );
   process.exit(2);
 }
-fs.writeFileSync(LOCK, String(process.pid));
-function releaseLock() {
-  try {
-    if (fs.readFileSync(LOCK, 'utf8').trim() === String(process.pid)) fs.unlinkSync(LOCK);
-  } catch { /* already gone */ }
-}
-
 // PREFLIGHT: every anchor must be present BEFORE anything is touched.
 //
 // Mid-run this is already reported per case as ANCHOR LOST — but by then other
@@ -328,7 +320,7 @@ function releaseLock() {
 {
   const missing = MUTATIONS.filter((m) => applyAnchor(fs.readFileSync(path.join(ROOT, m.file), 'utf8'), m.from, m.to) === null);
   if (missing.length) {
-    releaseLock();
+    releaseLock(LOCK);
     console.error(`\nREFUSING TO RUN — ${missing.length} of ${MUTATIONS.length} anchors are not in the source:\n`);
     for (const m of missing) console.error(`  ${m.file}  [b${m.blocker}] ${m.name}`);
     console.error(
@@ -353,9 +345,9 @@ function restoreAll() {
     try { if (fs.readFileSync(file, 'utf8') !== text) fs.writeFileSync(file, text); } catch { /* nothing to do */ }
   }
 }
-process.on('exit', () => { restoreAll(); releaseLock(); });
+process.on('exit', () => { restoreAll(); releaseLock(LOCK); });
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
-  process.on(sig, () => { restoreAll(); releaseLock(); process.exit(130); });
+  process.on(sig, () => { restoreAll(); releaseLock(LOCK); process.exit(130); });
 }
 
 /**
