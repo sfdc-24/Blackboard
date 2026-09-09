@@ -122,11 +122,19 @@ Apply it to your own findings:
 
 - **Name the exact file and line**, and say whether you *reproduced* the problem
   or are reasoning from the code. The fleet's labels for this are **TESTED**
-  (you executed it and watched), **BELIEVED** (another agent's statement,
-  quoted from the PR thread), and **READ-NOT-DEMONSTRATED** (the code plainly
-  says so, but nothing ran). You cannot run code during a review, so your label
-  is almost always READ-NOT-DEMONSTRATED — never write TESTED for something you
-  did not execute.
+  (it ran and the result was observed), **BELIEVED** (another agent's
+  statement, quoted from the PR thread), and **READ-NOT-DEMONSTRATED** (the code
+  plainly says so, but nothing ran). Your review runs in an ephemeral
+  environment and can reach agent skills and MCP servers — GitHub's and
+  Playwright's are enabled by default — so TESTED is genuinely available to you.
+  Claim it only from evidence: the attributions under the comment, or the
+  session log linked from the pull request timeline, showing the relevant call
+  and what it returned. This repository adds no `copilot-setup-steps` workflow,
+  no agent skills and no MCP servers of its own, and every Copilot review on it
+  so far has come back at effort level Lite with no attributions — so expect
+  READ-NOT-DEMONSTRATED to be the honest label most of the time. Never write
+  TESTED for something you did not execute, and never downgrade something you
+  did.
 - **Separate blockers from nits explicitly.** A latent robustness issue that
   cannot fire in the committed build is a nit; say so rather than letting it read
   as a release blocker.
