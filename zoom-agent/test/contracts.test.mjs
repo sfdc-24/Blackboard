@@ -1213,6 +1213,15 @@ test('P2: a 2xx with no message id is not an acceptance', async () => {
       ['an unexpected shape', JSON.stringify({ ok: true })],
       ['an empty messages array', JSON.stringify({ messages: [] })],
       ['a message with a blank id', JSON.stringify({ messages: [{ id: '' }] })],
+      // TRUTHY JUNK. The first version of this guard tested `!id`, so every one
+      // of these passed and was reported as an acceptance — the defect the
+      // guard was added to fix, surviving inside the fix. Checking that
+      // SOMETHING is there is not checking that it is an id.
+      ['an object id', JSON.stringify({ messages: [{ id: {} }] })],
+      ['an array id', JSON.stringify({ messages: [{ id: [] }] })],
+      ['a boolean id', JSON.stringify({ messages: [{ id: true }] })],
+      ['a numeric id', JSON.stringify({ messages: [{ id: 12345 }] })],
+      ['an all-whitespace id', JSON.stringify({ messages: [{ id: '   ' }] })],
     ]) {
       globalThis.fetch = async () => new Response(body, {
         status: 200, headers: { 'Content-Type': 'application/json' },
@@ -1221,7 +1230,7 @@ test('P2: a 2xx with no message id is not an acceptance', async () => {
       assert.equal(res.ok, false,
         `${label}: reported ok with no wamid, which the assistant counts as accepted and the `
         + 'board then publishes as an acceptance nothing evidences');
-      assert.match(res.error, /no message id/, `${label}: and must say why`);
+      assert.match(res.error, /no usable message id/, `${label}: and must say why`);
     }
 
     // The positive case still works, or the guard is just an outage.

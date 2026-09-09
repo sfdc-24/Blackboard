@@ -243,8 +243,8 @@ const MUTATIONS = [
     blocker: '12-wamid',
     name: 'a 2xx with no message id is called an acceptance again',
     file: 'src/notify.js',
-    from: '    const id = data?.messages?.[0]?.id;\n    if (!id) {',
-    to: '    const id = data?.messages?.[0]?.id;\n    if (false) {',
+    from: "    const id = typeof raw === 'string' ? raw.trim() : '';",
+    to: '    const id = raw;',
     expect: /no message id is not an acceptance/,
   },
 

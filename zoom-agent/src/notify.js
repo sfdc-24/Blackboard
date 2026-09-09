@@ -20,6 +20,14 @@
 // surfaced, never swallowed.
 import { config } from './config.js';
 
+/** What arrived, for an error message, without ever dumping a whole payload. */
+function describe(v) {
+  if (v === undefined) return 'nothing';
+  if (v === null) return 'null';
+  if (typeof v === 'string') return v.trim() ? `a ${v.length}-char string` : 'a blank string';
+  return `a ${Array.isArray(v) ? 'array' : typeof v}`;
+}
+
 const GRAPH = 'https://graph.facebook.com/v21.0';
 
 export function whatsappConfigured() {
@@ -78,12 +86,20 @@ export async function sendWhatsApp(text) {
     // delivery. Accepting a response with no id would have made it worse than
     // the defect it was written to fix: not an overstated claim, an unfounded
     // one.
-    const id = data?.messages?.[0]?.id;
+    // TRUTHINESS IS NOT VALIDATION. The first version of this guard tested
+    // `!id`, which passes for `{}`, `[]`, `true`, `0.5` and "   " — so a
+    // malformed 2xx carrying any truthy junk in that slot was still reported as
+    // an acceptance, and the board still published it. That is the same defect
+    // this guard was added to fix, surviving inside the fix: what was checked
+    // was that SOMETHING was there, not that it was an id.
+    const raw = data?.messages?.[0]?.id;
+    const id = typeof raw === 'string' ? raw.trim() : '';
     if (!id) {
       return {
         ok: false,
-        error: `Graph ${res.status} with no message id — the send cannot be confirmed. `
-          + 'Treating it as not accepted rather than claiming an acceptance nothing evidences.',
+        error: `Graph ${res.status} with no usable message id (got ${describe(raw)}) — the send `
+          + 'cannot be confirmed. Treating it as not accepted rather than claiming an acceptance '
+          + 'nothing evidences.',
       };
     }
     return { ok: true, id };
