@@ -16,11 +16,23 @@ const MAX_BACKOFF_MS = 30_000;
 // one and the 1-hour expiry it existed to dodge arrived anyway.
 const RECYCLE_MIN_TTL_MS = TOKEN_RECYCLE_MS + 5 * 60_000;
 
-// How long to wait for Zoom's build_connection acknowledgement after the socket
-// opens. Without a bound, a server that opens the TCP connection and then says
-// nothing would leave connect() pending forever -- a worse failure than the one
-// this timeout exists alongside, because nothing would ever retry.
-const ACK_TIMEOUT_MS = 15_000;
+// A single bound on the WHOLE of connect(): TCP, the WebSocket upgrade, and
+// Zoom's build_connection acknowledgement.
+//
+// The first version of this timer started on the `open` event, which left the
+// preceding window unguarded — and that window has its own way of hanging. If an
+// endpoint or an intermediary accepts the TCP connection but never completes the
+// upgrade, `open` never fires and neither does `close`, so the timer was never
+// created at all and connect() stayed pending forever with nothing scheduling a
+// retry. That is the same dead agent the timeout exists to prevent, reached
+// through the door I had not covered.
+//
+// One timer, started the moment the socket is constructed, cannot have that gap.
+// Default lives in config.js so a test can exercise the hang without waiting.
+
+// Belt and braces on the upgrade specifically: `ws` fails the handshake itself
+// rather than relying on our timer to notice.
+const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export class ZoomEventSocket {
   constructor(onEvent) {
@@ -64,20 +76,41 @@ export class ZoomEventSocket {
     this.retireCurrentSocket();
 
     this.intentionalClose = false;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { handshakeTimeout: HANDSHAKE_TIMEOUT_MS });
     this.ws = ws;
 
     return new Promise((resolve, reject) => {
       let settled = false;
-      let ackTimer = null;
 
       const settle = (fn, value) => {
         if (settled) return;
         settled = true;
-        clearTimeout(ackTimer);
-        ackTimer = null;
+        clearTimeout(connectTimer);
         fn(value);
       };
+
+      // Started NOW, not on open. Covers every way this can hang.
+      const connectTimer = setTimeout(() => {
+        if (ws !== this.ws || settled) return;
+        console.error(
+          `[events] no acknowledgement within ${config.connectTimeoutMs / 1000}s `
+          + `(state=${ws.readyState}) — closing`,
+        );
+        this.ackFailed = true;
+        try { ws.close(1000); } catch { /* already gone */ }
+        // A socket stuck mid-upgrade may never emit close either, so the
+        // rejection cannot wait for it.
+        setTimeout(() => {
+          if (settled) return;
+          const err = new Error('Zoom did not acknowledge the connection');
+          if (!this.intentionalClose && !this.recycling) {
+            this.scheduleReconnect();
+            err.retryScheduled = true;
+          }
+          settle(reject, err);
+        }, 250).unref?.();
+      }, config.connectTimeoutMs);
+      connectTimer.unref?.();
 
       // Called by handleMessage when the acknowledgement frame arrives.
       this.onAck = (success) => {
@@ -100,12 +133,6 @@ export class ZoomEventSocket {
       ws.on('open', () => {
         if (ws !== this.ws) return;
         console.log('[events] socket open — waiting for Zoom to acknowledge');
-        ackTimer = setTimeout(() => {
-          if (ws !== this.ws || settled) return;
-          console.error(`[events] no acknowledgement within ${ACK_TIMEOUT_MS / 1000}s — closing`);
-          this.ackFailed = true;
-          try { ws.close(1000); } catch { /* already gone */ }
-        }, ACK_TIMEOUT_MS);
       });
 
       ws.on('message', (raw) => {

@@ -709,37 +709,84 @@ test('F1: a refused build_connection is a failure, not a log line', async () => 
   }
 });
 
-test('F1: a socket that opens and says nothing does not hang forever', async () => {
-  const src = readFileSync(new URL('../src/events-ws.js', import.meta.url), 'utf8');
-  assert.match(src, /ACK_TIMEOUT_MS/,
-    'waiting for an acknowledgement with no bound turns one failure mode into a worse one: '
-    + 'connect() pending forever, so nothing ever retries');
-  assert.match(src, /no acknowledgement within/,
-    'and the timeout must say what it was waiting for');
+test('F1: a connection that never completes the upgrade still fails, and retries', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-hang-'));
+  config.tokenFile = path.join(dir, 'tokens.json');
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 60 * 60_000,
+  }));
+  const { loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+
+  // A plain TCP server that ACCEPTS and then says nothing. No WebSocket
+  // upgrade, so neither 'open' nor 'close' ever fires — the exact shape that
+  // left connect() pending forever when the timer started on open.
+  const srv = net.createServer(() => { /* accept, and hang */ });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  config.wsEndpoint = `ws://127.0.0.1:${srv.address().port}/ws`;
+  config.connectTimeoutMs = 300;
+
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
+  const socket = new ZoomEventSocket(() => {});
+  let scheduled = 0;
+  socket.scheduleReconnect = () => { scheduled += 1; };
+
+  try {
+    const err = await Promise.race([
+      socket.connect().then(() => null, (e) => e),
+      new Promise((r) => setTimeout(() => r('PENDING'), 3000)),
+    ]);
+    assert.notEqual(err, 'PENDING',
+      'connect() never settled against a socket stuck mid-upgrade — nothing would ever retry, '
+      + 'which is the dead agent the timeout exists to prevent, reached through the window the '
+      + 'first version of that timeout did not cover');
+    assert.ok(err, 'it must reject, not resolve');
+    assert.equal(scheduled, 1, `scheduled ${scheduled} retries for one hang`);
+  } finally {
+    socket.close();
+    srv.close();
+    config.connectTimeoutMs = 20_000;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('F2: the stream is reserved BEFORE the lazy import is awaited', () => {
+test('F1: the bound covers the whole of connect, not just the post-open window', () => {
+  const src = readFileSync(new URL('../src/events-ws.js', import.meta.url), 'utf8');
+  const timerAt = src.indexOf('config.connectTimeoutMs');
+  const openAt = src.indexOf("ws.on('open'");
+  assert.ok(timerAt !== -1 && openAt !== -1);
+  assert.ok(timerAt < openAt,
+    'the timer must be armed before the open handler is even registered — starting it inside '
+    + "'open' leaves the upgrade window unguarded, and a socket stuck there emits neither event");
+  assert.match(src, /handshakeTimeout/,
+    'and ws should fail the upgrade itself rather than relying only on our timer');
+});
+
+test('F2: a reservation is owned, so a superseding attempt cannot be mistaken for it', () => {
   const src = readFileSync(new URL('../src/rtms.js', import.meta.url), 'utf8');
   const fn = src.slice(src.indexOf('async function joinStream'), src.indexOf('let audioFrames'));
 
-  const reserve = fn.indexOf('active.set(streamId, null)');
+  const reserve = fn.indexOf('active.set(streamId, { token');
   const awaitLoad = fn.indexOf('await loadRtms()');
-  assert.ok(reserve !== -1, 'the stream must be reserved, not merely checked');
-  assert.ok(awaitLoad !== -1, 'the SDK is still loaded lazily');
-  assert.ok(reserve < awaitLoad,
-    'the reservation must precede the await. Checking `active.has` and THEN awaiting lets two '
-    + 'rtms_started events for the same stream both pass the guard while the SDK loads, and the '
-    + 'second join kicks out the first — the exact failure the guard exists to prevent');
+  assert.ok(reserve !== -1 && awaitLoad !== -1 && reserve < awaitLoad,
+    'the stream must be reserved, with a token, before the lazy import is awaited');
 
-  // A reservation that outlives its join attempt is a permanent lock on that
-  // stream id, so every abort path has to release it.
-  const aborts = fn.match(/active\.delete\(streamId\)/g) ?? [];
-  assert.ok(aborts.length >= 2,
-    `only ${aborts.length} release(s) on the abort paths — a load failure and a construction `
-    + 'failure must each free the reservation, or that stream can never be joined again');
+  assert.match(fn, /active\.get\(streamId\)\?\.token !== token/,
+    'after the await it must confirm the reservation is still OURS. `has()` was not enough: a '
+    + 'stop followed by a fresh start replaces the entry, and this continuation would mistake '
+    + "the newer attempt's reservation for its own and join anyway");
+
+  // Every release must be conditional, or an aborting attempt evicts a live one.
+  assert.equal((fn.match(/active\.delete\(streamId\)/g) ?? []).length, 0,
+    'no unconditional delete inside joinStream — an abort path must not remove a reservation '
+    + 'that now belongs to a newer attempt');
+  assert.ok((fn.match(/releaseIfOurs\(streamId, token\)/g) ?? []).length >= 2,
+    'both abort paths must release conditionally');
+
+  assert.match(src, /client\.onLeave\([\s\S]{0,200}releaseIfOurs/,
+    'a late leave from a superseded client must not evict the live one either');
 
   const stop = src.slice(src.indexOf("case 'meeting.rtms_stopped'"), src.indexOf('onMeetingEnded(meetingId)', src.indexOf("case 'meeting.rtms_stopped'")));
-  assert.match(stop, /active\.has\(streamId\)/,
-    'a stop must clear a RESERVATION too — `if (client)` skipped it for a null entry, leaving a '
-    + 'lock nothing would ever remove');
+  assert.match(stop, /entry\.client\?\.leave\(\)/,
+    'a stop must clear a reservation that has no client yet, without throwing on it');
 });

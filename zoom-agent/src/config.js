@@ -83,6 +83,10 @@ export const config = {
   // unaffected and remains on. Turn this on only once action=say is no longer
   // the route -- or knowingly, for a test.
   wrapUpEnabled: optional('WRAP_UP_ENABLED', 'false') === 'true',
+  // One bound on the WHOLE of connect(): TCP, the WebSocket upgrade, and Zoom's
+  // acknowledgement. A connection that hangs mid-upgrade emits neither open nor
+  // close, so nothing else would ever notice it.
+  connectTimeoutMs: num('CONNECT_TIMEOUT_MS', 20_000),
   // Client conversations. Off by default so a transcript is not sprayed into a
   // terminal log by accident.
   logTranscript: optional('LOG_TRANSCRIPT', 'false') === 'true',

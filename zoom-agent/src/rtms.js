@@ -30,7 +30,21 @@ async function loadRtms() {
   }
 }
 
-const active = new Map(); // rtms_stream_id -> rtms.Client
+// rtms_stream_id -> { token, client }
+//
+// The TOKEN is what makes an entry ownable. Without it, this sequence loses a
+// connection: attempt A reserves the id; a stop removes it; attempt B reserves
+// the same id; A's continuation resumes, sees *an* entry and assumes it is its
+// own, and both A and B join. The unconditional deletes had the mirror problem —
+// A's abort path would remove B's live reservation. Every read and every
+// release below is conditional on the token matching.
+const active = new Map();
+let nextToken = 0;
+
+/** Release a reservation ONLY if it is still ours. */
+function releaseIfOurs(streamId, token) {
+  if (active.get(streamId)?.token === token) active.delete(streamId);
+}
 
 // async because joinStream now loads the SDK lazily. Callers may ignore the
 // returned promise -- joinStream handles its own failures and never rejects --
@@ -57,10 +71,12 @@ export async function handleZoomEvent({ event, payload }) {
       // entry is `null` while the SDK is loading, and `if (client)` skipped the
       // delete for it — leaving a reservation nothing would ever remove, which
       // would silently refuse every future join of that stream id.
-      if (active.has(streamId)) {
-        const client = active.get(streamId);
-        active.delete(streamId);
-        if (client) client.leave();
+      {
+        const entry = active.get(streamId);
+        if (entry) {
+          active.delete(streamId);
+          entry.client?.leave();   // a reservation has no client yet
+        }
       }
       onMeetingEnded(meetingId);
       break;
@@ -90,21 +106,22 @@ async function joinStream(streamId, meetingId, obj) {
     console.log(`[rtms] already connected to stream ${streamId} — skipping duplicate join`);
     return;
   }
-  active.set(streamId, null);   // reservation: null means "joining"
+  const token = ++nextToken;
+  active.set(streamId, { token, client: null });   // client null means "joining"
 
   let rtms;
   try {
     rtms = await loadRtms();
   } catch (err) {
-    active.delete(streamId);    // never hold a reservation we cannot fulfil
+    releaseIfOurs(streamId, token);   // never hold a reservation we cannot fulfil
     console.error(`[rtms] cannot join stream ${streamId}: ${err.message}`);
     return;
   }
-  // The stream may have STOPPED while the SDK was loading. If our reservation is
-  // gone, someone cleared it deliberately and joining now would resurrect a
-  // stream nobody is listening to.
-  if (!active.has(streamId)) {
-    console.log(`[rtms] stream ${streamId} was stopped while the SDK loaded — not joining`);
+  // OUR reservation must still be the one in the map. `has()` was not enough:
+  // a stop followed by a fresh start replaces the entry, and this continuation
+  // would have mistaken that newer reservation for its own and joined anyway.
+  if (active.get(streamId)?.token !== token) {
+    console.log(`[rtms] reservation for ${streamId} is no longer ours (stopped or superseded) — not joining`);
     return;
   }
 
@@ -112,11 +129,11 @@ async function joinStream(streamId, meetingId, obj) {
   try {
     client = new rtms.Client();
   } catch (err) {
-    active.delete(streamId);    // a reservation we cannot fulfil is a dead lock
+    releaseIfOurs(streamId, token);   // a reservation we cannot fulfil is a dead lock
     console.error(`[rtms] could not construct a client for ${streamId}: ${err.message}`);
     return;
   }
-  active.set(streamId, client);
+  active.set(streamId, { token, client });
 
   let audioFrames = 0;
   let videoFrames = 0;
@@ -168,7 +185,8 @@ async function joinStream(streamId, meetingId, obj) {
 
   client.onLeave((reason) => {
     console.log(`[rtms] left ${meetingId} (reason=${reason})`);
-    active.delete(streamId);
+    // A late leave from a superseded client must not evict the live one.
+    releaseIfOurs(streamId, token);
   });
 
   console.log(`[rtms] joining media stream for ${meetingId}…`);
