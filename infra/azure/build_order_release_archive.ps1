@@ -222,6 +222,14 @@ function Get-OrderReleaseSafeExistingPath {
 function Assert-OrderReleaseNoAlternateObjectState {
     param([Parameter(Mandatory = $true)][IO.DirectoryInfo]$GitDirectory)
 
+    $commonDirectoryMatches = @(
+        $GitDirectory.EnumerateFileSystemInfos('commondir', [IO.SearchOption]::TopDirectoryOnly) |
+            Where-Object {
+                [string]::Equals([string]$_.Name, 'commondir', [StringComparison]::OrdinalIgnoreCase)
+            }
+    )
+    if ($commonDirectoryMatches.Count -gt 0) { throw 'repository_commondir_forbidden' }
+
     $objectsPath = Join-Path $GitDirectory.FullName 'objects'
     $objects = Get-OrderReleaseSafeExistingPath `
         -FullPath $objectsPath `
@@ -355,6 +363,29 @@ function Get-OrderReleaseCommitEntries {
     catch { throw 'repository_identity_invalid' }
     if (-not [string]::Equals($reportedGitDirectory, $GitDirectory, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'repository_identity_invalid'
+    }
+
+    $commonDirectoryCheck = Invoke-OrderReleaseGit `
+        -GitPath $GitPath `
+        -Repository $Repository `
+        -GitDirectory $GitDirectory `
+        -Arguments @('rev-parse', '--git-common-dir')
+    if ($commonDirectoryCheck.exit_code -ne 0) { throw 'repository_common_directory_invalid' }
+    $reportedCommonDirectory = (ConvertFrom-OrderReleaseGitUtf8 `
+        -Bytes $commonDirectoryCheck.stdout_bytes `
+        -ErrorCode 'repository_common_directory_invalid').Trim()
+    if ([string]::IsNullOrWhiteSpace($reportedCommonDirectory)) {
+        throw 'repository_common_directory_invalid'
+    }
+    try {
+        if ([IO.Path]::IsPathRooted($reportedCommonDirectory)) {
+            $reportedCommonDirectory = [IO.Path]::GetFullPath($reportedCommonDirectory)
+        } else {
+            $reportedCommonDirectory = [IO.Path]::GetFullPath((Join-Path $Repository $reportedCommonDirectory))
+        }
+    } catch { throw 'repository_common_directory_invalid' }
+    if (-not [string]::Equals($reportedCommonDirectory, $GitDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'repository_common_directory_invalid'
     }
 
     $workTreeCheck = Invoke-OrderReleaseGit `

@@ -123,7 +123,8 @@ repair mode and cannot create, update, or delete Azure resources.
    back before returning its SHA-256 and all six file SHA-256 values bound to
    that commit. It explicitly anchors the repository and rejects inherited Git
    redirection, replacement refs, object alternates, external config includes,
-   and reparse-point ancestors in repository or output paths. Require that
+   linked-worktree/common-directory indirection, and reparse-point ancestors in
+   repository or output paths. Require that
    receipt and use its archive digest and release ID as the inputs to
    `build_order_release_wrapper.ps1`, together with the independently computed
    installer SHA-256 digest. The wrapper builder

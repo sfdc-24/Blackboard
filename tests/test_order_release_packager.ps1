@@ -495,6 +495,25 @@ try {
     )
 
     $validCommit = New-TestFixtureRepository
+    $cleanClone = Join-Path $script:TestRoot 'clean-clone'
+    Invoke-TestGit -Repository $cleanClone -NoRepository -Arguments @(
+        'clone', '--quiet', '--no-hardlinks', $script:FixtureRepository, $cleanClone
+    ) | Out-Null
+    $cleanCloneOutput = Join-Path $script:TestRoot 'clean-clone.zip'
+    $cleanCloneRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+        '-RepositoryPath', $cleanClone,
+        '-CommitId', $validCommit,
+        '-OutputPath', $cleanCloneOutput
+    )
+    $cleanCloneReceipt = Read-TestReceipt -Result $cleanCloneRun -Success $true
+    $cleanCloneEntries = @(Read-TestArchiveEntries -Path $cleanCloneOutput)
+    Assert-True 'a plain clean clone with its own Git object directory remains accepted' (
+        (Invoke-TestGit -Repository $cleanClone -Arguments @('status', '--porcelain')).Length -eq 0 -and
+        $cleanCloneReceipt.commit_id -ceq $validCommit -and
+        (($cleanCloneEntries | ForEach-Object { $_.name }) -join '|') -ceq
+            (($script:ReleaseFiles | ForEach-Object { $_.Replace('\', '/') }) -join '|')
+    )
+
     [IO.File]::WriteAllText(
         (Join-Path $script:FixtureRepository 'scripts\bus.ps1'),
         "mutable working tree`r`nmust not ship`r`n",
@@ -584,6 +603,28 @@ try {
     Assert-True 'inherited Git environment and command-config cannot redirect the declared repository' (
         $redirectedReceipt.code -ceq 'commit_not_found' -and -not (Test-Path -LiteralPath $redirectedOutput)
     )
+
+    $commonDirectoryPath = Join-Path $script:FixtureRepository '.git\commondir'
+    [IO.File]::WriteAllText(
+        $commonDirectoryPath,
+        ([string]$foreignRepository.git_directory).Replace('\', '/') + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    try {
+        $commonDirectoryOutput = Join-Path $script:TestRoot 'repository-commondir.zip'
+        $commonDirectoryRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', ([string]$foreignRepository.commit),
+            '-OutputPath', $commonDirectoryOutput
+        )
+        $commonDirectoryReceipt = Read-TestReceipt -Result $commonDirectoryRun -Success $false
+        Assert-True 'repository commondir cannot redirect a declared full clone to a foreign-only commit' (
+            $commonDirectoryReceipt.code -ceq 'repository_commondir_forbidden' -and
+            -not (Test-Path -LiteralPath $commonDirectoryOutput)
+        )
+    } finally {
+        Remove-Item -LiteralPath $commonDirectoryPath -Force -ErrorAction Stop
+    }
 
     $configuredOutput = Join-Path $script:TestRoot 'local-config-worktree.zip'
     Invoke-TestGit -Repository $script:FixtureRepository -Arguments @(
