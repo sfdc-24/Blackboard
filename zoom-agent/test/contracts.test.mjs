@@ -1044,8 +1044,19 @@ test('P2: the mutation lock never lets two processes hold it at once', async () 
     const child = spawn(process.execPath,
       [racer, lock, witness, path.join(dir, `ready-${i}`), go, String(ROUNDS)]);
     let out = '';
+    let err = '';
     child.stdout.on('data', (d) => { out += d; });
-    return { child, done: new Promise((r) => child.on('close', () => r(out.trim()))) };
+    // STDERR IS CAPTURED because the first Windows failure reported only
+    // "2 racers reported" with six empty strings and no reason at all. A racer
+    // that dies must say why, or the next platform-specific fault costs another
+    // CI round to identify.
+    child.stderr.on('data', (d) => { err += d; });
+    return {
+      child,
+      done: new Promise((r) => child.on('close', (code) => r(
+        out.trim() || `EXITED ${code}: ${err.trim().split('\n').slice(-3).join(' / ') || 'no output'}`,
+      ))),
+    };
   });
 
   try {

@@ -235,18 +235,25 @@ const MUTATIONS = [
     blocker: '11-lock',
     name: 'the lock goes back to check-then-write, so two harnesses both hold it',
     file: 'test/lockfile.mjs',
-    from: "    const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall\n    try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }\n    return null;",
-    to: "    if (livingHolder(lock) === DEAD_HOLDER) { fs.writeFileSync(lock, String(process.pid)); return null; }\n    throw Object.assign(new Error('exists'), { code: 'EEXIST' });",
+    from: "      const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall\n      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }\n      return null;",
+    to: "      if (livingHolder(lock) === DEAD_HOLDER) { fs.writeFileSync(lock, String(process.pid)); return null; }\n      throw Object.assign(new Error('exists'), { code: 'EEXIST' });",
     expect: /never lets two processes hold it at once/,
   },
   {
     blocker: '11-lock',
     name: 'automatic stale reclamation returns, deleting a lock it does not own',
     file: 'test/lockfile.mjs',
-    from: "    if (err?.code !== 'EEXIST') throw err;\n    return livingHolder(lock);",
-    to: "    if (err?.code !== 'EEXIST') throw err;\n    if (livingHolder(lock) === DEAD_HOLDER) { try { fs.unlinkSync(lock); } catch { /* raced */ } return acquireLock(lock); }\n    return livingHolder(lock);",
+    from: "      if (err?.code === 'EEXIST') return livingHolder(lock);",
+    to: "      if (err?.code === 'EEXIST') { if (livingHolder(lock) === DEAD_HOLDER) { try { fs.unlinkSync(lock); } catch { /* raced */ } return acquireLock(lock); } return livingHolder(lock); }",
     expect: /never lets two processes hold it at once/,
   },
+  // NO CASE FOR THE TRANSIENT-ERROR RETRY (EPERM/EACCES/EBUSY), DELIBERATELY.
+  // Those codes are Windows delete-pending semantics; POSIX never produces them
+  // here, so reverting that branch changes nothing an ubuntu run can observe and
+  // the mutation would report NOT CAUGHT on a fix that is real. A mutation the
+  // platform cannot reach proves nothing and would make the gate lie in the
+  // other direction. Its guard is the windows-latest job, where removing it
+  // killed six of eight racers outright.
   {
     blocker: '11-token',
     name: 'the token request loses its abort, bypassing the connect bound',

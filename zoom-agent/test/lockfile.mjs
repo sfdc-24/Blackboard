@@ -79,14 +79,40 @@ export function livingHolder(lock) {
  * @returns {number|null} null when acquired; the holder's pid when it is
  *                        running; DEAD_HOLDER when a crashed run left it behind
  */
+// Windows does not delete a file the instant you unlink it: while another
+// handle is still closing, the name lingers in a delete-pending state and
+// CreateFile on it fails with ACCESS_DENIED rather than FILE_EXISTS. Node
+// surfaces that as EPERM or EACCES, not EEXIST.
+//
+// FOUND ON CI, NOT LOCALLY. The first version rethrew anything that was not
+// EEXIST, so on windows-latest six of eight contending processes died with no
+// output at all — the lock did not misbehave, it simply exploded under
+// contention on the platform the harness has to run on. POSIX never shows this,
+// so nothing local could have found it.
+//
+// These are not failures. They mean "not yours this instant", which is what
+// EEXIST means, so they are retried briefly and then reported the same way.
+const TRANSIENT = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const TRANSIENT_TRIES = 20;
+const TRANSIENT_WAIT_MS = 5;
+
+function sleepSync(ms) {
+  // Synchronous: this is called from synchronous CLI startup and cannot await.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function acquireLock(lock) {
-  try {
-    const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall
-    try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
-    return null;
-  } catch (err) {
-    if (err?.code !== 'EEXIST') throw err;
-    return livingHolder(lock);
+  for (let i = 0; ; i += 1) {
+    try {
+      const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall
+      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
+      return null;
+    } catch (err) {
+      if (err?.code === 'EEXIST') return livingHolder(lock);
+      if (!TRANSIENT.has(err?.code) || i >= TRANSIENT_TRIES) throw err;
+      // A name mid-deletion. Give it a moment and ask again.
+      sleepSync(TRANSIENT_WAIT_MS);
+    }
   }
 }
 
