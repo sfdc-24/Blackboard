@@ -31,9 +31,15 @@ the one production uses, had never executed and failed on three separate faults.
 
 **Naive rule.** "Remember to test on all platforms / test the real path."
 
-**Mechanism.** A CI matrix over `[ubuntu-latest, windows-latest]`, both required.
-The platform without the optional dependency is the one that proves the claim; a
-green run on the other says nothing. See `.github/workflows/zoom-agent-tests.yml`.
+**Mechanism — PROPOSED, not yet on `main`.** A CI matrix over
+`[ubuntu-latest, windows-latest]`, both required. The platform without the
+optional dependency is the one that proves the claim; a green run on the other
+says nothing.
+
+> `.github/workflows/zoom-agent-tests.yml` exists **only on PR #40**, which is
+> still NO-GO on five accepted blockers. Until that merges this entry is a
+> proposal, not a control. Do not cite it as though the mechanism is in place —
+> that is prose-as-proof, which is the thing this file exists to stop.
 
 ---
 
@@ -45,10 +51,13 @@ that failed.
 
 **Naive rule.** "Don't edit fixtures to make tests pass."
 
-**Mechanism.** Assert the fixture's SHA-256 in the suite. Changing it now
+**Mechanism — PROPOSED, not yet on `main`.** Assert the fixture's SHA-256 in
+the suite, hashed canonically so it is checkout-independent. Changing it then
 requires updating the constant in the same commit and naming who regenerated it
-with which tool. See `CORPUS_SHA256` in `tests/test_xray_page.py`
-(sfdc24-site).
+with which tool.
+
+> `CORPUS_SHA256` exists **only on sfdc24-site PR #13**. `main` at `4ae0e85`
+> does not have it. Same caveat as L-91: a proposal until it merges.
 
 ---
 
@@ -61,10 +70,17 @@ author had not modelled.
 
 **Naive rule.** "Write better tests."
 
-**Mechanism.** Before requesting review, delete the clause / flip the condition /
-remove the tag, re-run, and confirm the suite goes red. Publish that result with
-the head. A reviewer who sees a mutation result does not have to take the test's
-word for itself. Cost: one edit and one re-run.
+**Rule, not a mechanism — and by this file's own definition.** Before requesting
+review, delete the clause / flip the condition / remove the tag, re-run, and
+confirm the suite goes red. Publish that result with the head. A reviewer who
+sees a mutation result does not have to take the test's word for itself. Cost:
+one edit and one re-run.
+
+Nothing enforces this: it is remembered or it is not, which makes it a rule
+however useful it is. A mutation-testing gate in CI would make it a mechanism,
+and until someone builds one this belongs with L-97 and L-98 as a scoring
+candidate. Misfiled as a mechanism in the first version of this file, caught by
+chatgpt-codex-desktop-01a0839e.
 
 ---
 
@@ -110,9 +126,13 @@ credentials. Cost: 25 minutes.
 
 **Naive rule.** "Be careful with variable names."
 
-**Mechanism.** Credentials get a distinctive, non-generic identifier
-(`$GraphToken`, never `$META`). And diagnostically: **when a 401 moves rather
-than disappears after a fix, suspect the value, not the endpoint.**
+**Rule, not a mechanism.** Credentials get a distinctive, non-generic
+identifier (`$GraphToken`, never `$META`). And diagnostically: **when a 401
+moves rather than disappears after a fix, suspect the value, not the endpoint.**
+
+A naming convention is remembered or it is not. A linter rule that rejects a
+credential-shaped variable whose name collides case-insensitively with another
+in scope would make this a mechanism. Also misfiled in the first version.
 
 ---
 
@@ -178,6 +198,13 @@ one writer per tag, L-57 visitor text is data — are not restated. This file is
 for what 2026-09-08/09 added, and for the *distinction* between a rule and a
 mechanism. If an entry below ever becomes enforceable in CI or a rule engine,
 move it up into the mechanism form and say so.
+
+**Scoreboard, so this file does not flatter itself.** Of eight entries, **two**
+are mechanisms in place today (L-94's allowlist and L-95's failure-path warning,
+both merged). **Two more are proposed** and land only if PR #40 and
+sfdc24-site PR #13 do (L-91, L-92). **Four are rules with no enforcement at all**
+(L-93, L-96, L-97, L-98) and are the honest input for a scoring engine. A file
+that claimed eight mechanisms would have been the exact failure it documents.
 
 **The generalisation worth keeping**, because it explains all eight defects of
 that night in one line: *evaluating anything takes a correct answer and a
