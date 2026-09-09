@@ -6,6 +6,15 @@ $script:BoardHeader = @(
     'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
     'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist'
 )
+$script:KnownTrailingCellRowIdentity = [ordered]@{
+    row_id = '24bf9422-bb33-4943-b38a-77e2f023816d'
+    timestamp = '2026-09-09T03:13:51.0000000Z'
+    source = 'chatgpt-codex-desktop-01a0839e'
+    target = 'claude-code-cli,vm-claude-code-cli,ALL'
+    action = 'RESULT'
+    category = 'DONE'
+    project = 'Blackboard'
+}
 $script:WorkerSourceTag = 'vm-order-worker'
 $script:OrderResultSchema = 'order_supervisor_result.v2'
 $script:OrderResultSummaryMaximumLength = 500
@@ -214,6 +223,28 @@ function ConvertTo-UtcCursorTimestamp {
     }
 }
 
+function Test-KnownTrailingCellRow {
+    param([Parameter(Mandatory = $true)][object[]]$Cells)
+
+    # Match the stable A:J identity independently of whether Google Sheets
+    # projects the row at the canonical width or pads it to the A:L used
+    # range. This lets the caller enforce that the historical identity occurs
+    # exactly once before any row is projected or admitted.
+    if ($Cells.Count -ne 10 -and $Cells.Count -ne 12) { return $false }
+    $stamp = ConvertTo-UtcCursorTimestamp -Timestamp ([string]$Cells[1])
+    if (-not $stamp) { return $false }
+
+    return (
+        [string]::Equals([string]$Cells[0], [string]$script:KnownTrailingCellRowIdentity.row_id, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$stamp.Value, [string]$script:KnownTrailingCellRowIdentity.timestamp, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[2], [string]$script:KnownTrailingCellRowIdentity.source, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[3], [string]$script:KnownTrailingCellRowIdentity.target, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[4], [string]$script:KnownTrailingCellRowIdentity.action, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[6], [string]$script:KnownTrailingCellRowIdentity.category, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[7], [string]$script:KnownTrailingCellRowIdentity.project, [StringComparison]::Ordinal)
+    )
+}
+
 function ConvertFrom-BcbPayload {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Payload)
 
@@ -284,12 +315,25 @@ function Get-BoardRowsFromJson {
     $rawRows = @($response.rows)
     if ($rawRows.Count -lt 1) { throw 'board_header_missing' }
     $header = @($rawRows[0])
-    if ($header.Count -ne $script:BoardHeader.Count) { throw 'board_header_invalid' }
+    # Google Sheets returns every row at the width of the sheet's used range.
+    # One historical malformed append widened Alpha DB from canonical A:J to
+    # A:L, so the live response now carries two empty padding cells on every
+    # otherwise-valid row. Accept only that known shape and project it back to
+    # the ten-cell contract; any populated schema outside A:J remains invalid.
+    if ($header.Count -ne $script:BoardHeader.Count -and $header.Count -ne 12) {
+        throw 'board_header_invalid'
+    }
     for ($column = 0; $column -lt $script:BoardHeader.Count; $column++) {
         if (-not [string]::Equals([string]$header[$column], $script:BoardHeader[$column], [StringComparison]::Ordinal)) {
             throw 'board_header_invalid'
         }
     }
+    for ($column = $script:BoardHeader.Count; $column -lt $header.Count; $column++) {
+        if (-not [string]::IsNullOrEmpty([string]$header[$column])) {
+            throw 'board_header_invalid'
+        }
+    }
+    $knownTrailingRowCount = 0
     for ($index = 1; $index -lt $rawRows.Count; $index++) {
         $raw = $rawRows[$index]
         $cells = @()
@@ -298,11 +342,40 @@ function Get-BoardRowsFromJson {
         } else {
             $cells = @([string]$raw)
         }
-        if ($cells.Count -ne 10) {
+        $returnedCellCount = $cells.Count
+        if ($returnedCellCount -ne 10 -and $returnedCellCount -ne 12) {
             $result.Add([pscustomobject]@{
-                valid = $false; reason = 'cell_count'; cell_count = $cells.Count; index = $index; cells = @($cells)
+                valid = $false; reason = 'cell_count'; cell_count = $returnedCellCount; index = $index; cells = @()
             })
             continue
+        }
+        if (Test-KnownTrailingCellRow -Cells $cells) {
+            $knownTrailingRowCount++
+            if ($knownTrailingRowCount -ne 1) {
+                throw 'board_trailing_cells_invalid'
+            }
+        }
+        if ($returnedCellCount -eq 12) {
+            $hasNonemptyTrailingCell = $false
+            for ($column = 10; $column -lt $returnedCellCount; $column++) {
+                if (-not [string]::IsNullOrEmpty([string]$cells[$column])) {
+                    $hasNonemptyTrailingCell = $true
+                    break
+                }
+            }
+            if ($hasNonemptyTrailingCell) {
+                # Only the one observed historical append is a compatibility
+                # exception. Any identity drift or second occurrence fails the
+                # whole read before admission. K:L values are never retained.
+                if (-not (Test-KnownTrailingCellRow -Cells $cells)) {
+                    throw 'board_trailing_cells_invalid'
+                }
+                $result.Add([pscustomobject]@{
+                    valid = $false; reason = 'known_trailing_cells'; cell_count = $returnedCellCount; index = $index; cells = @()
+                })
+                continue
+            }
+            $cells = @($cells[0..9])
         }
         $stamp = ConvertTo-UtcCursorTimestamp -Timestamp $cells[1]
         if (-not $stamp -or [string]::IsNullOrWhiteSpace($cells[0])) {
@@ -561,6 +634,9 @@ function Get-OrderSelection {
         valid_count = $scannedValid.Count
         canonical_valid_count = $valid.Count
         malformed_count = @($Rows | Where-Object { -not $_.valid }).Count
+        known_trailing_row_count = @($Rows | Where-Object {
+            -not $_.valid -and [string]::Equals([string]$_.reason, 'known_trailing_cells', [StringComparison]::Ordinal)
+        }).Count
         after_cursor_count = $after.Count
         exact_duplicate_group_count = $exactDuplicateGroupCount
         exact_duplicate_row_count = $exactDuplicateRowCount
