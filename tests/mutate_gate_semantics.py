@@ -341,6 +341,15 @@ def main() -> int:
         mutated = text
         applied = True
         for old, new in m["edits"]:
+            # UNIQUE, not merely present — see the note in mutate_mcp_plan.py.
+            # An ambiguous anchor lands the mutation somewhere other than the
+            # place under test and then reports a healthy guard as dead.
+            if mutated.count(old) > 1:
+                print(f"  AMBIGUOUS    {m['name']}")
+                print(f"               an edit matches {mutated.count(old)} places; "
+                      "replace-once would pick the first")
+                applied = False
+                break
             if old not in mutated:
                 print(f"  ANCHOR LOST  {m['name']}")
                 print("               an edit no longer matches; a mutation that "

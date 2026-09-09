@@ -184,6 +184,20 @@ def main() -> int:
         # on one platform is a gate people switch off.
         was_crlf = b"\r\n" in raw
         text = raw.decode("utf-8").replace("\r\n", "\n")
+        # UNIQUE, not merely present. Round eleven named this gap and I had
+        # already been bitten by it hours earlier: an anchor on the generated
+        # acceptor line matched G7 as well as G9, `replace(..., 1)` mutated G7,
+        # the G9 test correctly stayed green, and this harness reported NOT
+        # CAUGHT on a healthy guard. A mutation that lands somewhere else is
+        # worse than one that fails to land, because it reads as a coverage gap
+        # and sends you looking for a defect that is not there.
+        hits = text.count(m["old"])
+        if hits > 1:
+            print(f"  AMBIGUOUS    {m['name']}")
+            print(f"               the anchor matches {hits} places; replace-once would "
+                  "pick the first, which may not be the one under test")
+            failures += 1
+            continue
         if m["old"] not in text:
             print(f"  ANCHOR LOST  {m['name']}")
             print("               the text to mutate is gone; fix the anchor, a "
