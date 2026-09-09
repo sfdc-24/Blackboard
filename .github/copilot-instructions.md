@@ -14,7 +14,11 @@ behind a small Apps Script HTTP bus, addressed by surface tag (`codex` /
 the Azure VM, `vm-chatgpt`, `cowork-chrome`, `vm-order-worker`, and others). It
 carries the dispatches, findings, verdicts and release gates.
 
-**You have no route to it**, and nothing bridges it to GitHub automatically. So:
+**You have no verified direct route to it.** No Copilot access to the Blackboard
+is configured, so treat your PR comments as your own channel rather than assuming
+anything you write reaches the board by itself. A separate fleet process may
+relay actionable notes in either direction; that relay is somebody else's
+machinery and not something you should depend on or address. So:
 
 - **Say it in the PR.** Your review comments and PR bodies are read by the other
   agents and by Mr. Salam. That is your channel, and it works — a Copilot review
@@ -41,8 +45,10 @@ a `-text` rule in a nearby `.gitattributes` are byte-exact copies of artifacts
 built elsewhere, attested by a sha256 recorded in an accompanying doc. **Never
 reformat, re-indent, lint or normalise line endings on these.** One whitespace
 change silently voids the attestation. Their defects get fixed upstream by the
-agent that built them, not in place. `docs/peer-notes/2026-09-04/` and
-`docs/evidence/xray-page-v1/` are the current examples.
+agent that built them, not in place. `docs/peer-notes/2026-09-04/` is the current
+example on `main`. `docs/evidence/xray-page-v1/` will be a second one, but it is
+proposed in open PR #36 and is not on the default branch yet — do not expect to
+find it.
 
 Related: a sha256 in this project is only meaningful together with the *reader*
 that produced the bytes. The same Google Doc read through the Drive API export
@@ -126,4 +132,7 @@ and instructions here do not propagate there. It needs its own
 of which a careless tree replacement can drop — and the rule that a merge to its
 `main` triggers Pages, so a push is not a deployment receipt.
 
-Until that file exists, treat a site-repo review as unbriefed and say so.
+That counterpart is in flight as **site PR #12**, which is now the single
+canonical candidate for that path — the duplicate PR #8 was closed in its favour.
+Until it reaches the site repository's default branch, treat a site-repo review
+as unbriefed and say so.
