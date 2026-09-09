@@ -120,12 +120,22 @@ it is force-pushed away or deleted. So the obvious test passes for a commit no
 branch and no pull request contains:
 
 ```
-$ ORPHAN=$(git hash-object -w -t blob --stdin <<< "reachable from nothing")
+$ ORPHAN=$(git commit-tree "$(git mktree </dev/null)" -m "reachable from nothing")
 $ git cat-file -e $ORPHAN && echo exists
 exists
 $ git branch -a --contains $ORPHAN
-                                        # nothing
+                                        # empty, exit 0
 ```
+
+> The first version of this example used `git hash-object -w -t blob`. `git
+> branch --contains` takes **commits**, so it answered `error: object … is a
+> blob, not a commit` and exited 129 — it demonstrated a type error, not
+> unreachability. The shell around it discarded stderr and printed *"the
+> reachability test correctly says no"* whatever happened, so the demonstration
+> announced a verdict it had not measured. That is the defect this whole document
+> is about, committed inside the example proving a fix for it. Found in review by
+> Codex; `commit-tree` produces a real unreachable commit and the check above now
+> means what it says.
 
 Use `git fetch` followed by `git branch -r --contains <sha>`, or compare against
 the pull request's head from the API. That distinction was found by Codex in
