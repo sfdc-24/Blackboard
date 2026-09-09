@@ -250,6 +250,53 @@ try {
     (Get-BoardBusIdentity -EnvPath $envA).Value -eq $idB.Value
   )
 
+  # ── The identity must be the bus bus.ps1 ACTUALLY CONNECTS TO ──────────────
+  #
+  # bus.ps1:154-158 folds every assignment into a hashtable, so the LAST
+  # BUS_URL wins. Reading the FIRST one pins the key to a superseded line: edit
+  # the active URL -- the only line that changes which board you are reading --
+  # and the key does not move, so a cursor from the old board is accepted for
+  # the new one and skips every row on it.
+  #
+  # This asserts AGREEMENT WITH bus.ps1, not "returns the last one". The same
+  # file is parsed here by bus.ps1's own algorithm, so if either side's
+  # semantics drift later this fails, which is the property that actually
+  # matters. Stating it as "the last value" would be a rule that happens to
+  # match today.
+  $dupEnv = Join-Path $tmpEnvDir 'dup.env'
+  Set-Content -LiteralPath $dupEnv -Encoding utf8 -Value @(
+    'BUS_URL=https://script.google.com/macros/s/SUPERSEDED/exec',
+    'BUS_SECRET=x',
+    'BUS_URL=https://script.google.com/macros/s/ACTIVE/exec'
+  )
+
+  # bus.ps1:154-158, verbatim in shape.
+  $busCfg = @{}
+  foreach ($line in (Get-Content -LiteralPath $dupEnv)) {
+    if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') {
+      $busCfg[$matches[1]] = $matches[2].Trim('"').Trim("'")
+    }
+  }
+  $idDup = Get-BoardBusIdentity -EnvPath $dupEnv
+  Assert-True 'the identity is the bus bus.ps1 would actually connect to' (
+    $idDup.Value -eq $busCfg.BUS_URL
+  ) ("identity=" + $idDup.Value + " bus.ps1=" + $busCfg.BUS_URL)
+
+  # And the consequence, stated directly: change the ACTIVE line and the key
+  # must move. Under the first-match bug it would not, because the first line
+  # is untouched.
+  $keyActiveA = Get-BoardSourceKey -Title 'T' -Bus $idDup.Value -BusSource $idDup.Source
+  Set-Content -LiteralPath $dupEnv -Encoding utf8 -Value @(
+    'BUS_URL=https://script.google.com/macros/s/SUPERSEDED/exec',
+    'BUS_SECRET=x',
+    'BUS_URL=https://script.google.com/macros/s/ACTIVE-2/exec'
+  )
+  $idDup2 = Get-BoardBusIdentity -EnvPath $dupEnv
+  $keyActiveB = Get-BoardSourceKey -Title 'T' -Bus $idDup2.Value -BusSource $idDup2.Source
+  Assert-True 'changing the ACTIVE BUS_URL moves the cursor key' (
+    $keyActiveA -ne $keyActiveB
+  ) 'a superseded first line must not pin the key while the real bus changes'
+
   # A BOM on the first line -- what Set-Content -Encoding utf8 writes on Windows
   # PowerShell 5.1, and what Notepad writes -- must not hide BUS_URL, because
   # `^\s*BUS_URL` does not match a BOM and a miss here falls silently back to

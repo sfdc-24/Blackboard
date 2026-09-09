@@ -233,12 +233,32 @@ function Get-BoardBusIdentity {
   if (-not $EnvPath) { return @{ Value = ''; Source = 'unresolved' } }
   try {
     if (Test-Path -LiteralPath $EnvPath) {
+      # THE WHOLE FILE, LAST VALUE WINS -- because that is what bus.ps1 does.
+      #
+      # bus.ps1:154-158 assigns every matching line into a hashtable:
+      #
+      #     $cfg = @{}
+      #     foreach ($line in (Get-Content -LiteralPath $EnvFile)) {
+      #       if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') {
+      #         $cfg[$matches[1]] = $matches[2].Trim('"').Trim("'")
+      #
+      # so a later BUS_URL overwrites an earlier one and THAT is the bus it
+      # connects to. Returning on the first match read a superseded line: the
+      # key would then be pinned to a URL nobody talks to, and editing the
+      # active one -- the line that actually changes the board -- would move
+      # the bus while leaving the key exactly where it was. A cursor from the
+      # old board is then accepted for the new one and skips every row on it.
+      #
+      # Which is this defect for the third time: not the URL, but the WRONG
+      # URL. Identity has to be read the way the thing being identified reads
+      # it, or it is describing something else.
+      $found = ''
       foreach ($line in (Get-Content -LiteralPath $EnvPath -ErrorAction Stop)) {
         if ($line -match '^\s*BUS_URL\s*=\s*(.*?)\s*$') {
-          $url = $matches[1].Trim('"').Trim("'")
-          if ($url) { return @{ Value = $url; Source = 'bus-url' } }
+          $found = $matches[1].Trim('"').Trim("'")
         }
       }
+      if ($found) { return @{ Value = $found; Source = 'bus-url' } }
     }
   } catch {
     # Unreadable for any reason -- permissions, a locked file, a directory.

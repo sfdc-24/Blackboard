@@ -28,6 +28,8 @@
 // Run: npm run mutate
 
 import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -230,6 +232,23 @@ const MUTATIONS = [
   },
 
   {
+    blocker: '10-stale',
+    name: 'a stale backoff survives a successful ack and tears the socket down',
+    file: 'src/events-ws.js',
+    from: '          this.clearPendingReconnect();\n          console.log(\'[events] Zoom acknowledged the connection — listening\');',
+    to: '          console.log(\'[events] Zoom acknowledged the connection — listening\');',
+    expect: /stale backoff does not tear down the healthy socket/,
+  },
+  {
+    blocker: '10-stale',
+    name: 'the backoff handle is not tracked, so nothing can cancel it',
+    file: 'src/events-ws.js',
+    from: '    this.reconnectTimer = setTimeout(() => {\n      this.reconnectTimer = null;',
+    to: '    setTimeout(() => {',
+    expect: /stale backoff does not tear down the healthy socket/,
+  },
+
+  {
     blocker: '9-join',
     name: 'a join that throws leaves the stream reserved and the call unrecoverable',
     file: 'src/rtms.js',
@@ -248,6 +267,80 @@ const MUTATIONS = [
   },
 ];
 
+// ── Two guards that stashing originals cannot provide ──────────────────────
+//
+// THE STASH DEFENCE HAS A HOLE, AND IT WAS FOUND BY FALLING INTO IT.
+//
+// One run was started in the background and a second was started before it
+// finished. The second stashed an ALREADY-MUTATED src/events-ws.js as its
+// "original" and faithfully restored that at the end. The tree looked clean —
+// one modified file, expected — and the reverted fix rode inside a legitimate
+// diff. It reported 27/27 caught while the source on disk carried a defect the
+// harness itself had introduced.
+//
+// The harness's own header says it cannot lose your source. It could, and this
+// is how: not by failing to restore, but by restoring the wrong thing. A
+// snapshot is only a safe baseline if nothing else is writing.
+
+const LOCK = path.join(
+  os.tmpdir(),
+  `zoom-agent-mutate-${crypto.createHash('sha256').update(ROOT).digest('hex').slice(0, 12)}.lock`,
+);
+
+function lockHolder() {
+  try {
+    const pid = Number(fs.readFileSync(LOCK, 'utf8').trim());
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    process.kill(pid, 0);     // signal 0 tests for existence, sends nothing
+    return pid;               // alive, and holding it
+  } catch (err) {
+    // ENOENT: no lock. ESRCH: the holder died without cleaning up — stale, take it.
+    if (err?.code === 'ESRCH') { try { fs.unlinkSync(LOCK); } catch { /* raced */ } }
+    return null;
+  }
+}
+
+const holder = lockHolder();
+if (holder !== null) {
+  console.error(
+    `\nREFUSING TO RUN — pid ${holder} is already mutating this checkout.\n`
+    + '\nTwo harnesses cannot share a working tree. The second one snapshots the\n'
+    + "first one's mutations as pristine source and restores THOSE, which silently\n"
+    + 'reverts a real fix inside a diff that looks intentional.\n'
+    + `\nWait for it, or remove ${LOCK} if you are certain it is dead.\n`,
+  );
+  process.exit(2);
+}
+fs.writeFileSync(LOCK, String(process.pid));
+function releaseLock() {
+  try {
+    if (fs.readFileSync(LOCK, 'utf8').trim() === String(process.pid)) fs.unlinkSync(LOCK);
+  } catch { /* already gone */ }
+}
+
+// PREFLIGHT: every anchor must be present BEFORE anything is touched.
+//
+// Mid-run this is already reported per case as ANCHOR LOST — but by then other
+// files have been mutated, and, worse, a missing anchor at the START means the
+// source is not pristine. Checking first is what turns "one case cannot apply"
+// into "stop: this tree is not a valid baseline", which is the difference that
+// mattered above. It is also the check that found the residue by hand.
+{
+  const missing = MUTATIONS.filter((m) => applyAnchor(fs.readFileSync(path.join(ROOT, m.file), 'utf8'), m.from, m.to) === null);
+  if (missing.length) {
+    releaseLock();
+    console.error(`\nREFUSING TO RUN — ${missing.length} of ${MUTATIONS.length} anchors are not in the source:\n`);
+    for (const m of missing) console.error(`  ${m.file}  [b${m.blocker}] ${m.name}`);
+    console.error(
+      '\nEither an anchor is stale, or this tree is already carrying a mutation —\n'
+      + 'an interrupted run, or a second harness that restored the wrong baseline.\n'
+      + 'Snapshotting it now would make that mutation the new "original".\n'
+      + 'Check `git diff` against the sources above before running again.\n',
+    );
+    process.exit(2);
+  }
+}
+
 // Stash every original BEFORE the first mutation, and put them back on any exit
 // path. `finally` alone does not survive a kill.
 const originals = new Map();
@@ -260,9 +353,9 @@ function restoreAll() {
     try { if (fs.readFileSync(file, 'utf8') !== text) fs.writeFileSync(file, text); } catch { /* nothing to do */ }
   }
 }
-process.on('exit', restoreAll);
+process.on('exit', () => { restoreAll(); releaseLock(); });
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
-  process.on(sig, () => { restoreAll(); process.exit(130); });
+  process.on(sig, () => { restoreAll(); releaseLock(); process.exit(130); });
 }
 
 /**

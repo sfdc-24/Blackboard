@@ -48,6 +48,7 @@ export class ZoomEventSocket {
     this.ws = null;
     this.pingTimer = null;
     this.recycleTimer = null;
+    this.reconnectTimer = null;
     this.attempts = 0;
     this.intentionalClose = false;
     this.recycling = false;
@@ -125,6 +126,17 @@ export class ZoomEventSocket {
         if (ws !== this.ws) return;
         if (success) {
           this.attempts = 0;
+          // A BACKOFF ARMED BEFORE THIS SUCCEEDED IS NOW A LIABILITY, NOT A
+          // SAFETY NET. It was scheduled for a failure that has since been
+          // superseded — most plausibly a pre-socket failure ("Not authorized
+          // yet") whose backoff was still counting down while the operator
+          // finished the OAuth flow, and the callback connected for real. When
+          // that stale timer then fires it calls connect(), which retires this
+          // healthy acknowledged socket and rebuilds it: a window with no event
+          // subscription at all, and any meeting.rtms_started arriving inside it
+          // is simply not received. A retry that tears down the thing it was
+          // meant to restore.
+          this.clearPendingReconnect();
           console.log('[events] Zoom acknowledged the connection — listening');
           this.startPing();
           this.scheduleTokenRecycle();
@@ -288,10 +300,28 @@ export class ZoomEventSocket {
     }, TOKEN_RECYCLE_MS);
   }
 
+  /** Drop a backoff that is no longer wanted. Safe to call when none is armed.
+   *
+   *  NOT folded into stopTimers(). The close handler calls stopTimers() and
+   *  then scheduleReconnect(), so it would survive today — but only because of
+   *  that order, and an edit that swapped the two lines would silently disable
+   *  every retry in the class with no test able to see the difference. The two
+   *  socket-lifetime timers and the between-sockets backoff have genuinely
+   *  different lifetimes; keeping them apart is what says so. */
+  clearPendingReconnect() {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
   scheduleReconnect() {
+    // Never let two backoffs run at once: without this, a failure arriving
+    // while one is already counting down doubles the attempts, and the pattern
+    // compounds across generations.
+    this.clearPendingReconnect();
     const delay = Math.min(1000 * 2 ** this.attempts++, MAX_BACKOFF_MS);
     console.log(`[events] reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.attempts})`);
-    setTimeout(() => {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.connect().catch((err) => {
         console.error('[events] reconnect failed:', err.message);
         // Only schedule when nothing else did. A failure that never produced a
@@ -300,10 +330,13 @@ export class ZoomEventSocket {
         if (!err.retryScheduled) this.scheduleReconnect();
       });
     }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   close() {
     this.intentionalClose = true;
+    // A shutdown that leaves a backoff armed reconnects on the way out.
+    this.clearPendingReconnect();
     // Clear a pending recycle too, or SIGINT during the recycle window would
     // close the socket and then dutifully reconnect it on the way out.
     this.recycling = false;

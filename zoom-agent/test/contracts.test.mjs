@@ -917,3 +917,67 @@ test('P2: a join that throws releases the reservation, so a replay can recover',
   assert.ok(errors.some((e) => /join failed/.test(e)),
     'the failure must be reported, not swallowed by the release');
 });
+
+
+test('P2: a stale backoff does not tear down the healthy socket it was meant to restore', async () => {
+  // THE SEQUENCE. A pre-socket failure — `getAccessToken` returning null,
+  // i.e. "Not authorized yet" — schedules a backoff. The operator then
+  // completes the OAuth flow INSIDE that delay, and the callback establishes a
+  // real, acknowledged connection. The old timer is still armed, and when it
+  // fires it calls connect(), which begins by retiring the current socket. The
+  // agent tears down a healthy subscription to rebuild one, and any
+  // meeting.rtms_started arriving in that window is never received.
+  //
+  // Driven for real: a live ws server, a genuine ack, and the backoff left to
+  // expire on its own. A source grep for `clearTimeout` would pass against a
+  // clear on the wrong path.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-stale-'));
+  config.tokenFile = path.join(dir, 'tokens.json');
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 60 * 60_000,
+  }));
+  const { loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+
+  const { WebSocketServer } = await import('ws');
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+
+  let connections = 0;
+  wss.on('connection', (sock) => {
+    connections += 1;
+    sock.send(JSON.stringify({ module: 'build_connection', success: true }));
+  });
+  config.wsEndpoint = `ws://127.0.0.1:${wss.address().port}/ws`;
+
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
+  const socket = new ZoomEventSocket(() => {});
+
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    // attempts = 0, so the backoff is 1000ms — long enough to connect inside.
+    socket.scheduleReconnect();
+    await socket.connect();
+    assert.equal(connections, 1, 'setup: the OAuth-completion connect should be the only one so far');
+
+    const healthy = socket.ws;
+    assert.equal(healthy.readyState, 1, 'setup: it should be OPEN and acknowledged');
+
+    // Let the stale backoff expire.
+    await new Promise((r) => { setTimeout(r, 1400); });
+
+    assert.equal(connections, 1,
+      `the stale backoff fired and opened a ${connections}th connection — it retired a healthy, `
+      + 'acknowledged socket to replace it, and the agent has no event subscription at all for '
+      + 'the duration of that rebuild');
+    assert.equal(socket.ws, healthy,
+      'the healthy socket was replaced by a retry for a failure that had already been superseded');
+    assert.equal(healthy.readyState, 1, 'and it should still be open');
+  } finally {
+    console.log = realLog;
+    socket.close();
+    wss.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
