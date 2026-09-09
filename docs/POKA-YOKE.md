@@ -143,6 +143,34 @@ was said on WhatsApp.
 
 ---
 
+## The first thing this file failed to prevent
+
+Recorded because a doctrine document that omits its own first failure is exactly
+the self-flattering artifact it warns about.
+
+**Sixty minutes after L-94 was written**, its author shipped a tamper guard for a
+test corpus — pinning the fixture's hash so nobody could quietly edit the answer
+key. A reviewer then found that the workflow's path filters did not include
+`tests/fixtures/`, so a change to the corpus **ran no job at all**. The guard did
+not run when the guarded thing changed. It could be bypassed by editing the one
+file it existed to protect.
+
+That is L-94's exact shape: a mechanism that looks like protection and is not.
+Having just written the entry did not help. The reviewer did.
+
+Two things follow, and they are the reason this section exists rather than a
+quiet fix:
+
+1. **Documentation is not a control.** This file lowers the cost of learning
+   something twice. It does not stop the first repetition, and should not be
+   cited as though it does.
+2. **When you add a guard, ask what triggers it.** A check that does not run on
+   the change it guards is decoration with a good comment on it. That question
+   is now the second half of L-93 in practice: break it on purpose, *and* prove
+   the break reaches CI.
+
+---
+
 ## What is deliberately not here
 
 Rules already covered elsewhere — D-4 read-back, L-80 never blind-retry, L-82
