@@ -52,6 +52,73 @@ class McpPlanConsistency(unittest.TestCase):
         # on how git happened to check the file out.
         cls.text = PLAN.read_bytes().decode("utf-8").replace("\r\n", "\n")
 
+    # ── The safety property, which was unguarded until 2026-09-09 ────────────
+    #
+    # chatgpt-codex-desktop-01a0839e demonstrated the hole rather than asserting
+    # it: change the status block to "approved executable architecture, client
+    # scans authorised" and change G9's authoriser to "claude-code-cli, start
+    # now", and BOTH suites stayed green. I reproduced it before fixing it.
+    #
+    # Everything else in this file checks that the document is internally
+    # consistent. None of it checked the one claim that actually restrains
+    # anything — that the plan authorises nothing and that a human, not me,
+    # opens the gate to a client org. Consistency is not safety.
+
+    REQUIRED_STATUS_PHRASES = (
+        "HELD",
+        "authorises nothing",
+        "not executable architecture",
+        "does not authorise a scan",
+        "no gate in §8 is passed",
+    )
+    # Words that would mean the hold had been lifted inside this file rather
+    # than by the person who is supposed to lift it.
+    FORBIDDEN_STATUS_PHRASES = (
+        "approved executable",
+        "scans authorised",
+        "scans authorized",
+        "authorised to scan",
+        "gate passed",
+    )
+
+    def test_the_status_block_still_holds_the_plan(self) -> None:
+        head = self.text[: self.text.index("## 0.")]
+        self.assertIn("STATUS", head, "the status block is gone from the top of the file")
+        for phrase in self.REQUIRED_STATUS_PHRASES:
+            self.assertIn(
+                phrase, head,
+                f'the status block no longer says "{phrase}". This document authorises '
+                "nothing, and the sentence saying so is the only thing enforcing that.",
+            )
+        lowered = head.lower()
+        for phrase in self.FORBIDDEN_STATUS_PHRASES:
+            self.assertNotIn(
+                phrase, lowered,
+                f'the status block now says "{phrase}". A hold is lifted by the person '
+                "who imposed it, in the open — not by editing the document that records it.",
+            )
+
+    def test_the_client_org_gate_is_not_self_authorised(self) -> None:
+        """G9 is the gate to a real client's Salesforce org. Its owner column
+        must name a human. An agent that can write 'claude-code-cli authorises'
+        into its own gate table has no gate."""
+        row = next(
+            (line for line in self.text.splitlines() if line.startswith("| **G9**")),
+            None,
+        )
+        self.assertIsNotNone(row, "the G9 client-org gate has been removed from the table")
+        owner = [c.strip() for c in row.strip("|").split("|")][2]
+        self.assertIn(
+            "Salam", owner,
+            f'G9 is authorised by "{owner}". The gate to a client org must be opened by '
+            "a person; a self-authorising gate is not a gate.",
+        )
+        for agent in ("claude", "codex", "vm-"):
+            self.assertNotIn(
+                agent, owner.lower(),
+                f'G9 names an agent ("{owner}") as its authoriser.',
+            )
+
     def test_plan_exists(self) -> None:
         self.assertTrue(PLAN.is_file(), f"{PLAN} is missing")
         self.assertGreater(len(self.text), 5000, "the plan is suspiciously short")
