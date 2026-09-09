@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test test/*.test.mjs",
+    "mutate": "node test/mutate.mjs",
     "selftest": "node test/simulate-call.mjs"
   },
   "dependencies": {
