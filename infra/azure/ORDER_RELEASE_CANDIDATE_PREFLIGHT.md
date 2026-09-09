@@ -10,9 +10,12 @@ The preflight does not trust the packager receipt by itself. It independently:
 - anchors Git to the exact absolute repository supplied by the operator;
 - removes inherited `GIT_*` and `GCM_*` context, disables object replacement,
   and never fetches or checks out a ref;
-- requires an ordinary in-tree `.git` directory, rejects reparse points in its
-  metadata, and rejects replacement refs, grafts, alternate object stores, and
+- requires an ordinary full clone with an in-tree `.git` directory, rejects a
+  case-insensitive `commondir` entry or any reparse point in its metadata, and
+  rejects replacement refs, grafts, alternate object stores, and
   repository-local external config includes;
+- resolves Git's absolute common directory and requires it to equal the
+  already validated in-tree `.git` directory;
 - resolves the full lowercase 40-character commit and its tree;
 - reads the six canonical release files directly from that commit as blobs;
 - reconstructs the packager's canonical ZIP representation and requires the

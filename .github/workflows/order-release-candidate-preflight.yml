@@ -4,8 +4,16 @@ on:
   pull_request:
     paths:
       - '.github/workflows/order-release-candidate-preflight.yml'
+      - 'infra/azure/build_order_release_archive.ps1'
+      - 'infra/azure/install_release_from_archive.ps1'
       - 'infra/azure/verify_order_release_candidate.ps1'
       - 'infra/azure/ORDER_RELEASE_CANDIDATE_PREFLIGHT.md'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/bus.ps1'
+      - 'scripts/install_order_supervisor.ps1'
+      - 'scripts/invoke_order_claude.ps1'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/order_supervisor_result.schema.json'
       - 'tests/test_order_release_candidate_preflight.ps1'
 
 permissions:

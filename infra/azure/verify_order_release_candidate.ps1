@@ -178,6 +178,11 @@ function Assert-OrderReleasePreflightMetadataTreeSafe {
 function Assert-OrderReleasePreflightNoAlternateObjectState {
     param([Parameter(Mandatory = $true)][IO.DirectoryInfo]$GitDirectory)
 
+    $commonDirectoryMatches = @($GitDirectory.EnumerateFileSystemInfos() | Where-Object {
+        [string]::Equals([string]$_.Name, 'commondir', [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($commonDirectoryMatches.Count -gt 0) { throw 'repository_common_directory_forbidden' }
+
     $objectsPath = Resolve-OrderReleasePreflightSafeItem `
         -Path (Join-Path $GitDirectory.FullName 'objects') `
         -Kind Directory `
@@ -384,6 +389,30 @@ function Get-OrderReleasePreflightRepositoryContext {
     catch { throw 'repository_identity_invalid' }
     if (-not [string]::Equals($reportedGitDirectory, $GitDirectory, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'repository_identity_mismatch'
+    }
+
+    $commonDirectoryResult = Invoke-OrderReleasePreflightGit `
+        -GitPath $GitPath `
+        -Repository $Repository `
+        -GitDirectory $GitDirectory `
+        -Arguments @('rev-parse', '--path-format=absolute', '--git-common-dir')
+    if ($commonDirectoryResult.exit_code -ne 0) { throw 'repository_common_directory_unavailable' }
+    $commonDirectoryText = (ConvertFrom-OrderReleasePreflightGitUtf8 `
+        -Bytes $commonDirectoryResult.stdout_bytes `
+        -ErrorCode 'repository_common_directory_invalid').Trim()
+    if ([string]::IsNullOrWhiteSpace($commonDirectoryText) -or
+        -not [IO.Path]::IsPathRooted($commonDirectoryText)) {
+        throw 'repository_common_directory_invalid'
+    }
+    try { $commonDirectoryPath = [IO.Path]::GetFullPath($commonDirectoryText).TrimEnd('\', '/') }
+    catch { throw 'repository_common_directory_invalid' }
+    $validatedGitDirectory = [IO.Path]::GetFullPath($GitDirectory).TrimEnd('\', '/')
+    if (-not [string]::Equals(
+        $commonDirectoryPath,
+        $validatedGitDirectory,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'repository_common_directory_mismatch'
     }
 
     $topResult = Invoke-OrderReleasePreflightGit `

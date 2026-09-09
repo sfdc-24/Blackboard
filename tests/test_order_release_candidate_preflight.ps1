@@ -8,11 +8,13 @@ Set-StrictMode -Version 2.0
 $script:Passed = 0
 $script:Failed = 0
 $script:RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$script:Packager = Join-Path $script:RepoRoot 'infra\azure\build_order_release_archive.ps1'
 $script:Preflight = Join-Path $script:RepoRoot 'infra\azure\verify_order_release_candidate.ps1'
 $script:SystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
-$script:TestRoot = Join-Path $script:SystemTemp ('order-release-candidate-preflight-test-' + [Guid]::NewGuid().ToString('N'))
+$script:TestRoot = Join-Path $script:SystemTemp ('order release candidate preflight test-' + [Guid]::NewGuid().ToString('N'))
 $script:FixtureRepository = Join-Path $script:TestRoot 'fixture-repository'
 $script:ForeignRepository = Join-Path $script:TestRoot 'foreign-repository'
+$script:CommonDirectoryRepository = Join-Path $script:TestRoot 'common-directory-repository'
 $script:InstallerRelativePath = 'infra\azure\install_release_from_archive.ps1'
 $script:ReleaseFiles = @(
     'scripts\OrderSupervisor.psm1',
@@ -57,7 +59,51 @@ function Quote-TestNativeArgument {
 
     if ($Value.Length -eq 0) { return '""' }
     if ($Value -notmatch '[\s"]') { return $Value }
-    return '"' + $Value.Replace('"', '\"') + '"'
+
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append(('\' * ($backslashes * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-TestTreeInventory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $root = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $rows = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse | Sort-Object FullName)) {
+        $relativePath = [string]$item.FullName.Substring($root.Length).TrimStart('\', '/')
+        if ($item -is [IO.DirectoryInfo]) {
+            $rows.Add(('D|{0}' -f $relativePath))
+        } elseif ($item -is [IO.FileInfo]) {
+            $rows.Add(('F|{0}|{1}|{2}' -f
+                $relativePath,
+                [long]$item.Length,
+                (Get-TestFileSha256 -Path ([string]$item.FullName))))
+        } else {
+            $rows.Add(('O|{0}|{1}' -f $relativePath, [string]$item.GetType().FullName))
+        }
+    }
+    return @($rows.ToArray()) -join "`n"
 }
 
 function Invoke-TestGit {
@@ -75,27 +121,17 @@ function Invoke-TestGit {
     return (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
 }
 
-function Invoke-TestPreflight {
+function Invoke-TestPowerShellFile {
     param(
-        [Parameter(Mandatory = $true)][string]$Repository,
-        [Parameter(Mandatory = $true)][string]$Commit,
-        [Parameter(Mandatory = $true)][string]$Archive,
-        [Parameter(Mandatory = $true)][string]$Receipt,
-        [Parameter(Mandatory = $true)][string]$Installer,
-        [Parameter(Mandatory = $true)][string]$InstallerSha256,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
         [hashtable]$Environment = @{}
     )
 
     $arguments = @(
         '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', $script:Preflight,
-        '-RepositoryPath', $Repository,
-        '-CommitId', $Commit,
-        '-ArchivePath', $Archive,
-        '-PackagerReceiptPath', $Receipt,
-        '-InstallerPath', $Installer,
-        '-ExpectedInstallerSha256', $InstallerSha256
-    )
+        '-File', $FilePath
+    ) + $ArgumentList
     $argumentText = (@($arguments | ForEach-Object {
         Quote-TestNativeArgument -Value ([string]$_)
     }) -join ' ')
@@ -123,6 +159,30 @@ function Invoke-TestPreflight {
             stderr = [string]$stderr
         }
     } finally { $process.Dispose() }
+}
+
+function Invoke-TestPreflight {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Commit,
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$Receipt,
+        [Parameter(Mandatory = $true)][string]$Installer,
+        [Parameter(Mandatory = $true)][string]$InstallerSha256,
+        [hashtable]$Environment = @{}
+    )
+
+    return Invoke-TestPowerShellFile `
+        -FilePath $script:Preflight `
+        -ArgumentList @(
+            '-RepositoryPath', $Repository,
+            '-CommitId', $Commit,
+            '-ArchivePath', $Archive,
+            '-PackagerReceiptPath', $Receipt,
+            '-InstallerPath', $Installer,
+            '-ExpectedInstallerSha256', $InstallerSha256
+        ) `
+        -Environment $Environment
 }
 
 function Get-TestNonEmptyLines {
@@ -329,13 +389,28 @@ try {
     $installer = [string]$fixture.installer
     $installerSha = Get-TestFileSha256 -Path $installer
     $archive = Join-Path $script:TestRoot 'release.zip'
-    New-TestCanonicalArchive -Path $archive -BytesByPath $script:OriginalBytes
+    $packagerRun = Invoke-TestPowerShellFile `
+        -FilePath $script:Packager `
+        -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', $commit,
+            '-OutputPath', $archive
+        )
+    $packagerReceipt = Read-TestPreflightReceipt -Result $packagerRun -Success $true
     $receiptPath = Join-Path $script:TestRoot 'packager-receipt.json'
-    $receiptObject = New-TestPackagerReceiptObject `
-        -ArchivePath $archive `
-        -Commit $commit `
-        -BytesByPath $script:OriginalBytes
-    Write-TestJson -Path $receiptPath -Value $receiptObject
+    [IO.File]::WriteAllText(
+        $receiptPath,
+        [string]$packagerRun.stdout,
+        (New-Object Text.UTF8Encoding($false))
+    )
+    Assert-True 'real packager creates the candidate consumed by preflight' (
+        $packagerReceipt.schema -ceq 'blackboard.order-release-archive-build-receipt.v1' -and
+        $packagerReceipt.ok -eq $true -and
+        $packagerReceipt.commit_id -ceq $commit -and
+        $packagerReceipt.output_path -ceq [IO.Path]::GetFullPath($archive) -and
+        $packagerReceipt.archive_sha256 -ceq (Get-TestFileSha256 -Path $archive) -and
+        $packagerReceipt.release_file_count -eq 6
+    ) (($packagerRun.stdout + $packagerRun.stderr).Trim())
 
     $statusBefore = Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('status', '--porcelain=v1')
     $validOne = Invoke-TestPreflight `
@@ -354,6 +429,14 @@ try {
         -Installer $installer `
         -InstallerSha256 $installerSha
     [void](Read-TestPreflightReceipt -Result $validTwo -Success $true)
+    $trailingSeparatorRun = Invoke-TestPreflight `
+        -Repository ($script:FixtureRepository + [IO.Path]::DirectorySeparatorChar) `
+        -Commit $commit `
+        -Archive $archive `
+        -Receipt $receiptPath `
+        -Installer $installer `
+        -InstallerSha256 $installerSha
+    [void](Read-TestPreflightReceipt -Result $trailingSeparatorRun -Success $true)
     $statusAfter = Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('status', '--porcelain=v1')
     $expectedTree = Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('rev-parse', ($commit + '^{tree}'))
     Assert-True 'valid candidate binds commit, tree, archive, installer, and all six file hashes' (
@@ -380,11 +463,15 @@ try {
         $validOne.stdout -ceq $validTwo.stdout -and
         $statusBefore -ceq $statusAfter
     )
+    Assert-True 'native invocation preserves a quoted repository path ending in a separator' (
+        $trailingSeparatorRun.stdout -ceq $validOne.stdout
+    ) (($trailingSeparatorRun.stdout + $trailingSeparatorRun.stderr).Trim())
 
     $redirectedReceiptPath = Join-Path $script:TestRoot 'redirected-packager-receipt.json'
+    $packagerReceiptJson = ([string]$packagerRun.stdout) -replace '\r?\n\z', ''
     [IO.File]::WriteAllText(
         $redirectedReceiptPath,
-        ((Get-Content -LiteralPath $receiptPath -Raw) + "`r`n"),
+        ($packagerReceiptJson + "`r`n"),
         (New-Object Text.UTF8Encoding($false))
     )
     $redirectedRun = Invoke-TestPreflight `
@@ -410,6 +497,8 @@ try {
         $sourceText -match "GIT_NO_REPLACE_OBJECTS'\] = '1'" -and
         $sourceText -match "repository_replace_refs_forbidden" -and
         $sourceText -match "repository_alternates_forbidden" -and
+        $sourceText -match "repository_common_directory_forbidden" -and
+        $sourceText -match "'--git-common-dir'" -and
         $sourceText -notmatch "(?im)@\('(?:fetch|pull|checkout|reset)'"
     )
     Assert-True 'implementation contains no Azure, VM, ScheduledTasks, extraction, or output-file mutation command' (
@@ -437,6 +526,66 @@ try {
     Assert-True 'foreign inherited Git context cannot redirect the explicitly supplied repository' (
         $ambientRun.exit_code -eq 0 -and $ambientRun.stdout -ceq $validOne.stdout
     ) (($ambientRun.stdout + $ambientRun.stderr).Trim())
+
+    $commonDirectoryFixture = New-TestRepository `
+        -Path $script:CommonDirectoryRepository `
+        -Marker 'common-directory-victim'
+    $candidateVisibleBeforeCommonDirectory = $true
+    try {
+        Invoke-TestGit `
+            -Repository $script:CommonDirectoryRepository `
+            -Arguments @('cat-file', '-e', ($commit + '^{commit}')) | Out-Null
+    } catch { $candidateVisibleBeforeCommonDirectory = $false }
+    Assert-True 'commondir attack fixture starts without the candidate in its own object store' (
+        $commonDirectoryFixture.commit -cne $commit -and
+        -not $candidateVisibleBeforeCommonDirectory
+    )
+    $commonDirectoryMetadataPath = Join-Path $script:CommonDirectoryRepository '.git\CoMmOnDiR'
+    [IO.File]::WriteAllText(
+        $commonDirectoryMetadataPath,
+        (Join-Path $script:FixtureRepository '.git').Replace('\', '/') + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    try {
+        $candidateVisibleThroughCommonDirectory = $true
+        try {
+            Invoke-TestGit `
+                -Repository $script:CommonDirectoryRepository `
+                -Arguments @('cat-file', '-e', ($commit + '^{commit}')) | Out-Null
+        } catch { $candidateVisibleThroughCommonDirectory = $false }
+        Assert-True 'plain mixed-case commondir redirects Git to the foreign candidate object store' (
+            $candidateVisibleThroughCommonDirectory
+        )
+        $commonDirectoryInventoryBefore = Get-TestTreeInventory -Path $script:CommonDirectoryRepository
+        $commonObjectInventoryBefore = Get-TestTreeInventory -Path $script:FixtureRepository
+        $commonArchiveShaBefore = Get-TestFileSha256 -Path $archive
+        $commonReceiptShaBefore = Get-TestFileSha256 -Path $receiptPath
+        $commonInstallerShaBefore = Get-TestFileSha256 -Path $installer
+        $commonDirectoryRun = Invoke-TestPreflight `
+            -Repository $script:CommonDirectoryRepository `
+            -Commit $commit `
+            -Archive $archive `
+            -Receipt $receiptPath `
+            -Installer $installer `
+            -InstallerSha256 $installerSha
+        $commonDirectoryFailure = Read-TestPreflightReceipt -Result $commonDirectoryRun -Success $false
+        $commonDirectoryInventoryAfter = Get-TestTreeInventory -Path $script:CommonDirectoryRepository
+        $commonObjectInventoryAfter = Get-TestTreeInventory -Path $script:FixtureRepository
+        Assert-True 'case-insensitive commondir metadata is rejected before foreign object resolution' (
+            $commonDirectoryFailure.code -ceq 'repository_common_directory_forbidden'
+        ) (($commonDirectoryRun.stdout + $commonDirectoryRun.stderr).Trim())
+        Assert-True 'commondir rejection performs no repository or artifact write' (
+            $commonDirectoryInventoryBefore -ceq $commonDirectoryInventoryAfter -and
+            $commonObjectInventoryBefore -ceq $commonObjectInventoryAfter -and
+            $commonArchiveShaBefore -ceq (Get-TestFileSha256 -Path $archive) -and
+            $commonReceiptShaBefore -ceq (Get-TestFileSha256 -Path $receiptPath) -and
+            $commonInstallerShaBefore -ceq (Get-TestFileSha256 -Path $installer)
+        )
+    } finally {
+        if (Test-Path -LiteralPath $commonDirectoryMetadataPath) {
+            [IO.File]::Delete($commonDirectoryMetadataPath)
+        }
+    }
 
     $hostileConfig = Join-Path $script:TestRoot 'hostile-include.config'
     [IO.File]::WriteAllText(
