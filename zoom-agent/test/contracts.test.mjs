@@ -983,72 +983,115 @@ test('P2: a stale backoff does not tear down the healthy socket it was meant to 
 });
 
 
-test('P2: the mutation lock admits exactly one LIVE holder under a real race', async () => {
-  // THE DEFECT THIS REPLACES was check-then-write: read the lock, see nobody,
-  // write. Two harnesses starting together both passed the read before either
-  // reached the write, so both "held" it and both mutated the same tree — the
+test('P2: the mutation lock never lets two processes hold it at once', async () => {
+  // THE DEFECT: check-then-write. Read the lock, see nobody, write. Two
+  // harnesses starting together both passed the read before either reached the
+  // write, so both "held" it and both mutated one working tree — the source
   // corruption the lock exists to prevent, rebuilt one layer down.
   //
-  // Simulating that with fake timers would test a story about the code. This
-  // starts twelve real processes on a shared start line and counts winners.
+  // THIS TEST HAS BEEN WRONG TWICE, AND BOTH WAYS ARE WORTH KEEPING WRITTEN
+  // DOWN, because the second one is the defect this whole PR keeps finding.
   //
-  // THE FIRST VERSION OF THIS TEST WAS WRONG, AND WRONG USEFULLY. Its racers
-  // exited the instant they acquired, so every lock was stale a millisecond
-  // later and the next process correctly reclaimed it: 5 of 12 "won" and the
-  // lock looked broken. It was not. The invariant is not "one process ever
-  // acquires" — a dead holder's lock MUST be reclaimable or a crashed run
-  // wedges the gate forever. The invariant is ONE LIVE HOLDER AT A TIME, so
-  // the winner here stays alive while the others contend.
-  const { lockPathFor, livingHolder } = await import('./lockfile.mjs');
+  //   1. Racers exited the instant they acquired, so every lock went stale a
+  //      millisecond later and the next process CORRECTLY reclaimed it. 5 of 12
+  //      "won" and the lock looked broken. It was not: a dead holder's lock
+  //      must be reclaimable or one crashed run wedges the gate forever. The
+  //      invariant is one LIVE holder, not one winner ever.
+  //
+  //   2. Then it lined the racers up on a wall-clock instant — and on Windows,
+  //      where spawning twelve node processes takes longer than the head start,
+  //      they never actually overlapped. It passed with the fix REVERTED. The
+  //      mutation gate caught that on CI; nothing I could run locally would
+  //      have. An inert guard, written by someone who had spent the night
+  //      deleting inert guards.
+  //
+  // So: a real barrier instead of a clock, and mutual exclusion is checked by
+  // WITNESS rather than by counting winners. Each holder stamps the witness
+  // file with its own pid and reads it straight back; under a working lock it
+  // can only ever read itself. Many short rounds, because one round is a coin
+  // toss and a gate must not be one.
+  const { lockPathFor, livingHolder, acquireLock } = await import('./lockfile.mjs');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lock-race-'));
   const lock = lockPathFor(dir);
-  fs.rmSync(lock, { force: true });
+  const RACERS = 8;
+  const ROUNDS = 120;
 
   const racer = path.join(dir, 'racer.mjs');
   const lockMod = new URL('./lockfile.mjs', import.meta.url).href;
   fs.writeFileSync(racer, `
-    import { acquireLock } from ${JSON.stringify(lockMod)};
-    // Line up on a shared wall-clock instant so these genuinely contend rather
-    // than starting whenever node happens to become ready.
-    const at = Number(process.argv[3]);
-    while (Date.now() < at) { /* spin to the start line */ }
-    const held = acquireLock(process.argv[2]) === null;
-    console.log(held ? 'WON' : 'LOST');
-    // A winner HOLDS it while the rest contend. Exiting immediately would make
-    // the lock legitimately stale and hand it to the next racer.
-    if (held) { const until = Date.now() + 1500; while (Date.now() < until); }
+    import fs from 'node:fs';
+    import { acquireLock, releaseLock } from ${JSON.stringify(lockMod)};
+    const [lock, witness, ready, go, rounds] = process.argv.slice(2);
+    fs.writeFileSync(ready, String(process.pid));
+    // A BARRIER, not a head start. Every racer is already booted and spinning
+    // here, so they leave together however slow this machine is to start them.
+    while (!fs.existsSync(go)) { /* spin */ }
+    let violations = 0;
+    for (let i = 0; i < Number(rounds); i += 1) {
+      if (acquireLock(lock) !== null) continue;      // lost this round
+      fs.writeFileSync(witness, String(process.pid));
+      // Anyone else inside the critical section overwrites this.
+      if (fs.readFileSync(witness, 'utf8') !== String(process.pid)) violations += 1;
+      releaseLock(lock);
+    }
+    console.log('VIOLATIONS ' + violations);
   `);
 
   const { spawn } = await import('node:child_process');
-  const RACERS = 12;
-  const startAt = Date.now() + 500;
-  const results = await Promise.all(
-    Array.from({ length: RACERS }, () => new Promise((resolve) => {
-      const child = spawn(process.execPath, [racer, lock, String(startAt)]);
-      let out = '';
-      child.stdout.on('data', (d) => { out += d; });
-      child.on('close', () => resolve(out.trim()));
-    })),
-  );
+  const witness = path.join(dir, 'witness');
+  const go = path.join(dir, 'go');
+  const children = Array.from({ length: RACERS }, (_, i) => {
+    const child = spawn(process.execPath,
+      [racer, lock, witness, path.join(dir, `ready-${i}`), go, String(ROUNDS)]);
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    return { child, done: new Promise((r) => child.on('close', () => r(out.trim()))) };
+  });
 
   try {
-    const won = results.filter((r) => r === 'WON').length;
-    const lost = results.filter((r) => r === 'LOST').length;
-    assert.equal(won, 1,
-      `${won} of ${RACERS} processes held the same lock at once. Two harnesses then snapshot and `
-      + "mutate one working tree, and the second restores the first's mutation as pristine "
-      + 'source — the exact corruption the lock exists to stop');
-    assert.equal(lost, RACERS - 1, `every other racer must be told it lost (got ${lost})`);
+    // Release the barrier only once every racer is up and spinning on it.
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline
+      && Array.from({ length: RACERS }, (_, i) => fs.existsSync(path.join(dir, `ready-${i}`)))
+        .filter(Boolean).length < RACERS) {
+      await new Promise((r) => { setTimeout(r, 25); });
+    }
+    const up = Array.from({ length: RACERS }, (_, i) => fs.existsSync(path.join(dir, `ready-${i}`)))
+      .filter(Boolean).length;
+    assert.equal(up, RACERS,
+      `only ${up} of ${RACERS} racers reached the barrier — they never contended, so this test `
+      + 'would pass whatever the lock did');
+    fs.writeFileSync(go, '1');
 
-    // The other half of the contract, and the half the broken first version of
-    // this test accidentally proved: once the holder is gone the lock must NOT
-    // read as live, or a crashed run locks everyone out permanently.
-    assert.equal(livingHolder(lock), null,
-      'the winner has exited, so its lock must read as stale and be reclaimable');
-    const { acquireLock } = await import('./lockfile.mjs');
-    assert.equal(acquireLock(lock), null,
-      'and a fresh run must be able to take it, rather than wedging on a dead pid');
+    const results = await Promise.all(children.map((c) => c.done));
+    const violations = results.reduce((n, r) => n + Number(/VIOLATIONS (\d+)/.exec(r)?.[1] ?? 0), 0);
+    assert.equal(results.filter((r) => /VIOLATIONS/.test(r)).length, RACERS,
+      `only ${results.filter((r) => /VIOLATIONS/.test(r)).length} racers reported: ${results.join(' | ')}`);
+    assert.equal(violations, 0,
+      `${violations} times across ${RACERS}x${ROUNDS} rounds, two processes were inside the lock `
+      + 'at once. Two harnesses then snapshot and mutate one working tree, and the second restores '
+      + "the first's mutation as pristine source");
+
+    // The other half of the contract, and it CHANGED as a result of this test.
+    // A dead holder's lock used to be reclaimed automatically. That meant
+    // deleting a file this process does not own, and the witness above caught
+    // it clobbering a lock another process had legitimately just created — 1 to
+    // 2 violations per 960 rounds, with `wx` in place and a settle-and-confirm
+    // on top. It is not reclaimed at all now: it is REPORTED, so the outcome is
+    // a loud gate and one `rm` rather than a silent double-mutation.
+    const { DEAD_HOLDER } = await import('./lockfile.mjs');
+    fs.writeFileSync(lock, '999999999');
+    assert.equal(livingHolder(lock), DEAD_HOLDER, 'a lock naming a dead pid must read as dead');
+    assert.equal(acquireLock(lock), DEAD_HOLDER,
+      'and must be refused rather than silently taken — automatic reclamation is the race');
+
+    // A LIVE holder must be named, so a human knows what to wait for.
+    fs.rmSync(lock, { force: true });
+    assert.equal(acquireLock(lock), null, 'a free lock is taken');
+    assert.equal(acquireLock(lock), process.pid,
+      'and a second attempt is told exactly which pid holds it');
   } finally {
+    for (const { child } of children) child.kill();
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(lock, { force: true });
   }

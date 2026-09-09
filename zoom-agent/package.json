@@ -2,7 +2,7 @@
   "name": "sfdc24-meeting-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "SFDC24 Consultant — real-time AI assistance on Zoom client calls via RTMS",
+  "description": "SFDC24 Consultant \u2014 real-time AI assistance on Zoom client calls via RTMS",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
@@ -11,7 +11,8 @@
     "start": "node src/index.js",
     "test": "node --test test/*.test.mjs",
     "mutate": "node test/mutate.mjs",
-    "selftest": "node test/simulate-call.mjs"
+    "selftest": "node test/simulate-call.mjs",
+    "verify:committed": "node test/verify-committed.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

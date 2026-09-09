@@ -18,64 +18,76 @@ export function lockPathFor(root) {
   );
 }
 
-/** The pid in the lock file if it names a LIVING process, else null. */
+/** Returned instead of a pid when the lock is held by a process that has died. */
+export const DEAD_HOLDER = -1;
+
+/**
+ * The pid in the lock file if it names a LIVING process; DEAD_HOLDER otherwise.
+ * Only ever called when the lock already exists, so "nobody holds it" is not an
+ * outcome — it is a message-quality question, not a control-flow one.
+ */
 export function livingHolder(lock) {
+  let pid;
   try {
-    const pid = Number(fs.readFileSync(lock, 'utf8').trim());
-    if (!Number.isInteger(pid) || pid <= 0) return null;   // garbage: treat as stale
-    process.kill(pid, 0);   // signal 0 tests for existence and sends nothing
+    pid = Number(fs.readFileSync(lock, 'utf8').trim());
+  } catch {
+    return DEAD_HOLDER;   // vanished or unreadable under us
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return DEAD_HOLDER;
+  try {
+    process.kill(pid, 0);   // signal 0 tests existence and sends nothing
     return pid;
   } catch {
-    // ENOENT: no lock at all. ESRCH: the holder died without cleaning up.
-    return null;
+    return DEAD_HOLDER;
   }
 }
 
 /**
- * Take the lock, or report who holds it.
+ * Take the lock, or report who holds it. Exactly one process can ever win.
  *
- * ACQUISITION IS ATOMIC, AND THE FIRST VERSION OF IT WAS NOT.
- *   It read the lock, decided nobody held it, and then wrote — and two
- *   harnesses starting together both passed the read before either reached the
- *   write. Both then "held" it and both mutated the tree, which is the exact
- *   corruption the lock exists to prevent, one layer down. A guard against a
- *   race, built out of a race.
+ * THREE VERSIONS OF THIS FUNCTION HAVE BEEN WRONG, AND THE THIRD IS THE ONE
+ * WORTH READING, because it is why there is no automatic stale recovery here.
  *
- *   `wx` is open-if-absent-else-fail in a single syscall. Exactly one process
- *   can win it, and that is not a claim about timing.
+ *   1. check-then-write. Read the lock, see nobody, write. Two harnesses
+ *      starting together both passed the read before either reached the write.
+ *      A guard against a race, built out of a race. (Found by review.)
  *
- * STALE RECOVERY IS BEST-EFFORT, AND SAYING SO IS THE POINT.
- *   A crashed run leaves a file naming a dead pid, and something must clear it
- *   or the gate wedges forever. That is unavoidably read-then-unlink. It is
- *   narrowed by requiring the holder to still be dead immediately before the
- *   unlink, and any process that loses the following `wx` race is told the
- *   winner's pid and stands down. The residual window needs two harnesses
- *   recovering the same crashed lock in the same instant — reachable only
- *   after a crash, where the original was reachable every single time.
+ *   2. `wx`, plus reclaiming a lock whose pid was dead. Atomic acquisition, and
+ *      still 1-2 mutual-exclusion violations per 960 contended rounds, because
+ *      reclaiming means DELETING A FILE YOU DO NOT OWN: a reclaimer that judged
+ *      the lock stale, then unlinked it a moment later, destroyed a fresh lock
+ *      another process had legitimately created in between. Both then held it.
  *
- * @returns {number|null} null when acquired; otherwise the pid holding it
- *                        (-1 when held by a process whose pid we could not read)
+ *   3. `wx` plus a settle-and-read-back after reclaiming. Narrowed it. Did not
+ *      close it — the victim of the stray unlink is whoever took the lock on
+ *      the FREE path, and that process has nothing to confirm against.
+ *
+ * There is no fourth version, because the flaw is not in the bookkeeping. Plain
+ * files give atomic create-if-absent and nothing else; safe reclamation needs
+ * compare-and-swap, which they do not have. Every scheme that deletes another
+ * process's file races something.
+ *
+ * SO NOTHING IS EVER DELETED HERE EXCEPT BY ITS OWN HOLDER. `wx` is the whole
+ * algorithm, and the guarantee is unconditional rather than probable.
+ *
+ * The cost is one line of human work after a hard kill: the caller is told the
+ * exact path to remove. That is the correct trade for a gate whose entire job
+ * is preventing two processes from writing the same source tree — a wedged gate
+ * is loud and costs a `rm`, while a raced one is silent and corrupts a commit.
+ * CI never pays it at all: every job gets a fresh temp directory.
+ *
+ * @returns {number|null} null when acquired; the holder's pid when it is
+ *                        running; DEAD_HOLDER when a crashed run left it behind
  */
 export function acquireLock(lock) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const fd = fs.openSync(lock, 'wx');   // create-or-fail, one syscall
-      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
-      return null;
-    } catch (err) {
-      if (err?.code !== 'EEXIST') throw err;
-      const holder = livingHolder(lock);
-      if (holder !== null) return holder;   // genuinely held: do not touch it
-      if (attempt === 0) {
-        // Stale. Clear it only while it is still dead, so a lock created
-        // between our read and this unlink is not destroyed.
-        try {
-          if (livingHolder(lock) === null) fs.unlinkSync(lock);
-        } catch { /* someone else cleared it first — fine, retry */ }
-      }
-    }
+  try {
+    const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall
+    try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }
+    return null;
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+    return livingHolder(lock);
   }
-  return livingHolder(lock) ?? -1;   // lost the retry
 }
 
 /** Release only our own lock. Never another holder's. */

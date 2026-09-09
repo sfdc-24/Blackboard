@@ -31,7 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { lockPathFor, acquireLock, releaseLock } from './lockfile.mjs';
+import { lockPathFor, acquireLock, releaseLock, DEAD_HOLDER } from './lockfile.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOCK = lockPathFor(ROOT);
@@ -235,9 +235,17 @@ const MUTATIONS = [
     blocker: '11-lock',
     name: 'the lock goes back to check-then-write, so two harnesses both hold it',
     file: 'test/lockfile.mjs',
-    from: "      const fd = fs.openSync(lock, 'wx');   // create-or-fail, one syscall\n      try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }\n      return null;",
-    to: "      if (livingHolder(lock) === null) { fs.writeFileSync(lock, String(process.pid)); return null; }\n      throw Object.assign(new Error('exists'), { code: 'EEXIST' });",
-    expect: /exactly one LIVE holder under a real race/,
+    from: "    const fd = fs.openSync(lock, 'wx');   // create-if-absent, one syscall\n    try { fs.writeSync(fd, String(process.pid)); } finally { fs.closeSync(fd); }\n    return null;",
+    to: "    if (livingHolder(lock) === DEAD_HOLDER) { fs.writeFileSync(lock, String(process.pid)); return null; }\n    throw Object.assign(new Error('exists'), { code: 'EEXIST' });",
+    expect: /never lets two processes hold it at once/,
+  },
+  {
+    blocker: '11-lock',
+    name: 'automatic stale reclamation returns, deleting a lock it does not own',
+    file: 'test/lockfile.mjs',
+    from: "    if (err?.code !== 'EEXIST') throw err;\n    return livingHolder(lock);",
+    to: "    if (err?.code !== 'EEXIST') throw err;\n    if (livingHolder(lock) === DEAD_HOLDER) { try { fs.unlinkSync(lock); } catch { /* raced */ } return acquireLock(lock); }\n    return livingHolder(lock);",
+    expect: /never lets two processes hold it at once/,
   },
   {
     blocker: '11-token',
@@ -302,11 +310,18 @@ const MUTATIONS = [
 const holder = acquireLock(LOCK);
 if (holder !== null) {
   console.error(
-    `\nREFUSING TO RUN — ${holder > 0 ? `pid ${holder}` : 'another process'} is already mutating this checkout.\n`
-    + '\nTwo harnesses cannot share a working tree. The second one snapshots the\n'
-    + "first one's mutations as pristine source and restores THOSE, which silently\n"
-    + 'reverts a real fix inside a diff that looks intentional.\n'
-    + `\nWait for it, or remove ${LOCK} if you are certain it is dead.\n`,
+    holder === DEAD_HOLDER
+      ? `\nREFUSING TO RUN — a previous run left this lock behind and did not survive to\n`
+        + 'clear it (killed, or the machine went down mid-run).\n'
+        + '\nIt is NOT reclaimed automatically. Doing that means deleting a file this\n'
+        + 'process does not own, and every version of that races a run starting at the\n'
+        + 'same moment — which is the source corruption this lock exists to prevent.\n'
+        + `\nCheck nothing else is running, then remove:\n  ${LOCK}\n`
+      : `\nREFUSING TO RUN — pid ${holder} is already mutating this checkout.\n`
+        + '\nTwo harnesses cannot share a working tree. The second one snapshots the\n'
+        + "first one's mutations as pristine source and restores THOSE, which silently\n"
+        + 'reverts a real fix inside a diff that looks intentional.\n'
+        + '\nWait for it to finish.\n',
   );
   process.exit(2);
 }
