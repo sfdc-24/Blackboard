@@ -2,6 +2,7 @@
 // The @zoom/rtms SDK handles the signaling/media WebSockets, HMAC signature,
 // and protocol heartbeats — we just wire up data callbacks.
 import { onTranscriptLine, onMeetingEnded } from './assistant.js';
+import { config } from './config.js';
 
 // @zoom/rtms is a NATIVE module published for linux and darwin only. A static
 // import here made this file — and therefore index.js, which imports it — fail
@@ -190,8 +191,24 @@ async function joinStream(streamId, meetingId, obj) {
   });
 
   // ── In-meeting chat
+  //
+  // TYPED CLIENT CONTENT IS CLIENT CONVERSATION, AND LOG_TRANSCRIPT GOVERNS IT.
+  // This wrote every chat message verbatim to stdout no matter what
+  // LOG_TRANSCRIPT said. The README and the PR both state that client
+  // conversation is not logged by default; on any host whose console is
+  // retained or shipped to a collector, it was — just through the one channel
+  // nobody had thought of as transcript. A privacy promise that holds for
+  // speech and not for the chat pane is not a privacy promise.
+  //
+  // Off by default: sender and size only, which is enough to see the stream is
+  // alive without persisting a word anyone typed.
   client.onChatData((buf, _ts, metadata) => {
-    console.log(`[chat] ${metadata?.userName ?? '?'}: ${buf.toString('utf8')}`);
+    const who = metadata?.userName ?? '?';
+    if (config.logTranscript) {
+      console.log(`[chat] ${who}: ${buf.toString('utf8')}`);
+    } else {
+      console.log(`[chat] ${who}: ${buf.length}B (content withheld — LOG_TRANSCRIPT=false)`);
+    }
   });
 
   client.onSharingEvent((ev, _ts, _userId, userName) => {

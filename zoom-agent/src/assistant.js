@@ -39,7 +39,8 @@ function newSession(meetingId) {
     conv: newConversation(),
     lines: [],
     startedAt: new Date(),
-    asks: 0,
+    asks: 0,          // LIVE asks only — wake-word and periodic. See summaryAsks.
+    summaryAsks: 0,   // requests the wrap-up spends. Never counted as live.
     accepted: 0,   // messages WhatsApp accepted. NOT deliveries: see notify.js.
     failures: [],
     // The in-flight live ask, as a PROMISE rather than a boolean. A boolean can
@@ -182,7 +183,7 @@ export function onMeetingEnded(meetingId) {
   sessions.delete(meetingId);
 
   const minutes = Math.max(1, Math.round((Date.now() - session.startedAt) / 60000));
-  console.log(`[assistant] meeting ${meetingId} ended — ${session.lines.length} lines, ${session.asks} asks, ${session.accepted} accepted`);
+  console.log(`[assistant] meeting ${meetingId} ended — ${session.lines.length} lines, ${session.asks} live asks, ${session.summaryAsks} summary requests, ${session.accepted} accepted`);
 
   if (session.lines.length === 0) return Promise.resolve();
 
@@ -288,7 +289,7 @@ async function summarise(session) {
   const single = buildBounded(SUMMARY_TASK, lines);
 
   if (single.dropped === 0) {
-    session.asks += 1;
+    session.summaryAsks += 1;
     const res = await ask(single.text, session.conv);
     return { ...res, covered: res.ok ? single.used : 0, total: session.lines.length, segments: 1 };
   }
@@ -305,7 +306,7 @@ async function summarise(session) {
   // than it has" defect the bounding work exists to remove, one level up.
   const kept = [];
   for (const chunk of plan.chunks) {
-    session.asks += 1;
+    session.summaryAsks += 1;
     const res = await ask(chunk.text, session.conv);
     if (!res.ok) {
       session.failures.push(res.error ?? 'segment summary failed');
@@ -322,7 +323,7 @@ async function summarise(session) {
   const survived = kept.slice(kept.length - reduced.used);
   const covered = survived.reduce((n, k) => n + k.lines, 0);
 
-  session.asks += 1;
+  session.summaryAsks += 1;
   const res = await ask(reduced.text, session.conv);
   return {
     ...res,
@@ -404,7 +405,12 @@ async function wrapUp(session, minutes) {
     transcript_lines: total,
     summary_covered_lines: covered,
     speakers: speakers.length,
+    // COUNTS WHAT ITS NAME SAYS. summarise() used to increment session.asks for
+    // every segment and reduction request, so a call where nobody spoke a wake
+    // word published one live ask for a short summary and several for a chunked
+    // one — a durable board record of interaction that never happened.
     live_asks: session.asks,
+    summary_requests: session.summaryAsks,
     accepted: session.accepted,
     errors: session.failures.length ? session.failures.slice(0, 3).join('; ') : 'none',
     summary: reply,
@@ -422,7 +428,7 @@ async function wrapUp(session, minutes) {
     // every reader's outstanding queue.
     'DONE',
     'ZOOM-AGENT',
-    `Live call assisted: ${minutes} min, ${session.asks} asks, ${session.accepted} accepted by WhatsApp`,
+    `Live call assisted: ${minutes} min, ${session.asks} live asks, ${session.accepted} accepted by WhatsApp`,
     'Transcript-derived. Not verified against any org.',
   ];
 

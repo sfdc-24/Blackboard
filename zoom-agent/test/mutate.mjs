@@ -249,6 +249,23 @@ const MUTATIONS = [
   },
 
   {
+    blocker: '15-privacy',
+    name: 'chat content is logged again regardless of LOG_TRANSCRIPT',
+    file: 'src/rtms.js',
+    from: '    if (config.logTranscript) {\n      console.log(`[chat] ${who}: ${buf.toString(\'utf8\')}`);\n    } else {',
+    to: '    if (true) {\n      console.log(`[chat] ${who}: ${buf.toString(\'utf8\')}`);\n    } else if (false) {',
+    expect: /chat content is not written to the console/,
+  },
+  {
+    blocker: '15-asks',
+    name: 'the wrap-up counts its own requests as live asks again',
+    file: 'src/assistant.js',
+    from: '    session.summaryAsks += 1;\n    const res = await ask(chunk.text, session.conv);',
+    to: '    session.asks += 1;\n    const res = await ask(chunk.text, session.conv);',
+    expect: /live_asks counts live asks/,
+  },
+
+  {
     blocker: '11-lock',
     name: 'the lock goes back to check-then-write, so two harnesses both hold it',
     file: 'test/lockfile.mjs',

@@ -1245,3 +1245,92 @@ test('P2: a 2xx with no message id is not an acceptance', async () => {
     globalThis.fetch = realFetch;
   }
 });
+
+
+test('P1: chat content is not written to the console when LOG_TRANSCRIPT is off', async () => {
+  // The README and the PR both say client conversation is not logged by
+  // default. onChatData wrote every typed message to stdout regardless — so on
+  // any host whose console is retained or shipped to a collector, it WAS
+  // logged, through the one channel nobody thought of as transcript. A privacy
+  // promise that holds for speech and not for the chat pane is not a promise.
+  const { handleZoomEvent, __testHooks } = await import('../src/rtms.js');
+
+  const SECRET = 'our renewal number is 480000 dollars';
+  let chatCb = null;
+  const noop = () => {};
+  class CaptureClient {
+    constructor() {
+      for (const cb of ['onJoinConfirm', 'onTranscriptData', 'onAudioData', 'onVideoData',
+        'onShareData', 'onSharingEvent', 'onLeave']) {
+        this[cb] = noop;
+      }
+      this.onChatData = (fn) => { chatCb = fn; };
+      this.join = noop;
+    }
+  }
+
+  const started = {
+    event: 'meeting.rtms_started',
+    payload: { object: { rtms_stream_id: 's-chat', meeting_uuid: 'm-chat' } },
+  };
+
+  const realLog = console.log;
+  const prev = config.logTranscript;
+  const logs = [];
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    __testHooks.setModule({ Client: CaptureClient });
+
+    config.logTranscript = false;
+    await handleZoomEvent(started);
+    assert.ok(chatCb, 'setup: the chat callback should have been registered');
+    chatCb(Buffer.from(SECRET, 'utf8'), 0, { userName: 'Client' });
+
+    const joined = logs.join('\n');
+    assert.ok(!joined.includes(SECRET),
+      `typed client content reached the console with LOG_TRANSCRIPT=false:\n${joined}`);
+    assert.ok(joined.includes('Client'), 'the sender and size should still be reported');
+    assert.ok(/content withheld/.test(joined), 'and it should say the content was withheld, not fail silently');
+
+    // Turning it ON must still work, or the guard is just an outage.
+    logs.length = 0;
+    __testHooks.reset();
+    __testHooks.setModule({ Client: CaptureClient });
+    config.logTranscript = true;
+    await handleZoomEvent({ ...started, payload: { object: { rtms_stream_id: 's-chat2', meeting_uuid: 'm2' } } });
+    chatCb(Buffer.from(SECRET, 'utf8'), 0, { userName: 'Client' });
+    assert.ok(logs.join('\n').includes(SECRET),
+      'with LOG_TRANSCRIPT=true the operator must still get the content');
+  } finally {
+    console.log = realLog;
+    config.logTranscript = prev;
+    __testHooks.reset();
+  }
+});
+
+test('P2: live_asks counts live asks, not the wrap-up talking to itself', async () => {
+  // summarise() incremented session.asks for every segment and reduction
+  // request, and the board row publishes that as `live_asks`. So a call where
+  // nobody spoke a wake word published one live ask for a short summary, and
+  // several for a chunked one — a durable record, on the shared board, of
+  // interaction that never happened.
+  const src = readFileSync(new URL('../src/assistant.js', import.meta.url), 'utf8');
+  const summarise = src.slice(src.indexOf('async function summarise('), src.indexOf('function boardRow') === -1
+    ? src.length : src.indexOf('function boardRow'));
+
+  assert.equal((summarise.match(/session\.asks \+= 1/g) ?? []).length, 0,
+    'summarise() must not touch the LIVE ask counter — every increment in it is the wrap-up '
+    + 'asking the backend on its own behalf, and publishing that as a live ask puts interaction '
+    + 'on the board that no participant ever had');
+  assert.ok((summarise.match(/session\.summaryAsks \+= 1/g) ?? []).length >= 3,
+    'each summary request must still be counted, just not as a live one');
+
+  // And the two are published as different fields, so neither has to be inferred.
+  assert.match(src, /live_asks: session\.asks/);
+  assert.match(src, /summary_requests: session\.summaryAsks/);
+
+  // Exactly one live increment, and it is on the wake-word path.
+  const wholeFile = (src.match(/session\.asks \+= 1/g) ?? []).length;
+  assert.equal(wholeFile, 1,
+    `${wholeFile} places increment the live ask counter; there is one live path`);
+});
