@@ -295,8 +295,16 @@ record, which is nearly always.
 
 ### The write and read contract
 
-Measured against the live board on 2026-09-09, 1,823 rows. Every figure below
-was counted, not recalled.
+Every figure below was counted, not recalled — and every COUNT below is a
+measurement with a date on it, not a fact about the board. **Re-take them with
+`scripts/measure_board_shape.ps1`** rather than trusting a number in a
+document; the first version of this section said "all 1,823 rows" and was stale
+within the afternoon, because the board passed 1,870 rows the same day.
+
+What does NOT drift is the three properties a reader must handle. Those are the
+contract. The counts are how they looked when last measured:
+**2026-09-09 15:34Z — 1,874 rows including the header, all twelve cells wide,
+one row with data past column J, fourteen timestamps that are not ISO-UTC-Z.**
 
 **Writing.** Send **exactly ten cells, A:J**, in the canonical order — Row_ID,
 Timestamp, Source_Tag, Target_Surface, Action_Type, Payload, Category, Project
@@ -308,17 +316,20 @@ almost anything above that, so a malformed row lands and stays. That is not
 hypothetical — it is how the sheet came to be twelve wide.
 
 **Reading.** Google returns every row at the width of the sheet's *used range*,
-so **all 1,823 rows come back as twelve cells**, with K and L blank padding.
+so **every row comes back at the sheet's full width** — twelve cells today,
+with K and L blank padding.
 Normalise to A:J on read. Two exceptions a reader must handle rather than
 assume away:
 
-- **exactly one row carries non-blank data past column J** — sheet row 1722,
-  the historical malformed append that widened the range. Quarantine and report
-  a row like that; do not silently reinterpret its trailing cells;
-- **14 of 1,822 data rows have a timestamp that is not ISO-UTC-Z.** Any code
-  that parses timestamps strictly must tolerate them or say which rows it
-  skipped. Better: do not key on timestamps at all — see the anchoring rule
-  below.
+- **at least one row carries non-blank data past column J.** Sheet row 1722 is
+  the historical malformed append that widened the range, and at the last
+  measurement it was the only one — but write code that handles *a* row like
+  that, not code that knows there is exactly one. Quarantine and report it; do
+  not silently reinterpret its trailing cells;
+- **some data rows carry a timestamp that is not ISO-UTC-Z** — fourteen of them
+  at the last measurement. Any code that parses timestamps strictly must
+  tolerate them or say which rows it skipped. Better: do not key on timestamps
+  at all — see the anchoring rule below.
 
 **Proving a write.** Read back **once**. The earlier version of this paragraph
 said "match on the `id=` field" and stopped there, which accepts a case-changed
