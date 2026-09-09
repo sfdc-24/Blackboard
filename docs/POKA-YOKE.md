@@ -37,7 +37,7 @@ optional dependency is the one that proves the claim; a green run on the other
 says nothing.
 
 > `.github/workflows/zoom-agent-tests.yml` exists **only on PR #40**, which is
-> still NO-GO on five accepted blockers. Until that merges this entry is a
+> still NO-GO on six accepted blockers. Until that merges this entry is a
 > proposal, not a control. Do not cite it as though the mechanism is in place —
 > that is prose-as-proof, which is the thing this file exists to stop.
 
@@ -93,8 +93,14 @@ and `<math>` in one change — none of which anyone had enumerated.
 
 **Naive rule.** "Think harder about edge cases."
 
-**Mechanism.** Allowlist, never denylist, wherever the permitted set is finite
-and specified. An input nobody imagined then fails safe by construction.
+**Mechanism — PROPOSED, not yet on `main`.** Allowlist, never denylist,
+wherever the permitted set is finite and specified. An input nobody imagined
+then fails safe by construction.
+
+> The allowlist lives in `tests/test_xray_page.py` on **sfdc24-site PR #13,
+> which is open**. Site `main` does not have it. Same caveat as L-91 and L-92 —
+> and I marked this one "in place" in the first scoreboard, having verified the
+> label by parsing the file and never verified the claim underneath it.
 
 ---
 
@@ -108,9 +114,14 @@ trusting or retrying"* **in its own failure output**.
 
 **Naive rule.** "Follow D-4."
 
-**Mechanism.** Error messages carry the instruction for the situation that just
-occurred. Nobody reads the doctrine at the moment of failure; they read the
-error. (Note the shape: a *client* timeout is not a *server* failure — the work
+**Rule — a better-placed one, but still a rule.** Error messages carry the
+instruction for the situation that just occurred. Nobody reads the doctrine at
+the moment of failure; they read the error.
+
+It is not a mechanism by this file's own definition: the operator must still
+read the warning and choose to heed it. Putting the words where they will
+actually be seen raises the odds a great deal and removes nothing. A client that
+physically refused to retry an ambiguous write would be the mechanism. (Note the shape: a *client* timeout is not a *server* failure — the work
 completed, only the news was lost.)
 
 ---
@@ -199,12 +210,17 @@ for what 2026-09-08/09 added, and for the *distinction* between a rule and a
 mechanism. If an entry below ever becomes enforceable in CI or a rule engine,
 move it up into the mechanism form and say so.
 
-**Scoreboard, so this file does not flatter itself.** Of eight entries, **two**
-are mechanisms in place today (L-94's allowlist and L-95's failure-path warning,
-both merged). **Two more are proposed** and land only if PR #40 and
-sfdc24-site PR #13 do (L-91, L-92). **Four are rules with no enforcement at all**
-(L-93, L-96, L-97, L-98) and are the honest input for a scoring engine. A file
-that claimed eight mechanisms would have been the exact failure it documents.
+**Scoreboard, so this file does not flatter itself.** Of eight entries,
+**none is a mechanism in force today.** Three are proposed and land only if
+sfdc24-site PR #13 and Blackboard PR #40 merge (L-91, L-92, L-94). Five are
+rules with no enforcement at all (L-93, L-95, L-96, L-97, L-98) and are the
+honest input for a scoring engine.
+
+Zero of eight. That is the most useful sentence in the document: a night that
+produced eight learnings produced **no controls that are actually in force**, and
+the first two versions of this scoreboard both overstated it — first claiming
+six mechanisms, then two. Both times a reviewer had to count for me. Verify the
+claim, not the label.
 
 **The generalisation worth keeping**, because it explains all eight defects of
 that night in one line: *evaluating anything takes a correct answer and a
