@@ -321,7 +321,7 @@ that my own guard was enforcing into the codebase. The columns are here now.
 Each gate below states seven things in prose. A gate that cannot be failed, or
 whose failure has no defined consequence, is not a gate.
 
-**Each also carries a `gate` block of 10 typed fields, and that block is what
+**Each also carries a `gate` block of 11 typed fields, and that block is what
 the tests read.** It exists because the eighth review of this file ran **eight
 semantic inversions of the plan and every one left the suite green** — the
 document made to say G8 did not unlock G9, that an unknown-cost scan could
@@ -352,6 +352,7 @@ human_precondition: yes
 fail_closed: yes
 fail_closed_rule: refuse_unconfirmed_claim
 evidence_must_name: named_authoriser, de_org_identifier, authorisation_scope, authorisation_expiry, tool_listing, version_output, commit_hash, no_connect_failure_mode
+absent_evidence_behaviour: refuse_connect
 passed: no
 ```
 
@@ -399,7 +400,8 @@ acceptor: agent:independent
 human_precondition: no
 fail_closed: yes
 fail_closed_rule: refuse_when_cost_unknown
-evidence_must_name: scan_envelope, limits_before, limits_after, paging_budget, retry_budget
+evidence_must_name: scan_envelope, scan_envelope_digest, limits_before, limits_after, paging_budget, retry_budget
+absent_evidence_behaviour: refuse_scan
 passed: no
 ```
 
@@ -433,6 +435,7 @@ human_precondition: no
 fail_closed: yes
 fail_closed_rule: deny_by_default
 evidence_must_name: mutating_tool_unreachable_test, unexpected_org_id_test
+absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
@@ -460,6 +463,7 @@ human_precondition: no
 fail_closed: yes
 fail_closed_rule: block_until_demonstrated
 evidence_must_name: attended_vs_unattended, eca_constraints, token_storage, token_rotation, revocation, tenant_isolation
+absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
@@ -490,6 +494,7 @@ human_precondition: no
 fail_closed: yes
 fail_closed_rule: refuse_unvalidated_emitter
 evidence_must_name: per_field_mutation, unexpected_field_mutation, pinned_corpus_digest
+absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
@@ -517,6 +522,7 @@ human_precondition: no
 fail_closed: yes
 fail_closed_rule: report_rate_not_sigma
 evidence_must_name: seventeen_fields_no_unresolved, stability, sample, stratification, uncertainty
+absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
@@ -544,6 +550,7 @@ human_precondition: no
 fail_closed: yes
 fail_closed_rule: refuse_without_approval
 evidence_must_name: stable_export_digest, leakage_mutation, approved_exact_bytes
+absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
@@ -566,11 +573,12 @@ id: G8
 requires: none
 unlocks: G9
 owner: claude-code-cli
-acceptor: human:salam
+acceptor: human:reviewer
 human_precondition: no
 fail_closed: yes
 fail_closed_rule: refuse_until_live_readback_matches
 evidence_must_name: merge_commit, deployment_run_id, live_page_readback
+absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
@@ -601,7 +609,8 @@ acceptor: human:salam
 human_precondition: yes
 fail_closed: yes
 fail_closed_rule: refuse_without_authorisation
-evidence_must_name: human_channel_row, org_identifier, scope, expiry
+evidence_must_name: authenticated_principal, human_channel_row, org_identifier, scope, expiry
+absent_evidence_behaviour: refuse_connect
 passed: no
 ```
 

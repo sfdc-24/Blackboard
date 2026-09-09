@@ -221,6 +221,70 @@ class GateSemantics(unittest.TestCase):
             "to have authorised it, and nothing else here reads an org.",
         )
 
+    # Round nine, "agent replaces G7 human": only G9's acceptor was pinned, so
+    # G7 — the gate that PUBLISHES — was quietly handed to an agent and the
+    # suite stayed green. Every acceptor is pinned now, with the reason, because
+    # "who may accept this" is the whole content of a gate. Changing one is a
+    # real decision: change it here and in the block, and say in the PR which
+    # accountability is being moved and to whom.
+    PINNED_ACCEPTORS = {
+        "G1": ("agent:independent", "a capability matrix is checkable by anyone who did not write it"),
+        "G2": ("agent:independent", "a cost measurement is checkable the same way"),
+        "G3": ("agent:independent", "an allowlist is checkable by reading it against the tool listing"),
+        "G4": ("human:salam-or-reviewer", "it decides where a client's credentials live, so it does not pass on my say-so"),
+        "G5": ("agent:independent", "a schema and its validator are mechanically checkable"),
+        "G6": ("human:salam-or-reviewer", "I should not be the one who decides my own statistical model is sound"),
+        "G7": ("human:salam", "it publishes, and a person approves the exact bytes that become public"),
+        "G8": ("human:reviewer", "Mr. Salam chooses the wording; a reviewer accepts the change — the typed field said human:salam and contradicted its own prose"),
+        "G9": ("human:salam", "it opens a client's org; an agent that can write its own authorisation has no gate"),
+    }
+
+    def test_every_acceptor_is_the_one_the_document_states(self) -> None:
+        for gid, (acceptor, why) in self.PINNED_ACCEPTORS.items():
+            self.assertEqual(
+                self.gates[gid].acceptor, acceptor,
+                f"{gid} is accepted by {self.gates[gid].acceptor!r}, not "
+                f"{acceptor!r}. Pinned because {why}.",
+            )
+
+    def test_a_gate_that_needs_a_person_did_not_get_an_agent(self) -> None:
+        """The structural half of the same property, independent of the pins.
+
+        Publishing and reading someone else's org are the two things this plan
+        does that cannot be taken back. Whatever else changes, those acceptors
+        stay human — this fails even if someone edits the pinned table above.
+        """
+        for gid in ("G7", "G9"):
+            self.assertTrue(
+                self.gates[gid].acceptor.startswith("human:"),
+                f"{gid} is accepted by {self.gates[gid].acceptor!r}. This gate's "
+                "outcome leaves our hands — published bytes, or a scan of an org "
+                "we do not own — and an agent cannot be accountable for it.",
+            )
+
+    def test_absent_evidence_refuses_rather_than_proceeds(self) -> None:
+        """Round nine, blocker 2: what happens when the receipt is NOT there.
+
+        Every gate said what evidence it needs. None said what it does when
+        that evidence is missing, so "no valid receipt, no connect" was an
+        inference a reader made, not a property anything checked.
+        """
+        for gid in ("G1", "G9"):
+            self.assertEqual(
+                self.gates[gid].absent_evidence_behaviour, "refuse_connect",
+                f"{gid} does not refuse to CONNECT when its authorisation "
+                f"evidence is absent — it says "
+                f"{self.gates[gid].absent_evidence_behaviour!r}. These are the "
+                "two gates that cause an org to be read.",
+            )
+        self.assertIn(
+            "authenticated_principal", self.gates["G9"].evidence_must_name,
+            "G9's receipt no longer has to identify an AUTHENTICATED principal. "
+            "A board row naming Mr. Salam is a claim about who wrote it; the "
+            "gate needs the claim verified, or anyone who can write a row can "
+            "authorise a client scan.",
+        )
+
     def test_G9_evidence_names_the_org_its_scope_and_an_expiry(self) -> None:
         required = {"org_identifier", "scope", "expiry", "human_channel_row"}
         missing = sorted(required - set(self.gates["G9"].evidence_must_name))
@@ -263,8 +327,21 @@ class GateSemantics(unittest.TestCase):
             "scan covers without anyone re-taking the measurement.",
         )
 
+    # Round nine, "arbitrary six G4 evidence names": the old test asserted only
+    # that there were SIX, so `a, b, c, d, e, f` satisfied it. A count is not a
+    # content check. These are the six concerns G4's prose names, and each is
+    # required to appear in that prose too, so the pair cannot drift.
+    G4_CONCERNS = {
+        "attended_vs_unattended": "attended",
+        "eca_constraints": "ECA",
+        "token_storage": "token storage",
+        "token_rotation": "rotation",
+        "revocation": "revocation",
+        "tenant_isolation": "isolation",
+    }
+
     def test_G4_still_answers_six_concerns(self) -> None:
-        """The count that was wrong four times, now derived from the field."""
+        """The count that was wrong four times — and now the names as well."""
         tokens = self.gates["G4"].evidence_must_name
         self.assertEqual(
             len(tokens), 6,
@@ -272,6 +349,20 @@ class GateSemantics(unittest.TestCase):
             "says six concerns; the two have to be the same number, and "
             "counting from memory is how this document went wrong four times.",
         )
+        self.assertEqual(
+            set(tokens), set(self.G4_CONCERNS),
+            f"G4's demonstrations are {sorted(tokens)}. Six arbitrary names "
+            "satisfy a count and answer nothing — round nine passed the whole "
+            "suite with `a, b, c, d, e, f`.",
+        )
+        prose = self.gates["G4"].prose
+        for token, phrase in self.G4_CONCERNS.items():
+            self.assertIn(
+                phrase, prose,
+                f"G4's typed evidence names {token} but its prose no longer "
+                f"mentions {phrase!r}, so the demonstration and the concern it "
+                "answers have come apart.",
+            )
         prose = _bullet(self.gates["G4"].prose, "artefact") or ""
         self.assertIn(
             "**six**", prose,
@@ -343,12 +434,22 @@ class GateSemantics(unittest.TestCase):
                 if text is None:
                     problems.append(f"{gid}: no `{label}` bullet")
                     continue
-                want = _render(value)
-                stripped = text.lstrip("*").strip()
-                if not stripped.startswith(want):
+                # PARSED, not prefix-matched. Round nine walked through
+                # `startswith` with "G90 is a different gate entirely" — because
+                # "G90..." starts with "G9". A prefix test on an identifier that
+                # can be extended tests nothing about the identifier. This runs
+                # the prose through the same grammar as the block and compares
+                # sets, so G90 is refused as a gate id rather than accepted as a
+                # prefix.
+                try:
+                    said = gg.prose_relation(text, f"{gid}.{label} prose")
+                except gg.GateSyntaxError as exc:
+                    problems.append(str(exc))
+                    continue
+                if said != value:
                     problems.append(
-                        f"{gid}.{label}: block says {want!r}; prose opens "
-                        f"{stripped[:60]!r}"
+                        f"{gid}.{label}: block says {_render(value)}; prose says "
+                        f"{_render(said)}"
                     )
         self.assertEqual(
             problems, [],

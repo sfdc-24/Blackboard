@@ -82,11 +82,24 @@ REQUIRED_FIELDS = (
     "fail_closed",
     "fail_closed_rule",
     "evidence_must_name",
+    # Round nine, blocker 2: the gates said what evidence they need and nothing
+    # said what happens when it is ABSENT. "No valid receipt, no connect" has to
+    # be a field, not an inference from the fail-closed sentence beside it.
+    "absent_evidence_behaviour",
     # "no gate in §8 is passed" was a sentence in the status block and nothing
     # else. A sentence cannot be checked against anything; this field can, and
     # the hold is enforced as `state == HOLD implies every passed == no`.
     "passed",
 )
+
+# What the gate does when its required evidence is missing or unverified. There
+# is no "proceed and note it".
+ABSENT_EVIDENCE = frozenset({
+    "refuse_connect",
+    "refuse_publish",
+    "refuse_accept",
+    "refuse_scan",
+})
 
 # ── The document-level hold, typed for the same reason ──────────────────────
 
@@ -100,7 +113,22 @@ LIFTED_BY = frozenset({"human:salam"})
 EVIDENCE_TOKEN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 BLOCK = re.compile(r"^```gate\n(.*?)^```$", re.MULTILINE | re.DOTALL)
-HEADING = re.compile(r"^### (G[1-9]) [^\n]*$", re.MULTILINE)
+
+# `G\d+`, NOT `G[1-9]`. Round nine slipped an extra fail-open `### G10` past the
+# whole suite: the old pattern simply did not see it, so it was neither parsed
+# nor counted nor rejected — it was invisible. Match any gate-shaped heading and
+# let the id grammar refuse it loudly.
+HEADING = re.compile(r"^### (G\d+) [^\n]*$", re.MULTILINE)
+
+# The leading relation value of a prose bullet, parsed with the SAME grammar as
+# the typed field rather than compared as a string.
+#
+# The previous check was `stripped.startswith(want)`, and round nine walked
+# through it with `- **unlocks** — G90 is a different gate entirely.` — because
+# "G90..." starts with "G9". A prefix test on an identifier that can be extended
+# is not a test of the identifier. `G\d+` is greedy, so `G90` is captured whole
+# and then REFUSED by GATE_ID, which is the behaviour a grammar is for.
+PROSE_LEAD = re.compile(r"^(?:\*\*)?(none(?![a-z])|G\d+(?:\s*,\s*G\d+)*)")
 
 
 class GateSyntaxError(ValueError):
@@ -119,6 +147,7 @@ class Gate:
     fail_closed: bool
     fail_closed_rule: str
     evidence_must_name: tuple[str, ...]
+    absent_evidence_behaviour: str
     passed: bool
     line: int = 0
     prose: str = field(default="", compare=False)
@@ -154,6 +183,24 @@ def _gate_set(raw: str, where: str) -> frozenset[str]:
     if parts != sorted(parts):
         raise GateSyntaxError(f"{where}: gate ids must ascend, got {raw!r}")
     return frozenset(parts)
+
+
+def prose_relation(bullet: str, where: str) -> frozenset[str]:
+    """The gate set a prose bullet OPENS with, parsed, not prefix-matched.
+
+    Returns the same kind of value as the typed field, so the test compares
+    `frozenset == frozenset` instead of asking whether one string starts with
+    another. Anything that is not a relation value — "nothing", "everything",
+    "G90" — raises rather than quietly matching.
+    """
+    m = PROSE_LEAD.match(bullet.strip())
+    if not m:
+        raise GateSyntaxError(
+            f"{where}: the bullet does not open with a relation value. It opens "
+            f"{bullet.strip()[:60]!r}. Write `none` or gate ids; the explanation "
+            "goes after them."
+        )
+    return _gate_set(re.sub(r"\s*,\s*", ", ", m.group(1)), where)
 
 
 def parse_gate_block(body: str, where: str) -> dict[str, str]:
@@ -194,7 +241,8 @@ def _build(fields: dict[str, str], where: str, line: int, prose: str) -> Gate:
         raise GateSyntaxError(f"{where}: id {gid!r} is not G1..G9")
 
     for name, table in (("owner", OWNERS), ("acceptor", ACCEPTORS),
-                        ("fail_closed_rule", FAIL_CLOSED_RULES)):
+                        ("fail_closed_rule", FAIL_CLOSED_RULES),
+                        ("absent_evidence_behaviour", ABSENT_EVIDENCE)):
         if fields[name] not in table:
             raise GateSyntaxError(
                 f"{where}: {name}={fields[name]!r} is outside the closed set. "
@@ -226,6 +274,7 @@ def _build(fields: dict[str, str], where: str, line: int, prose: str) -> Gate:
         fail_closed=BOOLS[fields["fail_closed"]],
         fail_closed_rule=fields["fail_closed_rule"],
         evidence_must_name=evidence,
+        absent_evidence_behaviour=fields["absent_evidence_behaviour"],
         passed=BOOLS[fields["passed"]],
         line=line,
         prose=prose,
@@ -282,6 +331,15 @@ def parse(text: str) -> dict[str, Gate]:
         raise GateSyntaxError(
             f"{len(headings)} gate heading(s) but {len(blocks)} typed block(s): "
             "every gate carries exactly one, or one of them is unchecked."
+        )
+
+    unknown = sorted({h for h, _ in headings if not GATE_ID.match(h)})
+    if unknown:
+        raise GateSyntaxError(
+            f"gate heading(s) {unknown} are outside G1..G9. Round nine added an "
+            "extra fail-open `### G10` and the old heading pattern could not see "
+            "it, so it was never parsed, counted or refused. A gate this module "
+            "cannot name is a gate it cannot check."
         )
 
     gates: dict[str, Gate] = {}

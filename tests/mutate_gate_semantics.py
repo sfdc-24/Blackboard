@@ -117,9 +117,8 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "G9's authorisation need not name a scope or an expiry",
-        "edits": [("evidence_must_name: human_channel_row, org_identifier, "
-                   "scope, expiry",
-                   "evidence_must_name: human_channel_row, org_identifier")],
+        # RE-ANCHORED for round nine: authenticated_principal joined the list.
+        "edits": [("org_identifier, scope, expiry", "org_identifier")],
         "expect": "test_G9_evidence_names_the_org_its_scope_and_an_expiry",
     },
     {
@@ -137,10 +136,12 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "a gate is marked passed while the document is still HELD",
-        "edits": [("evidence_must_name: human_channel_row, org_identifier, "
-                   "scope, expiry\npassed: no",
-                   "evidence_must_name: human_channel_row, org_identifier, "
-                   "scope, expiry\npassed: yes")],
+        # RE-ANCHORED for round nine: absent_evidence_behaviour sits between
+        # evidence_must_name and passed now.
+        "edits": [("scope, expiry\nabsent_evidence_behaviour: refuse_connect\n"
+                   "passed: no",
+                   "scope, expiry\nabsent_evidence_behaviour: refuse_connect\n"
+                   "passed: yes")],
         "expect": "test_a_held_document_has_no_passed_gates",
     },
     {
@@ -158,7 +159,9 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "G2 goes back to costing an undefined \"full scan\"",
-        "edits": [("evidence_must_name: scan_envelope, limits_before",
+        # RE-ANCHORED for round nine: the envelope is digest-pinned now.
+        "edits": [("evidence_must_name: scan_envelope, scan_envelope_digest, "
+                   "limits_before",
                    "evidence_must_name: limits_before")],
         "expect": "test_G2_measures_a_named_envelope_rather_than_a_full_scan",
     },
@@ -181,8 +184,63 @@ MUTATIONS: list[dict] = [
     },
     {
         "name": "a typed field is added without updating the stated count",
-        "edits": [("block of 10 typed fields", "block of 9 typed fields")],
+        "edits": [("block of 11 typed fields", "block of 10 typed fields")],
         "expect": "test_the_stated_field_count_is_the_real_one",
+    },
+    # ── Round nine. Twelve adversarial documents were accepted on all four
+    #    legs, 48/48 exit 0. These are the four novel shapes; all four were
+    #    reproduced here before any of them was fixed.
+
+    {
+        # `"G90...".startswith("G9")` is true. A prefix test on an identifier
+        # that can be extended tests nothing about the identifier.
+        "name": "a longer gate id satisfies the prose prefix check",
+        "edits": [("- **unlocks** — G9.\n\n*G8 has no prerequisites",
+                   "- **unlocks** — G90 is a different gate entirely.\n\n"
+                   "*G8 has no prerequisites")],
+        "expect": "test_the_prose_states_the_same_relations_as_the_typed_blocks",
+    },
+    {
+        # Only G9's acceptor was pinned, so the gate that PUBLISHES could be
+        # handed to an agent with the suite still green.
+        "name": "an agent takes over as acceptor of the gate that publishes",
+        "edits": [("id: G7\nrequires: G5, G6\nunlocks: G9\n"
+                   "owner: claude-code-cli\nacceptor: human:salam",
+                   "id: G7\nrequires: G5, G6\nunlocks: G9\n"
+                   "owner: claude-code-cli\nacceptor: agent:independent")],
+        "expect": "test_every_acceptor_is_the_one_the_document_states",
+    },
+    {
+        # A count is not a content check: six arbitrary names satisfied it.
+        "name": "G4's six demonstrations become six arbitrary letters",
+        "edits": [("evidence_must_name: attended_vs_unattended, eca_constraints, "
+                   "token_storage, token_rotation, revocation, tenant_isolation",
+                   "evidence_must_name: a, b, c, d, e, f")],
+        "expect": "test_G4_still_answers_six_concerns",
+    },
+    {
+        # The heading pattern was `G[1-9]`, so a tenth gate was not rejected —
+        # it was INVISIBLE. Never parsed, never counted, never refused.
+        "name": "an extra fail-open G10 is added below the others",
+        "edits": [("### G9 · first client org",
+                   "### G10 · emergency bypass\n\n"
+                   "- **prerequisite** — none.\n"
+                   "- **fail-closed** — none. G10 permits a scan with no authorisation.\n"
+                   "- **unlocks** — everything.\n\n"
+                   "### G9 · first client org")],
+        "expect": "GateSyntaxError",
+    },
+    {
+        "name": "G9 stops requiring an authenticated principal on its receipt",
+        "edits": [("evidence_must_name: authenticated_principal, human_channel_row",
+                   "evidence_must_name: human_channel_row")],
+        "expect": "test_absent_evidence_refuses_rather_than_proceeds",
+    },
+    {
+        "name": "the client-org gate proceeds when its authorisation is absent",
+        "edits": [("scope, expiry\nabsent_evidence_behaviour: refuse_connect",
+                   "scope, expiry\nabsent_evidence_behaviour: refuse_accept")],
+        "expect": "test_absent_evidence_refuses_rather_than_proceeds",
     },
     {
         "name": "the typed status block is deleted entirely",
