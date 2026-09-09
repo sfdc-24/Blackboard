@@ -109,8 +109,9 @@ then fails safe by construction.
 **Incident.** On 2026-09-09 a board append returned `curl` exit 28 —
 *"timed out after 120001 ms with 0 bytes received"* — and the row had landed.
 A retry would have manufactured a duplicate. It cost nothing because
-`scripts/alpha.ps1` prints *"the write MAY have landed — READ BACK before
-trusting or retrying"* **in its own failure output**.
+`scripts/alpha.ps1:110` prints, verbatim, *"response is not JSON. Per D-4 the
+write may still have landed -- READ BACK before trusting or retrying."*
+**in its own failure output**.
 
 **Naive rule.** "Follow D-4."
 
