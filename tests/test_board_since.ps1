@@ -159,23 +159,60 @@ Assert-True 'an anchor that moved is found by Row_ID rather than lost' (
   $searched.Anchor -eq 'searched' -and $searched.StartIndex -eq 3
 ) ("anchor=" + $searched.Anchor + " start=" + $searched.StartIndex)
 
-# Anchor gone entirely: fall back INCLUSIVELY. Repeating is acceptable; skipping
+# Anchor gone entirely: RESTART FROM THE TOP. Repeating is acceptable; skipping
 # is the failure this whole change exists to prevent.
 $lostCursor = [pscustomobject]@{ lastIndex = 1; lastRowId = 'vanished'; lastTs = '2026-09-09T06:00:00Z' }
 $lost = Resolve-BoardStartIndex -Rows $tied -Cursor $lostCursor
-Assert-True 'a lost anchor falls back inclusively, never past the tie' (
-  $lost.Anchor -eq 'anchor-lost' -and $lost.StartIndex -eq 1
+Assert-True 'a lost anchor restarts from the top' (
+  $lost.Anchor -eq 'anchor-lost' -and $lost.StartIndex -eq 0
 ) ("anchor=" + $lost.Anchor + " start=" + $lost.StartIndex)
 
 Assert-True 'a lost anchor says so, rather than failing quietly' (
-  $lost.Note -match 'INCLUSIVE'
+  $lost.Note -match 'RESTARTING FROM THE TOP'
 )
 
 # A cursor written by the previous version has no Row_ID at all.
 $legacy = Resolve-BoardStartIndex -Rows $tied -Cursor ([pscustomobject]@{ lastTs = '2026-09-09T06:00:00Z' })
-Assert-True 'a legacy timestamp cursor is migrated inclusively' (
-  $legacy.Anchor -eq 'legacy-ts' -and $legacy.StartIndex -eq 1
+Assert-True 'a legacy timestamp cursor reads from the top' (
+  $legacy.Anchor -eq 'legacy-ts' -and $legacy.StartIndex -eq 0
 ) ("anchor=" + $legacy.Anchor + " start=" + $legacy.StartIndex)
+
+# ── The board is NOT sorted by timestamp, and the fallback must not assume it ──
+#
+# apps-script/blackboard-bus-v1/Code.gs:154-155 appends the CALLER's row
+# verbatim:
+#
+#     const row = body.sheetRow || [nowStamp_(), body.text || ''];
+#     sheet.appendRow(row);
+#
+# so the timestamp cell is whatever the writer put there -- a slow clock, a
+# replayed row, a backfill. The old fallback scanned for the first row with
+# `ts >= lastTs` and returned the row COUNT when it found none: past the end,
+# skipping every row, permanently. Exactly what the file's own header promised
+# could never happen.
+#
+# This board is the shape that triggers it: the anchor is gone and EVERY row
+# appended since carries a timestamp older than the cursor's.
+$unsorted = @(
+  (New-Row -RowId 'u1' -Ts '2026-09-09T01:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=U1'),
+  (New-Row -RowId 'u2' -Ts '2026-09-09T02:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=U2'),
+  (New-Row -RowId 'u3' -Ts '2026-09-09T03:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=U3')
+)
+$staleTsCursor = [pscustomobject]@{ lastIndex = 7; lastRowId = 'trimmed-away'; lastTs = '2026-09-09T23:59:00Z' }
+$unsortedStart = Resolve-BoardStartIndex -Rows $unsorted -Cursor $staleTsCursor
+Assert-True 'rows appended out of timestamp order after an anchor loss are NOT skipped' (
+  $unsortedStart.StartIndex -eq 0
+) ("start=" + $unsortedStart.StartIndex + " of " + $unsorted.Count + " -- a start at the row count means every row is skipped, forever")
+
+# Stated as the guarantee rather than as an index, so the assertion survives a
+# change of strategy: whatever the fallback does, no addressed row may be lost.
+$addressedSeen = 0
+for ($i = [int]$unsortedStart.StartIndex; $i -lt $unsorted.Count; $i++) {
+  if (Test-BoardAddressed -Payload (Get-BoardRowPayload -Row $unsorted[$i]) -Tag 'claude-code-cli') { $addressedSeen++ }
+}
+Assert-True 'every addressed row on that board is still reachable' (
+  $addressedSeen -eq 3
+) ("saw " + $addressedSeen + " of 3 addressed rows")
 
 $firstRun = Resolve-BoardStartIndex -Rows $tied -Cursor $null
 Assert-True 'a first run reads from the top' (
@@ -364,15 +401,38 @@ Assert-True 'this board own cursor is accepted' (
   Test-BoardCursorMatches -Cursor ([pscustomobject]@{ lastRowId = 'x'; source = $keyDefault }) -SourceKey $keyDefault
 )
 
-# The damage, asserted directly: adopting the foreign cursor starts past the end.
+# THE DAMAGE THIS ASSERTION USED TO DEMONSTRATE IS GONE, AND THE ASSERTION HAS
+# BEEN RE-AIMED RATHER THAN RE-NUMBERED.
+#
+# It read `$adopted.StartIndex -eq $olderBoard.Count` -- adopting a foreign
+# cursor starts past the end and skips everything. That was true only because
+# the anchor-loss fallback scanned by timestamp. Now that the fallback restarts
+# from the top, an adopted cursor whose Row_ID is ABSENT here is harmless, and
+# the old assertion could only be kept by asserting a behaviour that no longer
+# exists. Changing the expected number to 0 would have kept a green line whose
+# name -- "would skip the whole board" -- had become false.
+#
+# What still bites is a Row_ID COLLISION: board identities are per-writer
+# sequences, not globally unique, so the same id can exist on both boards. The
+# anchor is then FOUND, at the wrong board's position, and every row up to it is
+# consumed unseen. That is why the source key still has to exist.
 $olderBoard = @(
   (New-Row -RowId 'b1' -Ts '2026-01-01T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=X'),
-  (New-Row -RowId 'b2' -Ts '2026-01-02T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=Y')
+  (New-Row -RowId 'b2' -Ts '2026-01-02T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=Y'),
+  (New-Row -RowId 'b3' -Ts '2026-01-03T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=Z')
 )
-$adopted = Resolve-BoardStartIndex -Rows $olderBoard -Cursor $foreign
-Assert-True 'adopting a foreign cursor would skip the whole board' (
-  $adopted.StartIndex -eq $olderBoard.Count
-) ("start=" + $adopted.StartIndex + " of " + $olderBoard.Count)
+$collided = [pscustomobject]@{ lastIndex = 9; lastRowId = 'b2'; lastTs = '2027-01-01T00:00:00Z'; source = $keyOther }
+$adopted = Resolve-BoardStartIndex -Rows $olderBoard -Cursor $collided
+Assert-True 'adopting a foreign cursor consumes rows it never showed' (
+  $adopted.StartIndex -gt 0
+) ("start=" + $adopted.StartIndex + " -- b1 and b2 are addressed, unread, and now behind the cursor")
+
+# And the fallback's own guarantee, restated where it is easiest to regress:
+# an absent anchor can no longer skip anything at all, on any board.
+$absent = [pscustomobject]@{ lastIndex = 9; lastRowId = 'not-here'; lastTs = '2027-01-01T00:00:00Z' }
+Assert-True 'an absent anchor never skips, whatever the timestamps say' (
+  (Resolve-BoardStartIndex -Rows $olderBoard -Cursor $absent).StartIndex -eq 0
+)
 
 # Refused, it reads as a first run and nothing is lost.
 $refused = Resolve-BoardStartIndex -Rows $olderBoard -Cursor $null

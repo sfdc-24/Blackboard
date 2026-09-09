@@ -24,9 +24,29 @@ THE TWO DEFECTS THIS FILE EXISTS TO FIX
      timestamp was silently and permanently skipped. The cursor is now anchored
      to a Row_ID at a known index, which is unique and stable.
 
-  Where the anchor cannot be found the fallback is INCLUSIVE — it may show a row
-  twice. Repeating a row costs a reader one duplicate; skipping one loses a
-  message that no later run will ever surface again.
+  Where the anchor cannot be found, the scan RESTARTS FROM THE TOP. It may show
+  many rows twice. Repeating a row costs a reader one duplicate; skipping one
+  loses a message that no later run will ever surface again.
+
+  3. A TIMESTAMP FALLBACK ON A BOARD THAT IS NOT SORTED BY TIMESTAMP. The
+     anchor-loss recovery used to scan for the first row with `ts >= lastTs`,
+     which silently assumes the board is in timestamp order. It is not:
+     `apps-script/blackboard-bus-v1/Code.gs:154-155` is
+
+         const row = body.sheetRow || [nowStamp_(), body.text || ''];
+         sheet.appendRow(row);
+
+     — the CALLER's row, timestamp cell and all, appended verbatim. A writer
+     with a slow clock, a replayed row, or any backfill puts an older timestamp
+     after a newer one. So rows appended after the anchor vanished could all
+     carry timestamps below `lastTs`, the scan would find nothing at or after
+     it, and it returned the row COUNT: past the end of the board, skipping
+     every one of them, permanently — while the comment three lines above
+     promised that could never happen.
+
+     The fallback now returns 0. Index order is append order, which is the one
+     ordering the board actually guarantees; timestamps are data the writer
+     chose.
 #>
 
 Set-StrictMode -Version 2.0
@@ -136,39 +156,33 @@ function Resolve-BoardStartIndex {
       }
     }
     return @{
-      StartIndex = (Get-InclusiveTsStart -Rows $Rows -LastTs $lastTs)
+      StartIndex = 0
       Anchor     = 'anchor-lost'
-      Note       = ("cursor row {0} is no longer on the board -- falling back to an INCLUSIVE timestamp scan; rows may repeat, none are skipped" -f $lastRowId)
+      Note       = ("cursor row {0} is no longer on the board -- RESTARTING FROM THE TOP; rows may repeat, none are skipped" -f $lastRowId)
     }
   }
 
   return @{
-    StartIndex = (Get-InclusiveTsStart -Rows $Rows -LastTs $lastTs)
+    StartIndex = 0
     Anchor     = 'legacy-ts'
-    Note       = 'cursor predates Row_ID anchoring -- inclusive scan this once'
+    Note       = 'cursor predates Row_ID anchoring -- reading from the top this once'
   }
 }
 
 <#
-First index whose timestamp is >= LastTs.
+Get-InclusiveTsStart IS DELETED, NOT FIXED.
 
-INCLUSIVE on purpose. The old code used `-le` to skip, which discarded every
-row sharing the newest timestamp. Re-showing one row is a cosmetic cost; the
-alternative silently loses messages.
+It answered "the first index whose timestamp is >= LastTs", and there is no
+version of that question worth asking here. Any answer it gives is a claim
+about POSITION derived from a value the writer supplies and the bus never
+validates or sorts. Making it inclusive rather than exclusive fixed the tie
+bug and left the assumption underneath it -- that later in the board means
+later in time -- completely intact.
+
+Its last caller now returns 0. Two functions with the same seductive shape are
+how this defect keeps coming back, so the shape is gone rather than left
+lying around for the next reader to reach for.
 #>
-function Get-InclusiveTsStart {
-  param(
-    [object[]]$Rows,
-    [string]$LastTs
-  )
-  if (-not $LastTs) { return 0 }
-  $count = 0
-  if ($Rows) { $count = $Rows.Count }
-  for ($i = 0; $i -lt $count; $i++) {
-    if (([string]$Rows[$i][1]) -ge $LastTs) { return $i }
-  }
-  return $count
-}
 
 <#
 Which .env file will bus.ps1 actually read?
