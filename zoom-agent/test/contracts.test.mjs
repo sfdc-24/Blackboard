@@ -295,6 +295,7 @@ test('acceptance: no Express, so no qs advisory in a process holding a refresh t
 // argument for these tests existing rather than a note in a commit message.
 
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 
 const assistant = await import('../src/assistant.js');
@@ -407,7 +408,15 @@ test('F5: coverage counts only the segments that survived', async () => {
 });
 
 test('F4: the Linux probe fails when the SDK is absent on a platform that publishes it', () => {
-  const probe = new URL('./linux-sdk-probe.mjs', import.meta.url).pathname;
+  // fileURLToPath, NOT url.pathname: on Windows the latter yields "/D:/a/..."
+  // with a leading slash, which node cannot open — so BOTH spawns exited 1 and
+  // the Windows branch read a path bug as a probe result. Caught by the
+  // windows-latest leg, which is the entire argument for that leg existing.
+  const probe = fileURLToPath(new URL('./linux-sdk-probe.mjs', import.meta.url));
+  // Platform-agnostic guard: with url.pathname this was "/D:/a/..." on Windows
+  // and existsSync would have caught it on the first run anywhere, instead of
+  // the spawn's exit code 1 masquerading as a probe verdict.
+  assert.ok(fs.existsSync(probe), `probe path is not openable on ${process.platform}: ${probe}`);
   const missing = spawnSync(process.execPath, [probe, '--simulate-missing'], { encoding: 'utf8' });
   const present = spawnSync(process.execPath, [probe], { encoding: 'utf8' });
 
@@ -418,7 +427,9 @@ test('F4: the Linux probe fails when the SDK is absent on a platform that publis
     assert.match(missing.stderr, /optionalDependency/);
     assert.equal(present.status, 0, 'and it must pass when the SDK really is there');
   } else {
-    assert.equal(missing.status, 0, 'off linux/darwin, absence is correct and must skip');
+    assert.equal(missing.status, 0,
+      `off linux/darwin, absence is correct and must skip (stderr: ${missing.stderr?.trim()})`);
+    assert.match(missing.stdout, /SKIP/, 'and it must say it skipped, not silently succeed');
   }
 });
 
