@@ -113,11 +113,17 @@ repair mode and cannot create, update, or delete Azure resources.
    Before any state-preservation claim, parse and validate the exact current v1
    state, including an array-valued `work` history, and require an existing log
    prefix to end on an LF record boundary.
-8. Package the six guest files listed by
-   `install_release_from_archive.ps1`. Use
-   `build_order_release_wrapper.ps1` with the 40-character lowercase
-   hexadecimal release ID and the independently computed archive and installer
-   SHA-256 digests. The builder
+8. Build the six-file archive from one caller-pinned commit with
+   `build_order_release_archive.ps1`. Supply an absolute Git repository path,
+   the full 40-character lowercase hexadecimal release ID (the caller-pinned
+   commit ID), and a new absolute `.zip` output path. The packager reads the six
+   canonical files from Git objects rather than the mutable checkout, preserves
+   their committed bytes and EOLs, fixes
+   ZIP ordering and metadata, never overwrites an output, and reads the archive
+   back before returning its SHA-256 and all six file SHA-256 values bound to
+   that commit. Require that receipt and use its archive digest and release ID
+   as the inputs to `build_order_release_wrapper.ps1`, together with the
+   independently computed installer SHA-256 digest. The wrapper builder
    rejects non-canonical archive inventory and emits a deterministic BOM-free
    Managed Run Command `source.script`. Deliver that wrapper, but do not change
    the Windows task yet.

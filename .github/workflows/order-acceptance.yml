@@ -18,6 +18,7 @@ on:
       - 'infra/azure/order_cutover_phase.ps1'
       - 'infra/azure/stage_order_escrow_tool.ps1'
       - 'infra/azure/build_order_escrow_transport_wrapper.ps1'
+      - 'infra/azure/build_order_release_archive.ps1'
       - 'infra/azure/build_order_release_wrapper.ps1'
       - 'infra/azure/job-schedule-00.json'
       - 'infra/azure/job-schedule-30.json'
@@ -30,6 +31,7 @@ on:
       - 'tests/test_order_task_escrow.ps1'
       - 'tests/test_order_cutover_phase.ps1'
       - 'tests/test_order_escrow_transport.ps1'
+      - 'tests/test_order_release_packager.ps1'
       - 'tests/test_order_deployment_wrappers.ps1'
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
@@ -76,6 +78,9 @@ jobs:
       - name: Test ORDER escrow transport
         shell: powershell
         run: .\tests\test_order_escrow_transport.ps1
+      - name: Test ORDER deterministic release packager
+        shell: powershell
+        run: .\tests\test_order_release_packager.ps1
       - name: Test ORDER deployment wrapper builders
         shell: powershell
         run: .\tests\test_order_deployment_wrappers.ps1
