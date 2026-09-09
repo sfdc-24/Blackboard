@@ -76,7 +76,12 @@ if (-not $busPs1) {
 $stateDir = Join-Path $env:LOCALAPPDATA 'sfdc24-board'
 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
 $safeTag   = ($Tag -replace '[^A-Za-z0-9_.-]', '_')
-$cursorFile = Join-Path $stateDir "cursor-$safeTag.json"
+# Keyed by tag AND board. -Title picks a different sheet and -EnvFile a
+# different bus; sharing one cursor across them let a second board inherit the
+# first board's anchor and skip every row it already had.
+$envIdentity = if ($EnvFile) { [IO.Path]::GetFullPath($EnvFile) } else { '<default>' }
+$sourceKey   = Get-BoardSourceKey -Title $Title -EnvPath $envIdentity
+$cursorFile  = Join-Path $stateDir ("cursor-{0}-{1}.json" -f $safeTag, $sourceKey)
 
 $tmp = Join-Path $env:TEMP ("board-since-" + [guid]::NewGuid().ToString('N') + '.json')
 try {
@@ -96,6 +101,13 @@ try {
   $cursor = $null
   if ((Test-Path $cursorFile) -and -not $Reset -and $Last -eq 0) {
     try { $cursor = (Get-Content -Raw $cursorFile | ConvertFrom-Json) } catch { $cursor = $null }
+  }
+  # Belt as well as braces: even with a per-board filename, refuse a cursor that
+  # does not name this board. A mismatch reads as a first run, which repeats
+  # rows at worst; adopting it would skip them.
+  if ($cursor -and -not (Test-BoardCursorMatches -Cursor $cursor -SourceKey $sourceKey)) {
+    Write-Warning 'cursor does not belong to this board -- ignoring it and reading from the top'
+    $cursor = $null
   }
 
   # Anchored by Row_ID at a known index, not by timestamp. The board is not
@@ -134,7 +146,7 @@ try {
 
   # ---- report ---------------------------------------------------------------
   $newestTs   = [string]$rows[$rows.Count - 1][1]
-  $nextCursor = New-BoardCursor -Rows $rows
+  $nextCursor = New-BoardCursor -Rows $rows -SourceKey $sourceKey
   $savedKb  = [Math]::Round(($raw.Length / 1KB), 0)
   $shownKb  = [Math]::Round((($selected | ForEach-Object { $_.Payload.Length } | Measure-Object -Sum).Sum / 1KB), 1)
 

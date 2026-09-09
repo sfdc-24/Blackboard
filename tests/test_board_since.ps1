@@ -187,6 +187,54 @@ Assert-True 'an empty board yields a cursor that cannot skip anything' (
   $empty.lastIndex -eq -1 -and $empty.lastRowId -eq ''
 )
 
+# ── The cursor belongs to ONE board ─────────────────────────────────────────
+
+# Keyed only by tag, a run against a second sheet or a second bus inherited the
+# first board's anchor. If that Row_ID is absent from the second board the
+# anchor is lost, and the inclusive timestamp fallback then starts PAST THE END
+# of a board whose rows are all older -- skipping every one of them, forever.
+
+$keyDefault = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath '<default>'
+$keyOther   = Get-BoardSourceKey -Title 'Blackboard - Beta DB'  -EnvPath '<default>'
+$keyOtherEnv = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath 'C:\other\.env'
+
+Assert-True 'the same board yields a stable key' (
+  $keyDefault -eq (Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath '<default>')
+)
+Assert-True 'a different sheet is a different board' ($keyDefault -ne $keyOther)
+Assert-True 'a different bus is a different board' ($keyDefault -ne $keyOtherEnv)
+
+$foreign = [pscustomobject]@{ lastIndex = 3; lastRowId = 'not-on-this-board'; lastTs = '2027-01-01T00:00:00Z'; source = $keyOther }
+Assert-True 'a cursor from another board is refused' (
+  -not (Test-BoardCursorMatches -Cursor $foreign -SourceKey $keyDefault)
+)
+Assert-True 'a cursor with no source at all is refused' (
+  -not (Test-BoardCursorMatches -Cursor ([pscustomobject]@{ lastRowId = 'x' }) -SourceKey $keyDefault)
+)
+Assert-True 'this board own cursor is accepted' (
+  Test-BoardCursorMatches -Cursor ([pscustomobject]@{ lastRowId = 'x'; source = $keyDefault }) -SourceKey $keyDefault
+)
+
+# The damage, asserted directly: adopting the foreign cursor starts past the end.
+$olderBoard = @(
+  (New-Row -RowId 'b1' -Ts '2026-01-01T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=X'),
+  (New-Row -RowId 'b2' -Ts '2026-01-02T00:00:00Z' -Writer 'other' -Payload 'BCB|v=1|to=claude-code-cli|id=Y')
+)
+$adopted = Resolve-BoardStartIndex -Rows $olderBoard -Cursor $foreign
+Assert-True 'adopting a foreign cursor would skip the whole board' (
+  $adopted.StartIndex -eq $olderBoard.Count
+) ("start=" + $adopted.StartIndex + " of " + $olderBoard.Count)
+
+# Refused, it reads as a first run and nothing is lost.
+$refused = Resolve-BoardStartIndex -Rows $olderBoard -Cursor $null
+Assert-True 'refusing it reads from the top instead' (
+  $refused.Anchor -eq 'first-run' -and $refused.StartIndex -eq 0
+)
+
+Assert-True 'a written cursor records the board it came from' (
+  (New-BoardCursor -Rows $olderBoard -SourceKey $keyDefault).source -eq $keyDefault
+)
+
 Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
 if ($script:Failed -gt 0) { exit 1 }
 exit 0

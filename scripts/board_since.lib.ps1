@@ -170,19 +170,62 @@ function Get-InclusiveTsStart {
   return $count
 }
 
+<#
+A stable identity for the board a cursor was taken from.
+
+WHY THE CURSOR CANNOT BE KEYED BY TAG ALONE
+
+  -Title selects a different sheet and -EnvFile can select a different bus
+  entirely, but the cursor file was named only for the tag. So a run against a
+  second board reused the first board's cursor. If that saved Row_ID is not on
+  the second board the anchor is lost, and the INCLUSIVE timestamp fallback then
+  starts from the newest saved timestamp -- which, on a board whose rows are all
+  older, is past the end. Every existing addressed row on that board is skipped,
+  permanently.
+
+  That is the same "permanently hides mail" failure as the substring addressing
+  and the tied-timestamp cursor above, arriving by a third route: the cursor was
+  right about a board nobody was reading.
+#>
+function Get-BoardSourceKey {
+  param([string]$Title, [string]$EnvPath)
+  $raw = ("{0}|{1}" -f $Title, $EnvPath).ToLowerInvariant()
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw))
+  } finally {
+    $sha.Dispose()
+  }
+  return -join ($bytes[0..5] | ForEach-Object { $_.ToString('x2') })
+}
+
+<#
+Does this cursor belong to the board we are about to read?
+
+A mismatch is treated as NO cursor, never as a usable one. Showing rows twice
+costs a reader a duplicate; adopting another board's cursor skips real messages.
+#>
+function Test-BoardCursorMatches {
+  param([object]$Cursor, [string]$SourceKey)
+  if (-not $Cursor) { return $false }
+  if ($Cursor.PSObject.Properties.Match('source').Count -eq 0) { return $false }
+  return ([string]$Cursor.source) -eq $SourceKey
+}
+
 <# The cursor to persist after a run: index AND the Row_ID that proves it. #>
 function New-BoardCursor {
-  param([object[]]$Rows)
+  param([object[]]$Rows, [string]$SourceKey = '')
   $count = 0
   if ($Rows) { $count = $Rows.Count }
   if ($count -eq 0) {
-    return @{ lastIndex = -1; lastRowId = ''; lastTs = ''; updated = (Get-Date).ToUniversalTime().ToString('o') }
+    return @{ lastIndex = -1; lastRowId = ''; lastTs = ''; source = $SourceKey; updated = (Get-Date).ToUniversalTime().ToString('o') }
   }
   $last = $Rows[$count - 1]
   return @{
     lastIndex = $count - 1
     lastRowId = [string]$last[0]
     lastTs    = [string]$last[1]
+    source    = $SourceKey
     updated   = (Get-Date).ToUniversalTime().ToString('o')
   }
 }

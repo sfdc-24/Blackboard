@@ -838,3 +838,21 @@ test('acceptance: the recycle asks for a horizon that outlasts its own window', 
   assert.match(src, /this\.connect\(\{\s*minTtlMs:\s*RECYCLE_MIN_TTL_MS\s*\}\)/,
     'the recycle path no longer passes RECYCLE_MIN_TTL_MS to connect()');
 });
+
+
+test('P1: a startup failure that never reached a socket still retries', () => {
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+
+  assert.match(src, /if \(!err\.retryScheduled\) socket\.scheduleReconnect\(\)/,
+    'connect() can reject BEFORE `new WebSocket()` — an expired saved token whose refresh fails '
+    + 'transiently does exactly that. There is no close handler to own the retry, so nothing '
+    + 'carries retryScheduled, and a catch that only logs leaves a long-running agent permanently '
+    + 'disconnected over a failure that would have cleared on the next attempt');
+
+  // Both entry points must go through it, not just the one I happened to edit.
+  const bare = src.match(/connectEventSocket\(\)\.catch/g) ?? [];
+  assert.equal(bare.length, 1,
+    `${bare.length} call sites still catch connectEventSocket() directly — only the wrapper should`);
+  assert.equal((src.match(/connectWithRetry\(/g) ?? []).length, 3,
+    'both the OAuth-callback path and the saved-token path must retry, and the helper defines it');
+});

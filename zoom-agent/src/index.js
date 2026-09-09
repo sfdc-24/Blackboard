@@ -24,14 +24,33 @@ function connectEventSocket() {
   return connecting;
 }
 
+/**
+ * A failed connect that never produced a socket has no close handler to own its
+ * retry, so this caller must — exactly as the reconnect and recycle paths
+ * already do.
+ *
+ * The gap this closes: start with a saved token that has expired, have the
+ * refresh fail transiently, and connect() rejects BEFORE `new WebSocket()`.
+ * There is no close event, so nothing carries `retryScheduled`, and the catch
+ * here only logged. A long-running agent then sat permanently disconnected
+ * until a human noticed and restarted it — the failure being a transient one
+ * that would have cleared on the next attempt.
+ */
+function connectWithRetry(onFail) {
+  connectEventSocket().catch((err) => {
+    onFail?.(err);
+    if (!err.retryScheduled) socket.scheduleReconnect();
+  });
+}
+
 startOAuthServer(() => {
   console.log('[oauth] authorized — connecting to Zoom event socket');
-  connectEventSocket().catch((err) => console.error('[events] connect failed:', err.message));
+  connectWithRetry((err) => console.error('[events] connect failed:', err.message));
 });
 
 if (loadTokens()) {
   console.log('[oauth] found saved tokens (.tokens.json)');
-  connectEventSocket().catch((err) => {
+  connectWithRetry((err) => {
     console.error('[events] connect failed:', err.message);
     console.log(`Re-authorize if needed: ${authorizeUrl()}`);
   });

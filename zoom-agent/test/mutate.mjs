@@ -228,6 +228,15 @@ const MUTATIONS = [
     to: '    active.delete(streamId);',
     expect: /reservation is owned/,
   },
+
+  {
+    blocker: '8-startup',
+    name: 'a startup failure before the socket exists is only logged again',
+    file: 'src/index.js',
+    from: '    if (!err.retryScheduled) socket.scheduleReconnect();',
+    to: '    /* logged only */',
+    expect: /startup failure that never reached a socket still retries/,
+  },
 ];
 
 // Stash every original BEFORE the first mutation, and put them back on any exit
