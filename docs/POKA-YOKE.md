@@ -122,12 +122,21 @@ then fails safe by construction.
 
 ## L-95 — Put the warning in the failure path, not the documentation
 
-**Incident.** On 2026-09-09 a board append returned `curl` exit 28 —
-*"timed out after 120001 ms with 0 bytes received"* — and the row had landed.
-A retry would have manufactured a duplicate. It cost nothing because
-`scripts/alpha.ps1:110` prints, verbatim, *"response is not JSON. Per D-4 the
-write may still have landed -- READ BACK before trusting or retrying."*
-**in its own failure output**.
+**Incident.** On 2026-09-09 a board append returned `curl` exit 28 — the run
+output read *"timed out after 120001 ms with 0 bytes received"* — and the row
+had landed. A retry would have manufactured a duplicate. It cost nothing
+because `scripts/bus.ps1:419` prints, verbatim, *"response is not JSON
+(redirect artifact?). Per D-4 the write may still have landed -- read back
+before trusting or retrying."* **in its own failure output**.
+
+> **The client had to be identified by arithmetic, not memory, and the first
+> two versions of this entry got it wrong.** A 120001 ms cap is
+> `--max-time 120`, which is `bus.ps1` (lines 263 and 325). `alpha.ps1` caps
+> every transfer at `--max-time 90` (lines 65, 93, 99) and `git log -S` finds
+> no commit in which it was ever 120, so it cannot have produced this timeout
+> in any past state of the tree. Both clients carry the practice — which is
+> the substantive good news for this entry — but their wordings differ, and
+> only one of them fired. Caught by `chatgpt-codex-connector`.
 
 **Naive rule.** "Follow D-4."
 
@@ -207,6 +216,24 @@ It was bypassable a second way, found later and recorded under L-92: even when
 the job does run, the digest it checks sits in the same editable tree, so one
 commit can change the corpus and the expected hash together. Two independent
 bypasses in one guard, neither found by its author.
+
+### And the second: a verification that confirmed the wrong thing
+
+L-95 originally paraphrased the warning it cited while presenting it as a
+quotation. That was caught, and the correction asserted the quoted string
+**programmatically** against `scripts/alpha.ps1` — string equality, not
+eyeballing, exactly the discipline this file preaches. The assertion passed.
+The attribution was still wrong: the timeout in the incident could only have
+come from `bus.ps1`, whose warning reads differently. A machine check had
+confirmed that the sentence matched *a* file in the tree, which was never the
+question.
+
+This is the closing generalisation of this document happening to the document:
+a sound distance function — exact string comparison — measured against the
+wrong correct answer. Rigour applied to the wrong target produces confident
+error, and reads in the diff exactly like rigour applied to the right one.
+The only thing that separated them was a reviewer doing arithmetic on a
+timeout value.
 
 That is L-94's exact shape: a mechanism that looks like protection and is not.
 Having just written the entry did not help. The reviewer did.
