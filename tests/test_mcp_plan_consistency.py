@@ -17,7 +17,11 @@ stating counts from memory in a document about writing things down precisely.
 A rule cannot fix that — the rule was already "count carefully" and I broke it
 three times. This is the mechanism instead.
 
-Run:  python -m unittest tests.test_mcp_plan_consistency
+Run:  python -B -m unittest discover -s tests -p 'test_mcp_plan_consistency.py'
+
+Use the discovery form, not `python -m unittest tests.<module>`: there is no
+tests/__init__.py, so the dotted form fails on Python 3.12 for every module in
+this directory. Verified on 3.11, 3.12 and 3.14.
 """
 from __future__ import annotations
 
@@ -43,7 +47,10 @@ def _table_after(heading: str, text: str) -> list[str]:
 class McpPlanConsistency(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.text = PLAN.read_text(encoding="utf-8")
+        # Read BYTES and normalise, so the suite behaves identically on an LF
+        # checkout and a CRLF one. Reading as text made every assertion depend
+        # on how git happened to check the file out.
+        cls.text = PLAN.read_bytes().decode("utf-8").replace("\r\n", "\n")
 
     def test_plan_exists(self) -> None:
         self.assertTrue(PLAN.is_file(), f"{PLAN} is missing")

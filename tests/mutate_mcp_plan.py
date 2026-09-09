@@ -18,7 +18,13 @@ as dead. The original is restored on every exit path including signals; an
 earlier harness of mine was interrupted and left deliberately broken source on
 disk.
 
-Run:  python tests/mutate_mcp_plan.py
+Run:  python tests/mutate_mcp_plan.py            (from the repository root)
+
+Verified on Python 3.11, 3.12 and 3.14. An earlier version invoked the suite as
+`python -m unittest tests.test_mcp_plan_consistency`, which fails on 3.12 for
+every module in tests/ because there is no __init__.py - so it caught 0 of 6
+there and said nothing was wrong. It now uses the discovery form the rest of
+this repository uses.
 """
 from __future__ import annotations
 
@@ -70,12 +76,18 @@ MUTATIONS: list[dict[str, str]] = [
     },
 ]
 
-ORIGINAL = PLAN.read_text(encoding="utf-8")
+# BYTES, not text. read_text/write_text translate line endings, so on a CRLF
+# checkout — which is what a canonical Windows clone gives — restoring rewrote
+# every line and left the file modified in `git status` with a different digest.
+# A harness that cannot put the file back exactly as it found it is a harness
+# that edits your repository as a side effect of checking it. Reproduced by
+# converting a copy of the tree to CRLF and comparing sha256 before and after.
+ORIGINAL = PLAN.read_bytes()
 
 
 def restore() -> None:
-    if PLAN.read_text(encoding="utf-8") != ORIGINAL:
-        PLAN.write_text(ORIGINAL, encoding="utf-8", newline="")
+    if PLAN.read_bytes() != ORIGINAL:
+        PLAN.write_bytes(ORIGINAL)
 
 
 def _on_signal(signum, _frame):  # noqa: ANN001
@@ -92,7 +104,15 @@ def main() -> int:
     print(f"\nmutation control — {len(MUTATIONS)} cases\n")
 
     for m in MUTATIONS:
-        text = PLAN.read_text(encoding="utf-8")
+        raw = PLAN.read_bytes()
+        # Work in LF internally, remember the file's real convention, and put it
+        # back on write. An anchor written with "\n" does not match a CRLF
+        # checkout, so on Windows this scored 5/6 and reported ANCHOR LOST on a
+        # document that was fine — the same failure the site's JS harness had,
+        # which I fixed there and did not carry across. A gate that cries wolf
+        # on one platform is a gate people switch off.
+        was_crlf = b"\r\n" in raw
+        text = raw.decode("utf-8").replace("\r\n", "\n")
         if m["old"] not in text:
             print(f"  ANCHOR LOST  {m['name']}")
             print("               the text to mutate is gone; fix the anchor, a "
@@ -106,10 +126,13 @@ def main() -> int:
             failures += 1
             continue
 
-        PLAN.write_text(mutated, encoding="utf-8", newline="")
+        # Preserve the file's existing line-ending convention exactly.
+        out = mutated.replace("\n", "\r\n") if was_crlf else mutated
+        PLAN.write_bytes(out.encode("utf-8"))
         try:
             run = subprocess.run(
-                [sys.executable, "-m", "unittest", "tests.test_mcp_plan_consistency"],
+                [sys.executable, "-B", "-m", "unittest", "discover",
+                 "-s", "tests", "-p", "test_mcp_plan_consistency.py"],
                 cwd=REPO, capture_output=True, text=True, timeout=120,
             )
             out = run.stdout + run.stderr

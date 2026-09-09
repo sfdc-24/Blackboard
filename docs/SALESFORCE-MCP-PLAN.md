@@ -1,4 +1,22 @@
-# Salesforce org inspection over MCP — a plan
+# Salesforce org inspection over MCP — a proposed work plan, under HOLD
+
+> **STATUS: proposed work plan. HELD. This document authorises nothing.**
+>
+> It is not executable architecture, it does not authorise a scan of any
+> Salesforce org, and no gate in §8 is passed. The architecture is what G1–G7
+> produce; this says what those artefacts must contain and who accepts them.
+>
+> That wording is `chatgpt-codex-desktop-01a0839e`'s, from the fourth review of
+> this file, and adopting it settles what I had been treating as a
+> disagreement. Their eight blockers ask for executable architecture. They are
+> right that this is not it — and right that it should not be read as it. It was
+> never meant to be, and now says so at the top instead of on page nine.
+>
+> **The one thing that does not wait is G8**: the live `/xray/` and homepage
+> six-sigma wording. That corrects a claim a visitor can read today, so it is
+> scheduled ahead of everything else here and is not gated on any of it.
+
+
 
 Asked for by Mr. Salam, 2026-09-09 05:26Z: *"work on salesforce integration and
 improving overall architecture to inspect, build and model solutions, assess
@@ -6,7 +24,7 @@ issues and score metrics for six sigma levels. Can you plan on creating MCP
 client for salesforce that can be plugged into any salesforce org instance for
 clients?"*
 
-**Fourth version.** The first said we would build a server. The second discovered
+**Fifth version.** The first said we would build a server. The second discovered
 Salesforce already ship two and said we would build a client. `chatgpt-codex-desktop-01a0839e`
 returned NO-GO on eight architectural points against `c492dd9`, and NO-GO again
 on eight more against `2839641`. All accepted. Two of the first eight were facts
@@ -366,7 +384,10 @@ manifest, private facts, internal score and public export. Naming them here as
 required is the plan doing its job; writing them here would produce a document
 nobody can review and a specification nobody can version.
 
-If a reviewer considers any of those a gate on **the plan** rather than on the
-first client scan, that is a real disagreement about scope rather than a defect,
-and it goes to Mr. Salam as a scheduling question — not into another revision of
-this file.
+**Settled, rather than argued.** The fourth review named this "a useful
+proposed work plan under HOLD, not executable architecture and no client-org
+scan authorization." That is exactly right, and it is now the status line at the
+top of the file. The eight architecture blockers are requirements on G1-G7's
+artefacts, which is where they were always going; what was missing was this
+document saying plainly what it is, so a reader could not mistake it for the
+architecture. It said so on page nine and now says so first.
