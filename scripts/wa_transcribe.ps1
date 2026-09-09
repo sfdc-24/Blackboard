@@ -60,11 +60,24 @@ foreach ($line in (Get-Content -LiteralPath $EnvFile)) {
 if (-not $cfg.GROQ_API_KEY) { throw "GROQ_API_KEY missing in $EnvFile" }
 if ($MediaId -and -not $cfg.META_TOKEN) { throw "META_TOKEN missing in $EnvFile" }
 
+# GOTCHA, already documented in wa_notify.ps1 and rediscovered the hard way on
+# 2026-09-09: the STORED META_TOKEN begins with the literal text "Bearer ".
+# Sending 'Bearer ' + token yields "Bearer Bearer EAA..." and Graph answers 401
+# with code 190. wa_notify.ps1 has always stripped it; this script did not, so
+# every -MediaId fetch here would have failed. It was never caught because the
+# script was only ever exercised with -File, which does not touch Graph at all.
+$GraphToken = $cfg.META_TOKEN -replace '^\s*[Bb]earer\s+', ''
+# NOT named $META. PowerShell variable names are CASE-INSENSITIVE, and line ~92
+# assigns the media metadata to $meta -- which would silently overwrite a token
+# held in $META and send the header 'Bearer @{url=...; mime_type=...}'. Graph
+# answers 401, identical to a bad token, and hop 1 still works because it runs
+# first. Cost 25 minutes on 2026-09-09 chasing a token bug that was a name bug.
+
 function Invoke-GraphJson {
   param([string]$Url)
   $req = [Net.HttpWebRequest]::Create($Url)
   $req.Method = 'GET'
-  $req.Headers.Add('Authorization', 'Bearer ' + $cfg.META_TOKEN)
+  $req.Headers.Add('Authorization', 'Bearer ' + $GraphToken)
   $req.Timeout = 60000
   $resp = $req.GetResponse()
   $sr = New-Object IO.StreamReader($resp.GetResponseStream())
@@ -95,7 +108,12 @@ if ($File) {
   $temp = $true
   $req = [Net.HttpWebRequest]::Create([string]$meta.url)
   $req.Method = 'GET'
-  $req.Headers.Add('Authorization', 'Bearer ' + $cfg.META_TOKEN)
+  $req.Headers.Add('Authorization', 'Bearer ' + $GraphToken)
+  # Hop 2 is served by Meta's lookaside CDN, not graph.facebook.com, and it
+  # rejects the default .NET user agent with a bare 401 that looks identical to
+  # a bad token. Hop 1 does not care. Found 2026-09-09 by fixing the token and
+  # watching the failure move from line 75 to here rather than disappear.
+  $req.UserAgent = 'sfdc24-blackboard/1.0'
   $req.Timeout = 120000
   $resp = $req.GetResponse()
   $fs = [IO.File]::Create($audioPath)
