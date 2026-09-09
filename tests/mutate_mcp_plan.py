@@ -74,9 +74,13 @@ MUTATIONS: list[dict[str, str]] = [
         "expect": "states_all_of_its_required_fields",
     },
     {
+        # Anchor moved on 2026-09-09 when G9's prerequisite bullet was rewritten
+        # to open with its typed value. The DEFECT is unchanged — a range lets a
+        # skipped gate hide inside a dash — so the case survives the rewrite
+        # rather than being quietly dropped because its anchor broke.
         "name": "structural: the client-org gate stops naming its prerequisites",
-        "old": "**G1, G2, G3, G4, G5, G6 and G7 accepted, and G8 shipped.**",
-        "new": "**G1-G7 accepted, and G8 shipped.**",
+        "old": "and therefore G1, G3, G5\n  and G6 **transitively**",
+        "new": "and therefore G1–G6 **transitively**",
         "expect": "pins_its_prerequisites_by_name",
     },
     {

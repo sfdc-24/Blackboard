@@ -106,8 +106,15 @@ class McpPlanConsistency(unittest.TestCase):
         self.assertEqual(len(parts), 2, "the G9 client-org gate has been removed")
         block = parts[-1]
 
+        # The PROSE acceptor, not the typed block's — since 2026-09-09 both
+        # exist, and `acceptor: human:salam` matched here first and failed a
+        # test that was working correctly. The typed field has its own,
+        # stronger assertion in test_mcp_gate_semantics.py; this one stays so
+        # the sentence a reader sees is checked independently of the record a
+        # parser reads. Two checks of one property, deliberately.
         acceptor = next(
-            (ln for ln in block.splitlines() if "acceptor" in ln.lower()),
+            (ln for ln in block.splitlines()
+             if "acceptor" in ln.lower() and not ln.startswith("acceptor:")),
             None,
         )
         self.assertIsNotNone(acceptor, "G9 states no acceptor")

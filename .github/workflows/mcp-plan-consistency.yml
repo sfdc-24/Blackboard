@@ -26,14 +26,20 @@ on:
     paths:
       - "docs/SALESFORCE-MCP-PLAN.md"
       - "tests/test_mcp_plan_consistency.py"
+      - "tests/test_mcp_gate_semantics.py"
+      - "tests/gate_graph.py"
       - "tests/mutate_mcp_plan.py"
+      - "tests/mutate_gate_semantics.py"
       - ".github/workflows/mcp-plan-consistency.yml"
   push:
     branches: [main]
     paths:
       - "docs/SALESFORCE-MCP-PLAN.md"
       - "tests/test_mcp_plan_consistency.py"
+      - "tests/test_mcp_gate_semantics.py"
+      - "tests/gate_graph.py"
       - "tests/mutate_mcp_plan.py"
+      - "tests/mutate_gate_semantics.py"
       - ".github/workflows/mcp-plan-consistency.yml"
 
 permissions:
@@ -63,7 +69,10 @@ jobs:
           import pathlib
           for name in ("docs/SALESFORCE-MCP-PLAN.md",
                        "tests/test_mcp_plan_consistency.py",
-                       "tests/mutate_mcp_plan.py"):
+                       "tests/test_mcp_gate_semantics.py",
+                       "tests/gate_graph.py",
+                       "tests/mutate_mcp_plan.py",
+                       "tests/mutate_gate_semantics.py"):
               p = pathlib.Path(name)
               p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
           print("converted")
@@ -81,6 +90,19 @@ jobs:
       # document was actually in while nothing caught them.
       - name: Mutation gate
         run: python tests/mutate_mcp_plan.py
+
+      # Added after review round eight. The suite above and the harness above
+      # were both healthy and both irrelevant to the finding: EIGHT SEMANTIC
+      # INVERSIONS of the plan left 12/12 green on all four legs, because every
+      # assertion was a substring and a substring cannot carry a negation.
+      - name: The gates mean what they say
+        run: python -B -m unittest discover -s tests -p 'test_mcp_gate_semantics.py' -v
+
+      # Each case here inverts a MEANING and names the test that must catch it.
+      # Four of them invert prose and typed block together, so a self-consistent
+      # lie is caught by the graph rather than by the two halves disagreeing.
+      - name: Semantic mutation gate
+        run: python tests/mutate_gate_semantics.py
 
       - name: The harness put the document back byte for byte
         run: |

@@ -16,6 +16,19 @@
 > six-sigma wording. That corrects a claim a visitor can read today, so it is
 > scheduled ahead of everything else here and is not gated on any of it.
 
+```status
+state: HOLD
+authorises: nothing
+execution: forbidden
+lifted_by: human:salam
+```
+
+*The block above is not decoration. `tests/test_mcp_gate_semantics.py` reads it,
+and while `state` is `HOLD` **every gate's `passed` field must be `no`** — so
+the hold cannot be lifted by rewriting the prose around it, which is what the
+eighth review demonstrated was possible.*
+
+
 
 
 Asked for by Mr. Salam, 2026-09-09 05:26Z: *"work on salesforce integration and
@@ -305,8 +318,22 @@ produce — while a test I had written asserted `len(cells) == 4`, which
 *actively prevented anyone adding them.* I could not honestly hold a position
 that my own guard was enforcing into the codebase. The columns are here now.
 
-Each gate below states seven things. A gate that cannot be failed, or whose
-failure has no defined consequence, is not a gate.
+Each gate below states seven things in prose. A gate that cannot be failed, or
+whose failure has no defined consequence, is not a gate.
+
+**Each also carries a `gate` block of 10 typed fields, and that block is what
+the tests read.** It exists because the eighth review of this file ran **eight
+semantic inversions of the plan and every one left the suite green** — the
+document made to say G8 did not unlock G9, that an unknown-cost scan could
+start, that G9's authorisation need not name a scope or an expiry. The tests
+were matching substrings, and a substring cannot carry a negation:
+`assertIn("G9", line)` is satisfied by a line saying G9 is *not* unlocked.
+
+The typed fields have a closed grammar, so an inversion either parses to a
+different value and breaks the graph, or fails to parse at all. `requires` and
+`unlocks` are checked for **reciprocity in both directions**, and the set of
+gates that must precede G9 is **computed from the graph** rather than read from
+the sentence that claims it.
 
 **Nothing in G1–G7 requires a client org.** That is the point: everything that
 can be wrong is wrong before a client is exposed to it.
@@ -315,8 +342,23 @@ can be wrong is wrong before a client is exposed to it.
 
 ### G1 · capability spike
 
-- **prerequisite** — a Developer Edition org we control **and a separate,
-  human authorisation to read it** (see below). Note which section is
+```gate
+id: G1
+requires: none
+unlocks: G2, G3, G5
+owner: claude-code-cli
+acceptor: agent:independent
+human_precondition: yes
+fail_closed: yes
+fail_closed_rule: refuse_unconfirmed_claim
+evidence_must_name: named_authoriser, de_org_identifier, authorisation_scope, authorisation_expiry, tool_listing, version_output, commit_hash, no_connect_failure_mode
+passed: no
+```
+
+- **prerequisite** — **none**: no gate precedes G1. What it does need is a
+  Developer Edition org we control **and a separate, human authorisation to
+  read it** (see below) — a real-world precondition, which is why it is
+  carried as `human_precondition` above rather than as a gate edge. Note which section is
   provisional: **§0 is the verified part**, checked against Salesforce's own
   documentation with sources, and it is not in question here. **§1's
   capability table is the unqualified one** and is what this gate confirms
@@ -326,15 +368,49 @@ can be wrong is wrong before a client is exposed to it.
 - **owner** — claude-code-cli.
 - **independent acceptor** — any agent that did not write it.
 - **evidence** — the raw tool listing and version output from both servers,
-  committed, with the commit hash recorded.
+  committed, with the commit hash recorded — **and the provenance of the
+  authorisation that produced them**: who authorised it by name, which
+  Developer Edition org by identifier, how far the authorisation reaches, and
+  when it lapses. A receipt that proves a connection happened but not *whose
+  permission it happened under* is a receipt for the wrong thing.
+  **The receipt is immutable**: it is the committed output at a recorded hash,
+  not a summary written afterwards.
+- **evidence, when it does not connect** — a failure is a result and is
+  recorded as one. `no_connect_failure_mode` names what was attempted, what the
+  org returned verbatim, and which of the two servers it was. This is not
+  hypothetical: the first contact with the DE org on 2026-09-09 returned
+  `invalid_grant / no client credentials user enabled`, and a **wrong secret
+  returns the identical error**, so that attempt confirms the org recognises
+  the connected app and confirms nothing about the secret. A gate that only
+  has a shape for success quietly promotes that to a pass.
 - **fail-closed** — if a claim in §1's table cannot be confirmed with a version,
   it is **struck from the table**, not softened.
-- **unlocks** — G2, G3.
+- **unlocks** — G2, G3, G5. G5's field inventory comes out of the same
+  spike, and pretending otherwise left G5 with no stated source.
 
 ### G2 · quota and spend
 
+```gate
+id: G2
+requires: G1
+unlocks: G9
+owner: claude-code-cli
+acceptor: agent:independent
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: refuse_when_cost_unknown
+evidence_must_name: scan_envelope, limits_before, limits_after, paging_budget, retry_budget
+passed: no
+```
+
 - **prerequisite** — G1 accepted.
-- **artefact** — folded into G1's matrix: measured API cost of a full scan.
+- **artefact** — folded into G1's matrix: measured API cost of a scan of a
+  **named, enumerated object set fixed at G1 time** — `scan_envelope`. "A full
+  scan" was undefined at this point in the order, because what a scan covers is
+  not settled until G5's schemas and G6's catalogue exist; a cost measured
+  against an undefined envelope is a number with no unit. The envelope is
+  stated explicitly here, and **when G5 or G6 changes it, G2's measurement is
+  re-taken** rather than inherited.
 - **owner** — claude-code-cli. **acceptor** — as G1.
 - **evidence** — before/after `/limits` readings around a full scan, or a
   written demonstration that `/limits` is unreachable over MCP.
@@ -346,6 +422,19 @@ can be wrong is wrong before a client is exposed to it.
 - **unlocks** — G9's spend argument.
 
 ### G3 · enforcement policy
+
+```gate
+id: G3
+requires: G1
+unlocks: G4
+owner: claude-code-cli
+acceptor: agent:independent
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: deny_by_default
+evidence_must_name: mutating_tool_unreachable_test, unexpected_org_id_test
+passed: no
+```
 
 - **prerequisite** — G1's tool listing.
 - **artefact** — `docs/mcp-enforcement-policy.md`: the literal tool allowlist,
@@ -360,6 +449,19 @@ can be wrong is wrong before a client is exposed to it.
 - **unlocks** — G4.
 
 ### G4 · auth and tenancy
+
+```gate
+id: G4
+requires: G3
+unlocks: G9
+owner: claude-code-cli
+acceptor: human:salam-or-reviewer
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: block_until_demonstrated
+evidence_must_name: attended_vs_unattended, eca_constraints, token_storage, token_rotation, revocation, tenant_isolation
+passed: no
+```
 
 - **prerequisite** — G3's org boundary.
 - **artefact** — `docs/mcp-auth-lifecycle.md`, answering **six** concerns:
@@ -378,6 +480,19 @@ can be wrong is wrong before a client is exposed to it.
 
 ### G5 · schemas
 
+```gate
+id: G5
+requires: G1
+unlocks: G6, G7
+owner: claude-code-cli
+acceptor: agent:independent
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: refuse_unvalidated_emitter
+evidence_must_name: per_field_mutation, unexpected_field_mutation, pinned_corpus_digest
+passed: no
+```
+
 - **prerequisite** — G1's field inventory.
 - **artefact** — `xray-score-v1` schema, validator, and a fixture corpus with a
   **pinned digest**; plus versioned collection-manifest, private-facts and
@@ -387,9 +502,23 @@ can be wrong is wrong before a client is exposed to it.
   way `tests/mutate_positioning.cjs` does for the site, including a mutation
   that adds an **unexpected field** rather than only removing known ones.
 - **fail-closed** — an emitter that cannot validate does not publish.
-- **unlocks** — G6.
+- **unlocks** — G6, G7. The sanitizer needs the public-export schema
+  directly, not only by way of the catalogue.
 
 ### G6 · catalogue and statistics
+
+```gate
+id: G6
+requires: G5
+unlocks: G7
+owner: claude-code-cli
+acceptor: human:salam-or-reviewer
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: report_rate_not_sigma
+evidence_must_name: seventeen_fields_no_unresolved, stability, sample, stratification, uncertainty
+passed: no
+```
 
 - **prerequisite** — G5's schemas.
 - **artefact** — the 17-field catalogue, and for any metric proposed to carry
@@ -405,8 +534,21 @@ can be wrong is wrong before a client is exposed to it.
 
 ### G7 · sanitizer
 
-- **prerequisite** — G5's public-export schema **and G6's catalogue**: a
-  sanitizer cannot know what to redact until the fields are defined.
+```gate
+id: G7
+requires: G5, G6
+unlocks: G9
+owner: claude-code-cli
+acceptor: human:salam
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: refuse_without_approval
+evidence_must_name: stable_export_digest, leakage_mutation, approved_exact_bytes
+passed: no
+```
+
+- **prerequisite** — G5, G6 — the public-export schema and the catalogue.
+  A sanitizer cannot know what to redact until the fields are defined.
 - **artefact** — `docs/mcp-sanitizer.md` and the tool.
 - **owner** — claude-code-cli builds. **acceptor** — **Mr. Salam approves the
   exact bytes** of anything that becomes public.
@@ -418,6 +560,19 @@ can be wrong is wrong before a client is exposed to it.
 - **unlocks** — G9.
 
 ### G8 · live correction — *out of order, and first*
+
+```gate
+id: G8
+requires: none
+unlocks: G9
+owner: claude-code-cli
+acceptor: human:salam
+human_precondition: no
+fail_closed: yes
+fail_closed_rule: refuse_until_live_readback_matches
+evidence_must_name: merge_commit, deployment_run_id, live_page_readback
+passed: no
+```
 
 - **prerequisite** — none. This is why it is out of order.
 - **artefact** — a source PR against `sfdc24-site` correcting the `/xray/` and
@@ -437,8 +592,24 @@ contradicted G9's own prerequisite list two blocks below.*
 
 ### G9 · first client org
 
-- **prerequisite** — **G1, G2, G3, G4, G5, G6 and G7 accepted, and G8 shipped.**
-  Pinned by name so "mostly done" cannot pass for done.
+```gate
+id: G9
+requires: G2, G4, G7, G8
+unlocks: none
+owner: none
+acceptor: human:salam
+human_precondition: yes
+fail_closed: yes
+fail_closed_rule: refuse_without_authorisation
+evidence_must_name: human_channel_row, org_identifier, scope, expiry
+passed: no
+```
+
+- **prerequisite** — G2, G4, G7, G8 **directly**, and therefore G1, G3, G5
+  and G6 **transitively** — the whole of G1–G8, with nothing reaching G9 by
+  another route. "Mostly done" cannot pass for done because the test
+  **computes that closure from the typed blocks** instead of trusting this
+  sentence, which is what an earlier version asked you to do.
 - **artefact** — none. This is an authorisation, not a document.
 - **owner** — n/a. **acceptor** — **Mr. Salam authorises.** A person, in the
   open. Not an agent, and not this document.
@@ -447,7 +618,8 @@ contradicted G9's own prerequisite list two blocks below.*
   note that it is fine is not evidence, and neither is an authorisation
   that does not say which org.
 - **fail-closed** — no authorisation, no scan. Silence is not a yes.
-- **unlocks** — the first scan of an org we do not own.
+- **unlocks** — none. G9 is terminal: what it opens is the first scan of an
+  org we do not own, and that is an authorisation, not another gate.
 
 ---
 
