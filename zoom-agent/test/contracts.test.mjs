@@ -101,7 +101,12 @@ test('blocker 2: the server-minted ct is kept and replaces the legacy vid', asyn
 
 // ── Blocker 3 — acceptance is not delivery ──────────────────────────────────
 
-test('blocker 3: a hung Graph call times out instead of silencing the assistant', async () => {
+// Bounded on purpose. The mutation control removes the abort, and without a
+// timeout here this test does not fail, it HANGS - so CI reports a job
+// timeout instead of naming the defect, and the mutation reads as "caught"
+// for the wrong reason.
+test('blocker 3: a hung Graph call times out instead of silencing the assistant',
+  { timeout: 10_000 }, async () => {
   Object.assign(config, { metaToken: 'x', waPhoneNumberId: '1', waTo: '2', notifyTimeoutMs: 50 });
   const res = await withFetch(
     (_url, opts) => new Promise((_resolve, reject) => {
@@ -742,4 +747,47 @@ test('F2: the stream is reserved BEFORE the lazy import is awaited', () => {
   assert.match(stop, /active\.has\(streamId\)/,
     'a stop must clear a RESERVATION too — `if (client)` skipped it for a null entry, leaving a '
     + 'lock nothing would ever remove');
+});
+
+// ── Gaps a mutation control found in the tests above ────────────────────────
+//
+// Each of these exists because reverting a fix left the suite GREEN. They are
+// not extra coverage of the same ground; they are the ground the existing
+// assertions were not standing on.
+
+test('blocker 3: the send result has no field that reads as a delivery', () => {
+  // The source-grep above looks for the PHRASE "delivered to phone". Adding a
+  // `delivered: true` field to the result satisfies that grep and puts the
+  // claim straight back into the object the assistant branches on. Check the
+  // contract, not just the prose.
+  Object.assign(config, { metaToken: 'x', waPhoneNumberId: '1', waTo: '2', notifyTimeoutMs: 5_000 });
+  return withFetch(
+    async () => jsonResponse({ messages: [{ id: 'wamid.X' }] }),
+    async () => {
+      const res = await sendWhatsApp('hello');
+      assert.equal(res.ok, true);
+      assert.ok(!('delivered' in res),
+        'a wamid means Meta accepted the message; nothing here may be called delivered');
+      assert.deepEqual(Object.keys(res).sort(), ['id', 'ok'],
+        'the send result gained a field — check it does not assert delivery');
+    },
+  );
+});
+
+test('acceptance: the recycle asks for a horizon that outlasts its own window', async () => {
+  // The test above passes minTtlMs itself, so it proves oauth.js honours a
+  // horizon — never that the recycle passes the RIGHT one. Reducing
+  // RECYCLE_MIN_TTL_MS to five minutes reinstates the original defect and that
+  // suite stayed green. This asserts the wiring.
+  const { __recycleContract } = await import('../src/events-ws.js');
+  const { TOKEN_RECYCLE_MS, RECYCLE_MIN_TTL_MS } = __recycleContract;
+  assert.ok(RECYCLE_MIN_TTL_MS > TOKEN_RECYCLE_MS,
+    `the recycle asks for ${RECYCLE_MIN_TTL_MS}ms of life but reconnects every `
+    + `${TOKEN_RECYCLE_MS}ms — a token satisfying that request can still expire `
+    + 'before the next recycle, which is the defect this was written to fix');
+
+  // And the source really does hand that constant to connect().
+  const src = readFileSync(new URL('../src/events-ws.js', import.meta.url), 'utf8');
+  assert.match(src, /this\.connect\(\{\s*minTtlMs:\s*RECYCLE_MIN_TTL_MS\s*\}\)/,
+    'the recycle path no longer passes RECYCLE_MIN_TTL_MS to connect()');
 });

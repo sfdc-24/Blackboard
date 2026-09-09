@@ -22,6 +22,14 @@ const RECYCLE_MIN_TTL_MS = TOKEN_RECYCLE_MS + 5 * 60_000;
 // this timeout exists alongside, because nothing would ever retry.
 const ACK_TIMEOUT_MS = 15_000;
 
+// Exported ONLY so a test can assert the horizon the recycle actually asks
+// for. A mutation control reduced this constant back to five minutes -- the
+// exact defect blocker 5 was about -- and the suite stayed green, because the
+// existing test called getAccessToken({minTtlMs}) itself and so proved the
+// oauth side honours a horizon without ever checking WHICH horizon the
+// recycle passes. The fix was covered; the wiring to it was not.
+export const __recycleContract = { TOKEN_RECYCLE_MS, RECYCLE_MIN_TTL_MS };
+
 export class ZoomEventSocket {
   constructor(onEvent) {
     this.onEvent = onEvent;

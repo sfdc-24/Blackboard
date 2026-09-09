@@ -29,7 +29,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    # The mutation gate runs the whole suite once per case.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: zoom-agent
@@ -59,6 +60,14 @@ jobs:
 
       - name: Offline tests
         run: npm test
+
+      # Green is not evidence. This reverts each fix the review forced and
+      # requires the suite to fail on the NAMED test. It found three real gaps
+      # the first time it ran against a fully green suite: a wamid could be
+      # relabelled a delivery, the recycle horizon could be reduced back to the
+      # original defect, and the hung-Graph test hung instead of failing.
+      - name: Mutation gate
+        run: npm run mutate
 
       # The declared engines floor must be one the locked SDK can run on, and
       # the audit must stay clean: this process holds a long-lived Zoom refresh
