@@ -234,18 +234,30 @@ deliverable; this is its schema and one worked row.
 | `cost` | API calls consumed, so a scan's spend is attributable per metric |
 | `privacy` | public / aggregate-only / private |
 
-Worked example:
+Worked example. **The last version of this example filled in nine of the
+seventeen and used an `unknown` value that was not in the closed set** — a
+worked example that does not satisfy its own schema teaches the wrong thing
+twice. All seventeen, with the unresolved ones marked as unresolved rather than
+omitted:
 
-| | |
+| field | value |
 |---|---|
 | `id` | `OPS-FLOW-ERROR-RATE` |
 | `pillar` | PROCESS |
 | `unit` | one flow interview |
-| `denominator` | flow interviews started in the window |
-| `query` | `FlowInterview` / event log, exact call TBD in the spike |
+| `numerator` | interviews whose final status is Error |
+| `denominator` | interviews *started* in the window, including those still running at its close |
+| `defect` | final status Error. A cancelled or paused interview is not a defect |
+| `formula` | `numerator / denominator`, reported as a rate per 10⁶ with its interval — **not** converted to sigma until §4's seven conditions are met for this metric |
+| `direction` | lower is better |
+| `threshold` | UNRESOLVED — no defensible value yet; must come from observed distribution across ≥3 orgs, not from a round number |
+| `exclusions` | interviews from the scanning identity's own actions; screen flows abandoned by a user, which are not automation failures |
+| `completeness` | interviews the query reached ÷ interviews the org reports started; below 0.95 the metric emits `not-reached` rather than a rate |
+| `query` | UNRESOLVED — `FlowInterview` versus Event Log Files, decided by the §8 spike |
 | `window` | trailing 30 days |
-| `permission` | View All Data or View Event Log Files |
-| `unknown` | `insufficient-permission` or `no-interviews-in-window`, distinct from a rate of 0 |
+| `permission` | View All Data, or View Event Log Files for the ELF path |
+| `unknown` | one of `insufficient-permission`, `query-failed`, `not-reached`, `no-data-in-window` — never a rate of 0 |
+| `cost` | UNRESOLVED — measured in the spike; ELF and SOQL paths differ by roughly an order of magnitude |
 | `privacy` | aggregate-only — flow names can identify a business process |
 
 **`unknown` is not paperwork.** A metric that reports zero defects when it could
@@ -265,19 +277,31 @@ spent, we cannot honestly promise a ceiling.
 
 ---
 
-## 8. Before writing client-facing code
+## 8. The ordered gates before a client org is touched
 
-1. **A raw capability spike, no LLM.** Hosted versus DX against a controlled
-   Developer Edition org: what can each actually read, what does each cost in
-   API calls, and is there a path to `/limits`. This settles §2 and §7 with
-   measurements instead of preferences.
-2. **The tool allowlist and expected-org assertion**, with a test that fails when
-   a mutating tool name is reachable — the fixture being the exact names in §0.
-3. **The `xray-score-v1` schema, validator and corpus**, before any emitter.
-4. **The metric catalogue**, all seven fields per metric, reviewed before use.
-5. **The sanitizer** (§9), with byte-exact approval before anything from a real
-   org becomes public.
-6. **Only then** a client org.
+The previous version listed six steps and left them as prose: no artefact name,
+no owner, no acceptance test. A reviewer correctly called that "six incomplete
+steps" that later prose "neither assigns nor accepts". A gate nobody can fail is
+not a gate. Each row below names the thing produced, who signs it off, and the
+condition under which it is done.
+
+Nothing in **G1–G6 requires a client org**, which is the point: everything that
+can be wrong is wrong before a client is exposed to it.
+
+| gate | artefact | owner | done when |
+|---|---|---|---|
+| **G1** capability spike | `docs/mcp-capability-matrix.md` — exact server ids, endpoints, version and maturity for Hosted and DX, measured not quoted | claude-code-cli, reviewed by any agent that did not write it | both servers run against the controlled DE org; every claim in §1's table is either confirmed with a version, or struck |
+| **G2** quota | folded into G1's artefact | same | `/limits` is reachable or proven unreachable, with the API cost of a full scan measured, plus stated ceiling, reserve and concurrency rules |
+| **G3** enforcement policy | `docs/mcp-enforcement-policy.md` — the literal tool allowlist, the org allowlist rule, the telemetry position and the non-GA rule | claude-code-cli | a test fails when any name in §0's mutating list is reachable, and a test fails when a response carries an unexpected org id. **If the per-response org id proves unobtainable, G3 fails and the DX path is abandoned** — that assertion is load-bearing, not decorative |
+| **G4** auth and tenancy | `docs/mcp-auth-lifecycle.md` — attended vs unattended, ECA constraints, token storage, rotation, revocation, per-tenant isolation | claude-code-cli, and it does not pass on my say-so alone | each of the five has a written answer and a named failure mode |
+| **G5** schemas | `xray-score-v1` schema, validator, and a fixture corpus with a pinned digest — plus the collection-manifest, private-facts and public-export schemas, each versioned | claude-code-cli | the validator rejects a corpus mutated in each field, the way `tests/mutate_positioning.cjs` does for the site |
+| **G6** catalogue and statistics | the 17-field catalogue, and for any metric proposed to carry sigma, a written demonstration of §4's seven conditions with a named acceptance owner | claude-code-cli proposes; **Mr. Salam or a reviewer accepts** — I should not be the one who decides my own model is sound | every metric has all 17 fields with no `UNRESOLVED`, and no metric carries sigma without its demonstration |
+| **G7** sanitizer | `docs/mcp-sanitizer.md` plus the tool | claude-code-cli builds; **Mr. Salam approves the exact bytes** of anything public | a fixture of private facts produces a public export with a stable digest, and a byte-exact approval is recorded |
+| **G8** live correction | the `/xray/` and homepage wording fix from §4 | claude-code-cli | shipped. **This one does not wait for G1–G7** — it corrects a claim already public, so it is scheduled first, not last |
+| **G9** first client org | — | Mr. Salam authorises | G1–G7 accepted, G8 shipped |
+
+**G8 is deliberately out of order.** Everything else gates future work; G8
+corrects something a visitor can read today.
 
 ---
 
