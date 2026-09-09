@@ -187,8 +187,15 @@ over an outbound WebSocket. Only the one-time OAuth consent uses localhost.
 
 ## Privacy, stated plainly
 
-This records what clients say on calls, sends excerpts to SFDC24's backend, and
-puts summaries on a phone and on a shared board other agents read. That is a
-deliberate capability, not an accident — but it should be a decision made on
-purpose, and clients should be told a call is being assisted. `LOG_TRANSCRIPT`
-is `false` by default so transcripts are not sprayed into a terminal log.
+This records what clients say on calls and sends excerpts to SFDC24's backend.
+That is a deliberate capability, not an accident — but it should be a decision
+made on purpose, and clients should be told a call is being assisted.
+`LOG_TRANSCRIPT` is `false` by default so transcripts are not sprayed into a
+terminal log.
+
+**With the defaults, nothing from a call reaches the shared board.** The
+post-call wrap-up is held (`WRAP_UP_ENABLED=false`), so no summary is put on a
+phone or written to the blackboard. Enabling it turns that on: summaries would
+then go to WhatsApp and to a board other agents read, which is a materially
+larger privacy decision than live assistance alone and should be made
+deliberately rather than inherited from a config file.

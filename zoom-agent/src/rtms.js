@@ -53,10 +53,14 @@ export async function handleZoomEvent({ event, payload }) {
       break;
 
     case 'meeting.rtms_stopped': {
-      const client = active.get(streamId);
-      if (client) {
-        client.leave();
+      // A RESERVATION (null) must be cleared too, not just a live client. The
+      // entry is `null` while the SDK is loading, and `if (client)` skipped the
+      // delete for it — leaving a reservation nothing would ever remove, which
+      // would silently refuse every future join of that stream id.
+      if (active.has(streamId)) {
+        const client = active.get(streamId);
         active.delete(streamId);
+        if (client) client.leave();
       }
       onMeetingEnded(meetingId);
       break;
@@ -74,19 +78,44 @@ async function joinStream(streamId, meetingId, obj) {
     return;
   }
   // Critical: only ONE connection per stream. A duplicate join kicks out the first.
+  //
+  // The check and the RESERVATION must happen in the same synchronous step. The
+  // previous version checked, then awaited the lazy SDK import, then joined —
+  // so two rtms_started events for the same stream arriving while the SDK was
+  // loading BOTH passed the check, and both joined. The second kicked out the
+  // first, which is the exact failure the guard exists to prevent, and it could
+  // only happen on the very first stream of the process (the one time the
+  // import is not already resolved).
   if (active.has(streamId)) {
     console.log(`[rtms] already connected to stream ${streamId} — skipping duplicate join`);
     return;
   }
+  active.set(streamId, null);   // reservation: null means "joining"
 
   let rtms;
   try {
     rtms = await loadRtms();
   } catch (err) {
+    active.delete(streamId);    // never hold a reservation we cannot fulfil
     console.error(`[rtms] cannot join stream ${streamId}: ${err.message}`);
     return;
   }
-  const client = new rtms.Client();
+  // The stream may have STOPPED while the SDK was loading. If our reservation is
+  // gone, someone cleared it deliberately and joining now would resurrect a
+  // stream nobody is listening to.
+  if (!active.has(streamId)) {
+    console.log(`[rtms] stream ${streamId} was stopped while the SDK loaded — not joining`);
+    return;
+  }
+
+  let client;
+  try {
+    client = new rtms.Client();
+  } catch (err) {
+    active.delete(streamId);    // a reservation we cannot fulfil is a dead lock
+    console.error(`[rtms] could not construct a client for ${streamId}: ${err.message}`);
+    return;
+  }
   active.set(streamId, client);
 
   let audioFrames = 0;

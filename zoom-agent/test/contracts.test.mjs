@@ -623,35 +623,123 @@ test('the README does not promise a capability that is held', () => {
   const cfg = readFileSync(new URL('../src/config.js', import.meta.url), 'utf8');
   const heldByDefault = /wrapUpEnabled: optional\('WRAP_UP_ENABLED', 'false'\)/.test(cfg);
 
-  // Operator-facing docs drifted from the diff on this PR three times before a
-  // reviewer caught each one. This makes the fourth surface fail loudly instead.
-  const start0 = readme.indexOf('**After the call');
-  assert.notEqual(start0, -1, 'the README must still describe what happens after a call');
-  const sect = readme.slice(start0, readme.indexOf('###', start0));
-  const saysHeld = /HELD|does not run|off by default/i.test(sect);
+  // TWO EARLIER VERSIONS OF THIS GUARD WERE BLIND, in different ways.
+  //
+  //   1. Scoped to the post-call section — the part I had just fixed. A
+  //      reviewer then found the privacy section three paragraphs down still
+  //      promising summaries in the present tense.
+  //   2. Whole file, but "is there a hold marker within 400 characters?" A
+  //      present-tense promise sitting in the same paragraph as the words
+  //      WRAP_UP_ENABLED passed, because proximity is not agreement.
+  //
+  // What actually misleads an operator is the INDICATIVE MOOD: "it puts
+  // summaries on a phone" reads as a description of what happens. Conditional
+  // phrasing — "would then go", "enabling it turns that on" — does not.
+  const PROMISES = [
+    /puts?\s+(?:a\s+|the\s+)?summar(?:y|ies)/i,
+    /sends?\s+(?:a\s+|the\s+)?summar(?:y|ies)/i,
+    /produces?\s+(?:a\s+|the\s+)?summar(?:y|ies)/i,
+    /summar(?:y|ies)\s+(?:is|are)\s+(?:sent|posted|written|put|delivered)/i,
+    /writes?\s+(?:a\s+|the\s+)?finding/i,
+  ];
+  const CONDITIONAL = /would|when enabled|enabling|if you enable|once enabled|no summary|nothing from a call/i;
 
-  // BIDIRECTIONAL. Drift in either direction is a lie to an operator: a README
-  // promising a capability that never runs, or one warning about a hold that
-  // has since been lifted.
-  if (!heldByDefault) {
-    assert.equal(saysHeld, false,
-      'the wrap-up is enabled by default now, but the README still describes it as held');
-    return;
+  const claims = [];
+  for (const rx of PROMISES) {
+    for (const m of readme.matchAll(new RegExp(rx.source, 'gi'))) {
+      // Look only at the sentence the claim lives in. A conditional two
+      // paragraphs away does not qualify the sentence in front of the reader.
+      const from = readme.lastIndexOf('.', m.index) + 1;
+      const to = readme.indexOf('.', m.index + m[0].length);
+      const sentence = readme.slice(from, to === -1 ? readme.length : to + 1);
+      if (!CONDITIONAL.test(sentence)) claims.push(sentence.trim().replace(/\s+/g, ' '));
+    }
   }
 
-  // Scoped to the section an operator actually reads about the wrap-up. A
-  // whole-file search passed even after the section header was rewritten to
-  // promise the feature, because the words still existed further down — the
-  // test asserted a true sentence about the wrong part of the file, which is
-  // the failure mode this suite keeps rediscovering.
-  const start = readme.indexOf('**After the call');
-  assert.notEqual(start, -1, 'the README must still describe what happens after a call');
-  const section = readme.slice(start, readme.indexOf('###', start));
+  if (heldByDefault) {
+    assert.deepEqual(claims, [],
+      'the wrap-up is held, but the README states in the indicative that summaries are produced. '
+      + 'An operator reading that sentence expects artefacts the default execution path never '
+      + 'creates — phrase it conditionally or say it does not run');
+  } else {
+    assert.doesNotMatch(readme, /\bHELD\b/,
+      'the wrap-up is enabled by default now, but the README still describes it as held');
+  }
+});
 
-  assert.match(section, /HELD|does not run|off by default/i,
-    'the README is the primary setup document — the post-call section itself must say the '
-    + 'capability does not run, not merely mention a flag somewhere else on the page');
-  assert.match(section, /WRAP_UP_ENABLED/,
-    'and it must name the flag in that same section, so an operator meets the constraint '
-    + 'where the promise used to be');
+
+// ── Fifth review round ──────────────────────────────────────────────────────
+
+test('F1: a refused build_connection is a failure, not a log line', async () => {
+  const { WebSocketServer } = await import('ws');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-ack-'));
+  config.tokenFile = path.join(dir, 'tokens.json');
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 60 * 60_000,
+  }));
+  const { loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+
+  // A server that accepts the socket and then DECLINES the subscription —
+  // exactly what Zoom does when the token or subscription is not valid.
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise((r) => wss.once('listening', r));
+  wss.on('connection', (sock) => {
+    sock.send(JSON.stringify({ module: 'build_connection', success: false }));
+  });
+  config.wsEndpoint = `ws://127.0.0.1:${wss.address().port}/ws`;
+
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
+  const socket = new ZoomEventSocket(() => {});
+  let scheduled = 0;
+  socket.scheduleReconnect = () => { scheduled += 1; };
+
+  try {
+    const err = await socket.connect().then(() => null, (e) => e);
+    assert.ok(err,
+      'connect() resolved against a connection Zoom REFUSED — the agent would sit there looking '
+      + 'healthy, retrying nothing, and receiving no meeting events until the 50-minute recycle');
+    assert.match(err.message, /did not acknowledge/i);
+    assert.equal(err.retryScheduled, true, 'the refusal must be owned by exactly one scheduler');
+    assert.equal(scheduled, 1, `scheduled ${scheduled} retries for one refusal`);
+  } finally {
+    socket.close();
+    wss.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('F1: a socket that opens and says nothing does not hang forever', async () => {
+  const src = readFileSync(new URL('../src/events-ws.js', import.meta.url), 'utf8');
+  assert.match(src, /ACK_TIMEOUT_MS/,
+    'waiting for an acknowledgement with no bound turns one failure mode into a worse one: '
+    + 'connect() pending forever, so nothing ever retries');
+  assert.match(src, /no acknowledgement within/,
+    'and the timeout must say what it was waiting for');
+});
+
+test('F2: the stream is reserved BEFORE the lazy import is awaited', () => {
+  const src = readFileSync(new URL('../src/rtms.js', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('async function joinStream'), src.indexOf('let audioFrames'));
+
+  const reserve = fn.indexOf('active.set(streamId, null)');
+  const awaitLoad = fn.indexOf('await loadRtms()');
+  assert.ok(reserve !== -1, 'the stream must be reserved, not merely checked');
+  assert.ok(awaitLoad !== -1, 'the SDK is still loaded lazily');
+  assert.ok(reserve < awaitLoad,
+    'the reservation must precede the await. Checking `active.has` and THEN awaiting lets two '
+    + 'rtms_started events for the same stream both pass the guard while the SDK loads, and the '
+    + 'second join kicks out the first — the exact failure the guard exists to prevent');
+
+  // A reservation that outlives its join attempt is a permanent lock on that
+  // stream id, so every abort path has to release it.
+  const aborts = fn.match(/active\.delete\(streamId\)/g) ?? [];
+  assert.ok(aborts.length >= 2,
+    `only ${aborts.length} release(s) on the abort paths — a load failure and a construction `
+    + 'failure must each free the reservation, or that stream can never be joined again');
+
+  const stop = src.slice(src.indexOf("case 'meeting.rtms_stopped'"), src.indexOf('onMeetingEnded(meetingId)', src.indexOf("case 'meeting.rtms_stopped'")));
+  assert.match(stop, /active\.has\(streamId\)/,
+    'a stop must clear a RESERVATION too — `if (client)` skipped it for a null entry, leaving a '
+    + 'lock nothing would ever remove');
 });

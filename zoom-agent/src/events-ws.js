@@ -16,6 +16,12 @@ const MAX_BACKOFF_MS = 30_000;
 // one and the 1-hour expiry it existed to dodge arrived anyway.
 const RECYCLE_MIN_TTL_MS = TOKEN_RECYCLE_MS + 5 * 60_000;
 
+// How long to wait for Zoom's build_connection acknowledgement after the socket
+// opens. Without a bound, a server that opens the TCP connection and then says
+// nothing would leave connect() pending forever -- a worse failure than the one
+// this timeout exists alongside, because nothing would ever retry.
+const ACK_TIMEOUT_MS = 15_000;
+
 export class ZoomEventSocket {
   constructor(onEvent) {
     this.onEvent = onEvent;
@@ -25,16 +31,26 @@ export class ZoomEventSocket {
     this.attempts = 0;
     this.intentionalClose = false;
     this.recycling = false;
+    this.ackFailed = false;
+    this.onAck = null;
   }
 
   /**
-   * Resolves when the socket is OPEN, not when the constructor returns.
+   * Resolves only after Zoom ACKNOWLEDGES the connection, not when the socket
+   * opens and certainly not when the constructor returns.
    *
-   * The previous version resolved as soon as `new WebSocket()` had been called,
-   * so `await connect()` succeeded against an endpoint that was refusing the
-   * connection, and startup reported itself healthy while nothing was
-   * listening. Rejecting here is what lets scheduleReconnect() back off
-   * properly instead of spinning against a dead endpoint.
+   * Two failures, found one review apart, both of which looked like health:
+   *
+   *   1. The first version resolved as soon as `new WebSocket()` had been
+   *      called, so `await connect()` succeeded against an endpoint that was
+   *      refusing the connection.
+   *   2. The second resolved on the transport `open` event -- but Zoom answers
+   *      with `{module:'build_connection', success:false}` when it declines the
+   *      subscription, and that was only logged. The agent then sat there
+   *      looking connected, scheduling no retry and no reauthorization, and
+   *      received no meeting events at all until the 50-minute recycle.
+   *
+   * A TCP handshake is not a subscription. Readiness is what Zoom says it is.
    */
   async connect({ minTtlMs } = {}) {
     const token = await getAccessToken(minTtlMs ? { minTtlMs } : undefined);
@@ -53,14 +69,43 @@ export class ZoomEventSocket {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let ackTimer = null;
+
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(ackTimer);
+        ackTimer = null;
+        fn(value);
+      };
+
+      // Called by handleMessage when the acknowledgement frame arrives.
+      this.onAck = (success) => {
+        if (ws !== this.ws) return;
+        if (success) {
+          this.attempts = 0;
+          console.log('[events] Zoom acknowledged the connection — listening');
+          this.startPing();
+          this.scheduleTokenRecycle();
+          settle(resolve);
+          return;
+        }
+        // Declined. Close it rather than sit on a socket that will never
+        // deliver an event, and let the close handler own the retry.
+        console.error('[events] Zoom REFUSED the connection (build_connection success=false) — closing');
+        this.ackFailed = true;
+        try { ws.close(1000); } catch { /* already gone */ }
+      };
 
       ws.on('open', () => {
         if (ws !== this.ws) return;
-        this.attempts = 0;
-        console.log('[events] connected to Zoom event socket');
-        this.startPing();
-        this.scheduleTokenRecycle();
-        if (!settled) { settled = true; resolve(); }
+        console.log('[events] socket open — waiting for Zoom to acknowledge');
+        ackTimer = setTimeout(() => {
+          if (ws !== this.ws || settled) return;
+          console.error(`[events] no acknowledgement within ${ACK_TIMEOUT_MS / 1000}s — closing`);
+          this.ackFailed = true;
+          try { ws.close(1000); } catch { /* already gone */ }
+        }, ACK_TIMEOUT_MS);
       });
 
       ws.on('message', (raw) => {
@@ -78,7 +123,9 @@ export class ZoomEventSocket {
         console.log(`[events] closed: ${code} ${reason?.toString() ?? ''}`);
         this.stopTimers();
 
-        // Closed before it ever opened: the awaiting caller must hear about it.
+        // Closed before it was acknowledged: the awaiting caller must hear about
+        // it. This covers a refused build_connection and a silent server, not
+        // only a socket that never opened.
         //
         // EXACTLY ONE OWNER SCHEDULES THE RETRY. This handler schedules, and
         // marks the rejection so the caller's catch does not schedule a SECOND
@@ -88,13 +135,16 @@ export class ZoomEventSocket {
         // generations. Introduced by making connect() reject on a pre-open
         // close, which is the fix that made the double path possible.
         if (!settled) {
-          settled = true;
-          const err = new Error(`event socket closed before opening (${code})`);
+          const why = this.ackFailed
+            ? 'Zoom did not acknowledge the connection'
+            : `event socket closed before opening (${code})`;
+          this.ackFailed = false;
+          const err = new Error(why);
           if (!this.intentionalClose && !this.recycling) {
             this.scheduleReconnect();
             err.retryScheduled = true;
           }
-          reject(err);
+          settle(reject, err);
           return;
         }
 
@@ -144,7 +194,11 @@ export class ZoomEventSocket {
     // Zoom's WS frames: connection acks and heartbeats use "module";
     // real events arrive as {module:"message", content:"<stringified event>"}.
     if (msg.module === 'build_connection') {
+      // The acknowledgement decides readiness. success=false used to be logged
+      // and otherwise ignored, which left the agent looking connected while
+      // Zoom had declined it.
       console.log(`[events] build_connection success=${msg.success}`);
+      this.onAck?.(Boolean(msg.success));
       return;
     }
     if (msg.module === 'heartbeat') return;
