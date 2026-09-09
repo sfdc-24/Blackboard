@@ -100,10 +100,17 @@ function Invoke-OrderReleaseGit {
     param(
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$GitDirectory,
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $argumentText = (@($Arguments | ForEach-Object {
+    $anchoredArguments = @(
+        '--no-replace-objects',
+        '--literal-pathspecs',
+        ('--git-dir=' + $GitDirectory),
+        ('--work-tree=' + $Repository)
+    ) + @($Arguments)
+    $argumentText = (@($anchoredArguments | ForEach-Object {
         ConvertTo-OrderReleaseNativeArgument -Value ([string]$_)
     }) -join ' ')
     $startInfo = New-Object Diagnostics.ProcessStartInfo
@@ -114,6 +121,16 @@ function Invoke-OrderReleaseGit {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    foreach ($environmentName in @($startInfo.EnvironmentVariables.Keys)) {
+        if ([string]$environmentName -imatch '^GIT_') {
+            [void]$startInfo.EnvironmentVariables.Remove([string]$environmentName)
+        }
+    }
+    $nullConfigPath = if ([IO.Path]::DirectorySeparatorChar -eq '\') { 'NUL' } else { '/dev/null' }
+    $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = $nullConfigPath
+    $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = $nullConfigPath
+    $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+    $startInfo.EnvironmentVariables['GIT_ATTR_NOSYSTEM'] = '1'
     $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
     $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = 'Never'
     $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
@@ -152,6 +169,125 @@ function ConvertFrom-OrderReleaseGitUtf8 {
     }
 }
 
+function Get-OrderReleaseSafeExistingPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$FullPath,
+        [Parameter(Mandatory = $true)][string]$MissingCode,
+        [Parameter(Mandatory = $true)][string]$ReparseCode,
+        [Parameter(Mandatory = $true)][string]$CollisionCode,
+        [Parameter(Mandatory = $true)][string]$AncestorNotDirectoryCode
+    )
+
+    $resolvedPath = [IO.Path]::GetFullPath($FullPath)
+    $volumeRoot = [IO.Path]::GetPathRoot($resolvedPath)
+    if ($resolvedPath.Length -gt $volumeRoot.Length) {
+        $resolvedPath = $resolvedPath.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+    }
+    $relativePath = $resolvedPath.Substring($volumeRoot.Length)
+    $segments = @(
+        $relativePath.Split(
+            [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar),
+            [StringSplitOptions]::RemoveEmptyEntries
+        )
+    )
+    try { $currentItem = Get-Item -LiteralPath $volumeRoot -Force -ErrorAction Stop }
+    catch { throw $MissingCode }
+    if (([int]$currentItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw $ReparseCode
+    }
+    if (-not ($currentItem -is [IO.DirectoryInfo])) { throw $AncestorNotDirectoryCode }
+
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        $segment = [string]$segments[$index]
+        $matches = @(
+            $currentItem.EnumerateFileSystemInfos($segment, [IO.SearchOption]::TopDirectoryOnly) |
+                Where-Object { [string]::Equals([string]$_.Name, $segment, [StringComparison]::OrdinalIgnoreCase) }
+        )
+        if ($matches.Count -eq 0) { throw $MissingCode }
+        if ($matches.Count -gt 1) { throw $CollisionCode }
+        $currentItem = $matches[0]
+        if (([int]$currentItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw $ReparseCode
+        }
+        if ($index -lt ($segments.Count - 1) -and -not ($currentItem -is [IO.DirectoryInfo])) {
+            throw $AncestorNotDirectoryCode
+        }
+    }
+    return $currentItem
+}
+
+function Assert-OrderReleaseNoAlternateObjectState {
+    param([Parameter(Mandatory = $true)][IO.DirectoryInfo]$GitDirectory)
+
+    $objectsPath = Join-Path $GitDirectory.FullName 'objects'
+    $objects = Get-OrderReleaseSafeExistingPath `
+        -FullPath $objectsPath `
+        -MissingCode 'repository_objects_missing' `
+        -ReparseCode 'repository_objects_reparse_point' `
+        -CollisionCode 'repository_objects_path_collision' `
+        -AncestorNotDirectoryCode 'repository_objects_ancestor_not_directory'
+    if (-not ($objects -is [IO.DirectoryInfo])) { throw 'repository_objects_invalid' }
+
+    $infoMatches = @(
+        $objects.EnumerateFileSystemInfos('info', [IO.SearchOption]::TopDirectoryOnly) |
+            Where-Object { [string]::Equals([string]$_.Name, 'info', [StringComparison]::OrdinalIgnoreCase) }
+    )
+    if ($infoMatches.Count -gt 1) { throw 'repository_objects_path_collision' }
+    if ($infoMatches.Count -eq 1) {
+        $info = $infoMatches[0]
+        if (([int]$info.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'repository_objects_reparse_point'
+        }
+        if (-not ($info -is [IO.DirectoryInfo])) { throw 'repository_objects_invalid' }
+        foreach ($alternateName in @('alternates', 'http-alternates')) {
+            $alternateMatches = @(
+                $info.EnumerateFileSystemInfos($alternateName, [IO.SearchOption]::TopDirectoryOnly) |
+                    Where-Object {
+                        [string]::Equals([string]$_.Name, $alternateName, [StringComparison]::OrdinalIgnoreCase)
+                    }
+            )
+            if ($alternateMatches.Count -gt 0) { throw 'repository_alternates_forbidden' }
+        }
+    }
+
+    $gitInfoMatches = @(
+        $GitDirectory.EnumerateFileSystemInfos('info', [IO.SearchOption]::TopDirectoryOnly) |
+            Where-Object { [string]::Equals([string]$_.Name, 'info', [StringComparison]::OrdinalIgnoreCase) }
+    )
+    if ($gitInfoMatches.Count -gt 1) { throw 'repository_git_path_collision' }
+    if ($gitInfoMatches.Count -eq 1) {
+        $gitInfo = $gitInfoMatches[0]
+        if (([int]$gitInfo.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'repository_git_reparse_point'
+        }
+        if (-not ($gitInfo -is [IO.DirectoryInfo])) { throw 'repository_git_directory_invalid' }
+        $graftMatches = @(
+            $gitInfo.EnumerateFileSystemInfos('grafts', [IO.SearchOption]::TopDirectoryOnly) |
+                Where-Object { [string]::Equals([string]$_.Name, 'grafts', [StringComparison]::OrdinalIgnoreCase) }
+        )
+        if ($graftMatches.Count -gt 0) { throw 'repository_grafts_forbidden' }
+    }
+}
+
+function Assert-OrderReleaseMetadataTreeSafe {
+    param([Parameter(Mandatory = $true)][IO.DirectoryInfo]$GitDirectory)
+
+    $directories = New-Object System.Collections.Queue
+    $directories.Enqueue($GitDirectory)
+    while ($directories.Count -gt 0) {
+        $directory = $directories.Dequeue()
+        foreach ($entry in @($directory.EnumerateFileSystemInfos())) {
+            if (([int]$entry.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'repository_git_reparse_point'
+            }
+            if ($entry -is [IO.DirectoryInfo]) { $directories.Enqueue($entry) }
+        }
+    }
+}
+
 function Resolve-OrderReleaseRepository {
     param([AllowEmptyString()][string]$Path)
 
@@ -160,13 +296,28 @@ function Resolve-OrderReleaseRepository {
     }
     try { $fullPath = [IO.Path]::GetFullPath($Path) }
     catch { throw 'repository_path_invalid' }
-    try { $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop }
-    catch { throw 'repository_missing' }
-    if (-not ($item -is [IO.DirectoryInfo]) -or
-        ([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'repository_unsafe'
+    $item = Get-OrderReleaseSafeExistingPath `
+        -FullPath $fullPath `
+        -MissingCode 'repository_missing' `
+        -ReparseCode 'repository_path_reparse_point' `
+        -CollisionCode 'repository_path_collision' `
+        -AncestorNotDirectoryCode 'repository_ancestor_not_directory'
+    if (-not ($item -is [IO.DirectoryInfo])) { throw 'repository_unsafe' }
+
+    $gitDirectoryPath = Join-Path $item.FullName '.git'
+    $gitDirectory = Get-OrderReleaseSafeExistingPath `
+        -FullPath $gitDirectoryPath `
+        -MissingCode 'repository_git_directory_missing' `
+        -ReparseCode 'repository_git_reparse_point' `
+        -CollisionCode 'repository_git_path_collision' `
+        -AncestorNotDirectoryCode 'repository_git_ancestor_not_directory'
+    if (-not ($gitDirectory -is [IO.DirectoryInfo])) { throw 'repository_git_directory_invalid' }
+    Assert-OrderReleaseMetadataTreeSafe -GitDirectory $gitDirectory
+    Assert-OrderReleaseNoAlternateObjectState -GitDirectory $gitDirectory
+    return [pscustomobject][ordered]@{
+        root = [string]$item.FullName
+        git_directory = [string]$gitDirectory.FullName
     }
-    return [string]$item.FullName
 }
 
 function Resolve-OrderReleaseGitPath {
@@ -185,6 +336,7 @@ function Get-OrderReleaseCommitEntries {
     param(
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$GitDirectory,
         [AllowEmptyString()][string]$FullCommitId
     )
 
@@ -193,12 +345,55 @@ function Get-OrderReleaseCommitEntries {
     $repositoryCheck = Invoke-OrderReleaseGit `
         -GitPath $GitPath `
         -Repository $Repository `
-        -Arguments @('rev-parse', '--git-dir')
+        -GitDirectory $GitDirectory `
+        -Arguments @('rev-parse', '--absolute-git-dir')
     if ($repositoryCheck.exit_code -ne 0) { throw 'repository_not_git' }
+    $reportedGitDirectory = (ConvertFrom-OrderReleaseGitUtf8 `
+        -Bytes $repositoryCheck.stdout_bytes `
+        -ErrorCode 'repository_identity_invalid').Trim()
+    try { $reportedGitDirectory = [IO.Path]::GetFullPath($reportedGitDirectory) }
+    catch { throw 'repository_identity_invalid' }
+    if (-not [string]::Equals($reportedGitDirectory, $GitDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'repository_identity_invalid'
+    }
+
+    $workTreeCheck = Invoke-OrderReleaseGit `
+        -GitPath $GitPath `
+        -Repository $Repository `
+        -GitDirectory $GitDirectory `
+        -Arguments @('rev-parse', '--show-toplevel')
+    if ($workTreeCheck.exit_code -ne 0) { throw 'repository_not_work_tree' }
+    $reportedWorkTree = (ConvertFrom-OrderReleaseGitUtf8 `
+        -Bytes $workTreeCheck.stdout_bytes `
+        -ErrorCode 'repository_identity_invalid').Trim()
+    try { $reportedWorkTree = [IO.Path]::GetFullPath($reportedWorkTree) }
+    catch { throw 'repository_identity_invalid' }
+    if (-not [string]::Equals($reportedWorkTree, $Repository, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'repository_identity_invalid'
+    }
+
+    $includeCheck = Invoke-OrderReleaseGit `
+        -GitPath $GitPath `
+        -Repository $Repository `
+        -GitDirectory $GitDirectory `
+        -Arguments @('config', '--local', '--no-includes', '--name-only', '--get-regexp', '^include')
+    if ($includeCheck.exit_code -eq 0 -and $includeCheck.stdout_bytes.Length -gt 0) {
+        throw 'repository_config_includes_forbidden'
+    }
+    if (@(0, 1) -cnotcontains $includeCheck.exit_code) { throw 'repository_config_check_failed' }
+
+    $replaceCheck = Invoke-OrderReleaseGit `
+        -GitPath $GitPath `
+        -Repository $Repository `
+        -GitDirectory $GitDirectory `
+        -Arguments @('for-each-ref', '--format=%(refname)', 'refs/replace/')
+    if ($replaceCheck.exit_code -ne 0) { throw 'repository_replace_ref_check_failed' }
+    if ($replaceCheck.stdout_bytes.Length -gt 0) { throw 'repository_replace_refs_forbidden' }
 
     $commitCheck = Invoke-OrderReleaseGit `
         -GitPath $GitPath `
         -Repository $Repository `
+        -GitDirectory $GitDirectory `
         -Arguments @('rev-parse', '--verify', '--quiet', ($FullCommitId + '^{commit}'))
     if ($commitCheck.exit_code -ne 0) { throw 'commit_not_found' }
     $resolvedCommit = (ConvertFrom-OrderReleaseGitUtf8 `
@@ -211,6 +406,7 @@ function Get-OrderReleaseCommitEntries {
     $treeResult = Invoke-OrderReleaseGit `
         -GitPath $GitPath `
         -Repository $Repository `
+        -GitDirectory $GitDirectory `
         -Arguments @('ls-tree', '-r', '-z', '--name-only', $FullCommitId, '--')
     if ($treeResult.exit_code -ne 0) { throw 'git_tree_read_failed' }
     $treeText = ConvertFrom-OrderReleaseGitUtf8 `
@@ -246,6 +442,7 @@ function Get-OrderReleaseCommitEntries {
         $metadataResult = Invoke-OrderReleaseGit `
             -GitPath $GitPath `
             -Repository $Repository `
+            -GitDirectory $GitDirectory `
             -Arguments @('ls-tree', '-z', $FullCommitId, '--', $archiveEntryPath)
         if ($metadataResult.exit_code -ne 0) { throw 'release_file_metadata_read_failed' }
         $metadataText = ConvertFrom-OrderReleaseGitUtf8 `
@@ -266,6 +463,7 @@ function Get-OrderReleaseCommitEntries {
         $blobResult = Invoke-OrderReleaseGit `
             -GitPath $GitPath `
             -Repository $Repository `
+            -GitDirectory $GitDirectory `
             -Arguments @('cat-file', 'blob', ($FullCommitId + ':' + $archiveEntryPath))
         if ($blobResult.exit_code -ne 0) { throw 'release_file_read_failed' }
         [byte[]]$blobBytes = $blobResult.stdout_bytes
@@ -379,14 +577,20 @@ function Resolve-OrderReleaseOutputPath {
     catch { throw 'output_path_invalid' }
     if ([IO.Path]::GetExtension($fullPath) -cne '.zip') { throw 'output_extension_invalid' }
     $parentPath = [IO.Path]::GetDirectoryName($fullPath)
-    try { $parent = Get-Item -LiteralPath $parentPath -Force -ErrorAction Stop }
-    catch { throw 'output_parent_missing' }
-    if (-not ($parent -is [IO.DirectoryInfo]) -or
-        ([int]$parent.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'output_parent_unsafe'
-    }
-    if (Test-Path -LiteralPath $fullPath) { throw 'output_already_exists' }
-    return $fullPath
+    $parent = Get-OrderReleaseSafeExistingPath `
+        -FullPath $parentPath `
+        -MissingCode 'output_parent_missing' `
+        -ReparseCode 'output_path_reparse_point' `
+        -CollisionCode 'output_path_collision' `
+        -AncestorNotDirectoryCode 'output_ancestor_not_directory'
+    if (-not ($parent -is [IO.DirectoryInfo])) { throw 'output_parent_unsafe' }
+    $fileName = [IO.Path]::GetFileName($fullPath)
+    $matches = @(
+        $parent.EnumerateFileSystemInfos($fileName, [IO.SearchOption]::TopDirectoryOnly) |
+            Where-Object { [string]::Equals([string]$_.Name, $fileName, [StringComparison]::OrdinalIgnoreCase) }
+    )
+    if ($matches.Count -gt 0) { throw 'output_already_exists' }
+    return (Join-Path $parent.FullName $fileName)
 }
 
 function Assert-OrderReleaseArchiveReadback {
@@ -506,7 +710,8 @@ function New-OrderReleaseArchive {
     $gitPath = Resolve-OrderReleaseGitPath
     $entries = @(Get-OrderReleaseCommitEntries `
         -GitPath $gitPath `
-        -Repository $repository `
+        -Repository $repository.root `
+        -GitDirectory $repository.git_directory `
         -FullCommitId $SourceCommitId)
     [byte[]]$archiveBytes = New-OrderReleaseDeterministicZipBytes -Entries $entries
     $output = Write-OrderReleaseArchiveNewFile `

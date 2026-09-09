@@ -14,6 +14,20 @@ $script:ReleaseInstaller = Join-Path $script:RepoRoot 'infra\azure\install_relea
 $script:SystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $script:TestRoot = Join-Path $script:SystemTemp ('order-release-packager-test-' + [Guid]::NewGuid().ToString('N'))
 $script:FixtureRepository = Join-Path $script:TestRoot 'fixture-repository'
+$script:TestJunctions = New-Object 'System.Collections.Generic.List[string]'
+$script:PowerShellExecutable = $(
+    $candidateName = if ($PSVersionTable.PSEdition -ceq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+    $candidatePath = Join-Path $PSHOME $candidateName
+    if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
+        [IO.Path]::GetFullPath($candidatePath)
+    } else {
+        $processPath = [string](Get-Process -Id $PID).Path
+        if ([string]::IsNullOrWhiteSpace($processPath) -or -not (Test-Path -LiteralPath $processPath -PathType Leaf)) {
+            throw 'test_powershell_executable_missing'
+        }
+        [IO.Path]::GetFullPath($processPath)
+    }
+)
 $script:ReleaseFiles = @(
     'scripts\OrderSupervisor.psm1',
     'scripts\bus.ps1',
@@ -57,7 +71,7 @@ function Invoke-TestPowerShellFile {
     foreach ($argument in $ArgumentList) { $tokens.Add((Quote-TestArgument -Value ([string]$argument))) }
 
     $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = (Join-Path $PSHOME 'powershell.exe')
+    $startInfo.FileName = $script:PowerShellExecutable
     $startInfo.Arguments = $tokens -join ' '
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -127,8 +141,15 @@ function Invoke-TestGit {
     $commandArguments = @()
     if (-not $NoRepository) { $commandArguments += @('-C', $Repository) }
     $commandArguments += $Arguments
-    $output = @(& git @commandArguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& git @commandArguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
         throw ('fixture_git_failed:' + ($output -join ' '))
     }
     return (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
@@ -169,6 +190,61 @@ function New-TestFixtureRepository {
         $env:GIT_COMMITTER_DATE = $previousCommitterDate
     }
     return Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('rev-parse', 'HEAD')
+}
+
+function New-TestForeignRepository {
+    param([Parameter(Mandatory = $true)][string]$SourceRepository)
+
+    $foreignRepository = Join-Path $script:TestRoot 'foreign-repository'
+    Invoke-TestGit -Repository $foreignRepository -NoRepository -Arguments @(
+        'clone', '--quiet', '--no-hardlinks', $SourceRepository, $foreignRepository
+    ) | Out-Null
+    Invoke-TestGit -Repository $foreignRepository -Arguments @('config', 'user.name', 'Foreign ORDER Test') | Out-Null
+    Invoke-TestGit -Repository $foreignRepository -Arguments @('config', 'user.email', 'foreign-order@example.invalid') | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $foreignRepository 'scripts\bus.ps1'),
+        "foreign repository payload`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    Invoke-TestGit -Repository $foreignRepository -Arguments @('add', '--', 'scripts/bus.ps1') | Out-Null
+    $previousAuthorDate = $env:GIT_AUTHOR_DATE
+    $previousCommitterDate = $env:GIT_COMMITTER_DATE
+    try {
+        $env:GIT_AUTHOR_DATE = '2001-02-03T04:05:08Z'
+        $env:GIT_COMMITTER_DATE = '2001-02-03T04:05:08Z'
+        Invoke-TestGit -Repository $foreignRepository -Arguments @('commit', '--quiet', '-m', 'foreign release') | Out-Null
+    } finally {
+        $env:GIT_AUTHOR_DATE = $previousAuthorDate
+        $env:GIT_COMMITTER_DATE = $previousCommitterDate
+    }
+    return [pscustomobject][ordered]@{
+        path = $foreignRepository
+        commit = Invoke-TestGit -Repository $foreignRepository -Arguments @('rev-parse', 'HEAD')
+        git_directory = Join-Path $foreignRepository '.git'
+        object_directory = Join-Path $foreignRepository '.git\objects'
+    }
+}
+
+function New-TestJunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+
+    $resolvedTestRoot = [IO.Path]::GetFullPath($script:TestRoot).TrimEnd('\', '/')
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    $resolvedTarget = [IO.Path]::GetFullPath($Target)
+    $testPrefix = $resolvedTestRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedPath.StartsWith($testPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $resolvedTarget.StartsWith($testPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'test_junction_scope_invalid'
+    }
+    $junction = New-Item -ItemType Junction -Path $resolvedPath -Target $resolvedTarget -ErrorAction Stop
+    if (([int]$junction.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0) {
+        throw 'test_junction_not_reparse_point'
+    }
+    $script:TestJunctions.Add($resolvedPath)
+    return [string]$junction.FullName
 }
 
 function New-TestPlumbingCommit {
@@ -477,6 +553,162 @@ try {
         $storedEntries -and (Test-DeterministicZipStructure -Path $archiveOne)
     )
 
+    $foreignRepository = New-TestForeignRepository -SourceRepository $script:FixtureRepository
+    $hostileConfig = Join-Path $script:TestRoot 'hostile-git-config'
+    [IO.File]::WriteAllText(
+        $hostileConfig,
+        "[core]`nworktree = " + ([string]$foreignRepository.path).Replace('\', '/') + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $redirectedOutput = Join-Path $script:TestRoot 'redirected-by-environment.zip'
+    $redirectedRun = Invoke-TestPowerShellFile `
+        -FilePath $script:Packager `
+        -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', ([string]$foreignRepository.commit),
+            '-OutputPath', $redirectedOutput
+        ) `
+        -Environment @{
+            GIT_DIR = [string]$foreignRepository.git_directory
+            GIT_WORK_TREE = [string]$foreignRepository.path
+            GIT_COMMON_DIR = [string]$foreignRepository.git_directory
+            GIT_OBJECT_DIRECTORY = [string]$foreignRepository.object_directory
+            git_alternate_object_directories = [string]$foreignRepository.object_directory
+            GIT_REPLACE_REF_BASE = 'refs/hostile-replace/'
+            GIT_CONFIG_GLOBAL = $hostileConfig
+            GIT_CONFIG_COUNT = '1'
+            GIT_CONFIG_KEY_0 = 'core.worktree'
+            GIT_CONFIG_VALUE_0 = [string]$foreignRepository.path
+        }
+    $redirectedReceipt = Read-TestReceipt -Result $redirectedRun -Success $false
+    Assert-True 'inherited Git environment and command-config cannot redirect the declared repository' (
+        $redirectedReceipt.code -ceq 'commit_not_found' -and -not (Test-Path -LiteralPath $redirectedOutput)
+    )
+
+    $configuredOutput = Join-Path $script:TestRoot 'local-config-worktree.zip'
+    Invoke-TestGit -Repository $script:FixtureRepository -Arguments @(
+        'config', 'core.worktree', ([string]$foreignRepository.path).Replace('\', '/')
+    ) | Out-Null
+    try {
+        $configuredRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', $validCommit,
+            '-OutputPath', $configuredOutput
+        )
+        $configuredReceipt = Read-TestReceipt -Result $configuredRun -Success $true
+        $configuredEntries = @(Read-TestArchiveEntries -Path $configuredOutput)
+        Assert-True 'explicit Git directory and work-tree anchors override hostile local core.worktree config' (
+            $configuredReceipt.commit_id -ceq $validCommit -and
+            [Convert]::ToBase64String([byte[]]$configuredEntries[1].bytes) -ceq
+                [Convert]::ToBase64String([byte[]]$script:CommittedBytes['scripts\bus.ps1'])
+        )
+    } finally {
+        Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('config', '--unset', 'core.worktree') | Out-Null
+    }
+
+    Invoke-TestGit -Repository $script:FixtureRepository -Arguments @(
+        'config', 'include.path', $hostileConfig.Replace('\', '/')
+    ) | Out-Null
+    try {
+        $includedConfigOutput = Join-Path $script:TestRoot 'included-config.zip'
+        $includedConfigRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', $validCommit,
+            '-OutputPath', $includedConfigOutput
+        )
+        $includedConfigReceipt = Read-TestReceipt -Result $includedConfigRun -Success $false
+        Assert-True 'repository-local external config includes are rejected before object resolution' (
+            $includedConfigReceipt.code -ceq 'repository_config_includes_forbidden' -and
+            -not (Test-Path -LiteralPath $includedConfigOutput)
+        )
+    } finally {
+        Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('config', '--unset', 'include.path') | Out-Null
+    }
+
+    $replacementBlobPath = Join-Path $script:TestRoot 'replacement-bus.ps1'
+    [IO.File]::WriteAllText($replacementBlobPath, "replacement-ref payload`n", (New-Object Text.UTF8Encoding($false)))
+    $replacementBlob = Invoke-TestGit -Repository $script:FixtureRepository -Arguments @(
+        'hash-object', '-w', $replacementBlobPath
+    )
+    $replacementCommit = New-TestPlumbingCommit `
+        -BaseCommit $validCommit `
+        -IndexArguments @(
+            'update-index', '--cacheinfo', ('100644,' + $replacementBlob + ',scripts/bus.ps1')
+        ) `
+        -Message 'replacement commit'
+    Invoke-TestGit -Repository $script:FixtureRepository -Arguments @(
+        'replace', $validCommit, $replacementCommit
+    ) | Out-Null
+    try {
+        $replacementOutput = Join-Path $script:TestRoot 'replacement-ref.zip'
+        $replacementRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', $validCommit,
+            '-OutputPath', $replacementOutput
+        )
+        $replacementReceipt = Read-TestReceipt -Result $replacementRun -Success $false
+        Assert-True 'replacement refs are rejected before a substituted commit can be packaged' (
+            $replacementReceipt.code -ceq 'repository_replace_refs_forbidden' -and
+            -not (Test-Path -LiteralPath $replacementOutput)
+        )
+    } finally {
+        Invoke-TestGit -Repository $script:FixtureRepository -Arguments @('replace', '-d', $validCommit) | Out-Null
+    }
+
+    $alternatesPath = Join-Path $script:FixtureRepository '.git\objects\info\alternates'
+    [IO.File]::WriteAllText(
+        $alternatesPath,
+        ([string]$foreignRepository.object_directory).Replace('\', '/') + "`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    try {
+        $alternatesOutput = Join-Path $script:TestRoot 'repository-alternates.zip'
+        $alternatesRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+            '-RepositoryPath', $script:FixtureRepository,
+            '-CommitId', $validCommit,
+            '-OutputPath', $alternatesOutput
+        )
+        $alternatesReceipt = Read-TestReceipt -Result $alternatesRun -Success $false
+        Assert-True 'repository object alternates are rejected before Git object resolution' (
+            $alternatesReceipt.code -ceq 'repository_alternates_forbidden' -and
+            -not (Test-Path -LiteralPath $alternatesOutput)
+        )
+    } finally {
+        Remove-Item -LiteralPath $alternatesPath -Force -ErrorAction Stop
+    }
+
+    $junctionTarget = Join-Path $script:TestRoot 'junction-target'
+    New-Item -ItemType Directory -Path $junctionTarget | Out-Null
+    $repositoryJunction = New-TestJunction `
+        -Path (Join-Path $script:TestRoot 'repository-junction') `
+        -Target $junctionTarget
+    $junctionRepositoryOutput = Join-Path $script:TestRoot 'repository-junction-result.zip'
+    $junctionRepositoryRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+        '-RepositoryPath', (Join-Path $repositoryJunction 'declared-repository'),
+        '-CommitId', $validCommit,
+        '-OutputPath', $junctionRepositoryOutput
+    )
+    $junctionRepositoryReceipt = Read-TestReceipt -Result $junctionRepositoryRun -Success $false
+    Assert-True 'repository junction ancestors are rejected before traversal' (
+        $junctionRepositoryReceipt.code -ceq 'repository_path_reparse_point' -and
+        -not (Test-Path -LiteralPath $junctionRepositoryOutput)
+    )
+
+    $outputJunction = New-TestJunction `
+        -Path (Join-Path $script:TestRoot 'output-junction') `
+        -Target $junctionTarget
+    $junctionOutputPath = Join-Path $outputJunction 'release.zip'
+    $junctionOutputRun = Invoke-TestPowerShellFile -FilePath $script:Packager -ArgumentList @(
+        '-RepositoryPath', $script:FixtureRepository,
+        '-CommitId', $validCommit,
+        '-OutputPath', $junctionOutputPath
+    )
+    $junctionOutputReceipt = Read-TestReceipt -Result $junctionOutputRun -Success $false
+    Assert-True 'output junction ancestors are rejected before traversal or file creation' (
+        $junctionOutputReceipt.code -ceq 'output_path_reparse_point' -and
+        -not (Test-Path -LiteralPath (Join-Path $junctionTarget 'release.zip'))
+    )
+
     $sentinelArchive = Join-Path $script:TestRoot 'sentinel.zip'
     [byte[]]$sentinel = [Text.Encoding]::UTF8.GetBytes('do-not-overwrite')
     [IO.File]::WriteAllBytes($sentinelArchive, $sentinel)
@@ -607,6 +839,11 @@ try {
         $packagerText -notmatch '(?i)Get-Content\s+.*OrderSupervisor|ReadAllBytes\s*\(.*relativePath'
     )
 } finally {
+    foreach ($junctionPath in @($script:TestJunctions.ToArray())) {
+        if (Test-Path -LiteralPath $junctionPath) {
+            Remove-Item -LiteralPath $junctionPath -Force -ErrorAction SilentlyContinue
+        }
+    }
     if (-not $KeepArtifacts -and [IO.Directory]::Exists($script:TestRoot)) {
         $resolvedTestRoot = [IO.Path]::GetFullPath($script:TestRoot).TrimEnd('\', '/')
         $tempPrefix = $script:SystemTemp + [IO.Path]::DirectorySeparatorChar
