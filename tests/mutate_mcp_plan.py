@@ -101,6 +101,31 @@ MUTATIONS: list[dict[str, str]] = [
         "new": "**acceptor** — **claude-code-cli authorises.** An agent, in the",
         "expect": "client_org_gate_is_not_self_authorised",
     },
+    # ── The three chatgpt-codex-desktop-01a0839e reproduced against 5c3870f ──
+    # All three left both suites green. Guarding who signs while leaving what
+    # counts as PROOF unguarded is not a gate.
+    {
+        "name": "G9 accepts an agent's note with no org named",
+        "old": "- **evidence** — a board row **from Mr. Salam's own channel**, naming the",
+        "new": "- **evidence** — a note from claude-code-cli saying it is fine, naming the",
+        "expect": "demands_a_named_org_from_a_person",
+    },
+    {
+        "name": "a scan of unknown cost is allowed to start",
+        "old": "**or when its cost is not yet known**",
+        "new": "(cost permitting)",
+        "expect": "unknown_cost_is_not_permission",
+    },
+    {
+        # This one needed its own fix first: the `unlocks` bullet carried prose
+        # mentioning other gates, so a partial mutation left a gate name behind
+        # and the guard skipped. The field is a bare value now and the
+        # explanation sits outside it.
+        "name": "a gate claims to unlock nothing while another requires it",
+        "old": "- **unlocks** — G9.",
+        "new": "- **unlocks** — nothing.",
+        "expect": "claims_to_gate_nothing_while_another_requires_it",
+    },
 ]
 
 # BYTES, not text. read_text/write_text translate line endings, so on a CRLF

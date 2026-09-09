@@ -228,6 +228,87 @@ class McpPlanConsistency(unittest.TestCase):
                 f"{name} is too thin to fail on: {body.strip()[:80]!r}",
             )
 
+    def test_the_client_org_gate_demands_a_named_org_from_a_person(self) -> None:
+        """The acceptor line was guarded and the EVIDENCE line was not.
+
+        chatgpt-codex-desktop-01a0839e replaced G9's evidence with "a note on the
+        board from claude-code-cli saying it is fine" — no org named, an agent as
+        the source — and both suites stayed green. Guarding who signs while
+        leaving what counts as proof unguarded is not a gate.
+        """
+        block = re.split(r"^### G9[^\n]*$", self.text, flags=re.MULTILINE)[-1]
+        evidence = next(
+            (ln for ln in block.splitlines() if ln.strip().startswith("- **evidence**")),
+            None,
+        )
+        self.assertIsNotNone(evidence, "G9 states no evidence requirement")
+        # Take the whole bullet, which may wrap over several lines.
+        start = block.index(evidence)
+        nxt = block.find("\n- **", start + 1)
+        evidence_text = block[start : nxt if nxt > 0 else len(block)].lower()
+
+        self.assertIn(
+            "salam", evidence_text,
+            "G9's evidence does not require the authorisation to come from Mr. Salam.",
+        )
+        self.assertIn(
+            "org identifier", evidence_text,
+            "G9's evidence does not require the exact org identifier. An authorisation "
+            "that does not say which org authorises every org.",
+        )
+        for word in ("claude", "codex", "vm-"):
+            self.assertNotIn(
+                word, evidence_text,
+                f"G9's evidence names an agent ({word}) as a source of authorisation.",
+            )
+
+    def test_unknown_cost_is_not_permission(self) -> None:
+        """G2 blocked a scan whose cost *exceeded* the budget, and said nothing
+        about one whose cost was unknown — so an unmeasured scan ran."""
+        block = re.split(r"^### G2[^\n]*$", self.text, flags=re.MULTILINE)[-1]
+        block = re.split(r"^### G3", block, flags=re.MULTILINE)[0].lower()
+        self.assertIn(
+            "not yet known", block,
+            "G2 does not block a scan of unknown cost. Unknown is not permission.",
+        )
+
+    def test_no_gate_claims_to_gate_nothing_while_another_requires_it(self) -> None:
+        """G8 said "it gates nothing and nothing gates it" while G9 listed
+        "G8 shipped" among its prerequisites, two blocks below. A document that
+        contradicts itself about its own ordering cannot be followed."""
+        gates = dict(
+            zip(
+                re.split(r"^### (G\d+)[^\n]*$", self.text, flags=re.MULTILINE)[1::2],
+                re.split(r"^### (G\d+)[^\n]*$", self.text, flags=re.MULTILINE)[2::2],
+            )
+        )
+        def field(body: str, label: str) -> str:
+            """One bullet's text, which may wrap. Scoped deliberately: the first
+            version of this test searched the whole block and fired on G8's own
+            QUOTATION of the wording it had corrected. A quotation is not a
+            claim — the same trap as grepping a document for a phrase it only
+            cites in order to withdraw it."""
+            m = re.search(rf"^- \*\*{re.escape(label)}\*\*(.*?)(?=^- \*\*|\Z)",
+                          body, flags=re.MULTILINE | re.DOTALL)
+            return (m.group(1) if m else "").lower()
+
+        # Ask what the field NAMES, not which words it contains. Searching for
+        # "nothing" fired on a corrected bullet that used the word while
+        # explaining the correction — twice now I have written a check that
+        # matched prose about a claim instead of the claim.
+        for name, body in gates.items():
+            unlocks = field(body, "unlocks")
+            if re.search(r"\bg\d+\b", unlocks):
+                continue  # it names a dependent, so there is nothing to contradict
+            for other, other_body in gates.items():
+                if other == name:
+                    continue
+                self.assertNotIn(
+                    name.lower(), field(other_body, "prerequisite"),
+                    f"{name}'s `unlocks` names no gate, but {other} lists {name} as a "
+                    "prerequisite. One of the two is wrong about the ordering.",
+                )
+
     def test_the_client_org_gate_pins_its_prerequisites_by_name(self) -> None:
         """"mostly done" must not pass for done. G9 opens a real customer's org,
         so its dependencies are named individually rather than as a range."""

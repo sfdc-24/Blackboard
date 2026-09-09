@@ -315,8 +315,12 @@ can be wrong is wrong before a client is exposed to it.
 
 ### G1 · capability spike
 
-- **prerequisite** — a Developer Edition org we control, and §0's platform
-  claims marked provisional until this runs.
+- **prerequisite** — a Developer Edition org we control **and a separate,
+  human authorisation to read it** (see below). Note which section is
+  provisional: **§0 is the verified part**, checked against Salesforce's own
+  documentation with sources, and it is not in question here. **§1's
+  capability table is the unqualified one** and is what this gate confirms
+  or strikes. The previous version had these the wrong way round.
 - **artefact** — `docs/mcp-capability-matrix.md`: exact server ids, endpoints,
   version and maturity for Hosted and DX, **measured, not quoted**.
 - **owner** — claude-code-cli.
@@ -334,8 +338,10 @@ can be wrong is wrong before a client is exposed to it.
 - **owner** — claude-code-cli. **acceptor** — as G1.
 - **evidence** — before/after `/limits` readings around a full scan, or a
   written demonstration that `/limits` is unreachable over MCP.
-- **fail-closed** — a scan that would exceed the configured share of remaining
-  quota **does not start**, and says so. Paging and retry budgets are stated as
+- **fail-closed** — a scan does not start when it *would exceed* the
+  configured share of remaining quota **or when its cost is not yet known**.
+  Unknown is not permission: the previous wording blocked only the measured
+  excess, so an unmeasured scan ran. Paging and retry budgets are stated as
   numbers or the gate fails.
 - **unlocks** — G9's spend argument.
 
@@ -399,7 +405,8 @@ can be wrong is wrong before a client is exposed to it.
 
 ### G7 · sanitizer
 
-- **prerequisite** — G5's public-export schema.
+- **prerequisite** — G5's public-export schema **and G6's catalogue**: a
+  sanitizer cannot know what to redact until the fields are defined.
 - **artefact** — `docs/mcp-sanitizer.md` and the tool.
 - **owner** — claude-code-cli builds. **acceptor** — **Mr. Salam approves the
   exact bytes** of anything that becomes public.
@@ -421,8 +428,12 @@ can be wrong is wrong before a client is exposed to it.
   the live page body** showing the corrected wording and no forbidden claim.
 - **fail-closed** — if the live read-back still shows the old wording, the gate
   is not passed however green CI was.
-- **unlocks** — nothing. **It gates nothing and nothing gates it**: it corrects
-  a claim a visitor can read today, so it is scheduled first.
+- **unlocks** — G9.
+
+*G8 has no prerequisites and one dependent, and that asymmetry is the point:
+it corrects a claim a visitor can read today, so nothing may hold it up. An
+earlier version wrote "it gates nothing and nothing gates it", which
+contradicted G9's own prerequisite list two blocks below.*
 
 ### G9 · first client org
 
@@ -431,7 +442,10 @@ can be wrong is wrong before a client is exposed to it.
 - **artefact** — none. This is an authorisation, not a document.
 - **owner** — n/a. **acceptor** — **Mr. Salam authorises.** A person, in the
   open. Not an agent, and not this document.
-- **evidence** — his authorisation recorded on the board, naming the org.
+- **evidence** — a board row **from Mr. Salam's own channel**, naming the
+  **exact org identifier** to be read, its scope, and an expiry. An agent's
+  note that it is fine is not evidence, and neither is an authorisation
+  that does not say which org.
 - **fail-closed** — no authorisation, no scan. Silence is not a yes.
 - **unlocks** — the first scan of an org we do not own.
 
