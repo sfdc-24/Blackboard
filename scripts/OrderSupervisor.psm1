@@ -226,7 +226,11 @@ function ConvertTo-UtcCursorTimestamp {
 function Test-KnownTrailingCellRow {
     param([Parameter(Mandatory = $true)][object[]]$Cells)
 
-    if ($Cells.Count -ne 12) { return $false }
+    # Match the stable A:J identity independently of whether Google Sheets
+    # projects the row at the canonical width or pads it to the A:L used
+    # range. This lets the caller enforce that the historical identity occurs
+    # exactly once before any row is projected or admitted.
+    if ($Cells.Count -ne 10 -and $Cells.Count -ne 12) { return $false }
     $stamp = ConvertTo-UtcCursorTimestamp -Timestamp ([string]$Cells[1])
     if (-not $stamp) { return $false }
 
@@ -345,6 +349,12 @@ function Get-BoardRowsFromJson {
             })
             continue
         }
+        if (Test-KnownTrailingCellRow -Cells $cells) {
+            $knownTrailingRowCount++
+            if ($knownTrailingRowCount -ne 1) {
+                throw 'board_trailing_cells_invalid'
+            }
+        }
         if ($returnedCellCount -eq 12) {
             $hasNonemptyTrailingCell = $false
             for ($column = 10; $column -lt $returnedCellCount; $column++) {
@@ -358,10 +368,6 @@ function Get-BoardRowsFromJson {
                 # exception. Any identity drift or second occurrence fails the
                 # whole read before admission. K:L values are never retained.
                 if (-not (Test-KnownTrailingCellRow -Cells $cells)) {
-                    throw 'board_trailing_cells_invalid'
-                }
-                $knownTrailingRowCount++
-                if ($knownTrailingRowCount -ne 1) {
                     throw 'board_trailing_cells_invalid'
                 }
                 $result.Add([pscustomobject]@{

@@ -110,6 +110,19 @@ function ConvertTo-WideBoardJson {
     return ([ordered]@{ ok = $true; rows = $nested.ToArray() } | ConvertTo-Json -Depth 8 -Compress)
 }
 
+function ConvertTo-MixedWidthBoardJson {
+    param([object[]]$CellRows)
+
+    $header = @(
+        'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
+        'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist', '', ''
+    )
+    $nested = New-Object System.Collections.Generic.List[object]
+    $nested.Add($header)
+    foreach ($cells in @($CellRows)) { $nested.Add(@($cells)) }
+    return ([ordered]@{ ok = $true; rows = $nested.ToArray() } | ConvertTo-Json -Depth 8 -Compress)
+}
+
 $wideSpec = New-Row -Id 'ORDER-WIDE' -Timestamp '2026-09-06T15:00:00.000Z'
 $wideRows = @(Get-BoardRowsFromJson -Json (ConvertTo-WideBoardJson -DataRows @($wideSpec)))
 Assert-True 'blank K:L used-range padding is projected to canonical A:J' (
@@ -161,6 +174,29 @@ Assert-True 'known historical K:L values are absent from returned row objects' (
     -not $serializedTrailingRows.Contains($knownTrailingCanaryK) -and
     -not $serializedTrailingRows.Contains($knownTrailingCanaryL)
 )
+
+$knownTrailingPopulatedCells = @($knownTrailingSpec.Cells) + @($knownTrailingCanaryK, $knownTrailingCanaryL)
+$knownTrailingBlankWideCells = @($knownTrailingSpec.Cells) + @('', '')
+$knownTrailingCanonicalCells = @($knownTrailingSpec.Cells)
+$mixedKnownIdentityCases = @(
+    [pscustomobject]@{
+        name = 'populated then blank-wide known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingPopulatedCells, $knownTrailingBlankWideCells)
+    },
+    [pscustomobject]@{
+        name = 'blank-wide then populated known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingBlankWideCells, $knownTrailingPopulatedCells)
+    },
+    [pscustomobject]@{
+        name = 'populated then canonical known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingPopulatedCells, $knownTrailingCanonicalCells)
+    }
+)
+foreach ($mixedKnownIdentityCase in $mixedKnownIdentityCases) {
+    Assert-Throws ('mixed-width duplicate fails closed: ' + $mixedKnownIdentityCase.name) {
+        Get-BoardRowsFromJson -Json $mixedKnownIdentityCase.json
+    } 'board_trailing_cells_invalid'
+}
 
 $elevenCellCanary = 'ELEVEN_CELL_CANARY'
 $elevenCellSpec = [pscustomobject]@{ Cells = @($wideSpec.Cells[0..8]); TrailingK = $elevenCellCanary; TrailingL = '' }
@@ -1242,6 +1278,74 @@ try {
         $duplicateTrailingSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
         $duplicateTrailingSaved.cursor.row_id -ceq 'cursor-before-duplicate-trailing'
     )
+
+    $mixedKnownEntrypointCases = @(
+        [pscustomobject]@{
+            name = 'populated-then-blank-wide'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingPopulatedCells,
+                $knownTrailingBlankWideCells,
+                (@($knownTrailingOrder.Cells) + @('', ''))
+            )
+        },
+        [pscustomobject]@{
+            name = 'blank-wide-then-populated'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingBlankWideCells,
+                $knownTrailingPopulatedCells,
+                (@($knownTrailingOrder.Cells) + @('', ''))
+            )
+        },
+        [pscustomobject]@{
+            name = 'populated-then-canonical'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingPopulatedCells,
+                $knownTrailingCanonicalCells,
+                @($knownTrailingOrder.Cells)
+            )
+        }
+    )
+    foreach ($mixedKnownEntrypointCase in $mixedKnownEntrypointCases) {
+        $caseRoot = Join-Path $tempRoot ('mixed-known-' + $mixedKnownEntrypointCase.name)
+        New-Item -ItemType Directory -Path $caseRoot | Out-Null
+        $fixturePath = Join-Path $caseRoot 'board.json'
+        $caseStatePath = Join-Path $caseRoot 'state.json'
+        $caseLogPath = Join-Path $caseRoot 'events.jsonl'
+        [IO.File]::WriteAllText($fixturePath, $mixedKnownEntrypointCase.json, (New-Object Text.UTF8Encoding($false)))
+        $caseState = New-OrderState -Mode Observe
+        $caseState.initialized = $true
+        $caseState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
+        $caseState.cursor.row_id = 'cursor-before-mixed-known'
+        Save-OrderState -Path $caseStatePath -State $caseState
+        $caseOutput = @(& powershell.exe `
+            -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $RunnerPath `
+            -Mode Observe `
+            -AllowedSourcesCsv codex `
+            -BoardFixturePath $fixturePath `
+            -StatePath $caseStatePath `
+            -LogPath $caseLogPath `
+            -ReplayHistorical)
+        $caseExitCode = $LASTEXITCODE
+        $caseResultLine = @($caseOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+        $caseResult = if ($caseResultLine.Count -eq 1) { $caseResultLine[0] | ConvertFrom-Json } else { $null }
+        $caseSaved = Read-OrderState -Path $caseStatePath -Mode Observe
+        $caseEvents = @([IO.File]::ReadAllLines($caseLogPath, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json })
+        Assert-True ('runner fails closed before admission: ' + $mixedKnownEntrypointCase.name) (
+            $caseExitCode -eq 20 -and
+            $caseResult.status -ceq 'error' -and
+            $caseResult.error_code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+            $caseSaved.error.code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+            $caseSaved.counts.selected -eq 0 -and
+            @($caseEvents | Where-Object { $_.event -in @('board_schema_incident', 'candidate_observed', 'claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+        )
+        Assert-True ('mixed duplicate preserves cursor: ' + $mixedKnownEntrypointCase.name) (
+            $caseSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
+            $caseSaved.cursor.row_id -ceq 'cursor-before-mixed-known'
+        )
+    }
 
     $duplicateFixturePath = Join-Path $tempRoot 'duplicate-board.json'
     $duplicateStatePath = Join-Path $tempRoot 'duplicate-state.json'
