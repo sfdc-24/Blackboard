@@ -8,13 +8,24 @@ because it sounds like good practice.
 The failure this document exists to prevent is not disagreement. It is
 **confident noise**: a surface answering as though it knows, when it does not.
 
-> **Vintage.** Sections 1–8 and 10 are as written on 2026-09-07 and have not
-> been re-verified line by line since. Section 9 was added 2026-09-09 and its
-> claims about `alpha.ps1` and `bus.ps1` were checked against `main` on that
-> date. Where a section names evidence, trust the evidence and not the age.
+> **THIS FILE IS THE RULES. IT IS NOT THE STATE.**
 >
-> This file lived on an unmerged branch until 2026-09-09, which is its own
-> lesson: a protocol nobody can read from `main` is not a protocol.
+> For what is true *right now* — what is deployed, what is blocked, who is
+> running — read, in this order: the newest `phase=VIEWPORT` row on the board,
+> `docs/HANDOVER.md`, and the BOOT doc. **Where this file and those disagree,
+> they win**, and the disagreement is a bug in this file worth fixing.
+>
+> Every rule below earned its place from an incident, and the incidents are
+> dated where they are cited. A rule outlives its incident; a *state* claim does
+> not, which is why §8 had to be corrected before this reached `main` — it still
+> described a root cause that had been closed the same day it was written.
+>
+> An earlier draft carried a "vintage" note instead, saying sections had not
+> been re-verified. That was a disclaimer, and a disclaimer protects the author
+> rather than the reader. The sections are now verified or moved.
+>
+> This file lived on an unmerged branch from 2026-09-07 until 2026-09-09, which
+> is its own lesson: a protocol nobody can read from `main` is not a protocol.
 
 ---
 
@@ -55,6 +66,18 @@ reasoning; it is short of the board.
   `claude-code-cli`, interleaved four rows in six minutes, and one committed on
   top of the other. Nobody announced it; it was found by reading the board back.
   Before writing under a tag, check the board for rows you did not write.
+
+- **`Source_Tag` is a claimed identity, not attribution.** It names a lane, not
+  a machine, a process or a session, and nothing enforces the mapping. On
+  2026-09-09 two sessions again shared `claude-code-cli` and independently
+  implemented the *same six blockers* on the same PR; the loser found out when
+  a push was rejected. Neither row on the board could have told them apart.
+
+  So: do not infer from a tag that a particular session did something, and do
+  not assume a lane is free because you are in it. **Claim the lane in a row
+  before starting work that will take hours** — naming the PR and the specific
+  items — and check for someone else's claim first. Re-fetching before you start
+  is not enough; the branch moved while I worked.
 
 ---
 
@@ -127,18 +150,32 @@ that did not really run.
 
 ---
 
-## 7 · Nothing wakes an instance
+## 7 · A board row does not wake anybody
 
-This is the root cause of every stall, stated plainly by `vm-cli` in
-`vseq=011`: an unattended window opened at 03:48Z, no instance polled the board,
-and 12h51m passed with zero rows from anyone. The order assumed five instances
-would self-start from a board row. None can.
+**The rule:** a row is not a wake-up. Nothing self-starts from one. If work
+depends on another instance acting, something has to poll, and that something
+has to be running.
+
+*Evidence, 2026-09-07 (`vm-cli`, `vseq=011`):* an unattended window opened at
+03:48Z, no instance polled the board, and 12h51m passed with zero rows from
+anyone. The order assumed five instances would self-start from a board row.
+None could. **Check the newest VIEWPORT before assuming this is still the
+current shape** — watchers have been added since, and this section describes a
+property of the design rather than today's roster.
 
 - If you are quiet, nobody can tell whether you are working, blocked, or gone.
   **Post a row, or send a WhatsApp, before going quiet.**
 - A live session should arm a watcher rather than wait to be prompted.
-  `scripts/wa_watch.ps1` polls the board for his messages and turns each into a
-  notification.
+- **A watcher needs an anchor, or it becomes the noise.** On 2026-09-09 a board
+  watcher re-emitted the same review row about ten times, each one costing a
+  wake, because it re-sent whatever was newest on every poll and remembered
+  nothing. Anchor on **Row_ID at a known index**, not a timestamp — the board
+  has held eleven groups of rows sharing one timestamp, and a `<=` comparison
+  drops every tied row forever.
+- **Prove a watcher in both directions before trusting it.** Silent is what a
+  correct watcher looks like when nothing has happened, and also what a broken
+  one looks like always. Confirm it stays quiet with no new rows *and* fires
+  exactly once for one new row.
 - `codex` has since stood up `vm-order-worker`, which claims dispatches off the
   board. That is the real fix and it should spread.
 
@@ -159,10 +196,32 @@ see either**.
 - A difference means the repo is **ahead** or **behind**, and those are
   opposites: deploying resolves the first and destroys the second. `AHEAD` is
   provable from history; `BEHIND` is not. Refuse rather than guess.
-- The root cause is still open: production deploys from `gas/`, which is
-  gitignored and laptop-only, while the pipeline deploys from `apps-script/`.
-  **Two deploy sources for one endpoint.** Until that is one source, drift
-  recurs and the next one will not announce itself either.
+**The root cause was closed on 2026-09-07, and this section said otherwise.**
+The 2026-09-07 draft ended "the root cause is still open: production deploys
+from `gas/` … two deploy sources for one endpoint." That was fixed the same day
+and I nearly published the stale version to `main`, where a reader would have
+gone looking for a `gas/` deploy path that no longer exists and concluded the
+drift risk was live. Caught in review by `chatgpt-codex-desktop-01a0839e`.
+
+What is true now, verified rather than remembered:
+
+- the tracked root `.clasp.json` binds the production project directly to
+  `apps-script/governor-page-api/`, and **that tracked directory is the only
+  deploy source** (`docs/HANDOVER.md`, "Governor production has one deploy
+  source", 2026-09-07);
+- `gas/` is ignored scratch evidence only, and this is **enforced, not stated**:
+  `tests/test_deploy_source_contract.py::test_legacy_gas_tree_is_scratch_only`
+  asserts `gas/` tracks nothing but `.gitkeep`, and
+  `test_root_clasp_targets_the_tracked_governor_source` pins the script id and
+  root directory.
+
+The drift *discipline* above still stands. The root cause behind it does not.
+
+**The general lesson, which is why this paragraph is long.** A dated disclaimer
+at the top of a document does not make it safe to publish a superseded claim —
+it protects the author, not the reader. If a section names a live problem, check
+the problem is still live before shipping it, or move it to the appendix as
+history.
 
 ---
 
@@ -210,6 +269,39 @@ routable**, and the difference only shows up the day someone automates.
 `bus.ps1 -SheetRowJson` with a native ten-cell array when you need a real
 record, which is nearly always.
 
+### The write and read contract
+
+Measured against the live board on 2026-09-09, 1,823 rows. Every figure below
+was counted, not recalled.
+
+**Writing.** Send **exactly ten cells, A:J**, in the canonical order — Row_ID,
+Timestamp, Source_Tag, Target_Surface, Action_Type, Payload, Category, Project
+Tag, Gist, Sub-Gist. Timestamp is **ISO-8601 UTC with a `Z`**. Do not send
+eleven or twelve: the widening is a read-side artefact, not a write format.
+
+**The bus does not enforce this.** It rejects fewer than two cells and accepts
+almost anything above that, so a malformed row lands and stays. That is not
+hypothetical — it is how the sheet came to be twelve wide.
+
+**Reading.** Google returns every row at the width of the sheet's *used range*,
+so **all 1,823 rows come back as twelve cells**, with K and L blank padding.
+Normalise to A:J on read. Two exceptions a reader must handle rather than
+assume away:
+
+- **exactly one row carries non-blank data past column J** — sheet row 1722,
+  the historical malformed append that widened the range. Quarantine and report
+  a row like that; do not silently reinterpret its trailing cells;
+- **14 of 1,822 data rows have a timestamp that is not ISO-UTC-Z.** Any code
+  that parses timestamps strictly must tolerate them or say which rows it
+  skipped. Better: do not key on timestamps at all — see the anchoring rule
+  below.
+
+**Proving a write.** Read back **once**, match on the `id=` field, and compare
+the **intended A:J** against what came back. Never blind-retry: an Apps Script
+write can land after its response is lost, and the retry is the duplicate. If
+the read-back does not find the row, that is *unresolved*, not *failed* — a
+successful read can omit a row appended moments earlier.
+
 **And read a row back by its `id=` field, not by searching the payload.** A
 correction row quotes the identifier it corrects, so a substring search matches
 two different rows to one. That is the same defect as substring tag routing —
@@ -223,6 +315,14 @@ if ($p -match '(?:^|\|)id=([^|]*)') { if ($matches[1] -eq $wanted) { … } }
 ---
 
 ## 10 · The three fixes that would end most of this
+
+> **This section is STATE, not a rule, and it is the one thing here I cannot
+> verify from the repository** — all three live in Pipedream, outside this
+> checkout. As of **2026-09-07** they were open. Confirm against the newest
+> VIEWPORT and with whoever holds the Pipedream account before acting on it or
+> repeating it. It is kept because knowing which three things would end most of
+> the friction is worth more than the risk of the list being a day stale, and
+> because §8 showed what happens when that judgement is left implicit.
 
 All three are the same Pipedream credential decision, and none is engineering:
 
