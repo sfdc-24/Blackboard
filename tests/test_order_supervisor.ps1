@@ -84,6 +84,163 @@ function To-ParsedRows {
     return @(Get-BoardRowsFromJson -Json (ConvertTo-BoardJson -DataRows $DataRows))
 }
 
+function ConvertTo-WideBoardJson {
+    param(
+        [object[]]$DataRows,
+        [string]$HeaderK = '',
+        [string]$HeaderL = '',
+        [string]$RowK = '',
+        [string]$RowL = ''
+    )
+    $header = @(
+        'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
+        'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist', $HeaderK, $HeaderL
+    )
+    $nested = New-Object System.Collections.Generic.List[object]
+    $nested.Add($header)
+    foreach ($rowSpec in @($DataRows)) {
+        $rowKValue = $RowK
+        $rowLValue = $RowL
+        $rowKProperty = $rowSpec.PSObject.Properties['TrailingK']
+        $rowLProperty = $rowSpec.PSObject.Properties['TrailingL']
+        if ($null -ne $rowKProperty) { $rowKValue = [string]$rowKProperty.Value }
+        if ($null -ne $rowLProperty) { $rowLValue = [string]$rowLProperty.Value }
+        $nested.Add(@($rowSpec.Cells) + @($rowKValue, $rowLValue))
+    }
+    return ([ordered]@{ ok = $true; rows = $nested.ToArray() } | ConvertTo-Json -Depth 8 -Compress)
+}
+
+function ConvertTo-MixedWidthBoardJson {
+    param([object[]]$CellRows)
+
+    $header = @(
+        'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
+        'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist', '', ''
+    )
+    $nested = New-Object System.Collections.Generic.List[object]
+    $nested.Add($header)
+    foreach ($cells in @($CellRows)) { $nested.Add(@($cells)) }
+    return ([ordered]@{ ok = $true; rows = $nested.ToArray() } | ConvertTo-Json -Depth 8 -Compress)
+}
+
+$wideSpec = New-Row -Id 'ORDER-WIDE' -Timestamp '2026-09-06T15:00:00.000Z'
+$wideRows = @(Get-BoardRowsFromJson -Json (ConvertTo-WideBoardJson -DataRows @($wideSpec)))
+Assert-True 'blank K:L used-range padding is projected to canonical A:J' (
+    $wideRows.Count -eq 1 -and
+    [bool]$wideRows[0].valid -and
+    @($wideRows[0].cells).Count -eq 10 -and
+    [string]$wideRows[0].row_id -ceq 'ORDER-WIDE'
+)
+$wideSelection = Get-OrderSelection -Rows $wideRows -Cursor $null -AllowedSources @('chat-mobile', 'codex')
+Assert-True 'blank K:L padding preserves normal ORDER admission' (
+    $wideSelection.selected -and
+    [string]$wideSelection.selected.assessment.work_id -ceq 'ORDER-WIDE' -and
+    [int]$wideSelection.malformed_count -eq 0 -and
+    [int]$wideSelection.known_trailing_row_count -eq 0
+)
+
+$knownTrailingCanaryK = 'KNOWN_TRAILING_K_CANARY'
+$knownTrailingCanaryL = 'KNOWN_TRAILING_L_CANARY'
+$knownTrailingSpec = [pscustomobject]@{
+    Cells = @(
+        '24bf9422-bb33-4943-b38a-77e2f023816d',
+        '2026-09-09T03:13:51.000Z',
+        'chatgpt-codex-desktop-01a0839e',
+        'claude-code-cli,vm-claude-code-cli,ALL',
+        'RESULT',
+        'historical compatibility fixture',
+        'DONE',
+        'Blackboard',
+        'known historical row',
+        'compatibility fixture'
+    )
+    TrailingK = $knownTrailingCanaryK
+    TrailingL = $knownTrailingCanaryL
+}
+$trailingRows = @(Get-BoardRowsFromJson -Json (ConvertTo-WideBoardJson -DataRows @($knownTrailingSpec)))
+$trailingSelection = Get-OrderSelection -Rows $trailingRows -Cursor $null -AllowedSources @('chat-mobile', 'codex')
+Assert-True 'the one known historical K:L row is ignored without retaining content' (
+    $trailingRows.Count -eq 1 -and
+    -not [bool]$trailingRows[0].valid -and
+    [string]$trailingRows[0].reason -ceq 'known_trailing_cells' -and
+    [int]$trailingRows[0].cell_count -eq 12 -and
+    @($trailingRows[0].cells).Count -eq 0 -and
+    -not $trailingSelection.selected -and
+    [int]$trailingSelection.malformed_count -eq 1 -and
+    [int]$trailingSelection.known_trailing_row_count -eq 1
+)
+$serializedTrailingRows = $trailingRows | ConvertTo-Json -Depth 8 -Compress
+Assert-True 'known historical K:L values are absent from returned row objects' (
+    -not $serializedTrailingRows.Contains($knownTrailingCanaryK) -and
+    -not $serializedTrailingRows.Contains($knownTrailingCanaryL)
+)
+
+$knownTrailingPopulatedCells = @($knownTrailingSpec.Cells) + @($knownTrailingCanaryK, $knownTrailingCanaryL)
+$knownTrailingBlankWideCells = @($knownTrailingSpec.Cells) + @('', '')
+$knownTrailingCanonicalCells = @($knownTrailingSpec.Cells)
+$mixedKnownIdentityCases = @(
+    [pscustomobject]@{
+        name = 'populated then blank-wide known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingPopulatedCells, $knownTrailingBlankWideCells)
+    },
+    [pscustomobject]@{
+        name = 'blank-wide then populated known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingBlankWideCells, $knownTrailingPopulatedCells)
+    },
+    [pscustomobject]@{
+        name = 'populated then canonical known identity'
+        json = ConvertTo-MixedWidthBoardJson -CellRows @($knownTrailingPopulatedCells, $knownTrailingCanonicalCells)
+    }
+)
+foreach ($mixedKnownIdentityCase in $mixedKnownIdentityCases) {
+    Assert-Throws ('mixed-width duplicate fails closed: ' + $mixedKnownIdentityCase.name) {
+        Get-BoardRowsFromJson -Json $mixedKnownIdentityCase.json
+    } 'board_trailing_cells_invalid'
+}
+
+$elevenCellCanary = 'ELEVEN_CELL_CANARY'
+$elevenCellSpec = [pscustomobject]@{ Cells = @($wideSpec.Cells[0..8]); TrailingK = $elevenCellCanary; TrailingL = '' }
+$elevenCellRows = @(Get-BoardRowsFromJson -Json (ConvertTo-WideBoardJson -DataRows @($elevenCellSpec)))
+$serializedElevenCellRows = $elevenCellRows | ConvertTo-Json -Depth 8 -Compress
+Assert-True '11-cell rows retain only safe structural metadata' (
+    $elevenCellRows.Count -eq 1 -and
+    -not [bool]$elevenCellRows[0].valid -and
+    [string]$elevenCellRows[0].reason -ceq 'cell_count' -and
+    [int]$elevenCellRows[0].cell_count -eq 11 -and
+    @($elevenCellRows[0].cells).Count -eq 0 -and
+    -not $serializedElevenCellRows.Contains($elevenCellCanary)
+)
+
+$thirteenCellCanary = 'THIRTEEN_CELL_CANARY'
+$thirteenCellSpec = [pscustomobject]@{ Cells = @($wideSpec.Cells) + @($thirteenCellCanary); TrailingK = ''; TrailingL = '' }
+$thirteenCellRows = @(Get-BoardRowsFromJson -Json (ConvertTo-WideBoardJson -DataRows @($thirteenCellSpec)))
+$serializedThirteenCellRows = $thirteenCellRows | ConvertTo-Json -Depth 8 -Compress
+Assert-True '13-cell rows retain only safe structural metadata' (
+    $thirteenCellRows.Count -eq 1 -and
+    -not [bool]$thirteenCellRows[0].valid -and
+    [string]$thirteenCellRows[0].reason -ceq 'cell_count' -and
+    [int]$thirteenCellRows[0].cell_count -eq 13 -and
+    @($thirteenCellRows[0].cells).Count -eq 0 -and
+    -not $serializedThirteenCellRows.Contains($thirteenCellCanary)
+)
+
+$identityMismatchCanary = 'IDENTITY_MISMATCH_TRAILING_CANARY'
+Assert-ThrowsFixedNoLeak 'identity-mismatched nonempty K:L row fails the whole read' {
+    Get-BoardRowsFromJson -Json (
+        ConvertTo-WideBoardJson -DataRows @($wideSpec) -RowK $identityMismatchCanary
+    ) | Out-Null
+} 'board_trailing_cells_invalid' $identityMismatchCanary
+Assert-ThrowsFixedNoLeak 'a second occurrence of the known malformed row fails the whole read' {
+    Get-BoardRowsFromJson -Json (
+        ConvertTo-WideBoardJson -DataRows @($knownTrailingSpec, $knownTrailingSpec)
+    ) | Out-Null
+} 'board_trailing_cells_invalid' $knownTrailingCanaryK
+Assert-Throws 'nonempty trailing header remains a schema failure' {
+    Get-BoardRowsFromJson -Json (
+        ConvertTo-WideBoardJson -DataRows @($wideSpec) -HeaderK 'Unexpected-Header'
+    ) | Out-Null
+} 'board_header_invalid'
+
 $rows = To-ParsedRows @(
     (New-Row -Id 'ORDER-B' -Timestamp '2026-09-06T15:01:00.000Z' -Vseq '009'),
     (New-Row -Id 'ORDER-A' -Timestamp '2026-09-06T15:00:00.000Z' -Vseq '009')
@@ -932,6 +1089,263 @@ try {
     Assert-True 'observe state has structured health fields' ($saved.last_poll -and $saved.seen -and $saved.success -and $saved.PSObject.Properties.Name -contains 'error')
     $logText = [IO.File]::ReadAllText($logPath, [Text.Encoding]::UTF8)
     Assert-True 'observe made no claim receipt or result' ($logText -notmatch 'claim_confirmed|receipt_confirmed|result_confirmed')
+
+    $knownTrailingFixturePath = Join-Path $tempRoot 'known-trailing-board.json'
+    $knownTrailingStatePath = Join-Path $tempRoot 'known-trailing-state.json'
+    $knownTrailingLogPath = Join-Path $tempRoot 'known-trailing-events.jsonl'
+    $knownTrailingOrder = New-Row `
+        -Id 'ORDER-AFTER-KNOWN-TRAILING' `
+        -Timestamp '2026-09-09T03:14:00.0000000Z' `
+        -Source 'codex' `
+        -Target 'vm-order-worker'
+    $knownTrailingFixtureJson = ConvertTo-WideBoardJson -DataRows @($knownTrailingSpec, $knownTrailingOrder)
+    [IO.File]::WriteAllText($knownTrailingFixturePath, $knownTrailingFixtureJson, (New-Object Text.UTF8Encoding($false)))
+    $knownTrailingParsedRows = @(Get-BoardRowsFromJson -Json $knownTrailingFixtureJson)
+    $knownTrailingSelection = Get-OrderSelection `
+        -Rows $knownTrailingParsedRows `
+        -Cursor ([pscustomobject]@{ timestamp = '2026-09-09T03:00:00.0000000Z'; row_id = 'cursor-before-known-trailing' }) `
+        -AllowedSources @('codex')
+    Assert-True 'known trailing compatibility keeps advancement on the admitted canonical tuple' (
+        $knownTrailingSelection.selected -and
+        $knownTrailingSelection.selected.assessment.work_id -ceq 'ORDER-AFTER-KNOWN-TRAILING' -and
+        $knownTrailingSelection.advance_cursor.timestamp -ceq '2026-09-09T03:14:00.0000000Z' -and
+        $knownTrailingSelection.advance_cursor.row_id -ceq 'ORDER-AFTER-KNOWN-TRAILING'
+    )
+    $knownTrailingState = New-OrderState -Mode Observe
+    $knownTrailingState.initialized = $true
+    $knownTrailingState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
+    $knownTrailingState.cursor.row_id = 'cursor-before-known-trailing'
+    Save-OrderState -Path $knownTrailingStatePath -State $knownTrailingState
+    $knownTrailingArgs = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $RunnerPath,
+        '-Mode', 'Observe',
+        '-AllowedSourcesCsv', 'codex',
+        '-BoardFixturePath', $knownTrailingFixturePath,
+        '-StatePath', $knownTrailingStatePath,
+        '-LogPath', $knownTrailingLogPath,
+        '-ReplayHistorical'
+    )
+    $knownTrailingOutput = @(& powershell.exe @knownTrailingArgs)
+    $knownTrailingExitCode = $LASTEXITCODE
+    $knownTrailingResultLine = @($knownTrailingOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $knownTrailingResult = if ($knownTrailingResultLine.Count -eq 1) { $knownTrailingResultLine[0] | ConvertFrom-Json } else { $null }
+    $knownTrailingStateText = [IO.File]::ReadAllText($knownTrailingStatePath, [Text.Encoding]::UTF8)
+    $knownTrailingSaved = Read-OrderState -Path $knownTrailingStatePath -Mode Observe
+    $knownTrailingLogText = [IO.File]::ReadAllText($knownTrailingLogPath, [Text.Encoding]::UTF8)
+    $knownTrailingEvents = @([IO.File]::ReadAllLines($knownTrailingLogPath, [Text.Encoding]::UTF8) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ | ConvertFrom-Json })
+    $knownTrailingWarnings = @($knownTrailingEvents | Where-Object event -ceq 'board_schema_incident')
+    $knownTrailingCandidateEvents = @($knownTrailingEvents | Where-Object event -ceq 'candidate_observed')
+    Assert-True 'runner admits a newer ORDER after the exact known malformed row' (
+        $knownTrailingExitCode -eq 0 -and
+        $knownTrailingResult.status -ceq 'candidate_observed' -and
+        $knownTrailingResult.work_id -ceq 'ORDER-AFTER-KNOWN-TRAILING' -and
+        $knownTrailingSaved.seen.row_id -ceq 'ORDER-AFTER-KNOWN-TRAILING' -and
+        $knownTrailingSaved.counts.selected -eq 1 -and
+        $knownTrailingCandidateEvents.Count -eq 1
+    )
+    Assert-True 'runner emits exactly one counts-only known-row schema incident' (
+        $knownTrailingWarnings.Count -eq 1 -and
+        $knownTrailingWarnings[0].level -ceq 'warning' -and
+        $knownTrailingWarnings[0].code -ceq 'BOARD_KNOWN_TRAILING_ROW_IGNORED' -and
+        $knownTrailingWarnings[0].work_id -ceq '' -and
+        $knownTrailingWarnings[0].row_id -ceq '' -and
+        $knownTrailingWarnings[0].message -ceq '' -and
+        @($knownTrailingWarnings[0].details.PSObject.Properties).Count -eq 1 -and
+        [int]$knownTrailingWarnings[0].details.row_count -eq 1
+    )
+    Assert-True 'Observe preserves its persisted cursor while reporting the admitted canonical row' (
+        $knownTrailingSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
+        $knownTrailingSaved.cursor.row_id -ceq 'cursor-before-known-trailing' -and
+        $knownTrailingSaved.success.work_id -ceq 'ORDER-AFTER-KNOWN-TRAILING' -and
+        $knownTrailingSaved.success.row_id -ceq 'ORDER-AFTER-KNOWN-TRAILING'
+    )
+    $knownTrailingAllText = (
+        ($knownTrailingOutput -join [Environment]::NewLine) +
+        $knownTrailingStateText +
+        $knownTrailingLogText +
+        ($knownTrailingParsedRows | ConvertTo-Json -Depth 8 -Compress)
+    )
+    Assert-True 'known K:L canaries never reach runner output log state or returned rows' (
+        -not $knownTrailingAllText.Contains($knownTrailingCanaryK) -and
+        -not $knownTrailingAllText.Contains($knownTrailingCanaryL)
+    )
+    Assert-True 'known-row Observe path has no claim receipt result or invocation side effect' (
+        @($knownTrailingEvents | Where-Object { $_.event -in @('claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+    )
+
+    $mismatchFixturePath = Join-Path $tempRoot 'mismatched-trailing-board.json'
+    $mismatchStatePath = Join-Path $tempRoot 'mismatched-trailing-state.json'
+    $mismatchLogPath = Join-Path $tempRoot 'mismatched-trailing-events.jsonl'
+    $mismatchCells = @($knownTrailingSpec.Cells)
+    $mismatchCells[0] = 'identity-mismatched-row'
+    $mismatchSpec = [pscustomobject]@{
+        Cells = $mismatchCells
+        TrailingK = $identityMismatchCanary
+        TrailingL = 'IDENTITY_MISMATCH_SECOND_CANARY'
+    }
+    $mismatchFixtureJson = ConvertTo-WideBoardJson -DataRows @($mismatchSpec, $knownTrailingOrder)
+    [IO.File]::WriteAllText($mismatchFixturePath, $mismatchFixtureJson, (New-Object Text.UTF8Encoding($false)))
+    $mismatchState = New-OrderState -Mode Observe
+    $mismatchState.initialized = $true
+    $mismatchState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
+    $mismatchState.cursor.row_id = 'cursor-before-mismatch'
+    Save-OrderState -Path $mismatchStatePath -State $mismatchState
+    $mismatchArgs = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $RunnerPath,
+        '-Mode', 'Observe',
+        '-AllowedSourcesCsv', 'codex',
+        '-BoardFixturePath', $mismatchFixturePath,
+        '-StatePath', $mismatchStatePath,
+        '-LogPath', $mismatchLogPath,
+        '-ReplayHistorical'
+    )
+    $mismatchOutput = @(& powershell.exe @mismatchArgs)
+    $mismatchExitCode = $LASTEXITCODE
+    $mismatchResultLine = @($mismatchOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $mismatchResult = if ($mismatchResultLine.Count -eq 1) { $mismatchResultLine[0] | ConvertFrom-Json } else { $null }
+    $mismatchStateText = [IO.File]::ReadAllText($mismatchStatePath, [Text.Encoding]::UTF8)
+    $mismatchSaved = Read-OrderState -Path $mismatchStatePath -Mode Observe
+    $mismatchLogText = [IO.File]::ReadAllText($mismatchLogPath, [Text.Encoding]::UTF8)
+    $mismatchEvents = @([IO.File]::ReadAllLines($mismatchLogPath, [Text.Encoding]::UTF8) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ | ConvertFrom-Json })
+    $mismatchAllText = ($mismatchOutput -join [Environment]::NewLine) + $mismatchStateText + $mismatchLogText
+    Assert-True 'runner fails closed on an identity-mismatched K:L anomaly before admission' (
+        $mismatchExitCode -eq 20 -and
+        $mismatchResult.status -ceq 'error' -and
+        $mismatchResult.error_code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+        $mismatchSaved.error.code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+        $mismatchSaved.counts.selected -eq 0 -and
+        @($mismatchEvents | Where-Object { $_.event -in @('board_schema_incident', 'candidate_observed', 'claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+    )
+    Assert-True 'identity-mismatched K:L canaries never reach output log or state' (
+        -not $mismatchAllText.Contains($identityMismatchCanary) -and
+        -not $mismatchAllText.Contains('IDENTITY_MISMATCH_SECOND_CANARY')
+    )
+    Assert-True 'identity-mismatch failure preserves the prior cursor tuple' (
+        $mismatchSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
+        $mismatchSaved.cursor.row_id -ceq 'cursor-before-mismatch'
+    )
+
+    $duplicateTrailingFixturePath = Join-Path $tempRoot 'duplicate-known-trailing-board.json'
+    $duplicateTrailingStatePath = Join-Path $tempRoot 'duplicate-known-trailing-state.json'
+    $duplicateTrailingLogPath = Join-Path $tempRoot 'duplicate-known-trailing-events.jsonl'
+    $duplicateTrailingFixtureJson = ConvertTo-WideBoardJson -DataRows @($knownTrailingSpec, $knownTrailingSpec, $knownTrailingOrder)
+    [IO.File]::WriteAllText($duplicateTrailingFixturePath, $duplicateTrailingFixtureJson, (New-Object Text.UTF8Encoding($false)))
+    $duplicateTrailingState = New-OrderState -Mode Observe
+    $duplicateTrailingState.initialized = $true
+    $duplicateTrailingState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
+    $duplicateTrailingState.cursor.row_id = 'cursor-before-duplicate-trailing'
+    Save-OrderState -Path $duplicateTrailingStatePath -State $duplicateTrailingState
+    $duplicateTrailingArgs = @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $RunnerPath,
+        '-Mode', 'Observe',
+        '-AllowedSourcesCsv', 'codex',
+        '-BoardFixturePath', $duplicateTrailingFixturePath,
+        '-StatePath', $duplicateTrailingStatePath,
+        '-LogPath', $duplicateTrailingLogPath,
+        '-ReplayHistorical'
+    )
+    $duplicateTrailingOutput = @(& powershell.exe @duplicateTrailingArgs)
+    $duplicateTrailingExitCode = $LASTEXITCODE
+    $duplicateTrailingResultLine = @($duplicateTrailingOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $duplicateTrailingResult = if ($duplicateTrailingResultLine.Count -eq 1) { $duplicateTrailingResultLine[0] | ConvertFrom-Json } else { $null }
+    $duplicateTrailingStateText = [IO.File]::ReadAllText($duplicateTrailingStatePath, [Text.Encoding]::UTF8)
+    $duplicateTrailingSaved = Read-OrderState -Path $duplicateTrailingStatePath -Mode Observe
+    $duplicateTrailingLogText = [IO.File]::ReadAllText($duplicateTrailingLogPath, [Text.Encoding]::UTF8)
+    $duplicateTrailingEvents = @([IO.File]::ReadAllLines($duplicateTrailingLogPath, [Text.Encoding]::UTF8) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [string]$_ | ConvertFrom-Json })
+    $duplicateTrailingAllText = ($duplicateTrailingOutput -join [Environment]::NewLine) + $duplicateTrailingStateText + $duplicateTrailingLogText
+    Assert-True 'runner fails closed on a second occurrence of the known K:L anomaly' (
+        $duplicateTrailingExitCode -eq 20 -and
+        $duplicateTrailingResult.status -ceq 'error' -and
+        $duplicateTrailingResult.error_code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+        $duplicateTrailingSaved.error.code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+        $duplicateTrailingSaved.counts.selected -eq 0 -and
+        @($duplicateTrailingEvents | Where-Object { $_.event -in @('board_schema_incident', 'candidate_observed', 'claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+    )
+    Assert-True 'duplicate known-row K:L canaries never reach output log or state' (
+        -not $duplicateTrailingAllText.Contains($knownTrailingCanaryK) -and
+        -not $duplicateTrailingAllText.Contains($knownTrailingCanaryL)
+    )
+    Assert-True 'second-anomaly failure preserves the prior cursor tuple' (
+        $duplicateTrailingSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
+        $duplicateTrailingSaved.cursor.row_id -ceq 'cursor-before-duplicate-trailing'
+    )
+
+    $mixedKnownEntrypointCases = @(
+        [pscustomobject]@{
+            name = 'populated-then-blank-wide'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingPopulatedCells,
+                $knownTrailingBlankWideCells,
+                (@($knownTrailingOrder.Cells) + @('', ''))
+            )
+        },
+        [pscustomobject]@{
+            name = 'blank-wide-then-populated'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingBlankWideCells,
+                $knownTrailingPopulatedCells,
+                (@($knownTrailingOrder.Cells) + @('', ''))
+            )
+        },
+        [pscustomobject]@{
+            name = 'populated-then-canonical'
+            json = ConvertTo-MixedWidthBoardJson -CellRows @(
+                $knownTrailingPopulatedCells,
+                $knownTrailingCanonicalCells,
+                @($knownTrailingOrder.Cells)
+            )
+        }
+    )
+    foreach ($mixedKnownEntrypointCase in $mixedKnownEntrypointCases) {
+        $caseRoot = Join-Path $tempRoot ('mixed-known-' + $mixedKnownEntrypointCase.name)
+        New-Item -ItemType Directory -Path $caseRoot | Out-Null
+        $fixturePath = Join-Path $caseRoot 'board.json'
+        $caseStatePath = Join-Path $caseRoot 'state.json'
+        $caseLogPath = Join-Path $caseRoot 'events.jsonl'
+        [IO.File]::WriteAllText($fixturePath, $mixedKnownEntrypointCase.json, (New-Object Text.UTF8Encoding($false)))
+        $caseState = New-OrderState -Mode Observe
+        $caseState.initialized = $true
+        $caseState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
+        $caseState.cursor.row_id = 'cursor-before-mixed-known'
+        Save-OrderState -Path $caseStatePath -State $caseState
+        $caseOutput = @(& powershell.exe `
+            -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $RunnerPath `
+            -Mode Observe `
+            -AllowedSourcesCsv codex `
+            -BoardFixturePath $fixturePath `
+            -StatePath $caseStatePath `
+            -LogPath $caseLogPath `
+            -ReplayHistorical)
+        $caseExitCode = $LASTEXITCODE
+        $caseResultLine = @($caseOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+        $caseResult = if ($caseResultLine.Count -eq 1) { $caseResultLine[0] | ConvertFrom-Json } else { $null }
+        $caseSaved = Read-OrderState -Path $caseStatePath -Mode Observe
+        $caseEvents = @([IO.File]::ReadAllLines($caseLogPath, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json })
+        Assert-True ('runner fails closed before admission: ' + $mixedKnownEntrypointCase.name) (
+            $caseExitCode -eq 20 -and
+            $caseResult.status -ceq 'error' -and
+            $caseResult.error_code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+            $caseSaved.error.code -ceq 'BOARD_TRAILING_CELLS_INVALID' -and
+            $caseSaved.counts.selected -eq 0 -and
+            @($caseEvents | Where-Object { $_.event -in @('board_schema_incident', 'candidate_observed', 'claim_confirmed', 'receipt_confirmed', 'result_confirmed', 'invocation_started') }).Count -eq 0
+        )
+        Assert-True ('mixed duplicate preserves cursor: ' + $mixedKnownEntrypointCase.name) (
+            $caseSaved.cursor.timestamp -ceq '2026-09-09T03:00:00.0000000Z' -and
+            $caseSaved.cursor.row_id -ceq 'cursor-before-mixed-known'
+        )
+    }
 
     $duplicateFixturePath = Join-Path $tempRoot 'duplicate-board.json'
     $duplicateStatePath = Join-Path $tempRoot 'duplicate-state.json'
