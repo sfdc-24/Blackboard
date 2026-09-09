@@ -53,15 +53,21 @@ export const __recycleContract = { TOKEN_RECYCLE_MS, RECYCLE_MIN_TTL_MS };
  * built over two review rounds to prevent. The gate was there; it accepted
  * anything.
  *
- * Only an explicit positive counts. `"true"` is allowed alongside `true`
- * because a JSON stringification quirk on Zoom's side should not strand the
- * agent in a retry loop against a working endpoint; every other value is a
- * refusal. Narrowing fails toward retry, which is recoverable — the direction
- * the old code got backwards.
+ * LITERAL BOOLEAN `true`, AND NOTHING ELSE.
+ *
+ * The first fix also accepted the string `"true"`, reasoning that a
+ * stringification quirk should not strand the agent in a retry loop. Review
+ * rejected that and was right: there is no evidence Zoom ever sends a string,
+ * so the allowance defended an imagined case by WIDENING the accept surface —
+ * the one direction this defect has already proven expensive. And the two
+ * failure modes are not symmetric. Rejecting a good ack costs a retry, which is
+ * logged on every attempt and impossible to miss. Accepting a bad one costs a
+ * socket that looks healthy and delivers nothing, silently, for fifty minutes.
+ *
+ * Fail closed. `value === true` or it is a refusal.
  */
 export function isPositiveAck(value) {
-  if (value === true) return true;
-  return typeof value === 'string' && value.trim().toLowerCase() === 'true';
+  return value === true;
 }
 
 export class ZoomEventSocket {

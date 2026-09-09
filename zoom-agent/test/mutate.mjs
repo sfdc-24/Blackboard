@@ -257,12 +257,33 @@ const MUTATIONS = [
     expect: /asks for an app token, not the user/,
   },
   {
-    blocker: '16-ack',
-    name: 'the acknowledgement goes back to Boolean() coercion',
+    // THE WIRING, NOT THE HELPER. The first version of this case mutated
+    // isPositiveAck's body, and a reviewer showed that reverting only the
+    // PRODUCTION CALL SITE left the whole 50-test suite green: the test called
+    // the helper and the mutation changed the helper, so nothing proved
+    // handleMessage used it. A mutation must break the path the product takes.
+    blocker: '16-ack-wiring',
+    name: 'handleMessage stops using the validator and coerces the ack again',
     file: 'src/events-ws.js',
-    from: "  if (value === true) return true;\n  return typeof value === 'string' && value.trim().toLowerCase() === 'true';",
-    to: '  return Boolean(value);',
-    expect: /only an explicit positive acknowledgement counts/,
+    from: '      this.onAck?.(isPositiveAck(msg.success));',
+    to: '      this.onAck?.(Boolean(msg.success));',
+    expect: /refused THROUGH connect\(\)/,
+  },
+  {
+    blocker: '16-ack-strict',
+    name: 'the acknowledgement loosens to accept string representations',
+    file: 'src/events-ws.js',
+    from: '  return value === true;',
+    to: "  return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');",
+    expect: /refused THROUGH connect\(\)/,
+  },
+  {
+    blocker: '16-coldstart',
+    name: 'startup gates the app-credential event plane on a user token file again',
+    file: 'src/index.js',
+    from: "if (config.eventTokenGrant !== 'user') {",
+    to: 'if (false) {',
+    expect: /app-credential startup connects with no user-token file/,
   },
 
   {

@@ -878,8 +878,22 @@ test('P1: a startup failure that never reached a socket still retries', () => {
   const bare = src.match(/connectEventSocket\(\)\.catch/g) ?? [];
   assert.equal(bare.length, 1,
     `${bare.length} call sites still catch connectEventSocket() directly — only the wrapper should`);
-  assert.equal((src.match(/connectWithRetry\(/g) ?? []).length, 3,
-    'both the OAuth-callback path and the saved-token path must retry, and the helper defines it');
+  // THE INVARIANT IS "NOTHING CONNECTS WITHOUT THE RETRY WRAPPER", not a head
+  // count. This asserted exactly 3 occurrences and broke the moment a third
+  // legitimate entry point was added for app-credential cold start — a guard
+  // that fails on correct changes trains people to edit the guard, which is how
+  // guards die. `connectEventSocket` appearing exactly twice — its definition
+  // and the single call inside connectWithRetry — says the same thing and stays
+  // true however many branches call the wrapper.
+  const direct = src.match(/connectEventSocket\(/g) ?? [];
+  assert.equal(direct.length, 2,
+    `connectEventSocket appears ${direct.length} times; it must be defined once and called once, `
+    + 'from inside connectWithRetry. Any other caller starts a connection whose pre-socket failure '
+    + 'nothing retries');
+  const wrapped = src.match(/connectWithRetry\(/g) ?? [];
+  assert.ok(wrapped.length >= 3,
+    `only ${wrapped.length - 1} entry point(s) go through the retry wrapper; the OAuth callback and `
+    + 'every startup branch must');
 });
 
 
@@ -1443,21 +1457,164 @@ test('NO-GO 1: the event socket asks for an app token, not the user\'s refresh g
   }
 });
 
-test('NO-GO 2: only an explicit positive acknowledgement counts as readiness', async () => {
-  // `Boolean(msg.success)` is truthiness, not validation, and the string
-  // "false" is truthy. A refusal serialised as a string, an object, an array
-  // or the number 1 all resolved connect() as a healthy subscription with no
-  // retry — the exact "looks connected, receives nothing" failure the
-  // acknowledgement gate was built over two review rounds to prevent. The gate
-  // was there. It accepted anything.
-  const { isPositiveAck } = await import('../src/events-ws.js');
+test('NO-GO 2: malformed acknowledgements are refused THROUGH connect(), not just by the helper', async () => {
+  // THE TEST THIS REPLACES WAS INERT, and a reviewer proved it by mutating only
+  // the production call site: `isPositiveAck(msg.success)` back to
+  // `Boolean(msg.success)` left the whole suite green. The old test called the
+  // helper directly and the mutation changed the helper, so neither could show
+  // that handleMessage USES it. A guard on the label, not the claim — the ninth
+  // time in this PR, and this one was inside the fix for the eighth.
+  //
+  // So: real frames, a real server, through the real connect().
+  const { WebSocketServer } = await import('ws');
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
 
-  for (const v of [true, 'true', 'TRUE', '  true  ']) {
-    assert.equal(isPositiveAck(v), true, `${JSON.stringify(v)} is an explicit positive`);
+  const REFUSALS = ['false', 'FALSE', 'true', 'TRUE', '  true  ', {}, [], 1, 2, 0, '', 'yes', null];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-ack-'));
+  const prevGrant = config.eventTokenGrant;
+  const prevTimeout = config.connectTimeoutMs;
+  config.tokenFile = path.join(dir, 'tokens.json');
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 60 * 60_000,
+  }));
+  const { loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+  config.eventTokenGrant = 'user';     // this test is about the ACK, not the grant
+  config.connectTimeoutMs = 400;
+
+  const realLog = console.log; const realErr = console.error;
+  console.log = () => {}; console.error = () => {};
+  try {
+    for (const value of REFUSALS) {
+      const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+      await new Promise((r) => wss.once('listening', r));
+      wss.on('connection', (sock) => {
+        sock.send(JSON.stringify({ module: 'build_connection', success: value }));
+      });
+      config.wsEndpoint = `ws://127.0.0.1:${wss.address().port}/ws`;
+
+      const socket = new ZoomEventSocket(() => {});
+      let scheduled = 0;
+      socket.scheduleReconnect = () => { scheduled += 1; };
+      const err = await socket.connect().then(() => null, (e) => e);
+      socket.close();
+      wss.close();
+
+      assert.ok(err,
+        `connect() RESOLVED on build_connection success=${JSON.stringify(value)}. The agent would `
+        + 'sit on a socket Zoom refused, scheduling nothing and receiving nothing until the '
+        + '50-minute recycle');
+      assert.equal(scheduled, 1,
+        `success=${JSON.stringify(value)} must schedule exactly one retry (got ${scheduled})`);
+    }
+
+    // And the one positive still works, or the gate is an outage.
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise((r) => wss.once('listening', r));
+    wss.on('connection', (sock) => {
+      sock.send(JSON.stringify({ module: 'build_connection', success: true }));
+    });
+    config.wsEndpoint = `ws://127.0.0.1:${wss.address().port}/ws`;
+    const ok = new ZoomEventSocket(() => {});
+    ok.scheduleReconnect = () => {};
+    await assert.doesNotReject(() => ok.connect(), 'literal boolean true must still be accepted');
+    ok.close();
+    wss.close();
+  } finally {
+    console.log = realLog; console.error = realErr;
+    config.eventTokenGrant = prevGrant;
+    config.connectTimeoutMs = prevTimeout;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
-  for (const v of ['false', 'FALSE', {}, [], 1, 2, 0, '', 'yes', 'ok', null, undefined, NaN]) {
-    assert.equal(isPositiveAck(v), false,
-      `${JSON.stringify(v) ?? String(v)} was accepted as an acknowledgement — the agent would sit `
-      + 'on a socket Zoom had refused, scheduling nothing, receiving nothing');
-  }
+});
+
+
+test('NO-GO 1: app-credential startup connects with no user-token file at all', async () => {
+  // THE DEFECT LIVES IN MODULE TOP-LEVEL WIRING, so it is only reachable by
+  // running the process. `if (loadTokens())` gated the event connection on a
+  // saved user-token file — correct while the socket rode on the user's grant,
+  // and wrong the moment it stopped. With client_credentials there is no such
+  // file, so the agent printed "First run — authorize" and sat there: zero
+  // token requests, zero sockets, waiting forever for an artifact it no longer
+  // uses. The credential was fixed and the gate still keyed on the old one.
+  //
+  // Found by a reviewer running `node src/index.js` for real. This is that,
+  // automated: a real child process, a real token endpoint, a real ws server.
+  const { WebSocketServer } = await import('ws');
+  const { spawn } = await import('node:child_process');
+
+  const run = async ({ grant, seedTokens }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-cold-'));
+    const tokenFile = path.join(dir, 'tokens.json');
+    if (seedTokens) fs.writeFileSync(tokenFile, seedTokens);
+
+    let tokenRequests = 0;
+    const grants = [];
+    const tok = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        tokenRequests += 1;
+        grants.push(new URLSearchParams(body).get('grant_type'));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ access_token: 't', expires_in: 3600 }));
+      });
+    });
+    await new Promise((r) => tok.listen(0, '127.0.0.1', r));
+
+    let sockets = 0;
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise((r) => wss.once('listening', r));
+    wss.on('connection', (sock) => {
+      sockets += 1;
+      sock.send(JSON.stringify({ module: 'build_connection', success: true }));
+    });
+
+    const child = spawn(process.execPath, ['src/index.js'], {
+      cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+      env: {
+        ...process.env,
+        ZOOM_CLIENT_ID: 'cid',
+        ZOOM_CLIENT_SECRET: 'secret',
+        ZOOM_TOKEN_URL: `http://127.0.0.1:${tok.address().port}/oauth/token`,
+        ZOOM_WS_ENDPOINT: `ws://127.0.0.1:${wss.address().port}/ws`,
+        ZOOM_EVENT_TOKEN_GRANT: grant,
+        TOKEN_FILE: tokenFile,
+        PORT: '0',
+        WRAP_UP_ENABLED: 'false',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+
+    await new Promise((r) => { setTimeout(r, 2500); });
+    child.kill('SIGKILL');
+    await new Promise((r) => child.on('close', r));
+    tok.close(); wss.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    return { tokenRequests, grants, sockets, out };
+  };
+
+  // 1. No user-token file at all. This is the cold start that hung.
+  const cold = await run({ grant: 'client_credentials', seedTokens: null });
+  assert.ok(cold.tokenRequests >= 1,
+    `no app-token was requested with no user-token file present (${cold.tokenRequests}). The agent `
+    + `waits forever for a personal artifact the event plane does not use.\n${cold.out}`);
+  assert.deepEqual([...new Set(cold.grants)], ['client_credentials'],
+    `startup requested ${JSON.stringify(cold.grants)}`);
+  assert.ok(cold.sockets >= 1, `no event socket was opened (${cold.sockets}).\n${cold.out}`);
+
+  // 2. A corrupt token file must not change that — it is not consulted.
+  const corrupt = await run({ grant: 'client_credentials', seedTokens: '{ this is not json' });
+  assert.ok(corrupt.sockets >= 1,
+    `an unreadable user-token file blocked app-credential startup.\n${corrupt.out}`);
+
+  // 3. The escape hatch keeps the old behaviour exactly: no user token, no connect.
+  const hatch = await run({ grant: 'user', seedTokens: null });
+  assert.equal(hatch.tokenRequests, 0,
+    'ZOOM_EVENT_TOKEN_GRANT=user with no saved token must still wait for authorization');
+  assert.equal(hatch.sockets, 0, 'and must not open a socket');
+  assert.match(hatch.out, /First run/, 'and must still print the authorization instructions');
 });

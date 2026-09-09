@@ -48,7 +48,27 @@ startOAuthServer(() => {
   connectWithRetry((err) => console.error('[events] connect failed:', err.message));
 });
 
-if (loadTokens()) {
+// THE EVENT PLANE'S CREDENTIAL DECIDES WHETHER STARTUP WAITS FOR A PERSON.
+//
+// This used to be `if (loadTokens())` unconditionally, which was right when the
+// event socket rode on the user's OAuth grant and wrong the moment it stopped.
+// With client_credentials there is no user token to find, so the agent printed
+// "First run — authorize the app" and sat there: zero token requests, zero
+// sockets, waiting forever for a personal artifact it no longer uses. The
+// credential was corrected and the startup gate still keyed on the old one.
+//
+// Found by an independent reviewer running `node src/index.js` for real against
+// localhost endpoints — no unit test here would have caught it, because the
+// defect is in module top-level wiring rather than in any function.
+const userTokens = loadTokens();
+
+if (config.eventTokenGrant !== 'user') {
+  console.log('[events] app credentials (client_credentials) — connecting without user authorization');
+  if (!userTokens) {
+    console.log(`(the OAuth flow is still available at http://localhost:${config.port}/ but the event plane does not need it)`);
+  }
+  connectWithRetry((err) => console.error('[events] connect failed:', err.message));
+} else if (userTokens) {
   console.log('[oauth] found saved tokens (.tokens.json)');
   connectWithRetry((err) => {
     console.error('[events] connect failed:', err.message);
