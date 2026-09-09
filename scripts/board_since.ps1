@@ -110,8 +110,9 @@ try {
     $r = $rows[$idx]
     $ts     = [string]$r[1]
     $writer = [string]$r[2]
-    $payload = [string](($r | Where-Object { ([string]$_).Length -gt 100 } | Select-Object -First 1))
-    if (-not $payload) { $payload = [string]$r[5] }
+    # Cell 5, always. See Get-BoardRowPayload for what the old length heuristic
+    # did to a row whose gist was longer than its payload.
+    $payload = Get-BoardRowPayload -Row $r
 
     if (-not $Mine -and $writer -eq $Tag) { continue }
 

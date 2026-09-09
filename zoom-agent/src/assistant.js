@@ -42,7 +42,10 @@ function newSession(meetingId) {
     asks: 0,
     accepted: 0,   // messages WhatsApp accepted. NOT deliveries: see notify.js.
     failures: [],
-    inFlight: false,
+    // The in-flight live ask, as a PROMISE rather than a boolean. A boolean can
+    // be tested but not awaited, and the wrap-up needs to wait: see
+    // onMeetingEnded.
+    pending: null,
     lastAskAtLine: 0,
   };
 }
@@ -63,7 +66,7 @@ export function onTranscriptLine({ meetingId, userName, text, ts }) {
   if (!trigger) return;
 
   // Fire and forget: the media stream must never wait on a network call.
-  handleAsk(session, trigger).catch((err) =>
+  handleAsk(session, trigger)?.catch((err) =>
     console.error('[assistant] ask failed:', err.message));
 }
 
@@ -95,62 +98,64 @@ function detectTrigger(line, session) {
 
 const asLines = (lines) => lines.map((l) => `${l.userName}: ${l.text}`);
 
-async function handleAsk(session, trigger) {
+function handleAsk(session, trigger) {
   // One outstanding request per meeting. Live speech arrives faster than a
   // model answers, and without this a busy call stacks up a queue of stale
   // questions that all arrive at once after the moment has passed.
-  if (session.inFlight) return;
-  session.inFlight = true;
+  if (session.pending) return null;
   session.lastAskAtLine = session.lines.length;
+  const run = runAsk(session, trigger).finally(() => {
+    if (session.pending === run) session.pending = null;
+  });
+  session.pending = run;
+  return run;
+}
 
-  try {
-    const context = asLines(session.lines.slice(-config.contextLines));
+async function runAsk(session, trigger) {
+  const context = asLines(session.lines.slice(-config.contextLines));
 
-    const header = trigger.kind === 'wake'
-      ? [
-          'You are assisting live during a Zoom call. Answer in at most three',
-          'sentences that can be read on a phone mid-conversation. If you do not',
-          'know, say so plainly rather than guessing.',
-          '',
-          `The question: ${trigger.question}`,
-          '',
-          'Recent transcript for context:',
-        ]
-      : [
-          'You are listening to a live Zoom call. From the transcript below, is',
-          'there ONE thing the consultant should know or ask right now? Answer in',
-          'at most two sentences. If there is nothing worth interrupting for,',
-          'reply with exactly: NOTHING',
-          '',
-        ];
+  const header = trigger.kind === 'wake'
+    ? [
+        'You are assisting live during a Zoom call. Answer in at most three',
+        'sentences that can be read on a phone mid-conversation. If you do not',
+        'know, say so plainly rather than guessing.',
+        '',
+        `The question: ${trigger.question}`,
+        '',
+        'Recent transcript for context:',
+      ]
+    : [
+        'You are listening to a live Zoom call. From the transcript below, is',
+        'there ONE thing the consultant should know or ask right now? Answer in',
+        'at most two sentences. If there is nothing worth interrupting for,',
+        'reply with exactly: NOTHING',
+        '',
+      ];
 
-    // Oldest context is dropped until it fits. A live question is about what
-    // was just said, so the tail is the part worth keeping.
-    const { text: prompt, dropped } = buildBounded(header, context);
-    if (dropped > 0) {
-      console.log(`[assistant] context trimmed to fit the 1,000-char contract (${dropped} older lines dropped)`);
-    }
-
-    session.asks += 1;
-    const { ok, reply, error } = await ask(prompt, session.conv);
-
-    if (!ok) {
-      session.failures.push(error ?? 'unknown');
-      console.error(`[assistant] reception failed: ${error}`);
-      return;
-    }
-
-    // The periodic gate: the model is allowed to decide there is nothing to say.
-    if (trigger.kind === 'periodic' && /^\s*nothing\b/i.test(reply)) {
-      console.log('[assistant] periodic check — nothing worth interrupting for');
-      return;
-    }
-
-    const prefix = trigger.kind === 'wake' ? 'Asked on the call' : 'Heads up';
-    await deliver(session, `${prefix}\n\n${reply}`);
-  } finally {
-    session.inFlight = false;
+  // Oldest context is dropped until it fits. A live question is about what
+  // was just said, so the tail is the part worth keeping.
+  const { text: prompt, dropped } = buildBounded(header, context);
+  if (dropped > 0) {
+    console.log(`[assistant] context trimmed to fit the 1,000-char contract (${dropped} older lines dropped)`);
   }
+
+  session.asks += 1;
+  const { ok, reply, error } = await ask(prompt, session.conv);
+
+  if (!ok) {
+    session.failures.push(error ?? 'unknown');
+    console.error(`[assistant] reception failed: ${error}`);
+    return;
+  }
+
+  // The periodic gate: the model is allowed to decide there is nothing to say.
+  if (trigger.kind === 'periodic' && /^\s*nothing\b/i.test(reply)) {
+    console.log('[assistant] periodic check — nothing worth interrupting for');
+    return;
+  }
+
+  const prefix = trigger.kind === 'wake' ? 'Asked on the call' : 'Heads up';
+  await deliver(session, `${prefix}\n\n${reply}`);
 }
 
 /** Hand a message to WhatsApp, or say plainly that there is nowhere to send it. */
@@ -173,15 +178,30 @@ async function deliver(session, message) {
 
 export function onMeetingEnded(meetingId) {
   const session = sessions.get(meetingId);
-  if (!session) return;
+  if (!session) return Promise.resolve();
   sessions.delete(meetingId);
 
   const minutes = Math.max(1, Math.round((Date.now() - session.startedAt) / 60000));
   console.log(`[assistant] meeting ${meetingId} ended — ${session.lines.length} lines, ${session.asks} asks, ${session.accepted} accepted`);
 
-  if (session.lines.length === 0) return;
-  wrapUp(session, minutes).catch((err) =>
-    console.error('[assistant] wrap-up failed:', err.message));
+  if (session.lines.length === 0) return Promise.resolve();
+
+  // WAIT for any live ask still in flight before summarising. Both use the same
+  // mutable conversation, and on the very first request neither has a `ct` yet —
+  // so two concurrent calls would each be minted a different server token and
+  // the later segments would lose continuity. A late WhatsApp result would also
+  // change `accepted` after the board payload had already captured it, putting
+  // a number on the board that was wrong the moment it was written.
+  //
+  // A failed live ask must not cancel the wrap-up, hence the swallowed catch.
+  //
+  // The chain is RETURNED. Callers may ignore it — this never rejects — but
+  // returning it is what lets a test observe the ordering deterministically
+  // rather than racing a floating promise. Same reasoning as rtms.js.
+  return Promise.resolve(session.pending)
+    .catch(() => {})
+    .then(() => wrapUp(session, minutes))
+    .catch((err) => console.error('[assistant] wrap-up failed:', err.message));
 }
 
 const SUMMARY_TASK = [
@@ -193,11 +213,18 @@ const SUMMARY_TASK = [
   '',
 ];
 
+// This must serve EVERY section of SUMMARY_TASK, not just the actionable ones.
+// The first version asked only for decisions, action items and org details, and
+// offered a NOTHING escape — so a discovery call that decided nothing mapped
+// every segment to NOTHING, left zero notes, and abandoned the wrap-up
+// entirely. A conversation with no decisions is still a call worth summarising,
+// and "what this part was about" is the first thing the final summary asks for.
 const SEGMENT_TASK = [
-  'This is ONE SEGMENT of a longer Zoom call, in order. In at most two short',
-  'sentences, note only what a summary of the whole call would need from it:',
-  'decisions, action items with owners, and anything said about a Salesforce',
-  'org. Reply with exactly NOTHING if the segment carries none of that.',
+  'This is ONE SEGMENT of a longer Zoom call, in order. In at most three short',
+  'sentences, capture what a summary of the whole call would need from it:',
+  'first what this part was ABOUT, then any decisions, any action items with',
+  'owners, and anything said about a Salesforce org. Always describe the',
+  'subject, even when nothing was decided.',
   '',
 ];
 
@@ -217,7 +244,7 @@ async function summarise(session) {
   if (single.dropped === 0) {
     session.asks += 1;
     const res = await ask(single.text, session.conv);
-    return { ...res, covered: single.used, total: session.lines.length, segments: 1 };
+    return { ...res, covered: res.ok ? single.used : 0, total: session.lines.length, segments: 1 };
   }
 
   const plan = planSummaryChunks(SEGMENT_TASK, lines, { maxChunks: config.summaryMaxChunks });
@@ -225,34 +252,44 @@ async function summarise(session) {
     return { ok: false, reply: null, error: 'nothing summarisable', covered: 0, total: session.lines.length, segments: 0 };
   }
 
-  const notes = [];
+  // Coverage is credited per segment, and only to segments whose note both
+  // came back AND survived the reduction. Reporting plan.covered regardless
+  // told WhatsApp and the board that the summary covered lines whose only
+  // intermediate representation had been thrown away — the same "claims more
+  // than it has" defect the bounding work exists to remove, one level up.
+  const kept = [];
   for (const chunk of plan.chunks) {
     session.asks += 1;
-    const res = await ask(chunk, session.conv);
+    const res = await ask(chunk.text, session.conv);
     if (!res.ok) {
       session.failures.push(res.error ?? 'segment summary failed');
       continue;
     }
-    if (!/^\s*nothing\b/i.test(res.reply)) notes.push(res.reply);
+    kept.push({ note: res.reply, lines: chunk.lines });
   }
-  if (notes.length === 0) {
-    return { ok: false, reply: null, error: 'every segment summary failed', covered: plan.covered, total: session.lines.length, segments: plan.chunks.length };
+  if (kept.length === 0) {
+    return { ok: false, reply: null, error: 'every segment summary failed', covered: 0, total: session.lines.length, segments: plan.chunks.length };
   }
 
-  const reduced = buildBounded(SUMMARY_TASK, notes);
+  const reduced = buildBounded(SUMMARY_TASK, kept.map((k) => k.note));
+  // buildBounded keeps the NEWEST notes that fit, so the survivors are the tail.
+  const survived = kept.slice(kept.length - reduced.used);
+  const covered = survived.reduce((n, k) => n + k.lines, 0);
+
   session.asks += 1;
   const res = await ask(reduced.text, session.conv);
   return {
     ...res,
-    covered: plan.covered,
+    covered: res.ok ? covered : 0,
     total: session.lines.length,
     segments: plan.chunks.length,
-    notesDropped: reduced.dropped,
+    segmentsKept: survived.length,
+    notesDropped: kept.length - survived.length,
   };
 }
 
 async function wrapUp(session, minutes) {
-  const { ok, reply, covered, total, segments, notesDropped = 0 } = await summarise(session);
+  const { ok, reply, covered, total, segments, segmentsKept = segments, notesDropped = 0 } = await summarise(session);
 
   if (!ok) {
     console.error('[assistant] could not summarise the call');
@@ -262,11 +299,15 @@ async function wrapUp(session, minutes) {
   const speakers = [...new Set(session.lines.map((l) => l.userName))];
   // Coverage is stated on the summary itself, not buried. A summary of 60% of a
   // call that presents as a summary of the call is the failure this replaced.
-  const coverage = covered >= total
-    ? `all ${total} lines`
-    : `the last ${covered} of ${total} lines`;
+  // NOT "the last N lines": when a middle segment fails, what is covered is no
+  // longer contiguous, and describing it as a tail would be a second false
+  // claim layered on the first.
+  const coverage = covered >= total ? `all ${total} lines` : `${covered} of ${total} lines`;
+  const segmentNote = segments > 1
+    ? ` across ${segmentsKept === segments ? `${segments} segments` : `${segmentsKept} of ${segments} segments`}`
+    : '';
   const header = `Call ended — ${minutes} min, ${total} transcript lines, ${speakers.length} speaker(s)\n`
-    + `Summary covers ${coverage}${segments > 1 ? ` across ${segments} segments` : ''}.`;
+    + `Summary covers ${coverage}${segmentNote}.`;
 
   if (whatsappConfigured()) {
     const sent = await sendWhatsApp(`${header}\n\n${reply}`);
@@ -290,8 +331,9 @@ async function wrapUp(session, minutes) {
     'and speech-to-text mishears names and identifiers - confirm before acting.',
     covered >= total
       ? `Summary covers all ${total} transcript lines.`
-      : `Summary covers the last ${covered} of ${total} transcript lines; the earlier ${total - covered} were outside the summarisation budget.`,
-    notesDropped > 0 ? `${notesDropped} segment notes did not fit the final reduction.` : '',
+      : `Summary covers ${covered} of ${total} transcript lines; the other ${total - covered} were outside the summarisation budget or their segment summary did not survive.`,
+    notesDropped > 0 ? `${notesDropped} segment notes did not fit the final reduction and are NOT counted as covered.` : '',
+    segments > 1 && segmentsKept < segments ? `${segments - segmentsKept} of ${segments} segments contributed nothing to this summary.` : '',
     `WhatsApp accepted ${session.accepted} message(s); acceptance is not proof of delivery to the handset.`,
   ].filter(Boolean).join(' ');
 

@@ -10,20 +10,46 @@
 // src/rtms.js makes at stream time) and then construction of the client. It
 // needs NO credentials, joins nothing, and opens no socket.
 //
-// It is deliberately skip-not-fail on a host without the SDK, because Windows
-// not having it is the correct and tested behaviour — see portability.test.mjs.
+// It SKIPS only where the SDK is not published (Windows), because absence there
+// is correct and separately tested in portability.test.mjs. On linux/darwin an
+// absent SDK FAILS: the package is an optionalDependency, so a broken native
+// install leaves `npm ci` green, and a check that cannot go red guards nothing.
 
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
+// The platforms @zoom/rtms actually publishes for. Anywhere else, its absence
+// is the correct and separately tested behaviour (portability.test.mjs).
+const SDK_PLATFORMS = new Set(['linux', 'darwin']);
+
+// --simulate-missing exercises the absent-SDK branch without uninstalling the
+// package. The branch decides whether CI can go red, so it needs a test of its
+// own; a guard whose failure path is never executed is the thing this file was
+// written to stop believing in.
+const simulateMissing = process.argv.includes('--simulate-missing');
+
 function have() {
+  if (simulateMissing) return false;
   try { require.resolve('@zoom/rtms'); return true; } catch { return false; }
 }
 
 if (!have()) {
-  console.log('SKIP @zoom/rtms is not installed on this platform — that is expected off linux/darwin');
-  process.exit(0);
+  if (!SDK_PLATFORMS.has(process.platform)) {
+    console.log(`SKIP @zoom/rtms is not published for ${process.platform} — absence is expected and tested elsewhere`);
+    process.exit(0);
+  }
+  // On a platform that DOES publish it, absence is a failure and must be one.
+  // @zoom/rtms is an optionalDependency, so `npm ci` exits 0 even when the
+  // native install fails — this branch previously exited 0 too, which meant
+  // the Linux job could be green while the deployed agent had no media
+  // capability whatsoever. A green check that cannot go red is decoration.
+  console.error(
+    `FAIL @zoom/rtms is not installed on ${process.platform}, which is a platform it publishes for. `
+    + 'It is an optionalDependency, so a failed native install does not fail npm ci — '
+    + 'this check is the only thing standing between that and a silently media-less agent.',
+  );
+  process.exit(1);
 }
 
 const mod = await import('@zoom/rtms');

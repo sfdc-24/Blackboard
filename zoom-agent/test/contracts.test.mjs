@@ -59,8 +59,10 @@ test('blocker 1: every summary segment fits, and coverage is counted honestly', 
 
   assert.ok(chunks.length > 0 && chunks.length <= 4, 'chunk count is bounded — each one costs money');
   for (const c of chunks) {
-    assert.ok(c.length <= MAX_QUERY_CHARS, `a segment was ${c.length} chars and would be truncated server-side`);
+    assert.ok(c.text.length <= MAX_QUERY_CHARS, `a segment was ${c.text.length} chars and would be truncated server-side`);
+    assert.ok(c.lines > 0, 'each segment must know how many lines it represents, for honest coverage');
   }
+  assert.equal(chunks.reduce((n, c) => n + c.lines, 0), covered, 'per-segment line counts must sum to reported coverage');
   assert.equal(covered + dropped, body.length, 'coverage plus loss must equal the call');
   assert.ok(dropped > 0, 'a 300-line call cannot fit four segments — that must be reported, not hidden');
 });
@@ -283,4 +285,200 @@ test('acceptance: no Express, so no qs advisory in a process holding a refresh t
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.dependencies?.express, undefined,
     'two routes did not justify a dependency tree carrying two moderate qs advisories');
+});
+
+
+// ── Second review round: six findings from chatgpt-codex-connector on 6256712 ──
+//
+// Five P1 and one P2, all confirmed against the source before being accepted.
+// Three were in code written the same night as the fixes above, which is the
+// argument for these tests existing rather than a note in a commit message.
+
+import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+
+const assistant = await import('../src/assistant.js');
+
+/** A free TCP port that is closed, so a connect() is refused immediately. */
+async function refusedPort() {
+  const srv = net.createServer();
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const { port } = srv.address();
+  await new Promise((r) => srv.close(r));
+  return port;
+}
+
+function receptionStub(handler) {
+  return async (url) => {
+    const u = new URL(url);
+    return jsonResponse(handler(u));
+  };
+}
+
+test('F2: the wrap-up waits for an in-flight live ask instead of racing it', async () => {
+  Object.assign(config, {
+    receptionExec: 'https://example.invalid/exec',
+    busUrl: '', busSecret: '', metaToken: '', waPhoneNumberId: '', waTo: '',
+  });
+  const order = [];
+
+  await withFetch(async (url) => {
+    const u = new URL(url);
+    const q = u.searchParams.get('q');
+    const isLive = q.includes('assisting live during a Zoom call');
+    if (isLive) {
+      order.push('live-start');
+      await new Promise((r) => setTimeout(r, 30));
+      order.push('live-end');
+      return jsonResponse({ ok: true, reply: 'live answer', ct: 'ct-from-live' });
+    }
+    order.push(`wrap-start(ct=${u.searchParams.get('ct')})`);
+    return jsonResponse({ ok: true, reply: 'the summary', ct: 'ct-from-live' });
+  }, async () => {
+    assistant.onTranscriptLine({ meetingId: 'm-race', userName: 'A', text: 'sfdc24 what now?' });
+    // The call ends while the live ask is still out — the exact race reported.
+    await assistant.onMeetingEnded('m-race');
+  });
+
+  assert.deepEqual(order.slice(0, 2), ['live-start', 'live-end'],
+    'the live ask must complete before the wrap-up begins');
+  assert.ok(order[2]?.startsWith('wrap-start('), 'the wrap-up runs after, not alongside');
+  assert.match(order[2], /ct=ct-from-live/,
+    'the wrap-up must reuse the token the live ask was minted — racing produced two conversations');
+});
+
+test('F3: a call that decided nothing still gets summarised', async () => {
+  const src = readFileSync(new URL('../src/assistant.js', import.meta.url), 'utf8');
+  const segmentTask = src.slice(src.indexOf('const SEGMENT_TASK'), src.indexOf('/**\n * Summarise the call'));
+  assert.doesNotMatch(segmentTask, /\bNOTHING\b/,
+    'a NOTHING escape in the segment task means a discussion-only call maps every segment to nothing '
+    + 'and the whole wrap-up is abandoned');
+  assert.match(segmentTask, /ABOUT/,
+    'the final summary asks what the call was about, so the segment task must preserve the subject');
+});
+
+test('F5: coverage counts only the segments that survived', async () => {
+  Object.assign(config, {
+    receptionExec: 'https://example.invalid/exec',
+    busUrl: 'https://example.invalid/bus', busSecret: 's',
+    metaToken: '', waPhoneNumberId: '', waTo: '',
+    summaryMaxChunks: 6,
+  });
+
+  // Long enough that one prompt cannot hold it, so the segment path is taken.
+  const line = (i) => `speaker: point number ${i} ${'detail '.repeat(8)}`;
+
+  async function runCall(meetingId, failNthSegment) {
+    let segment = 0;
+    let captured = null;
+    await withFetch(async (url, opts) => {
+      if (opts?.body) {
+        const body = JSON.parse(opts.body);
+        if (body.action === 'append') { captured = body.sheetRow; return jsonResponse({ ok: true }); }
+        return jsonResponse({ ok: true, rows: captured ? [captured] : [] });
+      }
+      const q = new URL(url).searchParams.get('q');
+      if (q.includes('ONE SEGMENT')) {
+        segment += 1;
+        if (segment === failNthSegment) return jsonResponse({ ok: false, reason: 'segment blew up' });
+        return jsonResponse({ ok: true, reply: `note ${segment}`, ct: 'ct1' });
+      }
+      return jsonResponse({ ok: true, reply: 'final summary', ct: 'ct1' });
+    }, async () => {
+      for (let i = 0; i < 60; i += 1) {
+        assistant.onTranscriptLine({ meetingId, userName: 'A', text: line(i) });
+      }
+      await assistant.onMeetingEnded(meetingId);
+    });
+    const payload = captured?.[5] ?? '';
+    const m = payload.match(/summary_covered_lines=(\d+)/);
+    return { covered: m ? Number(m[1]) : null, payload };
+  }
+
+  const clean = await runCall('m-cov-clean', 0);
+  const lossy = await runCall('m-cov-lossy', 2);
+
+  assert.ok(clean.covered > 0, 'a clean run should report real coverage');
+  assert.ok(lossy.covered < clean.covered,
+    `a failed segment must reduce reported coverage (clean=${clean.covered}, lossy=${lossy.covered}) — `
+    + 'reporting plan.covered regardless told the board it covered lines whose summary was discarded');
+  assert.match(lossy.payload, /contributed nothing to this summary/,
+    'and the finding must say so, not merely count differently');
+});
+
+test('F4: the Linux probe fails when the SDK is absent on a platform that publishes it', () => {
+  const probe = new URL('./linux-sdk-probe.mjs', import.meta.url).pathname;
+  const missing = spawnSync(process.execPath, [probe, '--simulate-missing'], { encoding: 'utf8' });
+  const present = spawnSync(process.execPath, [probe], { encoding: 'utf8' });
+
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    assert.equal(missing.status, 1,
+      'an optionalDependency that failed to install leaves npm ci green — this probe is the only thing '
+      + 'that can turn the Linux job red, so its absent-SDK branch must exit non-zero');
+    assert.match(missing.stderr, /optionalDependency/);
+    assert.equal(present.status, 0, 'and it must pass when the SDK really is there');
+  } else {
+    assert.equal(missing.status, 0, 'off linux/darwin, absence is correct and must skip');
+  }
+});
+
+test('F6: a refused connection schedules exactly one reconnect', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-ws-'));
+  config.tokenFile = path.join(dir, 'tokens.json');
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'a', refresh_token: 'r', expires_at: Date.now() + 60 * 60_000,
+  }));
+  const { loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+
+  const port = await refusedPort();
+  config.wsEndpoint = `ws://127.0.0.1:${port}/ws`;
+
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
+  const socket = new ZoomEventSocket(() => {});
+  let scheduled = 0;
+  socket.scheduleReconnect = () => { scheduled += 1; };   // count, never actually retry
+
+  try {
+    // ONE connect. The first draft of this test called connect() twice via a
+    // stray `??`, counted two schedules, and read exactly like the bug.
+    const err = await socket.connect().then(() => null, (e) => e);
+    assert.ok(err, 'connect must reject when the endpoint refuses');
+    assert.equal(err.retryScheduled, true,
+      'the rejection must be marked as already owned, or the caller schedules a duplicate');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(scheduled, 1, 'the close handler schedules exactly one retry');
+  } finally {
+    socket.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // The half the first assertion cannot see. Stubbing scheduleReconnect means
+  // the CALLER's catch never runs — and the caller is where the second,
+  // duplicate schedule came from. This drives the real scheduleReconnect once
+  // and proves the catch adds nothing when the failure is already owned.
+  {
+    const s2 = new ZoomEventSocket(() => {});
+    s2.attempts = -10;                       // backoff delay collapses to ~1ms
+    const real = Object.getPrototypeOf(s2).scheduleReconnect;
+    let calls = 0;
+    s2.scheduleReconnect = function counting(...args) {
+      calls += 1;
+      if (calls === 1) return real.apply(this, args);   // let the first run for real
+      return undefined;
+    };
+    s2.connect = async () => {
+      const e = new Error('refused, and the close handler already scheduled');
+      e.retryScheduled = true;
+      throw e;
+    };
+
+    s2.scheduleReconnect();
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(calls, 1,
+      `the retry path scheduled ${calls} times for one failure — when connect() rejects with `
+      + 'retryScheduled the caller must not schedule again, or every outage generation doubles '
+      + 'the pending sockets and delayed attempts supersede the recovered connection');
+    s2.close();
+  }
 });

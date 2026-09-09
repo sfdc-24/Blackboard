@@ -81,6 +81,33 @@ Assert-True 'ALLOCATE is not the ALL broadcast' (
   -not (Test-BoardAddressed -Payload 'BCB|v=1|to=ALLOCATE|from=x' -Tag 'claude-code-cli')
 ) 'the old \bALL\b regex was word-bounded, but token equality is what is meant'
 
+# ── The payload comes from the fixed cell, never the longest one ─────────────
+
+# A real row: short BCB payload in cell 5, a long human gist in cell 8. The old
+# "first cell over 100 chars" heuristic picked the gist, so addressing was read
+# from prose that contains no to= at all -- and the cursor still advanced.
+$longGist = 'x' * 250
+$shortPayloadRow = @(
+  'r-short', '2026-09-09T07:00:00Z', 'other', 'Blackboard Alpha DB', 'APPEND',
+  'BCB|v=1|to=claude-code-cli|id=SHORT', 'OPEN', 'ID', $longGist, 'sub'
+)
+
+Assert-True 'the payload comes from cell 5, not the longest cell' (
+  (Get-BoardRowPayload -Row $shortPayloadRow) -eq 'BCB|v=1|to=claude-code-cli|id=SHORT'
+) ("got: " + (Get-BoardRowPayload -Row $shortPayloadRow))
+
+Assert-True 'a row whose gist outweighs its payload is still delivered' (
+  Test-BoardAddressed -Payload (Get-BoardRowPayload -Row $shortPayloadRow) -Tag 'claude-code-cli'
+) 'this row was invisible to its recipient under the length heuristic'
+
+Assert-True 'the old heuristic really did pick the wrong cell' (
+  ([string](($shortPayloadRow | Where-Object { ([string]$_).Length -gt 100 } | Select-Object -First 1))) -eq $longGist
+) 'documents the defect: the first cell over 100 chars is the gist, not the payload'
+
+Assert-True 'a short row without a payload cell yields nothing rather than throwing' (
+  (Get-BoardRowPayload -Row @('a', 'b')) -eq ''
+)
+
 # ── Cursor: anchored by Row_ID, and ties are never dropped ───────────────────
 
 # Three rows share the newest timestamp. The old timestamp cursor stored that

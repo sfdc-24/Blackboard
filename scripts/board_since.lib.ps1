@@ -50,6 +50,23 @@ function Get-BoardFieldTokens {
 }
 
 <#
+The payload cell of a board row.
+
+FIXED at index 5 by the board schema. board_since.ps1 previously chose "the
+first cell longer than 100 characters", which picks a long gist or sub-gist
+whenever the BCB payload itself is short -- so the row was then addressed from
+the wrong cell, failed the addressing test, and the cursor advanced past it
+anyway. That hides a row from its recipient permanently, which is the same
+failure the exact-token addressing above exists to prevent.
+#>
+function Get-BoardRowPayload {
+  param([object[]]$Row)
+  if (-not $Row) { return '' }
+  if ($Row.Count -le 5) { return '' }
+  return [string]$Row[5]
+}
+
+<#
 Is this payload addressed to $Tag?
 
 EXACT token match, case-insensitive, plus the ALL broadcast. A tag that is a

@@ -75,7 +75,12 @@ export function buildBounded(header, body, max = MAX_QUERY_CHARS) {
  * allows, what is lost is the beginning — and `dropped` says exactly how many
  * lines that was, so the summary can admit it.
  *
- * @returns {{ chunks: string[], covered: number, dropped: number }}
+ * Each chunk carries the NUMBER OF LINES it represents, so the caller can
+ * report coverage from the segments whose summaries actually survived — a
+ * segment whose request failed, or whose note was dropped during reduction,
+ * covers nothing regardless of how many lines went into it.
+ *
+ * @returns {{ chunks: {text: string, lines: number}[], covered: number, dropped: number }}
  */
 export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChunks = 8 } = {}) {
   const headText = header.join('\n');
@@ -116,7 +121,7 @@ export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChun
   const ordered = groups.slice(0, maxChunks).reverse();
   const covered = ordered.reduce((n, g) => n + g.length, 0);
   return {
-    chunks: ordered.map((g) => `${headText}\n${g.join('\n')}`),
+    chunks: ordered.map((g) => ({ text: `${headText}\n${g.join('\n')}`, lines: g.length })),
     covered,
     dropped: body.length - covered,
   };

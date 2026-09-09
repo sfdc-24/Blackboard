@@ -79,10 +79,22 @@ export class ZoomEventSocket {
         this.stopTimers();
 
         // Closed before it ever opened: the awaiting caller must hear about it.
+        //
+        // EXACTLY ONE OWNER SCHEDULES THE RETRY. This handler schedules, and
+        // marks the rejection so the caller's catch does not schedule a SECOND
+        // one for the same failure. Without the marker each generation created
+        // two timers, then four, and during a sustained outage the recovered
+        // connection kept being superseded by delayed attempts from earlier
+        // generations. Introduced by making connect() reject on a pre-open
+        // close, which is the fix that made the double path possible.
         if (!settled) {
           settled = true;
-          reject(new Error(`event socket closed before opening (${code})`));
-          if (!this.intentionalClose && !this.recycling) this.scheduleReconnect();
+          const err = new Error(`event socket closed before opening (${code})`);
+          if (!this.intentionalClose && !this.recycling) {
+            this.scheduleReconnect();
+            err.retryScheduled = true;
+          }
+          reject(err);
           return;
         }
 
@@ -92,7 +104,7 @@ export class ZoomEventSocket {
           this.recycling = false;
           this.connect({ minTtlMs: RECYCLE_MIN_TTL_MS }).catch((err) => {
             console.error('[events] token-recycle reconnect failed:', err.message);
-            this.scheduleReconnect();
+            if (!err.retryScheduled) this.scheduleReconnect();
           });
           return;
         }
@@ -193,7 +205,10 @@ export class ZoomEventSocket {
     setTimeout(() => {
       this.connect().catch((err) => {
         console.error('[events] reconnect failed:', err.message);
-        this.scheduleReconnect();
+        // Only schedule when nothing else did. A failure that never produced a
+        // socket -- an unauthorized getAccessToken, say -- has no close handler
+        // to own the retry, so this caller must.
+        if (!err.retryScheduled) this.scheduleReconnect();
       });
     }, delay);
   }
