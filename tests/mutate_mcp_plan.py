@@ -63,10 +63,21 @@ MUTATIONS: list[dict[str, str]] = [
         "expect": "stated_field_count",
     },
     {
-        "name": "structural: a gate with no acceptance condition",
-        "old": "| **G7** sanitizer |",
-        "new": "| **G7** sanitizer | | | |\n| **G7b** leftover |",
-        "expect": "gate_names",
+        # Re-anchored 2026-09-09 when the gates became blocks rather than table
+        # rows. The old anchor targeted a four-column row — and that shape was
+        # itself the defect: a test of mine asserted len(cells) == 4, which
+        # prevented the prerequisite, acceptor, evidence, fail-closed and
+        # unlocks fields a reviewer had asked for three times.
+        "name": "structural: a gate stops stating its fail-closed behaviour",
+        "old": "- **fail-closed** — **no approval, no publication.**",
+        "new": "- **note** — approval is usually obtained.",
+        "expect": "states_all_of_its_required_fields",
+    },
+    {
+        "name": "structural: the client-org gate stops naming its prerequisites",
+        "old": "**G1, G2, G3, G4, G5, G6 and G7 accepted, and G8 shipped.**",
+        "new": "**G1-G7 accepted, and G8 shipped.**",
+        "expect": "pins_its_prerequisites_by_name",
     },
     {
         "name": "the worked example claims everything is resolved",
@@ -86,8 +97,8 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "name": "the client-org gate authorises itself",
-        "old": "| **G9** first client org | — | Mr. Salam authorises |",
-        "new": "| **G9** first client org | — | claude-code-cli, start now |",
+        "old": "**acceptor** — **Mr. Salam authorises.** A person, in the",
+        "new": "**acceptor** — **claude-code-cli authorises.** An agent, in the",
         "expect": "client_org_gate_is_not_self_authorised",
     },
 ]

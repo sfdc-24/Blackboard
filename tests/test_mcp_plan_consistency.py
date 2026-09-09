@@ -102,22 +102,29 @@ class McpPlanConsistency(unittest.TestCase):
         """G9 is the gate to a real client's Salesforce org. Its owner column
         must name a human. An agent that can write 'claude-code-cli authorises'
         into its own gate table has no gate."""
-        row = next(
-            (line for line in self.text.splitlines() if line.startswith("| **G9**")),
+        parts = re.split(r"^### G9[^\n]*$", self.text, flags=re.MULTILINE)
+        self.assertEqual(len(parts), 2, "the G9 client-org gate has been removed")
+        block = parts[-1]
+
+        acceptor = next(
+            (ln for ln in block.splitlines() if "acceptor" in ln.lower()),
             None,
         )
-        self.assertIsNotNone(row, "the G9 client-org gate has been removed from the table")
-        owner = [c.strip() for c in row.strip("|").split("|")][2]
+        self.assertIsNotNone(acceptor, "G9 states no acceptor")
         self.assertIn(
-            "Salam", owner,
-            f'G9 is authorised by "{owner}". The gate to a client org must be opened by '
-            "a person; a self-authorising gate is not a gate.",
+            "Salam", acceptor,
+            f'G9 is accepted by "{acceptor.strip()}". The gate to a client org must be '
+            "opened by a person; a self-authorising gate is not a gate.",
         )
         for agent in ("claude", "codex", "vm-"):
             self.assertNotIn(
-                agent, owner.lower(),
-                f'G9 names an agent ("{owner}") as its authoriser.',
+                agent, acceptor.lower(),
+                f'G9 names an agent as its acceptor: "{acceptor.strip()}"',
             )
+        self.assertIn(
+            "no authorisation, no scan", block.lower(),
+            "G9 no longer states its fail-closed behaviour. Silence must not be a yes.",
+        )
 
     def test_plan_exists(self) -> None:
         self.assertTrue(PLAN.is_file(), f"{PLAN} is missing")
@@ -181,23 +188,55 @@ class McpPlanConsistency(unittest.TestCase):
             f"set {sorted(allowed)} does not contain",
         )
 
-    def test_every_gate_names_an_artefact_an_owner_and_an_acceptance(self) -> None:
-        """A gate nobody can fail is not a gate — the reviewer's structural
-        finding. Each row of the gate table must fill all four columns."""
-        rows = [
-            line for line in self.text.splitlines()
-            if re.match(r"^\| \*\*G\d+\*\*", line)
-        ]
-        self.assertGreaterEqual(len(rows), 8, "the gate table is missing or short")
-        for row in rows:
-            cells = [c.strip() for c in row.strip("|").split("|")]
-            self.assertEqual(len(cells), 4, f"gate row has {len(cells)} cells: {row[:60]}")
-            gate, artefact, owner, done = cells
-            self.assertTrue(artefact, f"{gate} names no artefact")
-            self.assertTrue(owner, f"{gate} names no owner")
-            self.assertTrue(done, f"{gate} has no acceptance condition")
+    # Every field a gate must state. A gate that cannot be failed, or whose
+    # failure has no defined consequence, is not a gate.
+    #
+    # THIS LIST REPLACED AN ASSERTION THAT WAS ACTIVELY HARMFUL. The previous
+    # version required `len(cells) == 4` on a markdown table row — which meant
+    # my own test forbade the prerequisite, acceptor, evidence, fail-closed and
+    # unlock columns that chatgpt-codex-desktop-01a0839e had asked for across
+    # three review rounds. I was arguing those belonged elsewhere while a guard
+    # I had written prevented them from being anywhere. A test that enforces
+    # one side of an open disagreement is not a neutral check.
+    GATE_FIELDS = (
+        "prerequisite",
+        "artefact",
+        "owner",
+        "acceptor",
+        "evidence",
+        "fail-closed",
+        "unlocks",
+    )
+
+    def test_every_gate_states_all_of_its_required_fields(self) -> None:
+        blocks = re.split(r"^### (G\d+)[^\n]*$", self.text, flags=re.MULTILINE)
+        # re.split with one group yields [pre, name, body, name, body, ...]
+        gates = dict(zip(blocks[1::2], blocks[2::2]))
+        self.assertGreaterEqual(len(gates), 9, f"expected at least 9 gates, found {sorted(gates)}")
+
+        for name, body in gates.items():
+            lowered = body.lower()
+            for field in self.GATE_FIELDS:
+                self.assertIn(
+                    field, lowered,
+                    f"{name} does not state its {field!r}. "
+                    "A gate whose failure has no defined consequence is not a gate.",
+                )
+            # An acceptance that cannot be failed is decoration.
             self.assertGreater(
-                len(done), 20, f"{gate}'s acceptance is too vague to fail: {done!r}"
+                len(body.strip()), 200,
+                f"{name} is too thin to fail on: {body.strip()[:80]!r}",
+            )
+
+    def test_the_client_org_gate_pins_its_prerequisites_by_name(self) -> None:
+        """"mostly done" must not pass for done. G9 opens a real customer's org,
+        so its dependencies are named individually rather than as a range."""
+        block = re.split(r"^### G9[^\n]*$", self.text, flags=re.MULTILINE)[-1]
+        for gate in ("G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"):
+            self.assertIn(
+                gate, block,
+                f"G9 does not name {gate} among its prerequisites. A range like "
+                '"G1-G7" lets a skipped gate hide inside a dash.',
             )
 
     # Exactly which fields the worked example does not yet know. Pinned rather

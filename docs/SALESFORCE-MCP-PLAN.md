@@ -297,29 +297,145 @@ spent, we cannot honestly promise a ceiling.
 
 ## 8. The ordered gates before a client org is touched
 
-The previous version listed six steps and left them as prose: no artefact name,
-no owner, no acceptance test. A reviewer correctly called that "six incomplete
-steps" that later prose "neither assigns nor accepts". A gate nobody can fail is
-not a gate. Each row below names the thing produced, who signs it off, and the
-condition under which it is done.
+**These were four-column table rows until 2026-09-09, and my own test was the
+thing keeping them that way.** `chatgpt-codex-desktop-01a0839e` asked across
+three rounds for prerequisite, independent acceptor, evidence, fail-closed
+behaviour and unlock. I argued those belonged in the artefacts the gates
+produce — while a test I had written asserted `len(cells) == 4`, which
+*actively prevented anyone adding them.* I could not honestly hold a position
+that my own guard was enforcing into the codebase. The columns are here now.
 
-Nothing in **G1–G6 requires a client org**, which is the point: everything that
+Each gate below states seven things. A gate that cannot be failed, or whose
+failure has no defined consequence, is not a gate.
+
+**Nothing in G1–G7 requires a client org.** That is the point: everything that
 can be wrong is wrong before a client is exposed to it.
 
-| gate | artefact | owner | done when |
-|---|---|---|---|
-| **G1** capability spike | `docs/mcp-capability-matrix.md` — exact server ids, endpoints, version and maturity for Hosted and DX, measured not quoted | claude-code-cli, reviewed by any agent that did not write it | both servers run against the controlled DE org; every claim in §1's table is either confirmed with a version, or struck |
-| **G2** quota | folded into G1's artefact | same | `/limits` is reachable or proven unreachable, with the API cost of a full scan measured, plus stated ceiling, reserve and concurrency rules |
-| **G3** enforcement policy | `docs/mcp-enforcement-policy.md` — the literal tool allowlist, the org allowlist rule, the telemetry position and the non-GA rule | claude-code-cli | a test fails when any name in §0's mutating list is reachable, and a test fails when a response carries an unexpected org id. **If the per-response org id proves unobtainable, G3 fails and the DX path is abandoned** — that assertion is load-bearing, not decorative |
-| **G4** auth and tenancy | `docs/mcp-auth-lifecycle.md` — attended vs unattended, ECA constraints, token storage, rotation, revocation, per-tenant isolation | claude-code-cli, and it does not pass on my say-so alone | each of the five has a written answer and a named failure mode |
-| **G5** schemas | `xray-score-v1` schema, validator, and a fixture corpus with a pinned digest — plus the collection-manifest, private-facts and public-export schemas, each versioned | claude-code-cli | the validator rejects a corpus mutated in each field, the way `tests/mutate_positioning.cjs` does for the site |
-| **G6** catalogue and statistics | the 17-field catalogue, and for any metric proposed to carry sigma, a written demonstration of §4's seven conditions with a named acceptance owner | claude-code-cli proposes; **Mr. Salam or a reviewer accepts** — I should not be the one who decides my own model is sound | every metric has all 17 fields with no `UNRESOLVED`, and no metric carries sigma without its demonstration |
-| **G7** sanitizer | `docs/mcp-sanitizer.md` plus the tool | claude-code-cli builds; **Mr. Salam approves the exact bytes** of anything public | a fixture of private facts produces a public export with a stable digest, and a byte-exact approval is recorded |
-| **G8** live correction | the `/xray/` and homepage wording fix from §4 | claude-code-cli | shipped. **This one does not wait for G1–G7** — it corrects a claim already public, so it is scheduled first, not last |
-| **G9** first client org | — | Mr. Salam authorises | G1–G7 accepted, G8 shipped |
+---
 
-**G8 is deliberately out of order.** Everything else gates future work; G8
-corrects something a visitor can read today.
+### G1 · capability spike
+
+- **prerequisite** — a Developer Edition org we control, and §0's platform
+  claims marked provisional until this runs.
+- **artefact** — `docs/mcp-capability-matrix.md`: exact server ids, endpoints,
+  version and maturity for Hosted and DX, **measured, not quoted**.
+- **owner** — claude-code-cli.
+- **independent acceptor** — any agent that did not write it.
+- **evidence** — the raw tool listing and version output from both servers,
+  committed, with the commit hash recorded.
+- **fail-closed** — if a claim in §1's table cannot be confirmed with a version,
+  it is **struck from the table**, not softened.
+- **unlocks** — G2, G3.
+
+### G2 · quota and spend
+
+- **prerequisite** — G1 accepted.
+- **artefact** — folded into G1's matrix: measured API cost of a full scan.
+- **owner** — claude-code-cli. **acceptor** — as G1.
+- **evidence** — before/after `/limits` readings around a full scan, or a
+  written demonstration that `/limits` is unreachable over MCP.
+- **fail-closed** — a scan that would exceed the configured share of remaining
+  quota **does not start**, and says so. Paging and retry budgets are stated as
+  numbers or the gate fails.
+- **unlocks** — G9's spend argument.
+
+### G3 · enforcement policy
+
+- **prerequisite** — G1's tool listing.
+- **artefact** — `docs/mcp-enforcement-policy.md`: the literal tool allowlist,
+  the org allowlist rule, the telemetry position, the non-GA rule.
+- **owner** — claude-code-cli. **acceptor** — an agent that did not write it.
+- **evidence** — a test that fails when any name in §0's mutating list is
+  reachable, and a test that fails when a response carries an unexpected org id.
+- **fail-closed** — **deny by default**: a tool not on the allowlist is refused
+  even if the server offers it. **If the per-response org id proves
+  unobtainable, G3 fails and the DX path is abandoned** — load-bearing, not
+  decorative.
+- **unlocks** — G4.
+
+### G4 · auth and tenancy
+
+- **prerequisite** — G3's org boundary.
+- **artefact** — `docs/mcp-auth-lifecycle.md`, answering **six** concerns:
+  attended vs unattended authorisation, ECA constraints, token storage, token
+  rotation, revocation, per-tenant isolation. *(The previous version said
+  "each of the five" while listing six — a count stated from memory, the fourth
+  such error in two days. It now says six because they were counted.)*
+- **owner** — claude-code-cli. **acceptor** — Mr. Salam or a reviewer; **this
+  one does not pass on my say-so**, because it is the gate that decides where a
+  client's credentials live.
+- **evidence** — an executable demonstration per concern, not prose: a token
+  refresh, a revocation taking effect, a second tenant's scan failing to see
+  the first's data.
+- **fail-closed** — any concern without a demonstration blocks G9.
+- **unlocks** — G9.
+
+### G5 · schemas
+
+- **prerequisite** — G1's field inventory.
+- **artefact** — `xray-score-v1` schema, validator, and a fixture corpus with a
+  **pinned digest**; plus versioned collection-manifest, private-facts and
+  public-export schemas.
+- **owner** — claude-code-cli. **acceptor** — an agent that did not write it.
+- **evidence** — the validator rejects a corpus mutated in **each** field, the
+  way `tests/mutate_positioning.cjs` does for the site, including a mutation
+  that adds an **unexpected field** rather than only removing known ones.
+- **fail-closed** — an emitter that cannot validate does not publish.
+- **unlocks** — G6.
+
+### G6 · catalogue and statistics
+
+- **prerequisite** — G5's schemas.
+- **artefact** — the 17-field catalogue, and for any metric proposed to carry
+  sigma, a written demonstration of §4's seven conditions.
+- **owner** — claude-code-cli proposes. **acceptor** — **Mr. Salam or a
+  reviewer**; I should not be the one who decides my own model is sound.
+- **evidence** — every metric carries all 17 fields with no `UNRESOLVED`; each
+  sigma claim carries its stability, sample, stratification and uncertainty
+  working.
+- **fail-closed** — a metric without its demonstration reports a **rate**, not
+  a sigma. It is not dropped and it is not promoted.
+- **unlocks** — G7.
+
+### G7 · sanitizer
+
+- **prerequisite** — G5's public-export schema.
+- **artefact** — `docs/mcp-sanitizer.md` and the tool.
+- **owner** — claude-code-cli builds. **acceptor** — **Mr. Salam approves the
+  exact bytes** of anything that becomes public.
+- **evidence** — a fixture of private facts produces a public export with a
+  **stable digest**, plus a leakage mutation: an org name injected into a
+  finding must not survive to the export.
+- **fail-closed** — **no approval, no publication.** Absence of approval is not
+  permission.
+- **unlocks** — G9.
+
+### G8 · live correction — *out of order, and first*
+
+- **prerequisite** — none. This is why it is out of order.
+- **artefact** — a source PR against `sfdc24-site` correcting the `/xray/` and
+  homepage six-sigma wording per §4.
+- **owner** — claude-code-cli. **acceptor** — Mr. Salam chooses the wording;
+  a reviewer accepts the change.
+- **evidence** — the merge commit, the deployment run id, and a **read-back of
+  the live page body** showing the corrected wording and no forbidden claim.
+- **fail-closed** — if the live read-back still shows the old wording, the gate
+  is not passed however green CI was.
+- **unlocks** — nothing. **It gates nothing and nothing gates it**: it corrects
+  a claim a visitor can read today, so it is scheduled first.
+
+### G9 · first client org
+
+- **prerequisite** — **G1, G2, G3, G4, G5, G6 and G7 accepted, and G8 shipped.**
+  Pinned by name so "mostly done" cannot pass for done.
+- **artefact** — none. This is an authorisation, not a document.
+- **owner** — n/a. **acceptor** — **Mr. Salam authorises.** A person, in the
+  open. Not an agent, and not this document.
+- **evidence** — his authorisation recorded on the board, naming the org.
+- **fail-closed** — no authorisation, no scan. Silence is not a yes.
+- **unlocks** — the first scan of an org we do not own.
+
+---
 
 ---
 
