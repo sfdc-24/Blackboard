@@ -191,11 +191,26 @@ class Store:
         if kind not in ("doc", "sheet"):
             raise BusError(400, f"create kind must be 'doc' or 'sheet', got {kind!r}.")
         if kind == "sheet":
-            if not isinstance(header, list) or not header or not all(isinstance(c, str) and c.strip() for c in header):
-                raise BusError(400, "create kind=sheet requires header: a non-empty list of non-empty column names.")
-            if len(header) < 3:
-                raise BusError(400, f"sheet header needs at least 3 columns ({header[0] if header else 'id'}, "
-                                    "timestamp, and content) - got " + str(len(header)) + ".")
+            if not isinstance(header, list) or not header or not all(isinstance(c, str) for c in header):
+                raise BusError(400, "create kind=sheet requires header: a non-empty list of column names.")
+            # Google Sheets returns every row at the width of the sheet's USED range,
+            # not at the width of its named columns. "Blackboard - Alpha DB" has been
+            # widened past its ten names, so the live board answers A:L - ten names
+            # then two empty padding cells, on all 1883 rows. Requiring every column
+            # name to be non-empty made the real board unimportable, which is the same
+            # intolerance that took the ORDER worker down with board_header_invalid.
+            # Tolerate padding on the same terms PR46 settled for that worker: only as
+            # a TRAILING run. A blank column with named columns after it is a hole, and
+            # a padding cell carrying content is a schema change - both still fail.
+            named = len(header)
+            while named and not header[named - 1].strip():
+                named -= 1
+            if not all(c.strip() for c in header[:named]):
+                raise BusError(400, "create kind=sheet requires header: blank column names are allowed "
+                                    "only as trailing padding, not between named columns.")
+            if named < 3:
+                raise BusError(400, f"sheet header needs at least 3 NAMED columns ({header[0] if header else 'id'}, "
+                                    "timestamp, and content) - got " + str(named) + ".")
         fid = str(uuid.uuid4())
         ts = now_iso()
         try:

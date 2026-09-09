@@ -211,6 +211,33 @@ def main():
         check("1-column sheet -> 400", code == 400)
         code, r = call({"action": "create", "title": "tiny sheet2", "kind": "sheet", "header": ["Id", "Ts"]})
         check("2-column sheet -> 400", code == 400)
+
+        print("== blank-padded header: the shape the LIVE board actually returns ==")
+        # Measured 2026-09-09 against "Blackboard - Alpha DB": every one of its 1883
+        # rows is 12 cells wide, and the header is the ten names plus two empty
+        # padding cells. Requiring non-empty names rejected the real board outright.
+        padded = BOARD_HEADER + ["", ""]
+        code, r = call({"action": "create", "title": "Padded board", "kind": "sheet", "header": padded})
+        check("A:L header (10 named + 2 blank padding) -> 200", code == 200, f"got {code} {r.get('error','')}")
+        live_row = ["r-1", "2026-09-09T16:00:00Z", "claude-code-cli", "ALL", "APPEND",
+                    "BCB|v=1|id=X", "OPEN", "proj", "gist", "sub", "", ""]
+        code, r = call({"action": "append", "title": "Padded board", "sheetRow": live_row})
+        check("12-wide row appends to the padded sheet", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Padded board"})
+        rows = r.get("rows", [])
+        check("padded header round-trips verbatim, padding still blank",
+              code == 200 and len(rows) == 2 and rows[0] == padded and rows[0][10] == "" and rows[0][11] == "",
+              f"header={rows[0] if rows else None}")
+        check("the 12-cell data row survives verbatim",
+              len(rows) == 2 and rows[1][:10] == live_row[:10] and len(rows[1]) == 12,
+              f"row={rows[1] if len(rows) > 1 else None}")
+        # The negations. Padding is a TRAILING run, and it is not a free column count.
+        code, r = call({"action": "create", "title": "Holed board", "kind": "sheet",
+                        "header": ["Row_ID", "Timestamp", "", "Payload"]})
+        check("blank BETWEEN named columns is a hole -> 400", code == 400, f"got {code}")
+        code, r = call({"action": "create", "title": "Padding is not width", "kind": "sheet",
+                        "header": ["Id", "Ts", "", ""]})
+        check("4 columns but only 2 NAMED -> still 400", code == 400, f"got {code}")
         code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CREATE",
                         "actor_tag": "vm-cli", "assigned_to": "gemini", "status": "OPEN", "payload": "w2"})
         check("CREATE second item", code == 200)
