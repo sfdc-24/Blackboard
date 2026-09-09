@@ -6,155 +6,284 @@ issues and score metrics for six sigma levels. Can you plan on creating MCP
 client for salesforce that can be plugged into any salesforce org instance for
 clients?"*
 
-**Revised 06:00Z after checking whether a Salesforce MCP server already exists.
-It does — three of them, two official. That check changed the plan and cut the
-build by most of its size.** The first version of this document is preserved in
-the PR history; what follows replaces it.
+**Third version.** The first said we would build a server. The second discovered
+Salesforce already ship two and said we would build a client. `chatgpt-codex-desktop-01a0839e`
+then returned NO-GO on eight architectural points against head `c492dd9`. Every
+one is accepted. Two were factual claims I had asserted without checking, and I
+have now checked both against Salesforce's own documentation — they were wrong in
+my favour, which is the direction that matters.
+
+This version says what is **established**, what is **assumed**, and what is
+**unverified**, and it does not use a word for a thing the thing is not.
 
 ---
 
-## 1. He said "client". He was right, and I corrected him wrongly
+## 0. Corrections to the previous version, with sources
 
-The first draft of this plan told him the correct term was an MCP *server*. That
-would be true if nothing existed. It does:
+**The Enterprise-Edition premise was false, and it was load-bearing.** The last
+version said the Hosted MCP Server "needs Enterprise Edition and above, which our
+DE test org may not have. That alone decides the first sprint." Salesforce's own
+documentation says Hosted MCP Servers are production-ready on Enterprise Edition
+and above **and available in Developer Edition, sandboxes and scratch orgs by
+self-enablement, at no cost**. Enterprise+ is a production-support tier, not an
+availability gate. So the sentence that "alone decides the first sprint" decided
+nothing, and the DX-first recommendation has to stand on its remaining reasons or
+fall. Sources: [Hosted MCP Servers overview](https://developer.salesforce.com/docs/platform/hosted-mcp-servers/guide/hosted-mcp-servers-overview.html),
+[GA announcement](https://developer.salesforce.com/blogs/2026/04/salesforce-hosted-mcp-servers-are-now-generally-available),
+[Developer Edition availability](https://developer.salesforce.com/blogs/2026/04/new-developer-edition-agentforce-vibes-claude-mcp).
+
+**"Read-only" was an intention, not a boundary.** The previous version said we
+would simply not write. The DX MCP Server's broader toolsets contain, by name:
+`deploy_metadata`, `create_scratch_org`, `delete_org`, `create_org_snapshot`,
+`assign_permission_set`, and the DevOps Center `commit_…` / `create_…_pull_request`
+/ `promote_…` tools. Enabling `--toolsets all` — which the project itself marks
+as not recommended — hands an inspection agent the ability to deploy metadata into
+a client's org. Worse, org selection is not pinned: the `DEFAULT_TARGET_ORG` token
+is *resolved dynamically on every tool call, not when the server starts*, so
+"which org am I touching" is a runtime property. There is a real safeguard — the
+`--orgs` allowlist, and orgs must be explicitly authorised on the host first —
+and §3 below turns it into the boundary. Source: [salesforcecli/mcp](https://github.com/salesforcecli/mcp).
+
+---
+
+## 1. He said "client". He was right
+
+What plugs into an org and exposes it to an AI is an MCP **server**, and
+Salesforce ship two:
 
 | what | who | shape |
 |---|---|---|
-| **Hosted MCP Server** | Salesforce, GA April 2026 | Salesforce-managed endpoint. Records, flows, Apex invocable actions, `@AuraEnabled` methods, Named Queries. **Per-user OAuth 2.0 + PKCE** — the agent acts inside the requesting user's own permissions, so CRUD, FLS and sharing all still apply. Enterprise Edition and above. Read **and** write. |
-| **Salesforce DX MCP Server** | Salesforce, open source, `github.com/salesforcecli/mcp` | Self-hosted, TypeScript. Org listing, org records, **metadata retrieve/deploy**. Developer-preview since May 2025. |
-| community servers | several | SOQL/SOSL, metadata, Tooling API, Apex REST. |
+| **Hosted MCP Server** | Salesforce, GA April 2026 | Salesforce-managed endpoint. Records, flows, Apex invocable actions, `@AuraEnabled` methods, Named Queries. Per-user OAuth 2.0 + PKCE, so the agent acts inside the requesting user's own permissions and CRUD/FLS/sharing still apply. Production tier is Enterprise+; DE, sandbox and scratch orgs self-enable. Read **and** write. |
+| **Salesforce DX MCP Server** | Salesforce, open source, `github.com/salesforcecli/mcp` | Self-hosted, TypeScript, toolset-gated. Org listing, records, metadata retrieve **and deploy**, scratch-org lifecycle, permission-set assignment. |
 
-So the server side is solved, twice over by Salesforce themselves. **What we
-build is a client.** His word was the accurate one and mine was not.
+So we build a **client**. His word was the accurate one and mine was not.
 
 ---
 
-## 2. What this leaves us building — and it is much smaller
+## 2. Which server, on the reasons that actually survive
 
-```
-Salesforce org
-     │  Hosted MCP Server (theirs) or DX MCP Server (theirs, open source)
-     ▼
-  our MCP CLIENT  ──►  scoring engine  ──►  xray-score-v1  ──►  /xray/
-     (small)            (the product)        (contract, live)   (live)
-```
+With the edition argument withdrawn, the remaining case for **DX-first** is:
 
-`/xray/` shipped on 2026-09-09 and already consumes `xray-score-v1`:
+- **it is open source**, so we can read exactly what a tool does before pointing
+  it at a client org, and say so to their security review with a commit hash;
+- **it exposes metadata**, which is where org-health signals live — triggers,
+  flows, permission sets, profiles. The Hosted server is oriented at records and
+  actions.
 
-```
-overall  { score, belt, sigma, dpmo }
-pillars  SECURITY | OPERABILITY | WASTE | REDUNDANCY
-         each { score, belt, sigma, dpmo, defects, opportunities }
-findings [ { id, pillar, severity, title, opportunities, defects, dpmo,
-             sigma, effort, priority, frame, rec } ]
-```
+And the case for **Hosted** is stronger than the last version allowed:
 
-That is a real six-sigma model — defects per million opportunities → sigma →
-belt — and its presentation layer is built and reviewed.
+- per-user OAuth + PKCE is enforced **by Salesforce**, not by our configuration.
+  A scan cannot exceed the authorising user's permissions even if our client is
+  wrong. That is a better security story than anything we can build.
 
-**So neither end is missing. The scoring engine in the middle is.** Nothing today
-turns org facts into an `xray-score-v1`. That middle is also the only part a
-competitor cannot copy in an afternoon.
+**This is now genuinely open, and it is decision 1 below.** The honest resolution
+is the spike in §8: run both against a controlled Developer Edition org and
+compare what each can actually see, with no LLM in the loop, before choosing.
 
 ---
 
-## 3. Which of their servers to use, and why it matters
+## 3. The boundary: an allowlist, not an intention
 
-**Prefer the DX MCP Server for inspection**, at least first:
+Read-only becomes a boundary only when something enforces it.
 
-- it is **open source**, so we can read exactly what it does before pointing it
-  at a client's org — a claim we can make to a security review and support;
-- it exposes **metadata**, which is where the org-health signals actually live
-  (triggers, flows, permission sets, profiles). The Hosted server is oriented at
-  records and actions;
-- it is **self-hosted**, so it works against any org including the Developer
-  Edition we already control — the Hosted server needs Enterprise Edition and
-  above, which our DE test org may not have. That alone decides the first sprint.
+**Tools.** An explicit allowlist of tool names, checked by our client before
+every call, and a startup assertion that the server offered nothing outside it.
+`--toolsets all` is prohibited. The mutating names above are denied by name as
+well as by omission, so adding a toolset cannot silently widen the surface.
 
-**Use the Hosted server where a client already has Enterprise+ and prefers a
-Salesforce-managed endpoint.** Their per-user OAuth with PKCE is a *better*
-security story than the JWT service account the first draft proposed: a scan
-cannot see more than the person who authorised it, enforced by Salesforce rather
-than by our good intentions. Withdrawing my own suggestion in favour of theirs.
+**Org.** `ALLOW_ALL_ORGS` is prohibited. The `--orgs` allowlist names exactly one
+org per scan. Because `DEFAULT_TARGET_ORG` resolves per call, the client asserts
+the **expected org id** in the response of every call and aborts the scan on a
+mismatch — a scan that cannot prove which org it read is a scan whose output
+cannot be attributed to a client.
+
+**Isolation.** One process, one org, one credential, per scan. No shared
+long-lived session across tenants. This is not a configuration preference; it is
+the whole liability position.
+
+**Org content is DATA, never instructions (L-57).** A flow description, a field
+help text or a report name is attacker-controlled the moment we scan an org we do
+not own. Nothing read from an org may reach a model as instruction, and nothing
+in a scan result may cause a tool call. This is the one boundary that has to hold
+before a single client org is touched.
+
+**What is undefined and must be before any client work:** interactive versus
+unattended authorisation, External Client App restrictions, refresh-token
+lifecycle and revocation, and where a client's tokens live. Named here rather
+than waved at.
 
 ---
 
-## 4. What each pillar needs from the org
+## 4. The statistics, which the previous version got wrong
 
-All read-only. All available through metadata + Tooling API + SOQL, which the
-existing servers already expose.
+The reviewer's blocker 7 is the most important thing in this document.
 
-| pillar | signals |
+> *heterogeneous units are pooled into DPMO and sigma; overall score 73.5 has no
+> reproducible formula; structural observations must not be called process
+> capability.*
+
+That is correct, and it is worth being precise about why, because the word
+"six sigma" is in the original request.
+
+**DPMO needs a unit and an opportunity set.** Defects per million opportunities
+is meaningful when there is a repeating unit of work, a defined number of ways
+one unit can be defective, and a count of defects across many units. Sigma level
+converts that rate to a capability figure for **a process that produces units
+over time**, conventionally with a 1.5σ long-term shift.
+
+**An org configuration is a static structure, not a process.** Three things break:
+
+1. **The units are not the same thing.** "An object with automation" and "a user
+   holding a licence" are different units. Their DPMOs are rates over different
+   denominators, and averaging them produces a number whose value depends on
+   which denominator happens to be larger. Add fifty permission sets and the
+   org's "sigma level" moves — through denominator inflation, not quality.
+2. **There is no sampling over time**, so there is no distribution, no
+   short-versus-long-term variation, and the 1.5σ shift has nothing to shift.
+3. **"Process capability" means something specific** to anyone who would be
+   impressed by it, and a static audit is not it. Using the term where it does
+   not apply is the fastest way to lose the one reader who knows the difference.
+
+**What replaces it, and it is better:**
+
+- **Per-pillar defect rates stay**, because a rate against a *declared*
+  denominator is honest and useful. Each is reported with its unit and its
+  denominator visible, never pooled across units.
+- **The overall figure becomes a stated-formula index**, not a sigma. Weights
+  are published on the page. `73.5` currently has no derivation; whatever
+  replaces it must be recomputable by the reader from the pillar figures.
+- **Six sigma is kept where it is genuinely true.** An org *does* run repeating
+  processes with units over time: deployments, Apex test executions, scheduled
+  job runs, flow interviews. Failed flow interviews per million interviews over
+  thirty days **is** a DPMO, with a real unit, a real denominator and a real
+  window. So the product gets a clean split — a **structural audit** that is
+  scored and ranked, and a **process capability** section that carries sigma
+  because it has earned it. That is a stronger claim than the current one, and
+  it is defensible in the room.
+
+**This reaches further than this document.** `/xray/` presents the current model
+live, and the homepage copy written today says "four pillars, a number against
+each". If the framing changes, the page and the pitch change with it. Tracked as
+one thread, not three.
+
+---
+
+## 5. What `/xray/` actually is today
+
+The previous version said `xray-score-v1` was "a contract, live". Stated plainly:
+`/xray/` is a **static page with synthetic data inlined**, which it labels as
+synthetic in four places. There is no published schema file, no validator, no
+adapter and no reproducible corpus. The shape it renders is a shape, not a
+specification.
+
+So `xray-score-v1` is a **deliverable, not an asset**: a written schema, a
+validator, and a fixture corpus — the same treatment that settled the `/xray/`
+robots guard with 590 cases — before anything claims to emit it.
+
+---
+
+## 6. The metric catalogue
+
+The previous version's pillar table listed signals and nothing else, and it did
+not match what the live findings show. A signal is not a metric until seven
+things are written down. The catalogue is a deliverable; this is its schema and
+one worked row.
+
+| field | meaning |
 |---|---|
-| SECURITY | Health Check score, profiles/perm sets granting Modify All Data, org-wide defaults, session and password policy, guest user access |
-| OPERABILITY | Apex test coverage, failed scheduled jobs, API volume against limits, flow error rates, triggers per object |
-| WASTE | fields never populated, users inactive 90+ days holding licences, reports and dashboards never run, unused permission sets |
-| REDUNDANCY | multiple active triggers on one object, overlapping flows on one event, duplicate permission sets, near-identical record types |
+| `id` | stable identifier, quoted in output |
+| `pillar` | SECURITY / OPERABILITY / WASTE / REDUNDANCY, or PROCESS |
+| `unit` | the thing being counted — the denominator's member |
+| `denominator` | the opportunity set, exactly |
+| `query` | the SOQL / Tooling / metadata call, verbatim |
+| `window` | the period, or `static` for structure |
+| `permission` | what the scanning identity must hold to see it |
+| `unknown` | what is emitted when the query cannot run or returns nothing — never silently zero |
+| `privacy` | public / aggregate-only / private |
 
-**The scoring is the intellectual property, not the queries.** Anyone can count
-triggers. Deciding that two active triggers on one object is a defect *against a
-defined opportunity set* — and that the set is "objects with automation" rather
-than "all objects" — is the judgement a client pays for. It is already encoded in
-the findings on `/xray/`.
+Worked example:
 
----
+| | |
+|---|---|
+| `id` | `OPS-FLOW-ERROR-RATE` |
+| `pillar` | PROCESS |
+| `unit` | one flow interview |
+| `denominator` | flow interviews started in the window |
+| `query` | `FlowInterview` / event log, exact call TBD in the spike |
+| `window` | trailing 30 days |
+| `permission` | View All Data or View Event Log Files |
+| `unknown` | `insufficient-permission` or `no-interviews-in-window`, distinct from a rate of 0 |
+| `privacy` | aggregate-only — flow names can identify a business process |
 
-## 5. Read-only, and say so out loud
-
-The Hosted server can write. We should not.
-
-Writing into a client's production org is a different liability class from
-reading it. An inspection tool that *cannot* write is one a security review
-approves in an afternoon; one that can is held for a quarter. And "build and
-model solutions" is better served by the **prototype publisher we already have**:
-generate the proposed design, publish it as a page the client can open, let them
-implement it in their own org. They see the artefact before anyone touches
-anything, which is a better sales motion as well as a safer one.
-
----
-
-## 6. Governor limits are a feature
-
-An inspection that burns a client's daily API quota is one they disable. The
-client must read `/limits` first, refuse a scan that would consume more than a
-configured share of what remains, report what it spent, and cache — org metadata
-does not change between two scans an hour apart.
+**`unknown` is not paperwork.** A metric that reports zero defects when it could
+not run is the same failure as a test that passes because it never executed, and
+this project has shipped that twice.
 
 ---
 
-## 7. First sprint, now that the server is not ours to build
+## 7. Quota, spend, and what is not proven
 
-1. Stand up the **DX MCP Server** against the Developer Edition org
-   (`omnistudio-sandbox`) we already control. No client involved.
-2. Write the **scoring engine** against `xray-score-v1`, which is already
-   specified and already has a consumer. Test it with recorded org fixtures and
-   no live org at all — the same shape as the 590-case corpus that settled the
-   `/xray/` guard.
-3. Produce the **first real `xray-score-v1`** from our own DE org. That is the
-   honest replacement for the synthetic data `/xray/` currently carries and
-   correctly labels as fake in four places.
-4. Only then talk to a client org.
+The previous version said the client "must read `/limits` first". There is **no
+demonstrated MCP path to the REST `/limits` resource**, and no way yet to
+attribute a scan's API consumption to that scan. Both are assumptions, marked as
+such, and both are spike items. An inspection that silently eats a client's daily
+quota is one they disable after the first run — and if we cannot measure what we
+spent, we cannot honestly promise a ceiling.
 
 ---
 
-## 8. What this is worth, honestly
+## 8. Before writing client-facing code
 
-The MCP plumbing is not the differentiator and now demonstrably never was —
-Salesforce ship it, twice, free.
+1. **A raw capability spike, no LLM.** Hosted versus DX against a controlled
+   Developer Edition org: what can each actually read, what does each cost in
+   API calls, and is there a path to `/limits`. This settles §2 and §7 with
+   measurements instead of preferences.
+2. **The tool allowlist and expected-org assertion**, with a test that fails when
+   a mutating tool name is reachable — the fixture being the exact names in §0.
+3. **The `xray-score-v1` schema, validator and corpus**, before any emitter.
+4. **The metric catalogue**, all seven fields per metric, reviewed before use.
+5. **The sanitizer** (§9), with byte-exact approval before anything from a real
+   org becomes public.
+6. **Only then** a client org.
 
-The differentiator is the scoring model, a presentation layer that already
-exists, and a review culture that rejects unevidenced claims — where a client can
-read the whole argument afterwards. See `docs/POKA-YOKE.md`.
+---
+
+## 9. Private to public
+
+Nothing deterministic separates a private readout from a publishable one today.
+Exact counts, object and flow names, and generated finding text can each
+fingerprint an org — and a "sample readout" on a public page is the most likely
+place for that to leak. A real org's readout is client data **even when the
+client is us**. The sanitizer is a deliverable with an exact-byte approval step,
+not a review habit.
+
+---
+
+## 10. What this is worth, honestly
+
+The MCP plumbing is not the differentiator and demonstrably never was —
+Salesforce ship it twice, free.
+
+What is left is a scoring model, a presentation layer, and a review culture that
+rejects unevidenced claims. Two of those three are thinner than the last version
+of this document said: the model has a statistical error in it, and the
+presentation layer is a synthetic mock-up. **The third one is real, and it is the
+reason this document is on its third version rather than in production.** A
+client can read that argument afterwards. See `docs/POKA-YOKE.md`.
 
 ---
 
 ## Decisions that are Mr. Salam's
 
-1. **Read-only permanently?** I recommend yes, with "build" served by the
-   prototype publisher.
-2. **Which server first** — DX (open source, works on our DE org) or Hosted
-   (Salesforce-managed, needs Enterprise+)? I recommend DX for sprint one.
-3. **Does the first real org readout go public on `/xray/`,** or stay internal? A
-   real org's readout is client data even when the client is us.
-4. **Does this jump the six open Zoom blockers?** Smaller than the first draft
-   implied, but still larger than anything currently in flight.
+1. **Hosted or DX first?** Genuinely open now that my edition argument is
+   withdrawn. I recommend deciding from the §8 spike rather than from either of
+   us arguing it.
+2. **Read-only permanently**, with "build" served by the prototype publisher?
+   I recommend yes.
+3. **Does the six-sigma framing change on the live site**, per §4? This is the
+   one with a customer-facing consequence, and I recommend yes — a defensible
+   split beats an impressive-sounding number that a knowledgeable buyer can take
+   apart.
+4. **Does the first real org readout go public on `/xray/`,** or stay internal?
+5. **Does this jump the open Zoom blockers?** Larger than the last version
+   implied, because §5 and §6 are build, not paperwork.
