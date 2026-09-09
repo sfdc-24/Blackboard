@@ -320,6 +320,7 @@ test('F2: the wrap-up waits for an in-flight live ask instead of racing it', asy
   Object.assign(config, {
     receptionExec: 'https://example.invalid/exec',
     busUrl: '', busSecret: '', metaToken: '', waPhoneNumberId: '', waTo: '',
+    wrapUpEnabled: true,   // held off by default; these tests exercise it deliberately
   });
   const order = [];
 
@@ -363,7 +364,7 @@ test('F5: coverage counts only the segments that survived', async () => {
     receptionExec: 'https://example.invalid/exec',
     busUrl: 'https://example.invalid/bus', busSecret: 's',
     metaToken: '', waPhoneNumberId: '', waTo: '',
-    summaryMaxChunks: 6,
+    summaryMaxChunks: 6, wrapUpEnabled: true,
   });
 
   // Long enough that one prompt cannot hold it, so the segment path is taken.
@@ -502,6 +503,7 @@ test('P2a: a failed summary handoff reaches the durable evidence', async () => {
     receptionExec: 'https://example.invalid/exec',
     busUrl: 'https://example.invalid/bus', busSecret: 's',
     metaToken: 'x', waPhoneNumberId: '1', waTo: '2', notifyTimeoutMs: 200,
+    wrapUpEnabled: true,
   });
   let captured = null;
   await withFetch(async (url, opts) => {
@@ -564,4 +566,53 @@ test('P1: the board finding says which persona produced the summary', () => {
     + 'a finding that hides that is presenting a possible conversational reply as call evidence');
   const boundary = src.slice(src.indexOf('const boundary = ['), src.indexOf('const payload = bcb('));
   assert.match(boundary, /PERSONA_CAVEAT/, 'and it must be on the durable board row, not only in a comment');
+});
+
+
+// ── The PM decision of 2026-09-09: hold the wrap-up ─────────────────────────
+
+test('the wrap-up is held by default, and holding it writes nothing anywhere', async () => {
+  const src = readFileSync(new URL('../src/config.js', import.meta.url), 'utf8');
+  assert.match(src, /wrapUpEnabled: optional\('WRAP_UP_ENABLED', 'false'\)/,
+    'the default must be OFF — an operator turns this on knowingly or not at all');
+
+  Object.assign(config, {
+    receptionExec: 'https://example.invalid/exec',
+    busUrl: 'https://example.invalid/bus', busSecret: 's',
+    metaToken: 'x', waPhoneNumberId: '1', waTo: '2',
+    wrapUpEnabled: false,
+  });
+
+  const calls = [];
+  await withFetch(async (url, opts) => {
+    calls.push(opts?.body ? JSON.parse(opts.body).action ?? 'graph' : 'reception');
+    return jsonResponse({ ok: true, reply: 'should never be requested' });
+  }, async () => {
+    assistant.onTranscriptLine({ meetingId: 'm-held', userName: 'A', text: 'a real conversation' });
+    await assistant.onMeetingEnded('m-held');
+  });
+
+  assert.deepEqual(calls, [],
+    `held wrap-up still made ${calls.length} call(s): ${calls.join(', ')} — it must not ask reception, `
+    + 'hand anything to WhatsApp, or write a row. A FINDING with no finding is noise on a shared board');
+});
+
+test('live wake-word assistance still works while the wrap-up is held', async () => {
+  Object.assign(config, {
+    receptionExec: 'https://example.invalid/exec',
+    busUrl: '', busSecret: '', metaToken: '', waPhoneNumberId: '', waTo: '',
+    wrapUpEnabled: false,
+  });
+  let asked = 0;
+  await withFetch(async () => {
+    asked += 1;
+    return jsonResponse({ ok: true, reply: 'live answer', ct: 'ct-live' });
+  }, async () => {
+    await assistant.onTranscriptLine({ meetingId: 'm-live', userName: 'A', text: 'sfdc24 what now?' })
+      ?? await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 20));
+    await assistant.onMeetingEnded('m-live');
+  });
+  assert.equal(asked, 1,
+    'the held wrap-up must not take live assistance down with it — that groundwork is independently valid');
 });

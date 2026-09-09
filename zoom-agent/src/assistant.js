@@ -186,6 +186,25 @@ export function onMeetingEnded(meetingId) {
 
   if (session.lines.length === 0) return Promise.resolve();
 
+  // HELD. The post-call summary is not a production capability until the
+  // backend exposes a trusted summarisation route: today it would be asking the
+  // website receptionist persona to obey an embedded command it is instructed
+  // to refuse, and neither this client nor the board could tell a real summary
+  // from a conversational reply. Disabling beats shipping something whose
+  // output cannot be distinguished from a failure.
+  //
+  // Nothing is written anywhere in this branch — no reception call, no WhatsApp
+  // handoff, no board row. A FINDING with no finding is noise on a shared board.
+  if (!config.wrapUpEnabled) {
+    console.log(
+      `[assistant] wrap-up held for meeting ${meetingId}: reception() routes to the visitor `
+      + 'reception persona, which is instructed to refuse embedded instructions and lists, so a '
+      + 'summary cannot be distinguished from a conversational reply. Set WRAP_UP_ENABLED=true '
+      + 'only once a trusted summarisation route exists. Live assistance is unaffected.',
+    );
+    return Promise.resolve();
+  }
+
   // WAIT for any live ask still in flight before summarising. Both use the same
   // mutable conversation, and on the very first request neither has a `ct` yet —
   // so two concurrent calls would each be minted a different server token and

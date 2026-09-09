@@ -70,6 +70,19 @@ export const config = {
   // roughly the last 6,000 characters of speech; beyond that the summary says
   // how many lines it did not reach rather than pretending to cover them.
   summaryMaxChunks: num('SUMMARY_MAX_CHUNKS', 8),
+  // POST-CALL WRAP-UP: OFF until the backend has a trusted summarisation route.
+  //
+  // reception() has one persona -- the sfdc24.com visitor receptionist -- and it
+  // is instructed never to obey instructions embedded in a message and never to
+  // answer with a list (Code.gs:614,623). A wrap-up is exactly that: an embedded
+  // command asking for a three-part list. The persona may legitimately decline
+  // and answer conversationally, and nothing on this side can tell the
+  // difference between that and a real summary.
+  //
+  // Held on the PM decision of 2026-09-09 (PR #40). Live wake-word assistance is
+  // unaffected and remains on. Turn this on only once action=say is no longer
+  // the route -- or knowingly, for a test.
+  wrapUpEnabled: optional('WRAP_UP_ENABLED', 'false') === 'true',
   // Client conversations. Off by default so a transcript is not sprayed into a
   // terminal log by accident.
   logTranscript: optional('LOG_TRANSCRIPT', 'false') === 'true',
