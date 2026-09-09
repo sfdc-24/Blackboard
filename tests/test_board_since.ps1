@@ -194,15 +194,117 @@ Assert-True 'an empty board yields a cursor that cannot skip anything' (
 # anchor is lost, and the inclusive timestamp fallback then starts PAST THE END
 # of a board whose rows are all older -- skipping every one of them, forever.
 
-$keyDefault = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath '<default>'
-$keyOther   = Get-BoardSourceKey -Title 'Blackboard - Beta DB'  -EnvPath '<default>'
-$keyOtherEnv = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath 'C:\other\.env'
+$keyDefault  = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -Bus 'https://script.google.com/a/exec' -BusSource 'bus-url'
+$keyOther    = Get-BoardSourceKey -Title 'Blackboard - Beta DB'  -Bus 'https://script.google.com/a/exec' -BusSource 'bus-url'
+$keyOtherEnv = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -Bus 'https://script.google.com/b/exec' -BusSource 'bus-url'
 
 Assert-True 'the same board yields a stable key' (
-  $keyDefault -eq (Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -EnvPath '<default>')
+  $keyDefault -eq (Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -Bus 'https://script.google.com/a/exec' -BusSource 'bus-url')
 )
 Assert-True 'a different sheet is a different board' ($keyDefault -ne $keyOther)
 Assert-True 'a different bus is a different board' ($keyDefault -ne $keyOtherEnv)
+
+# ── The key is the BUS, not the path to the file that names it ──────────────
+#
+# THE DEFECT: the key hashed the env-file PATHNAME. Redeploy the Apps Script --
+# which mints a new /exec URL every single time -- and .env has not moved by one
+# character while the board underneath it has been replaced. The old cursor is
+# then accepted for a board that has never seen its Row_ID, and the inclusive
+# fallback starts past the end of it.
+
+$tmpEnvDir = Join-Path ([IO.Path]::GetTempPath()) ('board-key-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmpEnvDir -Force | Out-Null
+try {
+  $envA = Join-Path $tmpEnvDir '.env'
+  Set-Content -LiteralPath $envA -Encoding utf8 -Value @(
+    '# comment line',
+    'BUS_URL=https://script.google.com/macros/s/AAA/exec',
+    'BUS_SECRET=not-a-real-secret'
+  )
+  $idA = Get-BoardBusIdentity -EnvPath $envA
+  Assert-True 'the bus identity is read out of the env file' (
+    $idA.Source -eq 'bus-url' -and $idA.Value -eq 'https://script.google.com/macros/s/AAA/exec'
+  ) ("source=" + $idA.Source)
+
+  $keyBeforeRedeploy = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -Bus $idA.Value -BusSource $idA.Source
+
+  # SAME PATH. New deployment. This is the ordinary case, not an exotic one.
+  Set-Content -LiteralPath $envA -Encoding utf8 -Value @(
+    'BUS_URL=https://script.google.com/macros/s/BBB/exec',
+    'BUS_SECRET=not-a-real-secret'
+  )
+  $idB = Get-BoardBusIdentity -EnvPath $envA
+  $keyAfterRedeploy = Get-BoardSourceKey -Title 'Blackboard - Alpha DB' -Bus $idB.Value -BusSource $idB.Source
+
+  Assert-True 'a redeployed bus at the SAME env path is a different board' (
+    $keyBeforeRedeploy -ne $keyAfterRedeploy
+  ) 'the cursor key must follow BUS_URL, not the pathname'
+
+  Assert-True 'the stale cursor is therefore refused, not adopted' (
+    -not (Test-BoardCursorMatches -Cursor ([pscustomobject]@{ lastRowId = 'x'; source = $keyBeforeRedeploy }) -SourceKey $keyAfterRedeploy)
+  )
+
+  # Quoted values are the other .env dialect bus.ps1 accepts.
+  Set-Content -LiteralPath $envA -Encoding utf8 -Value @('BUS_URL="https://script.google.com/macros/s/BBB/exec"')
+  Assert-True 'a quoted BUS_URL resolves to the same identity as an unquoted one' (
+    (Get-BoardBusIdentity -EnvPath $envA).Value -eq $idB.Value
+  )
+
+  # A BOM on the first line -- what Set-Content -Encoding utf8 writes on Windows
+  # PowerShell 5.1, and what Notepad writes -- must not hide BUS_URL, because
+  # `^\s*BUS_URL` does not match a BOM and a miss here falls silently back to
+  # the pathname key this whole function exists to stop using.
+  #
+  # NO GUARD IN THE LIBRARY BACKS THIS. One was written and then removed: it
+  # could not be made to fail. Get-Content detects the BOM and strips it before
+  # the regex ever sees the line, so the strip was inert -- a green check
+  # standing on nothing, which is the exact shape of defect this suite exists
+  # to catch. The assertion stays because the PROPERTY matters and this is the
+  # only place it is stated; it does not care who satisfies it. If some reader
+  # on some host stops stripping, this goes red and the guard earns its place
+  # then, with a mutation that fails.
+  [IO.File]::WriteAllText($envA, "BUS_URL=https://script.google.com/macros/s/CCC/exec`nBUS_SECRET=x", (New-Object Text.UTF8Encoding $true))
+  Assert-True 'a BOM on the first line does not hide BUS_URL' (
+    (Get-BoardBusIdentity -EnvPath $envA).Value -eq 'https://script.google.com/macros/s/CCC/exec'
+  ) ("got source=" + (Get-BoardBusIdentity -EnvPath $envA).Source)
+
+  # An unreadable env file must NOT collapse to one shared key.
+  $missing = Join-Path $tmpEnvDir 'nope.env'
+  $idMissing = Get-BoardBusIdentity -EnvPath $missing
+  Assert-True 'an unreadable env file falls back to its own path, not a shared token' (
+    $idMissing.Source -eq 'env-path' -and $idMissing.Value -eq $missing
+  ) ("source=" + $idMissing.Source)
+  Assert-True 'and that fallback still separates two different paths' (
+    (Get-BoardSourceKey -Title 'T' -Bus $missing -BusSource 'env-path') -ne
+    (Get-BoardSourceKey -Title 'T' -Bus (Join-Path $tmpEnvDir 'other.env') -BusSource 'env-path')
+  )
+  # The tag keeps the two spaces apart, so a path that reads like a URL is
+  # still not that URL's board.
+  Assert-True 'a path and a URL with the same text are different boards' (
+    (Get-BoardSourceKey -Title 'T' -Bus 'https://x/exec' -BusSource 'env-path') -ne
+    (Get-BoardSourceKey -Title 'T' -Bus 'https://x/exec' -BusSource 'bus-url')
+  )
+} finally {
+  Remove-Item -LiteralPath $tmpEnvDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ── Two bus.ps1 candidates imply two DIFFERENT default .env files ───────────
+#
+# board_since.ps1 picks bus.ps1 from -BusScript, $env:SFDC24_BUS_PS1, its own
+# directory, or the repo root. Every one of those used to record the literal
+# string '<default>', so two checkouts pointing at two buses shared one cursor.
+$envFromA = Resolve-BoardEnvPath -BusScript (Join-Path ([IO.Path]::GetTempPath()) 'checkout-a/scripts/bus.ps1')
+$envFromB = Resolve-BoardEnvPath -BusScript (Join-Path ([IO.Path]::GetTempPath()) 'checkout-b/scripts/bus.ps1')
+Assert-True 'each bus script resolves to the .env beside its own repo root' (
+  $envFromA -ne $envFromB -and $envFromA.EndsWith('.env') -and $envFromB.EndsWith('.env')
+) ("a=" + $envFromA + " b=" + $envFromB)
+Assert-True 'and the two therefore key to different boards' (
+  (Get-BoardSourceKey -Title 'T' -Bus $envFromA -BusSource 'env-path') -ne
+  (Get-BoardSourceKey -Title 'T' -Bus $envFromB -BusSource 'env-path')
+)
+Assert-True 'an explicit -EnvFile still wins over the bus script default' (
+  (Resolve-BoardEnvPath -EnvFile (Join-Path ([IO.Path]::GetTempPath()) 'explicit.env') -BusScript $envFromA) -ne $envFromA
+)
 
 $foreign = [pscustomobject]@{ lastIndex = 3; lastRowId = 'not-on-this-board'; lastTs = '2027-01-01T00:00:00Z'; source = $keyOther }
 Assert-True 'a cursor from another board is refused' (

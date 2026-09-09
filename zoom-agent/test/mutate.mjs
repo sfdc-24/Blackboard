@@ -230,6 +230,15 @@ const MUTATIONS = [
   },
 
   {
+    blocker: '9-join',
+    name: 'a join that throws leaves the stream reserved and the call unrecoverable',
+    file: 'src/rtms.js',
+    from: '    releaseIfOurs(streamId, token);   // a join that never started can never leave',
+    to: '    /* the reservation stays */',
+    expect: /join that throws releases the reservation/,
+  },
+
+  {
     blocker: '8-startup',
     name: 'a startup failure before the socket exists is only logged again',
     file: 'src/index.js',

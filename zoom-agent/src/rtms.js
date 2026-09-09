@@ -30,6 +30,21 @@ async function loadRtms() {
   }
 }
 
+// A seam, exported ONLY for tests — the same reason events-ws.js exports
+// __recycleContract.
+//
+// The SDK is loaded lazily BY MODULE NAME, so on a host where @zoom/rtms is
+// genuinely installed (linux CI) there is no way to drive a failing join. Every
+// guard in this file was therefore asserted by reading its own source, which
+// proves the shape of the code and not what the code does — the exact class of
+// check this project has already been caught by three times. This makes the
+// abort paths executable.
+export const __testHooks = {
+  setModule(mod) { rtmsModule = mod; },
+  isActive(streamId) { return active.has(streamId); },
+  reset() { rtmsModule = null; active.clear(); },
+};
+
 // rtms_stream_id -> { token, client }
 //
 // The TOKEN is what makes an entry ownable. Without it, this sequence loses a
@@ -190,10 +205,29 @@ async function joinStream(streamId, meetingId, obj) {
   });
 
   console.log(`[rtms] joining media stream for ${meetingId}…`);
-  client.join({
-    meeting_uuid: obj.meeting_uuid,
-    rtms_stream_id: obj.rtms_stream_id,
-    server_urls: obj.server_urls,
-    signature: obj.signature,
-  });
+  try {
+    client.join({
+      meeting_uuid: obj.meeting_uuid,
+      rtms_stream_id: obj.rtms_stream_id,
+      server_urls: obj.server_urls,
+      signature: obj.signature,
+    });
+  } catch (err) {
+    // THE ONE ABORT PATH THAT WAS NOT RELEASING.
+    //
+    // join() validates its argument and can throw synchronously — a rejected
+    // signature, a malformed server_urls, an SDK that is loaded but not
+    // initialised. When it does, no socket was ever opened, so onLeave will
+    // never fire, and onLeave is the only thing that would otherwise have
+    // released this reservation. The stream id then sits in `active` for the
+    // life of the process, and the duplicate-join guard — working exactly as
+    // designed — refuses every replayed meeting.rtms_started for that call.
+    // The agent has failed to join AND has made itself unable to try again.
+    //
+    // Releasing here is safe for the same reason the other abort paths are:
+    // releaseIfOurs only removes a reservation that is still this attempt's.
+    releaseIfOurs(streamId, token);   // a join that never started can never leave
+    console.error(`[rtms] join failed for stream ${streamId}: ${err.message} — `
+      + 'reservation released so a replayed rtms_started can retry');
+  }
 }

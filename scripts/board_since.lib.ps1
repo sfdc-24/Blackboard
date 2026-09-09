@@ -171,6 +171,83 @@ function Get-InclusiveTsStart {
 }
 
 <#
+Which .env file will bus.ps1 actually read?
+
+bus.ps1 line 150 defaults it to the .env one level ABOVE its own directory:
+
+    if (-not $EnvFile) { $EnvFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env' }
+
+board_since.ps1 chooses its bus.ps1 from four candidates (-BusScript, the
+SFDC24_BUS_PS1 environment variable, beside itself, under the repo root), so
+"the default env file" is not one path -- it is one path PER BUS SCRIPT. The
+first version of the cursor key recorded the literal string '<default>' for all
+of them, which is exactly the collision the key exists to prevent: two
+checkouts, two buses, two boards, one cursor.
+#>
+function Resolve-BoardEnvPath {
+  param([string]$EnvFile, [string]$BusScript)
+  if ($EnvFile) {
+    try { return [IO.Path]::GetFullPath($EnvFile) } catch { return $EnvFile }
+  }
+  if (-not $BusScript) { return '' }
+  try {
+    $busDir = Split-Path -Parent ([IO.Path]::GetFullPath($BusScript))
+    if (-not $busDir) { return '' }
+    return (Join-Path (Split-Path -Parent $busDir) '.env')
+  } catch { return '' }
+}
+
+<#
+The BUS the cursor was taken from, not the path to the file that names it.
+
+WHY THE PATH IS THE WRONG THING TO HASH
+
+  The env file is configuration; BUS_URL is the identity. Point the same
+  .env at a different deployment -- a re-deployed Apps Script gets a NEW /exec
+  URL every time, so this is the ordinary case, not an exotic one -- and the
+  path has not changed by one character while the board underneath it has been
+  replaced entirely. The cursor then carries a Row_ID from the old board, the
+  anchor is lost on the new one, and the INCLUSIVE timestamp fallback starts
+  from a timestamp newer than every row there is. Every addressed row on the new
+  board is skipped, permanently, and the run reports "nothing new addressed to
+  you" -- which is indistinguishable from a quiet board.
+
+  Hashing the path checked the LABEL on the configuration instead of the claim
+  it makes. That is the same mistake, in a fourth place.
+
+RETURNS  @{ Value = <string>; Source = 'bus-url' | 'env-path' | 'unresolved' }
+
+  The value is a hash INPUT and nothing else. It is never printed, logged or
+  written: BUS_URL is a bearer-ish endpoint that lives only in .env (D-18), and
+  the cursor filename carries six bytes of SHA-256, not the URL.
+
+  Each Source is tagged into the hashed string so the spaces cannot collide --
+  an env path that happens to read like a URL is still a different board from
+  that URL. A file we cannot read falls back to its own path: that yields a
+  DIFFERENT key from the readable case, so the cursor is treated as foreign and
+  the run repeats rows. Repeating is the correct direction to fail; the whole
+  point of this key is that skipping is not.
+#>
+function Get-BoardBusIdentity {
+  param([string]$EnvPath)
+  if (-not $EnvPath) { return @{ Value = ''; Source = 'unresolved' } }
+  try {
+    if (Test-Path -LiteralPath $EnvPath) {
+      foreach ($line in (Get-Content -LiteralPath $EnvPath -ErrorAction Stop)) {
+        if ($line -match '^\s*BUS_URL\s*=\s*(.*?)\s*$') {
+          $url = $matches[1].Trim('"').Trim("'")
+          if ($url) { return @{ Value = $url; Source = 'bus-url' } }
+        }
+      }
+    }
+  } catch {
+    # Unreadable for any reason -- permissions, a locked file, a directory.
+    # Fall through to the path, which is still better than one shared key.
+  }
+  return @{ Value = $EnvPath; Source = 'env-path' }
+}
+
+<#
 A stable identity for the board a cursor was taken from.
 
 WHY THE CURSOR CANNOT BE KEYED BY TAG ALONE
@@ -186,10 +263,18 @@ WHY THE CURSOR CANNOT BE KEYED BY TAG ALONE
   That is the same "permanently hides mail" failure as the substring addressing
   and the tied-timestamp cursor above, arriving by a third route: the cursor was
   right about a board nobody was reading.
+
+  -Bus is what Get-BoardBusIdentity resolved: the BUS_URL where it could be
+  read, the env path where it could not. See there for why the URL and not the
+  path, and for why the two are tagged apart.
 #>
 function Get-BoardSourceKey {
-  param([string]$Title, [string]$EnvPath)
-  $raw = ("{0}|{1}" -f $Title, $EnvPath).ToLowerInvariant()
+  param(
+    [string]$Title,
+    [string]$Bus,
+    [string]$BusSource = 'unresolved'
+  )
+  $raw = ("{0}|{1}|{2}" -f $Title, $BusSource, $Bus).ToLowerInvariant()
   $sha = [Security.Cryptography.SHA256]::Create()
   try {
     $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($raw))

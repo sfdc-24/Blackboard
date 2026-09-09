@@ -76,12 +76,19 @@ if (-not $busPs1) {
 $stateDir = Join-Path $env:LOCALAPPDATA 'sfdc24-board'
 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
 $safeTag   = ($Tag -replace '[^A-Za-z0-9_.-]', '_')
-# Keyed by tag AND board. -Title picks a different sheet and -EnvFile a
+# Keyed by tag AND board. -Title picks a different sheet and the .env picks a
 # different bus; sharing one cursor across them let a second board inherit the
 # first board's anchor and skip every row it already had.
-$envIdentity = if ($EnvFile) { [IO.Path]::GetFullPath($EnvFile) } else { '<default>' }
-$sourceKey   = Get-BoardSourceKey -Title $Title -EnvPath $envIdentity
-$cursorFile  = Join-Path $stateDir ("cursor-{0}-{1}.json" -f $safeTag, $sourceKey)
+#
+# The board's identity is BUS_URL, not the path to the file that holds it. A
+# redeployed Apps Script gets a new /exec URL while .env stays exactly where it
+# was, and the four bus.ps1 candidates above each imply a DIFFERENT default .env
+# -- so keying on the path put two boards on one cursor by two separate routes.
+# The value is hashed and never printed (D-18).
+$envPath   = Resolve-BoardEnvPath -EnvFile $EnvFile -BusScript $busPs1
+$bus       = Get-BoardBusIdentity -EnvPath $envPath
+$sourceKey = Get-BoardSourceKey -Title $Title -Bus $bus.Value -BusSource $bus.Source
+$cursorFile = Join-Path $stateDir ("cursor-{0}-{1}.json" -f $safeTag, $sourceKey)
 
 $tmp = Join-Path $env:TEMP ("board-since-" + [guid]::NewGuid().ToString('N') + '.json')
 try {

@@ -856,3 +856,64 @@ test('P1: a startup failure that never reached a socket still retries', () => {
   assert.equal((src.match(/connectWithRetry\(/g) ?? []).length, 3,
     'both the OAuth-callback path and the saved-token path must retry, and the helper defines it');
 });
+
+
+test('P2: a join that throws releases the reservation, so a replay can recover', async () => {
+  // The FIRST executable test of an rtms abort path. Every other guard in that
+  // file reads its own source, which is why this one survived three reviews:
+  // `client.join()` is the only abort path with no `releaseIfOurs`, and a source
+  // grep for "both abort paths release conditionally" counts two and passes.
+  //
+  // The failure this prevents is not a lost join — it is a lost CALL. join()
+  // throwing means no socket, so onLeave never fires, so nothing releases the
+  // reservation, so the duplicate-join guard refuses every replayed
+  // meeting.rtms_started for that stream for the life of the process.
+  const { handleZoomEvent, __testHooks } = await import('../src/rtms.js');
+
+  let joins = 0;
+  const noop = () => {};
+  class ThrowingClient {
+    constructor() {
+      for (const cb of ['onJoinConfirm', 'onTranscriptData', 'onAudioData', 'onVideoData',
+        'onShareData', 'onChatData', 'onSharingEvent', 'onLeave']) {
+        this[cb] = noop;
+      }
+    }
+
+    // Synchronous throw: a rejected signature or a malformed server_urls.
+    join() { joins += 1; throw new Error('signature rejected'); }
+  }
+
+  const started = {
+    event: 'meeting.rtms_started',
+    payload: { object: { rtms_stream_id: 's-throws', meeting_uuid: 'm-throws' } },
+  };
+
+  const realError = console.error;
+  const realLog = console.log;
+  const errors = [];
+  console.error = (...a) => errors.push(a.join(' '));
+  console.log = noop;
+  try {
+    __testHooks.setModule({ Client: ThrowingClient });
+
+    await handleZoomEvent(started);
+    assert.equal(joins, 1, 'the first rtms_started should have attempted a join');
+    assert.equal(__testHooks.isActive('s-throws'), false,
+      'a join that threw left the stream reserved — nothing will ever release it, because '
+      + 'onLeave only fires for a socket that actually opened');
+
+    // The recovery this is really about: Zoom replays rtms_started.
+    await handleZoomEvent(started);
+    assert.equal(joins, 2,
+      'the replayed rtms_started was refused as a duplicate of a join that never happened — '
+      + 'the call is now unrecoverable for the life of the process');
+  } finally {
+    console.error = realError;
+    console.log = realLog;
+    __testHooks.reset();
+  }
+
+  assert.ok(errors.some((e) => /join failed/.test(e)),
+    'the failure must be reported, not swallowed by the release');
+});
