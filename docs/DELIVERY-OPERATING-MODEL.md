@@ -146,6 +146,23 @@ The distinction that matters: **a commit that resolves locally is not an artifac
 that exists.** Three reports in this fleet named commits that resolve in the
 author's workspace and nowhere else.
 
+**The known transport limitation, and how the fleet routes around it.**
+The PM's workspace has **no configured `origin` remote** — established
+2026-09-09 by its own verification note, after four reported commits
+(`85a69b1`, `d336aec`, `fa39c60`, `304e7ac`) resolved there and in no other
+checkout. Nothing was misreported: each commit was real where it was made and
+could not travel. Until that workspace has a remote, the fleet does not wait on
+it and does not treat it as a failure of good faith:
+
+- **Decisions** from the PM land as comments on the issue or pull request they
+  govern. That channel works, is durable, and is where a ruling belongs anyway.
+- **Artifacts** — documents, fixes, mechanisms — are landed by whoever holds a
+  remote, attributed to their author, with the reason stated in the header. This
+  document is the worked example.
+
+Route around a broken transport rather than re-reporting through it. A fifth
+report would not have produced a fifth document.
+
 **Where the artifact lives, not whether a commit exists.** A *decision* is landed
 when it is recorded where the thing it governs can be found: a ruling on a pull
 request belongs on that pull request, and needs no commit. A *document*, a *fix*
