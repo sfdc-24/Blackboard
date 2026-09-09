@@ -96,6 +96,13 @@ export const config = {
   // Injectable for the same reason wsEndpoint is: a bound that cannot be
   // pointed at a stalling server is a bound nothing can prove.
   tokenUrl: process.env.ZOOM_TOKEN_URL || 'https://zoom.us/oauth/token',
+
+  // Which credential the EVENT plane uses. 'client_credentials' is an
+  // app-level token, independent of any person's consent; 'user' restores the
+  // previous behaviour of reusing the interactive OAuth token. See
+  // getAppAccessToken in oauth.js for why the event subscription should not
+  // ride on a user grant.
+  eventTokenGrant: optional('ZOOM_EVENT_TOKEN_GRANT', 'client_credentials'),
   // Client conversations. Off by default so a transcript is not sprayed into a
   // terminal log by accident.
   logTranscript: optional('LOG_TRANSCRIPT', 'false') === 'true',

@@ -302,6 +302,7 @@ test('acceptance: no Express, so no qs advisory in a process holding a refresh t
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import http from 'node:http';
 
 const assistant = await import('../src/assistant.js');
 
@@ -447,6 +448,13 @@ test('F6: a refused connection schedules exactly one reconnect', async () => {
   }));
   const { loadTokens } = await import('../src/oauth.js');
   loadTokens();
+  // This test drives connect() to exercise SOCKET behaviour, and seeds a user
+  // token file to do it. The event plane's production default is an app-level
+  // client_credentials token, which would reach the network from here; the
+  // credential contract itself has its own test ("NO-GO 1"). Pin the grant so
+  // this test keeps testing the one thing it was written for.
+  const prevGrant = config.eventTokenGrant;
+  config.eventTokenGrant = 'user';
 
   const port = await refusedPort();
   config.wsEndpoint = `ws://127.0.0.1:${port}/ws`;
@@ -466,6 +474,7 @@ test('F6: a refused connection schedules exactly one reconnect', async () => {
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(scheduled, 1, 'the close handler schedules exactly one retry');
   } finally {
+    config.eventTokenGrant = prevGrant;
     socket.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -684,6 +693,13 @@ test('F1: a refused build_connection is a failure, not a log line', async () => 
   }));
   const { loadTokens } = await import('../src/oauth.js');
   loadTokens();
+  // This test drives connect() to exercise SOCKET behaviour, and seeds a user
+  // token file to do it. The event plane's production default is an app-level
+  // client_credentials token, which would reach the network from here; the
+  // credential contract itself has its own test ("NO-GO 1"). Pin the grant so
+  // this test keeps testing the one thing it was written for.
+  const prevGrant = config.eventTokenGrant;
+  config.eventTokenGrant = 'user';
 
   // A server that accepts the socket and then DECLINES the subscription —
   // exactly what Zoom does when the token or subscription is not valid.
@@ -708,6 +724,7 @@ test('F1: a refused build_connection is a failure, not a log line', async () => 
     assert.equal(err.retryScheduled, true, 'the refusal must be owned by exactly one scheduler');
     assert.equal(scheduled, 1, `scheduled ${scheduled} retries for one refusal`);
   } finally {
+    config.eventTokenGrant = prevGrant;
     socket.close();
     wss.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -722,6 +739,13 @@ test('F1: a connection that never completes the upgrade still fails, and retries
   }));
   const { loadTokens } = await import('../src/oauth.js');
   loadTokens();
+  // This test drives connect() to exercise SOCKET behaviour, and seeds a user
+  // token file to do it. The event plane's production default is an app-level
+  // client_credentials token, which would reach the network from here; the
+  // credential contract itself has its own test ("NO-GO 1"). Pin the grant so
+  // this test keeps testing the one thing it was written for.
+  const prevGrant = config.eventTokenGrant;
+  config.eventTokenGrant = 'user';
 
   // A plain TCP server that ACCEPTS and then says nothing. No WebSocket
   // upgrade, so neither 'open' nor 'close' ever fires — the exact shape that
@@ -748,6 +772,7 @@ test('F1: a connection that never completes the upgrade still fails, and retries
     assert.ok(err, 'it must reject, not resolve');
     assert.equal(scheduled, 1, `scheduled ${scheduled} retries for one hang`);
   } finally {
+    config.eventTokenGrant = prevGrant;
     socket.close();
     srv.close();
     config.connectTimeoutMs = 20_000;
@@ -938,6 +963,13 @@ test('P2: a stale backoff does not tear down the healthy socket it was meant to 
   }));
   const { loadTokens } = await import('../src/oauth.js');
   loadTokens();
+  // This test drives connect() to exercise SOCKET behaviour, and seeds a user
+  // token file to do it. The event plane's production default is an app-level
+  // client_credentials token, which would reach the network from here; the
+  // credential contract itself has its own test ("NO-GO 1"). Pin the grant so
+  // this test keeps testing the one thing it was written for.
+  const prevGrant = config.eventTokenGrant;
+  config.eventTokenGrant = 'user';
 
   const { WebSocketServer } = await import('ws');
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -976,6 +1008,7 @@ test('P2: a stale backoff does not tear down the healthy socket it was meant to 
     assert.equal(healthy.readyState, 1, 'and it should still be open');
   } finally {
     console.log = realLog;
+    config.eventTokenGrant = prevGrant;
     socket.close();
     wss.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1333,4 +1366,98 @@ test('P2: live_asks counts live asks, not the wrap-up talking to itself', async 
   const wholeFile = (src.match(/session\.asks \+= 1/g) ?? []).length;
   assert.equal(wholeFile, 1,
     `${wholeFile} places increment the live ask counter; there is one live path`);
+});
+
+
+test('NO-GO 1: the event socket asks for an app token, not the user\'s refresh grant', async () => {
+  // The event subscription is the APPLICATION asking Zoom to tell it when
+  // meetings start. It was riding on the interactive user grant, so it sent
+  // grant_type=refresh_token and would die whenever that person revoked
+  // consent or let the refresh token lapse — a background service stopped by
+  // an interactive lifecycle it has no reason to share.
+  //
+  // Driven through the real connect() against a local token endpoint, which is
+  // how the independent review established it. The grant on the wire is the
+  // claim; nothing here reads the source.
+  const grants = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (d) => { body += d; });
+    req.on('end', () => {
+      grants.push(new URLSearchParams(body).get('grant_type'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ access_token: 'app-token', expires_in: 3600 }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-grant-'));
+  const prevUrl = config.tokenUrl;
+  const prevGrant = config.eventTokenGrant;
+  const prevWs = config.wsEndpoint;
+  config.tokenFile = path.join(dir, 'tokens.json');
+  config.tokenUrl = `http://127.0.0.1:${srv.address().port}/oauth/token`;
+  // An EXPIRED user token, so the user path would have to refresh to proceed.
+  fs.writeFileSync(config.tokenFile, JSON.stringify({
+    access_token: 'stale', refresh_token: 'r', expires_at: Date.now() - 60_000,
+  }));
+
+  const { loadTokens, __resetAppToken } = await import('../src/oauth.js');
+  const { ZoomEventSocket } = await import('../src/events-ws.js');
+  loadTokens();
+  __resetAppToken();
+
+  const realLog = console.log;
+  const realErr = console.error;
+  console.log = () => {}; console.error = () => {};
+  try {
+    config.wsEndpoint = 'ws://127.0.0.1:1/ws';   // refused; we only care about the grant
+    const socket = new ZoomEventSocket(() => {});
+    socket.scheduleReconnect = () => {};
+    await socket.connect().catch(() => {});
+    socket.close();
+
+    assert.deepEqual(grants, ['client_credentials'],
+      `the event socket requested grant(s) ${JSON.stringify(grants)}. An event subscription on `
+      + "a user's refresh grant stops the moment that person's consent does");
+
+    // The escape hatch still works, because the contract could not be verified
+    // from this container and must be reversible without a deploy.
+    grants.length = 0;
+    __resetAppToken();
+    config.eventTokenGrant = 'user';
+    const s2 = new ZoomEventSocket(() => {});
+    s2.scheduleReconnect = () => {};
+    await s2.connect().catch(() => {});
+    s2.close();
+    assert.deepEqual(grants, ['refresh_token'],
+      'ZOOM_EVENT_TOKEN_GRANT=user must restore the previous behaviour exactly');
+  } finally {
+    console.log = realLog; console.error = realErr;
+    config.tokenUrl = prevUrl;
+    config.eventTokenGrant = prevGrant;
+    config.wsEndpoint = prevWs;
+    __resetAppToken();
+    srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('NO-GO 2: only an explicit positive acknowledgement counts as readiness', async () => {
+  // `Boolean(msg.success)` is truthiness, not validation, and the string
+  // "false" is truthy. A refusal serialised as a string, an object, an array
+  // or the number 1 all resolved connect() as a healthy subscription with no
+  // retry — the exact "looks connected, receives nothing" failure the
+  // acknowledgement gate was built over two review rounds to prevent. The gate
+  // was there. It accepted anything.
+  const { isPositiveAck } = await import('../src/events-ws.js');
+
+  for (const v of [true, 'true', 'TRUE', '  true  ']) {
+    assert.equal(isPositiveAck(v), true, `${JSON.stringify(v)} is an explicit positive`);
+  }
+  for (const v of ['false', 'FALSE', {}, [], 1, 2, 0, '', 'yes', 'ok', null, undefined, NaN]) {
+    assert.equal(isPositiveAck(v), false,
+      `${JSON.stringify(v) ?? String(v)} was accepted as an acknowledgement — the agent would sit `
+      + 'on a socket Zoom had refused, scheduling nothing, receiving nothing');
+  }
 });

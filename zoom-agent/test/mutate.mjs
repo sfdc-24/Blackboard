@@ -249,6 +249,23 @@ const MUTATIONS = [
   },
 
   {
+    blocker: '16-grant',
+    name: 'the event socket rides on the user consent grant again',
+    file: 'src/events-ws.js',
+    from: "import { getEventToken } from './oauth.js';",
+    to: "import { getAccessToken as getEventToken } from './oauth.js';",
+    expect: /asks for an app token, not the user/,
+  },
+  {
+    blocker: '16-ack',
+    name: 'the acknowledgement goes back to Boolean() coercion',
+    file: 'src/events-ws.js',
+    from: "  if (value === true) return true;\n  return typeof value === 'string' && value.trim().toLowerCase() === 'true';",
+    to: '  return Boolean(value);',
+    expect: /only an explicit positive acknowledgement counts/,
+  },
+
+  {
     blocker: '15-privacy',
     name: 'chat content is logged again regardless of LOG_TRANSCRIPT',
     file: 'src/rtms.js',

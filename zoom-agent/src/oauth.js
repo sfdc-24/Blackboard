@@ -144,6 +144,86 @@ async function tokenRequest(params) {
   return tokens;
 }
 
+/**
+ * An APP-level access token for the event plane, cached in memory.
+ *
+ * WHY THE EVENT SOCKET MUST NOT USE THE USER'S TOKEN
+ *   Everything above this line is the user-consent flow: authorization_code,
+ *   then refresh_token, tied to one person's grant and to a refresh token on
+ *   disk. That is right for acting on a user's behalf and wrong for the event
+ *   subscription, which is the APPLICATION asking Zoom to tell it when meetings
+ *   start. Binding it to a person means the whole event plane dies when that
+ *   person revokes consent, changes password, or simply lets the refresh token
+ *   lapse — a background service that stops on an interactive lifecycle it has
+ *   no reason to share.
+ *
+ *   Zoom's WebSocket guide additionally specifies `client_credentials` for this
+ *   endpoint for both General and Server-to-Server OAuth apps, per the
+ *   independent review of 2026-09-09 (developers.zoom.us/docs/api/websockets/).
+ *   THAT DOCUMENT COULD NOT BE READ FROM THE CONTAINER THIS WAS WRITTEN IN —
+ *   egress to developers.zoom.us is blocked — so the contract is taken from the
+ *   review, not verified here. The design argument above stands on its own and
+ *   does not depend on it.
+ *
+ *   `ZOOM_EVENT_TOKEN_GRANT=user` restores the previous behaviour if the
+ *   contract turns out to be otherwise, so this is reversible without a deploy.
+ */
+let appToken = null;   // { access_token, expires_at }
+
+export async function getAppAccessToken({ minTtlMs = 5 * 60_000 } = {}) {
+  if (appToken && appToken.expires_at - Date.now() > minTtlMs) return appToken.access_token;
+
+  const basic = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64');
+  let res;
+  try {
+    res = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${basic}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ grant_type: 'client_credentials' }),
+      signal: AbortSignal.timeout(config.tokenTimeoutMs),
+    });
+  } catch (err) {
+    appToken = null;
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      throw new Error(
+        `Zoom app-token request did not answer within ${config.tokenTimeoutMs}ms — `
+        + 'aborted so the connect path can retry rather than hang',
+      );
+    }
+    throw err;
+  }
+  if (!res.ok) {
+    appToken = null;
+    throw new Error(`Zoom app-token request failed (${res.status}): ${await res.text()}`);
+  }
+  const data = await res.json();
+  if (!data?.access_token) {
+    appToken = null;
+    throw new Error('Zoom app-token response carried no access_token');
+  }
+  appToken = {
+    access_token: data.access_token,
+    expires_at: Date.now() + (Number(data.expires_in) || 3600) * 1000,
+  };
+  return appToken.access_token;
+}
+
+/** Test seam: forget the cached app token. */
+export function __resetAppToken() { appToken = null; }
+
+/**
+ * The token the EVENT plane should use. One place decides, so the socket does
+ * not have to know which flow it is on.
+ */
+export async function getEventToken(opts) {
+  return config.eventTokenGrant === 'user'
+    ? getAccessToken(opts)
+    : getAppAccessToken(opts);
+}
+
 export async function exchangeCode(code) {
   return tokenRequest({
     grant_type: 'authorization_code',

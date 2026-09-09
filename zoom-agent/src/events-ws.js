@@ -3,7 +3,7 @@
 // The media itself flows over a separate RTMS socket managed in rtms.js.
 import WebSocket from 'ws';
 import { config } from './config.js';
-import { getAccessToken } from './oauth.js';
+import { getEventToken } from './oauth.js';
 
 const PING_INTERVAL_MS = 25_000;       // keep-alive cadence
 const TOKEN_RECYCLE_MS = 50 * 60_000;  // reconnect before the 1h token expires
@@ -42,6 +42,28 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 // recycle passes. The fix was covered; the wiring to it was not.
 export const __recycleContract = { TOKEN_RECYCLE_MS, RECYCLE_MIN_TTL_MS };
 
+/**
+ * Is this acknowledgement a POSITIVE one?
+ *
+ * THE DEFECT: `Boolean(msg.success)`. Truthiness is not validation, and the
+ * worst case is not exotic — **the string "false" is truthy**. A refusal
+ * serialised as a string, an object, an array, or the number 1 all resolved
+ * connect() as a healthy subscription with no retry scheduled, which is exactly
+ * the "looks connected, receives nothing" failure the acknowledgement gate was
+ * built over two review rounds to prevent. The gate was there; it accepted
+ * anything.
+ *
+ * Only an explicit positive counts. `"true"` is allowed alongside `true`
+ * because a JSON stringification quirk on Zoom's side should not strand the
+ * agent in a retry loop against a working endpoint; every other value is a
+ * refusal. Narrowing fails toward retry, which is recoverable — the direction
+ * the old code got backwards.
+ */
+export function isPositiveAck(value) {
+  if (value === true) return true;
+  return typeof value === 'string' && value.trim().toLowerCase() === 'true';
+}
+
 export class ZoomEventSocket {
   constructor(onEvent) {
     this.onEvent = onEvent;
@@ -74,7 +96,9 @@ export class ZoomEventSocket {
    * A TCP handshake is not a subscription. Readiness is what Zoom says it is.
    */
   async connect({ minTtlMs } = {}) {
-    const token = await getAccessToken(minTtlMs ? { minTtlMs } : undefined);
+    // getEventToken, not getAccessToken: the event subscription is the
+    // application's, not a user's. See oauth.js.
+    const token = await getEventToken(minTtlMs ? { minTtlMs } : undefined);
     if (!token) throw new Error('Not authorized yet — complete the OAuth flow first.');
 
     const base = config.wsEndpoint;
@@ -244,8 +268,8 @@ export class ZoomEventSocket {
       // The acknowledgement decides readiness. success=false used to be logged
       // and otherwise ignored, which left the agent looking connected while
       // Zoom had declined it.
-      console.log(`[events] build_connection success=${msg.success}`);
-      this.onAck?.(Boolean(msg.success));
+      console.log(`[events] build_connection success=${JSON.stringify(msg.success)}`);
+      this.onAck?.(isPositiveAck(msg.success));
       return;
     }
     if (msg.module === 'heartbeat') return;
