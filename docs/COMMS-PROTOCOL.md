@@ -33,15 +33,26 @@ The failure this document exists to prevent is not disagreement. It is
 
 Say what is true, not what is architecturally intended.
 
+**The durable rule — this part does not age:** a surface can send WhatsApp **if
+and only if the host it runs on holds the Meta credentials**, and reach is a
+property of that host, not of a tag. **No instance may copy that credential to
+another machine.** If Mr. Salam wants another surface to send, he places the
+credential there himself. So do not read the roster below as a capability list;
+**verify the host you are on**, and check the newest VIEWPORT for who else is
+running.
+
+*Roster as observed 2026-09-07, and it is a state claim — confirm before relying
+on it:*
+
 | From | To Mr. Salam's phone | To the board |
 |---|---|---|
 | `claude-code-cli` (laptop) | **yes** — `scripts/wa_notify.ps1` | yes |
 | `vm-cli`, `vm-chrome`, `chat-mobile`, `codex`, `vm-order-worker` | **no** | yes |
 | the gateway lanes tagged `claude` / `gemini` | yes, automatically | they write rows, but read none |
 
-Only the laptop can send WhatsApp, because the Meta token is in the laptop
-`.env` that Mr. Salam filled in himself. **No instance may copy that credential
-to another machine.** If he wants another surface to send, he places it there.
+*Verified 2026-09-09: the laptop `.env` does hold `META_TOKEN` and
+`WA_PHONE_NUMBER_ID`, so the first row still holds. The others were not
+re-checked from here and cannot be — that is the point of the rule above.*
 
 **The lanes tagged `claude` and `gemini` in the WhatsApp conversation are not
 fleet instances.** They are the Pipedream gateway auto-replying in about two
@@ -91,9 +102,14 @@ He reads on a phone, usually while doing something else.
 - **Make it answerable in one tap or one letter.** WhatsApp's native poll cannot
   be sent by the Cloud API and cannot be a reply — he established that himself.
   Interactive buttons are the API equivalent and `wa_notify.ps1` sends them.
-- **Until the gateway is fixed, ask for a letter, not a tap.** His button press
-  on 2026-09-06 arrived as an empty board row and his vote was lost. Sending
-  buttons is fine; relying on them is not.
+- **Ask for a letter, not a tap, while the gateway cannot carry a tap.** His
+  button press on 2026-09-06 arrived as an empty board row and his vote was
+  lost. Sending buttons is fine; relying on them is not.
+
+  *Status, checked 2026-09-09:* `docs/WHATSAPP-GATEWAY-REPAIR.md` on `main`
+  states the repair components have **"offline contract evidence only, and have
+  not been deployed to Pipedream."** So this still holds — but it is a state
+  claim with a source, and that file is where to check it, not this one.
 - **Never ask for a credential, and say so when declining.** Passwords and OAuth
   consents are his, permanently. Two or three of those a month is the right
   amount of friction, and no automation tool can or should remove it.
@@ -232,7 +248,7 @@ all.** It was missing, and its absence cost a full session.
 
 Every row I wrote on 2026-09-09 — roughly twenty of them — was **plain prose**
 with an ad-hoc identifier, posted through `alpha.ps1 -Payload`. No `id=`, no
-`to=`, no `cc=`, and columns G, I and J left empty. A row from `codex` beside
+`to=`, no `cc=`, and columns H, I and J left empty. A row from `codex` beside
 mine looks like this:
 
 ```
@@ -258,10 +274,18 @@ routable**, and the difference only shows up the day someone automates.
 
 | | |
 |---|---|
+**The canonical columns, letter by letter, read off the live header rather
+than recalled** — I wrote "Project Tag (G)" in the first version of this
+section and G is **Category**:
+
+`A` Row_ID · `B` Timestamp · `C` Source_Tag · `D` Target_Surface ·
+`E` Action_Type · `F` Payload · `G` Category · `H` Project Tag · `I` Gist ·
+`J` Sub-Gist. `K` and `L` are blank padding on read and are never written.
+
 | payload | `BCB\|v=1\|id=…\|phase=…\|class=…\|from=…\|to=…\|cc=…\|` then the content |
 | `id=` | globally unique, quotable by a later `answers=` |
 | `to=` / `cc=` | exact tags, comma-separated. `ALL` broadcasts |
-| Project Tag (G) | which project this belongs to |
+| Project Tag (H) | which project this belongs to |
 | Gist (I) | one sentence. This is what a fleet notification shows |
 | Sub-Gist (J) | the second sentence, if one is needed |
 
@@ -296,11 +320,26 @@ assume away:
   skipped. Better: do not key on timestamps at all — see the anchoring rule
   below.
 
-**Proving a write.** Read back **once**, match on the `id=` field, and compare
-the **intended A:J** against what came back. Never blind-retry: an Apps Script
-write can land after its response is lost, and the retry is the duplicate. If
-the read-back does not find the row, that is *unresolved*, not *failed* — a
-successful read can omit a row appended moments earlier.
+**Proving a write.** Read back **once**. The earlier version of this paragraph
+said "match on the `id=` field" and stopped there, which accepts a case-changed
+id, a payload carrying two `id=` fields, and two rows both matching. All three
+are ways of appearing to prove a write that was never made. State it precisely:
+
+1. the payload contains **exactly one** `id=` field — a second one is a
+   malformed row, not a tie to break;
+2. its value matches the intended id **case-sensitively and exactly**, not as a
+   substring — a correction row quotes the id it corrects, so a substring search
+   matches two different rows to one;
+3. **exactly one row** in the sheet matches. Zero is *unresolved*; two or more
+   is a duplicate already on the board and must be reported, never appended to;
+4. that row's **A:J equals the intended A:J**, cell for cell;
+5. its trailing shape is acceptable — 10 cells, or 12 with **K and L blank**.
+   Anything else is quarantined and reported rather than reinterpreted.
+
+Never blind-retry: an Apps Script write can land after its response is lost, and
+the retry is the duplicate. If the read-back does not find the row, that is
+*unresolved*, not *failed* — a successful read can omit a row appended moments
+earlier.
 
 **And read a row back by its `id=` field, not by searching the payload.** A
 correction row quotes the identifier it corrects, so a substring search matches
