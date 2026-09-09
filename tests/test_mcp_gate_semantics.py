@@ -418,58 +418,115 @@ class GateSemantics(unittest.TestCase):
 
     # ── Prose and typed block must say the same thing ───────────────────────
 
-    def test_the_prose_states_the_same_relations_as_the_typed_blocks(self) -> None:
-        """Positive agreement, in both fields, for every gate.
+    # ── One authoritative source, so there is no remainder to contradict ────
+    #
+    # ROUND TEN. The previous version parsed the LEADING gate list out of each
+    # prose bullet and DISCARDED THE REST OF THE SENTENCE, so
+    #
+    #     - **unlocks** — G9. In practice G8 gates nothing and G9 may proceed
+    #       without it.
+    #
+    # parsed to {G9}, matched the block, and passed. I had replaced a prefix
+    # check with a leading-token parse, which is still only reading the
+    # beginning. Eight earlier attacks came back through that gap and two new
+    # ones with them; I reproduced them before changing anything.
+    #
+    # The fix is not a longer parser. The contract bullets are GENERATED from
+    # the typed block and compared byte for byte, so nobody writes that text by
+    # hand and there is nothing after the value to disagree with it.
 
-        Not "the prose mentions G9" — the bullet must OPEN with the canonical
-        rendering of the typed value. `- **unlocks** — nothing. G8 does not
-        unlock G9.` opens with "nothing" while the block says `G9`, and fails
-        here even before reciprocity gets to it.
-        """
-        problems: list[str] = []
+    def test_the_contract_prose_is_exactly_what_the_block_generates(self) -> None:
+        problems = []
         for gid, gate in sorted(self.gates.items()):
-            for label, value in (("prerequisite", gate.requires),
-                                 ("unlocks", gate.unlocks)):
-                text = _bullet(gate.prose, label)
-                if text is None:
-                    problems.append(f"{gid}: no `{label}` bullet")
-                    continue
-                # PARSED, not prefix-matched. Round nine walked through
-                # `startswith` with "G90 is a different gate entirely" — because
-                # "G90..." starts with "G9". A prefix test on an identifier that
-                # can be extended tests nothing about the identifier. This runs
-                # the prose through the same grammar as the block and compares
-                # sets, so G90 is refused as a gate id rather than accepted as a
-                # prefix.
-                try:
-                    said = gg.prose_relation(text, f"{gid}.{label} prose")
-                except gg.GateSyntaxError as exc:
-                    problems.append(str(exc))
-                    continue
-                if said != value:
-                    problems.append(
-                        f"{gid}.{label}: block says {_render(value)}; prose says "
-                        f"{_render(said)}"
-                    )
+            want = gg.render_contract(gate)
+            if want in gate.prose:
+                continue
+            found = re.search(
+                re.escape(gg.CONTRACT_BEGIN) + r".*?" + re.escape(gg.CONTRACT_END),
+                gate.prose, re.DOTALL)
+            problems.append(
+                f"--- {gid} expected ---"
+                + chr(10) + want
+                + chr(10) + f"--- {gid} found ---" + chr(10)
+                + (found.group(0) if found else "(no generated region at all)"))
         self.assertEqual(
             problems, [],
-            "the prose and the typed blocks disagree:\n  " + "\n  ".join(problems),
+            "the contract prose is not what the typed block generates. It is "
+            "generated, not written: run tests/render_contracts.py rather than "
+            "editing it, and if the wording is wrong change the block or the "
+            "sentence table in tests/gate_graph.py."
+            + chr(10) + chr(10) + (chr(10) + chr(10)).join(problems),
         )
 
-    def test_the_prose_repeats_each_gates_fail_closed_rule(self) -> None:
-        """Every gate's fail-closed bullet must exist and be non-empty.
+    def test_commentary_never_restates_the_contract(self) -> None:
+        """A second copy of a rule is a rule that can change unnoticed.
 
-        Deliberately weaker than the relation check above: a fail-closed rule
-        is an English sentence, and pretending a token match proves the
-        sentence means it would be the same mistake in a new costume. The
-        typed field is what the tests assert on; this only ensures the reader
-        is told something.
+        My own restructure created this: it moved each hand-written contract
+        bullet into a `why` bullet, so the normative sentence existed twice —
+        once generated, once by hand. The legacy mutation harness found it
+        within minutes. A mutation edited the hand-written copy and the suite
+        stayed GREEN, because a document-wide scan was satisfied by the
+        generated one sitting fifteen lines above.
+
+        `test_no_contract_label_is_used_outside_a_generated_region` catches a
+        rival LABEL. This catches a rival SENTENCE, which is the same defect
+        wearing different clothes.
         """
-        empty = sorted(
-            gid for gid, gate in self.gates.items()
-            if not (_bullet(gate.prose, "fail-closed") or "").strip()
+        def norm(s):
+            return " ".join(re.sub(r"[*_`]", "", s).split()).lower()
+
+        WINDOW = 40
+        offenders = []
+        for gid, gate in sorted(self.gates.items()):
+            region = re.search(
+                re.escape(gg.CONTRACT_BEGIN) + r".*?" + re.escape(gg.CONTRACT_END),
+                gate.prose, re.DOTALL)
+            contract = norm(region.group(0)) if region else ""
+            outside = re.sub(
+                re.escape(gg.CONTRACT_BEGIN) + r".*?" + re.escape(gg.CONTRACT_END),
+                "", gate.prose, flags=re.DOTALL)
+            body = norm(outside)
+            for i in range(0, max(0, len(body) - WINDOW) + 1):
+                chunk = body[i:i + WINDOW]
+                if chunk in contract:
+                    offenders.append(f"{gid}: commentary repeats the contract — {chunk!r}")
+                    break
+        self.assertEqual(
+            offenders, [],
+            "commentary is restating the contract. The generated region states the "
+            "rule; prose beside it should say WHY, not say the rule again — a second "
+            "copy is one that can be edited while a scan stays satisfied by the "
+            "first:" + chr(10) + "  " + (chr(10) + "  ").join(offenders),
         )
-        self.assertEqual(empty, [], f"{empty} state no fail-closed behaviour in prose")
+
+
+    def test_no_contract_label_is_used_outside_a_generated_region(self) -> None:
+        """A second `- **unlocks** —` below the region would be a rival contract.
+
+        This is the assertion that makes generation worth anything. Without it
+        the generated block can be perfect while a hand-written bullet three
+        lines down says the opposite — which is the shape round ten used. It
+        also catches a label hiding INSIDE another bullet, which is where an
+        acceptor statement was sitting where no per-bullet check could see it.
+        """
+        offenders = []
+        for gid, gate in sorted(self.gates.items()):
+            outside = re.sub(
+                re.escape(gg.CONTRACT_BEGIN) + r".*?" + re.escape(gg.CONTRACT_END),
+                "", gate.prose, flags=re.DOTALL)
+            for label in gg.CONTRACT_LABELS:
+                pattern = r"\*\*(?:independent )?" + re.escape(label) + r"\*\*"
+                for m in re.finditer(pattern, outside):
+                    line = outside[:m.start()].count(chr(10)) + 1
+                    offenders.append(
+                        f"{gid}: **{label}** appears outside the generated region "
+                        f"(line {line} of the section)")
+        self.assertEqual(
+            offenders, [],
+            "these are rival contracts. The generated region is the contract; "
+            "anything else using its labels can contradict it and nothing would "
+            "notice:" + chr(10) + "  " + (chr(10) + "  ").join(offenders),
+        )
 
 
 if __name__ == "__main__":

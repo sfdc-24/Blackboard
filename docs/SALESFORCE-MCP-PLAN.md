@@ -356,18 +356,16 @@ absent_evidence_behaviour: refuse_connect
 passed: no
 ```
 
-- **prerequisite** — **none**: no gate precedes G1. What it does need is a
-  Developer Edition org we control **and a separate, human authorisation to
-  read it** (see below) — a real-world precondition, which is why it is
-  carried as `human_precondition` above rather than as a gate edge. Note which section is
-  provisional: **§0 is the verified part**, checked against Salesforce's own
-  documentation with sources, and it is not in question here. **§1's
-  capability table is the unqualified one** and is what this gate confirms
-  or strikes. The previous version had these the wrong way round.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — none.
+- **unlocks** — G2, G3, G5.
+- **acceptor** — any agent that did not write it.
+- **fail-closed** — a claim that cannot be confirmed with a version is **struck**, not softened. And no valid evidence, **no connection**.
+<!-- end generated -->
+
 - **artefact** — `docs/mcp-capability-matrix.md`: exact server ids, endpoints,
   version and maturity for Hosted and DX, **measured, not quoted**.
 - **owner** — claude-code-cli.
-- **independent acceptor** — any agent that did not write it.
 - **evidence** — the raw tool listing and version output from both servers,
   committed, with the commit hash recorded — **and the provenance of the
   authorisation that produced them**: who authorised it by name, which
@@ -384,10 +382,9 @@ passed: no
   returns the identical error**, so that attempt confirms the org recognises
   the connected app and confirms nothing about the secret. A gate that only
   has a shape for success quietly promotes that to a pass.
-- **fail-closed** — if a claim in §1's table cannot be confirmed with a version,
-  it is **struck from the table**, not softened.
-- **unlocks** — G2, G3, G5. G5's field inventory comes out of the same
-  spike, and pretending otherwise left G5 with no stated source.
+
+- **why** — the Developer Edition org and the separate human authorisation are real-world preconditions, not gate edges, which is why they are carried as `human_precondition`. On which section is provisional: **§0 is the verified part**, checked against Salesforce's own documentation with sources. **§1's capability table is the unqualified one**, and is what this gate confirms or strikes. An earlier version had these the wrong way round.
+- **why** — G5's field inventory comes out of the same spike, and pretending otherwise left G5 with no stated source.
 
 ### G2 · quota and spend
 
@@ -405,7 +402,13 @@ absent_evidence_behaviour: refuse_scan
 passed: no
 ```
 
-- **prerequisite** — G1 accepted.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G1.
+- **unlocks** — G9.
+- **acceptor** — any agent that did not write it.
+- **fail-closed** — a scan does not start when its cost **is not yet known**. Unknown is not permission. And no valid evidence, **no scan starts**.
+<!-- end generated -->
+
 - **artefact** — folded into G1's matrix: measured API cost of a scan of a
   **named, enumerated object set fixed at G1 time** — `scan_envelope`. "A full
   scan" was undefined at this point in the order, because what a scan covers is
@@ -413,15 +416,11 @@ passed: no
   against an undefined envelope is a number with no unit. The envelope is
   stated explicitly here, and **when G5 or G6 changes it, G2's measurement is
   re-taken** rather than inherited.
-- **owner** — claude-code-cli. **acceptor** — as G1.
+- **owner** — claude-code-cli.
 - **evidence** — before/after `/limits` readings around a full scan, or a
   written demonstration that `/limits` is unreachable over MCP.
-- **fail-closed** — a scan does not start when it *would exceed* the
-  configured share of remaining quota **or when its cost is not yet known**.
-  Unknown is not permission: the previous wording blocked only the measured
-  excess, so an unmeasured scan ran. Paging and retry budgets are stated as
-  numbers or the gate fails.
-- **unlocks** — G9's spend argument.
+
+- **why** — the previous wording blocked only the *measured* excess, so an unmeasured scan ran. Paging and retry budgets are stated as numbers or the gate fails.
 
 ### G3 · enforcement policy
 
@@ -439,17 +438,20 @@ absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
-- **prerequisite** — G1's tool listing.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G1.
+- **unlocks** — G4.
+- **acceptor** — any agent that did not write it.
+- **fail-closed** — **deny by default** — a tool not on the allowlist is refused even if the server offers it. And no valid evidence, **the gate is not accepted**.
+<!-- end generated -->
+
 - **artefact** — `docs/mcp-enforcement-policy.md`: the literal tool allowlist,
   the org allowlist rule, the telemetry position, the non-GA rule.
-- **owner** — claude-code-cli. **acceptor** — an agent that did not write it.
+- **owner** — claude-code-cli.
 - **evidence** — a test that fails when any name in §0's mutating list is
   reachable, and a test that fails when a response carries an unexpected org id.
-- **fail-closed** — **deny by default**: a tool not on the allowlist is refused
-  even if the server offers it. **If the per-response org id proves
-  unobtainable, G3 fails and the DX path is abandoned** — load-bearing, not
-  decorative.
-- **unlocks** — G4.
+
+- **why** — **if the per-response org id proves unobtainable, G3 fails and the DX path is abandoned.** That consequence is load-bearing, not decorative.
 
 ### G4 · auth and tenancy
 
@@ -467,20 +469,24 @@ absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
-- **prerequisite** — G3's org boundary.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G3.
+- **unlocks** — G9.
+- **acceptor** — **Mr. Salam or a reviewer**. Not the author.
+- **fail-closed** — any concern without an executable demonstration **blocks G9**. And no valid evidence, **the gate is not accepted**.
+<!-- end generated -->
+
 - **artefact** — `docs/mcp-auth-lifecycle.md`, answering **six** concerns:
   attended vs unattended authorisation, ECA constraints, token storage, token
   rotation, revocation, per-tenant isolation. *(The previous version said
   "each of the five" while listing six — a count stated from memory, the fourth
   such error in two days. It now says six because they were counted.)*
-- **owner** — claude-code-cli. **acceptor** — Mr. Salam or a reviewer; **this
-  one does not pass on my say-so**, because it is the gate that decides where a
-  client's credentials live.
+- **owner** — claude-code-cli.
 - **evidence** — an executable demonstration per concern, not prose: a token
   refresh, a revocation taking effect, a second tenant's scan failing to see
   the first's data.
-- **fail-closed** — any concern without a demonstration blocks G9.
-- **unlocks** — G9.
+
+- **why** — Mr. Salam or a reviewer; **this one does not pass on my say-so**, because it is the gate that decides where a client's credentials live.
 
 ### G5 · schemas
 
@@ -498,17 +504,22 @@ absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
-- **prerequisite** — G1's field inventory.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G1.
+- **unlocks** — G6, G7.
+- **acceptor** — any agent that did not write it.
+- **fail-closed** — an emitter that cannot validate **does not publish**. And no valid evidence, **nothing is published**.
+<!-- end generated -->
+
 - **artefact** — `xray-score-v1` schema, validator, and a fixture corpus with a
   **pinned digest**; plus versioned collection-manifest, private-facts and
   public-export schemas.
-- **owner** — claude-code-cli. **acceptor** — an agent that did not write it.
+- **owner** — claude-code-cli.
 - **evidence** — the validator rejects a corpus mutated in **each** field, the
   way `tests/mutate_positioning.cjs` does for the site, including a mutation
   that adds an **unexpected field** rather than only removing known ones.
-- **fail-closed** — an emitter that cannot validate does not publish.
-- **unlocks** — G6, G7. The sanitizer needs the public-export schema
-  directly, not only by way of the catalogue.
+
+- **why** — The sanitizer needs the public-export schema directly, not only by way of the catalogue.
 
 ### G6 · catalogue and statistics
 
@@ -526,17 +537,21 @@ absent_evidence_behaviour: refuse_accept
 passed: no
 ```
 
-- **prerequisite** — G5's schemas.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G5.
+- **unlocks** — G7.
+- **acceptor** — **Mr. Salam or a reviewer**. Not the author.
+- **fail-closed** — a metric without its demonstration reports a **rate**, not a sigma. And no valid evidence, **the gate is not accepted**.
+<!-- end generated -->
+
 - **artefact** — the 17-field catalogue, and for any metric proposed to carry
   sigma, a written demonstration of §4's seven conditions.
-- **owner** — claude-code-cli proposes. **acceptor** — **Mr. Salam or a
-  reviewer**; I should not be the one who decides my own model is sound.
+- **owner** — claude-code-cli proposes.
 - **evidence** — every metric carries all 17 fields with no `UNRESOLVED`; each
   sigma claim carries its stability, sample, stratification and uncertainty
   working.
-- **fail-closed** — a metric without its demonstration reports a **rate**, not
-  a sigma. It is not dropped and it is not promoted.
-- **unlocks** — G7.
+
+- **why** — **Mr. Salam or a reviewer**; I should not be the one who decides my own model is sound.
 
 ### G7 · sanitizer
 
@@ -554,17 +569,20 @@ absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
-- **prerequisite** — G5, G6 — the public-export schema and the catalogue.
-  A sanitizer cannot know what to redact until the fields are defined.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G5, G6.
+- **unlocks** — G9.
+- **acceptor** — **Mr. Salam**. A person, in the open.
+- **fail-closed** — **no approval, no publication.** Absence of approval is not permission. And no valid evidence, **nothing is published**.
+<!-- end generated -->
+
 - **artefact** — `docs/mcp-sanitizer.md` and the tool.
-- **owner** — claude-code-cli builds. **acceptor** — **Mr. Salam approves the
-  exact bytes** of anything that becomes public.
+- **owner** — claude-code-cli builds.
 - **evidence** — a fixture of private facts produces a public export with a
   **stable digest**, plus a leakage mutation: an org name injected into a
   finding must not survive to the export.
-- **fail-closed** — **no approval, no publication.** Absence of approval is not
-  permission.
-- **unlocks** — G9.
+
+- **why** — a sanitizer cannot know what to redact until the fields are defined, which is why it waits on both the export schema and the catalogue.
 
 ### G8 · live correction — *out of order, and first*
 
@@ -582,21 +600,20 @@ absent_evidence_behaviour: refuse_publish
 passed: no
 ```
 
-- **prerequisite** — none. This is why it is out of order.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — none.
+- **unlocks** — G9.
+- **acceptor** — a reviewer. Not the author, and not an agent.
+- **fail-closed** — if the live read-back still shows the old wording the gate is **not passed**, however green CI was. And no valid evidence, **nothing is published**.
+<!-- end generated -->
+
 - **artefact** — a source PR against `sfdc24-site` correcting the `/xray/` and
   homepage six-sigma wording per §4.
-- **owner** — claude-code-cli. **acceptor** — Mr. Salam chooses the wording;
-  a reviewer accepts the change.
+- **owner** — claude-code-cli.
 - **evidence** — the merge commit, the deployment run id, and a **read-back of
   the live page body** showing the corrected wording and no forbidden claim.
-- **fail-closed** — if the live read-back still shows the old wording, the gate
-  is not passed however green CI was.
-- **unlocks** — G9.
 
-*G8 has no prerequisites and one dependent, and that asymmetry is the point:
-it corrects a claim a visitor can read today, so nothing may hold it up. An
-earlier version wrote "it gates nothing and nothing gates it", which
-contradicted G9's own prerequisite list two blocks below.*
+- **why** — *G8 has no prerequisites and one dependent, and that asymmetry is the point: it corrects a claim a visitor can read today, so nothing may hold it up. An earlier version wrote "it gates nothing and nothing gates it", which contradicted G9's own prerequisite list two blocks below.*
 
 ### G9 · first client org
 
@@ -614,88 +631,68 @@ absent_evidence_behaviour: refuse_connect
 passed: no
 ```
 
-- **prerequisite** — G2, G4, G7, G8 **directly**, and therefore G1, G3, G5
-  and G6 **transitively** — the whole of G1–G8, with nothing reaching G9 by
-  another route. "Mostly done" cannot pass for done because the test
-  **computes that closure from the typed blocks** instead of trusting this
-  sentence, which is what an earlier version asked you to do.
+<!-- generated from the gate block above; do not hand-edit -->
+- **prerequisite** — G2, G4, G7, G8.
+- **unlocks** — none.
+- **acceptor** — **Mr. Salam**. A person, in the open.
+- **fail-closed** — **no authorisation, no scan.** Silence is not a yes. And no valid evidence, **no connection**.
+<!-- end generated -->
+
 - **artefact** — none. This is an authorisation, not a document.
-- **owner** — n/a. **acceptor** — **Mr. Salam authorises.** A person, in the
-  open. Not an agent, and not this document.
+- **owner** — n/a.
 - **evidence** — a board row **from Mr. Salam's own channel**, naming the
   **exact org identifier** to be read, its scope, and an expiry. An agent's
   note that it is fine is not evidence, and neither is an authorisation
   that does not say which org.
-- **fail-closed** — no authorisation, no scan. Silence is not a yes.
-- **unlocks** — none. G9 is terminal: what it opens is the first scan of an
-  org we do not own, and that is an authorisation, not another gate.
 
+- **why** — G2, G4, G7 and G8 are the direct prerequisites; G1, G3, G5 and G6 reach G9 through them, so the whole of G1–G8 must be accepted. "Mostly done" cannot pass for done because the test **computes that closure from the typed blocks** rather than trusting this sentence, which is what an earlier version asked you to do.
+- **why** — G9 is terminal: what it opens is the first scan of an org we do not own, and that is an authorisation, not another gate.
 ---
 
 ---
 
 ## 9. Private to public
 
-Nothing deterministic separates a private readout from a publishable one today.
-Exact counts, object and flow names, and generated finding text can each
+Nothing deterministic separates a private readout from a publishable one today. Exact counts, object and flow names, and generated finding text can each
 fingerprint an org — and a "sample readout" on a public page is the most likely
 place for that to leak. A real org's readout is client data **even when the
 client is us**. The sanitizer is a deliverable with an exact-byte approval step,
-not a review habit.
-
----
+not a review habit. ---
 
 ## 10. What this is worth, honestly
 
 The MCP plumbing is not the differentiator and demonstrably never was —
-Salesforce ship it twice, free.
-
-What is left is a scoring model, a presentation layer, and a review culture that
+Salesforce ship it twice, free. What is left is a scoring model, a presentation layer, and a review culture that
 rejects unevidenced claims. Two of those three are thinner than the last version
 of this document said: the model has a statistical error in it, and the
 presentation layer is a synthetic mock-up. **The third one is real, and it is the
 reason this document is on its third version rather than in production.** A
-client can read that argument afterwards. See `docs/POKA-YOKE.md`.
-
----
+client can read that argument afterwards. See `docs/POKA-YOKE.md`. ---
 
 ## Decisions that are Mr. Salam's
 
 1. **Hosted or DX first?** Genuinely open now that my edition argument is
    withdrawn. I recommend deciding from the §8 spike rather than from either of
-   us arguing it.
-2. **Read-only permanently**, with "build" served by the prototype publisher?
-   I recommend yes.
-3. **How and when the live site's six-sigma wording is corrected**, per §4.
-   *Whether* is not a decision — a page presenting a pooled figure as a sigma
+   us arguing it. 2. **Read-only permanently**, with "build" served by the prototype publisher? I recommend yes. 3. **How and when the live site's six-sigma wording is corrected**, per §4. *Whether* is not a decision — a page presenting a pooled figure as a sigma
    level is making a claim that does not hold. The wording and the timing
-   relative to launch are yours.
-4. **Does the first real org readout go public on `/xray/`,** or stay internal?
-5. **Does this jump the open Zoom blockers?** Larger than the last version
-   implied, because §5 and §6 are build, not paperwork.
-
----
+   relative to launch are yours. 4. **Does the first real org readout go public on `/xray/`,** or stay internal? 5. **Does this jump the open Zoom blockers?** Larger than the last version
+   implied, because §5 and §6 are build, not paperwork. ---
 
 ## What this document is, and where it stops
 
 A reviewer can keep asking a plan for more specification, and each ask can be
-individually reasonable while the document is the wrong place for the answer.
-So, plainly:
+individually reasonable while the document is the wrong place for the answer. So, plainly:
 
 **This is a plan. It commits to producing four specifications and gates client
 work behind them** — the tool/org enforcement policy (§3), the
 `xray-score-v1` schema with validator and corpus (§5), the metric catalogue
-(§6), and the sanitizer (§9). Each is a separate artefact with its own review.
-
-**What belongs in those artefacts and not here:** an exact versioned capability
+(§6), and the sanitizer (§9). Each is a separate artefact with its own review. **What belongs in those artefacts and not here:** an exact versioned capability
 matrix per server release, the literal enforceable allowlist and telemetry
 policy, the attended/unattended auth and token-lifecycle design, the quota
 reserve/retry/paging budget, and the formal versioned schemas for collection
 manifest, private facts, internal score and public export. Naming them here as
 required is the plan doing its job; writing them here would produce a document
-nobody can review and a specification nobody can version.
-
-**Settled, rather than argued.** The fourth review named this "a useful
+nobody can review and a specification nobody can version. **Settled, rather than argued.** The fourth review named this "a useful
 proposed work plan under HOLD, not executable architecture and no client-org
 scan authorization." That is exactly right, and it is now the status line at the
 top of the file. The eight architecture blockers are requirements on G1-G7's

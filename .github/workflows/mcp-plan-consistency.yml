@@ -25,21 +25,23 @@ on:
   pull_request:
     paths:
       - "docs/SALESFORCE-MCP-PLAN.md"
-      - "tests/test_mcp_plan_consistency.py"
-      - "tests/test_mcp_gate_semantics.py"
-      - "tests/gate_graph.py"
-      - "tests/mutate_mcp_plan.py"
-      - "tests/mutate_gate_semantics.py"
+      # tests/** and not a hand-listed set. On the site repo the same shape of
+      # workflow RAN a control file while omitting it from the triggers, so the
+      # gate's own control could be neutered with no check running. A glob
+      # cannot be forgotten; a list gains an entry every round and eventually
+      # misses one.
+      - "tests/**"
       - ".github/workflows/mcp-plan-consistency.yml"
   push:
     branches: [main]
     paths:
       - "docs/SALESFORCE-MCP-PLAN.md"
-      - "tests/test_mcp_plan_consistency.py"
-      - "tests/test_mcp_gate_semantics.py"
-      - "tests/gate_graph.py"
-      - "tests/mutate_mcp_plan.py"
-      - "tests/mutate_gate_semantics.py"
+      # tests/** and not a hand-listed set. On the site repo the same shape of
+      # workflow RAN a control file while omitting it from the triggers, so the
+      # gate's own control could be neutered with no check running. A glob
+      # cannot be forgotten; a list gains an entry every round and eventually
+      # misses one.
+      - "tests/**"
       - ".github/workflows/mcp-plan-consistency.yml"
 
 permissions:
@@ -67,12 +69,11 @@ jobs:
         run: |
           python - <<'PY'
           import pathlib
-          for name in ("docs/SALESFORCE-MCP-PLAN.md",
-                       "tests/test_mcp_plan_consistency.py",
-                       "tests/test_mcp_gate_semantics.py",
-                       "tests/gate_graph.py",
-                       "tests/mutate_mcp_plan.py",
-                       "tests/mutate_gate_semantics.py"):
+          # Globbed for the same reason the path filter is: a CRLF leg that
+          # converts a hand-listed subset silently tests LF copies of whatever
+          # was forgotten, and proves nothing about the convention it exists for.
+          for name in ["docs/SALESFORCE-MCP-PLAN.md",
+                       *sorted(str(q) for q in pathlib.Path("tests").glob("*.py"))]:
               p = pathlib.Path(name)
               p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
           print("converted")
@@ -95,6 +96,13 @@ jobs:
       # were both healthy and both irrelevant to the finding: EIGHT SEMANTIC
       # INVERSIONS of the plan left 12/12 green on all four legs, because every
       # assertion was a substring and a substring cannot carry a negation.
+      # The contract bullets are OUTPUT. If the committed document does not match
+      # what the generator produces, someone hand-edited the contract - which is
+      # the exact defect round ten used, and the reason generation replaced a
+      # parser that read only the leading value of each bullet.
+      - name: The contract prose is what the blocks generate
+        run: python tests/render_contracts.py --check
+
       - name: The gates mean what they say
         run: python -B -m unittest discover -s tests -p 'test_mcp_gate_semantics.py' -v
 

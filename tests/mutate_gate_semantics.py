@@ -73,11 +73,14 @@ MUTATIONS: list[dict] = [
     },
     {
         # The exact inversion I reproduced before writing any of this.
+        # RE-ANCHORED for round ten: the contract prose is generated, so this
+        # defect now shows up as the file disagreeing with the generator rather
+        # than as a parser being talked past.
         "name": "the PROSE says G8 does not unlock G9 (block untouched)",
-        "edits": [("- **unlocks** — G9.\n\n*G8 has no prerequisites",
-                   "- **unlocks** — nothing. G8 does **not** unlock G9.\n\n"
-                   "*G8 has no prerequisites")],
-        "expect": "test_the_prose_states_the_same_relations_as_the_typed_blocks",
+        "edits": [("- **unlocks** — G9.\n- **acceptor** — a reviewer.",
+                   "- **unlocks** — nothing. G8 does **not** unlock G9."
+                   "\n- **acceptor** — a reviewer.")],
+        "expect": "test_the_contract_prose_is_exactly_what_the_block_generates",
     },
     {
         "name": "the BLOCK says G8 unlocks nothing (prose untouched)",
@@ -92,8 +95,8 @@ MUTATIONS: list[dict] = [
              "id: G8\nrequires: none\nunlocks: none"),
             ("id: G9\nrequires: G2, G4, G7, G8",
              "id: G9\nrequires: G2, G4, G7"),
-            ("- **unlocks** — G9.\n\n*G8 has no prerequisites",
-             "- **unlocks** — none.\n\n*G8 has no prerequisites"),
+            ("- **unlocks** — G9.\n- **acceptor** — a reviewer.",
+             "- **unlocks** — none.\n- **acceptor** — a reviewer."),
         ],
         "expect": "test_every_gate_leads_to_the_client_org_gate",
     },
@@ -110,8 +113,10 @@ MUTATIONS: list[dict] = [
             ("id: G4\nrequires: G3\nunlocks: G9", "id: G4\nrequires: G3\nunlocks: none"),
             ("id: G7\nrequires: G5, G6\nunlocks: G9",
              "id: G7\nrequires: G5, G6\nunlocks: none"),
-            ("- **unlocks** — G9.\n\n### G5", "- **unlocks** — none.\n\n### G5"),
-            ("- **unlocks** — G9.\n\n### G8", "- **unlocks** — none.\n\n### G8"),
+            ("- **unlocks** — G9.\n- **acceptor** — **Mr. Salam or a reviewer**.",
+             "- **unlocks** — none.\n- **acceptor** — **Mr. Salam or a reviewer**."),
+            ("- **unlocks** — G9.\n- **acceptor** — **Mr. Salam**. A person",
+             "- **unlocks** — none.\n- **acceptor** — **Mr. Salam**. A person"),
         ],
         "expect": "test_every_gate_leads_to_the_client_org_gate",
     },
@@ -194,11 +199,13 @@ MUTATIONS: list[dict] = [
     {
         # `"G90...".startswith("G9")` is true. A prefix test on an identifier
         # that can be extended tests nothing about the identifier.
+        # RE-ANCHORED for round ten. Kept because the DEFECT is unchanged even
+        # though the mechanism that catches it is stronger now.
         "name": "a longer gate id satisfies the prose prefix check",
-        "edits": [("- **unlocks** — G9.\n\n*G8 has no prerequisites",
-                   "- **unlocks** — G90 is a different gate entirely.\n\n"
-                   "*G8 has no prerequisites")],
-        "expect": "test_the_prose_states_the_same_relations_as_the_typed_blocks",
+        "edits": [("- **unlocks** — G9.\n- **acceptor** — a reviewer.",
+                   "- **unlocks** — G90 is a different gate entirely."
+                   "\n- **acceptor** — a reviewer.")],
+        "expect": "test_the_contract_prose_is_exactly_what_the_block_generates",
     },
     {
         # Only G9's acceptor was pinned, so the gate that PUBLISHES could be
@@ -241,6 +248,41 @@ MUTATIONS: list[dict] = [
         "edits": [("scope, expiry\nabsent_evidence_behaviour: refuse_connect",
                    "scope, expiry\nabsent_evidence_behaviour: refuse_accept")],
         "expect": "test_absent_evidence_refuses_rather_than_proceeds",
+    },
+    # ── Round ten. The root cause was that the prose parser read only the
+    #    LEADING gate list and discarded the rest of the sentence, so a typed
+    #    safe state could sit beside a fail-open instruction. All three shapes
+    #    below were reproduced before the contract prose became generated.
+
+    {
+        "name": "the contract states the relation and then contradicts it",
+        "edits": [("- **unlocks** \u2014 G9.\n- **acceptor** \u2014 a reviewer.",
+                   "- **unlocks** \u2014 G9. In practice G8 gates nothing and G9 "
+                   "may proceed without it.\n- **acceptor** \u2014 a reviewer.")],
+        "expect": "test_the_contract_prose_is_exactly_what_the_block_generates",
+    },
+    {
+        "name": "a rival unlocks bullet is added below the generated region",
+        "edits": [("- **artefact** \u2014 a source PR against `sfdc24-site`",
+                   "- **unlocks** \u2014 nothing, in practice.\n"
+                   "- **artefact** \u2014 a source PR against `sfdc24-site`")],
+        "expect": "test_no_contract_label_is_used_outside_a_generated_region",
+    },
+    {
+        # RE-ANCHORED: G3's `why` was rewritten when the restated contract
+        # sentence was trimmed out of it, so the old anchor stopped matching.
+        "name": "commentary reuses a contract label to reverse deny-by-default",
+        "edits": [("- **why** \u2014 **if the per-response org id proves unobtainable,",
+                   "- **fail-closed** \u2014 advisory only; unknown tools are "
+                   "permitted.\n- **why** \u2014 **if the per-response org id proves "
+                   "unobtainable**")],
+        "expect": "test_no_contract_label_is_used_outside_a_generated_region",
+    },
+    {
+        "name": "a gate block changes without the generated contract being re-rendered",
+        "edits": [("id: G3\nrequires: G1\nunlocks: G4",
+                   "id: G3\nrequires: G1\nunlocks: G4, G9")],
+        "expect": "test_the_dependency_graph_is_reciprocal",
     },
     {
         "name": "the typed status block is deleted entirely",

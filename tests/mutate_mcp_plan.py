@@ -79,8 +79,10 @@ MUTATIONS: list[dict[str, str]] = [
         # skipped gate hide inside a dash — so the case survives the rewrite
         # rather than being quietly dropped because its anchor broke.
         "name": "structural: the client-org gate stops naming its prerequisites",
-        "old": "and therefore G1, G3, G5\n  and G6 **transitively**",
-        "new": "and therefore G1–G6 **transitively**",
+        # RE-ANCHORED 2026-09-09 (round ten): G9's prerequisite prose is
+        # generated now, and the transitive explanation moved to a `why` bullet.
+        "old": "G1, G3, G5 and G6 reach G9 through them",
+        "new": "G1–G6 reach G9 through them",
         "expect": "pins_its_prerequisites_by_name",
     },
     {
@@ -101,8 +103,17 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "name": "the client-org gate authorises itself",
-        "old": "**acceptor** — **Mr. Salam authorises.** A person, in the",
-        "new": "**acceptor** — **claude-code-cli authorises.** An agent, in the",
+        # RE-ANCHORED TWICE on 2026-09-09. First to the generated acceptor line,
+        # which was WRONG: G7 has the identical line and `replace(old, new, 1)`
+        # hit G7 instead, so the mutation applied, the G9 test correctly stayed
+        # green, and the harness reported NOT CAUGHT on a healthy guard. A
+        # mutation that lands somewhere else is worse than one that fails to
+        # land, because it looks like a coverage gap. Anchored on G9's own
+        # prerequisite and unlocks lines, which no other gate shares.
+        "old": "- **prerequisite** — G2, G4, G7, G8.\n- **unlocks** — none.\n"
+               "- **acceptor** — **Mr. Salam**. A person, in the open.",
+        "new": "- **prerequisite** — G2, G4, G7, G8.\n- **unlocks** — none.\n"
+               "- **acceptor** — **claude-code-cli**. An agent, in the open.",
         "expect": "client_org_gate_is_not_self_authorised",
     },
     # ── The three chatgpt-codex-desktop-01a0839e reproduced against 5c3870f ──
@@ -116,8 +127,12 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "name": "a scan of unknown cost is allowed to start",
-        "old": "**or when its cost is not yet known**",
-        "new": "(cost permitting)",
+        # RE-ANCHORED 2026-09-09. The old anchor hit a `why` bullet that
+        # RESTATED the rule while the generated one kept the scan satisfied, so
+        # this case reported NOT CAUGHT on a healthy guard. The duplicate is
+        # gone and the anchor now points at the single authoritative sentence.
+        "old": "a scan does not start when its cost **is not yet known**",
+        "new": "a scan starts whatever its cost",
         "expect": "unknown_cost_is_not_permission",
     },
     {

@@ -131,6 +131,80 @@ HEADING = re.compile(r"^### (G\d+) [^\n]*$", re.MULTILINE)
 PROSE_LEAD = re.compile(r"^(?:\*\*)?(none(?![a-z])|G\d+(?:\s*,\s*G\d+)*)")
 
 
+# ── Generated contract prose ────────────────────────────────────────────────
+#
+# ROUND TEN, and the root cause was exact: PROSE_LEAD parsed only the LEADING
+# `none` or gate list and DISCARDED THE REST OF THE SENTENCE. So
+#
+#     - **unlocks** — G9. In practice G8 gates nothing and G9 may proceed
+#       without it.
+#
+# parsed to {G9}, matched the block, and passed. I had replaced a prefix check
+# with a leading-token parse, which is still only looking at the beginning. A
+# typed safe state could sit beside a fail-open instruction, and eight earlier
+# attacks came back this way.
+#
+# The answer is not a longer parser. It is ONE AUTHORITATIVE SOURCE: the
+# contract bullets are GENERATED from the typed block, and a test asserts the
+# file matches what the generator produces, byte for byte. There is no remainder
+# to contradict because nobody writes that text by hand. Commentary keeps its
+# place below the generated region, under labels the contract does not use.
+
+CONTRACT_BEGIN = "<!-- generated from the gate block above; do not hand-edit -->"
+CONTRACT_END = "<!-- end generated -->"
+CONTRACT_LABELS = ("prerequisite", "unlocks", "acceptor", "fail-closed")
+
+ACCEPTOR_SENTENCE = {
+    "agent:independent": "any agent that did not write it.",
+    "human:reviewer": "a reviewer. Not the author, and not an agent.",
+    "human:salam": "**Mr. Salam**. A person, in the open.",
+    "human:salam-or-reviewer": "**Mr. Salam or a reviewer**. Not the author.",
+}
+
+FAIL_CLOSED_SENTENCE = {
+    "refuse_unconfirmed_claim":
+        "a claim that cannot be confirmed with a version is **struck**, not softened.",
+    "refuse_when_cost_unknown":
+        "a scan does not start when its cost **is not yet known**. Unknown is not permission.",
+    "deny_by_default":
+        "**deny by default** — a tool not on the allowlist is refused even if the server offers it.",
+    "block_until_demonstrated":
+        "any concern without an executable demonstration **blocks G9**.",
+    "refuse_unvalidated_emitter":
+        "an emitter that cannot validate **does not publish**.",
+    "report_rate_not_sigma":
+        "a metric without its demonstration reports a **rate**, not a sigma.",
+    "refuse_without_approval":
+        "**no approval, no publication.** Absence of approval is not permission.",
+    "refuse_until_live_readback_matches":
+        "if the live read-back still shows the old wording the gate is **not passed**, however green CI was.",
+    "refuse_without_authorisation":
+        "**no authorisation, no scan.** Silence is not a yes.",
+}
+
+ABSENT_EVIDENCE_SENTENCE = {
+    "refuse_connect": "no valid evidence, **no connection**.",
+    "refuse_publish": "no valid evidence, **nothing is published**.",
+    "refuse_accept": "no valid evidence, **the gate is not accepted**.",
+    "refuse_scan": "no valid evidence, **no scan starts**.",
+}
+
+
+def render_contract(gate: "Gate") -> str:
+    """The generated contract bullets for one gate. The single source is the block."""
+    def ids(value):
+        return ", ".join(sorted(value)) + "." if value else "none."
+    return "\n".join([
+        CONTRACT_BEGIN,
+        f"- **prerequisite** — {ids(gate.requires)}",
+        f"- **unlocks** — {ids(gate.unlocks)}",
+        f"- **acceptor** — {ACCEPTOR_SENTENCE[gate.acceptor]}",
+        f"- **fail-closed** — {FAIL_CLOSED_SENTENCE[gate.fail_closed_rule]} "
+        f"And {ABSENT_EVIDENCE_SENTENCE[gate.absent_evidence_behaviour]}",
+        CONTRACT_END,
+    ])
+
+
 class GateSyntaxError(ValueError):
     """A gate block does not parse. Never downgraded to a warning: an
     unparseable relation is the failure mode this whole module exists for."""
