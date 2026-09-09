@@ -81,7 +81,21 @@ def validate_row(index, row):
     malformed, warnings = [], []
     cells = ["" if c is None else str(c) for c in row]
 
-    if len(cells) != EXPECTED_COLS:
+    if len(cells) > EXPECTED_COLS:
+        # Google Sheets returns every row at the width of the sheet's USED range, so
+        # a board widened past its ten named columns pads all of them. Empty padding
+        # is the transport and not a defect - calling it malformed condemned all 1882
+        # live rows and buried the 322 rows with real findings. A padding cell that
+        # carries CONTENT is a genuine schema change and stays malformed. Same
+        # contract as the ORDER worker (PR46) and the bus.
+        extra = cells[EXPECTED_COLS:]
+        first = next((i for i, c in enumerate(extra) if c.strip()), None)
+        if first is not None:
+            malformed.append(f"row has {len(cells)} columns and column "
+                             f"{EXPECTED_COLS + first + 1}, past the {EXPECTED_COLS}-column "
+                             f"schema, is not empty")
+        cells = cells[:EXPECTED_COLS]
+    elif len(cells) < EXPECTED_COLS:
         malformed.append(f"row has {len(cells)} columns, expected {EXPECTED_COLS}")
         cells = (cells + [""] * EXPECTED_COLS)[:EXPECTED_COLS]
 
@@ -197,7 +211,10 @@ def main():
 
     rows = data["rows"]
     header, body = rows[0], rows[1:]
-    if [str(c).strip() for c in header] != COLUMNS:
+    named = [str(c).strip() for c in header]
+    while named and not named[-1]:
+        named.pop()          # trailing blanks are used-range padding, not columns
+    if named != COLUMNS:
         print(f"NOTE: header row differs from expected schema: {header}")
 
     malformed_rows, warned_rows = [], []
