@@ -1148,3 +1148,91 @@ test('P2: a token request that stalls is aborted, not left to hang the connect p
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test('P1: the OAuth callback reflects nothing from the query string', async () => {
+  // /oauth/callback?error=<script>… was echoed into a text/html response, and
+  // echoed BEFORE the state nonce was checked, so the CSRF guard protected
+  // nothing. Script running on this loopback origin can fetch `/`, read a
+  // freshly minted authorize URL and its state, and bind the agent to an
+  // attacker's Zoom authorization. The token file this process writes is the
+  // prize.
+  //
+  // Driven over real HTTP against the real server, because the defect is in
+  // what reaches the browser, not in what the source looks like.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoom-xss-'));
+  config.tokenFile = path.join(dir, 'tokens.json');
+  const { startOAuthServer, loadTokens } = await import('../src/oauth.js');
+  loadTokens();
+
+  const prevPort = config.port;
+  config.port = 0;
+  const server = startOAuthServer(() => {});
+  await new Promise((r) => server.listening ? r() : server.once('listening', r));
+  const { port } = server.address();
+
+  const PAYLOAD = '<script>alert(1)</script>';
+  const realError = console.error;
+  console.error = () => {};
+  try {
+    const res = await fetch(
+      `http://127.0.0.1:${port}/oauth/callback?error=${encodeURIComponent(PAYLOAD)}`,
+    );
+    const body = await res.text();
+
+    assert.equal(res.status, 400, 'it must still reject the callback');
+    assert.ok(!body.includes(PAYLOAD),
+      `the response reflected the attacker-controlled error verbatim into text/html: ${body}`);
+    assert.ok(!body.includes('<script'),
+      `the response carries an injected script tag: ${body}`);
+    // Not merely escaped-and-present: the value should not appear at all.
+    assert.ok(!body.includes('alert(1)'),
+      `the payload still reaches the page, escaped or otherwise: ${body}`);
+  } finally {
+    console.error = realError;
+    server.close();
+    config.port = prevPort;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('P2: a 2xx with no message id is not an acceptance', async () => {
+  // Graph, or any proxy in front of it, can answer 200 with an empty body. The
+  // JSON fallback then yields {} and this used to return ok:true with an
+  // undefined id — and the assistant increments session.accepted on `ok`, so
+  // the board finding reported "WhatsApp accepted N message(s)" with nothing
+  // behind it. This module exists because acceptance is not delivery; an
+  // acceptance with no wamid is worse than an overstated claim, it is an
+  // unfounded one.
+  Object.assign(config, { metaToken: 'x', waPhoneNumberId: '1', waTo: '2', notifyTimeoutMs: 5_000 });
+  const realFetch = globalThis.fetch;
+
+  try {
+    for (const [label, body] of [
+      ['an empty body', ''],
+      ['an unexpected shape', JSON.stringify({ ok: true })],
+      ['an empty messages array', JSON.stringify({ messages: [] })],
+      ['a message with a blank id', JSON.stringify({ messages: [{ id: '' }] })],
+    ]) {
+      globalThis.fetch = async () => new Response(body, {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+      const res = await sendWhatsApp('hello');
+      assert.equal(res.ok, false,
+        `${label}: reported ok with no wamid, which the assistant counts as accepted and the `
+        + 'board then publishes as an acceptance nothing evidences');
+      assert.match(res.error, /no message id/, `${label}: and must say why`);
+    }
+
+    // The positive case still works, or the guard is just an outage.
+    globalThis.fetch = async () => new Response(
+      JSON.stringify({ messages: [{ id: 'wamid.REAL' }] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+    const good = await sendWhatsApp('hello');
+    assert.equal(good.ok, true, 'a genuine wamid must still be accepted');
+    assert.equal(good.id, 'wamid.REAL');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

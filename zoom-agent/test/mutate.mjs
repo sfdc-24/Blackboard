@@ -65,8 +65,8 @@ const MUTATIONS = [
     blocker: 3,
     name: 'a wamid is called a delivery again',
     file: 'src/notify.js',
-    from: '    return { ok: true, id: data?.messages?.[0]?.id };',
-    to: '    return { ok: true, delivered: true, id: data?.messages?.[0]?.id };',
+    from: '    return { ok: true, id };',
+    to: '    return { ok: true, delivered: true, id };',
     expect: /claims delivery to a phone|no field that reads as a delivery/,
   },
   {
@@ -229,6 +229,23 @@ const MUTATIONS = [
     from: '    // A late leave from a superseded client must not evict the live one.\n    releaseIfOurs(streamId, token);',
     to: '    active.delete(streamId);',
     expect: /reservation is owned/,
+  },
+
+  {
+    blocker: '12-xss',
+    name: 'the OAuth callback reflects the attacker-controlled error again',
+    file: 'src/oauth.js',
+    from: "        return send(400, 'Authorization failed. Check the backend logs for the reason.');",
+    to: "        return send(400, `Authorization failed: ${error ?? 'missing code'}`);",
+    expect: /reflects nothing from the query string/,
+  },
+  {
+    blocker: '12-wamid',
+    name: 'a 2xx with no message id is called an acceptance again',
+    file: 'src/notify.js',
+    from: '    const id = data?.messages?.[0]?.id;\n    if (!id) {',
+    to: '    const id = data?.messages?.[0]?.id;\n    if (false) {',
+    expect: /no message id is not an acceptance/,
   },
 
   {

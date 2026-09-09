@@ -214,7 +214,21 @@ export function startOAuthServer(onAuthorized) {
       const state = url.searchParams.get('state');
 
       if (error || !code) {
-        return send(400, `Authorization failed: ${error ?? 'missing code'}`);
+        // NOTHING FROM THE QUERY STRING IS REFLECTED HERE. `send` writes
+        // text/html, so echoing `error` put attacker-controlled markup into a
+        // page served from this loopback origin — reachable by anything that
+        // can make the operator's browser open a URL, and reached BEFORE the
+        // state nonce is checked, so the CSRF guard offered no protection at
+        // all. Script running on this origin can request `/`, read a freshly
+        // minted authorize URL and its state, and bind the agent to an
+        // attacker's Zoom authorization. The token file this process writes is
+        // the whole prize.
+        //
+        // Escaping would work. A fixed string cannot be got wrong later, and
+        // the operator loses nothing: the real value is logged here, where it
+        // is useful and inert.
+        console.error(`[oauth] callback rejected — error=${JSON.stringify(error)} code=${code ? 'present' : 'missing'}`);
+        return send(400, 'Authorization failed. Check the backend logs for the reason.');
       }
       // Before the exchange, never after: an unbound code must not be spent.
       if (!consumeState(state)) {

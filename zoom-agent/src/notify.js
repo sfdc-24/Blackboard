@@ -64,7 +64,29 @@ export async function sendWhatsApp(text) {
         : '';
       return { ok: false, error: `Graph ${res.status} code=${code}${hint}` };
     }
-    return { ok: true, id: data?.messages?.[0]?.id };
+    // A 2xx IS NOT THE EVIDENCE. THE wamid IS.
+    //
+    // Graph, or any proxy in front of it, can answer 200 with an empty or
+    // unexpected body; `.catch(() => ({}))` above then makes `data` an empty
+    // object and this used to return ok:true with an undefined id. The
+    // assistant increments session.accepted on `ok`, and the board finding
+    // reports "WhatsApp accepted N message(s)" — so a blank response became a
+    // durable claim, on the board, that a message was accepted, with nothing
+    // behind it.
+    //
+    // This module's entire reason for existing is that acceptance is not
+    // delivery. Accepting a response with no id would have made it worse than
+    // the defect it was written to fix: not an overstated claim, an unfounded
+    // one.
+    const id = data?.messages?.[0]?.id;
+    if (!id) {
+      return {
+        ok: false,
+        error: `Graph ${res.status} with no message id — the send cannot be confirmed. `
+          + 'Treating it as not accepted rather than claiming an acceptance nothing evidences.',
+      };
+    }
+    return { ok: true, id };
   } catch (err) {
     return {
       ok: false,
