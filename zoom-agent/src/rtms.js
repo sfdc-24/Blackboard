@@ -1,19 +1,49 @@
 // Media plane: joins the RTMS stream when a meeting starts.
 // The @zoom/rtms SDK handles the signaling/media WebSockets, HMAC signature,
 // and protocol heartbeats — we just wire up data callbacks.
-import rtms from '@zoom/rtms';
 import { onTranscriptLine, onMeetingEnded } from './assistant.js';
+
+// @zoom/rtms is a NATIVE module published for linux and darwin only. A static
+// import here made this file — and therefore index.js, which imports it — fail
+// to load on Windows with npm error notsup. That is why the agent could not be
+// developed or tested on the laptop at all, and why it sat untouched from
+// 29 August: the wall was in the first line of the module graph, not in the
+// logic.
+//
+// It is now an OPTIONAL dependency loaded lazily, at the moment a stream
+// actually starts. Everything else — the assistant, reception, the board and
+// WhatsApp delivery — imports and tests on any platform. On a host without the
+// SDK the failure is one clear sentence at the point of use rather than a
+// module-resolution error at startup.
+let rtmsModule = null;
+async function loadRtms() {
+  if (rtmsModule) return rtmsModule;
+  try {
+    rtmsModule = (await import('@zoom/rtms')).default;
+    return rtmsModule;
+  } catch (err) {
+    throw new Error(
+      '@zoom/rtms is not installed on this host. It publishes for linux and darwin '
+      + 'only, so live media cannot run here — the rest of the agent still can. '
+      + `Underlying error: ${err.message}`,
+    );
+  }
+}
 
 const active = new Map(); // rtms_stream_id -> rtms.Client
 
-export function handleZoomEvent({ event, payload }) {
+// async because joinStream now loads the SDK lazily. Callers may ignore the
+// returned promise -- joinStream handles its own failures and never rejects --
+// but awaiting it is what lets a test observe the outcome deterministically
+// instead of racing a floating promise.
+export async function handleZoomEvent({ event, payload }) {
   const obj = payload?.object ?? payload ?? {};
   const streamId = obj.rtms_stream_id;
   const meetingId = obj.meeting_uuid ?? streamId ?? 'unknown';
 
   switch (event) {
     case 'meeting.rtms_started':
-      joinStream(streamId, meetingId, obj);
+      await joinStream(streamId, meetingId, obj);
       break;
 
     case 'meeting.rtms_interrupted':
@@ -38,7 +68,7 @@ export function handleZoomEvent({ event, payload }) {
   }
 }
 
-function joinStream(streamId, meetingId, obj) {
+async function joinStream(streamId, meetingId, obj) {
   if (!streamId) {
     console.error('[rtms] rtms_started without rtms_stream_id — payload:', JSON.stringify(obj));
     return;
@@ -49,6 +79,13 @@ function joinStream(streamId, meetingId, obj) {
     return;
   }
 
+  let rtms;
+  try {
+    rtms = await loadRtms();
+  } catch (err) {
+    console.error(`[rtms] cannot join stream ${streamId}: ${err.message}`);
+    return;
+  }
   const client = new rtms.Client();
   active.set(streamId, client);
 

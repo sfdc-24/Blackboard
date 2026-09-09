@@ -1,0 +1,59 @@
+name: zoom-agent-tests
+
+# Runs on BOTH platforms on purpose. The whole point of the change this guards
+# is that the agent installs and imports without the linux-only media SDK, and
+# the only way to keep that true is to prove it on Windows every time.
+#
+# ubuntu-latest DOES get @zoom/rtms, since it publishes for linux — so the two
+# legs together cover "works with the SDK" and "works without it". A green
+# ubuntu run alone would have said nothing about the thing that was broken.
+
+on:
+  pull_request:
+    paths:
+      - "zoom-agent/**"
+      - ".github/workflows/zoom-agent-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "zoom-agent/**"
+      - ".github/workflows/zoom-agent-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: zoom-agent
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      # `npm ci` rather than `npm install`: it installs exactly the committed
+      # lockfile and fails if package.json and the lock have drifted. Before
+      # this change there was no lockfile at all and no run on any platform.
+      - name: Install from the lockfile
+        run: npm ci
+
+      - name: Report whether the optional media SDK resolved here
+        run: node -e "try{require.resolve('@zoom/rtms');console.log('@zoom/rtms IS installed on ${{ matrix.os }}')}catch{console.log('@zoom/rtms is NOT installed on ${{ matrix.os }} - the agent must still work')}"
+
+      - name: Offline tests
+        run: npm test
+
+# test/simulate-call.mjs is NOT run here. It calls the real SFDC24 reception()
+# endpoint, needs SFDC24_EXEC, and costs money on every invocation. A suite that
+# spends money is not a suite that should run on every push. Run it by hand with
+# `npm run selftest`.
