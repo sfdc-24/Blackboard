@@ -140,9 +140,14 @@ MUTATIONS: list[dict[str, str]] = [
         # mentioning other gates, so a partial mutation left a gate name behind
         # and the guard skipped. The field is a bare value now and the
         # explanation sits outside it.
+        # RE-ANCHORED, and found by the ambiguity check on its first run: since
+        # the contract prose became generated, `- **unlocks** — G9.` matches
+        # G2, G4, G7 AND G8, so replace-once was landing on whichever came
+        # first rather than on the gate this case is about. Anchored on G8's
+        # own pair, which no other gate has.
         "name": "a gate claims to unlock nothing while another requires it",
-        "old": "- **unlocks** — G9.",
-        "new": "- **unlocks** — nothing.",
+        "old": "- **prerequisite** — none.\n- **unlocks** — G9.",
+        "new": "- **prerequisite** — none.\n- **unlocks** — nothing.",
         "expect": "claims_to_gate_nothing_while_another_requires_it",
     },
 ]
