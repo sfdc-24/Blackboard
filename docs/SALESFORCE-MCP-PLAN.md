@@ -6,12 +6,15 @@ issues and score metrics for six sigma levels. Can you plan on creating MCP
 client for salesforce that can be plugged into any salesforce org instance for
 clients?"*
 
-**Third version.** The first said we would build a server. The second discovered
+**Fourth version.** The first said we would build a server. The second discovered
 Salesforce already ship two and said we would build a client. `chatgpt-codex-desktop-01a0839e`
-then returned NO-GO on eight architectural points against head `c492dd9`. Every
-one is accepted. Two were factual claims I had asserted without checking, and I
-have now checked both against Salesforce's own documentation — they were wrong in
-my favour, which is the direction that matters.
+returned NO-GO on eight architectural points against `c492dd9`, and NO-GO again
+on eight more against `2839641`. All accepted. Two of the first eight were facts
+I had asserted without checking; I checked both against Salesforce's own
+documentation and both were wrong in my favour, which is the direction that
+matters. Two of the second eight were errors made *inside the corrections* — a
+miscount in the section about writing things down precisely, and an over-claim
+about capability in the paragraph withdrawing an over-claim.
 
 This version says what is **established**, what is **assumed**, and what is
 **unverified**, and it does not use a word for a thing the thing is not.
@@ -152,19 +155,34 @@ over time**, conventionally with a 1.5σ long-term shift.
 - **The overall figure becomes a stated-formula index**, not a sigma. Weights
   are published on the page. `73.5` currently has no derivation; whatever
   replaces it must be recomputable by the reader from the pillar figures.
-- **Six sigma is kept where it is genuinely true.** An org *does* run repeating
-  processes with units over time: deployments, Apex test executions, scheduled
-  job runs, flow interviews. Failed flow interviews per million interviews over
-  thirty days **is** a DPMO, with a real unit, a real denominator and a real
-  window. So the product gets a clean split — a **structural audit** that is
-  scored and ranked, and a **process capability** section that carries sigma
-  because it has earned it. That is a stronger claim than the current one, and
-  it is defensible in the room.
+- **Six sigma is a candidate only where there is a real process**, and the last
+  version over-claimed here too. It said failed flow interviews per million
+  interviews over thirty days "**is** a DPMO" and that a section built on it
+  would carry sigma "because it has earned it." A defect **rate** is not
+  capability, and I reached that conclusion inside the very paragraph correcting
+  an over-claim.
 
-**This reaches further than this document.** `/xray/` presents the current model
-live, and the homepage copy written today says "four pillars, a number against
-each". If the framing changes, the page and the pitch change with it. Tracked as
-one thread, not three.
+  A rate over a window becomes capability only with all of: a **homogeneous
+  unit**, evidence the process is **stable** over that window rather than
+  drifting or shifting, a **sample** large enough for the rate to mean anything,
+  **stratification** where the population is not one population (three release
+  trains are not one process), a stated **uncertainty interval**, an explicit
+  **transform** from rate to sigma, and a declared **shift convention** rather
+  than an unexamined 1.5σ. None of those is established for any org signal
+  today.
+
+  So: the product ships a **structural audit** with declared rates now, and a
+  **process** section that reports rates *as rates* with their windows and
+  intervals. Sigma appears only after the seven conditions above are
+  demonstrated for a specific metric, in writing, per metric. That is a weaker
+  claim than the last version made and a stronger one than the page makes.
+
+**This reaches further than this document, and it is not optional.** `/xray/`
+presents the current model live and the homepage copy written today says "four
+pillars, a number against each". A live page presenting a pooled figure as a
+sigma level is making a claim that does not hold, so correcting it is a required
+follow-on, not a decision to be weighed. What is Mr. Salam's is the *wording*
+and the timing, not whether an unsound claim stays up.
 
 ---
 
@@ -185,20 +203,35 @@ robots guard with 590 cases — before anything claims to emit it.
 ## 6. The metric catalogue
 
 The previous version's pillar table listed signals and nothing else, and it did
-not match what the live findings show. A signal is not a metric until seven
-things are written down. The catalogue is a deliverable; this is its schema and
-one worked row.
+not match what the live findings show.
+
+**A correction first: the last version said "seven things" and then listed
+nine.** A miscount in a section about writing things down precisely, and the
+second time in two days I have stated a count from memory instead of counting —
+the Zoom blockers were "five" when they were six. The list below is 17, and that number comes from counting the rows
+rather than from me.
+
+A signal is not a metric until all 17 are written down. The catalogue is a
+deliverable; this is its schema and one worked row.
 
 | field | meaning |
 |---|---|
 | `id` | stable identifier, quoted in output |
 | `pillar` | SECURITY / OPERABILITY / WASTE / REDUNDANCY, or PROCESS |
 | `unit` | the thing being counted — the denominator's member |
+| `numerator` | what is counted as present, stated separately from what makes it a defect |
 | `denominator` | the opportunity set, exactly |
+| `defect` | the rule that turns a counted thing into a defect |
+| `formula` | how numerator and denominator combine into the reported figure |
+| `direction` | whether higher is better or worse — never left to the reader |
+| `threshold` | the value at which it becomes a finding, and where that value came from |
+| `exclusions` | what is deliberately not counted, and why |
+| `completeness` | how much of the denominator the query actually reached |
 | `query` | the SOQL / Tooling / metadata call, verbatim |
 | `window` | the period, or `static` for structure |
 | `permission` | what the scanning identity must hold to see it |
-| `unknown` | what is emitted when the query cannot run or returns nothing — never silently zero |
+| `unknown` | the closed set of non-numeric outcomes — `insufficient-permission`, `query-failed`, `not-reached`, `no-data-in-window` — never silently zero, and never merged with a real value |
+| `cost` | API calls consumed, so a scan's spend is attributable per metric |
 | `privacy` | public / aggregate-only / private |
 
 Worked example:
@@ -280,10 +313,36 @@ client can read that argument afterwards. See `docs/POKA-YOKE.md`.
    us arguing it.
 2. **Read-only permanently**, with "build" served by the prototype publisher?
    I recommend yes.
-3. **Does the six-sigma framing change on the live site**, per §4? This is the
-   one with a customer-facing consequence, and I recommend yes — a defensible
-   split beats an impressive-sounding number that a knowledgeable buyer can take
-   apart.
+3. **How and when the live site's six-sigma wording is corrected**, per §4.
+   *Whether* is not a decision — a page presenting a pooled figure as a sigma
+   level is making a claim that does not hold. The wording and the timing
+   relative to launch are yours.
 4. **Does the first real org readout go public on `/xray/`,** or stay internal?
 5. **Does this jump the open Zoom blockers?** Larger than the last version
    implied, because §5 and §6 are build, not paperwork.
+
+---
+
+## What this document is, and where it stops
+
+A reviewer can keep asking a plan for more specification, and each ask can be
+individually reasonable while the document is the wrong place for the answer.
+So, plainly:
+
+**This is a plan. It commits to producing four specifications and gates client
+work behind them** — the tool/org enforcement policy (§3), the
+`xray-score-v1` schema with validator and corpus (§5), the metric catalogue
+(§6), and the sanitizer (§9). Each is a separate artefact with its own review.
+
+**What belongs in those artefacts and not here:** an exact versioned capability
+matrix per server release, the literal enforceable allowlist and telemetry
+policy, the attended/unattended auth and token-lifecycle design, the quota
+reserve/retry/paging budget, and the formal versioned schemas for collection
+manifest, private facts, internal score and public export. Naming them here as
+required is the plan doing its job; writing them here would produce a document
+nobody can review and a specification nobody can version.
+
+If a reviewer considers any of those a gate on **the plan** rather than on the
+first client scan, that is a real disagreement about scope rather than a defect,
+and it goes to Mr. Salam as a scheduling question — not into another revision of
+this file.
