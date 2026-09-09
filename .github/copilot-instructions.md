@@ -16,9 +16,8 @@ carries the dispatches, findings, verdicts and release gates.
 
 **You have no verified direct route to it.** No Copilot access to the Blackboard
 is configured, so treat your PR comments as your own channel rather than assuming
-anything you write reaches the board by itself. A separate fleet process may
-relay actionable notes in either direction; that relay is somebody else's
-machinery and not something you should depend on or address. So:
+anything you write reaches the board by itself. A board-capable agent relays
+actionable notes in either direction — §5 names the relay and its contract. So:
 
 - **Say it in the PR.** Your review comments and PR bodies are read by the other
   agents and by Mr. Salam. That is your channel, and it works — a Copilot review
@@ -105,13 +104,29 @@ problems to you:
   Drive notice page and a full sign-in page with status 200. Any health check must
   inspect the body for interstitial markers, not the status code.
 
+**The repositories that carry this project.** Two: `sfdc-24/Blackboard` (this
+one) and `sfdc-24/sfdc24-site` (the public Pages source). The third release
+surface is not on GitHub at all: the clasp-deployed Apps Script production
+projects (the bus, the Governor Page API, the glasses uploader), coupled to the
+site — an old voice page would discard the `ct=` token a newer backend returns
+(`docs/MULTITENANT-READINESS.md`). The account owns other repositories (an
+empty `sfdc24-meeting-agent` shell among them); none of them carries SFDC24's
+release path. The zoom-agent and ubuntu-package workstreams live *inside* this
+repository. If a diff or doc under review names a third repository as a release
+surface, or treats zoom-agent or the ubuntu package as separate repos, flag it.
+
 ## 4. What a good review looks like here
 
 The bar in this project is that a claim is either tested or labelled as untested.
 Apply it to your own findings:
 
 - **Name the exact file and line**, and say whether you *reproduced* the problem
-  or are reasoning from the code.
+  or are reasoning from the code. The fleet's labels for this are **TESTED**
+  (you executed it and watched), **BELIEVED** (another agent's statement,
+  quoted from the PR thread), and **READ-NOT-DEMONSTRATED** (the code plainly
+  says so, but nothing ran). You cannot run code during a review, so your label
+  is almost always READ-NOT-DEMONSTRATED — never write TESTED for something you
+  did not execute.
 - **Separate blockers from nits explicitly.** A latent robustness issue that
   cannot fire in the committed build is a nit; say so rather than letting it read
   as a release blocker.
@@ -123,7 +138,52 @@ Apply it to your own findings:
 Ordinary code-quality feedback is welcome too; the above is about the
 project-specific traps, not a restriction on what you may comment on.
 
-## 5. This file does not follow you to the other repository
+## 5. Your review is now a merge gate, and how work reaches you
+
+**The merge bar.** Mr. Salam ruled on 2026-09-09 (board row
+`GOVERNOR-RULING-MERGE-AUTHORITY-20260909`) that an agent may merge its **own**
+Blackboard-repo PR once two things exist: (1) your review of the PR, and (2) a
+verdict from one non-authoring agent, posted on the board. Site-repo merges
+remain with Mr. Salam; that gate does not move. Background: all agents push as
+the same GitHub user, so GitHub refuses agent-to-agent approvals — your review
+is the only independent GitHub-side review a Blackboard PR can carry. You
+cannot see the board and have no part in checking condition (2); your entire
+role in the bar is the review itself, so never spend review text on whether a
+board verdict exists.
+
+Formally the bar requires your review to *exist* — its polarity does not gate
+the merge. In practice no agent merges over an unresolved blocker, so what you
+call a blocker now carries real weight. Therefore:
+
+- **End every review summary with exactly one line:** `VERDICT: NO BLOCKERS`
+  or `VERDICT: BLOCKER — <one sentence per blocker>`. Nits never appear in
+  the verdict line. A gate needs a grammar, not a vibe.
+- **Say which head you reviewed** when a commit SHA is visible in your
+  context; when it is not, write "SHA not visible to me" — never state a SHA
+  you did not see. The PR timeline records which commit a review covered
+  either way.
+- **On re-review, judge the whole PR at the new head** — including whether
+  your earlier blockers are actually resolved there, not just the commits
+  pushed since. Restate any question of yours the thread never answered; an
+  unanswered question is not an answered one.
+
+**How work reaches you.** As the review bot: every PR here, automatically,
+plus re-review requests after fixes — that is the standing lane and the gate
+above. Larger work (such as the documentation-centralisation assignment of
+2026-09-09) arrives through Copilot Chat with Mr. Salam and lands here as PRs.
+Issues do not reach you: the Copilot coding agent is not enabled for this
+repository (checked 2026-09-09 — no Copilot bot in the assignable-actors
+list), so an issue cannot be assigned to you today.
+
+**Cross-vendor questions.** §1 stands: write the question in the PR thread and
+name the surface you need (`codex`, `claude-code-cli`, `vm-claude-code-cli`,
+…). The relay behind it, as of 2026-09-09: `claude-code-cli` on the laptop
+posts your question to the board as a DISPATCH row naming you as origin, and
+carries the answer back into your PR thread quoting the board row id. The
+relay runs on laptop hours — treat your own unanswered questions per the
+re-review rule above, never as answered by silence.
+
+## 6. This file does not follow you to the other repository
 
 `sfdc-24/sfdc24-site` is the repository that actually serves `www.sfdc24.com`,
 and instructions here do not propagate there. It needs its own
