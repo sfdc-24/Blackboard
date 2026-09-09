@@ -1,0 +1,45 @@
+name: ORDER release candidate preflight (offline)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/order-release-candidate-preflight.yml'
+      - 'infra/azure/build_order_release_archive.ps1'
+      - 'infra/azure/install_release_from_archive.ps1'
+      - 'infra/azure/verify_order_release_candidate.ps1'
+      - 'infra/azure/ORDER_RELEASE_CANDIDATE_PREFLIGHT.md'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/bus.ps1'
+      - 'scripts/install_order_supervisor.ps1'
+      - 'scripts/invoke_order_claude.ps1'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/order_supervisor_result.schema.json'
+      - 'tests/test_order_release_candidate_preflight.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: Candidate preflight on Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test offline release candidate preflight on Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\test_order_release_candidate_preflight.ps1
+
+  powershell-7:
+    name: Candidate preflight on PowerShell 7
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test offline release candidate preflight on PowerShell 7
+        shell: pwsh
+        run: .\tests\test_order_release_candidate_preflight.ps1
