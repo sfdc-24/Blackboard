@@ -129,6 +129,8 @@ async function postOnce(payload) {
  */
 async function countRowId(title, rowId) {
   let last = 'no attempt made';
+  let sawValidRead = false;
+
   for (let i = 0; i < READ_ATTEMPTS; i += 1) {
     try {
       const body = await postOnce({ action: 'read', secret: config.busSecret, title });
@@ -137,12 +139,23 @@ async function countRowId(title, rowId) {
         last = 'response carried no rows array';
         continue;
       }
-      return { count: rows.filter((r) => String(r?.[0] ?? '') === rowId).length };
+      sawValidRead = true;
+      const count = rows.filter((r) => String(r?.[0] ?? '') === rowId).length;
+      // Found it (or found it twice): settled, return immediately.
+      if (count > 0) return { count };
+      // NOT found. This module already knows a successful read can omit a row
+      // appended moments earlier, so a single absent read is not an answer --
+      // it is the one case worth spending another idempotent attempt on.
+      // Retrying only malformed responses meant the exact condition the header
+      // comment describes was the one condition never retried.
+      last = 'row absent from an otherwise valid read';
     } catch (err) {
       last = err.message;
     }
   }
-  return { error: last };
+  // Every attempt spent. If at least one read was structurally valid we can say
+  // the row is absent from the board as last seen; if none were, we know nothing.
+  return sawValidRead ? { count: 0 } : { error: last };
 }
 
 function parseBus(text) {

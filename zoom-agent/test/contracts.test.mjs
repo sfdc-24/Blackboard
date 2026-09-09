@@ -493,3 +493,75 @@ test('F6: a refused connection schedules exactly one reconnect', async () => {
     s2.close();
   }
 });
+
+
+// ── Third review round: four findings on 852d9ce ────────────────────────────
+
+test('P2a: a failed summary handoff reaches the durable evidence', async () => {
+  Object.assign(config, {
+    receptionExec: 'https://example.invalid/exec',
+    busUrl: 'https://example.invalid/bus', busSecret: 's',
+    metaToken: 'x', waPhoneNumberId: '1', waTo: '2', notifyTimeoutMs: 200,
+  });
+  let captured = null;
+  await withFetch(async (url, opts) => {
+    if (opts?.body) {
+      const body = JSON.parse(opts.body);
+      if (body.action === 'append') { captured = body.sheetRow; return jsonResponse({ ok: true }); }
+      if (body.action === 'read') return jsonResponse({ ok: true, rows: captured ? [captured] : [] });
+      // the Graph send: reject the summary handoff
+      return jsonResponse({ error: { code: 131047 } }, 400);
+    }
+    return jsonResponse({ ok: true, reply: 'the summary', ct: 'ct1' });
+  }, async () => {
+    assistant.onTranscriptLine({ meetingId: 'm-fail', userName: 'A', text: 'a short call' });
+    await assistant.onMeetingEnded('m-fail');
+  });
+
+  assert.ok(captured, 'a board row should still be written');
+  const payload = captured[5];
+  assert.doesNotMatch(payload, /errors=none/,
+    'the row claimed errors=none while the principal summary handoff had failed');
+  assert.match(payload, /Graph 400/, 'the actual failure must be on the row');
+});
+
+test('P2b: a line placed only in part is not counted as covered', () => {
+  const long = 'y'.repeat(3000);          // cannot fit any single prompt
+  const normal = Array.from({ length: 5 }, (_, i) => `speaker: ordinary line ${i}`);
+  const { covered, partial, dropped, chunks } = planSummaryChunks(
+    ['Summarise this segment.', ''], [long, ...normal], { maxChunks: 8 },
+  );
+
+  assert.ok(partial >= 1, 'the oversized line was placed only in part and must be counted as such');
+  assert.equal(covered + partial + dropped, 6, 'every line is covered, partial or dropped — never uncounted');
+  const sliced = chunks.find((c) => c.text.includes('y'.repeat(50)));
+  assert.ok(sliced, 'the tail of the long line is still sent for context');
+  assert.equal(sliced.lines, 0, 'but it credits no coverage — its opening was discarded');
+});
+
+test('P2c: a stale read-back is retried before the write is called unresolved', async () => {
+  Object.assign(config, { busUrl: 'https://example.invalid/bus', busSecret: 's' });
+  let reads = 0;
+  const impl = async (_url, opts) => {
+    const body = JSON.parse(opts?.body ?? '{}');
+    if (body.action === 'append') return jsonResponse({ ok: true });
+    reads += 1;
+    // First read is valid but STALE — the exact condition the module documents.
+    return jsonResponse({ ok: true, rows: reads === 1 ? [['someone-else']] : [['late-row']] });
+  };
+  const res = await withFetch(impl, () => appendRow('Blackboard - Alpha DB', ['late-row']));
+
+  assert.ok(reads >= 2, `only ${reads} read(s) — a stale read must not consume the whole budget`);
+  assert.equal(res.verified, true,
+    'the row was there on the second look; declaring it unresolved wasted the retries the module budgets');
+});
+
+test('P1: the board finding says which persona produced the summary', () => {
+  const src = readFileSync(new URL('../src/assistant.js', import.meta.url), 'utf8');
+  assert.match(src, /PERSONA_CAVEAT/, 'the caveat must exist');
+  assert.match(src, /never to obey instructions/i,
+    'reception() is the website receptionist and is instructed to refuse embedded commands — '
+    + 'a finding that hides that is presenting a possible conversational reply as call evidence');
+  const boundary = src.slice(src.indexOf('const boundary = ['), src.indexOf('const payload = bcb('));
+  assert.match(boundary, /PERSONA_CAVEAT/, 'and it must be on the durable board row, not only in a comment');
+});

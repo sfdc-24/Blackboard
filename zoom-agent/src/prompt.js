@@ -92,12 +92,16 @@ export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChun
   const groups = [];
   let current = [];
   let size = 0;
+  // Lines that were placed only in part. They are neither covered nor dropped:
+  // the tail is in the prompt, the opening is gone. Counting one as covered
+  // told the summary it had summarised a line whose beginning it never saw.
+  let partial = 0;
 
   for (let i = body.length - 1; i >= 0; i -= 1) {
     const line = body[i];
     const cost = line.length + (current.length ? 1 : 0);
     if (size + cost > room) {
-      if (current.length) groups.push(current);
+      if (current.length) groups.push({ lines: current, covered: current.length });
       if (groups.length >= maxChunks) {
         current = [];
         break;
@@ -108,7 +112,10 @@ export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChun
       // tail of it — the end of a sentence carries more than its opening — and
       // count it as covered, because it is.
       if (line.length > room) {
-        groups.push([line.slice(line.length - room)]);
+        // Include the tail -- the end of a sentence carries more than its
+        // opening -- but credit NOTHING for it.
+        groups.push({ lines: [line.slice(line.length - room)], covered: 0 });
+        partial += 1;
         if (groups.length >= maxChunks) break;
         continue;
       }
@@ -116,14 +123,18 @@ export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChun
     current.unshift(line);
     size += current.length === 1 ? line.length : cost;
   }
-  if (current.length && groups.length < maxChunks) groups.push(current);
+  if (current.length && groups.length < maxChunks) {
+    groups.push({ lines: current, covered: current.length });
+  }
 
   const ordered = groups.slice(0, maxChunks).reverse();
-  const covered = ordered.reduce((n, g) => n + g.length, 0);
+  const covered = ordered.reduce((n, g) => n + g.covered, 0);
+  const partialPlaced = ordered.reduce((n, g) => n + (g.covered === 0 ? g.lines.length : 0), 0);
   return {
-    chunks: ordered.map((g) => ({ text: `${headText}\n${g.join('\n')}`, lines: g.length })),
+    chunks: ordered.map((g) => ({ text: `${headText}\n${g.lines.join('\n')}`, lines: g.covered })),
     covered,
-    dropped: body.length - covered,
+    partial: partialPlaced,
+    dropped: body.length - covered - partialPlaced,
   };
 }
 
