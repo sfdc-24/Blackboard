@@ -51,13 +51,29 @@ that failed.
 
 **Naive rule.** "Don't edit fixtures to make tests pass."
 
-**Mechanism — PROPOSED, not yet on `main`.** Assert the fixture's SHA-256 in
-the suite, hashed canonically so it is checkout-independent. Changing it then
-requires updating the constant in the same commit and naming who regenerated it
-with which tool.
+**Rule — and the demotion is the interesting part.** Assert the fixture's
+SHA-256 in the suite, hashed canonically so it is checkout-independent.
 
-> `CORPUS_SHA256` exists **only on sfdc24-site PR #13**. `main` at `4ae0e85`
-> does not have it. Same caveat as L-91: a proposal until it merges.
+This was filed as a proposed *mechanism* until `chatgpt-codex-connector`
+observed that it is not one, and would not become one if sfdc24-site PR #13
+merged tomorrow. The bypass is written into the entry's own former wording:
+a contributor who deletes the failing case and updates `CORPUS_SHA256` **in
+the same commit** gets a green suite. The digest lives in the same editable
+tree as the thing it certifies, so it constrains nobody willing to edit both.
+
+What it actually buys is **tamper-evidence**: the edit stops being invisible
+and surfaces in the diff as a hash change a reviewer can challenge. Worth
+having, worth shipping — but it is the same shape as L-95, a well-placed
+prompt that still needs a human to act on it, which by this file's own
+definition makes it a rule.
+
+The mechanism would be a digest the same commit cannot reach: a separately
+approved source, a protected path with different reviewers, or an enforced
+provenance check on regeneration.
+
+> `CORPUS_SHA256` exists **only on sfdc24-site PR #13**; `main` at `4ae0e85`
+> does not have it. Both facts matter and neither rescues the other — it is
+> not merged, and it would not be a mechanism if it were.
 
 ---
 
@@ -187,6 +203,11 @@ key. A reviewer then found that the workflow's path filters did not include
 not run when the guarded thing changed. It could be bypassed by editing the one
 file it existed to protect.
 
+It was bypassable a second way, found later and recorded under L-92: even when
+the job does run, the digest it checks sits in the same editable tree, so one
+commit can change the corpus and the expected hash together. Two independent
+bypasses in one guard, neither found by its author.
+
 That is L-94's exact shape: a mechanism that looks like protection and is not.
 Having just written the entry did not help. The reviewer did.
 
@@ -212,16 +233,19 @@ mechanism. If an entry below ever becomes enforceable in CI or a rule engine,
 move it up into the mechanism form and say so.
 
 **Scoreboard, so this file does not flatter itself.** Of eight entries,
-**none is a mechanism in force today.** Three are proposed and land only if
-sfdc24-site PR #13 and Blackboard PR #40 merge (L-91, L-92, L-94). Five are
-rules with no enforcement at all (L-93, L-95, L-96, L-97, L-98) and are the
+**none is a mechanism in force today.** Two are proposed and land only if
+Blackboard PR #40 (L-91) and sfdc24-site PR #13 (L-94) merge. Six are rules
+with no enforcement at all (L-92, L-93, L-95, L-96, L-97, L-98) and are the
 honest input for a scoring engine.
 
 Zero of eight. That is the most useful sentence in the document: a night that
 produced eight learnings produced **no controls that are actually in force**, and
-the first two versions of this scoreboard both overstated it — first claiming
-six mechanisms, then two. Both times a reviewer had to count for me. Verify the
-claim, not the label.
+every previous version of this scoreboard overstated it — six mechanisms, then
+two, then three proposals of which one was not a mechanism at all. Three
+corrections, three different reviewers, none of them the author. The count has
+never once been right on the first try, which is the strongest evidence in the
+file for its own thesis: verify the claim, not the label, and do not be the
+only one who checks.
 
 **The generalisation worth keeping**, because it explains all eight defects of
 that night in one line: *evaluating anything takes a correct answer and a
