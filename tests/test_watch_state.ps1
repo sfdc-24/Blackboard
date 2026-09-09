@@ -659,6 +659,90 @@ Assert-True 'a string and a datetime resolve identically' `
 Assert-True 'and neither depends on the current culture' `
   ((ConvertTo-WatchTime $asDate).ToString('o') -eq (ConvertTo-WatchTime $isoText).ToString('o'))
 
+
+Write-Output ''
+Write-Output '== BOUNDED PRODUCERS (vm-claude-code-cli, PR34 6833db2 NO-GO) =='
+# The invariants were right and the PRODUCERS were wrong. Both watchers built
+# values Test-StateInvariants forbids, so the emit happened and the save was then
+# refused -- which is not a stall, it is a message repeated for ever, or a
+# message and every message after it lost.
+
+# --- the defect these replaced, asserted so it cannot come back quietly -------
+$longPay = 'x' * 500
+$oldKey  = 'whatsapp::' + $longPay
+$stOld = New-WatchState
+$stOld.boardId = 'b1'; $stOld.lastEmitKey = $oldKey; $stOld.lastEmitTs = '2026-09-09T12:00:00Z'
+Assert-True 'THE DEFECT: the old source::payload key is refused by the invariants' `
+  ((Test-StateInvariants -State $stOld) -like '*lastEmitKey*') `
+  ("invariant said: " + [string](Test-StateInvariants -State $stOld))
+Assert-True 'and 500 characters is a normal message, not an edge case' `
+  ($oldKey.Length -gt $script:WATCH_MAX_FIELD)
+
+# --- Get-WatchEmitKey ---------------------------------------------------------
+$row5k = @('rid', '2026-09-09T12:00:00Z', 'whatsapp', 'ALL', 'APPEND', ('y' * 5000), 'OPEN', 'p', 'g', 's')
+$k5k = Get-WatchEmitKey -Row $row5k
+Assert-True 'a 5000-char payload yields a 67-char key' ($k5k.Length -eq 67) ("was " + $k5k.Length)
+Assert-True 'which the field bound accepts' ($k5k.Length -le $script:WATCH_MAX_FIELD)
+Assert-True 'and it is versioned so a future change is visible' ($k5k -like 'k1:*')
+$stNew = New-WatchState
+$stNew.boardId = 'b1'; $stNew.lastEmitKey = $k5k; $stNew.lastEmitTs = '2026-09-09T12:00:00Z'
+Assert-True 'a state carrying it passes the SAME invariants that refused the old key' `
+  (-not (Test-StateInvariants -State $stNew)) `
+  ([string](Test-StateInvariants -State $stNew))
+$rowA = @('r1','t','whatsapp','ALL','APPEND','hello there','OPEN','p','g','s')
+$rowB = @('r2','t','whatsapp','ALL','APPEND','hello therf','OPEN','p','g','s')
+Assert-True 'the same message gives the same key' `
+  ((Get-WatchEmitKey -Row $rowA) -eq (Get-WatchEmitKey -Row @('rZ','t2','whatsapp','x','y','hello there','c','p','g','s')))
+Assert-True 'a one-character difference gives a different key' `
+  ((Get-WatchEmitKey -Row $rowA) -ne (Get-WatchEmitKey -Row $rowB))
+Assert-True 'the same text from a different source is a different message' `
+  ((Get-WatchEmitKey -Row $rowA) -ne (Get-WatchEmitKey -Row @('r1','t','governor-page','ALL','APPEND','hello there','OPEN','p','g','s')))
+Assert-True 'whitespace is normalised, as the old key did' `
+  ((Get-WatchEmitKey -Row $rowA) -eq (Get-WatchEmitKey -Row @('r1','t','whatsapp','ALL','APPEND',"hello`t  there",'OPEN','p','g','s')))
+
+# --- Limit-WatchLine ----------------------------------------------------------
+$short = 'a short line'
+Assert-True 'a short line is returned untouched' ((Limit-WatchLine -Line $short) -eq $short)
+Assert-True 'and is NOT marked as truncated' ((Limit-WatchLine -Line $short) -notlike '*TRUNCATED*')
+$long = 'z' * 5000
+$cut = Limit-WatchLine -Line $long
+Assert-True 'a 5000-char line is cut to the outbox bound' ($cut.Length -le $script:WATCH_MAX_LINE) ("was " + $cut.Length)
+Assert-True 'the cut is VISIBLE, not silent' ($cut -like '*TRUNCATED*')
+Assert-True 'and it says how long the original really was' ($cut -like '*5000*')
+$stLine = New-WatchState
+$stLine.boardId = 'b1'; $stLine.anchorId = 'a1'; $stLine.lastIndex = 1
+$stLine.pendingIndex = 2; $stLine.pendingAnchor = 'a1'; $stLine.planFrom = 1; $stLine.planMode = 'steady'
+$stLine.pendingLines = @($cut); $stLine.pendingRowIds = @('r1')
+Assert-True 'a truncated line can actually be STAGED, which the raw one could not' `
+  (-not (Test-StateInvariants -State $stLine)) `
+  ([string](Test-StateInvariants -State $stLine))
+$stRaw = New-WatchState
+$stRaw.boardId = 'b1'; $stRaw.anchorId = 'a1'; $stRaw.lastIndex = 1
+$stRaw.pendingIndex = 2; $stRaw.pendingAnchor = 'a1'; $stRaw.planFrom = 1; $stRaw.planMode = 'steady'
+$stRaw.pendingLines = @($long); $stRaw.pendingRowIds = @('r1')
+Assert-True 'THE DEFECT: the unbounded line is refused, which is why nothing was heard' `
+  ((Test-StateInvariants -State $stRaw) -like '*line*')
+
+# --- MAX_PATH, found by vm-claude-code-cli by accident ------------------------
+$budget = Get-WatchStatePathBudget
+Assert-True 'the path budget is derived from the transition suffix, not hardcoded' `
+  ($budget -eq (259 - ($script:WATCH_TX_MARKER + '.' + ('0' * 64) + '.' + ('0' * 64)).Length)) `
+  ("budget " + $budget)
+Assert-True 'and on this host that is 120 characters' ($budget -eq 120) ("was " + $budget)
+if ($script:WATCH_IS_WINDOWS) {
+  $okPath = 'C:\' + ('a' * ($budget - 3))
+  $threw = $false
+  try { Assert-WatchStatePathFits -Path $okPath } catch { $threw = $true }
+  Assert-True 'a path exactly at the budget is accepted' (-not $threw) ("len " + $okPath.Length)
+  $badPath = 'C:\' + ('a' * ($budget - 2))
+  $msg = ''
+  try { Assert-WatchStatePathFits -Path $badPath } catch { $msg = [string]$_.Exception.Message }
+  Assert-True 'one character over is REFUSED at startup' ($msg -ne '') ("len " + $badPath.Length)
+  Assert-True 'and the refusal names the length, not a missing directory' `
+    ($msg -like ('*' + $badPath.Length + ' characters*')) $msg
+  Assert-True 'and says what the limit is' ($msg -like ('*' + $budget + '*'))
+}
+
 } finally {
   Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }

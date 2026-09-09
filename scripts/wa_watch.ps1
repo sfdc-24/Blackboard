@@ -50,6 +50,11 @@ if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this s
 
 if (-not $StateFile) { $StateFile = Get-DefaultStatePath -Leaf 'wa_watch.state.json' }
 $StateFile = Resolve-StatePath $StateFile
+# Refuse an over-long path BEFORE taking the lock. Every durable save writes a
+# transition asset 139 characters longer, and .NET Framework enforces MAX_PATH
+# 260, so an over-long path makes every save throw "could not find a part of the
+# path" - which reads as a missing directory and hides the real cause.
+Assert-WatchStatePathFits -Path $StateFile
 
 $lock = Enter-WatchLock -Path $StateFile
 if (-not $lock.ok) { throw ("WA watch CANNOT START - " + $lock.reason) }
@@ -107,9 +112,11 @@ function Format-Line {
     $t = $t -replace '^GOV\|kind=feed\|', ''
     $t = $t -replace '^(project=[^|]*\|)?tag=[^|]*\|text=', ''
     $t = $t -replace '\|project=[^|]*$', ''
-    return ($Prefix + "GOVERNOR PAGE - MR SALAM [" + $Row[1] + "] " + $t.Trim())
+    return (Limit-WatchLine -Line ($Prefix + "GOVERNOR PAGE - MR SALAM [" + $Row[1] + "] " + $t.Trim()))
   }
-  return ($Prefix + "WA FROM MR SALAM [" + $Row[1] + "] " + $t.Trim())
+  # Bounded HERE rather than at the call site, so a future caller cannot
+  # reintroduce an unbounded line the outbox will silently refuse to stage.
+  return (Limit-WatchLine -Line ($Prefix + "WA FROM MR SALAM [" + $Row[1] + "] " + $t.Trim()))
 }
 
 function Get-ModePrefix { param([string]$Mode)
@@ -138,7 +145,7 @@ function Get-PlanEntries {
   $plan = @()
   foreach ($e in $elig) {
     $r = $e.row
-    $key = ([string]$r[2]) + '::' + (([string]$r[5]) -replace '\s+', ' ')
+    $key = Get-WatchEmitKey -Row $r
     if (Test-KeyIsDuplicate -PrevKey $k -PrevTs $t -Key $key -RowTs ([string]$r[1])) { continue }
     $k = $key; $t = [string]$r[1]
     $plan += ,@{ line = (Format-Line -Row $r -Prefix $prefix); rowIndex = [int]$e.i; rowId = [string]$r[0]; key = $key; ts = [string]$r[1] }
@@ -220,7 +227,7 @@ try {
       $mk = $state.lastEmitKey; $mt = $state.lastEmitTs
       for ($i = 1; $i -le $lastData; $i++) {
         if (([string]$rows[$i][0]) -eq $lastId) {
-          $mk = ([string]$rows[$i][2]) + '::' + (([string]$rows[$i][5]) -replace '\s+', ' ')
+          $mk = Get-WatchEmitKey -Row $rows[$i]
           $mt = [string]$rows[$i][1]
           break
         }

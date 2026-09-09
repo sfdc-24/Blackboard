@@ -74,6 +74,10 @@ if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this s
 
 if (-not $StateFile) { $StateFile = Get-DefaultStatePath -Leaf ('fleet_watch.' + $Tag + '.state.json') }
 $StateFile = Resolve-StatePath $StateFile
+# Refuse an over-long path BEFORE taking the lock. See Assert-WatchStatePathFits:
+# the transition asset is 139 characters longer than the state file, and MAX_PATH
+# turns that into a misleading "could not find a part of the path" on every save.
+Assert-WatchStatePathFits -Path $StateFile
 
 $lock = Enter-WatchLock -Path $StateFile
 if (-not $lock.ok) { throw ("Fleet watch CANNOT START - " + $lock.reason) }
@@ -200,7 +204,10 @@ function Format-Line {
   $head = $Prefix + "BOARD -> " + $Tag + " from " + $(if ($from) { $from } else { [string]$Row[2] })
   if ($prio) { $head += " [" + $prio + "]" }
   $head += " " + $phase + " " + $id
-  return ($head + " :: " + ($ask -replace '\s+', ' '))
+  # $ask is capped above, but $head is not: from, prio, phase and id are all
+  # payload fields and none of them is bounded. Cap the finished line, or the
+  # outbox refuses to stage it and the reader hears nothing at all.
+  return (Limit-WatchLine -Line ($head + " :: " + ($ask -replace '\s+', ' ')))
 }
 function Get-ModePrefix { param([string]$Mode)
   if ($Mode -eq 'cold') { return '(recent) ' }
@@ -228,7 +235,7 @@ function Get-PlanEntries {
   $plan = @()
   foreach ($e in $elig) {
     $r = $e.row
-    $key = ([string]$r[2]) + '::' + (([string]$r[5]) -replace '\s+', ' ')
+    $key = Get-WatchEmitKey -Row $r
     if (Test-KeyIsDuplicate -PrevKey $k -PrevTs $t -Key $key -RowTs ([string]$r[1])) { continue }
     $k = $key; $t = [string]$r[1]
     $plan += ,@{ line = (Format-Line -Row $r -Prefix $prefix); rowIndex = [int]$e.i; rowId = [string]$r[0]; key = $key; ts = [string]$r[1] }
@@ -310,7 +317,7 @@ try {
       $mk = $state.lastEmitKey; $mt = $state.lastEmitTs
       for ($i = 1; $i -le $lastData; $i++) {
         if (([string]$rows[$i][0]) -eq $lastId) {
-          $mk = ([string]$rows[$i][2]) + '::' + (([string]$rows[$i][5]) -replace '\s+', ' ')
+          $mk = Get-WatchEmitKey -Row $rows[$i]
           $mt = [string]$rows[$i][1]
           break
         }

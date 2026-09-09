@@ -125,12 +125,122 @@ function Get-DefaultStatePath {
   return (Join-Path (Join-Path $base 'sfdc24') $Leaf)
 }
 
+function Get-WatchStatePathBudget {
+  # The longest state path that still leaves room for its transition asset.
+  # Get-TxAssetPath appends WATCH_TX_MARKER plus two 64-character digests; that
+  # suffix is fixed, so the budget is derived from it rather than written down as
+  # a number that can drift away from the thing it describes.
+  $suffix = ($script:WATCH_TX_MARKER + '.' + ('0' * 64) + '.' + ('0' * 64)).Length
+  return (259 - $suffix)   # 259, not 260: MAX_PATH counts the terminating null
+}
+
+function Assert-WatchStatePathFits {
+  <#
+    Windows PowerShell 5.1 runs on .NET Framework, which enforces MAX_PATH 260
+    unless LongPathsEnabled is set -- and it is 0 on this host. Every durable
+    save writes a transition asset BESIDE the state file, named for the state
+    path plus a marker and two digests. So a state path that is itself perfectly
+    legal makes every save throw, and the watcher fails closed for ever.
+
+    The failure hides its own cause. .NET reports "Could not find a part of the
+    path" and names a path that does not exist, which reads as a missing
+    directory, not as a length.
+
+    Found by vm-claude-code-cli reviewing PR34, and found BY ACCIDENT: their
+    first reproduction used a GUID-named state file at exactly 121 characters and
+    the CONTROL failed. Measured on this host: production default 59 chars
+    (total 198) safe; the repo harness 107 (total 246) safe by FOURTEEN
+    characters; 121 (total 260) fails. Fourteen characters is one longer
+    username, temp directory or CI workspace away from turning the whole watcher
+    suite red with a misleading message.
+
+    Refuse it at startup, and say the length out loud.
+  #>
+  param([string]$Path)
+  if (-not $script:WATCH_IS_WINDOWS) { return }
+  $budget = Get-WatchStatePathBudget
+  if (([string]$Path).Length -le $budget) { return }
+  throw ("State file path is " + ([string]$Path).Length + " characters; the limit here is " + $budget + ". " +
+         "Every durable save writes a transition asset " + ((Get-TxAssetPath -Path '' -CandidateHash ('0' * 64) -PriorHash ('0' * 64)).Length) +
+         " characters longer, and Windows PowerShell 5.1 enforces MAX_PATH 260 with LongPathsEnabled off, so every " +
+         "save would fail as 'could not find a part of the path' - which names a missing directory, not the length " +
+         "that actually caused it. Pass a shorter -StateFile. Path was: " + $Path)
+}
+
 function Resolve-StatePath {
   param([string]$Path)
   try {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { $Path = Join-Path (Get-Location).ProviderPath $Path }
     return [System.IO.Path]::GetFullPath($Path)
   } catch { return $Path }
+}
+# NOTE: the length guard is deliberately NOT called from here. Resolve-StatePath
+# is a pure resolver used by tests that build paths without ever saving through
+# them, and folding policy into it turned one of those into a suite-aborting
+# throw. The watchers call Assert-WatchStatePathFits themselves, at startup,
+# which is where the reviewer asked for it and where a refusal can be reported.
+
+function Get-WatchEmitKey {
+  <#
+    The dedupe marker, bounded BY CONSTRUCTION.
+
+    It used to be "<source>::<payload, whitespace collapsed>", built identically
+    in wa_watch.ps1 and fleet_watch.ps1 -- and the payload is unbounded.
+    Test-StateInvariants bounds lastEmitKey at WATCH_MAX_FIELD, so a payload
+    past about 390 characters (a normal three-sentence message, not an edge
+    case) built a key the state file was not allowed to hold. The line was
+    EMITTED, the save was then refused, the cursor never moved, and the same
+    message was re-emitted on every tick indefinitely.
+
+    The refusal was correct. The producer was wrong. A digest is bounded whatever
+    the payload does, and it is still exact: two different messages cannot share
+    a key short of a SHA-256 collision.
+
+    Always 67 characters. The k1: prefix is a version marker, so if what gets
+    hashed ever changes, the state file shows it instead of silently comparing
+    unlike things.
+
+    Migration: an existing state file holds an old-format key. It will not equal
+    a k1: key, so Test-KeyIsDuplicate returns false and at most one message can
+    repeat, once, and only if it lands within WATCH_DUPE_SECONDS of the upgrade.
+    That fails toward saying something twice rather than toward silence, which is
+    the right direction for this watcher.
+  #>
+  param($Row)
+  $src = ([string]$Row[2]) -replace '\s+', ' '
+  $pay = ([string]$Row[5]) -replace '\s+', ' '
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($src + '::' + $pay)
+    $hex = [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+  } finally { $sha.Dispose() }
+  return ('k1:' + $hex)
+}
+
+function Limit-WatchLine {
+  <#
+    An emitted line, bounded to what the outbox can actually stage.
+
+    Format-Line was unbounded in both watchers while the outbox bounds a staged
+    line at WATCH_MAX_LINE. A 5000-character payload therefore emitted NOTHING:
+    the save refused, the cursor never advanced, and that message AND EVERY
+    MESSAGE AFTER IT went unheard. Loud on stderr, silent to the reader - which
+    is the failure this watcher exists to prevent.
+
+    Truncation is the smaller loss, and it has to be VISIBLE. A cut line says it
+    was cut and how long the original was, so nobody reads a truncated message
+    as a complete one and answers the half they were shown.
+  #>
+  param([string]$Line)
+  $s = [string]$Line
+  $max = [int]$script:WATCH_MAX_LINE
+  if ($s.Length -le $max) { return $s }
+  $marker = ' ... [TRUNCATED - full message was ' + $s.Length + ' characters]'
+  $keep = $max - $marker.Length
+  # A bound too small to hold the marker is pathological, but a negative
+  # Substring throws, and throwing here would reintroduce the silence.
+  if ($keep -lt 1) { return $s.Substring(0, $max) }
+  return ($s.Substring(0, $keep) + $marker)
 }
 
 function New-WatchState {
