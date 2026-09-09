@@ -193,6 +193,13 @@ appended row must read back byte-exactly.
 - **Write cells without commas** on the LEARNINGS and check-in sheets; commas
   split cells on import there.
 
+**And read `docs/POKA-YOKE.md` before you write a guard or a test.** It is the
+short version of what 2026-09-08/09 cost, and it draws the distinction this pack
+otherwise leaves implicit: a *rule* asks you to remember, a *poka-yoke* removes
+the chance to get it wrong. Prefer the second. The fleet already has ninety
+rules; on that night an instance broke three it had quoted in writing the same
+hour.
+
 ---
 
 ## 6. How you report back — corrected
