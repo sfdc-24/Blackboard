@@ -16,7 +16,7 @@ transcript / chat).
 
 ## Prerequisites
 
-- Node.js **20.3.0+** (24 LTS recommended — the `@zoom/rtms` SDK needs it)
+- Node.js **22+** (the locked `@zoom/rtms` 1.1.0 requires it; 24 LTS also fine)
 - The Marketplace app configured as we set it up: RTMS scopes, Event
   Subscription (WebSocket) with `meeting.rtms_started`, `meeting.rtms_stopped`,
   `meeting.rtms_interrupted`
@@ -101,7 +101,7 @@ transcript / chat).
 | Socket closes with 1008 | Token invalid/expired — delete `.tokens.json`, re-authorize |
 | `rtms_started` arrives but join fails | Client ID/Secret mismatch — SDK signs with `ZM_RTMS_*` (auto-mirrored from `.env`) |
 | Duplicate join / stream kicked | Only one connection per stream — this scaffold guards via the `active` map |
-| Segfault on start | Node too old — upgrade to 20.3+ / 24 LTS |
+| Segfault on start | Node too old — upgrade to 22+ / 24 LTS |
 | No transcript lines | Transcript scope missing, or meeting captions/transcription not active |
 
 ---

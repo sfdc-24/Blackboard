@@ -31,6 +31,12 @@ export const config = {
   wsEndpoint: required('ZOOM_WS_ENDPOINT'),
   redirectUri: process.env.ZOOM_REDIRECT_URI ?? 'http://localhost:3000/oauth/callback',
   port: num('PORT', 3000),
+  // The OAuth callback listens on LOOPBACK ONLY unless an operator overrides it
+  // by hand. Express's default bound every interface — `server.address()` on the
+  // reviewed head returned {address:'::'} — which published the authorization
+  // endpoint of a process holding a long-lived Zoom refresh token to whatever
+  // network the host was on. Zoom's own guidance is a loopback literal.
+  oauthHost: optional('OAUTH_HOST', '127.0.0.1'),
   tokenFile: process.env.TOKEN_FILE ?? '.tokens.json',
 
   // ── SFDC24 brain: the same reception() the website and WhatsApp call ──
@@ -40,6 +46,10 @@ export const config = {
   metaToken: optional('META_TOKEN'),
   waPhoneNumberId: optional('WA_PHONE_NUMBER_ID'),
   waTo: optional('WA_TO'),
+  // Absolute ceiling on the Graph call. A hung send used to hold the meeting's
+  // inFlight lock forever, which silences the assistant for the rest of the
+  // call and looks exactly like a quiet meeting.
+  notifyTimeoutMs: num('NOTIFY_TIMEOUT_MS', 15_000),
 
   // ── The blackboard, for the post-call finding ──
   busUrl: optional('BUS_URL'),
@@ -54,6 +64,12 @@ export const config = {
   assistEveryN: num('ASSIST_EVERY_N', 0),
   contextLines: num('CONTEXT_LINES', 30),
   summaryLines: num('SUMMARY_LINES', 400),
+  // How many 1,000-char segments a wrap-up may spend. reception() cuts `q` at
+  // CHAT_MAX_INPUT, so a long call has to be summarised in pieces — and every
+  // piece is a paid backend call against the shared caps. Eight segments covers
+  // roughly the last 6,000 characters of speech; beyond that the summary says
+  // how many lines it did not reach rather than pretending to cover them.
+  summaryMaxChunks: num('SUMMARY_MAX_CHUNKS', 8),
   // Client conversations. Off by default so a transcript is not sprayed into a
   // terminal log by accident.
   logTranscript: optional('LOG_TRANSCRIPT', 'false') === 'true',

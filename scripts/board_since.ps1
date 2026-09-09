@@ -53,6 +53,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot  = Split-Path -Parent $scriptDir
+
+# Selection and cursor logic lives beside this script so it can be tested
+# without a bus, a network or a board. See tests/test_board_since.ps1.
+. (Join-Path $scriptDir 'board_since.lib.ps1')
 # bus.ps1 is NOT on main -- main carries only scripts/.gitkeep -- so a checkout
 # of the default branch does not have it beside this file. Look in the obvious
 # places and then say plainly what to pass, rather than failing with a path.
@@ -93,24 +97,27 @@ try {
   if ((Test-Path $cursorFile) -and -not $Reset -and $Last -eq 0) {
     try { $cursor = (Get-Content -Raw $cursorFile | ConvertFrom-Json) } catch { $cursor = $null }
   }
-  $lastSeenTs = if ($cursor) { [string]$cursor.lastTs } else { '' }
+
+  # Anchored by Row_ID at a known index, not by timestamp. The board is not
+  # unique by timestamp -- a snapshot on 2026-09-09 held 11 duplicate-timestamp
+  # groups -- and the old `-le` comparison skipped every tied row permanently.
+  $start = @{ StartIndex = 0; Anchor = 'first-run'; Note = 'no cursor yet -- this is a first run' }
+  if ($Last -eq 0) { $start = Resolve-BoardStartIndex -Rows $rows -Cursor $cursor }
 
   # ---- select ---------------------------------------------------------------
   $selected = New-Object System.Collections.ArrayList
-  foreach ($r in $rows) {
+  for ($idx = [int]$start.StartIndex; $idx -lt $rows.Count; $idx++) {
+    $r = $rows[$idx]
     $ts     = [string]$r[1]
     $writer = [string]$r[2]
     $payload = [string](($r | Where-Object { ([string]$_).Length -gt 100 } | Select-Object -First 1))
     if (-not $payload) { $payload = [string]$r[5] }
 
-    if ($Last -eq 0 -and $lastSeenTs -and ($ts -le $lastSeenTs)) { continue }
     if (-not $Mine -and $writer -eq $Tag) { continue }
 
-    # Addressed to me, cc'd to me, or broadcast.
-    $addressed = $false
-    if ($payload -match 'to=([^|]*)')  { if ($matches[1] -match [regex]::Escape($Tag) -or $matches[1] -match '\bALL\b') { $addressed = $true } }
-    if (-not $addressed -and $payload -match 'cc=([^|]*)') { if ($matches[1] -match [regex]::Escape($Tag) -or $matches[1] -match '\bALL\b') { $addressed = $true } }
-    if (-not $addressed) { continue }
+    # Addressed to me, cc'd to me, or broadcast -- by EXACT token, never by
+    # substring. `-Tag codex` must not consume mail for chatgpt-codex-desktop.
+    if (-not (Test-BoardAddressed -Payload $payload -Tag $Tag)) { continue }
 
     [void]$selected.Add([pscustomobject]@{
       Ts = $ts; Writer = $writer; Payload = $payload
@@ -125,20 +132,24 @@ try {
   }
 
   # ---- report ---------------------------------------------------------------
-  $newestTs = [string]$rows[$rows.Count - 1][1]
+  $newestTs   = [string]$rows[$rows.Count - 1][1]
+  $nextCursor = New-BoardCursor -Rows $rows
   $savedKb  = [Math]::Round(($raw.Length / 1KB), 0)
   $shownKb  = [Math]::Round((($selected | ForEach-Object { $_.Payload.Length } | Measure-Object -Sum).Sum / 1KB), 1)
 
   if ($Reset) {
-    @{ lastTs = $newestTs; updated = (Get-Date).ToUniversalTime().ToString('o') } |
-      ConvertTo-Json | Set-Content -LiteralPath $cursorFile -Encoding utf8
-    Write-Output "cursor for $Tag reset to $newestTs -- nothing printed"
+    $nextCursor | ConvertTo-Json | Set-Content -LiteralPath $cursorFile -Encoding utf8
+    Write-Output "cursor for $Tag reset to row $($nextCursor.lastIndex) ($newestTs) -- nothing printed"
     return
   }
 
   Write-Output ("board {0} rows, {1} KB read in {2:N1}s  |  new and addressed to {3}: {4} rows, {5} KB  |  context saved: {6} KB" -f `
     $rows.Count, $savedKb, $sw.Elapsed.TotalSeconds, $Tag, $selected.Count, $shownKb, [Math]::Max(0, $savedKb - $shownKb))
-  if ($lastSeenTs) { Write-Output ("since {0}" -f $lastSeenTs) } else { Write-Output "no cursor yet -- this is a first run" }
+  if ($start.Note) { Write-Output $start.Note }
+  elseif ($start.Anchor -eq 'index' -or $start.Anchor -eq 'searched') {
+    Write-Output ("since row {0}" -f ([int]$start.StartIndex - 1))
+  }
+  if ($start.Anchor -eq 'anchor-lost') { Write-Warning 'board cursor anchor lost -- some rows above may be shown again' }
   Write-Output ''
 
   if ($selected.Count -eq 0) {
@@ -160,9 +171,8 @@ try {
   }
 
   if (-not $Peek -and $Last -eq 0) {
-    @{ lastTs = $newestTs; updated = (Get-Date).ToUniversalTime().ToString('o') } |
-      ConvertTo-Json | Set-Content -LiteralPath $cursorFile -Encoding utf8
-    Write-Output ("cursor advanced to {0}" -f $newestTs)
+    $nextCursor | ConvertTo-Json | Set-Content -LiteralPath $cursorFile -Encoding utf8
+    Write-Output ("cursor advanced to row {0} ({1})" -f $nextCursor.lastIndex, $nextCursor.lastRowId)
   } elseif ($Peek) {
     Write-Output "(peek -- cursor not moved)"
   }

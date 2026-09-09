@@ -50,8 +50,21 @@ jobs:
       - name: Report whether the optional media SDK resolved here
         run: node -e "try{require.resolve('@zoom/rtms');console.log('@zoom/rtms IS installed on ${{ matrix.os }}')}catch{console.log('@zoom/rtms is NOT installed on ${{ matrix.os }} - the agent must still work')}"
 
+      # Resolution is not use. This dynamically imports the SDK and constructs
+      # its client — the same call src/rtms.js makes when a stream starts — so
+      # the Linux media boundary is actually guarded rather than assumed. No
+      # credentials, no join, no socket.
+      - name: Cross the Linux media boundary for real
+        run: node test/linux-sdk-probe.mjs
+
       - name: Offline tests
         run: npm test
+
+      # The declared engines floor must be one the locked SDK can run on, and
+      # the audit must stay clean: this process holds a long-lived Zoom refresh
+      # token, so a known advisory in its dependency tree is not a paper cut.
+      - name: Production dependencies carry no known advisories
+        run: npm audit --omit=dev --audit-level=moderate
 
 # test/simulate-call.mjs is NOT run here. It calls the real SFDC24 reception()
 # endpoint, needs SFDC24_EXEC, and costs money on every invocation. A suite that

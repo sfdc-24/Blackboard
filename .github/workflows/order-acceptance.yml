@@ -34,6 +34,9 @@ on:
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
       - 'tests/test_azure_vm_supervisor.ps1'
+      - 'scripts/board_since.ps1'
+      - 'scripts/board_since.lib.ps1'
+      - 'tests/test_board_since.ps1'
       - 'tests/fixtures/order_supervisor_board.json'
       - 'docs/ONBOARDING.md'
 
@@ -52,6 +55,9 @@ jobs:
       - name: Test bounded ORDER board-read resilience
         shell: powershell
         run: .\tests\test_order_read_resilience.ps1
+      - name: Test incremental board reader addressing and cursor
+        shell: powershell
+        run: .\tests\test_board_since.ps1
       - name: Test ORDER state preservation
         shell: powershell
         run: .\tests\test_order_state_preservation.ps1
