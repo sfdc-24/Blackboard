@@ -19,7 +19,7 @@
 
 ## Why this exists
 
-Mr. Salam asked, on 2026-09-08, why work circles instead of closing — and whether
+Mr. Salam asked, on 2026-09-09, why work circles instead of closing — and whether
 the cause was the lack of a central repository everyone can reach.
 
 It is not storage. The board and the repository were both reachable the whole
@@ -36,8 +36,8 @@ fourteen review rounds, and every one of them has the same shape:
 | 4 | Reviews bound to a moving head | Five reviews landed on a commit that no longer existed; two then read as *"the author's claimed fix is absent"* |
 | 5 | Verification tooling producing false green | Two mutation harnesses in one tree: the second snapshotted the first's mutation as pristine source and restored it, reporting 30/30 caught over a reverted fix |
 
-Route 5 is the sharpest. **A gate reported perfect health over source it had itself
-corrupted.** Any rule that keys on green inherits whatever the gate's own failure
+Route 5 is the sharpest. **A gate reported perfect health over source it had itself corrupted.**
+Any rule that keys on green inherits whatever the gate's own failure
 modes are — which is why M7 exists, and why the auto-merge decision below is
 harder than it looks.
 
@@ -110,12 +110,38 @@ begins.
 
 ### M6 — A work item closes on a repository read, never on a report
 
-*"Committed as `<sha>`"* and *"created PR"* are claims until `git cat-file`
-resolves the sha **in this repository** or the pull request appears in a listing.
+*"Committed as `<sha>`"* and *"created PR"* are claims until the sha is
+**reachable from an advertised ref** in this repository — or is the current head
+of an open pull request — or the pull request itself appears in a listing.
+
+**Reachability, not existence.** `git cat-file -e` answers only *"is this object
+in the local database"*, and an object stays there after the branch that carried
+it is force-pushed away or deleted. So the obvious test passes for a commit no
+branch and no pull request contains:
+
+```
+$ ORPHAN=$(git hash-object -w -t blob --stdin <<< "reachable from nothing")
+$ git cat-file -e $ORPHAN && echo exists
+exists
+$ git branch -a --contains $ORPHAN
+                                        # nothing
+```
+
+Use `git fetch` followed by `git branch -r --contains <sha>`, or compare against
+the pull request's head from the API. That distinction was found by Codex in
+review of this document — a hole in M6's own test, which is the shape M7 exists
+to catch and which the author had been relying on all night.
 
 The distinction that matters: **a commit that resolves locally is not an artifact
 that exists.** Three reports in this fleet named commits that resolve in the
 author's workspace and nowhere else.
+
+**Where the artifact lives, not whether a commit exists.** A *decision* is landed
+when it is recorded where the thing it governs can be found: a ruling on a pull
+request belongs on that pull request, and needs no commit. A *document*, a *fix*
+or a *mechanism* is landed only when a repository read resolves it. Applied
+mechanically the rule would have counted a PM ratification — correctly recorded
+on the pull request it ratified — as a fourth missing artifact. It was not one.
 
 This is D-4 — *read-back is the only proof of a write* — one level up from where it
 was written. `board.js` already refuses to believe the bus's own `ok:true` and
