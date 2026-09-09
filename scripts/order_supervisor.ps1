@@ -813,6 +813,19 @@ try {
                 exact_duplicate_row_count = [int]$selection.exact_duplicate_row_count
             }
     }
+    if ([int]$selection.known_trailing_row_count -gt 0) {
+        # The live sheet may be wider than canonical A:J because a historical
+        # malformed row expanded its used range. Blank K:L padding is projected
+        # away by the reader. Only the exact known malformed row is ignored;
+        # populated trailing cells are never admitted or copied into the log.
+        Write-OrderLog `
+            -Path $LogPath `
+            -Event 'board_schema_incident' `
+            -Level warning `
+            -RunId $RunId `
+            -Code 'BOARD_KNOWN_TRAILING_ROW_IGNORED' `
+            -Details @{ row_count = [int]$selection.known_trailing_row_count }
+    }
     if ($selection.newest_seen) {
         $state.seen = [pscustomobject][ordered]@{
             at = Get-UtcStamp
