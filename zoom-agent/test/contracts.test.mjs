@@ -616,3 +616,42 @@ test('live wake-word assistance still works while the wrap-up is held', async ()
   assert.equal(asked, 1,
     'the held wrap-up must not take live assistance down with it — that groundwork is independently valid');
 });
+
+
+test('the README does not promise a capability that is held', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const cfg = readFileSync(new URL('../src/config.js', import.meta.url), 'utf8');
+  const heldByDefault = /wrapUpEnabled: optional\('WRAP_UP_ENABLED', 'false'\)/.test(cfg);
+
+  // Operator-facing docs drifted from the diff on this PR three times before a
+  // reviewer caught each one. This makes the fourth surface fail loudly instead.
+  const start0 = readme.indexOf('**After the call');
+  assert.notEqual(start0, -1, 'the README must still describe what happens after a call');
+  const sect = readme.slice(start0, readme.indexOf('###', start0));
+  const saysHeld = /HELD|does not run|off by default/i.test(sect);
+
+  // BIDIRECTIONAL. Drift in either direction is a lie to an operator: a README
+  // promising a capability that never runs, or one warning about a hold that
+  // has since been lifted.
+  if (!heldByDefault) {
+    assert.equal(saysHeld, false,
+      'the wrap-up is enabled by default now, but the README still describes it as held');
+    return;
+  }
+
+  // Scoped to the section an operator actually reads about the wrap-up. A
+  // whole-file search passed even after the section header was rewritten to
+  // promise the feature, because the words still existed further down — the
+  // test asserted a true sentence about the wrong part of the file, which is
+  // the failure mode this suite keeps rediscovering.
+  const start = readme.indexOf('**After the call');
+  assert.notEqual(start, -1, 'the README must still describe what happens after a call');
+  const section = readme.slice(start, readme.indexOf('###', start));
+
+  assert.match(section, /HELD|does not run|off by default/i,
+    'the README is the primary setup document — the post-call section itself must say the '
+    + 'capability does not run, not merely mention a flag somewhere else on the page');
+  assert.match(section, /WRAP_UP_ENABLED/,
+    'and it must name the flag in that same section, so an operator meets the constraint '
+    + 'where the promise used to be');
+});
