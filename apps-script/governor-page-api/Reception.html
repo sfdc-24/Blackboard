@@ -373,21 +373,41 @@ button.rec .dot{animation:b .8s step-end infinite}
       // The return value is deliberately discarded to make that explicit.
       var threw = false;
       try { window.open(href, "_blank", "noopener"); } catch (x) { threw = true; }
-      if (!document.getElementById("popblock")) {
-        var n = document.createElement("div");
+      // Create OR UPDATE, never create-once.
+      //
+      // The guard here used to be `if (!getElementById("popblock"))`, which built
+      // the block on the first click and then never touched it again. Click the
+      // voice link, then Sign out, and the page still offered the VOICE address
+      // under "open this address directly" - a confidently wrong address, which
+      // is worse than no address at all.
+      //
+      // The guard predates this PR, but it had never RENDERED before, because
+      // esc() threw first. Fixing that crash promoted a latent bug into a live
+      // wrong answer. Found by vm-claude-code-cli reviewing 77ec7e3, who said
+      // plainly that this defect is less severe than the crash it fixes; it is
+      // still a wrong address shown to a visitor.
+      var n = document.getElementById("popblock"), lead, addr;
+      if (n) {
+        lead = n.querySelector(".kv");
+        addr = n.querySelector(".popaddr");
+      } else {
+        n = document.createElement("div");
         n.id = "popblock"; n.className = "empty"; n.style.marginTop = "10px";
-        var lead = document.createElement("span");
+        lead = document.createElement("span");
         lead.className = "kv";
-        lead.textContent = threw
-          ? "Your browser blocked the new tab. Open this address directly:"
-          : "If the new tab did not open, open this address directly:";
-        var addr = document.createElement("div");
-        // textContent, never innerHTML: the address is data, and this block used
-        // to build markup out of it through a helper that did not exist here.
-        addr.textContent = href;
+        addr = document.createElement("div");
+        addr.className = "popaddr";
         n.appendChild(lead); n.appendChild(addr);
-        (a.closest(".wrap") || document.body).appendChild(n);
       }
+      lead.textContent = threw
+        ? "Your browser blocked the new tab. Open this address directly:"
+        : "If the new tab did not open, open this address directly:";
+      // textContent, never innerHTML: the address is data, and this block used
+      // to build markup out of it through a helper that did not exist here.
+      addr.textContent = href;
+      // Re-appending an existing node MOVES it, which is what we want: the block
+      // belongs beside the link the visitor just clicked, not beside the first one.
+      (a.closest(".wrap") || document.body).appendChild(n);
     }, true);
   })();
   // ---- boot ----
