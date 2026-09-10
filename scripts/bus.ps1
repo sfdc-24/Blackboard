@@ -234,7 +234,7 @@ if ($SheetRowJson) {
     $boardTimestampPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$'
     if ($boardTimestamp -cnotmatch $boardTimestampPattern) {
       throw [InvalidOperationException]::new(
-        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require invariant UTC ISO-8601 in cell[1], ending in uppercase Z with zero to seven fractional digits. Refusing transport.'
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require invariant UTC ISO-8601 in cell B (index 1), ending in uppercase Z with zero to seven fractional digits. Refusing transport.'
       )
     }
 
@@ -259,7 +259,7 @@ if ($SheetRowJson) {
       [ref]$parsedBoardTimestamp
     )) {
       throw [InvalidOperationException]::new(
-        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require a real invariant UTC calendar timestamp in cell[1]. Refusing transport.'
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require a real invariant UTC calendar timestamp in cell B (index 1). Refusing transport.'
       )
     }
     if ($parsedBoardTimestamp -gt [DateTimeOffset]::UtcNow.AddMinutes(2)) {
