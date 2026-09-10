@@ -20,7 +20,7 @@ SCHEMA = "blackboard.publication-proof.v1"
 COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 REMOTE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 GIT_OPTIONS = [
-    "--no-replace-objects", "-c", "core.hooksPath=",
+    "--no-replace-objects", "--no-lazy-fetch", "-c", "core.hooksPath=",
     "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
     "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
 ]
@@ -34,8 +34,12 @@ def git_env():
     # Do not let another checkout's GIT_DIR, replacement refs or config override
     # the explicitly selected repository. Normal user Git/SSH credentials remain
     # available; interactive prompts are disabled for bounded unattended use.
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
-    env.update(GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="", GCM_INTERACTIVE="Never")
+    auth_keys = {"GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_ASKPASS"}
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith("GIT_") or k in auth_keys}
+    env.setdefault("GIT_ASKPASS", "")
+    env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never",
+               GIT_NO_LAZY_FETCH="1")
     return env
 
 
@@ -95,9 +99,16 @@ def verify(repo, commit, remote="origin", branch="main", timeout=30):
         if not (valid_commit and valid_remote and valid_branch
                 and isinstance(timeout, (int, float)) and 0 < timeout <= 300):
             raise CheckError("INVALID_INPUT")
-        repo = Path(repo).resolve(strict=True)
+        try:
+            repo = Path(repo).resolve(strict=True)
+        except FileNotFoundError:
+            raise CheckError("REPOSITORY_UNAVAILABLE") from None
         if not repo.is_dir():
             raise CheckError("REPOSITORY_UNAVAILABLE")
+        # An older Git may ignore an unknown environment variable. Requiring the
+        # corresponding command-line option fails closed before probing objects.
+        if run_git(repo, ["--version"], timeout).returncode:
+            raise CheckError("GIT_NO_LAZY_FETCH_UNSUPPORTED")
         ref = "refs/heads/" + branch
         if run_git(repo, ["check-ref-format", ref], timeout).returncode:
             raise CheckError("INVALID_BRANCH")

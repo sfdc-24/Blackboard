@@ -123,6 +123,72 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "UNKNOWN")
         self.assertEqual(receipt["reason"], "REMOTE_NOT_CONFIGURED")
 
+    def test_missing_repository_has_specific_diagnostic(self):
+        receipt = publication.verify(self.root / "missing", self.first)
+        self.assertEqual(receipt["status"], "UNKNOWN")
+        self.assertEqual(receipt["reason"], "REPOSITORY_UNAVAILABLE")
+
+    def test_auth_environment_reaches_git_but_repository_overrides_do_not(self):
+        auth = {"GIT_SSH": "/trusted/ssh", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
+                "GIT_SSH_VARIANT": "ssh", "GIT_ASKPASS": "/trusted/askpass"}
+        original = subprocess.run
+        with patch.dict(os.environ, dict(auth, GIT_DIR="/wrong/repo",
+                                         GIT_NO_LAZY_FETCH="0")):
+            with patch.object(publication.subprocess, "run", wraps=original) as child:
+                self.assertEqual(publication.run_git(self.source, ["--version"], 30).returncode, 0)
+                actual = child.call_args.kwargs["env"]
+        for key, value in auth.items():
+            self.assertEqual(actual[key], value)
+        self.assertNotIn("GIT_DIR", actual)
+        self.assertEqual(actual["GIT_NO_LAZY_FETCH"], "1")
+
+    def test_unsupported_lazy_fetch_guard_fails_before_object_probe(self):
+        real = publication.run_git
+        calls = []
+
+        def unsupported(where, args, timeout):
+            calls.append(args)
+            if args == ["--version"]:
+                return subprocess.CompletedProcess(args, 129, b"", b"")
+            return real(where, args, timeout)
+
+        with patch.object(publication, "run_git", side_effect=unsupported):
+            receipt = self.check()
+        self.assertEqual(receipt["status"], "UNKNOWN")
+        self.assertEqual(receipt["reason"], "GIT_NO_LAZY_FETCH_UNSUPPORTED")
+        self.assertFalse(any(args[0] == "cat-file" for args in calls))
+
+    def test_partial_clone_never_lazy_fetches_into_source(self):
+        self.git(self.remote, "config", "uploadpack.allowFilter", "true")
+        self.git(self.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+        partial = self.root / "partial"
+        self.git(self.root, "clone", "--filter=blob:none", "--no-checkout",
+                 self.remote.as_uri(), str(partial))
+        self.assertEqual(self.git(partial, "config", "remote.origin.promisor"), "true")
+        target = self.commit("new promised commit")
+        self.git(self.source, "push", "origin", "main")
+
+        def snapshot():
+            return {str(p.relative_to(partial)): p.read_bytes()
+                    for p in partial.rglob("*") if p.is_file()}
+
+        before = snapshot()
+        with patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "0"}):
+            receipt = publication.verify(partial, target)
+        self.assertEqual(receipt["status"], "PUBLISHED")
+        self.assertFalse(receipt["local_commit_present"])
+        self.assertEqual(snapshot(), before)
+        # Positive reproduction of the old defect in this disposable clone:
+        # plain cat-file really does download the missing object. The fixture
+        # cannot pass merely because its promisor transport is nonfunctional.
+        unsafe_env = publication.git_env()
+        unsafe_env["GIT_NO_LAZY_FETCH"] = "0"
+        unsafe = subprocess.run(["git", "-C", str(partial), "cat-file", "-t", target],
+                                env=unsafe_env, capture_output=True, timeout=30)
+        self.assertEqual(unsafe.returncode, 0)
+        self.assertEqual(unsafe.stdout, b"commit\n")
+        self.assertNotEqual(snapshot(), before)
+
     def test_transport_failure_receipt_never_leaks_remote_or_stderr(self):
         marker = "DO_NOT_PRINT_private_credential"
         missing = str(self.root / marker / "missing.git")

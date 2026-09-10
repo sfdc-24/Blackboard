@@ -36,6 +36,15 @@ and the nominated repository configuration are trusted; this is not a sandbox
 for hostile repositories. `--timeout` bounds each Git operation to 30 seconds
 by default. No remote writes, retries, deployments or automated messages occur.
 
+The Git executable must support `--no-lazy-fetch`; an unsupported executable
+returns `UNKNOWN / GIT_NO_LAZY_FETCH_UNSUPPORTED` before object inspection.
+Both that option and `GIT_NO_LAZY_FETCH=1` are enforced in child processes,
+including when a caller sets the variable to `0`. Missing local objects can
+still be proved against the separately fetched remote history. Existing
+`GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_SSH_VARIANT` and `GIT_ASKPASS` settings are
+preserved; repository-selection overrides and Git tracing are not inherited.
+See [Git's no-lazy-fetch option](https://git-scm.com/docs/git#Documentation/git.txt---no-lazy-fetch).
+
 Regression checks use real local working/bare repositories, including deleted
 and force-pushed branches, dangling local objects and branch movement during
 verification:

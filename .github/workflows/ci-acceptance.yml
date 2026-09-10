@@ -21,6 +21,8 @@ on:
       - 'scripts/gas_staging_target.py'
       - 'scripts/gas_build_identity.py'
       - 'scripts/baseline_verify.py'
+      - 'scripts/verify_published_commit.py'
+      - 'tests/test_verify_published_commit.py'
       - 'tests/test_baseline_verify.py'
       - 'tests/fixtures/governor-v31-manifest.json'
       - 'scripts/gas_tts_canary.py'
@@ -95,6 +97,8 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_operator_script_guards.py' -v
       - name: Test board client read and append safety contracts
         run: python -B -m unittest discover -s tests -p 'test_board_clients.py' -v
+      - name: Test remote publication and partial-clone source preservation
+        run: python -B -m unittest discover -s tests -p 'test_verify_published_commit.py' -v
       - name: Test single production deploy source contract
         run: python -B -m unittest discover -s tests -p 'test_deploy_source_contract.py' -v
       - name: Test governed Foundry evaluator contract
