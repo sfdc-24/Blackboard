@@ -18,7 +18,7 @@ USAGE (any working directory; paths are resolved from this script's location)
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action time
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action read -Title "SFDC24 — Dispatch (Work Queue)" -OutFile out.json
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "SFDC24 — Inbox · claude-code-cli" -TextFile entry.txt
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "Claude Instance - check in sheet" -SheetRowJson '["claude-code-cli","Working","Instance unification","2026-08-26 3:00 PM EDT","","<targets>","<intent>"]'
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "Claude Instance - check in sheet" -SheetRowJson '["claude-code-cli","Working","Instance unification","2026-08-26T19:00:00Z","","<targets>","<intent>"]'
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action replace -Title "SFDC24 — SESSION STATE · claude-code-cli" -TextFile state.txt   (bus v2+)
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action list   (bus v2+)
 
@@ -26,7 +26,7 @@ RULES THIS SCRIPT DOES NOT RELAX
   D-4: read-back is the only proof of a write. This script prints the response; it
   verifies nothing. Never blind-retry an append -- read the target back first.
   ISSUE 010: for a Sheet, always send -SheetRowJson (a native array), never -Text.
-  ISSUE 006: put timestamps in the form "2026-08-26 3:00 PM EDT" (EDT suffix).
+  ISSUE 006: put timestamps in invariant UTC ISO-8601 form ending in Z.
 #>
 param(
   # 'upload' here is a DEPLOY PROBE, not a working uploader -- this client cannot
@@ -221,6 +221,75 @@ if ($SheetRowJson) {
   foreach ($c in $parsed) { $cells += $(if ($null -eq $c) { '' } else { [string]$c }) }
   if ($cells.Count -lt 2) {
     throw "SheetRowJson produced $($cells.Count) cell(s) -- expected a JSON array of cells such as a bracketed list of quoted strings. Refusing to write a malformed row (ISSUE 010 / REQ-C4NDX7)."
+  }
+
+  # A canonical Blackboard control-bus full row is exactly A:J, with its timestamp
+  # in cell B and a BCB envelope in cell F. Read-side blank K:L padding, truncated
+  # rows, and shifted envelopes are not write shapes. Reject them before
+  # serialization or transport instead of allowing a different width to bypass
+  # this guard. The self-hosted server supports an eight-content-cell shorthand,
+  # but Apps Script v1 appends those eight cells verbatim; this portable client
+  # therefore cannot opt into that backend-specific behavior implicitly.
+  # Non-BCB rows sent to other sheets keep their existing compatibility behavior.
+  $isAlphaBoardTitle = [string]::Equals(
+    [string]$Title,
+    'Blackboard - Alpha DB',
+    [StringComparison]::Ordinal
+  )
+  $hasBcbEnvelope = $false
+  foreach ($cell in $cells) {
+    if (([string]$cell).StartsWith('BCB|', [StringComparison]::Ordinal)) {
+      $hasBcbEnvelope = $true
+      break
+    }
+  }
+  $isFullBcbRow = $cells.Count -gt 5 -and
+    ([string]$cells[5]).StartsWith('BCB|', [StringComparison]::Ordinal)
+  $isCanonicalBcbRow = $cells.Count -eq 10 -and $isFullBcbRow
+  if (($isAlphaBoardTitle -and $cells.Count -ne 10) -or
+      ($hasBcbEnvelope -and -not $isCanonicalBcbRow)) {
+    throw [InvalidOperationException]::new(
+      'BOARD_ROW_SHAPE_INVALID: Blackboard BCB writes require exactly 10 logical A:J cells with the envelope in cell F (index 5). Read-side padding, truncated rows, shifted rows, and backend-specific shorthand are not portable write shapes. Refusing transport.'
+    )
+  }
+  if ($isCanonicalBcbRow) {
+    $boardTimestamp = [string]$cells[1]
+    $boardTimestampPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$'
+    if ($boardTimestamp -cnotmatch $boardTimestampPattern) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require invariant UTC ISO-8601 in cell B (index 1), ending in uppercase Z with zero to seven fractional digits. Refusing transport.'
+      )
+    }
+
+    $boardTimestampFormats = [string[]]@(
+      "yyyy-MM-dd'T'HH:mm:ss'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.f'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'"
+    )
+    $parsedBoardTimestamp = [DateTimeOffset]::MinValue
+    $boardTimestampStyles = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+      [Globalization.DateTimeStyles]::AdjustToUniversal
+    if (-not [DateTimeOffset]::TryParseExact(
+      $boardTimestamp,
+      $boardTimestampFormats,
+      [Globalization.CultureInfo]::InvariantCulture,
+      $boardTimestampStyles,
+      [ref]$parsedBoardTimestamp
+    )) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require a real invariant UTC calendar timestamp in cell B (index 1). Refusing transport.'
+      )
+    }
+    if ($parsedBoardTimestamp -gt [DateTimeOffset]::UtcNow.AddMinutes(2)) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_FUTURE: canonical 10-cell BCB row timestamp is more than two minutes ahead of the local UTC clock. Refusing transport.'
+      )
+    }
   }
   $payload.sheetRow = @($cells)
 }
