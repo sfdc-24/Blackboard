@@ -99,6 +99,11 @@ Assess before acting — and bound the assessment.
   Sep 4)*
 - A relayed "go" authorizes building, never publishing to the live site — hand
   him the one-tap route instead. *(Relayed-go learning, Sep 8)*
+- **Every approval ask carries one plain sentence a human can act on**: what
+  changes, what saying yes does, what waiting costs. "Merge PR19" is not an
+  ask; "say yes and the live X-Ray page stops claiming future features in the
+  present tense" is. No identifiers without their meaning attached.
+  *(Governor correction, Sep 9 evening, this window)*
 
 ## 8 · Situational quick table
 
@@ -109,6 +114,7 @@ Assess before acting — and bound the assessment.
 | Two writers, one tag | Measure from the board, declare a sole writer in a row, split lanes explicitly |
 | Review NO-GO received | Reproduce the finding first, fix, push a fast-forward, answer the row by id |
 | Governor away | Decide within standing rulings; queue only genuine (d)-class decisions as one-tap cards |
+| Asking the Governor anything | One plain sentence: what changes, what yes does, what waiting costs — never a bare identifier |
 | Claim you're about to make | Label it TESTED or BELIEVED before someone else has to |
 | Session ending | Footer + board row + state refresh — then stop; don't trickle |
 
