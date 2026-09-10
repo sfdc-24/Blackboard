@@ -42,6 +42,7 @@ USAGE
 """
 import argparse
 import json
+import math
 import os
 import statistics
 import sys
@@ -55,11 +56,17 @@ UNKNOWN = "UNKNOWN"
 
 def percentile(values, pct):
     """Nearest-rank percentile. No interpolation: with a dozen samples,
-    interpolating invents a number that was never observed."""
+    interpolating invents a number that was never observed.
+
+    CEIL, not round. Nearest-rank is defined as ceil(P/100 * N); using round()
+    gave p95 of 12 samples as rank 11 (0.95*12 = 11.4 rounds down), so the
+    reported p95 excluded the slowest sample - which is the one a p95 exists to
+    show. codex caught it at 1beac6f.
+    """
     if not values:
         return None
     ordered = sorted(values)
-    k = max(1, int(round(pct / 100.0 * len(ordered))))
+    k = max(1, math.ceil(pct / 100.0 * len(ordered)))
     return ordered[min(k, len(ordered)) - 1]
 
 
@@ -93,9 +100,61 @@ def timed(fn):
         return None, "{0}: {1}".format(type(exc).__name__, exc)
 
 
-def http_get(url, timeout=45):
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+def assert_transport_ok(url, where="request"):
+    """HTTPS, or literal loopback. Nothing else.
+
+    This benchmark POSTS THE LIVE BUS SECRET. An http:// URL sends it in the
+    clear and a redirect to another origin sends it somewhere nobody approved,
+    so both are refused rather than measured. codex found both accepted at
+    1beac6f - the same class of hole as the token exchange in xray_score.py,
+    which is not a coincidence: I hardened the read path and left the path that
+    actually carries the credential.
+    """
+    parts = urllib.parse.urlparse(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https":
+        return parts
+    if parts.scheme == "http" and host in LOOPBACK:
+        return parts        # loopback never leaves the machine
+    raise ValueError("refusing a non-HTTPS {0} to {1} - this carries a secret"
+                     .format(where, host or url[:40]))
+
+
+def same_origin(a, b):
+    """Scheme, host and port must all match. A redirect that changes any of
+    them is a different destination, whatever the path says."""
+    pa, pb = urllib.parse.urlparse(a), urllib.parse.urlparse(b)
+    return (pa.scheme == pb.scheme
+            and (pa.hostname or "").lower() == (pb.hostname or "").lower()
+            and pa.port == pb.port)
+
+
+class Deadline:
+    """One end-to-end budget for a whole operation.
+
+    The two-hop read previously passed the FULL timeout to each hop, so a slow
+    bus could take twice the stated budget and the recorded latency meant
+    something different from what the flag said.
+    """
+
+    def __init__(self, seconds):
+        self.expires = time.monotonic() + seconds
+
+    def remaining(self):
+        left = self.expires - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("end-to-end deadline exceeded")
+        return left
+
+
+def http_get(url, deadline=None, timeout=45):
+    assert_transport_ok(url, "GET")
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(
+            req, timeout=(deadline.remaining() if deadline else timeout)) as resp:
         return resp.read()
 
 
@@ -126,17 +185,31 @@ def http_post(url, payload, timeout=90):
     successful 755ms read - which would have made the target look ~16x faster
     than a thing that had not actually been measured at all.
     """
+    assert_transport_ok(url, "POST")
+    deadline = Deadline(timeout)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=deadline.remaining()) as resp:
             return resp.read()
     except _Redirected as hop:
         # Hop two: a plain GET on the Location, which returns the real JSON.
+        # The Location is validated before it is fetched - a redirect that
+        # downgrades to http, or moves to another origin, would carry the
+        # request that just contained the secret somewhere unapproved.
+        assert_transport_ok(hop.location, "redirect")
+        if not same_origin(url, hop.location):
+            # Apps Script legitimately redirects script.google.com to
+            # script.googleusercontent.com, so a cross-origin hop is allowed
+            # only within Google's own script hosts - and never as a downgrade.
+            host = (urllib.parse.urlparse(hop.location).hostname or "").lower()
+            if not host.endswith((".google.com", ".googleusercontent.com")):
+                raise ValueError("refusing a cross-origin redirect to " + host)
         with urllib.request.urlopen(
-                urllib.request.Request(hop.location), timeout=timeout) as resp2:
+                urllib.request.Request(hop.location),
+                timeout=deadline.remaining()) as resp2:
             return resp2.read()
 
 
