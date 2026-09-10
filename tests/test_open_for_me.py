@@ -374,6 +374,59 @@ check("but a v=1 clear from the placer still works (the control)",
 check("is_canonical_bcb rejects a missing version",
       not ofm.is_canonical_bcb("BCB|id=x|to=y"))
 
+print("")
+print("== a key written twice with two values grants nothing ==")
+# field() returns the FIRST match, so BCB|v=1|v=999 satisfied a check for v=1
+# while also declaring v=999. A reader taking the last value would disagree
+# about what the row says - and it was a row that could lift a safety hold.
+SMUGGLE = ("BCB|v=1|v=999|id=SMUGGLE|phase=RESULT|from=codex|to=claude-code-cli"
+           "|clears=PR40-HOLD")
+rs = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", SMUGGLE, "DONE")),
+                  TAG, now=NOW)
+check("a payload declaring v=1 AND v=999 cannot clear",
+      rs["active_holds"] == ["PR40-HOLD"], rs["active_holds"])
+check("is_canonical_bcb refuses conflicting versions",
+      not ofm.is_canonical_bcb(SMUGGLE))
+check("but the SAME value twice is harmless",
+      ofm.is_canonical_bcb("BCB|v=1|v=1|id=x|to=y"))
+for key in ("from", "clears", "verdict", "pr", "exact_head"):
+    payload = "BCB|v=1|id=x|to=y|{0}=a|{0}=b".format(key)
+    check("a conflicting " + key + " makes the row non-canonical",
+          not ofm.is_canonical_bcb(payload))
+check("fields() returns every value, not just the first",
+      ofm.fields("BCB|v=1|v=999", "v") == ["1", "999"],
+      ofm.fields("BCB|v=1|v=999", "v"))
+
+# The other half of the split: it must still be SHOWN. Dropping an ambiguous
+# row would recreate the invisible-hold defect this tool exists to fix.
+AMBIG_HOLD = ("BCB|v=1|id=AMBIG-HOLD|from=codex|from=someone-else"
+              "|to=claude-code-cli|priority=CRITICAL|hold=stop")
+ra = ofm.open_for([row("2026-09-09T12:00:00Z", "codex", AMBIG_HOLD, "DONE"),
+                   row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")],
+                  TAG, now=NOW)
+check("an ambiguous row is still surfaced, not dropped",
+      any(d["id"] == "AMBIG-HOLD" for d in ra["rows"]), ra["rows"])
+check("and it is flagged as ambiguous",
+      any(d.get("ambiguous_payload") for d in ra["rows"]))
+check("and the render says so", "AMBIGUOUS PAYLOAD" in ofm.render(ra))
+
+print("")
+print("== hex is not the same thing as a SHA ==")
+FORTY = "a" * 40
+FORTYONE = "b" * 41
+check("41 hex characters is UNCOMPARABLE, not DIFFERENT",
+      ofm.commit_relation(FORTYONE, FORTY) == ofm.UNCOMPARABLE,
+      ofm.commit_relation(FORTYONE, FORTY))
+check("a 41-hex GO therefore cannot lift a hold",
+      ofm.open_for(with_pr_hold(row(
+          "2026-09-09T15:00:00Z", "codex",
+          "BCB|v=1|id=LONG-GO|phase=RESULT|from=codex|to=claude-code-cli"
+          "|pr=https://x/pull/40|exact_head=" + FORTYONE + "|verdict=GO",
+          "DONE")), TAG, now=NOW)["active_holds"] == ["PR40-HOLD"])
+check("exactly 40 still works", ofm.commit_relation(FORTY, FORTY) == ofm.SAME)
+check("and two real 40-char SHAs still compare DIFFERENT",
+      ofm.commit_relation(HEAD_HELD, HEAD_OTHER) == ofm.DIFFERENT)
+
 # THE LIVE SHAPE. Every fixture above uses exact_head - which I invented. The
 # real PR40 rows on Blackboard - Alpha DB use `reviewed_head=`, so requiring
 # exact_head made the supersede path unreachable on real data while all of the

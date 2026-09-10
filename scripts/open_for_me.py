@@ -93,15 +93,45 @@ def field(payload, name):
 BCB_VERSION = "1"
 
 
+def fields(payload, name):
+    """EVERY value written for a key, not just the first one."""
+    return [m.strip() for m in re.findall(
+        r"(?:^|\|)" + re.escape(name) + r"=([^|]*)", payload)]
+
+
+def has_conflicting_keys(payload):
+    """Does any key appear twice with DIFFERENT values?
+
+    `field()` returns the first match, so `BCB|v=1|v=999|...` satisfied a check
+    for v=1 while also declaring v=999 - a reader that took the last value would
+    disagree with this one about what the row says. Two readers disagreeing
+    about a row that lifts a safety hold is the whole problem.
+
+    Repeating a key with the SAME value is harmless and stays legal. This looks
+    only at the keys that carry authority; an unknown repeated key is not our
+    business to police.
+    """
+    for key in ("v", "id", "from", "to", "pr", "verdict", "hold",
+                "clears", "supersedes") + HEAD_FIELDS:
+        if len(set(fields(payload, key))) > 1:
+            return True
+    return False
+
+
 def is_canonical_bcb(payload):
     """A BCB-1 envelope, not merely something that starts with the four letters.
 
     The clearing path used `payload.startswith("BCB|")`, so `BCB|v=999|...` was
     accepted as a canonical row and could retire a hold under a grammar this
     build has never seen and cannot validate. A row that declares a version we
-    do not implement is not a row we are entitled to act on.
+    do not implement is not a row we are entitled to act on - and neither is one
+    that declares two.
     """
-    return payload.startswith("BCB|") and field(payload, "v") == BCB_VERSION
+    if not payload.startswith("BCB|"):
+        return False
+    if has_conflicting_keys(payload):
+        return False
+    return fields(payload, "v")[:1] == [BCB_VERSION]
 
 
 REDACTED = "[REDACTED]"
@@ -223,6 +253,7 @@ def head_of(payload):
 
 
 MIN_SHA = 7          # git's own shortest unambiguous default
+MAX_SHA = 40         # a SHA-1 is exactly this long; 41 hex characters is not one
 
 SAME = "SAME"
 DIFFERENT = "DIFFERENT"
@@ -252,9 +283,13 @@ def commit_relation(a, b):
         return SAME
     if not (re.fullmatch(r"[0-9a-f]+", a) and re.fullmatch(r"[0-9a-f]+", b)):
         return UNCOMPARABLE
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) < MIN_SHA:
+    # Hex alone is not enough. A 41-character hex string is not a SHA-1, but it
+    # IS hex, so it reached the prefix test, failed it, and came back DIFFERENT
+    # - which supersedes a hold. Anything outside git's own range is a string we
+    # cannot resolve to a commit, so it is UNCOMPARABLE like any other garbage.
+    if not (MIN_SHA <= len(a) <= MAX_SHA and MIN_SHA <= len(b) <= MAX_SHA):
         return UNCOMPARABLE
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
     return SAME if long_.startswith(short) else DIFFERENT
 
 
@@ -405,6 +440,12 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
             "hold_lifecycle": lifecycle if is_hold else "",
             "hold_note": sanitize(why, MAX_NOTE) if is_hold else "",
             "category": sanitize(cell(r, COL_CATEGORY).strip().upper(), MAX_CATEGORY),
+            # A row whose keys disagree with themselves cannot CLEAR anything
+            # (is_canonical_bcb refuses it), but it is still SHOWN. Ambiguity
+            # must never grant authority and must never hide work either -
+            # dropping it here would recreate the invisible-hold defect this
+            # whole tool exists to fix.
+            "ambiguous_payload": has_conflicting_keys(payload),
         })
     out.sort(key=lambda d: (d["ts"] or ""))      # oldest first - the forgotten ones
 
@@ -465,8 +506,11 @@ def render(result):
     for d in result["rows"]:
         mark = "INVISIBLE" if d["invisible_to_wake_read"] else "         "
         tail = ""
+        if d.get("ambiguous_payload"):
+            tail += " [AMBIGUOUS PAYLOAD: a key is written twice with different"
+            tail += " values; it cannot clear a hold]"
         if d["standing_hold"]:
-            tail = " [HOLD " + d["hold_lifecycle"] + ", filed " + d["category"] + "]"
+            tail += " [HOLD " + d["hold_lifecycle"] + ", filed " + d["category"] + "]"
             if d["hold_note"]:
                 tail += " " + d["hold_note"]
         lines.append("  {0} {1}  {2:<8} {3}{4}".format(
