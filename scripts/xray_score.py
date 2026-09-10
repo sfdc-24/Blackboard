@@ -61,6 +61,7 @@ READ-ONLY BY CONSTRUCTION
 import argparse
 import json
 import math
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -250,14 +251,42 @@ def normalise_base(domain):
     return base
 
 
+ORG_ID = re.compile(r"^00D[0-9A-Za-z]{12}(?:[0-9A-Za-z]{3})?$")
+USER_ID = re.compile(r"^005[0-9A-Za-z]{12}(?:[0-9A-Za-z]{3})?$")
+
+
+def identity_from(token_response):
+    """The org and the principal this token actually belongs to.
+
+    The token response carries `id`, of the form
+    https://login.salesforce.com/id/<orgId>/<userId>. It was being discarded, so
+    the tool scored whatever org the credentials happened to open and the report
+    said only what the CONFIG claimed. Swap the client_id for another org's and
+    every number changes while the header stays the same - a scoring engine that
+    cannot say which org it scored is not evidence of anything.
+    """
+    raw = str(token_response.get("id") or "")
+    parts = [p for p in urllib.parse.urlparse(raw).path.split("/") if p]
+    # .../id/<org>/<user>
+    if len(parts) < 3 or parts[0] != "id":
+        return None, None
+    org, user = parts[1], parts[2]
+    return (org if ORG_ID.match(org) else None,
+            user if USER_ID.match(user) else None)
+
+
 def get_token(conf):
-    """Exchange client credentials for a token.
+    """Exchange client credentials for a token, and learn WHOSE it is.
 
     HTTPS to a verified Salesforce host, and NO REDIRECTS. A redirect on this
     request would carry the client_id and client_secret to whatever host the
     Location header names - which is the worst possible thing to follow
     automatically. The Data API path was hardened first and this one was not;
     found by codex reviewing PR55 at 2c1ae2f.
+
+    Returns (base, token, identity). The base is taken from `instance_url` when
+    the org supplies one, because that is the host the token is actually good
+    for; the configured domain only has to agree with it.
     """
     base = normalise_base(conf["Headless_domain"])
     body = urllib.parse.urlencode({
@@ -267,7 +296,66 @@ def get_token(conf):
     req = urllib.request.Request(base + "/services/oauth2/token", data=body)
     opener = urllib.request.build_opener(NoRedirect)
     with opener.open(req, timeout=45) as resp:
-        return base, json.load(resp)["access_token"]
+        payload = json.load(resp)
+
+    org, user = identity_from(payload)
+
+    # The org's own answer for where its API lives. Validated through the same
+    # gate as the configured domain - it arrives over the network, so it is
+    # input, not truth.
+    instance = payload.get("instance_url")
+    if instance:
+        instance_base = normalise_base(instance)
+        if instance_base != base:
+            # Not fatal by itself: My Domain and instance_url legitimately
+            # differ in some orgs. It IS reported, and the token's own host wins,
+            # because that is the one the credentials were issued for.
+            base = instance_base
+
+    expected_org = (conf.get("Headless_expected_org_id") or "").strip()
+    expected_user = (conf.get("Headless_expected_user_id") or "").strip()
+    if expected_org:
+        if not org:
+            raise ValueError("an expected org id is configured but the token "
+                             "response carried no readable org id; refusing to "
+                             "score an org this run cannot identify")
+        if not same_sf_id(org, expected_org):
+            raise ValueError("this token belongs to a DIFFERENT org than the one "
+                             "configured as expected; refusing to score it")
+    if expected_user:
+        if not user or not same_sf_id(user, expected_user):
+            raise ValueError("this token's principal is not the configured "
+                             "expected user; refusing to score under it")
+
+    return base, payload["access_token"], {
+        "org_id": org,
+        "user_id": user,
+        "instance_host": urllib.parse.urlparse(base).hostname,
+        # The whole point of the field: a reader must be able to tell a run that
+        # PROVED it hit the right org from one that merely hoped so.
+        "binding": "VERIFIED" if expected_org else "UNVERIFIED",
+        "binding_note": (
+            "org id matched Headless_expected_org_id" if expected_org else
+            "no Headless_expected_org_id configured, so nothing checked that "
+            "these credentials open the org this report names"),
+    }
+
+
+def same_sf_id(a, b):
+    """Salesforce ids come in 15- and 18-character forms for the same record.
+
+    The 18-char form is the 15-char form plus a 3-character checksum, so a
+    prefix comparison on the first 15 is the correct equality test. A raw string
+    compare would call the same org two different orgs and fail a run that
+    should pass - and, worse, invite someone to "fix" it by removing the check.
+    The 15-char prefix is case-SENSITIVE; only the checksum suffix is not.
+    """
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return False
+    if len(a) not in (15, 18) or len(b) not in (15, 18):
+        return False
+    return a[:15] == b[:15]
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -420,13 +508,21 @@ def main():
         if not conf.get(k):
             sys.exit("missing {0} in {1} - credentials are read from .env only (D-18)".format(k, env_path))
 
-    base, token = get_token(conf)
+    base, token, identity = get_token(conf)
     checks = build_checks(base, token, args.window)
     summary = summarise(checks)
     print(render(conf["Headless_domain"], checks, summary))
+    print("")
+    print("scored org {0} as principal {1} on {2}".format(
+        identity["org_id"] or "UNKNOWN", identity["user_id"] or "UNKNOWN",
+        identity["instance_host"]))
+    print("identity binding: {0} - {1}".format(
+        identity["binding"], identity["binding_note"]))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
             json.dump({"org": conf["Headless_domain"],
+                       # Which org this actually was, not which one was asked for.
+                       "identity": identity,
                        "window_days": args.window,
                        "checks": [c.to_dict() for c in checks],
                        "summary": summary}, fh, indent=2)

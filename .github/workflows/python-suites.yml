@@ -49,9 +49,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # PINNED TO COMMIT SHAs, not tags.
+      #
+      # `actions/checkout@v4` is a MUTABLE reference: the tag is repointed by
+      # its maintainers, so the code this workflow runs can change without a
+      # commit here. That is ordinary supply-chain exposure, and it matters more
+      # than usual in this repo because these suites gate safety claims about
+      # holds and credentials. A pinned SHA means the reviewed workflow and the
+      # executed workflow are the same thing.
+      #
+      # persist-credentials: false because nothing after checkout pushes, tags,
+      # or calls the API. The default leaves a usable GITHUB_TOKEN in
+      # .git/config for every later step; these steps run third-party test code,
+      # and a token they cannot reach is a token they cannot misuse.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.3.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 

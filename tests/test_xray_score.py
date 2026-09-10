@@ -28,6 +28,8 @@ RUN
   python3 tests/test_xray_score.py
 """
 import importlib.util
+import io
+import json
 import os
 import sys
 
@@ -243,6 +245,114 @@ needles = ["9" + "00,000", "9" + "00000 DPMO", "00" + "Dbm000", "dbm0" + "0000wk
            "abdus." + "omnistudio", "sigma 0" + ".22"]
 for leaked in needles:
     check("absent from the engine: " + leaked[:14], leaked not in src)
+
+print("")
+print("== the run knows WHICH org it scored ==")
+# Deliberately synthetic. This file's own leak checks exist to keep real org
+# material out of the repo, so the fixtures must not resemble the live org
+# either - a plausible-looking id is the thing a future reader would copy.
+ORG_A15 = "00D000000000AAA"
+ORG_A18 = ORG_A15 + "2AQ"          # same org, 18-char form
+ORG_B18 = "00D000000000BBB" + "2AQ"
+USER_A18 = "005000000000CCC" + "AAQ"
+
+check("identity is read out of the token response id",
+      xs.identity_from({"id": "https://login.salesforce.com/id/{0}/{1}".format(
+          ORG_A18, USER_A18)}) == (ORG_A18, USER_A18))
+check("a missing id yields no identity, not a guess",
+      xs.identity_from({}) == (None, None))
+check("a malformed id yields no identity",
+      xs.identity_from({"id": "https://login.salesforce.com/nope"}) == (None, None))
+check("an org id that is not an org id is refused",
+      xs.identity_from({"id": "https://x/id/NOTANORG/{0}".format(USER_A18)})[0] is None)
+
+# 15 and 18 character forms are the SAME record. A raw compare would call them
+# different and fail a run that should pass, which invites someone to "fix" it
+# by deleting the check.
+check("15- and 18-char forms of one org match", xs.same_sf_id(ORG_A15, ORG_A18))
+check("two different orgs do not match", not xs.same_sf_id(ORG_A18, ORG_B18))
+check("an empty id matches nothing", not xs.same_sf_id("", ORG_A18))
+check("a truncated id matches nothing", not xs.same_sf_id(ORG_A18[:10], ORG_A18))
+check("case matters in the 15-char prefix",
+      not xs.same_sf_id(ORG_A15.lower(), ORG_A18))
+
+print("")
+print("== a token for the wrong org is refused, not scored ==")
+
+
+def token_run(conf_extra, response):
+    """Drive get_token with a scripted token endpoint. No network."""
+    conf = {"Headless_domain": "https://example.my.salesforce.com",
+            "Headless_consumer_key": "k", "Headless_consumer_secret": "s"}
+    conf.update(conf_extra)
+
+    class FakeResp:
+        def read(self_inner):
+            return json.dumps(response).encode()
+
+        def __enter__(self_inner):
+            return io.BytesIO(json.dumps(response).encode())
+
+        def __exit__(self_inner, *a):
+            return False
+
+    class FakeOpener:
+        def open(self_inner, req, timeout=None):
+            return FakeResp().__enter__()
+
+    real = xs.urllib.request.build_opener
+    xs.urllib.request.build_opener = lambda *a, **k: FakeOpener()
+    try:
+        return xs.get_token(conf)
+    finally:
+        xs.urllib.request.build_opener = real
+
+
+GOOD = {"access_token": "tok",
+        "instance_url": "https://example.my.salesforce.com",
+        "id": "https://login.salesforce.com/id/{0}/{1}".format(ORG_A18, USER_A18)}
+
+base, tok, ident = token_run({}, GOOD)
+check("with no expectation configured the run still reports the org",
+      ident["org_id"] == ORG_A18 and ident["user_id"] == USER_A18, ident)
+check("and marks the binding UNVERIFIED rather than implying it checked",
+      ident["binding"] == "UNVERIFIED", ident["binding"])
+
+base, tok, ident = token_run({"Headless_expected_org_id": ORG_A15}, GOOD)
+check("a matching expected org (given 15-char) verifies",
+      ident["binding"] == "VERIFIED", ident)
+
+try:
+    token_run({"Headless_expected_org_id": ORG_B18}, GOOD)
+    check("a token for a DIFFERENT org is refused", False, "it was accepted")
+except ValueError:
+    check("a token for a DIFFERENT org is refused", True)
+
+try:
+    token_run({"Headless_expected_org_id": ORG_A18},
+              {"access_token": "tok", "instance_url": GOOD["instance_url"]})
+    check("an expectation with no readable org id fails closed", False, "accepted")
+except ValueError:
+    check("an expectation with no readable org id fails closed", True)
+
+try:
+    token_run({"Headless_expected_user_id": "0055g00000zzzzz" + "AAQ"}, GOOD)
+    check("a token under the wrong principal is refused", False, "accepted")
+except ValueError:
+    check("a token under the wrong principal is refused", True)
+
+# instance_url is network input, so it goes through the same host gate as the
+# configured domain rather than being trusted because the org said it.
+try:
+    token_run({}, dict(GOOD, instance_url="https://evil.example"))
+    check("a non-Salesforce instance_url is refused", False, "accepted")
+except ValueError:
+    check("a non-Salesforce instance_url is refused", True)
+try:
+    token_run({}, dict(GOOD, instance_url="http://example.my.salesforce.com"))
+    check("a plaintext instance_url is refused", False, "accepted")
+except ValueError:
+    check("a plaintext instance_url is refused", True)
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))
