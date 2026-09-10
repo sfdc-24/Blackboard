@@ -8,11 +8,30 @@ Timestamp is stamped here in UTC.
 """
 import datetime
 import json
+import re
 import sys
 
 from bus import fetch, load_env, read_board
 
 TITLE = "Blackboard - Alpha DB"
+
+# The keys that carry authority. Kept in step with the same list in
+# scripts/open_for_me.py: a key the reader will refuse to act on ambiguously is
+# a key the writer must refuse to publish ambiguously.
+AUTHORITY_KEYS = ("v", "id", "from", "to", "pr", "verdict", "hold",
+                  "clears", "supersedes",
+                  "exact_head", "reviewed_head", "head", "merged_head", "new_head")
+
+
+def _conflicting_keys(payload):
+    """Authority keys written more than once with DIFFERENT values."""
+    bad = set()
+    for key in AUTHORITY_KEYS:
+        values = {m.strip() for m in re.findall(
+            r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", payload)}
+        if len(values) > 1:
+            bad.add(key)
+    return bad
 
 
 def main():
@@ -43,6 +62,33 @@ def main():
         spec.get("gist", ""),
         spec.get("subgist", ""),
     ]
+
+    # REFUSE AN AMBIGUOUS PAYLOAD BEFORE IT REACHES THE BOARD.
+    #
+    # BCB-1 is pipe-delimited with no escaping, so a `|` inside a VALUE is
+    # indistinguishable from the start of a new key. Writing prose such as
+    # "duplicate v=1|v=999 parsing" into a semantics field therefore publishes a
+    # row that declares v=1 to a first-value reader and v=999 to a last-value
+    # one. Two readers disagreeing about a row that can lift a safety hold is
+    # the whole problem, and intent does not enter into it.
+    #
+    # Found by running the new reader against the live board: five rows were
+    # flagged and THREE OF THEM WERE MINE, written while describing this very
+    # defect. The reader was right; the writer was wrong. Fail here, at the
+    # writer, the way scripts/bus.ps1 fails on a malformed timestamp - a row
+    # already on an append-only board cannot be taken back.
+    payload = spec["payload"]
+    if not payload.startswith("BCB|"):
+        raise SystemExit("payload must be a BCB envelope starting with 'BCB|'")
+    conflicts = sorted(_conflicting_keys(payload))
+    if conflicts:
+        raise SystemExit(
+            "BCB_PAYLOAD_AMBIGUOUS: these keys are written more than once with "
+            "different values: " + ", ".join(conflicts) + ".\n"
+            "BCB-1 has no escaping, so a '|' inside a value starts a new key as "
+            "far as any reader is concerned. Rewrite the value without pipes "
+            "(say 'v=1 then v=999' rather than 'v=1|v=999'). Refusing to append."
+        )
     # tries=1 is deliberately explicit even though fetch() now enforces the same
     # rule for every append. The v1 bus does not dedup, and a googleusercontent
     # 404 on the redirect hop can be raised client-side AFTER the row has already

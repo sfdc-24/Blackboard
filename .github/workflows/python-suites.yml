@@ -29,6 +29,8 @@ on:
       - "tests/test_open_for_me.py"
       - "scripts/bus_benchmark.py"
       - "tests/test_bus_benchmark.py"
+      - "scripts/append.py"
+      - "tests/test_append_payload_guard.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -39,6 +41,8 @@ on:
       - "tests/test_open_for_me.py"
       - "scripts/bus_benchmark.py"
       - "tests/test_bus_benchmark.py"
+      - "scripts/append.py"
+      - "tests/test_append_payload_guard.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -49,19 +53,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # PINNED TO COMMIT SHAs, not tags.
+      # PINNED TO COMMIT SHAs, not tags. `actions/checkout@v4` is a MUTABLE
+      # reference - the tag is repointed by its maintainers, so the code this
+      # workflow runs can change without a commit here. These suites gate safety
+      # claims about holds and credentials; the reviewed workflow and the
+      # executed workflow must be the same thing.
       #
-      # `actions/checkout@v4` is a MUTABLE reference: the tag is repointed by
-      # its maintainers, so the code this workflow runs can change without a
-      # commit here. That is ordinary supply-chain exposure, and it matters more
-      # than usual in this repo because these suites gate safety claims about
-      # holds and credentials. A pinned SHA means the reviewed workflow and the
-      # executed workflow are the same thing.
-      #
-      # persist-credentials: false because nothing after checkout pushes, tags,
-      # or calls the API. The default leaves a usable GITHUB_TOKEN in
-      # .git/config for every later step; these steps run third-party test code,
-      # and a token they cannot reach is a token they cannot misuse.
+      # persist-credentials: false because nothing after checkout pushes, tags
+      # or calls the API, and the default leaves a usable GITHUB_TOKEN in
+      # .git/config for every later step that runs test code.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
@@ -114,6 +114,15 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_bus_benchmark.py ]; then
             sudo unshare -n python3 tests/test_bus_benchmark.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: append payload guard (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_append_payload_guard.py ]; then
+            sudo unshare -n python3 tests/test_append_payload_guard.py
           else
             echo "not on this branch; skipping"
           fi

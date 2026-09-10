@@ -23,6 +23,7 @@ on:
       - 'infra/azure/job-schedule-00.json'
       - 'infra/azure/job-schedule-30.json'
       - 'tests/test_order_read_resilience.ps1'
+      - 'tests/test_bus_timestamp_contract.ps1'
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
       - 'tests/test_order_release_installer.ps1'
@@ -44,7 +45,7 @@ permissions:
 
 jobs:
   powershell-7-release-packager:
-    name: ORDER release packager on PowerShell 7
+    name: ORDER release packager and bus contract on PowerShell 7
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -54,6 +55,9 @@ jobs:
       - name: Test ORDER deterministic release packager
         shell: pwsh
         run: .\tests\test_order_release_packager.ps1
+      - name: Test Blackboard writer timestamp contract
+        shell: pwsh
+        run: .\tests\test_bus_timestamp_contract.ps1
 
   windows-powershell-51:
     name: ORDER and Azure contracts on Windows PowerShell 5.1
@@ -66,6 +70,9 @@ jobs:
       - name: Test bounded ORDER board-read resilience
         shell: powershell
         run: .\tests\test_order_read_resilience.ps1
+      - name: Test Blackboard writer timestamp contract
+        shell: powershell
+        run: .\tests\test_bus_timestamp_contract.ps1
       - name: Test ORDER state preservation
         shell: powershell
         run: .\tests\test_order_state_preservation.ps1
