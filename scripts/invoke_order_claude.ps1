@@ -236,11 +236,31 @@ try {
     }
     $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
+    # The deny rule below needs the env file as an ABSOLUTE path in the shape
+    # Claude's permission matcher expects. On Windows that is //c/path/to/file;
+    # on Linux an absolute path is already that shape.
+    #
+    # This used to accept ONLY the drive-letter form, so on Linux every single
+    # invocation died with claude_env_file_drive_root_required before the
+    # provider was ever reached. Codex found it; my Linux execute test could not,
+    # because it drives a FAKE adapter and so never touches this line.
+    #
+    # A RELATIVE path is still refused on both platforms. The point of the rule
+    # is to deny reads of one exact file, and a relative path does not name one.
     $envPermissionPath = $EnvFile -replace '\\', '/'
-    if ($envPermissionPath -notmatch '^(?<drive>[A-Za-z]):/(?<tail>.*)$') {
+    $onWindows = $true
+    if (Test-Path Variable:IsWindows) { $onWindows = [bool]$IsWindows }
+    if ($envPermissionPath -match '^(?<drive>[A-Za-z]):/(?<tail>.*)$') {
+        $envPermissionPath = '//' + $matches['drive'].ToLowerInvariant() + '/' + $matches['tail'].TrimEnd('/')
+    } elseif (-not $onWindows -and $envPermissionPath.StartsWith('/')) {
+        # Already absolute and already POSIX. TrimEnd matches the Windows branch
+        # so a trailing slash cannot produce two different deny rules for one
+        # file depending on the host.
+        $envPermissionPath = $envPermissionPath.TrimEnd('/')
+        if (-not $envPermissionPath) { throw 'claude_env_file_absolute_path_required' }
+    } else {
         throw 'claude_env_file_drive_root_required'
     }
-    $envPermissionPath = '//' + $matches['drive'].ToLowerInvariant() + '/' + $matches['tail'].TrimEnd('/')
     $settingsDocument = [ordered]@{
         env = [ordered]@{
             CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1'
