@@ -15,6 +15,7 @@ RUN
   python3 tests/test_open_for_me.py
 """
 import importlib.util
+import json
 import os
 import sys
 
@@ -69,8 +70,9 @@ check("a row newer than the VIEWPORT is NOT marked invisible",
       newer["invisible_to_wake_read"] is False)
 check("the count of unreachable rows is reported", res["invisible"] == 1, res["invisible"])
 check("oldest first, so the forgotten one leads", res["rows"][0]["id"] == "CODEX-G1-HOLD")
-check("the newest VIEWPORT is identified",
-      res["newest_viewport"] == "2026-09-09T14:50:47Z", res["newest_viewport"])
+check("the horizon is identified", res["horizon_trusted"] is True)
+check("and it is the VIEWPORT row", res["horizon"]["ts"] == "2026-09-09T14:50:47Z",
+      res["horizon"])
 
 print("")
 print("== the substring trap ==")
@@ -154,6 +156,104 @@ MY_HOLD = ("BCB|v=1|id=MY-HOLD|from=claude-code-cli|to=claude-code-cli|priority=
            "|hold=something I told myself")
 check("a hold this tag WROTE is not surfaced back to it",
       ofm.open_for([row("2026-09-09T10:00:00Z", TAG, MY_HOLD, "DONE")], TAG)["total"] == 0)
+
+print("")
+print("== the horizon is chosen by vseq, and refuses a future stamp ==")
+# Live on the board 2026-09-10: v018 was written with a timestamp FOUR HOURS
+# AHEAD and v019, the correction, carried an earlier stamp. "Newest by
+# timestamp" therefore chose the superseded one, put the horizon in the future,
+# and marked all 109 rows unreachable at once.
+import datetime as _dt
+NOW = _dt.datetime(2026, 9, 10, 3, 30, tzinfo=_dt.timezone.utc)
+V018 = "BCB|v=1|phase=VIEWPORT|vseq=018|by=codex"
+V019 = "BCB|v=1|phase=VIEWPORT|vseq=019|by=codex|note=corrected UTC timestamp"
+skewed = [row("2026-09-10T07:00:26Z", "codex", V018, "DONE"),
+          row("2026-09-10T03:02:20Z", "codex", V019, "DONE")]
+h = ofm.newest_viewport(skewed, now=NOW)
+check("a future-dated VIEWPORT is refused", h["vseq"] == 19, h)
+check("and the correction becomes the horizon", h["ts"].startswith("2026-09-10T03:02"), h)
+# without the future one present, vseq still decides over timestamp
+h2 = ofm.newest_viewport([row("2026-09-10T02:00:00Z", "codex", V019, "DONE"),
+                          row("2026-09-10T03:00:00Z", "codex", V018, "DONE")], now=NOW)
+check("vseq beats a later timestamp", h2["vseq"] == 19, h2)
+
+print("")
+print("== the horizon is parsed, not substring-matched ==")
+PROSE = ("BCB|v=1|id=CHATTY|phase=RESULT|from=codex|to=claude-code-cli|priority=LOW"
+         "|note=I will write a phase=VIEWPORT row later today")
+h3 = ofm.newest_viewport([row("2026-09-10T06:00:00Z", "codex", PROSE, "OPEN")], now=NOW)
+check("prose mentioning phase=VIEWPORT does not move the horizon", h3 is None, h3)
+
+print("")
+print("== no trustworthy horizon FAILS CLOSED ==")
+only_hold = [row("2026-09-09T12:33:17Z", "codex", HOLD, "OPEN", "a hold")]
+rf = ofm.open_for(only_hold, TAG, now=NOW)
+check("with no VIEWPORT at all, horizon_trusted is False", rf["horizon_trusted"] is False)
+check("and every row is treated as unreachable", rf["invisible"] == rf["total"] == 1)
+BAD_TS = [["id", "not-a-timestamp", "codex", "", "RESULT", HOLD, "OPEN", "p", "g", "", "", ""]]
+rb = ofm.open_for(BAD_TS, TAG, now=NOW)
+check("an unparseable row timestamp is unreachable, not assumed fresh",
+      rb["total"] == 1 and rb["rows"][0]["invisible_to_wake_read"] is True)
+
+print("")
+print("== a hold has a lifecycle: it is not immortal ==")
+PR40_HOLD = ("BCB|v=1|id=PR40-4CCB-HOLD|phase=RESULT|from=codex|to=claude-code-cli"
+             "|priority=HIGH|pr=https://github.com/sfdc-24/Blackboard/pull/40"
+             "|exact_head=4ccb|verdict=NO-GO|hold=do not merge PR40 at this head")
+PR40_GO = ("BCB|v=1|id=PR40-8230-GO|phase=RESULT|from=codex|to=claude-code-cli"
+           "|priority=HIGH|pr=https://github.com/sfdc-24/Blackboard/pull/40"
+           "|exact_head=8230|verdict=GO")
+live_shape = [row("2026-09-09T12:00:06Z", "codex", PR40_HOLD, "DONE", "PR40 4ccb NO-GO"),
+              row("2026-09-09T14:18:59Z", "codex", PR40_GO, "DONE", "PR40 8230 GO"),
+              row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")]
+rl = ofm.open_for(live_shape, TAG, now=NOW)
+held = [d for d in rl["rows"] if d["id"] == "PR40-4CCB-HOLD"]
+check("a hold settled by a later GO on the same PR is still SHOWN", len(held) == 1)
+check("but marked SUPERSEDED_LIKELY rather than ACTIVE",
+      held and held[0]["hold_lifecycle"] == ofm.SUPERSEDED_LIKELY, held)
+check("with the clearing row named", held and "PR40-8230-GO" in held[0]["hold_note"])
+check("and it does NOT count as an active hold", rl["active_holds"] == [], rl["active_holds"])
+
+EXPLICIT = ("BCB|v=1|id=CLEARER|phase=RESULT|from=codex|to=claude-code-cli"
+            "|clears=CODEX-G1-HOLD|note=released")
+cleared = [row("2026-09-09T12:33:17Z", "codex", HOLD, "OPEN", "a hold"),
+           row("2026-09-09T16:00:00Z", "codex", EXPLICIT, "DONE"),
+           row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")]
+rc = ofm.open_for(cleared, TAG, now=NOW)
+check("an EXPLICITLY cleared hold disappears entirely",
+      not any(d["id"] == "CODEX-G1-HOLD" for d in rc["rows"]), rc["rows"])
+# and an uncleared one still counts
+ru = ofm.open_for([row("2026-09-09T12:33:17Z", "codex", HOLD, "OPEN", "a hold"),
+                   row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")], TAG, now=NOW)
+check("an uncleared hold IS an active hold", ru["active_holds"] == ["CODEX-G1-HOLD"])
+
+print("")
+print("== board text is sanitised and bounded ==")
+NASTY = ("BCB|v=1|id=NASTY|phase=RESULT|from=codex|to=claude-code-cli|priority=HIGH")
+NEWLINE = chr(10)
+ESC = chr(27)
+BEL = chr(7)
+# Built from chr() rather than backslash escapes. This file has been corrupted
+# twice by passing escapes through a shell heredoc, and a mangled test that
+# still passes is worse than no test at all.
+nasty_gist = ("line one" + NEWLINE + "line two" + ESC + "[31mred" + BEL + " "
+              + ("x" * 500))
+rn = ofm.open_for([row("2026-09-09T13:00:00Z", "codex", NASTY, "OPEN", nasty_gist),
+                   row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")], TAG, now=NOW)
+g = rn["rows"][0]["gist"]
+check("newlines are removed", NEWLINE not in g)
+check("escape sequences are removed", ESC not in g and BEL not in g)
+check("and it is bounded", len(g) <= ofm.MAX_GIST, len(g))
+check("truncation is visible", g.endswith("..."))
+big = [row("2026-09-09T13:00:{0:02d}Z".format(i % 60), "codex",
+           "BCB|v=1|id=R{0}|from=codex|to=claude-code-cli|priority=LOW".format(i), "OPEN")
+       for i in range(300)]
+big.append(row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE"))
+rbig = ofm.open_for(big, TAG, now=NOW)
+check("row output is capped", rbig["total"] == ofm.MAX_ROWS, rbig["total"])
+check("and the number withheld is reported", rbig["truncated"] == 100, rbig["truncated"])
+check("the cap applies to the JSON too, not just the text",
+      len(json.dumps(rbig)) < 200000 and len(rbig["rows"]) == ofm.MAX_ROWS)
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))
