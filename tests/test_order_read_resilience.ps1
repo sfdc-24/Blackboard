@@ -496,7 +496,7 @@ param(
     [Parameter(Mandatory = $true)][string]$MetadataPath,
     [Parameter(Mandatory = $true)][string]$TracePath,
     [Parameter(Mandatory = $true)][string]$EmptyPath,
-    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location')][string]$Scenario
+    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location', 'realistic-5-1-redirect')][string]$Scenario
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -521,6 +521,25 @@ function Invoke-WebRequest {
         body_present = ($null -ne $Body)
     })
     if ($Method -ceq 'Post') {
+        if ($Scenario -ceq 'realistic-5-1-redirect') {
+            # WHAT THE REAL CMDLET DOES, which every other scenario here skips.
+            # Measured on Windows PowerShell 5.1.26100.9444 against a local
+            # HttpListener: -MaximumRedirection 0 on a 302 emits a NON-TERMINATING
+            # InvalidOperationException and STILL RETURNS the response. The other
+            # scenarios return the 302 silently, so they exercise the success path
+            # and never reach hop 1's error handling at all -- which is why a
+            # handler that cannot work on 5.1 passed this suite.
+            #
+            # Write-Error honours the CALLER's -ErrorAction through CmdletBinding.
+            # bus.ps1 passes -ErrorAction SilentlyContinue, so this stays
+            # non-terminating and the response below is used. Remove that
+            # parameter from bus.ps1 and $ErrorActionPreference='Stop' promotes
+            # this to terminating, the response is discarded, and the read dies --
+            # which is exactly the regression this case exists to catch.
+            Write-Error -Exception ([System.InvalidOperationException]::new(
+                'The maximum redirection count has been exceeded. To increase the number of redirections allowed, supply a higher value to the -MaximumRedirection parameter.'
+            )) -Category InvalidOperation
+        }
         return [pscustomobject]@{
             StatusCode = 302
             Headers = @{
@@ -693,6 +712,32 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         $ErrorActionPreference = $previousErrorActionPreference
     }
 
+    $realisticRoot = Join-Path $caseRoot 'realistic-5-1-redirect'
+    New-Item -ItemType Directory -Path $realisticRoot -Force | Out-Null
+    $realisticOutPath = Join-Path $realisticRoot 'response.txt'
+    $realisticMetadataPath = Join-Path $realisticRoot 'metadata.json'
+    $realisticTracePath = Join-Path $realisticRoot 'trace.json'
+    # $ErrorActionPreference='Continue' around the call, as every other
+    # failure-capable scenario here does. Without it a regression makes the
+    # child's stderr a terminating NativeCommandError and the whole SUITE
+    # aborts, so the guard reads as a crash instead of a named FAIL.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $realisticOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $realisticOutPath `
+            -MetadataPath $realisticMetadataPath `
+            -TracePath $realisticTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario realistic-5-1-redirect 2>&1)
+        $realisticExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
     $successMetadataText = [IO.File]::ReadAllText($successMetadataPath, [Text.Encoding]::UTF8)
     $failureMetadataText = [IO.File]::ReadAllText($failureMetadataPath, [Text.Encoding]::UTF8)
     $redirectMetadataText = [IO.File]::ReadAllText($redirectMetadataPath, [Text.Encoding]::UTF8)
@@ -724,6 +769,11 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         empty_location_metadata_text = $emptyLocationMetadataText
         empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json
         empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        realistic_exit_code = $realisticExitCode
+        realistic_output = @($realisticOutput)
+        realistic_body = $(if (Test-Path -LiteralPath $realisticOutPath) { [IO.File]::ReadAllText($realisticOutPath, [Text.Encoding]::UTF8) } else { '' })
+        realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
+        realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
     }
 }
 
@@ -841,6 +891,29 @@ try {
         $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
         $null -eq $actualBusIwrFallback.success_trace.exception_type
     )
+    # The 302 exactly as Windows PowerShell 5.1 really delivers it: a
+    # non-terminating InvalidOperationException alongside the response. Every
+    # other IWR scenario above returns the 302 silently, so none of them reach
+    # hop 1's error handling; this is the only case that does.
+    Assert-True 'realistic 5.1 non-terminating 302 still completes the read' (
+        $actualBusIwrFallback.realistic_exit_code -eq 0 -and
+        @($actualBusIwrFallback.realistic_trace.calls).Count -eq 2 -and
+        $actualBusIwrFallback.realistic_trace.calls[0].method -ceq 'Post' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[0].maximum_redirection -eq 0 -and
+        $actualBusIwrFallback.realistic_trace.calls[1].method -ceq 'Get' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -eq $actualBusIwrFallback.realistic_trace.exception_type
+    )
+    Assert-True 'realistic 5.1 302 reaches hop 2 and keeps its body and metadata' (
+        $actualBusIwrFallback.realistic_body.Contains('"ok":true') -and
+        [int]$actualBusIwrFallback.realistic_metadata.http_status -eq 200 -and
+        $actualBusIwrFallback.realistic_metadata.content_type_class -ceq 'json'
+    )
+    Assert-True 'realistic 5.1 302 leaks no secret or one-shot URL' (
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('BUS_SECRET_IWR_CANARY') -and
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('ONE_SHOT_IWR_CANARY')
+    )
+
     $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
     Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
