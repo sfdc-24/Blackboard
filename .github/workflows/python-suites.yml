@@ -62,7 +62,7 @@ jobs:
       # persist-credentials: false because nothing after checkout pushes, tags
       # or calls the API, and the default leaves a usable GITHUB_TOKEN in
       # .git/config for every later step that runs test code.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
 
