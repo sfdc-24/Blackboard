@@ -898,9 +898,13 @@ function Invoke-ClaudeWorker {
             FilePath = $engine
             ArgumentList = ($parts -join ' ')
             WorkingDirectory = $WorkspacePath
-            WindowStyle = 'Hidden'
             PassThru = $true
         }
+        # -WindowStyle is a Windows-only parameter and THROWS elsewhere. It sits
+        # on the execute path, which no Observe-mode run reaches, so every
+        # cross-host comparison so far sailed straight past it. Windows keeps
+        # Hidden exactly as before.
+        if (Test-OnWindows) { $startArgs.WindowStyle = 'Hidden' }
         $process = Start-Process @startArgs
         $cleanupOwnedRun = $false
         $completedWithinLimit = $process.WaitForExit($WallTimeoutSeconds * 1000)
