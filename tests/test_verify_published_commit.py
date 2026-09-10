@@ -162,8 +162,9 @@ class PublicationTests(unittest.TestCase):
         self.git(self.remote, "config", "uploadpack.allowFilter", "true")
         self.git(self.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
         partial = self.root / "partial"
-        self.git(self.root, "clone", "--filter=blob:none", "--no-checkout",
-                 self.remote.as_uri(), str(partial))
+        self.git(self.root, "-c", "protocol.file.allow=always", "clone",
+                 "--filter=blob:none", "--no-checkout", self.remote.as_uri(),
+                 str(partial))
         self.assertEqual(self.git(partial, "config", "remote.origin.promisor"), "true")
         target = self.commit("new promised commit")
         self.git(self.source, "push", "origin", "main")
@@ -203,6 +204,13 @@ class PublicationTests(unittest.TestCase):
 
     def test_relative_remote_uses_source_directory(self):
         self.git(self.source, "remote", "set-url", "origin", "../remote.git")
+        self.assertEqual(self.check()["status"], "PUBLISHED")
+
+    def test_distinct_push_urls_do_not_make_fetch_url_ambiguous(self):
+        self.git(self.source, "remote", "set-url", "--add", "--push", "origin",
+                 "ssh://example.invalid/first.git")
+        self.git(self.source, "remote", "set-url", "--add", "--push", "origin",
+                 "ssh://example.invalid/second.git")
         self.assertEqual(self.check()["status"], "PUBLISHED")
 
     def test_inherited_git_directory_does_not_select_another_repository(self):
