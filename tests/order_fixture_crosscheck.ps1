@@ -31,7 +31,7 @@ param(
     [string]$FixturePath,
     [string]$OutFile
 )
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $FixturePath) {
@@ -73,6 +73,7 @@ foreach ($scenario in $scenarios) {
     foreach ($n in 1..$scenario.passes) {
         $stdout = ''
         $threw = ''
+        $runnerExit = $null
         $common = @{
             Mode = 'Observe'
             BoardFixturePath = $FixturePath
@@ -82,12 +83,15 @@ foreach ($scenario in $scenarios) {
             MaxOrderAgeMinutes = 10080
         }
         try {
+            $global:LASTEXITCODE = $null
             if ($scenario.replay) {
                 $stdout = (& $runner @common -ReplayHistorical *>&1 | Out-String)
             } else {
                 $stdout = (& $runner @common *>&1 | Out-String)
             }
+            $runnerExit = $LASTEXITCODE
         } catch {
+            $runnerExit = $LASTEXITCODE
             $threw = [string]$_.Exception.Message
         }
         $passes += [pscustomobject][ordered]@{
@@ -95,6 +99,7 @@ foreach ($scenario in $scenarios) {
             pass = $n
             stdout = $stdout.Trim()
             threw = $threw
+            exit_code = $runnerExit
         }
     }
     # Each scenario keeps its own log, read back below by scenario name.
@@ -103,8 +108,37 @@ foreach ($scenario in $scenarios) {
 }
 
 function ConvertTo-Normalised {
-    param([string]$Text)
+    param([string]$Text, [switch]$StateDocument)
     if (-not $Text) { return '' }
+    if ($StateDocument) {
+        # Preserve fixture-derived timestamps and IDs. Applying the broad text
+        # substitutions below would erase differences in cursor.timestamp.
+        $parse = @{ InputObject = $Text; ErrorAction = 'Stop' }
+        if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+            $parse.DateKind = 'String'
+        } elseif ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
+            throw 'State comparison requires Windows PowerShell 5.1 or PowerShell 7.5+'
+        }
+        $stateObject = ConvertFrom-Json @parse
+        foreach ($section in @('last_poll', 'seen', 'success', 'error')) {
+            $entry = $stateObject.$section
+            if ($null -ne $entry -and $null -ne $entry.PSObject.Properties['at'] -and $entry.at) {
+                $entry.at = '<TS>'
+            }
+        }
+        if ($null -ne $stateObject.last_poll) {
+            foreach ($field in @('run_id', 'identity', 'user_profile')) {
+                if ($null -ne $stateObject.last_poll.PSObject.Properties[$field]) {
+                    $stateObject.last_poll.$field = $(switch ($field) {
+                        'run_id' { '<RUNID32>' }
+                        'identity' { '<EXECUTION_IDENTITY>' }
+                        'user_profile' { '<USER_PROFILE>' }
+                    })
+                }
+            }
+        }
+        return ($stateObject | ConvertTo-Json -Depth 64)
+    }
     $s = $Text
 
     # Absolute paths differ by host by design. Replaced FIRST, because a path
@@ -163,7 +197,7 @@ $states = [ordered]@{}
 foreach ($scenario in $scenarios) {
     $decisions[$scenario.name] = @(Get-Decisions -LogFile (Get-Variable -Name ('log_' + $scenario.name) -ValueOnly))
     $sp = Get-Variable -Name ('state_' + $scenario.name) -ValueOnly
-    $states[$scenario.name] = $(if (Test-Path -LiteralPath $sp) { ConvertTo-Normalised ([IO.File]::ReadAllText($sp)) } else { '' })
+    $states[$scenario.name] = $(if (Test-Path -LiteralPath $sp) { ConvertTo-Normalised ([IO.File]::ReadAllText($sp)) -StateDocument } else { '' })
 }
 $events = @()
 foreach ($k in $decisions.Keys) { $events += $decisions[$k] }
@@ -179,14 +213,40 @@ $report = [pscustomobject][ordered]@{
                             pass   = $_.pass
                             stdout = ConvertTo-Normalised $_.stdout
                             threw  = ConvertTo-Normalised $_.threw
+                            exit_code = $_.exit_code
                         } })
     state         = $states
     log_decisions = $decisions
 }
 
 $json = $report | ConvertTo-Json -Depth 8
-[IO.File]::WriteAllText($OutFile, $json, (New-Object Text.UTF8Encoding($false)))
-Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
+$destination = [IO.Path]::GetFullPath($OutFile)
+$temporary = $destination + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+$published = $false
+try {
+    [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding($false)))
+    if ([IO.File]::ReadAllText($temporary) -cne $json) { throw 'artifact temporary readback differs' }
+    if ([IO.File]::Exists($destination)) {
+        # 5.1 binds $null to an empty string here; NullString is a CLR null.
+        [IO.File]::Replace($temporary, $destination, [System.Management.Automation.Language.NullString]::Value)
+    } else {
+        [IO.File]::Move($temporary, $destination)
+    }
+    if ([IO.File]::ReadAllText($destination) -cne $json) { throw 'artifact destination readback differs' }
+    $published = $true
+} catch {
+    Write-Output ('ARTIFACT_WRITE_FAILED: ' + $_.Exception.Message)
+} finally {
+    if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    # Only remove the unique scratch directory created by this invocation.
+    $scratchRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $resolvedSandbox = [IO.Path]::GetFullPath($sandbox)
+    if ($resolvedSandbox.StartsWith($scratchRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedSandbox) -match '^order-crosscheck-[0-9a-f]{32}$') {
+        Remove-Item -LiteralPath $resolvedSandbox -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+if (-not $published) { exit 1 }
 
 Write-Output ('platform      : ' + $report.platform + ' / ' + $report.ps_version + ' (' + $report.ps_edition + ')')
 Write-Output ('fixture sha   : ' + $report.fixture_sha)
@@ -208,16 +268,28 @@ $failed = @()
 foreach ($p in $passes) {
     $label = $p.scenario + ' pass ' + $p.pass
     if ($p.threw) { $failed += ($label + ': threw'); continue }
+    if ($null -eq $p.exit_code -or $p.exit_code -isnot [int] -or $p.exit_code -ne 0) {
+        $failed += ($label + ': runner exit_code is not integer zero')
+    }
     $last = ($p.stdout -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
     if (-not $last) { $failed += ($label + ': no stdout'); continue }
     try {
         $verdict = $last | ConvertFrom-Json -ErrorAction Stop
-        if ($verdict.ok -ne $true) { $failed += ($label + ': ok is not true') }
+        if ($verdict.ok -isnot [bool] -or $verdict.ok -ne $true) { $failed += ($label + ': ok is not Boolean true') }
     } catch {
         $failed += ($label + ': stdout is not the JSON verdict')
     }
 }
 foreach ($k in $decisions.Keys) {
+    if (@($decisions[$k] | Where-Object { $_.event -eq 'poll_started' }).Count -ne 2) {
+        $failed += ($k + ': expected two poll_started events')
+    }
+    try {
+        $parsedState = $states[$k] | ConvertFrom-Json -ErrorAction Stop
+        if ($parsedState -isnot [pscustomobject] -or @($parsedState.PSObject.Properties).Count -eq 0) {
+            throw 'missing persisted state'
+        }
+    } catch { $failed += ($k + ': missing or invalid persisted state') }
     foreach ($e in $decisions[$k]) {
         if ($e.event -eq 'run_error' -or $e.event -eq '<UNPARSEABLE>') {
             $failed += ($k + ': logged ' + $e.event + ' [' + $e.code + ']')
