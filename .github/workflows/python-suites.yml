@@ -27,6 +27,8 @@ on:
       - "scripts/open_for_me.py"
       - "tests/test_xray_score.py"
       - "tests/test_open_for_me.py"
+      - "scripts/bus_benchmark.py"
+      - "tests/test_bus_benchmark.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -35,6 +37,8 @@ on:
       - "scripts/open_for_me.py"
       - "tests/test_xray_score.py"
       - "tests/test_open_for_me.py"
+      - "scripts/bus_benchmark.py"
+      - "tests/test_bus_benchmark.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -55,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "python: $(python3 --version)"
-          for t in tests/test_xray_score.py tests/test_open_for_me.py; do
+          for t in tests/test_xray_score.py tests/test_open_for_me.py tests/test_bus_benchmark.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -90,12 +94,21 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      - name: bus_benchmark (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_benchmark.py ]; then
+            sudo unshare -n python3 tests/test_bus_benchmark.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # A workflow that skips everything and reports success is the failure mode
       # this file exists to prevent. If neither suite ran, say so and fail.
       - name: Refuse a green tick over nothing
         run: |
           set -euo pipefail
-          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ]; then
+          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ]              && [ ! -f tests/test_bus_benchmark.py ]; then
             echo "Neither suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
