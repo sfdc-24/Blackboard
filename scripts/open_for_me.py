@@ -186,19 +186,55 @@ def sanitize(text, limit=MAX_GIST):
     return s
 
 
+# Anchored at BOTH ends. The previous pattern used re.match with no trailing
+# anchor, so it matched a PREFIX and threw the rest away.
+TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,9}))?"
+    r"(Z|[+-]\d{2}:?\d{2})?$")
+
+
 def parse_ts(ts):
-    """A comparable timestamp, or None if it is not ISO-8601.
+    """A comparable UTC instant, or None if it is not a timestamp we can trust.
 
     Returning None rather than a guess matters: an unparseable stamp must not
     silently sort as the oldest or the newest thing on the board.
+
+    THE OFFSET USED TO BE DISCARDED. The old pattern matched only the date and
+    time prefix, so 2026-09-10T12:00:00+05:00 and 2026-09-10T12:00:00-08:00
+    both became 12:00 UTC - a thirteen-hour spread collapsed onto one instant -
+    and 2026-09-10T12:00:00XYZZY parsed happily. Ordering decisions are made on
+    these values, including "a clearing row must be strictly later than the
+    hold", so a row stamped 12:00:00+05:00 (really 07:00Z) could look later than
+    a hold at 09:00Z and clear it. Codex reproduced exactly that.
+
+    A missing offset is read as UTC, which is what the fleet writes and what
+    scripts/bus.ps1 now enforces at the writer. Trailing anything else is a
+    refusal, not a shrug.
     """
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})", str(ts))
+    m = TS_RE.match(str(ts).strip())
     if not m:
         return None
+    year, month, day, hour, minute, second, frac, offset = m.groups()
+    micro = int((frac or "0").ljust(6, "0")[:6])
+    if offset in (None, "Z"):
+        tz = datetime.timezone.utc
+    else:
+        sign = 1 if offset[0] == "+" else -1
+        body = offset[1:].replace(":", "")
+        try:
+            delta = datetime.timedelta(hours=int(body[:2]), minutes=int(body[2:4]))
+        except ValueError:
+            return None
+        if delta >= datetime.timedelta(hours=24):
+            return None
+        tz = datetime.timezone(sign * delta)
     try:
-        return datetime.datetime.fromisoformat(m.group(1) + "T" + m.group(2) + "+00:00")
+        moment = datetime.datetime(int(year), int(month), int(day),
+                                   int(hour), int(minute), int(second), micro, tz)
     except ValueError:
-        return None
+        return None                       # a real calendar check: 2026-02-30 fails here
+    return moment.astimezone(datetime.timezone.utc)
 
 
 def newest_viewport(rows, now=None):
@@ -254,6 +290,11 @@ def head_of(payload):
 
 MIN_SHA = 7          # git's own shortest unambiguous default
 MAX_SHA = 40         # a SHA-1 is exactly this long; 41 hex characters is not one
+
+# Verdicts that may retire a hold. A CLOSED SET: anything not written here
+# supersedes nothing, so a verdict this build does not understand fails safe
+# rather than being matched by prefix. GONOGO used to pass startswith("GO").
+CLEARING_VERDICTS = frozenset(("GO", "MERGED"))
 
 SAME = "SAME"
 DIFFERENT = "DIFFERENT"
@@ -356,22 +397,42 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
             continue
 
         if hold_pr and field(payload, "pr") == hold_pr and authorised:
-            verdict = (field(payload, "verdict") or "").upper()
+            verdict = (field(payload, "verdict") or "").strip().upper()
             head = head_of(payload)
-            if verdict.startswith("GO") or verdict == "MERGED":
+            # A CLOSED SET, not a prefix. `verdict.startswith("GO")` also matched
+            # GONOGO and GO-NO-GO - verdicts that mean the reviewer has NOT
+            # decided - so an explicitly undecided review superseded a safety
+            # hold. Codex reproduced it. Anything not named here supersedes
+            # nothing, including a verdict this build has never heard of.
+            if verdict in CLEARING_VERDICTS:
                 # Only a head we could actually COMPARE may supersede. `not
                 # same_commit` used to stand in for "different", which quietly
                 # included every head we failed to parse - so `head=main` lifted
                 # a CRITICAL hold. UNCOMPARABLE leaves the hold ACTIVE and says
                 # so, because a clear we cannot justify is not a clear.
                 relation = commit_relation(head, hold_head)
-                if relation == DIFFERENT:
+                # A supersede must NAME THE COMMIT IN FULL. A seven-character
+                # head is enough to identify a commit you already have, but a
+                # reviewer retiring a safety hold is making a claim about an
+                # exact tree, and an abbreviation is cheap to invent. This does
+                # not stop forgery - only the placer can supersede at all - but
+                # it stops a vague verdict from doing it by accident.
+                if relation == DIFFERENT and len(head.strip()) != MAX_SHA:
+                    # The verdict leads. These notes are truncated to MAX_NOTE
+                    # for display, and a bounded message whose last word is the
+                    # decision loses the decision first.
+                    rejected = rejected or (
+                        "hold STANDS: a later GO by its placer named an "
+                        "abbreviated head, and a supersede must name the full "
+                        "40-character commit (" + (field(payload, "id")
+                                                   or cell(r, COL_ROWID)) + ")")
+                elif relation == DIFFERENT:
                     return SUPERSEDED_LIKELY, ("a later GO by its placer on a different head: "
                                                + (field(payload, "id") or cell(r, COL_ROWID)))
                 if relation == UNCOMPARABLE:
                     rejected = rejected or (
-                        "a later GO by its placer named a head that cannot be "
-                        "compared to the held one, so the hold STANDS ("
+                        "hold STANDS: a later GO by its placer named a head that "
+                        "cannot be compared to the held one ("
                         + (field(payload, "id") or cell(r, COL_ROWID)) + ")")
     return ACTIVE, rejected
 
@@ -551,7 +612,10 @@ class BoardError(ValueError):
     """The input is not a board this tool is entitled to reason about."""
 
 
-def load_board(data):
+BOARD_TITLE = "Blackboard - Alpha DB"
+
+
+def load_board(data, expect_title=BOARD_TITLE):
     """Validate a v1 bus read response and return its DATA rows.
 
     Previously this did `rows[1:]` on anything with a `rows` key - so a file
@@ -564,9 +628,26 @@ def load_board(data):
     """
     if isinstance(data, dict):
         # An error envelope is not a board, even though it has the right shape.
-        if "ok" in data and not data.get("ok"):
-            raise BoardError("the bus returned ok=false; that is an error "
-                             "envelope, not a board")
+        #
+        # `if "ok" in data and not data.get("ok")` let {"ok": "false"} through,
+        # because the STRING "false" is truthy - the classic JSON-boolean trap,
+        # and the same one that shipped in the events-ws acknowledgement gate.
+        # `ok` must be a real boolean and it must be True.
+        if "ok" in data:
+            if not isinstance(data["ok"], bool):
+                raise BoardError(
+                    "the envelope's ok field is a {0}, not a boolean; the string "
+                    "\"false\" is truthy and would have been read as success"
+                    .format(type(data["ok"]).__name__))
+            if not data["ok"]:
+                raise BoardError("the bus returned ok=false; that is an error "
+                                 "envelope, not a board")
+        if expect_title is not None and "title" in data:
+            if str(data.get("title")) != expect_title:
+                raise BoardError(
+                    "this is a different sheet: the envelope says {0!r} but this "
+                    "run expects {1!r}. Holds are per-board.".format(
+                        str(data.get("title"))[:80], expect_title))
         rows = data.get("rows")
     elif isinstance(data, list):
         rows = data
@@ -613,6 +694,21 @@ def load_board(data):
                 raise BoardError("row {0} has a cell of {1} characters; the cap "
                                  "is {2}".format(i, len(c), MAX_CELL_CHARS))
         out.append(r)
+
+    # A TRUNCATED READ IS NOT A SHORT BOARD. The bus reports how many data rows
+    # it believes it sent; if that disagrees with what arrived, some rows are
+    # missing - and a missing row is exactly how a standing hold becomes
+    # invisible. Refuse rather than answer confidently about a partial board.
+    if isinstance(data, dict) and data.get("total_rows") is not None:
+        claimed = data["total_rows"]
+        if isinstance(claimed, bool) or not isinstance(claimed, int):
+            raise BoardError("total_rows is a {0}, not an integer".format(
+                type(claimed).__name__))
+        if claimed != len(out):
+            raise BoardError(
+                "the envelope claims {0} data rows but {1} arrived; this read is "
+                "incomplete and a hold could be among the missing rows".format(
+                    claimed, len(out)))
     return out
 
 

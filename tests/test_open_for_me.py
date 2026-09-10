@@ -411,6 +411,112 @@ check("and it is flagged as ambiguous",
 check("and the render says so", "AMBIGUOUS PAYLOAD" in ofm.render(ra))
 
 print("")
+print("== 'GO' is a closed set, not a prefix ==")
+# verdict.startswith("GO") also matched GONOGO and GO-NO-GO - verdicts that mean
+# the reviewer has NOT decided. An explicitly undecided review superseded a
+# safety hold.
+for bad in ("GONOGO", "GO-NO-GO", "GO/NO-GO", "GONE", "GOING", "GO?", "NO-GO"):
+    payload = ("BCB|v=1|id=V-GO|phase=RESULT|from=codex|to=claude-code-cli"
+               "|pr=https://x/pull/40|exact_head=" + HEAD_OTHER + "|verdict=" + bad)
+    rv = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", payload, "DONE")),
+                      TAG, now=NOW)
+    check("verdict=" + bad + " clears nothing",
+          rv["active_holds"] == ["PR40-HOLD"], rv["active_holds"])
+for good in ("GO", "go", " GO ", "MERGED"):
+    payload = ("BCB|v=1|id=V-GO|phase=RESULT|from=codex|to=claude-code-cli"
+               "|pr=https://x/pull/40|exact_head=" + HEAD_OTHER + "|verdict=" + good)
+    rv = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", payload, "DONE")),
+                      TAG, now=NOW)
+    check("verdict=" + repr(good) + " still supersedes", rv["active_holds"] == [],
+          rv["active_holds"])
+
+print("")
+print("== a supersede must name the commit in full ==")
+short_go = ("BCB|v=1|id=SHORT-GO|phase=RESULT|from=codex|to=claude-code-cli"
+            "|pr=https://x/pull/40|exact_head=" + HEAD_OTHER[:7] + "|verdict=GO")
+rsg = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", short_go, "DONE")),
+                   TAG, now=NOW)
+check("an abbreviated head does not supersede",
+      rsg["active_holds"] == ["PR40-HOLD"], rsg["active_holds"])
+check("and the refusal says the hold STANDS",
+      any("STANDS" in d["hold_note"] for d in rsg["rows"]),
+      [d["hold_note"] for d in rsg["rows"]])
+
+print("")
+print("== timestamps: the offset is not decoration ==")
+# The old parser matched a PREFIX, so every offset became UTC. Two stamps
+# thirteen hours apart collapsed onto one instant, and a clear that really
+# preceded its hold could look later than it.
+check("Z is UTC", ofm.parse_ts("2026-09-10T12:00:00Z").hour == 12)
+check("a bare stamp is read as UTC", ofm.parse_ts("2026-09-10T12:00:00").hour == 12)
+check("+05:00 is FIVE HOURS EARLIER in UTC",
+      ofm.parse_ts("2026-09-10T12:00:00+05:00").hour == 7,
+      ofm.parse_ts("2026-09-10T12:00:00+05:00"))
+check("-08:00 is eight hours later in UTC",
+      ofm.parse_ts("2026-09-10T12:00:00-08:00").hour == 20,
+      ofm.parse_ts("2026-09-10T12:00:00-08:00"))
+check("+0500 without a colon also parses",
+      ofm.parse_ts("2026-09-10T12:00:00+0500").hour == 7)
+check("two stamps that differ only by offset are NOT equal",
+      ofm.parse_ts("2026-09-10T12:00:00+05:00") != ofm.parse_ts("2026-09-10T12:00:00-08:00"))
+for junk in ("2026-09-10T12:00:00XYZZY", "2026-09-10T12:00:00+99:00",
+             "2026-09-10T12:00:00 and then some", "2026-13-10T12:00:00Z",
+             "2026-02-30T12:00:00Z", "not-a-timestamp", ""):
+    check("refuses " + repr(junk[:28]), ofm.parse_ts(junk) is None, ofm.parse_ts(junk))
+check("fractional seconds survive",
+      ofm.parse_ts("2026-09-10T12:00:00.123456Z").microsecond == 123456)
+
+# The behaviour that actually matters: a clear whose LOCAL time looks later but
+# whose real instant is earlier must not clear.
+skewed = ("BCB|v=1|id=SKEWED-CLEAR|phase=RESULT|from=codex|to=claude-code-cli"
+          "|clears=PR40-HOLD")
+rskew = ofm.open_for(
+    [row("2026-09-09T12:00:00Z", "codex", H4CCB, "DONE"),
+     # 13:00+05:00 is 08:00Z - BEFORE the hold, despite reading as later.
+     row("2026-09-09T13:00:00+05:00", "codex", skewed, "DONE"),
+     row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")],
+    TAG, now=NOW)
+check("a clear that only LOOKS later cannot clear",
+      rskew["active_holds"] == ["PR40-HOLD"], rskew["active_holds"])
+
+print("")
+print("== the envelope's ok must be a real boolean ==")
+HDR_OK = list(ofm.BOARD_HEADER) + ["", ""]
+ROW_OK = row("2026-09-09T15:00:00Z", "codex", "BCB|v=1|id=X|to=claude-code-cli", "OPEN")
+for value, why in [("false", "the STRING \"false\", which is truthy"),
+                   ("true", "the string \"true\""),
+                   (0, "an integer"), (None, "null")]:
+    try:
+        ofm.load_board({"ok": value, "title": ofm.BOARD_TITLE, "rows": [HDR_OK, ROW_OK]})
+        check("refuses ok as " + why, False, "accepted it")
+    except ofm.BoardError:
+        check("refuses ok as " + why, True)
+check("accepts a real boolean true",
+      len(ofm.load_board({"ok": True, "title": ofm.BOARD_TITLE,
+                          "rows": [HDR_OK, ROW_OK]})) == 1)
+
+print("")
+print("== a different sheet, or a truncated read, is refused ==")
+try:
+    ofm.load_board({"ok": True, "title": "Some Other Sheet", "rows": [HDR_OK, ROW_OK]})
+    check("refuses a different board title", False, "accepted it")
+except ofm.BoardError:
+    check("refuses a different board title", True)
+try:
+    ofm.load_board({"ok": True, "title": ofm.BOARD_TITLE, "total_rows": 99,
+                    "rows": [HDR_OK, ROW_OK]})
+    check("refuses a read that arrived short of its own count", False, "accepted")
+except ofm.BoardError:
+    check("refuses a read that arrived short of its own count", True)
+check("but an accurate total_rows is fine",
+      len(ofm.load_board({"ok": True, "title": ofm.BOARD_TITLE, "total_rows": 1,
+                          "rows": [HDR_OK, ROW_OK]})) == 1)
+# The live envelope carries no total_rows at all, so absence must stay legal.
+check("and a missing total_rows is still legal",
+      len(ofm.load_board({"ok": True, "title": ofm.BOARD_TITLE,
+                          "rows": [HDR_OK, ROW_OK]})) == 1)
+
+print("")
 print("== hex is not the same thing as a SHA ==")
 FORTY = "a" * 40
 FORTYONE = "b" * 41
