@@ -69,7 +69,8 @@ def summarise(samples, unit="ms"):
            "failed": len(samples) - len(ok)}
     if not ok:
         out["state"] = UNKNOWN
-        out["why"] = "every attempt failed; there is no measurement here"
+        out["why"] = ("every attempt failed or returned no rows; there is no "
+                      "measurement here")
         return out
     out["state"] = "MEASURED"
     out["min"] = round(min(ok), 1)
@@ -98,12 +99,45 @@ def http_get(url, timeout=45):
         return resp.read()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Capture a 302 instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _Redirected(newurl)
+
+
+class _Redirected(Exception):
+    def __init__(self, location):
+        super().__init__(location)
+        self.location = location
+
+
 def http_post(url, payload, timeout=90):
+    """POST, honouring the v1 bus's redirect contract.
+
+    The live Apps Script bus answers a POST with a 302 whose Location must be
+    fetched with a PLAIN GET; following the redirect automatically returns a
+    redirect artifact instead of the JSON. scripts/bus.ps1 has done the two-hop
+    dance since REQ-PR4EXZ made it standing law, and a benchmark that does not
+    is not measuring the same operation a real client performs.
+
+    Measured the hard way: the first version of this file did a plain POST and
+    got 63 bytes and zero rows back from the live bus, then reported it as a
+    successful 755ms read - which would have made the target look ~16x faster
+    than a thing that had not actually been measured at all.
+    """
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.read()
+    except _Redirected as hop:
+        # Hop two: a plain GET on the Location, which returns the real JSON.
+        with urllib.request.urlopen(
+                urllib.request.Request(hop.location), timeout=timeout) as resp2:
+            return resp2.read()
 
 
 def bench_health(url, runs):
@@ -116,13 +150,21 @@ def bench_read(url, secret, title, runs):
     for _ in range(runs):
         ms, res = timed(lambda: http_post(url, {"action": "read", "title": title,
                                                 "secret": secret}))
-        samples.append(ms)
+        got = None
         if ms is not None and isinstance(res, (bytes, bytearray)):
             sizes.append(len(res))
             try:
-                rows.append(len(json.loads(res).get("rows", [])))
+                got = len(json.loads(res).get("rows", []))
+                rows.append(got)
             except Exception:
-                pass
+                got = None
+        # A read that returned NO ROWS is not a fast read, it is a failed one.
+        # HTTP succeeding is not the same as the board arriving, and timing a
+        # redirect artifact as if it were a board read is how a benchmark lies.
+        if got is None or got < 1:
+            samples.append(None)
+        else:
+            samples.append(ms)
     return samples, sizes, rows
 
 
@@ -185,10 +227,19 @@ def main():
             print("         " + s["full_read_ms"]["why"])
 
     print("")
-    print("NOT a like-for-like engine comparison: Apps Script over a Sheet versus")
-    print("stdlib Python over SQLite. What is comparable is what a client experiences.")
-    print("Reads only against the live bus - benchmark writes would leave junk rows")
-    print("on a permanent append-only record.")
+    print("HOW TO READ THIS, AND HOW NOT TO:")
+    print("  * NOT a like-for-like engine comparison. Apps Script over a Sheet")
+    print("    versus stdlib Python over SQLite is two different systems.")
+    print("  * NETWORK DISTANCE IS IN THESE NUMBERS. Run from the instance, the")
+    print("    target is localhost and the current bus is a remote HTTPS call to")
+    print("    Google. A client somewhere else will NOT see the target figure -")
+    print("    part of the gap is proximity, not software. Run this from the")
+    print("    client's own machine before quoting it to a client.")
+    print("  * Row counts may differ between sides. The target holds a snapshot")
+    print("    taken at import; the live board keeps growing. A difference is")
+    print("    staleness, not a defect - but a LARGE one means the snapshot is old.")
+    print("  * Reads only against the live bus. Benchmark writes would leave junk")
+    print("    rows on a permanent append-only record for ever.")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
