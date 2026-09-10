@@ -56,8 +56,15 @@ param($Mode, $BoardFixturePath, $StatePath, $LogPath, $WorkspacePath,
             # Python can inherit Core-only module paths from a pwsh parent.
             # Let a fresh 5.1 child construct its own standard module path.
             child_env = {k: v for k, v in child_env.items() if k.lower() != 'psmodulepath'}
+        # -ExecutionPolicy Bypass is not optional here, and every other
+        # PowerShell-invoking test in this repo passes it. The harness is copied
+        # into a temp directory and run from there, so on a machine whose
+        # LocalMachine policy is AllSigned the copy is unsigned and refuses to
+        # load: 4 failures and 1 error, all UnauthorizedAccess, on the laptop
+        # that owns this branch. Hosted runners are permissive, so CI was green
+        # while the suite could not run for its own author.
         proc = subprocess.run(
-            [ENGINE, "-NoProfile", "-NonInteractive", "-File",
+            [ENGINE, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
              str(REPO / "tests/order_fixture_crosscheck.ps1" if real else self.harness),
              "-FixturePath", str(REPO / "tests/fixtures/order_supervisor_board.json" if real else self.fixture),
              "-OutFile", str(destination or self.outfile)],
