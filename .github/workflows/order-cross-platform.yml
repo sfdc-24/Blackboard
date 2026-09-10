@@ -3,6 +3,7 @@ name: ORDER fixture comparison (offline)
 on:
   pull_request:
     paths:
+      - '.gitattributes'
       - '.github/workflows/order-cross-platform.yml'
       - 'scripts/order_supervisor.ps1'
       - 'scripts/OrderSupervisor.psm1'

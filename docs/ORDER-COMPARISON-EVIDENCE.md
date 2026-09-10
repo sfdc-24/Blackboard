@@ -4,6 +4,9 @@ The fixture comparison accepts one Windows/Desktop PowerShell 5.1 artifact
 and one Linux/Core PowerShell 7.5+ artifact, generated from the same fixture.
 Runtime identity is declared by the harness; it is not remote host attestation.
 The CI workflow generates both artifacts from the same checked-out revision.
+The committed fixture is pinned to LF in `.gitattributes`: the first hosted
+comparison correctly refused Windows CRLF versus Linux LF hashes despite
+matching JSON content. Fixture identity continues to mean identical bytes.
 
 Generate fresh artifacts with `tests/order_fixture_crosscheck.ps1 -OutFile PATH`
 on each endpoint, then run:
