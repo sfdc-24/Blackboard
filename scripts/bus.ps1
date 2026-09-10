@@ -223,13 +223,36 @@ if ($SheetRowJson) {
     throw "SheetRowJson produced $($cells.Count) cell(s) -- expected a JSON array of cells such as a bracketed list of quoted strings. Refusing to write a malformed row (ISSUE 010 / REQ-C4NDX7)."
   }
 
-  # A canonical Blackboard control-bus row is exactly A:J, with its timestamp in
-  # cell B and a BCB envelope in cell F. Fail before serialization or transport
-  # when that timestamp is not the wire-format string the readers compare. Do not
-  # normalize it here: rewriting would conceal a caller-side clock/serializer bug
-  # and could change ordering semantics. Other sheets and legacy row shapes keep
-  # their existing compatibility behavior.
-  if ($cells.Count -eq 10 -and ([string]$cells[5]).StartsWith('BCB|', [StringComparison]::Ordinal)) {
+  # A canonical Blackboard control-bus full row is exactly A:J, with its timestamp
+  # in cell B and a BCB envelope in cell F. Read-side blank K:L padding, truncated
+  # rows, and shifted envelopes are not write shapes. Reject them before
+  # serialization or transport instead of allowing a different width to bypass
+  # this guard. The self-hosted server supports an eight-content-cell shorthand,
+  # but Apps Script v1 appends those eight cells verbatim; this portable client
+  # therefore cannot opt into that backend-specific behavior implicitly.
+  # Non-BCB rows sent to other sheets keep their existing compatibility behavior.
+  $isAlphaBoardTitle = [string]::Equals(
+    [string]$Title,
+    'Blackboard - Alpha DB',
+    [StringComparison]::Ordinal
+  )
+  $hasBcbEnvelope = $false
+  foreach ($cell in $cells) {
+    if (([string]$cell).StartsWith('BCB|', [StringComparison]::Ordinal)) {
+      $hasBcbEnvelope = $true
+      break
+    }
+  }
+  $isFullBcbRow = $cells.Count -gt 5 -and
+    ([string]$cells[5]).StartsWith('BCB|', [StringComparison]::Ordinal)
+  $isCanonicalBcbRow = $cells.Count -eq 10 -and $isFullBcbRow
+  if (($isAlphaBoardTitle -and $cells.Count -ne 10) -or
+      ($hasBcbEnvelope -and -not $isCanonicalBcbRow)) {
+    throw [InvalidOperationException]::new(
+      'BOARD_ROW_SHAPE_INVALID: Blackboard BCB writes require exactly 10 logical A:J cells with the envelope in cell F (index 5). Read-side padding, truncated rows, shifted rows, and backend-specific shorthand are not portable write shapes. Refusing transport.'
+    )
+  }
+  if ($isCanonicalBcbRow) {
     $boardTimestamp = [string]$cells[1]
     $boardTimestampPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$'
     if ($boardTimestamp -cnotmatch $boardTimestampPattern) {

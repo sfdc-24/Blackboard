@@ -166,6 +166,8 @@ function New-TestRowJson {
     )
     if ($CellCount -lt $cells.Count) {
         $cells = @($cells[0..($CellCount - 1)])
+    } elseif ($CellCount -gt $cells.Count) {
+        $cells += @('') * ($CellCount - $cells.Count)
     }
     return (ConvertTo-Json -InputObject @($cells) -Compress)
 }
@@ -173,7 +175,9 @@ function New-TestRowJson {
 function Invoke-BusCase {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][string]$RowJson
+        [Parameter(Mandatory = $true)][string]$RowJson,
+        [string]$Title = 'Blackboard - Alpha DB',
+        [string]$FileId = ''
     )
 
     $caseRoot = Join-Path $script:TestRoot $Name
@@ -188,7 +192,11 @@ function Invoke-BusCase {
     $records = @()
     $errorMessage = ''
     try {
-        $records = @(& $script:BusPath -Action append -Title 'Blackboard - Alpha DB' -SheetRowJson $RowJson -EnvFile $envPath *>&1)
+        if ($FileId) {
+            $records = @(& $script:BusPath -Action append -FileId $FileId -SheetRowJson $RowJson -EnvFile $envPath *>&1)
+        } else {
+            $records = @(& $script:BusPath -Action append -Title $Title -SheetRowJson $RowJson -EnvFile $envPath *>&1)
+        }
     } catch {
         $errorMessage = [string]$_.Exception.Message
     }
@@ -279,8 +287,19 @@ try {
 
     $generalRow = New-TestRowJson -Timestamp 'September 10, 2026 3:00 AM' -Envelope 'GENERAL-SHEET-ROW'
     $generalResult = Invoke-BusCase -Name 'general-sheet-ten-cells' -RowJson $generalRow
-    Assert-True 'general 10-cell sheet row remains compatible' ($generalResult.ErrorMessage.Length -eq 0) $generalResult.ErrorMessage
-    Assert-True 'general 10-cell sheet row reaches transport' $generalResult.TransportObserved
+    Assert-True 'legacy non-BCB Alpha row remains compatible' ($generalResult.ErrorMessage.Length -eq 0) $generalResult.ErrorMessage
+    Assert-True 'legacy non-BCB Alpha row reaches transport' $generalResult.TransportObserved
+
+    $otherSheetRow = New-TestRowJson -Timestamp 'legacy local time' -CellCount 7 -Envelope 'GENERAL-SHEET-ROW'
+    $otherSheetResult = Invoke-BusCase -Name 'other-sheet-seven-cells' -RowJson $otherSheetRow -Title 'General Test Sheet'
+    Assert-True 'unrelated sheet row width remains compatible' ($otherSheetResult.ErrorMessage.Length -eq 0) $otherSheetResult.ErrorMessage
+    Assert-True 'unrelated sheet row reaches transport' $otherSheetResult.TransportObserved
+
+    $shortAlphaResult = Invoke-BusCase -Name 'alpha-seven-cell-non-bcb' -RowJson $otherSheetRow
+    Assert-True 'short non-BCB Alpha row is rejected by the destination shape contract' (
+        $shortAlphaResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+    ) $shortAlphaResult.ErrorMessage
+    Assert-True 'short non-BCB Alpha row is rejected before transport' (-not $shortAlphaResult.TransportObserved)
 
     $unicodeGist = 'caf{0} | {1}{2} | {3}' -f (
         [char]0x00E9,
@@ -300,10 +319,91 @@ try {
         $null -ne $unicodeRequest -and [string]$unicodeRequest.sheetRow[8] -ceq $unicodeGist
     )
 
-    $legacyBcbRow = New-TestRowJson -Timestamp 'legacy local time' -CellCount 8
-    $legacyResult = Invoke-BusCase -Name 'noncanonical-eight-cell-bcb' -RowJson $legacyBcbRow
-    Assert-True 'noncanonical BCB row shape remains compatible' ($legacyResult.ErrorMessage.Length -eq 0) $legacyResult.ErrorMessage
-    Assert-True 'noncanonical BCB row shape reaches transport' $legacyResult.TransportObserved
+    $paddedBcbRow = New-TestRowJson -Timestamp 'legacy local time' -CellCount 12
+    $paddedResult = Invoke-BusCase -Name 'padded-twelve-cell-bcb' -RowJson $paddedBcbRow
+    Assert-True 'padded BCB row is rejected with stable shape code' (
+        $paddedResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+    ) $paddedResult.ErrorMessage
+    Assert-True 'padded BCB row is rejected before transport' (-not $paddedResult.TransportObserved)
+    Assert-True 'padded BCB row error is bounded' ($paddedResult.Output.Length -le 512) ('length=' + $paddedResult.Output.Length)
+    Assert-True 'padded BCB row error hides bus secret' (-not $paddedResult.Output.Contains($script:FakeSecret))
+    Assert-True 'padded BCB row error hides row payload' (-not $paddedResult.Output.Contains($script:PayloadSecret))
+    Assert-True 'padded BCB row error hides rejected timestamp' (-not $paddedResult.Output.Contains('legacy local time'))
+
+    $fileIdPaddedResult = Invoke-BusCase -Name 'file-id-padded-twelve-cell-bcb' -RowJson $paddedBcbRow -FileId 'TEST-BOARD-FILE-ID'
+    Assert-True 'FileId-only padded BCB row is rejected with stable shape code' (
+        $fileIdPaddedResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+    ) $fileIdPaddedResult.ErrorMessage
+    Assert-True 'FileId-only padded BCB row is rejected before transport' (-not $fileIdPaddedResult.TransportObserved)
+
+    $truncatedBcbRow = New-TestRowJson -Timestamp 'legacy local time' -CellCount 8
+    $truncatedResult = Invoke-BusCase -Name 'truncated-eight-cell-full-bcb' -RowJson $truncatedBcbRow
+    Assert-True 'truncated full BCB row is rejected with stable shape code' (
+        $truncatedResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+    ) $truncatedResult.ErrorMessage
+    Assert-True 'truncated full BCB row is rejected before transport' (-not $truncatedResult.TransportObserved)
+    Assert-True 'truncated full BCB row error is bounded' ($truncatedResult.Output.Length -le 512) ('length=' + $truncatedResult.Output.Length)
+    Assert-True 'truncated full BCB row error hides bus secret' (-not $truncatedResult.Output.Contains($script:FakeSecret))
+    Assert-True 'truncated full BCB row error hides row payload' (-not $truncatedResult.Output.Contains($script:PayloadSecret))
+    Assert-True 'truncated full BCB row error hides rejected timestamp' (-not $truncatedResult.Output.Contains('legacy local time'))
+
+    $contentEnvelope = 'BCB|v=1|id=TEST-SERVER-TIMESTAMP|phase=RESULT|hold=' + $script:PayloadSecret
+    $contentCells = @(
+        'codex',
+        'claude-code-cli',
+        'APPEND',
+        $contentEnvelope,
+        'DONE',
+        'BUS-TIMESTAMP-CONTRACT',
+        'server timestamp shorthand',
+        ''
+    )
+    $contentRow = ConvertTo-Json -InputObject @($contentCells) -Compress
+    $contentResult = Invoke-BusCase -Name 'eight-content-cell-bcb' -RowJson $contentRow
+    Assert-True 'backend-specific eight-content-cell BCB shorthand is rejected with stable shape code' (
+        $contentResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+    ) $contentResult.ErrorMessage
+    Assert-True 'backend-specific eight-content-cell BCB shorthand is rejected before transport' (-not $contentResult.TransportObserved)
+    Assert-True 'backend-specific shorthand error is bounded' ($contentResult.Output.Length -le 512) ('length=' + $contentResult.Output.Length)
+    Assert-True 'backend-specific shorthand error hides row payload' (-not $contentResult.Output.Contains($script:PayloadSecret))
+
+    $shiftEnvelope = 'BCB|v=1|id=TEST-SHIFTED|phase=RESULT|hold=' + $script:PayloadSecret
+    $leftShiftCells = @(
+        'legacy local time',
+        'codex',
+        'claude-code-cli',
+        'APPEND',
+        $shiftEnvelope,
+        'DONE',
+        'BUS-TIMESTAMP-CONTRACT',
+        'left shifted',
+        ''
+    )
+    $rightShiftCells = @(
+        'inserted-prefix',
+        'TEST-TIMESTAMP',
+        'legacy local time',
+        'codex',
+        'claude-code-cli',
+        'APPEND',
+        $shiftEnvelope,
+        'DONE',
+        'BUS-TIMESTAMP-CONTRACT',
+        'right shifted',
+        ''
+    )
+    $shiftedCases = @(
+        [pscustomobject]@{ Name = 'left-shifted-nine-cell-bcb'; Cells = $leftShiftCells },
+        [pscustomobject]@{ Name = 'right-shifted-eleven-cell-bcb'; Cells = $rightShiftCells }
+    )
+    foreach ($case in $shiftedCases) {
+        $shiftResult = Invoke-BusCase -Name $case.Name -RowJson (ConvertTo-Json -InputObject @($case.Cells) -Compress)
+        Assert-True ($case.Name + ' is rejected with stable shape code') (
+            $shiftResult.ErrorMessage.StartsWith('BOARD_ROW_SHAPE_INVALID:', [StringComparison]::Ordinal)
+        ) $shiftResult.ErrorMessage
+        Assert-True ($case.Name + ' is rejected before transport') (-not $shiftResult.TransportObserved)
+        Assert-True ($case.Name + ' error hides row payload') (-not $shiftResult.Output.Contains($script:PayloadSecret))
+    }
 } finally {
     if ($KeepArtifacts) {
         [Console]::Out.WriteLine('Artifacts: ' + $script:TestRoot)
