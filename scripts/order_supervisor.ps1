@@ -648,6 +648,30 @@ function Get-PosixChildProcessId {
     return $children
 }
 
+function Get-CurrentIdentityName {
+    # [Security.Principal.WindowsIdentity]::GetCurrent() exists in .NET on Linux
+    # and THROWS PlatformNotSupportedException there. That is worse than being
+    # absent: it parses, it resolves, the static analysis says it is fine, and
+    # the supervisor dies on its first poll. The fixture cross-check found it
+    # after a clean parse, a clean cmdlet audit and 19/0 of unit tests.
+    #
+    # Windows keeps the fully-qualified DOMAIN\user name it has always recorded.
+    if (Test-OnWindows) {
+        return [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    }
+    foreach ($candidate in @($env:USER, $env:LOGNAME, [Environment]::UserName)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate }
+    }
+    return 'unknown'
+}
+
+function Get-CurrentHomePath {
+    # $env:USERPROFILE does not exist on Linux; $env:HOME does.
+    if (Test-OnWindows) { return $env:USERPROFILE }
+    if (-not [string]::IsNullOrWhiteSpace($env:HOME)) { return $env:HOME }
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+}
+
 function Test-PosixProcessAlive {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
 
@@ -953,8 +977,8 @@ try {
         at = Get-UtcStamp
         run_id = $RunId
         status = 'reading'
-        identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        user_profile = $env:USERPROFILE
+        identity = Get-CurrentIdentityName
+        user_profile = Get-CurrentHomePath
     }
     Save-OrderState -Path $StatePath -State $state
     Write-OrderLog -Path $LogPath -Event 'poll_started' -RunId $RunId -Details @{ mode = $Mode }
