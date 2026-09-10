@@ -358,26 +358,60 @@ if ($curl) {
     Remove-Item -LiteralPath $tmpHead -Force -ErrorAction SilentlyContinue
   }
 } else {
+  # THE 302 IS NOT AN EXCEPTION ON 5.1 UNLESS WE MAKE IT ONE.
+  #
+  # Measured on Windows PowerShell 5.1.26100.9444 against a local HttpListener
+  # returning a 302, which is the same shape the bus returns:
+  #
+  #   -MaximumRedirection 0 emits a NON-TERMINATING InvalidOperationException
+  #   ("The maximum redirection count has been exceeded") AND STILL RETURNS the
+  #   response, StatusCode 302 with Location intact.
+  #
+  # $ErrorActionPreference = 'Stop' at the top of this script is what turned that
+  # into a terminating error and threw the response away. The exception it raises
+  # is InvalidOperationException, which has no .Response property at all -- exactly
+  # what the 2026-08-28 regression note ~50 lines above records. So no catch block
+  # can recover the Location on 5.1: by the time control reaches one, the only
+  # object that ever held the header is gone.
+  #
+  # -ErrorAction SilentlyContinue keeps the error non-terminating for THIS call
+  # only, so the response survives and the ordinary success path below reads the
+  # 302 the way the curl branch does. -ErrorVariable keeps the error inspectable
+  # rather than discarded.
+  #
+  # This is why the fallback was dead on Windows and why making it a
+  # two-edition catch could not have revived it.
+  # The catch is KEPT for editions that raise a genuine terminating error for the
+  # same 302 -- PowerShell 7 is reported to raise HttpResponseException carrying an
+  # HttpResponseMessage. -ErrorAction SilentlyContinue only downgrades NON-terminating
+  # errors, so a truly terminating one still arrives here. This surface has no pwsh
+  # installed, so the 7.x branch below is written defensively and is NOT verified
+  # here; the 5.1 path above is measured.
+  $iwrError = $null
   try {
     $r1 = Invoke-WebRequest -Uri $cfg.BUS_URL -Method Post -Body $bytes `
           -ContentType 'application/json; charset=utf-8' -MaximumRedirection 0 `
-          -UseBasicParsing -TimeoutSec 120
+          -UseBasicParsing -TimeoutSec 120 `
+          -ErrorAction SilentlyContinue -ErrorVariable iwrError
+
+    if ($null -eq $r1) {
+      # No response object at all: a real transport failure, not a suppressed 302.
+      if ($iwrError -and @($iwrError).Count -gt 0) { throw @($iwrError)[0] }
+      throw "BUS_IWR_NO_RESPONSE: Invoke-WebRequest returned nothing for hop 1."
+    }
+
     $readHttpStatus = [int]$r1.StatusCode
     $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r1.Headers['Content-Type'])
-    if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) { $location = $r1.Headers['Location'] }
+    if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) {
+      $location = $r1.Headers['Location']
+      if (-not $location) {
+        throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $([int]$r1.StatusCode) with no Location header."
+      }
+    }
     else { $content = $r1.Content }
   } catch {
-    # TWO EDITIONS THROW TWO DIFFERENT TYPES for the same 302.
-    #
-    # Windows PowerShell 5.1 raises System.Net.WebException carrying an
-    # HttpWebResponse, whose headers are indexed like a dictionary. PowerShell 7
-    # raises Microsoft.PowerShell.Commands.HttpResponseException carrying an
-    # HttpResponseMessage, whose headers are a typed collection and whose
-    # StatusCode is an enum. Catching only WebException meant that on
-    # PowerShell 7 the 302 this contract DEPENDS ON escaped as an unhandled
-    # error and every read died before hop 2 - the same failure mode the 2026-08-28
-    # regression fix above describes, arriving by a different route.
-    $resp = $_.Exception.Response
+    $resp = $null
+    try { $resp = $_.Exception.Response } catch { $resp = $null }
     if (-not $resp) { throw }
 
     $status = 0
@@ -385,20 +419,28 @@ if ($curl) {
 
     $contentType = ''
     $locationValue = $null
-    if ($resp.PSObject.Properties['Headers'] -and $resp.Headers) {
-      try {
-        # HttpResponseMessage: typed headers.
-        if ($resp.Headers -is [System.Net.Http.Headers.HttpResponseHeaders]) {
-          if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
-          if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
-            $contentType = [string]$resp.Content.Headers.ContentType
-          }
-        } else {
-          # HttpWebResponse: dictionary-style indexing.
-          $locationValue = [string]$resp.Headers['Location']
-          $contentType = [string]$resp.Headers['Content-Type']
+    # DUCK-TYPE, never a type literal. `-is [System.Net.Http.Headers.HttpResponseHeaders]`
+    # cannot be evaluated on Windows PowerShell 5.1 at all: System.Net.Http is not
+    # loaded at startup and this script does not Add-Type it, so the literal raises
+    # "Unable to find type" and takes the whole branch with it. Comparing the type
+    # NAME needs no assembly to be loaded and behaves the same on both editions.
+    try {
+      $headerTypeName = ''
+      if ($null -ne $resp.Headers) { $headerTypeName = $resp.Headers.GetType().FullName }
+      if ($headerTypeName -eq 'System.Net.Http.Headers.HttpResponseHeaders') {
+        if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
+        if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
+          $contentType = [string]$resp.Content.Headers.ContentType
         }
-      } catch { }
+      } elseif ($headerTypeName) {
+        # HttpWebResponse and the 5.1 dictionary shapes: indexed access.
+        $locationValue = [string]$resp.Headers['Location']
+        $contentType = [string]$resp.Headers['Content-Type']
+      }
+    } catch {
+      # Do NOT swallow silently. An unreadable header collection is a fact hop 2
+      # needs, and the previous empty catch turned it into a wrong answer.
+      Write-Warning "BUS_IWR_HEADER_READ_FAILED: $($_.Exception.Message)"
     }
 
     if ($status) { $readHttpStatus = $status }
