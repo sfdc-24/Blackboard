@@ -314,7 +314,21 @@ $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 # The no-follow contract from REQ-PR4EXZ is unchanged -- only the client is.
 $location = $null
 $content  = $null
-$curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+# curl.exe on Windows, curl on Linux and macOS. Looking only for curl.exe meant
+# the PREFERRED, well-tested two-hop path was silently unavailable off Windows,
+# and every read fell through to the Invoke-WebRequest fallback - which then
+# failed on the 302 for a different reason entirely (see the catch below).
+#
+# -CommandType Application is load-bearing, not tidiness. In Windows PowerShell
+# 5.1 `curl` is an ALIAS FOR Invoke-WebRequest, so a bare `Get-Command curl`
+# resolves to the very cmdlet this branch exists to avoid, and the "curl path"
+# would quietly be the fallback path wearing its name.
+$curl = $null
+foreach ($candidate in @('curl.exe', 'curl')) {
+    $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($found) { $curl = $found; break }
+}
 $readTransportExit = $null
 $readHttpStatus = $null
 $readContentTypeClass = $null
@@ -352,14 +366,45 @@ if ($curl) {
     $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r1.Headers['Content-Type'])
     if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) { $location = $r1.Headers['Location'] }
     else { $content = $r1.Content }
-  } catch [System.Net.WebException] {
+  } catch {
+    # TWO EDITIONS THROW TWO DIFFERENT TYPES for the same 302.
+    #
+    # Windows PowerShell 5.1 raises System.Net.WebException carrying an
+    # HttpWebResponse, whose headers are indexed like a dictionary. PowerShell 7
+    # raises Microsoft.PowerShell.Commands.HttpResponseException carrying an
+    # HttpResponseMessage, whose headers are a typed collection and whose
+    # StatusCode is an enum. Catching only WebException meant that on
+    # PowerShell 7 the 302 this contract DEPENDS ON escaped as an unhandled
+    # error and every read died before hop 2 - the same failure mode the 2026-08-28
+    # regression fix above describes, arriving by a different route.
     $resp = $_.Exception.Response
-    if ($resp) {
-      $readHttpStatus = [int]$resp.StatusCode
-      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$resp.Headers['Content-Type'])
+    if (-not $resp) { throw }
+
+    $status = 0
+    try { $status = [int]$resp.StatusCode } catch { $status = 0 }
+
+    $contentType = ''
+    $locationValue = $null
+    if ($resp.PSObject.Properties['Headers'] -and $resp.Headers) {
+      try {
+        # HttpResponseMessage: typed headers.
+        if ($resp.Headers -is [System.Net.Http.Headers.HttpResponseHeaders]) {
+          if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
+          if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
+            $contentType = [string]$resp.Content.Headers.ContentType
+          }
+        } else {
+          # HttpWebResponse: dictionary-style indexing.
+          $locationValue = [string]$resp.Headers['Location']
+          $contentType = [string]$resp.Headers['Content-Type']
+        }
+      } catch { }
     }
-    if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
-      $location = $resp.Headers['Location']
+
+    if ($status) { $readHttpStatus = $status }
+    if ($contentType) { $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $contentType }
+    if ($status -ge 300 -and $status -lt 400 -and $locationValue) {
+      $location = $locationValue
     } else { throw }
   }
 }
