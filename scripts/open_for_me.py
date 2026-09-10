@@ -160,6 +160,36 @@ def head_of(payload):
     return ""
 
 
+MIN_SHA = 7          # git's own shortest unambiguous default
+
+
+def same_commit(a, b):
+    """Do two head strings name the same commit?
+
+    The fleet writes both short and full SHAs - the live PR40 hold says
+    `4ccb0cd9...` while its id says `PR40-4CCB`. A raw string comparison called
+    those different, so a GO on the SAME commit expressed at a different length
+    would have superseded a hold placed on it. That is a fail-open inside the
+    thing meant to keep holds alive, and codex found it at a5453de.
+
+    Hex only, at least seven characters, and one must be a prefix of the other.
+    Anything shorter or non-hex is treated as NOT a match, because guessing here
+    lifts safety holds.
+    """
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if not (re.fullmatch(r"[0-9a-f]+", a) and re.fullmatch(r"[0-9a-f]+", b)):
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < MIN_SHA:
+        return False
+    return long_.startswith(short)
+
+
 def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
     """Is this hold still in force?
 
@@ -215,7 +245,10 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
         if hold_pr and field(payload, "pr") == hold_pr and authorised:
             verdict = (field(payload, "verdict") or "").upper()
             head = head_of(payload)
-            if (verdict.startswith("GO") or verdict == "MERGED") and head and head != hold_head:
+            # same_commit, not string inequality: a GO on the same commit written
+            # at a different SHA length must NOT supersede a hold placed on it.
+            if ((verdict.startswith("GO") or verdict == "MERGED")
+                    and head and hold_head and not same_commit(head, hold_head)):
                 return SUPERSEDED_LIKELY, ("a later GO by its placer on a different head: "
                                            + (field(payload, "id") or cell(r, COL_ROWID)))
     return ACTIVE, rejected

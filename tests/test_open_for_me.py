@@ -330,6 +330,36 @@ check("and still prefers exact_head when both are present",
       ofm.head_of("BCB|v=1|exact_head=aaa|reviewed_head=bbb") == "aaa")
 
 print("")
+print("== a short SHA and a full SHA are the SAME commit ==")
+# The fleet writes both. The live PR40 hold carries 4ccb0cd9... while its id
+# says PR40-4CCB. String inequality called those different, so a GO on the SAME
+# commit at a different length would have superseded a hold placed on it - a
+# fail-open inside the thing meant to keep holds alive. Found by codex at a5453de.
+FULL = "4ccb0cd93f237eac6909b56739be698b752846e4"
+check("full vs its own 7-char prefix is the same commit",
+      ofm.same_commit(FULL, FULL[:7]))
+check("full vs its 12-char prefix is the same commit", ofm.same_commit(FULL[:12], FULL))
+check("identical strings are the same commit", ofm.same_commit(FULL, FULL))
+check("a genuinely different SHA is NOT the same commit",
+      not ofm.same_commit(FULL, "82300d1d5bd265418235b83aaa81e9af1084a841"))
+check("a prefix shorter than 7 is refused, not guessed",
+      not ofm.same_commit(FULL, "4ccb"))
+check("non-hex is refused", not ofm.same_commit(FULL, "4ccb0cd-branch"))
+check("empty is refused", not ofm.same_commit(FULL, "") and not ofm.same_commit("", FULL))
+
+# And the behaviour that matters: a GO on the same commit must NOT lift the hold.
+SHORT_HOLD = ("BCB|v=1|id=SHORT-HOLD|phase=RESULT|from=codex|to=claude-code-cli"
+              "|pr=https://x/pull/40|reviewed_head=" + FULL[:12] + "|verdict=NO-GO"
+              "|hold=do not merge this head")
+SAME_COMMIT_GO = ("BCB|v=1|id=SAMECOMMIT-GO|phase=RESULT|from=codex|to=claude-code-cli"
+                  "|pr=https://x/pull/40|reviewed_head=" + FULL + "|verdict=GO")
+r_sha = ofm.open_for([row("2026-09-09T12:00:00Z", "codex", SHORT_HOLD, "DONE"),
+                      row("2026-09-09T15:00:00Z", "codex", SAME_COMMIT_GO, "DONE"),
+                      row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")], TAG, now=NOW)
+check("a GO on the SAME commit written longer does NOT lift the hold",
+      r_sha["active_holds"] == ["SHORT-HOLD"], r_sha["active_holds"])
+
+print("")
 print("== board text is sanitised and bounded ==")
 NASTY = ("BCB|v=1|id=NASTY|phase=RESULT|from=codex|to=claude-code-cli|priority=HIGH")
 NEWLINE = chr(10)
