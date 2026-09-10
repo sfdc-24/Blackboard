@@ -144,35 +144,81 @@ def newest_viewport(rows, now=None):
     return best
 
 
-def hold_lifecycle(hold_id, hold_pr, hold_when, rows):
+# The fleet names a reviewed commit in more than one way. Read what is actually
+# written rather than what a schema says should be: the live PR40 rows use
+# `reviewed_head=`, and requiring `exact_head=` made the supersede path
+# unreachable on real data while every invented fixture still passed. A test
+# built on an assumed field name validates the assumption, not the board.
+HEAD_FIELDS = ("exact_head", "reviewed_head", "head", "merged_head", "new_head")
+
+
+def head_of(payload):
+    for key in HEAD_FIELDS:
+        value = field(payload, key)
+        if value:
+            return value
+    return ""
+
+
+def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
     """Is this hold still in force?
 
-    Explicitly cleared when a LATER row names it in `clears=` or `supersedes=`.
+    ONLY THE PLACER MAY LIFT THEIR OWN HOLD.
 
-    Likely superseded when the hold names a PR and a later row from another tag
-    records a GO on that same PR at a different exact head - the shape that had
-    a settled PR40 hold resurfacing for ever.
+    The first version honoured any later row carrying `clears=<id>`. The board
+    is append-only and every instance can write to it, so that meant ANY writer
+    - or any row that merely happened to contain the text - could retire a
+    CRITICAL safety hold and turn the gate green. Codex reproduced exactly that
+    against 8fdf4bd with adversarial rows. A lock anyone can open is decoration.
 
-    A likely-superseded hold is still SHOWN, with the clearing row named. It is
-    not deleted: guessing a safety hold closed is a worse error than repeating
-    one that is already handled, and the reader can see the evidence and judge.
+    A clearing row must therefore:
+      * be a canonical BCB row, not arbitrary prose that contains the id;
+      * come from the SAME identity that placed the hold, matched on `from=`
+        and on the row's own Source_Tag - board text is data, but the Source_Tag
+        column is written by the bus rather than the payload author;
+      * be strictly later than the hold.
+
+    The same-PR GO path is narrower still: same placer, and an `exact_head` that
+    is present and DIFFERENT from the head the hold was placed on. A GO on the
+    same head the hold objected to clears nothing.
+
+    Anything unauthorised leaves the hold ACTIVE and says why, rather than
+    silently ignoring the attempt - a rejected clear is worth seeing.
     """
     if not hold_id:
         return ACTIVE, ""
+    rejected = ""
     for r in rows:
         payload = cell(r, COL_PAYLOAD)
+        if not payload.startswith("BCB|"):
+            continue                     # prose that mentions an id is not a clear
         when = parse_ts(cell(r, COL_TS))
         if when is None or (hold_when and when <= hold_when):
             continue
-        for key in ("clears", "supersedes"):
-            if hold_id and hold_id in [v.strip() for v in field(payload, key).split(",")]:
-                return CLEARED, "cleared by " + (field(payload, "id") or cell(r, COL_ROWID))
-        if hold_pr and field(payload, "pr") == hold_pr:
+        row_from = field(payload, "from")
+        row_tag = cell(r, COL_SOURCE)
+        # Authorised means the SAME placer, by both the payload claim and the
+        # bus-written Source_Tag. Requiring both means forging the payload alone
+        # is not enough.
+        authorised = bool(hold_from) and row_from == hold_from and row_tag == hold_from
+
+        names_it = any(hold_id in [v.strip() for v in field(payload, key).split(",")]
+                       for key in ("clears", "supersedes"))
+        if names_it:
+            who = field(payload, "id") or cell(r, COL_ROWID)
+            if authorised:
+                return CLEARED, "cleared by its placer in " + who
+            rejected = ("an UNAUTHORISED clear from " + (row_tag or "?")
+                        + " was ignored (" + who + ")")
+            continue
+
+        if hold_pr and field(payload, "pr") == hold_pr and authorised:
             verdict = (field(payload, "verdict") or "").upper()
-            if verdict.startswith("GO") or verdict == "MERGED":
-                return SUPERSEDED_LIKELY, ("a later GO on the same PR: "
+            head = head_of(payload)
+            if (verdict.startswith("GO") or verdict == "MERGED") and head and head != hold_head:
+                return SUPERSEDED_LIKELY, ("a later GO by its placer on a different head: "
                                            + (field(payload, "id") or cell(r, COL_ROWID)))
-    return ACTIVE, ""
+    return ACTIVE, rejected
 
 
 def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, now=None):
@@ -207,8 +253,13 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
         when = parse_ts(cell(r, COL_TS))
         lifecycle, why = (ACTIVE, "")
         if is_hold:
+            # The placer identity comes from the row's own Source_Tag where
+            # present, falling back to the payload's from=. Source_Tag is
+            # written by the bus; from= is written by the author.
+            placer = cell(r, COL_SOURCE) or field(payload, "from")
             lifecycle, why = hold_lifecycle(field(payload, "id"), field(payload, "pr"),
-                                            when, rows)
+                                            when, placer, head_of(payload),
+                                            rows)
             if lifecycle == CLEARED:
                 continue                     # explicitly cleared: not work any more
         # Fail closed: an unparseable stamp or no trustworthy horizon means we
