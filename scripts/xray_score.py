@@ -220,21 +220,53 @@ def load_env(path):
     return conf
 
 
+# Only these suffixes are accepted as the org host. A client secret is about to
+# be posted to it, so "looks like a URL" is not good enough.
+SALESFORCE_HOSTS = (".salesforce.com", ".force.com", ".salesforce.mil")
+
+
 def normalise_base(domain):
-    base = domain.rstrip("/")
-    if not base.startswith("http"):
+    """HTTPS to a Salesforce host, or nothing.
+
+    The old version prepended https:// only when the string did not already
+    start with "http" - so a value of http://evil.example passed straight
+    through as PLAINTEXT, and the client secret below would have gone with it.
+    A config file is not a trust boundary; this is.
+    """
+    base = str(domain).strip().rstrip("/")
+    if not base:
+        raise ValueError("no org domain configured")
+    if base.startswith("http://"):
+        raise ValueError("refusing a plaintext http:// org domain - a client "
+                         "secret is posted to this host")
+    if not base.startswith("https://"):
         base = "https://" + base
+    host = (urllib.parse.urlparse(base).hostname or "").lower()
+    if not host:
+        raise ValueError("could not parse a hostname from the org domain")
+    if not host.endswith(SALESFORCE_HOSTS):
+        raise ValueError("refusing to send client credentials to a non-Salesforce "
+                         "host: " + host)
     return base
 
 
 def get_token(conf):
+    """Exchange client credentials for a token.
+
+    HTTPS to a verified Salesforce host, and NO REDIRECTS. A redirect on this
+    request would carry the client_id and client_secret to whatever host the
+    Location header names - which is the worst possible thing to follow
+    automatically. The Data API path was hardened first and this one was not;
+    found by codex reviewing PR55 at 2c1ae2f.
+    """
     base = normalise_base(conf["Headless_domain"])
     body = urllib.parse.urlencode({
         "grant_type": "client_credentials",
         "client_id": conf["Headless_consumer_key"],
         "client_secret": conf["Headless_consumer_secret"]}).encode()
     req = urllib.request.Request(base + "/services/oauth2/token", data=body)
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(req, timeout=45) as resp:
         return base, json.load(resp)["access_token"]
 
 

@@ -175,6 +175,37 @@ check("more active than total is UNKNOWN, not negative defects",
       flows.state == xs.UNKNOWN, flows.state)
 
 print("")
+print("== the CREDENTIAL path refuses anywhere it should not post a secret ==")
+# The Data API path was hardened first and the token exchange was not. A client
+# secret is posted to whatever normalise_base returns, so this is the boundary
+# that matters most in the file. Found by codex reviewing 2c1ae2f.
+for bad, why in [("http://dbm.my.salesforce.com", "plaintext http, secret in the clear"),
+                 ("http://evil.example", "plaintext AND foreign"),
+                 ("https://evil.example", "https but not a Salesforce host"),
+                 ("https://salesforce.com.evil.test", "suffix-lookalike host"),
+                 ("", "empty domain")]:
+    try:
+        xs.normalise_base(bad)
+        check("refused: " + why, False, "accepted " + repr(bad))
+    except ValueError:
+        check("refused: " + why, True)
+for good, why in [("dbm00000.develop.my.salesforce.com", "bare host gets https"),
+                  ("https://dbm00000.develop.my.salesforce.com", "already https"),
+                  ("https://x.my.salesforce.com/", "trailing slash trimmed")]:
+    try:
+        got = xs.normalise_base(good)
+        check("accepted: " + why, got.startswith("https://") and not got.endswith("/"), got)
+    except ValueError as e:
+        check("accepted: " + why, False, str(e))
+# The token request must not follow a redirect - a Location header would carry
+# client_id and client_secret to a host nobody approved.
+import inspect
+src_tok = inspect.getsource(xs.get_token)
+check("the token exchange builds a no-redirect opener",
+      "build_opener(NoRedirect)" in src_tok, src_tok[-120:])
+check("and does not call bare urlopen", "urllib.request.urlopen(" not in src_tok)
+
+print("")
 print("== read-only is enforced at runtime, not asserted in a comment ==")
 for bad_path, why in [("/services/apexrest/thing", "not a Data API path"),
                       ("https://evil.example/services/data/v67.0/query", "absolute foreign URL")]:
@@ -191,10 +222,15 @@ check("a redirect handler is installed rather than followed",
 src = open(ENGINE, encoding="utf-8").read()
 # Exactly one raw urlopen (the OAuth token POST) and exactly one opener.open
 # (inside get_json). Any third network call would be a path around the boundary.
-check("only get_token calls urlopen directly",
-      src.count("urllib.request.urlopen") == 1, src.count("urllib.request.urlopen"))
-check("only get_json opens the guarded opener",
-      src.count("opener.open") == 1, src.count("opener.open"))
+# Both network paths now go through a no-redirect opener: the Data API GET and
+# the token exchange. There is no bare urlopen left in the engine at all.
+# These two assertions previously read "urlopen == 1, opener.open == 1", which
+# encoded the OLD design where the credential exchange followed redirects. They
+# failed when that was fixed, which is exactly what a good assertion does.
+check("no bare urlopen remains anywhere in the engine",
+      src.count("urllib.request.urlopen(") == 0, src.count("urllib.request.urlopen("))
+check("both network paths use the guarded opener",
+      src.count("opener.open") == 2, src.count("opener.open"))
 check("count() goes through get_json rather than building its own request",
       "def count(" in src and "get_json(base, token," in src)
 
