@@ -8,10 +8,29 @@ drops fields is how a port gets declared equivalent when it is not.
 """
 import json
 import sys
+import re
+
+
+def strict_json(text):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate JSON key: ' + key)
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError('invalid JSON constant: ' + value)
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+
 
 a_path, b_path = sys.argv[1], sys.argv[2]
-a = json.load(open(a_path, encoding="utf-8-sig"))
-b = json.load(open(b_path, encoding="utf-8-sig"))
+with open(a_path, encoding="utf-8-sig") as source:
+    a = strict_json(source.read())
+with open(b_path, encoding="utf-8-sig") as source:
+    b = strict_json(source.read())
 
 print("A: {0:<10} PowerShell {1} ({2})".format(a["platform"], a["ps_version"], a["ps_edition"]))
 print("B: {0:<10} PowerShell {1} ({2})".format(b["platform"], b["ps_version"], b["ps_edition"]))
@@ -32,13 +51,15 @@ def pass_succeeded(p):
     preserves behaviour. It is evidence that nothing was measured, and it is
     worse than a red result because it wears a green one.
     """
-    if p.get("threw"):
+    if type(p.get("exit_code")) is not int or p["exit_code"] != 0:
+        return False, "runner exit_code must be integer zero"
+    if p.get("threw") != "":
         return False, "threw: " + str(p["threw"])[:120]
     out = (p.get("stdout") or "").strip()
     if not out:
         return False, "no stdout at all"
     try:
-        verdict = json.loads(out.splitlines()[-1])
+        verdict = strict_json(out.splitlines()[-1])
     except Exception:
         return False, "last stdout line is not the JSON verdict: " + out.splitlines()[-1][:100]
     if not isinstance(verdict, dict):
@@ -51,13 +72,55 @@ def pass_succeeded(p):
 def side_ran(doc, label):
     """Every pass on this side must have succeeded, and no run_error logged."""
     ok = True
-    for p in doc["passes"]:
+    expected = {(s, n) for s in ("seeded", "replay") for n in (1, 2)}
+    passes = doc.get("passes")
+    if not isinstance(passes, list) or len(passes) != 4:
+        problems.append(label + ": expected exactly four fixture passes")
+        return False
+    identities = []
+    for p in passes:
+        if not isinstance(p, dict) or type(p.get("pass")) is not int or not isinstance(p.get("scenario"), str):
+            problems.append(label + ": invalid pass identity")
+            return False
+        identities.append((p["scenario"], p["pass"]))
+    if set(identities) != expected:
+        problems.append(label + ": expected seeded/replay passes 1 and 2 without duplicates")
+        ok = False
+    for p in passes:
         good, why = pass_succeeded(p)
         if not good:
             ok = False
             problems.append("{0} {1} pass {2} did not run: {3}".format(
                 label, p.get("scenario", "?"), p.get("pass", "?"), why))
-    for scenario, decisions in (doc.get("log_decisions") or {}).items():
+    scenarios = {"seeded", "replay"}
+    logs = doc.get("log_decisions")
+    states = doc.get("state")
+    if not isinstance(logs, dict) or set(logs) != scenarios:
+        problems.append(label + ": missing scenario decision evidence")
+        return False
+    if not isinstance(states, dict) or set(states) != scenarios:
+        problems.append(label + ": missing scenario state evidence")
+        return False
+    for scenario, state in states.items():
+        try:
+            parsed = strict_json(state)
+            if not isinstance(parsed, dict) or not parsed:
+                raise ValueError("empty state")
+        except (ValueError, TypeError):
+            problems.append(label + " " + scenario + ": missing or invalid persisted state")
+            ok = False
+    for scenario, decisions in logs.items():
+        if not isinstance(decisions, list) or not decisions:
+            problems.append(label + " " + scenario + ": empty decision evidence")
+            ok = False
+            continue
+        if any(not isinstance(d, dict) or not isinstance(d.get("event"), str) for d in decisions):
+            problems.append(label + " " + scenario + ": invalid decision evidence")
+            ok = False
+            continue
+        if sum(d.get("event") == "poll_started" for d in decisions) != 2:
+            problems.append(label + " " + scenario + ": expected two poll_started events")
+            ok = False
         for d in decisions or []:
             if str(d.get("event")) in ("run_error", "<UNPARSEABLE>"):
                 ok = False
@@ -83,14 +146,29 @@ print("")
 
 # A run must also be from two DIFFERENT platforms, or it is a comparison with
 # itself wearing two filenames.
-if a["platform"] == b["platform"] and a["ps_version"] == b["ps_version"]:
-    print("REFUSING TO COMPARE: both artifacts are {0} PowerShell {1}. That is the "
-          "same host twice, not a cross-host comparison.".format(
-              a["platform"], a["ps_version"]))
+def endpoint(doc):
+    version = doc.get("ps_version")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+(?:\.\d+){1,3}", version):
+        return None
+    parts = tuple(int(p) for p in version.split("."))
+    if doc.get("platform") == "Windows" and doc.get("ps_edition") == "Desktop" and parts[:2] == (5, 1):
+        return "Windows"
+    if doc.get("platform") == "Linux" and doc.get("ps_edition") == "Core" and parts[:2] >= (7, 5):
+        return "Linux"
+    return None
+
+
+if {endpoint(a), endpoint(b)} != {"Windows", "Linux"}:
+    print("REFUSING TO COMPARE: require Windows/Desktop 5.1 versus Linux/Core 7.5+.")
+    print("The same host twice or two Windows runtimes is not a cross-platform comparison.")
     sys.exit(1)
 
 # The input must be identical or nothing below means anything.
-if a["fixture_sha"] != b["fixture_sha"]:
+for doc in (a, b):
+    if not isinstance(doc.get("fixture_sha"), str) or not re.fullmatch(r"[0-9a-fA-F]{64}", doc["fixture_sha"]):
+        print("REFUSING TO COMPARE: invalid fixture SHA-256")
+        sys.exit(1)
+if a["fixture_sha"].lower() != b["fixture_sha"].lower():
     problems.append("DIFFERENT FIXTURE: {0} vs {1}".format(a["fixture_sha"][:16], b["fixture_sha"][:16]))
     print("!! the two runs did not read the same fixture; stopping")
     sys.exit(1)
@@ -104,6 +182,11 @@ def decisions(doc, scenario):
 
 scenarios = sorted(set(list(a["log_decisions"].keys()) + list(b["log_decisions"].keys())))
 for s in scenarios:
+    # Preserve JSON types: Python's direct equality would equate true with 1.
+    sa = json.dumps(strict_json(a["state"][s]), sort_keys=True, separators=(",", ":"))
+    sb = json.dumps(strict_json(b["state"][s]), sort_keys=True, separators=(",", ":"))
+    if sa != sb:
+        problems.append("scenario {0}: persisted state differs".format(s))
     da, db = decisions(a, s), decisions(b, s)
     if da == db:
         print("scenario {0:<8}: MATCH ({1} decisions)".format(s, len(da)))
@@ -149,7 +232,7 @@ if problems:
     for p in problems:
         print("  - " + p)
     sys.exit(1)
-print("No behavioural differences in decisions or stdout.")
+print("No behavioural differences in decisions, stdout, or persisted state.")
 print("This is equal output on equal input. It is NOT proof the port is")
 print("complete: only the fixture's paths were exercised, in Observe mode,")
 print("with no provider invocation and no board write.")
