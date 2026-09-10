@@ -22,6 +22,27 @@ function Assert-True {
     }
 }
 
+function ConvertTo-FlowedText {
+    # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
+    # pipeline, so an assertion that matches a long phrase in captured error
+    # output is really asserting on the width of whoever ran it. Measured on one
+    # machine, one commit, real 5.1: at a 74-column console the hop-2 phrase check
+    # below FAILS; at 200 columns the identical run passes. Collapsing every run of
+    # whitespace to one space removes the wrap and leaves the phrase intact.
+    param([AllowNull()][object[]]$Lines)
+    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', ' ')
+}
+
+function ConvertTo-SquashedText {
+    # For canary-ABSENCE checks, collapsing to a space is not enough: a wrap can
+    # land INSIDE a long token, and `-not $text.Contains('SOME_LONG_CANARY')` then
+    # passes because the canary was split across two lines. A negative assertion
+    # that a leaked secret is absent must not be satisfiable by console width.
+    # Removing whitespace entirely rejoins any hard-wrapped token before matching.
+    param([AllowNull()][object[]]$Lines)
+    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', '')
+}
+
 function Write-TestUtf8 {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -779,7 +800,8 @@ try {
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('CANONICAL_REDIRECT_CANARY') -and
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('BUS_SECRET_REDIRECT_CANARY')
     )
-    $secondRedirectFailureText = @($actualBusSecondRedirect.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    $secondRedirectFailureText = ConvertTo-FlowedText -Lines $actualBusSecondRedirect.failure_output
+    $secondRedirectFailureSquashed = ConvertTo-SquashedText -Lines $actualBusSecondRedirect.failure_output
     Assert-True 'failed final hop 2 preserves sanitized metadata before returning nonzero' (
         $actualBusSecondRedirect.failure_exit_code -ne 0 -and
         $actualBusSecondRedirect.failure_call_count -eq 2 -and
@@ -793,10 +815,10 @@ try {
     )
     Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
         $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
-        -not $secondRedirectFailureText.Contains('ONE_SHOT_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('CANONICAL_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('FINAL_REDIRECT_BODY_CANARY') -and
-        -not $secondRedirectFailureText.Contains('BUS_SECRET_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('ONE_SHOT_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('CANONICAL_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('FINAL_REDIRECT_BODY_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('BUS_SECRET_REDIRECT_CANARY') -and
         -not $actualBusSecondRedirect.failure_metadata_text.Contains('FINAL_REDIRECT_BODY_CANARY')
     )
 
@@ -819,7 +841,7 @@ try {
         $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
         $null -eq $actualBusIwrFallback.success_trace.exception_type
     )
-    $iwrFailureOutputText = @($actualBusIwrFallback.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
     Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
         @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
