@@ -96,7 +96,33 @@ Nothing below has started.
    timer that does what the Scheduled Task does: run the worker on an interval,
    as a fixed user, not overlapping, restart on failure. `install_order_supervisor.ps1`
    and `register_task.ps1` are replaced, not translated.
-2. **Fix the five known runtime blockers above**, engine path first.
+2. **Fix the known runtime blockers**, engine path first.
+
+   > **Update, later the same day.** The list above said five. Doing the work
+   > found **eight**, and the three extra ones are the interesting part because
+   > each needed something to actually RUN before it appeared:
+   >
+   > 6. `[Security.Principal.WindowsIdentity]::GetCurrent()` **exists** in .NET
+   >    on Linux and throws `PlatformNotSupportedException`. It parses, it
+   >    resolves, static analysis is happy, and the supervisor dies on its
+   >    first poll.
+   > 7. `ConvertFrom-Json` on PowerShell 7 coerces ISO-8601 strings to
+   >    `[DateTime]`, so board timestamps stop being the text the admission
+   >    rules compare. The guard written to prevent this asked for a parameter
+   >    that only exists in PowerShell 7.5, and silently fell through below it.
+   > 8. `Start-Process -WindowStyle Hidden` is Windows-only and throws
+   >    elsewhere. It sits on the EXECUTE path, so every Observe-mode
+   >    comparison — including 2,466 matching decisions on real board data —
+   >    went straight past it.
+   >
+   > Plus two in the bus client: the `curl` lookup asked for `curl.exe`, and
+   > the 302 catch expected `WebException` where PowerShell 7 throws
+   > `HttpResponseException`. Together those meant `bus.ps1` could not read the
+   > bus off Windows at all.
+   >
+   > The count is not the lesson. The lesson is that a static inventory found
+   > the first five and **execution found the rest**, so the estimate below
+   > should be read as a floor rather than a total.
 3. **Run the worker against a FIXTURE board on the instance**, never the live
    board, and diff its output against the same fixture run on Windows. Equal
    output on the same input is the only evidence that means anything here.
