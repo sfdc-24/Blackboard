@@ -23,6 +23,7 @@ RUN
   python3 tests/test_bus_benchmark.py
 """
 import importlib.util
+import json
 import os
 import sys
 
@@ -116,6 +117,128 @@ mixed = bb.summarise([10.0, None, 30.0])
 check("a partial run is MEASURED but counts the failures",
       mixed["state"] == "MEASURED" and mixed["failed"] == 1, mixed)
 check("and reports how many actually succeeded", mixed["ok"] == 2)
+
+print("")
+print("== what counts as a board, and what only looks like one ==")
+GOOD = json.dumps({"ok": True, "rows": [["Row_ID"], ["a"], ["b"]]}).encode()
+n, why = bb.board_rows(GOOD)
+check("a real board counts its rows", n == 3 and why is None, (n, why))
+
+for raw, why_expected in [
+        (json.dumps({"ok": False, "error": "nope", "rows": [["x"]]}).encode(),
+         "an ok=false envelope that still carries rows"),
+        (json.dumps({"rows": "1963"}).encode(),
+         "rows as a STRING, whose len() is 4"),
+        (json.dumps({"rows": {"a": 1}}).encode(),
+         "rows as a dict"),
+        (json.dumps({"rows": []}).encode(), "zero rows"),
+        (json.dumps({"rows": [["ok"], "not-a-row"]}).encode(),
+         "a row that is not a list"),
+        (json.dumps([1, 2, 3]).encode(), "a JSON array instead of an object"),
+        (b"<html>redirect artifact</html>", "an HTML redirect artifact"),
+        (b"", "an empty body"),
+        (None, "no body at all")]:
+    n, why = bb.board_rows(raw)
+    check("refuses " + why_expected, n is None and bool(why), (n, why))
+
+print("")
+print("== every number stays with the request that produced it ==")
+# The defect: sizes and rows were separate lists, appended under different
+# conditions, then quoted as sizes[0] and rows[0] - one line describing one
+# request, assembled from two.
+calls = []
+
+
+def fake_post_factory(script):
+    def fake_post(url, payload, timeout=90):
+        calls.append(url)
+        item = script[len(calls) - 1]
+        if isinstance(item, Exception):
+            raise item
+        return item
+    return fake_post
+
+
+real_post = bb.http_post
+bb.http_post = fake_post_factory([
+    b"tiny redirect artifact",                                   # invalid, 22 bytes
+    json.dumps({"ok": True, "rows": [["h"]] + [["r"]] * 99}).encode(),   # valid, 100 rows
+])
+samples = bb.bench_read("https://x/y", "s", "t", 2)
+bb.http_post = real_post
+check("the invalid sample carries its own byte count and no rows",
+      samples[0]["bytes"] == 22 and samples[0]["rows"] is None, samples[0])
+check("and records WHY it was not a board", bool(samples[0]["why"]), samples[0])
+check("the invalid sample contributes no timing", samples[0]["ms"] is None)
+check("the valid sample carries both its bytes and its rows",
+      samples[1]["rows"] == 100 and samples[1]["bytes"] > 100, samples[1])
+check("the invalid sample's bytes are NOT the ones a report would quote",
+      [s for s in samples if s["rows"] is not None][0]["bytes"] != 22)
+
+print("")
+print("== the exit code distinguishes clean, partial, and no measurement ==")
+
+
+def side(read_state, failed=0, health_failed=0, drift=None):
+    s = {"full_read_ms": {"state": read_state, "failed": failed},
+         "health_ms": {"state": "MEASURED", "failed": health_failed}}
+    if drift:
+        s["row_count_varied"] = drift
+    return s
+
+
+def rep(cur, tgt):
+    return {"sides": {"current": cur, "target": tgt}}
+
+
+check("all clean is 0",
+      bb.verdict(rep(side("MEASURED"), side("MEASURED"))) == bb.EXIT_OK)
+check("one failed read sample is NOT 0",
+      bb.verdict(rep(side("MEASURED", failed=1), side("MEASURED"))) == bb.EXIT_INCOMPLETE)
+check("nine of ten failing is NOT 0 (the whole point)",
+      bb.verdict(rep(side("MEASURED", failed=9), side("MEASURED"))) == bb.EXIT_INCOMPLETE)
+check("a failed HEALTH probe is NOT 0",
+      bb.verdict(rep(side("MEASURED"), side("MEASURED", health_failed=1)))
+      == bb.EXIT_INCOMPLETE)
+check("row-count drift is NOT 0",
+      bb.verdict(rep(side("MEASURED"), side("MEASURED", drift=[10, 11])))
+      == bb.EXIT_INCOMPLETE)
+check("no measurement at all is 2",
+      bb.verdict(rep(side(bb.UNKNOWN), side("MEASURED"))) == bb.EXIT_UNKNOWN)
+check("UNKNOWN outranks INCOMPLETE",
+      bb.verdict(rep(side("MEASURED", failed=3), side(bb.UNKNOWN))) == bb.EXIT_UNKNOWN)
+check("the three codes are distinct",
+      len({bb.EXIT_OK, bb.EXIT_INCOMPLETE, bb.EXIT_UNKNOWN}) == 3)
+
+print("")
+print("== redirects are followed one hop at a time, each one checked ==")
+check("there is a hop ceiling", isinstance(bb.MAX_HOPS, int) and bb.MAX_HOPS >= 2)
+for bad, why in [("http://script.googleusercontent.com/x", "a downgrade to plaintext"),
+                 ("https://evil.example/x", "a hop to a foreign origin"),
+                 ("https://notgoogle.com.evil.example/x", "a lookalike host")]:
+    try:
+        bb._redirect_allowed("https://script.google.com/macros/s/x", bad)
+        check("refuses " + why, False, "allowed " + bad)
+    except ValueError:
+        check("refuses " + why, True)
+for good, why in [("https://script.googleusercontent.com/echo", "Google's own script host"),
+                  ("https://script.google.com/macros/s/y", "the same origin")]:
+    try:
+        bb._redirect_allowed("https://script.google.com/macros/s/x", good)
+        check("allows " + why, True)
+    except ValueError as e:
+        check("allows " + why, False, str(e))
+
+# The deadline must be SHARED across hops, not renewed per hop. Proven by
+# behaviour: a deadline already spent must refuse the next hop outright.
+spent = bb.Deadline(-1)
+try:
+    bb._open_no_follow(bb.urllib.request.Request("https://example.invalid/"), spent)
+    check("a spent deadline stops the next hop", False, "it opened anyway")
+except TimeoutError:
+    check("a spent deadline stops the next hop", True)
+except Exception as e:
+    check("a spent deadline stops the next hop", False, type(e).__name__ + ": " + str(e))
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))

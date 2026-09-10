@@ -150,12 +150,51 @@ class Deadline:
         return left
 
 
-def http_get(url, deadline=None, timeout=45):
-    assert_transport_ok(url, "GET")
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(
-            req, timeout=(deadline.remaining() if deadline else timeout)) as resp:
+MAX_HOPS = 4        # one POST plus the bus's own redirect, with room to spare
+
+
+def _redirect_allowed(origin_url, next_url):
+    """May the request carrying our secret follow this hop?
+
+    Same origin is always fine. Apps Script legitimately sends
+    script.google.com to script.googleusercontent.com, so a cross-origin hop is
+    allowed only within Google's own script hosts - and assert_transport_ok has
+    already refused any downgrade to plaintext.
+    """
+    assert_transport_ok(next_url, "redirect")
+    if same_origin(origin_url, next_url):
+        return
+    host = (urllib.parse.urlparse(next_url).hostname or "").lower()
+    if not host.endswith((".google.com", ".googleusercontent.com")):
+        raise ValueError("refusing a cross-origin redirect to " + host)
+
+
+def _open_no_follow(req, deadline):
+    """One hop. Never follows a redirect by itself; raises _Redirected instead."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(req, timeout=deadline.remaining()) as resp:
         return resp.read()
+
+
+def http_get(url, deadline=None, timeout=45):
+    """GET, following redirects MANUALLY so each hop is checked.
+
+    This used the default opener, which follows redirects on its own: hops after
+    the first got no transport check, no origin check, and a FRESH socket
+    timeout each - so a chain of slow redirects could run far past the deadline
+    the caller thought it had set. Every hop is now validated against the
+    original origin and drawn from one shared budget.
+    """
+    assert_transport_ok(url, "GET")
+    deadline = deadline or Deadline(timeout)
+    current = url
+    for _ in range(MAX_HOPS):
+        try:
+            return _open_no_follow(urllib.request.Request(current), deadline)
+        except _Redirected as hop:
+            _redirect_allowed(url, hop.location)
+            current = hop.location
+    raise ValueError("too many redirects (more than {0})".format(MAX_HOPS))
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -190,55 +229,90 @@ def http_post(url, payload, timeout=90):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(req, timeout=deadline.remaining()) as resp:
-            return resp.read()
+        return _open_no_follow(req, deadline)
     except _Redirected as hop:
-        # Hop two: a plain GET on the Location, which returns the real JSON.
-        # The Location is validated before it is fetched - a redirect that
-        # downgrades to http, or moves to another origin, would carry the
+        # Hop two onward: PLAIN GETs on the Location, which return the real
+        # JSON. Each Location is validated before it is fetched - a redirect
+        # that downgrades to http, or moves to another origin, would carry the
         # request that just contained the secret somewhere unapproved.
-        assert_transport_ok(hop.location, "redirect")
-        if not same_origin(url, hop.location):
-            # Apps Script legitimately redirects script.google.com to
-            # script.googleusercontent.com, so a cross-origin hop is allowed
-            # only within Google's own script hosts - and never as a downgrade.
-            host = (urllib.parse.urlparse(hop.location).hostname or "").lower()
-            if not host.endswith((".google.com", ".googleusercontent.com")):
-                raise ValueError("refusing a cross-origin redirect to " + host)
-        with urllib.request.urlopen(
-                urllib.request.Request(hop.location),
-                timeout=deadline.remaining()) as resp2:
-            return resp2.read()
+        #
+        # This used urlopen with the DEFAULT opener, so any further redirect was
+        # followed automatically: unvalidated, and with a fresh timeout that
+        # escaped the deadline entirely. http_get now shares this walk, and both
+        # draw from the one Deadline created above.
+        _redirect_allowed(url, hop.location)
+        return http_get(hop.location, deadline=deadline)
 
 
 def bench_health(url, runs):
     return [timed(lambda: http_get(url))[0] for _ in range(runs)]
 
 
+def board_rows(raw):
+    """How many board rows did this response actually carry? Or why it is not one.
+
+    Returns (row_count, None) or (None, reason).
+
+    `len(json.loads(res).get("rows", []))` was doing this job, and it accepted
+    things that are not boards:
+      * `{"ok": false, "error": "..."}` with a rows key alongside - an error
+        envelope timed as a successful read;
+      * `{"rows": "1963"}` - a STRING, whose len() is 4, reported as a
+        successful read of four rows;
+      * `{"rows": {"a": 1}}` - a dict, len() 1.
+    A benchmark that counts those is not measuring a board read.
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        return None, "no response body"
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None, "response is not JSON"
+    if not isinstance(obj, dict):
+        return None, "response is a {0}, not an object".format(type(obj).__name__)
+    if "ok" in obj and not obj["ok"]:
+        return None, "the bus answered ok=false"
+    rows = obj.get("rows")
+    if not isinstance(rows, list):
+        return None, "rows is a {0}, not a list".format(type(rows).__name__)
+    if not rows:
+        return None, "the board came back with zero rows"
+    if not all(isinstance(r, list) for r in rows):
+        return None, "rows contains something that is not a row"
+    return len(rows), None
+
+
 def bench_read(url, secret, title, runs):
-    """Full-board read - the operation every fleet client actually performs."""
-    samples, sizes, rows = [], [], []
+    """Full-board read - the operation every fleet client actually performs.
+
+    Every number a sample produces stays WITH that sample. The previous version
+    appended to `sizes` before it knew whether the response was a board, and
+    `rows` only when it was, then the report quoted sizes[0] and rows[0] - so a
+    failed read's byte count could be printed beside a different, successful
+    read's row count, as one line describing one request that never happened.
+    """
+    samples = []
     for _ in range(runs):
         ms, res = timed(lambda: http_post(url, {"action": "read", "title": title,
                                                 "secret": secret}))
-        got = None
-        if ms is not None and isinstance(res, (bytes, bytearray)):
-            sizes.append(len(res))
-            try:
-                got = len(json.loads(res).get("rows", []))
-                rows.append(got)
-            except Exception:
-                got = None
-        # A read that returned NO ROWS is not a fast read, it is a failed one.
-        # HTTP succeeding is not the same as the board arriving, and timing a
-        # redirect artifact as if it were a board read is how a benchmark lies.
-        if got is None or got < 1:
-            samples.append(None)
+        rec = {"ms": None, "bytes": None, "rows": None, "why": None}
+        if ms is None:
+            rec["why"] = str(res)          # timed() puts the error string here
+            samples.append(rec)
+            continue
+        rec["bytes"] = len(res) if isinstance(res, (bytes, bytearray)) else None
+        count, why = board_rows(res)
+        if count is None:
+            # HTTP succeeding is not the same as the board arriving. Timing a
+            # redirect artifact as if it were a board read is how a benchmark
+            # reported 755ms for a 63-byte response carrying no board at all.
+            rec["why"] = why
         else:
-            samples.append(ms)
-    return samples, sizes, rows
+            rec["rows"] = count
+            rec["ms"] = ms
+        samples.append(rec)
+    return samples
 
 
 def main():
@@ -270,12 +344,32 @@ def main():
         # not something to depend on.
         side = {"url_host": urllib.parse.urlparse(url).hostname or "?"}
         side["health_ms"] = summarise(bench_health(url, args.runs))
-        samples, sizes, rows = bench_read(url, secret, args.title, args.runs)
-        side["full_read_ms"] = summarise(samples)
-        side["bytes"] = sizes[0] if sizes else UNKNOWN
-        side["rows"] = rows[0] if rows else UNKNOWN
-        if rows and len(set(rows)) > 1:
-            side["row_count_varied"] = sorted(set(rows))
+        samples = bench_read(url, secret, args.title, args.runs)
+        side["full_read_ms"] = summarise([s["ms"] for s in samples])
+
+        # PAIRED. bytes and rows are quoted from ONE valid sample, never
+        # assembled from whichever sample happened to reach each list first.
+        valid = [s for s in samples if s["rows"] is not None]
+        if valid:
+            side["bytes"] = valid[0]["bytes"]
+            side["rows"] = valid[0]["rows"]
+        else:
+            side["bytes"] = UNKNOWN
+            side["rows"] = UNKNOWN
+
+        counts = sorted({s["rows"] for s in valid})
+        if len(counts) > 1:
+            # The board is append-only and genuinely grows, so drift is not
+            # automatically a defect - but it means the samples did not all
+            # measure the same read, and figures across a drifting run cannot be
+            # quoted as one measurement. It is reported, and it fails the run.
+            side["row_count_varied"] = counts
+            side["drift_rows"] = counts[-1] - counts[0]
+        # Why each failed sample failed, deduplicated - a bare failure count
+        # tells you something broke but never what.
+        reasons = sorted({s["why"] for s in samples if s["ms"] is None and s["why"]})
+        if reasons:
+            side["failure_reasons"] = reasons[:10]
         report["sides"][label] = side
 
     print("bus_benchmark  " + report["measured_at"] + "   runs=" + str(args.runs))
@@ -298,6 +392,15 @@ def main():
             label, s["rows"], s["bytes"], s["full_read_ms"].get("failed", "?"), args.runs))
         if s["full_read_ms"]["state"] == UNKNOWN:
             print("         " + s["full_read_ms"]["why"])
+        for reason in s.get("failure_reasons", []):
+            print("         failed sample: " + reason)
+        if s.get("row_count_varied"):
+            print("         ROW COUNT DRIFTED across samples: {0} - these "
+                  "samples did not all measure the same read".format(
+                      s["row_count_varied"]))
+        hf = s["health_ms"].get("failed", 0)
+        if hf:
+            print("         health probe failed {0}/{1}".format(hf, args.runs))
 
     print("")
     print("HOW TO READ THIS, AND HOW NOT TO:")
@@ -320,8 +423,31 @@ def main():
         print("")
         print("wrote " + args.json_out)
 
-    both = [report["sides"][s]["full_read_ms"]["state"] for s in ("current", "target")]
-    return 2 if UNKNOWN in both else 0
+    return verdict(report)
+
+
+# Exit codes. `2 if UNKNOWN in both else 0` treated nine failures out of ten as
+# a clean run, because one surviving sample makes the state MEASURED. A figure
+# assembled from a run that was mostly failing is not a figure to quote, and a
+# benchmark that exits 0 on it is asserting that it is.
+EXIT_OK = 0
+EXIT_INCOMPLETE = 3      # it measured, but not cleanly enough to quote
+EXIT_UNKNOWN = 2         # it did not measure at all
+
+
+def verdict(report):
+    """0 only when every sample on both sides succeeded and nothing drifted."""
+    worst = EXIT_OK
+    for label in ("current", "target"):
+        s = report["sides"][label]
+        if s["full_read_ms"]["state"] == UNKNOWN:
+            return EXIT_UNKNOWN
+        if (s["full_read_ms"].get("failed")
+                or s["health_ms"].get("failed")
+                or s["health_ms"]["state"] == UNKNOWN
+                or s.get("row_count_varied")):
+            worst = EXIT_INCOMPLETE
+    return worst
 
 
 if __name__ == "__main__":
