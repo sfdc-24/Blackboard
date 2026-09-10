@@ -22,6 +22,22 @@ function Assert-True {
     }
 }
 
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case here launches scripts/bus.ps1 in a CHILD process, and that child was
+# hardcoded to powershell.exe in ten places. So the whole suite only ever exercised
+# bus.ps1 under Windows PowerShell 5.1 -- even when the suite itself was started
+# from pwsh. bus.ps1's hop-1 error handling differs by EDITION, which meant the
+# PowerShell 7 path had no coverage anywhere in CI, and adding this file to the
+# pwsh job would not have changed that.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 function ConvertTo-FlowedText {
     # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
     # pipeline, so an assertion that matches a long phrase in captured error
@@ -203,7 +219,7 @@ function Invoke-ReadCase {
             '-WorkspacePath', $workspace,
             '-ClaudeCommand', $fakeClaudePath
         )
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& $script:ResolvedChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_ROOT', $previousRoot, 'Process')
@@ -303,7 +319,7 @@ BUS_SECRET=BUS_SECRET_CANARY
         )
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_BODY', '<html>ACTUAL_BUS_BODY_CANARY</html>', 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_EXIT', '7', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -414,7 +430,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         [Environment]::SetEnvironmentVariable('PATH', ($fakeBin + [IO.Path]::PathSeparator + $previous.PATH), 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_ROOT', $caseRoot, 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_FINAL_STATUS', '200', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -428,7 +444,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         $previousErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
                 -Action read `
                 -Title 'test board' `
@@ -613,7 +629,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $successOutPath = Join-Path $successRoot 'response.txt'
     $successMetadataPath = Join-Path $successRoot 'metadata.json'
     $successTracePath = Join-Path $successRoot 'trace.json'
-    $successOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+    $successOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
         -File $wrapperPath `
         -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
         -EnvPath $envPath `
@@ -632,7 +648,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -654,7 +670,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $redirectOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $redirectOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -676,7 +692,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $insecureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $insecureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -698,7 +714,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $emptyLocationOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $emptyLocationOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -724,7 +740,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $realisticOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $realisticOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
