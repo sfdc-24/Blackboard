@@ -41,6 +41,7 @@ USAGE
   because a command line is visible in the process table and in shell history.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -152,6 +153,26 @@ class Deadline:
 
 MAX_HOPS = 4        # one POST plus the bus's own redirect, with room to spare
 
+# The ONLY cross-origin hop this request may take.
+#
+# `.google.com` was far too broad: it is every Google property there is, and
+# this request is carrying the bus secret. Apps Script redirects exactly one
+# way - script.google.com to a script.googleusercontent.com host - so that is
+# what is allowed. Note the leading dot on the suffix: without it,
+# "evilgoogleusercontent.com" would match.
+APPS_SCRIPT_HOSTS = ("script.google.com", "script.googleusercontent.com")
+APPS_SCRIPT_SUFFIXES = (".googleusercontent.com",)
+
+
+def _is_apps_script_host(host):
+    host = (host or "").lower().rstrip(".")
+    if host in APPS_SCRIPT_HOSTS:
+        return True
+    # Apps Script serves user content from per-deployment subdomains such as
+    # <id>-script.googleusercontent.com, so the suffix form is needed - bounded
+    # to that one domain rather than to Google at large.
+    return host.endswith(APPS_SCRIPT_SUFFIXES)
+
 
 def _redirect_allowed(origin_url, next_url):
     """May the request carrying our secret follow this hop?
@@ -165,15 +186,46 @@ def _redirect_allowed(origin_url, next_url):
     if same_origin(origin_url, next_url):
         return
     host = (urllib.parse.urlparse(next_url).hostname or "").lower()
-    if not host.endswith((".google.com", ".googleusercontent.com")):
+    if not _is_apps_script_host(host):
         raise ValueError("refusing a cross-origin redirect to " + host)
+
+
+MAX_BODY_BYTES = 64 * 1024 * 1024      # the board is ~2MB; 64MB is absurd headroom
+READ_CHUNK = 256 * 1024
+
+
+def _read_bounded(resp, deadline):
+    """Read a body under the DEADLINE, not merely under a socket timeout.
+
+    `resp.read()` returns only when the body is complete. The timeout passed to
+    urlopen applies to individual socket operations, so a server that dribbles
+    one byte just inside the timeout, forever, is never interrupted - the
+    "absolute deadline" was absolute only until the response started arriving.
+    That also makes the measured time unbounded, which is worse in a benchmark
+    than in ordinary client code: it silently produces a number.
+
+    Reading in chunks lets the deadline be checked between them, and caps the
+    total so a hostile or broken endpoint cannot exhaust memory either.
+    """
+    parts = []
+    total = 0
+    while True:
+        deadline.remaining()               # raises TimeoutError when spent
+        chunk = resp.read(READ_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise ValueError("response exceeded {0} bytes".format(MAX_BODY_BYTES))
+        parts.append(chunk)
+    return b"".join(parts)
 
 
 def _open_no_follow(req, deadline):
     """One hop. Never follows a redirect by itself; raises _Redirected instead."""
     opener = urllib.request.build_opener(_NoRedirect)
     with opener.open(req, timeout=deadline.remaining()) as resp:
-        return resp.read()
+        return _read_bounded(resp, deadline)
 
 
 def http_get(url, deadline=None, timeout=45):
@@ -249,6 +301,30 @@ def bench_health(url, runs):
     return [timed(lambda: http_get(url))[0] for _ in range(runs)]
 
 
+def board_digest(raw):
+    """A stable fingerprint of the board CONTENT this response carried.
+
+    Row counts were the only cross-side comparison, and equal counts do not mean
+    equal content: two sides can hold the same number of different rows, which
+    is precisely the state a stale migration snapshot reaches. "current 1969
+    rows / target 1969 rows" read as agreement when it was a coincidence.
+
+    Canonical JSON with sorted separators so formatting differences between the
+    Apps Script bus and the Python bus do not show up as content differences.
+    Truncated to 16 hex characters: this identifies a snapshot, it does not
+    protect one.
+    """
+    try:
+        rows = json.loads(raw).get("rows")
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    canonical = json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
+
 def board_rows(raw):
     """How many board rows did this response actually carry? Or why it is not one.
 
@@ -296,7 +372,7 @@ def bench_read(url, secret, title, runs):
     for _ in range(runs):
         ms, res = timed(lambda: http_post(url, {"action": "read", "title": title,
                                                 "secret": secret}))
-        rec = {"ms": None, "bytes": None, "rows": None, "why": None}
+        rec = {"ms": None, "bytes": None, "rows": None, "digest": None, "why": None}
         if ms is None:
             rec["why"] = str(res)          # timed() puts the error string here
             samples.append(rec)
@@ -310,6 +386,7 @@ def bench_read(url, secret, title, runs):
             rec["why"] = why
         else:
             rec["rows"] = count
+            rec["digest"] = board_digest(res)
             rec["ms"] = ms
         samples.append(rec)
     return samples
@@ -353,9 +430,11 @@ def main():
         if valid:
             side["bytes"] = valid[0]["bytes"]
             side["rows"] = valid[0]["rows"]
+            side["digest"] = valid[0]["digest"]
         else:
             side["bytes"] = UNKNOWN
             side["rows"] = UNKNOWN
+            side["digest"] = UNKNOWN
 
         counts = sorted({s["rows"] for s in valid})
         if len(counts) > 1:
@@ -401,6 +480,28 @@ def main():
         hf = s["health_ms"].get("failed", 0)
         if hf:
             print("         health probe failed {0}/{1}".format(hf, args.runs))
+
+    # SAME COUNT IS NOT SAME BOARD. Two sides can hold the same number of
+    # different rows, which is exactly what a stale migration snapshot looks
+    # like - and the report used to present that as agreement.
+    cur, tgt = report["sides"]["current"], report["sides"]["target"]
+    print("")
+    if UNKNOWN in (cur["digest"], tgt["digest"]):
+        report["snapshots_comparable"] = UNKNOWN
+        print("SNAPSHOT MATCH: UNKNOWN - at least one side produced no readable board.")
+    elif cur["digest"] == tgt["digest"]:
+        report["snapshots_comparable"] = True
+        print("SNAPSHOT MATCH: identical content on both sides ({0}).".format(
+            cur["digest"]))
+    else:
+        report["snapshots_comparable"] = False
+        print("SNAPSHOT MISMATCH: the two sides did NOT read the same board.")
+        print("  current {0} ({1} rows)   target {2} ({3} rows)".format(
+            cur["digest"], cur["rows"], tgt["digest"], tgt["rows"]))
+        if cur["rows"] == tgt["rows"]:
+            print("  The ROW COUNTS AGREE but the content does not - equal counts"
+                  " were never evidence of the same board.")
+        print("  Latency is still comparable; anything about content is not.")
 
     print("")
     print("HOW TO READ THIS, AND HOW NOT TO:")

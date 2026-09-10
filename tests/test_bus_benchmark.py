@@ -241,6 +241,101 @@ except Exception as e:
     check("a spent deadline stops the next hop", False, type(e).__name__ + ": " + str(e))
 
 print("")
+print("== the same row COUNT is not the same board ==")
+A = json.dumps({"ok": True, "rows": [["h"], ["alpha"], ["beta"]]}).encode()
+A2 = json.dumps({"ok": True, "rows": [["h"], ["alpha"], ["beta"]]}).encode()
+B = json.dumps({"ok": True, "rows": [["h"], ["alpha"], ["DIFFERENT"]]}).encode()
+check("identical content gives identical digests",
+      bb.board_digest(A) == bb.board_digest(A2), (bb.board_digest(A), bb.board_digest(A2)))
+check("the SAME ROW COUNT with different content does NOT",
+      bb.board_digest(A) != bb.board_digest(B), (bb.board_digest(A), bb.board_digest(B)))
+check("and the counts really are equal, which is the whole point",
+      bb.board_rows(A)[0] == bb.board_rows(B)[0] == 3)
+SPACED = b'{"ok": true, "rows": [ ["h"] , ["alpha"] , ["beta"] ] }'
+check("whitespace differences are not content differences",
+      bb.board_digest(SPACED) == bb.board_digest(A),
+      (bb.board_digest(SPACED), bb.board_digest(A)))
+check("a non-board gives no digest", bb.board_digest(b"<html>") is None)
+check("the digest is short enough to read", len(bb.board_digest(A)) == 16)
+
+print("")
+print("== the redirect allowlist is Apps Script, not Google ==")
+for host, ok in [("script.google.com", True),
+                 ("script.googleusercontent.com", True),
+                 ("abc123-script.googleusercontent.com", True),
+                 ("SCRIPT.GOOGLE.COM", True),
+                 ("sites.google.com", False),
+                 ("accounts.google.com", False),
+                 ("drive.google.com", False),
+                 ("evilgoogleusercontent.com", False),
+                 ("googleusercontent.com.evil.example", False),
+                 ("script.google.com.evil.example", False),
+                 ("", False)]:
+    got = bb._is_apps_script_host(host)
+    check("{0!r} allowed={1}".format(host or "<empty>", ok), got == ok, got)
+
+print("")
+print("== a body is read under the DEADLINE, not just a socket timeout ==")
+
+
+class DribbleResponse:
+    """Never ends. `read()` always returns one more byte."""
+
+    def read(self, n=None):
+        return b"x"
+
+
+try:
+    bb._read_bounded(DribbleResponse(), bb.Deadline(-1))
+    check("an already-spent deadline reads nothing at all", False, "it read anyway")
+except TimeoutError:
+    check("an already-spent deadline reads nothing at all", True)
+
+# The stronger claim: a deadline that expires PARTWAY THROUGH an endless body
+# must interrupt it. A spent-deadline test alone only proves the first check
+# fires - it would pass even if the loop never checked again.
+import time as _time
+started = _time.perf_counter()
+try:
+    bb._read_bounded(DribbleResponse(), bb.Deadline(0.4))
+    check("an endless body is cut off MID-READ", False, "it read forever")
+except TimeoutError:
+    elapsed = _time.perf_counter() - started
+    check("an endless body is cut off MID-READ", 0.3 < elapsed < 8.0, elapsed)
+
+
+class BigResponse:
+    def __init__(self):
+        self.left = bb.MAX_BODY_BYTES + bb.READ_CHUNK
+
+    def read(self, n=None):
+        n = n or bb.READ_CHUNK
+        take = min(n, self.left)
+        self.left -= take
+        return b"y" * take
+
+
+try:
+    bb._read_bounded(BigResponse(), bb.Deadline(30))
+    check("an oversized body is refused", False, "it was accepted")
+except ValueError:
+    check("an oversized body is refused", True)
+
+
+class NormalResponse:
+    def __init__(self, payload):
+        self.buf = payload
+
+    def read(self, n=None):
+        n = n or bb.READ_CHUNK
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+
+check("an ordinary body still reads back exactly",
+      bb._read_bounded(NormalResponse(A), bb.Deadline(30)) == A)
+
+print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))
 for f in FAILURES:
     print("  - " + f)
