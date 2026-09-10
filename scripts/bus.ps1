@@ -447,6 +447,12 @@ if ($curl) {
     if ($contentType) { $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $contentType }
     if ($status -ge 300 -and $status -lt 400 -and $locationValue) {
       $location = $locationValue
+    } elseif ($status -ge 300 -and $status -lt 400) {
+      # Same contract failure as the non-terminating path above, so it gets the
+      # same name. Rethrowing the original transport exception here would report
+      # a redirect-with-no-usable-Location as whatever the edition happened to
+      # raise, which is the one thing a caller cannot act on.
+      throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $status with no readable Location header."
     } else { throw }
   }
 }
