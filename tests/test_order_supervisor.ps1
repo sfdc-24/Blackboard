@@ -1674,7 +1674,14 @@ $runnerAst = [Management.Automation.Language.Parser]::ParseFile(
     [ref]$runnerErrors
 )
 Assert-True 'runner parses before timeout-path extraction' (@($runnerErrors).Count -eq 0)
-foreach ($functionName in @('Quote-ProcessArgument', 'Invoke-TaskkillTree', 'Test-RunTreeContainsReparsePoint', 'Remove-OwnedRunDirectory', 'Invoke-ClaudeWorker')) {
+# Invoke-ClaudeWorker now resolves its engine and its process-tree kill through
+# helpers, so the helpers have to be extracted too. Leaving them out did not
+# make the tests pass with a gap - it broke them loudly, which is the harness
+# working: the runner and the extracted subset must stay in step.
+foreach ($functionName in @('Quote-ProcessArgument', 'Test-OnWindows', 'Resolve-WorkerEngine',
+                            'Invoke-TaskkillTree', 'Get-PosixChildProcessId', 'Invoke-PosixTreeKill',
+                            'Invoke-ProcessTreeKill', 'Test-RunTreeContainsReparsePoint',
+                            'Remove-OwnedRunDirectory', 'Invoke-ClaudeWorker')) {
     $definitions = @($runnerAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and

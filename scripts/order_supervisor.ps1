@@ -602,6 +602,15 @@ function Quote-ProcessArgument {
     return '"' + $Value + '"'
 }
 
+function Test-OnWindows {
+    # $IsWindows exists only in PowerShell 6 and later. Windows PowerShell 5.1
+    # does not define it AND only runs on Windows, so its absence IS Windows.
+    # Reading $IsWindows directly under 5.1 yields $null, which is falsey - that
+    # would have made every 5.1 host look like Linux.
+    if (Test-Path Variable:IsWindows) { return [bool]$IsWindows }
+    return $true
+}
+
 function Invoke-TaskkillTree {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
 
@@ -609,6 +618,160 @@ function Invoke-TaskkillTree {
     if (-not (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) { return -1 }
     & $taskkillPath /PID $ProcessId /T /F 1>$null 2>$null
     return [int]$LASTEXITCODE
+}
+
+function Get-PosixChildProcessId {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # PPid comes from /proc/<pid>/status, not /proc/<pid>/stat. The stat file's
+    # second field is the executable name in parentheses and it may itself
+    # contain spaces or parentheses, so splitting stat on whitespace to reach
+    # field four is a well-known way to read the wrong number.
+    $children = @()
+    foreach ($entry in [IO.Directory]::EnumerateDirectories('/proc')) {
+        $leaf = [IO.Path]::GetFileName($entry)
+        $childId = 0
+        if (-not [int]::TryParse($leaf, [ref]$childId)) { continue }
+        try {
+            foreach ($line in [IO.File]::ReadLines((Join-Path $entry 'status'))) {
+                if ($line.StartsWith('PPid:')) {
+                    $parent = 0
+                    if ([int]::TryParse($line.Substring(5).Trim(), [ref]$parent) -and
+                        $parent -eq $ProcessId) {
+                        $children += $childId
+                    }
+                    break
+                }
+            }
+        } catch { continue }        # the process exited while we were reading it
+    }
+    return $children
+}
+
+function Test-PosixProcessAlive {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # A SIGKILLed process does not vanish - it becomes a ZOMBIE until its parent
+    # reaps it, and Get-Process still returns it. Counting zombies as survivors
+    # made a tree kill that had worked perfectly report failure, which would
+    # have made the supervisor quarantine healthy runs.
+    $statusPath = "/proc/$ProcessId/status"
+    if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
+    try {
+        foreach ($line in [IO.File]::ReadLines($statusPath)) {
+            if ($line.StartsWith('State:')) {
+                # "State:\tZ (zombie)" - dead for every purpose except the table.
+                return -not ($line.Substring(6).Trim().StartsWith('Z'))
+            }
+        }
+    } catch {
+        return $false                     # it exited while we were reading it
+    }
+    return $true
+}
+
+function Invoke-PosixTreeKill {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # taskkill /T kills the process AND its descendants. Stop-Process does not,
+    # so swapping one for the other would leave grandchildren running while
+    # reporting success - the adapter spawns its own children, so that is the
+    # normal case, not an edge case.
+    if (-not (Test-Path -LiteralPath '/proc')) { return -1 }
+
+    # PARENTS FIRST, and this order is the whole correctness argument.
+    #
+    # The obvious choice is deepest-first, and it is wrong. Killing a shell's
+    # CURRENT COMMAND does not kill the shell - it makes the shell proceed to
+    # its next line. So killing `sleep 6` inside a script frees the script to
+    # run the very command we are trying to stop. A real test caught this: the
+    # child wrote its marker after the tree kill "succeeded", and it had passed
+    # earlier only because a faster interpreter happened to win the race.
+    #
+    # SIGKILL cannot be caught or deferred, so killing a parent before its
+    # children means the parent never reaches its next statement. Descendants
+    # already enumerated are then orphans, and are killed by pid regardless of
+    # having been reparented to init.
+    $ordered = @()
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($ProcessId)
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if (-not $seen.Add($current)) { continue }
+        $ordered += $current                       # breadth-first: shallowest first
+        foreach ($child in (Get-PosixChildProcessId -ProcessId $current)) {
+            $pending.Enqueue($child)
+        }
+    }
+
+    $killList = {
+        param([int[]]$Targets)
+        $remaining = 0
+        foreach ($target in $Targets) {
+            try {
+                Stop-Process -Id $target -Force -ErrorAction Stop
+            } catch {
+                # Already gone is success, not failure: the tree is what
+                # matters, not whether we personally delivered the signal.
+            }
+            if (Test-PosixProcessAlive -ProcessId $target) { $remaining++ }
+        }
+        return $remaining
+    }
+
+    $failed = & $killList $ordered
+
+    # A SECOND SWEEP, because enumeration and killing are not atomic. A process
+    # can fork between the two, and that child is in nobody's list. Re-walking
+    # from the root catches it. Bounded, because an unbounded retry against a
+    # fork bomb is its own outage - two passes is enough for the case this
+    # actually has, which is one adapter spawning one helper.
+    foreach ($sweep in 1..2) {
+        $stragglers = @()
+        $pending2 = New-Object System.Collections.Generic.Queue[int]
+        $pending2.Enqueue($ProcessId)
+        $seen2 = New-Object 'System.Collections.Generic.HashSet[int]'
+        while ($pending2.Count -gt 0) {
+            $cur = $pending2.Dequeue()
+            if (-not $seen2.Add($cur)) { continue }
+            if ($cur -ne $ProcessId) { $stragglers += $cur }
+            foreach ($c in (Get-PosixChildProcessId -ProcessId $cur)) { $pending2.Enqueue($c) }
+        }
+        if ($stragglers.Count -eq 0) { break }
+        $failed += & $killList $stragglers
+    }
+
+    return $(if ($failed -eq 0) { 0 } else { 1 })
+}
+
+function Invoke-ProcessTreeKill {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    if (Test-OnWindows) { return Invoke-TaskkillTree -ProcessId $ProcessId }
+    return Invoke-PosixTreeKill -ProcessId $ProcessId
+}
+
+function Resolve-WorkerEngine {
+    # The engine used to be Windows PowerShell 5.1 by absolute path, which is
+    # correct on Windows and simply absent on Linux.
+    #
+    # Windows behaviour is UNCHANGED - the Azure VM runs this in production and
+    # the adapter is written against 5.1 semantics. Only the non-Windows branch
+    # is new.
+    if (Test-OnWindows) {
+        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'windows_powershell_5_1_missing' }
+        return $engine
+    }
+    # The pwsh ALREADY RUNNING this, not a PATH lookup. A PATH lookup can find a
+    # different build than the one whose semantics we are relying on, and on a
+    # host with both a snap and a tarball install that is not hypothetical.
+    $current = (Get-Process -Id $PID -ErrorAction SilentlyContinue).Path
+    if ($current -and (Test-Path -LiteralPath $current -PathType Leaf)) { return $current }
+    $fallback = Join-Path $PSHOME 'pwsh'
+    if (Test-Path -LiteralPath $fallback -PathType Leaf) { return $fallback }
+    throw 'powershell_engine_missing'
 }
 
 function Test-RunTreeContainsReparsePoint {
@@ -694,8 +857,7 @@ function Invoke-ClaudeWorker {
             -Source $Source `
             -Task $Task
         Write-Utf8NoBom -Path $promptPath -Text $prompt
-        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'windows_powershell_5_1_missing' }
+        $engine = Resolve-WorkerEngine
         $parts = @(
             '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
             '-File', (Quote-ProcessArgument $ClaudeAdapter),
@@ -720,7 +882,7 @@ function Invoke-ClaudeWorker {
         $completedWithinLimit = $process.WaitForExit($WallTimeoutSeconds * 1000)
         if (-not $completedWithinLimit) {
             $taskkillExitCode = -1
-            try { $taskkillExitCode = Invoke-TaskkillTree -ProcessId $process.Id } catch {}
+            try { $taskkillExitCode = Invoke-ProcessTreeKill -ProcessId $process.Id } catch {}
             if ($taskkillExitCode -ne 0) { throw 'claude_termination_failed' }
             $terminationObserved = $false
             try {
