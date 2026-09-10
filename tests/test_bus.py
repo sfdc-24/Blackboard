@@ -238,6 +238,53 @@ def main():
         code, r = call({"action": "create", "title": "Padding is not width", "kind": "sheet",
                         "header": ["Id", "Ts", "", ""]})
         check("4 columns but only 2 NAMED -> still 400", code == 400, f"got {code}")
+
+        print("== appending to a padded sheet: the shift codex-oversight found ==")
+        # THE DEFECT: append reasoned about len(header) - the WIRE width - so on a
+        # sheet imported from the live board a TEN-CELL FULL ROW (what every fleet
+        # client sends) looked like eight content cells. The server prepended its
+        # own Row_ID and Timestamp and shifted every field two columns left, with
+        # HTTP 200 and no error. That is REQ-B4TQX9 reintroduced by the padding fix.
+        code, r = call({"action": "create", "title": "Live shape", "kind": "sheet", "header": padded})
+        check("create a sheet with the live board's exact header", code == 200)
+        full10 = ["11111111-2222-3333-4444-555555555555", "2026-09-09T23:00:00Z", "claude-code-cli",
+                  "ALL", "APPEND", "BCB|v=1|id=X", "OPEN", "Blackboard", "a gist", "a sub"]
+        code, r = call({"action": "append", "title": "Live shape", "sheetRow": full10})
+        check("a 10-cell FULL ROW is accepted on a padded sheet", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Live shape"})
+        stored = r.get("rows", [[], []])[1] if len(r.get("rows", [])) > 1 else []
+        check("and every field stays in its own column - NO SHIFT",
+              stored[:10] == full10, f"stored={stored}")
+        check("stored at the sheet's wire width, padding empty",
+              len(stored) == 12 and stored[10] == "" and stored[11] == "", f"stored={stored}")
+        # content-cell form still works, and still cannot shift
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["chat-mobile", "ALL", "APPEND", "BCB|v=1|id=Y", "OPEN", "P", "g", "s"]})
+        check("8 content cells still get a server Row_ID and Timestamp", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Live shape"})
+        rows_ls = r.get("rows", [])
+        row2 = rows_ls[2] if len(rows_ls) > 2 else []
+        check("and land in the NAMED columns, not shifted",
+              len(row2) == 12 and row2[2] == "chat-mobile" and row2[3] == "ALL", f"row={row2}")
+        # a client echoing a padded row back
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["22222222-2222-3333-4444-555555555555", "2026-09-09T23:30:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=Z", "OPEN", "P", "g", "s", "", ""]})
+        check("a 12-cell row whose padding is EMPTY is accepted", code == 200, f"got {code} {r.get('error','')}")
+        # THE NEGATIONS
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["33333333-2222-3333-4444-555555555555", "2026-09-09T23:31:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=W", "OPEN", "P", "g", "s", "leaked", ""]})
+        check("content in a PADDING column -> 400, same rule bcb_lint applies",
+              code == 400 and "padding" in r.get("error", "").lower(), f"got {code} {r.get('error','')}")
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["2026-09-09T23:32:00Z", "2026-09-09T23:32:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=V", "OPEN", "P", "g", "s"]})
+        check("a timestamp in col 0 is still REQ-B4TQX9 -> 400",
+              code == 400 and "REQ-B4TQX9" in r.get("error", ""), f"got {code} {r.get('error','')}")
+        code, r = call({"action": "append", "title": "Live shape", "sheetRow": ["only", "three", "cells"]})
+        check("a wrong cell count still names the NAMED width, not 12",
+              code == 400 and " 10 " in (" " + r.get("error", "") + " "), f"got {code} {r.get('error','')}")
         code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CREATE",
                         "actor_tag": "vm-cli", "assigned_to": "gemini", "status": "OPEN", "payload": "w2"})
         check("CREATE second item", code == 200)
