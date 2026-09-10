@@ -15,8 +15,9 @@
 # WHY EACH SUITE IS NAMED RATHER THAN GLOBBED
 #   tests/ also holds node:test suites, PowerShell suites and network-touching
 #   scripts. A glob would drag those in and either fail or, worse, make a
-#   network call from CI. Every suite listed here is offline by construction:
-#   no org, no board, no bus, no credentials.
+#   network call from CI. Every suite listed here is offline by construction -
+#   no org, no board, no bus, no credentials - and that is PROVED by running
+#   them in an empty network namespace rather than asserted in a comment.
 name: python-suites
 
 on:
@@ -62,20 +63,29 @@ jobs:
       # than hiding inside a loop. `if [ -f ]` because the two suites arrive on
       # different branches; a branch carrying only one must not fail on the
       # other's absence.
-      - name: xray-score-v1
+      # Each suite runs inside an EMPTY NETWORK NAMESPACE (`unshare -n`), so
+      # "these tests need no network" is proved by execution rather than
+      # asserted. If a future edit adds a real call, the suite fails here.
+      #
+      # The first version of this workflow grepped the suites for "urlopen" and
+      # friends instead. It failed immediately - on a test whose whole job is to
+      # assert that the ENGINE contains exactly one urlopen, so the word appears
+      # in a string literal. A substring cannot tell "calls urlopen" from
+      # "asserts about urlopen", and the behavioural check does not have to.
+      - name: xray-score-v1 (no network)
         run: |
           set -euo pipefail
           if [ -f tests/test_xray_score.py ]; then
-            python3 tests/test_xray_score.py
+            sudo unshare -n python3 tests/test_xray_score.py
           else
             echo "not on this branch; skipping"
           fi
 
-      - name: open_for_me
+      - name: open_for_me (no network)
         run: |
           set -euo pipefail
           if [ -f tests/test_open_for_me.py ]; then
-            python3 tests/test_open_for_me.py
+            sudo unshare -n python3 tests/test_open_for_me.py
           else
             echo "not on this branch; skipping"
           fi
@@ -92,16 +102,14 @@ jobs:
           fi
           echo "at least one suite ran for real"
 
-      - name: Prove the suites are offline
+      # A negative control for the isolation itself. If `unshare -n` silently
+      # stopped isolating, every "no network" claim above would be worthless and
+      # nothing would say so.
+      - name: Prove the isolation actually isolates
         run: |
           set -euo pipefail
-          # These must not reach the network. If a future edit adds a call, this
-          # catches it here rather than in a reviewer's head.
-          for t in tests/test_xray_score.py tests/test_open_for_me.py; do
-            [ -f "$t" ] || continue
-            if grep -nE "urlopen|requests\.|socket\.|http\.client" "$t"; then
-              echo "$t appears to make a network call; suites here must be offline" >&2
-              exit 1
-            fi
-          done
-          echo "no network calls in the suites"
+          if sudo unshare -n python3 -c "import urllib.request; urllib.request.urlopen('http://example.com', timeout=5)" 2>/dev/null; then
+            echo "unshare -n did NOT isolate the network; the offline claims above prove nothing" >&2
+            exit 1
+          fi
+          echo "confirmed: no network inside the namespace the suites ran in"
