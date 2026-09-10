@@ -341,21 +341,75 @@ def get_token(conf):
     }
 
 
-def same_sf_id(a, b):
-    """Salesforce ids come in 15- and 18-character forms for the same record.
+def sf_checksum(fifteen):
+    """The 3-character suffix Salesforce appends to make an 18-char id.
 
-    The 18-char form is the 15-char form plus a 3-character checksum, so a
-    prefix comparison on the first 15 is the correct equality test. A raw string
-    compare would call the same org two different orgs and fail a run that
-    should pass - and, worse, invite someone to "fix" it by removing the check.
-    The 15-char prefix is case-SENSITIVE; only the checksum suffix is not.
+    Each group of five characters becomes one letter: bit i is set when the
+    character at that position is uppercase, and the resulting 0-31 value indexes
+    ABCDEFGHIJKLMNOPQRSTUVWXYZ012345. That is precisely why the 15-char form is
+    case-SENSITIVE - the case IS the extra information.
     """
-    a, b = (a or "").strip(), (b or "").strip()
-    if not a or not b:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    out = ""
+    for chunk in range(3):
+        bits = 0
+        for i, ch in enumerate(fifteen[chunk * 5:chunk * 5 + 5]):
+            if ch.isupper():
+                bits |= 1 << i
+        out += alphabet[bits]
+    return out
+
+
+def normalise_sf_id(value):
+    """One canonical 15-character id, or None if it is not an id at all.
+
+    An 18-char id carries a checksum over the case of its first 15 characters,
+    so a LOWERCASED 18-char id - what you get from copying one out of a URL or a
+    case-insensitive store - can be restored exactly. Without this, comparing
+    case-sensitively false-rejects a correct configured id and comparing
+    case-insensitively accepts a genuinely different one. Recomputing from the
+    checksum is the only option that is wrong in neither direction.
+    """
+    v = (value or "").strip()
+    if len(v) == 15:
+        return v if v.isalnum() else None
+    if len(v) != 18 or not v.isalnum():
+        return None
+    head, tail = v[:15], v[15:].upper()
+    if sf_checksum(head) == tail:
+        return head                       # already correctly cased
+    # Try to rebuild the case from the checksum, which is what a lowercased or
+    # uppercased 18-char id needs.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    rebuilt = ""
+    for chunk in range(3):
+        if tail[chunk] not in alphabet:
+            return None
+        bits = alphabet.index(tail[chunk])
+        for i, ch in enumerate(head[chunk * 5:chunk * 5 + 5]):
+            rebuilt += ch.upper() if bits & (1 << i) else ch.lower()
+    # ROUND-TRIP THE CHECKSUM. The obvious test here - does the rebuild match
+    # the input ignoring case - is VACUOUS: rebuilding only ever changes case,
+    # so it is true for every suffix, and an arbitrary three characters would be
+    # accepted. Recomputing the checksum over the rebuilt id is the only thing
+    # that actually validates the suffix. Codex warned the suffix was
+    # unvalidated and the first version of this function proved the point.
+    return rebuilt if sf_checksum(rebuilt) == tail else None
+
+
+def same_sf_id(a, b):
+    """Do two strings name the same Salesforce record?
+
+    Both are reduced to the canonical 15-character form first. A raw compare
+    would call one org two orgs and fail a run that should pass, which is how a
+    safety check gets deleted for being annoying; a case-insensitive compare
+    would call two orgs one org, which is far worse. An arbitrary checksum
+    suffix is rejected rather than ignored.
+    """
+    ca, cb = normalise_sf_id(a), normalise_sf_id(b)
+    if ca is None or cb is None:
         return False
-    if len(a) not in (15, 18) or len(b) not in (15, 18):
-        return False
-    return a[:15] == b[:15]
+    return ca == cb
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -520,16 +574,30 @@ def main():
         identity["binding"], identity["binding_note"]))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
-            json.dump({"org": conf["Headless_domain"],
-                       # Which org this actually was, not which one was asked for.
-                       "identity": identity,
-                       "window_days": args.window,
-                       "checks": [c.to_dict() for c in checks],
-                       "summary": summary}, fh, indent=2)
+            json.dump({
+                # `org` used to be the CONFIGURED domain string, which is the
+                # one thing in the file that no evidence supports. The org this
+                # run actually reached leads; the configured text is kept beside
+                # it, named for what it is.
+                "org": identity["org_id"] or "UNIDENTIFIED",
+                "org_host": identity["instance_host"],
+                "configured_domain": conf["Headless_domain"],
+                "identity": identity,
+                "window_days": args.window,
+                "checks": [c.to_dict() for c in checks],
+                "summary": summary}, fh, indent=2)
         print("\nwrote " + args.json_out)
     # Non-zero when the run did not establish what it claims. A scoring tool
     # that exits 0 after failing to reach the org is the defect this fixes.
-    return 2 if summary["checks_unknown"] else 0
+    if summary["checks_unknown"]:
+        return 2
+    # An UNVERIFIED run measured a real org, but nothing checked it was the
+    # RIGHT one. Exiting 0 on it invites a pipeline to treat the numbers as
+    # bound to a named org when only the credentials decided which org answered.
+    # 3, not 2: it is a weaker claim, not a failed one.
+    if identity["binding"] != "VERIFIED":
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

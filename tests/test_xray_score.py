@@ -252,9 +252,15 @@ print("== the run knows WHICH org it scored ==")
 # material out of the repo, so the fixtures must not resemble the live org
 # either - a plausible-looking id is the thing a future reader would copy.
 ORG_A15 = "00D000000000AAA"
-ORG_A18 = ORG_A15 + "2AQ"          # same org, 18-char form
-ORG_B18 = "00D000000000BBB" + "2AQ"
-USER_A18 = "005000000000CCC" + "AAQ"
+# The 18-char forms are COMPUTED, not hardcoded. The first version of this file
+# invented a "2AQ" suffix, which is not the checksum for any of these ids - so
+# the fixtures were not 18-char ids at all and the assertions about them were
+# meaningless. A checksum you make up is exactly what the code must reject.
+ORG_A18 = ORG_A15 + xs.sf_checksum(ORG_A15)
+ORG_B15 = "00D000000000BBB"
+ORG_B18 = ORG_B15 + xs.sf_checksum(ORG_B15)
+USER_A15 = "005000000000CCC"
+USER_A18 = USER_A15 + xs.sf_checksum(USER_A15)
 
 check("identity is read out of the token response id",
       xs.identity_from({"id": "https://login.salesforce.com/id/{0}/{1}".format(
@@ -273,8 +279,39 @@ check("15- and 18-char forms of one org match", xs.same_sf_id(ORG_A15, ORG_A18))
 check("two different orgs do not match", not xs.same_sf_id(ORG_A18, ORG_B18))
 check("an empty id matches nothing", not xs.same_sf_id("", ORG_A18))
 check("a truncated id matches nothing", not xs.same_sf_id(ORG_A18[:10], ORG_A18))
-check("case matters in the 15-char prefix",
-      not xs.same_sf_id(ORG_A15.lower(), ORG_A18))
+
+# The checksum IS the case information, so an 18-char id can be restored from
+# any casing. Comparing case-sensitively would false-reject a correct id copied
+# out of a URL; comparing case-insensitively would accept a different org. Only
+# recomputing is wrong in neither direction.
+MIXED15 = "00DBm0000000aAa"
+MIXED18 = MIXED15 + xs.sf_checksum(MIXED15)
+check("the checksum is three characters", len(xs.sf_checksum(MIXED15)) == 3,
+      xs.sf_checksum(MIXED15))
+# AN EXTERNAL CONTROL. Round-tripping my own implementation against itself
+# proves only that it is self-consistent - it would pass just as happily with
+# the bit order reversed. This is a published 15-to-18 pair, and the expected
+# value is hand-derived rather than recalled: chunk "001D0" has D at index 3, so
+# bits=8 -> 'I'; "00000" -> 'A'; "IqhSL" is uppercase at 0, 3 and 4, so
+# bits=1+8+16=25 -> 'Z'.
+check("matches a known real 15-to-18 conversion",
+      xs.sf_checksum("001D000000IqhSL") == "IAZ", xs.sf_checksum("001D000000IqhSL"))
+check("and normalises that real 18-char id back",
+      xs.normalise_sf_id("001D000000IqhSLIAZ") == "001D000000IqhSL")
+check("including from its lowercased form",
+      xs.same_sf_id("001d000000iqhsliaz", "001D000000IqhSL"))
+check("a correctly cased 18-char id normalises to its 15-char form",
+      xs.normalise_sf_id(MIXED18) == MIXED15, xs.normalise_sf_id(MIXED18))
+check("a LOWERCASED 18-char id is restored, not rejected",
+      xs.same_sf_id(MIXED18.lower(), MIXED15), xs.normalise_sf_id(MIXED18.lower()))
+check("an UPPERCASED 18-char id is restored too",
+      xs.same_sf_id(MIXED18.upper(), MIXED15))
+check("but a WRONG checksum suffix is refused, not ignored",
+      xs.normalise_sf_id(MIXED15 + "ZZZ") is None, xs.normalise_sf_id(MIXED15 + "ZZZ"))
+check("and two genuinely different orgs still do not match",
+      not xs.same_sf_id(MIXED18.lower(), ORG_B18))
+check("a 17-character string is not an id", xs.normalise_sf_id(MIXED18[:17]) is None)
+check("a non-alphanumeric id is refused", xs.normalise_sf_id("00D!!!0000000AAA2A") is None)
 
 print("")
 print("== a token for the wrong org is refused, not scored ==")
