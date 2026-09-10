@@ -10,19 +10,35 @@ WHY THIS EXISTS, AND WHY IT IS PYTHON
   the laptop and on an Ubuntu instance.
 
 THE RULE THIS FILE EXISTS TO ENFORCE
-  A check that cannot tell must SAY SO.
+  A check that cannot tell must SAY SO, and it must say WHICH KIND of "cannot".
 
-  Measured 2026-09-09 against the real workshop org: the first version counted
-  "never logged in" as "stale", found 9 of 10 active users had never logged in,
-  and reported 900,000 DPMO and sigma 0.22. Every one of those users had been
-  created inside the 90-day window - none had ever had the chance to log in. The
-  defect rate was computed over a population that could not contain a defect.
+  There are three answers, never two:
 
-  On a paying customer that is a confident, precise, wrong answer given to the
-  person paying for the answer. So a Check carries OPPORTUNITIES and DEFECTS
-  separately, and where there are no opportunities it returns NOT_APPLICABLE -
-  not zero, not a DPMO, not a sigma. Scoring nothing is not the same as scoring
-  perfectly, and telling those two apart is the product.
+    SCORED          the population existed and was measured
+    NOT_APPLICABLE  the population was genuinely empty - nothing COULD be a defect
+    UNKNOWN         we could not find out - a query failed, the org was
+                    unreachable, something threw
+
+  Collapsing UNKNOWN into NOT_APPLICABLE is how a total outage reports as a
+  clean org. Reproduced offline with every query failing: the first version of this
+  file built zero checks, reported "no check had a
+  population that could contain a defect", and exited 0 - indistinguishable from
+  a genuinely fresh org. That is the same failure shape as counting "never
+  logged in" as "stale": a confident answer where there was no evidence.
+
+  The metric defect that started this, described by SHAPE rather than by the
+  numbers it produced. The stale-user check counted "never logged in" as
+  "stale". In an org where the active users had all been provisioned inside the
+  window, every one of them scored as a defect - and the defect rate was
+  computed over a population that could not contain a defect. The measurements
+  that exposed it came from a scan taken under a hold, so they are not
+  reproduced here and no fixture is derived from them.
+
+UNITS ARE NOT INTERCHANGEABLE
+  A dormant user and an inactive flow are not the same kind of thing, so their
+  opportunities cannot be added. Pooling them produced one DPMO with no
+  defensible denominator. Rollups are per-unit, and a cross-unit total is simply
+  not offered.
 
 USAGE
   python3 scripts/xray_score.py
@@ -32,10 +48,15 @@ USAGE
   Credentials come from .env (D-18): Headless_domain, Headless_consumer_key,
   Headless_consumer_secret. Never from argv, never echoed.
 
+EXIT CODES
+  0  every check reached a verdict (SCORED or NOT_APPLICABLE)
+  2  at least one check is UNKNOWN - the run did not establish what it claims
+
 READ-ONLY BY CONSTRUCTION
-  Every call here is a GET against the Data API. There is no write path in this
-  file and there must never be one - a scoring engine that can change the org it
-  is scoring is a different and far more dangerous product.
+  Every Data API call goes through get_json(), which is GET-only and refuses a
+  host that is not the expected org. There is no write path and there must never
+  be one - a scoring engine that can change the org it is scoring is a different
+  and far more dangerous product.
 """
 import argparse
 import json
@@ -45,46 +66,55 @@ import urllib.parse
 import urllib.request
 
 API = "v67.0"
+
+SCORED = "SCORED"
 NOT_APPLICABLE = "NOT_APPLICABLE"
+UNKNOWN = "UNKNOWN"
 
 
 class Check:
     """One measurable thing, as opportunities and defects.
 
-    `opportunities` is the population that COULD have been a defect. `defects`
-    is how many of them were. Keeping them apart is the whole point: a defect
-    count without its denominator is a number without a meaning.
+    `opportunities` is the population that COULD have been a defect; `defects`
+    is how many of them were. Either may be None, which means we could not find
+    out - and that is reported as UNKNOWN, never as zero.
     """
 
-    def __init__(self, key, title, opportunities, defects, unit="record", note=""):
-        if defects < 0 or opportunities < 0:
-            raise ValueError(key + ": counts cannot be negative")
-        if defects > opportunities:
-            raise ValueError(
-                "{0}: {1} defects out of {2} opportunities - more defects than "
-                "chances to have one means the query is wrong, not that the org "
-                "is broken".format(key, defects, opportunities))
+    def __init__(self, key, title, opportunities, defects, unit="record",
+                 note="", reason=""):
+        if opportunities is None or defects is None:
+            self.state = UNKNOWN
+        else:
+            if defects < 0 or opportunities < 0:
+                raise ValueError(key + ": counts cannot be negative")
+            if defects > opportunities:
+                raise ValueError(
+                    "{0}: {1} defects out of {2} opportunities - more defects than "
+                    "chances to have one means the query is wrong, not that the "
+                    "org is broken".format(key, defects, opportunities))
+            self.state = SCORED if opportunities > 0 else NOT_APPLICABLE
         self.key = key
         self.title = title
         self.opportunities = opportunities
         self.defects = defects
         self.unit = unit
         self.note = note
+        self.reason = reason
 
     @property
     def scoreable(self):
-        return self.opportunities > 0
+        return self.state == SCORED
 
     @property
     def dpmo(self):
-        if not self.scoreable:
-            return NOT_APPLICABLE
+        if self.state != SCORED:
+            return self.state
         return round(self.defects / self.opportunities * 1000000)
 
     @property
     def sigma(self):
-        if not self.scoreable:
-            return NOT_APPLICABLE
+        if self.state != SCORED:
+            return self.state
         good = 1.0 - (self.defects / self.opportunities)
         if good >= 1.0:
             # A clean run is real, but "infinite sigma" is not a claim worth
@@ -99,9 +129,10 @@ class Check:
 
     def to_dict(self):
         return {"key": self.key, "title": self.title, "unit": self.unit,
+                "state": self.state,
                 "opportunities": self.opportunities, "defects": self.defects,
-                "scoreable": self.scoreable, "dpmo": self.dpmo,
-                "sigma": self.sigma, "note": self.note}
+                "dpmo": self.dpmo, "sigma": self.sigma,
+                "note": self.note, "reason": self.reason}
 
 
 def inv_norm_cdf(p):
@@ -137,31 +168,43 @@ def inv_norm_cdf(p):
 
 
 def summarise(checks):
-    """Roll checks up WITHOUT silently dropping the unscoreable ones.
+    """Roll up PER UNIT, and never hide an UNKNOWN.
 
-    An unscoreable check that quietly contributes 0/0 would drag a rollup toward
-    "perfect" for the reason that nothing was measured. They are named instead.
+    Opportunities of different units are different kinds of thing. A dormant
+    user and an inactive flow cannot be added, so no cross-unit total is offered
+    - a single DPMO over both would have no defensible denominator.
     """
-    scoreable = [c for c in checks if c.scoreable]
-    skipped = [c for c in checks if not c.scoreable]
-    opp = sum(c.opportunities for c in scoreable)
-    bad = sum(c.defects for c in scoreable)
+    unknown = [c for c in checks if c.state == UNKNOWN]
+    skipped = [c for c in checks if c.state == NOT_APPLICABLE]
+    scored = [c for c in checks if c.state == SCORED]
+
+    by_unit = {}
+    for c in scored:
+        acc = by_unit.setdefault(c.unit, {"opportunities": 0, "defects": 0, "keys": []})
+        acc["opportunities"] += c.opportunities
+        acc["defects"] += c.defects
+        acc["keys"].append(c.key)
+    for unit, acc in by_unit.items():
+        rolled = Check("_rollup_" + unit, "rollup", acc["opportunities"], acc["defects"], unit)
+        acc["dpmo"] = rolled.dpmo
+        acc["sigma"] = rolled.sigma
+
     out = {"checks_total": len(checks),
-           "checks_scored": len(scoreable),
+           "checks_scored": len(scored),
            "checks_not_applicable": [c.key for c in skipped],
-           "opportunities": opp,
-           "defects": bad}
-    if opp == 0:
-        out["dpmo"] = NOT_APPLICABLE
-        out["sigma"] = NOT_APPLICABLE
-        out["verdict"] = ("NOT SCOREABLE - no check in this org had a population "
-                          "that could contain a defect. This is not a clean org; "
-                          "it is an unmeasured one.")
-        return out
-    rolled = Check("_rollup", "rollup", opp, bad)
-    out["dpmo"] = rolled.dpmo
-    out["sigma"] = rolled.sigma
-    out["verdict"] = "scored"
+           "checks_unknown": [c.key for c in unknown],
+           "by_unit": by_unit,
+           "cross_unit_total": None}
+    if unknown:
+        out["verdict"] = ("INCOMPLETE - {0} check(s) could not be established: {1}. "
+                          "This run does not know what it did not measure, and must "
+                          "not be read as a score.").format(
+                              len(unknown), ", ".join(c.key for c in unknown))
+    elif not scored:
+        out["verdict"] = ("NOT SCOREABLE - every check had an empty population. This is "
+                          "not a clean org; it is an unmeasured one.")
+    else:
+        out["verdict"] = "scored"
     return out
 
 
@@ -177,10 +220,15 @@ def load_env(path):
     return conf
 
 
-def get_token(conf):
-    base = conf["Headless_domain"].rstrip("/")
+def normalise_base(domain):
+    base = domain.rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
+    return base
+
+
+def get_token(conf):
+    base = normalise_base(conf["Headless_domain"])
     body = urllib.parse.urlencode({
         "grant_type": "client_credentials",
         "client_id": conf["Headless_consumer_key"],
@@ -190,52 +238,95 @@ def get_token(conf):
         return base, json.load(resp)["access_token"]
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect can move a request to a host we never approved."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "refusing to follow a redirect to " + str(newurl), headers, fp)
+
+
+def get_json(base, token, path):
+    """The ONLY way this file talks to the org. GET, to the expected host, no
+    redirects, no body - enforced at runtime rather than asserted in a comment.
+
+    A source-text assertion that "there are no POSTs" is bypassable by anyone
+    who splits a line. This is the boundary itself.
+    """
+    if not path.startswith("/services/data/"):
+        raise ValueError("refusing a non Data API path: " + path)
+    url = base + path
+    if not url.startswith(normalise_base(base) + "/"):
+        raise ValueError("refusing a host that is not the expected org")
+    if not url.startswith("https://"):
+        raise ValueError("refusing a non-HTTPS request")
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    if req.get_method() != "GET":
+        raise ValueError("refusing a non-GET request")
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(req, timeout=60) as resp:
+        return json.load(resp)
+
+
 def count(base, token, soql):
     """COUNT() via SOQL.
 
     Returns None on failure and never 0. A failed query and an empty result are
-    different facts, and only one of them is news about the org.
+    different facts, and only one of them is news about the org. The caller
+    turns None into an UNKNOWN check rather than dropping it.
     """
-    url = base + "/services/data/" + API + "/query?q=" + urllib.parse.quote(soql)
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.load(resp)["totalSize"]
+        return get_json(base, token,
+                        "/services/data/" + API + "/query?q=" + urllib.parse.quote(soql))["totalSize"]
     except Exception:
         return None
 
 
-def build_checks(base, token, window_days=90):
-    """The checks, each stated as opportunity and defect."""
+def build_checks(base, token, window_days=90, counter=None):
+    """The checks, each stated as opportunity and defect.
+
+    A check is ALWAYS emitted. If its queries failed it is emitted UNKNOWN, so a
+    total outage cannot masquerade as an org with nothing to find.
+    """
+    q = counter or count
     w = "LAST_N_DAYS:" + str(window_days)
     checks = []
 
-    # Dormant users. The opportunity is users who have HAD the window in which
-    # to log in. A user created inside the window has not, and is not a defect.
-    eligible = count(base, token,
-                     "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate < " + w)
-    dormant = count(base, token,
-                    "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate < " + w
-                    + " AND (LastLoginDate = null OR LastLoginDate < " + w + ")")
-    if eligible is not None and dormant is not None:
-        note = ""
-        if eligible == 0:
-            fresh = count(base, token,
-                          "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate >= " + w)
-            note = ("every active user was provisioned inside the last {0} days"
-                    "{1}, so none has had the chance to go dormant yet").format(
-                        window_days, " (" + str(fresh) + " of them)" if fresh else "")
-        checks.append(Check("dormant_users",
-                            "Active users with no login in {0} days".format(window_days),
-                            eligible, dormant, "user", note))
+    eligible = q(base, token,
+                 "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate < " + w)
+    dormant = q(base, token,
+                "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate < " + w
+                + " AND (LastLoginDate = null OR LastLoginDate < " + w + ")")
+    note = ""
+    if eligible == 0:
+        fresh = q(base, token,
+                  "SELECT COUNT() FROM User WHERE IsActive=true AND CreatedDate >= " + w)
+        note = ("every active user was provisioned inside the last {0} days{1}, so "
+                "none has had the chance to go dormant yet").format(
+                    window_days, " (" + str(fresh) + " of them)" if fresh else "")
+    checks.append(Check(
+        "dormant_users",
+        "Active users with no login in {0} days".format(window_days),
+        eligible, dormant, "user", note,
+        reason="" if eligible is not None and dormant is not None
+               else "a User COUNT() query did not return"))
 
-    # Dead automation an admin has to read past every time they open the org.
-    all_flows = count(base, token, "SELECT COUNT() FROM FlowDefinitionView")
-    live_flows = count(base, token,
-                       "SELECT COUNT() FROM FlowDefinitionView WHERE IsActive=true")
+    all_flows = q(base, token, "SELECT COUNT() FROM FlowDefinitionView")
+    live_flows = q(base, token, "SELECT COUNT() FROM FlowDefinitionView WHERE IsActive=true")
+    inactive = None
     if all_flows is not None and live_flows is not None:
-        checks.append(Check("inactive_flows", "Flow definitions that are not active",
-                            all_flows, all_flows - live_flows, "flow"))
+        inactive = all_flows - live_flows
+        if inactive < 0:
+            # More active than total means the two queries disagree. That is a
+            # broken measurement, not an org with negative dead flows.
+            all_flows, inactive = None, None
+    checks.append(Check(
+        "inactive_flows", "Flow definitions that are not active",
+        all_flows, inactive, "flow",
+        reason="" if all_flows is not None
+               else "a FlowDefinitionView COUNT() query did not return, or the "
+                    "active count exceeded the total"))
     return checks
 
 
@@ -246,30 +337,38 @@ def render(org, checks, summary):
     out.append("")
     for c in checks:
         out.append(c.title)
+        if c.state == UNKNOWN:
+            out.append("  state         : UNKNOWN")
+            out.append("  why           : " + (c.reason or "could not be established"))
+            out.append("")
+            continue
         out.append("  opportunities : {0} {1}(s)".format(c.opportunities, c.unit))
         out.append("  defects       : {0}".format(c.defects))
-        if c.scoreable:
+        if c.state == SCORED:
             sig = c.sigma
             sigtxt = "unbounded" if sig["value"] is None else "{0:.2f}".format(sig["value"])
             out.append("  DPMO          : {0:,}".format(c.dpmo))
-            out.append("  sigma         : " + sigtxt + (("  (" + sig["why"] + ")") if sig["why"] else ""))
+            out.append("  sigma         : " + sigtxt + ((" (" + sig["why"] + ")") if sig["why"] else ""))
         else:
-            out.append("  DPMO          : NOT APPLICABLE")
+            out.append("  state         : NOT APPLICABLE")
             out.append("  why           : " + (c.note or "no opportunities to score"))
         out.append("")
-    out.append("ROLLUP")
-    if summary["verdict"] == "scored":
-        sig = summary["sigma"]
-        sigtxt = "unbounded" if sig["value"] is None else "{0:.2f}".format(sig["value"])
-        # ASCII only. A U+00B7 separator here rendered as a replacement
-        # character on the Windows console codepage and would corrupt the output
-        # of any pipe or CI capture. This tool has to read the same everywhere.
-        out.append("  {0:,} DPMO over {1:,} opportunities | sigma {2}".format(
-            summary["dpmo"], summary["opportunities"], sigtxt))
+    out.append("ROLLUP, per unit - opportunities of different kinds are not added")
+    if summary["by_unit"]:
+        for unit, acc in sorted(summary["by_unit"].items()):
+            sig = acc["sigma"]
+            sigtxt = "unbounded" if sig["value"] is None else "{0:.2f}".format(sig["value"])
+            out.append("  {0:<8} {1:,} DPMO over {2:,} opportunities | sigma {3}".format(
+                unit, acc["dpmo"], acc["opportunities"], sigtxt))
     else:
-        out.append("  " + summary["verdict"])
+        out.append("  nothing was scoreable")
+    if summary["checks_unknown"]:
+        out.append("  UNKNOWN: " + ", ".join(summary["checks_unknown"]))
     if summary["checks_not_applicable"]:
         out.append("  not applicable: " + ", ".join(summary["checks_not_applicable"]))
+    if summary["verdict"] != "scored":
+        out.append("")
+        out.append("  " + summary["verdict"])
     return "\n".join(out)
 
 
@@ -300,7 +399,9 @@ def main():
                        "checks": [c.to_dict() for c in checks],
                        "summary": summary}, fh, indent=2)
         print("\nwrote " + args.json_out)
-    return 0
+    # Non-zero when the run did not establish what it claims. A scoring tool
+    # that exits 0 after failing to reach the org is the defect this fixes.
+    return 2 if summary["checks_unknown"] else 0
 
 
 if __name__ == "__main__":
