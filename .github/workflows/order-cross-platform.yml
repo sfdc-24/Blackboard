@@ -26,11 +26,9 @@ jobs:
         include:
           - platform: Windows
             os: windows-latest
-            shell: powershell
             engine: powershell.exe
           - platform: Linux
             os: ubuntu-24.04
-            shell: pwsh
             engine: pwsh
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -47,9 +45,14 @@ jobs:
         env:
           ORDER_TEST_ENGINE: ${{ matrix.engine }}
         run: python tests/test_order_crosscheck_harness.py
-      - name: Produce fixture evidence
-        shell: ${{ matrix.shell }}
-        run: ./tests/order_fixture_crosscheck.ps1 -OutFile fixture-${{ matrix.platform }}.json
+      - name: Produce Windows 5.1 fixture evidence
+        if: matrix.platform == 'Windows'
+        shell: powershell
+        run: ./tests/order_fixture_crosscheck.ps1 -OutFile fixture-Windows.json
+      - name: Produce Linux fixture evidence
+        if: matrix.platform == 'Linux'
+        shell: pwsh
+        run: ./tests/order_fixture_crosscheck.ps1 -OutFile fixture-Linux.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fixture-${{ matrix.platform }}
