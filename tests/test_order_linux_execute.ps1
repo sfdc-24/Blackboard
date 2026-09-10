@@ -50,6 +50,7 @@ Assert-True 'runner parses' (@($errors).Count -eq 0)
 # job: the runner and the subset this file loads must stay in step.
 foreach ($fn in @('Test-OnWindows', 'Resolve-WorkerEngine', 'Get-PosixChildProcessId',
                   'Get-PosixProcessGroupId', 'Invoke-PosixGroupKill',
+                  'Resolve-PosixKillBinary', 'Get-PosixProcessGroupMemberId',
                   'Test-PosixProcessAlive', 'Invoke-PosixTreeKill', 'Invoke-ProcessTreeKill',
                   'Invoke-TaskkillTree', 'Quote-ProcessArgument',
                   'Test-RunTreeContainsReparsePoint', 'Remove-OwnedRunDirectory',

@@ -643,8 +643,53 @@ function Get-PosixProcessGroupId {
     return $pgid
 }
 
-function Invoke-PosixGroupKill {
+function Resolve-PosixKillBinary {
+    # util-linux ships kill at /bin/kill on Debian and Ubuntu and at
+    # /usr/bin/kill elsewhere. The previous code hard-coded /bin/kill and then
+    # returned success unconditionally, so on a host without it the supervisor
+    # reported a clean containment having sent no signal at all.
+    foreach ($candidate in @('/bin/kill', '/usr/bin/kill')) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return ''
+}
+
+function Get-PosixProcessGroupMemberId {
     param([Parameter(Mandatory = $true)][int]$ProcessGroupId)
+
+    # The members of a group, so a kill can be PROVEN rather than assumed.
+    #
+    # ZOMBIES ARE NOT SURVIVORS. A SIGKILLed process stays in /proc as a zombie
+    # until its parent reaps it. Counting those as members made a kill that had
+    # worked perfectly report failure - the same mistake Test-PosixProcessAlive
+    # already exists to avoid, so it is avoided the same way here.
+    $members = @()
+    if (-not (Test-Path -LiteralPath '/proc')) { return $members }
+    foreach ($entry in [IO.Directory]::EnumerateDirectories('/proc')) {
+        $leaf = [IO.Path]::GetFileName($entry)
+        $candidateId = 0
+        if (-not [int]::TryParse($leaf, [ref]$candidateId)) { continue }
+        try {
+            $raw = [IO.File]::ReadAllText((Join-Path $entry 'stat'))
+        } catch { continue }            # it exited while we were reading it
+        $close = $raw.LastIndexOf(')')
+        if ($close -lt 0) { continue }
+        $fields = $raw.Substring($close + 1).Trim() -split '\s+'
+        # after comm: [0]=state [1]=ppid [2]=pgrp
+        if ($fields.Count -lt 3) { continue }
+        if ($fields[0] -ceq 'Z') { continue }
+        $pgid = 0
+        if (-not [int]::TryParse($fields[2], [ref]$pgid)) { continue }
+        if ($pgid -eq $ProcessGroupId) { $members += $candidateId }
+    }
+    return $members
+}
+
+function Invoke-PosixGroupKill {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessGroupId,
+        [int]$DrainMilliseconds = 5000
+    )
 
     # CONTAINMENT BY IDENTITY, NOT BY SEARCH.
     #
@@ -660,17 +705,52 @@ function Invoke-PosixGroupKill {
     # on Windows, and it is the only shape that does not race.
     if ($ProcessGroupId -le 1) { throw 'refusing to signal process group ' + $ProcessGroupId }
 
-    # THE SAFETY CHECK THAT MATTERS. If setsid did not take effect, the adapter
-    # shares OUR process group, and kill(-pgid) would kill the supervisor - and
-    # every other process in its group - instead of the adapter. Refuse rather
-    # than take the whole lane down to clean up one run.
+    # THE SAFETY CHECK THAT MATTERS, AND IT NOW FAILS CLOSED.
+    #
+    # If setsid did not take effect, the adapter shares OUR process group, and
+    # kill(-pgid) would kill the supervisor - and every other process in its
+    # group - instead of the adapter.
+    #
+    # The previous form was `if ($ownGroup -gt 0 -and ...)`, which SKIPPED the
+    # guard entirely when the lookup returned -1. That is fail-open on the one
+    # check standing between a cleanup and the supervisor killing itself: an
+    # unreadable /proc/self/stat became permission to signal. Not knowing our own
+    # group is a reason to refuse, never a reason to proceed.
     $ownGroup = Get-PosixProcessGroupId -ProcessId $PID
-    if ($ownGroup -gt 0 -and $ProcessGroupId -eq $ownGroup) {
+    if ($ownGroup -le 0) {
+        throw 'refusing to signal a process group without knowing our own'
+    }
+    if ($ProcessGroupId -eq $ownGroup) {
         throw 'refusing to kill the supervisor own process group'
     }
 
-    & /bin/kill -s KILL -- "-$ProcessGroupId" 2>$null | Out-Null
-    return 0
+    $killBinary = Resolve-PosixKillBinary
+    if (-not $killBinary) { return -1 }
+
+    & $killBinary -s KILL -- "-$ProcessGroupId" 2>$null | Out-Null
+    $signalExit = [int]$LASTEXITCODE
+
+    # A BOUNDED DRAIN PROOF, because the exit code is not the answer.
+    #
+    # This used to `return 0` unconditionally - it reported success even when
+    # the signal was rejected. But the native exit code alone is not the truth
+    # either, in BOTH directions: kill returns non-zero for a group that is
+    # already gone, which is success, and returns zero while a member is still
+    # dying, which is not yet success. So the verdict is taken from observing
+    # the group empty, and the exit code only distinguishes the failure modes.
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($DrainMilliseconds)
+    $survivors = @(Get-PosixProcessGroupMemberId -ProcessGroupId $ProcessGroupId)
+    while ($survivors.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+        $survivors = @(Get-PosixProcessGroupMemberId -ProcessGroupId $ProcessGroupId)
+    }
+    if ($survivors.Count -eq 0) { return 0 }
+
+    # Still populated after the deadline. Distinguishable so the caller's log
+    # says whether the kernel refused the signal or accepted it and the group
+    # simply did not die.
+    if ($signalExit -ne 0) { return 2 }
+    return 1
 }
 
 function Get-PosixChildProcessId {

@@ -39,7 +39,14 @@ $runnerPath = Join-Path $repoRoot 'scripts/order_supervisor.ps1'
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$errors)
 Assert-True 'runner parses' (@($errors).Count -eq 0)
+# THIS LIST IS A DEPENDENCY MANIFEST, not a wish list. Each function is lifted
+# out of the runner in isolation, so anything a listed function CALLS must be
+# listed too or the call dies with "not recognized" mid-test. Adding a helper to
+# Invoke-PosixGroupKill without adding it here turned this suite red while the
+# runner itself was correct - the failure looked like a containment regression
+# and was a loading one.
 foreach ($fn in @('Test-OnWindows', 'Get-PosixProcessGroupId', 'Invoke-PosixGroupKill',
+                  'Resolve-PosixKillBinary', 'Get-PosixProcessGroupMemberId',
                   'Get-PosixChildProcessId', 'Test-PosixProcessAlive',
                   'Invoke-PosixTreeKill', 'Invoke-ProcessTreeKill', 'Invoke-TaskkillTree')) {
     $defs = @($ast.FindAll({
