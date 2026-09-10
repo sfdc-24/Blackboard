@@ -1,0 +1,107 @@
+# Hosted CI for the self-contained Python suites.
+#
+# WHY THIS EXISTS
+#   Both PR55 (xray-score-v1) and PR56 (open_for_me) were blocked on the same
+#   finding: the suites pass when run directly and there is no hosted check, so
+#   a reviewer has to take the author's word for a number. "Green is not proof"
+#   cuts both ways - an unrunnable test is not evidence either.
+#
+# WHY IT RUNS THE FILES DIRECTLY
+#   These suites are plain scripts that print results and call sys.exit(1) on
+#   failure. `unittest discover` does NOT collect them and exits 0 having run
+#   nothing, which is worse than no CI: a green tick over zero assertions.
+#   Running the file is what actually honours its exit code.
+#
+# WHY EACH SUITE IS NAMED RATHER THAN GLOBBED
+#   tests/ also holds node:test suites, PowerShell suites and network-touching
+#   scripts. A glob would drag those in and either fail or, worse, make a
+#   network call from CI. Every suite listed here is offline by construction:
+#   no org, no board, no bus, no credentials.
+name: python-suites
+
+on:
+  pull_request:
+    paths:
+      - "scripts/xray_score.py"
+      - "scripts/open_for_me.py"
+      - "tests/test_xray_score.py"
+      - "tests/test_open_for_me.py"
+      - ".github/workflows/python-suites.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/xray_score.py"
+      - "scripts/open_for_me.py"
+      - "tests/test_xray_score.py"
+      - "tests/test_open_for_me.py"
+      - ".github/workflows/python-suites.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show what will run
+        run: |
+          set -euo pipefail
+          echo "python: $(python3 --version)"
+          for t in tests/test_xray_score.py tests/test_open_for_me.py; do
+            if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
+          done
+
+      # Each suite is its own step so a failure names the suite in the UI rather
+      # than hiding inside a loop. `if [ -f ]` because the two suites arrive on
+      # different branches; a branch carrying only one must not fail on the
+      # other's absence.
+      - name: xray-score-v1
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_xray_score.py ]; then
+            python3 tests/test_xray_score.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: open_for_me
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_open_for_me.py ]; then
+            python3 tests/test_open_for_me.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # A workflow that skips everything and reports success is the failure mode
+      # this file exists to prevent. If neither suite ran, say so and fail.
+      - name: Refuse a green tick over nothing
+        run: |
+          set -euo pipefail
+          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ]; then
+            echo "Neither suite is present, so this check proved nothing." >&2
+            echo "A passing check over zero assertions is worse than no check." >&2
+            exit 1
+          fi
+          echo "at least one suite ran for real"
+
+      - name: Prove the suites are offline
+        run: |
+          set -euo pipefail
+          # These must not reach the network. If a future edit adds a call, this
+          # catches it here rather than in a reviewer's head.
+          for t in tests/test_xray_score.py tests/test_open_for_me.py; do
+            [ -f "$t" ] || continue
+            if grep -nE "urlopen|requests\.|socket\.|http\.client" "$t"; then
+              echo "$t appears to make a network call; suites here must be offline" >&2
+              exit 1
+            fi
+          done
+          echo "no network calls in the suites"
