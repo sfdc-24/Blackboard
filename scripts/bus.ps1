@@ -231,7 +231,7 @@ if ($SheetRowJson) {
   # their existing compatibility behavior.
   if ($cells.Count -eq 10 -and ([string]$cells[5]).StartsWith('BCB|', [StringComparison]::Ordinal)) {
     $boardTimestamp = [string]$cells[1]
-    $boardTimestampPattern = '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$'
+    $boardTimestampPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$'
     if ($boardTimestamp -cnotmatch $boardTimestampPattern) {
       throw [InvalidOperationException]::new(
         'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require invariant UTC ISO-8601 in cell[1], ending in uppercase Z with zero to seven fractional digits. Refusing transport.'

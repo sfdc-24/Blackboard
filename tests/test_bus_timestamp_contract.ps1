@@ -60,30 +60,40 @@ function Start-TransportTrap {
         $ErrorActionPreference = 'Stop'
         $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, [int]$ListenPort)
         $client = $null
-        $reader = $null
         try {
             $listener.Start()
             [IO.File]::WriteAllText($ReadyFile, 'ready', (New-Object Text.UTF8Encoding($false)))
             $client = $listener.AcceptTcpClient()
             $client.ReceiveTimeout = 10000
             $stream = $client.GetStream()
-            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $false, 4096, $true)
-            $contentLength = 0
+            $headerBytes = New-Object 'System.Collections.Generic.List[byte]'
             while ($true) {
-                $line = $reader.ReadLine()
-                if ($null -eq $line -or $line.Length -eq 0) { break }
-                if ($line -match '^Content-Length:\s*(\d+)\s*$') {
-                    $contentLength = [int]$matches[1]
+                $nextByte = $stream.ReadByte()
+                if ($nextByte -lt 0) { throw 'test_transport_trap_header_ended_early' }
+                $headerBytes.Add([byte]$nextByte)
+                if ($headerBytes.Count -gt 65536) { throw 'test_transport_trap_header_too_large' }
+                if ($headerBytes.Count -ge 4 -and
+                    $headerBytes[$headerBytes.Count - 4] -eq 13 -and
+                    $headerBytes[$headerBytes.Count - 3] -eq 10 -and
+                    $headerBytes[$headerBytes.Count - 2] -eq 13 -and
+                    $headerBytes[$headerBytes.Count - 1] -eq 10) {
+                    break
                 }
             }
-            $buffer = New-Object char[] $contentLength
+            $headerText = [Text.Encoding]::ASCII.GetString($headerBytes.ToArray())
+            $contentLength = 0
+            if ($headerText -match '(?im)^Content-Length:\s*([0-9]+)\s*$') {
+                $contentLength = [int]$matches[1]
+            }
+            $buffer = New-Object byte[] $contentLength
             $readTotal = 0
             while ($readTotal -lt $contentLength) {
-                $readNow = $reader.Read($buffer, $readTotal, $contentLength - $readTotal)
+                $readNow = $stream.Read($buffer, $readTotal, $contentLength - $readTotal)
                 if ($readNow -le 0) { break }
                 $readTotal += $readNow
             }
-            $body = New-Object string($buffer, 0, $readTotal)
+            if ($readTotal -ne $contentLength) { throw 'test_transport_trap_body_ended_early' }
+            $body = [Text.Encoding]::UTF8.GetString($buffer, 0, $readTotal)
             [IO.File]::WriteAllText($CaptureFile, $body, (New-Object Text.UTF8Encoding($false)))
 
             $responseBody = '{"ok":true}'
@@ -94,7 +104,6 @@ function Start-TransportTrap {
             $stream.Write($responseBytes, 0, $responseBytes.Length)
             $stream.Flush()
         } finally {
-            if ($reader) { $reader.Dispose() }
             if ($client) { $client.Close() }
             $listener.Stop()
         }
@@ -135,12 +144,14 @@ function New-TestRowJson {
     param(
         [Parameter(Mandatory = $true)][string]$Timestamp,
         [int]$CellCount = 10,
-        [string]$Envelope = ''
+        [string]$Envelope = '',
+        [string]$Gist = ''
     )
 
     if (-not $Envelope) {
         $Envelope = 'BCB|v=1|id=TEST-TIMESTAMP|phase=RESULT|hold=' + $script:PayloadSecret
     }
+    if (-not $Gist) { $Gist = 'credential=' + $script:PayloadSecret }
     $cells = @(
         'TEST-TIMESTAMP',
         $Timestamp,
@@ -150,7 +161,7 @@ function New-TestRowJson {
         $Envelope,
         'DONE',
         'BUS-TIMESTAMP-CONTRACT',
-        ('credential=' + $script:PayloadSecret),
+        $Gist,
         ''
     )
     if ($CellCount -lt $cells.Count) {
@@ -237,11 +248,16 @@ try {
     } finally {
         [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
     }
+    $unicodeDigitTimestamp = (@(
+        0x0662, 0x0660, 0x0662, 0x0666, 0x002D, 0x0660, 0x0669, 0x002D, 0x0661, 0x0660,
+        0x0054, 0x0660, 0x0663, 0x003A, 0x0660, 0x0660, 0x003A, 0x0662, 0x0666, 0x005A
+    ) | ForEach-Object { [char]$_ }) -join ''
     $rejected = @(
         [pscustomobject]@{ Name = 'locale'; Timestamp = '09/10/2026 03:00:26'; Code = 'BOARD_TIMESTAMP_INVALID' },
         [pscustomobject]@{ Name = 'missing-z'; Timestamp = '2026-09-10T03:00:26'; Code = 'BOARD_TIMESTAMP_INVALID' },
         [pscustomobject]@{ Name = 'offset'; Timestamp = '2026-09-10T03:00:26+00:00'; Code = 'BOARD_TIMESTAMP_INVALID' },
         [pscustomobject]@{ Name = 'impossible-date'; Timestamp = '2026-02-30T03:00:26Z'; Code = 'BOARD_TIMESTAMP_INVALID' },
+        [pscustomobject]@{ Name = 'unicode-digits'; Timestamp = $unicodeDigitTimestamp; Code = 'BOARD_TIMESTAMP_INVALID'; MessageContains = 'ending in uppercase Z' },
         [pscustomobject]@{ Name = 'datetime-culture'; Timestamp = $dateTimeCultureValue; Code = 'BOARD_TIMESTAMP_INVALID' },
         [pscustomobject]@{ Name = 'future'; Timestamp = ([DateTime]::UtcNow.AddMinutes(5).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', [Globalization.CultureInfo]::InvariantCulture)); Code = 'BOARD_TIMESTAMP_FUTURE' }
     )
@@ -253,12 +269,36 @@ try {
         Assert-True ($case.Name + ' error hides bus secret') (-not $result.Output.Contains($script:FakeSecret))
         Assert-True ($case.Name + ' error hides row payload') (-not $result.Output.Contains($script:PayloadSecret))
         Assert-True ($case.Name + ' error hides rejected value') (-not $result.Output.Contains($case.Timestamp))
+        $messageExpectation = $case.PSObject.Properties['MessageContains']
+        if ($messageExpectation) {
+            Assert-True ($case.Name + ' is rejected by the ASCII wire-format gate') (
+                $result.ErrorMessage.Contains([string]$messageExpectation.Value)
+            ) $result.ErrorMessage
+        }
     }
 
     $generalRow = New-TestRowJson -Timestamp 'September 10, 2026 3:00 AM' -Envelope 'GENERAL-SHEET-ROW'
     $generalResult = Invoke-BusCase -Name 'general-sheet-ten-cells' -RowJson $generalRow
     Assert-True 'general 10-cell sheet row remains compatible' ($generalResult.ErrorMessage.Length -eq 0) $generalResult.ErrorMessage
     Assert-True 'general 10-cell sheet row reaches transport' $generalResult.TransportObserved
+
+    $unicodeGist = 'caf{0} | {1}{2} | {3}' -f (
+        [char]0x00E9,
+        [char]0x6F22,
+        [char]0x5B57,
+        [char]::ConvertFromUtf32(0x1F642)
+    )
+    $unicodeTimestamp = $clock.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+    $unicodeResult = Invoke-BusCase -Name 'canonical-bcb-multibyte-cell' -RowJson (New-TestRowJson -Timestamp $unicodeTimestamp -Gist $unicodeGist)
+    $unicodeRequest = $(if ($unicodeResult.TransportObserved) { $unicodeResult.RequestBody | ConvertFrom-Json } else { $null })
+    Assert-True 'canonical BCB row with multibyte cell is accepted' ($unicodeResult.ErrorMessage.Length -eq 0) $unicodeResult.ErrorMessage
+    Assert-True 'canonical BCB row with multibyte cell reaches transport' $unicodeResult.TransportObserved
+    Assert-True 'transport trap receives a genuinely multibyte request body' (
+        [Text.Encoding]::UTF8.GetByteCount($unicodeResult.RequestBody) -gt $unicodeResult.RequestBody.Length
+    )
+    Assert-True 'multibyte cell survives request JSON exactly' (
+        $null -ne $unicodeRequest -and [string]$unicodeRequest.sheetRow[8] -ceq $unicodeGist
+    )
 
     $legacyBcbRow = New-TestRowJson -Timestamp 'legacy local time' -CellCount 8
     $legacyResult = Invoke-BusCase -Name 'noncanonical-eight-cell-bcb' -RowJson $legacyBcbRow
