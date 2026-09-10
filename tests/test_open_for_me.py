@@ -250,10 +250,36 @@ big = [row("2026-09-09T13:00:{0:02d}Z".format(i % 60), "codex",
        for i in range(300)]
 big.append(row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE"))
 rbig = ofm.open_for(big, TAG, now=NOW)
-check("row output is capped", rbig["total"] == ofm.MAX_ROWS, rbig["total"])
+check("row DISPLAY is capped", rbig["shown"] == ofm.MAX_ROWS, rbig["shown"])
+check("but the total reports ALL matching rows", rbig["total"] == 300, rbig["total"])
 check("and the number withheld is reported", rbig["truncated"] == 100, rbig["truncated"])
 check("the cap applies to the JSON too, not just the text",
       len(json.dumps(rbig)) < 200000 and len(rbig["rows"]) == ofm.MAX_ROWS)
+
+print("")
+print("== THE CAP IS A DISPLAY LIMIT, NEVER A SAFETY DECISION ==")
+# codex reproduced this against 8fdf4bd: a hold sitting past the display cap
+# vanished from active_holds and the gate exited 0. A cap that silently decides
+# "no holds" is a fail-open dressed as tidiness.
+buried = [row("2026-09-09T13:00:{0:02d}Z".format(i % 60), "codex",
+              "BCB|v=1|id=NOISE{0}|from=codex|to=claude-code-cli|priority=LOW".format(i),
+              "OPEN") for i in range(250)]
+# timestamped LAST so it sorts past the cap
+buried.append(row("2026-09-09T23:59:59Z", "codex",
+                  "BCB|v=1|id=BURIED-HOLD|from=codex|to=claude-code-cli|priority=CRITICAL"
+                  "|hold=do not touch the thing", "DONE", "a hold past the cap"))
+buried.append(row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE"))
+rb2 = ofm.open_for(buried, TAG, now=NOW)
+check("the buried hold is NOT in the displayed rows",
+      not any(d["id"] == "BURIED-HOLD" for d in rb2["rows"]))
+check("but it IS in active_holds anyway", "BURIED-HOLD" in rb2["active_holds"],
+      rb2["active_holds"])
+check("and it is called out as not displayed",
+      "BURIED-HOLD" in rb2["active_holds_beyond_cap"], rb2["active_holds_beyond_cap"])
+check("the unreachable count also covers rows past the cap",
+      rb2["invisible"] >= ofm.MAX_ROWS, rb2["invisible"])
+check("and the render says the counts cover everything",
+      "cover ALL of them" in ofm.render(rb2))
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))

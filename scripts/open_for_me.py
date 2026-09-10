@@ -231,17 +231,36 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
             "category": cell(r, COL_CATEGORY).strip().upper(),
         })
     out.sort(key=lambda d: (d["ts"] or ""))      # oldest first - the forgotten ones
+
+    # THE CAP IS A DISPLAY LIMIT AND NOTHING ELSE.
+    #
+    # It used to bound the safety decision too: active_holds and the unreachable
+    # count were computed over the SHOWN slice, so a hold sitting at row 201
+    # disappeared from active_holds and the gate exited 0. Codex reproduced
+    # exactly that against 8fdf4bd. A cap that silently decides "no holds" is a
+    # fail-open dressed as tidiness, and it is worse than unbounded output
+    # because it looks like an answer.
+    #
+    # Every decision below is computed over ALL rows. Only `rows` is truncated.
+    active_holds = [d["id"] for d in out
+                    if d["standing_hold"] and d["hold_lifecycle"] == ACTIVE]
+    invisible_all = sum(1 for d in out if d["invisible_to_wake_read"])
     truncated = max(0, len(out) - MAX_ROWS)
     shown = out[:MAX_ROWS]
-    active_holds = [d for d in shown if d["standing_hold"] and d["hold_lifecycle"] == ACTIVE]
+    # A hold that exists but is NOT displayed must still be visible as a fact,
+    # or the reader cannot act on the number the exit code is based on.
+    holds_beyond_cap = [d["id"] for d in out[MAX_ROWS:]
+                        if d["standing_hold"] and d["hold_lifecycle"] == ACTIVE]
     return {"tag": tag,
             "horizon": horizon and {"ts": horizon["ts"], "vseq": horizon["vseq"]},
             "horizon_trusted": horizon is not None,
             "rows": shown,
-            "total": len(shown),
+            "shown": len(shown),
+            "total": len(out),                    # ALL matching rows, not the slice
             "truncated": truncated,
-            "invisible": sum(1 for d in shown if d["invisible_to_wake_read"]),
-            "active_holds": [d["id"] for d in active_holds]}
+            "invisible": invisible_all,           # over all rows, not the slice
+            "active_holds": active_holds,         # over all rows, not the slice
+            "active_holds_beyond_cap": holds_beyond_cap}
 
 
 def render(result):
@@ -269,13 +288,17 @@ def render(result):
         if d["gist"]:
             lines.append("            " + d["gist"])
     lines.append("")
-    lines.append("{0} shown, {1} unreachable by the documented wake read.".format(
-        result["total"], result["invisible"]))
+    lines.append("{0} rows match; {1} shown. {2} unreachable by the documented "
+                 "wake read.".format(result["total"], result["shown"], result["invisible"]))
     if result["truncated"]:
-        lines.append("{0} further rows not shown (capped at {1}).".format(
-            result["truncated"], MAX_ROWS))
+        lines.append("{0} further rows not shown (display capped at {1}) - the counts "
+                     "and holds above cover ALL of them.".format(
+                         result["truncated"], MAX_ROWS))
     if result["active_holds"]:
         lines.append("ACTIVE HOLDS: " + ", ".join(result["active_holds"]))
+    if result["active_holds_beyond_cap"]:
+        lines.append("OF WHICH NOT DISPLAYED ABOVE: "
+                     + ", ".join(result["active_holds_beyond_cap"]))
     return "\n".join(lines)
 
 
