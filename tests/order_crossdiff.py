@@ -19,6 +19,76 @@ print("")
 
 problems = []
 
+
+def pass_succeeded(p):
+    """Did this pass actually RUN, or merely finish?
+
+    THE FAILURE ORACLE. Without one, this differ compares two failures and
+    reports MATCH - which is exactly what it did on PowerShell 7.4.6, where
+    every pass errored on board or state JSON and the diff still said "no
+    behavioural differences" and exited 0. Codex reproduced it against 373f9da.
+
+    Two runs agreeing that they both broke is not evidence that a port
+    preserves behaviour. It is evidence that nothing was measured, and it is
+    worse than a red result because it wears a green one.
+    """
+    if p.get("threw"):
+        return False, "threw: " + str(p["threw"])[:120]
+    out = (p.get("stdout") or "").strip()
+    if not out:
+        return False, "no stdout at all"
+    try:
+        verdict = json.loads(out.splitlines()[-1])
+    except Exception:
+        return False, "last stdout line is not the JSON verdict: " + out.splitlines()[-1][:100]
+    if not isinstance(verdict, dict):
+        return False, "verdict is not an object"
+    if verdict.get("ok") is not True:
+        return False, "verdict ok is {0!r}, not true".format(verdict.get("ok"))
+    return True, ""
+
+
+def side_ran(doc, label):
+    """Every pass on this side must have succeeded, and no run_error logged."""
+    ok = True
+    for p in doc["passes"]:
+        good, why = pass_succeeded(p)
+        if not good:
+            ok = False
+            problems.append("{0} {1} pass {2} did not run: {3}".format(
+                label, p.get("scenario", "?"), p.get("pass", "?"), why))
+    for scenario, decisions in (doc.get("log_decisions") or {}).items():
+        for d in decisions or []:
+            if str(d.get("event")) in ("run_error", "<UNPARSEABLE>"):
+                ok = False
+                problems.append("{0} {1} logged {2} [{3}]".format(
+                    label, scenario, d.get("event"), d.get("code") or ""))
+    return ok
+
+
+# The oracle runs BEFORE any comparison, because a comparison between two
+# broken runs has nothing to say.
+a_ran = side_ran(a, "A")
+b_ran = side_ran(b, "B")
+print("side A actually ran : {0}".format(a_ran))
+print("side B actually ran : {0}".format(b_ran))
+if not (a_ran and b_ran):
+    print("")
+    print("REFUSING TO COMPARE. At least one side did not produce a real run, so")
+    print("any agreement between them would be agreement about failure.")
+    for p in problems:
+        print("  - " + p)
+    sys.exit(1)
+print("")
+
+# A run must also be from two DIFFERENT platforms, or it is a comparison with
+# itself wearing two filenames.
+if a["platform"] == b["platform"] and a["ps_version"] == b["ps_version"]:
+    print("REFUSING TO COMPARE: both artifacts are {0} PowerShell {1}. That is the "
+          "same host twice, not a cross-host comparison.".format(
+              a["platform"], a["ps_version"]))
+    sys.exit(1)
+
 # The input must be identical or nothing below means anything.
 if a["fixture_sha"] != b["fixture_sha"]:
     problems.append("DIFFERENT FIXTURE: {0} vs {1}".format(a["fixture_sha"][:16], b["fixture_sha"][:16]))

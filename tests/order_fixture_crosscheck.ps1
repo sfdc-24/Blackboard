@@ -197,3 +197,37 @@ foreach ($k in $decisions.Keys) {
     }
 }
 Write-Output ('wrote ' + $OutFile)
+
+# THE HARNESS MUST NOT EXIT 0 OVER A RUN THAT DID NOT HAPPEN.
+#
+# It used to produce an artifact and exit 0 whatever the passes did, leaving the
+# differ as the only thing that could notice - and the differ had no failure
+# oracle either, so on PowerShell 7.4.6 every pass errored and the whole chain
+# reported success. Two places that each assumed the other was checking.
+$failed = @()
+foreach ($p in $passes) {
+    $label = $p.scenario + ' pass ' + $p.pass
+    if ($p.threw) { $failed += ($label + ': threw'); continue }
+    $last = ($p.stdout -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+    if (-not $last) { $failed += ($label + ': no stdout'); continue }
+    try {
+        $verdict = $last | ConvertFrom-Json -ErrorAction Stop
+        if ($verdict.ok -ne $true) { $failed += ($label + ': ok is not true') }
+    } catch {
+        $failed += ($label + ': stdout is not the JSON verdict')
+    }
+}
+foreach ($k in $decisions.Keys) {
+    foreach ($e in $decisions[$k]) {
+        if ($e.event -eq 'run_error' -or $e.event -eq '<UNPARSEABLE>') {
+            $failed += ($k + ': logged ' + $e.event + ' [' + $e.code + ']')
+        }
+    }
+}
+if ($failed.Count -gt 0) {
+    Write-Output ''
+    Write-Output 'THIS RUN DID NOT PRODUCE A USABLE COMPARISON:'
+    foreach ($f in $failed) { Write-Output ('  - ' + $f) }
+    exit 1
+}
+exit 0
