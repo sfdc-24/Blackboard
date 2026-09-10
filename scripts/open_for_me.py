@@ -382,8 +382,17 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
         row_from = field(payload, "from")
         row_tag = cell(r, COL_SOURCE)
         # Authorised means the SAME placer, by both the payload claim and the
-        # bus-written Source_Tag. Requiring both means forging the payload alone
-        # is not enough.
+        # Source_Tag column. Requiring both means forging the payload alone is
+        # not enough.
+        #
+        # BUT KNOW WHAT THIS IS WORTH. Source_Tag is supplied by the CLIENT on
+        # append, not minted by the bus, so anyone holding the bus secret can
+        # write any tag they like and satisfy both halves. This raises the cost
+        # of an accidental or careless clear; it does NOT stop a deliberate one.
+        # The board has no per-tag authentication and this function cannot
+        # invent one - a reader who believes otherwise will trust a CLEARED
+        # verdict further than it deserves, so the result says so out loud
+        # rather than leaving it in a comment nobody reads.
         authorised = bool(hold_from) and row_from == hold_from and row_tag == hold_from
 
         names_it = any(hold_id in [v.strip() for v in field(payload, key).split(",")]
@@ -442,6 +451,7 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
     horizon = newest_viewport(rows, now=now)
     limit = PRIORITY_ORDER.get((min_priority or "").upper(), None) if min_priority else None
     out = []
+    settled = 0          # holds cleared or superseded on a client-supplied tag
     for r in rows:
         payload = cell(r, COL_PAYLOAD)
         if not payload.startswith("BCB|"):
@@ -477,6 +487,7 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
                                             when, placer, head_of(payload),
                                             rows)
             if lifecycle == CLEARED:
+                settled += 1
                 continue                     # explicitly cleared: not work any more
         # Fail closed: an unparseable stamp or no trustworthy horizon means we
         # CANNOT say a row is reachable, so we do not say it is.
@@ -548,7 +559,12 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
             "active_holds_total": len(active_holds),          # THE GATE READS THIS
             "active_holds_listed_capped": max(0, len(active_holds) - MAX_HOLDS_LISTED),
             "active_holds_beyond_cap": holds_beyond_cap[:MAX_HOLDS_LISTED],
-            "active_holds_beyond_cap_total": len(holds_beyond_cap)}
+            "active_holds_beyond_cap_total": len(holds_beyond_cap),
+            # Holds this run decided were no longer in force. Surfaced because
+            # every one of those decisions trusted a client-supplied Source_Tag.
+            "holds_settled": settled + sum(
+                1 for d in out
+                if d["standing_hold"] and d["hold_lifecycle"] == SUPERSEDED_LIKELY)}
 
 
 def render(result):
@@ -561,6 +577,19 @@ def render(result):
         lines.append("horizon: NONE TRUSTED - no VIEWPORT with a usable, non-future "
                      "timestamp. Treating every row as unreachable.")
     lines.append("")
+
+    # THE CAVEAT GOES ABOVE THE EARLY RETURN. It matters most in exactly the
+    # case that used to skip it: every hold was settled, there are no rows left,
+    # and the output cheerfully says "nothing outstanding". A reader seeing that
+    # after a forged clear would take silence for safety.
+    if result.get("holds_settled"):
+        lines.append("NOTE: {0} hold(s) were treated as cleared or superseded. "
+                     "Authority for that rests on the Source_Tag column, which "
+                     "clients set themselves - it is not minted by the bus. Any "
+                     "writer with the bus secret can present as any tag."
+                     .format(result["holds_settled"]))
+        lines.append("")
+
     if not result["rows"]:
         lines.append("  nothing outstanding for this tag.")
         return "\n".join(lines)
