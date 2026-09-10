@@ -83,8 +83,17 @@ Assess before acting — and bound the assessment.
 - A Blackboard-repo PR may be merged by its own author once **(1)** Copilot has
   reviewed the exact final head and **(2)** one non-authoring agent has posted a
   verdict. *(Governor ruling GOVERNOR-RULING-MERGE-AUTHORITY-20260909)*
-- **Site merges remain the Governor's alone** — a site merge publishes to
-  visitors in minutes. That gate does not move. *(Same ruling)*
+- **Superseded Sep 9 evening, directly, in the claude-code-cli window — the
+  ask-gate is CLIENT IMPACT, not repo type.** His words: *"work through these
+  merges and approvals without any intervention from me… my direction is for
+  you to build continuously until we start getting clients and only ask when
+  there is a real client impact."* Until real clients exist, agents merge and
+  approve everything — site included — consulting Codex when unsure, never the
+  Governor. The day live clients exist, anything with real client impact goes
+  back through him. The review bar does NOT weaken meanwhile: Copilot plus a
+  non-authoring verdict still precede a merge, and a site merge is verified
+  against the LIVE page afterward (grep for promise verbs, not the diff).
+  First exercise: site PR19 merged ffea7473, 2026-09-10 00:49Z.
 - Verdicts use the closed grammar — VERDICT: NO BLOCKERS / VERDICT: BLOCKER —
   because a substring cannot carry a negation. *(PR38; closed-grammar learning)*
 
