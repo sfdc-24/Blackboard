@@ -60,6 +60,17 @@ COL_ROWID, COL_TS, COL_SOURCE, COL_PAYLOAD, COL_CATEGORY, COL_GIST = 0, 1, 2, 5,
 MAX_GIST = 160          # characters of board text ever echoed
 MAX_ROWS = 200          # rows rendered or serialised, in text AND json
 
+# Per-field caps. Every serialised field has one; none of them is optional, and
+# none of them may ever bound a SAFETY decision (see the cap note in open_for).
+MAX_TS = 32
+MAX_TAG = 40
+MAX_ID = 72
+MAX_PHASE = 16
+MAX_PRIORITY = 12
+MAX_CATEGORY = 16
+MAX_NOTE = 120
+MAX_HOLDS_LISTED = 50   # DISPLAY bound on the hold arrays - counts stay exact
+
 ACTIVE = "ACTIVE"
 CLEARED = "CLEARED"
 SUPERSEDED_LIKELY = "SUPERSEDED_LIKELY"
@@ -79,18 +90,69 @@ def field(payload, name):
     return m.group(1).strip() if m else ""
 
 
+BCB_VERSION = "1"
+
+
+def is_canonical_bcb(payload):
+    """A BCB-1 envelope, not merely something that starts with the four letters.
+
+    The clearing path used `payload.startswith("BCB|")`, so `BCB|v=999|...` was
+    accepted as a canonical row and could retire a hold under a grammar this
+    build has never seen and cannot validate. A row that declares a version we
+    do not implement is not a row we are entitled to act on.
+    """
+    return payload.startswith("BCB|") and field(payload, "v") == BCB_VERSION
+
+
+REDACTED = "[REDACTED]"
+
+# Credential SHAPES, not credential names. A secret that reaches this tool is
+# already a leak; the job here is to stop it being copied onward into a terminal
+# scrollback, a JSON artefact, or a board row quoting the output.
+#
+# Deliberately NOT matching bare hex runs: a 40-character lowercase hex string
+# is a git SHA, and SHAs are the whole point of the hold comparison above.
+# Every pattern below therefore needs a marker a SHA cannot have - a known
+# prefix, a dot-separated JWT, mixed case, or an explicit key= label.
+CREDENTIAL_PATTERNS = (
+    re.compile(r"\bAKIA[0-9A-Z]{12,}", re.I),                       # AWS key id
+    re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}"),    # GitHub tokens
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{8,}"),                   # Slack
+    re.compile(r"\bey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}"),  # JWT
+    re.compile(r"\b00D[A-Za-z0-9]{10,}![A-Za-z0-9._-]{10,}"),       # Salesforce session
+    re.compile(r"\b(?:AIza|ya29\.)[A-Za-z0-9._-]{12,}"),            # Google
+    # An explicitly labelled secret, whatever it looks like.
+    re.compile(r"(?i)\b(?:secret|token|password|passwd|api[_-]?key|client[_-]?secret|"
+               r"authorization|bearer|refresh[_-]?token)\b\s*[=:]\s*\S+"),
+)
+
+
+def redact(text):
+    """Blank anything credential-shaped before it is echoed or serialised."""
+    s = str(text)
+    for pattern in CREDENTIAL_PATTERNS:
+        s = pattern.sub(REDACTED, s)
+    return s
+
+
 def sanitize(text, limit=MAX_GIST):
     """Board text is DATA written by other instances (L-57).
 
     It reaches a terminal and a JSON file, so control characters, newlines and
-    escape sequences are removed rather than trusted, and the result is bounded.
-    An unbounded Gist turned a 1000-row board into 156,000 characters of output.
+    escape sequences are removed rather than trusted, credential-shaped runs are
+    redacted, and the result is bounded. An unbounded Gist turned a 1000-row
+    board into 156,000 characters of output.
+
+    EVERY field that leaves this module goes through here - not just the Gist.
+    Timestamp, priority and category were previously copied out raw on the
+    theory that they are "structured", but nothing validates them on the way in:
+    they are board cells like any other, and a writer can put anything in them.
     """
-    s = str(text)
+    s = redact(str(text))
     s = re.sub(r"[\x00-\x1f\x7f]", " ", s)      # control chars, incl. newline and ESC
     s = re.sub(r"\s+", " ", s).strip()
-    if len(s) > limit:
-        s = s[:limit - 3] + "..."
+    if limit is not None and len(s) > limit:
+        s = s[:max(0, limit - 3)] + "..."
     return s
 
 
@@ -162,32 +224,48 @@ def head_of(payload):
 
 MIN_SHA = 7          # git's own shortest unambiguous default
 
+SAME = "SAME"
+DIFFERENT = "DIFFERENT"
+UNCOMPARABLE = "UNCOMPARABLE"
 
-def same_commit(a, b):
-    """Do two head strings name the same commit?
 
-    The fleet writes both short and full SHAs - the live PR40 hold says
-    `4ccb0cd9...` while its id says `PR40-4CCB`. A raw string comparison called
-    those different, so a GO on the SAME commit expressed at a different length
-    would have superseded a hold placed on it. That is a fail-open inside the
-    thing meant to keep holds alive, and codex found it at a5453de.
+def commit_relation(a, b):
+    """SAME, DIFFERENT, or UNCOMPARABLE - and the third one is the point.
 
-    Hex only, at least seven characters, and one must be a prefix of the other.
-    Anything shorter or non-hex is treated as NOT a match, because guessing here
-    lifts safety holds.
+    `same_commit` used to answer a yes/no question, and the supersede path read
+    its `False` as "proven to be a different commit". Those are not complements.
+    A head of `main`, or `4ccb`, or an empty string is not the same commit AND
+    not a different one - it is a string we cannot compare. Reading "no" as
+    "different" meant an unparseable head SUPERSEDED a safety hold, which is the
+    exact fail-open direction: garbage in, hold lifted. Codex found it in the
+    exact-head review of 34beded.
+
+    So: hex only, at least seven characters, one a prefix of the other for SAME.
+    Two comparable heads that do not share a prefix are DIFFERENT. Anything we
+    cannot parse is UNCOMPARABLE and must never move a hold in either direction.
     """
     a = (a or "").strip().lower()
     b = (b or "").strip().lower()
     if not a or not b:
-        return False
+        return UNCOMPARABLE
     if a == b:
-        return True
+        return SAME
     if not (re.fullmatch(r"[0-9a-f]+", a) and re.fullmatch(r"[0-9a-f]+", b)):
-        return False
+        return UNCOMPARABLE
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
     if len(short) < MIN_SHA:
-        return False
-    return long_.startswith(short)
+        return UNCOMPARABLE
+    return SAME if long_.startswith(short) else DIFFERENT
+
+
+def same_commit(a, b):
+    """Do two head strings PROVABLY name the same commit?
+
+    Kept as the narrow yes/no wrapper. Callers deciding whether to lift a hold
+    must use commit_relation and act only on DIFFERENT - never on `not
+    same_commit`, which silently includes every string we failed to parse.
+    """
+    return commit_relation(a, b) == SAME
 
 
 def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
@@ -220,7 +298,7 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
     rejected = ""
     for r in rows:
         payload = cell(r, COL_PAYLOAD)
-        if not payload.startswith("BCB|"):
+        if not is_canonical_bcb(payload):
             continue                     # prose that mentions an id is not a clear
         when = parse_ts(cell(r, COL_TS))
         if when is None or (hold_when and when <= hold_when):
@@ -245,12 +323,21 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
         if hold_pr and field(payload, "pr") == hold_pr and authorised:
             verdict = (field(payload, "verdict") or "").upper()
             head = head_of(payload)
-            # same_commit, not string inequality: a GO on the same commit written
-            # at a different SHA length must NOT supersede a hold placed on it.
-            if ((verdict.startswith("GO") or verdict == "MERGED")
-                    and head and hold_head and not same_commit(head, hold_head)):
-                return SUPERSEDED_LIKELY, ("a later GO by its placer on a different head: "
-                                           + (field(payload, "id") or cell(r, COL_ROWID)))
+            if verdict.startswith("GO") or verdict == "MERGED":
+                # Only a head we could actually COMPARE may supersede. `not
+                # same_commit` used to stand in for "different", which quietly
+                # included every head we failed to parse - so `head=main` lifted
+                # a CRITICAL hold. UNCOMPARABLE leaves the hold ACTIVE and says
+                # so, because a clear we cannot justify is not a clear.
+                relation = commit_relation(head, hold_head)
+                if relation == DIFFERENT:
+                    return SUPERSEDED_LIKELY, ("a later GO by its placer on a different head: "
+                                               + (field(payload, "id") or cell(r, COL_ROWID)))
+                if relation == UNCOMPARABLE:
+                    rejected = rejected or (
+                        "a later GO by its placer named a head that cannot be "
+                        "compared to the held one, so the hold STANDS ("
+                        + (field(payload, "id") or cell(r, COL_ROWID)) + ")")
     return ACTIVE, rejected
 
 
@@ -302,17 +389,22 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
         else:
             invisible = when < horizon["when"]
         out.append({
-            "ts": cell(r, COL_TS),
-            "from": sanitize(cell(r, COL_SOURCE) or field(payload, "from"), 40),
-            "id": sanitize(field(payload, "id"), 72),
-            "phase": sanitize(field(payload, "phase"), 16),
-            "priority": prio,
-            "gist": sanitize(cell(r, COL_GIST)),
+            # Every one of these is a board cell written by another instance,
+            # so every one of them is sanitised and capped. `ts`, `priority` and
+            # `category` used to be copied raw because they look structured;
+            # nothing enforces that, and a 40KB "priority" is as easy to write
+            # as a 40KB Gist.
+            "ts": sanitize(cell(r, COL_TS), MAX_TS),
+            "from": sanitize(cell(r, COL_SOURCE) or field(payload, "from"), MAX_TAG),
+            "id": sanitize(field(payload, "id"), MAX_ID),
+            "phase": sanitize(field(payload, "phase"), MAX_PHASE),
+            "priority": sanitize(prio, MAX_PRIORITY),
+            "gist": sanitize(cell(r, COL_GIST), MAX_GIST),
             "invisible_to_wake_read": invisible,
             "standing_hold": is_hold,
             "hold_lifecycle": lifecycle if is_hold else "",
-            "hold_note": sanitize(why, 80) if is_hold else "",
-            "category": cell(r, COL_CATEGORY).strip().upper(),
+            "hold_note": sanitize(why, MAX_NOTE) if is_hold else "",
+            "category": sanitize(cell(r, COL_CATEGORY).strip().upper(), MAX_CATEGORY),
         })
     out.sort(key=lambda d: (d["ts"] or ""))      # oldest first - the forgotten ones
 
@@ -335,16 +427,26 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
     # or the reader cannot act on the number the exit code is based on.
     holds_beyond_cap = [d["id"] for d in out[MAX_ROWS:]
                         if d["standing_hold"] and d["hold_lifecycle"] == ACTIVE]
+    # The hold ARRAYS are bounded so a pathological board cannot emit megabytes
+    # of ids. The COUNTS are not, and the exit code is driven by the counts.
+    #
+    # This is the same trap as the row-201 fail-open, one level down: bounding a
+    # list is tidiness, but if the gate then asks "is the list empty?" the bound
+    # has silently become the safety decision. It asks the count instead.
     return {"tag": tag,
-            "horizon": horizon and {"ts": horizon["ts"], "vseq": horizon["vseq"]},
+            "horizon": horizon and {"ts": sanitize(horizon["ts"], MAX_TS),
+                                    "vseq": horizon["vseq"]},
             "horizon_trusted": horizon is not None,
             "rows": shown,
             "shown": len(shown),
             "total": len(out),                    # ALL matching rows, not the slice
             "truncated": truncated,
             "invisible": invisible_all,           # over all rows, not the slice
-            "active_holds": active_holds,         # over all rows, not the slice
-            "active_holds_beyond_cap": holds_beyond_cap}
+            "active_holds": active_holds[:MAX_HOLDS_LISTED],
+            "active_holds_total": len(active_holds),          # THE GATE READS THIS
+            "active_holds_listed_capped": max(0, len(active_holds) - MAX_HOLDS_LISTED),
+            "active_holds_beyond_cap": holds_beyond_cap[:MAX_HOLDS_LISTED],
+            "active_holds_beyond_cap_total": len(holds_beyond_cap)}
 
 
 def render(result):
@@ -378,12 +480,96 @@ def render(result):
         lines.append("{0} further rows not shown (display capped at {1}) - the counts "
                      "and holds above cover ALL of them.".format(
                          result["truncated"], MAX_ROWS))
-    if result["active_holds"]:
-        lines.append("ACTIVE HOLDS: " + ", ".join(result["active_holds"]))
-    if result["active_holds_beyond_cap"]:
-        lines.append("OF WHICH NOT DISPLAYED ABOVE: "
-                     + ", ".join(result["active_holds_beyond_cap"]))
+    if result["active_holds_total"]:
+        line = "ACTIVE HOLDS ({0}): ".format(result["active_holds_total"])
+        line += ", ".join(result["active_holds"])
+        if result["active_holds_listed_capped"]:
+            line += " ... and {0} more not listed".format(
+                result["active_holds_listed_capped"])
+        lines.append(line)
+    if result["active_holds_beyond_cap_total"]:
+        lines.append("OF WHICH NOT DISPLAYED ABOVE ({0}): ".format(
+            result["active_holds_beyond_cap_total"])
+            + ", ".join(result["active_holds_beyond_cap"]))
     return "\n".join(lines)
+
+
+# The BCB-1 board, by name. Ten named columns; the wire carries two trailing
+# blank padding cells on every row (REQ-B4TQX9), which are transport, not data.
+BOARD_HEADER = ("Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
+                "Payload", "Category", "Project Tag", "Gist", "Sub-Gist")
+MAX_BOARD_ROWS = 100000     # refuse an input that is not plausibly this board
+MAX_ROW_CELLS = 64
+MAX_CELL_CHARS = 100000
+
+
+class BoardError(ValueError):
+    """The input is not a board this tool is entitled to reason about."""
+
+
+def load_board(data):
+    """Validate a v1 bus read response and return its DATA rows.
+
+    Previously this did `rows[1:]` on anything with a `rows` key - so a file
+    with no header row silently lost its first real row, a `{"ok": false}` error
+    envelope was parsed as a board, and a row could be a string, a dict or a
+    million cells wide. Every one of those produces a confident, wrong answer
+    about which holds are in force, which is the one thing this tool must not do.
+
+    Fails closed with a reason. A malformed board is not an empty board.
+    """
+    if isinstance(data, dict):
+        # An error envelope is not a board, even though it has the right shape.
+        if "ok" in data and not data.get("ok"):
+            raise BoardError("the bus returned ok=false; that is an error "
+                             "envelope, not a board")
+        rows = data.get("rows")
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise BoardError("expected a bus read response object or a list of rows, "
+                         "got " + type(data).__name__)
+
+    if not isinstance(rows, list) or not rows:
+        raise BoardError("that file does not look like a bus read response (no rows)")
+    if len(rows) > MAX_BOARD_ROWS:
+        raise BoardError("refusing {0} rows; the cap is {1}".format(
+            len(rows), MAX_BOARD_ROWS))
+
+    header = rows[0]
+    if not isinstance(header, list):
+        raise BoardError("the first row is a {0}, not a list of cells".format(
+            type(header).__name__))
+    # Compare only the NAMED columns, tolerating trailing blank padding - the
+    # same rule the bus itself applies. A header that does not match means we
+    # are about to read the wrong column for Payload and Category.
+    named = [str(c).strip() for c in header[:len(BOARD_HEADER)]]
+    if tuple(named) != BOARD_HEADER:
+        raise BoardError(
+            "the first row is not the BCB-1 header, so column positions cannot "
+            "be trusted. Expected " + ", ".join(BOARD_HEADER) + " but found "
+            + ", ".join(named[:len(BOARD_HEADER)] or ["<empty>"]))
+    if any(str(c).strip() for c in header[len(BOARD_HEADER):]):
+        raise BoardError("the header has content past its {0} named columns".format(
+            len(BOARD_HEADER)))
+
+    out = []
+    for i, r in enumerate(rows[1:], start=2):
+        if not isinstance(r, list):
+            raise BoardError("row {0} is a {1}, not a list of cells".format(
+                i, type(r).__name__))
+        if len(r) > MAX_ROW_CELLS:
+            raise BoardError("row {0} has {1} cells; the cap is {2}".format(
+                i, len(r), MAX_ROW_CELLS))
+        for c in r:
+            if c is not None and not isinstance(c, (str, int, float, bool)):
+                raise BoardError("row {0} contains a {1} cell".format(
+                    i, type(c).__name__))
+            if isinstance(c, str) and len(c) > MAX_CELL_CHARS:
+                raise BoardError("row {0} has a cell of {1} characters; the cap "
+                                 "is {2}".format(i, len(c), MAX_CELL_CHARS))
+        out.append(r)
+    return out
 
 
 def main():
@@ -398,11 +584,17 @@ def main():
     args = ap.parse_args()
 
     with open(args.file, encoding="utf-8-sig") as fh:
-        data = json.load(fh)
-    rows = data.get("rows") if isinstance(data, dict) else data
-    if not isinstance(rows, list) or not rows:
-        sys.exit("that file does not look like a bus read response (no rows)")
-    result = open_for(rows[1:], args.tag, args.include_cc, args.include_all, args.min_priority)
+        try:
+            data = json.load(fh)
+        except ValueError as e:
+            sys.exit("that file is not JSON: " + str(e))
+    try:
+        rows = load_board(data)
+    except BoardError as e:
+        # Fail CLOSED and loudly. Exit 1, not 0: "I could not read the board" and
+        # "there is nothing outstanding" must never look the same to a caller.
+        sys.exit(str(e))
+    result = open_for(rows, args.tag, args.include_cc, args.include_all, args.min_priority)
     print(render(result))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
@@ -410,7 +602,8 @@ def main():
         print("\nwrote " + args.json_out)
     # Non-zero when a session should not simply carry on: something is
     # unreachable, a hold is in force, or we could not establish the horizon.
-    if result["invisible"] or result["active_holds"] or not result["horizon_trusted"]:
+    if (result["invisible"] or result["active_holds_total"]
+            or not result["horizon_trusted"]):
         return 1
     return 0
 

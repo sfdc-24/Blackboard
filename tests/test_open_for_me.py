@@ -199,10 +199,11 @@ print("")
 print("== a hold has a lifecycle: it is not immortal ==")
 PR40_HOLD = ("BCB|v=1|id=PR40-4CCB-HOLD|phase=RESULT|from=codex|to=claude-code-cli"
              "|priority=HIGH|pr=https://github.com/sfdc-24/Blackboard/pull/40"
-             "|exact_head=4ccb|verdict=NO-GO|hold=do not merge PR40 at this head")
+             "|exact_head=4ccb0cd93f237eac6909b56739be698b752846e4"
+             "|verdict=NO-GO|hold=do not merge PR40 at this head")
 PR40_GO = ("BCB|v=1|id=PR40-8230-GO|phase=RESULT|from=codex|to=claude-code-cli"
            "|priority=HIGH|pr=https://github.com/sfdc-24/Blackboard/pull/40"
-           "|exact_head=8230|verdict=GO")
+           "|exact_head=82300d1d5bd265418235b83aaa81e9af1084a841|verdict=GO")
 live_shape = [row("2026-09-09T12:00:06Z", "codex", PR40_HOLD, "DONE", "PR40 4ccb NO-GO"),
               row("2026-09-09T14:18:59Z", "codex", PR40_GO, "DONE", "PR40 8230 GO"),
               row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")]
@@ -270,14 +271,21 @@ check("a clear written BEFORE the hold does not lift it",
 
 print("")
 print("== a GO only supersedes on a DIFFERENT exact head, from the placer ==")
+# REAL SHA LENGTHS. These fixtures used to say exact_head=4ccb and 8230 - four
+# characters, shorter than git's own shortest unambiguous default. That made
+# every assertion below a statement about strings git would refuse to resolve,
+# and it hid the fail-open: `not same_commit(...)` called two uncomparable
+# stubs "different" and lifted the hold.
+HEAD_HELD = "4ccb0cd93f237eac6909b56739be698b752846e4"
+HEAD_OTHER = "82300d1d5bd265418235b83aaa81e9af1084a841"
 H4CCB = ("BCB|v=1|id=PR40-HOLD|phase=RESULT|from=codex|to=claude-code-cli|priority=HIGH"
-         "|pr=https://x/pull/40|exact_head=4ccb|verdict=NO-GO|hold=do not merge")
+         "|pr=https://x/pull/40|exact_head=" + HEAD_HELD + "|verdict=NO-GO|hold=do not merge")
 def with_pr_hold(*extra):
     return [row("2026-09-09T12:00:00Z", "codex", H4CCB, "DONE", "PR40 4ccb NO-GO"),
             row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")] + list(extra)
 
 SAME_HEAD_GO = ("BCB|v=1|id=SAME-GO|phase=RESULT|from=codex|to=claude-code-cli"
-                "|pr=https://x/pull/40|exact_head=4ccb|verdict=GO")
+                "|pr=https://x/pull/40|exact_head=" + HEAD_HELD[:7] + "|verdict=GO")
 r_same = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", SAME_HEAD_GO, "DONE")),
                       TAG, now=NOW)
 check("a GO on the SAME head the hold objected to clears nothing",
@@ -291,18 +299,80 @@ check("a GO with NO exact_head clears nothing",
       r_nohead["active_holds"] == ["PR40-HOLD"], r_nohead["active_holds"])
 
 OTHER_GO = ("BCB|v=1|id=OTHER-GO|phase=RESULT|from=somebody-else|to=claude-code-cli"
-            "|pr=https://x/pull/40|exact_head=8230|verdict=GO")
+            "|pr=https://x/pull/40|exact_head=" + HEAD_OTHER + "|verdict=GO")
 r_other = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "somebody-else", OTHER_GO, "DONE")),
                        TAG, now=NOW)
 check("a GO from someone who did not place the hold clears nothing",
       r_other["active_holds"] == ["PR40-HOLD"], r_other["active_holds"])
 
 GOOD_GO = ("BCB|v=1|id=GOOD-GO|phase=RESULT|from=codex|to=claude-code-cli"
-           "|pr=https://x/pull/40|exact_head=8230|verdict=GO")
+           "|pr=https://x/pull/40|exact_head=" + HEAD_OTHER + "|verdict=GO")
 r_good = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", GOOD_GO, "DONE")),
                       TAG, now=NOW)
 check("but the placer's GO on a DIFFERENT head does supersede",
       r_good["active_holds"] == [], r_good["active_holds"])
+
+print("")
+print("== a head we cannot COMPARE must never lift a hold ==")
+# The fail-open codex found at 34beded. `not same_commit(a, b)` was read as
+# "proven different", but it is also true for every head that cannot be parsed.
+# Each of these used to supersede a CRITICAL safety hold.
+for bad, why in [("main", "a branch name, not a SHA"),
+                 ("8230", "hex but shorter than git's own minimum"),
+                 ("HEAD~1", "a revision expression"),
+                 ("82300d1d5bd265418235b83aaa81e9af1084a84z", "one non-hex character"),
+                 ("", "no head at all")]:
+    payload = ("BCB|v=1|id=BAD-GO|phase=RESULT|from=codex|to=claude-code-cli"
+               "|pr=https://x/pull/40|exact_head=" + bad + "|verdict=GO")
+    rb = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", payload, "DONE")),
+                      TAG, now=NOW)
+    check("a GO on " + why + " leaves the hold ACTIVE",
+          rb["active_holds"] == ["PR40-HOLD"], rb["active_holds"])
+
+# And the rejection is VISIBLE - a clear that was refused is worth seeing.
+rb_note = ofm.open_for(
+    with_pr_hold(row("2026-09-09T15:00:00Z", "codex",
+                     "BCB|v=1|id=BAD-GO|phase=RESULT|from=codex|to=claude-code-cli"
+                     "|pr=https://x/pull/40|exact_head=main|verdict=GO", "DONE")),
+    TAG, now=NOW)
+check("and the refusal says the hold STANDS",
+      any("STANDS" in d["hold_note"] for d in rb_note["rows"]),
+      [d["hold_note"] for d in rb_note["rows"]])
+
+print("")
+print("== commit_relation has three states, not two ==")
+check("equal full SHAs are SAME", ofm.commit_relation(HEAD_HELD, HEAD_HELD) == ofm.SAME)
+check("a 7-char prefix is SAME", ofm.commit_relation(HEAD_HELD[:7], HEAD_HELD) == ofm.SAME)
+check("two real, unrelated SHAs are DIFFERENT",
+      ofm.commit_relation(HEAD_HELD, HEAD_OTHER) == ofm.DIFFERENT)
+check("a 6-char prefix is UNCOMPARABLE, not SAME",
+      ofm.commit_relation(HEAD_HELD[:6], HEAD_HELD) == ofm.UNCOMPARABLE)
+check("a branch name is UNCOMPARABLE, not DIFFERENT",
+      ofm.commit_relation("main", HEAD_HELD) == ofm.UNCOMPARABLE)
+check("an empty head is UNCOMPARABLE", ofm.commit_relation("", HEAD_HELD) == ofm.UNCOMPARABLE)
+check("same_commit still answers the narrow yes/no",
+      ofm.same_commit(HEAD_HELD[:7], HEAD_HELD) and not ofm.same_commit("main", HEAD_HELD))
+# The inversion itself, stated as a property: UNCOMPARABLE must never be
+# reachable through `not same_commit` being treated as DIFFERENT.
+check("UNCOMPARABLE is not DIFFERENT",
+      ofm.UNCOMPARABLE != ofm.DIFFERENT and ofm.UNCOMPARABLE != ofm.SAME)
+
+print("")
+print("== a clearing row must be BCB v=1, not merely start with BCB| ==")
+V999 = ("BCB|v=999|id=FUTURE-CLEAR|phase=RESULT|from=codex|to=claude-code-cli"
+        "|clears=PR40-HOLD")
+r999 = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", V999, "DONE")),
+                    TAG, now=NOW)
+check("a v=999 envelope cannot clear a v=1 hold",
+      r999["active_holds"] == ["PR40-HOLD"], r999["active_holds"])
+V1 = ("BCB|v=1|id=REAL-CLEAR|phase=RESULT|from=codex|to=claude-code-cli"
+      "|clears=PR40-HOLD")
+rv1 = ofm.open_for(with_pr_hold(row("2026-09-09T15:00:00Z", "codex", V1, "DONE")),
+                   TAG, now=NOW)
+check("but a v=1 clear from the placer still works (the control)",
+      rv1["active_holds"] == [], rv1["active_holds"])
+check("is_canonical_bcb rejects a missing version",
+      not ofm.is_canonical_bcb("BCB|id=x|to=y"))
 
 # THE LIVE SHAPE. Every fixture above uses exact_head - which I invented. The
 # real PR40 rows on Blackboard - Alpha DB use `reviewed_head=`, so requiring
@@ -412,6 +482,108 @@ check("the unreachable count also covers rows past the cap",
       rb2["invisible"] >= ofm.MAX_ROWS, rb2["invisible"])
 check("and the render says the counts cover everything",
       "cover ALL of them" in ofm.render(rb2))
+
+print("")
+print("== the board envelope is validated, not assumed ==")
+HDR = list(ofm.BOARD_HEADER) + ["", ""]
+GOOD_ROW = row("2026-09-09T15:00:00Z", "codex", "BCB|v=1|id=X|to=claude-code-cli", "OPEN")
+
+
+def refuses(data, why):
+    try:
+        ofm.load_board(data)
+        check("refuses " + why, False, "accepted it")
+    except ofm.BoardError:
+        check("refuses " + why, True)
+
+
+refuses({"ok": False, "error": "nope", "rows": [HDR, GOOD_ROW]},
+        "an ok=false error envelope that happens to carry rows")
+refuses({"rows": []}, "an empty rows list")
+refuses({"rows": [["Row_ID", "Timestamp", "WRONG"]]}, "a header that is not BCB-1")
+refuses({"rows": [HDR, "this is a string, not a row"]}, "a row that is a string")
+refuses({"rows": [HDR, {"Row_ID": "x"}]}, "a row that is a dict")
+refuses({"rows": [HDR, GOOD_ROW + [{"nested": 1}]]}, "a cell that is an object")
+refuses({"rows": [HDR, [ "x" * (ofm.MAX_CELL_CHARS + 1) ]]}, "an oversized cell")
+refuses({"rows": [HDR, GOOD_ROW + ["x"] * ofm.MAX_ROW_CELLS]}, "an absurdly wide row")
+refuses("just a string", "a JSON string instead of a board")
+refuses({"rows": [list(ofm.BOARD_HEADER) + ["SNEAKY"]]}, "content past the named columns")
+
+ok_rows = ofm.load_board({"ok": True, "rows": [HDR, GOOD_ROW]})
+check("accepts the real envelope and returns DATA rows only",
+      len(ok_rows) == 1 and ok_rows[0][0] == GOOD_ROW[0], ok_rows)
+check("a bare list of rows with a header is accepted too",
+      len(ofm.load_board([HDR, GOOD_ROW])) == 1)
+# The silent-drop bug: rows[1:] on a headerless file ate a real row and said
+# nothing. It must now refuse rather than quietly answer about fewer rows.
+refuses([GOOD_ROW, GOOD_ROW], "a headerless list, rather than eating row one")
+
+print("")
+print("== credential-shaped text never reaches stdout or JSON ==")
+SECRETS = [
+    ("AKIAIOSFODNN7EXAMPLE", "an AWS key id"),
+    ("ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8", "a GitHub token"),
+    ("xoxb-123456789012-abcdefghijklmnop", "a Slack bot token"),
+    ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NX0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g", "a JWT"),
+    ("client_secret=hunter2hunter2hunter2", "a labelled client secret"),
+    ("Bearer: 00D5g000004abcdEAA!AQEAQxyz123456789", "a bearer line"),
+]
+for secret, why in SECRETS:
+    out = ofm.sanitize("leaked " + secret + " here", 200)
+    check("redacts " + why, secret not in out and ofm.REDACTED in out, out)
+
+# The control that keeps redaction from eating the thing it protects: a git SHA
+# is 40 lowercase hex characters and must survive, or the hold comparison above
+# starts comparing "[REDACTED]" to "[REDACTED]" and calls everything the same.
+check("but a full git SHA is NOT redacted",
+      HEAD_HELD in ofm.sanitize("head " + HEAD_HELD, 200),
+      ofm.sanitize("head " + HEAD_HELD, 200))
+check("and a short SHA is not redacted either",
+      HEAD_HELD[:7] in ofm.sanitize("head " + HEAD_HELD[:7], 200))
+
+print("")
+print("== every serialised field is bounded, not just the gist ==")
+LONG = "z" * 5000
+noisy = [HDR,
+         # hold= so it surfaces whatever the (absurd) Category cell says - which
+         # is the point: Category is a board cell too, and it must be bounded.
+         [LONG, LONG, LONG, "", "RESULT",
+          "BCB|v=1|id=" + LONG + "|phase=" + LONG + "|to=claude-code-cli"
+          "|priority=" + LONG + "|hold=stop",
+          LONG, "", LONG, "", "", ""],
+         row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE")]
+rn = ofm.open_for(ofm.load_board(noisy), TAG, now=NOW)
+if rn["rows"]:
+    d = rn["rows"][0]
+    for fieldname, cap in [("ts", ofm.MAX_TS), ("from", ofm.MAX_TAG), ("id", ofm.MAX_ID),
+                           ("phase", ofm.MAX_PHASE), ("priority", ofm.MAX_PRIORITY),
+                           ("gist", ofm.MAX_GIST), ("category", ofm.MAX_CATEGORY)]:
+        check("field " + fieldname + " is capped at " + str(cap),
+              len(d[fieldname]) <= cap, (fieldname, len(d[fieldname])))
+    check("the whole rendered line is bounded too", len(ofm.render(rn)) < 4000,
+          len(ofm.render(rn)))
+else:
+    check("the noisy row was surfaced at all", False, rn)
+
+print("")
+print("== bounding the hold ARRAY must not bound the hold DECISION ==")
+many = []
+for i in range(ofm.MAX_HOLDS_LISTED + 25):
+    many.append(row("2026-09-09T12:{0:02d}:00Z".format(i % 60), "codex-" + str(i),
+                    "BCB|v=1|id=HOLD-{0}|from=codex-{0}|to=claude-code-cli"
+                    "|priority=CRITICAL|hold=stop".format(i), "DONE"))
+many.append(row("2026-09-09T14:50:47Z", "codex", VIEWPORT, "DONE"))
+rm = ofm.open_for(many, TAG, now=NOW)
+check("the listed array is capped",
+      len(rm["active_holds"]) == ofm.MAX_HOLDS_LISTED, len(rm["active_holds"]))
+check("but the TOTAL is exact",
+      rm["active_holds_total"] == ofm.MAX_HOLDS_LISTED + 25, rm["active_holds_total"])
+check("and the render admits how many it did not list",
+      "and 25 more not listed" in ofm.render(rm))
+# The row-201 fail-open, one level down: if the gate asked "is the array empty?"
+# a board with only capped-away holds would exit 0. It asks the count.
+check("the exit decision reads the count, not the capped array",
+      rm["active_holds_total"] > len(rm["active_holds"]) and rm["active_holds_total"] > 0)
 
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))
