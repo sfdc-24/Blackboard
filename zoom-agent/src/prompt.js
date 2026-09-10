@@ -108,12 +108,16 @@ export function planSummaryChunks(header, body, { max = MAX_QUERY_CHARS, maxChun
       }
       current = [];
       size = 0;
-      // A single line longer than the whole budget cannot be placed. Take the
-      // tail of it — the end of a sentence carries more than its opening — and
-      // count it as covered, because it is.
+      // A single line longer than the whole budget cannot be placed whole.
+      // Take the tail of it — the end of a sentence carries more than its
+      // opening — but credit NOTHING for it: only part of that line reached the
+      // model, and coverage is a claim about what was actually summarised.
+      //
+      // The comment that used to sit here said the opposite ("count it as
+      // covered, because it is") and survived the fix that changed the code
+      // below to credit 0. A comment that contradicts its own code is worse
+      // than no comment: the next reader trusts it and reverts the fix.
       if (line.length > room) {
-        // Include the tail -- the end of a sentence carries more than its
-        // opening -- but credit NOTHING for it.
         groups.push({ lines: [line.slice(line.length - room)], covered: 0 });
         partial += 1;
         if (groups.length >= maxChunks) break;
