@@ -44,7 +44,12 @@ $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$tokens, [ref]$errors)
 Assert-True 'runner parses' (@($errors).Count -eq 0)
 
+# Invoke-ClaudeWorker now captures a process-GROUP identity at launch, so the
+# group helpers have to be extracted too. Leaving them out did not silently
+# weaken the test - it broke it loudly, which is the extraction list doing its
+# job: the runner and the subset this file loads must stay in step.
 foreach ($fn in @('Test-OnWindows', 'Resolve-WorkerEngine', 'Get-PosixChildProcessId',
+                  'Get-PosixProcessGroupId', 'Invoke-PosixGroupKill',
                   'Test-PosixProcessAlive', 'Invoke-PosixTreeKill', 'Invoke-ProcessTreeKill',
                   'Invoke-TaskkillTree', 'Quote-ProcessArgument',
                   'Test-RunTreeContainsReparsePoint', 'Remove-OwnedRunDirectory',

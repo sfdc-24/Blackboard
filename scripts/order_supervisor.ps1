@@ -620,6 +620,59 @@ function Invoke-TaskkillTree {
     return [int]$LASTEXITCODE
 }
 
+function Get-PosixProcessGroupId {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # pgrp is field 5 of /proc/<pid>/stat, but field 2 is the executable name in
+    # PARENTHESES and may itself contain spaces or parentheses - so the fields
+    # are counted from the LAST ')' rather than by splitting the whole line.
+    # Splitting on whitespace from the start is a well-known way to read the
+    # wrong number here.
+    try {
+        $raw = [IO.File]::ReadAllText("/proc/$ProcessId/stat")
+    } catch {
+        return -1
+    }
+    $close = $raw.LastIndexOf(')')
+    if ($close -lt 0) { return -1 }
+    $fields = $raw.Substring($close + 1).Trim() -split '\s+'
+    # after comm: [0]=state [1]=ppid [2]=pgrp
+    if ($fields.Count -lt 3) { return -1 }
+    $pgid = 0
+    if (-not [int]::TryParse($fields[2], [ref]$pgid)) { return -1 }
+    return $pgid
+}
+
+function Invoke-PosixGroupKill {
+    param([Parameter(Mandatory = $true)][int]$ProcessGroupId)
+
+    # CONTAINMENT BY IDENTITY, NOT BY SEARCH.
+    #
+    # The /proc tree walk this replaces could not be made correct. A child
+    # forked AFTER the scan, whose parent then died, is reparented away from the
+    # root - so re-walking from the root can never find it, however many sweeps
+    # are added. It returned 0 while such a child survived and wrote its
+    # post-timeout marker. Codex reproduced exactly that against 373f9da.
+    #
+    # A process GROUP is durable: a child inherits the pgid at fork and keeps it
+    # when its parent dies, so kill(-pgid) reaches the whole group atomically
+    # regardless of who reparented to whom. That is what taskkill /T approximates
+    # on Windows, and it is the only shape that does not race.
+    if ($ProcessGroupId -le 1) { throw 'refusing to signal process group ' + $ProcessGroupId }
+
+    # THE SAFETY CHECK THAT MATTERS. If setsid did not take effect, the adapter
+    # shares OUR process group, and kill(-pgid) would kill the supervisor - and
+    # every other process in its group - instead of the adapter. Refuse rather
+    # than take the whole lane down to clean up one run.
+    $ownGroup = Get-PosixProcessGroupId -ProcessId $PID
+    if ($ownGroup -gt 0 -and $ProcessGroupId -eq $ownGroup) {
+        throw 'refusing to kill the supervisor own process group'
+    }
+
+    & /bin/kill -s KILL -- "-$ProcessGroupId" 2>$null | Out-Null
+    return 0
+}
+
 function Get-PosixChildProcessId {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
 
@@ -770,9 +823,30 @@ function Invoke-PosixTreeKill {
 }
 
 function Invoke-ProcessTreeKill {
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        # Captured AT LAUNCH, while the process still exists. See below.
+        [int]$ProcessGroupId = 0
+    )
 
     if (Test-OnWindows) { return Invoke-TaskkillTree -ProcessId $ProcessId }
+
+    # PREFER THE GROUP. When the run was launched under setsid it is its own
+    # process-group leader, so kill(-pgid) reaches every member atomically -
+    # including one forked a microsecond ago whose parent has already died.
+    # That is the case a tree walk provably cannot cover.
+    #
+    # THE GROUP ID MUST BE PASSED IN, not looked up here. The first version
+    # resolved it from /proc at kill time, and by then the launcher had usually
+    # exited - so the lookup returned -1 and it fell through to the walk,
+    # silently, while reporting success. Reading an identity from a process that
+    # no longer exists is the same mistake as searching a tree that is still
+    # changing: the identity has to be captured while it is knowable.
+    if ($ProcessGroupId -gt 1) {
+        return Invoke-PosixGroupKill -ProcessGroupId $ProcessGroupId
+    }
+    # Last resort for a run that never got its own group (no setsid on the
+    # host). Racy, and known to be racy - a fallback, not a second opinion.
     return Invoke-PosixTreeKill -ProcessId $ProcessId
 }
 
@@ -904,13 +978,34 @@ function Invoke-ClaudeWorker {
         # on the execute path, which no Observe-mode run reaches, so every
         # cross-host comparison so far sailed straight past it. Windows keeps
         # Hidden exactly as before.
-        if (Test-OnWindows) { $startArgs.WindowStyle = 'Hidden' }
+        if (Test-OnWindows) {
+            $startArgs.WindowStyle = 'Hidden'
+        } elseif (Test-Path -LiteralPath '/usr/bin/setsid' -PathType Leaf) {
+            # LAUNCH INTO ITS OWN PROCESS GROUP so the whole run has a durable
+            # identity to kill later. Without --fork, setsid execs in place when
+            # the caller is not already a group leader, so the pid is preserved
+            # and becomes the new pgid - which means $process.Id stays the
+            # handle for both waiting and killing.
+            $startArgs.ArgumentList = ($startArgs.FilePath + ' ' + $startArgs.ArgumentList)
+            $startArgs.FilePath = '/usr/bin/setsid'
+        }
         $process = Start-Process @startArgs
+        # Capture the containment identity NOW, while the process exists. By the
+        # time a wall timeout fires the launcher may already have exited, and
+        # /proc would answer -1.
+        $runGroupId = 0
+        if (-not (Test-OnWindows)) {
+            $candidate = Get-PosixProcessGroupId -ProcessId $process.Id
+            if ($candidate -gt 1) { $runGroupId = $candidate }
+        }
         $cleanupOwnedRun = $false
         $completedWithinLimit = $process.WaitForExit($WallTimeoutSeconds * 1000)
         if (-not $completedWithinLimit) {
             $taskkillExitCode = -1
-            try { $taskkillExitCode = Invoke-ProcessTreeKill -ProcessId $process.Id } catch {}
+            try {
+                $taskkillExitCode = Invoke-ProcessTreeKill -ProcessId $process.Id `
+                    -ProcessGroupId $runGroupId
+            } catch {}
             if ($taskkillExitCode -ne 0) { throw 'claude_termination_failed' }
             $terminationObserved = $false
             try {
