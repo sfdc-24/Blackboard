@@ -66,6 +66,9 @@ in ninety seconds beats a beautiful thing in a week.
 - Voice output uses the browser/device voice. The prototype does not call a TTS
   provider, expose a JSONP route, put text/capabilities in query strings, or
   pretend to implement the production Google sign-in flow.
+- Microphone listening begins only after an explicit **Start talking** tap.
+  Typing, replaying an answer or pressing Stop ends automatic listening; late
+  responses and speech callbacks cannot restart a stopped exchange.
 - Generated pages are self-contained, carry a restrictive CSP, make no runtime
   network requests, and are not uploaded anywhere by this prototype.
 
@@ -117,4 +120,5 @@ node tests/test_build_page.js
 node tests/test_beat1_history.js
 node tests/test_beat1_provider.js
 node tests/test_beat1_runtime.js
+node tests/test_beat1_voice.js
 ```
