@@ -21,6 +21,23 @@
 #
 #   If assertion 1 or 2 ever fails, containment has been extended and this file
 #   should be rewritten to match - a red result here is news, not a defect.
+#
+# WHERE THE ESCAPE IS ACTUALLY BOUNDED, which this file alone does not show
+#   Do not read this as "an escapee runs forever". On the real host the unit
+#   bounds it: a setsid child leaves the process GROUP but STAYS IN THE UNIT'S
+#   CGROUP, and packaging/systemd/blackboard-order.service is Type=oneshot with
+#   KillMode=mixed, so systemd SIGKILLs whatever is left in that cgroup when the
+#   pass ends. The escapee outlives the supervisor's own kill, not the pass.
+#
+#   Note also that the remedy exercised below is NOT available to that service:
+#   it runs User=blackboard as a system service, so there is no user session bus
+#   for systemd-run --user, and ProtectControlGroups=yes makes /sys/fs/cgroup
+#   read-only so it cannot create a sub-cgroup either. The remedy is proven here
+#   as a mechanism, not proposed as the patch.
+#
+#   tests/test_order_unit_containment.ps1 guards those unit directives, because
+#   the containment lives in that file and nothing else in the repo would notice
+#   if someone changed KillMode.
 $ErrorActionPreference = 'Continue'
 $script:Pass = 0
 $script:Fail = 0

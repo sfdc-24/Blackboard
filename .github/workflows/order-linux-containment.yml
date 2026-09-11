@@ -85,6 +85,13 @@ jobs:
         shell: pwsh
         run: ./tests/test_order_setsid_escape.ps1
 
+      # The unit file is where that escape is actually bounded, so the
+      # directives that bound it are asserted rather than trusted. Pure file
+      # parsing - no processes, no platform requirement.
+      - name: The unit directives that bound an escaped descendant
+        shell: pwsh
+        run: ./tests/test_order_unit_containment.ps1
+
       - name: Adapter invocation and wall timeout
         shell: pwsh
         run: ./tests/test_order_linux_execute.ps1
