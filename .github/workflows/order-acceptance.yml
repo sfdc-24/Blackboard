@@ -174,8 +174,9 @@ jobs:
         env:
           ORDER_TEST_CHILD_SHELL: pwsh
         run: |
-          if (-not $IsLinux) {
-            throw 'This job requires a Linux PowerShell host.'
+          $hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+          if (-not $IsLinux -or -not $hasDateKind) {
+            throw 'This job requires Linux and ConvertFrom-Json -DateKind (PowerShell 7.5+).'
           }
 
           $priorErrorActionPreference = $ErrorActionPreference
