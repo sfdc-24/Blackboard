@@ -8,7 +8,7 @@ sha256 that any whitespace change destroys. Changes belong upstream with
 
 **It is not released, and as of 2026-09-08 it should not be.** A confirmed
 DOM-injection defect and an information-disclosure question both stand against
-this build — see "Three things to settle" below.
+this build — see "Four things to settle" below.
 
 ## Where it lives, and why not in `site/`
 
@@ -88,12 +88,12 @@ Served from a local web root and loaded in Chrome:
   username and live org telemetry, which is an information-disclosure question
   rather than a secret-in-source one; see item 2 below.
 
-## Three things to settle before it goes live
+## Four things to settle before it goes live
 
 Item 1 is a defect and blocks release. Items 2 and 3 are publication choices that
-belong to the acceptance gate. None of them was fixed in place: changing one byte
-breaks the attestation the handoff rests on, so all three go back to
-`cowork-chrome`.
+belong to the acceptance gate. Item 4 is a wording defect on a claim about money.
+None of them was fixed in place: changing one byte breaks the attestation the
+handoff rests on, so all four go back to `cowork-chrome`.
 
 **1. DOM injection from a crafted `scores.json` — blocking.** Raised by GitHub
 Copilot's code review on PR #36 and reproduced here. The renderer escapes most
@@ -138,7 +138,25 @@ which is also unlisted, so the page would be reachable but not advertised. If
 `/xray/` is meant to be a public funnel entry it needs a sitemap entry; if it is
 meant to be a demo link handed out deliberately, leaving it unlisted is correct.
 
-A fourth, minor one, also from Copilot: the live-sample tile divides by
+**4. The cost meter says "live" and "prepaid", and it is neither.** Raised by the
+Codex client-rehearsal task `01a04639` on 2026-09-10 and verified here against the
+attested bytes. `index.html:219` carries
+`title="Live cost meter — every action priced in pennies against your prepaid scan budget"`,
+above a readout of `$0.000 of $25.00`. Nothing behind it is live: the meter is
+`const METER={spent:0, budget:25, paused:false}` (`index.html:556`), and every
+movement is a hardcoded call in the page's own script — `meterTick(0.011)` for the
+scan (line 571), `0.002` per click (line 570), `0.004` per copied work order
+(line 543). No price is fetched, nothing is billed, and no prepaid budget exists.
+
+That is a different kind of problem from the demo scores, which the page labels as
+demo. This one is a claim about **money**, in a tooltip, on a page meant for
+prospects, and the words "live" and "prepaid" are the two that make it a claim
+rather than an illustration. Relabelling it is the fix — not removing the meter,
+which is a good idea presented honestly once the wording matches.
+
+It is not covered by items 1 to 3 and was not in Copilot's review.
+
+A minor one, also from Copilot: the live-sample tile divides by
 `LIVE.activeUsers` without a zero guard. With the value hardcoded to `10` it
 cannot fire in this build, so it is a robustness nit for upstream rather than a
 release blocker.
