@@ -872,6 +872,27 @@ function Invoke-PosixTreeKill {
                 # Already gone is success, not failure: the tree is what
                 # matters, not whether we personally delivered the signal.
             }
+
+            # SIGKILL IS ASYNCHRONOUS. The signal is delivered immediately; the
+            # process is torn down and reaped when the kernel gets to it. Asking
+            # "is it alive?" in the next instruction is asking whether the box
+            # was quick, not whether the kill worked.
+            #
+            # That is exactly what this did, and it produced a reproducible
+            # false FAILURE: on a loaded runner the tree kill reported exit 1
+            # while the very next assertions confirmed the parent and the child
+            # were both gone. A kill that worked, reported as one that did not,
+            # which then makes the supervisor quarantine a healthy run.
+            #
+            # It is also the plainest explanation for the intermittent flakiness
+            # reported against this suite family, and it is the same mistake as
+            # sleeping at a condition instead of waiting for it - here in the
+            # other direction: not waiting at all.
+            $settleBy = [DateTime]::UtcNow.AddMilliseconds(2000)
+            while ((Test-PosixProcessAlive -ProcessId $target) -and
+                   [DateTime]::UtcNow -lt $settleBy) {
+                Start-Sleep -Milliseconds 25
+            }
             if (Test-PosixProcessAlive -ProcessId $target) { $remaining++ }
         }
         return $remaining
