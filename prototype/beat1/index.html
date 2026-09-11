@@ -208,7 +208,10 @@
   document.getElementById("form").addEventListener("submit", function(ev){
     ev.preventDefault();
     var text = box.value.trim();
-    if (!text) return;
+    if (!text || send.disabled) return;
+    // An accepted correction makes the previous sketch ineligible for export.
+    lastSketch = null;
+    document.getElementById("make").hidden = true;
     box.value = ""; send.disabled = true;
     turn("you", "you", text);
     var priorHistory = Beat1History.acceptUser(history, text);
@@ -238,11 +241,14 @@
   // taken away. They can save it, print it or forward it without us.
   document.getElementById("make").addEventListener("click", function(){
     var b = document.getElementById("make");
+    if (!lastSketch || b.disabled) return;
+    var requestedSketch = lastSketch;
     b.disabled = true; b.textContent = "Building…";
     fetch("/api/build", { method:"POST", headers:{"content-type":"application/json", "x-beat1-token":RUNTIME_TOKEN},
-      body: JSON.stringify({ sketch: lastSketch }) })
+      body: JSON.stringify({ sketch: requestedSketch }) })
     .then(function(r){ return r.json() })
     .then(function(res){
+      if (lastSketch !== requestedSketch) return; // a newer correction supersedes this result
       if (!res.ok || !res.html) { hint.textContent = "Couldn't build it just then — your conversation is still here."; return }
       var w = window.open("", "_blank");
       if (!w) { hint.textContent = "Your browser blocked the new tab — allow pop-ups and try again."; return }
@@ -250,7 +256,7 @@
       w.document.open(); w.document.write(res.html); w.document.close();
       hint.textContent = "That page is yours. Save it, print it, send it on.";
     })
-    .catch(function(){ hint.textContent = "Couldn't build it just then — your conversation is still here." })
+    .catch(function(){ if (lastSketch === requestedSketch) hint.textContent = "Couldn't build it just then — your conversation is still here." })
     .finally(function(){ b.disabled = false; b.textContent = "Turn this into a page I can send →" });
   });
 
