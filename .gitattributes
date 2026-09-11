@@ -1,2 +1,12 @@
 # Cross-platform evidence requires identical fixture bytes, including on Windows.
 /tests/fixtures/order_supervisor_board.json text eol=lf
+
+# Shell scripts are executed by a POSIX shell, and a CRLF checkout makes that
+# shell fail with "bad interpreter: /bin/bash^M" - a confusing error that looks
+# like a broken script rather than a broken checkout.
+#
+# This repo is developed on Windows and increasingly run on Linux, so the
+# scripts most likely to be checked out with CRLF are exactly the ones that must
+# not be. All 14 tracked .sh blobs are LF today, so this pins what is already
+# true rather than renormalising anything.
+*.sh text eol=lf
