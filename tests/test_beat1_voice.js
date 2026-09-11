@@ -22,6 +22,10 @@ function harness({ recognitionAvailable = true, speechAvailable = true } = {}) {
       get lastElementChild() { return this.children.at(-1); },
       get firstChild() { return this.children[0]; },
       querySelector(selector) { return this.children.find(child => '.' + child.className === selector); },
+      querySelectorAll(selector) {
+        const classes = selector.split('.').filter(Boolean);
+        return this.children.filter(child => classes.every(name => child.className.split(/\s+/).includes(name)));
+      },
       focus() {},
     };
   }
@@ -30,11 +34,11 @@ function harness({ recognitionAvailable = true, speechAvailable = true } = {}) {
     'state', 'stateword', 'statewho', 'statevoice', 'voices', 'voicebtn',
   ].map(id => [id, element()]));
   const recognition = [];
-  let starts = 0;
+  let starts = 0, aborts = 0;
   class Recognition {
     constructor() { recognition.push(this); }
     start() { starts++; }
-    abort() { if (this.onend) this.onend(); }
+    abort() { aborts++; if (this.onend) this.onend(); }
   }
   const spoken = [];
   const speechSynthesis = {
@@ -65,11 +69,16 @@ function harness({ recognitionAvailable = true, speechAvailable = true } = {}) {
   });
   return {
     get starts() { return starts; },
+    get aborts() { return aborts; },
     get mode() { return elements.stateword.textContent; },
     get currentRecognition() { return recognition.at(-1); },
     get spokenCount() { return spoken.filter(utterance => utterance.text.trim()).length; },
     get turnCount() { return elements.tape.children.length; },
+    get liveCount() { return elements.tape.children.filter(node => node.className === 'turn live').length; },
+    get draft() { return elements.box.value; },
+    get sendDisabled() { return elements.send.disabled; },
     tapMic() { elements.mic.listeners.click(); },
+    edit(text) { elements.box.value = text; elements.box.listeners.input(); },
     type(text) {
       elements.box.value = text;
       elements.box.listeners.input();
@@ -79,6 +88,10 @@ function harness({ recognitionAvailable = true, speechAvailable = true } = {}) {
       const result = [{ transcript: text }]; result.isFinal = true;
       recognition.at(-1).onresult({ resultIndex: 0, results: [result] });
       recognition.at(-1).onend();
+    },
+    interim(text) {
+      const result = [{ transcript: text }]; result.isFinal = false;
+      recognition.at(-1).onresult({ resultIndex: 0, results: [result] });
     },
     replayFirst() {
       const reply = elements.tape.children.find(node => node.children.some(child => child.className === 'replay'));
@@ -188,4 +201,56 @@ test('typed fallback works without browser recognition or speech synthesis', asy
   h.type('Typed fallback.'); await h.answer();
   assert.equal(h.starts, 0);
   assert.equal(h.mode, 'ready');
+});
+
+test('editing before submit stops recognition and removes its interim transcript', () => {
+  const h = harness();
+  h.tapMic(); h.interim('unfinished spoken words');
+  assert.equal(h.liveCount, 1);
+  h.edit('A keyboard draft');
+  assert.equal(h.mode, 'ready');
+  assert.equal(h.draft, 'A keyboard draft');
+  assert.equal(h.liveCount, 0);
+  assert.equal(h.aborts, 1, 'drafting must abort capture, not only change the UI');
+  h.currentRecognition.onend();
+  assert.equal(h.starts, 1);
+});
+
+test('editing during a pending spoken reply preserves the reply but cancels automatic listening', async () => {
+  const h = harness();
+  h.tapMic(); h.recognize('Question.');
+  h.edit('My next typed question');
+  assert.equal(h.mode, 'thinking');
+  assert.equal(h.sendDisabled, true);
+  (await h.answer())();
+  assert.equal(h.spokenCount, 1);
+  assert.equal(h.mode, 'ready');
+  assert.equal(h.starts, 1);
+  assert.equal(h.draft, 'My next typed question');
+  assert.equal(h.sendDisabled, false);
+});
+
+test('Stop clears interim text without letting an old end event clear a new preview', () => {
+  const h = harness();
+  h.tapMic(); h.interim('Old preview');
+  const oldRecognition = h.currentRecognition;
+  h.tapMic();
+  assert.equal(h.liveCount, 0);
+  assert.equal(h.aborts, 1);
+  h.tapMic(); h.interim('Current preview');
+  oldRecognition.onend();
+  assert.equal(h.liveCount, 1);
+  assert.equal(h.mode, 'listening');
+  assert.equal(h.starts, 2);
+});
+
+test('editing while speech plays keeps the current answer but disables its microphone continuation', async () => {
+  const h = harness();
+  h.tapMic(); h.recognize('Question.');
+  const finish = await h.answer();
+  h.edit('Next typed question');
+  assert.equal(h.mode, 'speaking');
+  finish();
+  assert.equal(h.mode, 'ready');
+  assert.equal(h.starts, 1);
 });

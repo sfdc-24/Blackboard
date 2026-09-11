@@ -67,8 +67,10 @@ in ninety seconds beats a beautiful thing in a week.
   provider, expose a JSONP route, put text/capabilities in query strings, or
   pretend to implement the production Google sign-in flow.
 - Microphone listening begins only after an explicit **Start talking** tap.
-  Typing, replaying an answer or pressing Stop ends automatic listening; late
-  responses and speech callbacks cannot restart a stopped exchange.
+  Entering a nonempty text draft ends microphone listening immediately while
+  preserving any reply already in progress. Replaying an answer or pressing Stop
+  cancels the previous exchange. Interim speech text is removed when capture
+  stops; late responses and speech callbacks cannot restart a stopped exchange.
 - Generated pages are self-contained, carry a restrictive CSP, make no runtime
   network requests, and are not uploaded anywhere by this prototype.
 

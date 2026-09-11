@@ -464,6 +464,23 @@ body{overflow:hidden}
     hint.textContent = HINTS[m] || "";
     bars.hidden = (m !== "speaking");
     mic.setAttribute("aria-label", m === "off" ? "Start talking" : m === "speaking" ? "Interrupt" : "Stop");
+    syncSend();
+  }
+
+  function clearInterim(){
+    var live = tape.querySelectorAll(".turn.live");
+    for (var i = 0; i < live.length; i++) tape.removeChild(live[i]);
+  }
+
+  // Drafting stops capture without discarding a reply already in progress.
+  function stopListening(){
+    listeningRequested = false;
+    var previousRecognition = rec;
+    rec = null;
+    finalText = "";
+    clearInterim();
+    if (mode === "listening") setMode("off");
+    try { if (previousRecognition) previousRecognition.abort() } catch(e){}
   }
 
   // ---- listening ----------------------------------------------------------
@@ -518,8 +535,7 @@ body{overflow:hidden}
     rec.onend = function(){
       if (rec !== activeRecognition || !listeningRequested) return;
       var text = finalText.trim();
-      var last = tape.lastElementChild;
-      if (last && last.className.indexOf("live") >= 0) tape.removeChild(last);
+      clearInterim();
       if (mode !== "listening") return;
       if (!text) { try { rec.start() } catch(e){ setMode("off") } return }
       handle(text);
@@ -583,10 +599,9 @@ body{overflow:hidden}
   }
 
   function stopAll(){
-    listeningRequested = false;
     exchange++;
     setMode("off");
-    try { if (rec) rec.abort() } catch(e){}
+    stopListening();
     stopAudio();
   }
 
@@ -646,7 +661,10 @@ body{overflow:hidden}
 
   // ---- typed --------------------------------------------------------------
   function syncSend(){ send.disabled = !box.value.trim() || mode === "thinking" }
-  box.addEventListener("input", syncSend);
+  box.addEventListener("input", function(){
+    if (box.value.trim()) stopListening();
+    syncSend();
+  });
   box.addEventListener("keydown", function(e){
     if (e.key === "Enter" && box.value.trim()) { e.preventDefault(); submitTyped() }
   });
