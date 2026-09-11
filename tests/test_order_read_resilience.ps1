@@ -38,6 +38,35 @@ $script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Applic
                               Select-Object -First 1).Source
 Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
 
+# HOW THIS HARNESS READS JSON, AND WHY NOT WITH A BARE ConvertFrom-Json.
+#
+# PowerShell 7 turns any ISO-8601-shaped string into [DateTime] on the way in. The
+# PRODUCT already refuses to read a board that way -- OrderSupervisor.psm1 has
+# ConvertFrom-JsonPreserveStrings for exactly this, after two hosts disagreed about
+# admission over it -- but this HARNESS was still calling the bare cmdlet. So under
+# pwsh the cursor it read back from the state file was a [DateTime], four exact
+# -ceq assertions failed, and the code under test had done nothing wrong: the
+# harness was measuring its own parser. It also loses precision, which is the part
+# that would not have looked like a parser bug at all -- a round trip turns
+# 2026-09-07T08:01:00.0000000Z into 2026-09-07T08:01:00Z.
+#
+# Splatting the parameter onto the same cmdlet, rather than wrapping it in a helper,
+# keeps pipeline and array-unrolling behaviour byte-identical to what every call
+# site here already relied on. 5.1 does not coerce and needs no parameter.
+#
+# -DateKind arrived in PowerShell 7.5. An edition that coerces and cannot be told
+# not to is REFUSED here, as the product refuses it, rather than running a suite
+# whose failures would describe the harness instead of the bus client.
+$script:JsonDateArgs = @{}
+if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    $script:JsonDateArgs = @{ DateKind = 'String' }
+} elseif ($PSVersionTable.PSEdition -cne 'Desktop') {
+    throw ('This harness cannot read board JSON on ' + $PSVersionTable.PSEdition + ' ' +
+           $PSVersionTable.PSVersion + ' without coercing ISO-8601 cells to [DateTime]. ' +
+           'PowerShell 7.5 or later provides ConvertFrom-Json -DateKind String. Refusing ' +
+           'rather than reporting assertions that measured the harness.')
+}
+
 function ConvertTo-FlowedText {
     # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
     # pipeline, so an assertion that matches a long phrase in captured error
@@ -45,8 +74,23 @@ function ConvertTo-FlowedText {
     # machine, one commit, real 5.1: at a 74-column console the hop-2 phrase check
     # below FAILS; at 200 columns the identical run passes. Collapsing every run of
     # whitespace to one space removes the wrap and leaves the phrase intact.
+    #
+    # Width is not the only thing that gets between an error message and a match.
+    # PowerShell 7 renders errors in a BOX, and its continuation lines carry a
+    # gutter -- optional line number, a vertical bar, then the text. Collapsing
+    # whitespace leaves that bar embedded, so the fixed hop-2 message arrives as
+    # '...following up to | 5 redirects' and a Contains check fails against a
+    # product that did nothing wrong. Measured with the child on pwsh 7.6.6: one
+    # assertion failed on both parent editions, with no canary leaked.
+    #
+    # The gutter is stripped only at the START of a line, and only here. This
+    # helper feeds POSITIVE phrase assertions; every canary-ABSENCE check runs on
+    # ConvertTo-SquashedText, which stays strict. Loosening this one cannot make a
+    # leak check pass, and that separation is the point of having two functions.
     param([AllowNull()][object[]]$Lines)
-    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', ' ')
+    $text = (@($Lines | ForEach-Object { [string]$_ }) -join "`n")
+    $text = $text -replace '(?m)^[ \t]*\d*[ \t]*\|[ \t]?', ''
+    return ($text -replace '\s+', ' ')
 }
 
 function ConvertTo-SquashedText {
@@ -69,6 +113,56 @@ function Write-TestUtf8 {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+# HOW THE FAKE curl.exe GETS BUILT, AND WHY NOT WITH Add-Type.
+#
+# The two actual-bus cases need a REAL executable named curl.exe ahead of the system
+# one on PATH. It has to be that exact name: bus.ps1 asks for 'curl.exe' before it
+# asks for 'curl', so a .cmd or .ps1 shim loses the lookup to C:\Windows\System32\
+# curl.exe and the case would silently exercise the real curl instead of the fake.
+#
+# This used to be Add-Type -OutputType ConsoleApplication. PowerShell 7 removed that
+# -- it refuses both ConsoleApplication and WindowsApplication -- so this file died
+# 0.2 seconds in under pwsh, on the edition the ORDER worker is being migrated to.
+# The suite that guards the bus client had therefore never run on the target edition.
+#
+# The C# source is unchanged and now goes to the .NET Framework C# compiler, which is
+# what Add-Type was driving underneath on 5.1 anyway. csc.exe ships with .NET
+# Framework 4 and is present on every supported Windows and on the hosted windows
+# runners. Both editions now take THE SAME build path: no edition gets a skip, and no
+# edition gets a second implementation of the fake that could drift from the first.
+#
+# This does NOT make the suite runnable on Linux. There curl has no .exe in its name
+# and there is no csc.exe; that needs its own change and its own evidence.
+function New-FakeCurlExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $csc = @(
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+
+    if (-not $csc) {
+        # Fail loudly. A skip here would report a green suite that never built the
+        # fake and therefore never tested the bus client's curl path at all.
+        throw ('No .NET Framework csc.exe found under ' + $env:WINDIR +
+               '\Microsoft.NET. The fake curl.exe cannot be built, so the actual-bus ' +
+               'cases cannot run and must not be reported as passing.')
+    }
+
+    $sourcePath = [IO.Path]::ChangeExtension($Path, '.cs')
+    Write-TestUtf8 -Path $sourcePath -Text $Source
+
+    $output = & $csc /nologo /target:exe ('/out:' + $Path) $sourcePath 2>&1
+    $code = $LASTEXITCODE
+    if ($code -ne 0 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw ('csc.exe exited ' + $code + ' building the fake curl: ' +
+               (ConvertTo-FlowedText -Lines @($output)))
+    }
 }
 
 function New-BoardJson {
@@ -134,7 +228,13 @@ $metadata = [ordered]@{
 }
 $failurePath = Join-Path $root ('failure-' + $count + '.json')
 if (Test-Path -LiteralPath $failurePath -PathType Leaf) {
-    $spec = [IO.File]::ReadAllText($failurePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    # This runs in the CHILD process and cannot see the parent's variables, so it
+    # works out the same date-coercion guard for itself.
+    $childJsonDateArgs = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        $childJsonDateArgs = @{ DateKind = 'String' }
+    }
+    $spec = [IO.File]::ReadAllText($failurePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @childJsonDateArgs
     $clientErrorProperty = $spec.PSObject.Properties['client_error']
     if ($clientErrorProperty -and [bool]$clientErrorProperty.Value) {
         throw [InvalidOperationException]::new('simulated_local_client_failure')
@@ -227,12 +327,12 @@ function Invoke-ReadCase {
     }
 
     $jsonLine = @($output | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
-    $result = if ($jsonLine.Count -eq 1) { $jsonLine[0] | ConvertFrom-Json } else { $null }
-    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $result = if ($jsonLine.Count -eq 1) { $jsonLine[0] | ConvertFrom-Json @script:JsonDateArgs } else { $null }
+    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
     $events = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
         @([IO.File]::ReadAllLines($logPath, [Text.Encoding]::UTF8) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { [string]$_ | ConvertFrom-Json })
+            ForEach-Object { [string]$_ | ConvertFrom-Json @script:JsonDateArgs })
     } else { @() }
     $readCountPath = Join-Path $caseRoot 'read-count.txt'
     $readCount = if (Test-Path -LiteralPath $readCountPath -PathType Leaf) {
@@ -294,7 +394,7 @@ public static class FakeCurl {
     }
 }
 '@
-    Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_CANARY
@@ -338,7 +438,7 @@ BUS_SECRET=BUS_SECRET_CANARY
         exit_code = $exitCode
         output = @($output)
         metadata_text = $metadataText
-        metadata = $metadataText | ConvertFrom-Json
+        metadata = $metadataText | ConvertFrom-Json @script:JsonDateArgs
     }
 }
 
@@ -410,7 +510,7 @@ public static class FakeSecondRedirectCurl {
     }
 }
 '@
-    Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_REDIRECT_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
@@ -488,12 +588,12 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         body = [IO.File]::ReadAllText($outPath, [Text.Encoding]::UTF8)
         expected_body = $expectedBody
         metadata_text = $metadataText
-        metadata = $metadataText | ConvertFrom-Json
+        metadata = $metadataText | ConvertFrom-Json @script:JsonDateArgs
         failure_exit_code = $failureExitCode
         failure_output = @($failureOutput)
         failure_call_count = $failureCallCount
         failure_metadata_text = $failureMetadataText
-        failure_metadata = $failureMetadataText | ConvertFrom-Json
+        failure_metadata = $failureMetadataText | ConvertFrom-Json @script:JsonDateArgs
     }
 }
 
@@ -763,39 +863,49 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         success_exit_code = $successExitCode
         success_output = @($successOutput)
         success_body = [IO.File]::ReadAllText($successOutPath, [Text.Encoding]::UTF8)
-        success_metadata = $successMetadataText | ConvertFrom-Json
-        success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        success_metadata = $successMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         failure_exit_code = $failureExitCode
         failure_output = @($failureOutput)
         failure_metadata_text = $failureMetadataText
-        failure_metadata = $failureMetadataText | ConvertFrom-Json
-        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        failure_metadata = $failureMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         redirect_exit_code = $redirectExitCode
         redirect_output = @($redirectOutput)
         redirect_metadata_text = $redirectMetadataText
-        redirect_metadata = $redirectMetadataText | ConvertFrom-Json
-        redirect_trace = [IO.File]::ReadAllText($redirectTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        redirect_metadata = $redirectMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        redirect_trace = [IO.File]::ReadAllText($redirectTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         insecure_exit_code = $insecureExitCode
         insecure_output = @($insecureOutput)
         insecure_metadata_text = $insecureMetadataText
-        insecure_metadata = $insecureMetadataText | ConvertFrom-Json
-        insecure_trace = [IO.File]::ReadAllText($insecureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        insecure_metadata = $insecureMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        insecure_trace = [IO.File]::ReadAllText($insecureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         empty_location_exit_code = $emptyLocationExitCode
         empty_location_output = @($emptyLocationOutput)
         empty_location_metadata_text = $emptyLocationMetadataText
-        empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json
-        empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         realistic_exit_code = $realisticExitCode
         realistic_output = @($realisticOutput)
         realistic_body = $(if (Test-Path -LiteralPath $realisticOutPath) { [IO.File]::ReadAllText($realisticOutPath, [Text.Encoding]::UTF8) } else { '' })
-        realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
-        realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
+        realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
+        realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
     }
 }
 
 $script:TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-read-resilience-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $script:TestRoot | Out-Null
 try {
+    # The harness checks its own reader before it checks anything else. Four
+    # assertions below compare a cursor to an exact timestamp string, and if this
+    # reader ever goes back to coercing, those four fail in a way that reads like a
+    # product bug. This one fails in a way that reads like what it is.
+    $script:DateProbe = '{"t":"2026-09-07T08:00:00.0000000Z"}' | ConvertFrom-Json @script:JsonDateArgs
+    Assert-True 'harness reads ISO-8601 board cells as strings, on this edition' (
+        $script:DateProbe.t -is [string] -and
+        $script:DateProbe.t -ceq '2026-09-07T08:00:00.0000000Z'
+    )
+
     $validEmpty = New-BoardJson
     $eligible = New-BoardJson -DataRows (, (New-EligibleOrderRow))
 

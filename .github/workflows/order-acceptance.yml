@@ -58,6 +58,28 @@ jobs:
       - name: Test Blackboard writer timestamp contract
         shell: pwsh
         run: .\tests\test_bus_timestamp_contract.ps1
+      - name: Test bounded ORDER board-read resilience
+        shell: pwsh
+        run: .\tests\test_order_read_resilience.ps1
+      # The step above runs the SUITE on PowerShell 7. It still launches bus.ps1 in a
+      # child process, and that child defaults to powershell.exe -- so on its own it
+      # proves nothing about the bus client on the edition being migrated to. This
+      # step moves the child too, and then refuses to pass unless the child really
+      # moved: a misspelt variable name would otherwise run 5.1 and report green.
+      - name: Test bounded ORDER board-read resilience with the bus client on PowerShell 7
+        shell: pwsh
+        env:
+          ORDER_TEST_CHILD_SHELL: pwsh
+        run: |
+          $output = .\tests\test_order_read_resilience.ps1
+          $suiteExit = $LASTEXITCODE
+          $output
+          $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
+          if ($childShell.Count -ne 1 -or $childShell[0] -notmatch 'pwsh') {
+            throw ("This leg exists to exercise bus.ps1 under PowerShell 7. The child " +
+                   "shell was: " + ($childShell -join ' '))
+          }
+          if ($suiteExit -ne 0) { exit $suiteExit }
 
   windows-powershell-51:
     name: ORDER and Azure contracts on Windows PowerShell 5.1
