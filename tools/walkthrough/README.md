@@ -85,6 +85,27 @@ never on a command line, never in a process list, and never in this repository. 
 it at **both** ends afterwards; deleting it from the box alone is not containment while
 it still sits on the laptop.
 
+### Deleting `~/join.url` is not the cleanup
+
+On 2026-09-11 I deleted the file I knew about and then swept for the *pattern*. It
+found two more on the box, and the second one mattered:
+
+| file | why |
+|---|---|
+| `~/zoom_live_join.sh` | a leftover launcher built around the URL |
+| `~/.zoom/logs/zoom_stdout_stderr.log` | **Zoom logs the URL it was launched with — 11 copies** |
+
+Zoom's own log is the one nobody thinks of, and no amount of care with your own files
+removes it. Sweep the class, not the filename:
+
+```
+grep -rIl 'pwd=\|zoommtg://\|confno=' ~/ 2>/dev/null
+```
+
+Re-run that **after** deleting, and require zero. Also check the local end the same
+way — a passcode on the laptop is exposed whether or not the box is clean. Shell
+history and any launcher you wrote during the session belong in the same sweep.
+
 **The bus secret never comes to this box.** The board digest in the top panel is
 rendered on the laptop and copied over as plain text. The presenter is a screen, not a
 client.

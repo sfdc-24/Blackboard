@@ -73,16 +73,18 @@ fi
 # So: require a capture stream whose application really is the Zoom client AND whose
 # source really is our virtual mic. Both halves matter - Zoom bound to some other
 # device hears nothing from us either.
+# THE COUNT COMES FROM A TESTED PARSER, NOT FROM AN AWK INVENTED HERE.
+#
+# My previous inline version matched the source NAME against each record, but pactl
+# prints `Source: 94` - a numeric index. It matched nothing and reported zero for a
+# correctly bound Zoom, so the script refused to speak. The version before that
+# counted every source-output, which the test harness's own parec satisfied.
+#
+# Two opposite errors in the same check, neither ever run against real pactl output.
+# zoom_bound_count.sh resolves the name to its index and is driven by committed
+# fixtures in the regression test, so it is exercised without a live box.
 SOURCE_NAME="${PRESENTER_SOURCE:-vmic_src}"
-ZOOM_BOUND=$(pactl list source-outputs 2>/dev/null | awk -v src="$SOURCE_NAME" '
-    /^Source Output #/    { app=""; on_src=0 }
-    /Source:/             { }
-    /application\.name/   { if (tolower($0) ~ /zoom/) app=1 }
-    /application\.process\.binary/ { if (tolower($0) ~ /zoom/) app=1 }
-    /node\.name|media\.name/ { if (tolower($0) ~ /zoom/) app=1 }
-    $0 ~ src              { on_src=1 }
-    /^$/                  { if (app && on_src) c++ }
-    END                   { print c+0 }')
+ZOOM_BOUND=$("$(dirname "$0")/zoom_bound_count.sh" "${SOURCE_NAME}" 2>/dev/null || echo 0)
 
 paplay --device="${SINK}" "${WAV}"
 RC=$?
