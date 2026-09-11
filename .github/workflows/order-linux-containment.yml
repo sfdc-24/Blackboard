@@ -22,6 +22,7 @@ on:
       - 'tests/test_order_linux_containment.ps1'
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
+      - 'tests/test_order_setsid_escape.ps1'
   push:
     paths:
       - '.github/workflows/order-linux-containment.yml'
@@ -30,6 +31,7 @@ on:
       - 'tests/test_order_linux_containment.ps1'
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
+      - 'tests/test_order_setsid_escape.ps1'
 
 permissions:
   contents: read
@@ -74,6 +76,14 @@ jobs:
       - name: Group kill drain proof, with its negative control
         shell: pwsh
         run: ./tests/test_order_group_drain.ps1
+
+      # Characterises a KNOWN limit rather than a fix: a child that calls setsid
+      # leaves the group, so the kill returns 0 with that descendant still
+      # running. It also exercises the cgroup remedy where a systemd --user
+      # session exists, and says so loudly where one does not.
+      - name: The setsid escape, and the cgroup that contains it
+        shell: pwsh
+        run: ./tests/test_order_setsid_escape.ps1
 
       - name: Adapter invocation and wall timeout
         shell: pwsh
