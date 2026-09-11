@@ -32,6 +32,29 @@ start_if_absent() {           # name, then the command
   fi
 }
 
+count_proc() {                # exactly one line, always, whatever pgrep does
+  # THE BUG THIS REPLACES, and it cost a live walkthrough its window manager.
+  #
+  # Every counter here was written as "$(pgrep -c -x NAME || echo 0)". When pgrep
+  # matches nothing it PRINTS "0" and ALSO exits non-zero, so the || fires and
+  # appends a SECOND "0". The substitution becomes the two-line string "0\n0".
+  #
+  # Printed, that looks like a harmless stray zero. Fed to [ ... -lt 1 ] it is
+  # "integer expression expected", the test errors, and - the part that actually
+  # hurt - the if body NEVER RUNS. So fluxbox was never started on 2026-09-11,
+  # while the readiness line below demanded fluxbox>=1. A guard that fails open
+  # and a status line that reads almost-right is a bad combination.
+  local n
+  n=$(pgrep -c -x "$1" 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
+
+count_match() {               # same, for pgrep -f patterns
+  local n
+  n=$(pgrep -f -c "$1" 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
+
 echo "=== presenter rig up $(date -u +%FT%TZ) ==="
 
 # 1. The displays. :99 is the one that gets shared; :98 only matters for the
@@ -48,11 +71,15 @@ echo "  :99 $(xdpyinfo -display :99 2>/dev/null | awk '/dimensions/{print $2}' |
 echo "  :98 $(xdpyinfo -display :98 2>/dev/null | awk '/dimensions/{print $2}' || echo DEAD)"
 
 # 2. Window manager. Zoom's dialogs are unmanageable without one.
-if [ "$(pgrep -c -x fluxbox || echo 0)" -lt 1 ]; then
-  nohup env DISPLAY=:99 fluxbox >/tmp/fluxbox99.log 2>&1 & disown
-  sleep 2
-fi
-echo "  fluxbox instances: $(pgrep -c -x fluxbox || echo 0)"
+# Both displays get one. :98 was previously left without a window manager, which
+# is the same latent problem as having none on :99.
+for wm_display in :99 :98; do
+  if ! pgrep -f "[f]luxbox" >/dev/null 2>&1 || [ "$(count_proc fluxbox)" -lt 2 ]; then
+    nohup env DISPLAY="$wm_display" fluxbox >"/tmp/fluxbox${wm_display#:}.log" 2>&1 & disown
+    sleep 2
+  fi
+done
+echo "  fluxbox instances: $(count_proc fluxbox)"
 
 # 3. Audio, then THE PIECE THAT ACTUALLY MATTERS.
 #    Zoom refuses to run its share manager unless xdg-desktop-portal and
@@ -77,15 +104,18 @@ fi
 
 echo
 echo "--- state, as returned values rather than assurances ---"
-echo "  xvfb        $(pgrep -c -x Xvfb || echo 0)"
-echo "  fluxbox     $(pgrep -c -x fluxbox || echo 0)"
-echo "  pulseaudio  $(pgrep -c -x pulseaudio || echo 0)"
-echo "  pipewire    $(pgrep -c -x pipewire || echo 0)"
-echo "  portal      $(pgrep -f '[l]ibexec/xdg-desktop-portal$' | wc -l)"
-echo "  portal-gtk  $(pgrep -f '[x]dg-desktop-portal-gtk' | wc -l)"
-echo "  xterms      $(pgrep -c -x xterm || echo 0)"
-echo "  zoom        $(pgrep -c -x zoom || echo 0)  (0 is correct here - joining is a separate step)"
+echo "  xvfb        $(count_proc Xvfb)"
+echo "  fluxbox     $(count_proc fluxbox)"
+echo "  pulseaudio  $(count_proc pulseaudio)"
+echo "  pipewire    $(count_proc pipewire)"
+echo "  portal      $(count_match '[l]ibexec/xdg-desktop-portal$')"
+echo "  portal-gtk  $(count_match '[x]dg-desktop-portal-gtk')"
+echo "  xterms      $(count_proc xterm)"
+echo "  zoom        $(count_proc zoom)  (0 is correct here - joining is a separate step)"
 echo
 echo "READY when xvfb>=1, fluxbox>=1, pipewire=1 and portal=1."
+echo
+echo "The rig is MUTE until the virtual microphone exists. Run presenter_voice_up.sh"
+echo "if this box needs to speak; it is separate because a silent share still works."
 echo "Joining is deliberately NOT done here: it needs the meeting passcode,"
 echo "which is shipped over stdin at join time and never stored on this box."
