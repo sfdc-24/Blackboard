@@ -13,6 +13,22 @@ $SystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd(
 $script:TestRoot = Join-Path $SystemTemp ('blackboard-order-release-installer-tests-' + [Guid]::NewGuid().ToString('N'))
 $script:ReleaseRoot = Join-Path $script:TestRoot 'releases'
 $script:InstallerTempRoot = Join-Path $script:TestRoot 'installer-temp'
+
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case here runs install_release_from_archive.ps1 in a CHILD process, and that
+# child was hardcoded to powershell.exe. On Linux the launch fails and the suite does
+# not report a shell problem - it reports the SYMPTOM, "cannot find releases/<sha>
+# because it does not exist", from a Get-ChildItem 120 lines later that is looking for
+# output the installer never got to write. Measured: 0 assertions reached on Linux.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 $script:Passed = 0
 $script:Failed = 0
 $script:RequiredFiles = @(
@@ -128,7 +144,7 @@ function Invoke-Installer {
         [Environment]::SetEnvironmentVariable('TEMP', $script:InstallerTempRoot, 'Process')
         [Environment]::SetEnvironmentVariable('TMP', $script:InstallerTempRoot, 'Process')
         $lines = @(
-            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            & $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File $InstallerUnderTest `
                 -Payload ([string]$Archive.payload) `
                 -ArchiveSha256 $Digest `
