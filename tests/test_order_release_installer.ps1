@@ -859,6 +859,64 @@ try {
         $reparseReplay.output -notmatch 'ALREADY_INSTALLED'
     ) $reparseReplay.output
 
+    # THE EXISTING RELEASE DIRECTORY *ITSELF* BEING A LINK.
+    #
+    # The case above links a directory INSIDE an installed release, which the
+    # inventory walk catches at install_release_from_archive.ps1:183. The release root
+    # and its ancestors are caught at :301. Between them sits a third, separate guard
+    # at :163-166 - the existing destination itself carrying ReparsePoint - and until
+    # now NOTHING reached it. codex proved that by disabling line 164 and watching the
+    # suite stay green: three traversal assertions, two product guards, and a line
+    # nobody's test depended on.
+    #
+    # That is the unproven-guard shape again, and it is the one I keep writing about
+    # while leaving instances of it behind. It is a release-path traversal control: if
+    # it stopped working, an attacker who can replace an installed release directory
+    # with a link would have the installer inventory, hash and trust files that live
+    # somewhere else entirely.
+    #
+    # The construction matters. The release must first install NORMALLY so the replay
+    # takes the existing-release branch at all - a link where no release was ever
+    # installed is a different path and proves nothing about this guard. So: install,
+    # move the real directory aside, then put a link in its place pointing at what was
+    # moved. The bytes are identical and every hash would match; only the reparse point
+    # differs, which is precisely what the guard is for.
+    # Every single-character id from 0 through f is already taken by a case above, and
+    # reusing one silently replays into an existing release: the first install then
+    # fails with existing_release_manifest_invalid and this assertion goes red while
+    # the guard it targets is working perfectly. Mixed digits, so it collides with
+    # nothing.
+    $rootLinkReleaseId = '0123456789abcdef0123456789abcdef01234567'
+    $rootLinkInstall = Invoke-Installer -Archive $archiveA -ReleaseId $rootLinkReleaseId
+    $rootLinkDestination = Join-Path $script:ReleaseRoot $rootLinkReleaseId
+    $rootLinkMovedAside = Join-Path $script:TestRoot 'root-link-moved-aside'
+    Move-Item -LiteralPath $rootLinkDestination -Destination $rootLinkMovedAside
+    # A marker that only exists via the link, so the assertion can show the installer
+    # did not read THROUGH the reparse point before refusing.
+    Write-TestUtf8 `
+        -Path (Join-Path $rootLinkMovedAside 'must-not-be-traversed-through-root.txt') `
+        -Text 'reached only by following the link'
+    $null = New-TestDirectoryLink -Path $rootLinkDestination -Target $rootLinkMovedAside
+    $rootLinkReplay = Invoke-Installer -Archive $archiveA -ReleaseId $rootLinkReleaseId
+    Assert-True 'existing release root that is itself a link is rejected before traversal' (
+        $rootLinkInstall.exit_code -eq 0 -and
+        $rootLinkReplay.exit_code -ne 0 -and
+        # ':.' is the root-item form. ':<relative path>' would be the entry guard at
+        # :183, which the case above already covers - matching loosely here would let
+        # this assertion pass on the wrong guard entirely.
+        $rootLinkReplay.output -match 'existing_release_reparse_point:\.' -and
+        $rootLinkReplay.output -notmatch 'must-not-be-traversed-through-root' -and
+        $rootLinkReplay.output -notmatch 'ALREADY_INSTALLED'
+    ) (
+        # Name every component. A detail line carrying only the replay output cannot
+        # say WHICH condition failed, and the first failure of this assertion showed
+        # exactly the error it was looking for while still reporting red.
+        'install_exit=' + $rootLinkInstall.exit_code +
+        ' replay_exit=' + $rootLinkReplay.exit_code +
+        ' install_out=' + ($rootLinkInstall.output -replace '\s+', ' ') +
+        ' replay_out=' + ($rootLinkReplay.output -replace '\s+', ' ')
+    )
+
     $remainingInstallerTempItems = @(
         Get-ChildItem -LiteralPath $script:InstallerTempRoot -Force -ErrorAction SilentlyContinue
     )
