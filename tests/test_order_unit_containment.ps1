@@ -45,7 +45,11 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $unitPath = Join-Path $repoRoot 'packaging/systemd/blackboard-order.service'
 Assert-True 'the ORDER unit file exists' (Test-Path -LiteralPath $unitPath) $unitPath
 if (-not (Test-Path -LiteralPath $unitPath)) {
-    Write-Output ("" + $script:Pass + " passed, " + $script:Fail + " failed")
+    # RESULT passed=N failed=N is the convention every other suite in this repo
+# ends with, and harnesses parse it. Three suites I wrote invented their own
+# wording, which made them unparseable by the very tooling that measures Linux
+# readiness. codex hit exactly that. A summary line is an interface.
+Write-Output ("RESULT passed=" + $script:Pass + " failed=" + $script:Fail)
     exit 1
 }
 
@@ -168,7 +172,11 @@ Assert-True 'credentials arrive by EnvironmentFile, not Environment=' (
     "EnvironmentFile=" + $directives['EnvironmentFile'])
 
 Write-Output ''
-Write-Output ("" + $script:Pass + " passed, " + $script:Fail + " failed")
+# RESULT passed=N failed=N is the convention every other suite in this repo
+# ends with, and harnesses parse it. Three suites I wrote invented their own
+# wording, which made them unparseable by the very tooling that measures Linux
+# readiness. codex hit exactly that. A summary line is an interface.
+Write-Output ("RESULT passed=" + $script:Pass + " failed=" + $script:Fail)
 if ($script:Fail -gt 0) {
     foreach ($f in $script:Failures) { Write-Output ('  - ' + $f) }
     exit 1
