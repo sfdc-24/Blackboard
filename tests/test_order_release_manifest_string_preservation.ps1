@@ -297,3 +297,4 @@ finally {
 
 Write-Output ("RESULT passed={0} failed={1}" -f $script:Passed, $script:Failed)
 if ($script:Failed -ne 0) { exit 1 }
+exit 0
