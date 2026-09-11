@@ -58,6 +58,37 @@ bash "${COUNTER}" >/dev/null 2>&1
 check "no argument exits non-zero" "$( [ $? -ne 0 ] && echo nonzero || echo zero )" "nonzero"
 
 echo
+echo "== THE HOSTNAME IS NOT AN IDENTITY: this box is called zoom-presenter-tmp =="
+# pactl stamps application.process.host on every record. On this rig that string
+# contains 'zoom', so a parser matching the word anywhere counts the recorder as Zoom -
+# straight back to v1's bug, by way of the machine's own name.
+got=$(bash "${COUNTER}" vmic_src "${FIX}/pactl_host_collision.txt")
+check "a parec record on a host named zoom-* is NOT counted" "$got" "0"
+
+echo
+echo "== the production call path, not a path only the test uses =="
+# presenter_say.sh runs the counter itself. The counter is committed mode 100644, so
+# executing it directly is EACCES - and the old '|| echo 0' turned that into "nobody is
+# listening". Calling `bash <file>` here would hide that, which is exactly how the
+# defect survived: the test exercised a path production does not use.
+if [ -x "${COUNTER}" ]; then
+    direct_rc=0; "${COUNTER}" vmic_src "${FIX}/pactl_zoom_bound.txt" >/dev/null 2>&1 || direct_rc=$?
+    check "the counter is executable and runs directly" "$direct_rc" "0"
+else
+    # Not executable: then production MUST NOT silently read that as zero.
+    check "a non-executable counter is not silently treated as zero" \
+        "$( grep -q '|| echo 0' "${HERE}/presenter_say.sh" && echo swallowed || echo surfaced )" "surfaced"
+fi
+check "presenter_say invokes it through bash, so the mode cannot gate the check" \
+    "$( grep -q 'bash "${COUNTER}"' "${HERE}/presenter_say.sh" && echo viabash || echo direct )" "viabash"
+
+echo
+echo "== a measurement error is not an answer of zero =="
+got_rc=0
+bash "${COUNTER}" vmic_src /nonexistent/fixture.txt >/dev/null 2>&1 || got_rc=$?
+check "an unreadable fixture exits 2, not 0" "$got_rc" "2"
+
+echo
 echo "RESULT passed=$pass failed=$fail"
 [ "$fail" -gt 0 ] && exit 1
 exit 0

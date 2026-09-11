@@ -83,8 +83,30 @@ fi
 # Two opposite errors in the same check, neither ever run against real pactl output.
 # zoom_bound_count.sh resolves the name to its index and is driven by committed
 # fixtures in the regression test, so it is exercised without a live box.
+#
+# AND `|| echo 0` WAS ITSELF A THIRD WAY TO LIE.
+#
+# The counter is committed mode 100644, so executing it directly gives EACCES - and
+# `|| echo 0` turned that permission error into "Zoom is not listening". A script that
+# cannot run and a meeting nobody is in produced the identical answer. The test called
+# `bash <file>` and so never touched this path at all.
+#
+# Invoked through `bash` explicitly, so the file mode cannot decide whether the check
+# happens; and the exit status is kept, because 2 means "could not look" and must not
+# be flattened into 0 meaning "looked and saw none".
 SOURCE_NAME="${PRESENTER_SOURCE:-vmic_src}"
-ZOOM_BOUND=$("$(dirname "$0")/zoom_bound_count.sh" "${SOURCE_NAME}" 2>/dev/null || echo 0)
+COUNTER="$(dirname "$0")/zoom_bound_count.sh"
+if [ ! -r "${COUNTER}" ]; then
+    echo "cannot read ${COUNTER} - refusing to guess whether Zoom is listening" >&2
+    exit 1
+fi
+ZOOM_BOUND=$(bash "${COUNTER}" "${SOURCE_NAME}")
+COUNTER_RC=$?
+if [ "${COUNTER_RC}" -ne 0 ]; then
+    echo "the binding check could not run (exit ${COUNTER_RC}). That is NOT the same as" >&2
+    echo "'nobody is listening' - refusing to speak rather than report a guess." >&2
+    exit 1
+fi
 
 paplay --device="${SINK}" "${WAV}"
 RC=$?
