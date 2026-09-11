@@ -10,3 +10,14 @@
 # not be. All 14 tracked .sh blobs are LF today, so this pins what is already
 # true rather than renormalising anything.
 *.sh text eol=lf
+
+# The walkthrough fixtures are PARSED, not just read. zoom_bound_count.sh splits them
+# with sed and awk, and a trailing CR turns `Source: 94` into `Source: 94\r`, so the
+# numeric comparison silently stops matching. That is the same class as the CRLF
+# shebang above but quieter: no error, just a check that answers zero forever.
+/tools/walkthrough/fixtures/*.txt text eol=lf
+
+# Python tolerates CRLF where bash does not, so this is a smaller hazard - but these
+# files are shipped to a Linux box and read by tooling that may not be so forgiving,
+# and git was already warning on measure_wav.py. Pin what is already true.
+*.py text eol=lf
