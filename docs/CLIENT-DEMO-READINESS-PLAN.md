@@ -137,12 +137,16 @@ tenant traffic itself. Phased so Wednesday doesn't wait on architecture:
 ### W7 — Ways-of-working cleanup — 35%
 - **Built:** strong doc discipline (HANDOVER, ONBOARDING, POKA-YOKE, BCB-1
   grammar + lint); evidence culture.
-- **Pending:** burn down the 8-PR open queue to a clean main (ORDER Linux
-  lane is converging; #70 verified GO on Linux); **GitHub Actions billing
-  unblocked (Mr. Salam — runs die in ~5s account-wide)**; retire stale
-  branches; refresh ONBOARDING for demo-tenant world; consolidate the
-  duplicate site copies story (repo `site/` is reference-only — already
-  documented, enforce in demo materials).
+- **Pending:** burn down the open PR queue to a clean main (ORDER Linux
+  lane is converging; #65/#67/#68 merged 09-11, #70 verified GO on Linux
+  and green on hosted CI at its current head); retire stale branches;
+  refresh ONBOARDING for demo-tenant world; consolidate the duplicate site
+  copies story (repo `site/` is reference-only — already documented,
+  enforce in demo materials).
+- ~~GitHub Actions billing~~ — **RESOLVED 2026-09-11 ~20:50Z**: hosted runs
+  execute again with real durations and successes (verified against the
+  Actions API, not the comment alone). The earlier account-wide ~5s
+  pre-start failures are retired.
 
 ## 4. Research questions to the fleet (dispatch when bus reachable)
 
@@ -239,8 +243,8 @@ sell ("your consultant, augmented", not "a bot runs your meeting").
 
 ## 8. Unblock queue (each surfaced one at a time, per L-86)
 
-1. **GitHub Actions billing** — every CI run account-wide dies in ~5s; the
-   whole PR queue is hand-verified until this is fixed.
+1. ~~GitHub Actions billing~~ — **RESOLVED 2026-09-11**: hosted runs execute
+   and pass again (e.g. PR #70's current head, both ORDER workflows).
 2. **Network egress for this cloud environment** — allow `script.google.com`
    + `script.googleusercontent.com` (board access), and Meta Graph API
    domain when WhatsApp goes live.
