@@ -81,6 +81,87 @@ jobs:
           }
           if ($suiteExit -ne 0) { exit $suiteExit }
 
+      # SAME SHAPE, FOR THE SUITE WITH TEN CHILDREN IN IT.
+      #
+      # test_order_supervisor.ps1 launched every child as powershell.exe regardless of
+      # the host, so running the suite under pwsh proved nothing about the edition the
+      # ORDER lane is migrating to: the assertions ran on 7, the supervisor they were
+      # asserting about ran on 5.1. This leg moves the children too, and then refuses to
+      # pass unless they really moved -- a misspelt variable name would otherwise run
+      # 5.1 and report green, which is the failure this step exists to make impossible.
+      - name: Test ORDER supervisor contracts with its children on PowerShell 7
+        shell: pwsh
+        env:
+          ORDER_TEST_CHILD_SHELL: pwsh
+        run: |
+          $output = .	ests	est_order_supervisor.ps1
+          $suiteExit = $LASTEXITCODE
+          $output
+          $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
+          if ($childShell.Count -ne 1 -or $childShell[0] -notmatch 'pwsh') {
+            throw ("This leg exists to run the supervisor's children on PowerShell 7. " +
+                   "The child shell was: " + ($childShell -join ' '))
+          }
+          if ($suiteExit -ne 0) { exit $suiteExit }
+
+  # THE SUPERVISOR SUITE, ON THE PLATFORM THE LANE IS MIGRATING TO.
+  #
+  # Until now this suite ran only on windows-latest, so a green ORDER badge meant
+  # green ON WINDOWS. The suite aborted 333 assertions in on Linux at the first
+  # powershell.exe and the ~160 after it never reached a verdict either way.
+  #
+  # It now runs to completion there. Two guards keep that from becoming a badge that
+  # means nothing: the platform is asserted before the suite runs, and a run that
+  # skips NOTHING is refused, because on Linux this suite must declare the guards it
+  # cannot stage -- a Linux run with skipped=0 means the platform branch did not take
+  # and the result is about some other host.
+  linux-powershell-7:
+    name: ORDER supervisor contracts on Linux and PowerShell 7
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # 7.5 is not this job being fussy. OrderSupervisor.psm1's
+      # ConvertFrom-JsonPreserveStrings REFUSES to read a board on a Core edition
+      # without ConvertFrom-Json -DateKind, which arrived in 7.5, because below it
+      # every ISO-8601 board cell silently becomes [DateTime] and every row is judged
+      # ineligible. A runner below 7.5 cannot run the supervisor at all, so it must
+      # say so here rather than produce a confusing failure deep in the suite.
+      - name: Refuse to report a Linux result from a non-Linux runner
+        shell: pwsh
+        run: |
+          $version = $PSVersionTable.PSVersion
+          Write-Output "edition=$($PSVersionTable.PSEdition) version=$version IsLinux=$IsLinux"
+          Write-Output "DateKind=$((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind'))"
+          if (-not $IsLinux) { throw 'this job must run on Linux' }
+          if ($version.Major -lt 7 -or ($version.Major -eq 7 -and $version.Minor -lt 5)) {
+            throw ("PowerShell $version cannot read a board: the supervisor refuses any " +
+                   "Core edition without ConvertFrom-Json -DateKind (7.5+).")
+          }
+
+      - name: Test ORDER supervisor contracts
+        shell: pwsh
+        run: |
+          $output = ./tests/test_order_supervisor.ps1
+          $suiteExit = $LASTEXITCODE
+          $output
+          $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
+          if ($childShell.Count -ne 1 -or $childShell[0] -notmatch 'pwsh' -or $childShell[0] -match '\.exe') {
+            throw ("The children must be pwsh on Linux. The child shell was: " +
+                   ($childShell -join ' '))
+          }
+          $result = @($output | Where-Object { $_ -like 'RESULT *' })
+          if ($result.Count -ne 1) { throw ("expected one RESULT line, got: " + ($result -join ' | ')) }
+          if ($result[0] -notmatch 'skipped=(\d+)' -or [int]$Matches[1] -eq 0) {
+            throw ("A Linux run of this suite skips the guards it cannot stage -- an NTFS " +
+                   "junction, and the installer CLI gate. skipped=0 means the platform " +
+                   "branch never took, so this result is not about Linux: " + $result[0])
+          }
+          if ($suiteExit -ne 0) { exit $suiteExit }
+
   windows-powershell-51:
     name: ORDER and Azure contracts on Windows PowerShell 5.1
     runs-on: windows-latest
