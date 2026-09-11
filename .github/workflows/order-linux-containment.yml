@@ -23,6 +23,8 @@ on:
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
       - 'tests/test_order_setsid_escape.ps1'
+      - 'tests/test_order_read_resilience.ps1'
+      - 'scripts/bus.ps1'
   push:
     paths:
       - '.github/workflows/order-linux-containment.yml'
@@ -32,6 +34,8 @@ on:
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
       - 'tests/test_order_setsid_escape.ps1'
+      - 'tests/test_order_read_resilience.ps1'
+      - 'scripts/bus.ps1'
 
 permissions:
   contents: read
@@ -101,3 +105,27 @@ jobs:
       - name: Adapter invocation and wall timeout
         shell: pwsh
         run: ./tests/test_order_linux_execute.ps1
+
+      # THE SUITE THAT GUARDS THE BUS CLIENT, ON THE PLATFORM IT IS MOVING TO.
+      #
+      # Until this step existed it had never run on Linux. It is also the only
+      # coverage the Linux fake curl has: the fake is written in C# on Windows and
+      # in PowerShell here, and the single thing keeping those two honest is that
+      # the same assertions run against both. Remove this step and the two halves
+      # are free to drift with nothing to notice.
+      #
+      # The child shell is asserted for the same reason as on the windows job - a
+      # misspelt variable name would fall back to a default and report green while
+      # testing something else. On Linux the old default could not even resolve.
+      - name: Bounded ORDER board-read resilience, with the bus client on Linux
+        shell: pwsh
+        run: |
+          $output = ./tests/test_order_read_resilience.ps1
+          $suiteExit = $LASTEXITCODE
+          $output
+          $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
+          if ($childShell.Count -ne 1 -or $childShell[0] -match '\.exe') {
+            throw ("This leg exists to exercise bus.ps1 under PowerShell 7 on Linux. " +
+                   "The child shell was: " + ($childShell -join ' '))
+          }
+          if ($suiteExit -ne 0) { exit $suiteExit }
