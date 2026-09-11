@@ -1,6 +1,11 @@
 #!/bin/bash
-# ORDER 045 direction A: present from the headless GCE client into the LIVE
-# meeting 861 9538 6120, with the portal/pipewire stack now installed.
+# ORDER 045 direction A: present from the headless GCE client into whichever LIVE
+# meeting ~/join.url points at, with the portal/pipewire stack installed.
+#
+# The meeting number that used to sit on this line named a meeting that has since been
+# deleted, so it was both stale and a small piece of standing metadata about a private
+# call. The script takes its target from ~/join.url at run time and this file names no
+# meeting at all.
 #
 # Coordinates read from 19_live.png at 1920x1080:
 #   ( 958, 492) Join with Computer Audio
