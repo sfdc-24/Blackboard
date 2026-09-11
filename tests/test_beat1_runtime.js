@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const vm = require('vm');
 const { spawn, spawnSync } = require('child_process');
 
 const SOURCE = path.join(__dirname, '..', 'prototype', 'beat1');
@@ -53,6 +54,46 @@ async function stop(child) {
     child.once('exit', () => { clearTimeout(timer); resolve(); });
     child.kill();
   });
+}
+
+// Execute the real typed-page handlers with a deferred fetch. This is a state
+// transition check; browser rendering is checked separately in local acceptance.
+function typedClient(html) {
+  const elements = {};
+  const requests = [];
+  const opened = [];
+  function element() {
+    return {
+      value: '', hidden: false, disabled: false, style: {}, children: [], handlers: {},
+      addEventListener(type, handler) { this.handlers[type] = handler; },
+      appendChild(child) { this.children.push(child); },
+      get firstChild() { return this.children[0]; },
+      removeChild(child) { this.children.splice(this.children.indexOf(child), 1); },
+      querySelector() { return element(); }, setAttribute() {}, focus() {}
+    };
+  }
+  const document = {
+    getElementById(id) { return elements[id] || (elements[id] = element()); },
+    createElement: element, createElementNS: element
+  };
+  const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+  vm.runInNewContext(scripts[scripts.length - 1][1], {
+    document,
+    Beat1History: require('../prototype/beat1/history.js'),
+    window: { open() { opened.push(true); return { document: { open() {}, write() {}, close() {} } }; } },
+    fetch(route, options) {
+      return new Promise((resolve, reject) => requests.push({
+        route, body: JSON.parse(options.body), reject,
+        reply(value) { resolve({ json: () => Promise.resolve(value) }); }
+      }));
+    }
+  });
+  return {
+    elements, requests, opened,
+    submit(text) { elements.box.value = text; elements.form.handlers.submit({ preventDefault() {} }); },
+    build() { elements.make.handlers.click(); },
+    settle() { return new Promise(resolve => setImmediate(resolve)); }
+  };
 }
 
 async function main() {
@@ -198,6 +239,50 @@ async function main() {
     });
     check('malformed provider-call caps fail closed at startup',
       invalidCap.status === 2 && /must be an integer/.test(invalidCap.stderr || ''));
+
+    console.log('\nT5 · exporting requires the latest accepted correction');
+    const client = typedClient(index.body);
+    const initialSketch = { title: 'Lead routing', nodes: [{ id: 'n0', label: 'Partner spreadsheet', kind: 'system' }], edges: [] };
+    const correctedSketch = { title: 'Lead routing', nodes: [{ id: 'n0', label: 'Channel manager', kind: 'person' }], edges: [] };
+    client.submit('Describe the partner path');
+    client.requests[0].reply({ ok: true, reply: 'What should I correct?', sketch: initialSketch });
+    await client.settle();
+    check('the first accepted sketch is available to export', client.elements.make.hidden === false);
+    client.submit('Send partner leads to the Channel manager');
+    client.build();
+    check('a pending correction hides export and rejects stale build events',
+      client.elements.make.hidden === true && client.requests.length === 2);
+    client.submit('A concurrent correction must wait');
+    check('a second submit cannot race the pending correction', client.requests.length === 2);
+    client.requests[1].reply({ ok: true, reply: 'Please clarify that path.', sketch: null });
+    await client.settle();
+    client.build();
+    check('a missing updated sketch cannot re-enable the previous export',
+      client.elements.make.hidden === true && client.requests.length === 2);
+    client.submit('Partner leads go to Channel manager');
+    client.requests[2].reply({ ok: true, reply: 'Does that capture it?', sketch: correctedSketch });
+    await client.settle();
+    client.build();
+    check('a successful correction exports only the new sketch',
+      client.elements.make.hidden === false && client.requests.length === 4 &&
+      client.requests[3].route === '/api/build' && client.requests[3].body.sketch.nodes[0].label === 'Channel manager');
+    client.submit('Another correction');
+    client.requests[3].reply({ ok: true, html: '<!doctype html><title>superseded build</title>' });
+    await client.settle();
+    check('a build superseded while in flight cannot open a stale page',
+      client.opened.length === 0 && client.elements.make.hidden === true);
+    client.requests[4].reject(new Error('stubbed network failure'));
+    await client.settle();
+    client.build();
+    check('a failed correction also keeps the previous export unavailable',
+      client.elements.make.hidden === true && client.requests.length === 5);
+    client.submit('Confirm the corrected partner path');
+    client.requests[5].reply({ ok: true, reply: 'Confirmed.', sketch: correctedSketch });
+    await client.settle();
+    client.build();
+    client.requests[6].reply({ ok: true, html: '<!doctype html><title>current build</title>' });
+    await client.settle();
+    check('a build of the current sketch still opens its page', client.opened.length === 1);
   } finally {
     await stop(child);
     const relative = path.relative(tempBase, tempRoot);
