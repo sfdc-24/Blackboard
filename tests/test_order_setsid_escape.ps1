@@ -168,8 +168,20 @@ try {
 if (-not $scopeStarted) {
     # Reported loudly rather than skipped silently: a remedy that was never
     # exercised must not read as a remedy that passed.
-    $script:Notes += 'REMEDY NOT EXERCISED: no systemd --user session on this host, so the cgroup containment case did not run.'
-    Write-Output '  REMEDY NOT EXERCISED on this host (no systemd --user session).'
+    #
+    # AND ON CI IT IS A FAILURE, NOT A NOTE. codex asked for exactly this: a
+    # hosted runner that quietly lacked a systemd --user session would pass this
+    # file with the remedy untested, which is the skip-that-passes shape - the
+    # same one the platform guard in the workflow exists to prevent. The
+    # workflow sets ORDER_REQUIRE_CGROUP_REMEDY=1, so there it must run.
+    if ($env:ORDER_REQUIRE_CGROUP_REMEDY -ceq '1') {
+        Assert-True 'the cgroup remedy was exercised, as ORDER_REQUIRE_CGROUP_REMEDY demands' $false (
+            'no systemd --user session on this host, so the remedy could not run - ' +
+            'unset ORDER_REQUIRE_CGROUP_REMEDY to allow that, but never on CI')
+    } else {
+        $script:Notes += 'REMEDY NOT EXERCISED: no systemd --user session on this host, so the cgroup containment case did not run.'
+        Write-Output '  REMEDY NOT EXERCISED on this host (no systemd --user session).'
+    }
 } else {
     $scoped = 0
     $null = [int]::TryParse((Get-Content -LiteralPath $scopePidFile -Raw).Trim(), [ref]$scoped)

@@ -81,8 +81,14 @@ jobs:
       # leaves the group, so the kill returns 0 with that descendant still
       # running. It also exercises the cgroup remedy where a systemd --user
       # session exists, and says so loudly where one does not.
+      # ORDER_REQUIRE_CGROUP_REMEDY makes an unexercised remedy a FAILURE here.
+      # Without it, a runner that quietly lacked a systemd --user session would
+      # pass this step having never tested the remedy at all - the same
+      # skip-that-passes shape the platform guard above exists to prevent.
       - name: The setsid escape, and the cgroup that contains it
         shell: pwsh
+        env:
+          ORDER_REQUIRE_CGROUP_REMEDY: '1'
         run: ./tests/test_order_setsid_escape.ps1
 
       # The unit file is where that escape is actually bounded, so the
