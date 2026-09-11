@@ -13,6 +13,22 @@ $SystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd(
 $script:TestRoot = Join-Path $SystemTemp ('blackboard-order-release-installer-tests-' + [Guid]::NewGuid().ToString('N'))
 $script:ReleaseRoot = Join-Path $script:TestRoot 'releases'
 $script:InstallerTempRoot = Join-Path $script:TestRoot 'installer-temp'
+
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case here runs install_release_from_archive.ps1 in a CHILD process, and that
+# child was hardcoded to powershell.exe. On Linux the launch fails and the suite does
+# not report a shell problem - it reports the SYMPTOM, "cannot find releases/<sha>
+# because it does not exist", from a Get-ChildItem 120 lines later that is looking for
+# output the installer never got to write. Measured: 0 assertions reached on Linux.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 $script:Passed = 0
 $script:Failed = 0
 $script:RequiredFiles = @(
@@ -53,6 +69,45 @@ function Get-TestSha256 {
     param([Parameter(Mandatory = $true)][string] $Path)
 
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function New-TestDirectoryLink {
+    # STAGES THE TRAVERSAL ATTACK ON WHICHEVER PLATFORM WE ARE ON.
+    #
+    # The installer refuses any release root, entry, or ancestor carrying
+    # [IO.FileAttributes]::ReparsePoint. These fixtures exist to prove it refuses.
+    # They were written with -ItemType Junction, which is NTFS-only, so on Linux the
+    # fixture threw, the attack never staged, the installer had nothing to refuse,
+    # and the assertion failed for the WRONG REASON - reporting an unguarded door as
+    # a broken test. That is codex's commondir finding in another file.
+    #
+    # I measured the substitution rather than assuming it. On pwsh 7.5.4 on Linux a
+    # symbolic link to a directory reports Attributes "Directory, ReparsePoint" and
+    # LinkType "SymbolicLink", and writing through it lands OUTSIDE the intended root
+    # - so the attack is real and all three guard sites see the attribute they key on.
+    # The guard was already working on Linux; nothing proved it.
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Target
+    )
+
+    # $IsWindows exists only in PowerShell 6+. Under Windows PowerShell 5.1 with
+    # Set-StrictMode -Version 2.0, reading it directly THROWS rather than returning
+    # $null - so the presence test is not decoration. scripts/order_supervisor.ps1
+    # already carries this exact guard and tests/test_order_linux_host.ps1 asserts it;
+    # this follows that convention rather than inventing a second one.
+    $onWindows = if (Test-Path Variable:IsWindows) { [bool]$IsWindows } else { $true }
+    $itemType = if ($onWindows) { 'Junction' } else { 'SymbolicLink' }
+    New-Item -ItemType $itemType -Path $Path -Target $Target | Out-Null
+
+    # Never let a fixture report success without staging the attack. If the link is
+    # not a reparse point, the guard under test would pass for having nothing to
+    # refuse, which is the precise failure this helper exists to prevent.
+    $created = Get-Item -LiteralPath $Path -Force
+    if (($created.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        throw ('test_directory_link_is_not_a_reparse_point:' + $Path + ':' + $created.Attributes)
+    }
+    return $created
 }
 
 function Get-TestArchiveDescriptor {
@@ -128,7 +183,7 @@ function Invoke-Installer {
         [Environment]::SetEnvironmentVariable('TEMP', $script:InstallerTempRoot, 'Process')
         [Environment]::SetEnvironmentVariable('TMP', $script:InstallerTempRoot, 'Process')
         $lines = @(
-            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            & $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File $InstallerUnderTest `
                 -Payload ([string]$Archive.payload) `
                 -ArchiveSha256 $Digest `
@@ -459,7 +514,7 @@ try {
         -Path (Join-Path $releaseRootJunctionTarget 'release-root-marker-must-not-be-read.txt') `
         -Text 'outside release root'
     $releaseRootJunction = Join-Path $script:TestRoot 'release-root-junction'
-    New-Item -ItemType Junction -Path $releaseRootJunction -Target $releaseRootJunctionTarget | Out-Null
+    $null = New-TestDirectoryLink -Path $releaseRootJunction -Target $releaseRootJunctionTarget
     $releaseRootJunctionResult = Invoke-Installer `
         -Archive $archiveA `
         -ReleaseId ('f' * 40) `
@@ -477,7 +532,7 @@ try {
         -Path (Join-Path $ancestorJunctionTarget 'ancestor-marker-must-not-be-read.txt') `
         -Text 'outside ancestor'
     $ancestorJunction = Join-Path $script:TestRoot 'ancestor-junction'
-    New-Item -ItemType Junction -Path $ancestorJunction -Target $ancestorJunctionTarget | Out-Null
+    $null = New-TestDirectoryLink -Path $ancestorJunction -Target $ancestorJunctionTarget
     $rootBelowJunction = Join-Path $ancestorJunction 'nested\releases'
     $ancestorJunctionResult = Invoke-Installer `
         -Archive $archiveA `
@@ -794,7 +849,7 @@ try {
     New-Item -ItemType Directory -Path $reparseTarget | Out-Null
     Write-TestUtf8 -Path (Join-Path $reparseTarget 'must-not-be-traversed.txt') -Text 'outside release'
     $reparsePath = Join-Path (Join-Path $script:ReleaseRoot $reparseReleaseId) 'linked-directory'
-    New-Item -ItemType Junction -Path $reparsePath -Target $reparseTarget | Out-Null
+    $null = New-TestDirectoryLink -Path $reparsePath -Target $reparseTarget
     $reparseReplay = Invoke-Installer -Archive $archiveA -ReleaseId $reparseReleaseId
     Assert-True 'existing release reparse directory is rejected before traversal' (
         $reparseInstall.exit_code -eq 0 -and

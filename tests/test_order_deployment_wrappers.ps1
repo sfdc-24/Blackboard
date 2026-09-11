@@ -14,6 +14,25 @@ $script:StageDriver = Join-Path $script:RepoRoot 'infra\azure\stage_order_escrow
 $script:EscrowTool = Join-Path $script:RepoRoot 'infra\azure\order_task_escrow.ps1'
 $script:ReleaseInstaller = Join-Path $script:RepoRoot 'infra\azure\install_release_from_archive.ps1'
 $script:SystemTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# The child was built as (Join-Path $PSHOME 'powershell.exe'), which is not merely
+# Windows-only - it is wrong under pwsh on WINDOWS too, where $PSHOME is the pwsh
+# directory and that path does not exist either. It only ever worked because this
+# suite was only ever started from Windows PowerShell 5.1, where $PSHOME happens to
+# be the directory powershell.exe lives in. Measured on Linux: the suite dies on the
+# first Start() with "No such file or directory", 0 assertions reached.
+#
+# Resolving through Get-Command instead of composing a path means the shell is found
+# the way the operating system finds it, on either platform.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
 $script:TestRoot = Join-Path $script:SystemTemp ('order-deployment-wrapper-test-' + [Guid]::NewGuid().ToString('N'))
 $script:ReleaseFiles = @(
     'scripts\OrderSupervisor.psm1',
@@ -63,7 +82,7 @@ function Invoke-TestPowerShellFile {
     foreach ($argument in $ArgumentList) { $tokens.Add((Quote-TestArgument -Value ([string]$argument))) }
 
     $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = (Join-Path $PSHOME 'powershell.exe')
+    $startInfo.FileName = $script:ResolvedChildShell
     $startInfo.Arguments = $tokens -join ' '
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
