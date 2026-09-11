@@ -63,15 +63,39 @@ if [ "${BYTES}" -lt 1000 ]; then
     exit 1
 fi
 
-# Report the values rather than the intention: whether Zoom currently holds a capture
-# stream on the virtual mic decides whether anyone can possibly hear this.
-LISTENERS=$(pactl list short source-outputs 2>/dev/null | grep -c . || true)
+# IS *ZOOM* LISTENING, not "is anything listening".
+#
+# This counted ALL source-outputs, which is a check that passes for the wrong reason:
+# prove_voice.sh's own parec creates a source-output, so the count reads 1 and the
+# script reports success with Zoom absent entirely. A listener check satisfied by the
+# test harness measuring itself is not a listener check.
+#
+# So: require a capture stream whose application really is the Zoom client AND whose
+# source really is our virtual mic. Both halves matter - Zoom bound to some other
+# device hears nothing from us either.
+SOURCE_NAME="${PRESENTER_SOURCE:-vmic_src}"
+ZOOM_BOUND=$(pactl list source-outputs 2>/dev/null | awk -v src="$SOURCE_NAME" '
+    /^Source Output #/    { app=""; on_src=0 }
+    /Source:/             { }
+    /application\.name/   { if (tolower($0) ~ /zoom/) app=1 }
+    /application\.process\.binary/ { if (tolower($0) ~ /zoom/) app=1 }
+    /node\.name|media\.name/ { if (tolower($0) ~ /zoom/) app=1 }
+    $0 ~ src              { on_src=1 }
+    /^$/                  { if (app && on_src) c++ }
+    END                   { print c+0 }')
+
 paplay --device="${SINK}" "${WAV}"
 RC=$?
 
-echo "spoke_bytes=${BYTES} sink=${SINK} paplay_rc=${RC} capture_streams_open=${LISTENERS}"
-if [ "${LISTENERS}" -eq 0 ]; then
-    echo "WARNING: nothing was capturing the virtual mic, so the meeting heard NOTHING." >&2
+echo "spoke_bytes=${BYTES} sink=${SINK} source=${SOURCE_NAME} paplay_rc=${RC} zoom_capture_streams=${ZOOM_BOUND}"
+if [ "${ZOOM_BOUND}" -eq 0 ]; then
+    echo "WARNING: no ZOOM capture stream is bound to ${SOURCE_NAME}, so the meeting" >&2
+    echo "         heard NOTHING. Pick the microphone inside Zoom: the chevron beside" >&2
+    echo "         the Audio button -> SFDC24-VirtualMic." >&2
     exit 1
 fi
+
+# Even with Zoom bound, this proves the audio reached Zoom's input - not that a human
+# heard it. Say so rather than letting the exit code imply more than it knows.
+echo "note: this confirms Zoom is reading ${SOURCE_NAME}; it is not receiver-side proof."
 exit ${RC}

@@ -71,15 +71,32 @@ echo "  :99 $(xdpyinfo -display :99 2>/dev/null | awk '/dimensions/{print $2}' |
 echo "  :98 $(xdpyinfo -display :98 2>/dev/null | awk '/dimensions/{print $2}' || echo DEAD)"
 
 # 2. Window manager. Zoom's dialogs are unmanageable without one.
-# Both displays get one. :98 was previously left without a window manager, which
-# is the same latent problem as having none on :99.
+# PER DISPLAY, because a global count cannot answer a per-display question.
+#
+# My first repair of this loop gated each iteration on the TOTAL fluxbox count, which
+# codex knocked over with one counterexample: start with a window manager on :99 and
+# none on :98, and the :99 iteration starts a SECOND :99, the total reaches 2, and the
+# :98 iteration then skips. Result :99=2, :98=0 - while the status line says "2" and
+# the commit message claimed both displays were covered.
+#
+# That is the same failure as the bug it replaced, one level up: a number that is
+# almost right standing in for the condition actually being asked about. Ask each
+# display whether IT has a window manager, by talking to that display.
 for wm_display in :99 :98; do
-  if ! pgrep -f "[f]luxbox" >/dev/null 2>&1 || [ "$(count_proc fluxbox)" -lt 2 ]; then
-    nohup env DISPLAY="$wm_display" fluxbox >"/tmp/fluxbox${wm_display#:}.log" 2>&1 & disown
+  wm_log="/tmp/fluxbox${wm_display#:}.log"
+  if DISPLAY="$wm_display" xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+    echo "  fluxbox on $wm_display already running"
+  else
+    nohup env DISPLAY="$wm_display" fluxbox >"$wm_log" 2>&1 & disown
     sleep 2
+    if DISPLAY="$wm_display" xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+      echo "  fluxbox on $wm_display started"
+    else
+      echo "  fluxbox on $wm_display FAILED to take the display - see $wm_log"
+    fi
   fi
 done
-echo "  fluxbox instances: $(count_proc fluxbox)"
+echo "  fluxbox instances: $(count_proc fluxbox)  (expect one per display)"
 
 # 3. Audio, then THE PIECE THAT ACTUALLY MATTERS.
 #    Zoom refuses to run its share manager unless xdg-desktop-portal and

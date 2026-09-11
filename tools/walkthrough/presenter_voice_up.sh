@@ -39,6 +39,28 @@ have_module() {               # module name, then a string that must appear in i
   pactl list short modules 2>/dev/null | grep -q "$1.*$2"
 }
 
+# READ BACK, DO NOT ANNOUNCE.
+#
+# The first version ran pactl load-module, ignored its exit status, and printed
+# "created". A failed load therefore reported success and the script finished 0 with
+# no virtual microphone at all - so the first thing anyone would learn is that the
+# meeting could not hear them. Every step below now asserts the thing it claims.
+require_source() {
+  if pactl list short sources 2>/dev/null | grep -q "[[:space:]]$1[[:space:]]"; then
+    return 0
+  fi
+  echo "  FAILED: source '$1' does not exist after loading its module." >&2
+  return 1
+}
+
+require_sink() {
+  if pactl list short sinks 2>/dev/null | grep -q "[[:space:]]$1[[:space:]]"; then
+    return 0
+  fi
+  echo "  FAILED: sink '$1' does not exist after loading its module." >&2
+  return 1
+}
+
 echo "=== presenter voice up $(date -u +%FT%TZ) ==="
 
 if ! command -v espeak-ng >/dev/null 2>&1; then
@@ -48,39 +70,59 @@ if ! command -v espeak-ng >/dev/null 2>&1; then
 fi
 echo "  espeak-ng   $(command -v espeak-ng)"
 
+FAILED=0
+
 # 1. The sink whose monitor becomes the microphone.
 if have_module module-null-sink "sink_name=vmic"; then
     echo "  vmic sink   already present"
 else
-    pactl load-module module-null-sink \
-        sink_name=vmic \
-        sink_properties=device.description=SFDC24-VirtualMic-Sink >/dev/null
-    echo "  vmic sink   created"
+    if pactl load-module module-null-sink \
+            sink_name=vmic \
+            sink_properties=device.description=SFDC24-VirtualMic-Sink >/dev/null; then
+        echo "  vmic sink   loaded"
+    else
+        echo "  vmic sink   LOAD FAILED" >&2; FAILED=1
+    fi
 fi
+require_sink vmic || FAILED=1
 
 # 2. The remap that makes it visible to Zoom as an input device.
 if have_module module-remap-source "source_name=vmic_src"; then
     echo "  vmic_src    already present"
 else
-    pactl load-module module-remap-source \
-        master=vmic.monitor \
-        source_name=vmic_src \
-        source_properties=device.description=SFDC24-VirtualMic >/dev/null
-    echo "  vmic_src    created"
+    if pactl load-module module-remap-source \
+            master=vmic.monitor \
+            source_name=vmic_src \
+            source_properties=device.description=SFDC24-VirtualMic >/dev/null; then
+        echo "  vmic_src    loaded"
+    else
+        echo "  vmic_src    LOAD FAILED" >&2; FAILED=1
+    fi
 fi
+require_source vmic_src || FAILED=1
 
 # 3. A separate sink for Zoom's own output, so it never loops into the mic.
 if have_module module-null-sink "sink_name=zspk"; then
     echo "  zspk sink   already present"
 else
-    pactl load-module module-null-sink \
-        sink_name=zspk \
-        sink_properties=device.description=SFDC24-Speaker >/dev/null
-    echo "  zspk sink   created"
+    if pactl load-module module-null-sink \
+            sink_name=zspk \
+            sink_properties=device.description=SFDC24-Speaker >/dev/null; then
+        echo "  zspk sink   loaded"
+    else
+        echo "  zspk sink   LOAD FAILED" >&2; FAILED=1
+    fi
 fi
+require_sink zspk || FAILED=1
 
 pactl set-default-source vmic_src 2>/dev/null
 pactl set-default-sink zspk 2>/dev/null
+
+# Assert the defaults took, rather than assuming the set commands worked.
+ACTUAL_SOURCE=$(pactl info 2>/dev/null | sed -n 's/^Default Source: //p')
+ACTUAL_SINK=$(pactl info 2>/dev/null | sed -n 's/^Default Sink: //p')
+[ "${ACTUAL_SOURCE}" = "vmic_src" ] || { echo "  default source is '${ACTUAL_SOURCE}', not vmic_src" >&2; FAILED=1; }
+[ "${ACTUAL_SINK}" = "zspk" ]       || { echo "  default sink is '${ACTUAL_SINK}', not zspk" >&2; FAILED=1; }
 
 echo
 echo "--- state, as returned values rather than assurances ---"
@@ -96,5 +138,13 @@ echo "  Zoom does not re-read the default device for a meeting it has already jo
 echo "  Click the chevron beside the Audio button and choose:"
 echo "      Microphone -> SFDC24-VirtualMic"
 echo "      Speaker    -> SFDC24-Speaker     (NOT SFDC24-VirtualMic-Sink, that echoes)"
-echo "  Then confirm with tools/walkthrough/prove_voice.sh - a capture-stream count of"
-echo "  zero means the meeting hears NOTHING no matter what any exit code says."
+echo "  Then confirm with tools/walkthrough/prove_voice.sh, which now FAILS rather than"
+echo "  reporting, and presenter_say.sh, which refuses unless a ZOOM capture stream is"
+echo "  bound to vmic_src specifically."
+
+if [ "${FAILED}" -ne 0 ]; then
+    echo
+    echo "VOICE SETUP FAILED - the box is still mute. Do not report it as working." >&2
+    exit 1
+fi
+exit 0

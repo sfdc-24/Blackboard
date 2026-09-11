@@ -14,11 +14,28 @@ that fails the moment the session ends.
 
 A GCE instance schedule powers the instance **on**. It starts **nothing inside it**.
 
-> **And on 2026-09-11 the schedule did not fire at all.** The instance read
-> `TERMINATED` at 17:01Z, one minute after its start time, and had to be started by
-> hand. A peer surface reported "scheduled start succeeded" purely because the box was
-> running by then — it was running because a human started it. **Check `status`, never
-> the policy.** Verify a scheduled job *ran*; do not verify that it was *scheduled*.
+> **On 2026-09-11 the schedule fired late enough to look broken, and the operator
+> beat it by four seconds.** The exact timeline, from the GCE operation log:
+>
+> | time | actor |
+> |---|---|
+> | 17:01:11Z | instance still reads `TERMINATED` |
+> | 17:01:18.868Z | **manual** start inserted |
+> | 17:01:23.211Z | **compute-system** scheduler start inserted, 4.343s later |
+>
+> So the policy worked. Start it by hand if it has not come up — that is still the
+> right move — but **do not conclude from a single `status` read that the schedule is
+> broken.** An instantaneous status cannot say *who* started an instance, or that
+> nobody was about to. To attribute a start, read the operation log and look at the
+> actor and insert time:
+>
+> ```
+> gcloud compute operations list --project=sfdc24 --filter="targetLink~zoom-presenter-tmp"
+> ```
+>
+> I originally wrote the opposite here, on the strength of that one `TERMINATED`
+> reading. Inferring "it never fired" from one sample is the same mistake as inferring
+> "it works" from one green — an absence asserted from a single observation.
 
 Xvfb, fluxbox, pulseaudio, pipewire, `xdg-desktop-portal` and the presenter panels are
 all started interactively and **none of them survive a stop/start**. The packages and
