@@ -5,8 +5,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$ModulePath = Join-Path $RepoRoot 'scripts\OrderSupervisor.psm1'
-$RunnerPath = Join-Path $RepoRoot 'scripts\order_supervisor.ps1'
+$ScriptsRoot = Join-Path $RepoRoot 'scripts'
+$ModulePath = Join-Path $ScriptsRoot 'OrderSupervisor.psm1'
+$RunnerPath = Join-Path $ScriptsRoot 'order_supervisor.ps1'
 Import-Module $ModulePath -Force
 
 $script:Passed = 0
@@ -31,9 +32,20 @@ function Assert-True {
 # PowerShell 7 path had no coverage anywhere in CI, and adding this file to the
 # pwsh job would not have changed that.
 #
-# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before
+# on Windows, and defaults to pwsh everywhere else -- powershell.exe does not exist
+# off Windows, so the old default did not fail a test, it failed the whole file at
+# line 1 of the run. A default that cannot resolve is not a default.
+#
+# $IsWindows does not exist in Windows PowerShell 5.1, and reading a missing
+# variable under Set-StrictMode 2.0 throws, so it is read defensively rather than
+# referenced. Desktop edition is Windows by definition and settles 5.1 on its own.
+$script:OnWindows = ($PSVersionTable.PSEdition -ceq 'Desktop') -or
+                    [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)
 $script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
-if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) {
+    $script:ChildShell = $(if ($script:OnWindows) { 'powershell.exe' } else { 'pwsh' })
+}
 $script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
                               Select-Object -First 1).Source
 Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
@@ -67,6 +79,33 @@ if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
            'rather than reporting assertions that measured the harness.')
 }
 
+function ConvertTo-UndecoratedText {
+    # EVERYTHING THE RENDERER ADDED, REMOVED BEFORE ANYTHING IS MATCHED.
+    #
+    # Two layers, both measured, neither of them content:
+    #
+    # 1. ANSI SGR escapes. PowerShell 7 colours error output and on LINUX it does so
+    #    even when the stream is redirected into a variable, so captured text arrives
+    #    full of ESC[31;1m. On Windows it does not, which is why this only showed up
+    #    once the suite ran on the platform being migrated to.
+    # 2. The PowerShell 7 error BOX gutter: optional line number, a vertical bar,
+    #    then the text, at the start of every continuation line.
+    #
+    # Order matters. On Linux the escapes come BEFORE the gutter on each line, so a
+    # gutter pattern anchored at the line start never matches until they are gone.
+    #
+    # This runs for BOTH the phrase matcher and the canary detector, and it makes the
+    # canary detector STRICTER rather than looser: the escapes sit exactly at the wrap
+    # points, so a secret hard-wrapped by the renderer is split by ESC sequences and a
+    # gutter as well as by whitespace, and removing whitespace alone cannot rejoin it.
+    # A leak detector a coloured terminal can satisfy is no better than one a narrow
+    # terminal can satisfy.
+    param([AllowNull()][object[]]$Lines)
+    $text = (@($Lines | ForEach-Object { [string]$_ }) -join "`n")
+    $text = $text -replace ([string][char]27 + '\[[0-9;]*[A-Za-z]'), ''
+    return ($text -replace '(?m)^[ \t]*\d*[ \t]*\|[ \t]?', '')
+}
+
 function ConvertTo-FlowedText {
     # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
     # pipeline, so an assertion that matches a long phrase in captured error
@@ -88,9 +127,7 @@ function ConvertTo-FlowedText {
     # ConvertTo-SquashedText, which stays strict. Loosening this one cannot make a
     # leak check pass, and that separation is the point of having two functions.
     param([AllowNull()][object[]]$Lines)
-    $text = (@($Lines | ForEach-Object { [string]$_ }) -join "`n")
-    $text = $text -replace '(?m)^[ \t]*\d*[ \t]*\|[ \t]?', ''
-    return ($text -replace '\s+', ' ')
+    return ((ConvertTo-UndecoratedText -Lines $Lines) -replace '\s+', ' ')
 }
 
 function ConvertTo-SquashedText {
@@ -99,8 +136,13 @@ function ConvertTo-SquashedText {
     # passes because the canary was split across two lines. A negative assertion
     # that a leaked secret is absent must not be satisfiable by console width.
     # Removing whitespace entirely rejoins any hard-wrapped token before matching.
+    #
+    # On Linux whitespace is not all that sits at a wrap point -- the renderer puts
+    # ANSI escapes and a box gutter there too, and neither is whitespace. Those are
+    # removed first now, so this detector rejoins a secret the renderer split rather
+    # than reporting it absent.
     param([AllowNull()][object[]]$Lines)
-    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', '')
+    return ((ConvertTo-UndecoratedText -Lines $Lines) -replace '\s+', '')
 }
 
 function Write-TestUtf8 {
@@ -133,14 +175,54 @@ function Write-TestUtf8 {
 # runners. Both editions now take THE SAME build path: no edition gets a skip, and no
 # edition gets a second implementation of the fake that could drift from the first.
 #
-# This does NOT make the suite runnable on Linux. There curl has no .exe in its name
-# and there is no csc.exe; that needs its own change and its own evidence.
+# OFF WINDOWS THE SAME PROBLEM HAS A DIFFERENT SHAPE.
+#
+# There is no csc.exe, and curl carries no .exe: bus.ps1's first candidate simply
+# does not resolve, and the second one does, so the fake has to be a POSIX
+# executable named plainly `curl`. It is a pwsh script with a shebang pointing at
+# the running engine -- not at `pwsh` on PATH, because the migration target may
+# well carry an unpacked PowerShell that is not on PATH, exactly like the box this
+# was developed on.
+#
+# That leaves the behaviour written twice, in C# for Windows and in PowerShell for
+# everywhere else, which is the drift risk this file warns about elsewhere. The
+# guard is not discipline, it is coverage: BOTH fakes are driven by the same 93
+# assertions, so any divergence fails the suite on one platform. That only holds
+# while the Linux leg actually runs in CI, which makes that leg part of the fix
+# rather than a nice-to-have.
 function New-FakeCurlExecutable {
     param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$CSharpSource,
+        [Parameter(Mandatory = $true)][string]$PowerShellSource
     )
 
+    if (-not $script:OnWindows) {
+        $path = Join-Path $Directory 'curl'
+        $engine = (Get-Process -Id $PID).Path
+        if ([string]::IsNullOrWhiteSpace($engine)) {
+            throw 'Cannot determine the running PowerShell engine path for the fake curl shebang.'
+        }
+        Write-TestUtf8 -Path $path -Text ('#!' + $engine + "`n" + $PowerShellSource)
+        & chmod '+x' $path
+        if ($LASTEXITCODE -ne 0) { throw ('chmod +x failed on ' + $path) }
+
+        # Prove it is executable rather than assume it. A fake that is merely a file
+        # is invisible to Get-Command -CommandType Application, bus.ps1 falls through
+        # to its Invoke-WebRequest branch, and the case passes having tested a
+        # different code path than the one it names.
+        $resolved = Get-Command $path -CommandType Application -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+        if (-not $resolved) {
+            throw ('The fake curl at ' + $path + ' is not discoverable as an application ' +
+                   'after chmod. bus.ps1 would silently take its Invoke-WebRequest branch ' +
+                   'instead, so this must not be reported as passing.')
+        }
+        return $path
+    }
+
+    $Path = Join-Path $Directory 'curl.exe'
+    $Source = $CSharpSource
     $csc = @(
         (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
         (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
@@ -163,6 +245,7 @@ function New-FakeCurlExecutable {
         throw ('csc.exe exited ' + $code + ' building the fake curl: ' +
                (ConvertTo-FlowedText -Lines @($output)))
     }
+    return $Path
 }
 
 function New-BoardJson {
@@ -361,7 +444,6 @@ function Invoke-ReadCase {
 function Invoke-ActualBusMetadataCase {
     $caseRoot = Join-Path $script:TestRoot 'actual-bus-sidecar'
     $fakeBin = Join-Path $caseRoot 'bin'
-    $fakeCurlPath = Join-Path $fakeBin 'curl.exe'
     $envPath = Join-Path $caseRoot 'test.env'
     $outPath = Join-Path $caseRoot 'response.txt'
     $metadataPath = Join-Path $caseRoot 'metadata.json'
@@ -394,7 +476,27 @@ public static class FakeCurl {
     }
 }
 '@
-    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
+    # The POSIX twin of the C# above. Same contract: find -D, write the headers env
+    # var to that file, write the body env var to stdout with no trailing newline,
+    # exit with the exit env var.
+    $fakeCurlPwshSource = @'
+$ErrorActionPreference = 'Stop'
+$utf8 = New-Object Text.UTF8Encoding($false)
+$headerPath = $null
+for ($i = 0; $i + 1 -lt $args.Count; $i++) {
+    if ([string]$args[$i] -ceq '-D') { $headerPath = [string]$args[$i + 1]; break }
+}
+if (-not [string]::IsNullOrEmpty($headerPath)) {
+    [IO.File]::WriteAllText($headerPath, [string]$env:ORDER_READ_FAKE_CURL_HEADERS, $utf8)
+}
+[Console]::OutputEncoding = $utf8
+[Console]::Out.Write([string]$env:ORDER_READ_FAKE_CURL_BODY)
+$exitCode = 0
+if ([int]::TryParse([string]$env:ORDER_READ_FAKE_CURL_EXIT, [ref]$exitCode)) { exit $exitCode }
+exit 0
+'@
+    $fakeCurlPath = New-FakeCurlExecutable -Directory $fakeBin `
+        -CSharpSource $fakeCurlSource -PowerShellSource $fakeCurlPwshSource
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_CANARY
@@ -445,7 +547,6 @@ BUS_SECRET=BUS_SECRET_CANARY
 function Invoke-ActualBusSecondRedirectCase {
     $caseRoot = Join-Path $script:TestRoot 'actual-bus-second-redirect'
     $fakeBin = Join-Path $caseRoot 'bin'
-    $fakeCurlPath = Join-Path $fakeBin 'curl.exe'
     $envPath = Join-Path $caseRoot 'test.env'
     $outPath = Join-Path $caseRoot 'response.txt'
     $metadataPath = Join-Path $caseRoot 'metadata.json'
@@ -510,7 +611,64 @@ public static class FakeSecondRedirectCurl {
     }
 }
 '@
-    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
+    # The POSIX twin of the C# above. Same contract, including the exit codes 90, 91
+    # and 92, which the assertions read back as transport_exit.
+    $fakeCurlPwshSource = @'
+$ErrorActionPreference = 'Stop'
+$utf8 = New-Object Text.UTF8Encoding($false)
+$root = [string]$env:ORDER_READ_REDIRECT_ROOT
+if ([string]::IsNullOrEmpty($root)) { exit 90 }
+
+$countPath = Join-Path $root 'curl-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $countPath -PathType Leaf) {
+    $count = [int][IO.File]::ReadAllText($countPath, [Text.Encoding]::UTF8)
+}
+$count++
+[IO.File]::WriteAllText($countPath, [string]$count, $utf8)
+[IO.File]::AppendAllText(
+    (Join-Path $root 'curl-arguments.txt'),
+    ((@($args | ForEach-Object { [string]$_ }) -join [string][char]31) + [Environment]::NewLine),
+    $utf8
+)
+
+$headerPath = $null
+for ($i = 0; $i + 1 -lt $args.Count; $i++) {
+    if ([string]$args[$i] -ceq '-D') { $headerPath = [string]$args[$i + 1]; break }
+}
+if ([string]::IsNullOrEmpty($headerPath)) { exit 91 }
+
+if ($count -eq 1) {
+    [IO.File]::WriteAllText(
+        $headerPath,
+        "HTTP/1.1 302 Found`r`nLocation: https://ONE_SHOT_REDIRECT_CANARY.invalid/one-shot`r`n`r`n",
+        $utf8
+    )
+    exit 0
+}
+if ($count -eq 2) {
+    $finalStatus = [string]$env:ORDER_READ_REDIRECT_FINAL_STATUS
+    if ([string]::IsNullOrEmpty($finalStatus)) { $finalStatus = '200' }
+    if ($finalStatus -ceq '503') {
+        $finalHeader = "HTTP/1.1 503 Service Unavailable`r`nContent-Type: text/html`r`n`r`n"
+        $finalBody = '<html>FINAL_REDIRECT_BODY_CANARY</html>'
+    } else {
+        $finalHeader = "HTTP/1.1 200 OK`r`nContent-Type: application/json; charset=utf-8`r`n`r`n"
+        $finalBody = '{"ok":true,"rows":[]}'
+    }
+    [IO.File]::WriteAllText(
+        $headerPath,
+        ("HTTP/1.1 302 Found`r`nLocation: https://CANONICAL_REDIRECT_CANARY.invalid/exec`r`n`r`n" + $finalHeader),
+        $utf8
+    )
+    [Console]::OutputEncoding = $utf8
+    [Console]::Out.Write($finalBody)
+    exit 0
+}
+exit 92
+'@
+    $fakeCurlPath = New-FakeCurlExecutable -Directory $fakeBin `
+        -CSharpSource $fakeCurlSource -PowerShellSource $fakeCurlPwshSource
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_REDIRECT_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
@@ -904,6 +1062,24 @@ try {
     Assert-True 'harness reads ISO-8601 board cells as strings, on this edition' (
         $script:DateProbe.t -is [string] -and
         $script:DateProbe.t -ceq '2026-09-07T08:00:00.0000000Z'
+    )
+
+    # The canary detector is checked against a hostile input before it is trusted to
+    # clear real output. This is the shape PowerShell 7 actually produced on Linux:
+    # a secret hard-wrapped mid-token, with the two halves separated by a newline, a
+    # box gutter and ANSI escapes. Removing whitespace alone leaves it split and the
+    # absence check passes for the wrong reason -- the precise failure this suite
+    # exists to prevent, arriving through the renderer instead of the code.
+    $script:Esc = [string][char]27
+    $script:SplitCanaryLines = @(
+        ($script:Esc + '[31;1mException: ' + $script:Esc + '[0mleaked SECRET_DETECTOR_PRO'),
+        ($script:Esc + '[36;1m     | ' + $script:Esc + '[31;1mBE_VALUE and more' + $script:Esc + '[0m')
+    )
+    Assert-True 'canary detector rejoins a secret the renderer split across a wrap' (
+        (ConvertTo-SquashedText -Lines $script:SplitCanaryLines).Contains('SECRET_DETECTOR_PROBE_VALUE')
+    )
+    Assert-True 'phrase matcher reads a message the renderer wrapped and decorated' (
+        (ConvertTo-FlowedText -Lines $script:SplitCanaryLines).Contains('Exception: leaked')
     )
 
     $validEmpty = New-BoardJson
