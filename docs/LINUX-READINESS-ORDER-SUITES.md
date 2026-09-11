@@ -35,7 +35,7 @@ count, that failure was reproduced in a second, separate run.
 | `test_order_linux_host` | 0 | 19 | 0 | — green |
 | `test_order_setsid_escape` | 0 | 14 | 0 | — green |
 | `test_order_unit_containment` | 0 | 13 | 0 | — green |
-| `test_order_supervisor` | 1 | **333** | 0 | `powershell.exe` not found |
+| `test_order_supervisor` | 1 | **333** | 0 | `powershell.exe` not found — **runs to the end in PR #73: 482 passed, 0 failed, 17 skipped** |
 | `test_order_workspace` | 1 | **282** | **4** | four real failures, below |
 | `test_order_release_candidate_preflight` | 1 | 23 | **2** | two real failures, below |
 | `test_order_installer_safety` | 1 | 11 | 0 | stops after 11 |
@@ -60,6 +60,17 @@ before hitting one — that suite is far closer to Linux-ready than a grep for
 `powershell.exe` (11 sites) suggests. PR #62 added `ORDER_TEST_CHILD_SHELL` and
 PR #66 makes the default `pwsh` off Windows; applying that same preamble is a
 mechanical change for each of the five.
+
+> **Correction, from doing it.** For `test_order_supervisor` (PR #73) the preamble
+> was the *easy* half. Ten sites substituted; the eleventh is inside a single-quoted
+> here-string where the variable is literal text, which is the 494→491 Windows
+> regression already recorded in `test_order_linux_execute.ps1`. Past that, running
+> the suite found three things no preamble covers: an extraction list that had
+> silently drifted from the runner's Posix helpers, a stub bus client using the
+> .NET-Framework-only `System.Web.Extensions`, and a product bug —
+> `install_order_supervisor.ps1:189` trims only the Windows path separator, so the
+> installer refuses its own `/tmp/` base on Linux. **Read "mechanical" as the floor,
+> not the estimate**, exactly as the port plan says of its own count.
 
 **A useful surprise: `Join-Path` normalises backslashes on Linux.** `Join-Path $root
 'scripts\OrderSupervisor.psm1'` resolves to `$root/scripts/OrderSupervisor.psm1` and
@@ -136,6 +147,8 @@ covered when it has never run.
 
 No suite was ported here and no product file was touched. This document is a
 measurement so that whoever does the porting starts from evidence rather than from a
-grep. `test_order_read_resilience` is the one row already being addressed, by PR #66.
+grep. `test_order_read_resilience` is being addressed by PR #66, and
+`test_order_supervisor` by PR #73 — which also reports, without fixing, an installer
+path bug that leaves its CLI compatibility gate unable to pass on Linux at all.
 The `Start-Process` failures and the two no-output suites were not diagnosed line by
 line.
