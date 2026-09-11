@@ -1,0 +1,2 @@
+# Cross-platform evidence requires identical fixture bytes, including on Windows.
+/tests/fixtures/order_supervisor_board.json text eol=lf

@@ -22,6 +22,43 @@ function Assert-True {
     }
 }
 
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case here launches scripts/bus.ps1 in a CHILD process, and that child was
+# hardcoded to powershell.exe in ten places. So the whole suite only ever exercised
+# bus.ps1 under Windows PowerShell 5.1 -- even when the suite itself was started
+# from pwsh. bus.ps1's hop-1 error handling differs by EDITION, which meant the
+# PowerShell 7 path had no coverage anywhere in CI, and adding this file to the
+# pwsh job would not have changed that.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
+function ConvertTo-FlowedText {
+    # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
+    # pipeline, so an assertion that matches a long phrase in captured error
+    # output is really asserting on the width of whoever ran it. Measured on one
+    # machine, one commit, real 5.1: at a 74-column console the hop-2 phrase check
+    # below FAILS; at 200 columns the identical run passes. Collapsing every run of
+    # whitespace to one space removes the wrap and leaves the phrase intact.
+    param([AllowNull()][object[]]$Lines)
+    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', ' ')
+}
+
+function ConvertTo-SquashedText {
+    # For canary-ABSENCE checks, collapsing to a space is not enough: a wrap can
+    # land INSIDE a long token, and `-not $text.Contains('SOME_LONG_CANARY')` then
+    # passes because the canary was split across two lines. A negative assertion
+    # that a leaked secret is absent must not be satisfiable by console width.
+    # Removing whitespace entirely rejoins any hard-wrapped token before matching.
+    param([AllowNull()][object[]]$Lines)
+    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', '')
+}
+
 function Write-TestUtf8 {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -182,7 +219,7 @@ function Invoke-ReadCase {
             '-WorkspacePath', $workspace,
             '-ClaudeCommand', $fakeClaudePath
         )
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& $script:ResolvedChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_ROOT', $previousRoot, 'Process')
@@ -282,7 +319,7 @@ BUS_SECRET=BUS_SECRET_CANARY
         )
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_BODY', '<html>ACTUAL_BUS_BODY_CANARY</html>', 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_EXIT', '7', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -393,7 +430,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         [Environment]::SetEnvironmentVariable('PATH', ($fakeBin + [IO.Path]::PathSeparator + $previous.PATH), 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_ROOT', $caseRoot, 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_FINAL_STATUS', '200', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -407,7 +444,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         $previousErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
                 -Action read `
                 -Title 'test board' `
@@ -475,7 +512,7 @@ param(
     [Parameter(Mandatory = $true)][string]$MetadataPath,
     [Parameter(Mandatory = $true)][string]$TracePath,
     [Parameter(Mandatory = $true)][string]$EmptyPath,
-    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location')][string]$Scenario
+    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location', 'realistic-5-1-redirect')][string]$Scenario
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -500,6 +537,25 @@ function Invoke-WebRequest {
         body_present = ($null -ne $Body)
     })
     if ($Method -ceq 'Post') {
+        if ($Scenario -ceq 'realistic-5-1-redirect') {
+            # WHAT THE REAL CMDLET DOES, which every other scenario here skips.
+            # Measured on Windows PowerShell 5.1.26100.9444 against a local
+            # HttpListener: -MaximumRedirection 0 on a 302 emits a NON-TERMINATING
+            # InvalidOperationException and STILL RETURNS the response. The other
+            # scenarios return the 302 silently, so they exercise the success path
+            # and never reach hop 1's error handling at all -- which is why a
+            # handler that cannot work on 5.1 passed this suite.
+            #
+            # Write-Error honours the CALLER's -ErrorAction through CmdletBinding.
+            # bus.ps1 passes -ErrorAction SilentlyContinue, so this stays
+            # non-terminating and the response below is used. Remove that
+            # parameter from bus.ps1 and $ErrorActionPreference='Stop' promotes
+            # this to terminating, the response is discarded, and the read dies --
+            # which is exactly the regression this case exists to catch.
+            Write-Error -Exception ([System.InvalidOperationException]::new(
+                'The maximum redirection count has been exceeded. To increase the number of redirections allowed, supply a higher value to the -MaximumRedirection parameter.'
+            )) -Category InvalidOperation
+        }
         return [pscustomobject]@{
             StatusCode = 302
             Headers = @{
@@ -573,7 +629,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $successOutPath = Join-Path $successRoot 'response.txt'
     $successMetadataPath = Join-Path $successRoot 'metadata.json'
     $successTracePath = Join-Path $successRoot 'trace.json'
-    $successOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+    $successOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
         -File $wrapperPath `
         -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
         -EnvPath $envPath `
@@ -592,7 +648,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -614,7 +670,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $redirectOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $redirectOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -636,7 +692,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $insecureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $insecureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -658,7 +714,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $emptyLocationOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $emptyLocationOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -668,6 +724,32 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
             -EmptyPath $emptyPath `
             -Scenario empty-location 2>&1)
         $emptyLocationExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $realisticRoot = Join-Path $caseRoot 'realistic-5-1-redirect'
+    New-Item -ItemType Directory -Path $realisticRoot -Force | Out-Null
+    $realisticOutPath = Join-Path $realisticRoot 'response.txt'
+    $realisticMetadataPath = Join-Path $realisticRoot 'metadata.json'
+    $realisticTracePath = Join-Path $realisticRoot 'trace.json'
+    # $ErrorActionPreference='Continue' around the call, as every other
+    # failure-capable scenario here does. Without it a regression makes the
+    # child's stderr a terminating NativeCommandError and the whole SUITE
+    # aborts, so the guard reads as a crash instead of a named FAIL.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $realisticOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $realisticOutPath `
+            -MetadataPath $realisticMetadataPath `
+            -TracePath $realisticTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario realistic-5-1-redirect 2>&1)
+        $realisticExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
@@ -703,6 +785,11 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         empty_location_metadata_text = $emptyLocationMetadataText
         empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json
         empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        realistic_exit_code = $realisticExitCode
+        realistic_output = @($realisticOutput)
+        realistic_body = $(if (Test-Path -LiteralPath $realisticOutPath) { [IO.File]::ReadAllText($realisticOutPath, [Text.Encoding]::UTF8) } else { '' })
+        realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
+        realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null })
     }
 }
 
@@ -779,7 +866,8 @@ try {
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('CANONICAL_REDIRECT_CANARY') -and
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('BUS_SECRET_REDIRECT_CANARY')
     )
-    $secondRedirectFailureText = @($actualBusSecondRedirect.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    $secondRedirectFailureText = ConvertTo-FlowedText -Lines $actualBusSecondRedirect.failure_output
+    $secondRedirectFailureSquashed = ConvertTo-SquashedText -Lines $actualBusSecondRedirect.failure_output
     Assert-True 'failed final hop 2 preserves sanitized metadata before returning nonzero' (
         $actualBusSecondRedirect.failure_exit_code -ne 0 -and
         $actualBusSecondRedirect.failure_call_count -eq 2 -and
@@ -793,10 +881,10 @@ try {
     )
     Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
         $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
-        -not $secondRedirectFailureText.Contains('ONE_SHOT_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('CANONICAL_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('FINAL_REDIRECT_BODY_CANARY') -and
-        -not $secondRedirectFailureText.Contains('BUS_SECRET_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('ONE_SHOT_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('CANONICAL_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('FINAL_REDIRECT_BODY_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('BUS_SECRET_REDIRECT_CANARY') -and
         -not $actualBusSecondRedirect.failure_metadata_text.Contains('FINAL_REDIRECT_BODY_CANARY')
     )
 
@@ -819,7 +907,30 @@ try {
         $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
         $null -eq $actualBusIwrFallback.success_trace.exception_type
     )
-    $iwrFailureOutputText = @($actualBusIwrFallback.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    # The 302 exactly as Windows PowerShell 5.1 really delivers it: a
+    # non-terminating InvalidOperationException alongside the response. Every
+    # other IWR scenario above returns the 302 silently, so none of them reach
+    # hop 1's error handling; this is the only case that does.
+    Assert-True 'realistic 5.1 non-terminating 302 still completes the read' (
+        $actualBusIwrFallback.realistic_exit_code -eq 0 -and
+        @($actualBusIwrFallback.realistic_trace.calls).Count -eq 2 -and
+        $actualBusIwrFallback.realistic_trace.calls[0].method -ceq 'Post' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[0].maximum_redirection -eq 0 -and
+        $actualBusIwrFallback.realistic_trace.calls[1].method -ceq 'Get' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -eq $actualBusIwrFallback.realistic_trace.exception_type
+    )
+    Assert-True 'realistic 5.1 302 reaches hop 2 and keeps its body and metadata' (
+        $actualBusIwrFallback.realistic_body.Contains('"ok":true') -and
+        [int]$actualBusIwrFallback.realistic_metadata.http_status -eq 200 -and
+        $actualBusIwrFallback.realistic_metadata.content_type_class -ceq 'json'
+    )
+    Assert-True 'realistic 5.1 302 leaks no secret or one-shot URL' (
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('BUS_SECRET_IWR_CANARY') -and
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('ONE_SHOT_IWR_CANARY')
+    )
+
+    $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
     Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
         @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and

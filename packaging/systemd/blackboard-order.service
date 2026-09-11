@@ -1,0 +1,66 @@
+[Unit]
+# The Linux replacement for the Windows Scheduled Task that runs the ORDER
+# supervisor. See docs/ORDER-PORT-PLAN.md.
+#
+# Type=oneshot with a matching .timer, NOT a long-running daemon. The Scheduled
+# Task fires the supervisor on an interval and the supervisor exits; a daemon
+# would be a different program with different failure modes, and the point of
+# this port is to change the scheduler and nothing else.
+Description=Blackboard ORDER supervisor (one pass)
+Documentation=file:/opt/blackboard/docs/ORDER-PORT-PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# NOT root. The Scheduled Task runs as a named principal, not SYSTEM, and this
+# process reads credentials and writes to an append-only shared board.
+User=blackboard
+Group=blackboard
+
+WorkingDirectory=/opt/blackboard
+
+# Credentials come from a root-owned file the service user can read, never from
+# the command line and never from this unit (D-18). systemd passes it as
+# environment; the file itself is 0640 root:blackboard.
+EnvironmentFile=/etc/blackboard-order/env
+
+ExecStart=/usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File /opt/blackboard/scripts/order_supervisor.ps1
+
+# A supervisor pass that hangs must not sit on the lock forever. The timer's
+# interval is longer than this, so a killed pass is always finished before the
+# next one is due.
+TimeoutStartSec=900
+KillSignal=SIGTERM
+# The supervisor kills its own child tree on the way out; give it room to do so
+# before systemd escalates, or the adapter's grandchildren survive the unit.
+TimeoutStopSec=45
+KillMode=mixed
+
+# Restart=no is deliberate. The Scheduled Task does not retry a failed run
+# either - it waits for the next interval. Restarting here would let a run that
+# fails instantly spin, and every pass writes to the board.
+Restart=no
+
+# Containment. None of this exists on the Windows side, and it is the one place
+# the Linux host is allowed to be stricter than what it replaces.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/blackboard/state /opt/blackboard/logs /opt/blackboard/runs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blackboard-order
+
+[Install]
+WantedBy=multi-user.target
