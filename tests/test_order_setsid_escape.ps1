@@ -58,7 +58,8 @@ function Assert-True {
 
 if (-not (Test-Path -LiteralPath '/proc')) {
     Write-Output 'SKIP: POSIX process groups require /proc.'
-    Write-Output '0 passed, 0 failed (skipped)'
+    # The SKIP line above is what a human reads; this is what a parser reads.
+    Write-Output 'RESULT passed=0 failed=0'
     exit 0
 }
 
@@ -208,7 +209,8 @@ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output ''
 foreach ($n in $script:Notes) { Write-Output ('NOTE ' + $n) }
-Write-Output ("" + $script:Pass + " passed, " + $script:Fail + " failed")
+# RESULT passed=N failed=N is the repo convention and harnesses parse it.
+Write-Output ("RESULT passed=" + $script:Pass + " failed=" + $script:Fail)
 if ($script:Fail -gt 0) {
     foreach ($f in $script:Failures) { Write-Output ('  - ' + $f) }
     exit 1

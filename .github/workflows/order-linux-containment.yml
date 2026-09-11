@@ -23,6 +23,12 @@ on:
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
       - 'tests/test_order_setsid_escape.ps1'
+      # Both added after codex found them missing. Omitting the guard means a
+      # change to the guard itself does not run it; omitting the unit means a
+      # change to the very file the guard exists to protect does not run it
+      # either - which is the more serious half.
+      - 'tests/test_order_unit_containment.ps1'
+      - 'packaging/systemd/blackboard-order.service'
   push:
     paths:
       - '.github/workflows/order-linux-containment.yml'
@@ -32,6 +38,12 @@ on:
       - 'tests/test_order_linux_execute.ps1'
       - 'tests/test_order_group_drain.ps1'
       - 'tests/test_order_setsid_escape.ps1'
+      # Both added after codex found them missing. Omitting the guard means a
+      # change to the guard itself does not run it; omitting the unit means a
+      # change to the very file the guard exists to protect does not run it
+      # either - which is the more serious half.
+      - 'tests/test_order_unit_containment.ps1'
+      - 'packaging/systemd/blackboard-order.service'
 
 permissions:
   contents: read

@@ -114,12 +114,30 @@ Set-Content -LiteralPath $parent -Encoding utf8 -Value @(
 
 # Launch under setsid so the run owns a group, exactly as the supervisor does.
 $proc = Start-Process -FilePath '/usr/bin/setsid' -ArgumentList ('/bin/bash ' + $parent) -PassThru
-Start-Sleep -Milliseconds 300
-# CAPTURED WHILE ALIVE, exactly as the supervisor now does. Reading it later
-# returns -1, because this launcher exits within a second - which is how the
-# first version of this fix silently fell through to the racy walk while
-# reporting success.
+
+# WAIT FOR THE CONDITION, DO NOT SLEEP AT IT.
+#
+# This was a fixed 300ms pause, which is an assumption about how quickly the
+# kernel schedules a new process and setsid re-parents it into its own group.
+# On an unloaded box that assumption holds and the test is green; on a loaded
+# one /proc/<pid>/stat may not be readable yet, the capture returns -1, and the
+# suite fails for a reason that has nothing to do with containment. That is
+# measured, not theoretical: on this rig at load average 6.7 the racy tree-walk
+# suite failed three runs in four while the group path passed four in four.
+#
+# A test whose result depends on machine load reports load, not behaviour. So
+# poll until the group is READABLE, bounded, and let the assertions below judge
+# whether it is the RIGHT group. A timeout still fails - it just fails having
+# actually waited.
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
 $group = Get-PosixProcessGroupId -ProcessId $proc.Id
+while ($group -le 0 -and [DateTime]::UtcNow -lt $deadline) {
+    Start-Sleep -Milliseconds 50
+    $group = Get-PosixProcessGroupId -ProcessId $proc.Id
+}
+# CAPTURED WHILE ALIVE, exactly as the supervisor now does. Reading it after the
+# launcher exits returns -1 - which is how the first version of this fix
+# silently fell through to the racy walk while reporting success.
 Assert-True 'the run is its own process-group leader' ($group -eq $proc.Id) (
     "pgid $group vs pid " + $proc.Id)
 Assert-True 'and that group is NOT ours' ($group -ne $ownGroup)
@@ -127,7 +145,24 @@ Assert-True 'and that group is NOT ours' ($group -ne $ownGroup)
 # The first scan happens here - and only now do we let the parent fork.
 $null = Get-PosixChildProcessId -ProcessId $proc.Id
 Set-Content -LiteralPath $scanned -Value 'go' -Encoding utf8
-Start-Sleep -Seconds 2
+
+# Same reasoning as the capture above: wait for the two facts this scenario
+# needs - the late child exists, and its parent has gone - rather than sleeping
+# two seconds and hoping both happened. Under load they may not have, and the
+# failure would read as "late child never started" when the truth is "the box
+# was busy".
+$deadline = [DateTime]::UtcNow.AddSeconds(20)
+$lateSeenAt = [DateTime]::MaxValue
+while ([DateTime]::UtcNow -lt $deadline) {
+    if ($lateSeenAt -eq [DateTime]::MaxValue -and (Test-Path -LiteralPath $latePid -PathType Leaf)) {
+        # Observed AFTER the child started, so it is a safe lower bound on its
+        # start time: waiting N seconds from here is at least N from the start.
+        $lateSeenAt = [DateTime]::UtcNow
+    }
+    if ($lateSeenAt -ne [DateTime]::MaxValue -and
+        -not (Test-PosixProcessAlive -ProcessId $proc.Id)) { break }
+    Start-Sleep -Milliseconds 100
+}
 Assert-True 'a late child was forked after the scan' (
     Test-Path -LiteralPath $latePid -PathType Leaf) 'late child never started'
 Assert-True 'and its parent has already exited, orphaning it' (
@@ -144,9 +179,40 @@ Assert-True 'looking the group up now would return -1, not the real group' (
     (Get-PosixProcessGroupId -ProcessId $proc.Id) -ne $group) (
     'lookup ' + (Get-PosixProcessGroupId -ProcessId $proc.Id) + ' vs captured ' + $group)
 
-Start-Sleep -Seconds 10
+# THE MARKER-ABSENCE ASSERTION IS ONLY MEANINGFUL PAST THE CHILD'S OWN TIMER.
+#
+# The late child does `sleep 8` and then touches the marker. Checking for the
+# marker before that moment proves nothing: it would be absent whether the kill
+# worked or the child was simply still sleeping - an absence satisfied by not
+# having waited, which is the shape of every false green in this port.
+#
+# The old code slept a flat 10 seconds, leaving a 2-second margin over the
+# child's 8. Under load that margin is not real. Anchor on when the child was
+# observed instead, and wait past 8 plus a margin, while also requiring the pid
+# to actually be gone.
+# If the child was never observed, $lateSeenAt is DateTime.MaxValue and adding
+# to it throws. The assertion above has already failed in that case, so fall
+# back to a deadline that is simply now - there is no child timer to outlast.
+$markerDeadline = $(if ($lateSeenAt -eq [DateTime]::MaxValue) {
+    [DateTime]::UtcNow
+} else {
+    $lateSeenAt.AddSeconds(14)
+})
+$pidDeadline = [DateTime]::UtcNow.AddSeconds(20)
+$latePidValue = 0
+if (Test-Path -LiteralPath $latePid -PathType Leaf) {
+    $null = [int]::TryParse((Get-Content -LiteralPath $latePid -Raw).Trim(), [ref]$latePidValue)
+}
+while ([DateTime]::UtcNow -lt $pidDeadline) {
+    if ($latePidValue -gt 0 -and -not (Test-PosixProcessAlive -ProcessId $latePidValue)) { break }
+    Start-Sleep -Milliseconds 200
+}
+while ([DateTime]::UtcNow -lt $markerDeadline) { Start-Sleep -Milliseconds 200 }
+
 # THE ASSERTION THE OLD WALK FAILED. The orphaned late child is not reachable
 # from the root by any tree search, but it is still in the process group.
+Assert-True 'we waited past the moment the child would have written its marker' (
+    [DateTime]::UtcNow -ge $markerDeadline) 'the absence check below would be vacuous'
 Assert-True 'the ORPHANED late child is dead' (
     -not (Test-Path -LiteralPath $lateMarker)) 'it survived and wrote its marker'
 if (Test-Path -LiteralPath $latePid -PathType Leaf) {

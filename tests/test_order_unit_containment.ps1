@@ -45,17 +45,33 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $unitPath = Join-Path $repoRoot 'packaging/systemd/blackboard-order.service'
 Assert-True 'the ORDER unit file exists' (Test-Path -LiteralPath $unitPath) $unitPath
 if (-not (Test-Path -LiteralPath $unitPath)) {
-    Write-Output ("" + $script:Pass + " passed, " + $script:Fail + " failed")
+    # RESULT passed=N failed=N is the convention every other suite in this repo
+# ends with, and harnesses parse it. Three suites I wrote invented their own
+# wording, which made them unparseable by the very tooling that measures Linux
+# readiness. codex hit exactly that. A summary line is an interface.
+Write-Output ("RESULT passed=" + $script:Pass + " failed=" + $script:Fail)
     exit 1
 }
 
-# Directives only: strip comments so a directive named inside a comment can
-# never satisfy an assertion about the directive itself.
+# Directives from the [Service] SECTION only. Comments are stripped so a
+# directive named inside a comment cannot satisfy an assertion about the
+# directive itself.
+#
+# The first version of this parser ignored section headers and built one flat
+# map, so a KillMode written under [Unit] - where it means nothing - would have
+# satisfied a [Service] assertion. codex raised the section point; it is the
+# same class as everything else here, a check that can be satisfied by
+# something other than the thing it names.
 $directives = @{}
+$section = ''
 foreach ($raw in [IO.File]::ReadAllLines($unitPath)) {
     $line = $raw.Trim()
     if (-not $line -or $line.StartsWith('#') -or $line.StartsWith(';')) { continue }
-    if ($line.StartsWith('[')) { continue }
+    if ($line.StartsWith('[')) {
+        $section = $line.Trim('[', ']')
+        continue
+    }
+    if ($section -cne 'Service') { continue }
     $eq = $line.IndexOf('=')
     if ($eq -lt 1) { continue }
     $key = $line.Substring(0, $eq).Trim()
@@ -84,10 +100,50 @@ $type = [string]$directives['Type']
 Assert-True 'Type is oneshot, so the pass ends and the cgroup is torn down' (
     $type -ceq 'oneshot') ("Type=" + $type)
 
-# Without a stop timeout systemd could wait indefinitely before escalating.
-$stopTimeout = [string]$directives['TimeoutStopSec']
-Assert-True 'a stop timeout is set, so escalation to SIGKILL is bounded' (
-    -not [string]::IsNullOrWhiteSpace($stopTimeout)) ("TimeoutStopSec=" + $stopTimeout)
+# Without a FINITE stop timeout systemd waits forever before escalating.
+#
+# This asserted only that the directive was non-empty, which codex showed
+# false-passes on TimeoutStopSec=infinity - a setting that means the escalation
+# never happens, so the escapee is never reaped and the whole containment
+# argument above is void. "Present" is not the property; "finite" is. systemd
+# also treats 0 as no timeout, so that is rejected too.
+$stopTimeout = ([string]$directives['TimeoutStopSec']).Trim()
+$stopTimeoutFinite = $false
+if (-not [string]::IsNullOrWhiteSpace($stopTimeout)) {
+    $lowered = $stopTimeout.ToLowerInvariant()
+    # infinity never escalates; a bare zero means the same thing to systemd.
+    if ($lowered -ne 'infinity' -and $lowered -notmatch '^0+\s*(s|sec|secs|second|seconds|ms|us|min|m)?$') {
+        # Anything left must carry a non-zero magnitude to be a real deadline.
+        $stopTimeoutFinite = $lowered -match '[1-9]'
+    }
+}
+Assert-True 'the stop timeout is FINITE, so escalation to SIGKILL actually happens' (
+    $stopTimeoutFinite) ("TimeoutStopSec=" + $stopTimeout + " never escalates")
+
+# SendSIGKILL=no tells systemd never to send the final SIGKILL at all. With it,
+# KillMode=mixed still SIGTERMs the main process and then leaves everything else
+# in the cgroup running. Another directive that silently voids the containment.
+$sendSigkill = ([string]$directives['SendSIGKILL']).Trim().ToLowerInvariant()
+Assert-True 'SendSIGKILL is absent or yes, so the final kill is actually sent' (
+    [string]::IsNullOrWhiteSpace($sendSigkill) -or
+    $sendSigkill -eq 'yes' -or $sendSigkill -eq 'true' -or $sendSigkill -eq '1') (
+    "SendSIGKILL=" + $sendSigkill)
+
+# FinalKillSignal replaces the signal used for that final sweep. Anything
+# catchable can be ignored by the very descendant we are trying to reap.
+$finalSignal = ([string]$directives['FinalKillSignal']).Trim().ToUpperInvariant()
+Assert-True 'the final kill signal is absent or SIGKILL, so it cannot be caught' (
+    [string]::IsNullOrWhiteSpace($finalSignal) -or
+    $finalSignal -eq 'SIGKILL' -or $finalSignal -eq 'KILL') (
+    "FinalKillSignal=" + $finalSignal)
+
+# RemainAfterExit=yes keeps a oneshot unit ACTIVE after its process exits, so
+# the pass ending no longer tears the cgroup down and an escapee simply lives on.
+$remainAfterExit = ([string]$directives['RemainAfterExit']).Trim().ToLowerInvariant()
+Assert-True 'RemainAfterExit is absent or no, so the pass ending tears the cgroup down' (
+    [string]::IsNullOrWhiteSpace($remainAfterExit) -or
+    $remainAfterExit -eq 'no' -or $remainAfterExit -eq 'false' -or $remainAfterExit -eq '0') (
+    "RemainAfterExit=" + $remainAfterExit)
 
 Write-Output ''
 Write-Output '== the reason the in-process cgroup remedy is unavailable =='
@@ -116,7 +172,11 @@ Assert-True 'credentials arrive by EnvironmentFile, not Environment=' (
     "EnvironmentFile=" + $directives['EnvironmentFile'])
 
 Write-Output ''
-Write-Output ("" + $script:Pass + " passed, " + $script:Fail + " failed")
+# RESULT passed=N failed=N is the convention every other suite in this repo
+# ends with, and harnesses parse it. Three suites I wrote invented their own
+# wording, which made them unparseable by the very tooling that measures Linux
+# readiness. codex hit exactly that. A summary line is an interface.
+Write-Output ("RESULT passed=" + $script:Pass + " failed=" + $script:Fail)
 if ($script:Fail -gt 0) {
     foreach ($f in $script:Failures) { Write-Output ('  - ' + $f) }
     exit 1
