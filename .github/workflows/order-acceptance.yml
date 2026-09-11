@@ -27,6 +27,7 @@ on:
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
       - 'tests/test_order_release_installer.ps1'
+      - 'tests/test_order_release_manifest_string_preservation.ps1'
       - 'tests/test_order_system_adapter_smoke.ps1'
       - 'tests/test_order_job_schedule_link_validator.ps1'
       - 'tests/test_order_task_escrow.ps1'
@@ -55,6 +56,9 @@ jobs:
       - name: Test ORDER deterministic release packager
         shell: pwsh
         run: .\tests\test_order_release_packager.ps1
+      - name: Test ORDER release-manifest string preservation
+        shell: pwsh
+        run: .\tests\test_order_release_manifest_string_preservation.ps1
       - name: Test Blackboard writer timestamp contract
         shell: pwsh
         run: .\tests\test_bus_timestamp_contract.ps1
@@ -104,6 +108,9 @@ jobs:
       - name: Test ORDER immutable release installer
         shell: powershell
         run: .\tests\test_order_release_installer.ps1
+      - name: Test ORDER release-manifest string preservation
+        shell: powershell
+        run: .\tests\test_order_release_manifest_string_preservation.ps1
       - name: Test provider-free ORDER SYSTEM adapter smoke
         shell: powershell
         run: .\tests\test_order_system_adapter_smoke.ps1
@@ -134,3 +141,22 @@ jobs:
       - name: Test Azure supervisor contracts
         shell: powershell
         run: .\tests\test_azure_vm_supervisor.ps1
+
+  powershell-7-release-manifest-linux:
+    name: ORDER release-manifest string preservation on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Require the intended Linux PowerShell host
+        shell: pwsh
+        run: |
+          $hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+          if (-not $IsLinux -or -not $hasDateKind) {
+            throw "This job requires Linux and ConvertFrom-Json -DateKind (PowerShell 7.5+)."
+          }
+      - name: Test ORDER release-manifest string preservation
+        shell: pwsh
+        run: ./tests/test_order_release_manifest_string_preservation.ps1
