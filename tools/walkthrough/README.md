@@ -96,15 +96,40 @@ found two more on the box, and the second one mattered:
 | `~/.zoom/logs/zoom_stdout_stderr.log` | **Zoom logs the URL it was launched with — 11 copies** |
 
 Zoom's own log is the one nobody thinks of, and no amount of care with your own files
-removes it. Sweep the class, not the filename:
+removes it. Sweep the class, not the filename — but the naive sweep has two faults that
+make "no output" meaningless:
 
-```
-grep -rIl 'pwd=\|zoommtg://\|confno=' ~/ 2>/dev/null
+- **`2>/dev/null` hides the scan failing.** An unreadable directory prints nothing and
+  looks exactly like a clean result. Silence must mean *clean*, never *did not look*.
+- **It matches itself.** Run it anywhere at or above a checkout of this repo and it
+  finds this very file, because these paragraphs contain the patterns. "Require zero"
+  then becomes impossible to satisfy honestly, so people stop requiring it.
+
+On the presenter box (no checkout there, so self-match is not a concern):
+
+```bash
+set -o pipefail
+grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" 2>/tmp/sweep.err
+status=$?          # 0 = hits found, 1 = clean, >1 = the SCAN failed
+test -s /tmp/sweep.err && { echo "scan hit errors, result is not trustworthy"; cat /tmp/sweep.err; }
+test "$status" -eq 1 || echo "FOUND credential-bearing files above - remove and re-run"
 ```
 
-Re-run that **after** deleting, and require zero. Also check the local end the same
-way — a passcode on the laptop is exposed whether or not the box is clean. Shell
-history and any launcher you wrote during the session belong in the same sweep.
+Also stop Zoom before sweeping. A running client re-creates
+`~/.zoom/logs/zoom_stdout_stderr.log` after you delete it, so the sweep is only
+meaningful once nothing is writing.
+
+On the laptop, exclude the repository so the sweep does not find its own
+documentation, and check `--exclude-dir=.git` too:
+
+```bash
+grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' <scratchpad> \
+    --exclude-dir=.git --exclude-dir=tools 2>/tmp/sweep.err
+```
+
+Then read the hits: a match in *prose* (a runbook saying "never put `pwd=` on a command
+line") is not a credential. Distinguish by searching for the actual passcode and token
+values, which should return **zero** everywhere.
 
 **The bus secret never comes to this box.** The board digest in the top panel is
 rendered on the laptop and copied over as plain text. The presenter is a screen, not a
