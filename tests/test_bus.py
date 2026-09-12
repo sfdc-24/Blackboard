@@ -13,6 +13,7 @@ Exit 0 = all pass.
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,68 @@ def call(body=None, method="POST", with_secret=True, raw=None):
 
 BOARD_HEADER = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
                 "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
+
+
+def test_import_atomicity(server_py, tmp):
+    """Exercise the real import CLI and read committed state from fresh processes."""
+    db = os.path.join(tmp, "migration.db")
+    dump = os.path.join(tmp, "migration.json")
+    header = ["Row_ID", "Timestamp", "Payload"]
+    row = ["synthetic-1", "2026-09-12T12:00:00Z", "historical payload"]
+    rows = [header, row]
+
+    def import_rows(title, data):
+        with open(dump, "w", encoding="utf-8") as fh:
+            json.dump({"title": title, "rows": data}, fh)
+        return subprocess.run([sys.executable, server_py, "--db", db, "import-file", dump],
+                              capture_output=True, text=True, timeout=15)
+
+    def snapshot():
+        with sqlite3.connect(db) as conn:
+            return (conn.execute("SELECT * FROM files ORDER BY title").fetchall(),
+                    conn.execute("SELECT * FROM sheet_rows ORDER BY file_id, n").fetchall())
+
+    def exported_rows(title):
+        result = subprocess.run([sys.executable, server_py, "--db", db, "export", "--title", title],
+                                capture_output=True, text=True, timeout=15)
+        return json.loads(result.stdout).get("rows") if result.returncode == 0 else None
+
+    print("== migration import atomicity ==")
+    result = import_rows("Existing synthetic board", rows)
+    check("import seeds existing destination", result.returncode == 0 and
+          exported_rows("Existing synthetic board") == rows, result.stderr)
+    for label, malformed in (("null", None), ("string", "not a row"), ("object", {"cell": "value"})):
+        title = "Malformed " + label
+        before = snapshot()
+        result = import_rows(title, [header, row, malformed])
+        check(label + " row rejected with location", result.returncode != 0 and
+              "data row 2 must be a list" in result.stderr, result.stderr)
+        check(label + " failure leaves no destination or data", snapshot() == before)
+        result = import_rows(title, rows)
+        check(label + " corrected retry succeeds", result.returncode == 0 and
+              exported_rows(title) == rows, result.stderr)
+
+    before = snapshot()
+    result = import_rows("Existing synthetic board", [header, ["replacement", "ts", "do not overwrite"]])
+    check("duplicate import refuses and preserves existing data", result.returncode != 0 and
+          "refusing to double-import" in result.stderr and snapshot() == before, result.stderr)
+
+    # This fails only after the destination and the first row have been inserted.
+    # Prevalidation alone cannot pass: the database transaction must roll back.
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TRIGGER fail_second_import_row BEFORE INSERT ON sheet_rows "
+                     "WHEN NEW.n = 2 BEGIN SELECT RAISE(ABORT, 'injected second-row failure'); END")
+    before = snapshot()
+    two_rows = rows + [["synthetic-2", "2026-09-12T12:01:00Z", "second payload"]]
+    result = import_rows("Interrupted synthetic import", two_rows)
+    check("injected mid-insert failure reached", result.returncode != 0 and
+          "injected second-row failure" in result.stderr, result.stderr)
+    check("mid-insert failure rolls back title and rows", snapshot() == before)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TRIGGER fail_second_import_row")
+    result = import_rows("Interrupted synthetic import", two_rows)
+    check("retry after database failure succeeds", result.returncode == 0 and
+          exported_rows("Interrupted synthetic import") == two_rows, result.stderr)
 
 
 def main():
@@ -240,6 +303,8 @@ def main():
                         "actor_tag": "vm-cli", "status": "CLAIMED", "payload": "x",
                         "evidence_ref": {"k": 1}})
         check("object evidence_ref -> 400 not 500", code == 400)
+
+        test_import_atomicity(server_py, tmp)
 
         print(f"\n{PASS} passed, {FAIL} failed")
         if FAILURES:
