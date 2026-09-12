@@ -124,6 +124,25 @@ for i in $(seq 1 15); do
   if win_titled 'as_toolbar' >/dev/null 2>&1; then live=1; break; fi
 done
 
+# --- get Zoom's own furniture out of the picture ------------------------------
+# ZOOM DOES NOT HIDE ITS OVERLAYS FROM VIEWERS. I assumed it did, said so, and
+# was wrong - Mr Salam's phone screenshot shows them arriving as BLACK BOXES over
+# the page: a bar across the top, the participant thumbnail on the right, the
+# annotate button bottom-left. They are ordinary X windows sitting on the desktop
+# being captured, so the capture takes them.
+#
+# Moving them off-screen keeps the share alive - the windows still exist, Zoom is
+# still happy, they are simply not over the content any more. Verified by
+# screenshot after the move: page only, share still committed.
+for n in as_toolbar annotate_toolbar zoom_linux_float_video_window; do
+  for w in $(xdotool search --onlyvisible --name "^${n}$" 2>/dev/null); do
+    xdotool windowmove "$w" -3000 -3000 2>/dev/null && echo "  moved $n out of the capture"
+  done
+done
+for w in $(xdotool search --onlyvisible --name 'Zoom Workplace' 2>/dev/null); do
+  xdotool windowminimize "$w" 2>/dev/null && echo "  minimised the Zoom Workplace panel"
+done
+
 echo
 echo "--- state ---"
 echo "  zoom processes : $(pgrep -c -x zoom 2>/dev/null)"
