@@ -21,3 +21,9 @@
 # files are shipped to a Linux box and read by tooling that may not be so forgiving,
 # and git was already warning on measure_wav.py. Pin what is already true.
 *.py text eol=lf
+
+# Dialogue files are shipped to the presenter box and their text is SPOKEN.
+# dialogue_parse.py collapses whitespace so a stray CR would not reach espeak-ng,
+# but these files are also read aloud by a human rehearsing from them, and the
+# JSON sits beside .sh and .py that are already pinned. Pin what is already true.
+/tools/walkthrough/dialogue/*.json text eol=lf
