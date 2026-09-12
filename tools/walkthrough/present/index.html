@@ -42,7 +42,14 @@
     font-family:var(--body);font-size:21px;line-height:1.5;
     -webkit-font-smoothing:antialiased;overflow:hidden;
   }
-  .page{height:100vh;display:flex;flex-direction:column;padding:26px 38px 20px}
+  /* THE TOP GUTTER IS FOR ZOOM'S TOOLBAR, not for looks.
+     Zoom's share toolbar is an ordinary X window on the captured desktop, so
+     viewers see it. It can be parked off-screen to keep it out of frame - but
+     then presenter_mute_state.sh cannot read the mute state off it, and parked
+     along the bottom its Audio button is unclickable behind the Chrome kiosk
+     window. So it stays at 0,0, 865x86, and the page keeps clear of it.
+     100px = 86px of toolbar plus a little air. */
+  .page{height:100vh;display:flex;flex-direction:column;padding:100px 38px 20px}
 
   header{display:flex;justify-content:space-between;align-items:flex-end;gap:24px;
          border-bottom:3px solid var(--ink);padding-bottom:14px;flex:none}

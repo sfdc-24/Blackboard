@@ -134,7 +134,22 @@ done
 # Moving them off-screen keeps the share alive - the windows still exist, Zoom is
 # still happy, they are simply not over the content any more. Verified by
 # screenshot after the move: page only, share still committed.
-for n in as_toolbar annotate_toolbar zoom_linux_float_video_window; do
+# as_toolbar is treated DIFFERENTLY from the other two, and the reason matters.
+#
+# It is the only thing on this machine that knows whether Zoom is muted - nothing
+# in PulseAudio can see Zoom's own mute switch. presenter_mute_state.sh reads the
+# red slash off its Audio button, which needs the window ON the root window to be
+# captured. Parked off-screen the mute guard goes blind and returns UNKNOWN; and
+# parked along the bottom its Audio button sits behind the Chrome kiosk window
+# and cannot be clicked at all.
+#
+# So it goes to 0,0 and the page carries a 100px top gutter to stay clear of it.
+# Visible furniture, in exchange for a guard that works. The other two overlays
+# carry no information and go off-screen entirely.
+for w in $(xdotool search --onlyvisible --name '^as_toolbar$' 2>/dev/null); do
+  xdotool windowmove "$w" 0 0 2>/dev/null && echo "  parked as_toolbar at 0,0 (in the page's top gutter, readable by the mute guard)"
+done
+for n in annotate_toolbar zoom_linux_float_video_window; do
   for w in $(xdotool search --onlyvisible --name "^${n}$" 2>/dev/null); do
     xdotool windowmove "$w" -3000 -3000 2>/dev/null && echo "  moved $n out of the capture"
   done
