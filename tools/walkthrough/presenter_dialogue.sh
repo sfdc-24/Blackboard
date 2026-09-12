@@ -97,6 +97,9 @@ if [ "${DRY_RUN}" -eq 0 ] && [ ! -r "${SAY}" ]; then
 fi
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is missing" >&2; exit 1; }
+# base64 decodes every turn's text. Discovering it is absent at turn 1 would
+# abort a dialogue the preflight below has just declared playable.
+command -v base64  >/dev/null 2>&1 || { echo "base64 is missing" >&2; exit 1; }
 
 # VALIDATE THE WHOLE FILE FIRST. Nothing below runs unless every turn parsed.
 RECORDS="$(python3 "${PARSER}" "${FILE}")"
@@ -111,6 +114,37 @@ if [ -z "${RECORDS}" ]; then
 fi
 
 TOTAL=$(printf '%s\n' "${RECORDS}" | grep -c '[^[:space:]]')
+
+# VOICE PREFLIGHT - RESOLVE EVERY PERSONA BEFORE SPEAKING ANY OF THEM.
+#
+# Found by chatgpt-codex-connector reviewing PR85, and it was a real hole in
+# the all-or-nothing promise this script makes. Parsing validated the file, but
+# the voice lookup happened inside the playback loop - so if the parser and the
+# voice table ever drifted apart, the turns BEFORE the unmapped persona were
+# spoken and only then did it refuse. The guarantee held for every malformed
+# file and broke on exactly the case the two-file split makes possible.
+#
+# The static check in test_presenter_dialogue.sh compares the two lists, but a
+# static check cannot bind a promise made at runtime. This does.
+unmapped=""
+while read -r _pf_index _pf_persona _pf_rest; do
+    [ -n "${_pf_index}" ] || continue
+    if ! voice_for "${_pf_persona}" >/dev/null 2>&1; then
+        unmapped="${unmapped} ${_pf_persona}(turn ${_pf_index})"
+    fi
+done <<EOF_PREFLIGHT
+${RECORDS}
+EOF_PREFLIGHT
+
+if [ -n "${unmapped}" ]; then
+    echo "the parser accepted personas this script has no voice for:${unmapped}" >&2
+    echo "" >&2
+    echo "dialogue_parse.py and the voice_for table in this file are out of step." >&2
+    echo "Refusing before ANY turn is spoken - fix the table rather than letting" >&2
+    echo "the dialogue stop halfway through, in the meeting." >&2
+    exit 1
+fi
+
 echo "=== dialogue: ${FILE} - ${TOTAL} turns ==="
 
 spoken=0

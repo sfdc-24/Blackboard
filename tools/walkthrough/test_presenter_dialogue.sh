@@ -174,6 +174,45 @@ else
   bad "the failure did not say which turn stopped it"
 fi
 
+# ---- 8b. DRIFT AT RUNTIME speaks zero turns ---------------------------------
+# Found by chatgpt-codex-connector reviewing PR85. Check 9 below compares the
+# two persona lists statically, but a static check cannot bind a runtime
+# promise: before the preflight existed, a parser that accepted a persona the
+# voice table lacked spoke every turn up to it and only then refused. The
+# all-or-nothing guarantee held for every malformed file and broke on exactly
+# the case that splitting parser and table makes possible.
+#
+# So this mutates ONLY the parser, in a sandbox of its own so check 9 still
+# sees an unmutated pair, and demands zero turns spoken.
+DRIFT="${WORK}/drift"
+mkdir -p "${DRIFT}"
+cp "${SAND}/presenter_dialogue.sh" "${SAND}/dialogue_parse.py" "${DRIFT}/"
+sed -i 's/KNOWN_PERSONAS = ("ba", "sa")/KNOWN_PERSONAS = ("ba", "sa", "cfo")/' \
+    "${DRIFT}/dialogue_parse.py"
+
+if grep -q '"cfo"' "${DRIFT}/dialogue_parse.py"; then
+  ok "drift fixture: the sandbox parser was actually mutated"
+else
+  bad "drift fixture did NOT apply - the check below would pass vacuously"
+fi
+
+install_stub ok
+cp "${SPOKEN}" /dev/null 2>/dev/null || true
+cat > "${DRIFT}/presenter_say.sh" <<STUB
+#!/bin/bash
+echo "\${PRESENTER_VOICE:-?} \$*" >> "${SPOKEN}"
+exit 0
+STUB
+write_json drift.json '[{"persona":"ba","text":"one"},{"persona":"sa","text":"two"},{"persona":"cfo","text":"three"},{"persona":"ba","text":"four"}]'
+out=$(bash "${DRIFT}/presenter_dialogue.sh" "${WORK}/drift.json" 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${rc}" -ne 0 ] && [ "${n}" -eq 0 ]; then
+  ok "parser/table drift refuses with ZERO turns spoken, not two then a stop"
+else
+  bad "drift: rc=${rc} spoke=${n} - expected rc!=0 with 0 spoken"
+fi
+
 # ---- 9. parser personas and voice table are in step -------------------------
 # These live in two files and drift silently: the parser would accept a persona
 # the player has no voice for, and the player would refuse at playback time -
