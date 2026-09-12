@@ -68,7 +68,35 @@ only offers it under Wayland). Zoom does not need it. It needs the stack to exis
 | `presenter_suites.sh` | Bottom panel: displays that block. Never shows a half-drawn frame. |
 | `live_share.sh` | Joins audio, dismisses the banner, opens the share picker. |
 | `presenter_say.sh` | Speaks one line into the live meeting. |
+| `presenter_dialogue.sh` | Plays a multi-turn dialogue, **one voice per persona**. |
 | `prove_voice.sh` | Records Zoom's own mic source and measures it against a silent control. |
+
+### Rehearsing the dialogue before the box is up
+
+`presenter_dialogue.sh <file.json> --dry-run` validates the file, resolves each
+persona to its voice, and prints the running order **without speaking**. It runs
+the identical parse path as a real run, so a clean dry run means the file is
+playable — and it is safe to run during a live call, which is the point. The
+regression test proves the silence by stubbing `presenter_say.sh` and asserting it
+was invoked zero times; "it printed the text" would not have proved it.
+
+```bash
+tools/walkthrough/presenter_dialogue.sh \
+    tools/walkthrough/dialogue/ba-sa-rehearsal-20260912.json --dry-run
+```
+
+Two refusals that are deliberate, so they are not surprises at T-2:
+
+- **One bad turn refuses the whole file.** Validation completes before anything is
+  spoken, because finding at turn 5 that turn 6 is malformed leaves five turns
+  already in the meeting and no way to take them back.
+- **A persona with no voice is refused, not defaulted.** Quietly using the default
+  voice keeps the transcript correct and turns the audio into a monologue — which
+  is the exact claim the cross-check beat exists to disprove. A file with only one
+  persona is refused for the same reason; use `presenter_say.sh` for a monologue.
+
+`test_presenter_dialogue.sh <dir>` runs 13 assertions with no sound card, no X
+server and no meeting.
 
 The board digest goes to **`/tmp/board_digest.txt`**, not `~`. `presenter_loop.sh` reads
 only the `/tmp` path; a digest copied to the home directory renders as
