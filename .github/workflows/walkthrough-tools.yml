@@ -71,10 +71,7 @@ jobs:
           set -euo pipefail
           output=$(./tools/walkthrough/test_zoom_bound_count.sh)
           echo "$output"
-          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
-          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
-          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
-            || { echo "the suite reported failures" >&2; exit 1; }
+          printf '%s\n' "$output" | ./tools/walkthrough/assert_suite_result.sh "zoom-binding contracts"
 
       # measure_wav.py is the tool that decides whether the voice proof is real. It
       # shipped once printing UNREADABLE and returning 0, so assert the exit code on
@@ -101,7 +98,32 @@ jobs:
           set -euo pipefail
           output=$(./tools/walkthrough/test_meeting_panels.sh tools/walkthrough)
           echo "$output"
-          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
-          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
-          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
-            || { echo "the suite reported failures" >&2; exit 1; }
+          printf '%s\n' "$output" | ./tools/walkthrough/assert_suite_result.sh "meeting panel contracts"
+
+      # THE RESULT GUARD'S OWN SUITE, AND WHY IT IS NOT GUARDED BY ITSELF.
+      #
+      # assert_suite_result.sh now decides whether every other suite passed, so
+      # an assert_suite_result.sh that accepted everything would hide its own
+      # breakage: its test would report failures, and the broken guard would
+      # then accept that report. The circularity is not theoretical - "accept
+      # everything" is the most likely way for this particular file to break.
+      #
+      # So this step reads the exit status directly and greps for a zero
+      # failure count itself. It is the one place the duplication is correct.
+      - name: The result guard refuses what it must
+        run: |
+          set -euo pipefail
+          output=$(./tools/walkthrough/test_assert_suite_result.sh tools/walkthrough)
+          echo "$output"
+          printf '%s\n' "$output" | grep -qE '^RESULT passed=[1-9][0-9]* failed=0$' \
+            || { echo "the result guard's own suite did not pass cleanly" >&2; exit 1; }
+
+      # The dialogue player speaks into a LIVE meeting, so its refusals are the
+      # product. Committed without this step it would be a test no job invokes,
+      # which is the note at the top of this file and the whole of PR74.
+      - name: Dialogue player contracts
+        run: |
+          set -euo pipefail
+          output=$(PRESENTER_DIALOGUE_GAP=0 ./tools/walkthrough/test_presenter_dialogue.sh tools/walkthrough)
+          echo "$output"
+          printf '%s\n' "$output" | ./tools/walkthrough/assert_suite_result.sh "dialogue player contracts"
