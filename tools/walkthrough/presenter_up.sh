@@ -82,14 +82,30 @@ echo "  :98 $(xdpyinfo -display :98 2>/dev/null | awk '/dimensions/{print $2}' |
 # That is the same failure as the bug it replaced, one level up: a number that is
 # almost right standing in for the condition actually being asked about. Ask each
 # display whether IT has a window manager, by talking to that display.
+wm_present() {                # a window manager is actually managing this display
+  # THE EXIT CODE OF xprop IS NOT THE ANSWER.
+  #
+  # `xprop -root _NET_SUPPORTING_WM_CHECK` prints "_NET_SUPPORTING_WM_CHECK:  not
+  # found." and EXITS 0 when no window manager is running. So the obvious check
+  # succeeds on a bare display, reports "already running", and never starts fluxbox -
+  # which is exactly what happened on a cold box: "fluxbox on :99 already running"
+  # printed directly above "fluxbox instances: 0".
+  #
+  # That is the third guard in this file to be satisfied for the wrong reason, after
+  # the pgrep counter and the global-count loop. The shape is always the same: a check
+  # whose success path can be reached without the condition being true. Look at the
+  # VALUE - a real window manager publishes a window id.
+  DISPLAY="$1" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -qi 'window id'
+}
+
 for wm_display in :99 :98; do
   wm_log="/tmp/fluxbox${wm_display#:}.log"
-  if DISPLAY="$wm_display" xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+  if wm_present "$wm_display"; then
     echo "  fluxbox on $wm_display already running"
   else
     nohup env DISPLAY="$wm_display" fluxbox >"$wm_log" 2>&1 & disown
-    sleep 2
-    if DISPLAY="$wm_display" xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+    sleep 3
+    if wm_present "$wm_display"; then
       echo "  fluxbox on $wm_display started"
     else
       echo "  fluxbox on $wm_display FAILED to take the display - see $wm_log"
