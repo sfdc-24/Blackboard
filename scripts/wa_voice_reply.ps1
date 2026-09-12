@@ -35,18 +35,25 @@ USAGE
 param(
   [string]$Text,
   [string]$TextFile,
+  # A persona key from scripts/voices.json ('ba', 'sa', or an instance tag).
+  # It supplies voice + direction together, so a Business Analyst voice note and
+  # a Solution Architect voice note stay tellable apart by ear. Explicit -Voice
+  # or -Direction still wins over the persona. The SENDER identity is unchanged:
+  # -Tag below stays the instance, because a persona is a hat, not an author.
+  [string]$Persona,
   # He asked on 2026-09-08 for "female and one that sounds airy and smart like in
   # claude mobile", heard all six of the shortlist, and chose NOVA. The newer model
   # carries voices the original six do not -- sage and coral are the warm,
   # articulate ones -- so both models are selectable rather than the voice list
-  # being silently limited by a model choice nobody stated.
-  [ValidateSet('alloy', 'ash', 'ballad', 'coral', 'echo', 'fable',
+  # being silently limited by a model choice nobody stated. Empty means: let the
+  # persona decide, and fall back to nova when there is no persona either.
+  [ValidateSet('', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'fable',
                'nova', 'onyx', 'sage', 'shimmer', 'verse')]
-  [string]$Voice = 'nova',
+  [string]$Voice = '',
   [ValidateSet('tts-1', 'tts-1-hd', 'gpt-4o-mini-tts')]
   [string]$Model = 'gpt-4o-mini-tts',
   # Only gpt-4o-mini-tts honours this. It steers delivery, not words.
-  [string]$Direction = 'Calm, warm and articulate. Unhurried. Never salesy.',
+  [string]$Direction = '',
   [ValidateRange(1, 3500)]
   [int]$MaxChars = 1200,
   [switch]$AlsoText,
@@ -72,6 +79,24 @@ if ($Text.Length -gt $MaxChars) {
   throw ("refusing to speak " + $Text.Length + " characters; the bound is " + $MaxChars +
          ". Shorten it, or raise -MaxChars deliberately. Long spoken messages are also worse to listen to.")
 }
+
+# ---- persona resolution (scripts/voices.json), explicit flags win --------------
+if ($Persona) {
+  $registryFile = Join-Path $PSScriptRoot 'voices.json'
+  if (-not (Test-Path -LiteralPath $registryFile)) { throw "persona '$Persona' requested but registry not found: $registryFile" }
+  $registry = Get-Content -LiteralPath $registryFile -Raw | ConvertFrom-Json
+  $entry = $null
+  if ($registry.personas -and $registry.personas.PSObject.Properties[$Persona]) {
+    $entry = $registry.personas.$Persona
+  } elseif ($registry.instances -and $registry.instances.PSObject.Properties[$Persona]) {
+    $entry = $registry.instances.$Persona
+  }
+  if (-not $entry) { throw "persona '$Persona' not in $registryFile" }
+  if (-not $Voice) { $Voice = [string]$entry.voice }
+  if (-not $Direction) { $Direction = [string]$entry.direction }
+}
+if (-not $Voice) { $Voice = 'nova' }
+if (-not $Direction) { $Direction = 'Calm, warm and articulate. Unhurried. Never salesy.' }
 
 # ---- credentials, from the env file only (D-18) -------------------------------
 if (-not $EnvFile) { $EnvFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env' }
