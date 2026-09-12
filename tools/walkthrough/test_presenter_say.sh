@@ -142,6 +142,8 @@ run_case() {
     if PATH="${BIN}:${PATH}" \
         PAPLAY_LOG="${PAPLAY_LOG}" \
         PRESENTER_REAL_AWK="${REAL_AWK}" \
+        PRESENTER_SINK='vmic' \
+        PRESENTER_SOURCE='vmic_src' \
         PRESENTER_TEST_MODE="${mode}" \
         bash "${PRESENTER}" "behavioral playback probe" \
         > "${CASE_OUT}" 2> "${CASE_ERR}"; then
