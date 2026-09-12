@@ -115,6 +115,42 @@ else
   bad "Toronto and Buenos Aires printed the same time ('$tor' / '$bue') - TZ lookup failed"
 fi
 
+# ---- 3b. a long file keeps its NEWEST lines ---------------------------------
+# The panels tail rather than cat. On the box the notes panel fits fourteen body
+# lines, and during a live call the notes only grow - so a panel that cat'd would
+# silently drop the line the guest had just watched being written, while keeping
+# the header he read ten minutes ago. Clipping has to land on the old end.
+#
+# Off a tty `tput lines` gives nothing, the panels fall back to 24, and the
+# budget is 24-5 = 19 body lines. With 100 lines in, the last must survive and
+# the first must not.
+: > "$NOTES"
+i=1
+while [ "$i" -le 100 ]; do printf '   LINE-%03d\n' "$i" >> "$NOTES"; i=$((i+1)); done
+
+n_tail=$(capture "$RIG/meeting_notes_panel.sh")
+if printf '%s' "$n_tail" | grep -q 'LINE-100'; then
+  ok "a 100-line notes file still shows its LAST line"
+else
+  bad "the newest line was clipped - the panel is cat'ing, not tailing"
+fi
+if printf '%s' "$n_tail" | grep -q 'LINE-001'; then
+  bad "line 1 of 100 is on screen, so nothing is being tailed at all"
+else
+  ok "the oldest lines are the ones dropped"
+fi
+# And the body must not exceed the budget, or the terminal scrolls and the
+# single-printf redraw stops meaning anything.
+# DISTINCT lines, not a raw count: capture() runs the panel for four seconds and
+# the loop sleeps three, so the output holds about two identical frames and a
+# plain grep -c would report double the budget and fail a correct panel.
+kept=$(printf '%s' "$n_tail" | grep -o 'LINE-[0-9]\{3\}' | sort -u | wc -l | tr -d ' ')
+if [ "$kept" -le 19 ]; then
+  ok "kept $kept body lines, inside the 19-line budget"
+else
+  bad "kept $kept body lines, over the 19-line budget - the panel will scroll"
+fi
+
 # ---- 4. one printf per frame ------------------------------------------------
 # Every frame must begin with the clear sequence. If a frame were echoed line by
 # line the viewer would catch a blank window on every refresh - the bug the

@@ -21,9 +21,23 @@ set -uo pipefail
 
 WORK=/tmp/meeting_work.txt
 
+# Same row budget as the notes panel: blank, title, rule, blank, and one held
+# back so nothing is pushed off the bottom.
+visible_rows() {
+  local rows
+  rows=$(tput lines 2>/dev/null)
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  rows=$((rows - 5))
+  [ "$rows" -lt 3 ] && rows=3
+  printf '%s' "$rows"
+}
+
 while true; do
   if [ -s "$WORK" ]; then
-    body=$(cat "$WORK")
+    # TAIL, NOT CAT - and it matters more here than in the notes panel, because
+    # this one carries the output of something running. Work output only ever
+    # grows, and the interesting line is always the most recent.
+    body=$(tail -n "$(visible_rows)" "$WORK")
   else
     body=$(printf '%s\n' \
       "   Idle - waiting for something to work on." \

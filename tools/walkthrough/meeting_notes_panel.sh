@@ -24,9 +24,26 @@ set -uo pipefail
 
 NOTES=/tmp/meeting_notes.txt
 
+# How many lines of body actually fit. The frame spends four rows on a blank
+# line, the title, the rule and another blank; one more is kept back so the
+# shell prompt never pushes the last line off.
+visible_rows() {
+  local rows
+  rows=$(tput lines 2>/dev/null)
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  rows=$((rows - 5))
+  [ "$rows" -lt 3 ] && rows=3
+  printf '%s' "$rows"
+}
+
 while true; do
   if [ -s "$NOTES" ]; then
-    body=$(cat "$NOTES")
+    # TAIL, NOT CAT. During a live call the notes only grow, and a panel sized to
+    # exactly fourteen lines was one sentence away from silently cutting off the
+    # newest one - the line the guest just watched me write. Clipping the top
+    # loses something he has already read; clipping the bottom loses the thing he
+    # is looking for. Tail so the failure lands on the harmless end.
+    body=$(tail -n "$(visible_rows)" "$NOTES")
   else
     body=$(printf '%s\n' \
       "   Nothing captured yet - this fills in as we talk." \
