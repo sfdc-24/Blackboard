@@ -148,16 +148,44 @@ Also stop Zoom before sweeping. A running client re-creates
 `~/.zoom/logs/zoom_stdout_stderr.log` after you delete it, so the sweep is only
 meaningful once nothing is writing.
 
-On this Windows laptop, scan recursively from the exact scratchpad root, not the whole
-checkout or user profile. `--no-ignore` prevents ignore files from silently hiding an
-artifact; the two narrow globs skip only Git object databases and this README's known
-self-match. This PowerShell procedure treats hits and scan errors as failures; only
-ripgrep's clean `1` becomes procedure exit `0`:
+On a Windows laptop, set the required input to the absolute scratchpad root in the same
+PowerShell process that will run the sweep. The value is a path, not a meeting URL,
+passcode or token; use the actual operator-selected root in place of this example:
+
+```powershell
+$env:SFDC24_SCRATCH_ROOT = 'C:\absolute\path\to\scratchpad'
+```
+
+The sweep resolves that exact root and refuses a missing, relative, nonexistent or
+non-directory value. It does not broaden the scan to the checkout or user profile.
+`--no-ignore` prevents ignore files from silently hiding an artifact; the two narrow
+globs skip only Git object databases and this README's known self-match. Hits and scan
+errors are failures; only ripgrep's clean `1` becomes procedure exit `0`:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false # inspect rg's 0/1/>1 status below
-$ScratchRoot = (Resolve-Path -LiteralPath 'C:\Users\salam\AppData\Local\Temp\claude\C--Users-salam-Quantum-Blackboard\a4b334b8-f18c-4390-aa28-72bb51a029c3\scratchpad').Path
+$RequestedScratchRoot = $env:SFDC24_SCRATCH_ROOT
+if ([string]::IsNullOrWhiteSpace($RequestedScratchRoot)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT is required and must name one absolute scratchpad directory.')
+    exit 2
+}
+$IsDriveAbsolute = $RequestedScratchRoot -match '^[A-Za-z]:[\\/]'
+$IsUncAbsolute = $RequestedScratchRoot -match '^\\\\[^\\/]+\\[^\\/]+(?:\\|$)'
+if (-not ($IsDriveAbsolute -or $IsUncAbsolute)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must be a fully qualified drive-rooted or UNC path; refusing to guess the scan root.')
+    exit 2
+}
+try {
+    $ScratchRoot = (Resolve-Path -LiteralPath $RequestedScratchRoot -ErrorAction Stop).Path
+} catch {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT could not be resolved; a clean result cannot be claimed.')
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $ScratchRoot -PathType Container)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve to a directory; refusing to scan another shape.')
+    exit 2
+}
 $Rg = (Get-Command rg.exe -CommandType Application -ErrorAction Stop).Source
 $HitFile = [IO.Path]::GetTempFileName()
 $ErrorFile = [IO.Path]::GetTempFileName()
