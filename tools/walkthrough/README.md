@@ -96,11 +96,13 @@ found two more on the box, and the second one mattered:
 | `~/.zoom/logs/zoom_stdout_stderr.log` | **Zoom logs the URL it was launched with — 11 copies** |
 
 Zoom's own log is the one nobody thinks of, and no amount of care with your own files
-removes it. Sweep the class, not the filename — but the naive sweep has two faults that
+removes it. Sweep the class, not the filename — but the naive sweep has three faults that
 make "no output" meaningless:
 
 - **`2>/dev/null` hides the scan failing.** An unreadable directory prints nothing and
   looks exactly like a clean result. Silence must mean *clean*, never *did not look*.
+- **Binary-file filtering skips artifacts.** A log or cache containing a NUL byte still
+  can contain a credential. Do not use `grep -I`, and tell ripgrep to scan as text.
 - **It matches itself.** Run it anywhere at or above a checkout of this repo and it
   finds this very file, because these paragraphs contain the patterns. "Require zero"
   then becomes impossible to satisfy honestly, so people stop requiring it.
@@ -119,7 +121,7 @@ if ! errors=$(mktemp /tmp/presenter-sweep-errors-XXXXXX); then
 fi
 trap 'rm -f "$hits" "$errors"' EXIT
 
-if grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" \
+if grep -rl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" \
      >"$hits" 2>"$errors"; then
     status=0
 else
@@ -159,9 +161,10 @@ $env:SFDC24_SCRATCH_ROOT = 'C:\absolute\path\to\scratchpad'
 The sweep resolves that exact filesystem root and refuses a missing, relative,
 nonexistent, non-filesystem or non-directory value. It does not broaden the scan to
 the checkout or user profile.
-`--no-ignore` prevents ignore files from silently hiding an artifact; the one narrow
-glob skips only Git object databases. Hits and scan errors are failures; only
-ripgrep's clean `1` becomes procedure exit `0`:
+`--no-ignore` prevents ignore files from silently hiding an artifact, and `--text`
+prevents binary detection from skipping a NUL-containing file. The one narrow glob
+skips only Git object databases. Hits and scan errors are failures; only ripgrep's
+clean `1` becomes procedure exit `0`:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -197,7 +200,7 @@ $HitFile = [IO.Path]::GetTempFileName()
 $ErrorFile = [IO.Path]::GetTempFileName()
 try {
     $RgArgs = @(
-        '--files-with-matches', '--hidden', '--no-config', '--no-ignore',
+        '--files-with-matches', '--hidden', '--no-config', '--no-ignore', '--text',
         '--glob', '!**/.git/objects/**',
         '--regexp', 'pwd=', '--regexp', 'zoommtg://', '--regexp', 'confno=',
         '--', $ScratchRoot
