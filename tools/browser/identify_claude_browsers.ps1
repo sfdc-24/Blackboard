@@ -189,13 +189,24 @@ if ($DeviceId.Count -gt 0) {
             Write-Output ("  MATCHED  {0}  -> {1} / {2}  [{3}]  {4}" -f $d, $h.Browser, $h.Profile, $live, $h.DisplayName)
         } else {
             $stale++
-            Write-Output ("  STALE    {0}  -> no local profile holds this id" -f $d)
+            Write-Output ("  ELSEWHERE {0}  -> no profile ON THIS MACHINE holds this id" -f $d)
         }
     }
     Write-Output ''
-    Write-Output ("  $stale of $($DeviceId.Count) registrations have no browser behind them on this machine.")
+    Write-Output ("  $stale of $($DeviceId.Count) ids belong to no browser on this machine.")
     if ($stale -gt 0) {
-        Write-Output '  A browser action sent to one of those will appear to do nothing.'
+        # DO NOT CALL THESE STALE. This label used to read "STALE", and that one
+        # word caused a wrong conclusion the first time the tool was run: two ids
+        # were reported as dead registrations and they turned out to be the
+        # user's LAPTOP browsers, one of which connected fine moments later.
+        #
+        # "Not here" and "not anywhere" are different claims and this script can
+        # only ever make the first one. It sees one machine's disk.
+        Write-Output '  That means NOT HERE - it does NOT mean stale. They may be'
+        Write-Output '  live browsers on another machine on the same account. Run'
+        Write-Output '  this on that machine to tell the two apart; isLocal in the'
+        Write-Output '  API response does not, having been observed true for a'
+        Write-Output '  browser on a different host.'
     }
 }
 
