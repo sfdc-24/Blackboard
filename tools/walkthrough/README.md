@@ -102,7 +102,7 @@ make "no output" meaningless:
 - **`2>/dev/null` hides the scan failing.** An unreadable directory prints nothing and
   looks exactly like a clean result. Silence must mean *clean*, never *did not look*.
 - **Binary-file filtering skips artifacts.** A log or cache containing a NUL byte still
-  can contain a credential. Do not use `grep -I`, and tell ripgrep to scan as text.
+  can contain a credential. Use `grep -a` and `rg --text` to scan it as text.
 - **It matches itself.** Run it anywhere at or above a checkout of this repo and it
   finds this very file, because these paragraphs contain the patterns. "Require zero"
   then becomes impossible to satisfy honestly, so people stop requiring it.
@@ -121,11 +121,27 @@ if ! errors=$(mktemp /tmp/presenter-sweep-errors-XXXXXX); then
 fi
 trap 'rm -f "$hits" "$errors"' EXIT
 
-if grep -rl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" \
-     >"$hits" 2>"$errors"; then
+if ! exec 3>"$hits"; then
+    echo "credential sweep could not open its results file" >&2
+    exit 2
+fi
+if ! exec 4>"$errors"; then
+    echo "credential sweep could not open its error file" >&2
+    exec 3>&-
+    exit 2
+fi
+
+if grep -ral -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" >&3 2>&4; then
     status=0
 else
     status=$?
+fi
+exec 3>&-
+exec 4>&-
+
+if [ ! -r "$hits" ] || [ ! -r "$errors" ]; then
+    echo "credential sweep lost a results file; a clean result cannot be claimed" >&2
+    exit 2
 fi
 
 if [ "$status" -gt 1 ] || [ -s "$errors" ]; then
@@ -195,9 +211,19 @@ if (-not (Test-Path -LiteralPath $ScratchRoot -PathType Container)) {
     [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve to a directory; refusing to scan another shape.')
     exit 2
 }
-$Rg = (Get-Command rg.exe -CommandType Application -ErrorAction Stop).Source
-$HitFile = [IO.Path]::GetTempFileName()
-$ErrorFile = [IO.Path]::GetTempFileName()
+$HitFile = $null
+$ErrorFile = $null
+try {
+    $Rg = (Get-Command rg.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1).Source
+    $HitFile = [IO.Path]::GetTempFileName()
+    $ErrorFile = [IO.Path]::GetTempFileName()
+} catch {
+    if ($null -ne $HitFile) { Remove-Item -LiteralPath $HitFile -Force -ErrorAction SilentlyContinue }
+    if ($null -ne $ErrorFile) { Remove-Item -LiteralPath $ErrorFile -Force -ErrorAction SilentlyContinue }
+    [Console]::Error.WriteLine('Credential sweep setup failed; a clean result cannot be claimed.')
+    exit 2
+}
 try {
     $RgArgs = @(
         '--files-with-matches', '--hidden', '--no-config', '--no-ignore', '--text',
@@ -225,6 +251,9 @@ try {
     }
     Write-Output 'credential sweep clean'
     exit 0
+} catch {
+    [Console]::Error.WriteLine('Credential sweep execution failed; a clean result cannot be claimed.')
+    exit 2
 } finally {
     Remove-Item -LiteralPath $HitFile, $ErrorFile -Force -ErrorAction SilentlyContinue
 }

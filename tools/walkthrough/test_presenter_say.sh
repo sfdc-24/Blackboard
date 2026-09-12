@@ -102,7 +102,7 @@ cat > "${BIN}/awk" <<'STUB'
 set -u
 : "${PRESENTER_REAL_AWK:?PRESENTER_REAL_AWK is required}"
 case "${PRESENTER_TEST_MODE:-}" in
-    empty|leading-zero|malformed|oversized)
+    empty|leading-zero|malformed|nine-digit|ten-digit|oversized)
         for arg in "$@"; do
             case "${arg}" in
                 idx=*)
@@ -110,6 +110,8 @@ case "${PRESENTER_TEST_MODE:-}" in
                         empty) ;;
                         leading-zero) echo '01' ;;
                         malformed) echo 'not-a-count' ;;
+                        nine-digit) echo '999999999' ;;
+                        ten-digit) echo '1000000000' ;;
                         oversized) echo '9999999999999999999999999999999999999999' ;;
                     esac
                     exit 0
@@ -190,6 +192,20 @@ run_case oversized
 check_nonzero 'oversized count returns non-zero' "${CASE_RC}"
 check_equal 'oversized count never invokes paplay' "${CASE_PAPLAY_CALLS}" '0'
 check_contains 'oversized count is reported as invalid' 'invalid count' "${CASE_ERR}"
+
+echo
+echo '== the maximum nine-digit count remains valid =='
+run_case nine-digit
+check_equal 'nine-digit count returns success' "${CASE_RC}" '0'
+check_equal 'nine-digit count invokes paplay exactly once' "${CASE_PAPLAY_CALLS}" '1'
+check_contains 'nine-digit success reports the measured binding' 'zoom_capture_streams=999999999' "${CASE_OUT}"
+
+echo
+echo '== the first ten-digit count is refused =='
+run_case ten-digit
+check_nonzero 'ten-digit count returns non-zero' "${CASE_RC}"
+check_equal 'ten-digit count never invokes paplay' "${CASE_PAPLAY_CALLS}" '0'
+check_contains 'ten-digit count is reported as invalid' 'invalid count' "${CASE_ERR}"
 
 echo
 echo '== one Zoom binding permits exactly one playback =='
