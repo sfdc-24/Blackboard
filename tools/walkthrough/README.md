@@ -158,9 +158,9 @@ $env:SFDC24_SCRATCH_ROOT = 'C:\absolute\path\to\scratchpad'
 
 The sweep resolves that exact root and refuses a missing, relative, nonexistent or
 non-directory value. It does not broaden the scan to the checkout or user profile.
-`--no-ignore` prevents ignore files from silently hiding an artifact; the two narrow
-globs skip only Git object databases and this README's known self-match. Hits and scan
-errors are failures; only ripgrep's clean `1` becomes procedure exit `0`:
+`--no-ignore` prevents ignore files from silently hiding an artifact; the one narrow
+glob skips only Git object databases. Hits and scan errors are failures; only
+ripgrep's clean `1` becomes procedure exit `0`:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -192,7 +192,7 @@ $ErrorFile = [IO.Path]::GetTempFileName()
 try {
     $RgArgs = @(
         '--files-with-matches', '--hidden', '--no-config', '--no-ignore',
-        '--glob', '!**/.git/objects/**', '--glob', '!**/tools/walkthrough/README.md',
+        '--glob', '!**/.git/objects/**',
         '--regexp', 'pwd=', '--regexp', 'zoommtg://', '--regexp', 'confno=',
         '--', $ScratchRoot
     )
