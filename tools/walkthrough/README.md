@@ -156,8 +156,9 @@ passcode or token; use the actual operator-selected root in place of this exampl
 $env:SFDC24_SCRATCH_ROOT = 'C:\absolute\path\to\scratchpad'
 ```
 
-The sweep resolves that exact root and refuses a missing, relative, nonexistent or
-non-directory value. It does not broaden the scan to the checkout or user profile.
+The sweep resolves that exact filesystem root and refuses a missing, relative,
+nonexistent, non-filesystem or non-directory value. It does not broaden the scan to
+the checkout or user profile.
 `--no-ignore` prevents ignore files from silently hiding an artifact; the one narrow
 glob skips only Git object databases. Hits and scan errors are failures; only
 ripgrep's clean `1` becomes procedure exit `0`:
@@ -177,11 +178,16 @@ if (-not ($IsDriveAbsolute -or $IsUncAbsolute)) {
     exit 2
 }
 try {
-    $ScratchRoot = (Resolve-Path -LiteralPath $RequestedScratchRoot -ErrorAction Stop).Path
+    $ResolvedScratchRoot = Resolve-Path -LiteralPath $RequestedScratchRoot -ErrorAction Stop
 } catch {
     [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT could not be resolved; a clean result cannot be claimed.')
     exit 2
 }
+if ($ResolvedScratchRoot.Provider.Name -ne 'FileSystem') {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve through the FileSystem provider.')
+    exit 2
+}
+$ScratchRoot = $ResolvedScratchRoot.ProviderPath
 if (-not (Test-Path -LiteralPath $ScratchRoot -PathType Container)) {
     [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve to a directory; refusing to scan another shape.')
     exit 2
