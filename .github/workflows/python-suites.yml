@@ -16,7 +16,7 @@
 #   tests/ also holds node:test suites, PowerShell suites and network-touching
 #   scripts. A glob would drag those in and either fail or, worse, make a
 #   network call from CI. Every suite listed here is offline by construction -
-#   no org, no board, no bus, no credentials - and that is PROVED by running
+#   no remote org, board, bus, or credentials - and that is PROVED by running
 #   them in an empty network namespace rather than asserted in a comment.
 name: python-suites
 
@@ -31,6 +31,8 @@ on:
       - "tests/test_bus_benchmark.py"
       - "scripts/append.py"
       - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -43,6 +45,8 @@ on:
       - "tests/test_bus_benchmark.py"
       - "scripts/append.py"
       - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -126,6 +130,19 @@ jobs:
           else
             echo "not on this branch; skipping"
           fi
+
+      # The bus suite starts its own server and scratch database. Enable only
+      # loopback in a fresh namespace, and retain setup-python's exact binary
+      # across sudo rather than silently switching to the system interpreter.
+      - name: bus API and migration imports (isolated loopback)
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec "$1" tests/test_bus.py src/bus_server.py
+          ' _ "$python_bin"
 
       # A workflow that skips everything and reports success is the failure mode
       # this file exists to prevent. If neither suite ran, say so and fail.
