@@ -147,6 +147,39 @@ if [ "${COUNTER_RC}" -ne 0 ]; then
     exit 1
 fi
 
+# IS THE CLIENT MUTED? Asked BEFORE playing, because speaking while muted burns
+# the audio and writes a spoke_bytes line that reads exactly like success.
+#
+# This is the check that was missing on 2026-09-12, when the rig spoke into a
+# live meeting with paplay_rc=0, zoom_capture_streams=1, and a muted client. The
+# binding check above is necessary and was never sufficient: Zoom's mute sits
+# AFTER the point it measures, and nothing in PulseAudio can see it - verified by
+# toggling a live client twice while pactl reported Corked:no Mute:no throughout.
+MUTE="$(dirname "$0")/presenter_mute_state.sh"
+if [ -r "${MUTE}" ]; then
+    MUTE_OUT=$(bash "${MUTE}" 2>&1)
+    MUTE_RC=$?
+    case "${MUTE_RC}" in
+      1)
+        echo "REFUSING TO SPEAK - the Zoom client is MUTED." >&2
+        echo "  ${MUTE_OUT}" >&2
+        echo "  Speaking now would consume the audio and report success. Unmute in Zoom" >&2
+        echo "  (the Audio button, or alt+a) and run this again." >&2
+        exit 1
+        ;;
+      0) : ;;   # open, carry on
+      *)
+        # NOT a refusal. as_toolbar only exists while sharing, and speaking
+        # without a share is legitimate. But say plainly that the guard did not
+        # run, rather than letting silence imply it passed.
+        echo "WARNING: could not determine mute state, so this is unguarded:" >&2
+        echo "  ${MUTE_OUT}" >&2
+        ;;
+    esac
+else
+    echo "WARNING: ${MUTE} not present - speaking without a mute guard" >&2
+fi
+
 paplay --device="${SINK}" "${WAV}"
 RC=$?
 
