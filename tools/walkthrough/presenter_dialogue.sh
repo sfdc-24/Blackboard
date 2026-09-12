@@ -74,6 +74,17 @@ done
 # that differ only by a few pitch points arrive as the same speaker. The
 # parser refuses any persona not listed here, so this table and KNOWN_PERSONAS
 # have to stay in step - test_presenter_dialogue.sh asserts that they do.
+#
+# THIS PARTICULAR PAIR IS REASONING, NOT MEASUREMENT - SAID PLAINLY.
+#   The test asserts the two CONFIGURATIONS differ. It does not and cannot
+#   assert that a human on the far end of Zoom's codec hears two speakers,
+#   which is the claim that actually matters. Nothing here has been put
+#   through espeak-ng and measured, because no box with espeak-ng was
+#   reachable when it was written; measure_wav.py is the wrong instrument
+#   anyway - it measures amplitude, and two voices can share a peak.
+#   Settling it needs an F0 or spectral comparison of real synthesis, ideally
+#   after a Zoom round trip. Until someone does that, treat the pair as a
+#   considered guess and not as a verified property.
 voice_for() {
     case "$1" in
         ba) echo "en-gb 140 45" ;;
