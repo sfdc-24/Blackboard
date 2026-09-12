@@ -174,7 +174,7 @@ try {
   Case 'missing env invalidates an old success before provider processing' {
     $envPath=Join-Path $testRoot '.env'; $panel=Join-Path $testRoot 'panel.txt'
     Set-Content -LiteralPath $panel -Value 'OLD_SUCCESS'
-    Remove-Item -LiteralPath $envPath
+    Remove-Item -LiteralPath $envPath -Force
     try {
       $global:CrosscheckTestMockStarts=0; $global:LASTEXITCODE=0
       $out=@(& (Join-Path $testTools 'crosscheck_intake.ps1') -PanelFile $panel 6>&1)
