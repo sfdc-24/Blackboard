@@ -100,16 +100,48 @@ function Get-SettingAfterKey {
     return $null
 }
 
+# Every place the id has been seen or might plausibly live. Searching only one
+# of these made "not found" a much weaker statement than it read as - the
+# laptop's probe had to check the other three by hand to establish anything.
+# The list is reported in the refusal so "not found" is always scoped to what
+# was actually opened.
+function Get-SettingsDirs {
+    param([string]$ProfilePath)
+    # Labelled explicitly rather than by Split-Path -Leaf: "Local Extension
+    # Settings\<ext>" and "Sync Extension Settings\<ext>" share a leaf, so a
+    # derived label printed the same extension id for both and the report could
+    # not say which of them had been read.
+    return @(
+        @{ Label = 'Local Extension Settings'
+           Path  = (Join-Path $ProfilePath "Local Extension Settings\$EXT_ID") },
+        @{ Label = 'Sync Extension Settings'
+           Path  = (Join-Path $ProfilePath "Sync Extension Settings\$EXT_ID") },
+        @{ Label = 'IndexedDB (extension origin)'
+           Path  = (Join-Path $ProfilePath "IndexedDB\chrome-extension_${EXT_ID}_0.indexeddb.leveldb") },
+        # Shared across origins and full of unrelated UUIDs - 194 of them on the
+        # laptop, including claude.ai's own web analytics `anonymous_id`. Safe to
+        # include ONLY because extraction is anchored on the key name; a bare
+        # UUID regex pointed here would return a confident wrong answer.
+        @{ Label = 'Local Storage\leveldb (all origins)'
+           Path  = (Join-Path $ProfilePath "Local Storage\leveldb") }
+    )
+}
+
 function Get-ProfileIdentity {
     param([string]$ProfilePath)
-    $settings = Join-Path $ProfilePath "Local Extension Settings\$EXT_ID"
-    $result = @{ DeviceId = $null; DisplayName = $null; Unreadable = 0 }
-    if (-not (Test-Path $settings)) { return $result }
+    $result = @{ DeviceId = $null; DisplayName = $null; Unreadable = 0;
+                 Searched = @(); Absent = @() }
+
+    $files = @()
+    foreach ($d in (Get-SettingsDirs $ProfilePath)) {
+        if (-not (Test-Path $d.Path)) { $result.Absent += $d.Label; continue }
+        $result.Searched += $d.Label
+        $files += @(Get-ChildItem $d.Path -File -ErrorAction SilentlyContinue)
+    }
 
     # Newest first: the current value lives in the most recently written table,
     # and an older compacted .ldb can still carry a superseded deviceId.
-    $files = Get-ChildItem $settings -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime -Descending
+    $files = @($files | Sort-Object LastWriteTime -Descending)
     foreach ($f in $files) {
         $txt = Read-SharedText $f.FullName
         if ($null -eq $txt) { $result.Unreadable++; continue }
@@ -183,6 +215,11 @@ foreach ($b in $BROWSERS) {
             # locked and "(none stored)" because there is genuinely no id are
             # different facts, and a reader cannot tell them apart otherwise.
             Unreadable  = $id.Unreadable
+            # Which storage locations actually existed and were opened. Carried
+            # on the row so the refusal can scope "not found" to what was read,
+            # rather than implying the whole profile was examined.
+            Searched    = $id.Searched
+            Absent      = $id.Absent
             Running     = ($procs.Count -gt 0)
             Windows     = $titles.Count
             Title       = $(if ($titles.Count -gt 0) { $titles[0] } else { '' })
@@ -227,13 +264,35 @@ if ($DeviceId.Count -gt 0) {
             Write-Output ("  $unread settings file(s) could not be read - the browser may be")
             Write-Output '  holding them. Close it and re-run.'
         } else {
-            Write-Output '  All settings files were readable, so the id is stored somewhere'
-            Write-Output '  this script does not look. Extension versions found here:'
+            Write-Output '  All settings files were readable, and no bridgeDeviceId key was'
+            Write-Output '  found in any of them. Extension versions found here:'
             foreach ($v in ($rows | Select-Object -ExpandProperty ExtVersion -Unique)) {
                 Write-Output ("    v$v")
             }
-            Write-Output '  Compare against a profile where extraction works - the key or the'
-            Write-Output '  storage location may differ between extension versions.'
+            Write-Output ''
+            Write-Output '  Searched, per profile:'
+            foreach ($s in ($rows | Select-Object -ExpandProperty Searched -Unique)) {
+                Write-Output ("    present  $s")
+            }
+            foreach ($s in ($rows | Select-Object -ExpandProperty Absent -Unique)) {
+                Write-Output ("    absent   $s")
+            }
+            Write-Output ''
+            # STATE THE LIMIT OF THE SCAN, not just its result.
+            #
+            # The laptop probe reported zero hits and then said the thing this
+            # paragraph exists to encode: it read those files as ASCII and
+            # matched text. An id stored as raw 16 bytes, compressed, or in any
+            # binary encoding produces exactly the same zero. Reporting that as
+            # "no id here" would be the same empty-set mistake one level down -
+            # a scan that could not see the value, presented as a value that is
+            # not there.
+            Write-Output '  LIMIT: this reads those files as ASCII and matches the key as'
+            Write-Output '  TEXT. An id stored binary or compressed would produce this same'
+            Write-Output '  result, so this is "no bridgeDeviceId as readable text in the'
+            Write-Output '  paths above" - NOT proof the browser has no id. Measured on'
+            Write-Output '  extension 1.0.92 the key is plain text; 1.0.91 appears not to'
+            Write-Output '  persist it at all, but that was established the same ASCII way.'
         }
         exit 2
     }
