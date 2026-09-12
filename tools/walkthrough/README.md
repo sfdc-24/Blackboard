@@ -108,28 +108,95 @@ make "no output" meaningless:
 On the presenter box (no checkout there, so self-match is not a concern):
 
 ```bash
-set -o pipefail
-grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" 2>/tmp/sweep.err
-status=$?          # 0 = hits found, 1 = clean, >1 = the SCAN failed
-test -s /tmp/sweep.err && { echo "scan hit errors, result is not trustworthy"; cat /tmp/sweep.err; }
-test "$status" -eq 1 || echo "FOUND credential-bearing files above - remove and re-run"
+if ! hits=$(mktemp /tmp/presenter-sweep-hits-XXXXXX); then
+    echo "credential sweep could not create its results file" >&2
+    exit 2
+fi
+if ! errors=$(mktemp /tmp/presenter-sweep-errors-XXXXXX); then
+    echo "credential sweep could not create its error file" >&2
+    rm -f "$hits"
+    exit 2
+fi
+trap 'rm -f "$hits" "$errors"' EXIT
+
+if grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" \
+     >"$hits" 2>"$errors"; then
+    status=0
+else
+    status=$?
+fi
+
+if [ "$status" -gt 1 ] || [ -s "$errors" ]; then
+    echo "credential sweep failed; a clean result cannot be claimed" >&2
+    cat "$errors" >&2
+    exit 2
+fi
+if [ "$status" -eq 0 ]; then
+    echo "FOUND credential-bearing files; remove them and re-run:" >&2
+    cat "$hits" >&2
+    exit 1
+fi
+if [ "$status" -ne 1 ]; then
+    echo "credential sweep returned unexpected status $status" >&2
+    exit 2
+fi
+echo "credential sweep clean"
+exit 0
 ```
 
 Also stop Zoom before sweeping. A running client re-creates
 `~/.zoom/logs/zoom_stdout_stderr.log` after you delete it, so the sweep is only
 meaningful once nothing is writing.
 
-On the laptop, exclude the repository so the sweep does not find its own
-documentation, and check `--exclude-dir=.git` too:
+On this Windows laptop, scan recursively from the exact scratchpad root, not the whole
+checkout or user profile. `--no-ignore` prevents ignore files from silently hiding an
+artifact; the two narrow globs skip only Git's object database and this README's known
+self-match. This PowerShell procedure treats hits and scan errors as failures; only
+ripgrep's clean `1` becomes procedure exit `0`:
 
-```bash
-grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' <scratchpad> \
-    --exclude-dir=.git --exclude-dir=tools 2>/tmp/sweep.err
+```powershell
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false # inspect rg's 0/1/>1 status below
+$ScratchRoot = (Resolve-Path -LiteralPath 'C:\Users\salam\AppData\Local\Temp\claude\C--Users-salam-Quantum-Blackboard\a4b334b8-f18c-4390-aa28-72bb51a029c3\scratchpad').Path
+$Rg = (Get-Command rg.exe -CommandType Application -ErrorAction Stop).Source
+$HitFile = [IO.Path]::GetTempFileName()
+$ErrorFile = [IO.Path]::GetTempFileName()
+try {
+    $RgArgs = @(
+        '--files-with-matches', '--hidden', '--no-config', '--no-ignore',
+        '--glob', '!.git/**', '--glob', '!**/tools/walkthrough/README.md',
+        '--regexp', 'pwd=', '--regexp', 'zoommtg://', '--regexp', 'confno=',
+        '--', $ScratchRoot
+    )
+    & $Rg @RgArgs 1> $HitFile 2> $ErrorFile
+    $status = $LASTEXITCODE
+    $scanErrors = [IO.File]::ReadAllText($ErrorFile)
+
+    if ($status -gt 1 -or $scanErrors.Length -gt 0) {
+        [Console]::Error.WriteLine('Credential sweep failed; a clean result cannot be claimed.')
+        if ($scanErrors.Length -gt 0) { [Console]::Error.WriteLine($scanErrors) }
+        exit 2
+    }
+    if ($status -eq 0) {
+        [Console]::Error.WriteLine('FOUND credential-class matches; inspect, remove, and re-run:')
+        Get-Content -LiteralPath $HitFile | ForEach-Object { [Console]::Error.WriteLine($_) }
+        exit 1
+    }
+    if ($status -ne 1) {
+        [Console]::Error.WriteLine("Credential sweep returned unexpected status $status.")
+        exit 2
+    }
+    Write-Output 'credential sweep clean'
+    exit 0
+} finally {
+    Remove-Item -LiteralPath $HitFile, $ErrorFile -Force -ErrorAction SilentlyContinue
+}
 ```
 
-Then read the hits: a match in *prose* (a runbook saying "never put `pwd=` on a command
-line") is not a credential. Distinguish by searching for the actual passcode and token
-values, which should return **zero** everywhere.
+The search arguments contain only credential-class markers, never a real meeting URL,
+passcode or token. Do not add an actual secret with `--regexp`: child-process arguments
+are observable. Any listed file makes the procedure fail, including prose; remove or
+relocate the match and rerun instead of teaching the sweep to ignore broader directories.
 
 **The bus secret never comes to this box.** The board digest in the top panel is
 rendered on the laptop and copied over as plain text. The presenter is a screen, not a

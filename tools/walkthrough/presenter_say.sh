@@ -108,16 +108,24 @@ if [ "${COUNTER_RC}" -ne 0 ]; then
     exit 1
 fi
 
-paplay --device="${SINK}" "${WAV}"
-RC=$?
+case "${ZOOM_BOUND}" in
+    ''|*[!0-9]*)
+        echo "the binding check returned an invalid count - refusing to speak" >&2
+        exit 1
+        ;;
+esac
 
-echo "spoke_bytes=${BYTES} sink=${SINK} source=${SOURCE_NAME} paplay_rc=${RC} zoom_capture_streams=${ZOOM_BOUND}"
 if [ "${ZOOM_BOUND}" -eq 0 ]; then
     echo "WARNING: no ZOOM capture stream is bound to ${SOURCE_NAME}, so the meeting" >&2
     echo "         heard NOTHING. Pick the microphone inside Zoom: the chevron beside" >&2
     echo "         the Audio button -> SFDC24-VirtualMic." >&2
     exit 1
 fi
+
+paplay --device="${SINK}" "${WAV}"
+RC=$?
+
+echo "spoke_bytes=${BYTES} sink=${SINK} source=${SOURCE_NAME} paplay_rc=${RC} zoom_capture_streams=${ZOOM_BOUND}"
 
 # Even with Zoom bound, this proves the audio reached Zoom's input - not that a human
 # heard it. Say so rather than letting the exit code imply more than it knows.
