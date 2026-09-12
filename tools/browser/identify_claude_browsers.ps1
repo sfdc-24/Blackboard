@@ -127,16 +127,74 @@ function Get-SettingsDirs {
     )
 }
 
+# Is this specific id recorded here? Asked as a QUESTION rather than answered by
+# extracting the value, because the stored value cannot be read back intact.
+#
+# LevelDB compresses its blocks, so framing bytes land INSIDE the value, not only
+# before the key. The laptop's real records read:
+#
+#   bridgeDeviceId....@\"295592ab-1617-486d-b1b4.?df2e7b40ac"
+#   bridgeDeviceId....@."7e788.??>677b-43ea-98ae-a0b29ef8ee6f"
+#
+# so a contiguous UUID regex matches NEITHER - which is why a probe there found
+# 194 UUIDs and none of the ones being looked for. Every one of those 194 was an
+# unrelated id sitting in an uncompressed blob; the wanted ones were the only
+# ones broken up. Characters are lost, not merely inserted, so the value also
+# cannot be reassembled: `-434f` arrives as `.?df`.
+#
+# Reconstruction is therefore impossible, but the question that actually matters
+# is answerable. Anchor on the key, look only at the window after it, and ask
+# whether a candidate's leading run appears there. 13 characters (8 hex, a dash,
+# 4 hex) is 48 bits of prefix against a handful of candidates.
+function Test-IdInWindow {
+    param([string]$Text, [string]$Candidate)
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+
+    # Refuse a candidate that is not a UUID. Prefix matching is only safe on a
+    # value of known shape: a caller that accidentally passes two ids as one
+    # comma-joined string would otherwise "match" on the first 13 characters and
+    # be told a browser holds an id that does not exist. That is exactly what a
+    # quoting bug in the test harness did.
+    if ($Candidate -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        Write-Warning "ignoring malformed deviceId '$Candidate' - expected a UUID"
+        return $false
+    }
+
+    # 'ridgeDeviceId': the leading character is eaten by the length byte often
+    # enough that anchoring on the full key misses real records.
+    foreach ($m in [regex]::Matches($Text, 'ridgeDeviceId')) {
+        $start = $m.Index + $m.Length
+        $len = [Math]::Min(160, $Text.Length - $start)
+        if ($len -le 0) { continue }
+        $window = $Text.Substring($start, $len)
+
+        if ($window.Contains($Candidate)) { return $true }
+        if ($Candidate.Length -ge 13 -and $window.Contains($Candidate.Substring(0, 13))) { return $true }
+    }
+    return $false
+}
+
 function Get-ProfileIdentity {
-    param([string]$ProfilePath)
+    param([string]$ProfilePath, [string[]]$Candidates = @())
     $result = @{ DeviceId = $null; DisplayName = $null; Unreadable = 0;
-                 Searched = @(); Absent = @() }
+                 Searched = @(); Absent = @(); Empty = @(); MatchedIds = @();
+                 KeySeen = $false }
 
     $files = @()
     foreach ($d in (Get-SettingsDirs $ProfilePath)) {
         if (-not (Test-Path $d.Path)) { $result.Absent += $d.Label; continue }
+        $found = @(Get-ChildItem $d.Path -File -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 0) {
+            # EXISTS IS NOT SEARCHED. A directory that is present but holds no
+            # files was being counted as searched, so the report claimed to
+            # have read a location where nothing was opened. That is the same
+            # overclaim as the empty-set reconciliation, one level down: the
+            # scope of "not found" quietly grew to cover a place never read.
+            $result.Empty += $d.Label
+            continue
+        }
         $result.Searched += $d.Label
-        $files += @(Get-ChildItem $d.Path -File -ErrorAction SilentlyContinue)
+        $files += $found
     }
 
     # Newest first: the current value lives in the most recently written table,
@@ -145,9 +203,26 @@ function Get-ProfileIdentity {
     foreach ($f in $files) {
         $txt = Read-SharedText $f.FullName
         if ($null -eq $txt) { $result.Unreadable++; continue }
+        # Was the key here AT ALL? This, not a parsed value, is what makes a
+        # non-match meaningful: key present and candidate absent is evidence;
+        # key never seen is an open question.
+        if ($txt.Contains('ridgeDeviceId')) { $result.KeySeen = $true }
+
         if (-not $result.DeviceId) {
+            # Best effort, for DISPLAY only. It succeeds where the block
+            # happened to be stored uncompressed and fails silently otherwise,
+            # so it must never be what reconciliation depends on.
             $v = Get-SettingAfterKey $txt 'bridgeDeviceId'
             if ($v -match '^[0-9a-fA-F-]{36}$') { $result.DeviceId = $v }
+        }
+
+        # RECONCILIATION USES THIS, NOT THE EXTRACTED VALUE.
+        # Asking "is this id here" survives a value the compressor has broken
+        # up; reading the value back does not.
+        foreach ($c in $Candidates) {
+            if ($result.MatchedIds -notcontains $c) {
+                if (Test-IdInWindow $txt $c) { $result.MatchedIds += $c }
+            }
         }
         if (-not $result.DisplayName) {
             # 'isplayName', not 'displayName', ON PURPOSE.
@@ -192,18 +267,36 @@ foreach ($b in $BROWSERS) {
                   Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
 
     foreach ($p in $profiles) {
-        $manifest = $null
+        # ALL VERSION DIRECTORIES, NEWEST REPORTED - NOT WHICHEVER CAME FIRST.
+        #
+        # Chrome keeps old versions beside the current one, so this directory
+        # routinely holds 1.0.91_0, 1.0.92_0 and 1.0.93_0 together. Reporting
+        # `Select-Object -First 1` gave 1.0.91 on a laptop actually running
+        # 1.0.93, and that single wrong number sent two sessions chasing a
+        # storage-format-changed-between-versions theory that did not exist.
+        # A number that invites a theory has to be the right number.
         $extDir = Join-Path $p.FullName "Extensions\$EXT_ID"
-        if (Test-Path $extDir) {
-            $manifest = Get-ChildItem $extDir -Recurse -Filter 'manifest.json' -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
+        if (-not (Test-Path $extDir)) { continue }   # not installed in this profile
+
+        $versions = @()
+        foreach ($vd in @(Get-ChildItem $extDir -Directory -ErrorAction SilentlyContinue)) {
+            $mf = Join-Path $vd.FullName 'manifest.json'
+            if (-not (Test-Path $mf)) { continue }
+            try { $versions += (Get-Content $mf -Raw | ConvertFrom-Json).version }
+            catch { $versions += ($vd.Name -replace '_\d+$', '') }
         }
-        if (-not $manifest) { continue }   # extension not installed in this profile
+        if ($versions.Count -eq 0) { continue }
 
-        $version = '?'
-        try { $version = (Get-Content $manifest.FullName -Raw | ConvertFrom-Json).version } catch {}
+        $sorted = @($versions | Sort-Object -Property @{ Expression = {
+            $parsed = $null
+            if ([version]::TryParse($_, [ref]$parsed)) { $parsed } else { [version]'0.0.0' }
+        } })
+        $version = $sorted[-1]
+        if ($sorted.Count -gt 1) {
+            $version = $sorted[-1] + ' (also ' + (($sorted[0..($sorted.Count-2)]) -join ', ') + ')'
+        }
 
-        $id = Get-ProfileIdentity $p.FullName
+        $id = Get-ProfileIdentity -ProfilePath $p.FullName -Candidates $DeviceId
 
         $rows += [PSCustomObject]@{
             Browser     = $b.Name
@@ -220,6 +313,9 @@ foreach ($b in $BROWSERS) {
             # rather than implying the whole profile was examined.
             Searched    = $id.Searched
             Absent      = $id.Absent
+            Empty       = $id.Empty
+            MatchedIds  = $id.MatchedIds
+            KeySeen     = $id.KeySeen
             Running     = ($procs.Count -gt 0)
             Windows     = $titles.Count
             Title       = $(if ($titles.Count -gt 0) { $titles[0] } else { '' })
@@ -252,8 +348,12 @@ if ($DeviceId.Count -gt 0) {
     #
     # An extraction failure must never again present as a clean NOT HERE.
     # Silence has to mean clean, never "did not look".
-    $withIds = @($rows | Where-Object { $_.DeviceId -ne '(none stored)' })
-    if ($rows.Count -gt 0 -and $withIds.Count -eq 0) {
+    # The signal is whether the KEY was seen, not whether a value parsed. The
+    # laptop proved those differ: its records hold bridgeDeviceId perfectly well
+    # while the value is broken up by compression, so keying the refusal on a
+    # parsed value would refuse a machine that can in fact answer.
+    $canAnswer = @($rows | Where-Object { $_.KeySeen })
+    if ($rows.Count -gt 0 -and $canAnswer.Count -eq 0) {
         Write-Output ''
         Write-Output ("  REFUSING TO RECONCILE: found $($rows.Count) extension install(s) here,")
         Write-Output '  and read a deviceId from NONE of them. Every answer below would be'
@@ -273,6 +373,9 @@ if ($DeviceId.Count -gt 0) {
             Write-Output '  Searched, per profile:'
             foreach ($s in ($rows | Select-Object -ExpandProperty Searched -Unique)) {
                 Write-Output ("    present  $s")
+            }
+            foreach ($s in ($rows | Select-Object -ExpandProperty Empty -Unique)) {
+                Write-Output ("    EMPTY    $s  (exists, held no files - nothing was read)")
             }
             foreach ($s in ($rows | Select-Object -ExpandProperty Absent -Unique)) {
                 Write-Output ("    absent   $s")
@@ -299,7 +402,9 @@ if ($DeviceId.Count -gt 0) {
 
     $stale = 0
     foreach ($d in $DeviceId) {
-        $hit = @($rows | Where-Object { $_.DeviceId -eq $d })
+        # MatchedIds first: it survives a compressed value. DeviceId equality is
+        # kept as a fallback for the uncompressed case and costs nothing.
+        $hit = @($rows | Where-Object { ($_.MatchedIds -contains $d) -or ($_.DeviceId -eq $d) })
         if ($hit.Count -gt 0) {
             $h = $hit[0]
             $live = $(if ($h.Running -and $h.Windows -gt 0) { 'LIVE' } else { 'installed but not running' })
@@ -330,7 +435,14 @@ if ($DeviceId.Count -gt 0) {
 # Exit non-zero when asked to reconcile and nothing matched: a caller that
 # cannot find ANY live browser should fail rather than pick one at random.
 if ($DeviceId.Count -gt 0) {
-    $matched = @($rows | Where-Object { $DeviceId -contains $_.DeviceId })
+    # Same basis as the reconciliation above. Keying this on the PARSED value
+    # made a run that printed MATCHED exit 1, because the value it matched on
+    # was compression-broken and never parsed - the report and the exit code
+    # disagreeing, which is the failure PR70 shipped.
+    $matched = @($rows | Where-Object {
+        (@($_.MatchedIds | Where-Object { $DeviceId -contains $_ }).Count -gt 0) -or
+        ($DeviceId -contains $_.DeviceId)
+    })
     if ($matched.Count -eq 0) { exit 1 }
 }
 exit 0

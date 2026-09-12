@@ -94,20 +94,44 @@ function Invoke-Sut {
     $o = [System.IO.Path]::GetTempFileName()
     $e = [System.IO.Path]::GetTempFileName()
     try {
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SUT,
-                     '-ScanRoot', $Root, '-ScanName', 'Fixture')
-        # Only pass -DeviceId when there is something to pass: a bare switch
-        # with an empty array makes powershell.exe reject the command line,
-        # which is a harness failure that reads like a tool failure.
-        if ($Ids.Count -gt 0) { $argList += @('-DeviceId', ($Ids -join ',')) }
+        # THE IDS MUST ARRIVE AS AN ARRAY, AND THE COMMAND LINE CANNOT DO IT.
+        #
+        # Two attempts failed differently and both produced WRONG TEST RESULTS
+        # rather than errors:
+        #   Start-Process quoted ('-DeviceId','a,b') into -DeviceId "a,b";
+        #   cmd.exe passed it through unquoted and `powershell -File` STILL
+        #   bound it as one string, because -File does not split a comma the
+        #   way -Command does.
+        # Either way the script saw a single malformed candidate. The first
+        # version then "matched" it on a 13-character prefix and printed
+        # MATCHED for an id that does not exist - a harness bug manufacturing a
+        # false positive, which is worse than a broken tool because it reads as
+        # evidence. (The script now refuses a non-UUID candidate outright,
+        # which is how the second attempt showed up as a clean ELSEWHERE
+        # instead of a phantom match.)
+        #
+        # A generated wrapper sidesteps the quoting entirely: the array is
+        # built in PowerShell source, where an array is unambiguous.
+        $w = [System.IO.Path]::GetTempFileName() + '.ps1'
+        $idLiteral = '@()'
+        if ($Ids.Count -gt 0) {
+            $idLiteral = '@(' + (($Ids | ForEach-Object { "'" + $_ + "'" }) -join ',') + ')'
+        }
+        $wrapper = "& '$SUT' -ScanRoot '$Root' -ScanName 'Fixture' -DeviceId $idLiteral" +
+                   [Environment]::NewLine + 'exit $LASTEXITCODE'
+        Set-Content -Path $w -Value $wrapper -Encoding ascii
 
-        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList `
-             -NoNewWindow -Wait -PassThru -RedirectStandardOutput $o -RedirectStandardError $e
+        $cmd = '"' + (Get-Command powershell.exe).Source + '"' +
+               ' -NoProfile -ExecutionPolicy Bypass -File "' + $w + '"' +
+               ' > "' + $o + '" 2> "' + $e + '"'
+        $null = & cmd.exe /c $cmd
+        $code = $LASTEXITCODE
+        Remove-Item $w -Force -ErrorAction SilentlyContinue
         $text = (Get-Content $o -Raw -ErrorAction SilentlyContinue)
         $err  = (Get-Content $e -Raw -ErrorAction SilentlyContinue)
         if ($null -eq $text) { $text = '' }
         if ($null -eq $err)  { $err  = '' }
-        return [PSCustomObject]@{ Text = ($text + $err); Code = $p.ExitCode }
+        return [PSCustomObject]@{ Text = ($text + $err); Code = $code }
     } finally {
         Remove-Item $o, $e -Force -ErrorAction SilentlyContinue
     }
@@ -196,6 +220,56 @@ try {
     Assert-True 'the refusal names the extension versions it saw' ($res6.Text -match 'v1\.0\.91')
     Assert-True 'refusing to reconcile exits 2, distinct from 0 and from 1' ($res6.Code -eq 2) `
         "got exit $($res6.Code); 2 means could-not-look and must not be flattened into no-match"
+
+    # ---- fixture 8: the laptop's COMPRESSED value -------------------------
+    # The real records on VANLAS, transcribed from its probe:
+    #
+    #   bridgeDeviceId....@\"295592ab-1617-486d-b1b4.?df2e7b40ac"
+    #   bridgeDeviceId....@."7e788.??>677b-43ea-98ae-a0b29ef8ee6f"
+    #
+    # LevelDB compresses the block, so framing bytes land INSIDE the value and
+    # characters are LOST, not merely inserted - `-434f` arrives as `.?df`. No
+    # contiguous UUID regex can match these, and the value cannot be rebuilt.
+    # Reconciliation must still answer, by anchoring on the key and asking
+    # whether the candidate's leading run is in the window after it.
+    $LAPTOP_CHROME = '295592ab-1617-486d-b1b4-434f2e7b40ac'
+    $LAPTOP_EDGE   = '7e788713-677b-43ea-98ae-a0b29ef8ee6f'
+
+    $r8 = Join-Path $WORK 'r8'
+    $chromeBody = $NUL + '&bridgeDeviceId' + $NUL + $NUL + $NUL + $NUL + '@' + $NUL +
+                  '"295592ab-1617-486d-b1b4' + $NUL + '?df' + '2e7b40ac"'
+    New-FixtureProfile -Root $r8 -Profile 'Profile 9' -Version '1.0.93' -Tables @(
+        @{ Name = '000079.ldb'; Body = $chromeBody; AgeMinutes = 3 }
+    ) | Out-Null
+
+    $res8 = Invoke-Sut -Root $r8 -Ids @($LAPTOP_CHROME, $LAPTOP_EDGE)
+    Assert-True 'a compression-broken value still reconciles as MATCHED' `
+        ($res8.Text -cmatch 'MATCHED') `
+        'the stored UUID is split by framing bytes; matching must anchor on the key'
+    Assert-True 'the id that is NOT there is still reported ELSEWHERE' `
+        ($res8.Text -cmatch 'ELSEWHERE') `
+        'a key-anchored window must not match every candidate indiscriminately'
+    Assert-True 'a compression-broken value does not trigger the refusal path' `
+        (-not ($res8.Text -match 'REFUSING TO RECONCILE')) `
+        'the key is present, so this machine CAN answer even though no value parses'
+    Assert-True 'a broken value that still matches exits 0' ($res8.Code -eq 0) `
+        "got exit $($res8.Code)"
+
+    # ---- fixture 7: a settings dir that exists but is empty ---------------
+    # "Exists" was being counted as "searched", so the report claimed to have
+    # read a location where nothing was opened - the scope of "not found"
+    # quietly growing to cover a place never read.
+    $r7 = Join-Path $WORK 'r7'
+    New-FixtureProfile -Root $r7 -Profile 'Default' -Version '1.0.91' -Tables @() | Out-Null
+
+    $res7 = Invoke-Sut -Root $r7 -Ids @($LIVE_ID)
+    Assert-True 'an existing but empty settings dir is reported EMPTY, not searched' `
+        ($res7.Text -cmatch 'EMPTY') `
+        'a directory holding no files was counted as one that had been read'
+    Assert-True 'an empty settings dir still refuses to reconcile' `
+        ($res7.Text -match 'REFUSING TO RECONCILE')
+    Assert-True 'the empty-dir case also exits 2' ($res7.Code -eq 2) `
+        "got exit $($res7.Code)"
 
     # ---- fixture 5: no reconciliation requested ---------------------------
     $res5 = Invoke-Sut -Root $r1
