@@ -36,7 +36,19 @@
 #>
 [CmdletBinding()]
 param(
-    [string[]]$DeviceId = @()
+    [string[]]$DeviceId = @(),
+
+    # TESTABILITY, not a user-facing option.
+    #
+    # Without this the script can only ever be run against whatever browsers
+    # this machine happens to have, which means the parsing - the part that has
+    # already been wrong three times - is exercised by hand and never the same
+    # way twice. With it, tests/test_identify_claude_browsers.ps1 points it at a
+    # fixture tree and asserts on the values it pulls out.
+    #
+    # Production behaviour is unchanged when it is absent.
+    [string]$ScanRoot,
+    [string]$ScanName = 'Test'
 )
 
 Set-StrictMode -Version 2.0
@@ -129,6 +141,13 @@ function Get-ProfileIdentity {
     return $result
 }
 
+if ($ScanRoot) {
+    # Process name deliberately impossible to match, so a fixture run reports
+    # Running=False rather than borrowing the state of a real browser that
+    # happens to be open on the machine running the tests.
+    $BROWSERS = @(@{ Name = $ScanName; Root = $ScanRoot; Process = '__fixture_no_such_process__' })
+}
+
 $rows = @()
 
 foreach ($b in $BROWSERS) {
@@ -160,6 +179,10 @@ foreach ($b in $BROWSERS) {
             ExtVersion  = $version
             DeviceId    = $(if ($id.DeviceId) { $id.DeviceId } else { '(none stored)' })
             DisplayName = $(if ($id.DisplayName) { $id.DisplayName } else { '' })
+            # Surfaced, not just counted. "(none stored)" because the file was
+            # locked and "(none stored)" because there is genuinely no id are
+            # different facts, and a reader cannot tell them apart otherwise.
+            Unreadable  = $id.Unreadable
             Running     = ($procs.Count -gt 0)
             Windows     = $titles.Count
             Title       = $(if ($titles.Count -gt 0) { $titles[0] } else { '' })
@@ -180,6 +203,41 @@ Write-Output "=== Local installs: $($rows.Count) ==="
 if ($DeviceId.Count -gt 0) {
     Write-Output ''
     Write-Output '=== Reconciliation against the connected list ==='
+
+    # REFUSE TO RECONCILE AGAINST AN EMPTY SET.
+    #
+    # Found by the laptop session (VANLAS) running this for real: both of its
+    # profiles returned "(none stored)", so every id was reported ELSEWHERE -
+    # which is true only in the way a statement about an empty set is true. It
+    # read as "these ids are not on that machine" when it meant "this script
+    # extracted nothing and therefore compared nothing", and one of those ids
+    # was very probably the Edge sitting open on that very desk.
+    #
+    # An extraction failure must never again present as a clean NOT HERE.
+    # Silence has to mean clean, never "did not look".
+    $withIds = @($rows | Where-Object { $_.DeviceId -ne '(none stored)' })
+    if ($rows.Count -gt 0 -and $withIds.Count -eq 0) {
+        Write-Output ''
+        Write-Output ("  REFUSING TO RECONCILE: found $($rows.Count) extension install(s) here,")
+        Write-Output '  and read a deviceId from NONE of them. Every answer below would be'
+        Write-Output '  "not here" regardless of the truth, so no answer is given.'
+        Write-Output ''
+        $unread = ($rows | Measure-Object -Property Unreadable -Sum).Sum
+        if ($unread -gt 0) {
+            Write-Output ("  $unread settings file(s) could not be read - the browser may be")
+            Write-Output '  holding them. Close it and re-run.'
+        } else {
+            Write-Output '  All settings files were readable, so the id is stored somewhere'
+            Write-Output '  this script does not look. Extension versions found here:'
+            foreach ($v in ($rows | Select-Object -ExpandProperty ExtVersion -Unique)) {
+                Write-Output ("    v$v")
+            }
+            Write-Output '  Compare against a profile where extraction works - the key or the'
+            Write-Output '  storage location may differ between extension versions.'
+        }
+        exit 2
+    }
+
     $stale = 0
     foreach ($d in $DeviceId) {
         $hit = @($rows | Where-Object { $_.DeviceId -eq $d })
