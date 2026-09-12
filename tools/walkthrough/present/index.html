@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SFDC 24 × Tax Everyday</title>
+<!--
+  The prospect-facing screen, replacing the two xterm panels.
+
+  Mr Salam, 2026-09-12, looking at the old ones live in a meeting: "the dark
+  panel looks dull and hard to understand". He was right. Green on black is an
+  engineer's console; it says "we are debugging" to someone who came to see
+  whether we can help their tax practice.
+
+  It polls state.json every two seconds. That keeps the mechanism that already
+  worked - ship a file from the laptop, the screen follows - while replacing the
+  thing doing the rendering. The laptop drives; this only draws.
+
+  Type is deliberately large. It is shared into Zoom, re-encoded, and may be
+  watched on a phone.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#F6F7F4; --surface:#FFFFFF; --surface-2:#ECEEE8;
+    --ink:#161A17; --ink-soft:#3C4540; --muted:#6C7570;
+    --rule:#DCDED6; --rule-soft:#E8EAE3;
+    --accent:#1F4E5F; --accent-soft:#E4EEF1;
+    --ok:#0B6B5B;   --ok-bg:#E1EFEA;
+    --wait:#8A6210; --wait-bg:#F5EEDA;
+    --late:#A6342A; --late-bg:#F7E5E2;
+    --split:#5B4B8A;--split-bg:#EAE6F4;
+    --display:"Zilla Slab",Georgia,serif;
+    --body:"Public Sans",system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--paper);color:var(--ink);
+    font-family:var(--body);font-size:21px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;overflow:hidden;
+  }
+  .page{height:100vh;display:flex;flex-direction:column;padding:26px 38px 20px}
+
+  header{display:flex;justify-content:space-between;align-items:flex-end;gap:24px;
+         border-bottom:3px solid var(--ink);padding-bottom:14px;flex:none}
+  .brand{font-family:var(--display);font-weight:700;font-size:34px;letter-spacing:-.015em;line-height:1}
+  .brand span{color:var(--muted);font-weight:500}
+  .clocks{font-family:var(--mono);font-size:16px;color:var(--muted);text-align:right;
+          font-variant-numeric:tabular-nums;line-height:1.5}
+  .clocks b{color:var(--ink);font-weight:600}
+
+  main{flex:1;min-height:0;padding-top:22px;display:flex;flex-direction:column}
+  h2{font-family:var(--display);font-weight:600;font-size:27px;margin:0 0 4px;letter-spacing:-.01em}
+  .sub{color:var(--muted);font-size:17px;margin:0 0 18px}
+
+  /* ---- notes ---- */
+  ul.notes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:11px;
+           overflow:hidden}
+  ul.notes li{display:flex;gap:14px;align-items:flex-start;font-size:23px;line-height:1.42}
+  ul.notes li::before{content:"";flex:none;width:9px;height:9px;border-radius:2px;
+                      background:var(--accent);margin-top:13px}
+  ul.notes li.h{font-family:var(--mono);font-size:14px;letter-spacing:.13em;text-transform:uppercase;
+                color:var(--muted);margin-top:14px}
+  ul.notes li.h::before{display:none}
+  ul.notes li.h:first-child{margin-top:0}
+
+  /* ---- cross-check ---- */
+  .cc{display:flex;flex-direction:column;gap:9px;overflow:hidden}
+  .ccrow{display:grid;grid-template-columns:108px 210px 1fr;gap:16px;align-items:start;
+         padding:11px 14px;border-radius:4px;background:var(--surface)}
+  .ccrow.split{background:var(--split-bg)}
+  .tag{font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.07em;
+       padding:3px 9px;border-radius:3px;text-align:center}
+  .tag.agree{background:var(--ok-bg);color:var(--ok)}
+  .tag.split{background:var(--split-bg);color:var(--split);outline:1px solid var(--split)}
+  .fld{font-family:var(--mono);font-size:17px;color:var(--ink-soft)}
+  .val{font-size:19px}
+  .val .a,.val .b{display:block}
+  .val .lbl{font-family:var(--mono);font-size:13px;color:var(--muted);margin-right:8px}
+  .verdict{margin-top:14px;padding:14px 18px;border-radius:4px;font-size:20px;
+           background:var(--split-bg);color:var(--split);border-left:4px solid var(--split)}
+
+  /* ---- board ---- */
+  table.board{width:100%;border-collapse:collapse;font-size:20px}
+  table.board th{text-align:left;font-family:var(--mono);font-size:13px;letter-spacing:.12em;
+                 text-transform:uppercase;color:var(--muted);font-weight:500;
+                 padding:0 16px 10px 0;border-bottom:2px solid var(--rule)}
+  table.board td{padding:13px 16px 13px 0;border-bottom:1px solid var(--rule-soft);vertical-align:middle}
+  table.board tr:last-child td{border-bottom:0}
+  .name{font-weight:600}
+  .miss{color:var(--muted);font-size:17px}
+  .pill{font-family:var(--mono);font-size:12.5px;font-weight:600;letter-spacing:.06em;
+        text-transform:uppercase;padding:4px 9px;border-radius:3px;white-space:nowrap}
+  .pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .pill.wait{background:var(--wait-bg);color:var(--wait)}
+  .pill.late{background:var(--late-bg);color:var(--late)}
+  .pill.review{background:var(--split-bg);color:var(--split)}
+  .bar{width:96px;height:7px;background:var(--surface-2);border-radius:99px;overflow:hidden;display:inline-block;vertical-align:middle}
+  .bar i{display:block;height:100%;background:var(--accent)}
+
+  footer{flex:none;padding-top:12px;border-top:1px solid var(--rule);
+         font-family:var(--mono);font-size:13.5px;color:var(--muted);
+         display:flex;justify-content:space-between;gap:16px}
+  .demo{color:var(--wait)}
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div class="brand">SFDC 24 <span>×</span> Tax Everyday</div>
+    <div class="clocks">
+      Toronto <b id="tor">--:--</b><br>Buenos Aires <b id="bue">--:--</b>
+    </div>
+  </header>
+  <main id="main"></main>
+  <footer>
+    <span id="foot-l">live</span>
+    <span class="demo" id="foot-r"></span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var main = document.getElementById('main');
+  var lastRaw = null;
+
+  function clocks(){
+    function t(tz){
+      try{ return new Intl.DateTimeFormat('en-GB',{timeZone:tz,hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date()); }
+      catch(e){ return '--:--'; }
+    }
+    document.getElementById('tor').textContent = t('America/Toronto');
+    document.getElementById('bue').textContent = t('America/Argentina/Buenos_Aires');
+  }
+  setInterval(clocks, 1000); clocks();
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+  function renderNotes(st){
+    var items = (st.notes||[]).map(function(n){
+      if (typeof n === 'string' && n.slice(0,2) === '# ')
+        return '<li class="h">'+esc(n.slice(2))+'</li>';
+      return '<li>'+esc(n)+'</li>';
+    }).join('');
+    return '<h2>'+esc(st.title||'What we are learning')+'</h2>'+
+           '<p class="sub">'+esc(st.subtitle||'Written down as we talk.')+'</p>'+
+           '<ul class="notes">'+(items||'<li>—</li>')+'</ul>';
+  }
+
+  function renderCross(st){
+    var c = st.crosscheck||{}, rows = (c.fields||[]).map(function(f){
+      var split = !f.agree;
+      var val = split
+        ? '<span class="a"><span class="lbl">'+esc(c.a||'A')+'</span>'+esc(f.a)+'</span>'+
+          '<span class="b"><span class="lbl">'+esc(c.b||'B')+'</span>'+esc(f.b)+'</span>'
+        : esc(f.a);
+      return '<div class="ccrow'+(split?' split':'')+'">'+
+             '<span class="tag '+(split?'split':'agree')+'">'+(split?'SPLIT':'AGREE')+'</span>'+
+             '<span class="fld">'+esc(f.field)+'</span>'+
+             '<span class="val">'+val+'</span></div>';
+    }).join('');
+    var splits = (c.fields||[]).filter(function(f){return !f.agree;}).length;
+    return '<h2>'+esc(c.title||'The same message, read by two different companies')+'</h2>'+
+           '<p class="sub">'+esc(c.subtitle||'')+'</p>'+
+           '<div class="cc">'+rows+'</div>'+
+           (splits ? '<div class="verdict">'+esc(c.verdict||
+              (splits+' field'+(splits===1?'':'s')+' split. The board stops there rather than choosing. A person decides those.'))+'</div>' : '');
+  }
+
+  function renderBoard(st){
+    var rows = (st.clients||[]).map(function(cl){
+      var inn = (cl.docs||[]).filter(function(d){return d.in;}).length,
+          tot = (cl.docs||[]).length || 1,
+          miss = (cl.docs||[]).filter(function(d){return !d.in;}).map(function(d){return d.l;});
+      return '<tr><td class="name">'+esc(cl.name)+'<div class="miss">'+
+             (miss.length? 'waiting on '+esc(miss.join(', ')) : 'nothing outstanding')+'</div></td>'+
+             '<td>'+esc(cl.kind)+'</td>'+
+             '<td>'+esc(cl.due||'')+'</td>'+
+             '<td><span class="bar"><i style="width:'+Math.round(inn/tot*100)+'%"></i></span> '+inn+'/'+tot+'</td>'+
+             '<td><span class="pill '+esc(cl.status||'wait')+'">'+esc(cl.statusLabel||cl.status||'')+'</span></td></tr>';
+    }).join('');
+    return '<h2>'+esc(st.title||'Who is holding up what')+'</h2>'+
+           '<p class="sub">'+esc(st.subtitle||'')+'</p>'+
+           '<table class="board"><thead><tr><th>Client</th><th>Return</th><th>Due</th><th>Documents</th><th>Status</th></tr></thead>'+
+           '<tbody>'+rows+'</tbody></table>';
+  }
+
+  function render(st){
+    var m = st.mode||'notes';
+    main.innerHTML = m==='crosscheck' ? renderCross(st)
+                   : m==='board'      ? renderBoard(st)
+                   :                    renderNotes(st);
+    document.getElementById('foot-l').textContent = st.footLeft || 'SFDC 24 — live';
+    document.getElementById('foot-r').textContent = st.footRight || '';
+  }
+
+  // Poll rather than push. The laptop already ships files to this box for the
+  // panels; keeping that mechanism means one way of doing things, and a page
+  // that simply stops updating if the laptop goes away rather than going blank.
+  function tick(){
+    fetch('state.json?t='+Date.now(), {cache:'no-store'})
+      .then(function(r){ return r.ok ? r.text() : null; })
+      .then(function(txt){
+        if (txt == null || txt === lastRaw) return;
+        var st; try { st = JSON.parse(txt); } catch(e){ return; }  // half-written file: keep the last good frame
+        lastRaw = txt; render(st);
+      })
+      .catch(function(){ /* keep the last good frame on screen */ });
+  }
+  setInterval(tick, 2000); tick();
+
+  render({mode:'notes', notes:[
+    '# waiting for the meeting to start',
+    'This screen is driven from the laptop and updates by itself.'
+  ]});
+})();
+</script>
+</body>
+</html>

@@ -37,29 +37,68 @@ VOICE="${PRESENTER_VOICE:-en-gb}"
 SPEED="${PRESENTER_SPEED:-140}"
 PITCH="${PRESENTER_PITCH:-45}"
 
-if [ "$#" -lt 1 ]; then
-    echo "usage: presenter_say.sh \"text to speak\"" >&2
-    echo "       text may also be piped on stdin" >&2
-    exit 2
+# PLAY A RECORDING MADE SOMEWHERE ELSE, when one is supplied.
+#
+# espeak-ng is a formant synthesiser. It is intelligible, it needs no network and
+# no key, and it sounds like a machine - which is fine for "the box can speak at
+# all" and not fine in front of a client. Mr Salam, hearing it live in a meeting
+# on 2026-09-12: "robotic and very unpleasant". He is right, and it is the wrong
+# thing to put in front of a prospect at 2pm.
+#
+# So the box stops being the thing that makes the sound. PRESENTER_WAV points at
+# a recording already on disk, synthesised on the laptop by a neural voice (nova,
+# which he picked by ear on 2026-09-08) and shipped over stdin.
+#
+# THE KEY STAYS ON THE LAPTOP. Doing the synthesis here would mean putting an
+# OpenAI key on a disposable box that gets destroyed and rebuilt, whose Zoom
+# client logs its own launch URL, and which exists to be thrown away. A WAV is
+# not a credential; an API key is.
+#
+# Everything below this branch is UNCHANGED - the Zoom binding check, the refusal
+# to claim it spoke, the byte accounting. Only the source of the audio moves.
+PREMADE="${PRESENTER_WAV:-}"
+
+if [ -n "${PREMADE}" ]; then
+    if [ ! -f "${PREMADE}" ]; then
+        echo "PRESENTER_WAV is set to ${PREMADE}, which does not exist" >&2
+        exit 2
+    fi
+    # RIFF, or it is not a WAV. A truncated or half-shipped download makes paplay
+    # play nothing and return 0 - a silent success, which is the exact shape of
+    # failure this rig has already been bitten by twice.
+    if [ "$(head -c 4 "${PREMADE}" 2>/dev/null)" != "RIFF" ]; then
+        echo "${PREMADE} does not begin with RIFF - that is not a WAV, refusing" >&2
+        exit 1
+    fi
+    WAV="${PREMADE}"
+    TEXT="(pre-synthesised recording)"
+else
+    if [ "$#" -lt 1 ]; then
+        echo "usage: presenter_say.sh \"text to speak\"" >&2
+        echo "       text may also be piped on stdin" >&2
+        echo "       or set PRESENTER_WAV=/path/to.wav to play a recording instead" >&2
+        exit 2
+    fi
+
+    TEXT="$*"
+    if [ "${TEXT}" = "-" ]; then
+        TEXT="$(cat)"
+    fi
+
+    if [ -z "${TEXT// /}" ]; then
+        echo "refusing to speak an empty string" >&2
+        exit 2
+    fi
+
+    WAV="$(mktemp /tmp/presenter-say-XXXXXX.wav)"
+    trap 'rm -f "${WAV}"' EXIT
+
+    espeak-ng -v "${VOICE}" -s "${SPEED}" -p "${PITCH}" -w "${WAV}" "${TEXT}" 2>/dev/null
 fi
 
-TEXT="$*"
-if [ "${TEXT}" = "-" ]; then
-    TEXT="$(cat)"
-fi
-
-if [ -z "${TEXT// /}" ]; then
-    echo "refusing to speak an empty string" >&2
-    exit 2
-fi
-
-WAV="$(mktemp /tmp/presenter-say-XXXXXX.wav)"
-trap 'rm -f "${WAV}"' EXIT
-
-espeak-ng -v "${VOICE}" -s "${SPEED}" -p "${PITCH}" -w "${WAV}" "${TEXT}" 2>/dev/null
 BYTES=$(stat -c %s "${WAV}" 2>/dev/null || echo 0)
 if [ "${BYTES}" -lt 1000 ]; then
-    echo "synthesis produced ${BYTES} bytes - refusing to claim it spoke" >&2
+    echo "recording is ${BYTES} bytes - refusing to claim it spoke" >&2
     exit 1
 fi
 
