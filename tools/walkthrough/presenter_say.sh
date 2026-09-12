@@ -86,7 +86,7 @@ fi
 #
 # AND `|| echo 0` WAS ITSELF A THIRD WAY TO LIE.
 #
-# The counter is committed mode 100644, so executing it directly gives EACCES - and
+# The counter was once committed mode 100644, so executing it directly gave EACCES - and
 # `|| echo 0` turned that permission error into "Zoom is not listening". A script that
 # cannot run and a meeting nobody is in produced the identical answer. The test called
 # `bash <file>` and so never touched this path at all.

@@ -150,7 +150,7 @@ meaningful once nothing is writing.
 
 On this Windows laptop, scan recursively from the exact scratchpad root, not the whole
 checkout or user profile. `--no-ignore` prevents ignore files from silently hiding an
-artifact; the two narrow globs skip only Git's object database and this README's known
+artifact; the two narrow globs skip only Git object databases and this README's known
 self-match. This PowerShell procedure treats hits and scan errors as failures; only
 ripgrep's clean `1` becomes procedure exit `0`:
 
@@ -164,7 +164,7 @@ $ErrorFile = [IO.Path]::GetTempFileName()
 try {
     $RgArgs = @(
         '--files-with-matches', '--hidden', '--no-config', '--no-ignore',
-        '--glob', '!.git/**', '--glob', '!**/tools/walkthrough/README.md',
+        '--glob', '!**/.git/objects/**', '--glob', '!**/tools/walkthrough/README.md',
         '--regexp', 'pwd=', '--regexp', 'zoommtg://', '--regexp', 'confno=',
         '--', $ScratchRoot
     )
