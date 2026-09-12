@@ -28,6 +28,11 @@ WHY EXTRACTION AND NOT A TAX QUESTION
 D-18. Keys are read from .env at run time. Neither reaches a command line, a log
 line, or the panel file that gets shipped to the presenter box.
 
+EXIT STATUS
+  0 = two valid extractions agree (not independently verified truth)
+  1 = missing/invalid provider result or execution failure
+  2 = PENDING_HUMAN; split values remain visible, no downstream approval
+
 USAGE
   .\crosscheck_intake.ps1                              # the built-in sample message
   .\crosscheck_intake.ps1 -MessageFile msg.txt
@@ -36,7 +41,7 @@ USAGE
 param(
   [string]$MessageFile,
   [string]$PanelFile,
-  [string]$EnvFile = 'C:\Users\salam\Quantum\Blackboard\.env',
+  [string]$EnvFile = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) '.env'),
   [string]$OpenAIModel = 'gpt-4o-mini',
   # QWEN, DELIBERATELY. The first draft named llama-3.3-70b-versatile from
   # memory and got a 404 - Groq had retired it. Asking the models endpoint what
@@ -61,7 +66,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+. (Join-Path $PSScriptRoot 'crosscheck_contract.ps1')
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-CrosscheckPanel { param([string]$Content)
+  if (-not $PanelFile) { return }
+  [IO.File]::WriteAllText($PanelFile, $Content, (New-Object Text.UTF8Encoding $false))
+  if ([IO.File]::ReadAllText($PanelFile) -cne $Content) { throw 'panel file readback mismatch' }
+}
+$jobs = @()
+try {
+Write-CrosscheckPanel 'CROSS-CHECK PENDING - waiting for two valid provider answers.'
 
 # ---- the message -------------------------------------------------------------
 # Deliberately ambiguous in three places, because a cross-check that only ever
@@ -107,40 +122,10 @@ Return ONLY a JSON object, no prose, no code fence, with exactly these keys:
   "urgent"            boolean
 '@
 
-# ---- one HTTP helper, used for both, so neither gets an advantage ------------
-function Invoke-Chat {
-  param([string]$Url, [string]$Key, [string]$Model, [string]$System, [string]$User)
-
-  $body = @{
-    model       = $Model
-    temperature = 0
-    messages    = @(
-      @{ role = 'system'; content = $System },
-      @{ role = 'user';   content = $User }
-    )
-    response_format = @{ type = 'json_object' }
-  } | ConvertTo-Json -Depth 8 -Compress
-
-  $req = [Net.HttpWebRequest]::Create($Url)
-  $req.Method = 'POST'
-  $req.ContentType = 'application/json'
-  $req.Headers.Add('Authorization', 'Bearer ' + $Key)
-  $req.Timeout = $TimeoutSec * 1000
-  $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-  $req.ContentLength = $bytes.Length
-  $s = $req.GetRequestStream(); try { $s.Write($bytes, 0, $bytes.Length) } finally { $s.Dispose() }
-
-  $resp = $req.GetResponse()
-  $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-  try { $raw = $sr.ReadToEnd() } finally { $sr.Dispose(); $resp.Dispose() }
-  $parsed = $raw | ConvertFrom-Json
-  return ($parsed.choices[0].message.content | ConvertFrom-Json)
-}
-
 # ---- both at once ------------------------------------------------------------
 # Sequentially these are 4-10 seconds. Together they are the slower of the two,
 # which is what keeps this inside the time a person will watch without talking.
-$jobs = @()
+$sw = [Diagnostics.Stopwatch]::StartNew()
 $jobs += Start-Job -Name 'openai' -ArgumentList $cfg['OPENAI_API_KEY'], $OpenAIModel, $INSTRUCTION, $message, $TimeoutSec, $MaxTokens -ScriptBlock {
   param($key, $model, $sys, $usr, $t, $maxTok)
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -209,7 +194,6 @@ $jobs += Start-Job -Name 'groq' -ArgumentList $cfg['GROQ_API_KEY'], $GroqModel, 
   }
 }
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
 $null = Wait-Job -Job $jobs -Timeout ($TimeoutSec + 5)
 $sw.Stop()
 
@@ -244,14 +228,18 @@ foreach ($j in $jobs) {
   if (-not $out) { $failed += "$($j.Name) returned nothing: $(Get-JobReason $j)"; continue }
   $txt = ($out | Out-String).Trim()
   if ($txt -like 'PROVIDER_ERROR*') { $failed += "$($j.Name): $txt"; continue }
-  try { $answers[$j.Name] = $txt | ConvertFrom-Json }
-  catch { $failed += "$($j.Name) did not return parseable JSON. First 200 chars: $($txt.Substring(0, [Math]::Min(200, $txt.Length)))" }
+  try { $answers[$j.Name] = ConvertFrom-CrosscheckAnswer $txt }
+  catch { $failed += "$($j.Name) returned an invalid extraction; required keys and types were not satisfied" }
 }
 Remove-Job -Job $jobs -Force
+$jobs = @()
 
 # REFUSE rather than degrade. One model answering is not a cross-check, and
 # showing it as though it were is exactly the lie this whole beat is against.
 if ($failed.Count -gt 0 -or $answers.Count -ne 2) {
+  # The presenter tails this path; leaving a previous agreement there would
+  # display an old successful run during a current failed one.
+  Write-CrosscheckPanel 'CROSS-CHECK FAILED - no current result; do not use an earlier comparison.'
   Write-Host "CROSS-CHECK FAILED - this is NOT a result, it is a missing one"
   foreach ($f in $failed) { Write-Host "  $f" }
   Write-Host "  models that answered: $($answers.Count) of 2"
@@ -259,35 +247,9 @@ if ($failed.Count -gt 0 -or $answers.Count -ne 2) {
 }
 
 # ---- compare -----------------------------------------------------------------
-$a = $answers['openai']; $b = $answers['groq']
-
-function Get-Field { param($obj, [string]$name)
-  if ($obj.PSObject.Properties.Name -contains $name) { return $obj.$name }
-  return $null
-}
-function As-Text { param($v)
-  if ($null -eq $v) { return '(absent)' }
-  if ($v -is [bool]) { return $v.ToString().ToLower() }
-  if ($v -is [Array]) {
-    if ($v.Count -eq 0) { return '(none)' }
-    if ($v[0] -is [psobject] -and $v[0].PSObject.Properties.Name -contains 'label') {
-      return (($v | ForEach-Object { "$($_.label)=$($_.amount)" } | Sort-Object) -join ', ')
-    }
-    return (($v | ForEach-Object { "$_" } | Sort-Object) -join ', ')
-  }
-  return "$v"
-}
-
-$fields = @('tax_year','return_type','documents_received','documents_pending','figures','deadline_claimed','urgent')
-$rows = @()
-$agree = 0; $split = 0
-foreach ($f in $fields) {
-  $av = As-Text (Get-Field $a $f)
-  $bv = As-Text (Get-Field $b $f)
-  $same = ($av -eq $bv)
-  if ($same) { $agree++ } else { $split++ }
-  $rows += [pscustomobject]@{ field = $f; a = $av; b = $b_v = $bv; same = $same }
-}
+$rows = @(Compare-CrosscheckAnswers $answers['openai'] $answers['groq'])
+$agree = @($rows | Where-Object { $_.same }).Count
+$split = $rows.Count - $agree
 
 # ---- report ------------------------------------------------------------------
 $lines = @()
@@ -305,10 +267,10 @@ foreach ($r in $rows) {
 }
 $lines += ""
 if ($split -eq 0) {
-  $lines += "   $agree of $($fields.Count) agreed. Nothing held back."
+  $lines += "   $agree of $($rows.Count) agreed. Both vendors agree; this is not proof the extraction is correct."
 } else {
   $lines += "   $agree agreed, $split SPLIT. The split fields are not resolved here"
-  $lines += "   and are not written to the file. A person decides those."
+  $lines += "   and remain visible in this panel for a person to decide. No approval is recorded."
 }
 
 $text = ($lines -join "`n")
@@ -322,11 +284,23 @@ if ($PanelFile) {
   # disposable box and put on a screen someone else is watching. For a live
   # deployment the panel needs redaction, or the comparison stays on the laptop
   # and only the agreed/split COUNTS go to the screen.
-  Set-Content -LiteralPath $PanelFile -Value $text -Encoding utf8
+  Write-CrosscheckPanel $text
   Write-Host ""
   Write-Host "panel file written: $PanelFile ($((Get-Item $PanelFile).Length) bytes)"
 }
 
 Write-Host ""
-Write-Host "RESULT agreed=$agree split=$split fields=$($fields.Count)"
+if ($split -gt 0) {
+  Write-Host "RESULT status=PENDING_HUMAN agreed=$agree split=$split fields=$($rows.Count)"
+  exit 2
+}
+Write-Host "RESULT status=AGREED agreed=$agree split=0 fields=$($rows.Count)"
 exit 0
+} catch {
+  # Do not expose a raw provider response or client message through exceptions.
+  try { Write-CrosscheckPanel 'CROSS-CHECK FAILED - no current result; do not use an earlier comparison.' } catch {}
+  Write-Host 'CROSS-CHECK FAILED - input, job startup, or panel output could not complete.'
+  exit 1
+} finally {
+  if ($jobs.Count -gt 0) { Remove-Job -Job $jobs -Force -ErrorAction SilentlyContinue }
+}
