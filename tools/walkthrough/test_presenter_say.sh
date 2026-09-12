@@ -101,16 +101,22 @@ cat > "${BIN}/awk" <<'STUB'
 #!/bin/bash
 set -u
 : "${PRESENTER_REAL_AWK:?PRESENTER_REAL_AWK is required}"
-if [ "${PRESENTER_TEST_MODE:-}" = 'malformed' ]; then
-    for arg in "$@"; do
-        case "${arg}" in
-            idx=*)
-                echo 'not-a-count'
-                exit 0
-                ;;
-        esac
-    done
-fi
+case "${PRESENTER_TEST_MODE:-}" in
+    malformed|oversized)
+        for arg in "$@"; do
+            case "${arg}" in
+                idx=*)
+                    if [ "${PRESENTER_TEST_MODE}" = 'malformed' ]; then
+                        echo 'not-a-count'
+                    else
+                        echo '9999999999999999999999999999999999999999'
+                    fi
+                    exit 0
+                    ;;
+            esac
+        done
+        ;;
+esac
 exec "${PRESENTER_REAL_AWK}" "$@"
 STUB
 
@@ -162,6 +168,13 @@ run_case malformed
 check_nonzero 'malformed count returns non-zero' "${CASE_RC}"
 check_equal 'malformed count never invokes paplay' "${CASE_PAPLAY_CALLS}" '0'
 check_contains 'malformed count is reported as invalid' 'invalid count' "${CASE_ERR}"
+
+echo
+echo '== oversized successful counter output cannot overflow into playback =='
+run_case oversized
+check_nonzero 'oversized count returns non-zero' "${CASE_RC}"
+check_equal 'oversized count never invokes paplay' "${CASE_PAPLAY_CALLS}" '0'
+check_contains 'oversized count is reported as invalid' 'invalid count' "${CASE_ERR}"
 
 echo
 echo '== one Zoom binding permits exactly one playback =='
