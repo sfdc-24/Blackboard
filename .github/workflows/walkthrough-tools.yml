@@ -88,3 +88,20 @@ jobs:
             exit 1
           fi
           echo "  ok: a missing WAV is refused"
+
+      # The meeting panels are what a PROSPECT looks at for forty-five minutes. They
+      # are printf loops, so they need no X server and there is nothing stopping them
+      # being tested here.
+      #
+      # This step exists because of the note at the top of this file: a committed test
+      # that no job invokes is not coverage. Adding test_meeting_panels.sh without
+      # adding this step would have repeated PR74 exactly.
+      - name: Meeting panel contracts
+        run: |
+          set -euo pipefail
+          output=$(./tools/walkthrough/test_meeting_panels.sh tools/walkthrough)
+          echo "$output"
+          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
+          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
+            || { echo "the suite reported failures" >&2; exit 1; }
