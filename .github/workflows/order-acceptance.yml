@@ -94,7 +94,7 @@ jobs:
         env:
           ORDER_TEST_CHILD_SHELL: pwsh
         run: |
-          $output = .	ests	est_order_supervisor.ps1
+          $output = .\tests\test_order_supervisor.ps1
           $suiteExit = $LASTEXITCODE
           $output
           $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
