@@ -186,6 +186,11 @@ class Store:
                 "header": json.loads(row[5]) if row[5] else None}
 
     def create_file(self, title, kind, header=None):
+        with WRITE_LOCK, self.conn:
+            return self._create_file(title, kind, header)
+
+    def _create_file(self, title, kind, header=None):
+        """Insert a file within the caller's write lock and transaction."""
         if not title or not str(title).strip():
             raise BusError(400, "create requires a non-empty title.")
         if kind not in ("doc", "sheet"):
@@ -199,12 +204,11 @@ class Store:
         fid = str(uuid.uuid4())
         ts = now_iso()
         try:
-            with WRITE_LOCK, self.conn:
-                self.conn.execute(
-                    "INSERT INTO files (file_id, title, kind, created_ts, updated_ts, revision, body, header) "
-                    "VALUES (?,?,?,?,?,1,?,?)",
-                    (fid, title, kind, ts, ts, "" if kind == "doc" else None,
-                     json.dumps(header) if header else None))
+            self.conn.execute(
+                "INSERT INTO files (file_id, title, kind, created_ts, updated_ts, revision, body, header) "
+                "VALUES (?,?,?,?,?,1,?,?)",
+                (fid, title, kind, ts, ts, "" if kind == "doc" else None,
+                 json.dumps(header) if header else None))
         except sqlite3.IntegrityError:
             raise BusError(409, f"A file titled {title!r} already exists.")
         return {"fileId": fid, "title": title, "kind": kind}
@@ -626,17 +630,21 @@ def _import_rows(store, title, rows):
         sys.exit(f"A file titled {title!r} already exists - refusing to double-import.")
     except BusError:
         pass
-    store.create_file(title, "sheet", header)
-    f = store.get_file(title=title)
     ts = now_iso()
+    # The destination and its history are one commit. A failed import must not
+    # leave an empty title behind that prevents a corrected retry.
     with WRITE_LOCK, store.conn:
+        created = store._create_file(title, "sheet", header)
+        fid = created["fileId"]
         for i, row in enumerate(rows[1:], start=1):
+            if not isinstance(row, list):
+                raise BusError(400, f"Import data row {i} must be a list of cells.")
             cells = ["" if c is None else str(c) for c in row]
             # preserve the board verbatim - imports are history, not new writes
             store.conn.execute(
                 "INSERT INTO sheet_rows (file_id, n, row, appended_ts) VALUES (?,?,?,?)",
-                (f["file_id"], i, json.dumps(cells), ts))
-        store.conn.execute("UPDATE files SET updated_ts = ? WHERE file_id = ?", (ts, f["file_id"]))
+                (fid, i, json.dumps(cells), ts))
+        store.conn.execute("UPDATE files SET updated_ts = ? WHERE file_id = ?", (ts, fid))
     print(f"Imported {len(rows) - 1} rows into sheet {title!r} (header: {len(header)} columns).")
 
 
