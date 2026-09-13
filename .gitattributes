@@ -12,9 +12,14 @@
 # and then fails to configure, on the GCloud instance, at the end of the runbook.
 #
 # eol=lf pins the working-tree form regardless of the checkout platform.
+#
+# This file is the UNION of two branches that each added rules for the same
+# reason: PR52 for the Debian packaging, and the walkthrough work for the shell
+# tools and their fixtures. Neither set is redundant, so both are kept.
 
 *.sh                             text eol=lf
 *.bash                           text eol=lf
+*.py                             text eol=lf
 
 # Debian maintainer scripts and control files: dpkg runs these as /bin/sh.
 packaging/DEBIAN/preinst         text eol=lf
@@ -28,3 +33,8 @@ packaging/DEBIAN/conffiles       text eol=lf
 packaging/blackboard-bus         text eol=lf
 packaging/blackboard-bus.service text eol=lf
 packaging/env.example            text eol=lf
+
+# Fixtures compared byte-for-byte by tests. A CRLF rewrite here does not break
+# an interpreter, it breaks an assertion, and the failure names the wrong cause.
+/tests/fixtures/order_supervisor_board.json  text eol=lf
+/tools/walkthrough/fixtures/*.txt            text eol=lf

@@ -1,0 +1,107 @@
+name: Walkthrough tools on Linux
+
+# WHY THIS EXISTS
+#   PR74 added tools/walkthrough/test_zoom_bound_count.sh and merged with three green
+#   checks. ZERO of those checks ran it. They were unrelated ORDER crossdiff jobs
+#   triggered by a .gitattributes edit in the same commit, and I read the green as
+#   coverage. codex caught it.
+#
+#   A committed test that no job invokes is not coverage - it is a file that happens to
+#   contain assertions. It is the same shape as the phantom-test problem one level up:
+#   the line looks covered, so nobody covers it.
+#
+#   These tools decide whether a client-facing demo has a voice. They run on Linux,
+#   they are pure shell and Python, and they need no box, no Zoom, no audio hardware
+#   and no credential - so there is no excuse for them not being in CI.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/walkthrough-tools.yml'
+      - 'tools/walkthrough/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/walkthrough-tools.yml'
+      - 'tools/walkthrough/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  walkthrough-tools:
+    name: Walkthrough tool contracts on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Refuse rather than skip. A run of these tools on a non-Linux host would be
+      # reporting about some other platform, and the presenter box is Linux.
+      - name: Refuse to report a Linux result from a non-Linux runner
+        run: |
+          set -euo pipefail
+          echo "uname=$(uname -s) python=$(python3 --version)"
+          test "$(uname -s)" = "Linux" || { echo "this job must run on Linux" >&2; exit 1; }
+
+      # The committed modes are part of the contract. presenter_say.sh executes the
+      # counter, and a 100644 counter gives EACCES - which the old code turned into
+      # "Zoom is not listening". Assert the bit rather than trusting it survived.
+      - name: The shell tools are committed executable
+        run: |
+          set -euo pipefail
+          rc=0
+          for f in tools/walkthrough/*.sh; do
+            if [ ! -x "$f" ]; then echo "NOT EXECUTABLE: $f"; rc=1; fi
+          done
+          exit $rc
+
+      - name: Every shell tool parses
+        run: |
+          set -euo pipefail
+          for f in tools/walkthrough/*.sh; do bash -n "$f"; echo "  ok $f"; done
+
+      # The real assertions. This refuses to pass if it reports no RESULT line, which
+      # is how a suite that died early would otherwise look like a suite that passed.
+      - name: Zoom-binding contracts
+        run: |
+          set -euo pipefail
+          output=$(./tools/walkthrough/test_zoom_bound_count.sh)
+          echo "$output"
+          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
+          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
+            || { echo "the suite reported failures" >&2; exit 1; }
+
+      # measure_wav.py is the tool that decides whether the voice proof is real. It
+      # shipped once printing UNREADABLE and returning 0, so assert the exit code on
+      # its own failure cases rather than reading its output.
+      - name: The measurement refuses unmeasurable input
+        run: |
+          set -euo pipefail
+          if python3 tools/walkthrough/measure_wav.py \
+               --control /nonexistent/a.wav --speech /nonexistent/b.wav >/dev/null 2>&1; then
+            echo "measure_wav.py returned success for files that do not exist" >&2
+            exit 1
+          fi
+          echo "  ok: a missing WAV is refused"
+
+      # The meeting panels are what a PROSPECT looks at for forty-five minutes. They
+      # are printf loops, so they need no X server and there is nothing stopping them
+      # being tested here.
+      #
+      # This step exists because of the note at the top of this file: a committed test
+      # that no job invokes is not coverage. Adding test_meeting_panels.sh without
+      # adding this step would have repeated PR74 exactly.
+      - name: Meeting panel contracts
+        run: |
+          set -euo pipefail
+          output=$(./tools/walkthrough/test_meeting_panels.sh tools/walkthrough)
+          echo "$output"
+          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
+          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
+            || { echo "the suite reported failures" >&2; exit 1; }

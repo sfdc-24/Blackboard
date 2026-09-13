@@ -432,8 +432,20 @@ function Assert-ExistingRelease {
         }
         throw 'existing_release_manifest_invalid'
     }
+    $jsonParseArgs = @{ ErrorAction = 'Stop' }
+    $convertFromJsonCommand = Get-Command ConvertFrom-Json -ErrorAction Stop
+    if ($convertFromJsonCommand.Parameters.ContainsKey('DateKind')) {
+        # PowerShell 7.5+ otherwise coerces ISO-8601 JSON strings to DateTime.
+        # The manifest validator must see the exact signed text that was written.
+        $jsonParseArgs['DateKind'] = 'String'
+    }
+    elseif ($PSVersionTable.PSEdition -cne 'Desktop') {
+        # Windows PowerShell 5.1 already preserves strings. PowerShell Core
+        # versions without -DateKind cannot parse this manifest faithfully.
+        throw 'existing_release_manifest_json_date_coercion_unsafe'
+    }
     try {
-        $existing = $manifestText | ConvertFrom-Json
+        $existing = ConvertFrom-Json -InputObject $manifestText @jsonParseArgs
     }
     catch {
         throw 'existing_release_manifest_invalid'

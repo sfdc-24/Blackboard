@@ -12,6 +12,24 @@ Import-Module $ModulePath -Force
 
 $script:Passed = 0
 $script:Failed = 0
+
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case runs the isolated ORDER runner in a CHILD process, hardcoded to
+# powershell.exe. On Linux the launch fails silently from this suite's point of view
+# and the failure surfaces 160 lines later as "Could not find file events.jsonl" -
+# the runner never started, so it never wrote its log. Measured: 1 assertion reached.
+#
+# That distance is worth keeping in mind when reading any of these ports: the line
+# that throws is rarely the line that is wrong.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 function Assert-True {
     param([string]$Name, [bool]$Condition, [string]$Detail = '')
     if ($Condition) {
@@ -80,7 +98,7 @@ function Invoke-StateCase {
             '-WorkspacePath', $script:WorkspacePath,
             '-ClaudeCommand', 'unused-test-command'
         )
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& $script:ResolvedChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_STATE_TEST_CASE_ROOT', $previousCaseRoot, 'Process')

@@ -602,6 +602,15 @@ function Quote-ProcessArgument {
     return '"' + $Value + '"'
 }
 
+function Test-OnWindows {
+    # $IsWindows exists only in PowerShell 6 and later. Windows PowerShell 5.1
+    # does not define it AND only runs on Windows, so its absence IS Windows.
+    # Reading $IsWindows directly under 5.1 yields $null, which is falsey - that
+    # would have made every 5.1 host look like Linux.
+    if (Test-Path Variable:IsWindows) { return [bool]$IsWindows }
+    return $true
+}
+
 function Invoke-TaskkillTree {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
 
@@ -609,6 +618,359 @@ function Invoke-TaskkillTree {
     if (-not (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) { return -1 }
     & $taskkillPath /PID $ProcessId /T /F 1>$null 2>$null
     return [int]$LASTEXITCODE
+}
+
+function Get-PosixProcessGroupId {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # pgrp is field 5 of /proc/<pid>/stat, but field 2 is the executable name in
+    # PARENTHESES and may itself contain spaces or parentheses - so the fields
+    # are counted from the LAST ')' rather than by splitting the whole line.
+    # Splitting on whitespace from the start is a well-known way to read the
+    # wrong number here.
+    try {
+        $raw = [IO.File]::ReadAllText("/proc/$ProcessId/stat")
+    } catch {
+        return -1
+    }
+    $close = $raw.LastIndexOf(')')
+    if ($close -lt 0) { return -1 }
+    $fields = $raw.Substring($close + 1).Trim() -split '\s+'
+    # after comm: [0]=state [1]=ppid [2]=pgrp
+    if ($fields.Count -lt 3) { return -1 }
+    $pgid = 0
+    if (-not [int]::TryParse($fields[2], [ref]$pgid)) { return -1 }
+    return $pgid
+}
+
+function Resolve-PosixKillBinary {
+    # util-linux ships kill at /bin/kill on Debian and Ubuntu and at
+    # /usr/bin/kill elsewhere. The previous code hard-coded /bin/kill and then
+    # returned success unconditionally, so on a host without it the supervisor
+    # reported a clean containment having sent no signal at all.
+    foreach ($candidate in @('/bin/kill', '/usr/bin/kill')) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return ''
+}
+
+function Get-PosixProcessGroupMemberId {
+    param([Parameter(Mandatory = $true)][int]$ProcessGroupId)
+
+    # The members of a group, so a kill can be PROVEN rather than assumed.
+    #
+    # ZOMBIES ARE NOT SURVIVORS. A SIGKILLed process stays in /proc as a zombie
+    # until its parent reaps it. Counting those as members made a kill that had
+    # worked perfectly report failure - the same mistake Test-PosixProcessAlive
+    # already exists to avoid, so it is avoided the same way here.
+    $members = @()
+    if (-not (Test-Path -LiteralPath '/proc')) { return $members }
+    foreach ($entry in [IO.Directory]::EnumerateDirectories('/proc')) {
+        $leaf = [IO.Path]::GetFileName($entry)
+        $candidateId = 0
+        if (-not [int]::TryParse($leaf, [ref]$candidateId)) { continue }
+        try {
+            $raw = [IO.File]::ReadAllText((Join-Path $entry 'stat'))
+        } catch { continue }            # it exited while we were reading it
+        $close = $raw.LastIndexOf(')')
+        if ($close -lt 0) { continue }
+        $fields = $raw.Substring($close + 1).Trim() -split '\s+'
+        # after comm: [0]=state [1]=ppid [2]=pgrp
+        if ($fields.Count -lt 3) { continue }
+        if ($fields[0] -ceq 'Z') { continue }
+        $pgid = 0
+        if (-not [int]::TryParse($fields[2], [ref]$pgid)) { continue }
+        if ($pgid -eq $ProcessGroupId) { $members += $candidateId }
+    }
+    return $members
+}
+
+function Invoke-PosixGroupKill {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessGroupId,
+        [int]$DrainMilliseconds = 5000
+    )
+
+    # CONTAINMENT BY IDENTITY, NOT BY SEARCH.
+    #
+    # The /proc tree walk this replaces could not be made correct. A child
+    # forked AFTER the scan, whose parent then died, is reparented away from the
+    # root - so re-walking from the root can never find it, however many sweeps
+    # are added. It returned 0 while such a child survived and wrote its
+    # post-timeout marker. Codex reproduced exactly that against 373f9da.
+    #
+    # A process GROUP is durable: a child inherits the pgid at fork and keeps it
+    # when its parent dies, so kill(-pgid) reaches the whole group atomically
+    # regardless of who reparented to whom. That is what taskkill /T approximates
+    # on Windows, and it is the only shape that does not race.
+    if ($ProcessGroupId -le 1) { throw 'refusing to signal process group ' + $ProcessGroupId }
+
+    # THE SAFETY CHECK THAT MATTERS, AND IT NOW FAILS CLOSED.
+    #
+    # If setsid did not take effect, the adapter shares OUR process group, and
+    # kill(-pgid) would kill the supervisor - and every other process in its
+    # group - instead of the adapter.
+    #
+    # The previous form was `if ($ownGroup -gt 0 -and ...)`, which SKIPPED the
+    # guard entirely when the lookup returned -1. That is fail-open on the one
+    # check standing between a cleanup and the supervisor killing itself: an
+    # unreadable /proc/self/stat became permission to signal. Not knowing our own
+    # group is a reason to refuse, never a reason to proceed.
+    $ownGroup = Get-PosixProcessGroupId -ProcessId $PID
+    if ($ownGroup -le 0) {
+        throw 'refusing to signal a process group without knowing our own'
+    }
+    if ($ProcessGroupId -eq $ownGroup) {
+        throw 'refusing to kill the supervisor own process group'
+    }
+
+    $killBinary = Resolve-PosixKillBinary
+    if (-not $killBinary) { return -1 }
+
+    & $killBinary -s KILL -- "-$ProcessGroupId" 2>$null | Out-Null
+    $signalExit = [int]$LASTEXITCODE
+
+    # A BOUNDED DRAIN PROOF, because the exit code is not the answer.
+    #
+    # This used to `return 0` unconditionally - it reported success even when
+    # the signal was rejected. But the native exit code alone is not the truth
+    # either, in BOTH directions: kill returns non-zero for a group that is
+    # already gone, which is success, and returns zero while a member is still
+    # dying, which is not yet success. So the verdict is taken from observing
+    # the group empty, and the exit code only distinguishes the failure modes.
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($DrainMilliseconds)
+    $survivors = @(Get-PosixProcessGroupMemberId -ProcessGroupId $ProcessGroupId)
+    while ($survivors.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+        $survivors = @(Get-PosixProcessGroupMemberId -ProcessGroupId $ProcessGroupId)
+    }
+    if ($survivors.Count -eq 0) { return 0 }
+
+    # Still populated after the deadline. Distinguishable so the caller's log
+    # says whether the kernel refused the signal or accepted it and the group
+    # simply did not die.
+    if ($signalExit -ne 0) { return 2 }
+    return 1
+}
+
+function Get-PosixChildProcessId {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # PPid comes from /proc/<pid>/status, not /proc/<pid>/stat. The stat file's
+    # second field is the executable name in parentheses and it may itself
+    # contain spaces or parentheses, so splitting stat on whitespace to reach
+    # field four is a well-known way to read the wrong number.
+    $children = @()
+    foreach ($entry in [IO.Directory]::EnumerateDirectories('/proc')) {
+        $leaf = [IO.Path]::GetFileName($entry)
+        $childId = 0
+        if (-not [int]::TryParse($leaf, [ref]$childId)) { continue }
+        try {
+            foreach ($line in [IO.File]::ReadLines((Join-Path $entry 'status'))) {
+                if ($line.StartsWith('PPid:')) {
+                    $parent = 0
+                    if ([int]::TryParse($line.Substring(5).Trim(), [ref]$parent) -and
+                        $parent -eq $ProcessId) {
+                        $children += $childId
+                    }
+                    break
+                }
+            }
+        } catch { continue }        # the process exited while we were reading it
+    }
+    return $children
+}
+
+function Get-CurrentIdentityName {
+    # [Security.Principal.WindowsIdentity]::GetCurrent() exists in .NET on Linux
+    # and THROWS PlatformNotSupportedException there. That is worse than being
+    # absent: it parses, it resolves, the static analysis says it is fine, and
+    # the supervisor dies on its first poll. The fixture cross-check found it
+    # after a clean parse, a clean cmdlet audit and 19/0 of unit tests.
+    #
+    # Windows keeps the fully-qualified DOMAIN\user name it has always recorded.
+    if (Test-OnWindows) {
+        return [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    }
+    foreach ($candidate in @($env:USER, $env:LOGNAME, [Environment]::UserName)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate }
+    }
+    return 'unknown'
+}
+
+function Get-CurrentHomePath {
+    # $env:USERPROFILE does not exist on Linux; $env:HOME does.
+    if (Test-OnWindows) { return $env:USERPROFILE }
+    if (-not [string]::IsNullOrWhiteSpace($env:HOME)) { return $env:HOME }
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+}
+
+function Test-PosixProcessAlive {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # A SIGKILLed process does not vanish - it becomes a ZOMBIE until its parent
+    # reaps it, and Get-Process still returns it. Counting zombies as survivors
+    # made a tree kill that had worked perfectly report failure, which would
+    # have made the supervisor quarantine healthy runs.
+    $statusPath = "/proc/$ProcessId/status"
+    if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
+    try {
+        foreach ($line in [IO.File]::ReadLines($statusPath)) {
+            if ($line.StartsWith('State:')) {
+                # "State:\tZ (zombie)" - dead for every purpose except the table.
+                return -not ($line.Substring(6).Trim().StartsWith('Z'))
+            }
+        }
+    } catch {
+        return $false                     # it exited while we were reading it
+    }
+    return $true
+}
+
+function Invoke-PosixTreeKill {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # taskkill /T kills the process AND its descendants. Stop-Process does not,
+    # so swapping one for the other would leave grandchildren running while
+    # reporting success - the adapter spawns its own children, so that is the
+    # normal case, not an edge case.
+    if (-not (Test-Path -LiteralPath '/proc')) { return -1 }
+
+    # PARENTS FIRST, and this order is the whole correctness argument.
+    #
+    # The obvious choice is deepest-first, and it is wrong. Killing a shell's
+    # CURRENT COMMAND does not kill the shell - it makes the shell proceed to
+    # its next line. So killing `sleep 6` inside a script frees the script to
+    # run the very command we are trying to stop. A real test caught this: the
+    # child wrote its marker after the tree kill "succeeded", and it had passed
+    # earlier only because a faster interpreter happened to win the race.
+    #
+    # SIGKILL cannot be caught or deferred, so killing a parent before its
+    # children means the parent never reaches its next statement. Descendants
+    # already enumerated are then orphans, and are killed by pid regardless of
+    # having been reparented to init.
+    $ordered = @()
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($ProcessId)
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if (-not $seen.Add($current)) { continue }
+        $ordered += $current                       # breadth-first: shallowest first
+        foreach ($child in (Get-PosixChildProcessId -ProcessId $current)) {
+            $pending.Enqueue($child)
+        }
+    }
+
+    $killList = {
+        param([int[]]$Targets)
+        $remaining = 0
+        foreach ($target in $Targets) {
+            try {
+                Stop-Process -Id $target -Force -ErrorAction Stop
+            } catch {
+                # Already gone is success, not failure: the tree is what
+                # matters, not whether we personally delivered the signal.
+            }
+
+            # SIGKILL IS ASYNCHRONOUS. The signal is delivered immediately; the
+            # process is torn down and reaped when the kernel gets to it. Asking
+            # "is it alive?" in the next instruction is asking whether the box
+            # was quick, not whether the kill worked.
+            #
+            # That is exactly what this did, and it produced a reproducible
+            # false FAILURE: on a loaded runner the tree kill reported exit 1
+            # while the very next assertions confirmed the parent and the child
+            # were both gone. A kill that worked, reported as one that did not,
+            # which then makes the supervisor quarantine a healthy run.
+            #
+            # It is also the plainest explanation for the intermittent flakiness
+            # reported against this suite family, and it is the same mistake as
+            # sleeping at a condition instead of waiting for it - here in the
+            # other direction: not waiting at all.
+            $settleBy = [DateTime]::UtcNow.AddMilliseconds(2000)
+            while ((Test-PosixProcessAlive -ProcessId $target) -and
+                   [DateTime]::UtcNow -lt $settleBy) {
+                Start-Sleep -Milliseconds 25
+            }
+            if (Test-PosixProcessAlive -ProcessId $target) { $remaining++ }
+        }
+        return $remaining
+    }
+
+    $failed = & $killList $ordered
+
+    # A SECOND SWEEP, because enumeration and killing are not atomic. A process
+    # can fork between the two, and that child is in nobody's list. Re-walking
+    # from the root catches it. Bounded, because an unbounded retry against a
+    # fork bomb is its own outage - two passes is enough for the case this
+    # actually has, which is one adapter spawning one helper.
+    foreach ($sweep in 1..2) {
+        $stragglers = @()
+        $pending2 = New-Object System.Collections.Generic.Queue[int]
+        $pending2.Enqueue($ProcessId)
+        $seen2 = New-Object 'System.Collections.Generic.HashSet[int]'
+        while ($pending2.Count -gt 0) {
+            $cur = $pending2.Dequeue()
+            if (-not $seen2.Add($cur)) { continue }
+            if ($cur -ne $ProcessId) { $stragglers += $cur }
+            foreach ($c in (Get-PosixChildProcessId -ProcessId $cur)) { $pending2.Enqueue($c) }
+        }
+        if ($stragglers.Count -eq 0) { break }
+        $failed += & $killList $stragglers
+    }
+
+    return $(if ($failed -eq 0) { 0 } else { 1 })
+}
+
+function Invoke-ProcessTreeKill {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        # Captured AT LAUNCH, while the process still exists. See below.
+        [int]$ProcessGroupId = 0
+    )
+
+    if (Test-OnWindows) { return Invoke-TaskkillTree -ProcessId $ProcessId }
+
+    # PREFER THE GROUP. When the run was launched under setsid it is its own
+    # process-group leader, so kill(-pgid) reaches every member atomically -
+    # including one forked a microsecond ago whose parent has already died.
+    # That is the case a tree walk provably cannot cover.
+    #
+    # THE GROUP ID MUST BE PASSED IN, not looked up here. The first version
+    # resolved it from /proc at kill time, and by then the launcher had usually
+    # exited - so the lookup returned -1 and it fell through to the walk,
+    # silently, while reporting success. Reading an identity from a process that
+    # no longer exists is the same mistake as searching a tree that is still
+    # changing: the identity has to be captured while it is knowable.
+    if ($ProcessGroupId -gt 1) {
+        return Invoke-PosixGroupKill -ProcessGroupId $ProcessGroupId
+    }
+    # Last resort for a run that never got its own group (no setsid on the
+    # host). Racy, and known to be racy - a fallback, not a second opinion.
+    return Invoke-PosixTreeKill -ProcessId $ProcessId
+}
+
+function Resolve-WorkerEngine {
+    # The engine used to be Windows PowerShell 5.1 by absolute path, which is
+    # correct on Windows and simply absent on Linux.
+    #
+    # Windows behaviour is UNCHANGED - the Azure VM runs this in production and
+    # the adapter is written against 5.1 semantics. Only the non-Windows branch
+    # is new.
+    if (Test-OnWindows) {
+        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'windows_powershell_5_1_missing' }
+        return $engine
+    }
+    # The pwsh ALREADY RUNNING this, not a PATH lookup. A PATH lookup can find a
+    # different build than the one whose semantics we are relying on, and on a
+    # host with both a snap and a tarball install that is not hypothetical.
+    $current = (Get-Process -Id $PID -ErrorAction SilentlyContinue).Path
+    if ($current -and (Test-Path -LiteralPath $current -PathType Leaf)) { return $current }
+    $fallback = Join-Path $PSHOME 'pwsh'
+    if (Test-Path -LiteralPath $fallback -PathType Leaf) { return $fallback }
+    throw 'powershell_engine_missing'
 }
 
 function Test-RunTreeContainsReparsePoint {
@@ -694,8 +1056,7 @@ function Invoke-ClaudeWorker {
             -Source $Source `
             -Task $Task
         Write-Utf8NoBom -Path $promptPath -Text $prompt
-        $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        if (-not (Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'windows_powershell_5_1_missing' }
+        $engine = Resolve-WorkerEngine
         $parts = @(
             '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
             '-File', (Quote-ProcessArgument $ClaudeAdapter),
@@ -712,15 +1073,40 @@ function Invoke-ClaudeWorker {
             FilePath = $engine
             ArgumentList = ($parts -join ' ')
             WorkingDirectory = $WorkspacePath
-            WindowStyle = 'Hidden'
             PassThru = $true
         }
+        # -WindowStyle is a Windows-only parameter and THROWS elsewhere. It sits
+        # on the execute path, which no Observe-mode run reaches, so every
+        # cross-host comparison so far sailed straight past it. Windows keeps
+        # Hidden exactly as before.
+        if (Test-OnWindows) {
+            $startArgs.WindowStyle = 'Hidden'
+        } elseif (Test-Path -LiteralPath '/usr/bin/setsid' -PathType Leaf) {
+            # LAUNCH INTO ITS OWN PROCESS GROUP so the whole run has a durable
+            # identity to kill later. Without --fork, setsid execs in place when
+            # the caller is not already a group leader, so the pid is preserved
+            # and becomes the new pgid - which means $process.Id stays the
+            # handle for both waiting and killing.
+            $startArgs.ArgumentList = ($startArgs.FilePath + ' ' + $startArgs.ArgumentList)
+            $startArgs.FilePath = '/usr/bin/setsid'
+        }
         $process = Start-Process @startArgs
+        # Capture the containment identity NOW, while the process exists. By the
+        # time a wall timeout fires the launcher may already have exited, and
+        # /proc would answer -1.
+        $runGroupId = 0
+        if (-not (Test-OnWindows)) {
+            $candidate = Get-PosixProcessGroupId -ProcessId $process.Id
+            if ($candidate -gt 1) { $runGroupId = $candidate }
+        }
         $cleanupOwnedRun = $false
         $completedWithinLimit = $process.WaitForExit($WallTimeoutSeconds * 1000)
         if (-not $completedWithinLimit) {
             $taskkillExitCode = -1
-            try { $taskkillExitCode = Invoke-TaskkillTree -ProcessId $process.Id } catch {}
+            try {
+                $taskkillExitCode = Invoke-ProcessTreeKill -ProcessId $process.Id `
+                    -ProcessGroupId $runGroupId
+            } catch {}
             if ($taskkillExitCode -ne 0) { throw 'claude_termination_failed' }
             $terminationObserved = $false
             try {
@@ -791,8 +1177,8 @@ try {
         at = Get-UtcStamp
         run_id = $RunId
         status = 'reading'
-        identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        user_profile = $env:USERPROFILE
+        identity = Get-CurrentIdentityName
+        user_profile = Get-CurrentHomePath
     }
     Save-OrderState -Path $StatePath -State $state
     Write-OrderLog -Path $LogPath -Event 'poll_started' -RunId $RunId -Details @{ mode = $Mode }
