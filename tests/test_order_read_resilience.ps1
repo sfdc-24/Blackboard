@@ -713,6 +713,9 @@ function Invoke-WebRequest {
         StatusCode = 200
         Headers = @{ 'Content-Type' = 'application/json; charset=utf-8' }
         Content = '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}'
+        RawContentStream = [IO.MemoryStream]::new(
+            [Text.Encoding]::UTF8.GetBytes('{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}')
+        )
     }
 }
 
@@ -1023,7 +1026,7 @@ try {
         $actualBusSecondRedirect.failure_metadata.content_type_class -ceq 'html'
     )
     Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
-        $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
+        $secondRedirectFailureText.Contains('BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.') -and
         -not $secondRedirectFailureSquashed.Contains('ONE_SHOT_REDIRECT_CANARY') -and
         -not $secondRedirectFailureSquashed.Contains('CANONICAL_REDIRECT_CANARY') -and
         -not $secondRedirectFailureSquashed.Contains('FINAL_REDIRECT_BODY_CANARY') -and
@@ -1074,14 +1077,14 @@ try {
     )
 
     $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
-    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
+    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and reaches the common read gate' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
         @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
         @($actualBusIwrFallback.failure_metadata.PSObject.Properties).Count -eq 0 -and
-        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.Net.WebException'
+        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.InvalidOperationException'
     )
     Assert-True 'IWR pre-response failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.failure_trace.exception_message -ceq 'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.' -and
+        $actualBusIwrFallback.failure_trace.exception_message -ceq 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.' -and
         -not $iwrFailureOutputText.Contains('RAW_IWR_EXCEPTION_CANARY') -and
         -not $iwrFailureOutputText.Contains('ONE_SHOT_IWR_CANARY') -and
         -not $iwrFailureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
@@ -1096,10 +1099,10 @@ try {
         $null -ne $actualBusIwrFallback.redirect_metadata.PSObject.Properties['http_status'] -and
         [int]$actualBusIwrFallback.redirect_metadata.http_status -eq 302 -and
         $actualBusIwrFallback.redirect_metadata.content_type_class -ceq 'html' -and
-        $actualBusIwrFallback.redirect_trace.exception_type -ceq 'System.Net.WebException'
+        $actualBusIwrFallback.redirect_trace.exception_type -ceq 'System.InvalidOperationException'
     )
     Assert-True 'IWR second-redirect failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.redirect_trace.exception_message -ceq 'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.' -and
+        $actualBusIwrFallback.redirect_trace.exception_message -ceq 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.' -and
         -not $iwrRedirectOutputText.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
         -not $iwrRedirectOutputText.Contains('IWR_REDIRECT_BODY_CANARY') -and
         -not $iwrRedirectOutputText.Contains('BUS_SECRET_IWR_CANARY') -and

@@ -119,6 +119,145 @@ function Write-BusReadMetadata {
   [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Get-BusIwrResponseBytes {
+  param([Parameter(Mandatory = $true)]$Response)
+
+  $streamProperty = $Response.PSObject.Properties['RawContentStream']
+  if ($null -eq $streamProperty -or $null -eq $streamProperty.Value) {
+    throw [InvalidOperationException]::new('BUS_IWR_RAW_RESPONSE_UNAVAILABLE')
+  }
+
+  $stream = $streamProperty.Value
+  if ($stream -is [IO.MemoryStream]) {
+    return ,([byte[]]$stream.ToArray())
+  }
+  if (-not $stream.CanRead -or -not $stream.CanSeek) {
+    throw [InvalidOperationException]::new('BUS_IWR_RAW_RESPONSE_UNAVAILABLE')
+  }
+
+  $savedPosition = $stream.Position
+  $copy = New-Object IO.MemoryStream
+  try {
+    $stream.Position = 0
+    $stream.CopyTo($copy)
+    return ,([byte[]]$copy.ToArray())
+  } finally {
+    $stream.Position = $savedPosition
+    $copy.Dispose()
+  }
+}
+
+function ConvertFrom-BusJsonStringLiteral {
+  param([Parameter(Mandatory = $true)][string]$Literal)
+
+  if ($Literal.Length -lt 2 -or $Literal[0] -cne '"' -or
+      $Literal[$Literal.Length - 1] -cne '"') {
+    throw [FormatException]::new('invalid JSON string literal')
+  }
+
+  $builder = New-Object Text.StringBuilder
+  for ($index = 1; $index -lt $Literal.Length - 1; $index++) {
+    $character = $Literal[$index]
+    if ($character -cne '\') {
+      if ([int][char]$character -lt 0x20) {
+        throw [FormatException]::new('invalid JSON string literal')
+      }
+      [void]$builder.Append($character)
+      continue
+    }
+
+    $index++
+    if ($index -ge $Literal.Length - 1) {
+      throw [FormatException]::new('invalid JSON string literal')
+    }
+    $escape = $Literal[$index]
+    switch -CaseSensitive ($escape) {
+      '"' { [void]$builder.Append('"') }
+      '\' { [void]$builder.Append('\') }
+      '/'  { [void]$builder.Append('/') }
+      'b'  { [void]$builder.Append([char]0x08) }
+      'f'  { [void]$builder.Append([char]0x0C) }
+      'n'  { [void]$builder.Append([char]0x0A) }
+      'r'  { [void]$builder.Append([char]0x0D) }
+      't'  { [void]$builder.Append([char]0x09) }
+      'u'  {
+        if ($index + 4 -ge $Literal.Length) {
+          throw [FormatException]::new('invalid JSON string literal')
+        }
+        $hex = $Literal.Substring($index + 1, 4)
+        if ($hex -cnotmatch '^[0-9A-Fa-f]{4}$') {
+          throw [FormatException]::new('invalid JSON string literal')
+        }
+        [void]$builder.Append([char][Convert]::ToUInt16($hex, 16))
+        $index += 4
+      }
+      default { throw [FormatException]::new('invalid JSON string literal') }
+    }
+  }
+  return $builder.ToString()
+}
+
+function Test-BusJsonHasCollidingRootProperty {
+  param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
+
+  # ConvertFrom-Json overwrites duplicate object members. Scan the raw root
+  # object first, including escaped property names, so no edition can turn an
+  # ambiguous response into an apparently valid PSCustomObject. Case-insensitive
+  # collisions are rejected too because PowerShell property lookup cannot retain
+  # those names portably across Desktop and Core.
+  $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $objectDepth = 0
+  $arrayDepth = 0
+  $expectRootProperty = $false
+  for ($index = 0; $index -lt $Content.Length; $index++) {
+    $character = $Content[$index]
+    if ([char]::IsWhiteSpace($character)) { continue }
+
+    if ($character -ceq '"') {
+      $literalStart = $index
+      $escaped = $false
+      do {
+        $index++
+        if ($index -ge $Content.Length) {
+          throw [FormatException]::new('unterminated JSON string')
+        }
+        $stringCharacter = $Content[$index]
+        if ($escaped) {
+          $escaped = $false
+        } elseif ($stringCharacter -ceq '\') {
+          $escaped = $true
+        } elseif ($stringCharacter -ceq '"') {
+          break
+        }
+      } while ($true)
+
+      if ($objectDepth -eq 1 -and $arrayDepth -eq 0 -and $expectRootProperty) {
+        $literal = $Content.Substring($literalStart, $index - $literalStart + 1)
+        $propertyName = ConvertFrom-BusJsonStringLiteral -Literal $literal
+        if (-not $seen.Add($propertyName)) { return $true }
+        $expectRootProperty = $false
+      }
+      continue
+    }
+
+    switch -CaseSensitive ($character) {
+      '{' {
+        $objectDepth++
+        if ($objectDepth -eq 1 -and $arrayDepth -eq 0) { $expectRootProperty = $true }
+      }
+      '}' {
+        if ($objectDepth -gt 0) { $objectDepth-- }
+      }
+      '[' { $arrayDepth++ }
+      ']' { if ($arrayDepth -gt 0) { $arrayDepth-- } }
+      ',' {
+        if ($objectDepth -eq 1 -and $arrayDepth -eq 0) { $expectRootProperty = $true }
+      }
+    }
+  }
+  return $false
+}
+
 function Get-BusExactJsonProperty {
   param(
     [Parameter(Mandatory = $true)]$InputObject,
@@ -185,10 +324,14 @@ function Assert-BusReadResponseContract {
     if ($trimmedContent.Length -eq 0 -or $trimmedContent[0] -cne '{') {
       throw [InvalidOperationException]::new($invalidMessage)
     }
+    if (Test-BusJsonHasCollidingRootProperty -Content $Content) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
     # PowerShell 7 otherwise turns ISO-8601-looking JSON strings into DateTime.
     # That changes legitimate document text and identity values before the type
     # and ordinal checks below. DateKind arrived in 7.5; Desktop 5.1 already
-    # preserves strings, while older Core editions must fail closed.
+    # preserves strings. Read validation is therefore supported on Desktop 5.1
+    # and Core 7.5+, while older Core editions deliberately fail closed.
     $jsonCommand = Get-Command ConvertFrom-Json
     if ($jsonCommand.Parameters.ContainsKey('DateKind')) {
       $response = ConvertFrom-Json -InputObject $Content -DateKind String -ErrorAction Stop
@@ -300,6 +443,38 @@ function Resolve-BusHttpsLocation {
     )
   }
   return $resolvedUri.AbsoluteUri
+}
+
+# ---- fail-closed read preflight (no credential load, request, or file write) --
+if ($Action -eq 'read') {
+  if ([string]::IsNullOrWhiteSpace($Title) -and
+      [string]::IsNullOrWhiteSpace($FileId)) {
+    throw [InvalidOperationException]::new(
+      'BUS_READ_SELECTOR_REQUIRED: Action read requires Title or FileId.'
+    )
+  }
+  if ($OutFile -and $ReadMetadataOutFile) {
+    $resolvedOutFile = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($OutFile)) {
+      $OutFile
+    } else {
+      Join-Path (Get-Location).Path $OutFile
+    }))
+    $resolvedMetadataFile = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($ReadMetadataOutFile)) {
+      $ReadMetadataOutFile
+    } else {
+      Join-Path (Get-Location).Path $ReadMetadataOutFile
+    }))
+    $pathComparison = if ([IO.Path]::DirectorySeparatorChar -ceq '\') {
+      [StringComparison]::OrdinalIgnoreCase
+    } else {
+      [StringComparison]::Ordinal
+    }
+    if ([string]::Equals($resolvedOutFile, $resolvedMetadataFile, $pathComparison)) {
+      throw [InvalidOperationException]::new(
+        'BUS_READ_OUTPUT_PATH_CONFLICT: OutFile and ReadMetadataOutFile must identify different files.'
+      )
+    }
+  }
 }
 
 # ---- load credentials from .env (never from argv) ---------------------------
@@ -499,6 +674,7 @@ foreach ($candidate in $curlCandidates) {
 $readTransportExit = $null
 $readHttpStatus = $null
 $readContentTypeClass = $null
+$readIwrResponse = $null
 
 if ($curl) {
   # ONE request only. -D dumps headers to a file; reads also put the response body
@@ -517,14 +693,26 @@ if ($curl) {
       # newline. Capture read bodies to a file so an accepted response can be
       # written to OutFile byte-for-byte, without reserialization or newline loss.
       $tmpReadResponse = [IO.Path]::GetTempFileName()
-      $out = & $curl.Source -s -S -D $tmpHead -o $tmpReadResponse --max-time 120 `
-               -X POST $cfg.BUS_URL -H 'Content-Type: application/json; charset=utf-8' `
-               --data-binary "@$tmpBody"
+      # WinPS 5.1 promotes a native stderr record to a terminating error under
+      # the script-wide Stop preference before LASTEXITCODE can be inspected.
+      # A failed read must still write its sanitized metadata sidecar, so suppress
+      # only this native diagnostic and capture the numeric exit explicitly.
+      $savedErrorActionPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = 'Continue'
+        $out = & $curl.Source -s -S -D $tmpHead -o $tmpReadResponse --max-time 120 `
+                 -X POST $cfg.BUS_URL -H 'Content-Type: application/json; charset=utf-8' `
+                 --data-binary "@$tmpBody" 2>$null
+        $hop1Exit = [int]$LASTEXITCODE
+      } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+      }
     } else {
       $out = & $curl.Source -s -S -D $tmpHead --max-time 120 -X POST $cfg.BUS_URL `
                -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$tmpBody"
+      $hop1Exit = [int]$LASTEXITCODE
     }
-    $readTransportExit = [int]$LASTEXITCODE
+    $readTransportExit = $hop1Exit
     $head = Get-Content -LiteralPath $tmpHead -ErrorAction SilentlyContinue
     $hop1Metadata = Get-BusHeaderMetadata -HeaderLines @($head)
     $readHttpStatus = $hop1Metadata.http_status
@@ -534,7 +722,6 @@ if ($curl) {
       $location = ($loc -replace '^\s*[Ll]ocation:\s*', '').Trim()
     } elseif ($Action -eq 'read') {
       $contentBytes = [IO.File]::ReadAllBytes($tmpReadResponse)
-      $content = [Text.Encoding]::UTF8.GetString($contentBytes)
     } else {
       $content = ($out -join "`n")
     }
@@ -592,56 +779,63 @@ if ($curl) {
     $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r1.Headers['Content-Type'])
     if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) {
       $location = $r1.Headers['Location']
-      if (-not $location) {
+      if (-not $location -and $Action -ne 'read') {
         throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $([int]$r1.StatusCode) with no Location header."
       }
     }
-    else { $content = $r1.Content }
+    else {
+      if ($Action -eq 'read') { $readIwrResponse = $r1 }
+      else { $content = $r1.Content }
+    }
   } catch {
     $resp = $null
     try { $resp = $_.Exception.Response } catch { $resp = $null }
-    if (-not $resp) { throw }
+    if (-not $resp) {
+      if ($Action -ne 'read') { throw }
+    } else {
+      $status = 0
+      try { $status = [int]$resp.StatusCode } catch { $status = 0 }
 
-    $status = 0
-    try { $status = [int]$resp.StatusCode } catch { $status = 0 }
-
-    $contentType = ''
-    $locationValue = $null
-    # DUCK-TYPE, never a type literal. `-is [System.Net.Http.Headers.HttpResponseHeaders]`
-    # cannot be evaluated on Windows PowerShell 5.1 at all: System.Net.Http is not
-    # loaded at startup and this script does not Add-Type it, so the literal raises
-    # "Unable to find type" and takes the whole branch with it. Comparing the type
-    # NAME needs no assembly to be loaded and behaves the same on both editions.
-    try {
-      $headerTypeName = ''
-      if ($null -ne $resp.Headers) { $headerTypeName = $resp.Headers.GetType().FullName }
-      if ($headerTypeName -eq 'System.Net.Http.Headers.HttpResponseHeaders') {
-        if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
-        if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
-          $contentType = [string]$resp.Content.Headers.ContentType
+      $contentType = ''
+      $locationValue = $null
+      # DUCK-TYPE, never a type literal. `-is [System.Net.Http.Headers.HttpResponseHeaders]`
+      # cannot be evaluated on Windows PowerShell 5.1 at all: System.Net.Http is not
+      # loaded at startup and this script does not Add-Type it, so the literal raises
+      # "Unable to find type" and takes the whole branch with it. Comparing the type
+      # NAME needs no assembly to be loaded and behaves the same on both editions.
+      try {
+        $headerTypeName = ''
+        if ($null -ne $resp.Headers) { $headerTypeName = $resp.Headers.GetType().FullName }
+        if ($headerTypeName -eq 'System.Net.Http.Headers.HttpResponseHeaders') {
+          if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
+          if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
+            $contentType = [string]$resp.Content.Headers.ContentType
+          }
+        } elseif ($headerTypeName) {
+          # HttpWebResponse and the 5.1 dictionary shapes: indexed access.
+          $locationValue = [string]$resp.Headers['Location']
+          $contentType = [string]$resp.Headers['Content-Type']
         }
-      } elseif ($headerTypeName) {
-        # HttpWebResponse and the 5.1 dictionary shapes: indexed access.
-        $locationValue = [string]$resp.Headers['Location']
-        $contentType = [string]$resp.Headers['Content-Type']
+      } catch {
+        # Do NOT swallow silently. An unreadable header collection is a fact hop 2
+        # needs, and the previous empty catch turned it into a wrong answer.
+        Write-Warning "BUS_IWR_HEADER_READ_FAILED: $($_.Exception.Message)"
       }
-    } catch {
-      # Do NOT swallow silently. An unreadable header collection is a fact hop 2
-      # needs, and the previous empty catch turned it into a wrong answer.
-      Write-Warning "BUS_IWR_HEADER_READ_FAILED: $($_.Exception.Message)"
-    }
 
-    if ($status) { $readHttpStatus = $status }
-    if ($contentType) { $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $contentType }
-    if ($status -ge 300 -and $status -lt 400 -and $locationValue) {
-      $location = $locationValue
-    } elseif ($status -ge 300 -and $status -lt 400) {
-      # Same contract failure as the non-terminating path above, so it gets the
-      # same name. Rethrowing the original transport exception here would report
-      # a redirect-with-no-usable-Location as whatever the edition happened to
-      # raise, which is the one thing a caller cannot act on.
-      throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $status with no readable Location header."
-    } else { throw }
+      if ($status) { $readHttpStatus = $status }
+      if ($contentType) { $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $contentType }
+      if ($status -ge 300 -and $status -lt 400 -and $locationValue) {
+        $location = $locationValue
+      } elseif ($status -ge 300 -and $status -lt 400) {
+        if ($Action -ne 'read') {
+          # Same contract failure as the non-terminating path above, so it gets the
+          # same name. Rethrowing the original transport exception here would report
+          # a redirect-with-no-usable-Location as whatever the edition happened to
+          # raise, which is the one thing a caller cannot act on.
+          throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $status with no readable Location header."
+        }
+      } elseif ($Action -ne 'read') { throw }
+    }
   }
 }
 
@@ -673,22 +867,30 @@ if ($location) {
       # would be added to (rather than replace) the protocols curl already allows.
       if ($Action -eq 'read') {
         $tmpReadResponse2 = [IO.Path]::GetTempFileName()
-        $out2 = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
-                  --proto '=https' --proto-redir '=https' `
-                  -D $tmpHead2 -o $tmpReadResponse2 --max-time 120 $location
+        $savedErrorActionPreference = $ErrorActionPreference
+        try {
+          $ErrorActionPreference = 'Continue'
+          $out2 = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
+                    --proto '=https' --proto-redir '=https' `
+                    -D $tmpHead2 -o $tmpReadResponse2 --max-time 120 $location 2>$null
+          $hop2Exit = [int]$LASTEXITCODE
+        } finally {
+          $ErrorActionPreference = $savedErrorActionPreference
+        }
       } else {
         $out2 = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
                   --proto '=https' --proto-redir '=https' `
                   -D $tmpHead2 --max-time 120 $location
+        $hop2Exit = [int]$LASTEXITCODE
       }
-      $hop2Exit = [int]$LASTEXITCODE
       if ($null -eq $readTransportExit -or $hop2Exit -ne 0) { $readTransportExit = $hop2Exit }
       $head2 = Get-Content -LiteralPath $tmpHead2 -ErrorAction SilentlyContinue
       $hop2Metadata = Get-BusHeaderMetadata -HeaderLines @($head2)
       $readHttpStatus = $hop2Metadata.http_status
       $readContentTypeClass = $hop2Metadata.content_type_class
-      if ($hop2Exit -ne 0 -or $null -eq $readHttpStatus -or
-          $readHttpStatus -lt 200 -or $readHttpStatus -ge 300) {
+      if ($Action -ne 'read' -and
+          ($hop2Exit -ne 0 -or $null -eq $readHttpStatus -or
+          $readHttpStatus -lt 200 -or $readHttpStatus -ge 300)) {
         # Preserve the sanitized sidecar even though the standalone client fails.
         # The supervisor uses it to distinguish a retryable transport/HTTP fault
         # from a deterministic local-client error without logging response data.
@@ -701,7 +903,6 @@ if ($location) {
       }
       if ($Action -eq 'read') {
         $contentBytes = [IO.File]::ReadAllBytes($tmpReadResponse2)
-        $content = [Text.Encoding]::UTF8.GetString($contentBytes)
       } else {
         $content = ($out2 -join "`n")
       }
@@ -734,42 +935,49 @@ if ($location) {
         -TransportExit $readTransportExit `
         -HttpStatus $readHttpStatus `
         -ContentTypeClass $readContentTypeClass
-      if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
+      if ($Action -ne 'read') {
+        if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
+          throw [System.Net.WebException]::new(
+            'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+          )
+        }
         throw [System.Net.WebException]::new(
-          'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+          'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
         )
       }
-      throw [System.Net.WebException]::new(
-        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
-      )
     } catch {
       Write-BusReadMetadata `
         -Path $ReadMetadataOutFile `
         -TransportExit $readTransportExit `
         -HttpStatus $readHttpStatus `
         -ContentTypeClass $readContentTypeClass
-      throw [System.Net.WebException]::new(
-        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
-      )
-    }
-    $readHttpStatus = [int]$r2.StatusCode
-    $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r2.Headers['Content-Type'])
-    if ($readHttpStatus -lt 200 -or $readHttpStatus -ge 300) {
-      Write-BusReadMetadata `
-        -Path $ReadMetadataOutFile `
-        -TransportExit $readTransportExit `
-        -HttpStatus $readHttpStatus `
-        -ContentTypeClass $readContentTypeClass
-      if ($readHttpStatus -ge 300 -and $readHttpStatus -lt 400) {
+      if ($Action -ne 'read') {
         throw [System.Net.WebException]::new(
-          'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+          'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
         )
       }
-      throw [System.Net.WebException]::new(
-        'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
-      )
     }
-    $content = $r2.Content
+    if ($null -ne $r2) {
+      $readHttpStatus = [int]$r2.StatusCode
+      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r2.Headers['Content-Type'])
+      if ($Action -ne 'read' -and ($readHttpStatus -lt 200 -or $readHttpStatus -ge 300)) {
+        Write-BusReadMetadata `
+          -Path $ReadMetadataOutFile `
+          -TransportExit $readTransportExit `
+          -HttpStatus $readHttpStatus `
+          -ContentTypeClass $readContentTypeClass
+        if ($readHttpStatus -ge 300 -and $readHttpStatus -lt 400) {
+          throw [System.Net.WebException]::new(
+            'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
+          )
+        }
+        throw [System.Net.WebException]::new(
+          'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
+        )
+      }
+      if ($Action -eq 'read') { $readIwrResponse = $r2 }
+      else { $content = $r2.Content }
+    }
   }
 }
 
@@ -778,6 +986,35 @@ Write-BusReadMetadata `
   -TransportExit $readTransportExit `
   -HttpStatus $readHttpStatus `
   -ContentTypeClass $readContentTypeClass
+
+if ($Action -eq 'read') {
+  $readInvalidMessage = 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.'
+  $transportExitAccepted = $null -eq $readTransportExit -or [int]$readTransportExit -eq 0
+  if (-not $transportExitAccepted -or
+      $null -eq $readHttpStatus -or
+      [int]$readHttpStatus -lt 200 -or
+      [int]$readHttpStatus -ge 300 -or
+      $readContentTypeClass -cne 'json') {
+    throw [InvalidOperationException]::new($readInvalidMessage)
+  }
+
+  if ($null -eq $contentBytes -and $null -ne $readIwrResponse) {
+    try {
+      $contentBytes = Get-BusIwrResponseBytes -Response $readIwrResponse
+    } catch {
+      throw [InvalidOperationException]::new($readInvalidMessage)
+    }
+  }
+
+  if ($null -ne $contentBytes) {
+    try {
+      $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+      $content = $strictUtf8.GetString($contentBytes)
+    } catch {
+      throw [InvalidOperationException]::new($readInvalidMessage)
+    }
+  }
+}
 
 if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
 # [string]$null is $null in WinPS 5.1, not '' -- coalesce before calling a method on it.

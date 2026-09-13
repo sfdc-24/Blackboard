@@ -60,6 +60,18 @@ function Test-ByteArraysEqual {
     return $true
 }
 
+function Test-ContainsIgnoringWhitespace {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [AllowEmptyString()][string]$Needle
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Needle)) { return $false }
+    $compactText = [regex]::Replace([string]$Text, '\s', '')
+    $compactNeedle = [regex]::Replace([string]$Needle, '\s', '')
+    return $compactText.Contains($compactNeedle)
+}
+
 function Start-TestResponseServer {
     param(
         [Parameter(Mandatory = $true)][int]$Port,
@@ -117,7 +129,20 @@ function Start-TestResponseServer {
                     $responseBytes = [IO.File]::ReadAllBytes(
                         (Join-Path $ServerRoot ('response-' + $responseIndex + '.json'))
                     )
-                    $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($responseBytes.Length)`r`nConnection: close`r`n`r`n"
+                    $responseStatus = [int][IO.File]::ReadAllText(
+                        (Join-Path $ServerRoot ('status-' + $responseIndex + '.txt')),
+                        [Text.Encoding]::UTF8
+                    )
+                    $responseContentType = [IO.File]::ReadAllText(
+                        (Join-Path $ServerRoot ('content-type-' + $responseIndex + '.txt')),
+                        [Text.Encoding]::UTF8
+                    )
+                    $declaredLengthExtra = [int][IO.File]::ReadAllText(
+                        (Join-Path $ServerRoot ('length-extra-' + $responseIndex + '.txt')),
+                        [Text.Encoding]::UTF8
+                    )
+                    $declaredLength = $responseBytes.Length + $declaredLengthExtra
+                    $head = "HTTP/1.1 $responseStatus Test`r`nContent-Type: $responseContentType`r`nContent-Length: $declaredLength`r`nConnection: close`r`n`r`n"
                     $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
                     $stream.Write($headBytes, 0, $headBytes.Length)
                     $stream.Write($responseBytes, 0, $responseBytes.Length)
@@ -161,7 +186,18 @@ function New-ReadCase {
         [AllowEmptyString()][string]$FileId = '',
         [ValidateSet('read', 'READ')][string]$Action = 'read',
         [bool]$UseOutFile = $true,
-        [AllowEmptyString()][string]$LeakToken = ''
+        [AllowEmptyString()][string]$LeakToken = '',
+        [int]$HttpStatus = 200,
+        [AllowEmptyString()][string]$ContentType = 'application/json; charset=utf-8',
+        [int]$DeclaredLengthExtra = 0,
+        [AllowNull()]$ExpectedTransportExit = 0,
+        [AllowEmptyString()][string]$ExpectedContentTypeClass = 'json',
+        [bool]$RawInvalidUtf8 = $false,
+        [bool]$ForceIwr = $false,
+        [bool]$ExpectRequest = $true,
+        [bool]$ExpectMetadata = $true,
+        [AllowEmptyString()][string]$ExpectedErrorCode = 'BUS_READ_RESPONSE_INVALID',
+        [bool]$AliasOutputMetadata = $false
     )
 
     return [pscustomobject][ordered]@{
@@ -174,6 +210,18 @@ function New-ReadCase {
         UseOutFile = $UseOutFile
         LeakToken = $LeakToken
         IsRead = $true
+        HttpStatus = $HttpStatus
+        ContentType = $ContentType
+        DeclaredLengthExtra = $DeclaredLengthExtra
+        ExpectedTransportExit = $ExpectedTransportExit
+        ExpectedContentTypeClass = $ExpectedContentTypeClass
+        RawInvalidUtf8 = $RawInvalidUtf8
+        ForceIwr = $ForceIwr
+        ExpectRequest = $ExpectRequest
+        ExpectMetadata = $ExpectMetadata
+        ExpectedErrorCode = $ExpectedErrorCode
+        AliasOutputMetadata = $AliasOutputMetadata
+        ServerIndex = 0
     }
 }
 
@@ -189,6 +237,12 @@ function Invoke-TestCase {
     New-Item -ItemType Directory -Path $caseRoot -Force | Out-Null
     $outPath = Join-Path $caseRoot 'response.json'
     $metadataPath = Join-Path $caseRoot 'metadata.json'
+    $metadataArgument = $metadataPath
+    if ($Case.AliasOutputMetadata) {
+        $metadataPath = $outPath
+        $metadataArgument = Join-Path $caseRoot ('unused' + [IO.Path]::DirectorySeparatorChar + '..' +
+            [IO.Path]::DirectorySeparatorChar + 'response.json')
+    }
     $sentinel = 'OUTFILE_SENTINEL_' + $Case.Name
     if ($Case.UseOutFile -and -not $Case.Valid) {
         Write-TestUtf8 -Path $outPath -Text $sentinel
@@ -208,21 +262,30 @@ function Invoke-TestCase {
     }
     if ($Case.UseOutFile) { $arguments += @('-OutFile', $outPath) }
     if ($Case.IsRead) {
-        $arguments += @('-ReadMetadataOutFile', $metadataPath)
+        $arguments += @('-ReadMetadataOutFile', $metadataArgument)
     } else {
         $arguments += @('-Text', 'append compatibility payload')
     }
 
     $previousPreference = $ErrorActionPreference
+    $previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
     $ErrorActionPreference = 'Continue'
     try {
+        if ($Case.ForceIwr) {
+            [Environment]::SetEnvironmentVariable('PATH', '', 'Process')
+        }
         $output = @(& $ChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
+        [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
         $ErrorActionPreference = $previousPreference
     }
 
-    $requestPath = Join-Path $script:TestRoot ('request-' + $Index + '.json')
+    $requestPath = if ($Case.ExpectRequest) {
+        Join-Path $script:TestRoot ('request-' + [int]$Case.ServerIndex + '.json')
+    } else {
+        Join-Path $script:TestRoot ('request-local-' + $Index + '.json')
+    }
     $requestText = if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
         [IO.File]::ReadAllText($requestPath, [Text.Encoding]::UTF8)
     } else { '' }
@@ -278,12 +341,26 @@ $cases = @(
     (New-ReadCase -Name 'uppercase-read' -Valid $true -Action 'READ' -Title 'Uppercase Action' -Body '{"ok":true,"fileId":"upper-file","title":"Uppercase Action","rows":[]}'),
     (New-ReadCase -Name 'unicode-raw-preservation' -Valid $true -Title 'Unicode Sheet' -Body $unicodeRawBody),
     (New-ReadCase -Name 'valid-stdout-preservation' -Valid $true -UseOutFile $false -Title 'Stdout Sheet' -Body $unicodeStdoutBody),
-    (New-ReadCase -Name 'no-selector-generic-identity' -Valid $true -Title '' -Body '{"ok":true,"fileId":"generic-file","title":"Generic Title","rows":[]}'),
+    (New-ReadCase -Name 'iwr-valid-sheet' -Valid $true -ForceIwr $true -ExpectedTransportExit $null -Body '{"ok":true,"fileId":"iwr-valid","title":"Contract Sheet","rows":[["fallback"]]}'),
 
     # Regression and mutation control: the observed HTTP-200 health object must
     # fail without changing a preseeded output file or leaking its body to stdout.
     (New-ReadCase -Name 'health-object-preseed' -Body '{"ok":true,"service":"blackboard-bus","canary":"HEALTH_BODY_CANARY_PRESEED"}' -LeakToken 'HEALTH_BODY_CANARY_PRESEED'),
     (New-ReadCase -Name 'health-object-stdout' -UseOutFile $false -Body '{"ok":true,"service":"blackboard-bus","canary":"HEALTH_BODY_CANARY_STDOUT"}' -LeakToken 'HEALTH_BODY_CANARY_STDOUT'),
+    (New-ReadCase -Name 'curl-nonzero-valid-body' -Body '{"ok":true,"fileId":"transport-exit","title":"Contract Sheet","rows":[],"canary":"CURL_NONZERO_BODY_CANARY"}' -LeakToken 'CURL_NONZERO_BODY_CANARY' -DeclaredLengthExtra 19 -ExpectedTransportExit 18),
+    # The spaced canary proves leak checks remain effective if diagnostics add
+    # formatting whitespace between response fragments.
+    (New-ReadCase -Name 'http-500-valid-body' -Body '{"ok":true,"fileId":"http-500","title":"Contract Sheet","rows":[],"canary":"HTTP 500 BODY CANARY"}' -LeakToken 'HTTP 500 BODY CANARY' -HttpStatus 500),
+    (New-ReadCase -Name 'html-content-type-valid-body' -Body '{"ok":true,"fileId":"html-type","title":"Contract Sheet","rows":[],"canary":"HTML_TYPE_BODY_CANARY"}' -LeakToken 'HTML_TYPE_BODY_CANARY' -ContentType 'text/html; charset=utf-8' -ExpectedContentTypeClass 'html'),
+    (New-ReadCase -Name 'redirect-no-location-valid-body' -Body '{"ok":true,"fileId":"redirect-no-location","title":"Contract Sheet","rows":[],"canary":"REDIRECT_NO_LOCATION_BODY_CANARY"}' -LeakToken 'REDIRECT_NO_LOCATION_BODY_CANARY' -HttpStatus 302),
+    (New-ReadCase -Name 'iwr-http-500-valid-body' -Body '{"ok":true,"fileId":"iwr-http-500","title":"Contract Sheet","rows":[],"canary":"IWR_HTTP_500_BODY_CANARY"}' -LeakToken 'IWR_HTTP_500_BODY_CANARY' -HttpStatus 500 -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'iwr-html-content-type-valid-body' -Body '{"ok":true,"fileId":"iwr-html-type","title":"Contract Sheet","rows":[],"canary":"IWR_HTML_TYPE_BODY_CANARY"}' -LeakToken 'IWR_HTML_TYPE_BODY_CANARY' -ContentType 'text/html; charset=utf-8' -ExpectedContentTypeClass 'html' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'iwr-redirect-no-location-valid-body' -Body '{"ok":true,"fileId":"iwr-redirect-no-location","title":"Contract Sheet","rows":[],"canary":"IWR_REDIRECT_NO_LOCATION_BODY_CANARY"}' -LeakToken 'IWR_REDIRECT_NO_LOCATION_BODY_CANARY' -HttpStatus 302 -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'curl-malformed-utf8-valid-shape' -Body 'RAW_BYTES_WRITTEN_BELOW' -LeakToken 'CURL_MALFORMED_UTF8_BODY_CANARY' -RawInvalidUtf8 $true),
+    (New-ReadCase -Name 'iwr-malformed-utf8-valid-shape' -Body 'RAW_BYTES_WRITTEN_BELOW' -LeakToken 'IWR_MALFORMED_UTF8_BODY_CANARY' -RawInvalidUtf8 $true -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'duplicate-ok' -Body '{"ok":false,"ok":true,"fileId":"duplicate-ok","title":"Contract Sheet","rows":[],"canary":"DUPLICATE_OK_BODY_CANARY"}' -LeakToken 'DUPLICATE_OK_BODY_CANARY'),
+    (New-ReadCase -Name 'duplicate-title' -Body '{"ok":true,"fileId":"duplicate-title","title":"Wrong Title","title":"Contract Sheet","rows":[],"canary":"DUPLICATE_TITLE_BODY_CANARY"}' -LeakToken 'DUPLICATE_TITLE_BODY_CANARY'),
+    (New-ReadCase -Name 'duplicate-rows' -Body '{"ok":true,"fileId":"duplicate-rows","title":"Contract Sheet","rows":"wrong","rows":[],"canary":"DUPLICATE_ROWS_BODY_CANARY"}' -LeakToken 'DUPLICATE_ROWS_BODY_CANARY'),
     (New-ReadCase -Name 'ok-false' -Body '{"ok":false,"fileId":"bad","title":"Contract Sheet","rows":[],"canary":"OK_FALSE_CANARY"}' -LeakToken 'OK_FALSE_CANARY'),
     (New-ReadCase -Name 'ok-string' -Body '{"ok":"true","fileId":"bad","title":"Contract Sheet","rows":[],"canary":"OK_STRING_CANARY"}' -LeakToken 'OK_STRING_CANARY'),
     (New-ReadCase -Name 'missing-ok' -Body '{"fileId":"bad","title":"Contract Sheet","rows":[],"canary":"MISSING_OK_CANARY"}' -LeakToken 'MISSING_OK_CANARY'),
@@ -310,10 +387,10 @@ $cases = @(
     (New-ReadCase -Name 'body-number' -Body '{"ok":true,"fileId":"bad","title":"Contract Sheet","body":4,"canary":"BODY_NUMBER_CANARY"}' -LeakToken 'BODY_NUMBER_CANARY'),
     (New-ReadCase -Name 'title-mismatch' -Title 'Requested Title' -Body '{"ok":true,"fileId":"bad","title":"Different Title","rows":[],"canary":"TITLE_MISMATCH_CANARY"}' -LeakToken 'TITLE_MISMATCH_CANARY'),
     (New-ReadCase -Name 'title-case-mismatch' -Title 'Requested Title' -Body '{"ok":true,"fileId":"bad","title":"requested title","rows":[],"canary":"TITLE_CASE_CANARY"}' -LeakToken 'TITLE_CASE_CANARY'),
-    (New-ReadCase -Name 'whitespace-title-selector' -Title '   ' -Body '{"ok":true,"fileId":"bad","title":"Different Title","rows":[],"canary":"WHITESPACE_TITLE_SELECTOR_CANARY"}' -LeakToken 'WHITESPACE_TITLE_SELECTOR_CANARY'),
+    (New-ReadCase -Name 'whitespace-title-selector' -Title '   ' -Body '{"ok":true,"fileId":"bad","title":"Different Title","rows":[],"canary":"WHITESPACE_TITLE_SELECTOR_CANARY"}' -LeakToken 'WHITESPACE_TITLE_SELECTOR_CANARY' -ExpectRequest $false -ExpectMetadata $false -ExpectedErrorCode 'BUS_READ_SELECTOR_REQUIRED'),
     (New-ReadCase -Name 'file-id-mismatch' -Title '' -FileId 'requested-file' -Body '{"ok":true,"fileId":"different-file","title":"Any Title","rows":[],"canary":"FILE_MISMATCH_CANARY"}' -LeakToken 'FILE_MISMATCH_CANARY'),
     (New-ReadCase -Name 'file-id-case-mismatch' -Title '' -FileId 'Requested-File' -Body '{"ok":true,"fileId":"requested-file","title":"Any Title","rows":[],"canary":"FILE_CASE_CANARY"}' -LeakToken 'FILE_CASE_CANARY'),
-    (New-ReadCase -Name 'whitespace-file-id-selector' -Title '' -FileId '   ' -Body '{"ok":true,"fileId":"different-file","title":"Any Title","rows":[],"canary":"WHITESPACE_FILE_SELECTOR_CANARY"}' -LeakToken 'WHITESPACE_FILE_SELECTOR_CANARY'),
+    (New-ReadCase -Name 'whitespace-file-id-selector' -Title '' -FileId '   ' -Body '{"ok":true,"fileId":"different-file","title":"Any Title","rows":[],"canary":"WHITESPACE_FILE_SELECTOR_CANARY"}' -LeakToken 'WHITESPACE_FILE_SELECTOR_CANARY' -ExpectRequest $false -ExpectMetadata $false -ExpectedErrorCode 'BUS_READ_SELECTOR_REQUIRED'),
     (New-ReadCase -Name 'wrong-property-case' -Body '{"OK":true,"fileId":"bad","title":"Contract Sheet","rows":[],"canary":"PROPERTY_CASE_CANARY"}' -LeakToken 'PROPERTY_CASE_CANARY')
 )
 
@@ -327,8 +404,24 @@ $appendCase = [pscustomobject][ordered]@{
     UseOutFile = $true
     LeakToken = ''
     IsRead = $false
+    HttpStatus = 200
+    ContentType = 'application/json; charset=utf-8'
+    DeclaredLengthExtra = 0
+    ExpectedTransportExit = 0
+    ExpectedContentTypeClass = 'json'
+    RawInvalidUtf8 = $false
+    ForceIwr = $false
+    ExpectRequest = $true
+    ExpectMetadata = $false
+    ExpectedErrorCode = ''
+    AliasOutputMetadata = $false
+    ServerIndex = 0
 }
 $cases += $appendCase
+$cases += @(
+    (New-ReadCase -Name 'selector-required-preflight' -Title '' -Body '{"ok":true,"fileId":"unserved-selector","title":"Unserved Selector","rows":[],"canary":"NO_SELECTOR_BODY_CANARY"}' -LeakToken 'NO_SELECTOR_BODY_CANARY' -ExpectRequest $false -ExpectMetadata $false -ExpectedErrorCode 'BUS_READ_SELECTOR_REQUIRED'),
+    (New-ReadCase -Name 'output-metadata-path-conflict' -Body '{"ok":true,"fileId":"unserved-alias","title":"Contract Sheet","rows":[],"canary":"PATH_ALIAS_BODY_CANARY"}' -LeakToken 'PATH_ALIAS_BODY_CANARY' -ExpectRequest $false -ExpectMetadata $false -ExpectedErrorCode 'BUS_READ_OUTPUT_PATH_CONFLICT' -AliasOutputMetadata $true)
+)
 
 New-Item -ItemType Directory -Path $script:TestRoot -Force | Out-Null
 $serverJob = $null
@@ -337,11 +430,45 @@ try {
     $envPath = Join-Path $script:TestRoot 'test.env'
     $readyPath = Join-Path $script:TestRoot 'ready.txt'
     $serverErrorPath = Join-Path $script:TestRoot 'server-error.txt'
-    Write-TestUtf8 -Path $envPath -Text ("BUS_URL=http://127.0.0.1:$port/`nBUS_SECRET=$($script:FakeSecret)`n")
-    for ($index = 0; $index -lt $cases.Count; $index++) {
+    $script:BusUrl = "http://127.0.0.1:$port/"
+    Write-TestUtf8 -Path $envPath -Text ("BUS_URL=$($script:BusUrl)`nBUS_SECRET=$($script:FakeSecret)`n")
+    $responseIndex = 0
+    foreach ($case in $cases) {
+        if (-not $case.ExpectRequest) { continue }
+        $responseIndex++
+        $case.ServerIndex = $responseIndex
+        $responsePath = Join-Path $script:TestRoot ('response-' + $responseIndex + '.json')
+        if ($case.RawInvalidUtf8) {
+            $prefixBytes = [Text.Encoding]::UTF8.GetBytes(
+                '{"ok":true,"fileId":"raw-utf8","title":"Contract Sheet","rows":[],"raw":"'
+            )
+            $invalidBytes = [byte[]]@(0xC3, 0x28)
+            $suffixBytes = [Text.Encoding]::UTF8.GetBytes(
+                '","canary":"' + [string]$case.LeakToken + '"}'
+            )
+            $rawBytes = New-Object byte[] ($prefixBytes.Length + $invalidBytes.Length + $suffixBytes.Length)
+            [Array]::Copy($prefixBytes, 0, $rawBytes, 0, $prefixBytes.Length)
+            [Array]::Copy($invalidBytes, 0, $rawBytes, $prefixBytes.Length, $invalidBytes.Length)
+            [Array]::Copy(
+                $suffixBytes,
+                0,
+                $rawBytes,
+                $prefixBytes.Length + $invalidBytes.Length,
+                $suffixBytes.Length
+            )
+            [IO.File]::WriteAllBytes($responsePath, $rawBytes)
+        } else {
+            Write-TestUtf8 -Path $responsePath -Text ([string]$case.Body)
+        }
         Write-TestUtf8 `
-            -Path (Join-Path $script:TestRoot ('response-' + ($index + 1) + '.json')) `
-            -Text ([string]$cases[$index].Body)
+            -Path (Join-Path $script:TestRoot ('status-' + $responseIndex + '.txt')) `
+            -Text ([string]$case.HttpStatus)
+        Write-TestUtf8 `
+            -Path (Join-Path $script:TestRoot ('content-type-' + $responseIndex + '.txt')) `
+            -Text ([string]$case.ContentType)
+        Write-TestUtf8 `
+            -Path (Join-Path $script:TestRoot ('length-extra-' + $responseIndex + '.txt')) `
+            -Text ([string]$case.DeclaredLengthExtra)
     }
 
     $childShell = if ($PSVersionTable.PSEdition -ceq 'Desktop') {
@@ -360,7 +487,7 @@ try {
     $serverJob = Start-TestResponseServer `
         -Port $port `
         -Root $script:TestRoot `
-        -ResponseCount $cases.Count `
+        -ResponseCount $responseIndex `
         -ReadyPath $readyPath `
         -ErrorPath $serverErrorPath
 
@@ -373,43 +500,49 @@ try {
             -ChildShell $childShell
         $prefix = [string]$case.Name
 
-        Assert-True ($prefix + ' reached the real bus entrypoint and loopback transport') (
-            Test-Path -LiteralPath $result.RequestPath -PathType Leaf
-        )
+        if ($case.ExpectRequest) {
+            Assert-True ($prefix + ' reached the real bus entrypoint and loopback transport') (
+                Test-Path -LiteralPath $result.RequestPath -PathType Leaf
+            )
+        } else {
+            Assert-True ($prefix + ' fails before making a transport request') (
+                -not (Test-Path -LiteralPath $result.RequestPath)
+            )
+        }
         Assert-True ($prefix + ' never exposes the bus secret') (
-            -not $result.Rendered.Contains($script:FakeSecret)
+            -not (Test-ContainsIgnoringWhitespace -Text $result.Rendered -Needle $script:FakeSecret)
         )
 
         $request = if ($result.RequestText) { $result.RequestText | ConvertFrom-Json } else { $null }
         $expectedWireAction = if ($case.IsRead) { 'read' } else { [string]$case.Action }
-        Assert-True ($prefix + ' sends the expected wire action') (
-            $null -ne $request -and [string]$request.action -ceq $expectedWireAction
-        ) $(if ($null -eq $request) { 'no captured JSON request' } else { 'action=' + [string]$request.action })
-        if ($prefix -ceq 'whitespace-title-selector') {
-            Assert-True ($prefix + ' sends the nonempty whitespace Title selector') (
-                $null -ne $request -and
-                $null -ne $request.PSObject.Properties['title'] -and
-                [string]$request.title -ceq '   '
-            )
+        if ($case.ExpectRequest) {
+            Assert-True ($prefix + ' sends the expected wire action') (
+                $null -ne $request -and [string]$request.action -ceq $expectedWireAction
+            ) $(if ($null -eq $request) { 'no captured JSON request' } else { 'action=' + [string]$request.action })
         }
-        if ($prefix -ceq 'whitespace-file-id-selector') {
-            Assert-True ($prefix + ' sends the nonempty whitespace FileId selector') (
-                $null -ne $request -and
-                $null -ne $request.PSObject.Properties['fileId'] -and
-                [string]$request.fileId -ceq '   '
-            )
-        }
-
-        if ($case.IsRead) {
-            $metadata = if ($result.MetadataText) { $result.MetadataText | ConvertFrom-Json } else { $null }
+        if ($case.IsRead -and $case.ExpectMetadata) {
+            $expectedMetadata = [ordered]@{}
+            if ($null -ne $case.ExpectedTransportExit) {
+                $expectedMetadata.transport_exit = [int]$case.ExpectedTransportExit
+            }
+            $expectedMetadata.http_status = [int]$case.HttpStatus
+            $expectedMetadata.content_type_class = [string]$case.ExpectedContentTypeClass
+            $expectedMetadataText = $expectedMetadata | ConvertTo-Json -Compress
             Assert-True ($prefix + ' preserves sanitized transport metadata') (
-                $null -ne $metadata -and
-                $metadata.transport_exit -isnot [string] -and
-                [int]$metadata.transport_exit -eq 0 -and
-                $metadata.http_status -isnot [string] -and
-                [int]$metadata.http_status -eq 200 -and
-                [string]$metadata.content_type_class -ceq 'json'
-            ) $result.MetadataText
+                [string]$result.MetadataText -ceq [string]$expectedMetadataText -and
+                -not (Test-ContainsIgnoringWhitespace -Text $result.MetadataText -Needle $script:FakeSecret) -and
+                -not (Test-ContainsIgnoringWhitespace -Text $result.MetadataText -Needle $script:BusUrl) -and
+                -not (Test-ContainsIgnoringWhitespace -Text $result.MetadataText -Needle ([string]$case.LeakToken))
+            ) ('expected=' + $expectedMetadataText + '; actual=' + $result.MetadataText)
+        } elseif ($case.IsRead) {
+            $localMetadataUntouched = if ($case.AliasOutputMetadata) {
+                [string]$result.MetadataText -ceq [string]$result.Sentinel
+            } else {
+                -not (Test-Path -LiteralPath $result.MetadataPath)
+            }
+            Assert-True ($prefix + ' makes no metadata write during local preflight') (
+                $localMetadataUntouched
+            )
         }
 
         if ($case.Valid) {
@@ -445,14 +578,14 @@ try {
         } else {
             Assert-True ($prefix + ' fails closed') ($result.ExitCode -ne 0) ('exit=' + $result.ExitCode)
             Assert-True ($prefix + ' reports the stable semantic code') (
-                $result.Rendered.Contains('BUS_READ_RESPONSE_INVALID')
+                $result.Rendered.Contains([string]$case.ExpectedErrorCode)
             )
             Assert-True ($prefix + ' keeps diagnostics bounded') (
                 $result.Rendered.Length -le 2048
             ) ('length=' + $result.Rendered.Length)
             if (-not [string]::IsNullOrWhiteSpace([string]$case.LeakToken)) {
                 Assert-True ($prefix + ' never emits the response-body canary') (
-                    -not $result.Rendered.Contains([string]$case.LeakToken)
+                    -not (Test-ContainsIgnoringWhitespace -Text $result.Rendered -Needle ([string]$case.LeakToken))
                 )
             }
             if ($case.UseOutFile) {
