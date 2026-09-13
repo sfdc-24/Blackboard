@@ -333,6 +333,32 @@ try {
         (-not ($res11.Text -cmatch 'MATCHED')) `
         'reporting either would be a guess presented as evidence'
 
+    # ---- fixture 11b: ambiguity must not hide a definite match ------------
+    # chatgpt-codex-connector, reviewing PR89. Ambiguity was checked BEFORE
+    # matches, so a profile that could not separate two candidates suppressed a
+    # definite unique match for the same candidate in a DIFFERENT profile. That
+    # is global suppression by another name - the exact thing I had just argued
+    # against in codex's own proposal, reintroduced one scope down.
+    $r11b = Join-Path $WORK 'r11b'
+    # Chrome: clean, unique, definite evidence for LAPTOP_CHROME.
+    New-FixtureProfile -Root $r11b -Profile 'Profile 9' -Version '1.0.93' -Tables @(
+        @{ Name = '000001.ldb'; Body = (New-RealisticBody $ANON_ID $LAPTOP_CHROME 'Clean Chrome'); AgeMinutes = 5 }
+    ) | Out-Null
+    # Edge: muddled - both candidates clear the floor here.
+    $muddled = $NUL + '&bridgeDeviceId' + $NUL + '@' + '"295592ab-1617-486d-b1b4' + $NUL + 'x"' +
+               $NUL + '&bridgeDeviceId' + $NUL + '@' + '"7e788713-677b-43ea-98ae' + $NUL + 'y"'
+    New-FixtureProfile -Root $r11b -Profile 'Profile 2' -Version '1.0.93' -Tables @(
+        @{ Name = '000002.ldb'; Body = $muddled; AgeMinutes = 5 }
+    ) | Out-Null
+
+    $res11b = Invoke-Sut -Root $r11b -Ids @($LAPTOP_CHROME, $LAPTOP_EDGE)
+    Assert-True 'a definite match wins over ambiguity in another profile' `
+        ($res11b.Text -cmatch ('MATCHED\*?\s+' + [regex]::Escape($LAPTOP_CHROME))) `
+        'ambiguity elsewhere must not suppress unique positive evidence here'
+    Assert-True 'the candidate with only ambiguous evidence stays AMBIGUOUS' `
+        ($res11b.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_EDGE))) `
+        'ambiguity is profile-local, but it still applies where nothing definite exists'
+
     # ---- fixture 12: conflicting complete ids, misleading mtimes ----------
     # Files are walked newest-mtime-first, and that ordering was being treated
     # as LevelDB's. It is not - LevelDB orders by sequence number, and a

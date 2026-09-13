@@ -492,12 +492,13 @@ if ($DeviceId.Count -gt 0) {
             # "no id here" would be the same empty-set mistake one level down -
             # a scan that could not see the value, presented as a value that is
             # not there.
-            Write-Output '  LIMIT: this reads those files as ASCII and matches the key as'
-            Write-Output '  TEXT. An id stored binary or compressed would produce this same'
-            Write-Output '  result, so this is "no bridgeDeviceId as readable text in the'
-            Write-Output '  paths above" - NOT proof the browser has no id. Measured on'
-            Write-Output '  extension 1.0.92 the key is plain text; 1.0.91 appears not to'
-            Write-Output '  persist it at all, but that was established the same ASCII way.'
+            Write-Output '  LIMIT: this reads those files as Latin-1 - byte-faithful, so no'
+            Write-Output '  byte is lost - and matches the KEY as text. An id whose key is'
+            Write-Output '  itself stored compressed or encoded would produce this same'
+            Write-Output '  result, so this is "no bridgeDeviceId key as readable text in'
+            Write-Output '  the paths above" - NOT proof the browser has no id. The VALUE'
+            Write-Output '  being unreadable is expected and handled: it is matched by'
+            Write-Output '  contiguous run, not read back.'
         }
         exit 2
     }
@@ -507,18 +508,31 @@ if ($DeviceId.Count -gt 0) {
     foreach ($d in $DeviceId) {
         # MatchedIds first: it survives a compressed value. DeviceId equality is
         # kept as a fallback for the uncompressed case and costs nothing.
-        # A profile that could not tell two candidates apart must not answer for
-        # EITHER of them. Reported separately from a clean miss, because
-        # "ambiguous here" and "not here" call for different next actions.
-        $amb = @($rows | Where-Object { $_.Ambiguous -contains $d })
-        if ($amb.Count -gt 0) {
-            $ambiguous++
-            $a = $amb[0]
-            Write-Output ("  AMBIGUOUS {0}  -> {1} / {2} matched more than one candidate; refusing to guess" -f $d, $a.Browser, $a.Profile)
-            continue
+        # DEFINITE EVIDENCE FIRST. AMBIGUITY IS PROFILE-LOCAL.
+        #
+        # Found by chatgpt-codex-connector reviewing PR89, and it is the same
+        # mistake I had just objected to in its own proposal: I argued that one
+        # unresolved profile must not suppress verdicts for every other
+        # profile, and then checked ambiguity before matches - so a profile
+        # that could not separate two candidates silently suppressed a
+        # DEFINITE, unique match for the same candidate in a different profile.
+        # Global suppression by another name, and I wrote it while arguing
+        # against it.
+        #
+        # A machine with a clean Chrome match and a muddled Edge profile knows
+        # perfectly well where that id lives. AMBIGUOUS is now reported only
+        # when no profile offers unique positive evidence.
+        $hit = @($rows | Where-Object { ($_.MatchedIds -contains $d) -or ($_.DeviceId -eq $d) })
+        if ($hit.Count -eq 0) {
+            $amb = @($rows | Where-Object { $_.Ambiguous -contains $d })
+            if ($amb.Count -gt 0) {
+                $ambiguous++
+                $a = $amb[0]
+                Write-Output ("  AMBIGUOUS {0}  -> {1} / {2} matched more than one candidate; refusing to guess" -f $d, $a.Browser, $a.Profile)
+                continue
+            }
         }
 
-        $hit = @($rows | Where-Object { ($_.MatchedIds -contains $d) -or ($_.DeviceId -eq $d) })
         if ($hit.Count -gt 0) {
             $h = $hit[0]
             $live = $(if ($h.Running -and $h.Windows -gt 0) { 'LIVE' } else { 'installed but not running' })
