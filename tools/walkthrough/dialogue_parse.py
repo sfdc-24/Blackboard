@@ -40,12 +40,39 @@ def fail(msg):
     raise SystemExit(1)
 
 
+class TurnError(Exception):
+    """One turn is unplayable. Raised rather than exiting, so the caller can
+    decide between refusing the file and stopping at this turn."""
+
+
 def main(argv):
-    if len(argv) != 2:
-        sys.stderr.write("usage: dialogue_parse.py <dialogue.json>\n")
+    # --allow-partial exists because of a real cost, not a preference.
+    #
+    # All-or-nothing is the right DEFAULT: a dialogue is played into a live
+    # meeting, and discovering at turn 5 that turn 6 is malformed leaves five
+    # turns already spoken. But the cost of that default is a typo in the last
+    # turn refusing a rehearsal that is 95% fine, possibly at T-2 with a guest
+    # already on the call. Refusing to speak at all is not obviously better
+    # than speaking the part that is known good.
+    #
+    # So the operator gets the choice, and the default stays safe. Partial
+    # plays the valid LEADING turns and stops at the first bad one - it never
+    # SKIPS a turn and carries on, because a dialogue missing its middle puts
+    # an answer with no question in front of the guest, which is the failure
+    # this tool was built around.
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    flags = [a for a in argv[1:] if a.startswith("--")]
+    allow_partial = "--allow-partial" in flags
+
+    for f in flags:
+        if f != "--allow-partial":
+            sys.stderr.write("unknown option: " + f + "\n")
+            raise SystemExit(2)
+    if len(args) != 1:
+        sys.stderr.write("usage: dialogue_parse.py <dialogue.json> [--allow-partial]\n")
         raise SystemExit(2)
 
-    path = argv[1]
+    path = args[0]
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
@@ -71,47 +98,79 @@ def main(argv):
     if not turns:
         fail("the dialogue is empty - refusing to claim a rehearsal happened")
 
-    records = []
-    seen_personas = set()
-    for index, turn in enumerate(turns, start=1):
+    def check(turn, index):
+        """Return (persona, text) or raise TurnError. Raising rather than
+        exiting is what lets --allow-partial stop here instead of dying."""
         where = "turn " + str(index)
         if not isinstance(turn, dict):
-            fail(where + " is " + type(turn).__name__ + ", expected an object")
+            raise TurnError(where + " is " + type(turn).__name__ + ", expected an object")
 
         persona = turn.get("persona")
         if not isinstance(persona, str) or not persona.strip():
-            fail(where + " has no 'persona'")
+            raise TurnError(where + " has no 'persona'")
         persona = persona.strip().lower()
         if persona not in KNOWN_PERSONAS:
-            fail(where + " has persona '" + persona + "', which has no voice on "
-                 "this rig. Known: " + ", ".join(KNOWN_PERSONAS) + ". Refusing "
-                 "rather than defaulting, so two speakers cannot silently "
-                 "become one voice.")
+            raise TurnError(
+                where + " has persona '" + persona + "', which has no voice on "
+                "this rig. Known: " + ", ".join(KNOWN_PERSONAS) + ". Refusing "
+                "rather than defaulting, so two speakers cannot silently "
+                "become one voice.")
 
         text = turn.get("text")
         if not isinstance(text, str):
-            fail(where + " has no 'text' string")
+            raise TurnError(where + " has no 'text' string")
         # Collapse whitespace: espeak-ng reads a newline as a pause long enough
         # to sound like the speaker stopped, and JSON prose is often wrapped.
         text = " ".join(text.split())
         if not text:
-            fail(where + " has empty text - refusing to speak a silent turn")
+            raise TurnError(where + " has empty text - refusing to speak a silent turn")
         if len(text) > MAX_TURN_CHARS:
-            fail(where + " is " + str(len(text)) + " chars, over the "
-                 + str(MAX_TURN_CHARS) + " limit. Split it: a single "
-                 "uninterruptible block that long cannot be talked over by a "
-                 "human who wants to interject.")
+            raise TurnError(
+                where + " is " + str(len(text)) + " chars, over the "
+                + str(MAX_TURN_CHARS) + " limit. Split it: a single "
+                "uninterruptible block that long cannot be talked over by a "
+                "human who wants to interject.")
+        return persona, text
+
+    records = []
+    seen_personas = set()
+    stopped_at = None
+    for index, turn in enumerate(turns, start=1):
+        try:
+            persona, text = check(turn, index)
+        except TurnError as exc:
+            if not allow_partial:
+                fail(str(exc))
+            # Stop here. Do NOT skip this turn and keep going: a dialogue
+            # missing its middle puts an answer with no question in front of
+            # the guest, which is worse than a short rehearsal.
+            stopped_at = (index, str(exc))
+            break
 
         seen_personas.add(persona)
         encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
         records.append(str(index) + " " + persona + " " + encoded)
 
+    if not records:
+        fail("no playable turns" + (": " + stopped_at[1] if stopped_at else ""))
+
     # A "dialogue" with one speaker is a monologue, and playing it through this
     # tool would present one voice as though the cross-examination happened.
+    # This applies to the PLAYED set, so a partial run that trims back to one
+    # voice is refused for the same reason a one-persona file is.
     if len(seen_personas) < 2:
-        fail("every turn is persona '" + list(seen_personas)[0] + "'. That is a "
-             "monologue, not a dialogue - use presenter_say.sh for a single "
-             "voice, or add the other side.")
+        fail("the playable turns are all persona '" + list(seen_personas)[0]
+             + "'. That is a monologue, not a dialogue - use presenter_say.sh "
+             "for a single voice, or fix the turn that stopped it"
+             + (" (" + stopped_at[1] + ")" if stopped_at else ""))
+
+    if stopped_at:
+        # stderr, so it cannot be mistaken for a playable record on stdout,
+        # and loud, because a shortened rehearsal that nobody noticed was
+        # shortened is its own kind of false green.
+        sys.stderr.write(
+            "PARTIAL: playing " + str(len(records)) + " of " + str(len(turns))
+            + " turns; stopped at " + stopped_at[1] + "\n")
 
     sys.stdout.write("\n".join(records) + "\n")
     return 0

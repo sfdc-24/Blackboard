@@ -213,6 +213,68 @@ else
   bad "drift: rc=${rc} spoke=${n} - expected rc!=0 with 0 spoken"
 fi
 
+# ---- 8c. --allow-partial: the operator's escape hatch ----------------------
+# All-or-nothing is the right default and it has a real cost: a typo in the
+# last turn refuses a rehearsal that is 95% fine, possibly at T-2. Partial
+# plays the valid LEADING turns and stops - it must never SKIP a turn and
+# carry on, because a dialogue missing its middle is the "answer with no
+# question" failure this tool was built around.
+install_stub ok
+write_json partial.json '[{"persona":"ba","text":"one"},{"persona":"sa","text":"two"},{"persona":"ba","text":"three"},{"persona":"sa","text":""}]'
+
+out=$(bash "${SAND}/presenter_dialogue.sh" "${WORK}/partial.json" 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${rc}" -ne 0 ] && [ "${n}" -eq 0 ]; then
+  ok "without --allow-partial the default still refuses the whole file"
+else
+  bad "default changed: rc=${rc} spoke=${n} - all-or-nothing must remain the default"
+fi
+
+install_stub ok
+out=$(bash "${SAND}/presenter_dialogue.sh" "${WORK}/partial.json" --allow-partial 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${rc}" -eq 0 ] && [ "${n}" -eq 3 ]; then
+  ok "--allow-partial plays the 3 valid leading turns and stops"
+else
+  bad "--allow-partial: rc=${rc} spoke=${n} of 3 valid"
+fi
+if printf '%s' "${out}" | grep -q 'PARTIAL: playing 3 of 4'; then
+  ok "it says how many of how many it played"
+else
+  bad "a shortened rehearsal did not announce that it was shortened"
+fi
+if printf '%s' "${out}" | grep -q 'SHORTENED'; then
+  ok "the shortening is repeated at the END, where the operator reads"
+else
+  bad "the last line described a truncated rehearsal as a clean one"
+fi
+
+# It must STOP, not skip. A bad turn 2 with valid 3 and 4 must play only 1.
+install_stub ok
+write_json midbad.json '[{"persona":"ba","text":"one"},{"persona":"sa","text":""},{"persona":"ba","text":"three"},{"persona":"sa","text":"four"}]'
+out=$(bash "${SAND}/presenter_dialogue.sh" "${WORK}/midbad.json" --allow-partial 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${n}" -le 1 ]; then
+  ok "a bad middle turn stops playback rather than skipping to the good ones"
+else
+  bad "spoke ${n} turns across a gap - that puts an answer with no question in the room"
+fi
+
+# Trimming back to one voice is still a monologue and still refused.
+install_stub ok
+write_json trimmono.json '[{"persona":"ba","text":"one"},{"persona":"ba","text":""},{"persona":"sa","text":"three"}]'
+out=$(bash "${SAND}/presenter_dialogue.sh" "${WORK}/trimmono.json" --allow-partial 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${rc}" -ne 0 ] && [ "${n}" -eq 0 ]; then
+  ok "a partial run that trims back to ONE voice is refused as a monologue"
+else
+  bad "partial trimmed to a monologue and played it: rc=${rc} spoke=${n}"
+fi
+
 # ---- 9. parser personas and voice table are in step -------------------------
 # These live in two files and drift silently: the parser would accept a persona
 # the player has no voice for, and the player would refuse at playback time -

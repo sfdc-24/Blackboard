@@ -33,6 +33,7 @@ SAY="${HERE}/presenter_say.sh"
 PARSER="${HERE}/dialogue_parse.py"
 
 DRY_RUN=0
+ALLOW_PARTIAL=0
 FILE=""
 
 # GAP BETWEEN TURNS. Not cosmetic: back-to-back synthesis runs together into
@@ -52,6 +53,7 @@ usage() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        --allow-partial) ALLOW_PARTIAL=1 ;;
         -h|--help) usage ;;
         -*) echo "unknown option: $1" >&2; usage ;;
         *)
@@ -113,8 +115,19 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is missing" >&2; exit 1; }
 command -v base64  >/dev/null 2>&1 || { echo "base64 is missing" >&2; exit 1; }
 
 # VALIDATE THE WHOLE FILE FIRST. Nothing below runs unless every turn parsed.
-RECORDS="$(python3 "${PARSER}" "${FILE}")"
+PARSER_ARGS=""
+if [ "${ALLOW_PARTIAL}" -eq 1 ]; then PARSER_ARGS="--allow-partial"; fi
+
+# The parser's PARTIAL notice goes to stderr so it cannot be mistaken for a
+# playable record. Capture it separately and print it where the operator will
+# see it, because a rehearsal that was silently shortened is its own false
+# green - the run "succeeded" and the guest heard two thirds of the argument.
+PARSE_NOTE="$(mktemp /tmp/dialogue-parse-XXXXXX.err)"
+RECORDS="$(python3 "${PARSER}" "${FILE}" ${PARSER_ARGS} 2>"${PARSE_NOTE}")"
 PARSE_RC=$?
+if [ -s "${PARSE_NOTE}" ]; then cat "${PARSE_NOTE}" >&2; fi
+PARTIAL_NOTICE="$(grep '^PARTIAL:' "${PARSE_NOTE}" 2>/dev/null || true)"
+rm -f "${PARSE_NOTE}"
 if [ "${PARSE_RC}" -ne 0 ]; then
     echo "refusing to play ${FILE} - it did not validate" >&2
     exit 1
@@ -219,6 +232,16 @@ if [ "${DRY_RUN}" -eq 1 ]; then
     echo "Validated and voiced-resolved only. NOTHING was spoken."
 else
     echo "dialogue_ok turns=${spoken} file=${FILE}"
+fi
+
+# Repeated at the END as well as when the parser said it. The operator reads
+# the last line of a run, and "dialogue_ok" on its own would describe a
+# truncated rehearsal as a clean one.
+if [ -n "${PARTIAL_NOTICE}" ]; then
+    echo ""
+    echo "*** ${PARTIAL_NOTICE}"
+    echo "*** This rehearsal was SHORTENED. The turns after the one named above"
+    echo "*** were not played, and the dialogue ends where it was cut."
 fi
 
 # The count is returned rather than implied by exit 0, so a caller can assert

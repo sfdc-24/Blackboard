@@ -85,6 +85,13 @@ tools/walkthrough/presenter_dialogue.sh \
     tools/walkthrough/dialogue/ba-sa-rehearsal-20260912.json --dry-run
 ```
 
+If a turn is malformed at T-2 and you would rather have most of the rehearsal
+than none of it, `--allow-partial` plays the valid **leading** turns and stops at
+the bad one, announcing what it dropped both when it decides and again on the
+last line. It never *skips* a turn and continues — a dialogue missing its middle
+puts an answer with no question in front of the guest. A partial run that trims
+back to a single voice is still refused as a monologue.
+
 Two refusals that are deliberate, so they are not surprises at T-2:
 
 - **One bad turn refuses the whole file.** Validation completes before anything is
