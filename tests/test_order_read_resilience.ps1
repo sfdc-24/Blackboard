@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 param(
     [switch]$KeepArtifacts,
-    [switch]$SimulateJsonDateCoercion
+    [switch]$SimulateJsonDateCoercion,
+    [ValidateSet('Full', 'IwrOnly')][string]$Scope = 'Full'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -106,6 +107,64 @@ function ConvertTo-SquashedText {
     return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', '')
 }
 
+function Test-ExactByteSequence {
+    param(
+        [AllowNull()][byte[]]$Actual,
+        [AllowNull()][byte[]]$Expected
+    )
+
+    if ($null -eq $Actual -or $null -eq $Expected -or $Actual.Count -ne $Expected.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Actual.Count; $index++) {
+        if ($Actual[$index] -ne $Expected[$index]) { return $false }
+    }
+    return $true
+}
+
+function Test-SanitizedIwrNetworkFailure {
+    param(
+        [Parameter(Mandatory = $true)]$Run,
+        [Parameter(Mandatory = $true)][int]$ExpectedCallCount
+    )
+
+    $outputText = ConvertTo-SquashedText -Lines $Run.output
+    # Strip presentation markup only for positive message matching. The raw
+    # squashed output below remains the input to all canary-absence checks.
+    $plainOutputLines = @($Run.output | ForEach-Object {
+        [string]$_ -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+    })
+    $positiveOutputText = (ConvertTo-FlowedText -Lines $plainOutputLines) -replace '\s+', ''
+    if ($Run.exit_code -eq 0 -or
+        @($Run.trace.calls).Count -ne $ExpectedCallCount -or
+        $Run.trace.exception_type -cne 'System.Net.WebException' -or
+        $Run.trace.exception_message -cne 'BUS_READ_NETWORK_ERROR: read transport failed before an HTTP response was received.' -or
+        $null -ne $Run.trace.inner_exception_type -or
+        $null -ne $Run.trace.inner_exception_message -or
+        $Run.metadata_text -cne '{}' -or
+        -not (Test-ExactByteSequence -Actual $Run.metadata_bytes -Expected ([byte[]](0x7b, 0x7d))) -or
+        @($Run.metadata.PSObject.Properties).Count -ne 0 -or
+        $Run.out_text -cne $Run.sentinel -or
+        -not (Test-ExactByteSequence -Actual $Run.out_bytes -Expected $Run.sentinel_bytes) -or
+        -not $positiveOutputText.Contains('BUS_READ_NETWORK_ERROR:readtransportfailedbeforeanHTTPresponsewasreceived.')) {
+        return $false
+    }
+
+    foreach ($canary in @(
+        'RAW_IWR_',
+        'BUS_URL_IWR_CANARY',
+        'BUS_SECRET_IWR_CANARY',
+        'ONE_SHOT_IWR_CANARY'
+    )) {
+        if ($outputText.Contains($canary) -or
+            ([string]$Run.metadata_text).Contains($canary) -or
+            ([string]$Run.trace_text).Contains($canary)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Write-TestUtf8 {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -116,6 +175,16 @@ function Write-TestUtf8 {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Get-TestPort {
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return [int]$listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
 }
 
 # HOW THE FAKE curl.exe GETS BUILT, AND WHY NOT WITH Add-Type.
@@ -361,6 +430,95 @@ function Invoke-ReadCase {
     }
 }
 
+function Invoke-ActualBusClosedPortSupervisorCase {
+    $caseRoot = Join-Path $script:TestRoot 'actual-bus-iwr-closed-port-supervisor'
+    $releaseRoot = Join-Path $caseRoot 'release'
+    $scriptsRoot = Join-Path $releaseRoot 'scripts'
+    $workspace = Join-Path $caseRoot 'workspace'
+    $emptyPath = Join-Path $caseRoot 'empty-path'
+    $statePath = Join-Path $caseRoot 'state.json'
+    $logPath = Join-Path $caseRoot 'events.jsonl'
+    $envPath = Join-Path $caseRoot 'test.env'
+    $markerPath = Join-Path $caseRoot 'claude-called.txt'
+    $fakeClaudePath = Join-Path $caseRoot 'fake-claude.ps1'
+
+    New-Item -ItemType Directory -Path $scriptsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $workspace '.git') -Force | Out-Null
+    New-Item -ItemType Directory -Path $emptyPath -Force | Out-Null
+    Copy-Item -LiteralPath $RunnerPath -Destination (Join-Path $scriptsRoot 'order_supervisor.ps1')
+    Copy-Item -LiteralPath $ModulePath -Destination (Join-Path $scriptsRoot 'OrderSupervisor.psm1')
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\bus.ps1') -Destination (Join-Path $scriptsRoot 'bus.ps1')
+    Write-TestUtf8 -Path $fakeClaudePath -Text $fakeClaudeSource
+
+    $closedPort = Get-TestPort
+    $rawExceptionCanary = 'RAW_IWR_EXCEPTION_CANARY'
+    $oneShotCanary = 'ONE_SHOT_IWR_CANARY'
+    $busUrl = 'http://127.0.0.1:' + $closedPort + '/' +
+        $rawExceptionCanary + '/' + $oneShotCanary
+    $secretCanary = 'CLOSED_PORT_SECRET_CANARY'
+    Write-TestUtf8 -Path $envPath -Text ("BUS_URL=$busUrl`nBUS_SECRET=$secretCanary`n")
+
+    $state = New-OrderState -Mode Execute
+    $state.initialized = $true
+    $state.cursor.timestamp = '2026-09-07T08:00:00.0000000Z'
+    $state.cursor.row_id = 'cursor-before-closed-port'
+    Save-OrderState -Path $statePath -State $state
+
+    $previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+    $previousMarker = [Environment]::GetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', 'Process')
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # The resolved child executable is invoked by absolute path, while an
+        # empty child PATH forces the unmodified bus client through genuine IWR.
+        [Environment]::SetEnvironmentVariable('PATH', $emptyPath, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', $markerPath, 'Process')
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $script:ResolvedChildShell `
+            -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $scriptsRoot 'order_supervisor.ps1') `
+            -Mode Execute `
+            -StatePath $statePath `
+            -LogPath $logPath `
+            -EnvFile $envPath `
+            -WorkspacePath $workspace `
+            -ClaudeCommand $fakeClaudePath 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', $previousMarker, 'Process')
+    }
+
+    $jsonLine = @($output | ForEach-Object { [string]$_ } |
+        Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $result = if ($jsonLine.Count -eq 1) {
+        $jsonLine[0] | ConvertFrom-Json @script:JsonDateArgs
+    } else { $null }
+    $events = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+        @([IO.File]::ReadAllLines($logPath, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json @script:JsonDateArgs })
+    } else { @() }
+    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) |
+        ConvertFrom-Json @script:JsonDateArgs
+
+    return [pscustomobject][ordered]@{
+        exit_code = $exitCode
+        output = @($output)
+        result = $result
+        events = @($events)
+        state = $savedState
+        log_text = $(if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+            [IO.File]::ReadAllText($logPath, [Text.Encoding]::UTF8)
+        } else { '' })
+        bus_url = $busUrl
+        raw_exception_canary = $rawExceptionCanary
+        one_shot_canary = $oneShotCanary
+        secret_canary = $secretCanary
+        claude_called = Test-Path -LiteralPath $markerPath -PathType Leaf
+    }
+}
+
 function Invoke-ActualBusMetadataCase {
     $caseRoot = Join-Path $script:TestRoot 'actual-bus-sidecar'
     $fakeBin = Join-Path $caseRoot 'bin'
@@ -378,8 +536,10 @@ using System.Text;
 public static class FakeCurl {
     public static int Main(string[] args) {
         string headerPath = null;
+        string outputPath = null;
         for (int i = 0; i + 1 < args.Length; i++) {
-            if (args[i] == "-D") { headerPath = args[i + 1]; break; }
+            if (args[i] == "-D") { headerPath = args[i + 1]; }
+            if (args[i] == "-o") { outputPath = args[i + 1]; }
         }
         if (!String.IsNullOrEmpty(headerPath)) {
             File.WriteAllText(
@@ -388,8 +548,13 @@ public static class FakeCurl {
                 new UTF8Encoding(false)
             );
         }
-        Console.OutputEncoding = new UTF8Encoding(false);
-        Console.Write(Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_BODY") ?? String.Empty);
+        string body = Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_BODY") ?? String.Empty;
+        if (!String.IsNullOrEmpty(outputPath)) {
+            File.WriteAllText(outputPath, body, new UTF8Encoding(false));
+        } else {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            Console.Write(body);
+        }
         int exitCode;
         return Int32.TryParse(Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_EXIT"), out exitCode)
             ? exitCode
@@ -422,14 +587,20 @@ BUS_SECRET=BUS_SECRET_CANARY
         )
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_BODY', '<html>ACTUAL_BUS_BODY_CANARY</html>', 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_EXIT', '7', 'Process')
-        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
-            -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
-            -Action read `
-            -Title 'test board' `
-            -OutFile $outPath `
-            -EnvFile $envPath `
-            -ReadMetadataOutFile $metadataPath 2>&1)
-        $exitCode = $LASTEXITCODE
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
+                -Action read `
+                -Title 'test board' `
+                -OutFile $outPath `
+                -EnvFile $envPath `
+                -ReadMetadataOutFile $metadataPath 2>&1)
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
     } finally {
         foreach ($name in $variables) {
             [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
@@ -452,7 +623,7 @@ function Invoke-ActualBusSecondRedirectCase {
     $envPath = Join-Path $caseRoot 'test.env'
     $outPath = Join-Path $caseRoot 'response.txt'
     $metadataPath = Join-Path $caseRoot 'metadata.json'
-    $expectedBody = '{"ok":true,"rows":[]}'
+    $expectedBody = '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}'
     New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
 
     $fakeCurlSource = @'
@@ -476,8 +647,10 @@ public static class FakeSecondRedirectCurl {
         );
 
         string headerPath = null;
+        string outputPath = null;
         for (int i = 0; i + 1 < args.Length; i++) {
-            if (args[i] == "-D") { headerPath = args[i + 1]; break; }
+            if (args[i] == "-D") { headerPath = args[i + 1]; }
+            if (args[i] == "-o") { outputPath = args[i + 1]; }
         }
         if (String.IsNullOrEmpty(headerPath)) { return 91; }
 
@@ -498,15 +671,19 @@ public static class FakeSecondRedirectCurl {
                 finalBody = "<html>FINAL_REDIRECT_BODY_CANARY</html>";
             } else {
                 finalHeader = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n\r\n";
-                finalBody = "{\"ok\":true,\"rows\":[]}";
+                finalBody = "{\"ok\":true,\"fileId\":\"test-board-id\",\"title\":\"test board\",\"rows\":[]}";
             }
             File.WriteAllText(
                 headerPath,
                 "HTTP/1.1 302 Found\r\nLocation: https://CANONICAL_REDIRECT_CANARY.invalid/exec\r\n\r\n" + finalHeader,
                 new UTF8Encoding(false)
             );
-            Console.OutputEncoding = new UTF8Encoding(false);
-            Console.Write(finalBody);
+            if (!String.IsNullOrEmpty(outputPath)) {
+                File.WriteAllText(outputPath, finalBody, new UTF8Encoding(false));
+            } else {
+                Console.OutputEncoding = new UTF8Encoding(false);
+                Console.Write(finalBody);
+            }
             return 0;
         }
         return 92;
@@ -615,7 +792,17 @@ param(
     [Parameter(Mandatory = $true)][string]$MetadataPath,
     [Parameter(Mandatory = $true)][string]$TracePath,
     [Parameter(Mandatory = $true)][string]$EmptyPath,
-    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location', 'realistic-5-1-redirect')][string]$Scenario
+    [Parameter(Mandatory = $true)][ValidateSet(
+        'success',
+        'initial-network-failure',
+        'initial-errorvariable-no-response',
+        'network-failure',
+        'generic-network-failure',
+        'second-redirect',
+        'insecure-location',
+        'empty-location',
+        'realistic-5-1-redirect'
+    )][string]$Scenario
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -638,8 +825,30 @@ function Invoke-WebRequest {
         maximum_redirection = $MaximumRedirection
         uri_class = $(if ($Uri -like 'https://BUS_URL_IWR_CANARY.invalid/*') { 'bus' } else { 'redirect' })
         body_present = ($null -ne $Body)
+        error_action = [string]$PSBoundParameters['ErrorAction']
+        error_variable = [string]$PSBoundParameters['ErrorVariable']
     })
     if ($Method -ceq 'Post') {
+        if ($Scenario -ceq 'initial-network-failure') {
+            throw [System.Net.WebException]::new(
+                ('RAW_IWR_HOP1_THROW_CANARY ' + $Uri + ' BUS_SECRET_IWR_CANARY'),
+                [System.InvalidOperationException]::new(
+                    'RAW_IWR_HOP1_THROW_INNER_CANARY https://ONE_SHOT_IWR_CANARY.invalid/hop1-inner'
+                )
+            )
+        }
+        if ($Scenario -ceq 'initial-errorvariable-no-response') {
+            # Simulate an advanced IWR implementation that reports a response-less
+            # failure through -ErrorVariable while returning no response object.
+            # bus.ps1's explicit null path rethrows that record into its sanitizer.
+            Write-Error -Exception ([System.Net.WebException]::new(
+                ('RAW_IWR_HOP1_ERRORVARIABLE_CANARY ' + $Uri + ' BUS_SECRET_IWR_CANARY'),
+                [System.InvalidOperationException]::new(
+                    'RAW_IWR_HOP1_ERRORVARIABLE_INNER_CANARY https://ONE_SHOT_IWR_CANARY.invalid/hop1-errorvariable-inner'
+                )
+            )) -Category ConnectionError
+            return
+        }
         if ($Scenario -ceq 'realistic-5-1-redirect') {
             # WHAT THE REAL CMDLET DOES, which every other scenario here skips.
             # Measured on Windows PowerShell 5.1.26100.9444 against a local
@@ -677,7 +886,18 @@ function Invoke-WebRequest {
     if ($Method -cne 'Get') { throw 'IWR_TEST_METHOD_INVALID' }
     if ($Scenario -ceq 'network-failure') {
         throw [System.Net.WebException]::new(
-            'RAW_IWR_EXCEPTION_CANARY https://ONE_SHOT_IWR_CANARY.invalid/one-shot'
+            ('RAW_IWR_EXCEPTION_CANARY ' + $Uri + ' BUS_SECRET_IWR_CANARY'),
+            [System.InvalidOperationException]::new(
+                'RAW_IWR_WEB_INNER_CANARY https://ONE_SHOT_IWR_CANARY.invalid/web-inner'
+            )
+        )
+    }
+    if ($Scenario -ceq 'generic-network-failure') {
+        throw [System.TimeoutException]::new(
+            ('RAW_IWR_GENERIC_EXCEPTION_CANARY ' + $Uri + ' BUS_SECRET_IWR_CANARY'),
+            [System.InvalidOperationException]::new(
+                'RAW_IWR_GENERIC_INNER_CANARY https://ONE_SHOT_IWR_CANARY.invalid/generic-inner'
+            )
         )
     }
     if ($Scenario -ceq 'second-redirect') {
@@ -693,7 +913,10 @@ function Invoke-WebRequest {
     return [pscustomobject]@{
         StatusCode = 200
         Headers = @{ 'Content-Type' = 'application/json; charset=utf-8' }
-        Content = '{"ok":true,"rows":[]}'
+        Content = '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}'
+        RawContentStream = [IO.MemoryStream]::new(
+            [Text.Encoding]::UTF8.GetBytes('{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}')
+        )
     }
 }
 
@@ -715,6 +938,12 @@ try {
         calls = $global:OrderReadIwrFallbackCalls.ToArray()
         exception_type = $(if ($null -eq $caught) { $null } else { $caught.Exception.GetType().FullName })
         exception_message = $(if ($null -eq $caught) { $null } else { [string]$caught.Exception.Message })
+        inner_exception_type = $(if ($null -eq $caught -or $null -eq $caught.Exception.InnerException) {
+            $null
+        } else { $caught.Exception.InnerException.GetType().FullName })
+        inner_exception_message = $(if ($null -eq $caught -or $null -eq $caught.Exception.InnerException) {
+            $null
+        } else { [string]$caught.Exception.InnerException.Message })
     } | ConvertTo-Json -Depth 6 -Compress
     [IO.File]::WriteAllText($TracePath, $trace, [Text.UTF8Encoding]::new($false))
     Remove-Variable -Name OrderReadIwrFallbackCalls -Scope Global -Force -ErrorAction SilentlyContinue
@@ -743,27 +972,70 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         -Scenario success 2>&1)
     $successExitCode = $LASTEXITCODE
 
-    $failureRoot = Join-Path $caseRoot 'network-failure'
-    New-Item -ItemType Directory -Path $failureRoot -Force | Out-Null
-    $failureOutPath = Join-Path $failureRoot 'response.txt'
-    $failureMetadataPath = Join-Path $failureRoot 'metadata.json'
-    $failureTracePath = Join-Path $failureRoot 'trace.json'
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
-            -File $wrapperPath `
-            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
-            -EnvPath $envPath `
-            -OutPath $failureOutPath `
-            -MetadataPath $failureMetadataPath `
-            -TracePath $failureTracePath `
-            -EmptyPath $emptyPath `
-            -Scenario network-failure 2>&1)
-        $failureExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    function Invoke-IwrReadFailureScenario {
+        param(
+            [Parameter(Mandatory = $true)][string]$Name,
+            [Parameter(Mandatory = $true)][string]$Scenario,
+            [Parameter(Mandatory = $true)][string]$Sentinel
+        )
+
+        $scenarioRoot = Join-Path $caseRoot $Name
+        New-Item -ItemType Directory -Path $scenarioRoot -Force | Out-Null
+        $scenarioOutPath = Join-Path $scenarioRoot 'response.txt'
+        $scenarioMetadataPath = Join-Path $scenarioRoot 'metadata.json'
+        $scenarioTracePath = Join-Path $scenarioRoot 'trace.json'
+        Write-TestUtf8 -Path $scenarioOutPath -Text $Sentinel
+
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $scenarioOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File $wrapperPath `
+                -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+                -EnvPath $envPath `
+                -OutPath $scenarioOutPath `
+                -MetadataPath $scenarioMetadataPath `
+                -TracePath $scenarioTracePath `
+                -EmptyPath $emptyPath `
+                -Scenario $Scenario 2>&1)
+            $scenarioExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+
+        $scenarioMetadataText = [IO.File]::ReadAllText($scenarioMetadataPath, [Text.Encoding]::UTF8)
+        $scenarioTraceText = [IO.File]::ReadAllText($scenarioTracePath, [Text.Encoding]::UTF8)
+        return [pscustomobject][ordered]@{
+            exit_code = $scenarioExitCode
+            output = @($scenarioOutput)
+            metadata_text = $scenarioMetadataText
+            metadata_bytes = [byte[]][IO.File]::ReadAllBytes($scenarioMetadataPath)
+            metadata = $scenarioMetadataText | ConvertFrom-Json @script:JsonDateArgs
+            trace_text = $scenarioTraceText
+            trace = $scenarioTraceText | ConvertFrom-Json @script:JsonDateArgs
+            out_text = [IO.File]::ReadAllText($scenarioOutPath, [Text.Encoding]::UTF8)
+            out_bytes = [byte[]][IO.File]::ReadAllBytes($scenarioOutPath)
+            sentinel = $Sentinel
+            sentinel_bytes = [byte[]](New-Object Text.UTF8Encoding($false)).GetBytes($Sentinel)
+        }
     }
+
+    $initialFailure = Invoke-IwrReadFailureScenario `
+        -Name 'initial-network-failure' `
+        -Scenario 'initial-network-failure' `
+        -Sentinel 'IWR_HOP1_THROW_OUTFILE_SENTINEL'
+    $initialErrorVariableFailure = Invoke-IwrReadFailureScenario `
+        -Name 'initial-errorvariable-no-response' `
+        -Scenario 'initial-errorvariable-no-response' `
+        -Sentinel 'IWR_HOP1_ERRORVARIABLE_OUTFILE_SENTINEL'
+    $failure = Invoke-IwrReadFailureScenario `
+        -Name 'network-failure' `
+        -Scenario 'network-failure' `
+        -Sentinel 'IWR_HOP2_WEB_OUTFILE_SENTINEL'
+    $genericFailure = Invoke-IwrReadFailureScenario `
+        -Name 'generic-network-failure' `
+        -Scenario 'generic-network-failure' `
+        -Sentinel 'IWR_HOP2_GENERIC_OUTFILE_SENTINEL'
 
     $redirectRoot = Join-Path $caseRoot 'second-redirect'
     New-Item -ItemType Directory -Path $redirectRoot -Force | Out-Null
@@ -858,7 +1130,6 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     }
 
     $successMetadataText = [IO.File]::ReadAllText($successMetadataPath, [Text.Encoding]::UTF8)
-    $failureMetadataText = [IO.File]::ReadAllText($failureMetadataPath, [Text.Encoding]::UTF8)
     $redirectMetadataText = [IO.File]::ReadAllText($redirectMetadataPath, [Text.Encoding]::UTF8)
     $insecureMetadataText = [IO.File]::ReadAllText($insecureMetadataPath, [Text.Encoding]::UTF8)
     $emptyLocationMetadataText = [IO.File]::ReadAllText($emptyLocationMetadataPath, [Text.Encoding]::UTF8)
@@ -868,11 +1139,18 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         success_body = [IO.File]::ReadAllText($successOutPath, [Text.Encoding]::UTF8)
         success_metadata = $successMetadataText | ConvertFrom-Json @script:JsonDateArgs
         success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
-        failure_exit_code = $failureExitCode
-        failure_output = @($failureOutput)
-        failure_metadata_text = $failureMetadataText
-        failure_metadata = $failureMetadataText | ConvertFrom-Json @script:JsonDateArgs
-        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
+        initial_failure = $initialFailure
+        initial_errorvariable_failure = $initialErrorVariableFailure
+        failure = $failure
+        failure_exit_code = $failure.exit_code
+        failure_output = @($failure.output)
+        failure_metadata_text = $failure.metadata_text
+        failure_metadata = $failure.metadata
+        failure_trace_text = $failure.trace_text
+        failure_trace = $failure.trace
+        failure_out_text = $failure.out_text
+        failure_sentinel = $failure.sentinel
+        generic_failure = $genericFailure
         redirect_exit_code = $redirectExitCode
         redirect_output = @($redirectOutput)
         redirect_metadata_text = $redirectMetadataText
@@ -894,6 +1172,233 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
         realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
     }
+}
+
+function Invoke-IwrSecurityAssertions {
+    param([switch]$IncludeRenderRegression)
+
+    $iwrRun = Invoke-ActualBusIwrFallbackCase
+    Assert-True 'IWR fallback keeps hop 1 POST no-follow and hop 2 GET no-follow' (
+        $iwrRun.success_exit_code -eq 0 -and
+        @($iwrRun.success_trace.calls).Count -eq 2 -and
+        $iwrRun.success_trace.calls[0].method -ceq 'Post' -and
+        [int]$iwrRun.success_trace.calls[0].maximum_redirection -eq 0 -and
+        [bool]$iwrRun.success_trace.calls[0].body_present -and
+        $iwrRun.success_trace.calls[1].method -ceq 'Get' -and
+        [int]$iwrRun.success_trace.calls[1].maximum_redirection -eq 0 -and
+        -not [bool]$iwrRun.success_trace.calls[1].body_present
+    )
+    Assert-True 'IWR fallback retains the final successful body and metadata' (
+        $iwrRun.success_body -ceq '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}' -and
+        $null -ne $iwrRun.success_metadata.PSObject.Properties['http_status'] -and
+        $iwrRun.success_metadata.http_status -isnot [string] -and
+        [int]$iwrRun.success_metadata.http_status -eq 200 -and
+        $iwrRun.success_metadata.content_type_class -ceq 'json' -and
+        $null -eq $iwrRun.success_trace.exception_type
+    )
+    # The 302 exactly as Windows PowerShell 5.1 really delivers it: a
+    # non-terminating InvalidOperationException alongside the response. Every
+    # other IWR scenario above returns the 302 silently, so none of them reach
+    # hop 1's error handling; this is the only case that does.
+    Assert-True 'realistic 5.1 non-terminating 302 still completes the read' (
+        $iwrRun.realistic_exit_code -eq 0 -and
+        @($iwrRun.realistic_trace.calls).Count -eq 2 -and
+        $iwrRun.realistic_trace.calls[0].method -ceq 'Post' -and
+        [int]$iwrRun.realistic_trace.calls[0].maximum_redirection -eq 0 -and
+        $iwrRun.realistic_trace.calls[1].method -ceq 'Get' -and
+        [int]$iwrRun.realistic_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -eq $iwrRun.realistic_trace.exception_type
+    )
+    Assert-True 'realistic 5.1 302 reaches hop 2 and keeps its body and metadata' (
+        $iwrRun.realistic_body.Contains('"ok":true') -and
+        [int]$iwrRun.realistic_metadata.http_status -eq 200 -and
+        $iwrRun.realistic_metadata.content_type_class -ceq 'json'
+    )
+    Assert-True 'realistic 5.1 302 leaks no secret or one-shot URL' (
+        -not (ConvertTo-SquashedText -Lines $iwrRun.realistic_output).Contains('BUS_SECRET_IWR_CANARY') -and
+        -not (ConvertTo-SquashedText -Lines $iwrRun.realistic_output).Contains('ONE_SHOT_IWR_CANARY')
+    )
+
+    Assert-True 'IWR hop 1 terminating response-less failure exposes only the fixed inner-free network surface' (
+        Test-SanitizedIwrNetworkFailure -Run $iwrRun.initial_failure -ExpectedCallCount 1
+    )
+    Assert-True 'IWR hop 1 null plus ErrorVariable response-less failure exposes only the fixed inner-free network surface' (
+        Test-SanitizedIwrNetworkFailure -Run $iwrRun.initial_errorvariable_failure -ExpectedCallCount 1
+    )
+    Assert-True 'IWR hop 1 null plus ErrorVariable fixture reaches the explicit captured-error ingress' (
+        $iwrRun.initial_errorvariable_failure.trace.calls[0].method -ceq 'Post' -and
+        $iwrRun.initial_errorvariable_failure.trace.calls[0].error_action -ceq 'SilentlyContinue' -and
+        $iwrRun.initial_errorvariable_failure.trace.calls[0].error_variable -ceq 'iwrError'
+    )
+
+    Assert-True 'IWR hop 2 WebException clears stale hop 1 metadata and retains its network type' (
+        $iwrRun.failure_exit_code -ne 0 -and
+        @($iwrRun.failure_trace.calls).Count -eq 2 -and
+        @($iwrRun.failure_metadata.PSObject.Properties).Count -eq 0 -and
+        $iwrRun.failure_metadata_text -ceq '{}' -and
+        $iwrRun.failure_trace.exception_type -ceq 'System.Net.WebException' -and
+        $null -eq $iwrRun.failure_trace.inner_exception_type -and
+        $null -eq $iwrRun.failure_trace.inner_exception_message
+    )
+    Assert-True 'IWR hop 2 WebException exposes only the fixed inner-free network surface' (
+        Test-SanitizedIwrNetworkFailure -Run $iwrRun.failure -ExpectedCallCount 2
+    )
+    Assert-True 'IWR hop 2 generic response-less failure exposes only the fixed inner-free network surface' (
+        Test-SanitizedIwrNetworkFailure -Run $iwrRun.generic_failure -ExpectedCallCount 2
+    )
+
+    $iwrRedirectOutputText = @($iwrRun.redirect_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback refuses a second redirect without accepting its body' (
+        $iwrRun.redirect_exit_code -ne 0 -and
+        @($iwrRun.redirect_trace.calls).Count -eq 2 -and
+        $iwrRun.redirect_trace.calls[1].method -ceq 'Get' -and
+        [int]$iwrRun.redirect_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -ne $iwrRun.redirect_metadata.PSObject.Properties['http_status'] -and
+        [int]$iwrRun.redirect_metadata.http_status -eq 302 -and
+        $iwrRun.redirect_metadata.content_type_class -ceq 'html' -and
+        $iwrRun.redirect_trace.exception_type -ceq 'System.InvalidOperationException'
+    )
+    Assert-True 'IWR second-redirect failure exposes only a fixed safe error' (
+        $iwrRun.redirect_trace.exception_message -ceq 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.' -and
+        -not $iwrRedirectOutputText.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
+        -not $iwrRedirectOutputText.Contains('IWR_REDIRECT_BODY_CANARY') -and
+        -not $iwrRedirectOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
+        -not $iwrRun.redirect_metadata_text.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
+        -not $iwrRun.redirect_metadata_text.Contains('IWR_REDIRECT_BODY_CANARY')
+    )
+    $iwrInsecureOutputText = @($iwrRun.insecure_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback rejects an insecure initial hop 2 Location before transfer' (
+        $iwrRun.insecure_exit_code -ne 0 -and
+        @($iwrRun.insecure_trace.calls).Count -eq 1 -and
+        $iwrRun.insecure_trace.calls[0].method -ceq 'Post' -and
+        $null -ne $iwrRun.insecure_metadata.PSObject.Properties['http_status'] -and
+        [int]$iwrRun.insecure_metadata.http_status -eq 302 -and
+        $iwrRun.insecure_trace.exception_type -ceq 'System.InvalidOperationException'
+    )
+    Assert-True 'IWR insecure-Location failure exposes only a fixed safe error' (
+        $iwrRun.insecure_trace.exception_message -ceq 'hop 2 Location must resolve to HTTPS. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrInsecureOutputText.Contains('INSECURE_IWR_LOCATION_CANARY') -and
+        -not $iwrInsecureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
+        -not $iwrRun.insecure_metadata_text.Contains('INSECURE_IWR_LOCATION_CANARY')
+    )
+    $iwrEmptyLocationOutputText = @($iwrRun.empty_location_output | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True 'IWR fallback rejects an empty hop 2 Location before transfer' (
+        $iwrRun.empty_location_exit_code -ne 0 -and
+        @($iwrRun.empty_location_trace.calls).Count -eq 1 -and
+        $iwrRun.empty_location_trace.calls[0].method -ceq 'Post' -and
+        $null -ne $iwrRun.empty_location_metadata.PSObject.Properties['http_status'] -and
+        [int]$iwrRun.empty_location_metadata.http_status -eq 302 -and
+        $iwrRun.empty_location_trace.exception_type -ceq 'System.InvalidOperationException'
+    )
+    Assert-True 'IWR empty-Location failure exposes only a fixed safe error' (
+        $iwrRun.empty_location_trace.exception_message -ceq 'hop 2 Location or BUS_URL is empty. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
+        -not $iwrEmptyLocationOutputText.Contains('BUS_URL_IWR_CANARY') -and
+        -not $iwrEmptyLocationOutputText.Contains('BUS_SECRET_IWR_CANARY')
+    )
+    $actualClosedPort = Invoke-ActualBusClosedPortSupervisorCase
+    $actualClosedPortRetries = @($actualClosedPort.events |
+        Where-Object event -ceq 'board_read_retry')
+    Assert-True 'genuine forced-IWR closed-port failure remains retry-classifiable end to end' (
+        $actualClosedPort.exit_code -eq 20 -and
+        $actualClosedPort.result -and
+        $actualClosedPort.result.error_code -ceq 'BOARD_READ_TRANSPORT_ERROR' -and
+        $actualClosedPortRetries.Count -eq 1 -and
+        $actualClosedPortRetries[0].code -ceq 'BOARD_READ_TRANSPORT_ERROR' -and
+        $actualClosedPortRetries[0].details.attempt -ceq '1' -and
+        $actualClosedPortRetries[0].details.code -ceq 'BOARD_READ_TRANSPORT_ERROR'
+    )
+    $actualClosedPortOutputText = ConvertTo-SquashedText -Lines $actualClosedPort.output
+    Assert-True 'genuine forced-IWR retry failure preserves state and the no-side-effect boundary' (
+        $actualClosedPort.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $actualClosedPort.state.cursor.row_id -ceq 'cursor-before-closed-port' -and
+        @($actualClosedPort.state.work).Count -eq 0 -and
+        -not $actualClosedPort.claude_called -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.raw_exception_canary) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.raw_exception_canary) -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.one_shot_canary) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.one_shot_canary) -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.secret_canary) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.secret_canary) -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.bus_url) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.bus_url)
+    )
+
+    if ($IncludeRenderRegression) {
+        $escape = [char]27
+        $renderProbe = [pscustomobject][ordered]@{
+            exit_code = $iwrRun.initial_failure.exit_code
+            output = @(
+                ($escape + '[31;1mBUS_READ_NETWORK_ERROR: read' + $escape + '[0m'),
+                ($escape + '[31;1m  12 | transport failed before an HTTP response was' + $escape + '[0m'),
+                ($escape + '[31;1m     | received.' + $escape + '[0m')
+            )
+            trace = $iwrRun.initial_failure.trace
+            metadata_text = $iwrRun.initial_failure.metadata_text
+            metadata_bytes = $iwrRun.initial_failure.metadata_bytes
+            metadata = $iwrRun.initial_failure.metadata
+            out_text = $iwrRun.initial_failure.out_text
+            out_bytes = $iwrRun.initial_failure.out_bytes
+            sentinel = $iwrRun.initial_failure.sentinel
+            sentinel_bytes = $iwrRun.initial_failure.sentinel_bytes
+            trace_text = $iwrRun.initial_failure.trace_text
+        }
+        Assert-True 'ANSI and Core error gutters preserve the fixed-message positive guard' (
+            Test-SanitizedIwrNetworkFailure -Run $renderProbe -ExpectedCallCount 1
+        )
+
+        $rawCanaryProbe = $renderProbe | Select-Object *
+        $rawCanaryProbe.output = @($renderProbe.output) + @('RAW_IWR_', 'CANARY')
+        Assert-True 'render normalization cannot hide a split raw-exception canary' (
+            -not (Test-SanitizedIwrNetworkFailure -Run $rawCanaryProbe -ExpectedCallCount 1)
+        )
+
+        $busUrlCanaryProbe = $renderProbe | Select-Object *
+        $busUrlCanaryProbe.output = @($renderProbe.output) + 'https://BUS_URL_IWR_CANARY.invalid/private'
+        Assert-True 'render normalization cannot hide a BUS URL canary' (
+            -not (Test-SanitizedIwrNetworkFailure -Run $busUrlCanaryProbe -ExpectedCallCount 1)
+        )
+
+        $secretCanaryProbe = $renderProbe | Select-Object *
+        $secretCanaryProbe.trace_text = ([string]$renderProbe.trace_text) + ' BUS_SECRET_IWR_CANARY'
+        Assert-True 'render normalization cannot hide a BUS secret canary' (
+            -not (Test-SanitizedIwrNetworkFailure -Run $secretCanaryProbe -ExpectedCallCount 1)
+        )
+
+        $oneShotCanaryProbe = $renderProbe | Select-Object *
+        $oneShotCanaryProbe.trace_text = ([string]$renderProbe.trace_text) + ' https://ONE_SHOT_IWR_CANARY.invalid/private'
+        Assert-True 'render normalization cannot hide a one-shot URL canary' (
+            -not (Test-SanitizedIwrNetworkFailure -Run $oneShotCanaryProbe -ExpectedCallCount 1)
+        )
+    }
+}
+
+function Invoke-DateReaderNegativeControl {
+    param([Parameter(Mandatory = $true)][ValidateSet('Full', 'IwrOnly')][string]$CurrentScope)
+
+    if ($SimulateJsonDateCoercion) { return }
+
+    # Re-run only the prerequisite under this same engine. The child exits at
+    # the reader gate, and this explicit guard prevents recursive self-tests.
+    $currentShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+    $dateReaderFailureOutput = @(& $currentShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File $PSCommandPath -Scope $CurrentScope -SimulateJsonDateCoercion 2>&1)
+    $dateReaderFailureExitCode = $LASTEXITCODE
+    $dateReaderFailureLines = @($dateReaderFailureOutput | ForEach-Object { [string]$_ })
+    $dateReaderFailurePassLines = @($dateReaderFailureLines | Where-Object { $_ -like 'PASS *' })
+    $dateReaderFailureFailLines = @($dateReaderFailureLines | Where-Object { $_ -like 'FAIL *' })
+    $dateReaderFailureResultLines = @($dateReaderFailureLines | Where-Object { $_ -like 'RESULT *' })
+    Assert-True 'date-reader negative control stops at the harness boundary' (
+        $dateReaderFailureExitCode -eq 1 -and
+        $dateReaderFailurePassLines.Count -eq 0 -and
+        $dateReaderFailureFailLines.Count -eq 1 -and
+        $dateReaderFailureFailLines[0] -ceq
+            'FAIL harness reads ISO-8601 board cells as strings, on this edition' -and
+        $dateReaderFailureResultLines.Count -eq 1 -and
+        $dateReaderFailureResultLines[0] -ceq 'RESULT passed=0 failed=1'
+    ) ('exit=' + $dateReaderFailureExitCode +
+       ' pass_lines=' + $dateReaderFailurePassLines.Count +
+       ' fail_lines=' + $dateReaderFailureFailLines.Count +
+       ' result_lines=' + $dateReaderFailureResultLines.Count)
 }
 
 $script:TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-read-resilience-' + [Guid]::NewGuid().ToString('N'))
@@ -918,6 +1423,35 @@ try {
     if (-not $dateReaderSafe) {
         Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
         exit 1
+    }
+
+    if ($Scope -ceq 'IwrOnly') {
+        $isLinuxVariable = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
+        if (-not $isLinuxVariable -or -not [bool]$isLinuxVariable.Value -or
+            $PSVersionTable.PSEdition -cne 'Core' -or
+            $PSVersionTable.PSVersion -lt [version]'7.5' -or
+            -not [IO.Path]::IsPathRooted($script:ResolvedChildShell) -or
+            [IO.Path]::GetFileName($script:ResolvedChildShell) -cne 'pwsh') {
+            throw ('IwrOnly requires Linux PowerShell Core 7.5+ and an absolute pwsh child; host=' +
+                   $PSVersionTable.PSEdition + ' ' + $PSVersionTable.PSVersion +
+                   '; child=' + $script:ResolvedChildShell)
+        }
+
+        $busSourcePath = Join-Path $RepoRoot 'scripts/bus.ps1'
+        $busSourceSha256 = (Get-FileHash -LiteralPath $busSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $suiteSourceSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Output 'SCOPE IwrOnly'
+        Write-Output ('ENGINE Core ' + $PSVersionTable.PSVersion + ' child=' + $script:ResolvedChildShell)
+        Write-Output ('SOURCE bus.ps1 sha256=' + $busSourceSha256)
+        Write-Output ('SOURCE test_order_read_resilience.ps1 sha256=' + $suiteSourceSha256)
+
+        Invoke-IwrSecurityAssertions -IncludeRenderRegression
+        Invoke-DateReaderNegativeControl -CurrentScope $Scope
+
+        Write-Output ('CASES ' + ($script:Passed + $script:Failed))
+        Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
+        if ($script:Failed -gt 0) { exit 1 }
+        exit 0
     }
 
     $validEmpty = New-BoardJson
@@ -1004,7 +1538,7 @@ try {
         $actualBusSecondRedirect.failure_metadata.content_type_class -ceq 'html'
     )
     Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
-        $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
+        $secondRedirectFailureText.Contains('BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.') -and
         -not $secondRedirectFailureSquashed.Contains('ONE_SHOT_REDIRECT_CANARY') -and
         -not $secondRedirectFailureSquashed.Contains('CANONICAL_REDIRECT_CANARY') -and
         -not $secondRedirectFailureSquashed.Contains('FINAL_REDIRECT_BODY_CANARY') -and
@@ -1012,111 +1546,7 @@ try {
         -not $actualBusSecondRedirect.failure_metadata_text.Contains('FINAL_REDIRECT_BODY_CANARY')
     )
 
-    $actualBusIwrFallback = Invoke-ActualBusIwrFallbackCase
-    Assert-True 'IWR fallback keeps hop 1 POST no-follow and hop 2 GET no-follow' (
-        $actualBusIwrFallback.success_exit_code -eq 0 -and
-        @($actualBusIwrFallback.success_trace.calls).Count -eq 2 -and
-        $actualBusIwrFallback.success_trace.calls[0].method -ceq 'Post' -and
-        [int]$actualBusIwrFallback.success_trace.calls[0].maximum_redirection -eq 0 -and
-        [bool]$actualBusIwrFallback.success_trace.calls[0].body_present -and
-        $actualBusIwrFallback.success_trace.calls[1].method -ceq 'Get' -and
-        [int]$actualBusIwrFallback.success_trace.calls[1].maximum_redirection -eq 0 -and
-        -not [bool]$actualBusIwrFallback.success_trace.calls[1].body_present
-    )
-    Assert-True 'IWR fallback retains the final successful body and metadata' (
-        $actualBusIwrFallback.success_body -ceq '{"ok":true,"rows":[]}' -and
-        $null -ne $actualBusIwrFallback.success_metadata.PSObject.Properties['http_status'] -and
-        $actualBusIwrFallback.success_metadata.http_status -isnot [string] -and
-        [int]$actualBusIwrFallback.success_metadata.http_status -eq 200 -and
-        $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
-        $null -eq $actualBusIwrFallback.success_trace.exception_type
-    )
-    # The 302 exactly as Windows PowerShell 5.1 really delivers it: a
-    # non-terminating InvalidOperationException alongside the response. Every
-    # other IWR scenario above returns the 302 silently, so none of them reach
-    # hop 1's error handling; this is the only case that does.
-    Assert-True 'realistic 5.1 non-terminating 302 still completes the read' (
-        $actualBusIwrFallback.realistic_exit_code -eq 0 -and
-        @($actualBusIwrFallback.realistic_trace.calls).Count -eq 2 -and
-        $actualBusIwrFallback.realistic_trace.calls[0].method -ceq 'Post' -and
-        [int]$actualBusIwrFallback.realistic_trace.calls[0].maximum_redirection -eq 0 -and
-        $actualBusIwrFallback.realistic_trace.calls[1].method -ceq 'Get' -and
-        [int]$actualBusIwrFallback.realistic_trace.calls[1].maximum_redirection -eq 0 -and
-        $null -eq $actualBusIwrFallback.realistic_trace.exception_type
-    )
-    Assert-True 'realistic 5.1 302 reaches hop 2 and keeps its body and metadata' (
-        $actualBusIwrFallback.realistic_body.Contains('"ok":true') -and
-        [int]$actualBusIwrFallback.realistic_metadata.http_status -eq 200 -and
-        $actualBusIwrFallback.realistic_metadata.content_type_class -ceq 'json'
-    )
-    Assert-True 'realistic 5.1 302 leaks no secret or one-shot URL' (
-        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('BUS_SECRET_IWR_CANARY') -and
-        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('ONE_SHOT_IWR_CANARY')
-    )
-
-    $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
-    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
-        $actualBusIwrFallback.failure_exit_code -ne 0 -and
-        @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
-        @($actualBusIwrFallback.failure_metadata.PSObject.Properties).Count -eq 0 -and
-        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.Net.WebException'
-    )
-    Assert-True 'IWR pre-response failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.failure_trace.exception_message -ceq 'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.' -and
-        -not $iwrFailureOutputText.Contains('RAW_IWR_EXCEPTION_CANARY') -and
-        -not $iwrFailureOutputText.Contains('ONE_SHOT_IWR_CANARY') -and
-        -not $iwrFailureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
-        -not $actualBusIwrFallback.failure_metadata_text.Contains('302')
-    )
-    $iwrRedirectOutputText = @($actualBusIwrFallback.redirect_output | ForEach-Object { [string]$_ }) -join "`n"
-    Assert-True 'IWR fallback refuses a second redirect without accepting its body' (
-        $actualBusIwrFallback.redirect_exit_code -ne 0 -and
-        @($actualBusIwrFallback.redirect_trace.calls).Count -eq 2 -and
-        $actualBusIwrFallback.redirect_trace.calls[1].method -ceq 'Get' -and
-        [int]$actualBusIwrFallback.redirect_trace.calls[1].maximum_redirection -eq 0 -and
-        $null -ne $actualBusIwrFallback.redirect_metadata.PSObject.Properties['http_status'] -and
-        [int]$actualBusIwrFallback.redirect_metadata.http_status -eq 302 -and
-        $actualBusIwrFallback.redirect_metadata.content_type_class -ceq 'html' -and
-        $actualBusIwrFallback.redirect_trace.exception_type -ceq 'System.Net.WebException'
-    )
-    Assert-True 'IWR second-redirect failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.redirect_trace.exception_message -ceq 'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.' -and
-        -not $iwrRedirectOutputText.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
-        -not $iwrRedirectOutputText.Contains('IWR_REDIRECT_BODY_CANARY') -and
-        -not $iwrRedirectOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
-        -not $actualBusIwrFallback.redirect_metadata_text.Contains('IWR_DOWNGRADE_REDIRECT_CANARY') -and
-        -not $actualBusIwrFallback.redirect_metadata_text.Contains('IWR_REDIRECT_BODY_CANARY')
-    )
-    $iwrInsecureOutputText = @($actualBusIwrFallback.insecure_output | ForEach-Object { [string]$_ }) -join "`n"
-    Assert-True 'IWR fallback rejects an insecure initial hop 2 Location before transfer' (
-        $actualBusIwrFallback.insecure_exit_code -ne 0 -and
-        @($actualBusIwrFallback.insecure_trace.calls).Count -eq 1 -and
-        $actualBusIwrFallback.insecure_trace.calls[0].method -ceq 'Post' -and
-        $null -ne $actualBusIwrFallback.insecure_metadata.PSObject.Properties['http_status'] -and
-        [int]$actualBusIwrFallback.insecure_metadata.http_status -eq 302 -and
-        $actualBusIwrFallback.insecure_trace.exception_type -ceq 'System.InvalidOperationException'
-    )
-    Assert-True 'IWR insecure-Location failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.insecure_trace.exception_message -ceq 'hop 2 Location must resolve to HTTPS. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
-        -not $iwrInsecureOutputText.Contains('INSECURE_IWR_LOCATION_CANARY') -and
-        -not $iwrInsecureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
-        -not $actualBusIwrFallback.insecure_metadata_text.Contains('INSECURE_IWR_LOCATION_CANARY')
-    )
-    $iwrEmptyLocationOutputText = @($actualBusIwrFallback.empty_location_output | ForEach-Object { [string]$_ }) -join "`n"
-    Assert-True 'IWR fallback rejects an empty hop 2 Location before transfer' (
-        $actualBusIwrFallback.empty_location_exit_code -ne 0 -and
-        @($actualBusIwrFallback.empty_location_trace.calls).Count -eq 1 -and
-        $actualBusIwrFallback.empty_location_trace.calls[0].method -ceq 'Post' -and
-        $null -ne $actualBusIwrFallback.empty_location_metadata.PSObject.Properties['http_status'] -and
-        [int]$actualBusIwrFallback.empty_location_metadata.http_status -eq 302 -and
-        $actualBusIwrFallback.empty_location_trace.exception_type -ceq 'System.InvalidOperationException'
-    )
-    Assert-True 'IWR empty-Location failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.empty_location_trace.exception_message -ceq 'hop 2 Location or BUS_URL is empty. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
-        -not $iwrEmptyLocationOutputText.Contains('BUS_URL_IWR_CANARY') -and
-        -not $iwrEmptyLocationOutputText.Contains('BUS_SECRET_IWR_CANARY')
-    )
-
+    Invoke-IwrSecurityAssertions
     $validFirst = Invoke-ReadCase -Name 'valid-first' -Responses @($validEmpty, '<unused>')
     Assert-True 'valid-first exits zero' ($validFirst.exit_code -eq 0)
     Assert-True 'valid-first reads exactly once' ($validFirst.read_count -eq 1)
@@ -1581,30 +2011,7 @@ try {
         -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerInvalidError)
     )
 
-    if (-not $SimulateJsonDateCoercion) {
-        # Re-run only the prerequisite under this same engine. The child exits at
-        # the reader gate, and this explicit guard prevents recursive self-tests.
-        $currentShell = (Get-Process -Id $PID -ErrorAction Stop).Path
-        $dateReaderFailureOutput = @(& $currentShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
-            -File $PSCommandPath -SimulateJsonDateCoercion 2>&1)
-        $dateReaderFailureExitCode = $LASTEXITCODE
-        $dateReaderFailureLines = @($dateReaderFailureOutput | ForEach-Object { [string]$_ })
-        $dateReaderFailurePassLines = @($dateReaderFailureLines | Where-Object { $_ -like 'PASS *' })
-        $dateReaderFailureFailLines = @($dateReaderFailureLines | Where-Object { $_ -like 'FAIL *' })
-        $dateReaderFailureResultLines = @($dateReaderFailureLines | Where-Object { $_ -like 'RESULT *' })
-        Assert-True 'date-reader negative control stops at the harness boundary' (
-            $dateReaderFailureExitCode -eq 1 -and
-            $dateReaderFailurePassLines.Count -eq 0 -and
-            $dateReaderFailureFailLines.Count -eq 1 -and
-            $dateReaderFailureFailLines[0] -ceq
-                'FAIL harness reads ISO-8601 board cells as strings, on this edition' -and
-            $dateReaderFailureResultLines.Count -eq 1 -and
-            $dateReaderFailureResultLines[0] -ceq 'RESULT passed=0 failed=1'
-        ) ('exit=' + $dateReaderFailureExitCode +
-           ' pass_lines=' + $dateReaderFailurePassLines.Count +
-           ' fail_lines=' + $dateReaderFailureFailLines.Count +
-           ' result_lines=' + $dateReaderFailureResultLines.Count)
-    }
+    Invoke-DateReaderNegativeControl -CurrentScope $Scope
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $script:TestRoot -PathType Container)) {
         Remove-Item -LiteralPath $script:TestRoot -Recurse -Force
