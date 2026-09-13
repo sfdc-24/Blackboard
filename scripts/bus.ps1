@@ -732,6 +732,7 @@ $readTransportExit = $null
 $readHttpStatus = $null
 $readContentTypeClass = $null
 $readIwrResponse = $null
+$readNetworkFailureMessage = 'BUS_READ_NETWORK_ERROR: read transport failed before an HTTP response was received.'
 
 if ($curl) {
   # ONE request only. -D dumps headers to a file; reads also put the response body
@@ -850,13 +851,16 @@ if ($curl) {
     if (-not $resp) {
       if ($Action -eq 'read') {
         # No response means this is a transport exception, not an invalid read
-        # response. Preserve its type/inner chain so the supervisor can classify
-        # it as retryable; the sidecar remains an exact empty sanitized object.
+        # response. Preserve only the network TYPE so the supervisor can classify
+        # it as retryable. Never rethrow the original exception: its message or
+        # inner chain may contain BUS_URL or an authorization-bearing redirect URL.
+        # The sidecar remains an exact empty sanitized object.
         Write-BusReadMetadata `
           -Path $ReadMetadataOutFile `
           -TransportExit $readTransportExit `
           -HttpStatus $readHttpStatus `
           -ContentTypeClass $readContentTypeClass
+        throw [System.Net.WebException]::new($readNetworkFailureMessage)
       }
       throw
     } else {
@@ -1004,9 +1008,12 @@ if ($location) {
         -ContentTypeClass $readContentTypeClass
       if ($Action -eq 'read') {
         # A response-bearing failure is normalized by the common read gate below.
-        # A response-less WebException must retain its network type for the
-        # supervisor's one-retry classification.
-        if (-not $resp) { throw }
+        # A response-less failure retains only a fresh WebException type and a
+        # fixed message. The original exception can contain the unspent one-shot
+        # URL, so neither it nor its inner chain may cross this boundary.
+        if (-not $resp) {
+          throw [System.Net.WebException]::new($readNetworkFailureMessage)
+        }
       } else {
         if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
           throw [System.Net.WebException]::new(
@@ -1046,7 +1053,9 @@ if ($location) {
         -HttpStatus $readHttpStatus `
         -ContentTypeClass $readContentTypeClass
       if ($Action -eq 'read') {
-        if (-not $resp) { throw }
+        if (-not $resp) {
+          throw [System.Net.WebException]::new($readNetworkFailureMessage)
+        }
       } else {
         throw [System.Net.WebException]::new(
           'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
