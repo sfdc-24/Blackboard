@@ -44,6 +44,76 @@ function monitor(initial = {}) {
   };
 }
 
+function siteCheck({ wwwCode = 200, wwwBody = '', apexCode = 200 } = {}) {
+  const requests = [];
+  const response = (code, body = '') => ({
+    getResponseCode: () => code,
+    getContentText: () => body,
+  });
+  const context = vm.createContext({
+    UrlFetchApp: { fetch: (url, options) => {
+      requests.push({ url, options: { ...options } });
+      if (url === 'https://www.sfdc24.com/') return response(wwwCode, wwwBody);
+      if (url === 'http://sfdc24.com/') return response(apexCode);
+      throw new Error(`unexpected URL: ${url}`);
+    } },
+  });
+  vm.runInContext(fs.readFileSync(path.join(project, 'Monitor.gs'), 'utf8'), context);
+  return {
+    marker: context.MON_SITE_MARKER,
+    result: JSON.parse(JSON.stringify(context.checkSite_())),
+    requests,
+  };
+}
+
+test('v31 site check accepts the invariant canonical homepage marker', () => {
+  const marker = '<link rel="canonical" href="https://www.sfdc24.com/">';
+  const checked = siteCheck({
+    wwwBody: `<html><head>${marker}</head><body>` +
+      '<h2 class="sec">The first piece of work is a document</h2></body></html>',
+  });
+
+  assert.equal(checked.marker, marker);
+  assert.deepEqual(checked.result, {
+    wwwOk: true,
+    apexOk: true,
+    detail: 'www 200 with marker | apex chain 200',
+  });
+  assert.deepEqual(checked.requests.map(({ url, options }) => ({ url, options })), [
+    {
+      url: 'https://www.sfdc24.com/',
+      options: { muteHttpExceptions: true, followRedirects: true },
+    },
+    {
+      url: 'http://sfdc24.com/',
+      options: { muteHttpExceptions: true, followRedirects: true },
+    },
+  ]);
+});
+
+test('v31 site check rejects an unrelated 200 page without the canonical marker', () => {
+  const checked = siteCheck({
+    wwwBody: '<html><head><title>Welcome</title></head><body>Salesforce assessment</body></html>',
+  });
+
+  assert.equal(checked.result.wwwOk, false);
+  assert.equal(checked.result.apexOk, true);
+  assert.match(checked.result.detail, /homepage marker is missing - wrong page or an error shell/);
+});
+
+test('v31 site check rejects a branded 200 error shell despite current and retired copy', () => {
+  const checked = siteCheck({
+    wwwBody: '<html><head><title>Page not found - SFDC24</title></head>' +
+      '<body><a>sfdc24</a><h1>That page is not here</h1>' +
+      '<h2>The first piece of work is a document</h2>' +
+      '<p>first piece of work looks like</p></body></html>',
+  });
+
+  assert.equal(checked.result.wwwOk, false);
+  assert.equal(checked.result.apexOk, true);
+  assert.match(checked.result.detail, /homepage marker is missing - wrong page or an error shell/);
+});
+
 test('v31 retries an ANDON after a real mail failure and deduplicates only after success', () => {
   const m = monitor();
   m.board.andon = { ts: '2026-09-06T12:00:00Z', src: 'fixture', text: 'ANDON|test alert' };
