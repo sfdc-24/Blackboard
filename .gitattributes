@@ -1,23 +1,40 @@
-# Cross-platform evidence requires identical fixture bytes, including on Windows.
-/tests/fixtures/order_supervisor_board.json text eol=lf
-
-# Shell scripts are executed by a POSIX shell, and a CRLF checkout makes that
-# shell fail with "bad interpreter: /bin/bash^M" - a confusing error that looks
-# like a broken script rather than a broken checkout.
+# Line endings for files Linux EXECUTES.
 #
-# This repo is developed on Windows and increasingly run on Linux, so the
-# scripts most likely to be checked out with CRLF are exactly the ones that must
-# not be. All 14 tracked .sh blobs are LF today, so this pins what is already
-# true rather than renormalising anything.
-*.sh text eol=lf
+# The blobs in this repository are LF. That is not enough. Most of this fleet
+# works on Windows with core.autocrlf=true, which rewrites these files to CRLF
+# on checkout AND in `git archive` - so a Windows agent building the Ubuntu
+# package ships CRLF into it without ever seeing a modified file in git status.
+#
+# A shebang line ending in \r makes the kernel look for an interpreter literally
+# named "bash\r". Measured 2026-09-09 on this laptop:
+#   packaging/build-deb.sh: line 3: set: pipefail: invalid option name
+# and the same defect in packaging/DEBIAN/postinst is a package that installs
+# and then fails to configure, on the GCloud instance, at the end of the runbook.
+#
+# eol=lf pins the working-tree form regardless of the checkout platform.
+#
+# This file is the UNION of two branches that each added rules for the same
+# reason: PR52 for the Debian packaging, and the walkthrough work for the shell
+# tools and their fixtures. Neither set is redundant, so both are kept.
 
-# The walkthrough fixtures are PARSED, not just read. zoom_bound_count.sh splits them
-# with sed and awk, and a trailing CR turns `Source: 94` into `Source: 94\r`, so the
-# numeric comparison silently stops matching. That is the same class as the CRLF
-# shebang above but quieter: no error, just a check that answers zero forever.
-/tools/walkthrough/fixtures/*.txt text eol=lf
+*.sh                             text eol=lf
+*.bash                           text eol=lf
+*.py                             text eol=lf
 
-# Python tolerates CRLF where bash does not, so this is a smaller hazard - but these
-# files are shipped to a Linux box and read by tooling that may not be so forgiving,
-# and git was already warning on measure_wav.py. Pin what is already true.
-*.py text eol=lf
+# Debian maintainer scripts and control files: dpkg runs these as /bin/sh.
+packaging/DEBIAN/preinst         text eol=lf
+packaging/DEBIAN/postinst        text eol=lf
+packaging/DEBIAN/prerm           text eol=lf
+packaging/DEBIAN/postrm          text eol=lf
+packaging/DEBIAN/control         text eol=lf
+packaging/DEBIAN/conffiles       text eol=lf
+
+# Installed onto the target as an executable and a unit file.
+packaging/blackboard-bus         text eol=lf
+packaging/blackboard-bus.service text eol=lf
+packaging/env.example            text eol=lf
+
+# Fixtures compared byte-for-byte by tests. A CRLF rewrite here does not break
+# an interpreter, it breaks an assertion, and the failure names the wrong cause.
+/tests/fixtures/order_supervisor_board.json  text eol=lf
+/tools/walkthrough/fixtures/*.txt            text eol=lf

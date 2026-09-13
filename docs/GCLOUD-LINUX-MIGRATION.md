@@ -191,7 +191,7 @@ The **Blackboard bus is now Python** (`src/bus_server.py`), not PowerShell:
 - SQLite3 backing store
 - Supports: `/read`, `/append`, `/replace`, `/tail`, `/schema`
 - Systemd service integration
-- Debian package: `blackboard-bus_1.0.1_all.deb`
+- Debian package: `blackboard-bus_1.1.0_all.deb`
 
 **Install on GCloud Ubuntu:**
 ```bash
@@ -200,7 +200,7 @@ cd ~/Blackboard
 packaging/build-deb.sh
 
 # Install
-sudo apt-get install -y ~/build/blackboard-bus_1.0.1_all.deb
+sudo apt-get install -y ~/build/blackboard-bus_1.1.0_all.deb
 
 # Configure secret
 sudo nano /etc/blackboard-bus/env
@@ -289,7 +289,7 @@ echo 'source ~/.blackboard.env' >> ~/.bashrc
 # Build and install bus server
 cd ~/Blackboard
 packaging/build-deb.sh
-sudo apt install -y ~/build/blackboard-bus_1.0.1_all.deb
+sudo apt install -y ~/build/blackboard-bus_1.1.0_all.deb
 sudo systemctl enable blackboard-bus
 
 echo "=== Setup Complete ==="

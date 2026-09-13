@@ -1,5 +1,8 @@
 #Requires -Version 5.1
-param([switch]$KeepArtifacts)
+param(
+    [switch]$KeepArtifacts,
+    [switch]$SimulateJsonDateCoercion
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -900,11 +903,22 @@ try {
     # assertions below compare a cursor to an exact timestamp string, and if this
     # reader ever goes back to coercing, those four fail in a way that reads like a
     # product bug. This one fails in a way that reads like what it is.
-    $script:DateProbe = '{"t":"2026-09-07T08:00:00.0000000Z"}' | ConvertFrom-Json @script:JsonDateArgs
-    Assert-True 'harness reads ISO-8601 board cells as strings, on this edition' (
+    $script:DateProbe = if ($SimulateJsonDateCoercion) {
+        # 5.1 does not naturally coerce this JSON, so inject the bad type directly
+        # to keep the failure oracle deterministic on every supported engine.
+        [pscustomobject]@{ t = [datetime]'2026-09-07T08:00:00Z' }
+    } else {
+        '{"t":"2026-09-07T08:00:00.0000000Z"}' | ConvertFrom-Json @script:JsonDateArgs
+    }
+    $dateReaderSafe = (
         $script:DateProbe.t -is [string] -and
         $script:DateProbe.t -ceq '2026-09-07T08:00:00.0000000Z'
     )
+    Assert-True 'harness reads ISO-8601 board cells as strings, on this edition' $dateReaderSafe
+    if (-not $dateReaderSafe) {
+        Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
+        exit 1
+    }
 
     $validEmpty = New-BoardJson
     $eligible = New-BoardJson -DataRows (, (New-EligibleOrderRow))
@@ -1566,6 +1580,31 @@ try {
         -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerMissingError) -and
         -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerInvalidError)
     )
+
+    if (-not $SimulateJsonDateCoercion) {
+        # Re-run only the prerequisite under this same engine. The child exits at
+        # the reader gate, and this explicit guard prevents recursive self-tests.
+        $currentShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+        $dateReaderFailureOutput = @(& $currentShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $PSCommandPath -SimulateJsonDateCoercion 2>&1)
+        $dateReaderFailureExitCode = $LASTEXITCODE
+        $dateReaderFailureLines = @($dateReaderFailureOutput | ForEach-Object { [string]$_ })
+        $dateReaderFailurePassLines = @($dateReaderFailureLines | Where-Object { $_ -like 'PASS *' })
+        $dateReaderFailureFailLines = @($dateReaderFailureLines | Where-Object { $_ -like 'FAIL *' })
+        $dateReaderFailureResultLines = @($dateReaderFailureLines | Where-Object { $_ -like 'RESULT *' })
+        Assert-True 'date-reader negative control stops at the harness boundary' (
+            $dateReaderFailureExitCode -eq 1 -and
+            $dateReaderFailurePassLines.Count -eq 0 -and
+            $dateReaderFailureFailLines.Count -eq 1 -and
+            $dateReaderFailureFailLines[0] -ceq
+                'FAIL harness reads ISO-8601 board cells as strings, on this edition' -and
+            $dateReaderFailureResultLines.Count -eq 1 -and
+            $dateReaderFailureResultLines[0] -ceq 'RESULT passed=0 failed=1'
+        ) ('exit=' + $dateReaderFailureExitCode +
+           ' pass_lines=' + $dateReaderFailurePassLines.Count +
+           ' fail_lines=' + $dateReaderFailureFailLines.Count +
+           ' result_lines=' + $dateReaderFailureResultLines.Count)
+    }
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $script:TestRoot -PathType Container)) {
         Remove-Item -LiteralPath $script:TestRoot -Recurse -Force
