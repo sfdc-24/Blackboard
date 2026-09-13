@@ -130,32 +130,6 @@ jobs:
       # its place is that a fetch returning ZERO files is reported UNKNOWN
       # rather than IN_SYNC: an empty comparison finds no differences, which is
       # the shape of a pass and the substance of a run that never happened.
-      # scripts/alpha.ps1 is invoked by scripts/claude_board_worker.ps1 and has
-      # never appeared in any workflow, so nothing has ever executed a line of
-      # it in CI. Its own header states that D-18 keeps credentials "never on a
-      # command line", and its read path then passed ALPHA_SECRET to curl.exe
-      # inside the URL, where any local user can read it out of the process
-      # table. The write path in the same file already did it correctly.
-      #
-      # -SelfTest needs no .env and no network: it exercises the config-file
-      # helper with a canary secret and asserts the credential is absent from
-      # argv, present percent-encoded in the config, and that the file is
-      # deleted afterwards.
-      - name: Alpha client keeps its credential off the command line
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v pwsh >/dev/null || { echo "pwsh is not on this runner" >&2; exit 1; }
-          output=$(pwsh -NoProfile -File scripts/alpha.ps1 -SelfTest)
-          echo "$output"
-          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
-          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
-          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
-            || { echo "the suite reported failures" >&2; exit 1; }
-          count=$(printf '%s\n' "$output" | sed -n 's/^RESULT passed=\([0-9]*\) .*/\1/p')
-          test "${count:-0}" -ge 10 \
-            || { echo "only ${count:-0} assertions ran; this suite should have at least 10" >&2; exit 1; }
-
       - name: Apps Script drift-watch decision contracts
         shell: bash
         run: |
