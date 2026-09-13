@@ -112,6 +112,25 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is missing" >&2; exit 1; }
 # abort a dialogue the preflight below has just declared playable.
 command -v base64  >/dev/null 2>&1 || { echo "base64 is missing" >&2; exit 1; }
 
+# A bad pause is knowable before playback, just like a bad turn. Check it in
+# dry-run too. Restrict the spelling to decimal seconds accepted by sleep and
+# reject non-finite values (including a decimal exponent that overflows).
+if ! python3 - "${GAP}" <<'PY_GAP'
+import math
+import re
+import sys
+
+gap = sys.argv[1]
+decimal = re.fullmatch(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", gap)
+if not decimal or not math.isfinite(float(gap)):
+    raise SystemExit(1)
+PY_GAP
+then
+    echo "PRESENTER_DIALOGUE_GAP must be finite nonnegative seconds (for example 0 or 0.7)." >&2
+    echo "Refusing before ANY turn is spoken." >&2
+    exit 1
+fi
+
 # VALIDATE THE WHOLE FILE FIRST. Nothing below runs unless every turn parsed.
 RECORDS="$(python3 "${PARSER}" "${FILE}")"
 PARSE_RC=$?
@@ -205,10 +224,17 @@ while read -r index persona encoded; do
         echo "turn ${index} of ${TOTAL} did not land (presenter_say.sh exit ${SAY_RC})." >&2
         echo "STOPPING with ${spoken} turns already spoken. Playing the rest would" >&2
         echo "put an answer with no question in front of the guest." >&2
+        echo "dialogue_partial completed=${spoken} total=${TOTAL} phase=turn turn=${index} exit=${SAY_RC}" >&2
         exit 1
     fi
     spoken=$((spoken + 1))
     sleep "${GAP}"
+    PAUSE_RC=$?
+    if [ "${PAUSE_RC}" -ne 0 ]; then
+        echo "Pause after turn ${index} of ${TOTAL} failed (sleep exit ${PAUSE_RC}); STOPPING." >&2
+        echo "dialogue_partial completed=${spoken} total=${TOTAL} phase=pause after_turn=${index} exit=${PAUSE_RC}" >&2
+        exit 1
+    fi
 done <<EOF_RECORDS
 ${RECORDS}
 EOF_RECORDS
