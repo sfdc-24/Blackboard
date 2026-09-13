@@ -145,16 +145,18 @@ jobs:
           ' _ "$python_bin"
 
       # A workflow that skips everything and reports success is the failure mode
-      # this file exists to prevent. If neither suite ran, say so and fail.
+      # this file exists to prevent. If no eligible suite is present, fail.
       - name: Refuse a green tick over nothing
         run: |
           set -euo pipefail
-          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ]              && [ ! -f tests/test_bus_benchmark.py ]; then
-            echo "Neither suite is present, so this check proved nothing." >&2
+          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
+             && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
+             && [ ! -f tests/test_bus.py ]; then
+            echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
           fi
-          echo "at least one suite ran for real"
+          echo "at least one eligible suite is present"
 
       # A negative control for the isolation itself. If `unshare -n` silently
       # stopped isolating, every "no network" claim above would be worthless and
