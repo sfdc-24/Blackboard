@@ -359,6 +359,22 @@ try {
         ($res11b.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_EDGE))) `
         'ambiguity is profile-local, but it still applies where nothing definite exists'
 
+    # ---- fixture 8b: the per-profile block must not contradict itself -----
+    # Reported by the laptop session against a real run. The block read:
+    #     DeviceId   : (none stored)
+    #     MatchedIds : {295592ab-...}
+    # Both true, nonsense together. "(none stored)" claimed the id is absent
+    # when it is present and merely unextractable, and a reader skimming
+    # profile blocks concluded the browser had no id while the next line
+    # named it.
+    $res8b = Invoke-Sut -Root $r8 -Ids @($LAPTOP_CHROME)
+    Assert-True 'a compression-broken value is not reported as "(none stored)"' `
+        (-not ($res8b.Text -match '\(none stored\)')) `
+        'the id is present; only the extraction failed, and the label said otherwise'
+    Assert-True 'it says the value is present but unextractable' `
+        ($res8b.Text -match 'present but unextractable') `
+        'the exit codes already drew this distinction; the display had not'
+
     # ---- fixture 12: conflicting complete ids, misleading mtimes ----------
     # Files are walked newest-mtime-first, and that ordering was being treated
     # as LevelDB's. It is not - LevelDB orders by sequence number, and a

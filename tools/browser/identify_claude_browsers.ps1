@@ -396,10 +396,22 @@ foreach ($b in $BROWSERS) {
             # whose id is the one in the newest file. It is a profile whose id
             # this tool cannot determine, and saying so is the only honest
             # rendering.
+            # "(none stored)" CLAIMED MORE THAN THE EVIDENCE, and contradicted
+            # the line below it. Reported by the laptop session, which saw:
+            #
+            #     DeviceId   : (none stored)
+            #     MatchedIds : {295592ab-...}
+            #
+            # Both true, read together as nonsense. The id IS stored; it simply
+            # cannot be extracted, because the value is compression-broken. A
+            # reader skimming profile blocks concluded the browser had no id
+            # while the very next line named it. The exit codes already drew
+            # this distinction and the display had not caught up.
             DeviceId    = $(
                 if ($id.AllIds.Count -gt 1) { '(CONFLICTING: ' + ($id.AllIds -join ', ') + ')' }
                 elseif ($id.DeviceId) { $id.DeviceId }
-                else { '(none stored)' })
+                elseif ($id.KeySeen) { '(present but unextractable - value is compression-broken)' }
+                else { '(no bridgeDeviceId key found here)' })
             DisplayName = $(if ($id.DisplayName) { $id.DisplayName } else { '' })
             # Surfaced, not just counted. "(none stored)" because the file was
             # locked and "(none stored)" because there is genuinely no id are
@@ -417,7 +429,10 @@ foreach ($b in $BROWSERS) {
             Exact       = $id.Exact
             # The length of the contiguous run each verdict rests on, so a
             # reader can weigh the evidence instead of taking MATCHED on faith.
-            Runs        = $id.Runs
+            # Named for what it is: `Runs` listed every candidate identically
+            # in every profile and read as noise until you worked out it was a
+            # per-candidate map rather than a per-profile finding.
+            LongestRunPerCandidate = $id.Runs
             Running     = ($procs.Count -gt 0)
             Windows     = $titles.Count
             Title       = $(if ($titles.Count -gt 0) { $titles[0] } else { '' })
@@ -545,7 +560,7 @@ if ($DeviceId.Count -gt 0) {
             if ($h.Exact -notcontains $d) {
                 $kind = 'MATCHED*'
                 $runLen = 0
-                if ($h.Runs.ContainsKey($d)) { $runLen = $h.Runs[$d] }
+                if ($h.LongestRunPerCandidate.ContainsKey($d)) { $runLen = $h.LongestRunPerCandidate[$d] }
                 $how = ("  [partial: {0} of {1} chars contiguous]" -f $runLen, $d.Length)
             }
             Write-Output ("  {0} {1}  -> {2} / {3}  [{4}]  {5}{6}" -f $kind, $d, $h.Browser, $h.Profile, $live, $h.DisplayName, $how)
