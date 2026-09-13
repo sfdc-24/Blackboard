@@ -42,6 +42,12 @@ supersede the live holder merely by reusing its actor name. `NOTE` and `FINDING`
 are observations: their recorded status, assignment, and lease do not reduce
 effective work state.
 
+New fenced claims require `CLAIM`/`CLAIMED`. Subsequent lifecycle transitions
+are fail-closed status pairs: `BLOCK`/`BLOCKED`, `RELEASE`/`OPEN`,
+`COMPLETE`/`DONE`, and `CANCEL`/`CANCELLED`. Contradictory pairs are rejected
+before storage once a work item is fenced, so they cannot leave a stale fence
+active; untouched legacy items retain their v1 behavior.
+
 Clients must persist `{work_id, actor_tag, claim_generation, fence_token}` as one
 atomic record before starting work. Concurrent responses can arrive out of
 order: never let a lower generation overwrite a higher one. Read APIs return the
@@ -54,6 +60,13 @@ live tokenless CLAIM. A future idempotent claim nonce could remove this liveness
 cost without exposing the capability. An exact `COMPLETE` retry can return its
 original receipt with `replayed: true` even after displacement because that path
 adds no transition; any changed stale result is rejected.
+
+Use UTC `Z` for lease timestamps when possible. Numeric offsets with or without
+a colon are accepted only when their absolute value is below 15 hours, matching
+the Python validator and SQLite's durable time comparison. Every new `CLAIM` and
+subsequent fenced state-bearing lease is capped at four hours from acceptance,
+including a lease refreshed by `PROGRESS`; observation-only `NOTE`/`FINDING`
+lease fields cannot affect a hold. Untouched legacy items keep their v1 rules.
 
 The token is a freshness capability, not actor authentication. Every holder of
 the shared `BUS_SECRET` can read ledger state and assert an `actor_tag`, but the

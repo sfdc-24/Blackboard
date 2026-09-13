@@ -436,6 +436,20 @@ def test_durable_claim_fencing(server_py, tmp):
         check("same actor's current generation can COMPLETE",
               code == 200 and current.get("claim_generation") == 2 and count(same_work, "COMPLETE") == 1)
 
+        claim_status_work = "WRK-FENCE-CLAIM-STATUS"
+        create(claim_status_work, base)
+        code, bad_claim_status = call({
+            "action": "event", "work_id": claim_status_work, "event_type": "CLAIM",
+            "actor_tag": "worker", "status": "OPEN", "payload": "not really held",
+            "lease_until": ((_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1))
+                            .isoformat().replace("+00:00", "Z"))}, base=base)
+        _, claim_status_history = call({"action": "work", "work_id": claim_status_work}, base=base)
+        code2, good_claim_status = claim(claim_status_work, "new-worker", base)
+        check("new fenced CLAIM requires CLAIMED and rejects before generation allocation",
+              code == 400 and "requires status 'CLAIMED'" in bad_claim_status.get("error", "") and
+              len(claim_status_history.get("events", [])) == 1 and code2 == 200 and
+              good_claim_status.get("claim_generation") == 1)
+
         identity_work = "WRK-FENCE-REPLAY-IDENTITY"
         create(identity_work, base)
         _, identity_first = claim(identity_work, "worker", base)
@@ -523,6 +537,94 @@ def test_durable_claim_fencing(server_py, tmp):
                                          cancel_claim["fence_token"], base)
         check("CANCEL revokes the claim before any later COMPLETE",
               code3 == 409 and "active unexpired CLAIM" in late_cancelled.get("error", ""))
+
+        status_work = "WRK-FENCE-STATUS-PAIR"
+        create(status_work, base)
+        _, status_claim = claim(status_work, "worker", base)
+        mismatched = []
+        for event_type, bad_status in (("BLOCK", "RUNNING"), ("RELEASE", "RUNNING"),
+                                       ("COMPLETE", "RUNNING"), ("CANCEL", "RUNNING")):
+            mismatch_code, mismatch_body = call({
+                "action": "event", "work_id": status_work, "event_type": event_type,
+                "actor_tag": "worker" if event_type != "CANCEL" else "operator",
+                "status": bad_status, "payload": "contradictory transition",
+                "fence_token": status_claim["fence_token"]}, base=base)
+            mismatched.append((mismatch_code, mismatch_body))
+        _, status_history = call({"action": "work", "work_id": status_work}, base=base)
+        check("contradictory fenced transition statuses fail before mutation",
+              all(code == 400 and "requires status" in body.get("error", "")
+                  for code, body in mismatched) and len(status_history.get("events", [])) == 2)
+        status_code, _ = complete(status_work, "worker", "valid after rejected contradictions",
+                                  status_claim["fence_token"], base)
+        check("rejected contradictory transitions do not revoke the valid current fence",
+              status_code == 200)
+
+        compact_offset_work = "WRK-FENCE-COMPACT-OFFSET"
+        create(compact_offset_work, base)
+        compact_offset_zone = _dt.timezone(_dt.timedelta(hours=14, minutes=59))
+        compact_offset_lease = ((_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1))
+                                .astimezone(compact_offset_zone)
+                                .strftime("%Y-%m-%dT%H:%M:%S%z"))
+        compact_code, compact_claim = claim(compact_offset_work, "worker", base,
+                                             lease=compact_offset_lease)
+        compact_progress_code, _ = call({
+            "action": "event", "work_id": compact_offset_work, "event_type": "PROGRESS",
+            "actor_tag": "worker", "status": "RUNNING", "payload": "valid compact offset",
+            "fence_token": compact_claim.get("fence_token")}, base=base)
+        check("API-accepted compact ISO offset remains valid inside the SQLite fence trigger",
+              compact_code == compact_progress_code == 200)
+
+        horizon_work = "WRK-FENCE-LEASE-HORIZON"
+        create(horizon_work, base)
+        _, horizon_claim = claim(horizon_work, "worker", base)
+        horizon_code, horizon_body = call({
+            "action": "event", "work_id": horizon_work, "event_type": "PROGRESS",
+            "actor_tag": "worker", "status": "RUNNING", "payload": "unbounded extension",
+            "lease_until": "2099-01-01T00:00:00Z",
+            "fence_token": horizon_claim["fence_token"]}, base=base)
+        _, horizon_history = call({"action": "work", "work_id": horizon_work}, base=base)
+        horizon_complete_code, _ = complete(horizon_work, "worker", "still current",
+                                            horizon_claim["fence_token"], base)
+        check("state-bearing PROGRESS cannot extend an unrecoverable lease beyond four hours",
+              horizon_code == 400 and "more than 4 hours" in horizon_body.get("error", "") and
+              len(horizon_history.get("events", [])) == 2 and horizon_complete_code == 200)
+
+        waited_complete_work = "WRK-FENCE-WRITER-WAIT-COMPLETE"
+        create(waited_complete_work, base)
+        waited_complete_lease = ((_dt.datetime.now(_dt.timezone.utc) +
+                                  _dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"))
+        _, waited_complete_claim = claim(waited_complete_work, "old-worker", base,
+                                          lease=waited_complete_lease)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            with sqlite3.connect(db) as gate:
+                gate.execute("BEGIN IMMEDIATE")
+                waited_future = pool.submit(complete, waited_complete_work, "old-worker",
+                                             "queued beyond lease",
+                                             waited_complete_claim["fence_token"], base)
+                time.sleep(1.3)
+                waited_before_release = not waited_future.done()
+            waited_complete_code, waited_complete_body = waited_future.result(timeout=15)
+        check("writer wait rechecks expiry and returns 409 instead of trigger 500",
+              waited_before_release and waited_complete_code == 409 and
+              "active unexpired CLAIM" in waited_complete_body.get("error", "") and
+              count(waited_complete_work, "COMPLETE") == 0)
+
+        waited_claim_work = "WRK-FENCE-WRITER-WAIT-CLAIM"
+        create(waited_claim_work, base)
+        waited_claim_lease = ((_dt.datetime.now(_dt.timezone.utc) +
+                               _dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"))
+        _, waited_old_claim = claim(waited_claim_work, "old-worker", base, lease=waited_claim_lease)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            with sqlite3.connect(db) as gate:
+                gate.execute("BEGIN IMMEDIATE")
+                waited_claim_future = pool.submit(claim, waited_claim_work, "new-worker", base)
+                time.sleep(1.3)
+                claim_waited_before_release = not waited_claim_future.done()
+            waited_claim_code, waited_new_claim = waited_claim_future.result(timeout=15)
+        check("rival CLAIM decides against post-wait time after the old lease expires",
+              claim_waited_before_release and waited_claim_code == 200 and
+              waited_new_claim.get("claim_generation") == 2 and
+              waited_new_claim.get("fence_token") != waited_old_claim.get("fence_token"))
 
         expired_work = "WRK-FENCE-EXPIRED"
         create(expired_work, base)
@@ -646,7 +748,9 @@ def test_fence_migration(server_py, tmp):
     check("cold migration creates durable claim-token and generation uniqueness indexes",
           {"idx_events_claim_fence", "idx_events_claim_generation"}.issubset(indexes))
     check("cold migration creates versioned database fence triggers",
-          {"trg_events_claim_fence_v1", "trg_events_scoped_fence_v1"}.issubset(triggers))
+          {"trg_events_claim_fence_v2", "trg_events_scoped_fence_v2",
+           "trg_events_transition_status_v1", "trg_events_lease_horizon_v1"}.issubset(triggers) and
+          not {"trg_events_claim_fence_v1", "trg_events_scoped_fence_v1"}.intersection(triggers))
     gate = sqlite3.connect(db)
     try:
         gate.execute("BEGIN IMMEDIATE")
@@ -723,6 +827,21 @@ def test_fence_migration(server_py, tmp):
             old_binary_claim_blocked = "claim fence invariant" in str(error)
         check("database rejects an old binary's unfenced CLAIM after the boundary",
               old_binary_claim_blocked)
+        bad_status_claim_blocked = False
+        fenced_claim_insert = (
+            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v, "
+            "claim_generation, fence_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        try:
+            with sqlite3.connect(db) as conn:
+                conn.execute(fenced_claim_insert, ("bad-status-claim", "2000-01-01T00:04:30Z",
+                                                   "WRK-LEGACY-ACTIVE", "CLAIM", "legacy-worker", None,
+                                                   "OPEN", future, "contradictory claim", None, None, None,
+                                                   1, 2, "direct-test-fence-token"))
+        except sqlite3.IntegrityError as error:
+            bad_status_claim_blocked = "claim fence invariant" in str(error)
+        check("database rejects a fenced CLAIM that cannot establish an active hold",
+              bad_status_claim_blocked)
         old_binary_progress_blocked = False
         try:
             with sqlite3.connect(db) as conn:
@@ -733,6 +852,32 @@ def test_fence_migration(server_py, tmp):
             old_binary_progress_blocked = "claim-scoped fence mismatch" in str(error)
         check("database rejects an old binary's unfenced claimant transition after the boundary",
               old_binary_progress_blocked)
+        unbounded_lease_blocked = False
+        fenced_insert = (
+            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v, "
+            "claim_generation, fence_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        try:
+            with sqlite3.connect(db) as conn:
+                conn.execute(fenced_insert, ("unbounded-progress", "2000-01-01T00:05:30Z",
+                                             "WRK-LEGACY-ACTIVE", "PROGRESS", "legacy-worker", None,
+                                             "RUNNING", "2099-01-01T00:00:00Z", "unbounded", None,
+                                             None, None, 1, 1, upgraded_claim["fence_token"]))
+        except sqlite3.IntegrityError as error:
+            unbounded_lease_blocked = "lease horizon invariant" in str(error)
+        check("database rejects a fenced state transition beyond the lease horizon",
+              unbounded_lease_blocked)
+        contradictory_transition_blocked = False
+        try:
+            with sqlite3.connect(db) as conn:
+                conn.execute(fenced_insert, ("bad-status-release", "2000-01-01T00:06:00Z",
+                                             "WRK-LEGACY-ACTIVE", "RELEASE", "legacy-worker", None,
+                                             "RUNNING", None, "contradictory release", None, None, None,
+                                             1, 1, upgraded_claim["fence_token"]))
+        except sqlite3.IntegrityError as error:
+            contradictory_transition_blocked = "transition status invariant" in str(error)
+        check("database rejects a correctly fenced transition with contradictory lifecycle status",
+              contradictory_transition_blocked)
         code, rejected = call({"action": "event", "work_id": "WRK-LEGACY-ACTIVE",
                                "event_type": "COMPLETE", "actor_tag": "legacy-worker",
                                "status": "DONE", "payload": "stale legacy process"}, base=base)
@@ -975,6 +1120,11 @@ def main():
                         "actor_tag": "gemini", "status": "CLAIMED", "payload": "c",
                         "lease_until": "2026-09-03T20:00:00+99:99"})
         check("impossible lease offset -> 400 not 500", code == 400)
+        code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CLAIM",
+                        "actor_tag": "gemini", "status": "CLAIMED", "payload": "c",
+                        "lease_until": "2030-01-01T20:00:00+15:00"})
+        check("Python-only offset outside SQLite fence grammar -> 400 before CLAIM", code == 400 and
+              "parseable lease_until" in r.get("error", ""))
         import datetime as _dt2
         lease2 = (_dt2.datetime.now(_dt2.timezone.utc) + _dt2.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         code, claim2 = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CLAIM",

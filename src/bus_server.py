@@ -62,6 +62,17 @@ MAX_LEASE_HOURS = 4
 OBSERVATION_EVENT_TYPES = {"NOTE", "FINDING"}
 CLAIMANT_EVENT_TYPES = {"PROGRESS", "BLOCK", "RELEASE", "COMPLETE"}
 FENCED_EVENT_TYPES = CLAIMANT_EVENT_TYPES | {"CANCEL"}
+# These transitions have one lifecycle meaning. Accepting a contradictory
+# caller-supplied status (for example RELEASE+RUNNING) would make the event look
+# terminal to a human while leaving the old lease and fence active in the state
+# reducer. Reject the contradiction instead of trying to guess intent.
+CANONICAL_TRANSITION_STATUS = {
+    "CLAIM": "CLAIMED",
+    "BLOCK": "BLOCKED",
+    "RELEASE": "OPEN",
+    "COMPLETE": "DONE",
+    "CANCEL": "CANCELLED",
+}
 
 ISO_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
 HUMAN_DATE = re.compile(
@@ -78,7 +89,9 @@ def now_iso():
 
 def parse_iso(value):
     """Parse an ISO-8601 timestamp to an aware UTC datetime, or None if it
-    does not actually parse (the regex alone accepts impossible offsets)."""
+    does not actually parse. The offset bound mirrors SQLite julianday(),
+    which the durable database fence also uses; accepting a wider Python-only
+    form would issue a claim that the storage boundary could never authorize."""
     if not isinstance(value, str) or not ISO_TS.match(value):
         return None
     try:
@@ -87,6 +100,9 @@ def parse_iso(value):
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    offset = dt.utcoffset()
+    if offset is None or abs(offset) >= timedelta(hours=15):
+        return None
     return dt.astimezone(timezone.utc)
 
 
@@ -154,13 +170,16 @@ def migrate_schema(conn):
     """
     required_columns = {"claim_generation", "fence_token"}
     required_indexes = {"idx_events_claim_fence", "idx_events_claim_generation"}
-    required_triggers = {"trg_events_claim_fence_v1", "trg_events_scoped_fence_v1"}
+    required_triggers = {"trg_events_claim_fence_v2", "trg_events_scoped_fence_v2",
+                         "trg_events_transition_status_v1", "trg_events_lease_horizon_v1"}
     columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     indexes = {row[1] for row in conn.execute("PRAGMA index_list(events)")}
     triggers = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger'")}
     if (required_columns.issubset(columns) and required_indexes.issubset(indexes)
-            and required_triggers.issubset(triggers)):
+            and required_triggers.issubset(triggers)
+            and not {"trg_events_claim_fence_v1",
+                     "trg_events_scoped_fence_v1"}.intersection(triggers)):
         # Every ThreadingHTTPServer request may establish a fresh thread-local
         # connection. Once the eager Store initialization has migrated the DB,
         # ordinary reads must not reserve the singleton SQLite writer merely to
@@ -189,8 +208,9 @@ def migrate_schema(conn):
         # is accidentally left pointed at the migrated DB. That binary omits
         # the new columns; after the first fenced CLAIM its NULL writes abort at
         # the database boundary rather than bypassing the new application code.
+        conn.execute("DROP TRIGGER IF EXISTS trg_events_claim_fence_v1")
         conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_events_claim_fence_v1
+            CREATE TRIGGER IF NOT EXISTS trg_events_claim_fence_v2
             BEFORE INSERT ON events
             WHEN NEW.event_type = 'CLAIM' AND (
               (NEW.claim_generation IS NULL AND NEW.fence_token IS NULL AND EXISTS (
@@ -200,6 +220,8 @@ def migrate_schema(conn):
               ))
               OR (NEW.claim_generation IS NULL AND NEW.fence_token IS NOT NULL)
               OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NULL)
+              OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NOT NULL
+                  AND NEW.status <> 'CLAIMED')
               OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NOT NULL AND (
                 NEW.claim_generation <> (
                   SELECT COALESCE(MAX(claim_generation), 0) + 1 FROM events
@@ -211,8 +233,13 @@ def migrate_schema(conn):
               SELECT RAISE(ABORT, 'claim fence invariant');
             END
         """)
+        # v1 passed API-accepted offsets such as +0000 to SQLite's julianday(),
+        # which accepts +00:00 but returns NULL for the compact form. Remove it
+        # during upgrade so a legitimate fenced transition cannot be rejected by
+        # both the corrected and obsolete trigger definitions.
+        conn.execute("DROP TRIGGER IF EXISTS trg_events_scoped_fence_v1")
         conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_events_scoped_fence_v1
+            CREATE TRIGGER IF NOT EXISTS trg_events_scoped_fence_v2
             BEFORE INSERT ON events
             WHEN NEW.event_type IN ('PROGRESS', 'BLOCK', 'RELEASE', 'COMPLETE', 'CANCEL')
               AND NOT (
@@ -246,7 +273,13 @@ def migrate_schema(conn):
                         AND current_state.status IN ('CLAIMED', 'RUNNING')
                     )
                     AND julianday((
-                      SELECT lease_until FROM events
+                      SELECT CASE
+                        WHEN lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                        THEN substr(lease_until, 1, length(lease_until) - 2)
+                             || ':' || substr(lease_until, -2)
+                        ELSE lease_until
+                      END
+                      FROM events
                       WHERE work_id = NEW.work_id AND lease_until IS NOT NULL
                         AND event_type NOT IN ('NOTE', 'FINDING')
                       ORDER BY seq DESC LIMIT 1
@@ -255,6 +288,55 @@ def migrate_schema(conn):
               )
             BEGIN
               SELECT RAISE(ABORT, 'claim-scoped fence mismatch');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_transition_status_v1
+            BEFORE INSERT ON events
+            WHEN NEW.event_type IN ('BLOCK', 'RELEASE', 'COMPLETE', 'CANCEL')
+              AND EXISTS (
+                SELECT 1 FROM events
+                WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                  AND fence_token IS NOT NULL
+              )
+              AND NOT (
+                (NEW.event_type = 'BLOCK' AND NEW.status = 'BLOCKED')
+                OR (NEW.event_type = 'RELEASE' AND NEW.status = 'OPEN')
+                OR (NEW.event_type = 'COMPLETE' AND NEW.status = 'DONE')
+                OR (NEW.event_type = 'CANCEL' AND NEW.status = 'CANCELLED')
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'transition status invariant');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_lease_horizon_v1
+            BEFORE INSERT ON events
+            WHEN NEW.event_type NOT IN ('NOTE', 'FINDING')
+              AND (NEW.fence_token IS NOT NULL OR EXISTS (
+                SELECT 1 FROM events
+                WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                  AND fence_token IS NOT NULL
+              ))
+              AND (
+                (NEW.event_type = 'CLAIM' AND NEW.lease_until IS NULL)
+                OR (NEW.lease_until IS NOT NULL AND (
+                  julianday(CASE
+                    WHEN NEW.lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                    THEN substr(NEW.lease_until, 1, length(NEW.lease_until) - 2)
+                         || ':' || substr(NEW.lease_until, -2)
+                    ELSE NEW.lease_until
+                  END) IS NULL
+                  OR julianday(CASE
+                    WHEN NEW.lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                    THEN substr(NEW.lease_until, 1, length(NEW.lease_until) - 2)
+                         || ':' || substr(NEW.lease_until, -2)
+                    ELSE NEW.lease_until
+                  END) > julianday('now', '+4 hours')
+                ))
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'lease horizon invariant');
             END
         """)
         conn.commit()
@@ -609,15 +691,20 @@ class Store:
             if val is not None and not isinstance(val, str):
                 raise BusError(400, f"{field} must be a string when present.")
         lease_until = body.get("lease_until")
-        now = datetime.now(timezone.utc)
+        validation_now = datetime.now(timezone.utc)
         if etype == "CLAIM":
+            if status != CANONICAL_TRANSITION_STATUS["CLAIM"]:
+                raise BusError(400, f"CLAIM requires status 'CLAIMED', got {status!r}.")
             lease_dt = parse_iso(lease_until) if isinstance(lease_until, str) else None
             if lease_dt is None:
-                raise BusError(400, "CLAIM with no parseable lease_until (ISO-8601 UTC required).")
-            if lease_dt > now + timedelta(hours=MAX_LEASE_HOURS):
+                raise BusError(400, "CLAIM with no supported parseable lease_until "
+                                    "(use ISO-8601 Z or an offset below 15 hours).")
+            if lease_dt > validation_now + timedelta(hours=MAX_LEASE_HOURS):
                 raise BusError(400, f"lease_until more than {MAX_LEASE_HOURS} hours out.")
-        elif lease_until is not None and parse_iso(str(lease_until)) is None:
-            raise BusError(400, "lease_until must be parseable ISO-8601 UTC when present.")
+        elif lease_until is not None:
+            lease_dt = parse_iso(str(lease_until))
+            if lease_dt is None:
+                raise BusError(400, "lease_until must be supported parseable ISO-8601 when present.")
 
         fence_token = body.get("fence_token")
         if fence_token is not None and (not isinstance(fence_token, str) or not fence_token.strip()):
@@ -636,7 +723,11 @@ class Store:
         # before lookup: WRITE_LOCK alone cannot serialize separate processes.
         with WRITE_LOCK, self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
-            return self._add_event(accepted, now)
+            # A different process may have held SQLite's writer until a lease
+            # expired. Authorization must use the time after that wait, not the
+            # stale pre-lock validation timestamp.
+            transaction_now = datetime.now(timezone.utc)
+            return self._add_event(accepted, transaction_now)
 
     def _add_event(self, accepted, now):
         """Look up or append within the caller's immediate transaction."""
@@ -716,6 +807,12 @@ class Store:
         elif etype in FENCED_EVENT_TYPES:
             claim = self.latest_claim(work_id)
             if claim and claim["fence_token"] is not None:
+                expected_status = CANONICAL_TRANSITION_STATUS.get(etype)
+                if expected_status is not None and status != expected_status:
+                    raise BusError(400, f"{etype} requires status {expected_status!r}, got {status!r}.")
+                if (lease_until is not None and
+                        parse_iso(str(lease_until)) > now + timedelta(hours=MAX_LEASE_HOURS)):
+                    raise BusError(400, f"state-bearing lease_until more than {MAX_LEASE_HOURS} hours out.")
                 if supplied_fence is None:
                     raise BusError(409, f"work_id {work_id!r} requires the current CLAIM fence_token.",
                                    extra={"holder": claim["actor_tag"],
@@ -742,12 +839,31 @@ class Store:
                 # had already crossed the fencing boundary. Do not silently
                 # downgrade it during a mixed-version rollout.
                 raise BusError(409, f"work_id {work_id!r} latest CLAIM is unfenced after fencing was enabled.")
-        cur = self.conn.execute(
-            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
-            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v, "
-            "claim_generation, fence_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event_id, ts, work_id, etype, actor, assigned_to, status, lease_until, payload,
-             evidence_ref, parent_work_id, project, schema_v, claim_generation, stored_fence))
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+                "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v, "
+                "claim_generation, fence_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, ts, work_id, etype, actor, assigned_to, status, lease_until, payload,
+                 evidence_ref, parent_work_id, project, schema_v, claim_generation, stored_fence))
+        except sqlite3.IntegrityError as error:
+            # SQLite evaluates julianday('now') at the insert boundary. A lease
+            # can expire in the few instructions after the Python authorization
+            # check; report that expected fence loss as 409, never an opaque 500.
+            message = str(error)
+            if "claim-scoped fence mismatch" in message and etype in FENCED_EVENT_TYPES:
+                claim = self.latest_claim(work_id)
+                raise BusError(409, f"work_id {work_id!r} has no active unexpired CLAIM.",
+                               extra={"holder": claim["actor_tag"] if claim else None,
+                                      "claim_generation": claim["claim_generation"]
+                                      if claim else None})
+            if "transition status invariant" in message:
+                expected_status = CANONICAL_TRANSITION_STATUS.get(etype)
+                raise BusError(400, f"{etype} requires status {expected_status!r}, got {status!r}.")
+            if "lease horizon invariant" in message:
+                raise BusError(400, f"state-bearing lease_until must be parseable and no more than "
+                                    f"{MAX_LEASE_HOURS} hours out.")
+            raise
         seq = cur.lastrowid
         # Success response echoes what was actually stored (LEDGER section 4).
         result = {"event_id": event_id, "seq": seq, "work_id": work_id,

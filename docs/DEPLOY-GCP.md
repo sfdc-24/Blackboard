@@ -134,6 +134,17 @@ COMPLETE, or CANCEL. A live same-actor CLAIM is a renewal and must carry the
 current token; a tokenless same-actor process receives 409. Never let a delayed
 lower-generation receipt overwrite a higher locally persisted generation.
 
+Use `CLAIM`/`CLAIMED` for every new fenced claim and the canonical lifecycle
+pairs `BLOCK`/`BLOCKED`, `RELEASE`/`OPEN`, `COMPLETE`/`DONE`, and
+`CANCEL`/`CANCELLED`. Once a work item is fenced, contradictory pairs fail
+before storage rather than leaving the previous claim deceptively active;
+untouched legacy items retain their v1 behavior.
+Prefer UTC `Z` for leases. Numeric offsets may be coloned or compact but must
+have an absolute value below 15 hours so Python and SQLite enforce the same time.
+Every new CLAIM and subsequent fenced state-bearing lease is capped at four hours
+from acceptance, including a lease refreshed by `PROGRESS`; `NOTE`/`FINDING`
+lease fields never affect a hold. Untouched legacy items keep their v1 rules.
+
 The `inbox` and `work` read APIs expose generations but redact tokens, including
 the token for a public CLAIM event id. A lost or ambiguous CLAIM response cannot
 be recovered through reads in v1.1: do no work, recover the process's own atomic
