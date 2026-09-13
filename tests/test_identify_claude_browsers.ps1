@@ -63,7 +63,13 @@ function New-FixtureProfile {
     $sdir = Join-Path $pdir "Local Extension Settings\$EXT_ID"
     New-Item -ItemType Directory -Force -Path $sdir | Out-Null
     foreach ($t in $Tables) {
-        [System.IO.File]::WriteAllText((Join-Path $sdir $t.Name), $t.Body, [System.Text.Encoding]::ASCII)
+        # LATIN-1, matching how the tool reads. Writing fixtures as ASCII folds
+        # every byte above 0x7F to '?', so a fixture built to carry a non-ASCII
+        # display name never contained one - and the suite reported the TOOL as
+        # mangling a name the FIXTURE had already destroyed. The test writer and
+        # the code under test have to agree on bytes or the test is fiction.
+        [System.IO.File]::WriteAllText((Join-Path $sdir $t.Name), $t.Body,
+                                       [System.Text.Encoding]::GetEncoding(28591))
         # Age the files so "newest first" ordering inside the tool is
         # deterministic rather than dependent on how fast the disk was.
         if ($t.ContainsKey('AgeMinutes')) {
@@ -117,18 +123,35 @@ function Invoke-Sut {
         if ($Ids.Count -gt 0) {
             $idLiteral = '@(' + (($Ids | ForEach-Object { "'" + $_ + "'" }) -join ',') + ')'
         }
-        $wrapper = "& '$SUT' -ScanRoot '$Root' -ScanName 'Fixture' -DeviceId $idLiteral" +
-                   [Environment]::NewLine + 'exit $LASTEXITCODE'
-        Set-Content -Path $w -Value $wrapper -Encoding ascii
+        # THE WRAPPER WRITES THE FILE ITSELF, WITH AN EXPLICIT ENCODING.
+        #
+        # Letting the shell redirect stdout captures raw bytes encoded with the
+        # console code page, and setting [Console]::OutputEncoding inside the
+        # child does not retake an already-redirected handle. A correctly
+        # decoded display name therefore came back mangled and the suite failed
+        # a tool that was right. That is the mirror of the earlier harness bug:
+        # one manufactured a false positive, this one a false negative. Both
+        # are the harness lying about the thing it exists to measure.
+        #
+        # Capturing in PowerShell and writing UTF-8 explicitly removes the
+        # console code page from the path entirely.
+        $wrapper = @(
+            '$ErrorActionPreference = ''Continue''',
+            "`$out = & '$SUT' -ScanRoot '$Root' -ScanName 'Fixture' -DeviceId $idLiteral 2>&1 | Out-String",
+            '$code = $LASTEXITCODE',
+            "[System.IO.File]::WriteAllText('$o', `$out, [System.Text.Encoding]::UTF8)",
+            'if ($null -eq $code) { $code = 0 }',
+            'exit $code'
+        ) -join [Environment]::NewLine
+        Set-Content -Path $w -Value $wrapper -Encoding utf8
 
-        $cmd = '"' + (Get-Command powershell.exe).Source + '"' +
-               ' -NoProfile -ExecutionPolicy Bypass -File "' + $w + '"' +
-               ' > "' + $o + '" 2> "' + $e + '"'
-        $null = & cmd.exe /c $cmd
-        $code = $LASTEXITCODE
+        $p = Start-Process -FilePath 'powershell.exe' `
+             -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $w) `
+             -NoNewWindow -Wait -PassThru
+        $code = $p.ExitCode
         Remove-Item $w -Force -ErrorAction SilentlyContinue
-        $text = (Get-Content $o -Raw -ErrorAction SilentlyContinue)
-        $err  = (Get-Content $e -Raw -ErrorAction SilentlyContinue)
+        $text = (Get-Content $o -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+        $err  = ''
         if ($null -eq $text) { $text = '' }
         if ($null -eq $err)  { $err  = '' }
         return [PSCustomObject]@{ Text = ($text + $err); Code = $code }
@@ -254,6 +277,93 @@ try {
         'the key is present, so this machine CAN answer even though no value parses'
     Assert-True 'a broken value that still matches exits 0' ($res8.Code -eq 0) `
         "got exit $($res8.Code)"
+
+    # ---- fixture 9: THE EDGE SHAPE - corruption near the START ------------
+    # The regression that shipped in the merged PR87. Its matcher tested the
+    # candidate's first 13 characters, which assumes the corruption lands late.
+    # The laptop's real Edge record breaks right after `7e788`, so the intact
+    # portion is the TAIL and the tool reported ELSEWHERE for the very browser
+    # it was built to identify. 26 green assertions missed it because the only
+    # compression fixture reproduced the Chrome shape.
+    $r9 = Join-Path $WORK 'r9'
+    $edgeBody = $NUL + '&bridgeDeviceId' + $NUL + $NUL + $NUL + $NUL + '@' + $NUL +
+                '."7e788' + $NUL + '?' + $NUL + '>' + '677b-43ea-98ae-a0b29ef8ee6f"'
+    New-FixtureProfile -Root $r9 -Profile 'Profile 2' -Version '1.0.93' -Tables @(
+        @{ Name = '000005.ldb'; Body = $edgeBody; AgeMinutes = 3 }
+    ) | Out-Null
+
+    $res9 = Invoke-Sut -Root $r9 -Ids @($LAPTOP_EDGE, $LIVE_ID)
+    Assert-True 'corruption near the START of the value still matches (tail intact)' `
+        ($res9.Text -cmatch 'MATCHED') `
+        'the merged version reported ELSEWHERE here - prefix matching assumed late corruption'
+    Assert-True 'the tail-intact match is labelled partial with its run length' `
+        ($res9.Text -match 'partial: 27 of 36') `
+        'a partial match must never be presented as an exact one'
+    Assert-True 'the unrelated id is still ELSEWHERE in the same run' `
+        ($res9.Text -cmatch 'ELSEWHERE')
+
+    # ---- fixture 10: a run BELOW the floor must not match ------------------
+    # codex constructed prefix collisions as its objection to the old matcher.
+    # With a 16-character floor, a window carrying only 13 characters of a
+    # candidate must be refused - otherwise the floor is decorative.
+    $r10 = Join-Path $WORK 'r10'
+    $shortBody = $NUL + '&bridgeDeviceId' + $NUL + $NUL + '@' + $NUL + '"7e788713-677' + $NUL + 'XXXX"'
+    New-FixtureProfile -Root $r10 -Profile 'Default' -Version '1.0.93' -Tables @(
+        @{ Name = '000001.ldb'; Body = $shortBody; AgeMinutes = 3 }
+    ) | Out-Null
+    $res10 = Invoke-Sut -Root $r10 -Ids @($LAPTOP_EDGE)
+    Assert-True 'a contiguous run shorter than the floor does NOT match' `
+        (-not ($res10.Text -cmatch 'MATCHED')) `
+        '13 characters was the old threshold and is exactly what codex objected to'
+
+    # ---- fixture 11: two candidates in one profile is AMBIGUOUS ------------
+    # A profile stores ONE id. If the evidence cannot separate two candidates,
+    # reporting either is a coin flip dressed as a finding.
+    $r11 = Join-Path $WORK 'r11'
+    $bothBody = $NUL + '&bridgeDeviceId' + $NUL + '@' + '"295592ab-1617-486d-b1b4' + $NUL + 'x"' +
+                $NUL + '&bridgeDeviceId' + $NUL + '@' + '"7e788713-677b-43ea-98ae' + $NUL + 'y"'
+    New-FixtureProfile -Root $r11 -Profile 'Default' -Version '1.0.93' -Tables @(
+        @{ Name = '000001.ldb'; Body = $bothBody; AgeMinutes = 3 }
+    ) | Out-Null
+    $res11 = Invoke-Sut -Root $r11 -Ids @($LAPTOP_CHROME, $LAPTOP_EDGE)
+    Assert-True 'two candidates matching one profile report AMBIGUOUS' `
+        ($res11.Text -cmatch 'AMBIGUOUS') `
+        'one profile holds one id; refusing to pick is the only honest answer'
+    Assert-True 'an ambiguous profile reports MATCHED for neither candidate' `
+        (-not ($res11.Text -cmatch 'MATCHED')) `
+        'reporting either would be a guess presented as evidence'
+
+    # ---- fixture 12: conflicting complete ids, misleading mtimes ----------
+    # Files are walked newest-mtime-first, and that ordering was being treated
+    # as LevelDB's. It is not - LevelDB orders by sequence number, and a
+    # compaction can give an older record a newer mtime. So the conflict was
+    # being resolved by an irrelevant clock.
+    $r12 = Join-Path $WORK 'r12'
+    New-FixtureProfile -Root $r12 -Profile 'Default' -Version '1.0.93' -Tables @(
+        @{ Name = '000090.ldb'; Body = (New-RealisticBody $ANON_ID $LIVE_ID 'Newest By Clock'); AgeMinutes = 1 },
+        @{ Name = '000010.ldb'; Body = (New-RealisticBody $ANON_ID $LAPTOP_CHROME 'Older By Clock'); AgeMinutes = 90 }
+    ) | Out-Null
+    $res12 = Invoke-Sut -Root $r12
+    Assert-True 'two different complete ids are reported as CONFLICTING' `
+        ($res12.Text -cmatch 'CONFLICTING') `
+        'picking the newest mtime resolves a LevelDB conflict by the wrong clock'
+
+    # ---- fixture 13: a non-ASCII display name survives --------------------
+    # ASCII decoding folds every byte above 0x7F to '?', so an accented or
+    # emoji name arrived as mojibake and read like a corrupt record.
+    $r13 = Join-Path $WORK 'r13'
+    $utf8Name = 'Chrome Berlin Buro'
+    $nameBytes = [System.Text.Encoding]::UTF8.GetBytes('Chrome Berlin B' + [char]0x00FC + 'ro')
+    $latin = [System.Text.Encoding]::GetEncoding(28591).GetString($nameBytes)
+    $uniBody = $NUL + '&bridgeDeviceId' + $NUL + $NUL + '@?"' + $LIVE_ID + '"' +
+               $NUL + 'isplayName' + $NUL + '<?"' + $latin + '"'
+    New-FixtureProfile -Root $r13 -Profile 'Default' -Version '1.0.93' -Tables @(
+        @{ Name = '000001.ldb'; Body = $uniBody; AgeMinutes = 3 }
+    ) | Out-Null
+    $res13 = Invoke-Sut -Root $r13 -Ids @($LIVE_ID)
+    Assert-True 'a non-ASCII display name is decoded, not mangled' `
+        ($res13.Text -match ([char]0x00FC)) `
+        'ASCII decoding turned every byte above 0x7F into a question mark'
 
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have

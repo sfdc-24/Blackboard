@@ -27,8 +27,21 @@
     that registration is stale.
 
 .PARAMETER DeviceId
-    Zero or more deviceIds from list_connected_browsers. Each is reported as
-    MATCHED (found in a local profile) or STALE (no local install holds it).
+    Zero or more deviceIds from list_connected_browsers. Each is reported as:
+
+      MATCHED    a complete id was read from a local profile
+      MATCHED*   the stored value is broken up by LevelDB compression, and a
+                 contiguous run of at least 16 characters identifies it; the
+                 run length is printed so the evidence can be weighed
+      AMBIGUOUS  more than one candidate cleared the floor in one profile, so
+                 the evidence cannot distinguish them and none is reported
+      ELSEWHERE  no profile ON THIS MACHINE holds it. That is NOT "stale" -
+                 it may be a live browser on another machine
+
+    Exit codes: 0 something matched, 1 nothing matched, 2 could not look
+    (installs exist but no bridgeDeviceId key was seen anywhere). 2 is kept
+    distinct from 1 because "could not look" and "looked and found nothing"
+    call for different actions.
 
 .EXAMPLE
     .\identify_claude_browsers.ps1
@@ -78,7 +91,17 @@ function Read-SharedText {
         $fs = New-Object System.IO.FileStream(
             $Path, [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::ASCII)
+        # LATIN-1, NOT ASCII, AND NOT UTF-8.
+        #
+        # ASCII folds every byte above 0x7F to '?', which destroys a non-ASCII
+        # display name outright. UTF-8 is worse for this job: the file is
+        # binary, so invalid sequences become replacement characters and the
+        # string indices stop corresponding to byte offsets - the very thing
+        # the key-anchored window arithmetic depends on. Latin-1 is the only
+        # encoding that maps all 256 byte values one-to-one, so the text is
+        # byte-faithful and offsets stay true. The display name is decoded back
+        # to UTF-8 from these bytes where it is read, not here.
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::GetEncoding(28591))
         $text = $sr.ReadToEnd()
         $sr.Close(); $fs.Close()
         return $text
@@ -146,18 +169,25 @@ function Get-SettingsDirs {
 # is answerable. Anchor on the key, look only at the window after it, and ask
 # whether a candidate's leading run appears there. 13 characters (8 hex, a dash,
 # 4 hex) is 48 bits of prefix against a handful of candidates.
-function Test-IdInWindow {
-    param([string]$Text, [string]$Candidate)
-    if ([string]::IsNullOrEmpty($Text)) { return $false }
+# The floor for calling a broken-up value a match. 16 characters of a UUID is
+# 64 bits of content; the real records yield 23 and 27. Paired with the
+# uniqueness rule below - one candidate per profile or none - a coincidental
+# hit would have to be constructed rather than encountered.
+$MIN_RUN = 16
 
-    # Refuse a candidate that is not a UUID. Prefix matching is only safe on a
-    # value of known shape: a caller that accidentally passes two ids as one
-    # comma-joined string would otherwise "match" on the first 13 characters and
-    # be told a browser holds an id that does not exist. That is exactly what a
+function Get-LongestRunInWindow {
+    param([string]$Text, [string]$Candidate)
+    $best = 0
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+
+    # Refuse a candidate that is not a UUID. Substring matching is only safe on
+    # a value of known shape: a caller that accidentally passes two ids as one
+    # comma-joined string would otherwise "match" on a run of the first and be
+    # told a browser holds an id that does not exist. That is exactly what a
     # quoting bug in the test harness did.
     if ($Candidate -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
         Write-Warning "ignoring malformed deviceId '$Candidate' - expected a UUID"
-        return $false
+        return 0
     }
 
     # 'ridgeDeviceId': the leading character is eaten by the length byte often
@@ -168,17 +198,37 @@ function Test-IdInWindow {
         if ($len -le 0) { continue }
         $window = $Text.Substring($start, $len)
 
-        if ($window.Contains($Candidate)) { return $true }
-        if ($Candidate.Length -ge 13 -and $window.Contains($Candidate.Substring(0, 13))) { return $true }
+        # LONGEST CONTIGUOUS RUN ANYWHERE IN THE CANDIDATE - NOT A PREFIX.
+        #
+        # The merged version tested the candidate's first 13 characters, which
+        # assumed the corruption lands LATE. It does on the laptop's Chrome
+        # record (295592ab-1617-486d-b1b4 then junk) and NOT on its Edge
+        # record, whose real bytes are:
+        #
+        #     bridgeDeviceId....@."7e788.??>677b-43ea-98ae-a0b29ef8ee6f"
+        #
+        # There the intact portion is the TAIL. `7e788713-677b` never appears,
+        # so the tool reported ELSEWHERE for the very browser it was built to
+        # identify - and 26 green assertions missed it because the fixture only
+        # reproduced the Chrome shape. A test that passes for the wrong reason.
+        #
+        # Scanning every offset finds 27 contiguous characters for that Edge
+        # record and 23 for the Chrome one, either of which is far stronger
+        # evidence than a 13-character prefix ever was.
+        for ($i = 0; $i -lt $Candidate.Length; $i++) {
+            for ($len = $Candidate.Length - $i; $len -gt $best; $len--) {
+                if ($window.Contains($Candidate.Substring($i, $len))) { $best = $len; break }
+            }
+        }
     }
-    return $false
+    return $best
 }
 
 function Get-ProfileIdentity {
     param([string]$ProfilePath, [string[]]$Candidates = @())
     $result = @{ DeviceId = $null; DisplayName = $null; Unreadable = 0;
                  Searched = @(); Absent = @(); Empty = @(); MatchedIds = @();
-                 KeySeen = $false }
+                 KeySeen = $false; Runs = @{}; Ambiguous = @(); Exact = @(); AllIds = @() }
 
     $files = @()
     foreach ($d in (Get-SettingsDirs $ProfilePath)) {
@@ -208,6 +258,19 @@ function Get-ProfileIdentity {
         # key never seen is an open question.
         if ($txt.Contains('ridgeDeviceId')) { $result.KeySeen = $true }
 
+        # COLLECT, DO NOT LET THE FIRST FILE WIN.
+        #
+        # Files are walked newest-mtime-first, and that ordering was being used
+        # as though it were LevelDB's. It is not: LevelDB orders by sequence
+        # number, and a compaction can give an older record a newer mtime. So
+        # "the first complete UUID I see" was resolving a conflict by an
+        # irrelevant clock. Gather every distinct value and let the caller
+        # refuse if they disagree.
+        $seen = Get-SettingAfterKey $txt 'bridgeDeviceId'
+        if ($seen -match '^[0-9a-fA-F-]{36}$' -and $result.AllIds -notcontains $seen) {
+            $result.AllIds += $seen
+        }
+
         if (-not $result.DeviceId) {
             # Best effort, for DISPLAY only. It succeeds where the block
             # happened to be stored uncompressed and fails silently otherwise,
@@ -220,8 +283,10 @@ function Get-ProfileIdentity {
         # Asking "is this id here" survives a value the compressor has broken
         # up; reading the value back does not.
         foreach ($c in $Candidates) {
-            if ($result.MatchedIds -notcontains $c) {
-                if (Test-IdInWindow $txt $c) { $result.MatchedIds += $c }
+            $run = Get-LongestRunInWindow $txt $c
+            if ($run -gt 0) {
+                if (-not $result.Runs.ContainsKey($c)) { $result.Runs[$c] = 0 }
+                if ($run -gt $result.Runs[$c]) { $result.Runs[$c] = $run }
             }
         }
         if (-not $result.DisplayName) {
@@ -241,10 +306,35 @@ function Get-ProfileIdentity {
             # them - a value that is obviously not a name, presented as one.
             $v = Get-SettingAfterKey $txt 'isplayName'
             if ($v -and $v.Length -ge 2 -and $v -match '[A-Za-z]{2}') {
+                # The text was read Latin-1 to keep byte offsets true, so the
+                # captured run is raw bytes in a string. Turn it back into
+                # bytes and decode as UTF-8, which is what Chrome actually
+                # stored - otherwise a name with an accent or an emoji renders
+                # as mojibake and looks like a corrupt record rather than a
+                # correctly stored name.
+                try {
+                    $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($v)
+                    $decoded = [System.Text.Encoding]::UTF8.GetString($bytes)
+                    if ($decoded -and ($decoded -notmatch [char]0xFFFD)) { $v = $decoded }
+                } catch { }
                 $result.DisplayName = $v
             }
         }
     }
+    # ONE CANDIDATE PER PROFILE, OR NONE.
+    #
+    # A profile stores one bridgeDeviceId. If two different candidates both
+    # clear the floor here, the evidence cannot distinguish them and reporting
+    # either would be a coin flip dressed as a finding - which is the whole
+    # failure this tool exists to end. Say ambiguous and let the caller refuse.
+    $over = @($result.Runs.Keys | Where-Object { $result.Runs[$_] -ge $MIN_RUN })
+    if ($over.Count -eq 1) {
+        $result.MatchedIds = @($over[0])
+        if ($result.Runs[$over[0]] -eq $over[0].Length) { $result.Exact = @($over[0]) }
+    } elseif ($over.Count -gt 1) {
+        $result.Ambiguous = $over
+    }
+
     return $result
 }
 
@@ -302,7 +392,14 @@ foreach ($b in $BROWSERS) {
             Browser     = $b.Name
             Profile     = $p.Name
             ExtVersion  = $version
-            DeviceId    = $(if ($id.DeviceId) { $id.DeviceId } else { '(none stored)' })
+            # A profile holding two different complete ids is not a profile
+            # whose id is the one in the newest file. It is a profile whose id
+            # this tool cannot determine, and saying so is the only honest
+            # rendering.
+            DeviceId    = $(
+                if ($id.AllIds.Count -gt 1) { '(CONFLICTING: ' + ($id.AllIds -join ', ') + ')' }
+                elseif ($id.DeviceId) { $id.DeviceId }
+                else { '(none stored)' })
             DisplayName = $(if ($id.DisplayName) { $id.DisplayName } else { '' })
             # Surfaced, not just counted. "(none stored)" because the file was
             # locked and "(none stored)" because there is genuinely no id are
@@ -316,6 +413,11 @@ foreach ($b in $BROWSERS) {
             Empty       = $id.Empty
             MatchedIds  = $id.MatchedIds
             KeySeen     = $id.KeySeen
+            Ambiguous   = $id.Ambiguous
+            Exact       = $id.Exact
+            # The length of the contiguous run each verdict rests on, so a
+            # reader can weigh the evidence instead of taking MATCHED on faith.
+            Runs        = $id.Runs
             Running     = ($procs.Count -gt 0)
             Windows     = $titles.Count
             Title       = $(if ($titles.Count -gt 0) { $titles[0] } else { '' })
@@ -401,14 +503,38 @@ if ($DeviceId.Count -gt 0) {
     }
 
     $stale = 0
+    $ambiguous = 0
     foreach ($d in $DeviceId) {
         # MatchedIds first: it survives a compressed value. DeviceId equality is
         # kept as a fallback for the uncompressed case and costs nothing.
+        # A profile that could not tell two candidates apart must not answer for
+        # EITHER of them. Reported separately from a clean miss, because
+        # "ambiguous here" and "not here" call for different next actions.
+        $amb = @($rows | Where-Object { $_.Ambiguous -contains $d })
+        if ($amb.Count -gt 0) {
+            $ambiguous++
+            $a = $amb[0]
+            Write-Output ("  AMBIGUOUS {0}  -> {1} / {2} matched more than one candidate; refusing to guess" -f $d, $a.Browser, $a.Profile)
+            continue
+        }
+
         $hit = @($rows | Where-Object { ($_.MatchedIds -contains $d) -or ($_.DeviceId -eq $d) })
         if ($hit.Count -gt 0) {
             $h = $hit[0]
             $live = $(if ($h.Running -and $h.Windows -gt 0) { 'LIVE' } else { 'installed but not running' })
-            Write-Output ("  MATCHED  {0}  -> {1} / {2}  [{3}]  {4}" -f $d, $h.Browser, $h.Profile, $live, $h.DisplayName)
+            # EXACT vs PARTIAL, never conflated. A partial rests on a contiguous
+            # run through a value the compressor broke up; a reader deciding
+            # whether to act on it deserves to know which, and how long the run
+            # was.
+            $kind = 'MATCHED'
+            $how = ''
+            if ($h.Exact -notcontains $d) {
+                $kind = 'MATCHED*'
+                $runLen = 0
+                if ($h.Runs.ContainsKey($d)) { $runLen = $h.Runs[$d] }
+                $how = ("  [partial: {0} of {1} chars contiguous]" -f $runLen, $d.Length)
+            }
+            Write-Output ("  {0} {1}  -> {2} / {3}  [{4}]  {5}{6}" -f $kind, $d, $h.Browser, $h.Profile, $live, $h.DisplayName, $how)
         } else {
             $stale++
             Write-Output ("  ELSEWHERE {0}  -> no profile ON THIS MACHINE holds this id" -f $d)
