@@ -302,6 +302,49 @@ try {
     Assert-True 'the unrelated id is still ELSEWHERE in the same run' `
         ($res9.Text -cmatch 'ELSEWHERE')
 
+    # ---- fixture 9b: THE LAPTOP SHAPE WITH REAL FRAMING BYTES -------------
+    # Fixtures 8 and 9 transcribe the laptop's values faithfully but spell the
+    # framing before the quote as NUL, because NUL was in the whitelist being
+    # checked. That is the blind spot that let a narrowing of the value-framing
+    # class ship: the framing in the transcript is written `....@."`, and the
+    # only machine here whose raw bytes could be read puts 01 07 00 05 40 D8 in
+    # exactly that position - the last of those dots is a HIGH byte, not a NUL.
+    #
+    # So re-run both laptop shapes with this disk's real framing sequence in
+    # front of the laptop's broken values. Nobody has re-run on VANLAS since
+    # PR92, and this is as close as this VM can get to that evidence: if its
+    # framing dots are high bytes like ours, these are the records PR92 refused.
+    # The run lengths are pinned to the numbers VANLAS actually produced, so
+    # framing may not quietly change what the evidence is worth.
+    $REAL_FRAMING = [Text.Encoding]::GetEncoding(28591).GetString(
+        [byte[]](0x01,0x07,0x00,0x05,0x40,0xD8))
+
+    $r9b = Join-Path $WORK ('r9b-' + [guid]::NewGuid().ToString('N'))
+    New-FixtureProfile -Root $r9b -Profile 'Profile 2' -Version '1.0.93' -Tables @(
+        @{ Name = '000005.ldb'
+           Body = $NUL + '&bridgeDeviceId' + $REAL_FRAMING +
+                  '"7e788' + $NUL + '?' + $NUL + '>' + '677b-43ea-98ae-a0b29ef8ee6f"'
+           AgeMinutes = 3 }
+    ) | Out-Null
+    $res9b = Invoke-Sut -Root $r9b -Ids @($LAPTOP_EDGE)
+    Assert-True 'the laptop Edge shape survives REAL framing bytes at 27 of 36' `
+        (($res9b.Text -cmatch 'MATCHED') -and ($res9b.Text -match 'partial: 27 of 36') -and
+         (-not ($res9b.Text -cmatch 'REFUSING TO RECONCILE')) -and $res9b.Code -eq 0) `
+        'PR92 refused this framing, which would have silently unidentified the laptop Edge'
+
+    $r9c = Join-Path $WORK ('r9c-' + [guid]::NewGuid().ToString('N'))
+    New-FixtureProfile -Root $r9c -Profile 'Profile 9' -Version '1.0.93' -Tables @(
+        @{ Name = '000079.ldb'
+           Body = $NUL + '&bridgeDeviceId' + $REAL_FRAMING +
+                  '"295592ab-1617-486d-b1b4' + $NUL + '?df' + '2e7b40ac"'
+           AgeMinutes = 3 }
+    ) | Out-Null
+    $res9c = Invoke-Sut -Root $r9c -Ids @($LAPTOP_CHROME)
+    Assert-True 'the laptop Chrome shape survives REAL framing bytes at 23 of 36' `
+        (($res9c.Text -cmatch 'MATCHED') -and ($res9c.Text -match 'partial: 23 of 36') -and
+         (-not ($res9c.Text -cmatch 'REFUSING TO RECONCILE')) -and $res9c.Code -eq 0) `
+        'the head-intact Chrome shape must also survive framing it did not choose'
+
     # ---- fixture 10: a run BELOW the floor must not match ------------------
     # codex constructed prefix collisions as its objection to the old matcher.
     # With a 16-character floor, a window carrying only 13 characters of a
