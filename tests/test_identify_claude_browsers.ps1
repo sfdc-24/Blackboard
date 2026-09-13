@@ -578,6 +578,90 @@ try {
     Assert-True 'a malformed multi-ID value cannot provide a match or successful exit' `
         ((-not ($res28.Text -cmatch 'MATCHED')) -and $res28.Code -eq 1)
 
+    # Every intrinsic full ID matters, even when only another partial ID is requested.
+    $r29 = Join-Path $WORK 'r29'
+    $oneFullPlusPartial = $NUL + 'bridgeDeviceId' + $NUL + '@"x' + $LIVE_ID + 'y' + $LAPTOP_CHROME.Substring(0, 20) + 'z"'
+    New-FixtureProfile -Root $r29 -Tables @(@{ Name = '000001.ldb'; Body = $oneFullPlusPartial }) | Out-Null
+    foreach ($requested in @(@($LAPTOP_CHROME), @($LAPTOP_CHROME, $LIVE_ID))) {
+        $res29 = Invoke-Sut -Root $r29 -Ids $requested
+        Assert-True 'one full competing ID defeats another requested partial regardless of candidate list' `
+            (($res29.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME))) -and
+             (-not ($res29.Text -cmatch 'MATCHED')) -and $res29.Code -eq 1)
+    }
+    $res29positive = Invoke-Sut -Root $r19 -Ids @($LIVE_ID)
+    Assert-True 'intrinsic collection keeps a lone embedded requested ID partial, never exact' `
+        (($res29positive.Text -cmatch ('MATCHED\*\s+' + [regex]::Escape($LIVE_ID))) -and
+         (-not ($res29positive.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID)))) -and $res29positive.Code -eq 0)
+    $res28both = Invoke-Sut -Root $r28 -Ids @($LIVE_ID, $LAPTOP_CHROME)
+    Assert-True 'two embedded full IDs remain ambiguous when both are requested' `
+        (($res28both.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LIVE_ID))) -and
+         ($res28both.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME))) -and
+         (-not ($res28both.Text -cmatch 'MATCHED')) -and $res28both.Code -eq 1)
+
+    # Latin-1 reading must not mistake UTF-8 bytes for binary key delimiters.
+    $utf8Accent = [Text.Encoding]::GetEncoding(28591).GetString([Text.Encoding]::UTF8.GetBytes([string][char]0x00E9))
+    foreach ($adjacent in @($utf8Accent, [string][char]0xE9, [string][char]0x80)) {
+        foreach ($side in @('prefix', 'suffix', 'framing')) {
+            $r30 = Join-Path $WORK ('r30-' + [guid]::NewGuid().ToString('N'))
+            $unicodeKey = switch ($side) {
+                'prefix' { $NUL + $adjacent + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"' }
+                'suffix' { $NUL + 'bridgeDeviceId' + $adjacent + $NUL + '@"' + $LIVE_ID + '"' }
+                'framing' { $NUL + 'bridgeDeviceId' + $NUL + $adjacent + '@"' + $LIVE_ID + '"' }
+            }
+            New-FixtureProfile -Root $r30 -Tables @(@{ Name = '000001.ldb'; Body = $unicodeKey }) | Out-Null
+            $res30 = Invoke-Sut -Root $r30 -Ids @($LIVE_ID)
+            Assert-True "high-byte $side length $($adjacent.Length) stays unknown with refusal2" `
+                (($res30.Text -cmatch 'REFUSING TO RECONCILE') -and
+                 (-not ($res30.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res30.Code -eq 2)
+        }
+    }
+
+    # Pin the supported boundary, not a perpetually expanding scan window.
+    foreach ($length in @(24, 25)) {
+        $r31 = Join-Path $WORK ('r31-' + $length)
+        $framed = $NUL + 'bridgeDeviceId' + ($NUL * $length) + '"' + $LIVE_ID + '"'
+        New-FixtureProfile -Root $r31 -Tables @(@{ Name = '000001.ldb'; Body = $framed }) | Out-Null
+        $res31 = Invoke-Sut -Root $r31 -Ids @($LIVE_ID)
+        if ($length -eq 24) {
+            Assert-True '24 framing bytes remain supported and exact' `
+                (($res31.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID))) -and $res31.Code -eq 0)
+        } else {
+            Assert-True '25 framing bytes refuse rather than return a negative location' `
+                (($res31.Text -cmatch 'REFUSING TO RECONCILE') -and
+                 (-not ($res31.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res31.Code -eq 2)
+            Assert-True 'recognized unsupported key retains KeySeen but not ValueSeen' `
+                (($res31.Text -match 'KeySeen\s+: True') -and ($res31.Text -match 'ValueSeen\s+: False'))
+        }
+    }
+
+    foreach ($unsupported in @('""', '"unterminated', ('"' + ('x' * 121) + '"'))) {
+        $r32 = Join-Path $WORK ('r32-' + [guid]::NewGuid().ToString('N'))
+        New-FixtureProfile -Root $r32 -Tables @(
+            @{ Name = '000001.ldb'; Body = ($NUL + 'bridgeDeviceId' + $NUL + $unsupported) }
+        ) | Out-Null
+        $res32 = Invoke-Sut -Root $r32 -Ids @($LIVE_ID)
+        Assert-True 'empty, unterminated and overlong windows cannot give a negative location' `
+            (($res32.Text -cmatch 'REFUSING TO RECONCILE') -and
+             (-not ($res32.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res32.Code -eq 2)
+    }
+
+    # A supported record elsewhere must not hide unresolved evidence for a nonmatch.
+    $r33 = Join-Path $WORK 'r33'
+    New-FixtureProfile -Root $r33 -Tables @(
+        @{ Name = '000001.ldb'; Body = (New-RealisticBody $ANON_ID $LIVE_ID 'Known Profile') }
+    ) | Out-Null
+    New-FixtureProfile -Root $r33 -Profile 'Profile 9' -Tables @(
+        @{ Name = '000002.ldb'; Body = ($NUL + 'bridgeDeviceId' + ($NUL * 25) + '"' + $LAPTOP_CHROME + '"') }
+    ) | Out-Null
+    $res33 = Invoke-Sut -Root $r33 -Ids @($LAPTOP_CHROME)
+    Assert-True 'an unmatched candidate stays UNKNOWN when another profile is unsupported' `
+        (($res33.Text -cmatch ('UNKNOWN ' + [regex]::Escape($LAPTOP_CHROME))) -and
+         (-not ($res33.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res33.Code -eq 2)
+    $res33mixed = Invoke-Sut -Root $r33 -Ids @($LIVE_ID, $LAPTOP_CHROME)
+    Assert-True 'a unique supported match survives alongside a different UNKNOWN candidate' `
+        (($res33mixed.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID))) -and
+         ($res33mixed.Text -cmatch ('UNKNOWN ' + [regex]::Escape($LAPTOP_CHROME))) -and $res33mixed.Code -eq 0)
+
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have
     # read a location where nothing was opened - the scope of "not found"
