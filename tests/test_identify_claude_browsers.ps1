@@ -490,6 +490,13 @@ try {
     Assert-True 'a missing bridge value cannot consume the following field' `
         ((-not ($res22.Text -cmatch 'MATCHED')) -and $res22.Code -ne 0)
 
+    $r23 = Join-Path $WORK 'r23'
+    $lookalike = $NUL + 'notbridgeDeviceId' + $NUL + '@"' + $ANON_ID + '"'
+    New-FixtureProfile -Root $r23 -Tables @(@{ Name = '000001.ldb'; Body = $lookalike }) | Out-Null
+    $res23 = Invoke-Sut -Root $r23 -Ids @($ANON_ID)
+    Assert-True 'a lookalike property name is not a bridge identity key' `
+        ((-not ($res23.Text -cmatch 'MATCHED')) -and $res23.Code -ne 0)
+
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have
     # read a location where nothing was opened - the scope of "not found"
