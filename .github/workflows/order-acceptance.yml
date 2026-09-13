@@ -23,6 +23,7 @@ on:
       - 'infra/azure/job-schedule-00.json'
       - 'infra/azure/job-schedule-30.json'
       - 'tests/test_order_read_resilience.ps1'
+      - 'tests/test_bus_read_response_contract.ps1'
       - 'tests/test_bus_timestamp_contract.ps1'
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
@@ -62,6 +63,35 @@ jobs:
       - name: Test Blackboard writer timestamp contract
         shell: pwsh
         run: .\tests\test_bus_timestamp_contract.ps1
+      - name: Test BUS read-response contract on PowerShell 7
+        shell: pwsh
+        run: |
+          $priorErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $rawOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File .\tests\test_bus_read_response_contract.ps1 2>&1)
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+          }
+          [string[]]$output = @($rawOutput | ForEach-Object { [string]$_ })
+          $output | ForEach-Object { Write-Output $_ }
+          $engine = @($output | Where-Object { $_ -clike 'ENGINE *' })
+          $cases = @($output | Where-Object { $_ -clike 'CASES *' })
+          $pass = @($output | Where-Object { $_ -clike 'PASS *' })
+          $fail = @($output | Where-Object { $_ -clike 'FAIL *' })
+          $result = @($output | Where-Object { $_ -clike 'RESULT *' })
+          $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($suiteExit -ne 0 -or
+              $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Core .+ child=.*[\\/]pwsh\.exe$' -or
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 43' -or
+              $pass.Count -ne 389 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=389 failed=0') {
+            throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
+                   '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
+                   '; pass=' + $pass.Count + '; fail=' + $fail.Count +
+                   '; result=' + ($result -join ','))
+          }
       - name: Test bounded ORDER board-read resilience
         shell: pwsh
         run: .\tests\test_order_read_resilience.ps1
@@ -96,6 +126,35 @@ jobs:
       - name: Test bounded ORDER board-read resilience
         shell: powershell
         run: .\tests\test_order_read_resilience.ps1
+      - name: Test BUS read-response contract on Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $priorErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $rawOutput = @(& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\test_bus_read_response_contract.ps1 2>&1)
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+          }
+          [string[]]$output = @($rawOutput | ForEach-Object { [string]$_ })
+          $output | ForEach-Object { Write-Output $_ }
+          $engine = @($output | Where-Object { $_ -clike 'ENGINE *' })
+          $cases = @($output | Where-Object { $_ -clike 'CASES *' })
+          $pass = @($output | Where-Object { $_ -clike 'PASS *' })
+          $fail = @($output | Where-Object { $_ -clike 'FAIL *' })
+          $result = @($output | Where-Object { $_ -clike 'RESULT *' })
+          $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($suiteExit -ne 0 -or
+              $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Desktop 5\.1\..+ child=.*[\\/]powershell\.exe$' -or
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 43' -or
+              $pass.Count -ne 389 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=389 failed=0') {
+            throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
+                   '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
+                   '; pass=' + $pass.Count + '; fail=' + $fail.Count +
+                   '; result=' + ($result -join ','))
+          }
       - name: Test Blackboard writer timestamp contract
         shell: powershell
         run: .\tests\test_bus_timestamp_contract.ps1
@@ -143,7 +202,7 @@ jobs:
         run: .\tests\test_azure_vm_supervisor.ps1
 
   powershell-7-release-manifest-linux:
-    name: ORDER release-manifest string preservation on Linux
+    name: ORDER release-manifest and bus response contracts on Linux
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -160,6 +219,35 @@ jobs:
       - name: Test ORDER release-manifest string preservation
         shell: pwsh
         run: ./tests/test_order_release_manifest_string_preservation.ps1
+      - name: Test BUS read-response contract on Linux PowerShell 7
+        shell: pwsh
+        run: |
+          $priorErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $rawOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File ./tests/test_bus_read_response_contract.ps1 2>&1)
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+          }
+          [string[]]$output = @($rawOutput | ForEach-Object { [string]$_ })
+          $output | ForEach-Object { Write-Output $_ }
+          $engine = @($output | Where-Object { $_ -clike 'ENGINE *' })
+          $cases = @($output | Where-Object { $_ -clike 'CASES *' })
+          $pass = @($output | Where-Object { $_ -clike 'PASS *' })
+          $fail = @($output | Where-Object { $_ -clike 'FAIL *' })
+          $result = @($output | Where-Object { $_ -clike 'RESULT *' })
+          $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($suiteExit -ne 0 -or
+              $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Core .+ child=.*/pwsh$' -or
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 43' -or
+              $pass.Count -ne 389 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=389 failed=0') {
+            throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
+                   '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
+                   '; pass=' + $pass.Count + '; fail=' + $fail.Count +
+                   '; result=' + ($result -join ','))
+          }
 
   powershell-7-workspace-linux:
     name: ORDER workspace contracts on Linux PowerShell 7

@@ -378,8 +378,10 @@ using System.Text;
 public static class FakeCurl {
     public static int Main(string[] args) {
         string headerPath = null;
+        string outputPath = null;
         for (int i = 0; i + 1 < args.Length; i++) {
-            if (args[i] == "-D") { headerPath = args[i + 1]; break; }
+            if (args[i] == "-D") { headerPath = args[i + 1]; }
+            if (args[i] == "-o") { outputPath = args[i + 1]; }
         }
         if (!String.IsNullOrEmpty(headerPath)) {
             File.WriteAllText(
@@ -388,8 +390,13 @@ public static class FakeCurl {
                 new UTF8Encoding(false)
             );
         }
-        Console.OutputEncoding = new UTF8Encoding(false);
-        Console.Write(Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_BODY") ?? String.Empty);
+        string body = Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_BODY") ?? String.Empty;
+        if (!String.IsNullOrEmpty(outputPath)) {
+            File.WriteAllText(outputPath, body, new UTF8Encoding(false));
+        } else {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            Console.Write(body);
+        }
         int exitCode;
         return Int32.TryParse(Environment.GetEnvironmentVariable("ORDER_READ_FAKE_CURL_EXIT"), out exitCode)
             ? exitCode
@@ -422,14 +429,20 @@ BUS_SECRET=BUS_SECRET_CANARY
         )
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_BODY', '<html>ACTUAL_BUS_BODY_CANARY</html>', 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_EXIT', '7', 'Process')
-        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
-            -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
-            -Action read `
-            -Title 'test board' `
-            -OutFile $outPath `
-            -EnvFile $envPath `
-            -ReadMetadataOutFile $metadataPath 2>&1)
-        $exitCode = $LASTEXITCODE
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+                -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
+                -Action read `
+                -Title 'test board' `
+                -OutFile $outPath `
+                -EnvFile $envPath `
+                -ReadMetadataOutFile $metadataPath 2>&1)
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
     } finally {
         foreach ($name in $variables) {
             [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
@@ -452,7 +465,7 @@ function Invoke-ActualBusSecondRedirectCase {
     $envPath = Join-Path $caseRoot 'test.env'
     $outPath = Join-Path $caseRoot 'response.txt'
     $metadataPath = Join-Path $caseRoot 'metadata.json'
-    $expectedBody = '{"ok":true,"rows":[]}'
+    $expectedBody = '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}'
     New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
 
     $fakeCurlSource = @'
@@ -476,8 +489,10 @@ public static class FakeSecondRedirectCurl {
         );
 
         string headerPath = null;
+        string outputPath = null;
         for (int i = 0; i + 1 < args.Length; i++) {
-            if (args[i] == "-D") { headerPath = args[i + 1]; break; }
+            if (args[i] == "-D") { headerPath = args[i + 1]; }
+            if (args[i] == "-o") { outputPath = args[i + 1]; }
         }
         if (String.IsNullOrEmpty(headerPath)) { return 91; }
 
@@ -498,15 +513,19 @@ public static class FakeSecondRedirectCurl {
                 finalBody = "<html>FINAL_REDIRECT_BODY_CANARY</html>";
             } else {
                 finalHeader = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n\r\n";
-                finalBody = "{\"ok\":true,\"rows\":[]}";
+                finalBody = "{\"ok\":true,\"fileId\":\"test-board-id\",\"title\":\"test board\",\"rows\":[]}";
             }
             File.WriteAllText(
                 headerPath,
                 "HTTP/1.1 302 Found\r\nLocation: https://CANONICAL_REDIRECT_CANARY.invalid/exec\r\n\r\n" + finalHeader,
                 new UTF8Encoding(false)
             );
-            Console.OutputEncoding = new UTF8Encoding(false);
-            Console.Write(finalBody);
+            if (!String.IsNullOrEmpty(outputPath)) {
+                File.WriteAllText(outputPath, finalBody, new UTF8Encoding(false));
+            } else {
+                Console.OutputEncoding = new UTF8Encoding(false);
+                Console.Write(finalBody);
+            }
             return 0;
         }
         return 92;
@@ -693,7 +712,7 @@ function Invoke-WebRequest {
     return [pscustomobject]@{
         StatusCode = 200
         Headers = @{ 'Content-Type' = 'application/json; charset=utf-8' }
-        Content = '{"ok":true,"rows":[]}'
+        Content = '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}'
     }
 }
 
@@ -1024,7 +1043,7 @@ try {
         -not [bool]$actualBusIwrFallback.success_trace.calls[1].body_present
     )
     Assert-True 'IWR fallback retains the final successful body and metadata' (
-        $actualBusIwrFallback.success_body -ceq '{"ok":true,"rows":[]}' -and
+        $actualBusIwrFallback.success_body -ceq '{"ok":true,"fileId":"test-board-id","title":"test board","rows":[]}' -and
         $null -ne $actualBusIwrFallback.success_metadata.PSObject.Properties['http_status'] -and
         $actualBusIwrFallback.success_metadata.http_status -isnot [string] -and
         [int]$actualBusIwrFallback.success_metadata.http_status -eq 200 -and

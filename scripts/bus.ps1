@@ -55,7 +55,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-if ($ReadMetadataOutFile -and $Action -cne 'read') {
+if ($ReadMetadataOutFile -and $Action -ne 'read') {
   throw 'ReadMetadataOutFile is available only for Action read'
 }
 
@@ -119,6 +119,143 @@ function Write-BusReadMetadata {
   [IO.File]::WriteAllText($metadataPath, $metadataJson, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Get-BusExactJsonProperty {
+  param(
+    [Parameter(Mandatory = $true)]$InputObject,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+
+  foreach ($property in @($InputObject.PSObject.Properties)) {
+    if ([string]::Equals([string]$property.Name, $Name, [StringComparison]::Ordinal)) {
+      return $property
+    }
+  }
+  return $null
+}
+
+function Test-BusJsonHttpStatus {
+  param([AllowNull()]$Value)
+
+  if ($null -eq $Value -or $Value -is [bool]) { return $false }
+  $typeCode = [Type]::GetTypeCode($Value.GetType())
+  if (@(
+      [TypeCode]::Byte,
+      [TypeCode]::SByte,
+      [TypeCode]::Int16,
+      [TypeCode]::UInt16,
+      [TypeCode]::Int32,
+      [TypeCode]::UInt32,
+      [TypeCode]::Int64,
+      [TypeCode]::UInt64,
+      [TypeCode]::Single,
+      [TypeCode]::Double,
+      [TypeCode]::Decimal
+    ) -notcontains $typeCode) {
+    return $false
+  }
+
+  try { $number = [double]$Value } catch { return $false }
+  return -not [double]::IsNaN($number) -and
+    -not [double]::IsInfinity($number) -and
+    $number -eq [Math]::Truncate($number) -and
+    $number -ge 200 -and
+    $number -lt 300
+}
+
+# READ responses fail closed before either stdout or OutFile. Apps Script returns
+# logical failures inside HTTP 200, and its bare GET health object is JSON with
+# ok=true, so transport success and a leading "{" are not read success. Keep this
+# gate generic: identity plus exactly one typed sheet/doc payload is the portable
+# contract shared by the Apps Script and self-hosted buses. Never add board headers,
+# row widths, timestamps, or other Blackboard-specific admission rules here.
+function Assert-BusReadResponseContract {
+  param(
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+    [AllowNull()][string]$RequestedTitle,
+    [AllowNull()][string]$RequestedFileId
+  )
+
+  $invalidMessage = 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.'
+  try {
+    $response = ConvertFrom-Json -InputObject $Content -ErrorAction Stop
+    if ($null -eq $response -or
+        $response -isnot [System.Management.Automation.PSCustomObject]) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    $okProperty = Get-BusExactJsonProperty -InputObject $response -Name 'ok'
+    if ($null -eq $okProperty -or
+        $okProperty.Value -isnot [bool] -or
+        $okProperty.Value -ne $true) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    $logicalStatusProperty = Get-BusExactJsonProperty -InputObject $response -Name '_httpStatus'
+    if ($null -ne $logicalStatusProperty -and
+        -not (Test-BusJsonHttpStatus -Value $logicalStatusProperty.Value)) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    $fileIdProperty = Get-BusExactJsonProperty -InputObject $response -Name 'fileId'
+    $titleProperty = Get-BusExactJsonProperty -InputObject $response -Name 'title'
+    if ($null -eq $fileIdProperty -or
+        $fileIdProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$fileIdProperty.Value) -or
+        $null -eq $titleProperty -or
+        $titleProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$titleProperty.Value)) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    if ($RequestedTitle -and
+        -not [string]::Equals(
+          [string]$titleProperty.Value,
+          $RequestedTitle,
+          [StringComparison]::Ordinal
+        )) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+    if ($RequestedFileId -and
+        -not [string]::Equals(
+          [string]$fileIdProperty.Value,
+          $RequestedFileId,
+          [StringComparison]::Ordinal
+        )) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    $rowsProperty = Get-BusExactJsonProperty -InputObject $response -Name 'rows'
+    $textProperty = Get-BusExactJsonProperty -InputObject $response -Name 'text'
+    $bodyProperty = Get-BusExactJsonProperty -InputObject $response -Name 'body'
+    $payloadProperties = @(
+      @($rowsProperty, $textProperty, $bodyProperty) |
+        Where-Object { $null -ne $_ }
+    )
+    if ($payloadProperties.Count -ne 1) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+
+    if ($null -ne $rowsProperty) {
+      if ($rowsProperty.Value -isnot [Array]) {
+        throw [InvalidOperationException]::new($invalidMessage)
+      }
+      foreach ($row in @($rowsProperty.Value)) {
+        if ($row -isnot [Array]) {
+          throw [InvalidOperationException]::new($invalidMessage)
+        }
+      }
+    } elseif ($null -ne $textProperty) {
+      if ($textProperty.Value -isnot [string]) {
+        throw [InvalidOperationException]::new($invalidMessage)
+      }
+    } elseif ($bodyProperty.Value -isnot [string]) {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+  } catch {
+    throw [InvalidOperationException]::new($invalidMessage)
+  }
+}
+
 function Resolve-BusHttpsLocation {
   param(
     [Parameter(Mandatory = $true)][string]$Location,
@@ -170,7 +307,8 @@ if ($Action -eq 'ping') {
 }
 
 # ---- build the payload ------------------------------------------------------
-$payload = @{ action = $Action; secret = $cfg.BUS_SECRET }
+$wireAction = if ($Action -eq 'read') { 'read' } else { $Action }
+$payload = @{ action = $wireAction; secret = $cfg.BUS_SECRET }
 if ($Title)       { $payload.title = $Title }
 if ($FileId)      { $payload.fileId = $FileId }
 if ($SheetName)   { $payload.sheetName = $SheetName }
@@ -314,6 +452,7 @@ $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 # The no-follow contract from REQ-PR4EXZ is unchanged -- only the client is.
 $location = $null
 $content  = $null
+$contentBytes = $null
 # curl.exe on Windows, curl on Linux and macOS. Looking only for curl.exe meant
 # the PREFERRED, well-tested two-hop path was silently unavailable off Windows,
 # and every read fell through to the Invoke-WebRequest fallback - which then
@@ -324,7 +463,16 @@ $content  = $null
 # resolves to the very cmdlet this branch exists to avoid, and the "curl path"
 # would quietly be the fallback path wearing its name.
 $curl = $null
-foreach ($candidate in @('curl.exe', 'curl')) {
+$isWindowsHost = $PSVersionTable.PSEdition -ceq 'Desktop'
+if (-not $isWindowsHost) {
+  $isWindowsVariable = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
+  if ($isWindowsVariable) { $isWindowsHost = [bool]$isWindowsVariable.Value }
+}
+# WSL inherits Windows PATH entries and can resolve curl.exe even though that
+# process cannot open Linux /tmp response/request files. Prefer the native name
+# for the current host; retain the other name only as a compatibility fallback.
+$curlCandidates = if ($isWindowsHost) { @('curl.exe', 'curl') } else { @('curl', 'curl.exe') }
+foreach ($candidate in $curlCandidates) {
     $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
              Select-Object -First 1
     if ($found) { $curl = $found; break }
@@ -334,28 +482,49 @@ $readHttpStatus = $null
 $readContentTypeClass = $null
 
 if ($curl) {
-  # ONE request only. -D dumps headers to a file while the body goes to stdout, so
-  # both are captured without ever calling the endpoint twice. An earlier draft of
+  # ONE request only. -D dumps headers to a file; reads also put the response body
+  # in a file so its bytes survive validation and OutFile unchanged. Other actions
+  # retain the stdout behavior. An earlier draft of
   # this fix used "-D - -o NUL" and then re-fired to capture the body: on the
   # no-redirect branch that would have APPENDED TWICE, and on hop 2 it burned the
   # one-shot key before reading it. Never call this endpoint twice for one payload.
   $tmpBody = [IO.Path]::GetTempFileName()
   $tmpHead = [IO.Path]::GetTempFileName()
+  $tmpReadResponse = $null
   try {
     [IO.File]::WriteAllBytes($tmpBody, $bytes)
-    $out  = & $curl.Source -s -S -D $tmpHead --max-time 120 -X POST $cfg.BUS_URL `
-              -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$tmpBody"
+    if ($Action -eq 'read') {
+      # Native stdout is line-oriented in Windows PowerShell and loses a final
+      # newline. Capture read bodies to a file so an accepted response can be
+      # written to OutFile byte-for-byte, without reserialization or newline loss.
+      $tmpReadResponse = [IO.Path]::GetTempFileName()
+      $out = & $curl.Source -s -S -D $tmpHead -o $tmpReadResponse --max-time 120 `
+               -X POST $cfg.BUS_URL -H 'Content-Type: application/json; charset=utf-8' `
+               --data-binary "@$tmpBody"
+    } else {
+      $out = & $curl.Source -s -S -D $tmpHead --max-time 120 -X POST $cfg.BUS_URL `
+               -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$tmpBody"
+    }
     $readTransportExit = [int]$LASTEXITCODE
     $head = Get-Content -LiteralPath $tmpHead -ErrorAction SilentlyContinue
     $hop1Metadata = Get-BusHeaderMetadata -HeaderLines @($head)
     $readHttpStatus = $hop1Metadata.http_status
     $readContentTypeClass = $hop1Metadata.content_type_class
     $loc  = @($head | Where-Object { $_ -match '^\s*[Ll]ocation:' }) | Select-Object -First 1
-    if ($loc) { $location = ($loc -replace '^\s*[Ll]ocation:\s*', '').Trim() }
-    else      { $content  = ($out -join "`n") }
+    if ($loc) {
+      $location = ($loc -replace '^\s*[Ll]ocation:\s*', '').Trim()
+    } elseif ($Action -eq 'read') {
+      $contentBytes = [IO.File]::ReadAllBytes($tmpReadResponse)
+      $content = [Text.Encoding]::UTF8.GetString($contentBytes)
+    } else {
+      $content = ($out -join "`n")
+    }
   } finally {
     Remove-Item -LiteralPath $tmpBody -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tmpHead -Force -ErrorAction SilentlyContinue
+    if ($tmpReadResponse) {
+      Remove-Item -LiteralPath $tmpReadResponse -Force -ErrorAction SilentlyContinue
+    }
   }
 } else {
   # THE 302 IS NOT AN EXCEPTION ON 5.1 UNLESS WE MAKE IT ONE.
@@ -478,13 +647,21 @@ if ($location) {
     # Location header on this leg is therefore not evidence that the key expired.
     $hop2MaxRedirects = 5
     $tmpHead2 = [IO.Path]::GetTempFileName()
+    $tmpReadResponse2 = $null
     try {
       # Keep both the server-supplied hop-2 URL and every redirect HTTPS-only.
       # The leading '=' replaces curl's default protocol set; without it, 'https'
       # would be added to (rather than replace) the protocols curl already allows.
-      $out2  = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
-                --proto '=https' --proto-redir '=https' `
-                -D $tmpHead2 --max-time 120 $location
+      if ($Action -eq 'read') {
+        $tmpReadResponse2 = [IO.Path]::GetTempFileName()
+        $out2 = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
+                  --proto '=https' --proto-redir '=https' `
+                  -D $tmpHead2 -o $tmpReadResponse2 --max-time 120 $location
+      } else {
+        $out2 = & $curl.Source -s -S -L --max-redirs $hop2MaxRedirects `
+                  --proto '=https' --proto-redir '=https' `
+                  -D $tmpHead2 --max-time 120 $location
+      }
       $hop2Exit = [int]$LASTEXITCODE
       if ($null -eq $readTransportExit -or $hop2Exit -ne 0) { $readTransportExit = $hop2Exit }
       $head2 = Get-Content -LiteralPath $tmpHead2 -ErrorAction SilentlyContinue
@@ -503,8 +680,18 @@ if ($location) {
           -ContentTypeClass $readContentTypeClass
         throw "hop 2 did not reach a successful final response after following up to $hop2MaxRedirects redirects. The write, if any, may still have landed: READ BACK before deciding anything."
       }
-      $content = ($out2 -join "`n")
-    } finally { Remove-Item -LiteralPath $tmpHead2 -Force -ErrorAction SilentlyContinue }
+      if ($Action -eq 'read') {
+        $contentBytes = [IO.File]::ReadAllBytes($tmpReadResponse2)
+        $content = [Text.Encoding]::UTF8.GetString($contentBytes)
+      } else {
+        $content = ($out2 -join "`n")
+      }
+    } finally {
+      Remove-Item -LiteralPath $tmpHead2 -Force -ErrorAction SilentlyContinue
+      if ($tmpReadResponse2) {
+        Remove-Item -LiteralPath $tmpReadResponse2 -Force -ErrorAction SilentlyContinue
+      }
+    }
   } else {
     # Do not carry hop 1's 302 metadata into a hop 2 failure that produced no
     # response. A response-less WebException must remain a transport failure.
@@ -576,14 +763,25 @@ Write-BusReadMetadata `
 if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
 # [string]$null is $null in WinPS 5.1, not '' -- coalesce before calling a method on it.
 if ($null -eq $content) { $content = '' }
-$trimmed = ([string]$content).TrimStart()
-if (-not $trimmed.StartsWith('{')) {
-  Write-Warning "response is not JSON (redirect artifact?). Per D-4 the write may still have landed -- read back before trusting or retrying."
+if ($Action -eq 'read') {
+  Assert-BusReadResponseContract `
+    -Content ([string]$content) `
+    -RequestedTitle $Title `
+    -RequestedFileId $FileId
+} else {
+  $trimmed = ([string]$content).TrimStart()
+  if (-not $trimmed.StartsWith('{')) {
+    Write-Warning "response is not JSON (redirect artifact?). Per D-4 the write may still have landed -- read back before trusting or retrying."
+  }
 }
 
 if ($OutFile) {
   $path = if ([IO.Path]::IsPathRooted($OutFile)) { $OutFile } else { Join-Path (Get-Location).Path $OutFile }
-  [IO.File]::WriteAllText($path, [string]$content, (New-Object Text.UTF8Encoding($false)))
+  if ($Action -eq 'read' -and $null -ne $contentBytes) {
+    [IO.File]::WriteAllBytes($path, $contentBytes)
+  } else {
+    [IO.File]::WriteAllText($path, [string]$content, (New-Object Text.UTF8Encoding($false)))
+  }
   Write-Output ("saved {0} chars to {1}" -f ([string]$content).Length, $path)
 } else {
   Write-Output $content
