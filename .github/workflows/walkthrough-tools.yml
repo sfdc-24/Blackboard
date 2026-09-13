@@ -30,6 +30,38 @@ permissions:
   contents: read
 
 jobs:
+  crosscheck-windows:
+    name: Cross-check contracts on Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Execute offline extraction contracts and regression controls
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5.1 required' }
+          Write-Host "runtime=$($PSVersionTable.PSVersion) edition=$($PSVersionTable.PSEdition)"
+          python tools/walkthrough/test_crosscheck_mutations.py --powershell (Join-Path $PSHOME 'powershell.exe')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  crosscheck-linux:
+    name: Cross-check contracts on Linux PowerShell
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Execute offline extraction contracts and regression controls
+        shell: pwsh
+        run: |
+          if (-not $IsLinux -or $PSVersionTable.PSEdition -ne 'Core') { throw 'Linux PowerShell required' }
+          Write-Host "runtime=$($PSVersionTable.PSVersion) edition=$($PSVersionTable.PSEdition)"
+          python3 tools/walkthrough/test_crosscheck_mutations.py --powershell (Join-Path $PSHOME 'pwsh')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   walkthrough-tools:
     name: Walkthrough tool contracts on Linux
     runs-on: ubuntu-latest
