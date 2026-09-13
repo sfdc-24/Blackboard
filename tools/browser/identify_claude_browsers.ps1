@@ -40,6 +40,10 @@
       ELSEWHERE  no supported local match was found; it may be a live browser
                  here in an unsupported record or on another machine
 
+    The summary counts resolved (MATCHED and MATCHED*), elsewhere, unknown,
+    and ambiguous candidates separately. Exit 0 means at least one unique
+    supported match, even if other candidates remain unknown or ambiguous.
+
     Exit codes: 0 something matched, 1 nothing matched, 2 could not look
     (installs exist but no supported value window, or unmatched evidence is unknown). 2 is kept
     distinct from 1 because "could not look" and "looked and found nothing"
@@ -641,7 +645,8 @@ if ($DeviceId.Count -gt 0) {
         }
     }
     Write-Output ''
-    Write-Output ("  $stale of $($DeviceId.Count) ids have no supported local match.")
+    Write-Output ("  Summary: {0} resolved, {1} elsewhere, {2} unknown, {3} ambiguous ({4} requested)." -f
+        $resolvedMatches, $stale, $unknown, $ambiguous, $DeviceId.Count)
     if ($stale -gt 0) {
         # DO NOT CALL THESE STALE. This label used to read "STALE", and that one
         # word caused a wrong conclusion the first time the tool was run: two ids

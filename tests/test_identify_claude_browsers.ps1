@@ -41,6 +41,30 @@ function Assert-True {
     }
 }
 
+function Assert-Summary {
+    param([string]$Name, $Result, [int]$Resolved, [int]$Elsewhere,
+          [int]$Unknown, [int]$Ambiguous, [int]$ExitCode)
+    $total = $Resolved + $Elsewhere + $Unknown + $Ambiguous
+    $expected = 'Summary: {0} resolved, {1} elsewhere, {2} unknown, {3} ambiguous ({4} requested).' -f
+        $Resolved, $Elsewhere, $Unknown, $Ambiguous, $total
+    $summaryLines = @($Result.Text -split '\r?\n' | Where-Object { $_ -cmatch '^\s*Summary:' })
+    # Compare the footer to the actual per-candidate verdicts, not just a
+    # second rendering of the same expected totals. Partial matches are resolved.
+    $verdicts = [regex]::Matches($Result.Text, '(?m)^\s*(MATCHED\*?|ELSEWHERE|UNKNOWN|AMBIGUOUS)\s+[0-9a-fA-F-]{36}\s+->')
+    $counts = @{ resolved = 0; elsewhere = 0; unknown = 0; ambiguous = 0 }
+    foreach ($verdict in $verdicts) {
+        $kind = $verdict.Groups[1].Value
+        if ($kind -clike 'MATCHED*') { $counts.resolved++ }
+        else { $counts[$kind.ToLowerInvariant()]++ }
+    }
+    Assert-True $Name (
+        $summaryLines.Count -eq 1 -and $summaryLines[0].Trim() -ceq $expected -and
+        $verdicts.Count -eq $total -and $counts.resolved -eq $Resolved -and
+        $counts.elsewhere -eq $Elsewhere -and $counts.unknown -eq $Unknown -and
+        $counts.ambiguous -eq $Ambiguous -and $Result.Code -eq $ExitCode
+    ) ('expected ' + $expected + ' with exit ' + $ExitCode + '; got ' + ($summaryLines -join '; ') + ' exit ' + $Result.Code)
+}
+
 $NUL = [string][char]0
 
 # Build a profile that looks like a real one to the tool: the extension
@@ -699,6 +723,24 @@ try {
     Assert-True 'a unique supported match survives alongside a different UNKNOWN candidate' `
         (($res33mixed.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID))) -and
          ($res33mixed.Text -cmatch ('UNKNOWN ' + [regex]::Escape($LAPTOP_CHROME))) -and $res33mixed.Code -eq 0)
+
+    # The old footer counted only ELSEWHERE. An all-UNKNOWN result therefore
+    # claimed zero ids lacked a supported match. Keep each outcome visible,
+    # including mixed successful runs that correctly retain exit 0.
+    Assert-Summary 'summary counts a unique exact match' $res 1 0 0 0 0
+    Assert-Summary 'summary counts a unique partial match as resolved' $res8b 1 0 0 0 0
+    Assert-Summary 'summary counts an elsewhere-only result' $res3 0 1 0 0 1
+    Assert-Summary 'summary counts all ambiguous candidates' $res11 0 0 0 2 1
+    Assert-Summary 'summary counts resolved and ambiguous separately with exit0' $res11b 1 0 0 1 0
+    Assert-Summary 'summary counts an unknown-only result with exit2' $res33 0 0 1 0 2
+    Assert-Summary 'summary counts resolved and unknown separately with exit0' $res33mixed 1 0 1 0 0
+    $resSummaryElsewhere = Invoke-Sut -Root $r1 -Ids @($LIVE_ID, $OTHER)
+    Assert-Summary 'summary counts resolved and elsewhere separately with exit0' $resSummaryElsewhere 1 1 0 0 0
+    New-FixtureProfile -Root $r11b -Profile 'Profile 3' -Tables @(
+        @{ Name = '000003.ldb'; Body = ($NUL + 'bridgeDeviceId' + ($NUL * 25) + '"' + $LIVE_ID + '"') }
+    ) | Out-Null
+    $resSummaryMixed = Invoke-Sut -Root $r11b -Ids @($LAPTOP_CHROME, $LAPTOP_EDGE, $LIVE_ID)
+    Assert-Summary 'summary accounts for resolved ambiguous and unknown in one run' $resSummaryMixed 1 0 1 1 0
 
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have
