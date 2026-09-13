@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke-test a RUNNING blackboard-bus. Usage:
 #   BUS_SECRET=... ./smoke-test.sh http://127.0.0.1:8787/
-# Exercises health, auth, doc lifecycle, sheet schema-guard, v2 ledger.
+# Exercises health, auth, doc lifecycle, sheet schema-guard, and fenced v2 ledger.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8787/}"
 : "${BUS_SECRET:?BUS_SECRET must be set in the environment}"
@@ -59,11 +59,23 @@ LEASE="$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CREATE\",\"actor_tag\":\"vm-cli\",\"assigned_to\":\"ANY\",\"status\":\"OPEN\",\"payload\":\"smoke item\",\"secret\":\"$S\"}")
 expect "CREATE event" 200 "$code" 'payload_bytes'
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CLAIM\",\"actor_tag\":\"gemini\",\"status\":\"CLAIMED\",\"lease_until\":\"$LEASE\",\"payload\":\"claiming\",\"secret\":\"$S\"}")
-expect "CLAIM with lease" 200 "$code"
+expect "CLAIM returns private fence" 200 "$code" '"fence_token"'
+FENCE="$(python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("claim_generation") == 1; print(d["fence_token"])' </tmp/bus-out.json)"
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CLAIM\",\"actor_tag\":\"vm-cli\",\"status\":\"CLAIMED\",\"lease_until\":\"$LEASE\",\"payload\":\"stealing\",\"secret\":\"$S\"}")
 expect "conflicting CLAIM -> 409" 409 "$code" 'holder'
 code=$(post "{\"action\":\"inbox\",\"tag\":\"gemini\",\"secret\":\"$S\"}")
 expect "inbox shows claimant's item" 200 "$code" "$W"
+if grep -q 'fence_token' /tmp/bus-out.json; then
+  say "inbox redacts private fence" "FAIL"; fail=$((fail+1))
+else
+  say "inbox redacts private fence" "ok"; pass=$((pass+1))
+fi
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"secret\":\"$S\"}")
+expect "COMPLETE without fence -> 409" 409 "$code" 'fence_token'
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"fence_token\":\"$FENCE\",\"secret\":\"$S\"}")
+expect "fenced COMPLETE" 200 "$code" '"claim_generation"'
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"fence_token\":\"$FENCE\",\"secret\":\"$S\"}")
+expect "exact fenced COMPLETE replay" 200 "$code" '"replayed": *true'
 
 echo
 echo "$pass passed, $fail failed"

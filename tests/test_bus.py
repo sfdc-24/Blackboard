@@ -341,6 +341,408 @@ def test_complete_replay(server_py, tmp):
             stop(proc)
 
 
+def test_durable_claim_fencing(server_py, tmp):
+    """A new CLAIM must displace every older process, including the same actor."""
+    import concurrent.futures
+    import datetime as _dt
+
+    db = os.path.join(tmp, "fencing.db")
+    processes = []
+
+    def stop(proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc.stderr.close()
+
+    def start():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        base = f"http://127.0.0.1:{port}/"
+        env = dict(os.environ, BUS_SECRET=SECRET, BUS_PORT=str(port),
+                   BUS_BIND="127.0.0.1", BUS_DB=db)
+        proc = subprocess.Popen([sys.executable, server_py, "--db", db, "serve"],
+                                env=env, stderr=subprocess.PIPE)
+        processes.append(proc)
+        for _ in range(50):
+            if proc.poll() is not None:
+                raise RuntimeError("fencing test server exited during startup")
+            try:
+                code, health = call(method="GET", base=base)
+                if code == 200 and health.get("service") == "sfdc24-blackboard-bus":
+                    return proc, base
+            except Exception:
+                pass
+            time.sleep(0.1)
+        raise RuntimeError("fencing test server never came up")
+
+    def create(work_id, base):
+        code, result = call({"action": "event", "work_id": work_id, "event_type": "CREATE",
+                             "actor_tag": "dispatcher", "assigned_to": "ANY",
+                             "status": "OPEN", "payload": "fence fixture"}, base=base)
+        if code != 200:
+            raise RuntimeError(f"fence fixture CREATE failed: {result}")
+
+    def claim(work_id, actor, base, token=None, lease=None):
+        lease = lease or ((_dt.datetime.now(_dt.timezone.utc) +
+                           _dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+        body = {"action": "event", "work_id": work_id, "event_type": "CLAIM",
+                "actor_tag": actor, "status": "CLAIMED", "payload": "claim",
+                "lease_until": lease}
+        if token is not None:
+            body["fence_token"] = token
+        return call(body, base=base)
+
+    def complete(work_id, actor, payload, token=None, base=None):
+        body = {"action": "event", "work_id": work_id, "event_type": "COMPLETE",
+                "actor_tag": actor, "status": "DONE", "payload": payload}
+        if token is not None:
+            body["fence_token"] = token
+        return call(body, base=base)
+
+    def count(work_id, event_type):
+        with sqlite3.connect(db) as conn:
+            return conn.execute("SELECT COUNT(*) FROM events WHERE work_id = ? AND event_type = ?",
+                                (work_id, event_type)).fetchone()[0]
+
+    print("== durable per-CLAIM fencing ==")
+    try:
+        _, base = start()
+
+        same_work = "WRK-FENCE-SAME-ACTOR"
+        create(same_work, base)
+        code1, first = claim(same_work, "worker", base)
+        code2, unbound_renewal = claim(same_work, "worker", base)
+        code3, second = claim(same_work, "worker", base, first.get("fence_token"))
+        check("live same-actor CLAIM needs the private token before advancing",
+              code1 == code3 == 200 and code2 == 409 and
+              unbound_renewal.get("claim_generation") == 1 and
+              first.get("claim_generation") == 1 and
+              second.get("claim_generation") == 2 and
+              first.get("fence_token") != second.get("fence_token") and
+              first.get("fence_token") != first.get("event_id"))
+        code, missing = complete(same_work, "worker", "missing", base=base)
+        check("missing token fails closed after first fenced CLAIM",
+              code == 409 and missing.get("claim_generation") == 2 and count(same_work, "COMPLETE") == 0)
+        code, stale = complete(same_work, "worker", "stale generation", first["fence_token"], base)
+        check("same-actor stale process cannot COMPLETE",
+              code == 409 and stale.get("claim_generation") == 2 and count(same_work, "COMPLETE") == 0)
+        code, current = complete(same_work, "worker", "current generation", second["fence_token"], base)
+        check("same actor's current generation can COMPLETE",
+              code == 200 and current.get("claim_generation") == 2 and count(same_work, "COMPLETE") == 1)
+
+        identity_work = "WRK-FENCE-REPLAY-IDENTITY"
+        create(identity_work, base)
+        _, identity_first = claim(identity_work, "worker", base)
+        code, identity_receipt1 = complete(identity_work, "worker", "byte-identical result",
+                                            identity_first["fence_token"], base)
+        _, identity_second = claim(identity_work, "worker", base)
+        code2, identity_receipt2 = complete(identity_work, "worker", "byte-identical result",
+                                             identity_second["fence_token"], base)
+        check("replay identity includes the claim generation's unique token",
+              code == code2 == 200 and identity_receipt1.get("event_id") != identity_receipt2.get("event_id") and
+              identity_receipt2.get("claim_generation") == 2 and
+              identity_receipt2.get("replayed") is not True and count(identity_work, "COMPLETE") == 2)
+
+        handoff_work = "WRK-FENCE-OLD-NEW"
+        create(handoff_work, base)
+        code, old = claim(handoff_work, "old-worker", base)
+        code, released = call({"action": "event", "work_id": handoff_work, "event_type": "RELEASE",
+                               "actor_tag": "old-worker", "status": "OPEN", "payload": "handoff",
+                               "fence_token": old["fence_token"]}, base=base)
+        code_late, late_released = complete(handoff_work, "old-worker", "late after release",
+                                            old["fence_token"], base)
+        code2, new = claim(handoff_work, "new-worker", base)
+        check("release then new actor advances the generation",
+              code == code2 == 200 and code_late == 409 and
+              "active unexpired CLAIM" in late_released.get("error", "") and
+              released.get("claim_generation") == 1 and
+              new.get("claim_generation") == 2)
+        code, old_result = call({"action": "event", "work_id": handoff_work, "event_type": "PROGRESS",
+                                 "actor_tag": "old-worker", "status": "RUNNING", "payload": "late",
+                                 "fence_token": old["fence_token"]}, base=base)
+        check("old actor is fenced after handoff", code == 409 and old_result.get("holder") == "new-worker")
+        code, cross = call({"action": "event", "work_id": handoff_work, "event_type": "PROGRESS",
+                            "actor_tag": "new-worker", "status": "RUNNING", "payload": "cross-work",
+                            "fence_token": second["fence_token"]}, base=base)
+        check("another work item's real token is rejected", code == 409 and cross.get("claim_generation") == 2)
+        code, fabricated = call({"action": "event", "work_id": handoff_work, "event_type": "PROGRESS",
+                                 "actor_tag": "new-worker", "status": "RUNNING", "payload": "fabricated",
+                                 "fence_token": "00000000-0000-4000-8000-000000000000"}, base=base)
+        check("fabricated token is rejected", code == 409 and fabricated.get("claim_generation") == 2)
+        code, wrong_actor = call({"action": "event", "work_id": handoff_work, "event_type": "BLOCK",
+                                  "actor_tag": "impostor", "status": "BLOCKED", "payload": "wrong actor",
+                                  "fence_token": new["fence_token"]}, base=base)
+        check("current token does not authorize the wrong actor", code == 409 and
+              wrong_actor.get("holder") == "new-worker")
+        code, fresh = call({"action": "event", "work_id": handoff_work, "event_type": "PROGRESS",
+                            "actor_tag": "new-worker", "status": "RUNNING", "payload": "current",
+                            "fence_token": new["fence_token"]}, base=base)
+        check("new actor's current token is accepted", code == 200 and fresh.get("claim_generation") == 2)
+        code, blocked = call({"action": "event", "work_id": handoff_work, "event_type": "BLOCK",
+                              "actor_tag": "new-worker", "status": "BLOCKED", "payload": "real blocker",
+                              "fence_token": new["fence_token"]}, base=base)
+        check("BLOCK carries the current fence", code == 200 and blocked.get("claim_generation") == 2)
+
+        observer_work = "WRK-FENCE-OBSERVATION"
+        create(observer_work, base)
+        _, observer_claim = claim(observer_work, "worker", base)
+        code1, _ = call({"action": "event", "work_id": observer_work, "event_type": "NOTE",
+                         "actor_tag": "stale-observer", "assigned_to": "intruder", "status": "DONE",
+                         "lease_until": "2000-01-01T00:00:00Z", "payload": "not a transition"}, base=base)
+        code2, _ = call({"action": "event", "work_id": observer_work, "event_type": "FINDING",
+                         "actor_tag": "stale-observer", "assigned_to": "intruder", "status": "CANCELLED",
+                         "payload": "also not a transition"}, base=base)
+        code3, observer_inbox = call({"action": "inbox", "tag": "worker"}, base=base)
+        observer_item = next((item for item in observer_inbox.get("items", [])
+                              if item.get("work_id") == observer_work), {})
+        _, observer_history = call({"action": "work", "work_id": observer_work}, base=base)
+        check("NOTE/FINDING cannot hide or reroute a fenced live claim",
+              code1 == code2 == code3 == 200 and observer_item.get("event_type") == "CLAIM" and
+              observer_item.get("status") == "CLAIMED" and
+              "fence_token" not in observer_item and
+              all("fence_token" not in event for event in observer_history.get("events", [])) and
+              observer_item.get("event_id") != observer_claim.get("fence_token"))
+
+        cancel_work = "WRK-FENCE-CANCEL"
+        create(cancel_work, base)
+        _, cancel_claim = claim(cancel_work, "worker", base)
+        code, _ = call({"action": "event", "work_id": cancel_work, "event_type": "CANCEL",
+                        "actor_tag": "operator", "status": "CANCELLED", "payload": "missing fence"}, base=base)
+        code2, cancelled = call({"action": "event", "work_id": cancel_work, "event_type": "CANCEL",
+                                 "actor_tag": "operator", "status": "CANCELLED", "payload": "cancelled",
+                                 "fence_token": cancel_claim["fence_token"]}, base=base)
+        check("operator CANCEL is freshness-fenced but does not impersonate claimant",
+              code == 409 and code2 == 200 and cancelled.get("claim_generation") == 1)
+        code3, late_cancelled = complete(cancel_work, "worker", "late after cancel",
+                                         cancel_claim["fence_token"], base)
+        check("CANCEL revokes the claim before any later COMPLETE",
+              code3 == 409 and "active unexpired CLAIM" in late_cancelled.get("error", ""))
+
+        expired_work = "WRK-FENCE-EXPIRED"
+        create(expired_work, base)
+        past = ((_dt.datetime.now(_dt.timezone.utc) -
+                 _dt.timedelta(minutes=1)).isoformat().replace("+00:00", "Z"))
+        code, expired_claim = claim(expired_work, "worker", base, lease=past)
+        code2, expired_result = complete(expired_work, "worker", "too late",
+                                         expired_claim.get("fence_token"), base)
+        check("expired CLAIM cannot authorize a transition",
+              code == 200 and code2 == 409 and
+              "active unexpired CLAIM" in expired_result.get("error", ""))
+
+        terminal_work = "WRK-FENCE-TERMINAL"
+        create(terminal_work, base)
+        _, terminal_old = claim(terminal_work, "old-worker", base)
+        original_body = "first terminal result"
+        code, terminal_receipt = complete(terminal_work, "old-worker", original_body,
+                                          terminal_old["fence_token"], base)
+        _, terminal_new = claim(terminal_work, "new-worker", base)
+        code2, replay = complete(terminal_work, "old-worker", original_body,
+                                 terminal_old["fence_token"], base)
+        check("exact terminal replay is acknowledged before current-fence authorization",
+              code == code2 == 200 and replay.get("replayed") is True and
+              replay.get("event_id") == terminal_receipt.get("event_id") and
+              replay.get("claim_generation") == terminal_old.get("claim_generation"))
+        code, displaced = complete(terminal_work, "old-worker", "changed late result",
+                                   terminal_old["fence_token"], base)
+        check("post-terminal displaced actor cannot append a changed COMPLETE",
+              code == 409 and displaced.get("holder") == "new-worker" and count(terminal_work, "COMPLETE") == 1)
+        code, new_terminal = complete(terminal_work, "new-worker", "replacement result",
+                                      terminal_new["fence_token"], base)
+        check("post-terminal current actor can COMPLETE", code == 200 and
+              new_terminal.get("claim_generation") == terminal_new.get("claim_generation"))
+
+        _, peer_base = start()
+        race_work = "WRK-FENCE-TWO-PROCESS"
+        create(race_work, base)
+        barrier = threading.Barrier(3)
+
+        def racing_claim(endpoint):
+            barrier.wait(timeout=5)
+            return claim(race_work, "same-worker", endpoint)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            with sqlite3.connect(db) as gate:
+                gate.execute("BEGIN IMMEDIATE")
+                futures = [pool.submit(racing_claim, endpoint) for endpoint in (base, peer_base)]
+                barrier.wait(timeout=5)
+                time.sleep(0.2)
+                check("independent claim processes wait behind the SQLite writer",
+                      all(not future.done() for future in futures))
+            race_results = [future.result(timeout=15) for future in futures]
+        receipts = [result for code, result in race_results if code == 200]
+        conflicts = [result for code, result in race_results if code == 409]
+        check("two-process tokenless same-actor CLAIM race has one winner",
+              len(receipts) == len(conflicts) == 1 and
+              receipts[0].get("claim_generation") == 1 and
+              conflicts[0].get("claim_generation") == 1 and
+              count(race_work, "CLAIM") == 1)
+        code, race_winner = complete(race_work, "same-worker", "winning process",
+                                     receipts[0]["fence_token"], peer_base)
+        check("the racing CLAIM winner can COMPLETE",
+              code == 200 and race_winner.get("claim_generation") == 1 and
+              count(race_work, "COMPLETE") == 1)
+    finally:
+        for proc in processes:
+            stop(proc)
+
+
+def test_fence_migration(server_py, tmp):
+    """Upgrade a real legacy events table without rewriting its historical rows."""
+    import datetime as _dt
+
+    db = os.path.join(tmp, "legacy-fence.db")
+    legacy_schema = """
+    CREATE TABLE events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
+      event_ts TEXT NOT NULL, work_id TEXT NOT NULL, event_type TEXT NOT NULL,
+      actor_tag TEXT NOT NULL, assigned_to TEXT, status TEXT NOT NULL,
+      lease_until TEXT, payload TEXT NOT NULL, evidence_ref TEXT,
+      parent_work_id TEXT, project TEXT, schema_v INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX idx_events_work ON events (work_id, seq);
+    """
+    future = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    rows = [
+        ("legacy-create-active", "2000-01-01T00:00:00Z", "WRK-LEGACY-ACTIVE", "CREATE",
+         "dispatcher", "legacy-worker", "OPEN", None, "legacy active", None, None, None, 1),
+        ("legacy-claim-active", "2000-01-01T00:01:00Z", "WRK-LEGACY-ACTIVE", "CLAIM",
+         "legacy-worker", None, "CLAIMED", future, "legacy claim", None, None, None, 1),
+        ("legacy-create-done", "2000-01-01T00:02:00Z", "WRK-LEGACY-DONE", "CREATE",
+         "dispatcher", "legacy-worker", "OPEN", None, "legacy done", None, None, None, 1),
+        ("legacy-complete", "2000-01-01T00:03:00Z", "WRK-LEGACY-DONE", "COMPLETE",
+         "legacy-worker", None, "DONE", None, "legacy result", None, None, None, 1),
+    ]
+    with sqlite3.connect(db) as conn:
+        conn.executescript(legacy_schema)
+        conn.executemany(
+            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        before = conn.execute("SELECT * FROM events ORDER BY seq").fetchall()
+
+    spec = importlib.util.spec_from_file_location("fence_migration_bus", server_py)
+    bus = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bus)
+    first = bus.Store(db)
+    first.conn.close()
+    second = bus.Store(db)
+    second.conn.close()
+    with sqlite3.connect(db) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(events)")]
+        after = conn.execute("SELECT * FROM events ORDER BY seq").fetchall()
+        indexes = [row[1] for row in conn.execute("PRAGMA index_list(events)")]
+        triggers = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'")]
+    check("cold migration adds both nullable fence columns exactly once",
+          columns.count("claim_generation") == columns.count("fence_token") == 1)
+    check("cold migration preserves every legacy value and leaves new fields NULL",
+          [row[:14] for row in after] == before and all(row[14:] == (None, None) for row in after))
+    check("cold migration creates durable claim-token and generation uniqueness indexes",
+          {"idx_events_claim_fence", "idx_events_claim_generation"}.issubset(indexes))
+    check("cold migration creates versioned database fence triggers",
+          {"trg_events_claim_fence_v1", "trg_events_scoped_fence_v1"}.issubset(triggers))
+    gate = sqlite3.connect(db)
+    try:
+        gate.execute("BEGIN IMMEDIATE")
+        try:
+            ready = bus.db_connect(db)
+            ready.close()
+            fast_path_read_only = True
+        except sqlite3.OperationalError:
+            fast_path_read_only = False
+        check("full db_connect on an already-migrated DB does not reserve the SQLite writer",
+              fast_path_read_only)
+    finally:
+        gate.rollback()
+        gate.close()
+
+    processes = []
+
+    def stop(proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc.stderr.close()
+
+    try:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        base = f"http://127.0.0.1:{port}/"
+        env = dict(os.environ, BUS_SECRET=SECRET, BUS_PORT=str(port), BUS_BIND="127.0.0.1", BUS_DB=db)
+        proc = subprocess.Popen([sys.executable, server_py, "--db", db, "serve"],
+                                env=env, stderr=subprocess.PIPE)
+        processes.append(proc)
+        for _ in range(50):
+            try:
+                code, health = call(method="GET", base=base)
+                if code == 200:
+                    break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("migrated server never came up")
+
+        code, legacy_progress = call({"action": "event", "work_id": "WRK-LEGACY-ACTIVE",
+                                      "event_type": "PROGRESS", "actor_tag": "legacy-worker",
+                                      "status": "RUNNING", "payload": "legacy compatibility"}, base=base)
+        check("legacy-only claimant remains tokenless-compatible until its next CLAIM", code == 200 and
+              legacy_progress.get("fence_token") is None)
+        code, replay = call({"action": "event", "work_id": "WRK-LEGACY-DONE",
+                             "event_type": "COMPLETE", "actor_tag": "legacy-worker",
+                             "status": "DONE", "payload": "legacy result"}, base=base)
+        check("legacy exact COMPLETE still replays after migration", code == 200 and
+              replay.get("replayed") is True and replay.get("event_id") == "legacy-complete")
+        code, upgraded_claim = call({"action": "event", "work_id": "WRK-LEGACY-ACTIVE",
+                                     "event_type": "CLAIM", "actor_tag": "legacy-worker",
+                                     "status": "CLAIMED", "payload": "upgrade boundary",
+                                     "lease_until": future}, base=base)
+        check("first post-migration CLAIM establishes generation one", code == 200 and
+              upgraded_claim.get("claim_generation") == 1 and upgraded_claim.get("fence_token"))
+        old_insert = (
+            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)")
+        old_binary_claim_blocked = False
+        try:
+            with sqlite3.connect(db) as conn:
+                conn.execute(old_insert, ("old-binary-claim", "2000-01-01T00:04:00Z",
+                                          "WRK-LEGACY-ACTIVE", "CLAIM", "legacy-worker", None,
+                                          "CLAIMED", future, "old binary claim", None, None, None))
+        except sqlite3.IntegrityError as error:
+            old_binary_claim_blocked = "claim fence invariant" in str(error)
+        check("database rejects an old binary's unfenced CLAIM after the boundary",
+              old_binary_claim_blocked)
+        old_binary_progress_blocked = False
+        try:
+            with sqlite3.connect(db) as conn:
+                conn.execute(old_insert, ("old-binary-progress", "2000-01-01T00:05:00Z",
+                                          "WRK-LEGACY-ACTIVE", "PROGRESS", "legacy-worker", None,
+                                          "RUNNING", None, "old binary progress", None, None, None))
+        except sqlite3.IntegrityError as error:
+            old_binary_progress_blocked = "claim-scoped fence mismatch" in str(error)
+        check("database rejects an old binary's unfenced claimant transition after the boundary",
+              old_binary_progress_blocked)
+        code, rejected = call({"action": "event", "work_id": "WRK-LEGACY-ACTIVE",
+                               "event_type": "COMPLETE", "actor_tag": "legacy-worker",
+                               "status": "DONE", "payload": "stale legacy process"}, base=base)
+        check("tokenless legacy process fails closed after the upgrade boundary",
+              code == 409 and rejected.get("claim_generation") == 1)
+    finally:
+        for proc in processes:
+            stop(proc)
+
+
 def main():
     server_py = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(__file__), "..", "src", "bus_server.py")
@@ -447,27 +849,32 @@ def main():
         check("CLAIM with 4h+ lease -> 400", code == 400 and "4 hours" in r.get("error", ""))
         import datetime as _dt
         lease = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-        code, r = call({"action": "event", "work_id": "WRK-TEST01", "event_type": "CLAIM",
-                        "actor_tag": "gemini", "status": "CLAIMED", "payload": "claiming",
-                        "lease_until": lease})
-        check("valid CLAIM accepted", code == 200)
+        code, claim1 = call({"action": "event", "work_id": "WRK-TEST01", "event_type": "CLAIM",
+                             "actor_tag": "gemini", "status": "CLAIMED", "payload": "claiming",
+                             "lease_until": lease})
+        check("valid CLAIM accepted with server-issued fence", code == 200 and
+              claim1.get("claim_generation") == 1 and claim1.get("fence_token") and
+              claim1.get("fence_token") != claim1.get("event_id"))
         code, r = call({"action": "event", "work_id": "WRK-TEST01", "event_type": "CLAIM",
                         "actor_tag": "chatgpt-codex-desktop", "status": "CLAIMED",
                         "payload": "stealing", "lease_until": lease})
         check("conflicting CLAIM -> 409 naming holder", code == 409 and r.get("holder") == "gemini")
         code, r = call({"action": "inbox", "tag": "gemini"})
         check("inbox(gemini): sees own claimed item", code == 200 and len(r.get("items", [])) == 1
-              and r["items"][0]["work_id"] == "WRK-TEST01")
+              and r["items"][0]["work_id"] == "WRK-TEST01"
+              and "fence_token" not in r["items"][0])
         code, r = call({"action": "inbox", "tag": "meta-ai-web"})
         check("inbox(other): empty", code == 200 and r.get("items") == [])
         code, r = call({"action": "event", "work_id": "WRK-TEST01", "event_type": "COMPLETE",
-                        "actor_tag": "gemini", "status": "DONE", "payload": "done"})
+                        "actor_tag": "gemini", "status": "DONE", "payload": "done",
+                        "fence_token": claim1["fence_token"]})
         check("COMPLETE accepted", code == 200)
         code, r = call({"action": "inbox", "tag": "gemini"})
         check("inbox after DONE: empty (reduction rule)", code == 200 and r.get("items") == [])
         code, r = call({"action": "work", "work_id": "WRK-TEST01"})
         check("work history: 3 events in seq order", code == 200 and len(r.get("events", [])) == 3
-              and [e["event_type"] for e in r["events"]] == ["CREATE", "CLAIM", "COMPLETE"])
+              and [e["event_type"] for e in r["events"]] == ["CREATE", "CLAIM", "COMPLETE"]
+              and all("fence_token" not in e for e in r["events"]))
 
         print("== regression: review findings ==")
         import concurrent.futures
@@ -570,11 +977,12 @@ def main():
         check("impossible lease offset -> 400 not 500", code == 400)
         import datetime as _dt2
         lease2 = (_dt2.datetime.now(_dt2.timezone.utc) + _dt2.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-        code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CLAIM",
-                        "actor_tag": "gemini", "status": "CLAIMED", "payload": "c", "lease_until": lease2})
-        check("valid CLAIM on second item", code == 200)
+        code, claim2 = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CLAIM",
+                             "actor_tag": "gemini", "status": "CLAIMED", "payload": "c", "lease_until": lease2})
+        check("valid CLAIM on second item", code == 200 and claim2.get("fence_token"))
         code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "PROGRESS",
-                        "actor_tag": "gemini", "status": "RUNNING", "payload": "working, no lease field"})
+                        "actor_tag": "gemini", "status": "RUNNING", "payload": "working, no lease field",
+                        "fence_token": claim2["fence_token"]})
         check("PROGRESS without lease accepted", code == 200)
         code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CLAIM",
                         "actor_tag": "chatgpt-codex-desktop", "status": "CLAIMED",
@@ -593,6 +1001,8 @@ def main():
 
         test_import_atomicity(server_py, tmp)
         test_complete_replay(server_py, tmp)
+        test_durable_claim_fencing(server_py, tmp)
+        test_fence_migration(server_py, tmp)
 
         print(f"\n{PASS} passed, {FAIL} failed")
         if FAILURES:
