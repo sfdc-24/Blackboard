@@ -248,6 +248,85 @@ jobs:
                    '; pass=' + $pass.Count + '; fail=' + $fail.Count +
                    '; result=' + ($result -join ','))
           }
+      - name: Test focused IWR security resilience on Linux PowerShell 7
+        shell: pwsh
+        run: |
+          $childShell = (Get-Command pwsh -CommandType Application -ErrorAction Stop |
+                         Select-Object -First 1).Source
+          if (-not $IsLinux -or [string]::IsNullOrWhiteSpace($childShell) -or
+              $PSVersionTable.PSVersion -lt [version]'7.5' -or
+              -not [IO.Path]::IsPathRooted($childShell) -or
+              [IO.Path]::GetFileName($childShell) -cne 'pwsh') {
+            throw ('This step requires Linux PowerShell 7.5+ and an absolute pwsh executable; resolved: ' +
+                   $childShell + '; host=' + $PSVersionTable.PSVersion)
+          }
+
+          $env:ORDER_TEST_CHILD_SHELL = $childShell
+          $expectedBusSource = 'SOURCE bus.ps1 sha256=' +
+            (Get-FileHash -LiteralPath ./scripts/bus.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedSuiteSource = 'SOURCE test_order_read_resilience.ps1 sha256=' +
+            (Get-FileHash -LiteralPath ./tests/test_order_read_resilience.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $priorErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $rawOutput = @(& $childShell -NoLogo -NoProfile -NonInteractive `
+              -File ./tests/test_order_read_resilience.ps1 -Scope IwrOnly 2>&1)
+            $suiteExit = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+          }
+
+          [string[]]$output = @($rawOutput | ForEach-Object { [string]$_ })
+          $output | ForEach-Object { Write-Output $_ }
+
+          $childShellLines = @($output | Where-Object { $_ -clike 'CHILD_SHELL *' })
+          $scopeLines = @($output | Where-Object { $_ -clike 'SCOPE *' })
+          $engineLines = @($output | Where-Object { $_ -clike 'ENGINE *' })
+          $sourceLines = @($output | Where-Object { $_ -clike 'SOURCE *' })
+          $caseLines = @($output | Where-Object { $_ -clike 'CASES *' })
+          $passLines = @($output | Where-Object { $_ -clike 'PASS *' })
+          $failLines = @($output | Where-Object { $_ -clike 'FAIL *' })
+          $resultLines = @($output | Where-Object { $_ -clike 'RESULT *' })
+          $expectedResultLines = @($output | Where-Object { $_ -cmatch '^RESULT passed=26 failed=0$' })
+          $nonblankLines = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $terminalLine = if ($nonblankLines.Count -gt 0) { $nonblankLines[-1] } else { '' }
+
+          $problems = New-Object System.Collections.Generic.List[string]
+          if ($suiteExit -ne 0) {
+            $problems.Add('suite_exit=' + $suiteExit)
+          }
+          if ($childShellLines.Count -ne 1 -or
+              $childShellLines[0] -cne ('CHILD_SHELL ' + $childShell)) {
+            $problems.Add('child_shell=' + ($childShellLines -join ','))
+          }
+          if ($scopeLines.Count -ne 1 -or $scopeLines[0] -cne 'SCOPE IwrOnly') {
+            $problems.Add('scope=' + ($scopeLines -join ','))
+          }
+          if ($engineLines.Count -ne 1 -or
+              $engineLines[0] -cne ('ENGINE Core ' + $PSVersionTable.PSVersion + ' child=' + $childShell)) {
+            $problems.Add('engine=' + ($engineLines -join ','))
+          }
+          if ($sourceLines.Count -ne 2 -or
+              @($sourceLines | Where-Object { $_ -ceq $expectedBusSource }).Count -ne 1 -or
+              @($sourceLines | Where-Object { $_ -ceq $expectedSuiteSource }).Count -ne 1) {
+            $problems.Add('source=' + ($sourceLines -join ','))
+          }
+          if ($caseLines.Count -ne 1 -or $caseLines[0] -cne 'CASES 26') {
+            $problems.Add('cases=' + ($caseLines -join ','))
+          }
+          if ($passLines.Count -ne 26) {
+            $problems.Add('pass_count=' + $passLines.Count)
+          }
+          if ($failLines.Count -ne 0) {
+            $problems.Add('fail_count=' + $failLines.Count)
+          }
+          if ($resultLines.Count -ne 1 -or $expectedResultLines.Count -ne 1 -or
+              $terminalLine -cne 'RESULT passed=26 failed=0') {
+            $problems.Add('result=' + ($resultLines -join ','))
+          }
+          if ($problems.Count -gt 0) {
+            throw ('order_iwr_security_linux_failed: ' + ($problems -join '; '))
+          }
 
   powershell-7-workspace-linux:
     name: ORDER workspace contracts on Linux PowerShell 7
