@@ -33,13 +33,13 @@
       MATCHED*   the stored value is broken up by LevelDB compression, and a
                  contiguous run of at least 16 characters identifies it; the
                  run length is printed so the evidence can be weighed
-      AMBIGUOUS  more than one candidate cleared the floor in one profile, so
-                 the evidence cannot distinguish them and none is reported
-      ELSEWHERE  no profile ON THIS MACHINE holds it. That is NOT "stale" -
-                 it may be a live browser on another machine
+      AMBIGUOUS  conflicting IDs in one profile, or a candidate matched in
+                 multiple profiles; no unique location can be reported
+      ELSEWHERE  no supported local match was found; it may be a live browser
+                 here in an unsupported record or on another machine
 
     Exit codes: 0 something matched, 1 nothing matched, 2 could not look
-    (installs exist but no bridgeDeviceId key was seen anywhere). 2 is kept
+    (installs exist but no supported bridgeDeviceId key boundary was seen). 2 is kept
     distinct from 1 because "could not look" and "looked and found nothing"
     call for different actions.
 
@@ -127,12 +127,22 @@ function Get-SettingAfterKey {
 # can include a following anonymousId or a second record and falsely promote it.
 # Restrict the framing before the quote so a missing value cannot borrow the
 # next readable field. Unknown encodings remain outside this diagnostic's scope.
-function Get-BridgeValues {
+# Recognize a record boundary, not a suffix of a readable property name. The
+# supported fixtures have binary framing (or start of buffer), optional '&'
+# framing, and sometimes a missing leading 'b'. After the key, accept a binary
+# boundary, a direct value quote, or end of buffer. Other layouts remain unknown.
+function Get-BridgeKeys {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return }
-    $pattern = '(?<![A-Za-z0-9_])b?ridgeDeviceId[^"A-Za-z0-9_]{0,24}"([^"]{0,120})"'
-    foreach ($m in [regex]::Matches($Text, $pattern)) {
-        $m.Groups[1].Value
+    [regex]::Matches($Text, '(?:^|[^\x20-\x7E])&?b?ridgeDeviceId(?=$|[^\x20-\x7E]|")')
+}
+
+function Get-BridgeValues {
+    param([string]$Text)
+    foreach ($key in @(Get-BridgeKeys $Text)) {
+        $tail = $Text.Substring($key.Index + $key.Length)
+        $value = [regex]::Match($tail, '\A[^"A-Za-z0-9_]{0,24}"([^"]{0,120})"')
+        if ($value.Success) { $value.Groups[1].Value }
     }
 }
 
@@ -180,10 +190,10 @@ function Get-SettingsDirs {
 #
 # This diagnostic does not reconstruct compressed blocks. It compares candidate
 # runs only within quoted values associated with the readable bridge key.
-# The floor for calling a broken-up value a match. 16 characters of a UUID is
-# 64 bits of content; the real records yield 23 and 27. Paired with the
-# uniqueness rule below - one candidate per profile or none - a coincidental
-# hit would have to be constructed rather than encountered.
+# The floor for calling a broken-up value a partial match. The observed records
+# yield runs of 23 and 27 characters. This heuristic does not prove identity or
+# connection freshness; uniqueness is limited to the scanned evidence and the
+# supplied candidate list.
 $MIN_RUN = 16
 
 function Get-LongestRunInWindow {
@@ -266,7 +276,7 @@ function Get-ProfileIdentity {
         # Was the key here AT ALL? This, not a parsed value, is what makes a
         # non-match meaningful: key present and candidate absent is evidence;
         # key never seen is an open question.
-        if ($txt.Contains('ridgeDeviceId')) { $result.KeySeen = $true }
+        if (@(Get-BridgeKeys $txt).Count -gt 0) { $result.KeySeen = $true }
 
         # COLLECT, DO NOT LET THE FIRST FILE WIN.
         #
@@ -280,6 +290,16 @@ function Get-ProfileIdentity {
             if ($seen -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
                 if ($result.AllIds -notcontains $seen) { $result.AllIds += $seen }
                 if (-not $result.DeviceId) { $result.DeviceId = $seen }
+            } else {
+                # A malformed quoted value can carry multiple complete IDs.
+                # Their conflict matters even if the caller supplies only one.
+                $embedded = @([regex]::Matches($seen, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') |
+                    ForEach-Object { $_.Value } | Sort-Object -Unique)
+                if ($embedded.Count -gt 1) {
+                    foreach ($candidate in $embedded) {
+                        if ($result.AllIds -notcontains $candidate) { $result.AllIds += $candidate }
+                    }
+                }
             }
         }
 
@@ -417,8 +437,8 @@ foreach ($b in $BROWSERS) {
             DeviceId    = $(
                 if ($id.AllIds.Count -gt 1) { '(CONFLICTING: ' + ($id.AllIds -join ', ') + ')' }
                 elseif ($id.DeviceId) { $id.DeviceId }
-                elseif ($id.KeySeen) { '(present but unextractable - value is compression-broken)' }
-                else { '(no bridgeDeviceId key found here)' })
+                elseif ($id.KeySeen) { '(present but unextractable - value may be compressed or unsupported)' }
+                else { '(no supported bridgeDeviceId key boundary found here)' })
             DisplayName = $(if ($id.DisplayName) { $id.DisplayName } else { '' })
             # Surfaced, not just counted. "(none stored)" because the file was
             # locked and "(none stored)" because there is genuinely no id are
@@ -480,7 +500,7 @@ if ($DeviceId.Count -gt 0) {
     if ($rows.Count -gt 0 -and $canAnswer.Count -eq 0) {
         Write-Output ''
         Write-Output ("  REFUSING TO RECONCILE: found $($rows.Count) extension install(s) here,")
-        Write-Output '  and read a deviceId from NONE of them. Every answer below would be'
+        Write-Output '  and recognized a bridgeDeviceId key boundary in NONE. Every answer would be'
         Write-Output '  "not here" regardless of the truth, so no answer is given.'
         Write-Output ''
         $unread = ($rows | Measure-Object -Property Unreadable -Sum).Sum
@@ -488,8 +508,8 @@ if ($DeviceId.Count -gt 0) {
             Write-Output ("  $unread settings file(s) could not be read - the browser may be")
             Write-Output '  holding them. Close it and re-run.'
         } else {
-            Write-Output '  All settings files were readable, and no bridgeDeviceId key was'
-            Write-Output '  found in any of them. Extension versions found here:'
+            Write-Output '  All settings files were readable, and no supported bridgeDeviceId'
+            Write-Output '  key boundary was found. Extension versions found here:'
             foreach ($v in ($rows | Select-Object -ExpandProperty ExtVersion -Unique)) {
                 Write-Output ("    v$v")
             }
@@ -515,9 +535,10 @@ if ($DeviceId.Count -gt 0) {
             # a scan that could not see the value, presented as a value that is
             # not there.
             Write-Output '  LIMIT: this reads those files as Latin-1 - byte-faithful, so no'
-            Write-Output '  byte is lost - and matches the KEY as text. An id whose key is'
+            Write-Output '  byte is lost - and matches supported binary/start key boundaries.'
+            Write-Output '  Other record framing is outside this diagnostic. An id whose key is'
             Write-Output '  itself stored compressed or encoded would produce this same'
-            Write-Output '  result, so this is "no bridgeDeviceId key as readable text in'
+            Write-Output '  result, so this is "no supported bridgeDeviceId key boundary in'
             Write-Output '  the paths above" - NOT proof the browser has no id. The VALUE'
             Write-Output '  being unreadable is expected and handled: it is matched by'
             Write-Output '  contiguous run, not read back.'
@@ -527,6 +548,7 @@ if ($DeviceId.Count -gt 0) {
 
     $stale = 0
     $ambiguous = 0
+    $resolvedMatches = 0
     foreach ($d in $DeviceId) {
         # Only the reconciled MatchedIds are authoritative. DeviceId is display
         # evidence and must never bypass a profile's conflict/ambiguity decision.
@@ -542,10 +564,16 @@ if ($DeviceId.Count -gt 0) {
         # against it.
         #
         # A machine with a clean Chrome match and a muddled Edge profile knows
-        # perfectly well where that id lives. AMBIGUOUS is now reported only
-        # when no profile offers unique positive evidence.
+        # has usable evidence for Chrome. However, two clean profiles naming
+        # the same candidate cannot establish one unique location either.
         $hit = @($rows | Where-Object { $_.MatchedIds -contains $d } |
-            Sort-Object -Property @{ Expression = { $_.Exact -contains $d }; Descending = $true })
+            Sort-Object -Property Browser, Profile)
+        if ($hit.Count -gt 1) {
+            $ambiguous++
+            $locations = @($hit | ForEach-Object { '{0} / {1}' -f $_.Browser, $_.Profile })
+            Write-Output ("  AMBIGUOUS {0}  -> multiple profiles: {1}; no unique location" -f $d, ($locations -join '; '))
+            continue
+        }
         if ($hit.Count -eq 0) {
             $amb = @($rows | Where-Object { $_.Ambiguous -contains $d })
             if ($amb.Count -gt 0) {
@@ -557,6 +585,7 @@ if ($DeviceId.Count -gt 0) {
         }
 
         if ($hit.Count -gt 0) {
+            $resolvedMatches++
             $h = $hit[0]
             $live = $(if ($h.Running -and $h.Windows -gt 0) { 'LIVE' } else { 'installed but not running' })
             # EXACT vs PARTIAL, never conflated. A partial rests on a contiguous
@@ -574,11 +603,11 @@ if ($DeviceId.Count -gt 0) {
             Write-Output ("  {0} {1}  -> {2} / {3}  [{4}]  {5}{6}" -f $kind, $d, $h.Browser, $h.Profile, $live, $h.DisplayName, $how)
         } else {
             $stale++
-            Write-Output ("  ELSEWHERE {0}  -> no profile ON THIS MACHINE holds this id" -f $d)
+            Write-Output ("  ELSEWHERE {0}  -> no supported local match in the scanned records" -f $d)
         }
     }
     Write-Output ''
-    Write-Output ("  $stale of $($DeviceId.Count) ids belong to no browser on this machine.")
+    Write-Output ("  $stale of $($DeviceId.Count) ids have no supported local match.")
     if ($stale -gt 0) {
         # DO NOT CALL THESE STALE. This label used to read "STALE", and that one
         # word caused a wrong conclusion the first time the tool was run: two ids
@@ -587,9 +616,9 @@ if ($DeviceId.Count -gt 0) {
         #
         # "Not here" and "not anywhere" are different claims and this script can
         # only ever make the first one. It sees one machine's disk.
-        Write-Output '  That means NOT HERE - it does NOT mean stale. They may be'
-        Write-Output '  live browsers on another machine on the same account. Run'
-        Write-Output '  this on that machine to tell the two apart; isLocal in the'
+        Write-Output '  No supported match does NOT mean stale. They may use unreadable'
+        Write-Output '  or unsupported records here, or be live on another machine.'
+        Write-Output '  Reuse a working connection and verify tab access; isLocal in the'
         Write-Output '  API response does not, having been observed true for a'
         Write-Output '  browser on a different host.'
     }
@@ -598,13 +627,8 @@ if ($DeviceId.Count -gt 0) {
 # Exit non-zero when asked to reconcile and nothing matched: a caller that
 # cannot find ANY live browser should fail rather than pick one at random.
 if ($DeviceId.Count -gt 0) {
-    # Same basis as the reconciliation above. Keying this on the PARSED value
-    # made a run that printed MATCHED exit 1, because the value it matched on
-    # was compression-broken and never parsed - the report and the exit code
-    # disagreeing, which is the failure PR70 shipped.
-    $matched = @($rows | Where-Object {
-        @($_.MatchedIds | Where-Object { $DeviceId -contains $_ }).Count -gt 0
-    })
-    if ($matched.Count -eq 0) { exit 1 }
+    # Count only the unique locations actually reported. Multiple profile hits
+    # must not silently produce exit0 while the report says ambiguous.
+    if ($resolvedMatches -eq 0) { exit 1 }
 }
 exit 0
