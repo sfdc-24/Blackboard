@@ -177,7 +177,26 @@ function Assert-BusReadResponseContract {
 
   $invalidMessage = 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.'
   try {
-    $response = ConvertFrom-Json -InputObject $Content -ErrorAction Stop
+    # ConvertFrom-Json is not a root-shape oracle across editions: PowerShell 7
+    # unwraps a one-element JSON array containing an object to PSCustomObject,
+    # while Windows PowerShell 5.1 retains Object[]. Check the raw JSON token first
+    # so both editions enforce one root object before deserialization.
+    $trimmedContent = $Content.TrimStart()
+    if ($trimmedContent.Length -eq 0 -or $trimmedContent[0] -cne '{') {
+      throw [InvalidOperationException]::new($invalidMessage)
+    }
+    # PowerShell 7 otherwise turns ISO-8601-looking JSON strings into DateTime.
+    # That changes legitimate document text and identity values before the type
+    # and ordinal checks below. DateKind arrived in 7.5; Desktop 5.1 already
+    # preserves strings, while older Core editions must fail closed.
+    $jsonCommand = Get-Command ConvertFrom-Json
+    if ($jsonCommand.Parameters.ContainsKey('DateKind')) {
+      $response = ConvertFrom-Json -InputObject $Content -DateKind String -ErrorAction Stop
+    } elseif ($PSVersionTable.PSEdition -ceq 'Desktop') {
+      $response = ConvertFrom-Json -InputObject $Content -ErrorAction Stop
+    } else {
+      throw [NotSupportedException]::new('BUS_JSON_DATE_COERCION_UNSAFE')
+    }
     if ($null -eq $response -or
         $response -isnot [System.Management.Automation.PSCustomObject]) {
       throw [InvalidOperationException]::new($invalidMessage)
