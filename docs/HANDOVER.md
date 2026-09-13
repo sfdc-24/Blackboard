@@ -372,6 +372,38 @@ Compare the scratch export with the candidate commit and leave it untracked.
 Existing local `gas/` snapshots may be retained for evidence, but they are not
 proof of what is currently deployed and must never be pushed.
 
+**`clasp push` writes HEAD; a web app serves a PINNED version. These are not
+the same surface, and confusing them makes a deploy claim either false or
+needlessly frightening.** Measured on the Governor project, 2026-09-13:
+`clasp list-deployments` returns two — one `@HEAD`, and the console pinned at
+`@33`. So a push changes the project's saved code and leaves the pinned console
+untouched. Which of the two a change reaches depends entirely on how the code is
+invoked:
+
+| invoked by | runs | so a `clasp push` is |
+| --- | --- | --- |
+| installable trigger (e.g. `monitorTick`) | HEAD | live on the next run |
+| web app `/exec` on a pinned deployment | that version | inert until a redeploy |
+
+Therefore "I pushed it" is **not** the same claim as "the console changed", and
+"the console is unchanged" is not evidence the push failed. Say which surface
+you mean. Verifying a push means pulling the project back and diffing against a
+snapshot taken *before* it — `clasp`'s own success line says a file was
+transmitted, not that the thing you meant to change now behaves differently.
+`clasp` cannot list triggers at all, so whether a trigger exists and is enabled
+is outside what this tooling can prove; do not assert it from a successful push.
+
+**The committed mirror drifts from deployed source, and drift is the normal
+state.** `scripts/gas_baseline_check.py` compares them by content hash; run it
+the easy way with `scripts/gas_drift_watch.ps1`, which fetches, compares and
+then deletes the pulled production source in a `finally` block. Measured
+2026-09-13: `Auth`, `Code`, `Reception` and `appsscript` all differ between
+`apps-script/governor-page-api/` and what is deployed. **Treat `clasp push` from
+that directory as a destructive operation** — it would push the committed copies
+over live and silently revert whatever exists only in the deployment. To change
+one file, pull the live tree, edit only that file, assert the scope is exactly
+what you intended, push, then pull back and prove it.
+
 ---
 
 ## Quarantine is LIVE — Version 14, verified 2026-09-03
