@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Map every Claude browser-extension install on this machine to the deviceId
     the server knows it by, so "which browser is Browser 2?" has an answer.
@@ -140,11 +140,34 @@ function Get-BridgeKeys {
     [regex]::Matches($Text, '(?:^|[\x00-\x1F\x7F])&?b?ridgeDeviceId(?=$|[\x00-\x1F\x7F]|")')
 }
 
+# A HIGH BYTE NEXT TO THE KEY NAME AND A HIGH BYTE IN THE VALUE FRAMING ARE
+# NOT THE SAME QUESTION, AND ANSWERING THEM WITH ONE RULE BLINDED THIS MACHINE.
+#
+# Refusing a high byte as a KEY boundary is right: 'e-acute'+'bridgeDeviceId' is
+# ordinary UTF-8 text, not a record start, and treating it as one exact-matched a
+# lookalike. That rule belongs in Get-BridgeKeys above and stays there.
+#
+# Applying it BETWEEN the key and the opening quote was wrong, and real disk
+# says so. This VM's own Chrome record reads:
+#
+#     26 62..64            &bridgeDeviceId
+#     01 07 00 05 40 D8    framing: control bytes, '@', and 0xD8
+#     22 "f1315438-e826-4a57-a576-0f169bd13666" 22
+#
+# 0xD8 is LevelDB framing, the value behind it is complete and perfectly
+# readable, and a whitelist without high bytes threw it away - so the tool
+# reported this machine's own id as unextractable and then refused to answer at
+# all. Every fixture built its framing from the whitelist, so the suite agreed
+# with itself, stayed green, and could not see it.
+#
+# Letters, digits and '_' remain excluded: that is what stops a missing value
+# from borrowing the next readable field, which is the protection actually
+# being bought here.
 function Get-BridgeValues {
     param([string]$Text)
     foreach ($key in @(Get-BridgeKeys $Text)) {
         $tail = $Text.Substring($key.Index + $key.Length)
-        $value = [regex]::Match($tail, '\A[\x00-\x1F\x7F@?.\\]{0,24}"([^"]{1,120})"')
+        $value = [regex]::Match($tail, '\A[\x00-\x1F\x7F\x80-\xFF@?.\\]{0,24}"([^"]{1,120})"')
         if ($value.Success) { $value.Groups[1].Value }
     }
 }

@@ -599,14 +599,15 @@ try {
          (-not ($res28both.Text -cmatch 'MATCHED')) -and $res28both.Code -eq 1)
 
     # Latin-1 reading must not mistake UTF-8 bytes for binary key delimiters.
+    # NEXT TO THE KEY NAME, a high byte is ordinary text and must not open a
+    # record - that is the lookalike this refuses.
     $utf8Accent = [Text.Encoding]::GetEncoding(28591).GetString([Text.Encoding]::UTF8.GetBytes([string][char]0x00E9))
     foreach ($adjacent in @($utf8Accent, [string][char]0xE9, [string][char]0x80)) {
-        foreach ($side in @('prefix', 'suffix', 'framing')) {
+        foreach ($side in @('prefix', 'suffix')) {
             $r30 = Join-Path $WORK ('r30-' + [guid]::NewGuid().ToString('N'))
             $unicodeKey = switch ($side) {
                 'prefix' { $NUL + $adjacent + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"' }
                 'suffix' { $NUL + 'bridgeDeviceId' + $adjacent + $NUL + '@"' + $LIVE_ID + '"' }
-                'framing' { $NUL + 'bridgeDeviceId' + $NUL + $adjacent + '@"' + $LIVE_ID + '"' }
             }
             New-FixtureProfile -Root $r30 -Tables @(@{ Name = '000001.ldb'; Body = $unicodeKey }) | Out-Null
             $res30 = Invoke-Sut -Root $r30 -Ids @($LIVE_ID)
@@ -614,7 +615,44 @@ try {
                 (($res30.Text -cmatch 'REFUSING TO RECONCILE') -and
                  (-not ($res30.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res30.Code -eq 2)
         }
+
+        # BUT BETWEEN THE KEY AND THE QUOTE, a high byte is LevelDB framing.
+        # This assertion used to demand a refusal here too, and that single
+        # over-applied rule is what stopped the VM running these tests from
+        # extracting its own deviceId. Real bytes decide this, not symmetry.
+        $r30f = Join-Path $WORK ('r30f-' + [guid]::NewGuid().ToString('N'))
+        $framed = $NUL + 'bridgeDeviceId' + $NUL + $adjacent + '@"' + $LIVE_ID + '"'
+        New-FixtureProfile -Root $r30f -Tables @(@{ Name = '000001.ldb'; Body = $framed }) | Out-Null
+        $res30f = Invoke-Sut -Root $r30f -Ids @($LIVE_ID)
+        Assert-True "high-byte framing length $($adjacent.Length) is supported and matches" `
+            (($res30f.Text -cmatch ('MATCHED ' + [regex]::Escape($LIVE_ID))) -and
+             (-not ($res30f.Text -cmatch 'REFUSING TO RECONCILE')) -and $res30f.Code -eq 0)
     }
+
+    # THE RECORD THIS TOOL FAILED TO READ ON THE MACHINE THAT RUNS THESE TESTS.
+    #
+    # Copied byte for byte from this VM's own Chrome Local Extension Settings,
+    # not composed from the framing set the other fixtures assume. A fixture
+    # built out of the whitelist can only ever agree with the whitelist; that is
+    # why a 108/0 suite stayed green while the tool called a complete, readable
+    # id unextractable and then refused to answer at all. The 0xD8 is the byte
+    # that did it. If a future narrowing drops high bytes from the value framing
+    # again, this is the assertion that must fail.
+    $realBytes = [byte[]](0x36,0x61,0x30,0x36,0x31,0x34,0x37,0x22,0x00,0x16,0x26,
+        0x62,0x72,0x69,0x64,0x67,0x65,0x44,0x65,0x76,0x69,0x63,0x65,0x49,0x64,
+        0x01,0x07,0x00,0x05,0x40,0xD8,0x22)
+    $realRecord = [Text.Encoding]::GetEncoding(28591).GetString($realBytes) + $LIVE_ID + '"'
+    $r31 = Join-Path $WORK ('r31-' + [guid]::NewGuid().ToString('N'))
+    New-FixtureProfile -Root $r31 -Tables @(@{ Name = '000041.ldb'; Body = $realRecord }) | Out-Null
+    $res31 = Invoke-Sut -Root $r31 -Ids @($LIVE_ID)
+    Assert-True 'the real on-disk LevelDB record (0xD8 framing) extracts and matches' `
+        (($res31.Text -cmatch ('MATCHED ' + [regex]::Escape($LIVE_ID))) -and
+         (-not ($res31.Text -cmatch 'REFUSING TO RECONCILE|unextractable')) -and $res31.Code -eq 0)
+
+    # The same record must still refuse to place an id that is not in it.
+    $res31Absent = Invoke-Sut -Root $r31 -Ids @($OTHER)
+    Assert-True 'the real on-disk record does not claim an id it does not hold' `
+        ((-not ($res31Absent.Text -cmatch 'MATCHED')) -and $res31Absent.Code -ne 0)
 
     # Pin the supported boundary, not a perpetually expanding scan window.
     foreach ($length in @(24, 25)) {
