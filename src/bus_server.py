@@ -196,11 +196,26 @@ class Store:
         if kind not in ("doc", "sheet"):
             raise BusError(400, f"create kind must be 'doc' or 'sheet', got {kind!r}.")
         if kind == "sheet":
-            if not isinstance(header, list) or not header or not all(isinstance(c, str) and c.strip() for c in header):
-                raise BusError(400, "create kind=sheet requires header: a non-empty list of non-empty column names.")
-            if len(header) < 3:
-                raise BusError(400, f"sheet header needs at least 3 columns ({header[0] if header else 'id'}, "
-                                    "timestamp, and content) - got " + str(len(header)) + ".")
+            if not isinstance(header, list) or not header or not all(isinstance(c, str) for c in header):
+                raise BusError(400, "create kind=sheet requires header: a non-empty list of column names.")
+            # Google Sheets returns every row at the width of the sheet's USED range,
+            # not at the width of its named columns. "Blackboard - Alpha DB" has been
+            # widened past its ten names, so the live board answers A:L - ten names
+            # then two empty padding cells, on all 1883 rows. Requiring every column
+            # name to be non-empty made the real board unimportable, which is the same
+            # intolerance that took the ORDER worker down with board_header_invalid.
+            # Tolerate padding on the same terms PR46 settled for that worker: only as
+            # a TRAILING run. A blank column with named columns after it is a hole, and
+            # a padding cell carrying content is a schema change - both still fail.
+            named = len(header)
+            while named and not header[named - 1].strip():
+                named -= 1
+            if not all(c.strip() for c in header[:named]):
+                raise BusError(400, "create kind=sheet requires header: blank column names are allowed "
+                                    "only as trailing padding, not between named columns.")
+            if named < 3:
+                raise BusError(400, f"sheet header needs at least 3 NAMED columns ({header[0] if header else 'id'}, "
+                                    "timestamp, and content) - got " + str(named) + ".")
         fid = str(uuid.uuid4())
         ts = now_iso()
         try:
@@ -284,28 +299,61 @@ class Store:
             raise BusError(400, f"{f['title']!r} is a sheet; append needs sheetRow, not text (REQ-C4NDX7).")
         header = f["header"]
         hl = len(header)
+        # Count the NAMED columns, not the wire width.
+        #
+        # create_file accepts a header whose trailing blanks are used-range
+        # padding, so on a sheet imported from the live board len(header) is 12
+        # while the schema is 10 columns wide. Reasoning about the wire width
+        # made a TEN-CELL FULL ROW - what every fleet client sends - look like
+        # eight content cells, so the server prepended its own Row_ID and
+        # Timestamp and shifted every field two columns left. HTTP 200, no
+        # error, Row_ID in Source_Tag and Timestamp in Target_Surface.
+        #
+        # That is REQ-B4TQX9: the exact defect the checks below exist to
+        # prevent, reintroduced by the padding fix on the padded path. Found by
+        # codex-oversight-01a06e94 and relayed by vm-claude-code-cli on PR52,
+        # and reproduced here over HTTP before it was believed.
+        named = hl
+        while named and not str(header[named - 1]).strip():
+            named -= 1
+        pad = hl - named
         cells = ["" if c is None else str(c) for c in sheet_row]
-        if len(cells) == hl - 2:
+        # A client that read a padded row and sent it straight back carries the
+        # padding with it. Accept that, but only when the padding is EMPTY - a
+        # padding cell with content is a schema change, which is the same rule
+        # bcb_lint applies. Without this the two halves of the fix held
+        # different rules and a row bcb_lint called malformed was persisted here.
+        if len(cells) == hl and pad:
+            if any(c.strip() for c in cells[named:]):
+                raise BusError(400, f"sheetRow has content in column {named + 1}, past the {named} named "
+                                    f"columns of {f['title']!r}. Trailing blanks are used-range padding, "
+                                    "not columns to write into.")
+            cells = cells[:named]
+        if len(cells) == named - 2:
             # Server issues Row_ID and Timestamp - the schema-aware fix:
             # clients supply only content cells and columns can never shift.
             row_id = str(uuid.uuid4())
             cells = [row_id, now_iso()] + cells
-        elif len(cells) == hl:
+        elif len(cells) == named:
             c0, c1 = cells[0].strip(), cells[1].strip()
             if not c0:
-                raise BusError(400, f"sheetRow col 0 ({header[0]}) is empty - supply an id or send {hl - 2} content cells.")
+                raise BusError(400, f"sheetRow col 0 ({header[0]}) is empty - supply an id or send {named - 2} content cells.")
             if ISO_TS.match(c0) or HUMAN_DATE.match(c0):
                 raise BusError(400, f"sheetRow col 0 ({header[0]}) looks like a timestamp - this is the "
-                                    f"column-shift defect REQ-B4TQX9; send {hl - 2} content cells and let the "
+                                    f"column-shift defect REQ-B4TQX9; send {named - 2} content cells and let the "
                                     "server issue Row_ID and Timestamp.")
             if not ISO_TS.match(c1):
                 raise BusError(400, f"sheetRow col 1 ({header[1]}) must be ISO-8601, got {c1[:40]!r}.")
             row_id = c0
         else:
-            raise BusError(400, f"sheetRow has {len(cells)} cells; sheet {f['title']!r} needs {hl} "
-                                f"(or {hl - 2} content cells with server-issued {header[0]}/{header[1]}).")
+            raise BusError(400, f"sheetRow has {len(cells)} cells; sheet {f['title']!r} needs {named} "
+                                f"(or {named - 2} content cells with server-issued {header[0]}/{header[1]}).")
         if not any(c.strip() for c in cells[2:]):
             raise BusError(400, "sheetRow content cells are all empty - nothing to write (REQ-V8QD7R).")
+        # Persist at the sheet's wire width so a padded sheet keeps its shape and
+        # a read-back is the same width as every other row on the board.
+        if pad:
+            cells = cells + [""] * pad
         ts = now_iso()
         with WRITE_LOCK, self.conn:
             n = self.conn.execute(
