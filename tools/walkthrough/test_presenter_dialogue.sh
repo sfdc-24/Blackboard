@@ -83,12 +83,15 @@ fi
 
 # ---- 3. the two personas get DIFFERENT voices -------------------------------
 install_stub ok
-bash "${SAND}/presenter_dialogue.sh" "${REAL}" >/dev/null 2>&1
+# Also exercise a valid nonzero decimal gap; the remaining checks use the
+# caller's zero-gap setting to keep the suite fast.
+PRESENTER_DIALOGUE_GAP=0.001 bash "${SAND}/presenter_dialogue.sh" "${REAL}" >/dev/null 2>&1
+rc=$?
 n=$(spoken_count)
-if [ "${n}" -eq 6 ]; then
+if [ "${rc}" -eq 0 ] && [ "${n}" -eq 6 ]; then
   ok "a real run spoke all 6 turns"
 else
-  bad "a real run spoke ${n} of 6 turns"
+  bad "a real run rc=${rc} spoke ${n} of 6 turns"
 fi
 
 distinct=$(awk '{print $1, $2}' "${SPOKEN}" | sort -u | wc -l | tr -d ' ')
@@ -172,6 +175,56 @@ if printf '%s' "${out}" | grep -q 'turn 3 of 6 did not land'; then
   ok "the failure names which turn did not land"
 else
   bad "the failure did not say which turn stopped it"
+fi
+if printf '%s\n' "${out}" | grep -q '^dialogue_partial completed=2 total=6 phase=turn turn=3 exit=1$' \
+   && ! printf '%s\n' "${out}" | grep -q '^dialogue_ok '; then
+  ok "a turn-3 failure reports 2 completed turns and never dialogue_ok"
+else
+  bad "turn-3 failure must report completed=2, total=6, phase=turn without success"
+fi
+
+# ---- 8a. pause validation and runtime failures cannot claim completion -------
+# The configured gap is known before playback, so reject an invalid value before
+# any turn, including in dry-run. These cover syntax, sign and finite-number
+# checks rather than assuming a value accepted by float() is safe for sleep.
+for gap in not-a-duration -0.1 NaN Infinity 1e309; do
+  for mode in play dry-run; do
+    install_stub ok
+    args=()
+    [ "${mode}" = "dry-run" ] && args=(--dry-run)
+    # Bound the negative control too: an unvalidated Infinity reaches sleep and
+    # otherwise never returns, instead of reporting this regression as a failure.
+    out=$(PRESENTER_DIALOGUE_GAP="${gap}" timeout 5 bash "${SAND}/presenter_dialogue.sh" "${REAL}" "${args[@]}" 2>&1)
+    rc=$?
+    n=$(spoken_count)
+    if [ "${rc}" -ne 0 ] && [ "${n}" -eq 0 ] \
+       && printf '%s\n' "${out}" | grep -q 'finite nonnegative seconds' \
+       && ! printf '%s\n' "${out}" | grep -qE '^(dialogue_ok|dry_run_ok) '; then
+      ok "invalid gap ${gap} (${mode}) refuses before any turn"
+    else
+      bad "invalid gap ${gap} (${mode}): rc=${rc} calls=${n} - expected a preflight refusal"
+    fi
+  done
+done
+
+# A valid setting does not make a runtime sleep failure impossible. Stub only
+# sleep through a per-invocation PATH; the original speaker remains a log stub.
+install_stub ok
+mkdir -p "${WORK}/bin"
+cat > "${WORK}/bin/sleep" <<'STUB_SLEEP'
+#!/bin/bash
+exit 9
+STUB_SLEEP
+chmod +x "${WORK}/bin/sleep"
+out=$(PATH="${WORK}/bin:${PATH}" PRESENTER_DIALOGUE_GAP=0 bash "${SAND}/presenter_dialogue.sh" "${REAL}" 2>&1)
+rc=$?
+n=$(spoken_count)
+if [ "${rc}" -ne 0 ] && [ "${n}" -eq 1 ] \
+   && printf '%s\n' "${out}" | grep -q '^dialogue_partial completed=1 total=6 phase=pause after_turn=1 exit=9$' \
+   && ! printf '%s\n' "${out}" | grep -q '^dialogue_ok '; then
+  ok "a failed first pause reports 1 completed turn and never starts turn 2"
+else
+  bad "first pause failure: rc=${rc} calls=${n} - expected completed=1 partial status and no success"
 fi
 
 # ---- 8b. DRIFT AT RUNTIME speaks zero turns ---------------------------------
