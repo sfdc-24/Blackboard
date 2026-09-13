@@ -495,7 +495,88 @@ try {
     New-FixtureProfile -Root $r23 -Tables @(@{ Name = '000001.ldb'; Body = $lookalike }) | Out-Null
     $res23 = Invoke-Sut -Root $r23 -Ids @($ANON_ID)
     Assert-True 'a lookalike property name is not a bridge identity key' `
-        ((-not ($res23.Text -cmatch 'MATCHED')) -and $res23.Code -ne 0)
+        ((-not ($res23.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res23.Code -eq 2)
+    Assert-True 'lookalike-only records refuse reconciliation without claiming a key was found' `
+        (($res23.Text -cmatch 'REFUSING TO RECONCILE') -and
+         (-not ($res23.Text -match 'present but unextractable')))
+
+    # Readable punctuation belongs to the property token, not binary framing.
+    foreach ($prefix in @('other.', 'other-', 'other/', 'other:', 'other&')) {
+        $r24 = Join-Path $WORK ('r24-' + [guid]::NewGuid().ToString('N'))
+        $punctuationKey = $NUL + $prefix + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"'
+        New-FixtureProfile -Root $r24 -Tables @(@{ Name = '000001.ldb'; Body = $punctuationKey }) | Out-Null
+        $res24 = Invoke-Sut -Root $r24 -Ids @($LIVE_ID)
+        Assert-True "readable prefix '$prefix' cannot supply a key, match or elsewhere verdict" `
+            (($res24.Text -cmatch 'REFUSING TO RECONCILE') -and
+             (-not ($res24.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res24.Code -eq 2)
+    }
+
+    foreach ($suffix in @('Backup', '_backup', '.backup', '-backup', '/backup')) {
+        $r24b = Join-Path $WORK ('r24b-' + [guid]::NewGuid().ToString('N'))
+        $suffixKey = $NUL + 'bridgeDeviceId' + $suffix + $NUL + '@"' + $LIVE_ID + '"'
+        New-FixtureProfile -Root $r24b -Tables @(@{ Name = '000001.ldb'; Body = $suffixKey }) | Out-Null
+        $res24b = Invoke-Sut -Root $r24b -Ids @($LIVE_ID)
+        Assert-True "readable suffix '$suffix' cannot supply a key, match or elsewhere verdict" `
+            (($res24b.Text -cmatch 'REFUSING TO RECONCILE') -and
+             (-not ($res24b.Text -cmatch 'MATCHED|ELSEWHERE')) -and $res24b.Code -eq 2)
+    }
+
+    # Keep every supported key boundary while tightening the lookalike guard.
+    foreach ($keyPrefix in @('', '&', $NUL, ($NUL + '&'))) {
+        foreach ($keyName in @('bridgeDeviceId', 'ridgeDeviceId')) {
+            $r25 = Join-Path $WORK ('r25-' + [guid]::NewGuid().ToString('N'))
+            $supportedKey = $keyPrefix + $keyName + $NUL + '@"' + $LIVE_ID + '"'
+            New-FixtureProfile -Root $r25 -Tables @(@{ Name = '000001.ldb'; Body = $supportedKey }) | Out-Null
+            $res25 = Invoke-Sut -Root $r25 -Ids @($LIVE_ID)
+            Assert-True "supported boundary length $($keyPrefix.Length) for $keyName remains exact" `
+                (($res25.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID))) -and $res25.Code -eq 0)
+        }
+    }
+
+    $r25b = Join-Path $WORK 'r25b'
+    New-FixtureProfile -Root $r25b -Tables @(
+        @{ Name = '000001.ldb'; Body = ('bridgeDeviceId"' + $LIVE_ID + '"') }
+    ) | Out-Null
+    $res25b = Invoke-Sut -Root $r25b -Ids @($LIVE_ID)
+    Assert-True 'a direct value quote after the key remains an exact match' `
+        (($res25b.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID))) -and $res25b.Code -eq 0)
+
+    # A unique UUID within each profile is not a unique location across profiles.
+    foreach ($shape in @('exact', 'partial', 'mixed')) {
+        $r26 = Join-Path $WORK ('r26-' + $shape)
+        $exactBody = New-RealisticBody $ANON_ID $LAPTOP_CHROME 'Duplicate Identity'
+        $firstBody = $(if ($shape -eq 'partial') { $chromeBody } else { $exactBody })
+        $secondBody = $(if ($shape -eq 'exact') { $exactBody } else { $chromeBody })
+        New-FixtureProfile -Root $r26 -Profile 'Default' -Tables @(@{ Name = '000001.ldb'; Body = $firstBody }) | Out-Null
+        New-FixtureProfile -Root $r26 -Profile 'Profile 9' -Tables @(@{ Name = '000002.ldb'; Body = $secondBody }) | Out-Null
+        $res26 = Invoke-Sut -Root $r26 -Ids @($LAPTOP_CHROME)
+        Assert-True "$shape duplicate-profile evidence is ambiguous and exits 1" `
+            (($res26.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME))) -and
+             (-not ($res26.Text -cmatch 'MATCHED')) -and $res26.Code -eq 1)
+        Assert-True "$shape duplicate-profile verdict names both locations" `
+            ($res26.Text -match 'multiple profiles:(?=[^\r\n]*Fixture / Default)(?=[^\r\n]*Fixture / Profile 9)')
+    }
+
+    # Ambiguous duplicate locations for one candidate do not hide another unique one.
+    New-FixtureProfile -Root $r26 -Profile 'Profile 2' -Tables @(
+        @{ Name = '000003.ldb'; Body = (New-RealisticBody $ANON_ID $LIVE_ID 'Unique Identity') }
+    ) | Out-Null
+    $res27 = Invoke-Sut -Root $r26 -Ids @($LAPTOP_CHROME, $LIVE_ID)
+    Assert-True 'a different uniquely located candidate remains matched with exit 0' `
+        (($res27.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID) + '\s+-> Fixture / Profile 2')) -and
+         ($res27.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME))) -and $res27.Code -eq 0)
+    Assert-True 'a successful mixed-result exit does not promote the duplicate candidate' `
+        (-not ($res27.Text -cmatch ('MATCHED\*?\s+' + [regex]::Escape($LAPTOP_CHROME))))
+
+    $r28 = Join-Path $WORK 'r28'
+    $multipleEmbedded = $NUL + 'bridgeDeviceId' + $NUL + '@"x' + $LIVE_ID + ' / ' + $LAPTOP_CHROME + 'x"'
+    New-FixtureProfile -Root $r28 -Tables @(@{ Name = '000001.ldb'; Body = $multipleEmbedded }) | Out-Null
+    $res28 = Invoke-Sut -Root $r28 -Ids @($LIVE_ID)
+    Assert-True 'multiple full IDs in one malformed quoted value conflict even with one requested ID' `
+        (($res28.Text -cmatch 'CONFLICTING') -and
+         ($res28.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LIVE_ID))))
+    Assert-True 'a malformed multi-ID value cannot provide a match or successful exit' `
+        ((-not ($res28.Text -cmatch 'MATCHED')) -and $res28.Code -eq 1)
 
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have
