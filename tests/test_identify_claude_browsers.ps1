@@ -407,6 +407,89 @@ try {
         ($res13.Text -match ([char]0x00FC)) `
         'ASCII decoding turned every byte above 0x7F into a question mark'
 
+    # ---- review regressions: evidence must belong to the bridge value -----
+    $r14 = Join-Path $WORK 'r14'
+    $neighbor = $NUL + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"' +
+                $NUL + 'anonymousId' + $NUL + '@"' + $ANON_ID + '"'
+    New-FixtureProfile -Root $r14 -Tables @(@{ Name = '000001.ldb'; Body = $neighbor }) | Out-Null
+    $res14 = Invoke-Sut -Root $r14 -Ids @($ANON_ID)
+    Assert-True 'a neighboring anonymousId is never a bridge match' (-not ($res14.Text -cmatch 'MATCHED'))
+    Assert-True 'neighbor-only evidence does not exit successfully' ($res14.Code -eq 1)
+    $res14live = Invoke-Sut -Root $r14 -Ids @($LIVE_ID)
+    Assert-True 'the actual complete bridge value remains an exact match' `
+        ($res14live.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID)))
+
+    $r14b = Join-Path $WORK 'r14b'
+    $brokenNeighbor = $chromeBody + $NUL + 'anonymousId' + $NUL + '@"' + $ANON_ID + '"'
+    New-FixtureProfile -Root $r14b -Tables @(@{ Name = '000001.ldb'; Body = $brokenNeighbor }) | Out-Null
+    $res14b = Invoke-Sut -Root $r14b -Ids @($ANON_ID, $LAPTOP_CHROME)
+    Assert-True 'a broken bridge value cannot borrow a neighboring candidate' `
+        (-not ($res14b.Text -cmatch ('MATCHED\*?\s+' + [regex]::Escape($ANON_ID))))
+    Assert-True 'a broken bridge value still supplies its own partial match' `
+        ($res14b.Text -cmatch ('MATCHED\*\s+' + [regex]::Escape($LAPTOP_CHROME)))
+
+    # Listing a conflict is insufficient: reconciliation and exit must agree.
+    $res15 = Invoke-Sut -Root $r12 -Ids @($LIVE_ID)
+    Assert-True 'a complete conflict outside the candidate list stays ambiguous' `
+        ($res15.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LIVE_ID)))
+    Assert-True 'a conflicted profile cannot supply a match or successful exit' `
+        ((-not ($res15.Text -cmatch 'MATCHED')) -and $res15.Code -eq 1)
+
+    $r16 = Join-Path $WORK 'r16'
+    $twoValues = $NUL + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"' +
+                 $NUL + 'bridgeDeviceId' + $NUL + '@"' + $LAPTOP_CHROME + '"'
+    New-FixtureProfile -Root $r16 -Tables @(@{ Name = '000001.ldb'; Body = $twoValues }) | Out-Null
+    $res16 = Invoke-Sut -Root $r16 -Ids @($LIVE_ID, $LAPTOP_CHROME)
+    Assert-True 'all complete values in one file contribute to conflict display' ($res16.Text -cmatch 'CONFLICTING')
+    Assert-True 'neither complete value bypasses within-file ambiguity' `
+        (($res16.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LIVE_ID))) -and
+         ($res16.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME))))
+    Assert-True 'within-file ambiguity yields no match and exits nonzero' `
+        ((-not ($res16.Text -cmatch 'MATCHED')) -and $res16.Code -eq 1)
+
+    $res17 = Invoke-Sut -Root $r9 -Ids @($LAPTOP_EDGE.ToUpperInvariant())
+    Assert-True 'uppercase UUID input matches the same lowercase compressed value' `
+        (($res17.Text -cmatch 'MATCHED\*') -and $res17.Code -eq 0)
+    Assert-True 'case normalization preserves the measured partial run length' ($res17.Text -match 'partial: 27 of 36')
+
+    $r18 = Join-Path $WORK 'r18'
+    New-FixtureProfile -Root $r18 -Tables @(@{ Name = '000001.ldb'; Body = $twoValues }) | Out-Null
+    New-FixtureProfile -Root $r18 -Profile 'Profile 9' -Tables @(
+        @{ Name = '000002.ldb'; Body = (New-RealisticBody $ANON_ID $LIVE_ID 'Independent Clean Profile') }
+    ) | Out-Null
+    $res18 = Invoke-Sut -Root $r18 -Ids @($LIVE_ID, $LAPTOP_CHROME)
+    Assert-True 'a clean profile supplies the exact attribution despite another conflict' `
+        (($res18.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID) + '\s+-> Fixture / Profile 9')) -and $res18.Code -eq 0)
+    Assert-True 'the candidate with only conflicting evidence is still ambiguous' `
+        ($res18.Text -cmatch ('AMBIGUOUS ' + [regex]::Escape($LAPTOP_CHROME)))
+
+    $r19 = Join-Path $WORK 'r19'
+    $embedded = $NUL + 'bridgeDeviceId' + $NUL + '@"x' + $LIVE_ID + 'x"'
+    New-FixtureProfile -Root $r19 -Tables @(@{ Name = '000001.ldb'; Body = $embedded }) | Out-Null
+    $res19 = Invoke-Sut -Root $r19 -Ids @($LIVE_ID)
+    Assert-True 'a full run inside a broken value is partial, not an exact extraction' `
+        (($res19.Text -cmatch ('MATCHED\*\s+' + [regex]::Escape($LIVE_ID))) -and
+         (-not ($res19.Text -cmatch ('MATCHED\s+' + [regex]::Escape($LIVE_ID)))))
+
+    $similar = $LIVE_ID.Substring(0, 35) + '7'
+    $res20 = Invoke-Sut -Root $r1 -Ids @($similar)
+    Assert-True 'a different complete UUID cannot match by a shared 35-character run' `
+        ((-not ($res20.Text -cmatch 'MATCHED')) -and $res20.Code -eq 1)
+
+    $r21 = Join-Path $WORK 'r21'
+    $mixed = $NUL + 'bridgeDeviceId' + $NUL + '@"' + $LIVE_ID + '"' + $chromeBody
+    New-FixtureProfile -Root $r21 -Tables @(@{ Name = '000001.ldb'; Body = $mixed }) | Out-Null
+    $res21 = Invoke-Sut -Root $r21 -Ids @($LAPTOP_CHROME)
+    Assert-True 'an unrequested complete ID still conflicts with a different partial candidate' `
+        (($res21.Text -cmatch 'AMBIGUOUS') -and (-not ($res21.Text -cmatch 'MATCHED')) -and $res21.Code -eq 1)
+
+    $r22 = Join-Path $WORK 'r22'
+    $missing = $NUL + 'bridgeDeviceId' + $NUL + 'anonymousId' + $NUL + '@"' + $ANON_ID + '"'
+    New-FixtureProfile -Root $r22 -Tables @(@{ Name = '000001.ldb'; Body = $missing }) | Out-Null
+    $res22 = Invoke-Sut -Root $r22 -Ids @($ANON_ID)
+    Assert-True 'a missing bridge value cannot consume the following field' `
+        ((-not ($res22.Text -cmatch 'MATCHED')) -and $res22.Code -ne 0)
+
     # ---- fixture 7: a settings dir that exists but is empty ---------------
     # "Exists" was being counted as "searched", so the report claimed to have
     # read a location where nothing was opened - the scope of "not found"
@@ -430,7 +513,13 @@ try {
         (-not ($res5.Text -match 'Reconciliation'))
 
 } finally {
-    Remove-Item -Recurse -Force $WORK -ErrorAction SilentlyContinue
+    $resolvedWork = [IO.Path]::GetFullPath($WORK)
+    $resolvedTemp = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if (-not $resolvedWork.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolvedWork) -notlike 'identify-browsers-test-*') {
+        throw 'Refusing cleanup outside the generated test workspace'
+    }
+    Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output ''

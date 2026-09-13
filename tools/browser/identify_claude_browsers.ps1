@@ -20,11 +20,11 @@
     pairs it with whether the browser is actually running.
 
 .WHAT IT PROVES AND WHAT IT DOES NOT
-    It proves which deviceIds belong to extension installs ON THIS MACHINE and
-    which of those browsers currently has a live process. It says nothing about
-    deviceIds registered from another machine - those simply will not appear,
-    which is itself the answer for a `isLocal:true` entry that is missing here:
-    that registration is stale.
+    It reports identity evidence in readable local extension records and live
+    browser processes. These records may be historical; this is not a LevelDB
+    sequence decoder or a connection test. A missing local match does not prove
+    a registration is stale. Reuse a working saved connection and verify actual
+    tab access before considering browser selection.
 
 .PARAMETER DeviceId
     Zero or more deviceIds from list_connected_browsers. Each is reported as:
@@ -123,6 +123,19 @@ function Get-SettingAfterKey {
     return $null
 }
 
+# Keep candidate evidence inside the quoted bridge value. A fixed-size window
+# can include a following anonymousId or a second record and falsely promote it.
+# Restrict the framing before the quote so a missing value cannot borrow the
+# next readable field. Unknown encodings remain outside this diagnostic's scope.
+function Get-BridgeValues {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    $pattern = 'ridgeDeviceId[^"A-Za-z0-9_]{0,24}"([^"]{0,120})"'
+    foreach ($m in [regex]::Matches($Text, $pattern)) {
+        $m.Groups[1].Value
+    }
+}
+
 # Every place the id has been seen or might plausibly live. Searching only one
 # of these made "not found" a much weaker statement than it read as - the
 # laptop's probe had to check the other three by hand to establish anything.
@@ -165,10 +178,8 @@ function Get-SettingsDirs {
 # ones broken up. Characters are lost, not merely inserted, so the value also
 # cannot be reassembled: `-434f` arrives as `.?df`.
 #
-# Reconstruction is therefore impossible, but the question that actually matters
-# is answerable. Anchor on the key, look only at the window after it, and ask
-# whether a candidate's leading run appears there. 13 characters (8 hex, a dash,
-# 4 hex) is 48 bits of prefix against a handful of candidates.
+# This diagnostic does not reconstruct compressed blocks. It compares candidate
+# runs only within quoted values associated with the readable bridge key.
 # The floor for calling a broken-up value a match. 16 characters of a UUID is
 # 64 bits of content; the real records yield 23 and 27. Paired with the
 # uniqueness rule below - one candidate per profile or none - a coincidental
@@ -190,13 +201,13 @@ function Get-LongestRunInWindow {
         return 0
     }
 
-    # 'ridgeDeviceId': the leading character is eaten by the length byte often
-    # enough that anchoring on the full key misses real records.
-    foreach ($m in [regex]::Matches($Text, 'ridgeDeviceId')) {
-        $start = $m.Index + $m.Length
-        $len = [Math]::Min(160, $Text.Length - $start)
-        if ($len -le 0) { continue }
-        $window = $Text.Substring($start, $len)
+    foreach ($window in @(Get-BridgeValues $Text)) {
+        # A complete readable value belongs to that UUID, not another UUID
+        # sharing a long substring. Partial comparison is for broken values.
+        if ($window -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            if ($window -eq $Candidate) { return $Candidate.Length }
+            continue
+        }
 
         # LONGEST CONTIGUOUS RUN ANYWHERE IN THE CANDIDATE - NOT A PREFIX.
         #
@@ -217,7 +228,7 @@ function Get-LongestRunInWindow {
         # evidence than a 13-character prefix ever was.
         for ($i = 0; $i -lt $Candidate.Length; $i++) {
             for ($len = $Candidate.Length - $i; $len -gt $best; $len--) {
-                if ($window.Contains($Candidate.Substring($i, $len))) { $best = $len; break }
+                if ($window.IndexOf($Candidate.Substring($i, $len), [StringComparison]::OrdinalIgnoreCase) -ge 0) { $best = $len; break }
             }
         }
     }
@@ -247,8 +258,7 @@ function Get-ProfileIdentity {
         $files += $found
     }
 
-    # Newest first: the current value lives in the most recently written table,
-    # and an older compacted .ldb can still carry a superseded deviceId.
+    # Stable display order only; mtime does not establish LevelDB value order.
     $files = @($files | Sort-Object LastWriteTime -Descending)
     foreach ($f in $files) {
         $txt = Read-SharedText $f.FullName
@@ -266,17 +276,11 @@ function Get-ProfileIdentity {
         # "the first complete UUID I see" was resolving a conflict by an
         # irrelevant clock. Gather every distinct value and let the caller
         # refuse if they disagree.
-        $seen = Get-SettingAfterKey $txt 'bridgeDeviceId'
-        if ($seen -match '^[0-9a-fA-F-]{36}$' -and $result.AllIds -notcontains $seen) {
-            $result.AllIds += $seen
-        }
-
-        if (-not $result.DeviceId) {
-            # Best effort, for DISPLAY only. It succeeds where the block
-            # happened to be stored uncompressed and fails silently otherwise,
-            # so it must never be what reconciliation depends on.
-            $v = Get-SettingAfterKey $txt 'bridgeDeviceId'
-            if ($v -match '^[0-9a-fA-F-]{36}$') { $result.DeviceId = $v }
+        foreach ($seen in @(Get-BridgeValues $txt)) {
+            if ($seen -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                if ($result.AllIds -notcontains $seen) { $result.AllIds += $seen }
+                if (-not $result.DeviceId) { $result.DeviceId = $seen }
+            }
         }
 
         # RECONCILIATION USES THIS, NOT THE EXTRACTED VALUE.
@@ -328,10 +332,13 @@ function Get-ProfileIdentity {
     # either would be a coin flip dressed as a finding - which is the whole
     # failure this tool exists to end. Say ambiguous and let the caller refuse.
     $over = @($result.Runs.Keys | Where-Object { $result.Runs[$_] -ge $MIN_RUN })
-    if ($over.Count -eq 1) {
+    # Complete IDs outside the caller's candidate list still create a conflict.
+    # Include them when deciding whether this profile has unique evidence.
+    $possible = @(@($over) + @($result.AllIds) | Sort-Object -Unique)
+    if ($over.Count -eq 1 -and $possible.Count -eq 1) {
         $result.MatchedIds = @($over[0])
-        if ($result.Runs[$over[0]] -eq $over[0].Length) { $result.Exact = @($over[0]) }
-    } elseif ($over.Count -gt 1) {
+        if ($result.AllIds -contains $over[0]) { $result.Exact = @($over[0]) }
+    } elseif ($possible.Count -gt 1) {
         $result.Ambiguous = $over
     }
 
@@ -521,8 +528,8 @@ if ($DeviceId.Count -gt 0) {
     $stale = 0
     $ambiguous = 0
     foreach ($d in $DeviceId) {
-        # MatchedIds first: it survives a compressed value. DeviceId equality is
-        # kept as a fallback for the uncompressed case and costs nothing.
+        # Only the reconciled MatchedIds are authoritative. DeviceId is display
+        # evidence and must never bypass a profile's conflict/ambiguity decision.
         # DEFINITE EVIDENCE FIRST. AMBIGUITY IS PROFILE-LOCAL.
         #
         # Found by chatgpt-codex-connector reviewing PR89, and it is the same
@@ -537,13 +544,14 @@ if ($DeviceId.Count -gt 0) {
         # A machine with a clean Chrome match and a muddled Edge profile knows
         # perfectly well where that id lives. AMBIGUOUS is now reported only
         # when no profile offers unique positive evidence.
-        $hit = @($rows | Where-Object { ($_.MatchedIds -contains $d) -or ($_.DeviceId -eq $d) })
+        $hit = @($rows | Where-Object { $_.MatchedIds -contains $d } |
+            Sort-Object -Property @{ Expression = { $_.Exact -contains $d }; Descending = $true })
         if ($hit.Count -eq 0) {
             $amb = @($rows | Where-Object { $_.Ambiguous -contains $d })
             if ($amb.Count -gt 0) {
                 $ambiguous++
                 $a = $amb[0]
-                Write-Output ("  AMBIGUOUS {0}  -> {1} / {2} matched more than one candidate; refusing to guess" -f $d, $a.Browser, $a.Profile)
+                Write-Output ("  AMBIGUOUS {0}  -> {1} / {2} has conflicting identity evidence; refusing to guess" -f $d, $a.Browser, $a.Profile)
                 continue
             }
         }
@@ -595,8 +603,7 @@ if ($DeviceId.Count -gt 0) {
     # was compression-broken and never parsed - the report and the exit code
     # disagreeing, which is the failure PR70 shipped.
     $matched = @($rows | Where-Object {
-        (@($_.MatchedIds | Where-Object { $DeviceId -contains $_ }).Count -gt 0) -or
-        ($DeviceId -contains $_.DeviceId)
+        @($_.MatchedIds | Where-Object { $DeviceId -contains $_ }).Count -gt 0
     })
     if ($matched.Count -eq 0) { exit 1 }
 }
