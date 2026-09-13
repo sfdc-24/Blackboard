@@ -130,7 +130,7 @@ function Get-SettingAfterKey {
 function Get-BridgeValues {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return }
-    $pattern = 'ridgeDeviceId[^"A-Za-z0-9_]{0,24}"([^"]{0,120})"'
+    $pattern = '(?<![A-Za-z0-9_])b?ridgeDeviceId[^"A-Za-z0-9_]{0,24}"([^"]{0,120})"'
     foreach ($m in [regex]::Matches($Text, $pattern)) {
         $m.Groups[1].Value
     }
