@@ -96,11 +96,13 @@ found two more on the box, and the second one mattered:
 | `~/.zoom/logs/zoom_stdout_stderr.log` | **Zoom logs the URL it was launched with — 11 copies** |
 
 Zoom's own log is the one nobody thinks of, and no amount of care with your own files
-removes it. Sweep the class, not the filename — but the naive sweep has two faults that
+removes it. Sweep the class, not the filename — but the naive sweep has three faults that
 make "no output" meaningless:
 
 - **`2>/dev/null` hides the scan failing.** An unreadable directory prints nothing and
   looks exactly like a clean result. Silence must mean *clean*, never *did not look*.
+- **Binary-file filtering skips artifacts.** A log or cache containing a NUL byte still
+  can contain a credential. Use `grep -a` and `rg --text` to scan it as text.
 - **It matches itself.** Run it anywhere at or above a checkout of this repo and it
   finds this very file, because these paragraphs contain the patterns. "Require zero"
   then becomes impossible to satisfy honestly, so people stop requiring it.
@@ -108,28 +110,159 @@ make "no output" meaningless:
 On the presenter box (no checkout there, so self-match is not a concern):
 
 ```bash
-set -o pipefail
-grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" 2>/tmp/sweep.err
-status=$?          # 0 = hits found, 1 = clean, >1 = the SCAN failed
-test -s /tmp/sweep.err && { echo "scan hit errors, result is not trustworthy"; cat /tmp/sweep.err; }
-test "$status" -eq 1 || echo "FOUND credential-bearing files above - remove and re-run"
+if ! hits=$(mktemp /tmp/presenter-sweep-hits-XXXXXX); then
+    echo "credential sweep could not create its results file" >&2
+    exit 2
+fi
+if ! errors=$(mktemp /tmp/presenter-sweep-errors-XXXXXX); then
+    echo "credential sweep could not create its error file" >&2
+    rm -f "$hits"
+    exit 2
+fi
+trap 'rm -f "$hits" "$errors"' EXIT
+
+if ! exec 3>"$hits"; then
+    echo "credential sweep could not open its results file" >&2
+    exit 2
+fi
+if ! exec 4>"$errors"; then
+    echo "credential sweep could not open its error file" >&2
+    exec 3>&-
+    exit 2
+fi
+
+if grep -ral -e 'pwd=' -e 'zoommtg://' -e 'confno=' "$HOME" >&3 2>&4; then
+    status=0
+else
+    status=$?
+fi
+exec 3>&-
+exec 4>&-
+
+if [ ! -r "$hits" ] || [ ! -r "$errors" ]; then
+    echo "credential sweep lost a results file; a clean result cannot be claimed" >&2
+    exit 2
+fi
+
+if [ "$status" -gt 1 ] || [ -s "$errors" ]; then
+    echo "credential sweep failed; a clean result cannot be claimed" >&2
+    cat "$errors" >&2
+    exit 2
+fi
+if [ "$status" -eq 0 ]; then
+    echo "FOUND credential-bearing files; remove them and re-run:" >&2
+    cat "$hits" >&2
+    exit 1
+fi
+if [ "$status" -ne 1 ]; then
+    echo "credential sweep returned unexpected status $status" >&2
+    exit 2
+fi
+echo "credential sweep clean"
+exit 0
 ```
 
 Also stop Zoom before sweeping. A running client re-creates
 `~/.zoom/logs/zoom_stdout_stderr.log` after you delete it, so the sweep is only
 meaningful once nothing is writing.
 
-On the laptop, exclude the repository so the sweep does not find its own
-documentation, and check `--exclude-dir=.git` too:
+On a Windows laptop, set the required input to the absolute scratchpad root in the same
+PowerShell process that will run the sweep. The value is a path, not a meeting URL,
+passcode or token; use the actual operator-selected root in place of this example:
 
-```bash
-grep -rIl -e 'pwd=' -e 'zoommtg://' -e 'confno=' <scratchpad> \
-    --exclude-dir=.git --exclude-dir=tools 2>/tmp/sweep.err
+```powershell
+$env:SFDC24_SCRATCH_ROOT = 'C:\absolute\path\to\scratchpad'
 ```
 
-Then read the hits: a match in *prose* (a runbook saying "never put `pwd=` on a command
-line") is not a credential. Distinguish by searching for the actual passcode and token
-values, which should return **zero** everywhere.
+The sweep resolves that exact filesystem root and refuses a missing, relative,
+nonexistent, non-filesystem or non-directory value. It does not broaden the scan to
+the checkout or user profile.
+`--no-ignore` prevents ignore files from silently hiding an artifact, and `--text`
+prevents binary detection from skipping a NUL-containing file. The one narrow glob
+skips only Git object databases. Hits and scan errors are failures; only ripgrep's
+clean `1` becomes procedure exit `0`:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false # inspect rg's 0/1/>1 status below
+$RequestedScratchRoot = $env:SFDC24_SCRATCH_ROOT
+if ([string]::IsNullOrWhiteSpace($RequestedScratchRoot)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT is required and must name one absolute scratchpad directory.')
+    exit 2
+}
+$IsDriveAbsolute = $RequestedScratchRoot -match '^[A-Za-z]:[\\/]'
+$IsUncAbsolute = $RequestedScratchRoot -match '^\\\\[^\\/]+\\[^\\/]+(?:\\|$)'
+if (-not ($IsDriveAbsolute -or $IsUncAbsolute)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must be a fully qualified drive-rooted or UNC path; refusing to guess the scan root.')
+    exit 2
+}
+try {
+    $ResolvedScratchRoot = Resolve-Path -LiteralPath $RequestedScratchRoot -ErrorAction Stop
+} catch {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT could not be resolved; a clean result cannot be claimed.')
+    exit 2
+}
+if ($ResolvedScratchRoot.Provider.Name -ne 'FileSystem') {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve through the FileSystem provider.')
+    exit 2
+}
+$ScratchRoot = $ResolvedScratchRoot.ProviderPath
+if (-not (Test-Path -LiteralPath $ScratchRoot -PathType Container)) {
+    [Console]::Error.WriteLine('SFDC24_SCRATCH_ROOT must resolve to a directory; refusing to scan another shape.')
+    exit 2
+}
+$HitFile = $null
+$ErrorFile = $null
+try {
+    $Rg = (Get-Command rg.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1).Source
+    $HitFile = [IO.Path]::GetTempFileName()
+    $ErrorFile = [IO.Path]::GetTempFileName()
+} catch {
+    if ($null -ne $HitFile) { Remove-Item -LiteralPath $HitFile -Force -ErrorAction SilentlyContinue }
+    if ($null -ne $ErrorFile) { Remove-Item -LiteralPath $ErrorFile -Force -ErrorAction SilentlyContinue }
+    [Console]::Error.WriteLine('Credential sweep setup failed; a clean result cannot be claimed.')
+    exit 2
+}
+try {
+    $RgArgs = @(
+        '--files-with-matches', '--hidden', '--no-config', '--no-ignore', '--text',
+        '--glob', '!**/.git/objects/**',
+        '--regexp', 'pwd=', '--regexp', 'zoommtg://', '--regexp', 'confno=',
+        '--', $ScratchRoot
+    )
+    & $Rg @RgArgs 1> $HitFile 2> $ErrorFile
+    $status = $LASTEXITCODE
+    $scanErrors = [IO.File]::ReadAllText($ErrorFile)
+
+    if ($status -gt 1 -or $scanErrors.Length -gt 0) {
+        [Console]::Error.WriteLine('Credential sweep failed; a clean result cannot be claimed.')
+        if ($scanErrors.Length -gt 0) { [Console]::Error.WriteLine($scanErrors) }
+        exit 2
+    }
+    if ($status -eq 0) {
+        [Console]::Error.WriteLine('FOUND credential-class matches; inspect, remove, and re-run:')
+        Get-Content -LiteralPath $HitFile | ForEach-Object { [Console]::Error.WriteLine($_) }
+        exit 1
+    }
+    if ($status -ne 1) {
+        [Console]::Error.WriteLine("Credential sweep returned unexpected status $status.")
+        exit 2
+    }
+    Write-Output 'credential sweep clean'
+    exit 0
+} catch {
+    [Console]::Error.WriteLine('Credential sweep execution failed; a clean result cannot be claimed.')
+    exit 2
+} finally {
+    Remove-Item -LiteralPath $HitFile, $ErrorFile -Force -ErrorAction SilentlyContinue
+}
+```
+
+The search arguments contain only credential-class markers, never a real meeting URL,
+passcode or token. Do not add an actual secret with `--regexp`: child-process arguments
+are observable. Any listed file makes the procedure fail, including prose; remove or
+relocate the match and rerun instead of teaching the sweep to ignore broader directories.
 
 **The bus secret never comes to this box.** The board digest in the top panel is
 rendered on the laptop and copied over as plain text. The presenter is a screen, not a

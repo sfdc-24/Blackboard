@@ -86,7 +86,7 @@ fi
 #
 # AND `|| echo 0` WAS ITSELF A THIRD WAY TO LIE.
 #
-# The counter is committed mode 100644, so executing it directly gives EACCES - and
+# The counter was once committed with mode 100644, so executing it directly gave EACCES - and
 # `|| echo 0` turned that permission error into "Zoom is not listening". A script that
 # cannot run and a meeting nobody is in produced the identical answer. The test called
 # `bash <file>` and so never touched this path at all.
@@ -108,16 +108,26 @@ if [ "${COUNTER_RC}" -ne 0 ]; then
     exit 1
 fi
 
-paplay --device="${SINK}" "${WAV}"
-RC=$?
+# The helper's contract is one canonical decimal. Bound it before any comparison;
+# an oversized integer must not turn a failed arithmetic test into permission to play.
+case "${ZOOM_BOUND}" in
+    ''|*[!0-9]*|0[0-9]*|??????????*)
+        echo "the binding check returned an invalid count - refusing to speak" >&2
+        exit 1
+        ;;
+esac
 
-echo "spoke_bytes=${BYTES} sink=${SINK} source=${SOURCE_NAME} paplay_rc=${RC} zoom_capture_streams=${ZOOM_BOUND}"
-if [ "${ZOOM_BOUND}" -eq 0 ]; then
+if [ "${ZOOM_BOUND}" = 0 ]; then
     echo "WARNING: no ZOOM capture stream is bound to ${SOURCE_NAME}, so the meeting" >&2
     echo "         heard NOTHING. Pick the microphone inside Zoom: the chevron beside" >&2
     echo "         the Audio button -> SFDC24-VirtualMic." >&2
     exit 1
 fi
+
+paplay --device="${SINK}" "${WAV}"
+RC=$?
+
+echo "spoke_bytes=${BYTES} sink=${SINK} source=${SOURCE_NAME} paplay_rc=${RC} zoom_capture_streams=${ZOOM_BOUND}"
 
 # Even with Zoom bound, this proves the audio reached Zoom's input - not that a human
 # heard it. Say so rather than letting the exit code imply more than it knows.

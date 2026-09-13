@@ -67,7 +67,7 @@ check "a parec record on a host named zoom-* is NOT counted" "$got" "0"
 
 echo
 echo "== the production call path, not a path only the test uses =="
-# presenter_say.sh runs the counter itself. The counter is committed mode 100644, so
+# presenter_say.sh runs the counter itself. The counter was once committed with mode 100644, so
 # executing it directly is EACCES - and the old '|| echo 0' turned that into "nobody is
 # listening". Calling `bash <file>` here would hide that, which is exactly how the
 # defect survived: the test exercised a path production does not use.

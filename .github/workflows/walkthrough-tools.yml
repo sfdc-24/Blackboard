@@ -71,10 +71,29 @@ jobs:
           set -euo pipefail
           output=$(./tools/walkthrough/test_zoom_bound_count.sh)
           echo "$output"
-          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
-          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
-          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
-            || { echo "the suite reported failures" >&2; exit 1; }
+          result_count=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          clean_count=$(printf '%s\n' "$output" | grep -c '^RESULT passed=10 failed=0$' || true)
+          test "$result_count" -eq 1 \
+            || { echo "expected exactly one RESULT line, got $result_count" >&2; exit 1; }
+          test "$clean_count" -eq 1 \
+            || { echo "expected exactly one RESULT passed=10 failed=0, got $clean_count" >&2; exit 1; }
+
+      # Exercise presenter_say.sh itself with controlled audio/pactl/awk commands. All
+      # refusal cases must leave paplay untouched; one valid binding must play once.
+      - name: Presenter playback fails closed
+        run: |
+          set -euo pipefail
+          suite_rc=0
+          output=$(./tools/walkthrough/test_presenter_say.sh) || suite_rc=$?
+          echo "$output"
+          result_count=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          clean_count=$(printf '%s\n' "$output" | grep -c '^RESULT passed=28 failed=0$' || true)
+          test "$result_count" -eq 1 \
+            || { echo "expected exactly one RESULT line, got $result_count" >&2; exit 1; }
+          test "$clean_count" -eq 1 \
+            || { echo "expected exactly one RESULT passed=28 failed=0, got $clean_count" >&2; exit 1; }
+          test "$suite_rc" -eq 0 \
+            || { echo "presenter behavior suite exited $suite_rc" >&2; exit "$suite_rc"; }
 
       # measure_wav.py is the tool that decides whether the voice proof is real. It
       # shipped once printing UNREADABLE and returning 0, so assert the exit code on
