@@ -31,7 +31,7 @@ USAGE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\alpha.ps1 -Action raw -BodyFile probe.json   (adversarial probes: sends the file verbatim)
 #>
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Run')]
   [ValidateSet('read', 'append', 'raw')]
   [string]$Action,
   [string]$SourceTag,
@@ -40,11 +40,133 @@ param(
   [string]$Payload,
   [string]$BodyFile,
   [switch]$NoSecret,
-  [int]$Retries = 4
+  [int]$Retries = 4,
+  # Exercise the secret-handling helper with fixed inputs, no .env and no
+  # network. A separate parameter set so -Action stays mandatory for a real run
+  # without -SelfTest having to supply it.
+  [Parameter(Mandatory = $true, ParameterSetName = 'SelfTest')]
+  [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# ---- keeping the read secret off the command line ---------------------------
+# THE DEFECT THIS REPLACES, and it was in this file for a fortnight. The header
+# of this script says, in its own words, that D-18 keeps credentials "never on a
+# command line". The read path then built
+#
+#     $url = $cfg.ALPHA_URL + '?secret=' + $cfg.ALPHA_SECRET
+#
+# and passed $url as an ARGUMENT to curl.exe, where any local user can read it
+# out of the process table while the transfer is in flight. The WRITE path in
+# the same file already did the right thing - the secret goes in a JSON body
+# written to a temp file and handed over as --data-binary @file - so the file
+# contained both the rule, the correct pattern, and the violation at once.
+#
+# scripts/hear_in_zoom.ps1 and scripts/wa_inbound_digest.ps1 already solved this
+# for header credentials with a curl config file and -K. This is the same fix
+# for a query-string credential, so the fleet now applies one pattern
+# everywhere rather than two thirds of the time.
+#
+# PERCENT-ENCODING IS NOT COSMETIC HERE. The old concatenation dropped the
+# secret into a query string raw, so a '&' would have started a new parameter,
+# a '#' would have truncated the URL at the fragment, and a '+' would have been
+# read by the server as a space. That is a correctness bug independent of the
+# exposure, and it fails as a mangled request rather than an obvious error.
+function New-CurlSecretConfig {
+  <#
+    Write a curl config naming the full URL, and return its path. The caller
+    passes it as `-K <path>` so the URL - and the credential inside it - is
+    never an argv element. Delete it in a finally block.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string]$BaseUrl,
+    [Parameter(Mandatory = $true)][string]$Secret
+  )
+  $url = $BaseUrl + '?secret=' + [uri]::EscapeDataString($Secret)
+  $path = Join-Path ([IO.Path]::GetTempPath()) ("alpha_" + [guid]::NewGuid().ToString('N') + ".conf")
+  # curl reads an unquoted value to end-of-line, which tolerates every character
+  # a percent-encoded URL can contain. A quoted value would re-interpret
+  # backslash escapes, so it is deliberately NOT quoted.
+  [IO.File]::WriteAllText($path, "url = $url`n", (New-Object Text.UTF8Encoding($false)))
+  return $path
+}
+
+function Get-AlphaReadCurlArgs {
+  <#
+    The exact argument vector the read uses. It exists as a function so the
+    self-test exercises the SAME construction a real run does, rather than a
+    copy of it that can drift.
+
+    Reverting the old `$url` concatenation would have to change this function to
+    pass a URL positionally, and the assertion below - that no element carries
+    the credential - is what fails when someone does.
+  #>
+  param([Parameter(Mandatory = $true)][string]$ConfigPath)
+  return @('-s', '-S', '-L', '--max-time', '90', '-K', $ConfigPath)
+}
+
+if ($SelfTest) {
+  $pass = 0; $fail = 0
+  function Check { param([string]$Name, [bool]$Ok, [string]$Detail = '')
+    if ($Ok) { $script:pass++; Write-Host "  ok   $Name" }
+    else     { $script:fail++; Write-Host "  FAIL $Name $Detail" }
+  }
+
+  # A secret containing every character that breaks a raw query string.
+  $canary = 'S3CR3T&with#hash+plus=eq/slash?q'
+  $base   = 'https://example.invalid/exec'
+  $cfgPath = New-CurlSecretConfig -BaseUrl $base -Secret $canary
+  try {
+    $body = [IO.File]::ReadAllText($cfgPath)
+
+    Check 'the config names the base URL' ($body -like "*$base*")
+    # The assertion this whole change exists for, run against the SAME argv
+    # builder the read path calls - not a copy of it written here.
+    $argv = Get-AlphaReadCurlArgs -ConfigPath $cfgPath
+    # BOTH FORMS, and the second is the one that matters. Mutation-testing this
+    # suite showed the raw-substring check PASSING against the pre-fix defect,
+    # because by then the secret in the URL is percent-encoded and the raw
+    # canary no longer appears anywhere in it. A search for the plaintext is
+    # blind to exactly the leak it was written to catch.
+    $encoded = [uri]::EscapeDataString($canary)
+    Check 'the secret is absent from every argv element, raw' (
+      -not (@($argv | Where-Object { $_ -like "*$canary*" }).Count)) "argv=$($argv -join ' ')"
+    Check 'the secret is absent from every argv element, percent-encoded' (
+      -not (@($argv | Where-Object { $_ -like "*$encoded*" }).Count)) "argv=$($argv -join ' ')"
+    Check 'the argv passes a config file rather than a URL' (
+      $argv -contains '-K' -and $argv[-1] -eq $cfgPath) "argv=$($argv -join ' ')"
+    Check 'no argv element looks like a URL at all' (
+      -not (@($argv | Where-Object { $_ -like 'http*://*' }).Count)) "argv=$($argv -join ' ')"
+    Check 'the raw secret never appears verbatim in the config either' ($body -notlike "*$canary*")
+    Check 'the secret IS present, percent-encoded, so the request still works' (
+      $body -like ("*" + [uri]::EscapeDataString($canary) + "*"))
+
+    # Each character that would have corrupted the old concatenated URL.
+    Check 'an ampersand is encoded and cannot start a new parameter' ($body -notlike '*&with*')
+    Check 'a hash is encoded and cannot truncate the URL' ($body -notlike '*#hash*')
+    Check 'the config is a single url line curl can read' (
+      ($body -split "`n" | Where-Object { $_.Trim() } | Measure-Object).Count -eq 1)
+    Check 'the config carries no quoting for curl to re-escape' ($body -notlike '*"*')
+  } finally {
+    Remove-Item -LiteralPath $cfgPath -Force -ErrorAction SilentlyContinue
+  }
+  Check 'the config file is removed after use' (-not (Test-Path -LiteralPath $cfgPath))
+
+  # Two different calls must not collide, or a concurrent run reads or deletes
+  # the other's credential.
+  $p1 = New-CurlSecretConfig -BaseUrl $base -Secret 'a'
+  $p2 = New-CurlSecretConfig -BaseUrl $base -Secret 'b'
+  try { Check 'each call gets its own config path' ($p1 -ne $p2) }
+  finally { Remove-Item -LiteralPath $p1, $p2 -Force -ErrorAction SilentlyContinue }
+
+  Write-Host ""
+  Write-Host "RESULT passed=$pass failed=$fail"
+  if ($fail -gt 0) { exit 1 }
+  if ($pass -eq 0) { Write-Host 'no assertions ran, which is not a pass'; exit 1 }
+  exit 0
+}
 
 $envFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env'
 if (-not (Test-Path -LiteralPath $envFile)) { throw "env file not found: $envFile" }
@@ -60,10 +182,17 @@ $curlPath = (Get-Command curl.exe -ErrorAction Stop).Source
 
 # ---- READ: GET, body-less, so following redirects is safe -------------------
 if ($Action -eq 'read') {
-  $url = $cfg.ALPHA_URL + '?secret=' + $cfg.ALPHA_SECRET
-  for ($n = 1; $n -le $Retries; $n++) {
-    $raw = (& $curlPath -s -S -L --max-time 90 $url) -join "`n"
-    if ($raw.TrimStart().StartsWith('{')) { Write-Output $raw; return }
+  # The URL - and the secret in it - goes in a curl config, never in argv.
+  $cc = New-CurlSecretConfig -BaseUrl $cfg.ALPHA_URL -Secret $cfg.ALPHA_SECRET
+  try {
+    for ($n = 1; $n -le $Retries; $n++) {
+      $raw = (& $curlPath @(Get-AlphaReadCurlArgs -ConfigPath $cc)) -join "`n"
+      if ($raw.TrimStart().StartsWith('{')) { Write-Output $raw; return }
+    }
+  } finally {
+    # ALWAYS, including on the early `return` above and on a throw. This file
+    # holds a live credential; it must not outlive the transfer.
+    Remove-Item -LiteralPath $cc -Force -ErrorAction SilentlyContinue
   }
   Write-Warning "read returned non-JSON $Retries times (redirect artifact). Last response follows."
   Write-Output $raw
