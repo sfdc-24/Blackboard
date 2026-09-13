@@ -16,7 +16,7 @@
 #   tests/ also holds node:test suites, PowerShell suites and network-touching
 #   scripts. A glob would drag those in and either fail or, worse, make a
 #   network call from CI. Every suite listed here is offline by construction -
-#   no org, no board, no bus, no credentials - and that is PROVED by running
+#   no remote org, board, bus, or credentials - and that is PROVED by running
 #   them in an empty network namespace rather than asserted in a comment.
 name: python-suites
 
@@ -31,6 +31,8 @@ on:
       - "tests/test_bus_benchmark.py"
       - "scripts/append.py"
       - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -43,6 +45,8 @@ on:
       - "tests/test_bus_benchmark.py"
       - "scripts/append.py"
       - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -127,17 +131,32 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The bus suite starts its own server and scratch database. Enable only
+      # loopback in a fresh namespace, and retain setup-python's exact binary
+      # across sudo rather than silently switching to the system interpreter.
+      - name: bus API and migration imports (isolated loopback)
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec "$1" tests/test_bus.py src/bus_server.py
+          ' _ "$python_bin"
+
       # A workflow that skips everything and reports success is the failure mode
-      # this file exists to prevent. If neither suite ran, say so and fail.
+      # this file exists to prevent. If no eligible suite is present, fail.
       - name: Refuse a green tick over nothing
         run: |
           set -euo pipefail
-          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ]              && [ ! -f tests/test_bus_benchmark.py ]; then
-            echo "Neither suite is present, so this check proved nothing." >&2
+          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
+             && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
+             && [ ! -f tests/test_bus.py ]; then
+            echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
           fi
-          echo "at least one suite ran for real"
+          echo "at least one eligible suite is present"
 
       # A negative control for the isolation itself. If `unshare -n` silently
       # stopped isolating, every "no network" claim above would be worthless and

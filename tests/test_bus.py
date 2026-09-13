@@ -13,6 +13,7 @@ Exit 0 = all pass.
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,68 @@ def call(body=None, method="POST", with_secret=True, raw=None):
 
 BOARD_HEADER = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
                 "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
+
+
+def test_import_atomicity(server_py, tmp):
+    """Exercise the real import CLI and read committed state from fresh processes."""
+    db = os.path.join(tmp, "migration.db")
+    dump = os.path.join(tmp, "migration.json")
+    header = ["Row_ID", "Timestamp", "Payload"]
+    row = ["synthetic-1", "2026-09-12T12:00:00Z", "historical payload"]
+    rows = [header, row]
+
+    def import_rows(title, data):
+        with open(dump, "w", encoding="utf-8") as fh:
+            json.dump({"title": title, "rows": data}, fh)
+        return subprocess.run([sys.executable, server_py, "--db", db, "import-file", dump],
+                              capture_output=True, text=True, timeout=15)
+
+    def snapshot():
+        with sqlite3.connect(db) as conn:
+            return (conn.execute("SELECT * FROM files ORDER BY title").fetchall(),
+                    conn.execute("SELECT * FROM sheet_rows ORDER BY file_id, n").fetchall())
+
+    def exported_rows(title):
+        result = subprocess.run([sys.executable, server_py, "--db", db, "export", "--title", title],
+                                capture_output=True, text=True, timeout=15)
+        return json.loads(result.stdout).get("rows") if result.returncode == 0 else None
+
+    print("== migration import atomicity ==")
+    result = import_rows("Existing synthetic board", rows)
+    check("import seeds existing destination", result.returncode == 0 and
+          exported_rows("Existing synthetic board") == rows, result.stderr)
+    for label, malformed in (("null", None), ("string", "not a row"), ("object", {"cell": "value"})):
+        title = "Malformed " + label
+        before = snapshot()
+        result = import_rows(title, [header, row, malformed])
+        check(label + " row rejected with location", result.returncode != 0 and
+              "data row 2 must be a list" in result.stderr, result.stderr)
+        check(label + " failure leaves no destination or data", snapshot() == before)
+        result = import_rows(title, rows)
+        check(label + " corrected retry succeeds", result.returncode == 0 and
+              exported_rows(title) == rows, result.stderr)
+
+    before = snapshot()
+    result = import_rows("Existing synthetic board", [header, ["replacement", "ts", "do not overwrite"]])
+    check("duplicate import refuses and preserves existing data", result.returncode != 0 and
+          "refusing to double-import" in result.stderr and snapshot() == before, result.stderr)
+
+    # This fails only after the destination and the first row have been inserted.
+    # Prevalidation alone cannot pass: the database transaction must roll back.
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TRIGGER fail_second_import_row BEFORE INSERT ON sheet_rows "
+                     "WHEN NEW.n = 2 BEGIN SELECT RAISE(ABORT, 'injected second-row failure'); END")
+    before = snapshot()
+    two_rows = rows + [["synthetic-2", "2026-09-12T12:01:00Z", "second payload"]]
+    result = import_rows("Interrupted synthetic import", two_rows)
+    check("injected mid-insert failure reached", result.returncode != 0 and
+          "injected second-row failure" in result.stderr, result.stderr)
+    check("mid-insert failure rolls back title and rows", snapshot() == before)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TRIGGER fail_second_import_row")
+    result = import_rows("Interrupted synthetic import", two_rows)
+    check("retry after database failure succeeds", result.returncode == 0 and
+          exported_rows("Interrupted synthetic import") == two_rows, result.stderr)
 
 
 def main():
@@ -211,6 +274,80 @@ def main():
         check("1-column sheet -> 400", code == 400)
         code, r = call({"action": "create", "title": "tiny sheet2", "kind": "sheet", "header": ["Id", "Ts"]})
         check("2-column sheet -> 400", code == 400)
+
+        print("== blank-padded header: the shape the LIVE board actually returns ==")
+        # Measured 2026-09-09 against "Blackboard - Alpha DB": every one of its 1883
+        # rows is 12 cells wide, and the header is the ten names plus two empty
+        # padding cells. Requiring non-empty names rejected the real board outright.
+        padded = BOARD_HEADER + ["", ""]
+        code, r = call({"action": "create", "title": "Padded board", "kind": "sheet", "header": padded})
+        check("A:L header (10 named + 2 blank padding) -> 200", code == 200, f"got {code} {r.get('error','')}")
+        live_row = ["r-1", "2026-09-09T16:00:00Z", "claude-code-cli", "ALL", "APPEND",
+                    "BCB|v=1|id=X", "OPEN", "proj", "gist", "sub", "", ""]
+        code, r = call({"action": "append", "title": "Padded board", "sheetRow": live_row})
+        check("12-wide row appends to the padded sheet", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Padded board"})
+        rows = r.get("rows", [])
+        check("padded header round-trips verbatim, padding still blank",
+              code == 200 and len(rows) == 2 and rows[0] == padded and rows[0][10] == "" and rows[0][11] == "",
+              f"header={rows[0] if rows else None}")
+        check("the 12-cell data row survives verbatim",
+              len(rows) == 2 and rows[1][:10] == live_row[:10] and len(rows[1]) == 12,
+              f"row={rows[1] if len(rows) > 1 else None}")
+        # The negations. Padding is a TRAILING run, and it is not a free column count.
+        code, r = call({"action": "create", "title": "Holed board", "kind": "sheet",
+                        "header": ["Row_ID", "Timestamp", "", "Payload"]})
+        check("blank BETWEEN named columns is a hole -> 400", code == 400, f"got {code}")
+        code, r = call({"action": "create", "title": "Padding is not width", "kind": "sheet",
+                        "header": ["Id", "Ts", "", ""]})
+        check("4 columns but only 2 NAMED -> still 400", code == 400, f"got {code}")
+
+        print("== appending to a padded sheet: the shift codex-oversight found ==")
+        # THE DEFECT: append reasoned about len(header) - the WIRE width - so on a
+        # sheet imported from the live board a TEN-CELL FULL ROW (what every fleet
+        # client sends) looked like eight content cells. The server prepended its
+        # own Row_ID and Timestamp and shifted every field two columns left, with
+        # HTTP 200 and no error. That is REQ-B4TQX9 reintroduced by the padding fix.
+        code, r = call({"action": "create", "title": "Live shape", "kind": "sheet", "header": padded})
+        check("create a sheet with the live board's exact header", code == 200)
+        full10 = ["11111111-2222-3333-4444-555555555555", "2026-09-09T23:00:00Z", "claude-code-cli",
+                  "ALL", "APPEND", "BCB|v=1|id=X", "OPEN", "Blackboard", "a gist", "a sub"]
+        code, r = call({"action": "append", "title": "Live shape", "sheetRow": full10})
+        check("a 10-cell FULL ROW is accepted on a padded sheet", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Live shape"})
+        stored = r.get("rows", [[], []])[1] if len(r.get("rows", [])) > 1 else []
+        check("and every field stays in its own column - NO SHIFT",
+              stored[:10] == full10, f"stored={stored}")
+        check("stored at the sheet's wire width, padding empty",
+              len(stored) == 12 and stored[10] == "" and stored[11] == "", f"stored={stored}")
+        # content-cell form still works, and still cannot shift
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["chat-mobile", "ALL", "APPEND", "BCB|v=1|id=Y", "OPEN", "P", "g", "s"]})
+        check("8 content cells still get a server Row_ID and Timestamp", code == 200, f"got {code} {r.get('error','')}")
+        code, r = call({"action": "read", "title": "Live shape"})
+        rows_ls = r.get("rows", [])
+        row2 = rows_ls[2] if len(rows_ls) > 2 else []
+        check("and land in the NAMED columns, not shifted",
+              len(row2) == 12 and row2[2] == "chat-mobile" and row2[3] == "ALL", f"row={row2}")
+        # a client echoing a padded row back
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["22222222-2222-3333-4444-555555555555", "2026-09-09T23:30:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=Z", "OPEN", "P", "g", "s", "", ""]})
+        check("a 12-cell row whose padding is EMPTY is accepted", code == 200, f"got {code} {r.get('error','')}")
+        # THE NEGATIONS
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["33333333-2222-3333-4444-555555555555", "2026-09-09T23:31:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=W", "OPEN", "P", "g", "s", "leaked", ""]})
+        check("content in a PADDING column -> 400, same rule bcb_lint applies",
+              code == 400 and "padding" in r.get("error", "").lower(), f"got {code} {r.get('error','')}")
+        code, r = call({"action": "append", "title": "Live shape",
+                        "sheetRow": ["2026-09-09T23:32:00Z", "2026-09-09T23:32:00Z", "vm-cli",
+                                     "ALL", "APPEND", "BCB|v=1|id=V", "OPEN", "P", "g", "s"]})
+        check("a timestamp in col 0 is still REQ-B4TQX9 -> 400",
+              code == 400 and "REQ-B4TQX9" in r.get("error", ""), f"got {code} {r.get('error','')}")
+        code, r = call({"action": "append", "title": "Live shape", "sheetRow": ["only", "three", "cells"]})
+        check("a wrong cell count still names the NAMED width, not 12",
+              code == 400 and " 10 " in (" " + r.get("error", "") + " "), f"got {code} {r.get('error','')}")
         code, r = call({"action": "event", "work_id": "WRK-TEST02", "event_type": "CREATE",
                         "actor_tag": "vm-cli", "assigned_to": "gemini", "status": "OPEN", "payload": "w2"})
         check("CREATE second item", code == 200)
@@ -240,6 +377,8 @@ def main():
                         "actor_tag": "vm-cli", "status": "CLAIMED", "payload": "x",
                         "evidence_ref": {"k": 1}})
         check("object evidence_ref -> 400 not 500", code == 400)
+
+        test_import_atomicity(server_py, tmp)
 
         print(f"\n{PASS} passed, {FAIL} failed")
         if FAILURES:
