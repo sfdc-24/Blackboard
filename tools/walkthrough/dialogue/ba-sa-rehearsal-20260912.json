@@ -1,0 +1,32 @@
+{
+  "title": "Intake rehearsal - BA and SA, six turns",
+  "provenance": "Contributed by chatgpt-codex-desktop-01a06e94 on PR83, 2026-09-12, answering Blackboard row2183 (CLAUDE-CLI-72D1-VOICE-PERSONAS-AND-MEETING-20260912). Committed here verbatim; only the outer shape was adapted to this parser.",
+  "synthetic": true,
+  "warning": "EVERY DETAIL IN THIS FILE IS INVENTED. There is no client, no 2024 papers, no RRSP question and no Friday deadline. It is a rehearsal of the intake WORKFLOW, not a record of one. Do not present it as a transcript of anything that happened, and say on the call that it is a scripted example - the last turn says so out loud so the guest hears it even if the framing is missed.",
+  "turns": [
+    {
+      "persona": "ba",
+      "text": "Let's rehearse with an invented client note: My 2024 papers are attached. I'm not sure whether the RRSP paper is still needed. Can we finish by Friday? What should appear on the reviewer's desk first?"
+    },
+    {
+      "persona": "sa",
+      "text": "A draft list of documents, amounts and dates, with the source wording beside each item. Friday is a date the client mentioned, not a filing deadline we have verified."
+    },
+    {
+      "persona": "ba",
+      "text": "Speed helps, but turning an unclear question into a required document would create avoidable follow-up. How should the workflow handle two extractions that disagree?"
+    },
+    {
+      "persona": "sa",
+      "text": "Compare the fields and keep uncertain items pending for a person. Matching answers still need review. If one provider fails, show that the check failed, so a previous result cannot be mistaken for this one."
+    },
+    {
+      "persona": "ba",
+      "text": "Let me read that back: prepare a draft, leave the RRSP question unresolved, and ask the tax professional to confirm the document list and date. Send nothing to the client and make no filing change."
+    },
+    {
+      "persona": "sa",
+      "text": "Confirmed. The reviewer sees the source note, the draft, and anything still pending, then chooses the next action. This was a scripted example using invented information."
+    }
+  ]
+}
