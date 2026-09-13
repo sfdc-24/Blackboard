@@ -16,7 +16,13 @@ function ConvertFrom-CrosscheckAnswer {
   param([string]$Json)
   # PS 5.1 unwraps a root singleton array; reject it before conversion.
   if ($Json.TrimStart() -notmatch '^\{') { throw 'expected a JSON object' }
-  $value = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
+  # PowerShell 7.5+ otherwise converts ISO-looking JSON strings to DateTime.
+  # Preserve the source text; Windows PowerShell 5.1 has no DateKind parameter.
+  $parseOptions = @{ InputObject = $Json; ErrorAction = 'Stop' }
+  if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    $parseOptions.DateKind = 'String'
+  }
+  $value = ConvertFrom-Json @parseOptions
   Assert-CrosscheckKeys $value $script:CrosscheckFields
   if ($value.tax_year -isnot [string] -or $value.tax_year -cnotmatch '^(?:[0-9]{4}|unclear)$') { throw 'invalid tax_year' }
   if ($value.return_type -isnot [string] -or @('T1','T2','HST','unclear') -cnotcontains $value.return_type) { throw 'invalid return_type' }

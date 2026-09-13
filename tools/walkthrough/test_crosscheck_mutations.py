@@ -13,7 +13,7 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parent
 names = ('crosscheck_contract.ps1', 'crosscheck_intake.ps1', 'test_crosscheck_intake.ps1')
 original = {name: (root / name).read_bytes() for name in names}
-EXPECTED_COUNT = 57
+EXPECTED_COUNT = 63
 
 
 def run(directory, expected):
@@ -42,7 +42,8 @@ controls = [
      {'urgent string false is rejected', 'urgent null is rejected', 'entry rejects schema-invalid urgent from both providers'}),
     ('pending-human exit', 'crosscheck_intake.ps1',
      '  exit 2', '  exit 0',
-     {'entry returns pending status and displays both split values'}),
+     {'entry returns pending status and displays both split values',
+      'entry relative panel uses current PowerShell location without BOM or false withholding claim'}),
 ]
 
 run(root, set())

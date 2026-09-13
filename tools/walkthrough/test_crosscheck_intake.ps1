@@ -50,6 +50,22 @@ Case 'return type must match enum' { $a=Sample; $a.return_type='t1'; Reject (Jso
 Case 'urgent string false is rejected' { $a=Sample; $a.urgent='false'; Reject (Json $a) }
 Case 'urgent null is rejected' { $a=Sample; $a.urgent=$null; Reject (Json $a) }
 Case 'deadline number is rejected' { $a=Sample; $a.deadline_claimed=7; Reject (Json $a) }
+Case 'ISO deadline remains an exact JSON string' {
+  $a=Sample; $a.deadline_claimed='2026-09-12T18:00:00Z'
+  $parsed=ConvertFrom-CrosscheckAnswer (Json $a)
+  Check ($parsed.deadline_claimed -is [string] -and $parsed.deadline_claimed -ceq $a.deadline_claimed) 'ISO text converted or changed'
+}
+Case 'equivalent instants with different source strings remain different claims' {
+  $a=Sample; $b=Sample
+  $a.deadline_claimed='2026-09-12T18:00:00Z'; $b.deadline_claimed='2026-09-12T14:00:00-04:00'
+  Is-Split $a $b 'deadline_claimed'
+}
+Case 'ISO-looking document and figure labels remain strings' {
+  $a=Sample; $a.documents_received=@('2026-09-12T18:00:00Z'); $a.figures[0].label='2026-09-12T14:00:00-04:00'
+  $parsed=ConvertFrom-CrosscheckAnswer (Json $a)
+  Check ($parsed.documents_received[0] -is [string] -and $parsed.documents_received[0] -ceq $a.documents_received[0]) 'document label converted'
+  Check ($parsed.figures[0].label -is [string] -and $parsed.figures[0].label -ceq $a.figures[0].label) 'figure label converted'
+}
 Case 'document scalar is rejected' { $a=Sample; $a.documents_received='t4'; Reject (Json $a) }
 Case 'document null is rejected' { $a=Sample; $a.documents_pending=$null; Reject (Json $a) }
 Case 'document nonstring item is rejected' { $a=Sample; $a.documents_received=@(2); Reject (Json $a) }
@@ -128,6 +144,7 @@ Set-Content -LiteralPath (Join-Path $testRoot '.env') -Value "OPENAI_API_KEY=syn
 $global:CrosscheckTestMockDelay=0
 function Start-Job { param($Name,$ArgumentList,$ScriptBlock)
   $global:CrosscheckTestMockStarts++
+  $global:CrosscheckTestMockMessages[$Name]=$ArgumentList[3]
   Check ((Get-Content -LiteralPath $global:CrosscheckTestMockPanel -Raw) -ceq 'CROSS-CHECK PENDING - waiting for two valid provider answers.') 'old success remained visible during provider startup'
   if ($global:CrosscheckTestMockDelay) { [Threading.Thread]::Sleep($global:CrosscheckTestMockDelay) }
   [pscustomobject]@{Name=$Name;State=$global:CrosscheckTestMockState[$Name];ChildJobs=@()}
@@ -135,23 +152,57 @@ function Start-Job { param($Name,$ArgumentList,$ScriptBlock)
 function Wait-Job { param($Job,$Timeout) }
 function Receive-Job { param($Job,$ErrorAction) $global:CrosscheckTestMockAnswers[$Job.Name] }
 function Remove-Job { param($Job,[switch]$Force) $global:CrosscheckTestMockRemoved=$true }
-function Entry { param([string]$Left,[string]$Right,[string]$RightState='Completed')
+function Entry { param([string]$Left,[string]$Right,[string]$RightState='Completed',[string]$MessageFile,[switch]$RelativePanel)
   $global:CrosscheckTestMockAnswers=@{openai=$Left;groq=$Right}; $global:CrosscheckTestMockState=@{openai='Completed';groq=$RightState}
   $global:CrosscheckTestMockStarts=0; $global:CrosscheckTestMockRemoved=$false
+  $global:CrosscheckTestMockMessages=@{}
   $panel=Join-Path $testRoot 'panel.txt'
   $global:CrosscheckTestMockPanel=$panel
   Set-Content -LiteralPath $panel -Value 'OLD_SUCCESS'
   $global:LASTEXITCODE=0
-  $output = @(& (Join-Path $testTools 'crosscheck_intake.ps1') -PanelFile $panel 6>&1)
-  $code=$LASTEXITCODE
+  $entryOptions=@{PanelFile=$panel}
+  if ($MessageFile) { $entryOptions.MessageFile=$MessageFile }
+  if ($RelativePanel) { $entryOptions.PanelFile='panel.txt'; Push-Location $testRoot }
+  try {
+    $output = @(& (Join-Path $testTools 'crosscheck_intake.ps1') @entryOptions 6>&1)
+    $code=$LASTEXITCODE
+  } finally { if ($RelativePanel) { Pop-Location } }
   Check ($global:CrosscheckTestMockStarts -eq 2 -and $global:CrosscheckTestMockRemoved) 'entry did not intercept/clean both jobs'
-  [pscustomobject]@{code=$code;output=($output | Out-String);panel=$panel}
+  # The formatter's default width wraps long Windows paths inside receipts.
+  [pscustomobject]@{code=$code;output=($output | Out-String -Width 4096);panel=$panel}
 }
 try {
   Case 'entry accepts two valid answers via portable default env' {
     $r=Entry (Json (Sample)) (Json (Sample)); Check ($r.code -eq 0) 'valid run did not succeed'
     Check ($r.output -match 'RESULT status=AGREED agreed=7 split=0 fields=7') 'agreement receipt missing'
     Check ((Get-Content -LiteralPath $r.panel -Raw) -notmatch 'synthetic-do-not-send') 'key reached panel'
+  }
+  Case 'entry accepts ISO deadline text from both providers' {
+    $a=Sample; $a.deadline_claimed='2026-09-12T18:00:00Z'
+    $r=Entry (Json $a) (Json $a)
+    Check ($r.code -eq 0 -and $r.output -match 'RESULT status=AGREED agreed=7 split=0 fields=7') 'valid ISO answers rejected'
+    Check (([IO.File]::ReadAllText($r.panel)).Contains($a.deadline_claimed)) 'ISO source text changed in panel'
+  }
+  Case 'entry passes exact BOM-free UTF8 message text to both provider jobs' {
+    $message='Synthetic: Jos' + [char]0xE9 + ' sent a re' + [char]0xE7 + 'u; montant ' + [char]0x20AC + '12.'
+    $messageFile=Join-Path $testRoot 'message.txt'
+    [IO.File]::WriteAllText($messageFile,$message,(New-Object Text.UTF8Encoding $false))
+    $r=Entry (Json (Sample)) (Json (Sample)) -MessageFile $messageFile
+    Check ($r.code -eq 0) 'UTF8 message run failed'
+    Check ($global:CrosscheckTestMockMessages.openai -ceq $message) 'OpenAI message was corrupted before job execution'
+    Check ($global:CrosscheckTestMockMessages.groq -ceq $message) 'Groq message was corrupted before job execution'
+  }
+  Case 'entry relative panel uses current PowerShell location without BOM or false withholding claim' {
+    $a=Sample; $b=Sample; $b.return_type='T2'
+    $r=Entry (Json $a) (Json $b) -RelativePanel
+    Check ($r.code -eq 2) 'relative panel failed or lost pending result'
+    Check ($r.output -match 'panel file written: (.+) \([0-9]+ bytes\)') 'receipt omitted the panel path'
+    $reportedPanel=$matches[1]
+    Check ([string]::Equals([IO.Path]::GetFullPath($reportedPanel),[IO.Path]::GetFullPath($r.panel),[StringComparison]::OrdinalIgnoreCase)) "receipt named a different panel: [$reportedPanel] expected [$($r.panel)]"
+    $bytes=[IO.File]::ReadAllBytes($r.panel)
+    Check (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) 'panel contains a UTF8 BOM'
+    $panel=[IO.File]::ReadAllText($r.panel)
+    Check ($panel -notmatch 'not written to the file' -and $panel -match 'remain visible' -and $panel -match 'T1' -and $panel -match 'T2') 'panel withholding claim contradicts displayed values'
   }
   Case 'entry returns pending status and displays both split values' {
     $a=Sample; $b=Sample; $b.tax_year='2025'; $r=Entry (Json $a) (Json $b)

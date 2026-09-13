@@ -137,3 +137,32 @@ jobs:
           test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
           printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
             || { echo "the suite reported failures" >&2; exit 1; }
+
+      # The cross-check panel is a .ps1, and every step above this one only ever
+      # touched the .sh tools - so this job was GREEN on the pull request that
+      # added crosscheck_intake.ps1 while never loading that file at all. That is
+      # the same failure as PR74 wearing a different extension.
+      #
+      # -SelfTest needs no network and no .env: the comparison and the panel
+      # writer are pure functions above the key-loading, and the self-test exits
+      # before reaching it. So the one thing a hosted runner CAN check here - that
+      # the panel tells the truth about itself and writes a file a Linux box can
+      # render - is checked.
+      - name: Cross-check panel contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v pwsh >/dev/null || { echo "pwsh is not on this runner" >&2; exit 1; }
+          output=$(pwsh -NoProfile -File tools/walkthrough/crosscheck_intake.ps1 -SelfTest)
+          echo "$output"
+          # ASSERT the exit code rather than inheriting it, and assert the summary
+          # separately - a green summary with a red exit, or a red summary with a
+          # green exit, are the same disease pointed in opposite directions.
+          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
+          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
+            || { echo "the suite reported failures" >&2; exit 1; }
+          # Refuse a green tick over nothing.
+          count=$(printf '%s\n' "$output" | sed -n 's/^RESULT passed=\([0-9]*\) .*/\1/p')
+          test "${count:-0}" -ge 10 \
+            || { echo "only ${count:-0} assertions ran; this suite should have at least 10" >&2; exit 1; }
