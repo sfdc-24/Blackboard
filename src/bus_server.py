@@ -457,30 +457,56 @@ class Store:
         elif lease_until is not None and parse_iso(str(lease_until)) is None:
             raise BusError(400, "lease_until must be parseable ISO-8601 UTC when present.")
 
+        # These are the exact values accepted for storage, without trimming or
+        # conflating NULL and empty strings. schema_v remains fixed at 1;
+        # caller-supplied versions are ignored as before.
+        accepted = (work_id, etype, actor, assigned_to, status, lease_until, payload,
+                    body.get("evidence_ref"), body.get("parent_work_id"), project, 1)
+        # Invalid input never waits for the writer. Valid input reserves the DB
+        # before lookup: WRITE_LOCK alone cannot serialize separate processes.
         with WRITE_LOCK, self.conn:
-            latest = self.latest_event(work_id)
-            if etype == "CREATE":
-                if latest is not None:
-                    raise BusError(409, f"work_id {work_id!r} already exists (latest seq {latest['seq']}).")
-            else:
-                if latest is None:
-                    raise BusError(400, f"work_id {work_id!r} has never been CREATEd.")
-                if etype == "CLAIM":
-                    hold = self.work_hold(work_id, latest)
-                    if hold and hold["holder"] != actor and hold["lease_dt"] and hold["lease_dt"] > now:
-                        raise BusError(409, f"work_id {work_id!r} is held by {hold['holder']!r} "
-                                            f"until {hold['lease_until']} (live lease).",
-                                       extra={"holder": hold["holder"],
-                                              "lease_until": hold["lease_until"]})
-            event_id = str(uuid.uuid4())
-            ts = now_iso()
-            cur = self.conn.execute(
-                "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
-                "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                (event_id, ts, work_id, etype, actor, assigned_to, status, lease_until,
-                 payload, body.get("evidence_ref"), body.get("parent_work_id"), project))
-            seq = cur.lastrowid
+            self.conn.execute("BEGIN IMMEDIATE")
+            return self._add_event(accepted, now)
+
+    def _add_event(self, accepted, now):
+        """Look up or append within the caller's immediate transaction."""
+        (work_id, etype, actor, assigned_to, status, lease_until, payload,
+         evidence_ref, parent_work_id, project, schema_v) = accepted
+        if etype == "COMPLETE":
+            replay = self.conn.execute(
+                "SELECT event_id, seq, event_ts FROM events WHERE work_id = ? "
+                "AND event_type = ? AND actor_tag = ? AND assigned_to IS ? "
+                "AND status = ? AND lease_until IS ? AND payload = ? "
+                "AND evidence_ref IS ? AND parent_work_id IS ? AND project IS ? "
+                "AND schema_v = ? ORDER BY seq LIMIT 1", accepted).fetchone()
+            if replay:
+                return {"event_id": replay[0], "seq": replay[1], "work_id": work_id,
+                        "event_ts": replay[2], "payload_bytes": len(payload.encode("utf-8")),
+                        "replayed": True}
+
+        # Replay acknowledgement precedes transition authorization: it returns
+        # an already accepted receipt and does not perform a new transition.
+        latest = self.latest_event(work_id)
+        if etype == "CREATE":
+            if latest is not None:
+                raise BusError(409, f"work_id {work_id!r} already exists (latest seq {latest['seq']}).")
+        else:
+            if latest is None:
+                raise BusError(400, f"work_id {work_id!r} has never been CREATEd.")
+            if etype == "CLAIM":
+                hold = self.work_hold(work_id, latest)
+                if hold and hold["holder"] != actor and hold["lease_dt"] and hold["lease_dt"] > now:
+                    raise BusError(409, f"work_id {work_id!r} is held by {hold['holder']!r} "
+                                        f"until {hold['lease_until']} (live lease).",
+                                   extra={"holder": hold["holder"],
+                                          "lease_until": hold["lease_until"]})
+        event_id = str(uuid.uuid4())
+        ts = now_iso()
+        cur = self.conn.execute(
+            "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
+            "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, ts) + accepted)
+        seq = cur.lastrowid
         # Success response echoes what was actually stored (LEDGER section 4).
         return {"event_id": event_id, "seq": seq, "work_id": work_id,
                 "event_ts": ts, "payload_bytes": len(payload.encode("utf-8"))}
