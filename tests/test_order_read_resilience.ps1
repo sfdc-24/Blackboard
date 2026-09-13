@@ -118,6 +118,16 @@ function Write-TestUtf8 {
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Get-TestPort {
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return [int]$listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
 # HOW THE FAKE curl.exe GETS BUILT, AND WHY NOT WITH Add-Type.
 #
 # The two actual-bus cases need a REAL executable named curl.exe ahead of the system
@@ -357,6 +367,90 @@ function Invoke-ReadCase {
         log_text = $(if (Test-Path -LiteralPath $logPath -PathType Leaf) {
             [IO.File]::ReadAllText($logPath, [Text.Encoding]::UTF8)
         } else { '' })
+        claude_called = Test-Path -LiteralPath $markerPath -PathType Leaf
+    }
+}
+
+function Invoke-ActualBusClosedPortSupervisorCase {
+    $caseRoot = Join-Path $script:TestRoot 'actual-bus-iwr-closed-port-supervisor'
+    $releaseRoot = Join-Path $caseRoot 'release'
+    $scriptsRoot = Join-Path $releaseRoot 'scripts'
+    $workspace = Join-Path $caseRoot 'workspace'
+    $emptyPath = Join-Path $caseRoot 'empty-path'
+    $statePath = Join-Path $caseRoot 'state.json'
+    $logPath = Join-Path $caseRoot 'events.jsonl'
+    $envPath = Join-Path $caseRoot 'test.env'
+    $markerPath = Join-Path $caseRoot 'claude-called.txt'
+    $fakeClaudePath = Join-Path $caseRoot 'fake-claude.ps1'
+
+    New-Item -ItemType Directory -Path $scriptsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $workspace '.git') -Force | Out-Null
+    New-Item -ItemType Directory -Path $emptyPath -Force | Out-Null
+    Copy-Item -LiteralPath $RunnerPath -Destination (Join-Path $scriptsRoot 'order_supervisor.ps1')
+    Copy-Item -LiteralPath $ModulePath -Destination (Join-Path $scriptsRoot 'OrderSupervisor.psm1')
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\bus.ps1') -Destination (Join-Path $scriptsRoot 'bus.ps1')
+    Write-TestUtf8 -Path $fakeClaudePath -Text $fakeClaudeSource
+
+    $closedPort = Get-TestPort
+    $busUrl = 'http://127.0.0.1:' + $closedPort + '/'
+    $secretCanary = 'CLOSED_PORT_SECRET_CANARY'
+    Write-TestUtf8 -Path $envPath -Text ("BUS_URL=$busUrl`nBUS_SECRET=$secretCanary`n")
+
+    $state = New-OrderState -Mode Execute
+    $state.initialized = $true
+    $state.cursor.timestamp = '2026-09-07T08:00:00.0000000Z'
+    $state.cursor.row_id = 'cursor-before-closed-port'
+    Save-OrderState -Path $statePath -State $state
+
+    $previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+    $previousMarker = [Environment]::GetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', 'Process')
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # The resolved child executable is invoked by absolute path, while an
+        # empty child PATH forces the unmodified bus client through genuine IWR.
+        [Environment]::SetEnvironmentVariable('PATH', $emptyPath, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', $markerPath, 'Process')
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $script:ResolvedChildShell `
+            -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $scriptsRoot 'order_supervisor.ps1') `
+            -Mode Execute `
+            -StatePath $statePath `
+            -LogPath $logPath `
+            -EnvFile $envPath `
+            -WorkspacePath $workspace `
+            -ClaudeCommand $fakeClaudePath 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
+        [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_CLAUDE_MARKER', $previousMarker, 'Process')
+    }
+
+    $jsonLine = @($output | ForEach-Object { [string]$_ } |
+        Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    $result = if ($jsonLine.Count -eq 1) {
+        $jsonLine[0] | ConvertFrom-Json @script:JsonDateArgs
+    } else { $null }
+    $events = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+        @([IO.File]::ReadAllLines($logPath, [Text.Encoding]::UTF8) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { [string]$_ | ConvertFrom-Json @script:JsonDateArgs })
+    } else { @() }
+    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) |
+        ConvertFrom-Json @script:JsonDateArgs
+
+    return [pscustomobject][ordered]@{
+        exit_code = $exitCode
+        output = @($output)
+        result = $result
+        events = @($events)
+        state = $savedState
+        log_text = $(if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+            [IO.File]::ReadAllText($logPath, [Text.Encoding]::UTF8)
+        } else { '' })
+        bus_url = $busUrl
+        secret_canary = $secretCanary
         claude_called = Test-Path -LiteralPath $markerPath -PathType Leaf
     }
 }
@@ -1077,16 +1171,16 @@ try {
     )
 
     $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
-    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and reaches the common read gate' (
+    Assert-True 'IWR pre-response failure clears stale hop 1 metadata and retains its network type' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
         @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
         @($actualBusIwrFallback.failure_metadata.PSObject.Properties).Count -eq 0 -and
-        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.InvalidOperationException'
+        $actualBusIwrFallback.failure_metadata_text -ceq '{}' -and
+        $actualBusIwrFallback.failure_trace.exception_type -ceq 'System.Net.WebException'
     )
-    Assert-True 'IWR pre-response failure exposes only a fixed safe error' (
-        $actualBusIwrFallback.failure_trace.exception_message -ceq 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.' -and
-        -not $iwrFailureOutputText.Contains('RAW_IWR_EXCEPTION_CANARY') -and
-        -not $iwrFailureOutputText.Contains('ONE_SHOT_IWR_CANARY') -and
+    Assert-True 'IWR pre-response failure preserves the original transport fact without exposing the bus secret' (
+        $actualBusIwrFallback.failure_trace.exception_message -ceq 'RAW_IWR_EXCEPTION_CANARY https://ONE_SHOT_IWR_CANARY.invalid/one-shot' -and
+        $iwrFailureOutputText.Contains('RAW_IWR_EXCEPTION_CANARY') -and
         -not $iwrFailureOutputText.Contains('BUS_SECRET_IWR_CANARY') -and
         -not $actualBusIwrFallback.failure_metadata_text.Contains('302')
     )
@@ -1137,6 +1231,28 @@ try {
         $actualBusIwrFallback.empty_location_trace.exception_message -ceq 'hop 2 Location or BUS_URL is empty. Refusing transfer; the write, if any, may still have landed: READ BACK before deciding anything.' -and
         -not $iwrEmptyLocationOutputText.Contains('BUS_URL_IWR_CANARY') -and
         -not $iwrEmptyLocationOutputText.Contains('BUS_SECRET_IWR_CANARY')
+    )
+
+    $actualClosedPort = Invoke-ActualBusClosedPortSupervisorCase
+    $actualClosedPortRetries = @($actualClosedPort.events |
+        Where-Object event -ceq 'board_read_retry')
+    Assert-True 'genuine forced-IWR closed-port failure remains retry-classifiable end to end' (
+        $actualClosedPort.exit_code -eq 20 -and
+        $actualClosedPort.result -and
+        $actualClosedPort.result.error_code -ceq 'BOARD_READ_TRANSPORT_ERROR' -and
+        $actualClosedPortRetries.Count -eq 1 -and
+        $actualClosedPortRetries[0].code -ceq 'BOARD_READ_TRANSPORT_ERROR' -and
+        $actualClosedPortRetries[0].details.attempt -ceq '1' -and
+        $actualClosedPortRetries[0].details.code -ceq 'BOARD_READ_TRANSPORT_ERROR'
+    )
+    $actualClosedPortOutputText = ConvertTo-SquashedText -Lines $actualClosedPort.output
+    Assert-True 'genuine forced-IWR retry failure preserves state and the no-side-effect boundary' (
+        $actualClosedPort.state.cursor.row_id -ceq 'cursor-before-closed-port' -and
+        -not $actualClosedPort.claude_called -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.secret_canary) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.secret_canary) -and
+        -not $actualClosedPortOutputText.Contains($actualClosedPort.bus_url) -and
+        -not $actualClosedPort.log_text.Contains($actualClosedPort.bus_url)
     )
 
     $validFirst = Invoke-ReadCase -Name 'valid-first' -Responses @($validEmpty, '<unused>')

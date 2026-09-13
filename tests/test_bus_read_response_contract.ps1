@@ -197,7 +197,8 @@ function New-ReadCase {
         [bool]$ExpectRequest = $true,
         [bool]$ExpectMetadata = $true,
         [AllowEmptyString()][string]$ExpectedErrorCode = 'BUS_READ_RESPONSE_INVALID',
-        [bool]$AliasOutputMetadata = $false
+        [bool]$AliasOutputMetadata = $false,
+        [double]$MaxElapsedSeconds = 0
     )
 
     return [pscustomobject][ordered]@{
@@ -221,6 +222,7 @@ function New-ReadCase {
         ExpectMetadata = $ExpectMetadata
         ExpectedErrorCode = $ExpectedErrorCode
         AliasOutputMetadata = $AliasOutputMetadata
+        MaxElapsedSeconds = $MaxElapsedSeconds
         ServerIndex = 0
     }
 }
@@ -269,6 +271,7 @@ function Invoke-TestCase {
 
     $previousPreference = $ErrorActionPreference
     $previousPath = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $ErrorActionPreference = 'Continue'
     try {
         if ($Case.ForceIwr) {
@@ -277,6 +280,7 @@ function Invoke-TestCase {
         $output = @(& $ChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
+        $stopwatch.Stop()
         [Environment]::SetEnvironmentVariable('PATH', $previousPath, 'Process')
         $ErrorActionPreference = $previousPreference
     }
@@ -308,6 +312,7 @@ function Invoke-TestCase {
         RequestPath = $requestPath
         RequestText = $requestText
         Sentinel = $sentinel
+        ElapsedSeconds = $stopwatch.Elapsed.TotalSeconds
     }
 }
 
@@ -329,6 +334,20 @@ $unicodeRawBody = @'
 $unicodeRawBody = $unicodeRawBody.Replace('UNICODE_VALUE_TOKEN', $unicodeValue).TrimEnd("`r", "`n") + "`n  "
 $unicodeStdoutBody = '{"ok":true,"fileId":"stdout-file","title":"Stdout Sheet","rows":[["' +
     $unicodeValue + '"]]}'
+$lineCommentDuplicateBody = '{"ok":false,// } [' + "`n" +
+    '"ok":true,"fileId":"line-comment","title":"Contract Sheet","rows":[],"canary":"LINE_COMMENT_BODY_CANARY"}'
+$strictStringSyntaxBody = @'
+{"ok":true,"fileId":"strict-string-data","title":"Contract Sheet","text":"apostrophe ' and /* } [ */ and // stay data"}
+'@.TrimEnd("`r", "`n")
+$largeDocText = '0123456789abcdef' * 200000
+$largeDocBody = '{"ok":true,"fileId":"large-doc","title":"Contract Sheet","text":"' +
+    $largeDocText + '"}'
+$largeBoardPayload = 'board-payload-' + ('0123456789abcdef' * 59)
+$largeBoardRow = '["source","2026-09-13T00:00:00Z","target","APPEND","WORK","' +
+    $largeBoardPayload + '","OPEN","owner","",""]'
+$largeBoardRows = (($largeBoardRow + ',') * 2323) + $largeBoardRow
+$largeBoardBody = '{"ok":true,"fileId":"large-board","title":"Contract Sheet","rows":[' +
+    $largeBoardRows + ']}'
 
 $cases = @(
     (New-ReadCase -Name 'apps-script-sheet' -Valid $true -Title 'Contract Sheet' -Body '{"ok":true,"fileId":"sheet-apps","title":"Contract Sheet","rows":[["a",1],[]]}'),
@@ -361,6 +380,51 @@ $cases = @(
     (New-ReadCase -Name 'duplicate-ok' -Body '{"ok":false,"ok":true,"fileId":"duplicate-ok","title":"Contract Sheet","rows":[],"canary":"DUPLICATE_OK_BODY_CANARY"}' -LeakToken 'DUPLICATE_OK_BODY_CANARY'),
     (New-ReadCase -Name 'duplicate-title' -Body '{"ok":true,"fileId":"duplicate-title","title":"Wrong Title","title":"Contract Sheet","rows":[],"canary":"DUPLICATE_TITLE_BODY_CANARY"}' -LeakToken 'DUPLICATE_TITLE_BODY_CANARY'),
     (New-ReadCase -Name 'duplicate-rows' -Body '{"ok":true,"fileId":"duplicate-rows","title":"Contract Sheet","rows":"wrong","rows":[],"canary":"DUPLICATE_ROWS_BODY_CANARY"}' -LeakToken 'DUPLICATE_ROWS_BODY_CANARY'),
+    (New-ReadCase -Name 'comment-brace-duplicate-ok-curl' -Body '{"ok":false,/* } */"ok":true,"fileId":"comment-brace","title":"Contract Sheet","rows":[],"canary":"COMMENT_BRACE_BODY_CANARY"}' -LeakToken 'COMMENT_BRACE_BODY_CANARY'),
+    (New-ReadCase -Name 'comment-brace-duplicate-ok-iwr' -Body '{"ok":false,/* } */"ok":true,"fileId":"comment-brace-iwr","title":"Contract Sheet","rows":[],"canary":"COMMENT_BRACE_IWR_BODY_CANARY"}' -LeakToken 'COMMENT_BRACE_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'comment-bracket-duplicate-ok-curl' -Body '{"ok":false,/* [ */"ok":true,"fileId":"comment-bracket","title":"Contract Sheet","rows":[],"canary":"COMMENT_BRACKET_BODY_CANARY"}' -LeakToken 'COMMENT_BRACKET_BODY_CANARY'),
+    (New-ReadCase -Name 'comment-bracket-duplicate-ok-iwr' -Body '{"ok":false,/* [ */"ok":true,"fileId":"comment-bracket-iwr","title":"Contract Sheet","rows":[],"canary":"COMMENT_BRACKET_IWR_BODY_CANARY"}' -LeakToken 'COMMENT_BRACKET_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'line-comment-duplicate-ok-curl' -Body $lineCommentDuplicateBody -LeakToken 'LINE_COMMENT_BODY_CANARY'),
+    (New-ReadCase -Name 'line-comment-duplicate-ok-iwr' -Body $lineCommentDuplicateBody.Replace('"fileId":"line-comment"', '"fileId":"line-comment-iwr"').Replace('LINE_COMMENT_BODY_CANARY', 'LINE_COMMENT_IWR_BODY_CANARY') -LeakToken 'LINE_COMMENT_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'single-quoted-duplicate-ok-curl' -Body '{"ok":false,''ok'':true,"fileId":"single-quoted-ok","title":"Contract Sheet","rows":[],"canary":"SINGLE_QUOTED_OK_BODY_CANARY"}' -LeakToken 'SINGLE_QUOTED_OK_BODY_CANARY'),
+    (New-ReadCase -Name 'single-quoted-duplicate-ok-iwr' -Body '{"ok":false,''ok'':true,"fileId":"single-quoted-ok-iwr","title":"Contract Sheet","rows":[],"canary":"SINGLE_QUOTED_OK_IWR_BODY_CANARY"}' -LeakToken 'SINGLE_QUOTED_OK_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'bare-duplicate-ok-curl' -Body '{ok:false,"ok":true,"fileId":"bare-ok","title":"Contract Sheet","rows":[],"canary":"BARE_OK_BODY_CANARY"}' -LeakToken 'BARE_OK_BODY_CANARY'),
+    (New-ReadCase -Name 'bare-duplicate-ok-iwr' -Body '{ok:false,"ok":true,"fileId":"bare-ok-iwr","title":"Contract Sheet","rows":[],"canary":"BARE_OK_IWR_BODY_CANARY"}' -LeakToken 'BARE_OK_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'bare-duplicate-title-curl' -Body '{"ok":true,"fileId":"bare-title",title:"Wrong Title","title":"Contract Sheet","rows":[],"canary":"BARE_TITLE_BODY_CANARY"}' -LeakToken 'BARE_TITLE_BODY_CANARY'),
+    (New-ReadCase -Name 'bare-duplicate-title-iwr' -Body '{"ok":true,"fileId":"bare-title-iwr",title:"Wrong Title","title":"Contract Sheet","rows":[],"canary":"BARE_TITLE_IWR_BODY_CANARY"}' -LeakToken 'BARE_TITLE_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'bare-duplicate-rows-curl' -Body '{"ok":true,"fileId":"bare-rows","title":"Contract Sheet",rows:"wrong","rows":[],"canary":"BARE_ROWS_BODY_CANARY"}' -LeakToken 'BARE_ROWS_BODY_CANARY'),
+    (New-ReadCase -Name 'bare-duplicate-rows-iwr' -Body '{"ok":true,"fileId":"bare-rows-iwr","title":"Contract Sheet",rows:"wrong","rows":[],"canary":"BARE_ROWS_IWR_BODY_CANARY"}' -LeakToken 'BARE_ROWS_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'single-quoted-value' -Body '{"ok":true,"fileId":''single-value'',"title":"Contract Sheet","rows":[],"canary":"SINGLE_VALUE_BODY_CANARY"}' -LeakToken 'SINGLE_VALUE_BODY_CANARY'),
+    (New-ReadCase -Name 'trailing-object-comma' -Body '{"ok":true,"fileId":"trailing-object","title":"Contract Sheet","rows":[],"canary":"TRAILING_OBJECT_BODY_CANARY",}' -LeakToken 'TRAILING_OBJECT_BODY_CANARY'),
+    (New-ReadCase -Name 'trailing-array-comma' -Body '{"ok":true,"fileId":"trailing-array","title":"Contract Sheet","rows":[[],],"canary":"TRAILING_ARRAY_BODY_CANARY"}' -LeakToken 'TRAILING_ARRAY_BODY_CANARY'),
+    (New-ReadCase -Name 'plus-number-extension' -Body '{"ok":true,"_httpStatus":+200,"fileId":"plus-number","title":"Contract Sheet","rows":[],"canary":"PLUS_NUMBER_BODY_CANARY"}' -LeakToken 'PLUS_NUMBER_BODY_CANARY'),
+    (New-ReadCase -Name 'nan-extension' -Body '{"ok":true,"fileId":"nan-extension","title":"Contract Sheet","rows":[],"extension":NaN,"canary":"NAN_BODY_CANARY"}' -LeakToken 'NAN_BODY_CANARY'),
+    (New-ReadCase -Name 'infinity-extension' -Body '{"ok":true,"fileId":"infinity-extension","title":"Contract Sheet","rows":[],"extension":Infinity,"canary":"INFINITY_BODY_CANARY"}' -LeakToken 'INFINITY_BODY_CANARY'),
+    (New-ReadCase -Name 'negative-infinity-extension' -Body '{"ok":true,"fileId":"negative-infinity","title":"Contract Sheet","rows":[],"extension":-Infinity,"canary":"NEGATIVE_INFINITY_BODY_CANARY"}' -LeakToken 'NEGATIVE_INFINITY_BODY_CANARY'),
+    (New-ReadCase -Name 'hex-number-extension' -Body '{"ok":true,"_httpStatus":0xC8,"fileId":"hex-number","title":"Contract Sheet","rows":[],"canary":"HEX_NUMBER_BODY_CANARY"}' -LeakToken 'HEX_NUMBER_BODY_CANARY'),
+    (New-ReadCase -Name 'undefined-extension' -Body '{"ok":true,"fileId":"undefined-extension","title":"Contract Sheet","rows":[],"extension":undefined,"canary":"UNDEFINED_BODY_CANARY"}' -LeakToken 'UNDEFINED_BODY_CANARY'),
+    (New-ReadCase -Name 'leading-zero-number-extension' -Body '{"ok":true,"fileId":"leading-zero","title":"Contract Sheet","rows":[],"extension":01,"canary":"LEADING_ZERO_BODY_CANARY"}' -LeakToken 'LEADING_ZERO_BODY_CANARY'),
+    (New-ReadCase -Name 'trailing-dot-number-extension' -Body '{"ok":true,"fileId":"trailing-dot","title":"Contract Sheet","rows":[],"extension":1.,"canary":"TRAILING_DOT_BODY_CANARY"}' -LeakToken 'TRAILING_DOT_BODY_CANARY'),
+    (New-ReadCase -Name 'incomplete-exponent-extension' -Body '{"ok":true,"fileId":"incomplete-exponent","title":"Contract Sheet","rows":[],"extension":1e+,"canary":"INCOMPLETE_EXPONENT_BODY_CANARY"}' -LeakToken 'INCOMPLETE_EXPONENT_BODY_CANARY'),
+    (New-ReadCase -Name 'uppercase-null-extension' -Body '{"ok":true,"fileId":"uppercase-null","title":"Contract Sheet","rows":[],"extension":NULL,"canary":"UPPERCASE_NULL_BODY_CANARY"}' -LeakToken 'UPPERCASE_NULL_BODY_CANARY'),
+    (New-ReadCase -Name 'non-rfc-whitespace-extension' -Body ("{`"ok`":true,`"fileId`":`"non-rfc-whitespace`",`"title`":`"Contract Sheet`",`"rows`":[]," + [char]0x00A0 + "`"canary`":`"NON_RFC_WHITESPACE_BODY_CANARY`"}") -LeakToken 'NON_RFC_WHITESPACE_BODY_CANARY'),
+    # JsonReaderWriterFactory itself admits these missing-separator forms. They
+    # are canaries that the strict token state machine, not that lax reader or
+    # ConvertFrom-Json, remains the one structural admission boundary.
+    (New-ReadCase -Name 'missing-array-comma-extension' -Body '{"ok":true,"fileId":"missing-array-comma","title":"Contract Sheet","rows":[["a" "b"]],"canary":"MISSING_ARRAY_COMMA_BODY_CANARY"}' -LeakToken 'MISSING_ARRAY_COMMA_BODY_CANARY'),
+    (New-ReadCase -Name 'adjacent-member-values-extension' -Body '{"ok":true,"fileId":"adjacent-values","title":"Contract Sheet","rows":[],"extension":true false,"canary":"ADJACENT_VALUES_BODY_CANARY"}' -LeakToken 'ADJACENT_VALUES_BODY_CANARY'),
+    (New-ReadCase -Name 'strict-string-syntax-data' -Valid $true -Body $strictStringSyntaxBody),
+    (New-ReadCase -Name 'strict-number-and-nesting-conformance' -Valid $true -Body '{"ok":true,"fileId":"strict-number-grammar","title":"Contract Sheet","rows":[[0,-0,1.25,-2.5,6e3,7E+2,-8e-2,{"nested":[true,false,null,{"value":9.1e+4}]}]],"extra":{"zero":0,"negativeZero":-0,"fraction":0.125,"exponent":1e-2,"array":[[],{}]}}'),
+    (New-ReadCase -Name 'large-doc-linear-scan' -Valid $true -Body $largeDocBody -MaxElapsedSeconds 30),
+    (New-ReadCase -Name 'large-board-linear-scan' -Valid $true -Body $largeBoardBody -MaxElapsedSeconds 30),
+    (New-ReadCase -Name 'escaped-name-duplicate-ok' -Body '{"o\u006b":false,"ok":true,"fileId":"escaped-name","title":"Contract Sheet","rows":[],"canary":"ESCAPED_NAME_BODY_CANARY"}' -LeakToken 'ESCAPED_NAME_BODY_CANARY'),
+    # DataContract's JSON/XML projection hides __type as a root attribute. These
+    # exact and decoded-spelling collisions prove root uniqueness is owned by the
+    # strict token parser through both transport implementations.
+    (New-ReadCase -Name 'reserved-type-exact-duplicate-curl' -Body '{"__type":"A:#B","__type":"C:#D","ok":true,"fileId":"reserved-type-exact","title":"Contract Sheet","rows":[],"canary":"RESERVED_TYPE_EXACT_BODY_CANARY"}' -LeakToken 'RESERVED_TYPE_EXACT_BODY_CANARY'),
+    (New-ReadCase -Name 'reserved-type-exact-duplicate-iwr' -Body '{"__type":"A:#B","__type":"C:#D","ok":true,"fileId":"reserved-type-exact-iwr","title":"Contract Sheet","rows":[],"canary":"RESERVED_TYPE_EXACT_IWR_BODY_CANARY"}' -LeakToken 'RESERVED_TYPE_EXACT_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
+    (New-ReadCase -Name 'reserved-type-escaped-duplicate-curl' -Body '{"__type":"A:#B","\u005F\u005Ftype":"C:#D","ok":true,"fileId":"reserved-type-escaped","title":"Contract Sheet","rows":[],"canary":"RESERVED_TYPE_ESCAPED_BODY_CANARY"}' -LeakToken 'RESERVED_TYPE_ESCAPED_BODY_CANARY'),
+    (New-ReadCase -Name 'reserved-type-escaped-duplicate-iwr' -Body '{"__type":"A:#B","\u005F\u005Ftype":"C:#D","ok":true,"fileId":"reserved-type-escaped-iwr","title":"Contract Sheet","rows":[],"canary":"RESERVED_TYPE_ESCAPED_IWR_BODY_CANARY"}' -LeakToken 'RESERVED_TYPE_ESCAPED_IWR_BODY_CANARY' -ForceIwr $true -ExpectedTransportExit $null),
     (New-ReadCase -Name 'ok-false' -Body '{"ok":false,"fileId":"bad","title":"Contract Sheet","rows":[],"canary":"OK_FALSE_CANARY"}' -LeakToken 'OK_FALSE_CANARY'),
     (New-ReadCase -Name 'ok-string' -Body '{"ok":"true","fileId":"bad","title":"Contract Sheet","rows":[],"canary":"OK_STRING_CANARY"}' -LeakToken 'OK_STRING_CANARY'),
     (New-ReadCase -Name 'missing-ok' -Body '{"fileId":"bad","title":"Contract Sheet","rows":[],"canary":"MISSING_OK_CANARY"}' -LeakToken 'MISSING_OK_CANARY'),
@@ -415,6 +479,7 @@ $appendCase = [pscustomobject][ordered]@{
     ExpectMetadata = $false
     ExpectedErrorCode = ''
     AliasOutputMetadata = $false
+    MaxElapsedSeconds = 0
     ServerIndex = 0
 }
 $cases += $appendCase
@@ -543,6 +608,16 @@ try {
             Assert-True ($prefix + ' makes no metadata write during local preflight') (
                 $localMetadataUntouched
             )
+        }
+        if ([double]$case.MaxElapsedSeconds -gt 0) {
+            [Console]::Out.WriteLine(('PERF {0} bytes={1} elapsed_seconds={2}' -f
+                $prefix,
+                [Text.Encoding]::UTF8.GetByteCount([string]$case.Body),
+                [Math]::Round([double]$result.ElapsedSeconds, 3)))
+            Assert-True ($prefix + ' completes within the large-response runtime bound') (
+                [double]$result.ElapsedSeconds -le [double]$case.MaxElapsedSeconds
+            ) ('elapsed_seconds=' + [Math]::Round([double]$result.ElapsedSeconds, 3) +
+                '; max_seconds=' + [double]$case.MaxElapsedSeconds)
         }
 
         if ($case.Valid) {

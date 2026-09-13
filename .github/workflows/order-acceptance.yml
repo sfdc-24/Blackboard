@@ -84,9 +84,9 @@ jobs:
           $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
           if ($suiteExit -ne 0 -or
               $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Core .+ child=.*[\\/]pwsh\.exe$' -or
-              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 59' -or
-              $pass.Count -ne 527 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
-              $nonblank[-1] -cne 'RESULT passed=527 failed=0') {
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 98' -or
+              $pass.Count -ne 880 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=880 failed=0') {
             throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
                    '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
                    '; pass=' + $pass.Count + '; fail=' + $fail.Count +
@@ -147,9 +147,9 @@ jobs:
           $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
           if ($suiteExit -ne 0 -or
               $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Desktop 5\.1\..+ child=.*[\\/]powershell\.exe$' -or
-              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 59' -or
-              $pass.Count -ne 527 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
-              $nonblank[-1] -cne 'RESULT passed=527 failed=0') {
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 98' -or
+              $pass.Count -ne 880 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=880 failed=0') {
             throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
                    '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
                    '; pass=' + $pass.Count + '; fail=' + $fail.Count +
@@ -240,9 +240,9 @@ jobs:
           $nonblank = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
           if ($suiteExit -ne 0 -or
               $engine.Count -ne 1 -or $engine[0] -cnotmatch '^ENGINE Core .+ child=.*/pwsh$' -or
-              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 59' -or
-              $pass.Count -ne 527 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
-              $nonblank[-1] -cne 'RESULT passed=527 failed=0') {
+              $cases.Count -ne 1 -or $cases[0] -cne 'CASES 98' -or
+              $pass.Count -ne 880 -or $fail.Count -ne 0 -or $result.Count -ne 1 -or
+              $nonblank[-1] -cne 'RESULT passed=880 failed=0') {
             throw ('bus_read_response_contract_failed: exit=' + $suiteExit +
                    '; engine=' + ($engine -join ',') + '; cases=' + ($cases -join ',') +
                    '; pass=' + $pass.Count + '; fail=' + $fail.Count +

@@ -147,30 +147,22 @@ function Get-BusIwrResponseBytes {
   }
 }
 
-function ConvertFrom-BusJsonStringLiteral {
-  param([Parameter(Mandatory = $true)][string]$Literal)
+function ConvertFrom-BusStrictJsonStringToken {
+  param([Parameter(Mandatory = $true)][string]$Token)
 
-  if ($Literal.Length -lt 2 -or $Literal[0] -cne '"' -or
-      $Literal[$Literal.Length - 1] -cne '"') {
-    throw [FormatException]::new('invalid JSON string literal')
-  }
-
+  # The strict lexer has already proved this token is a complete RFC JSON
+  # string. Decode only root property names so escaped spellings participate in
+  # the same collision set without copying multi-megabyte response values.
   $builder = New-Object Text.StringBuilder
-  for ($index = 1; $index -lt $Literal.Length - 1; $index++) {
-    $character = $Literal[$index]
+  for ($index = 1; $index -lt $Token.Length - 1; $index++) {
+    $character = $Token[$index]
     if ($character -cne '\') {
-      if ([int][char]$character -lt 0x20) {
-        throw [FormatException]::new('invalid JSON string literal')
-      }
       [void]$builder.Append($character)
       continue
     }
 
     $index++
-    if ($index -ge $Literal.Length - 1) {
-      throw [FormatException]::new('invalid JSON string literal')
-    }
-    $escape = $Literal[$index]
+    $escape = $Token[$index]
     switch -CaseSensitive ($escape) {
       '"' { [void]$builder.Append('"') }
       '\' { [void]$builder.Append('\') }
@@ -181,81 +173,153 @@ function ConvertFrom-BusJsonStringLiteral {
       'r'  { [void]$builder.Append([char]0x0D) }
       't'  { [void]$builder.Append([char]0x09) }
       'u'  {
-        if ($index + 4 -ge $Literal.Length) {
-          throw [FormatException]::new('invalid JSON string literal')
-        }
-        $hex = $Literal.Substring($index + 1, 4)
-        if ($hex -cnotmatch '^[0-9A-Fa-f]{4}$') {
-          throw [FormatException]::new('invalid JSON string literal')
-        }
+        $hex = $Token.Substring($index + 1, 4)
         [void]$builder.Append([char][Convert]::ToUInt16($hex, 16))
         $index += 4
       }
-      default { throw [FormatException]::new('invalid JSON string literal') }
     }
   }
   return $builder.ToString()
 }
 
-function Test-BusJsonHasCollidingRootProperty {
+function Assert-BusStrictJsonRootObject {
   param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content)
 
-  # ConvertFrom-Json overwrites duplicate object members. Scan the raw root
-  # object first, including escaped property names, so no edition can turn an
-  # ambiguous response into an apparently valid PSCustomObject. Case-insensitive
-  # collisions are rejected too because PowerShell property lookup cannot retain
-  # those names portably across Desktop and Core.
-  $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  $objectDepth = 0
-  $arrayDepth = 0
-  $expectRootProperty = $false
-  for ($index = 0; $index -lt $Content.Length; $index++) {
-    $character = $Content[$index]
-    if ([char]::IsWhiteSpace($character)) { continue }
+  # ConvertFrom-Json accepts different JavaScript extensions on Desktop and Core.
+  # Tokenize every character with the RFC 8259 lexical grammar first; a gap is a
+  # forbidden comment, quote, identifier, number form, whitespace character, or
+  # other extension. An iterative state machine owns the container grammar and
+  # decodes only depth-one property names for collision tracking. Platform JSON
+  # readers are intentionally not trusted here: ConvertFrom-Json is permissive,
+  # while JsonReaderWriterFactory admits missing separators and hides __type as
+  # an XML attribute. This avoids parser/scanner disagreement and a PowerShell
+  # loop over every byte of large response values.
+  $tokenPattern = '(?<string>"(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\x00-\x1F])*")|(?<number>-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?![0-9A-Za-z_.+-]))|(?<literal>true(?![A-Za-z0-9_])|false(?![A-Za-z0-9_])|null(?![A-Za-z0-9_]))|(?<punct>[{}\[\],:])|(?<ws>[ \t\r\n]+)'
+  $tokenRegex = New-Object Text.RegularExpressions.Regex(
+    $tokenPattern,
+    [Text.RegularExpressions.RegexOptions]::CultureInvariant,
+    [TimeSpan]::FromSeconds(10)
+  )
+  $cursor = 0
+  $depth = 0
+  $rootComplete = $false
+  # Object states: 0 key-or-end, 1 colon, 2 value, 3 comma-or-end,
+  # 4 key-after-comma. Array states: 0 value-or-end, 2 value-after-comma,
+  # 3 comma-or-end. A parent becomes complete-as-a-value when a child opens;
+  # the child still has to close before another parent token can be consumed.
+  $containerTypes = New-Object 'string[]' 128
+  $containerStates = New-Object 'int[]' 128
+  $rootPropertyNames = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+  )
+  foreach ($match in $tokenRegex.Matches($Content)) {
+    if ($match.Index -ne $cursor) {
+      throw [FormatException]::new('invalid strict JSON token')
+    }
+    $cursor += $match.Length
+    if ($match.Groups['ws'].Success) { continue }
 
-    if ($character -ceq '"') {
-      $literalStart = $index
-      $escaped = $false
-      do {
-        $index++
-        if ($index -ge $Content.Length) {
-          throw [FormatException]::new('unterminated JSON string')
-        }
-        $stringCharacter = $Content[$index]
-        if ($escaped) {
-          $escaped = $false
-        } elseif ($stringCharacter -ceq '\') {
-          $escaped = $true
-        } elseif ($stringCharacter -ceq '"') {
-          break
-        }
-      } while ($true)
-
-      if ($objectDepth -eq 1 -and $arrayDepth -eq 0 -and $expectRootProperty) {
-        $literal = $Content.Substring($literalStart, $index - $literalStart + 1)
-        $propertyName = ConvertFrom-BusJsonStringLiteral -Literal $literal
-        if (-not $seen.Add($propertyName)) { return $true }
-        $expectRootProperty = $false
+    $token = $match.Value
+    if ($rootComplete) {
+      throw [FormatException]::new('strict JSON trailing content')
+    }
+    if ($depth -eq 0) {
+      if ($token -cne '{') {
+        throw [FormatException]::new('strict JSON root object expected')
       }
+      $containerTypes[0] = '{'
+      $containerStates[0] = 0
+      $depth = 1
       continue
     }
 
-    switch -CaseSensitive ($character) {
-      '{' {
-        $objectDepth++
-        if ($objectDepth -eq 1 -and $arrayDepth -eq 0) { $expectRootProperty = $true }
+    $isScalar = $match.Groups['string'].Success -or
+      $match.Groups['number'].Success -or
+      $match.Groups['literal'].Success
+    $top = $depth - 1
+    $state = $containerStates[$top]
+    if ($containerTypes[$top] -ceq '{') {
+      if ($state -eq 0 -or $state -eq 4) {
+        if ($match.Groups['string'].Success) {
+          if ($depth -eq 1) {
+            $propertyName = ConvertFrom-BusStrictJsonStringToken -Token $token
+            if (-not $rootPropertyNames.Add($propertyName)) {
+              throw [FormatException]::new('colliding strict JSON root property')
+            }
+          }
+          $containerStates[$top] = 1
+        } elseif ($state -eq 0 -and $token -ceq '}') {
+          $depth--
+          if ($depth -eq 0) { $rootComplete = $true }
+        } else {
+          throw [FormatException]::new('strict JSON object property expected')
+        }
+      } elseif ($state -eq 1) {
+        if ($token -cne ':') {
+          throw [FormatException]::new('strict JSON property colon expected')
+        }
+        $containerStates[$top] = 2
+      } elseif ($state -eq 2) {
+        if ($isScalar) {
+          $containerStates[$top] = 3
+        } elseif ($token -ceq '{' -or $token -ceq '[') {
+          $containerStates[$top] = 3
+          if ($depth -ge $containerTypes.Length) {
+            throw [FormatException]::new('strict JSON nesting limit')
+          }
+          $containerTypes[$depth] = $token
+          $containerStates[$depth] = 0
+          $depth++
+        } else {
+          throw [FormatException]::new('strict JSON property value expected')
+        }
+      } elseif ($state -eq 3) {
+        if ($token -ceq ',') {
+          $containerStates[$top] = 4
+        } elseif ($token -ceq '}') {
+          $depth--
+          if ($depth -eq 0) { $rootComplete = $true }
+        } else {
+          throw [FormatException]::new('strict JSON object separator expected')
+        }
+      } else {
+        throw [FormatException]::new('invalid strict JSON object state')
       }
-      '}' {
-        if ($objectDepth -gt 0) { $objectDepth-- }
-      }
-      '[' { $arrayDepth++ }
-      ']' { if ($arrayDepth -gt 0) { $arrayDepth-- } }
-      ',' {
-        if ($objectDepth -eq 1 -and $arrayDepth -eq 0) { $expectRootProperty = $true }
+    } else {
+      if ($state -eq 0 -or $state -eq 2) {
+        if ($state -eq 0 -and $token -ceq ']') {
+          $depth--
+          if ($depth -eq 0) { $rootComplete = $true }
+        } elseif ($isScalar) {
+          $containerStates[$top] = 3
+        } elseif ($token -ceq '{' -or $token -ceq '[') {
+          $containerStates[$top] = 3
+          if ($depth -ge $containerTypes.Length) {
+            throw [FormatException]::new('strict JSON nesting limit')
+          }
+          $containerTypes[$depth] = $token
+          $containerStates[$depth] = 0
+          $depth++
+        } else {
+          throw [FormatException]::new('strict JSON array value expected')
+        }
+      } elseif ($state -eq 3) {
+        if ($token -ceq ',') {
+          $containerStates[$top] = 2
+        } elseif ($token -ceq ']') {
+          $depth--
+          if ($depth -eq 0) { $rootComplete = $true }
+        } else {
+          throw [FormatException]::new('strict JSON array separator expected')
+        }
+      } else {
+        throw [FormatException]::new('invalid strict JSON array state')
       }
     }
   }
-  return $false
+  if ($cursor -ne $Content.Length -or -not $rootComplete -or $depth -ne 0) {
+    throw [FormatException]::new('incomplete strict JSON root object')
+  }
 }
 
 function Get-BusExactJsonProperty {
@@ -316,17 +380,10 @@ function Assert-BusReadResponseContract {
 
   $invalidMessage = 'BUS_READ_RESPONSE_INVALID: read response failed the generic success, identity, or payload contract.'
   try {
-    # ConvertFrom-Json is not a root-shape oracle across editions: PowerShell 7
-    # unwraps a one-element JSON array containing an object to PSCustomObject,
-    # while Windows PowerShell 5.1 retains Object[]. Check the raw JSON token first
-    # so both editions enforce one root object before deserialization.
-    $trimmedContent = $Content.TrimStart()
-    if ($trimmedContent.Length -eq 0 -or $trimmedContent[0] -cne '{') {
-      throw [InvalidOperationException]::new($invalidMessage)
-    }
-    if (Test-BusJsonHasCollidingRootProperty -Content $Content) {
-      throw [InvalidOperationException]::new($invalidMessage)
-    }
+    # ConvertFrom-Json is neither a strict JSON grammar nor a root-shape oracle
+    # across editions. Validate one complete RFC-JSON root object and its unique
+    # decoded root-property names before the edition-specific deserializer runs.
+    Assert-BusStrictJsonRootObject -Content $Content
     # PowerShell 7 otherwise turns ISO-8601-looking JSON strings into DateTime.
     # That changes legitimate document text and identity values before the type
     # and ordinal checks below. DateKind arrived in 7.5; Desktop 5.1 already
@@ -791,7 +848,17 @@ if ($curl) {
     $resp = $null
     try { $resp = $_.Exception.Response } catch { $resp = $null }
     if (-not $resp) {
-      if ($Action -ne 'read') { throw }
+      if ($Action -eq 'read') {
+        # No response means this is a transport exception, not an invalid read
+        # response. Preserve its type/inner chain so the supervisor can classify
+        # it as retryable; the sidecar remains an exact empty sanitized object.
+        Write-BusReadMetadata `
+          -Path $ReadMetadataOutFile `
+          -TransportExit $readTransportExit `
+          -HttpStatus $readHttpStatus `
+          -ContentTypeClass $readContentTypeClass
+      }
+      throw
     } else {
       $status = 0
       try { $status = [int]$resp.StatusCode } catch { $status = 0 }
@@ -935,7 +1002,12 @@ if ($location) {
         -TransportExit $readTransportExit `
         -HttpStatus $readHttpStatus `
         -ContentTypeClass $readContentTypeClass
-      if ($Action -ne 'read') {
+      if ($Action -eq 'read') {
+        # A response-bearing failure is normalized by the common read gate below.
+        # A response-less WebException must retain its network type for the
+        # supervisor's one-retry classification.
+        if (-not $resp) { throw }
+      } else {
         if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
           throw [System.Net.WebException]::new(
             'hop 2 returned another redirect, which the IWR fallback refuses to follow. The write, if any, may still have landed: READ BACK before deciding anything.'
@@ -946,12 +1018,36 @@ if ($location) {
         )
       }
     } catch {
+      $resp = $null
+      try { $resp = $_.Exception.Response } catch { $resp = $null }
+      if ($resp) {
+        try { $readHttpStatus = [int]$resp.StatusCode } catch { $readHttpStatus = $null }
+        $responseContentType = ''
+        try {
+          $headerTypeName = ''
+          if ($null -ne $resp.Headers) { $headerTypeName = $resp.Headers.GetType().FullName }
+          if ($headerTypeName -eq 'System.Net.Http.Headers.HttpResponseHeaders') {
+            if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
+              $responseContentType = [string]$resp.Content.Headers.ContentType
+            }
+          } elseif ($headerTypeName) {
+            $responseContentType = [string]$resp.Headers['Content-Type']
+          }
+        } catch {
+          Write-Warning "BUS_IWR_HEADER_READ_FAILED: $($_.Exception.Message)"
+        }
+        if ($responseContentType) {
+          $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $responseContentType
+        }
+      }
       Write-BusReadMetadata `
         -Path $ReadMetadataOutFile `
         -TransportExit $readTransportExit `
         -HttpStatus $readHttpStatus `
         -ContentTypeClass $readContentTypeClass
-      if ($Action -ne 'read') {
+      if ($Action -eq 'read') {
+        if (-not $resp) { throw }
+      } else {
         throw [System.Net.WebException]::new(
           'hop 2 did not reach a successful final response. The write, if any, may still have landed: READ BACK before deciding anything.'
         )
