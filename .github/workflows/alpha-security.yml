@@ -97,12 +97,22 @@ jobs:
               ($env:EXPECTED_EDITION -ceq 'Core' -and $runtimeVersion.Major -lt 7)) {
             throw 'ALPHA_ENGINE_VERSION_INVALID'
           }
-          if (@($lines | Where-Object { $_ -ceq 'DRIVER_CASES total=19' }).Count -ne 1) {
+          if (@($lines | Where-Object { $_ -ceq 'DRIVER_CASES total=36' }).Count -ne 1) {
             throw 'ALPHA_DRIVER_CASE_COUNT_INVALID'
           }
-          if (@($lines | Where-Object { $_ -ceq 'DRIVER_RESULT passed=19 failed=0' }).Count -ne 1 -or
-              $lines[-1] -cne 'DRIVER_RESULT passed=19 failed=0') {
+          if (@($lines | Where-Object { $_ -ceq 'DRIVER_RESULT passed=36 failed=0' }).Count -ne 1 -or
+              $lines[-1] -cne 'DRIVER_RESULT passed=36 failed=0') {
             throw 'ALPHA_DRIVER_RESULT_INVALID'
+          }
+          # A printed total is not evidence that the driver assertions ran.
+          # Accept only its complete ordered transcript, without extra frames.
+          $nonEmptyLines = @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          if ($nonEmptyLines.Count -ne 39 -or
+              $nonEmptyLines[0] -cne $engineLines[0] -or
+              $nonEmptyLines[37] -cne 'DRIVER_CASES total=36' -or
+              $nonEmptyLines[38] -cne 'DRIVER_RESULT passed=36 failed=0' -or
+              @($nonEmptyLines[1..36] | Where-Object { $_ -cnotmatch '^  ok   .+$' }).Count -ne 0) {
+            throw 'ALPHA_DRIVER_ASSERTION_TRANSCRIPT_INVALID'
           }
           if (@($lines | Where-Object { $_ -like '*ALPHA_SECRET_CONFIG_CLEANUP_FAILED*' }).Count -ne 0) {
             throw 'ALPHA_DRIVER_EXPOSED_INTERNAL_FAILURE'

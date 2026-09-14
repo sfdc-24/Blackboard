@@ -269,6 +269,90 @@ try {
     Assert-AlphaDriver 'no-op mutation combined streams contain no raw, encoded, base, query, or full URL canary' (
       $mutationLeakCount -eq 0)
   }
+
+  # Keep all original read-mode cases above. These independent children invoke
+  # the WRITE mode explicitly, including both anchored privacy/delete mutants.
+  $writeSecret = 'WRITE_S3CR3T&hash#plus+eq=slash/question?'
+  $writeCanaries = @(
+    $writeSecret, [uri]::EscapeDataString($writeSecret),
+    'https://write-base.example.invalid/exec', 'WRITE_BASE_CANARY',
+    'https://write-hop.example.invalid/once', 'WRITE_ONE_SHOT_CANARY',
+    'WRITE_STDERR_CANARY', 'WRITE_THROW_OUTER_CANARY', 'WRITE_THROW_INNER_CANARY',
+    'WRITE_CREATION_EXCEPTION_CANARY', 'WRITE_NONJSON_CANARY', 'WRITE_SUCCESS_SENTINEL'
+  )
+  $expectedWriteEngine = "WRITE_ENGINE edition=$($PSVersionTable.PSEdition) version=$($PSVersionTable.PSVersion) platform=$platformName"
+  $expectedWriteResult = if ($script:IsWindowsPlatform) {
+    'WRITE_RESULT passed=36 failed=0 skipped=0'
+  } else { 'WRITE_RESULT passed=34 failed=0 skipped=2' }
+  $expectedWritePasses = if ($script:IsWindowsPlatform) { 36 } else { 34 }
+  $writeNormalRoot = Join-Path $testRoot 'write-normal'
+  New-Item -ItemType Directory -Path $writeNormalRoot -ErrorAction Stop | Out-Null
+  $writeNormal = Invoke-AlphaChild -EnginePath $enginePath -ScriptPath $resolvedAlphaPath `
+    -ScriptArguments @('-WriteSelfTest') -TemporaryRoot $writeNormalRoot -TimeoutMilliseconds 45000
+  $writeLines = @($writeNormal.stdout -split "`r?`n" | Where-Object { $_.Length -gt 0 })
+  $writeCombined = $writeNormal.stdout + "`n" + $writeNormal.stderr
+  $writeResidue = @(Get-ChildItem -LiteralPath $writeNormalRoot -Recurse -Force -ErrorAction Stop |
+    Where-Object { $_.Name -ceq 'request.conf' -or $_.Name -cmatch '^alpha_private_[0-9a-f]{32}$' })
+  Assert-AlphaDriver 'write mode child completes with exact zero exit within its bound' (
+    $writeNormal.completed -and $writeNormal.exit_code -eq 0 -and $writeNormal.elapsed_ms -lt 45000)
+  Assert-AlphaDriver 'write mode emits exact engine and explicit mode identities once' (
+    (Get-ExactLineCount -Lines $writeLines -Expected $expectedWriteEngine) -eq 1 -and
+    (Get-ExactLineCount -Lines $writeLines -Expected 'WRITE_MODE active=true') -eq 1)
+  Assert-AlphaDriver 'write mode reports the exact case inventory' (
+    (Get-ExactLineCount -Lines $writeLines -Expected 'WRITE_CASES total=36') -eq 1)
+  Assert-AlphaDriver 'write mode result is exact unique and terminal' (
+    (Get-ExactLineCount -Lines $writeLines -Expected $expectedWriteResult) -eq 1 -and
+    $writeLines[-1] -ceq $expectedWriteResult)
+  Assert-AlphaDriver 'write mode executed assertion counts are exact with no hidden failures' (
+    @($writeLines | Where-Object { $_ -like '  write-ok   *' }).Count -eq $expectedWritePasses -and
+    @($writeLines | Where-Object { $_ -like '  WRITE_FAIL *' }).Count -eq 0)
+  $writeLockLabelsCorrect = $true
+  foreach ($kind in @('BODY', 'HEADER')) {
+    $expectedLockLine = if ($script:IsWindowsPlatform) {
+      "WRITE_LOCK_$kind PASS platform=windows"
+    } else { "WRITE_LOCK_$kind SKIP platform=linux reason=open-file-unlink-semantics" }
+    if ((Get-ExactLineCount -Lines $writeLines -Expected $expectedLockLine) -ne 1) { $writeLockLabelsCorrect = $false }
+  }
+  Assert-AlphaDriver 'both write lock controls are explicitly passed or platform-skipped' (
+    $writeLockLabelsCorrect -and
+    @($writeLines | Where-Object { $_ -like 'WRITE_LOCK_*' }).Count -eq 2)
+  Assert-AlphaDriver 'write mode leaves no stderr or private-file residue' (
+    [string]::IsNullOrEmpty($writeNormal.stderr) -and $writeResidue.Count -eq 0)
+  Assert-AlphaDriver 'write mode emits no raw encoded URL diagnostic or success-response canary' (
+    @($writeCanaries | Where-Object { $writeCombined.Contains($_) }).Count -eq 0)
+  Assert-AlphaDriver 'write acceptance cannot be satisfied by the old read self-test' (
+    @($writeLines | Where-Object { $_ -like 'ENGINE *' -or $_ -like 'CASES *' -or $_ -like 'RESULT *' }).Count -eq 0)
+
+  foreach ($writeMutationKind in @('privacy', 'delete')) {
+    $writeMutationAnchorOk = if ($writeMutationKind -ceq 'privacy') { $privacyAnchorIsUnique } else { $anchorIsUnique }
+    if (-not $writeMutationAnchorOk) { continue } # The existing uniqueness assertion already fails this driver.
+    $writeMutationRoot = Join-Path $testRoot ('write-' + $writeMutationKind + '-mutation')
+    New-Item -ItemType Directory -Path $writeMutationRoot -ErrorAction Stop | Out-Null
+    $writeMutationPath = Join-Path $writeMutationRoot 'alpha-write-mutated.ps1'
+    $writeMutationSource = if ($writeMutationKind -ceq 'privacy') {
+      $source.Replace($privacyLine, $privacyReplacement)
+    } else { $source.Replace($deleteLine, '$null = $Path # ALPHA_CREDENTIAL_CONFIG_DELETE_MUTATION_NOOP') }
+    [IO.File]::WriteAllText($writeMutationPath, $writeMutationSource, (New-Object Text.UTF8Encoding($false)))
+    $writeMutation = Invoke-AlphaChild -EnginePath $enginePath -ScriptPath $writeMutationPath `
+      -ScriptArguments @('-WriteSelfTest') -TemporaryRoot $writeMutationRoot -TimeoutMilliseconds 45000
+    $writeMutationCombined = $writeMutation.stdout + "`n" + $writeMutation.stderr
+    $writeMutationLines = @($writeMutation.stdout -split "`r?`n" | Where-Object { $_.Length -gt 0 })
+    $writeMutationResidue = @(Get-ChildItem -LiteralPath $writeMutationRoot -Recurse -Force -ErrorAction Stop |
+      Where-Object { $_.Name -ceq 'request.conf' -or $_.Name -cmatch '^alpha_private_[0-9a-f]{32}$' })
+    $expectedWriteFailure = if ($writeMutationKind -ceq 'privacy') { 'ALPHA_WRITE_PREPARATION_FAILED' } else { 'ALPHA_WRITE_CLEANUP_FAILED' }
+    Assert-AlphaDriver "write $writeMutationKind mutation fails nonzero within its bound" (
+      $writeMutation.completed -and $writeMutation.exit_code -eq 1 -and $writeMutation.elapsed_ms -lt 45000)
+    Assert-AlphaDriver "write $writeMutationKind mutation reaches write failure not old read mode or a green result" (
+      (Get-ExactLineCount -Lines $writeMutationLines -Expected 'WRITE_MODE active=true') -eq 1 -and
+      $writeMutationCombined.Contains('WRITE_FAILURE token=' + $expectedWriteFailure) -and
+      (Get-ExactLineCount -Lines $writeMutationLines -Expected $expectedWriteResult) -eq 0 -and
+      @($writeMutationLines | Where-Object { $_ -like 'ENGINE *' -or $_ -like 'RESULT *' }).Count -eq 0 -and
+      $writeMutationCombined -cnotmatch 'alpha_private_[0-9a-f]{32}')
+    $expectedResidue = if ($writeMutationKind -ceq 'privacy') { $writeMutationResidue.Count -eq 0 } else { $writeMutationResidue.Count -ge 1 }
+    Assert-AlphaDriver "write $writeMutationKind mutation has the expected isolated residue state" $expectedResidue
+    Assert-AlphaDriver "write $writeMutationKind mutation emits no credential URL diagnostic or success canary" (
+      @($writeCanaries | Where-Object { $writeMutationCombined.Contains($_) }).Count -eq 0)
+  }
 } finally {
   try {
     if (Test-Path -LiteralPath $testRoot) {
