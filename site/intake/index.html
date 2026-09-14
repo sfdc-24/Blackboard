@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Describe what you want built, stood up, or fixed with the SFDC24 intake prototype.">
+<title>Tell us what you need &mdash; SFDC24</title>
+<link rel="canonical" href="https://www.sfdc24.com/intake/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="SFDC24">
+<meta property="og:url" content="https://www.sfdc24.com/intake/">
+<meta property="og:title" content="Tell us what you need — SFDC24">
+<meta property="og:description" content="Describe what you want built or fixed with the SFDC24 intake prototype.">
+<meta property="og:image" content="https://www.sfdc24.com/assets/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0B0D10">
+<link rel="icon" href="../assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="../assets/icon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  /* Intake-only components, on top of site.css. Every color comes from the
+     shared tokens so this page reads as the same product as the rest of the
+     site; nothing here redefines the palette or the type. */
+  .intake{max-width:1040px;margin:0 auto;padding:6px var(--pad) 40px}
+
+  .lead-in{max-width:64ch;margin:0 0 26px}
+  .eyebrow{font:600 12px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+  .lead-in h1{font:600 clamp(27px,5.2vw,40px)/1.12 var(--sans);
+    letter-spacing:-.022em;margin:10px 0 12px;text-wrap:balance}
+  .lead-in p{color:var(--muted);margin:0 0 12px;max-width:64ch}
+  .chip{display:inline-flex;align-items:center;gap:7px;font:600 12px var(--mono);
+    padding:7px 12px;border:1px solid var(--line);border-radius:999px;
+    background:var(--surface);color:var(--muted);margin-bottom:14px}
+
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}
+  @media (max-width:880px){.split{grid-template-columns:1fr}}
+
+  .panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:12px}
+  .panel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:16px 20px;border-bottom:1px solid var(--line)}
+  .panel-h .t{font:600 15px var(--sans)}
+  .panel-h .k{font:600 11px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.1em}
+
+  /* form (the glass) */
+  form{padding:20px}
+  .field{margin-bottom:15px}
+  .field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+  .field .hint{font-weight:400;color:var(--faint)}
+  .field input,.field textarea{
+    width:100%;font:inherit;font-size:16px;color:var(--text);background:var(--ground);
+    border:1px solid var(--line);border-radius:8px;padding:11px 13px;
+    transition:border-color .15s,box-shadow .15s}
+  .field textarea{min-height:92px;resize:vertical}
+  .field input:focus,.field textarea:focus{outline:none;border-color:var(--acc);
+    box-shadow:0 0 0 3px rgba(0,255,166,.15)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:460px){.row2{grid-template-columns:1fr}}
+  .seg{display:flex;gap:8px}
+  .seg label{flex:1;position:relative;cursor:pointer;margin:0}
+  .seg input{position:absolute;opacity:0;inset:0;cursor:pointer}
+  .seg .box{border:1px solid var(--line);border-radius:8px;padding:11px 12px;text-align:center;
+    font-size:14px;font-weight:600;color:var(--muted);background:var(--ground);transition:.15s}
+  .seg input:checked+.box{border-color:var(--acc);color:var(--acc);background:rgba(0,255,166,.08)}
+  .seg input:focus-visible+.box{box-shadow:0 0 0 3px rgba(0,255,166,.15)}
+  .submit{width:100%;margin-top:6px;font:inherit;font-weight:600;font-size:15px;cursor:pointer;
+    background:var(--acc);color:#04120C;border:none;border-radius:9px;padding:14px;
+    display:flex;align-items:center;justify-content:center;gap:9px;transition:filter .15s,transform .05s}
+  .submit:hover{filter:brightness(1.08)}.submit:active{transform:translateY(1px)}
+  .submit:disabled{opacity:.6;cursor:default}
+  .consent{font-size:12px;color:var(--faint);margin:12px 2px 0;text-align:center}
+
+  /* success overlay inside form panel */
+  .done{padding:34px 24px;text-align:center;display:none}
+  .done.show{display:block;animation:rise .4s ease both}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .done .seal{width:56px;height:56px;border-radius:50%;background:rgba(0,255,166,.08);
+    color:var(--acc);display:grid;place-items:center;margin:0 auto 14px}
+  .done h3{font:600 20px var(--sans);margin:0 0 6px}
+  .done p{color:var(--muted);margin:0 auto;max-width:40ch}
+  .textbtn{background:none;border:none;color:var(--acc);font:inherit;font-weight:600;
+    cursor:pointer;margin-top:16px;padding:6px}
+
+  /* pipeline (behind the glass) */
+  .machine{padding:18px 20px 20px}
+  .machine .note{font:400 12.5px/1.6 var(--mono);color:var(--muted);margin:0 0 16px}
+  .stage{display:grid;grid-template-columns:26px 1fr;gap:12px;position:relative;padding-bottom:16px}
+  .stage:last-child{padding-bottom:0}
+  .stage .rail{display:flex;flex-direction:column;align-items:center}
+  .stage .node{width:22px;height:22px;border-radius:50%;border:2px solid var(--line);
+    background:var(--surface);display:grid;place-items:center;font:600 11px var(--mono);
+    color:var(--faint);flex:none;transition:.3s;z-index:1}
+  .stage .wire{flex:1;width:2px;background:var(--line);margin:2px 0}
+  .stage:last-child .wire{display:none}
+  .stage.lit .node{border-color:var(--acc);color:var(--acc);background:rgba(0,255,166,.08)}
+  .stage.done-s .node{border-color:var(--acc);background:var(--acc);color:#04120C}
+  .stage .body .s-t{font-weight:600;font-size:14px}
+  .stage .body .s-d{font-size:12.5px;color:var(--muted);margin-top:2px}
+  .stage .body .s-obj{font:400 11px var(--mono);color:var(--faint);margin-top:3px;
+    text-transform:uppercase;letter-spacing:.06em}
+
+  .payload{margin-top:18px;border:1px dashed var(--line);border-radius:8px;
+    background:var(--ground);overflow:hidden}
+  .payload .ph{display:flex;justify-content:space-between;align-items:center;
+    padding:9px 13px;border-bottom:1px dashed var(--line)}
+  .payload .ph .lbl{font:400 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .payload .ph .ep{font:400 11px var(--mono);color:var(--acc);max-width:60%;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .payload pre{margin:0;padding:13px;font:400 12px/1.6 var(--mono);color:var(--text);overflow-x:auto}
+  .payload .empty{color:var(--faint)}
+
+  /* honesty cards */
+  .facts{margin-top:26px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:880px){.facts{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{font:600 13px var(--sans);margin:0 0 8px;letter-spacing:.02em;color:var(--acc)}
+  .card p{margin:0 0 8px;font-size:13px;color:var(--muted);max-width:66ch}
+  .card p:last-child{margin-bottom:0}
+
+  .modebar{display:flex;align-items:center;gap:9px;font:400 11px var(--mono);
+    color:var(--faint);margin-top:14px}
+</style>
+</head>
+<body>
+
+<a class="skip" href="#leadForm">Skip to the form</a>
+
+<header class="bar">
+  <a class="brand" href="../">sfdc24</a>
+  <nav class="barnav">
+    <a class="go" href="../voice/">Talk out loud</a>
+    <a href="../projects/">Projects</a>
+    <a href="mailto:abdus@sfdc24.com">Contact</a>
+  </nav>
+</header>
+
+<main class="intake">
+  <div class="lead-in">
+    <div class="eyebrow">Start here · Gate 1</div>
+    <h1>Tell us what you want to build.</h1>
+    <p>Salesforce assessment, business process automation and AI enablement for enterprises. Tell us what is going wrong and you will get a straight answer about whether it is worth a conversation.</p>
+    <p>Describe it in plain language. When you submit, your browser posts your details to Salesforce Web-to-Lead. This page cannot confirm that Salesforce received or stored them. No account to create, nothing to install.</p>
+    <span class="chip">Intake prototype · Salesforce Web-to-Lead</span>
+  </div>
+
+  <div class="split">
+    <!-- LEFT: the glass (customer-facing) -->
+    <section class="panel" aria-labelledby="glass-t">
+      <div class="panel-h"><span class="t" id="glass-t">Your request</span><span class="k">web-to-lead</span></div>
+      <form id="leadForm"
+            action="https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8" method="POST">
+        <!-- Salesforce Web-to-Lead required hidden fields -->
+        <input type="hidden" name="oid" id="oid" value="00Dbm00000wK2ibEAC">
+        <input type="hidden" name="retURL" id="retURL" value="">
+        <input type="hidden" name="lead_source" value="sfdc24.com">
+        <input type="hidden" name="description" id="salesforceDescription" value="">
+
+        <div class="field">
+          <label for="description">What do you want to build or run? <span class="hint">— plain language</span></label>
+          <textarea id="description" maxlength="31000" placeholder="e.g. Our case intake has grown complicated. We need one clear process for customers and the service team."></textarea>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="first_name">First name</label>
+            <input id="first_name" name="first_name" maxlength="40" autocomplete="given-name">
+          </div>
+          <div class="field">
+            <label for="last_name">Last name</label>
+            <input id="last_name" name="last_name" maxlength="80" autocomplete="family-name" required>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="email">Work email</label>
+            <input id="email" name="email" type="email" maxlength="80" autocomplete="email" required>
+          </div>
+          <div class="field">
+            <label for="company">Company</label>
+            <input id="company" name="company" maxlength="255" autocomplete="organization" required>
+          </div>
+        </div>
+        <div class="field">
+          <label>You are a…</label>
+          <div class="seg" role="radiogroup" aria-label="Relationship">
+            <label><input type="radio" name="rel" value="Customer" checked><span class="box">Customer</span></label>
+            <label><input type="radio" name="rel" value="Supplier"><span class="box">Supplier / partner</span></label>
+          </div>
+        </div>
+        <button class="submit" type="submit" id="submitBtn" disabled>
+          <span>Submit request</span>
+        </button>
+        <p class="consent">By sending, you agree we may contact you about your request.</p>
+        <noscript><p>JavaScript is required to include your request and relationship. Please enable it before submitting.</p></noscript>
+      </form>
+
+      <div class="done" id="doneState" aria-live="polite">
+        <div class="seal" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+        </div>
+        <h3>Submission status unconfirmed.</h3>
+        <p>This page cannot confirm that Salesforce received your request or created a record. If it reaches SFDC24, we may review it and contact you using the details you provided.</p>
+        <button class="textbtn" id="againBtn" type="button">Return to form</button>
+      </div>
+    </section>
+
+    <!-- RIGHT: behind the glass (the machinery) -->
+    <section class="panel" aria-labelledby="mach-t">
+      <div class="panel-h"><span class="t" id="mach-t">Behind the glass</span><span class="k">planned salesforce pipeline</span></div>
+      <div class="machine">
+        <p class="note">This form is configured for Salesforce Web-to-Lead. Assignment, conversion, and ongoing support below describe a planned workflow.</p>
+
+        <div class="stage" id="st1">
+          <div class="rail"><div class="node">1</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Capture on sfdc24.com</div><div class="s-d">Form posts to Salesforce Web-to-Lead — no middleware, no login.</div><div class="s-obj">endpoint · webto.salesforce.com</div></div>
+        </div>
+        <div class="stage" id="st2">
+          <div class="rail"><div class="node">2</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Web-to-Lead target</div><div class="s-d">The form posts to Salesforce Web-to-Lead using the configured SFDC24 org ID. This page cannot confirm receipt or record creation.</div><div class="s-obj">target · Lead</div></div>
+        </div>
+        <div class="stage" id="st3">
+          <div class="rail"><div class="node">3</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Planned: assign for follow-up</div><div class="s-d">The planned workflow would use an assignment rule and an Agentforce draft.</div><div class="s-obj">plan · Lead Assignment + Agentforce</div></div>
+        </div>
+        <div class="stage" id="st4">
+          <div class="rail"><div class="node">4</div><div class="wire"></div></div>
+          <div class="body"><div class="s-t">Planned: convert to a relationship</div><div class="s-d">After sign-off, the planned flow would create or update Account, Contact, and Opportunity records.</div><div class="s-obj">plan · Account · Contact · Opportunity</div></div>
+        </div>
+        <div class="stage" id="st5">
+          <div class="rail"><div class="node">5</div></div>
+          <div class="body"><div class="s-t">Planned: ongoing support</div><div class="s-d">The planned model would connect Service Cloud entitlements with a Data 360 profile.</div><div class="s-obj">plan · Service · Data 360</div></div>
+        </div>
+
+        <div class="payload">
+          <div class="ph"><span class="lbl">Form payload preview</span><span class="ep" id="epLabel">POST · webto.salesforce.com</span></div>
+          <pre id="payloadView"><span class="empty">// start typing — the outbound form payload appears here</span></pre>
+        </div>
+
+        <div class="modebar">
+          <span id="modeText">Submission path · Salesforce Web-to-Lead</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="facts">
+    <div class="card">
+      <h4>Submission destination</h4>
+      <p>The form targets Salesforce Web-to-Lead with your contact details and description. This page does not verify receipt or storage.</p>
+      <p>The form places the selected customer or supplier relationship in the outbound Salesforce description field. No custom field is used.</p>
+    </div>
+    <div class="card">
+      <h4>If your request reaches us</h4>
+      <p>SFDC24 may review it and contact you using the details you provide. This page cannot confirm receipt.</p>
+      <p>Stages 3–5 (assignment, conversion, lifetime support) are the <strong>planned</strong> funnel and are not verified by this intake test.</p>
+    </div>
+  </div>
+</main>
+
+<footer class="foot">
+  <span>© SFDC24 — Toronto · intake prototype · form targets Salesforce Web-to-Lead</span>
+  <nav>
+    <a href="../privacy/">Privacy</a>
+    <a href="../terms/">Terms</a>
+    <a href="mailto:abdus@sfdc24.com">abdus@sfdc24.com</a>
+  </nav>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var form = document.getElementById("leadForm");
+  var done = document.getElementById("doneState");
+  var payloadView = document.getElementById("payloadView");
+  var submit = document.getElementById("submitBtn");
+  var request = document.getElementById("description");
+  var storedDescription = document.getElementById("salesforceDescription");
+  var names = ["first_name", "last_name", "email", "company"];
+  var returnUrl = new URL(window.location.href);
+  if (returnUrl.protocol !== "https:" && returnUrl.protocol !== "http:") {
+    submit.querySelector("span").textContent = "Open the hosted intake page to submit";
+    return;
+  }
+  // Stay on the current host and path. Do not send query strings or fragments
+  // (which may contain preview/session data) through Salesforce's redirect.
+  returnUrl.search = "?submitted=1";
+  returnUrl.hash = "";
+
+  function updatePayload() {
+    // Reapply after form.reset(), which restores the empty markup default.
+    form.elements.namedItem("retURL").value = returnUrl.href;
+    var relationship = form.querySelector('input[name="rel"]:checked').value;
+    storedDescription.value = "[SFDC24 intake] Relationship: " + relationship + "\n\n" + request.value.trim();
+    var payload = {};
+    ["oid", "retURL", "lead_source"].concat(names).forEach(function (name) {
+      payload[name] = form.elements.namedItem(name).value.trim();
+    });
+    payload.description = storedDescription.value;
+    payloadView.textContent = new URLSearchParams(payload).toString();
+  }
+
+  form.addEventListener("input", updatePayload);
+  form.addEventListener("change", updatePayload);
+  form.addEventListener("formdata", function (event) {
+    // Relationship is captured in Description; rel is not a Salesforce field.
+    event.formData.delete("rel");
+  });
+  form.addEventListener("submit", function (event) {
+    names.forEach(function (name) {
+      var field = form.elements.namedItem(name);
+      field.value = field.value.trim();
+    });
+    if (!form.reportValidity()) {
+      event.preventDefault();
+      return;
+    }
+    updatePayload();
+    submit.disabled = true;
+    submit.querySelector("span").textContent = "Sending to Salesforce…";
+    // Native form navigation handles the POST. Do not infer record creation
+    // from the redirect: Web-to-Lead does not return a Lead ID to this page.
+  });
+  window.addEventListener("pageshow", function () {
+    submit.disabled = false;
+    submit.querySelector("span").textContent = "Submit request";
+  });
+  if (new URLSearchParams(window.location.search).get("submitted") === "1") {
+    form.hidden = true;
+    done.classList.add("show");
+  }
+  document.getElementById("againBtn").addEventListener("click", function () {
+    form.reset();
+    form.hidden = false;
+    done.classList.remove("show");
+    var url = new URL(window.location.href);
+    url.searchParams.delete("submitted");
+    window.history.replaceState(null, "", url);
+    updatePayload();
+    document.getElementById("description").focus();
+  });
+  updatePayload();
+  submit.disabled = false;
+})();
+
+</script>
+</body>
+</html>
