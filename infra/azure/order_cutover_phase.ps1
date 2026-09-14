@@ -505,9 +505,10 @@ function Get-CutoverInstallerArguments {
     param(
         [Parameter(Mandatory = $true)]$Context,
         [Parameter(Mandatory = $true)][string]$RequestedAction,
-        [Parameter(Mandatory = $true)][string]$RequestedMode
+        [Parameter(Mandatory = $true)][string]$RequestedMode,
+        [AllowEmptyString()][string]$ExpectedCurrentTaskXmlSha256 = ''
     )
-    return @(
+    $arguments = @(
         '-Action', $RequestedAction,
         '-Mode', $RequestedMode,
         '-UserProfilePath', $Context.user_profile_path,
@@ -518,6 +519,10 @@ function Get-CutoverInstallerArguments {
         '-WallTimeoutSeconds', ([string]$Context.wall_timeout_seconds),
         '-ClaudeCommand', $Context.claude_command
     )
+    if (-not [string]::IsNullOrEmpty($ExpectedCurrentTaskXmlSha256)) {
+        $arguments += @('-ExpectedCurrentTaskXmlSha256', $ExpectedCurrentTaskXmlSha256)
+    }
+    return $arguments
 }
 
 function Invoke-CutoverInstaller {
@@ -525,7 +530,8 @@ function Invoke-CutoverInstaller {
         [Parameter(Mandatory = $true)]$Context,
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [Parameter(Mandatory = $true)][string]$RequestedAction,
-        [Parameter(Mandatory = $true)][string]$RequestedMode
+        [Parameter(Mandatory = $true)][string]$RequestedMode,
+        [AllowEmptyString()][string]$ExpectedCurrentTaskXmlSha256 = ''
     )
     if ($ScriptPath -ceq $Context.installer_path) {
         $expectedSha256 = $Context.expected_installer_sha256
@@ -543,7 +549,11 @@ function Invoke-CutoverInstaller {
         -Prefix $prefix
     $result = Invoke-CutoverChildScript `
         -ScriptPath $ScriptPath `
-        -Arguments (Get-CutoverInstallerArguments -Context $Context -RequestedAction $RequestedAction -RequestedMode $RequestedMode) `
+        -Arguments (Get-CutoverInstallerArguments `
+            -Context $Context `
+            -RequestedAction $RequestedAction `
+            -RequestedMode $RequestedMode `
+            -ExpectedCurrentTaskXmlSha256 $ExpectedCurrentTaskXmlSha256) `
         -TimeoutSeconds $(if (@('Install', 'InstallFromDisabledNoStop') -ccontains $RequestedAction) { 180 } else { 60 }) `
         -FailureCode 'INSTALLER_CHILD_FAILED'
     if ($result.exit_code -ne 0 -or -not [string]::IsNullOrWhiteSpace($result.stderr)) {
@@ -2357,7 +2367,8 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             -Context $Context `
             -ScriptPath $Context.installer_path `
             -RequestedAction 'InstallFromDisabledNoStop' `
-            -RequestedMode 'Observe'
+            -RequestedMode 'Observe' `
+            -ExpectedCurrentTaskXmlSha256 $disabledXml.utf8_text_sha256
         $null = Assert-CutoverInstallerStatus `
             -Status $install `
             -Context $Context `

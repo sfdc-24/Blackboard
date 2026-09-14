@@ -116,7 +116,12 @@ repair mode and cannot create, update, or delete Azure resources.
    If and only if this step is blocked by the already deployed old task being
    exact `Execute`, `Ready`, result `20`, with the causally current state and
    trailing log both proving `BOARD_HEADER_INVALID`, use the distinct
-   `InstallObserveAndDrainFromFailedExecute` incident action instead. Supply
+   `InstallObserveAndDrainFromFailedExecute` incident action instead. Before
+   invoking it, complete the immutable candidate build, delivery, and guest
+   read-back in steps 8 and 9; staging that release does not change the task.
+   The incident action resolves and authenticates the candidate installer from
+   that already-staged release, so an archive that exists only on the operator
+   host is not sufficient. Supply
    the normal escrow, immutable candidate-installer, and restored-old-installer
    paths, release IDs, and SHA-256 pins required by `InstallObserveAndDrain`,
    plus these exact action-only inputs:
@@ -141,8 +146,10 @@ repair mode and cannot create, update, or delete Azure resources.
    candidate installer's dedicated `InstallFromDisabledNoStop` action in
    `Observe` without `-Start`. That action is valid only inside this transition's
    quarantine wrapper: it requires a managed `Disabled` task, rechecks that state
-   immediately before replacement, and has no reachable stop, start, unregister,
-   or automatic-rollback path. If replacement or readback fails, the installer
+   immediately before replacement, authenticates both exports and the rollback
+   backup against the driver's exact post-disable UTF-8 XML digest, and has no
+   reachable stop, start, unregister, or automatic-rollback path. If replacement
+   or readback fails, the installer
    deliberately leaves recovery to the outer quarantine, which disables the
    authenticated survivor and waits for any active instance to finish naturally.
    The driver then obtains a separate `Ready`/result-`0` status readback, verifies
@@ -255,13 +262,19 @@ repair mode and cannot create, update, or delete Azure resources.
     authentication leaves the surviving exact candidate or restored task
     disabled; a `Running` or `Queued` candidate is quarantined and never
     stopped, restored over, or treated as rollback-ready.
-13. Require one causally fresh natural 15-minute poll from the restored task,
-    then run the outer runbook manually. The Automation job must be new, bind
+13. For an ordinary rollback rehearsal to a known-good restored task, require
+    one causally fresh natural 15-minute poll, then run the outer runbook
+    manually. The Automation job must be new, bind
     the exact runbook and six parameters, finish `Completed`, and contain exactly
     one terminal outer JSON record. Require the guest task `Ready`, result `0`,
     an advanced `LastRunTime`, and zero board delta. `-Start` returning, a
     Managed Run Command success state, or an outer `PASS` without those causal
-    read-backs is not completion proof.
+    read-backs is not completion proof. Skip this natural-poll step after the
+    documented `BOARD_HEADER_INVALID` incident transition: the escrowed release
+    is the known failing worker. Instead, while both schedules remain disabled,
+    require more than 240 seconds of natural-trigger margin after `RestoreReady`
+    and immediately continue with step 14. Do not start the restored worker or
+    run the outer supervisor against it.
 14. Run `InstallObserveAndDrain`. It first proves the restored enabled task and
     escrow, disables it and proves that only the Enabled state changed, installs
     the same immutable candidate in Observe without `-Start`, validates the

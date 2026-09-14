@@ -434,10 +434,30 @@ try {
     # before registration, and deliberately has no automatic rollback path.
     $script:NoStopPreflightCalls = 0
     $script:NoStopMutations = New-Object System.Collections.Generic.List[string]
+    $script:NoStopAuthenticatedXml = '<Task><Settings><Enabled>false</Enabled></Settings></Task>'
+    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $script:NoStopAuthenticatedXml
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     function Assert-InstallPreflight { $script:NoStopPreflightCalls++ }
     function Test-Managed { param($Task) return $Task -and [bool]$Task.managed }
     function New-ExpectedDefinition { return [pscustomobject]@{ definition = 'candidate' } }
     function Save-PreviousTask { param($Existing) $script:NoStopMutations.Add('backup') }
+    function Read-ValidatedRollbackBackup {
+        return [pscustomobject]@{
+            previous_existed = $true
+            xml_sha256 = $script:NoStopBackupSha256
+        }
+    }
+    function Export-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+        $script:NoStopExportCalls++
+        if ($script:NoStopExportCalls -eq 2 -and
+            -not [string]::IsNullOrEmpty($script:NoStopSecondExportXml)) {
+            return $script:NoStopSecondExportXml
+        }
+        return $script:NoStopAuthenticatedXml
+    }
     function Register-ScheduledTask {
         [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $InputObject, [switch]$Force)
         $script:NoStopMutations.Add('register')
@@ -473,6 +493,15 @@ try {
     ) $startError
 
     $Start = $false
+    $ExpectedCurrentTaskXmlSha256 = 'not-a-digest'
+    $script:NoStopPreflightCalls = 0
+    $digestInputError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects a noncanonical expected XML digest before preflight' (
+        $digestInputError -ceq 'disabled_no_stop_expected_xml_sha256_invalid' -and
+        $script:NoStopPreflightCalls -eq 0
+    ) $digestInputError
+    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $script:NoStopAuthenticatedXml
+
     foreach ($initialCase in @(
         [pscustomobject]@{ name = 'missing'; task = $null; expected = 'disabled_no_stop_requires_existing_task' },
         [pscustomobject]@{ name = 'unmanaged'; task = [pscustomobject]@{ managed = $false; State = 'Disabled' }; expected = 'refusing_to_overwrite_unmanaged_task' },
@@ -487,6 +516,9 @@ try {
         $script:NoStopPreflightCalls = 0
         $script:NoStopRegisterFailure = ''
         $script:NoStopDefinitionDrift = $false
+        $script:NoStopExportCalls = 0
+        $script:NoStopSecondExportXml = ''
+        $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
         $initialError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
         Assert-True ('disabled no-stop action rejects initial ' + $initialCase.name + ' before mutation') (
             $initialError -ceq [string]$initialCase.expected -and
@@ -494,6 +526,20 @@ try {
             $script:NoStopMutations.Count -eq 0
         ) ($initialError + '; ' + ($script:NoStopMutations -join ','))
     }
+
+    $script:NoStopCurrentTask = [pscustomobject]@{ managed = $true; State = 'Disabled' }
+    function Get-RootTask { return $script:NoStopCurrentTask }
+    $script:NoStopMutations.Clear()
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
+    $ExpectedCurrentTaskXmlSha256 = ('0' * 64)
+    $initialXmlMismatch = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects wrong caller XML identity before backup or registration' (
+        $initialXmlMismatch -ceq 'disabled_no_stop_task_xml_mismatch' -and
+        $script:NoStopMutations.Count -eq 0
+    ) ($initialXmlMismatch + '; ' + ($script:NoStopMutations -join ','))
+    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $script:NoStopAuthenticatedXml
 
     $script:NoStopReadCount = 0
     function Get-RootTask {
@@ -506,6 +552,9 @@ try {
     $script:NoStopMutations.Clear()
     $script:NoStopRegisterFailure = ''
     $script:NoStopDefinitionDrift = $false
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     $preRegisterRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
     Assert-True 'disabled no-stop action refuses a pre-register Running race without stop or register' (
         $preRegisterRaceError -ceq 'disabled_no_stop_task_changed_before_register' -and
@@ -514,7 +563,31 @@ try {
 
     function Get-RootTask { return [pscustomobject]@{ managed = $true; State = 'Disabled' } }
     $script:NoStopMutations.Clear()
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = '<Task><Settings><Enabled>false</Enabled></Settings><RegistrationInfo><Description>concurrent</Description></RegistrationInfo></Task>'
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
+    $definitionRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects a managed Disabled definition replacement before registration' (
+        $definitionRaceError -ceq 'disabled_no_stop_task_changed_before_register' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup'
+    ) ($definitionRaceError + '; ' + ($script:NoStopMutations -join ','))
+
+    $script:NoStopMutations.Clear()
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = ('0' * 64)
+    $backupIdentityError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects a backup not bound to the caller XML before registration' (
+        $backupIdentityError -ceq 'disabled_no_stop_backup_identity_mismatch' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup'
+    ) ($backupIdentityError + '; ' + ($script:NoStopMutations -join ','))
+
+    function Get-RootTask { return [pscustomobject]@{ managed = $true; State = 'Disabled' } }
+    $script:NoStopMutations.Clear()
     $script:NoStopRegisterFailure = 'register_race_failure'
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     $registerRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
     Assert-True 'disabled no-stop registration failure never stops or auto-restores' (
         $registerRaceError -ceq 'register_race_failure' -and
@@ -532,6 +605,9 @@ try {
     $script:NoStopMutations.Clear()
     $script:NoStopRegisterFailure = ''
     $script:NoStopDefinitionDrift = $true
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     $postRegisterRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
     Assert-True 'disabled no-stop readback failure leaves quarantine to the driver without stop or restore' (
         $postRegisterRaceError -ceq 'task_readback_drift:definition_drift' -and
@@ -549,6 +625,9 @@ try {
     $script:NoStopMutations.Clear()
     $script:NoStopDefinitionDrift = $false
     $script:NoStopStatus = 'RUNNING'
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     $runningNoStopResult = Invoke-InstallFromDisabledNoStopAction
     Assert-True 'disabled no-stop action reports a matching post-register Running race without stop or restore' (
         [string]$runningNoStopResult.status -ceq 'RUNNING' -and
@@ -566,6 +645,9 @@ try {
     $script:NoStopMutations.Clear()
     $script:NoStopDefinitionDrift = $false
     $script:NoStopStatus = 'READY'
+    $script:NoStopExportCalls = 0
+    $script:NoStopSecondExportXml = ''
+    $script:NoStopBackupSha256 = $ExpectedCurrentTaskXmlSha256
     $noStopResult = Invoke-InstallFromDisabledNoStopAction
     Assert-True 'disabled no-stop action backs up and force-registers exactly once on success' (
         [string]$noStopResult.status -ceq 'READY' -and

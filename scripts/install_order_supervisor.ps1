@@ -19,6 +19,7 @@ param(
     [string]$LogPath,
     [ValidateRange(30, 840)][int]$WallTimeoutSeconds = 720,
     [string]$ClaudeCommand = 'claude',
+    [string]$ExpectedCurrentTaskXmlSha256 = '',
     [switch]$Start
 )
 
@@ -33,6 +34,10 @@ $Action = switch ($Action.ToLowerInvariant()) {
 }
 $Mode = if ($Mode -ieq 'Execute') { 'Execute' } else { 'Observe' }
 $IsInstallAction = @('Install', 'InstallFromDisabledNoStop') -ccontains $Action
+if ($Action -cne 'InstallFromDisabledNoStop' -and
+    -not [string]::IsNullOrEmpty($ExpectedCurrentTaskXmlSha256)) {
+    throw 'expected_current_task_xml_sha256_action_mismatch'
+}
 
 $TaskName = 'SFDC24 Blackboard Order Worker'
 $TaskPath = '\'
@@ -757,23 +762,48 @@ function Invoke-InstallFromDisabledNoStopAction {
     # final child-side read. The outer cutover driver owns quarantine on failure.
     if ($Mode -cne 'Observe') { throw 'disabled_no_stop_requires_observe' }
     if ($Start) { throw 'disabled_no_stop_forbids_start' }
+    if ($ExpectedCurrentTaskXmlSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'disabled_no_stop_expected_xml_sha256_invalid'
+    }
 
     Assert-InstallPreflight
     $existing = Get-RootTask
     if (-not $existing) { throw 'disabled_no_stop_requires_existing_task' }
     if (-not (Test-Managed $existing)) { throw 'refusing_to_overwrite_unmanaged_task' }
     if ([string]$existing.State -cne 'Disabled') { throw 'disabled_no_stop_requires_disabled_task' }
+    try {
+        $authenticatedXml = Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    } catch {
+        throw 'disabled_no_stop_task_xml_export_failed'
+    }
+    if ((Get-Sha256 -Text ([string]$authenticatedXml)) -cne $ExpectedCurrentTaskXmlSha256) {
+        throw 'disabled_no_stop_task_xml_mismatch'
+    }
 
     $expected = New-ExpectedDefinition
     Save-PreviousTask -Existing $existing
+    $backup = Read-ValidatedRollbackBackup
+    if (-not [bool]$backup.previous_existed -or
+        [string]$backup.xml_sha256 -cne $ExpectedCurrentTaskXmlSha256) {
+        throw 'disabled_no_stop_backup_identity_mismatch'
+    }
 
     # Save-PreviousTask performs filesystem I/O, so re-read immediately before
-    # registration. This narrows the race; structural absence of a stop path is
+    # registration and bind the exported definition to the caller-authenticated
+    # digest again. This narrows the race; structural absence of a stop path is
     # what keeps the no-stop guarantee valid across the remaining TOCTOU window.
     $current = Get-RootTask
     if (-not $current) { throw 'disabled_no_stop_task_changed_before_register' }
     if (-not (Test-Managed $current)) { throw 'disabled_no_stop_task_changed_before_register' }
     if ([string]$current.State -cne 'Disabled') { throw 'disabled_no_stop_task_changed_before_register' }
+    try {
+        $currentXml = Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+    } catch {
+        throw 'disabled_no_stop_task_changed_before_register'
+    }
+    if ((Get-Sha256 -Text ([string]$currentXml)) -cne $ExpectedCurrentTaskXmlSha256) {
+        throw 'disabled_no_stop_task_changed_before_register'
+    }
 
     Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -InputObject $expected -Force -ErrorAction Stop | Out-Null
     $registered = Get-RootTask

@@ -334,6 +334,7 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentInstallPath = ''
     $script:IncidentInstallAction = ''
     $script:IncidentInstallMode = ''
+    $script:IncidentExpectedCurrentTaskXmlSha256 = ''
     $script:IncidentDrainInstaller = ''
     $script:IncidentBackupUtf8Sha256 = ''
     $script:IncidentBackupUtf16LeBomSha256 = ''
@@ -809,10 +810,17 @@ try {
     Assert-True 'candidate and restored installer children recheck their distinct pins' (
         [bool]$candidateChild.ok -and [bool]$restoredChild.ok
     )
-    $noStopChild = Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction InstallFromDisabledNoStop -RequestedMode Observe
+    $noStopExpectedXmlSha256 = ('a' * 64)
+    $noStopChild = Invoke-CutoverInstaller `
+        -Context $installerContext `
+        -ScriptPath $installerPath `
+        -RequestedAction InstallFromDisabledNoStop `
+        -RequestedMode Observe `
+        -ExpectedCurrentTaskXmlSha256 $noStopExpectedXmlSha256
     Assert-True 'incident installer child receives the dedicated no-stop action and install timeout' (
         [bool]$noStopChild.ok -and
         ($script:ChildArguments -join '|').Contains('-Action|InstallFromDisabledNoStop|-Mode|Observe') -and
+        ($script:ChildArguments -join '|').Contains('-ExpectedCurrentTaskXmlSha256|' + $noStopExpectedXmlSha256) -and
         $script:ChildTimeout -eq 180
     ) (($script:ChildArguments -join '|') + '; timeout=' + $script:ChildTimeout)
     [IO.File]::WriteAllBytes($installerPath, [Text.Encoding]::UTF8.GetBytes('changed-installer'))
@@ -1725,11 +1733,12 @@ try {
     }
     Set-TestMock 'Disable-CutoverTask' { $script:IncidentDisableCalls++ }
     Set-TestMock 'Invoke-CutoverInstaller' {
-        param($Context, $ScriptPath, $RequestedAction, $RequestedMode)
+        param($Context, $ScriptPath, $RequestedAction, $RequestedMode, $ExpectedCurrentTaskXmlSha256)
         $script:IncidentInstallCalls++
         $script:IncidentInstallPath = $ScriptPath
         $script:IncidentInstallAction = $RequestedAction
         $script:IncidentInstallMode = $RequestedMode
+        $script:IncidentExpectedCurrentTaskXmlSha256 = $ExpectedCurrentTaskXmlSha256
         if ($script:IncidentInstallFailureCode) { Throw-Cutover -Code $script:IncidentInstallFailureCode }
         $script:IncidentCandidateInstalled = $true
         [pscustomobject]@{ status = $script:IncidentInstallReceiptStatus }
@@ -1807,6 +1816,7 @@ try {
         $script:IncidentInstallPath -ceq $incidentContext.installer_path -and
         $script:IncidentInstallAction -ceq 'InstallFromDisabledNoStop' -and
         $script:IncidentInstallMode -ceq 'Observe' -and
+        $script:IncidentExpectedCurrentTaskXmlSha256 -ceq $expectedDisabledXml.utf8_text_sha256 -and
         $script:IncidentDrainInstaller -ceq $incidentContext.installer_path -and
         $script:IncidentCandidateInstalled
     )
