@@ -1,0 +1,36 @@
+### short sources
+87	vmic.monitor	PipeWire	float32le 2ch 48000Hz	IDLE
+94	vmic_src	PipeWire	float32le 2ch 48000Hz	IDLE
+164	zspk.monitor	PipeWire	float32le 2ch 48000Hz	RUNNING
+### source-outputs
+Source Output #95
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: n/a
+	Source: 87
+	Sample Specification: float32le 2ch 48000Hz
+	Properties:
+		media.name = "remapped vmic.monitor"
+		node.name = "remap-source"
+
+Source Output #201
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 50
+	Source: 164
+	Sample Specification: s16le 2ch 48000Hz
+	Properties:
+		application.name = "ZOOM VoiceEngine"
+		application.process.binary = "zoom"
+		media.name = "ZOOM VoiceEngine"
+
+Source Output #137
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 126
+	Source: 94
+	Sample Specification: s16le 1ch 48000Hz
+	Properties:
+		application.name = "parec"
+		application.process.binary = "parec"
+		media.name = "Record Stream"

@@ -1,0 +1,82 @@
+name: ORDER fixture comparison (offline)
+
+on:
+  pull_request:
+    paths:
+      - '.gitattributes'
+      - '.github/workflows/order-cross-platform.yml'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/bus.ps1'
+      - 'tests/order_fixture_crosscheck.ps1'
+      - 'tests/order_crossdiff.py'
+      - 'tests/test_order_crossdiff.py'
+      - 'tests/test_order_crosscheck_harness.py'
+      - 'tests/fixtures/order_supervisor_board.json'
+      - 'docs/ORDER-COMPARISON-EVIDENCE.md'
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    name: Fixture and evidence contract on ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows
+            os: windows-latest
+            engine: powershell.exe
+          - platform: Linux
+            os: ubuntu-24.04
+            engine: pwsh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Test differ negative and positive controls
+        run: python tests/test_order_crossdiff.py
+      - name: Test actual harness, runner failures, and artifact publication
+        env:
+          ORDER_TEST_ENGINE: ${{ matrix.engine }}
+        run: python tests/test_order_crosscheck_harness.py
+      - name: Produce Windows 5.1 fixture evidence
+        if: matrix.platform == 'Windows'
+        shell: powershell
+        run: ./tests/order_fixture_crosscheck.ps1 -OutFile fixture-Windows.json
+      - name: Produce Linux fixture evidence
+        if: matrix.platform == 'Linux'
+        shell: pwsh
+        run: ./tests/order_fixture_crosscheck.ps1 -OutFile fixture-Linux.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fixture-${{ matrix.platform }}
+          path: fixture-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  compare:
+    name: Compare Windows 5.1 and Linux 7.5+ fixture evidence
+    needs: fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: fixture-*
+          merge-multiple: true
+          path: evidence
+      - name: Require complete runs and equal decisions, stdout, and state
+        run: python tests/order_crossdiff.py evidence/fixture-Windows.json evidence/fixture-Linux.json

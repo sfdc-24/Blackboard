@@ -14,6 +14,20 @@ $script:TestRoot = Join-Path $script:SystemTemp ('order-escrow-transport-test-' 
 $script:OriginalProgramData = [Environment]::GetEnvironmentVariable('ProgramData', 'Process')
 $script:Junctions = New-Object System.Collections.Generic.List[string]
 
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Same defect as tests/test_order_deployment_wrappers.ps1: the child was composed as
+# (Join-Path $PSHOME 'powershell.exe'), which is wrong on Linux AND wrong under pwsh
+# on Windows, and only worked because this suite was only ever started from Windows
+# PowerShell 5.1. Measured on Linux: dies on the first Start(), 0 assertions reached.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 function Assert-True {
     param([string]$Name, [bool]$Condition, [string]$Detail = '')
 
@@ -72,9 +86,8 @@ function Invoke-TestTransportProcess {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Digest
     )
 
-    $windowsPowerShell = Join-Path $PSHOME 'powershell.exe'
     $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $windowsPowerShell
+    $startInfo.FileName = $script:ResolvedChildShell
     $startInfo.Arguments = @(
         '-NoLogo',
         '-NoProfile',

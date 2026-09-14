@@ -1,20 +1,34 @@
 #!/usr/bin/env bash
 # Smoke-test a RUNNING blackboard-bus. Usage:
 #   BUS_SECRET=... ./smoke-test.sh http://127.0.0.1:8787/
-# Exercises health, auth, doc lifecycle, sheet schema-guard, v2 ledger.
+# Exercises health, auth, doc lifecycle, sheet schema-guard, and fenced v2 ledger.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8787/}"
 : "${BUS_SECRET:?BUS_SECRET must be set in the environment}"
+response_dir="$(mktemp -d /tmp/blackboard-bus-smoke.XXXXXX)"
+response_file="$response_dir/response.json"
+cleanup() {
+  rm -f -- "$response_file"
+  rmdir -- "$response_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 pass=0; fail=0
 say() { printf '  %-55s %s\n' "$1" "$2"; }
-post() { curl -s -o /tmp/bus-out.json -w '%{http_code}' -H 'Content-Type: application/json' -d "$1" "$BASE"; }
+show_response() {
+  python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("fence_token", None); print(json.dumps(d, ensure_ascii=False))' \
+    <"$response_file" 2>/dev/null || printf '%s\n' '<non-JSON response withheld>'
+}
+post() {
+  printf '%s' "$1" | curl -sS -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/json' --data-binary @- "$BASE"
+}
 expect() { # name, want_code, got_code, [grep pattern in body]
   local name="$1" want="$2" got="$3" pat="${4:-}"
-  if [ "$got" = "$want" ] && { [ -z "$pat" ] || grep -q "$pat" /tmp/bus-out.json; }; then
+  if [ "$got" = "$want" ] && { [ -z "$pat" ] || grep -q "$pat" "$response_file"; }; then
     say "$name" "ok"; pass=$((pass+1))
   else
-    say "$name" "FAIL (HTTP $got, wanted $want)"; cat /tmp/bus-out.json; echo; fail=$((fail+1))
+    say "$name" "FAIL (HTTP $got, wanted $want)"; show_response; fail=$((fail+1))
   fi
 }
 
@@ -24,7 +38,7 @@ DOC="smoke doc $TS"
 SHEET="smoke sheet $TS"
 
 echo "== health/auth =="
-code=$(curl -s -o /tmp/bus-out.json -w '%{http_code}' "$BASE")
+code=$(curl -sS -o "$response_file" -w '%{http_code}' "$BASE")
 expect "bare GET health" 200 "$code" '"ok": *true'
 code=$(post '{"action":"time","secret":"wrong"}')
 expect "wrong secret -> real 401" 401 "$code" 'Bad or missing secret'
@@ -59,11 +73,23 @@ LEASE="$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CREATE\",\"actor_tag\":\"vm-cli\",\"assigned_to\":\"ANY\",\"status\":\"OPEN\",\"payload\":\"smoke item\",\"secret\":\"$S\"}")
 expect "CREATE event" 200 "$code" 'payload_bytes'
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CLAIM\",\"actor_tag\":\"gemini\",\"status\":\"CLAIMED\",\"lease_until\":\"$LEASE\",\"payload\":\"claiming\",\"secret\":\"$S\"}")
-expect "CLAIM with lease" 200 "$code"
+expect "CLAIM returns private fence" 200 "$code" '"fence_token"'
+FENCE="$(python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("claim_generation") == 1; print(d["fence_token"])' <"$response_file")"
 code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"CLAIM\",\"actor_tag\":\"vm-cli\",\"status\":\"CLAIMED\",\"lease_until\":\"$LEASE\",\"payload\":\"stealing\",\"secret\":\"$S\"}")
 expect "conflicting CLAIM -> 409" 409 "$code" 'holder'
 code=$(post "{\"action\":\"inbox\",\"tag\":\"gemini\",\"secret\":\"$S\"}")
 expect "inbox shows claimant's item" 200 "$code" "$W"
+if grep -q 'fence_token' "$response_file"; then
+  say "inbox redacts private fence" "FAIL"; fail=$((fail+1))
+else
+  say "inbox redacts private fence" "ok"; pass=$((pass+1))
+fi
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"secret\":\"$S\"}")
+expect "COMPLETE without fence -> 409" 409 "$code" 'fence_token'
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"fence_token\":\"$FENCE\",\"secret\":\"$S\"}")
+expect "fenced COMPLETE" 200 "$code" '"claim_generation"'
+code=$(post "{\"action\":\"event\",\"work_id\":\"$W\",\"event_type\":\"COMPLETE\",\"actor_tag\":\"gemini\",\"status\":\"DONE\",\"payload\":\"smoke result\",\"fence_token\":\"$FENCE\",\"secret\":\"$S\"}")
+expect "exact fenced COMPLETE replay" 200 "$code" '"replayed": *true'
 
 echo
 echo "$pass passed, $fail failed"

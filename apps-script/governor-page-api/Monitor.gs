@@ -48,7 +48,7 @@ var MON_EMAIL_KEY   = 'MONITOR_EMAIL';
 var MON_SILENCE_HOURS      = 6;
 var MON_MAX_EMAILS_PER_DAY = 12;
 var MON_FAIL_STRIKES       = 2;    // consecutive bad checks before a state flips
-var MON_SITE_MARKER        = 'first piece of work looks like';
+var MON_SITE_MARKER        = '<link rel="canonical" href="https://www.sfdc24.com/">';
 
 var MON_NL = String.fromCharCode(10);
 

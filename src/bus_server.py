@@ -19,10 +19,11 @@ deployable on any Ubuntu VM (target: Google Cloud). Two API surfaces:
                      transitional client parity)
 
   v2 ledger      the LEDGER SCHEMA v1 event ledger (PROPOSED, not yet
-                 ratified - shipping it does not adopt it): actions
-                 event / inbox / work with the documented rejection
-                 rules, closed vocabularies, lease arithmetic, and 409
-                 on conflicting claims.
+                  ratified - shipping it does not adopt it): actions
+                  event / inbox / work with the documented rejection
+                  rules, closed vocabularies, lease arithmetic, 409 on
+                  conflicting claims, and a server-issued fence token for
+                  every claimant-scoped transition after CLAIM.
 
 Secrets come ONLY from the environment (BUS_SECRET, optional
 BUS_PREVIOUS_SECRET during rotation windows) per fleet rule D-18. The
@@ -34,6 +35,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -43,7 +45,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 SERVICE = "sfdc24-blackboard-bus"
 
 # ---- closed vocabularies (LEDGER SCHEMA v1, sections 1 and 5) ----
@@ -52,6 +54,25 @@ EVENT_TYPES = {"CREATE", "CLAIM", "PROGRESS", "BLOCK", "RELEASE",
 STATUSES = {"OPEN", "CLAIMED", "RUNNING", "BLOCKED", "REVIEW", "DONE", "CANCELLED"}
 PROJECTS = {"Blackboard", "Zoom Agent", "X-Ray", "Access Haiti", "Akatia", "Sales"}
 MAX_LEASE_HOURS = 4
+# NOTE/FINDING are observations: their caller-supplied status, assignment, and
+# lease are stored as evidence but never reduce the work item's effective state.
+# Every actual post-CLAIM transition is fenced. CANCEL is operator-authored, so
+# it needs the current token but (unlike claimant events) need not use the
+# claimant's actor tag.
+OBSERVATION_EVENT_TYPES = {"NOTE", "FINDING"}
+CLAIMANT_EVENT_TYPES = {"PROGRESS", "BLOCK", "RELEASE", "COMPLETE"}
+FENCED_EVENT_TYPES = CLAIMANT_EVENT_TYPES | {"CANCEL"}
+# These transitions have one lifecycle meaning. Accepting a contradictory
+# caller-supplied status (for example RELEASE+RUNNING) would make the event look
+# terminal to a human while leaving the old lease and fence active in the state
+# reducer. Reject the contradiction instead of trying to guess intent.
+CANONICAL_TRANSITION_STATUS = {
+    "CLAIM": "CLAIMED",
+    "BLOCK": "BLOCKED",
+    "RELEASE": "OPEN",
+    "COMPLETE": "DONE",
+    "CANCEL": "CANCELLED",
+}
 
 ISO_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
 HUMAN_DATE = re.compile(
@@ -68,7 +89,9 @@ def now_iso():
 
 def parse_iso(value):
     """Parse an ISO-8601 timestamp to an aware UTC datetime, or None if it
-    does not actually parse (the regex alone accepts impossible offsets)."""
+    does not actually parse. The offset bound mirrors SQLite julianday(),
+    which the durable database fence also uses; accepting a wider Python-only
+    form would issue a claim that the storage boundary could never authorize."""
     if not isinstance(value, str) or not ISO_TS.match(value):
         return None
     try:
@@ -77,6 +100,9 @@ def parse_iso(value):
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    offset = dt.utcoffset()
+    if offset is None or abs(offset) >= timedelta(hours=15):
+        return None
     return dt.astimezone(timezone.utc)
 
 
@@ -125,10 +151,198 @@ CREATE TABLE IF NOT EXISTS events (
   evidence_ref   TEXT,
   parent_work_id TEXT,
   project        TEXT,
-  schema_v       INTEGER NOT NULL DEFAULT 1
+  schema_v       INTEGER NOT NULL DEFAULT 1,
+  claim_generation INTEGER CHECK (claim_generation IS NULL OR claim_generation > 0),
+  fence_token    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_work ON events (work_id, seq);
 """
+
+
+def migrate_schema(conn):
+    """Apply additive SQLite migrations once, safely across processes.
+
+    CREATE TABLE IF NOT EXISTS does not add columns to an existing database.
+    The immediate transaction makes the inspect/ALTER sequence atomic when two
+    freshly upgraded server processes open the same legacy DB together. Legacy
+    rows remain NULL and value-for-value otherwise untouched; the first new CLAIM
+    is the explicit boundary at which that work item becomes fail-closed.
+    """
+    required_columns = {"claim_generation", "fence_token"}
+    required_indexes = {"idx_events_claim_fence", "idx_events_claim_generation"}
+    required_triggers = {"trg_events_claim_fence_v2", "trg_events_scoped_fence_v2",
+                         "trg_events_transition_status_v1", "trg_events_lease_horizon_v1"}
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(events)")}
+    triggers = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+    if (required_columns.issubset(columns) and required_indexes.issubset(indexes)
+            and required_triggers.issubset(triggers)
+            and not {"trg_events_claim_fence_v1",
+                     "trg_events_scoped_fence_v1"}.intersection(triggers)):
+        # Every ThreadingHTTPServer request may establish a fresh thread-local
+        # connection. Once the eager Store initialization has migrated the DB,
+        # ordinary reads must not reserve the singleton SQLite writer merely to
+        # rediscover that fact.
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read after acquiring the cross-process writer reservation: another
+        # freshly upgraded process may have completed the migration while this
+        # connection was waiting.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        if "claim_generation" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN claim_generation INTEGER "
+                         "CHECK (claim_generation IS NULL OR claim_generation > 0)")
+        if "fence_token" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN fence_token TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_claim_fence "
+            "ON events (fence_token) WHERE event_type = 'CLAIM' AND fence_token IS NOT NULL")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_claim_generation "
+            "ON events (work_id, claim_generation) "
+            "WHERE event_type = 'CLAIM' AND claim_generation IS NOT NULL")
+        # These triggers make the boundary durable even if an old server binary
+        # is accidentally left pointed at the migrated DB. That binary omits
+        # the new columns; after the first fenced CLAIM its NULL writes abort at
+        # the database boundary rather than bypassing the new application code.
+        conn.execute("DROP TRIGGER IF EXISTS trg_events_claim_fence_v1")
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_claim_fence_v2
+            BEFORE INSERT ON events
+            WHEN NEW.event_type = 'CLAIM' AND (
+              (NEW.claim_generation IS NULL AND NEW.fence_token IS NULL AND EXISTS (
+                SELECT 1 FROM events
+                WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                  AND fence_token IS NOT NULL
+              ))
+              OR (NEW.claim_generation IS NULL AND NEW.fence_token IS NOT NULL)
+              OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NULL)
+              OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NOT NULL
+                  AND NEW.status <> 'CLAIMED')
+              OR (NEW.claim_generation IS NOT NULL AND NEW.fence_token IS NOT NULL AND (
+                NEW.claim_generation <> (
+                  SELECT COALESCE(MAX(claim_generation), 0) + 1 FROM events
+                  WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                )
+              ))
+            )
+            BEGIN
+              SELECT RAISE(ABORT, 'claim fence invariant');
+            END
+        """)
+        # v1 passed API-accepted offsets such as +0000 to SQLite's julianday(),
+        # which accepts +00:00 but returns NULL for the compact form. Remove it
+        # during upgrade so a legitimate fenced transition cannot be rejected by
+        # both the corrected and obsolete trigger definitions.
+        conn.execute("DROP TRIGGER IF EXISTS trg_events_scoped_fence_v1")
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_scoped_fence_v2
+            BEFORE INSERT ON events
+            WHEN NEW.event_type IN ('PROGRESS', 'BLOCK', 'RELEASE', 'COMPLETE', 'CANCEL')
+              AND NOT (
+                (NEW.claim_generation IS NULL AND NEW.fence_token IS NULL AND NOT EXISTS (
+                  SELECT 1 FROM events
+                  WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                    AND fence_token IS NOT NULL
+                ))
+                OR EXISTS (
+                  SELECT 1 FROM events current_claim
+                  WHERE current_claim.work_id = NEW.work_id
+                    AND current_claim.event_type = 'CLAIM'
+                    AND current_claim.seq = (
+                      SELECT MAX(seq) FROM events
+                      WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                    )
+                    AND current_claim.claim_generation IS NOT NULL
+                    AND current_claim.fence_token IS NOT NULL
+                    AND NEW.claim_generation = current_claim.claim_generation
+                    AND NEW.fence_token = current_claim.fence_token
+                    AND (NEW.event_type = 'CANCEL' OR NEW.actor_tag = current_claim.actor_tag)
+                    AND EXISTS (
+                      SELECT 1 FROM events current_state
+                      WHERE current_state.work_id = NEW.work_id
+                        AND current_state.event_type NOT IN ('NOTE', 'FINDING')
+                        AND current_state.seq = (
+                          SELECT MAX(seq) FROM events
+                          WHERE work_id = NEW.work_id
+                            AND event_type NOT IN ('NOTE', 'FINDING')
+                        )
+                        AND current_state.status IN ('CLAIMED', 'RUNNING')
+                    )
+                    AND julianday((
+                      SELECT CASE
+                        WHEN lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                        THEN substr(lease_until, 1, length(lease_until) - 2)
+                             || ':' || substr(lease_until, -2)
+                        ELSE lease_until
+                      END
+                      FROM events
+                      WHERE work_id = NEW.work_id AND lease_until IS NOT NULL
+                        AND event_type NOT IN ('NOTE', 'FINDING')
+                      ORDER BY seq DESC LIMIT 1
+                    )) > julianday('now')
+                )
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'claim-scoped fence mismatch');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_transition_status_v1
+            BEFORE INSERT ON events
+            WHEN NEW.event_type IN ('BLOCK', 'RELEASE', 'COMPLETE', 'CANCEL')
+              AND EXISTS (
+                SELECT 1 FROM events
+                WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                  AND fence_token IS NOT NULL
+              )
+              AND NOT (
+                (NEW.event_type = 'BLOCK' AND NEW.status = 'BLOCKED')
+                OR (NEW.event_type = 'RELEASE' AND NEW.status = 'OPEN')
+                OR (NEW.event_type = 'COMPLETE' AND NEW.status = 'DONE')
+                OR (NEW.event_type = 'CANCEL' AND NEW.status = 'CANCELLED')
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'transition status invariant');
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_events_lease_horizon_v1
+            BEFORE INSERT ON events
+            WHEN NEW.event_type NOT IN ('NOTE', 'FINDING')
+              AND (NEW.fence_token IS NOT NULL OR EXISTS (
+                SELECT 1 FROM events
+                WHERE work_id = NEW.work_id AND event_type = 'CLAIM'
+                  AND fence_token IS NOT NULL
+              ))
+              AND (
+                (NEW.event_type = 'CLAIM' AND NEW.lease_until IS NULL)
+                OR (NEW.lease_until IS NOT NULL AND (
+                  julianday(CASE
+                    WHEN NEW.lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                    THEN substr(NEW.lease_until, 1, length(NEW.lease_until) - 2)
+                         || ':' || substr(NEW.lease_until, -2)
+                    ELSE NEW.lease_until
+                  END) IS NULL
+                  OR julianday(CASE
+                    WHEN NEW.lease_until GLOB '*[+-][0-9][0-9][0-9][0-9]'
+                    THEN substr(NEW.lease_until, 1, length(NEW.lease_until) - 2)
+                         || ':' || substr(NEW.lease_until, -2)
+                    ELSE NEW.lease_until
+                  END) > julianday('now', '+4 hours')
+                ))
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'lease horizon invariant');
+            END
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def db_connect(path):
@@ -137,6 +351,7 @@ def db_connect(path):
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
+    migrate_schema(conn)
     return conn
 
 
@@ -186,25 +401,44 @@ class Store:
                 "header": json.loads(row[5]) if row[5] else None}
 
     def create_file(self, title, kind, header=None):
+        with WRITE_LOCK, self.conn:
+            return self._create_file(title, kind, header)
+
+    def _create_file(self, title, kind, header=None):
+        """Insert a file within the caller's write lock and transaction."""
         if not title or not str(title).strip():
             raise BusError(400, "create requires a non-empty title.")
         if kind not in ("doc", "sheet"):
             raise BusError(400, f"create kind must be 'doc' or 'sheet', got {kind!r}.")
         if kind == "sheet":
-            if not isinstance(header, list) or not header or not all(isinstance(c, str) and c.strip() for c in header):
-                raise BusError(400, "create kind=sheet requires header: a non-empty list of non-empty column names.")
-            if len(header) < 3:
-                raise BusError(400, f"sheet header needs at least 3 columns ({header[0] if header else 'id'}, "
-                                    "timestamp, and content) - got " + str(len(header)) + ".")
+            if not isinstance(header, list) or not header or not all(isinstance(c, str) for c in header):
+                raise BusError(400, "create kind=sheet requires header: a non-empty list of column names.")
+            # Google Sheets returns every row at the width of the sheet's USED range,
+            # not at the width of its named columns. "Blackboard - Alpha DB" has been
+            # widened past its ten names, so the live board answers A:L - ten names
+            # then two empty padding cells, on all 1883 rows. Requiring every column
+            # name to be non-empty made the real board unimportable, which is the same
+            # intolerance that took the ORDER worker down with board_header_invalid.
+            # Tolerate padding on the same terms PR46 settled for that worker: only as
+            # a TRAILING run. A blank column with named columns after it is a hole, and
+            # a padding cell carrying content is a schema change - both still fail.
+            named = len(header)
+            while named and not header[named - 1].strip():
+                named -= 1
+            if not all(c.strip() for c in header[:named]):
+                raise BusError(400, "create kind=sheet requires header: blank column names are allowed "
+                                    "only as trailing padding, not between named columns.")
+            if named < 3:
+                raise BusError(400, f"sheet header needs at least 3 NAMED columns ({header[0] if header else 'id'}, "
+                                    "timestamp, and content) - got " + str(named) + ".")
         fid = str(uuid.uuid4())
         ts = now_iso()
         try:
-            with WRITE_LOCK, self.conn:
-                self.conn.execute(
-                    "INSERT INTO files (file_id, title, kind, created_ts, updated_ts, revision, body, header) "
-                    "VALUES (?,?,?,?,?,1,?,?)",
-                    (fid, title, kind, ts, ts, "" if kind == "doc" else None,
-                     json.dumps(header) if header else None))
+            self.conn.execute(
+                "INSERT INTO files (file_id, title, kind, created_ts, updated_ts, revision, body, header) "
+                "VALUES (?,?,?,?,?,1,?,?)",
+                (fid, title, kind, ts, ts, "" if kind == "doc" else None,
+                 json.dumps(header) if header else None))
         except sqlite3.IntegrityError:
             raise BusError(409, f"A file titled {title!r} already exists.")
         return {"fileId": fid, "title": title, "kind": kind}
@@ -280,28 +514,61 @@ class Store:
             raise BusError(400, f"{f['title']!r} is a sheet; append needs sheetRow, not text (REQ-C4NDX7).")
         header = f["header"]
         hl = len(header)
+        # Count the NAMED columns, not the wire width.
+        #
+        # create_file accepts a header whose trailing blanks are used-range
+        # padding, so on a sheet imported from the live board len(header) is 12
+        # while the schema is 10 columns wide. Reasoning about the wire width
+        # made a TEN-CELL FULL ROW - what every fleet client sends - look like
+        # eight content cells, so the server prepended its own Row_ID and
+        # Timestamp and shifted every field two columns left. HTTP 200, no
+        # error, Row_ID in Source_Tag and Timestamp in Target_Surface.
+        #
+        # That is REQ-B4TQX9: the exact defect the checks below exist to
+        # prevent, reintroduced by the padding fix on the padded path. Found by
+        # codex-oversight-01a06e94 and relayed by vm-claude-code-cli on PR52,
+        # and reproduced here over HTTP before it was believed.
+        named = hl
+        while named and not str(header[named - 1]).strip():
+            named -= 1
+        pad = hl - named
         cells = ["" if c is None else str(c) for c in sheet_row]
-        if len(cells) == hl - 2:
+        # A client that read a padded row and sent it straight back carries the
+        # padding with it. Accept that, but only when the padding is EMPTY - a
+        # padding cell with content is a schema change, which is the same rule
+        # bcb_lint applies. Without this the two halves of the fix held
+        # different rules and a row bcb_lint called malformed was persisted here.
+        if len(cells) == hl and pad:
+            if any(c.strip() for c in cells[named:]):
+                raise BusError(400, f"sheetRow has content in column {named + 1}, past the {named} named "
+                                    f"columns of {f['title']!r}. Trailing blanks are used-range padding, "
+                                    "not columns to write into.")
+            cells = cells[:named]
+        if len(cells) == named - 2:
             # Server issues Row_ID and Timestamp - the schema-aware fix:
             # clients supply only content cells and columns can never shift.
             row_id = str(uuid.uuid4())
             cells = [row_id, now_iso()] + cells
-        elif len(cells) == hl:
+        elif len(cells) == named:
             c0, c1 = cells[0].strip(), cells[1].strip()
             if not c0:
-                raise BusError(400, f"sheetRow col 0 ({header[0]}) is empty - supply an id or send {hl - 2} content cells.")
+                raise BusError(400, f"sheetRow col 0 ({header[0]}) is empty - supply an id or send {named - 2} content cells.")
             if ISO_TS.match(c0) or HUMAN_DATE.match(c0):
                 raise BusError(400, f"sheetRow col 0 ({header[0]}) looks like a timestamp - this is the "
-                                    f"column-shift defect REQ-B4TQX9; send {hl - 2} content cells and let the "
+                                    f"column-shift defect REQ-B4TQX9; send {named - 2} content cells and let the "
                                     "server issue Row_ID and Timestamp.")
             if not ISO_TS.match(c1):
                 raise BusError(400, f"sheetRow col 1 ({header[1]}) must be ISO-8601, got {c1[:40]!r}.")
             row_id = c0
         else:
-            raise BusError(400, f"sheetRow has {len(cells)} cells; sheet {f['title']!r} needs {hl} "
-                                f"(or {hl - 2} content cells with server-issued {header[0]}/{header[1]}).")
+            raise BusError(400, f"sheetRow has {len(cells)} cells; sheet {f['title']!r} needs {named} "
+                                f"(or {named - 2} content cells with server-issued {header[0]}/{header[1]}).")
         if not any(c.strip() for c in cells[2:]):
             raise BusError(400, "sheetRow content cells are all empty - nothing to write (REQ-V8QD7R).")
+        # Persist at the sheet's wire width so a padded sheet keeps its shape and
+        # a read-back is the same width as every other row on the board.
+        if pad:
+            cells = cells + [""] * pad
         ts = now_iso()
         with WRITE_LOCK, self.conn:
             n = self.conn.execute(
@@ -340,21 +607,47 @@ class Store:
 
     def latest_event(self, work_id):
         cur = self.conn.execute(
-            "SELECT seq, event_type, actor_tag, status, lease_until, assigned_to "
+            "SELECT seq, event_type, actor_tag, status, lease_until, assigned_to, "
+            "claim_generation, fence_token "
             "FROM events WHERE work_id = ? ORDER BY seq DESC LIMIT 1", (work_id,))
         row = cur.fetchone()
         if not row:
             return None
         return {"seq": row[0], "event_type": row[1], "actor_tag": row[2],
-                "status": row[3], "lease_until": row[4], "assigned_to": row[5]}
+                "status": row[3], "lease_until": row[4], "assigned_to": row[5],
+                "claim_generation": row[6], "fence_token": row[7]}
 
-    def work_hold(self, work_id, latest=None):
+    def latest_state_event(self, work_id):
+        """Latest event that is allowed to reduce effective work state."""
+        cur = self.conn.execute(
+            "SELECT seq, event_type, actor_tag, status, lease_until, assigned_to, "
+            "claim_generation, fence_token FROM events WHERE work_id = ? "
+            "AND event_type NOT IN ('NOTE', 'FINDING') ORDER BY seq DESC LIMIT 1",
+            (work_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"seq": row[0], "event_type": row[1], "actor_tag": row[2],
+                "status": row[3], "lease_until": row[4], "assigned_to": row[5],
+                "claim_generation": row[6], "fence_token": row[7]}
+
+    def latest_claim(self, work_id):
+        row = self.conn.execute(
+            "SELECT seq, actor_tag, claim_generation, fence_token FROM events "
+            "WHERE work_id = ? AND event_type = 'CLAIM' ORDER BY seq DESC LIMIT 1",
+            (work_id,)).fetchone()
+        if not row:
+            return None
+        return {"seq": row[0], "actor_tag": row[1],
+                "claim_generation": row[2], "fence_token": row[3]}
+
+    def work_hold(self, work_id, latest=None, at=None):
         """Effective hold on a work item. The latest event alone is not enough:
         a PROGRESS without lease_until, or a NOTE by a non-holder, must not
         erase the hold. Holder = actor of the most recent CLAIM; lease = most
         recent non-null lease_until. A hold exists only while the LATEST
         status is CLAIMED/RUNNING (reduction rule) and the lease is live."""
-        latest = latest or self.latest_event(work_id)
+        latest = latest or self.latest_state_event(work_id)
         if not latest or latest["status"] not in ("CLAIMED", "RUNNING"):
             return None
         got = self.conn.execute(
@@ -363,9 +656,12 @@ class Store:
         holder = got[0] if got else latest["actor_tag"]
         got = self.conn.execute(
             "SELECT lease_until FROM events WHERE work_id = ? AND lease_until IS NOT NULL "
+            "AND event_type NOT IN ('NOTE', 'FINDING') "
             "ORDER BY seq DESC LIMIT 1", (work_id,)).fetchone()
         lease = parse_iso(got[0]) if got else None
-        return {"holder": holder, "lease_until": got[0] if got else None, "lease_dt": lease}
+        if lease is None or lease <= (at or datetime.now(timezone.utc)):
+            return None
+        return {"holder": holder, "lease_until": got[0], "lease_dt": lease}
 
     def add_event(self, body):
         # Rejection rules, LEDGER SCHEMA v1 section 4: fail loudly, never default.
@@ -395,43 +691,186 @@ class Store:
             if val is not None and not isinstance(val, str):
                 raise BusError(400, f"{field} must be a string when present.")
         lease_until = body.get("lease_until")
-        now = datetime.now(timezone.utc)
+        validation_now = datetime.now(timezone.utc)
         if etype == "CLAIM":
+            if status != CANONICAL_TRANSITION_STATUS["CLAIM"]:
+                raise BusError(400, f"CLAIM requires status 'CLAIMED', got {status!r}.")
             lease_dt = parse_iso(lease_until) if isinstance(lease_until, str) else None
             if lease_dt is None:
-                raise BusError(400, "CLAIM with no parseable lease_until (ISO-8601 UTC required).")
-            if lease_dt > now + timedelta(hours=MAX_LEASE_HOURS):
+                raise BusError(400, "CLAIM with no supported parseable lease_until "
+                                    "(use ISO-8601 Z or an offset below 15 hours).")
+            if lease_dt > validation_now + timedelta(hours=MAX_LEASE_HOURS):
                 raise BusError(400, f"lease_until more than {MAX_LEASE_HOURS} hours out.")
-        elif lease_until is not None and parse_iso(str(lease_until)) is None:
-            raise BusError(400, "lease_until must be parseable ISO-8601 UTC when present.")
+        elif lease_until is not None:
+            lease_dt = parse_iso(str(lease_until))
+            if lease_dt is None:
+                raise BusError(400, "lease_until must be supported parseable ISO-8601 when present.")
 
+        fence_token = body.get("fence_token")
+        if fence_token is not None and (not isinstance(fence_token, str) or not fence_token.strip()):
+            raise BusError(400, "fence_token must be a non-empty string when present.")
+        if etype not in FENCED_EVENT_TYPES and etype != "CLAIM" and fence_token is not None:
+            raise BusError(400, "fence_token is accepted only on fenced transition events "
+                               f"{sorted(FENCED_EVENT_TYPES)}.")
+
+        # These are the exact values accepted for storage, without trimming or
+        # conflating NULL and empty strings. schema_v remains fixed at 1;
+        # caller-supplied versions are ignored as before.
+        accepted = (work_id, etype, actor, assigned_to, status, lease_until, payload,
+                    body.get("evidence_ref"), body.get("parent_work_id"), project, 1,
+                    fence_token)
+        # Invalid input never waits for the writer. Valid input reserves the DB
+        # before lookup: WRITE_LOCK alone cannot serialize separate processes.
         with WRITE_LOCK, self.conn:
-            latest = self.latest_event(work_id)
-            if etype == "CREATE":
-                if latest is not None:
-                    raise BusError(409, f"work_id {work_id!r} already exists (latest seq {latest['seq']}).")
-            else:
-                if latest is None:
-                    raise BusError(400, f"work_id {work_id!r} has never been CREATEd.")
-                if etype == "CLAIM":
-                    hold = self.work_hold(work_id, latest)
-                    if hold and hold["holder"] != actor and hold["lease_dt"] and hold["lease_dt"] > now:
+            self.conn.execute("BEGIN IMMEDIATE")
+            # A different process may have held SQLite's writer until a lease
+            # expired. Authorization must use the time after that wait, not the
+            # stale pre-lock validation timestamp.
+            transaction_now = datetime.now(timezone.utc)
+            return self._add_event(accepted, transaction_now)
+
+    def _add_event(self, accepted, now):
+        """Look up or append within the caller's immediate transaction."""
+        (work_id, etype, actor, assigned_to, status, lease_until, payload,
+         evidence_ref, parent_work_id, project, schema_v, supplied_fence) = accepted
+        if etype == "COMPLETE":
+            replay = self.conn.execute(
+                "SELECT event_id, seq, event_ts, claim_generation FROM events WHERE work_id = ? "
+                "AND event_type = ? AND actor_tag = ? AND assigned_to IS ? "
+                "AND status = ? AND lease_until IS ? AND payload = ? "
+                "AND evidence_ref IS ? AND parent_work_id IS ? AND project IS ? "
+                "AND schema_v = ? AND fence_token IS ? ORDER BY seq LIMIT 1", accepted).fetchone()
+            if replay:
+                result = {"event_id": replay[0], "seq": replay[1], "work_id": work_id,
+                          "event_ts": replay[2], "payload_bytes": len(payload.encode("utf-8")),
+                          "replayed": True}
+                if supplied_fence is not None:
+                    result.update({"claim_generation": replay[3], "fence_token": supplied_fence})
+                return result
+
+        # Replay acknowledgement precedes transition authorization: it returns
+        # an already accepted receipt and does not perform a new transition.
+        latest = self.latest_event(work_id)
+        if etype == "CREATE":
+            if latest is not None:
+                raise BusError(409, f"work_id {work_id!r} already exists (latest seq {latest['seq']}).")
+        else:
+            if latest is None:
+                raise BusError(400, f"work_id {work_id!r} has never been CREATEd.")
+            if etype == "CLAIM":
+                hold = self.work_hold(work_id, at=now)
+                claim = self.latest_claim(work_id)
+                if hold:
+                    if hold["holder"] != actor:
                         raise BusError(409, f"work_id {work_id!r} is held by {hold['holder']!r} "
                                             f"until {hold['lease_until']} (live lease).",
                                        extra={"holder": hold["holder"],
                                               "lease_until": hold["lease_until"]})
-            event_id = str(uuid.uuid4())
-            ts = now_iso()
+                    # Once a work item is fenced, a same-actor name is not
+                    # enough to supersede its live process. Only possession of
+                    # that process's private current capability can renew it.
+                    if claim and claim["fence_token"] is not None:
+                        if supplied_fence != claim["fence_token"]:
+                            raise BusError(409, f"work_id {work_id!r} live same-actor CLAIM "
+                                                "requires the current private fence_token.",
+                                           extra={"holder": claim["actor_tag"],
+                                                  "claim_generation": claim["claim_generation"]})
+                    elif supplied_fence is not None:
+                        raise BusError(409, f"work_id {work_id!r} has no server-issued "
+                                            "CLAIM fence_token to renew.")
+                elif supplied_fence is not None:
+                    # An inactive item may always be claimed without a token.
+                    # If a caller elects to carry one, validate it rather than
+                    # silently accepting a foreign/fabricated capability.
+                    if (not claim or claim["fence_token"] is None
+                            or claim["actor_tag"] != actor
+                            or supplied_fence != claim["fence_token"]):
+                        raise BusError(409, f"work_id {work_id!r} CLAIM fence_token is stale, "
+                                            "foreign, or fabricated.",
+                                       extra={"holder": claim["actor_tag"] if claim else None,
+                                              "claim_generation": claim["claim_generation"]
+                                              if claim else None})
+        event_id = str(uuid.uuid4())
+        ts = now_iso()
+        claim_generation = None
+        stored_fence = supplied_fence
+        if etype == "CLAIM":
+            # BEGIN IMMEDIATE above serializes this read/increment/insert across
+            # every process sharing the DB. The counter is per work item and is
+            # durable because CLAIM rows are append-only.
+            claim_generation = self.conn.execute(
+                "SELECT COALESCE(MAX(claim_generation), 0) + 1 FROM events "
+                "WHERE work_id = ? AND event_type = 'CLAIM'", (work_id,)).fetchone()[0]
+            # This capability is deliberately independent of the public event
+            # id. Read APIs expose event ids, but never disclose fence tokens.
+            stored_fence = secrets.token_urlsafe(32)
+        elif etype in FENCED_EVENT_TYPES:
+            claim = self.latest_claim(work_id)
+            if claim and claim["fence_token"] is not None:
+                expected_status = CANONICAL_TRANSITION_STATUS.get(etype)
+                if expected_status is not None and status != expected_status:
+                    raise BusError(400, f"{etype} requires status {expected_status!r}, got {status!r}.")
+                if (lease_until is not None and
+                        parse_iso(str(lease_until)) > now + timedelta(hours=MAX_LEASE_HOURS)):
+                    raise BusError(400, f"state-bearing lease_until more than {MAX_LEASE_HOURS} hours out.")
+                if supplied_fence is None:
+                    raise BusError(409, f"work_id {work_id!r} requires the current CLAIM fence_token.",
+                                   extra={"holder": claim["actor_tag"],
+                                          "claim_generation": claim["claim_generation"]})
+                actor_mismatch = etype in CLAIMANT_EVENT_TYPES and actor != claim["actor_tag"]
+                if supplied_fence != claim["fence_token"] or actor_mismatch:
+                    raise BusError(409, f"work_id {work_id!r} fence_token is stale, foreign, or fabricated.",
+                                   extra={"holder": claim["actor_tag"],
+                                          "claim_generation": claim["claim_generation"]})
+                hold = self.work_hold(work_id, at=now)
+                if not hold or hold["holder"] != claim["actor_tag"]:
+                    raise BusError(409, f"work_id {work_id!r} has no active unexpired CLAIM.",
+                                   extra={"holder": claim["actor_tag"],
+                                          "claim_generation": claim["claim_generation"]})
+                claim_generation = claim["claim_generation"]
+            elif supplied_fence is not None:
+                # No current server-issued fence can authorize this token. This
+                # also catches a cross-work token on a legacy/unclaimed item.
+                raise BusError(409, f"work_id {work_id!r} has no matching server-issued CLAIM fence_token.")
+            elif claim and self.conn.execute(
+                    "SELECT 1 FROM events WHERE work_id = ? AND event_type = 'CLAIM' "
+                    "AND fence_token IS NOT NULL LIMIT 1", (work_id,)).fetchone():
+                # A legacy binary wrote an unfenced CLAIM after this work item
+                # had already crossed the fencing boundary. Do not silently
+                # downgrade it during a mixed-version rollout.
+                raise BusError(409, f"work_id {work_id!r} latest CLAIM is unfenced after fencing was enabled.")
+        try:
             cur = self.conn.execute(
                 "INSERT INTO events (event_id, event_ts, work_id, event_type, actor_tag, assigned_to, "
-                "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                (event_id, ts, work_id, etype, actor, assigned_to, status, lease_until,
-                 payload, body.get("evidence_ref"), body.get("parent_work_id"), project))
-            seq = cur.lastrowid
+                "status, lease_until, payload, evidence_ref, parent_work_id, project, schema_v, "
+                "claim_generation, fence_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, ts, work_id, etype, actor, assigned_to, status, lease_until, payload,
+                 evidence_ref, parent_work_id, project, schema_v, claim_generation, stored_fence))
+        except sqlite3.IntegrityError as error:
+            # SQLite evaluates julianday('now') at the insert boundary. A lease
+            # can expire in the few instructions after the Python authorization
+            # check; report that expected fence loss as 409, never an opaque 500.
+            message = str(error)
+            if "claim-scoped fence mismatch" in message and etype in FENCED_EVENT_TYPES:
+                claim = self.latest_claim(work_id)
+                raise BusError(409, f"work_id {work_id!r} has no active unexpired CLAIM.",
+                               extra={"holder": claim["actor_tag"] if claim else None,
+                                      "claim_generation": claim["claim_generation"]
+                                      if claim else None})
+            if "transition status invariant" in message:
+                expected_status = CANONICAL_TRANSITION_STATUS.get(etype)
+                raise BusError(400, f"{etype} requires status {expected_status!r}, got {status!r}.")
+            if "lease horizon invariant" in message:
+                raise BusError(400, f"state-bearing lease_until must be parseable and no more than "
+                                    f"{MAX_LEASE_HOURS} hours out.")
+            raise
+        seq = cur.lastrowid
         # Success response echoes what was actually stored (LEDGER section 4).
-        return {"event_id": event_id, "seq": seq, "work_id": work_id,
-                "event_ts": ts, "payload_bytes": len(payload.encode("utf-8"))}
+        result = {"event_id": event_id, "seq": seq, "work_id": work_id,
+                  "event_ts": ts, "payload_bytes": len(payload.encode("utf-8"))}
+        if stored_fence is not None:
+            result.update({"claim_generation": claim_generation, "fence_token": stored_fence})
+        return result
 
     def inbox(self, tag):
         """The wake query, LEDGER SCHEMA v1 section 2: for each work_id whose
@@ -441,18 +880,21 @@ class Store:
             raise BusError(400, "inbox requires tag.")
         cur = self.conn.execute(
             "SELECT e.seq, e.event_id, e.event_ts, e.work_id, e.event_type, e.actor_tag, "
-            "e.assigned_to, e.status, e.lease_until, e.payload, e.project "
-            "FROM events e JOIN (SELECT work_id, MAX(seq) AS mseq FROM events GROUP BY work_id) m "
+            "e.assigned_to, e.status, e.lease_until, e.payload, e.project, "
+            "e.claim_generation "
+            "FROM events e JOIN (SELECT work_id, MAX(seq) AS mseq FROM events "
+            "WHERE event_type NOT IN ('NOTE', 'FINDING') GROUP BY work_id) m "
             "ON e.work_id = m.work_id AND e.seq = m.mseq ORDER BY e.seq")
         out = []
         for r in cur:
             (seq, event_id, event_ts, work_id, etype, actor, assigned_to,
-             status, lease_until, payload, project) = r
+             status, lease_until, payload, project, claim_generation) = r
             if assigned_to is None:
                 # assignment carries forward from the last event that set it
                 # (CLAIM/PROGRESS etc. need not repeat assigned_to)
                 got = self.conn.execute(
                     "SELECT assigned_to FROM events WHERE work_id = ? AND assigned_to IS NOT NULL "
+                    "AND event_type NOT IN ('NOTE', 'FINDING') "
                     "ORDER BY seq DESC LIMIT 1", (work_id,)).fetchone()
                 assigned_to = got[0] if got else None
             if assigned_to not in (tag, "ALL", "ANY"):
@@ -471,17 +913,20 @@ class Store:
             out.append({"seq": seq, "event_id": event_id, "event_ts": event_ts,
                         "work_id": work_id, "event_type": etype, "actor_tag": actor,
                         "assigned_to": assigned_to, "status": status,
-                        "lease_until": lease_until, "payload": payload, "project": project})
+                        "lease_until": lease_until, "payload": payload, "project": project,
+                        "claim_generation": claim_generation})
         return out
 
     def work_history(self, work_id):
         cur = self.conn.execute(
             "SELECT seq, event_id, event_ts, event_type, actor_tag, assigned_to, status, "
-            "lease_until, payload, evidence_ref, parent_work_id, project "
+            "lease_until, payload, evidence_ref, parent_work_id, project, "
+            "claim_generation "
             "FROM events WHERE work_id = ? ORDER BY seq", (work_id,))
         rows = [dict(zip(["seq", "event_id", "event_ts", "event_type", "actor_tag",
                           "assigned_to", "status", "lease_until", "payload",
-                          "evidence_ref", "parent_work_id", "project"], r)) for r in cur]
+                          "evidence_ref", "parent_work_id", "project",
+                          "claim_generation"], r)) for r in cur]
         if not rows:
             raise BusError(404, f"work_id {work_id!r} has no events.")
         return rows
@@ -626,17 +1071,21 @@ def _import_rows(store, title, rows):
         sys.exit(f"A file titled {title!r} already exists - refusing to double-import.")
     except BusError:
         pass
-    store.create_file(title, "sheet", header)
-    f = store.get_file(title=title)
     ts = now_iso()
+    # The destination and its history are one commit. A failed import must not
+    # leave an empty title behind that prevents a corrected retry.
     with WRITE_LOCK, store.conn:
+        created = store._create_file(title, "sheet", header)
+        fid = created["fileId"]
         for i, row in enumerate(rows[1:], start=1):
+            if not isinstance(row, list):
+                raise BusError(400, f"Import data row {i} must be a list of cells.")
             cells = ["" if c is None else str(c) for c in row]
             # preserve the board verbatim - imports are history, not new writes
             store.conn.execute(
                 "INSERT INTO sheet_rows (file_id, n, row, appended_ts) VALUES (?,?,?,?)",
-                (f["file_id"], i, json.dumps(cells), ts))
-        store.conn.execute("UPDATE files SET updated_ts = ? WHERE file_id = ?", (ts, f["file_id"]))
+                (fid, i, json.dumps(cells), ts))
+        store.conn.execute("UPDATE files SET updated_ts = ? WHERE file_id = ?", (ts, fid))
     print(f"Imported {len(rows) - 1} rows into sheet {title!r} (header: {len(header)} columns).")
 
 

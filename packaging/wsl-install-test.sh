@@ -3,7 +3,7 @@
 # systemd service, and verify health. Run inside Ubuntu with passwordless sudo.
 set -euo pipefail
 
-DEB="${1:-$HOME/build/blackboard-bus_1.0.0_all.deb}"
+DEB="${1:-$HOME/build/blackboard-bus_1.1.0_all.deb}"
 
 echo "== install =="
 sudo apt-get install -y "$DEB" 2>&1 | tail -4
