@@ -127,7 +127,7 @@
 </head>
 <body>
 
-<a class="skip" href="#leadForm">Skip to the form</a>
+<a class="skip" href="#request">Skip to the request panel</a>
 
 <header class="bar">
   <a class="brand" href="../">sfdc24</a>
@@ -149,7 +149,7 @@
 
   <div class="split">
     <!-- LEFT: the glass (customer-facing) -->
-    <section class="panel" aria-labelledby="glass-t">
+    <section class="panel" id="request" tabindex="-1" aria-labelledby="glass-t">
       <div class="panel-h"><span class="t" id="glass-t">Your request</span><span class="k">web-to-lead</span></div>
       <form id="leadForm"
             action="https://webto.salesforce.com/servlet/servlet.WebToLead?encoding=UTF-8" method="POST">
@@ -184,8 +184,8 @@
           </div>
         </div>
         <div class="field">
-          <label>You are a…</label>
-          <div class="seg" role="radiogroup" aria-label="Relationship">
+          <label id="rel-prompt">You are a…</label>
+          <div class="seg" role="radiogroup" aria-labelledby="rel-prompt">
             <label><input type="radio" name="rel" value="Customer" checked><span class="box">Customer</span></label>
             <label><input type="radio" name="rel" value="Supplier"><span class="box">Supplier / partner</span></label>
           </div>
