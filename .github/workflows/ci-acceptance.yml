@@ -25,6 +25,7 @@ on:
       - 'scripts/gas_build_identity.py'
       - 'scripts/baseline_verify.py'
       - 'tests/test_baseline_verify.py'
+      - 'tests/test_gas_baseline_check.py'
       - 'tests/fixtures/governor-v31-manifest.json'
       - 'scripts/gas_tts_canary.py'
       - 'scripts/gas_tts_canary_target.json'
@@ -106,6 +107,7 @@ jobs:
         run: |
           python -B -m unittest discover -s tests -p 'test_build_identity.py' -v
           python -B -m unittest discover -s tests -p 'test_baseline_verify.py' -v
+          python -B -m unittest discover -s tests -p 'test_gas_baseline_check.py' -v
           node --test tests/test_build_health.cjs
       - name: Test isolated TTS canary build, target and receipt contracts
         run: |
