@@ -234,7 +234,27 @@ function Write-OrderLog {
 }
 
 function ConvertTo-UtcCursorTimestamp {
-    param([Parameter(Mandatory = $true)][string]$Timestamp)
+    # [AllowEmptyString()] IS THE FIX, and the asymmetry it removes is the bug.
+    #
+    # A Mandatory [string] rejects '' at BINDING time, before one line of this
+    # body runs. So an unparseable-but-present timestamp like
+    # 'Saturday, September 12' fell through to `return $null` and the caller
+    # recorded reason='timestamp' exactly as designed - while an EMPTY timestamp
+    # threw a raw .NET binding exception that aborted the whole board read.
+    #
+    # The guard's own fallback was therefore unreachable for the single input it
+    # most obviously exists to handle. Measured 2026-09-14 against the live Alpha
+    # DB: FOUR rows carry an empty Timestamp with a human date string sitting in
+    # the Row_ID column instead (native indexes 2171, 2223, 2224, 2225), the
+    # 'writer timestamp coercion' defect recorded in VIEWPORT v020. Reading the
+    # board through Get-BoardRowsFromJson threw:
+    #   Cannot bind argument to parameter 'Timestamp' because it is an empty string.
+    #
+    # An empty cell is malformed DATA, and malformed data must produce a named
+    # refusal for that row, not an unhandled exception that discards 2400 good
+    # rows with it. Fail closed on the row; do not fail open, and do not fail
+    # loudly in a way that takes the read down.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Timestamp)
 
     if ($Timestamp -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$') { return $null }
     $parsed = [DateTimeOffset]::MinValue
