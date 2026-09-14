@@ -319,6 +319,16 @@ try {
         Assert-OrderTaskXml -XmlText $missingBootTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
     } 'task_xml_boot_trigger_id_invalid'
 
+    $mixedCaseBootTriggerIdXml = $systemXmlWithoutLogonType.Replace('id="AtBoot"', 'Id="AtBoot"')
+    Assert-ThrowsCode 'A mixed-case boot trigger Id attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $mixedCaseBootTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $extraBootTriggerAttributeXml = $systemXmlWithoutLogonType.Replace('id="AtBoot"', 'id="AtBoot" extra="unexpected"')
+    Assert-ThrowsCode 'An extra unqualified boot trigger attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $extraBootTriggerAttributeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
     $wrongIntervalTriggerIdXml = $systemXmlWithoutLogonType.Replace('id="Every15Minutes"', 'id="Every30Minutes"')
     Assert-ThrowsCode 'An incorrect interval trigger id attribute fails closed' {
         Assert-OrderTaskXml -XmlText $wrongIntervalTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
