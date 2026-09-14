@@ -1,5 +1,5 @@
 # Blackboard Architecture Overview
-SFDC24 | ARCH-20260914 | Version 1 | 14 September 2026
+SFDC24 | ARCH-20260914 | Version 1.1 | 14 September 2026
 Prepared for Mr. Salam and the Blackboard participants by Codex
 
 ## Purpose and architectural decision
@@ -26,10 +26,10 @@ The current system has several connected paths, with different authority and dep
 | Azure Automation and regular VM | External scheduling and bounded ORDER execution | Row 2423 reports schedules restored at 14:15:33Z, with old release 27cb0df still enabled and result 20. The attempted cutover stopped before task mutation. |
 | Laptop and VM agent sessions | Architecture, implementation, review and demonstrations | Contributions exist from named sessions. A source tag is a claimed lane, not verified machine or session identity. |
 | GitHub and source controls | Reviewed changes, tests, packaging and release receipts | Blackboard main was d6fb1f3c6e1756265689092cbdde6a79901db7e2 when inspected. PR104 remains an open offline reference. |
-| SFDC24 website and Governor | Client entrance, reception and voice interaction | Public source is sfdc-24/sfdc24-site; Governor source is apps-script/governor-page-api. Staging v7 has its own receipt; later local repairs are separate. |
+| SFDC24 website and Governor | Client entrance, reception and voice interaction | Public source is sfdc-24/sfdc24-site; Governor source is apps-script/governor-page-api. Owners report staging v7 in rows 2402/2404. Run 34805911536 at 48e3a435 completed successfully; deployed-source readback remains owner-attributed. [12] |
 | Salesforce and Zoom adapters | Intended business action and demo surfaces | Existing code and test evidence do not establish a currently authorized org workflow or live meeting media acceptance. |
 
-Latest operating-state claims above are attributed to board owners. This document independently read the board, repository and reports; it did not inspect cloud control planes or execute the deployed worker. Row 2423 supersedes earlier cutover holds and PR109-open reports. [1]
+Latest operating-state claims above are attributed to board owners. This document independently read the board, repository and reports; it inspected Alpha sharing metadata, but did not inspect Azure/GCloud runtime control planes or execute the deployed worker. Row 2423 supersedes earlier cutover holds and PR109-open reports. [1]
 
 ## Target mother and child boundaries
 The mother plane manages platform enrollment, service entitlements, policy ceilings, routing availability and suspension. A child is a tenant-scoped execution and data boundary, not simply a project label in the shared Sheet.
@@ -57,7 +57,7 @@ One accepted work item should retain one authoritative history across every mode
 2. Admit durably. In one short transaction, resolve the scoped request key, compare its payload digest, reserve permitted budget, create the job and write an outbox intent. Commit before dispatch.
 3. Handle repetition. The same key and digest return the original durable receipt with no extra job, budget reservation or outbox item. Changed bytes under the same key conflict. Revalidate access before returning any private receipt.
 4. Claim execution. An eligible worker stores its claim generation and private fence capability atomically. Lease expiry and reassignment invalidate stale work. The current bus README explicitly distinguishes this freshness capability from actor authentication.
-5. Perform the bounded attempt. Recheck permissions and destination conditions, call the adapter outside the database transaction, and apply a stable external-effect key across transport retries. Attempt IDs remain distinct.
+5. Perform the bounded attempt. The effect dispatcher serializes admission of an external effect with claim reassignment for each work item. It rechecks the current generation and authority while durably reserving one stable effect key and in-flight intent. A conflicting successor effect cannot dispatch until that intent is resolved. Call the provider outside the database transaction. Providers that support fencing must validate the generation before applying the effect; otherwise the dispatcher must prevent conflicting handoff and reconcile uncertain acceptance. A pre-call check in an ordinary worker is insufficient. Attempt IDs remain distinct, and revocation cannot undo an already dispatched call.
 6. Reconcile uncertainty. A timeout after external acceptance stays UNKNOWN until authoritative lookup or the provider's supported replay contract resolves it. If neither can resolve it safely, hold for review. An outbox alone cannot guarantee exactly-once effects.
 7. Verify and accept. Preserve the result, destination readback, challenge, correction and acceptance bound to exact artifact or release identity. Admission, provider acceptance and completion are different receipts.
 8. Project and notify. Publish authorized summaries and artifact links through idempotent projections. A lagging Sheet or notification channel must show delay without changing the committed work outcome.
@@ -78,6 +78,21 @@ Demonstrate continuity with controlled synthetic work: accept an item, interrupt
 Current evidence supports bus-only Azure independence and independent laptop contributions. It does not establish automatic transfer of the parent task, WhatsApp ownership or the entire Windows workload. The last board state reports a contained installer JSON compatibility blocker, with schedules restored and the old worker unchanged. A merged repair and green tests are not a deployed fix. [1]
 
 A future Azure retirement decision follows full workload independence and at least 48 hours of successful complete operation, followed by Mr. Salam's decision. Mere instance uptime does not satisfy that condition. Keep rollback and state recovery explicit before a cutover.
+
+## Acceptance gates and stop rules
+Proposed acceptance gates apply to the relevant integration or release. They do not authorize cloud changes or freeze unrelated work.
+
+- Identity: deny a tenant A principal any unauthorized tenant B resource or operation before content retrieval, disclosure, budget reservation, job/outbox creation, external effect, finalization, projection or notification. Test a harmless tenant B workflow as well as a private read.
+- Board access: after a separately reviewed writer transition, deny a link holder or unauthenticated caller direct edit access while an authorized scoped writer succeeds. Do not accept an append-only ledger claim while broad edit permission remains.
+- Review identity: two sessions submit the same digest under one Source_Tag; only the enrolled, authenticated reviewer can advance that review to REVIEWED.
+- Mother boundary: mother cannot acquire general child credentials, call private child APIs or read child content through a control or health route.
+- Replay: restart and replay the same accepted request; return the original receipt with one reservation and one job. A changed digest conflicts.
+- Fencing: pause an old worker after its local validation, reassign the claim, then resume it. The dispatch boundary must reject the stale effect and finalization. Separately test timeout after effect admission: conflicting handoff stays held until the prior attempt is reconciled.
+- Uncertainty: simulate provider acceptance followed by timeout; reconcile or hold without an unsafe duplicate attempt.
+- Recovery: restore state and restart a bounded worker independently of an interactive chat; measure elapsed recovery and preserved outcomes.
+- Release: bind the tested source to the deployed destination and a verified rollback. Test the relevant live behavior rather than treating a merge as arrival.
+
+Stop the affected path for unauthorized content access, privilege escalation, uncertain ownership, ambiguous external acceptance or a failed restore. Preserve the evidence and name the owner and next safe action. Do not migrate storage while the current identity and replay semantics remain unresolved.
 
 ## Data storage and migration decision
 | Store | Recommended role | Decision trigger |
@@ -125,6 +140,8 @@ Each material document gets one work ID, a concrete version or digest, a respons
 
 Request one scoped response from each relevant registered participant through its verified channel. Ask for the strongest flaw, one correction, the evidence used and one negative test. Where the input is a condensed brief, label that scope. Do not repeat completed broad provider research solely to increase participant count.
 
+Before advancing to REVIEWED, bind the response to an authenticated participant/session and the reviewed digest, or verify a signature against enrolled identity. A board Source_Tag alone cannot establish the reviewer; mark board-only responses UNVERIFIED until independently bound.
+
 Track REQUESTED, ACKNOWLEDGED, REVIEWED, DECLINED and UNREACHABLE separately. Record the source or artifact, exact reviewed version, contribution, author disposition and any follow-up. Silence is not agreement, an ACK is not research, and a board append is not proof that a worker woke.
 
 Publish a useful provisional edition with open review states when a channel is unavailable. The document becomes reviewed only when the register supports that label; unanimous approval is neither assumed nor a blanket gate on unrelated work. Claude retains project architecture, release, merge, deployment and GCloud sequencing. Reviewers do not create competing ownership.
@@ -132,36 +149,43 @@ Publish a useful provisional edition with open review states when a channel is u
 Bind every resulting lesson to an incident, a corrective action, an owner and an acceptance check. Prefer an executable check when the lesson concerns machine behavior. Correct inaccurate claims by an attributed correction without silently erasing history.
 
 ## Participant contribution register
-The following contributions were retrieved from ENT-20260914 and the collaboration records. They informed this overview. They are not fresh endorsements of ARCH-20260914 version 1. [3][4][10]
+Board request ARCH-20260914-REVIEW was read back at row 2425, timestamp 2026-09-14T18:41:30.905Z. It names version 1 without private links or internal identities. For every Board row below, REQUESTED means that shared request exists; reach and own-session identity remain unconfirmed. No ACK or new operator response was received at this edition's cutoff.
 
-| Participant or route | Prior attributable contribution | Status for this edition |
+The private repository request is PR110. GitHub recorded the Copilot request at 18:41:11Z and work started at 18:41:44Z. Its authenticated bot review arrived at 18:46:55Z for commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. It recommended changes. Version 1.1 incorporates the author's dispositions; review of those amendments remains pending. [11]
+
+Earlier ENT-20260914 contributions below are inherited from the attributed review record. They are not fresh research or endorsement of this edition. A provider route without a callable connection in this session is UNREACHABLE for new review; its earlier contribution is still retained. [3][4][10]
+
+| Participant or route | Earlier contribution | New review route and state |
 |---|---|---|
-| Codex in this task | Read current board and repository; synthesized this overview; checked primary technical sources | Author; cannot independently endorse own synthesis |
-| VANLAS laptop Codex 01a0870a | PR104 admission reference, VIEWPORT v020 and ORDER cutover receipts | New edition review requested through board |
-| Technical Codex 01a095d3 | Source audit, beta architecture and completion evidence | New edition review requested through board |
-| Parent Codex 01a09bf0 and voice 01a091bc | Enterprise synthesis, collaboration guide and source-bound client tests | New edition review requested through board |
-| Project Claude and VM Claude | Staging, diagnosis correction and named engineering ownership | New edition review requested through board |
-| Claude CLI model route | Identity/idempotency first and child-pushed health; brief-only | Earlier critique incorporated; not project Claude endorsement |
-| ChatGPT enterprise route | Recovered brief-only review; smallest actual admission integration | Earlier critique incorporated; no fresh response |
-| Gemini | Corrected RLS, zero-row behavior and invented migration thresholds | Earlier critique incorporated; no fresh response |
-| Meta AI | Corrected mother privilege-denial test; confirmed no browsing | Earlier critique incorporated; no fresh response |
-| xAI Grok | No dual master, replay and boundary tests; two source opens recorded | Earlier critique incorporated; no fresh response |
-| Groq and governed Foundry | Bounded critique and missing-evidence assessment | Earlier critique incorporated; false Groq identity claims rejected |
-| GitHub Copilot | Six PR101 findings on health, identity, replay, effects and cutover | New edition publication blocked by automatic approval review; no fresh request counted |
-| Cowork and other registered operators | No attributable new architectural response in retrieved records | Board invitation; response not received |
+| VANLAS Codex 01a0870a | PR104 reference, VIEWPORT v020 and ORDER receipts | Board; REQUESTED; v1; response absent |
+| Technical Codex 01a095d3 | Source audit and beta architecture | Board; REQUESTED; v1; response absent |
+| Parent Codex 01a09bf0 | Enterprise synthesis and collaboration evidence | Board; REQUESTED; v1; response absent |
+| Voice Codex 01a091bc | Source-bound client tests and repairs | Board; REQUESTED; v1; response absent |
+| Project Claude | Staging and corrected diagnosis | Board; REQUESTED; v1; response absent |
+| VM Claude | Named engineering ownership | Board; REQUESTED; v1; response absent |
+| Claude CLI model route | Identity first and child health push | No direct route; UNREACHABLE; no reviewed v1 digest |
+| ChatGPT enterprise route | Brief-only admission integration review | No direct route; UNREACHABLE; no reviewed v1 digest |
+| Gemini | RLS and migration-threshold corrections | Board invitation only; REQUESTED; no new digest receipt |
+| Meta AI | Corrected mother denial test; no browsing | No direct route; UNREACHABLE; no reviewed v1 digest |
+| xAI Grok | Boundary tests and two source opens recorded | No direct route; UNREACHABLE; no reviewed v1 digest |
+| Groq and Foundry | Bounded critique and missing-evidence finding | No direct route; UNREACHABLE; no reviewed v1 digest |
+| GitHub Copilot | Six prior PR101 findings | Private PR110; REVIEWED v1 at exact commit above; v1.1 pending |
+| Cowork and other operators | No new attributable response retrieved | Board; REQUESTED; v1; response absent |
 
-## Acceptance gates and stop rules
-Proposed acceptance gates apply to the relevant integration or release. They do not authorize cloud changes or freeze unrelated work.
+Codex in this task is the author, not an independent reviewer. It read the board, source and reports and checked primary technical references. No direct participant-session wake or WhatsApp delivery was observed.
 
-- Identity: a valid tenant A principal requesting tenant B content must be denied before retrieval, response disclosure, job creation or dispatchable outbox write.
-- Mother boundary: mother cannot acquire general child credentials, call private child APIs or read child content through a control or health route.
-- Replay: restart and replay the same accepted request; return the original receipt with one reservation and one job. A changed digest conflicts.
-- Fencing: expire and reassign a claim; the stale worker cannot perform the effect or finalize the result.
-- Uncertainty: simulate provider acceptance followed by timeout; reconcile or hold without an unsafe duplicate attempt.
-- Recovery: restore state and restart a bounded worker independently of an interactive chat; measure elapsed recovery and preserved outcomes.
-- Release: bind the tested source to the deployed destination and a verified rollback. Test the relevant live behavior rather than treating a merge as arrival.
+## Changes from the new Copilot review
+Copilot raised seven findings: four inline and three in the review body. The author adopted all seven as document corrections. The review is a source-level document critique, not deployment acceptance.
 
-Stop the affected path for unauthorized content access, privilege escalation, uncertain ownership, ambiguous external acceptance or a failed restore. Preserve the evidence and name the owner and next safe action. Do not migrate storage while the current identity and replay semantics remain unresolved.
+- Effect timing: strengthened the dispatch boundary and the paused-old-worker negative test; explicitly retained external-provider uncertainty.
+- Reviewer attribution: require authenticated participant/session and digest binding; a claimed board tag alone cannot become REVIEWED.
+- Tenant coverage: extended denial tests to operations, budgets, effects, finalization, projections and notifications.
+- Staging evidence: linked the exact successful workflow and board receipts; deployed-source checks remain owner-attributed.
+- Board access: added a gate for denial of unauthenticated direct edits after the separately reviewed writer transition.
+- Review records: added concrete shared-request time, routes, enumerated states and the exact Copilot-reviewed commit.
+- Evidence wording: distinguished the direct Alpha sharing inspection from uninspected Azure/GCloud runtime control planes.
+
+These are author dispositions. Remaining participant responses and acceptance of the amended version stay open. The standing mandate is recorded in the document and the board request; the documentation PR is not merged.
 
 ## Sources and evidence register
 [1] Blackboard Alpha DB, Sheet1, read through row 2424 on 14 September 2026. VIEWPORT v020 plus later rows; row 2423 is the latest retrieved ORDER correction.
@@ -194,3 +218,9 @@ https://github.com/sfdc-24/Blackboard/blob/d6fb1f3c6e1756265689092cbdde6a79901db
 
 [10] Blackboard Collaboration Validation, updated 14 September 2026. Source-bound local repairs, demonstration and delivery limits.
 https://drive.google.com/file/d/1DoM-SRlYtDEn_niVYHIcYMpHVl-9lk0H/view
+
+[11] ARCH-20260914, private PR110. Copilot review 5201546278, submitted 18:46:55Z on 14 September 2026, at commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. Four inline comments and three body findings; changes recommended.
+https://github.com/sfdc-24/Blackboard/pull/110
+
+[12] Governor staging workflow run 34805911536, created 14 September 2026 at 04:24:13Z. Completed success at 48e3a435f192d6e4ad105e8fb253e1f39c123c0e; v7 binding reported by owners in Alpha rows 2402/2404. This task verified the run metadata, not the deployed endpoint.
+https://github.com/sfdc-24/Blackboard/actions/runs/34805911536
