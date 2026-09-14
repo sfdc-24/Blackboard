@@ -271,10 +271,11 @@ repair mode and cannot create, update, or delete Azure resources.
     Managed Run Command success state, or an outer `PASS` without those causal
     read-backs is not completion proof. Skip this natural-poll step after the
     documented `BOARD_HEADER_INVALID` incident transition: the escrowed release
-    is the known failing worker. Instead, while both schedules remain disabled,
-    require more than 240 seconds of natural-trigger margin after `RestoreReady`
-    and immediately continue with step 14. Do not start the restored worker or
-    run the outer supervisor against it.
+    is the known failing worker. Instead, while both Azure Automation schedules
+    remain disabled, treat the guest task as enabled and `Ready` after
+    `RestoreReady` but do not manually start it. Require more than 240 seconds of
+    natural-trigger margin and immediately continue with step 14; do not run the
+    outer supervisor against the restored worker.
 14. Run `InstallObserveAndDrain`. It first proves the restored enabled task and
     escrow, disables it and proves that only the Enabled state changed, installs
     the same immutable candidate in Observe without `-Start`, validates the

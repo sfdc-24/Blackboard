@@ -385,7 +385,9 @@ function Test-TransientBoardReadFailure {
 function ConvertTo-OrderElapsedMillisecondsText {
     param([Parameter(Mandatory = $true)][double]$Milliseconds)
 
-    $rounded = [Math]::Round($Milliseconds, 2)
+    # The incident gate requires a positive canonical value; a real stopwatch
+    # sample can still round to zero at two-decimal precision.
+    $rounded = [Math]::Max(0.01, [Math]::Round($Milliseconds, 2))
     return [string]::Format(
         [Globalization.CultureInfo]::InvariantCulture,
         '{0:0.##}',

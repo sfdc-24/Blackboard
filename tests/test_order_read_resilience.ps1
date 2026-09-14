@@ -1662,11 +1662,17 @@ try {
             $elapsedExact = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3874.97
             $elapsedTenth = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3874.9
             $elapsedInteger = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3875.0
+            $elapsedZero = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 0
+            $elapsedSubCent = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 0.004
             Assert-True ('elapsed formatter is canonical under ' + $cultureName) (
                 $elapsedExact -is [string] -and $elapsedExact -ceq '3874.97' -and
                 $elapsedTenth -ceq '3874.9' -and $elapsedInteger -ceq '3875' -and
-                (Test-CanonicalElapsedMillisecondsText -Value $elapsedExact)
-            ) ($elapsedExact + ',' + $elapsedTenth + ',' + $elapsedInteger)
+                $elapsedZero -ceq '0.01' -and $elapsedSubCent -ceq '0.01' -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedExact) -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedZero) -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedSubCent)
+            ) ($elapsedExact + ',' + $elapsedTenth + ',' + $elapsedInteger + ',' +
+                $elapsedZero + ',' + $elapsedSubCent)
 
             $localeSensitiveMutant = ([Math]::Round(3874.97, 2)).ToString()
             Assert-True ('locale-sensitive elapsed mutant is rejected under ' + $cultureName) (
