@@ -55,6 +55,10 @@ param(
     [string]$ExpectedRowId = '',
     [string]$ExpectedResultStatus = '',
 
+    [string]$ExpectedCurrentTaskResult = '',
+    [string]$ExpectedCurrentFailureCode = '',
+    [string]$ExpectedCurrentRunId = '',
+
     [string]$GitPath = '',
     [string]$ExpectedGitSha256 = '',
     [string]$ExpectedClaudeSha256 = ''
@@ -81,6 +85,7 @@ $script:CutoverTreeMaximumEntries = 50000
 $script:CutoverProtectedFileMaximumBytes = 268435456
 $script:CutoverProtectedTreeMaximumBytes = 536870912
 $script:CutoverClockToleranceSeconds = 2
+$script:CutoverTaskStartupMaximumSeconds = 30
 
 function Throw-Cutover {
     param([Parameter(Mandatory = $true)][string]$Code)
@@ -93,6 +98,7 @@ function Get-CutoverSafeAction {
         'ValidateEscrowAndDisable',
         'DrainObserve',
         'InstallObserveAndDrain',
+        'InstallObserveAndDrainFromFailedExecute',
         'InstallExecuteReady',
         'RestoreReady',
         'StartAndAwait'
@@ -106,6 +112,17 @@ function Get-CutoverSafeOperationId {
     param([AllowEmptyString()][string]$Value)
     if ($Value -cmatch '^[0-9a-f]{32}$') { return $Value }
     return 'invalid'
+}
+
+function Get-CutoverExpectedFailedExecuteCode {
+    param([AllowEmptyString()][string]$Value)
+    # This transition is an incident-specific bridge for the known old release
+    # header-width incompatibility.  Transport/HTTP failures are intentionally
+    # excluded because they can be transient and do not authenticate deploy lag.
+    if ($Value -cne 'BOARD_HEADER_INVALID') {
+        Throw-Cutover -Code 'EXPECTED_CURRENT_FAILURE_CODE_INVALID'
+    }
+    return $Value
 }
 
 function Get-CutoverSafeErrorCode {
@@ -1276,6 +1293,7 @@ function Assert-CutoverLogRun {
         [AllowEmptyString()][string]$ExpectedWorkId,
         [AllowEmptyString()][string]$ExpectedRowId,
         [AllowEmptyString()][string]$ExpectedResultStatus,
+        [AllowEmptyString()][string]$ExpectedErrorCode = '',
         [AllowEmptyString()][string]$ExpectedMode = '',
         [DateTime]$RunWindowStartUtc = [DateTime]::MinValue,
         [DateTime]$RunWindowEndUtc = [DateTime]::MaxValue
@@ -1396,12 +1414,162 @@ function Assert-CutoverLogRun {
                 $_.details.output_sha256 -is [string] -and [string]$_.details.output_sha256 -cmatch '^[0-9a-f]{64}$'
             })
         }
+        'error' {
+            if ($ExpectedErrorCode -cnotmatch '^[A-Z][A-Z0-9_]{0,95}$') {
+                Throw-Cutover -Code 'EXPECTED_ERROR_CODE_INVALID'
+            }
+            @($Entries | Where-Object {
+                [string]$_.event -ceq 'run_error' -and
+                [string]$_.level -ceq 'error' -and
+                [string]$_.code -ceq $ExpectedErrorCode -and
+                -not [string]::IsNullOrEmpty([string]$_.message) -and
+                [string]$_.work_id -ceq $ExpectedWorkId -and
+                [string]$_.row_id -ceq $ExpectedRowId
+            })
+        }
         default { Throw-Cutover -Code 'TERMINAL_STATUS_INVALID' }
     }
     if (@($terminal).Count -ne 1 -or -not [object]::ReferenceEquals(@($terminal)[0], $terminalEntries[0])) {
         Throw-Cutover -Code 'LOG_TERMINAL_EVIDENCE_INVALID'
     }
     return $terminalEntries[0]
+}
+
+function Assert-CutoverCurrentFailedExecuteRun {
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$ExactStatus,
+        [Parameter(Mandatory = $true)]$LogCheckpoint,
+        [Parameter(Mandatory = $true)][int]$ExpectedTaskResult,
+        [Parameter(Mandatory = $true)][string]$ExpectedFailureCode,
+        [Parameter(Mandatory = $true)][string]$ExpectedRunId
+    )
+    if ($ExpectedTaskResult -ne 20) {
+        Throw-Cutover -Code 'EXPECTED_CURRENT_TASK_RESULT_INVALID'
+    }
+    $null = Get-CutoverExpectedFailedExecuteCode -Value $ExpectedFailureCode
+    if ($null -eq $ExactStatus.raw -or
+        $ExactStatus.raw.state -isnot [string] -or [string]$ExactStatus.raw.state -cne 'Ready' -or
+        ($ExactStatus.raw.last_task_result -isnot [int] -and $ExactStatus.raw.last_task_result -isnot [long]) -or
+        [int64]$ExactStatus.raw.last_task_result -ne [int64]$ExpectedTaskResult) {
+        Throw-Cutover -Code $(if ($null -ne $ExactStatus.raw -and $ExactStatus.raw.state -is [string] -and
+            [string]$ExactStatus.raw.state -cne 'Ready') { 'FAILED_EXECUTE_TASK_STATE_MISMATCH' } else { 'FAILED_EXECUTE_TASK_RESULT_MISMATCH' })
+    }
+
+    $null = Assert-CutoverStateShape -State $State
+    $lastPoll = Get-CutoverLastPoll `
+        -State $State `
+        -ExpectedMode 'Execute' `
+        -ExpectedUserProfile $Context.user_profile_path
+    if ([string]$lastPoll.status -cne 'error') {
+        Throw-Cutover -Code 'FAILED_EXECUTE_STATE_STATUS_MISMATCH'
+    }
+    if ($ExpectedRunId -cnotmatch '^[0-9a-f]{32}$') {
+        Throw-Cutover -Code 'EXPECTED_CURRENT_RUN_ID_INVALID'
+    }
+    if ([string]$lastPoll.run_id -cne $ExpectedRunId) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_RUN_ID_MISMATCH'
+    }
+    if ($null -eq $State.error -or
+        [string]$State.error.code -cne $ExpectedFailureCode -or
+        [string]$State.error.message -cne 'board_header_invalid' -or
+        -not [string]::IsNullOrEmpty([string]$State.error.work_id) -or
+        -not [string]::IsNullOrEmpty([string]$State.error.row_id) -or
+        [int64]$State.counts.errors -lt 1) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    }
+
+    $entries = @(Get-CutoverTrailingLogRun `
+        -Path $Context.log_path `
+        -Checkpoint $LogCheckpoint `
+        -RunId ([string]$lastPoll.run_id))
+    if ($entries.Count -ne 2) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_LOG_SHAPE_INVALID'
+    }
+    $terminal = Assert-CutoverLogRun `
+        -Entries $entries `
+        -RunId ([string]$lastPoll.run_id) `
+        -Status 'error' `
+        -ExpectedWorkId '' `
+        -ExpectedRowId '' `
+        -ExpectedErrorCode $ExpectedFailureCode `
+        -ExpectedMode 'Execute' `
+        -RunWindowStartUtc $ExactStatus.last_run_utc `
+        -RunWindowEndUtc ([DateTime]::UtcNow)
+    $pollStarted = $entries[0]
+    if ([string]$pollStarted.level -cne 'info' -or
+        -not [string]::IsNullOrEmpty([string]$pollStarted.work_id) -or
+        -not [string]::IsNullOrEmpty([string]$pollStarted.row_id) -or
+        -not [string]::IsNullOrEmpty([string]$pollStarted.code) -or
+        -not [string]::IsNullOrEmpty([string]$pollStarted.message)) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_POLL_EVIDENCE_INVALID'
+    }
+    if ([string]$terminal.message -cne [string]$State.error.message) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_STATE_LOG_MISMATCH'
+    }
+    $terminalDetailsProperty = $terminal.PSObject.Properties['details']
+    if ($null -eq $terminalDetailsProperty) {
+        Throw-Cutover -Code 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    }
+    $null = Assert-CutoverBoardHeaderFailureDetails -Details $terminalDetailsProperty.Value
+
+    $pollStartedAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$entries[0].at) -Code 'FAILED_EXECUTE_LOG_TIME_INVALID'
+    $statePollAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$lastPoll.at) -Code 'FAILED_EXECUTE_STATE_TIME_INVALID'
+    $terminalAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$terminal.at) -Code 'FAILED_EXECUTE_LOG_TIME_INVALID'
+    $stateErrorAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$State.error.at) -Code 'FAILED_EXECUTE_STATE_TIME_INVALID'
+    if ([Math]::Abs(($statePollAtUtc - $pollStartedAtUtc).TotalSeconds) -gt $script:CutoverClockToleranceSeconds -or
+        $stateErrorAtUtc -lt $pollStartedAtUtc.AddSeconds(-$script:CutoverClockToleranceSeconds) -or
+        $stateErrorAtUtc -gt $terminalAtUtc.AddSeconds($script:CutoverClockToleranceSeconds) -or
+        $terminalAtUtc -gt $stateErrorAtUtc.AddSeconds($script:CutoverClockToleranceSeconds)) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_STATE_LOG_TIME_MISMATCH'
+    }
+    $startupDelaySeconds = ($pollStartedAtUtc - $ExactStatus.last_run_utc).TotalSeconds
+    if ($startupDelaySeconds -lt -$script:CutoverClockToleranceSeconds -or
+        $startupDelaySeconds -gt $script:CutoverTaskStartupMaximumSeconds) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_TASK_TIME_MISMATCH'
+    }
+
+    return [pscustomobject][ordered]@{
+        run_id = [string]$lastPoll.run_id
+        last_run_utc = $ExactStatus.last_run_utc
+        poll_started_at_utc = $pollStartedAtUtc
+        error_at_utc = $stateErrorAtUtc
+        terminal_at_utc = $terminalAtUtc
+        failure_code = $ExpectedFailureCode
+        task_result = [int64]$ExpectedTaskResult
+        log_checkpoint = $LogCheckpoint
+    }
+}
+
+function Assert-CutoverBoardHeaderFailureDetails {
+    param([Parameter(Mandatory = $true)]$Details)
+    if ($null -eq $Details -or
+        $Details.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
+        Throw-Cutover -Code 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    }
+    $expected = @('attempt', 'transport_exit', 'http_status', 'content_type_class', 'elapsed_ms')
+    $properties = @($Details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($properties.Count -ne $expected.Count -or
+        @($expected | Where-Object { $properties -cnotcontains $_ }).Count -ne 0 -or
+        $Details.attempt -isnot [string] -or [string]$Details.attempt -cne '1' -or
+        $Details.transport_exit -isnot [string] -or [string]$Details.transport_exit -cne '0' -or
+        $Details.http_status -isnot [string] -or [string]$Details.http_status -cne '200' -or
+        $Details.content_type_class -isnot [string] -or [string]$Details.content_type_class -cne 'json' -or
+        $Details.elapsed_ms -isnot [string] -or
+        [string]$Details.elapsed_ms -cnotmatch '^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,2})?$') {
+        Throw-Cutover -Code 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    }
+    $elapsed = 0.0
+    if (-not [double]::TryParse(
+        [string]$Details.elapsed_ms,
+        [Globalization.NumberStyles]::AllowDecimalPoint,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$elapsed
+    ) -or $elapsed -le 0.0 -or $elapsed -gt 180000.0) {
+        Throw-Cutover -Code 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    }
+    return $Details
 }
 
 function Assert-CutoverStateTerminal {
@@ -2089,6 +2257,179 @@ function Invoke-CutoverInstallObserveAndDrain {
     }
 }
 
+function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
+    param([Parameter(Mandatory = $true)]$Context)
+
+    # Everything through the stable second readback is read-only.  In
+    # particular, an unexpected natural run, result, failure code, state/log
+    # record, or task definition must fail before Disable-CutoverTask is ever
+    # reachable.
+    $escrow = Invoke-CutoverEscrow -Context $Context -RequestedAction 'Validate'
+    $failedStatus = Get-CutoverExactInstallerStatus `
+        -Context $Context `
+        -ScriptPath $Context.restored_installer_path `
+        -ExpectedMode 'Execute' `
+        -ExpectedTaskState 'Ready' `
+        -RequireResultZero $false
+    if ([int64]$failedStatus.raw.last_task_result -ne [int64]$Context.expected_current_task_result) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_TASK_RESULT_MISMATCH'
+    }
+
+    $stateResult = Get-CutoverState -Path $Context.state_path
+    $stateBeforeInstall = $stateResult.checkpoint
+    $logBeforeInstall = Get-CutoverLogCheckpoint -Path $Context.log_path
+    $failedRun = Assert-CutoverCurrentFailedExecuteRun `
+        -Context $Context `
+        -State $stateResult.value `
+        -ExactStatus $failedStatus `
+        -LogCheckpoint $logBeforeInstall `
+        -ExpectedTaskResult $Context.expected_current_task_result `
+        -ExpectedFailureCode $Context.expected_current_failure_code `
+        -ExpectedRunId $Context.expected_current_run_id
+
+    $failedXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+    if (-not $failedXml.enabled -or
+        $failedXml.utf16le_bom_sha256 -cne [string]$escrow.task_xml_sha256) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_ESCROW_XML_MISMATCH'
+    }
+
+    $preDisable = Get-CutoverExactInstallerStatus `
+        -Context $Context `
+        -ScriptPath $Context.restored_installer_path `
+        -ExpectedMode 'Execute' `
+        -ExpectedTaskState 'Ready' `
+        -RequireResultZero $false
+    Assert-CutoverStableReadyReadback `
+        -Initial $failedStatus `
+        -Readback $preDisable `
+        -RequiredSeconds (180 + $Context.natural_trigger_margin_seconds) `
+        -DriftCode 'TASK_CHANGED_BEFORE_DISABLE'
+    if ([int64]$preDisable.raw.last_task_result -ne [int64]$Context.expected_current_task_result) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_TASK_RESULT_MISMATCH'
+    }
+    if ($preDisable.next_run_utc.Ticks -ne $failedStatus.next_run_utc.Ticks) {
+        Throw-Cutover -Code 'TASK_CHANGED_BEFORE_DISABLE'
+    }
+    $preDisableXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+    if (-not $preDisableXml.enabled -or
+        $preDisableXml.utf8_text_sha256 -cne $failedXml.utf8_text_sha256) {
+        Throw-Cutover -Code 'TASK_CHANGED_BEFORE_DISABLE'
+    }
+    Assert-CutoverFileCheckpointUnchanged `
+        -Before $stateBeforeInstall `
+        -Path $Context.state_path `
+        -MaximumBytes $script:CutoverStateMaximumBytes `
+        -Code 'STATE_CHANGED_BEFORE_DISABLE'
+    Assert-CutoverFileCheckpointUnchanged `
+        -Before $logBeforeInstall `
+        -Path $Context.log_path `
+        -MaximumBytes $script:CutoverLogMaximumBytes `
+        -Code 'LOG_CHANGED_BEFORE_DISABLE'
+
+    try {
+        Disable-CutoverTask
+        $disabledStatus = Get-CutoverExactInstallerStatus `
+            -Context $Context `
+            -ScriptPath $Context.restored_installer_path `
+            -ExpectedMode 'Execute' `
+            -ExpectedTaskState 'Disabled' `
+            -RequireResultZero $false
+        if ($disabledStatus.last_run_utc.Ticks -ne $preDisable.last_run_utc.Ticks -or
+            [int64]$disabledStatus.raw.last_task_result -ne [int64]$Context.expected_current_task_result) {
+            Throw-Cutover -Code 'TASK_CHANGED_DURING_DISABLE'
+        }
+        $disabledXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+        if ($disabledXml.enabled -or $disabledXml.normalized_sha256 -cne $failedXml.normalized_sha256) {
+            Throw-Cutover -Code 'TASK_DISABLE_DEFINITION_DRIFT'
+        }
+        Assert-CutoverFileCheckpointUnchanged `
+            -Before $stateBeforeInstall `
+            -Path $Context.state_path `
+            -MaximumBytes $script:CutoverStateMaximumBytes `
+            -Code 'STATE_CHANGED_DURING_DISABLE'
+        Assert-CutoverFileCheckpointUnchanged `
+            -Before $logBeforeInstall `
+            -Path $Context.log_path `
+            -MaximumBytes $script:CutoverLogMaximumBytes `
+            -Code 'LOG_CHANGED_DURING_DISABLE'
+
+        $install = Invoke-CutoverInstaller `
+            -Context $Context `
+            -ScriptPath $Context.installer_path `
+            -RequestedAction 'Install' `
+            -RequestedMode 'Observe'
+        $null = Assert-CutoverInstallerStatus `
+            -Status $install `
+            -Context $Context `
+            -ExpectedMode 'Observe' `
+            -ExpectedTaskState 'Ready'
+        $null = Get-CutoverExactInstallerStatus `
+            -Context $Context `
+            -ScriptPath $Context.installer_path `
+            -ExpectedMode 'Observe' `
+            -ExpectedTaskState 'Ready'
+        Assert-CutoverFileCheckpointUnchanged `
+            -Before $stateBeforeInstall `
+            -Path $Context.state_path `
+            -MaximumBytes $script:CutoverStateMaximumBytes `
+            -Code 'STATE_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged `
+            -Before $logBeforeInstall `
+            -Path $Context.log_path `
+            -MaximumBytes $script:CutoverLogMaximumBytes `
+            -Code 'LOG_CHANGED_DURING_INSTALL'
+        Assert-CutoverBackupMatchesExpectedXml `
+            -Context $Context `
+            -ExpectedUtf8TextSha256 $disabledXml.utf8_text_sha256 `
+            -ExpectedUtf16LeBomSha256 $disabledXml.utf16le_bom_sha256
+
+        $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path
+        $receipt = [pscustomobject][ordered]@{
+            schema = $script:CutoverSchema
+            ok = $true
+            action = 'InstallObserveAndDrainFromFailedExecute'
+            operation_id = $Context.operation_id
+            status = $drain.status
+            release_id = $Context.release_id
+            escrow_id = $Context.escrow_id
+            escrow_release_id = $Context.escrow_release_id
+            escrow_xml_sha256 = [string]$escrow.task_xml_sha256
+            failed_execute_code = $failedRun.failure_code
+            failed_execute_task_result = $failedRun.task_result
+            failed_execute_run_id = $failedRun.run_id
+            failed_execute_last_run_utc = $failedRun.last_run_utc.ToString('o')
+            failed_execute_error_at_utc = $failedRun.error_at_utc.ToString('o')
+            pre_task_state = 'Ready'
+            post_disable_task_state = 'Disabled'
+            candidate_task_state = 'Ready'
+            task_stopped = $false
+            enabled_escrow_xml_utf8_sha256 = $failedXml.utf8_text_sha256
+            post_disable_xml_utf8_sha256 = $disabledXml.utf8_text_sha256
+            old_definition_preserved_except_enabled = $true
+            backup_matches_post_disable_xml = $true
+            post_install_status_readback = $true
+            state_and_log_preserved_through_candidate_install = $true
+            state_not_restored = $true
+            rollback_action = 'RestoreReady'
+            runs = $drain.runs
+            final_run_id = $drain.final_run_id
+            final_worker_status = $drain.final_worker_status
+            final_last_run_utc = $drain.final_last_run_utc
+            log_appended_bytes = $drain.log_appended_bytes
+        }
+        $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
+        return $receipt
+    } catch {
+        Throw-CutoverAfterCleanup `
+            -FailureRecord $_ `
+            -Context $Context `
+            -Installer $Context.installer_path `
+            -ExpectedModes @('Observe') `
+            -FallbackInstaller $Context.restored_installer_path `
+            -FallbackModes @('Execute')
+    }
+}
+
 function Invoke-CutoverInstallExecuteReady {
     param([Parameter(Mandatory = $true)]$Context)
     Assert-CutoverPinnedExecutables -Context $Context
@@ -2459,6 +2800,9 @@ function New-CutoverContext {
         expected_work_id = $Values.ExpectedWorkId
         expected_row_id = $Values.ExpectedRowId
         expected_result_status = $Values.ExpectedResultStatus
+        expected_current_task_result = 0
+        expected_current_failure_code = ''
+        expected_current_run_id = ''
         metadata_root = ''
     }
     $programData = Resolve-CutoverAbsolutePath -Value $env:ProgramData -Code 'PROGRAM_DATA_INVALID' -ForbidVolumeRoot
@@ -2466,25 +2810,58 @@ function New-CutoverContext {
     Assert-CutoverSafeDirectory -Path $context.user_profile_path -MissingCode 'USER_PROFILE_MISSING' -UnsafeCode 'USER_PROFILE_UNSAFE'
     Assert-CutoverSafeDirectory -Path $context.workspace_path -MissingCode 'WORKSPACE_MISSING' -UnsafeCode 'WORKSPACE_UNSAFE'
 
-    if (@('ValidateEscrowAndDisable', 'InstallObserveAndDrain', 'RestoreReady') -ccontains $RequestedAction) {
+    if (@(
+        'ValidateEscrowAndDisable',
+        'InstallObserveAndDrain',
+        'InstallObserveAndDrainFromFailedExecute',
+        'RestoreReady'
+    ) -ccontains $RequestedAction) {
         if ($Values.EscrowId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or
             @('.', '..') -ccontains $Values.EscrowId) { Throw-Cutover -Code 'ESCROW_ID_INVALID' }
         if ($Values.ExpectedEscrowReleaseId -cnotmatch '^[0-9a-f]{40}$') { Throw-Cutover -Code 'ESCROW_RELEASE_ID_INVALID' }
         $context.escrow_tool_path = Resolve-CutoverEscrowTool -Path $Values.EscrowToolPath -ExpectedSha256 $Values.ExpectedEscrowToolSha256
         $context.escrow_path = [IO.Path]::GetFullPath((Join-Path $context.metadata_root ('acceptance\' + $Values.EscrowId))).TrimEnd('\', '/')
     }
-    if (@('ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait') -ccontains $RequestedAction) {
+    if (@(
+        'ValidateEscrowAndDisable',
+        'DrainObserve',
+        'InstallObserveAndDrain',
+        'InstallObserveAndDrainFromFailedExecute',
+        'InstallExecuteReady',
+        'RestoreReady',
+        'StartAndAwait'
+    ) -ccontains $RequestedAction) {
         $context.installer_path = Resolve-CutoverInstaller -Path $Values.InstallerPath -ExpectedSha256 $Values.ExpectedInstallerSha256 -ReleaseId $Values.ExpectedReleaseId -Prefix 'INSTALLER'
     }
-    if (@('InstallObserveAndDrain', 'RestoreReady') -ccontains $RequestedAction) {
+    if (@('InstallObserveAndDrain', 'InstallObserveAndDrainFromFailedExecute', 'RestoreReady') -ccontains $RequestedAction) {
         $context.restored_installer_path = Resolve-CutoverInstaller `
             -Path $Values.RestoredInstallerPath `
             -ExpectedSha256 $Values.ExpectedRestoredInstallerSha256 `
             -ReleaseId $Values.ExpectedEscrowReleaseId `
             -Prefix 'RESTORED_INSTALLER'
     }
-    if (@('DrainObserve', 'InstallObserveAndDrain') -ccontains $RequestedAction -and $context.mode -cne 'Observe') {
+    if (@('DrainObserve', 'InstallObserveAndDrain', 'InstallObserveAndDrainFromFailedExecute') -ccontains $RequestedAction -and $context.mode -cne 'Observe') {
         Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE'
+    }
+    if ($RequestedAction -ceq 'InstallObserveAndDrainFromFailedExecute') {
+        $context.expected_current_task_result = ConvertTo-CutoverInteger `
+            -Value ([string]$Values.ExpectedCurrentTaskResult) `
+            -Minimum 20 `
+            -Maximum 20 `
+            -Code 'EXPECTED_CURRENT_TASK_RESULT_INVALID'
+        $context.expected_current_failure_code = Get-CutoverExpectedFailedExecuteCode `
+            -Value ([string]$Values.ExpectedCurrentFailureCode)
+        if ([string]$Values.ExpectedCurrentRunId -cnotmatch '^[0-9a-f]{32}$') {
+            Throw-Cutover -Code 'EXPECTED_CURRENT_RUN_ID_INVALID'
+        }
+        $context.expected_current_run_id = [string]$Values.ExpectedCurrentRunId
+        if ([string]$context.release_id -ceq [string]$context.escrow_release_id) {
+            Throw-Cutover -Code 'FAILED_EXECUTE_RELEASE_NOT_ADVANCED'
+        }
+    } elseif (-not [string]::IsNullOrEmpty([string]$Values.ExpectedCurrentTaskResult) -or
+              -not [string]::IsNullOrEmpty([string]$Values.ExpectedCurrentFailureCode) -or
+              -not [string]::IsNullOrEmpty([string]$Values.ExpectedCurrentRunId)) {
+        Throw-Cutover -Code 'FAILED_EXECUTE_INPUTS_ACTION_MISMATCH'
     }
     if ($RequestedAction -ceq 'ValidateEscrowAndDisable' -and $context.mode -cne 'Execute') {
         Throw-Cutover -Code 'ACTION_REQUIRES_EXECUTE_MODE'
@@ -2524,6 +2901,7 @@ function Invoke-OrderCutoverPhase {
         'ValidateEscrowAndDisable' { return Invoke-CutoverValidateEscrowAndDisable -Context $context }
         'DrainObserve' { return Invoke-CutoverDrainObserveAction -Context $context }
         'InstallObserveAndDrain' { return Invoke-CutoverInstallObserveAndDrain -Context $context }
+        'InstallObserveAndDrainFromFailedExecute' { return Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $context }
         'InstallExecuteReady' { return Invoke-CutoverInstallExecuteReady -Context $context }
         'RestoreReady' { return Invoke-CutoverRestoreReady -Context $context }
         'StartAndAwait' { return Invoke-CutoverStartAndAwait -Context $context }
@@ -2622,6 +3000,9 @@ if ($MyInvocation.InvocationName -cne '.') {
         ExpectedWorkId = $ExpectedWorkId
         ExpectedRowId = $ExpectedRowId
         ExpectedResultStatus = $ExpectedResultStatus
+        ExpectedCurrentTaskResult = $ExpectedCurrentTaskResult
+        ExpectedCurrentFailureCode = $ExpectedCurrentFailureCode
+        ExpectedCurrentRunId = $ExpectedCurrentRunId
         GitPath = $GitPath
         ExpectedGitSha256 = $ExpectedGitSha256
         ExpectedClaudeSha256 = $ExpectedClaudeSha256

@@ -47,6 +47,7 @@ $mockNames = @(
     'Get-CutoverTaskRuntime',
     'Get-CutoverFileCheckpoint',
     'Get-CutoverLogCheckpoint',
+    'Get-CutoverTrailingLogRun',
     'Assert-CutoverFileCheckpointUnchanged',
     'Export-CutoverTaskXml',
     'Disable-CutoverTask',
@@ -111,6 +112,9 @@ function New-TestContext {
         expected_work_id = ''
         expected_row_id = ''
         expected_result_status = ''
+        expected_current_task_result = 0
+        expected_current_failure_code = ''
+        expected_current_run_id = ''
         git_path = 'C:\Program Files\Git\cmd\git.exe'
         expected_git_sha256 = ('3' * 64)
         expected_claude_sha256 = ('4' * 64)
@@ -129,6 +133,41 @@ function New-TestExactStatus {
         raw = [pscustomobject]@{ state = $State; last_task_result = $LastTaskResult }
         last_run_utc = $Last
         next_run_utc = $Next
+    }
+}
+
+function New-TestInstallerStatusReceipt {
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [string]$Mode = 'Execute',
+        [string]$State = 'Ready',
+        [int64]$LastTaskResult = 0
+    )
+    $statusText = switch ($State) {
+        'Ready' { 'READY' }
+        'Disabled' { 'DISABLED' }
+        'Running' { 'RUNNING' }
+        default { 'NOT_READY' }
+    }
+    return [pscustomobject][ordered]@{
+        status = $statusText
+        task_name = 'SFDC24 Blackboard Order Worker'
+        task_path = '\'
+        state = $State
+        mode = $Mode
+        user_profile = $Context.user_profile_path
+        workspace_path = $Context.workspace_path
+        state_path = $Context.state_path
+        log_path = $Context.log_path
+        wall_timeout_seconds = [int]$Context.wall_timeout_seconds
+        last_task_result = [int64]$LastTaskResult
+        runner_exists = $true
+        env_file_exists = $true
+        drift = @()
+        wall_timeout_readback = [pscustomobject]@{ confirmed = $true }
+        workspace_git_directory_exists = $true
+        last_run_time = [DateTime]'2026-09-07T00:00:00Z'
+        next_run_time = [DateTime]'2099-01-01T00:00:00Z'
     }
 }
 
@@ -158,7 +197,10 @@ function New-TestState {
         [string]$WorkId = '',
         [string]$RowId = '',
         [string]$ResultStatus = '',
-        [string]$PollAt = '2026-09-07T00:00:00.000Z'
+        [string]$PollAt = '2026-09-07T00:00:00.000Z',
+        [string]$ErrorCode = '',
+        [string]$ErrorMessage = '',
+        [string]$ErrorAt = '2026-09-07T00:00:01.000Z'
     )
     $work = @()
     $successEvent = 'poll_complete'
@@ -174,6 +216,19 @@ function New-TestState {
         })
     } elseif ($Status -ceq 'candidate_observed') {
         $successEvent = 'candidate_observed'
+    }
+    $errorEvidence = $null
+    if ($Status -ceq 'error') {
+        if ([string]::IsNullOrEmpty($ErrorMessage)) {
+            $ErrorMessage = if ($ErrorCode -ceq 'BOARD_HEADER_INVALID') { 'board_header_invalid' } else { $ErrorCode }
+        }
+        $errorEvidence = [pscustomobject][ordered]@{
+            at = $ErrorAt
+            code = $ErrorCode
+            message = $ErrorMessage
+            work_id = $WorkId
+            row_id = $RowId
+        }
     }
     return [pscustomobject][ordered]@{
         schema = 'order_supervisor_state.v1'
@@ -198,11 +253,11 @@ function New-TestState {
             work_id = $WorkId
             row_id = $RowId
         }
-        error = $null
+        error = $errorEvidence
         counts = [pscustomobject]@{
             polls = 1; seen = 1; selected = $(if ($WorkId) { 1 } else { 0 })
             succeeded = $(if ($Status -ceq 'result_confirmed' -and $ResultStatus -cne 'failed') { 1 } else { 0 })
-            errors = 0; ignored = 0
+            errors = $(if ($Status -ceq 'error') { 1 } else { 0 }); ignored = 0
         }
         work = $work
     }
@@ -232,6 +287,74 @@ function New-TestLogEntry {
     }
     if ($null -ne $Details) { $entry.details = $Details }
     return [pscustomobject]$entry
+}
+
+function New-TestBoardHeaderDetails {
+    return [pscustomobject][ordered]@{
+        attempt = '1'
+        transport_exit = '0'
+        http_status = '200'
+        content_type_class = 'json'
+        elapsed_ms = '3874.97'
+    }
+}
+
+function Reset-TestFailedExecuteScenario {
+    $script:IncidentRunId = '062af07187da47b29a208dfe4067c573'
+    $script:IncidentStart = [DateTime]::UtcNow.AddSeconds(-15)
+    $script:IncidentErrorAt = $script:IncidentStart.AddSeconds(4)
+    $script:IncidentTerminalAt = $script:IncidentStart.AddSeconds(5)
+    $startText = $script:IncidentStart.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $errorText = $script:IncidentErrorAt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $terminalText = $script:IncidentTerminalAt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $script:IncidentState = New-TestState `
+        -Mode Execute `
+        -RunId $script:IncidentRunId `
+        -Status error `
+        -PollAt $startText `
+        -ErrorAt $errorText `
+        -ErrorCode BOARD_HEADER_INVALID
+    $script:IncidentEntries = @(
+        (New-TestLogEntry -Event poll_started -RunId $script:IncidentRunId -At $startText -Details ([pscustomobject]@{ mode = 'Execute' })),
+        (New-TestLogEntry -Event run_error -RunId $script:IncidentRunId -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $terminalText -Details (New-TestBoardHeaderDetails))
+    )
+    $script:IncidentInitialResult = [int64]20
+    $script:IncidentSecondResult = [int64]20
+    $script:IncidentDisabledResult = [int64]20
+    $script:IncidentSecondLast = $script:IncidentStart
+    $script:IncidentDisabledLast = $script:IncidentStart
+    $script:IncidentInitialNext = [DateTime]'2099-01-01T00:00:00Z'
+    $script:IncidentSecondNext = $script:IncidentInitialNext
+    $script:IncidentStatusCall = 0
+    $script:IncidentXmlCall = 0
+    $script:IncidentDisableCalls = 0
+    $script:IncidentInstallCalls = 0
+    $script:IncidentCandidateInstalled = $false
+    $script:IncidentEscrowAction = ''
+    $script:IncidentInstallPath = ''
+    $script:IncidentInstallAction = ''
+    $script:IncidentInstallMode = ''
+    $script:IncidentDrainInstaller = ''
+    $script:IncidentBackupUtf8Sha256 = ''
+    $script:IncidentBackupUtf16LeBomSha256 = ''
+    $script:IncidentDrainCalls = 0
+    $script:IncidentCleanupCalls = 0
+    $script:IncidentStartCalls = 0
+    $script:IncidentBackupCalls = 0
+    $script:IncidentCheckpointCalls = 0
+    $script:IncidentCheckpointFailureCode = ''
+    $script:IncidentTriggerFailureCode = ''
+    $script:IncidentInstallFailureCode = ''
+    $script:IncidentInstallReceiptFailureCode = ''
+    $script:IncidentCandidateStatusFailureCode = ''
+    $script:IncidentBackupFailureCode = ''
+    $script:IncidentDrainFailureCode = ''
+    $script:IncidentEscrowHash = ''
+    $script:IncidentPreDisableXml = ''
+    $script:IncidentDisabledXml = ''
+    $script:IncidentDefinitionUnknown = $false
+    $script:IncidentCleanupSequence = New-Object 'System.Collections.Generic.List[string]'
+    $script:IncidentStatusSequence = New-Object 'System.Collections.Generic.List[string]'
 }
 
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('blackboard-cutover-tests-' + [Guid]::NewGuid().ToString('N'))
@@ -433,6 +556,29 @@ try {
         ConvertTo-CutoverInteger -Value '01' -Minimum 1 -Maximum 20 -Code 'NUMBER_INVALID' | Out-Null
     } 'NUMBER_INVALID'
     Assert-True 'integer parser accepts bounded canonical number' ((ConvertTo-CutoverInteger -Value '20' -Minimum 1 -Maximum 20 -Code 'NUMBER_INVALID') -eq 20)
+    Assert-True 'failed Execute gate accepts only the exact known header failure' (
+        (Get-CutoverExpectedFailedExecuteCode -Value 'BOARD_HEADER_INVALID') -ceq 'BOARD_HEADER_INVALID'
+    )
+    foreach ($unapprovedFailureCode in @('', 'board_header_invalid', 'BOARD_READ_HTTP_ERROR', 'BOARD_READ_TRANSPORT_ERROR')) {
+        Assert-ThrowsCode ('failed Execute gate rejects unapproved code ' + $(if ($unapprovedFailureCode) { $unapprovedFailureCode } else { 'empty' })) {
+            Get-CutoverExpectedFailedExecuteCode -Value $unapprovedFailureCode | Out-Null
+        } 'EXPECTED_CURRENT_FAILURE_CODE_INVALID'
+    }
+    $normalStatusContext = New-TestContext
+    $normalNonzeroStatus = New-TestInstallerStatusReceipt -Context $normalStatusContext -Mode Execute -State Ready -LastTaskResult 20
+    Assert-ThrowsCode 'normal installer status semantics still reject result 20' {
+        Assert-CutoverInstallerStatus -Status $normalNonzeroStatus -Context $normalStatusContext -ExpectedMode Execute -ExpectedTaskState Ready | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
+    $incidentStatusOkay = $true
+    try {
+        $null = Assert-CutoverInstallerStatus `
+            -Status $normalNonzeroStatus `
+            -Context $normalStatusContext `
+            -ExpectedMode Execute `
+            -ExpectedTaskState Ready `
+            -RequireResultZero $false
+    } catch { $incidentStatusOkay = $false }
+    Assert-True 'nonzero status requires an explicit specialist opt-out' $incidentStatusOkay
 
     $quoted = ConvertTo-CutoverCommandLineArgument -Value 'C:\A path\file.ps1'
     Assert-True 'native argument quoting wraps spaces' ($quoted -ceq '"C:\A path\file.ps1"')
@@ -449,10 +595,11 @@ try {
     foreach ($forbidden in @('Invoke-RestMethod', 'Invoke-WebRequest', 'az rest', 'bus.ps1', 'Register-ScheduledTask', 'Stop-ScheduledTask')) {
         Assert-True ('driver excludes direct surface ' + $forbidden) ($source.IndexOf($forbidden, [StringComparison]::OrdinalIgnoreCase) -lt 0)
     }
-    Assert-True 'driver exposes all six bounded actions' (@(
-        'ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait' |
+    Assert-True 'driver exposes all seven bounded actions' (@(
+        'ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain',
+        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait' |
             Where-Object { $source.IndexOf($_, [StringComparison]::Ordinal) -ge 0 }
-    ).Count -eq 6)
+    ).Count -eq 7)
     Assert-True 'receipt byte cap is literal 3072' ($source.Contains('$script:CutoverReceiptMaximumBytes = 3072'))
     Assert-True 'log and protected inputs have finite byte caps' (
         $source.Contains('$script:CutoverLogMaximumBytes = 67108864') -and
@@ -485,6 +632,98 @@ try {
     Assert-ThrowsCode 'installer rejects release-path substitution' {
         Resolve-CutoverInstaller -Path $toolPath -ExpectedSha256 $toolSha -ReleaseId $releaseId -Prefix 'INSTALLER' | Out-Null
     } 'INSTALLER_PATH_IDENTITY_MISMATCH'
+
+    # Command-surface/context wiring for the incident action requires all three
+    # action-only pins and the two distinct immutable releases.
+    $oldReleaseId = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
+    $oldInstallerBytes = [Text.Encoding]::UTF8.GetBytes('old-installer')
+    $oldInstallerSha = Get-CutoverBytesSha256 -Bytes $oldInstallerBytes
+    $oldInstallerPath = Join-Path $fakeProgramData ('SFDC24\OrderSupervisor\releases\' + $oldReleaseId + '\scripts\install_order_supervisor.ps1')
+    New-Item -ItemType Directory -Path (Split-Path -Parent $oldInstallerPath) -Force | Out-Null
+    [IO.File]::WriteAllBytes($oldInstallerPath, $oldInstallerBytes)
+    $contextUser = Join-Path $temporaryRoot 'incident-user'
+    $contextWorkspace = Join-Path $contextUser 'Blackboard'
+    New-Item -ItemType Directory -Path $contextWorkspace -Force | Out-Null
+    $contextValues = @{
+        OperationId = '0123456789abcdef0123456789abcdef'
+        EscrowToolPath = $toolPath
+        ExpectedEscrowToolSha256 = $toolSha
+        EscrowId = 'incident-cutover'
+        ExpectedEscrowReleaseId = $oldReleaseId
+        InstallerPath = $installerPath
+        ExpectedInstallerSha256 = $installerSha
+        ExpectedReleaseId = $releaseId
+        RestoredInstallerPath = $oldInstallerPath
+        ExpectedRestoredInstallerSha256 = $oldInstallerSha
+        Mode = 'Observe'
+        UserProfilePath = $contextUser
+        WorkspacePath = $contextWorkspace
+        EnvFile = (Join-Path $contextWorkspace '.env')
+        StatePath = (Join-Path $fakeProgramData 'SFDC24\OrderSupervisor\state.json')
+        LogPath = (Join-Path $fakeProgramData 'SFDC24\OrderSupervisor\events.jsonl')
+        ClaudeCommand = (Join-Path $contextUser 'claude.exe')
+        WallTimeoutSeconds = '720'
+        MaxRuns = '4'
+        TimeoutSeconds = '600'
+        PollMilliseconds = '100'
+        NaturalTriggerMarginSeconds = '60'
+        ExpectedTerminalStatus = ''
+        ExpectedWorkId = ''
+        ExpectedRowId = ''
+        ExpectedResultStatus = ''
+        ExpectedCurrentTaskResult = '20'
+        ExpectedCurrentFailureCode = 'BOARD_HEADER_INVALID'
+        ExpectedCurrentRunId = '062af07187da47b29a208dfe4067c573'
+        GitPath = ''
+        ExpectedGitSha256 = ''
+        ExpectedClaudeSha256 = ''
+    }
+    $wiredIncidentContext = New-CutoverContext `
+        -RequestedAction InstallObserveAndDrainFromFailedExecute `
+        -Values $contextValues
+    Assert-True 'incident context wires exact result code run and distinct releases' (
+        $wiredIncidentContext.expected_current_task_result -eq 20 -and
+        $wiredIncidentContext.expected_current_failure_code -ceq 'BOARD_HEADER_INVALID' -and
+        $wiredIncidentContext.expected_current_run_id -ceq $contextValues.ExpectedCurrentRunId -and
+        $wiredIncidentContext.release_id -cne $wiredIncidentContext.escrow_release_id
+    )
+    foreach ($badResult in @('', '0', '020', '21')) {
+        $badValues = $contextValues.Clone()
+        $badValues.ExpectedCurrentTaskResult = $badResult
+        Assert-ThrowsCode ('incident context rejects task-result input ' + $(if ($badResult) { $badResult } else { 'empty' })) {
+            New-CutoverContext -RequestedAction InstallObserveAndDrainFromFailedExecute -Values $badValues | Out-Null
+        } 'EXPECTED_CURRENT_TASK_RESULT_INVALID'
+    }
+    foreach ($badCode in @('', 'board_header_invalid', 'BOARD_READ_HTTP_ERROR')) {
+        $badValues = $contextValues.Clone()
+        $badValues.ExpectedCurrentFailureCode = $badCode
+        Assert-ThrowsCode ('incident context rejects failure-code input ' + $(if ($badCode) { $badCode } else { 'empty' })) {
+            New-CutoverContext -RequestedAction InstallObserveAndDrainFromFailedExecute -Values $badValues | Out-Null
+        } 'EXPECTED_CURRENT_FAILURE_CODE_INVALID'
+    }
+    foreach ($badRunId in @('', ('A' * 32), ('f' * 31), ('f' * 33))) {
+        $badValues = $contextValues.Clone()
+        $badValues.ExpectedCurrentRunId = $badRunId
+        Assert-ThrowsCode ('incident context rejects run-id input length ' + $badRunId.Length) {
+            New-CutoverContext -RequestedAction InstallObserveAndDrainFromFailedExecute -Values $badValues | Out-Null
+        } 'EXPECTED_CURRENT_RUN_ID_INVALID'
+    }
+    $sameReleaseValues = $contextValues.Clone()
+    $sameReleaseValues.InstallerPath = $oldInstallerPath
+    $sameReleaseValues.ExpectedInstallerSha256 = $oldInstallerSha
+    $sameReleaseValues.ExpectedReleaseId = $oldReleaseId
+    Assert-ThrowsCode 'incident context rejects candidate equal to escrow release' {
+        New-CutoverContext -RequestedAction InstallObserveAndDrainFromFailedExecute -Values $sameReleaseValues | Out-Null
+    } 'FAILED_EXECUTE_RELEASE_NOT_ADVANCED'
+    $wrongModeValues = $contextValues.Clone()
+    $wrongModeValues.Mode = 'Execute'
+    Assert-ThrowsCode 'incident context requires requested Observe mode' {
+        New-CutoverContext -RequestedAction InstallObserveAndDrainFromFailedExecute -Values $wrongModeValues | Out-Null
+    } 'ACTION_REQUIRES_OBSERVE_MODE'
+    $ordinaryValues = $contextValues.Clone()
+    Assert-ThrowsCode 'ordinary action refuses incident-only bypass inputs' {
+        New-CutoverContext -RequestedAction DrainObserve -Values $ordinaryValues | Out-Null
+    } 'FAILED_EXECUTE_INPUTS_ACTION_MISMATCH'
     $env:ProgramData = $oldProgramData
 
     $fakeClaudePath = Join-Path $temporaryRoot 'claude.exe'
@@ -704,6 +943,200 @@ try {
             -RunWindowEndUtc ([DateTime]'2026-09-07T00:02:00Z')
     } 'LOG_TIMESTAMP_INVALID'
 
+    # The exceptional gate authenticates one exact, causally current failed
+    # Execute run.  state.error alone is deliberately insufficient because it
+    # persists after later successful polls.
+    $failedRunId = '062af07187da47b29a208dfe4067c573'
+    $failedStart = [DateTime]::UtcNow.AddSeconds(-15)
+    $failedErrorAt = $failedStart.AddSeconds(4)
+    $failedTerminalAt = $failedStart.AddSeconds(5)
+    $failedStartText = $failedStart.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $failedErrorText = $failedErrorAt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $failedTerminalText = $failedTerminalAt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $failedState = New-TestState `
+        -Mode Execute `
+        -RunId $failedRunId `
+        -Status error `
+        -PollAt $failedStartText `
+        -ErrorAt $failedErrorText `
+        -ErrorCode BOARD_HEADER_INVALID
+    $failedEntries = @(
+        (New-TestLogEntry -Event poll_started -RunId $failedRunId -At $failedStartText -Details ([pscustomobject]@{ mode = 'Execute' })),
+        (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $failedTerminalText -Details (New-TestBoardHeaderDetails))
+    )
+    $failedLogPath = Join-Path $temporaryRoot 'current-failed-execute.jsonl'
+    $failedLogLines = @($failedEntries | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress })
+    [IO.File]::WriteAllText($failedLogPath, (($failedLogLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+    $failedContext = New-TestContext
+    $failedContext.log_path = $failedLogPath
+    $failedExactStatus = New-TestExactStatus -Last $failedStart -LastTaskResult 20
+    $failedEvidence = Assert-CutoverCurrentFailedExecuteRun `
+        -Context $failedContext `
+        -State $failedState `
+        -ExactStatus $failedExactStatus `
+        -LogCheckpoint (Get-CutoverLogCheckpoint -Path $failedLogPath) `
+        -ExpectedTaskResult 20 `
+        -ExpectedFailureCode BOARD_HEADER_INVALID `
+        -ExpectedRunId $failedRunId
+    Assert-True 'failed Execute gate binds result state log run and Scheduler time' (
+        $failedEvidence.run_id -ceq $failedRunId -and
+        $failedEvidence.failure_code -ceq 'BOARD_HEADER_INVALID' -and
+        $failedEvidence.task_result -eq 20
+    )
+    $delayedStartupEvidence = Assert-CutoverCurrentFailedExecuteRun `
+        -Context $failedContext `
+        -State $failedState `
+        -ExactStatus (New-TestExactStatus -Last $failedStart.AddSeconds(-15) -LastTaskResult 20) `
+        -LogCheckpoint (Get-CutoverLogCheckpoint -Path $failedLogPath) `
+        -ExpectedTaskResult 20 `
+        -ExpectedFailureCode BOARD_HEADER_INVALID `
+        -ExpectedRunId $failedRunId
+    Assert-True 'failed Execute gate permits bounded 15-second task startup' (
+        $delayedStartupEvidence.run_id -ceq $failedRunId
+    )
+
+    Reset-TestMocks
+    Set-TestMock 'Get-CutoverTrailingLogRun' {
+        param($Path, $Checkpoint, $RunId)
+        return @($script:FailedExecuteEntries)
+    }
+    $script:FailedExecuteEntries = $failedEntries
+    Assert-ThrowsCode 'failed Execute gate rejects any result other than 20' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus (New-TestExactStatus -Last $failedStart -LastTaskResult 0) -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_TASK_RESULT_MISMATCH'
+    Assert-ThrowsCode 'failed Execute gate rejects a non-Ready task' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus (New-TestExactStatus -Last $failedStart -State Disabled -LastTaskResult 20) -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_TASK_STATE_MISMATCH'
+    $wrongStatusState = New-TestState -Mode Execute -RunId $failedRunId -Status no_eligible_order -PollAt $failedStartText
+    Assert-ThrowsCode 'failed Execute gate rejects stale error after later success' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongStatusState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_STATE_STATUS_MISMATCH'
+    $wrongModeState = New-TestState -Mode Observe -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID
+    Assert-ThrowsCode 'failed Execute gate rejects Observe state' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongModeState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'STATE_LAST_POLL_INVALID'
+    $wrongIdentityState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID
+    $wrongIdentityState.last_poll.identity = 'OTHER\user'
+    Assert-ThrowsCode 'failed Execute gate rejects non-SYSTEM identity' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongIdentityState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'STATE_LAST_POLL_INVALID'
+    $wrongFailedProfileState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID
+    $wrongFailedProfileState.last_poll.user_profile = 'C:\Users\other'
+    Assert-ThrowsCode 'failed Execute gate rejects wrong SYSTEM profile' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongFailedProfileState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'STATE_LAST_POLL_INVALID'
+    Assert-ThrowsCode 'failed Execute gate rejects a stale caller-pinned run id' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId ('f' * 32) | Out-Null
+    } 'FAILED_EXECUTE_RUN_ID_MISMATCH'
+    $wrongCodeState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_READ_HTTP_ERROR
+    Assert-ThrowsCode 'failed Execute gate rejects a different state error code' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongCodeState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    $wrongMessageState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID -ErrorMessage different
+    Assert-ThrowsCode 'failed Execute gate rejects a different state error message' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $wrongMessageState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    $missingErrorState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID
+    $missingErrorState.error = $null
+    Assert-ThrowsCode 'failed Execute gate rejects missing current error evidence' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $missingErrorState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    $selectedErrorState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedErrorText -ErrorCode BOARD_HEADER_INVALID -WorkId WORK-1 -RowId row-1
+    Assert-ThrowsCode 'failed header gate rejects post-selection work identity' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $selectedErrorState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    $script:FailedExecuteEntries = @($failedEntries[0], (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_READ_HTTP_ERROR -Message BOARD_READ_HTTP_ERROR -Level error -At $failedTerminalText))
+    Assert-ThrowsCode 'failed Execute gate rejects a different trailing log code' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'LOG_TERMINAL_EVIDENCE_INVALID'
+    $script:FailedExecuteEntries = @(
+        (New-TestLogEntry -Event poll_started -RunId ('e' * 32) -At $failedStartText -Details ([pscustomobject]@{ mode = 'Execute' })),
+        (New-TestLogEntry -Event run_error -RunId ('e' * 32) -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $failedTerminalText -Details (New-TestBoardHeaderDetails))
+    )
+    Assert-ThrowsCode 'failed Execute gate rejects a different trailing log run id' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'LOG_RUN_ID_MISMATCH'
+    $script:FailedExecuteEntries = @($failedEntries[0], (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_HEADER_INVALID -Message different -Level error -At $failedTerminalText))
+    Assert-ThrowsCode 'failed Execute gate rejects a different trailing log message' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_STATE_LOG_MISMATCH'
+    $script:FailedExecuteEntries = @(
+        (New-TestLogEntry -Event poll_started -RunId $failedRunId -At $failedStartText -Details ([pscustomobject]@{ mode = 'Observe' })),
+        $failedEntries[1]
+    )
+    Assert-ThrowsCode 'failed Execute gate rejects a non-Execute poll log' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'LOG_POLL_MODE_MISMATCH'
+    foreach ($badPollCase in @(
+        [pscustomobject]@{ name = 'error-level poll'; property = 'level'; value = 'error' },
+        [pscustomobject]@{ name = 'poll work identity'; property = 'work_id'; value = 'WORK-1' },
+        [pscustomobject]@{ name = 'poll row identity'; property = 'row_id'; value = 'row-1' },
+        [pscustomobject]@{ name = 'poll code'; property = 'code'; value = 'BOARD_HEADER_INVALID' },
+        [pscustomobject]@{ name = 'poll message'; property = 'message'; value = 'unexpected' }
+    )) {
+        $badPoll = New-TestLogEntry -Event poll_started -RunId $failedRunId -At $failedStartText -Details ([pscustomobject]@{ mode = 'Execute' })
+        $badPoll.PSObject.Properties[$badPollCase.property].Value = $badPollCase.value
+        $script:FailedExecuteEntries = @($badPoll, $failedEntries[1])
+        Assert-ThrowsCode ('failed Execute gate rejects ' + $badPollCase.name) {
+            Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+        } 'FAILED_EXECUTE_POLL_EVIDENCE_INVALID'
+    }
+    $liveDetailsOkay = $true
+    try { $null = Assert-CutoverBoardHeaderFailureDetails -Details (New-TestBoardHeaderDetails) }
+    catch { $liveDetailsOkay = $false }
+    Assert-True 'header gate accepts exact live successful-sidecar details' $liveDetailsOkay
+    $script:FailedExecuteEntries = @(
+        $failedEntries[0],
+        (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $failedTerminalText)
+    )
+    Assert-ThrowsCode 'failed Execute gate rejects missing run-error details' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    foreach ($badDetailCase in @(
+        [pscustomobject]@{ name = 'numeric attempt type'; property = 'attempt'; value = 1; extra = $false },
+        [pscustomobject]@{ name = 'retry attempt'; property = 'attempt'; value = '2'; extra = $false },
+        [pscustomobject]@{ name = 'failed transport'; property = 'transport_exit'; value = '1'; extra = $false },
+        [pscustomobject]@{ name = 'nonexact successful HTTP'; property = 'http_status'; value = '204'; extra = $false },
+        [pscustomobject]@{ name = 'non-JSON content'; property = 'content_type_class'; value = 'html'; extra = $false },
+        [pscustomobject]@{ name = 'zero elapsed time'; property = 'elapsed_ms'; value = '0'; extra = $false },
+        [pscustomobject]@{ name = 'noncanonical elapsed precision'; property = 'elapsed_ms'; value = '3874.970'; extra = $false },
+        [pscustomobject]@{ name = 'unknown property'; property = 'unexpected'; value = 'x'; extra = $true }
+    )) {
+        $badDetails = New-TestBoardHeaderDetails
+        if ($badDetailCase.extra) {
+            $badDetails | Add-Member -NotePropertyName $badDetailCase.property -NotePropertyValue $badDetailCase.value
+        } else {
+            $badDetails.PSObject.Properties[$badDetailCase.property].Value = $badDetailCase.value
+        }
+        $script:FailedExecuteEntries = @(
+            $failedEntries[0],
+            (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $failedTerminalText -Details $badDetails)
+        )
+        Assert-ThrowsCode ('failed Execute gate rejects detail ' + $badDetailCase.name) {
+            Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+        } 'BOARD_HEADER_FAILURE_DETAILS_INVALID'
+    }
+    $script:FailedExecuteEntries = @($failedEntries + (New-TestLogEntry -Event run_error -RunId $failedRunId -Code BOARD_HEADER_INVALID -Message board_header_invalid -Level error -At $failedTerminalText -Details (New-TestBoardHeaderDetails)))
+    Assert-ThrowsCode 'failed Execute gate rejects any extra current-run record' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_LOG_SHAPE_INVALID'
+    $script:FailedExecuteEntries = $failedEntries
+    Assert-ThrowsCode 'failed Execute gate rejects excessive task-startup delay' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus (New-TestExactStatus -Last $failedStart.AddSeconds(-31) -LastTaskResult 20) -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_TASK_TIME_MISMATCH'
+    Assert-ThrowsCode 'failed Execute gate rejects poll before Scheduler start tolerance' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $failedState -ExactStatus (New-TestExactStatus -Last $failedStart.AddSeconds(3) -LastTaskResult 20) -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'LOG_TIMESTAMP_INVALID'
+    $lateErrorState = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedTerminalAt.AddSeconds(10).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') -ErrorCode BOARD_HEADER_INVALID
+    Assert-ThrowsCode 'failed Execute gate rejects noncausal state error time' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $lateErrorState -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_STATE_LOG_TIME_MISMATCH'
+    $staleStateError = New-TestState -Mode Execute -RunId $failedRunId -Status error -PollAt $failedStartText -ErrorAt $failedStart.AddSeconds(1).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') -ErrorCode BOARD_HEADER_INVALID
+    Assert-ThrowsCode 'failed Execute gate rejects terminal error delayed from state error' {
+        Assert-CutoverCurrentFailedExecuteRun -Context $failedContext -State $staleStateError -ExactStatus $failedExactStatus -LogCheckpoint ([pscustomobject]@{ length = 1 }) -ExpectedTaskResult 20 -ExpectedFailureCode BOARD_HEADER_INVALID -ExpectedRunId $failedRunId | Out-Null
+    } 'FAILED_EXECUTE_STATE_LOG_TIME_MISMATCH'
+    Reset-TestMocks
+
     $resultRow = '11111111-1111-1111-1111-111111111111'
     $resultState = New-TestState -Mode Execute -RunId $runId -Status result_confirmed -WorkId 'CANARY-1' -RowId $resultRow -ResultStatus completed
     $stateResultOkay = $true
@@ -914,6 +1347,38 @@ try {
     Assert-True 'ValidateEscrowAndDisable returns exact success status' ($disableReceipt.ok -and $disableReceipt.status -ceq 'TASK_DISABLED')
     Assert-True 'ValidateEscrowAndDisable invokes disable exactly once' ($script:DisableCalled -eq 1)
     Assert-True 'ValidateEscrowAndDisable proves definition delta only' ($disableReceipt.definition_preserved_except_enabled -and $disableReceipt.escrow_xml_sha256 -ceq $xmlHash)
+
+    Reset-TestMocks
+    $context = New-TestContext
+    $context.mode = 'Execute'
+    $script:OrdinaryResultTwentyInstallCalls = 0
+    $script:OrdinaryResultTwentyDisableCalls = 0
+    $script:OrdinaryResultTwentyDrainCalls = 0
+    $script:OrdinaryResultTwentyCleanupCalls = 0
+    $script:OrdinaryResultTwentyStartCalls = 0
+    Set-TestMock 'Invoke-CutoverEscrow' {
+        param($Context, $RequestedAction)
+        New-TestEscrowReceipt -Action Validate -XmlSha256 $script:TestXmlHash
+    }
+    Set-TestMock 'Invoke-CutoverInstaller' {
+        param($Context, $ScriptPath, $RequestedAction, $RequestedMode)
+        if ($RequestedAction -ceq 'Install') { $script:OrdinaryResultTwentyInstallCalls++ }
+        New-TestInstallerStatusReceipt -Context $Context -Mode Execute -State Ready -LastTaskResult 20
+    }
+    Set-TestMock 'Disable-CutoverTask' { $script:OrdinaryResultTwentyDisableCalls++ }
+    Set-TestMock 'Invoke-CutoverDrainObserve' { $script:OrdinaryResultTwentyDrainCalls++ }
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' { $script:OrdinaryResultTwentyCleanupCalls++ }
+    Set-TestMock 'Start-CutoverTask' { $script:OrdinaryResultTwentyStartCalls++ }
+    Assert-ThrowsCode 'ordinary ValidateEscrowAndDisable action rejects result 20' {
+        Invoke-CutoverValidateEscrowAndDisable -Context $context | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
+    Assert-True 'ordinary result-20 rejection cannot reach any mutation or cleanup path' (
+        $script:OrdinaryResultTwentyDisableCalls -eq 0 -and
+        $script:OrdinaryResultTwentyInstallCalls -eq 0 -and
+        $script:OrdinaryResultTwentyDrainCalls -eq 0 -and
+        $script:OrdinaryResultTwentyCleanupCalls -eq 0 -and
+        $script:OrdinaryResultTwentyStartCalls -eq 0
+    )
 
     # RestoreReady accepts either pinned candidate mode in Ready or Disabled.
     # Ready is disabled after a stable reread; Disabled is reread without a
@@ -1167,6 +1632,454 @@ try {
     Assert-True 'InstallObserveAndDrain performs a distinct post-install Status readback' (
         ($script:ObserveStatusExpectations.ToArray() -join ',') -ceq 'Execute:Ready,Execute:Ready,Execute:Disabled,Observe:Ready' -and
         $installDrainReceipt.post_install_status_readback
+    )
+
+    # The incident-only transition is the sole path that accepts the exact
+    # old Execute Ready/result-20 BOARD_HEADER_INVALID state.  Its complete
+    # exceptional proof is read-only and outside the cleanup/mutation region.
+    Reset-TestMocks
+    Reset-TestFailedExecuteScenario
+    $incidentContext = New-TestContext
+    $incidentContext.expected_current_task_result = 20
+    $incidentContext.expected_current_failure_code = 'BOARD_HEADER_INVALID'
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    Set-TestMock 'Invoke-CutoverEscrow' {
+        param($Context, $RequestedAction)
+        $script:IncidentEscrowAction = $RequestedAction
+        New-TestEscrowReceipt -Action Validate -XmlSha256 $script:IncidentEscrowHash
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        $explicitResultGate = $PSBoundParameters.ContainsKey('RequireResultZero')
+        $script:IncidentStatusSequence.Add(
+            $ExpectedMode + ':' + $ExpectedTaskState + ':' +
+            $(if ($explicitResultGate) { [string][bool]$RequireResultZero } else { 'default' })
+        )
+        if ($ScriptPath -ceq $Context.restored_installer_path -and $ExpectedTaskState -ceq 'Ready') {
+            $script:IncidentStatusCall++
+            if ($script:IncidentStatusCall -eq 1) {
+                return New-TestExactStatus -Last $script:IncidentStart -Next $script:IncidentInitialNext -State Ready -LastTaskResult $script:IncidentInitialResult
+            }
+            return New-TestExactStatus -Last $script:IncidentSecondLast -Next $script:IncidentSecondNext -State Ready -LastTaskResult $script:IncidentSecondResult
+        }
+        if ($ScriptPath -ceq $Context.restored_installer_path -and $ExpectedTaskState -ceq 'Disabled') {
+            return New-TestExactStatus -Last $script:IncidentDisabledLast -Next $script:IncidentSecondNext -State Disabled -LastTaskResult $script:IncidentDisabledResult
+        }
+        if ($script:IncidentCandidateStatusFailureCode) {
+            Throw-Cutover -Code $script:IncidentCandidateStatusFailureCode
+        }
+        return New-TestExactStatus -Last $script:IncidentStart -Next $script:IncidentInitialNext -State Ready -LastTaskResult 0
+    }
+    Set-TestMock 'Get-CutoverState' {
+        param($Path)
+        [pscustomobject]@{
+            value = $script:IncidentState
+            checkpoint = [pscustomobject]@{ length = 10; sha256 = ('d' * 64) }
+        }
+    }
+    Set-TestMock 'Get-CutoverLogCheckpoint' {
+        param($Path)
+        [pscustomobject]@{ length = 20; sha256 = ('e' * 64) }
+    }
+    Set-TestMock 'Get-CutoverTrailingLogRun' {
+        param($Path, $Checkpoint, $RunId)
+        return @($script:IncidentEntries)
+    }
+    Set-TestMock 'Assert-CutoverTriggerWindow' {
+        param($NextRunUtc, $RequiredSeconds)
+        if ($script:IncidentTriggerFailureCode) { Throw-Cutover -Code $script:IncidentTriggerFailureCode }
+    }
+    Set-TestMock 'Export-CutoverTaskXml' {
+        $script:IncidentXmlCall++
+        if ($script:IncidentXmlCall -eq 1) { return $script:XmlEnabled }
+        if ($script:IncidentXmlCall -eq 2) {
+            if ($script:IncidentPreDisableXml) { return $script:IncidentPreDisableXml }
+            return $script:XmlEnabled
+        }
+        if ($script:IncidentDisabledXml) { return $script:IncidentDisabledXml }
+        return $script:XmlDisabled
+    }
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {
+        param($Before, $Path, $MaximumBytes, $Code)
+        $script:IncidentCheckpointCalls++
+        if ($script:IncidentCheckpointFailureCode -and $Code -ceq $script:IncidentCheckpointFailureCode) {
+            Throw-Cutover -Code $Code
+        }
+    }
+    Set-TestMock 'Disable-CutoverTask' { $script:IncidentDisableCalls++ }
+    Set-TestMock 'Invoke-CutoverInstaller' {
+        param($Context, $ScriptPath, $RequestedAction, $RequestedMode)
+        $script:IncidentInstallCalls++
+        $script:IncidentInstallPath = $ScriptPath
+        $script:IncidentInstallAction = $RequestedAction
+        $script:IncidentInstallMode = $RequestedMode
+        if ($script:IncidentInstallFailureCode) { Throw-Cutover -Code $script:IncidentInstallFailureCode }
+        $script:IncidentCandidateInstalled = $true
+        [pscustomobject]@{ status = 'READY' }
+    }
+    Set-TestMock 'Assert-CutoverInstallerStatus' {
+        param($Status, $Context, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        if ($script:IncidentInstallReceiptFailureCode) {
+            Throw-Cutover -Code $script:IncidentInstallReceiptFailureCode
+        }
+        New-TestExactStatus -Last $script:IncidentStart -State Ready -LastTaskResult 0
+    }
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {
+        param($Context, $ExpectedUtf8TextSha256, $ExpectedUtf16LeBomSha256)
+        $script:IncidentBackupCalls++
+        $script:IncidentBackupUtf8Sha256 = $ExpectedUtf8TextSha256
+        $script:IncidentBackupUtf16LeBomSha256 = $ExpectedUtf16LeBomSha256
+        if ($script:IncidentBackupFailureCode) { Throw-Cutover -Code $script:IncidentBackupFailureCode }
+    }
+    Set-TestMock 'Invoke-CutoverDrainObserve' {
+        param($Context, $Installer)
+        $script:IncidentDrainCalls++
+        $script:IncidentDrainInstaller = $Installer
+        if ($script:IncidentDrainFailureCode) {
+            $exception = New-Object InvalidOperationException($script:IncidentDrainFailureCode)
+            if ($script:IncidentDrainFailureCode -ceq 'OBSERVE_DRAIN_ALREADY_QUARANTINED') {
+                $exception.Data['cleanup_status'] = 'DISABLED_VERIFIED'
+            }
+            throw $exception
+        }
+        [pscustomobject]@{
+            status = 'OBSERVE_DRAINED'; runs = 1; final_run_id = ('b' * 32)
+            final_worker_status = 'no_eligible_order'
+            final_last_run_utc = [DateTime]::UtcNow.ToString('o'); log_appended_bytes = 50
+        }
+    }
+    Set-TestMock 'Start-CutoverTask' { $script:IncidentStartCalls++ }
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {
+        param($Context, $Installer, $ExpectedModes)
+        $script:IncidentCleanupCalls++
+        $script:IncidentCleanupSequence.Add($Installer + ':' + (@($ExpectedModes) -join ','))
+        if ($script:IncidentDefinitionUnknown) {
+            Throw-Cutover -Code 'FAILURE_CLEANUP_DEFINITION_NOT_VERIFIED'
+        }
+        if ($Installer -ceq $Context.installer_path -and -not $script:IncidentCandidateInstalled) {
+            Throw-Cutover -Code 'FAILURE_CLEANUP_DEFINITION_NOT_VERIFIED'
+        }
+        [pscustomobject]@{
+            mode = $(if ($Installer -ceq $Context.restored_installer_path) { 'Execute' } else { 'Observe' })
+            initial_task_state = 'Disabled'; final_task_state = 'Disabled'; disable_performed = $false
+            future_triggers_disabled = $true; definition_preserved_except_enabled = $true; task_stopped = $false
+        }
+    }
+
+    $expectedDisabledXml = Get-CutoverTaskXmlEvidence -Text $script:XmlDisabled
+    $incidentReceipt = Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext
+    $incidentReceiptJson = ConvertTo-CutoverBoundedReceipt -Receipt $incidentReceipt
+    Assert-True 'failed Execute transition pins old result reads and candidate result-zero readback' (
+        ($script:IncidentStatusSequence.ToArray() -join ',') -ceq
+            'Execute:Ready:False,Execute:Ready:False,Execute:Disabled:False,Observe:Ready:default'
+    )
+    Assert-True 'failed Execute transition disables once then installs Observe without Start' (
+        $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
+        $script:IncidentStartCalls -eq 0 -and $script:IncidentDrainCalls -eq 1
+    )
+    Assert-True 'failed Execute transition passes exact governed action arguments' (
+        $script:IncidentEscrowAction -ceq 'Validate' -and
+        $script:IncidentInstallPath -ceq $incidentContext.installer_path -and
+        $script:IncidentInstallAction -ceq 'Install' -and
+        $script:IncidentInstallMode -ceq 'Observe' -and
+        $script:IncidentDrainInstaller -ceq $incidentContext.installer_path -and
+        $script:IncidentCandidateInstalled
+    )
+    Assert-True 'failed Execute transition verifies the exact disabled XML backup hashes' (
+        $script:IncidentBackupUtf8Sha256 -ceq $expectedDisabledXml.utf8_text_sha256 -and
+        $script:IncidentBackupUtf16LeBomSha256 -ceq $expectedDisabledXml.utf16le_bom_sha256
+    )
+    Assert-True 'failed Execute transition returns bounded causal recovery evidence' (
+        $incidentReceipt.ok -and
+        $incidentReceipt.action -ceq 'InstallObserveAndDrainFromFailedExecute' -and
+        $incidentReceipt.operation_id -ceq $incidentContext.operation_id -and
+        $incidentReceipt.release_id -ceq $incidentContext.release_id -and
+        $incidentReceipt.escrow_id -ceq $incidentContext.escrow_id -and
+        $incidentReceipt.escrow_release_id -ceq $incidentContext.escrow_release_id -and
+        $incidentReceipt.failed_execute_code -ceq 'BOARD_HEADER_INVALID' -and
+        $incidentReceipt.failed_execute_task_result -eq 20 -and
+        $incidentReceipt.failed_execute_run_id -ceq $script:IncidentRunId -and
+        $incidentReceipt.pre_task_state -ceq 'Ready' -and
+        $incidentReceipt.post_disable_task_state -ceq 'Disabled' -and
+        $incidentReceipt.candidate_task_state -ceq 'Ready' -and
+        $incidentReceipt.rollback_action -ceq 'RestoreReady' -and
+        $incidentReceipt.old_definition_preserved_except_enabled -and
+        $incidentReceipt.backup_matches_post_disable_xml -and
+        $incidentReceipt.post_install_status_readback -and
+        $incidentReceipt.state_and_log_preserved_through_candidate_install -and
+        -not $incidentReceipt.task_stopped -and
+        $script:IncidentBackupCalls -eq 1 -and $script:IncidentCleanupCalls -eq 0 -and
+        [Text.Encoding]::UTF8.GetByteCount($incidentReceiptJson) -le 3072
+    )
+
+    foreach ($badInitialResult in @(0, 1, 31)) {
+        Reset-TestFailedExecuteScenario
+        $script:IncidentEscrowHash = $script:TestXmlHash
+        $incidentContext.expected_current_run_id = $script:IncidentRunId
+        $script:IncidentInitialResult = [int64]$badInitialResult
+        Assert-ThrowsCode ('failed Execute preauth rejects initial result ' + $badInitialResult) {
+            Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+        } 'FAILED_EXECUTE_TASK_RESULT_MISMATCH'
+        Assert-True ('failed Execute initial-result rejection is non-mutating ' + $badInitialResult) (
+            $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+            $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+            $script:IncidentStartCalls -eq 0
+        )
+    }
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentState.error.code = 'BOARD_READ_HTTP_ERROR'
+    $script:IncidentState.error.message = 'BOARD_READ_HTTP_ERROR'
+    Assert-ThrowsCode 'failed Execute preauth rejects a transient HTTP failure' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'FAILED_EXECUTE_ERROR_EVIDENCE_INVALID'
+    Assert-True 'wrong current failure code cannot trigger cleanup or mutation' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = ('f' * 32)
+    Assert-ThrowsCode 'failed Execute preauth rejects a superseded caller run pin' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'FAILED_EXECUTE_RUN_ID_MISMATCH'
+    Assert-True 'stale run pin cannot disable or invoke cleanup' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = ('0' * 64)
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    Assert-ThrowsCode 'failed Execute preauth rejects escrow XML mismatch' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'FAILED_EXECUTE_ESCROW_XML_MISMATCH'
+    Assert-True 'escrow mismatch cannot disable or invoke cleanup' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentSecondLast = $script:IncidentStart.AddSeconds(1)
+    Assert-ThrowsCode 'failed Execute preauth rejects an advanced second LastRunTime' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'TASK_CHANGED_BEFORE_DISABLE'
+    Assert-True 'LastRunTime race is rejected before disable or cleanup' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentSecondResult = 0
+    Assert-ThrowsCode 'failed Execute preauth rejects changed result at second read' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'FAILED_EXECUTE_TASK_RESULT_MISMATCH'
+    Assert-True 'result race is rejected before disable or cleanup' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentSecondNext = $script:IncidentInitialNext.AddMinutes(15)
+    Assert-ThrowsCode 'failed Execute preauth rejects changed NextRunTime' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'TASK_CHANGED_BEFORE_DISABLE'
+    Assert-True 'NextRunTime race is rejected before disable or cleanup' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentTriggerFailureCode = 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+    Assert-ThrowsCode 'failed Execute preauth rejects an imminent natural trigger' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+    Assert-True 'trigger-window rejection is non-mutating' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentCheckpointFailureCode = 'STATE_CHANGED_BEFORE_DISABLE'
+    Assert-ThrowsCode 'failed Execute preauth rejects state drift before disable' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'STATE_CHANGED_BEFORE_DISABLE'
+    Assert-True 'pre-disable state drift cannot invoke cleanup or mutation' (
+        $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    foreach ($preauthCase in @(
+        [pscustomobject]@{
+            name = 'pre-disable task XML drift'; code = 'TASK_CHANGED_BEFORE_DISABLE'
+            setup = { $script:IncidentPreDisableXml = $script:XmlEnabled.Replace('</Task>', '<!--drift--></Task>') }
+        },
+        [pscustomobject]@{
+            name = 'pre-disable log drift'; code = 'LOG_CHANGED_BEFORE_DISABLE'
+            setup = { $script:IncidentCheckpointFailureCode = 'LOG_CHANGED_BEFORE_DISABLE' }
+        }
+    )) {
+        Reset-TestFailedExecuteScenario
+        $script:IncidentEscrowHash = $script:TestXmlHash
+        $incidentContext.expected_current_run_id = $script:IncidentRunId
+        & $preauthCase.setup
+        Assert-ThrowsCode ('failed Execute preauth rejects ' + $preauthCase.name) {
+            Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+        } $preauthCase.code
+        Assert-True ('failed Execute ' + $preauthCase.name + ' is non-mutating') (
+            $script:IncidentDisableCalls -eq 0 -and $script:IncidentInstallCalls -eq 0 -and
+            $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 0 -and
+            $script:IncidentStartCalls -eq 0
+        )
+    }
+
+    foreach ($postAuthCase in @(
+        [pscustomobject]@{
+            name = 'disabled result drift'; code = 'TASK_CHANGED_DURING_DISABLE'
+            cleanup_calls = 2
+            setup = { $script:IncidentDisabledResult = 0 }
+        },
+        [pscustomobject]@{
+            name = 'disabled LastRunTime drift'; code = 'TASK_CHANGED_DURING_DISABLE'
+            cleanup_calls = 2
+            setup = { $script:IncidentDisabledLast = $script:IncidentStart.AddSeconds(1) }
+        },
+        [pscustomobject]@{
+            name = 'post-disable state drift'; code = 'STATE_CHANGED_DURING_DISABLE'
+            cleanup_calls = 2
+            setup = { $script:IncidentCheckpointFailureCode = 'STATE_CHANGED_DURING_DISABLE' }
+        },
+        [pscustomobject]@{
+            name = 'post-disable log drift'; code = 'LOG_CHANGED_DURING_DISABLE'
+            cleanup_calls = 2
+            setup = { $script:IncidentCheckpointFailureCode = 'LOG_CHANGED_DURING_DISABLE' }
+        },
+        [pscustomobject]@{
+            name = 'invalid candidate Install receipt'; code = 'CANDIDATE_INSTALL_RECEIPT_INVALID'
+            cleanup_calls = 1
+            setup = { $script:IncidentInstallReceiptFailureCode = 'CANDIDATE_INSTALL_RECEIPT_INVALID' }
+        },
+        [pscustomobject]@{
+            name = 'failed distinct candidate Status readback'; code = 'CANDIDATE_STATUS_INVALID'
+            cleanup_calls = 1
+            setup = { $script:IncidentCandidateStatusFailureCode = 'CANDIDATE_STATUS_INVALID' }
+        },
+        [pscustomobject]@{
+            name = 'post-install state drift'; code = 'STATE_CHANGED_DURING_INSTALL'
+            cleanup_calls = 1
+            setup = { $script:IncidentCheckpointFailureCode = 'STATE_CHANGED_DURING_INSTALL' }
+        },
+        [pscustomobject]@{
+            name = 'post-install log drift'; code = 'LOG_CHANGED_DURING_INSTALL'
+            cleanup_calls = 1
+            setup = { $script:IncidentCheckpointFailureCode = 'LOG_CHANGED_DURING_INSTALL' }
+        },
+        [pscustomobject]@{
+            name = 'candidate backup mismatch'; code = 'BACKUP_EXPECTED_XML_MISMATCH'
+            cleanup_calls = 1
+            setup = { $script:IncidentBackupFailureCode = 'BACKUP_EXPECTED_XML_MISMATCH' }
+        }
+    )) {
+        Reset-TestFailedExecuteScenario
+        $script:IncidentEscrowHash = $script:TestXmlHash
+        $incidentContext.expected_current_run_id = $script:IncidentRunId
+        & $postAuthCase.setup
+        Assert-ThrowsCode ('failed Execute transition quarantines after ' + $postAuthCase.name) {
+            Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+        } $postAuthCase.code
+        $expectedCleanupSequence = if ($postAuthCase.cleanup_calls -eq 2) {
+            $incidentContext.installer_path + ':Observe,' + $incidentContext.restored_installer_path + ':Execute'
+        } else {
+            $incidentContext.installer_path + ':Observe'
+        }
+        Assert-True ('failed Execute ' + $postAuthCase.name + ' authenticates the surviving definition') (
+            $script:IncidentDisableCalls -eq 1 -and
+            $script:IncidentCleanupCalls -eq $postAuthCase.cleanup_calls -and
+            ($script:IncidentCleanupSequence.ToArray() -join ',') -ceq $expectedCleanupSequence -and
+            $script:IncidentCandidateInstalled -eq ($postAuthCase.cleanup_calls -eq 1) -and
+            $script:IncidentStartCalls -eq 0
+        )
+    }
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentDisabledXml = $script:XmlDisabled.Replace('</Task>', '<!--drift--></Task>')
+    $script:IncidentDefinitionUnknown = $true
+    $unknownDefinitionFailure = $null
+    try {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } catch { $unknownDefinitionFailure = $_ }
+    $unknownDefinitionReceipt = New-CutoverFailureReceipt `
+        -ActionValue InstallObserveAndDrainFromFailedExecute `
+        -OperationIdValue $incidentContext.operation_id `
+        -FailureRecord $unknownDefinitionFailure
+    Assert-True 'failed Execute rejects disabled XML drift when neither definition authenticates' (
+        $null -ne $unknownDefinitionFailure -and
+        [string]$unknownDefinitionFailure.Exception.Message -ceq 'CUTOVER_FAILURE_CLEANUP_FAILED' -and
+        $unknownDefinitionReceipt.code -ceq 'CUTOVER_FAILURE_CLEANUP_FAILED' -and
+        $unknownDefinitionReceipt.original_code -ceq 'TASK_DISABLE_DEFINITION_DRIFT' -and
+        $unknownDefinitionReceipt.cleanup_status -ceq 'FAILED' -and
+        $unknownDefinitionReceipt.cleanup_code -ceq 'FAILURE_CLEANUP_DEFINITION_NOT_VERIFIED'
+    )
+    Assert-True 'unknown disabled definition is not reported rollback-ready' (
+        $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 0 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 2 -and
+        ($script:IncidentCleanupSequence.ToArray() -join ',') -ceq
+            ($incidentContext.installer_path + ':Observe,' + $incidentContext.restored_installer_path + ':Execute') -and
+        $null -eq $unknownDefinitionReceipt.PSObject.Properties['cleanup_mode'] -and
+        $null -eq $unknownDefinitionReceipt.PSObject.Properties['rollback_action'] -and
+        $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentInstallFailureCode = 'CANDIDATE_INSTALL_FAILED'
+    Assert-ThrowsCode 'failed Execute transition quarantines after install failure' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'CANDIDATE_INSTALL_FAILED'
+    Assert-True 'post-auth install failure rejects candidate then quarantines surviving old definition' (
+        $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
+        $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 2 -and
+        $script:IncidentCleanupSequence[0] -ceq ($incidentContext.installer_path + ':Observe') -and
+        $script:IncidentCleanupSequence[1] -ceq ($incidentContext.restored_installer_path + ':Execute') -and
+        -not $script:IncidentCandidateInstalled -and $script:IncidentStartCalls -eq 0
+    )
+
+    Reset-TestFailedExecuteScenario
+    $script:IncidentEscrowHash = $script:TestXmlHash
+    $incidentContext.expected_current_run_id = $script:IncidentRunId
+    $script:IncidentDrainFailureCode = 'OBSERVE_DRAIN_ALREADY_QUARANTINED'
+    Assert-ThrowsCode 'failed Execute transition preserves shared-drain quarantine' {
+        Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+    } 'OBSERVE_DRAIN_ALREADY_QUARANTINED'
+    Assert-True 'outer transition does not duplicate shared-drain cleanup' (
+        $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
+        $script:IncidentDrainCalls -eq 1 -and $script:IncidentCleanupCalls -eq 0 -and
+        $script:IncidentStartCalls -eq 0
     )
 
     # InstallExecuteReady owns the Observe-to-Execute mutation without starting
