@@ -404,6 +404,23 @@ function Test-Managed {
     return $Task -and ([string]$Task.Description).Contains($ManagedMarker)
 }
 
+function Assert-SystemServiceAccountPrincipal {
+    param(
+        [Parameter(Mandatory = $true)]$Task,
+        [Parameter(Mandatory = $true)][string]$ErrorCode
+    )
+    try {
+        $principalId = [string]$Task.Principal.UserId
+        $logonType = [string]$Task.Principal.LogonType
+    } catch {
+        throw $ErrorCode
+    }
+    if (@('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains $principalId -or
+        $logonType -cne 'ServiceAccount') {
+        throw $ErrorCode
+    }
+}
+
 function Compare-Definition {
     param($Task)
     $problems = New-Object System.Collections.Generic.List[string]
@@ -430,6 +447,9 @@ function Compare-Definition {
 
 function Save-PreviousTask {
     param($Existing)
+    if ($Existing) {
+        Assert-SystemServiceAccountPrincipal -Task $Existing -ErrorCode 'backup_task_principal_invalid'
+    }
     if (-not (Test-Path -LiteralPath $MetadataRoot)) { New-Item -ItemType Directory -Path $MetadataRoot -Force | Out-Null }
     if ($Existing) {
         $xml = Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
@@ -528,11 +548,27 @@ function Read-ValidatedRollbackBackup {
         [string]$execActions[0].GetAttribute('id') -cne 'OrderSupervisor') {
         throw 'rollback_xml_identity_invalid'
     }
-    $userIdNode = $principals[0].SelectSingleNode('t:UserId', $namespaceManager)
-    $logonTypeNode = $principals[0].SelectSingleNode('t:LogonType', $namespaceManager)
-    if ($null -eq $userIdNode -or
-        @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains [string]$userIdNode.InnerText -or
-        $null -eq $logonTypeNode -or [string]$logonTypeNode.InnerText -cne 'ServiceAccount') {
+    $userIdNodes = @($principals[0].SelectNodes('t:UserId', $namespaceManager))
+    $userIdElements = @($principals[0].ChildNodes | Where-Object {
+        $_.NodeType -eq [Xml.XmlNodeType]::Element -and $_.LocalName -ceq 'UserId'
+    })
+    $logonTypeElements = @($principals[0].ChildNodes | Where-Object {
+        $_.NodeType -eq [Xml.XmlNodeType]::Element -and $_.LocalName -ceq 'LogonType'
+    })
+    # Task Scheduler may omit LogonType when it exports a task whose principal
+    # is the canonical S-1-5-18 account. Preserve the exact SYSTEM allow-list
+    # for explicit ServiceAccount XML, reject namespace lookalikes, and bind
+    # true omission to the observed canonical SID representation.
+    if ($userIdNodes.Count -ne 1 -or
+        $userIdElements.Count -ne 1 -or
+        [string]$userIdElements[0].NamespaceURI -cne $taskNamespace -or
+        @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains [string]$userIdNodes[0].InnerText -or
+        ($logonTypeElements.Count -eq 0 -and [string]$userIdNodes[0].InnerText -cne 'S-1-5-18') -or
+        $logonTypeElements.Count -gt 1 -or
+        ($logonTypeElements.Count -eq 1 -and (
+            [string]$logonTypeElements[0].NamespaceURI -cne $taskNamespace -or
+            [string]$logonTypeElements[0].InnerText -cne 'ServiceAccount'
+        ))) {
         throw 'rollback_xml_identity_invalid'
     }
 
@@ -581,6 +617,7 @@ function Restore-PreviousTask {
         Register-ScheduledTask -Xml ([string]$backup.xml) -TaskName $TaskName -TaskPath $TaskPath -Force -ErrorAction Stop | Out-Null
         $restored = Get-RootTask
         if (-not $restored -or -not (Test-Managed $restored)) { throw 'rollback_restore_not_visible' }
+        Assert-SystemServiceAccountPrincipal -Task $restored -ErrorCode 'rollback_restore_principal_invalid'
         try {
             $readbackXml = Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
         } catch {

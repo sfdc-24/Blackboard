@@ -51,7 +51,7 @@ function New-ValidBackupXml {
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
-      <UserId>SYSTEM</UserId>
+      <UserId>S-1-5-18</UserId>
       <LogonType>ServiceAccount</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
@@ -105,7 +105,10 @@ Assert-True 'action casing is canonicalized before action-sensitive preprocessin
 
 $requiredFunctions = @(
     'Get-Sha256',
+    'Write-Utf8',
     'Get-WallTimeoutReadback',
+    'Assert-SystemServiceAccountPrincipal',
+    'Save-PreviousTask',
     'Read-ValidatedRollbackBackup',
     'Restore-PreviousTask',
     'Stop-ManagedTask',
@@ -183,6 +186,7 @@ $ManagedMarker = 'managed-by=install_order_supervisor.ps1; schema=v1'
 $WindowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $BackupManifestPath = Join-Path $testRoot 'previous-task.json'
 $BackupXmlPath = Join-Path $testRoot 'previous-task.xml'
+$MetadataRoot = $testRoot
 $rollbackRunner = Join-Path $testRoot 'old-release\scripts\order_supervisor.ps1'
 New-Item -ItemType Directory -Path (Split-Path -Parent $rollbackRunner) -Force | Out-Null
 Write-TestUtf8 -Path $rollbackRunner -Text '# valid prior immutable runner'
@@ -255,6 +259,44 @@ try {
     Assert-True 'invalid backup causes no task mutation' ($script:MutationLog.Count -eq 0) ($script:MutationLog -join ',')
     Assert-True 'invalid backup is rejected before task discovery' ($script:RootTaskReads -eq 0) ([string]$script:RootTaskReads)
 
+    $systemBackupWithoutLogonType = $backupXml.Replace(
+        '      <LogonType>ServiceAccount</LogonType>',
+        ''
+    )
+    $omittedLogonDocument = New-Object Xml.XmlDocument
+    $omittedLogonDocument.LoadXml($systemBackupWithoutLogonType)
+    $omittedLogonNamespace = New-Object Xml.XmlNamespaceManager($omittedLogonDocument.NameTable)
+    $omittedLogonNamespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+    Assert-True 'omitted-LogonType fixture has canonical SID and no LogonType element in any namespace' (
+        @($omittedLogonDocument.SelectNodes('/t:Task/t:Principals/t:Principal/*[local-name()="LogonType"]', $omittedLogonNamespace)).Count -eq 0 -and
+        [string]$omittedLogonDocument.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $omittedLogonNamespace).InnerText -ceq 'S-1-5-18'
+    )
+    $script:BackupXmlForMock = $systemBackupWithoutLogonType
+    $safeExistingTask = [pscustomobject]@{
+        Principal = [pscustomobject]@{ UserId = 'SYSTEM'; LogonType = 'ServiceAccount' }
+    }
+    $systemBackupWithoutLogonTypeError = Invoke-ExpectedFailure -ScriptBlock {
+        Save-PreviousTask -Existing $safeExistingTask
+        $savedBackup = Read-ValidatedRollbackBackup
+        if ([string]$savedBackup.xml -cne $systemBackupWithoutLogonType) { throw 'saved_xml_mismatch' }
+    }
+    Assert-True 'backup capture and validation accept canonical SYSTEM XML with omitted optional LogonType' (
+        $systemBackupWithoutLogonTypeError -ceq 'NO_ERROR' -and
+        $script:MutationLog.Count -eq 0 -and $script:RootTaskReads -eq 0
+    ) $systemBackupWithoutLogonTypeError
+
+    $backupBytesBeforeUnsafeSave = [IO.File]::ReadAllBytes($BackupXmlPath)
+    $manifestBytesBeforeUnsafeSave = [IO.File]::ReadAllBytes($BackupManifestPath)
+    $unsafeExistingTask = [pscustomobject]@{
+        Principal = [pscustomobject]@{ UserId = 'SYSTEM'; LogonType = 'Password' }
+    }
+    $unsafeSaveError = Invoke-ExpectedFailure -ScriptBlock { Save-PreviousTask -Existing $unsafeExistingTask }
+    Assert-True 'backup capture rejects a non-ServiceAccount live principal before changing backup files' (
+        $unsafeSaveError -ceq 'backup_task_principal_invalid' -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($BackupXmlPath)) -ceq [Convert]::ToBase64String($backupBytesBeforeUnsafeSave) -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($BackupManifestPath)) -ceq [Convert]::ToBase64String($manifestBytesBeforeUnsafeSave)
+    ) $unsafeSaveError
+
     $invalidBackupCases = @(
         [pscustomobject]@{
             name = 'extra manifest property'
@@ -305,6 +347,69 @@ try {
             }
         },
         [pscustomobject]@{
+            name = 'missing logon type for a non-SYSTEM principal'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $systemBackupWithoutLogonType.Replace('<UserId>S-1-5-18</UserId>', '<UserId>LOCAL SERVICE</UserId>')
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'missing logon type for a noncanonical SYSTEM alias'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $systemBackupWithoutLogonType.Replace('<UserId>S-1-5-18</UserId>', '<UserId>SYSTEM</UserId>')
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'explicit non-ServiceAccount logon type'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace('<LogonType>ServiceAccount</LogonType>', '<LogonType>Password</LogonType>')
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'duplicate logon type elements'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace(
+                    '<LogonType>ServiceAccount</LogonType>',
+                    '<LogonType>ServiceAccount</LogonType><LogonType>ServiceAccount</LogonType>'
+                )
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'foreign namespace logon type lookalike'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace(
+                    '<LogonType>ServiceAccount</LogonType>',
+                    '<LogonType xmlns="">Password</LogonType>'
+                )
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'duplicate user id elements'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace(
+                    '<UserId>S-1-5-18</UserId>',
+                    '<UserId>S-1-5-18</UserId><UserId>S-1-5-18</UserId>'
+                )
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
             name = 'missing referenced runner'
             expected = 'rollback_runner_missing'
             setup = {
@@ -329,11 +434,13 @@ try {
 
     # A valid prior definition replaces the live task without any unregister
     # gap and is accepted only after byte-exact export readback.
-    [IO.File]::WriteAllText($BackupXmlPath, $backupXml, [Text.Encoding]::Unicode)
-    Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $backupXml)
+    [IO.File]::WriteAllText($BackupXmlPath, $systemBackupWithoutLogonType, [Text.Encoding]::Unicode)
+    Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $systemBackupWithoutLogonType)
     $script:RegisteredXmlForMock = $null
     $script:ExportXmlOverrideForMock = $null
     $script:RegisterSawForce = $false
+    $script:RestoredPrincipalUserId = 'SYSTEM'
+    $script:RestoredPrincipalLogonType = 'ServiceAccount'
     $script:CurrentTask = [pscustomobject]@{ Description = ('worker; ' + $ManagedMarker); State = 'Ready' }
     $script:MutationLog = New-Object System.Collections.Generic.List[string]
     function Get-RootTask { return $script:CurrentTask }
@@ -345,7 +452,14 @@ try {
         $script:RegisterSawForce = $true
         $script:RegisteredXmlForMock = $Xml
         $script:MutationLog.Add('register')
-        $script:CurrentTask = [pscustomobject]@{ Description = ('restored; ' + $ManagedMarker); State = 'Ready' }
+        $script:CurrentTask = [pscustomobject]@{
+            Description = ('restored; ' + $ManagedMarker)
+            State = 'Ready'
+            Principal = [pscustomobject]@{
+                UserId = $script:RestoredPrincipalUserId
+                LogonType = $script:RestoredPrincipalLogonType
+            }
+        }
     }
     function Unregister-ScheduledTask {
         [CmdletBinding(SupportsShouldProcess = $true)] param([string]$TaskName, [string]$TaskPath)
@@ -364,11 +478,20 @@ try {
     ) ($script:MutationLog -join ',')
     Assert-True 'valid rollback has no unregister gap' (-not $script:MutationLog.Contains('unregister'))
     Assert-True 'valid rollback registers exact validated XML with Force' (
-        $script:RegisterSawForce -and $script:RegisteredXmlForMock -ceq $backupXml
+        $script:RegisterSawForce -and $script:RegisteredXmlForMock -ceq $systemBackupWithoutLogonType
     )
 
     $script:MutationLog.Clear()
-    $script:ExportXmlOverrideForMock = $backupXml + [Environment]::NewLine
+    $script:RestoredPrincipalLogonType = 'Password'
+    $invalidPrincipalReadback = Invoke-ExpectedFailure -ScriptBlock { Restore-PreviousTask }
+    Assert-True 'rollback rejects a restored task whose live principal is not ServiceAccount' (
+        $invalidPrincipalReadback -ceq 'rollback_restore_principal_invalid' -and
+        ($script:MutationLog -join ',') -ceq 'stop,register'
+    ) ($invalidPrincipalReadback + '; ' + ($script:MutationLog -join ','))
+
+    $script:MutationLog.Clear()
+    $script:RestoredPrincipalLogonType = 'ServiceAccount'
+    $script:ExportXmlOverrideForMock = $systemBackupWithoutLogonType + [Environment]::NewLine
     $readbackMismatch = Invoke-ExpectedFailure -ScriptBlock { Restore-PreviousTask }
     Assert-True 'rollback rejects a non-exact registered definition readback' (
         $readbackMismatch -ceq 'rollback_restore_definition_mismatch'
@@ -428,6 +551,54 @@ try {
     Assert-True 'install plus rollback failure is fixed and visible' (
         $combinedError -ceq 'task_install_failed_and_rollback_failed'
     ) $combinedError
+
+    # Exercise the production Save -> Validate boundary through the incident
+    # no-stop action using the canonical Task Scheduler export that omits
+    # LogonType. All scheduler effects remain mocked and bounded.
+    Invoke-Expression $installerFunctionDefinitions['Save-PreviousTask'].Extent.Text
+    Invoke-Expression $installerFunctionDefinitions['Read-ValidatedRollbackBackup'].Extent.Text
+    $script:RealNoStopCurrentReads = 0
+    $script:RealNoStopExportReads = 0
+    $script:RealNoStopMutations = New-Object System.Collections.Generic.List[string]
+    $script:RealNoStopExisting = [pscustomobject]@{
+        managed = $true
+        State = 'Disabled'
+        Principal = [pscustomobject]@{ UserId = 'SYSTEM'; LogonType = 'ServiceAccount' }
+    }
+    function Assert-InstallPreflight { }
+    function Test-Managed { param($Task) return $Task -and [bool]$Task.managed }
+    function Get-RootTask {
+        $script:RealNoStopCurrentReads++
+        if ($script:RealNoStopCurrentReads -le 2) { return $script:RealNoStopExisting }
+        return [pscustomobject]@{ managed = $true; State = 'Ready' }
+    }
+    function Export-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+        $script:RealNoStopExportReads++
+        return $systemBackupWithoutLogonType
+    }
+    function New-ExpectedDefinition { return [pscustomobject]@{ definition = 'candidate' } }
+    function Register-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $InputObject, [switch]$Force)
+        if (-not $Force) { throw 'test_register_requires_force' }
+        $script:RealNoStopMutations.Add('register')
+    }
+    function Compare-Definition { param($Task) return @() }
+    function Get-StatusObject { return [pscustomobject]@{ status = 'READY' } }
+    $Mode = 'Observe'
+    $Start = $false
+    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $systemBackupWithoutLogonType
+    $realNoStopError = Invoke-ExpectedFailure -ScriptBlock {
+        $script:RealNoStopResult = Invoke-InstallFromDisabledNoStopAction
+    }
+    Assert-True 'disabled no-stop production backup path accepts canonical omitted LogonType and registers once' (
+        $realNoStopError -ceq 'NO_ERROR' -and
+        [string]$script:RealNoStopResult.status -ceq 'READY' -and
+        $script:RealNoStopCurrentReads -eq 3 -and
+        $script:RealNoStopExportReads -eq 3 -and
+        ($script:RealNoStopMutations -join ',') -ceq 'register' -and
+        [IO.File]::ReadAllText($BackupXmlPath, [Text.Encoding]::Unicode) -ceq $systemBackupWithoutLogonType
+    ) ($realNoStopError + '; reads=' + $script:RealNoStopCurrentReads + '; exports=' + $script:RealNoStopExportReads + '; mutations=' + ($script:RealNoStopMutations -join ','))
 
     # The incident-only installer action is a structurally separate contract.
     # It starts only from a managed Disabled task, re-reads that state just
