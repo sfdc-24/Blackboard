@@ -113,6 +113,79 @@ repair mode and cannot create, update, or delete Azure resources.
    Before any state-preservation claim, parse and validate the exact current v1
    state, including an array-valued `work` history, and require an existing log
    prefix to end on an LF record boundary.
+   If and only if this step is blocked by the already deployed old task being
+   exact `Execute`, `Ready`, result `20`, with the causally current state and
+   trailing log both proving `BOARD_HEADER_INVALID`, use the distinct
+   `InstallObserveAndDrainFromFailedExecute` incident action instead. Before
+   invoking it, complete the immutable candidate build, delivery, and guest
+   read-back in steps 8 and 9; staging that release does not change the task.
+   The incident action resolves and authenticates the candidate installer from
+   that already-staged release, so an archive that exists only on the operator
+   host is not sufficient. Supply
+   the normal escrow, immutable candidate-installer, and restored-old-installer
+   paths, release IDs, and SHA-256 pins required by `InstallObserveAndDrain`,
+   plus these exact action-only inputs:
+
+   ```powershell
+   -Action 'InstallObserveAndDrainFromFailedExecute' `
+   -Mode 'Observe' `
+   -ExpectedCurrentTaskResult '20' `
+   -ExpectedCurrentFailureCode 'BOARD_HEADER_INVALID' `
+   -ExpectedCurrentRunId '<latest-state-last_poll-run_id-as-32-lowercase-hex>'
+   ```
+
+   The incident action is not a general nonzero-result override. It rejects
+   `BOARD_READ_HTTP_ERROR`, every other failure code or result, a candidate
+   release equal to the escrowed release, and any mismatch among the pinned
+   run ID, SYSTEM/profile state, scheduler `LastRunTime`, two-record
+   `poll_started`/`run_error` tail, enabled escrow XML, stable `NextRunTime`, or
+   byte-identical state/log checkpoints. All of that authentication and a
+   second stable `Ready`/result-`20` read occur before mutation or cleanup is
+   authorized. It then disables without stopping, reads the old definition
+   back as `Disabled`/result `20`, proves only `Enabled` changed, and invokes the
+   candidate installer's dedicated `InstallFromDisabledNoStop` action in
+   `Observe` without `-Start`. That action is valid only inside this transition's
+   quarantine wrapper: it requires a managed `Disabled` task, rechecks that state
+   immediately before replacement, authenticates both exports and the rollback
+   backup against the driver's exact post-disable UTF-8 XML digest, and has no
+   reachable stop, start, unregister, or automatic-rollback path. If replacement
+   or readback fails, the installer
+   deliberately leaves recovery to the outer quarantine, which disables the
+   authenticated survivor and waits for any active instance to finish naturally.
+   The driver then obtains a separate `Ready`/result-`0` status readback, verifies
+   the disabled XML backup and unchanged state/log through candidate installation,
+   and runs the ordinary bounded Observe drain, which then advances state and
+   appends its own log evidence. The success receipt therefore scopes those proofs as
+   `old_definition_preserved_except_enabled` and
+   `state_and_log_preserved_through_candidate_install`; neither field claims
+   that the installed candidate still has the old definition or that the drain
+   left state/log unchanged. If a
+   post-authentication step fails, quarantine authenticates the candidate
+   first and the old definition second, leaves the surviving definition
+   disabled, and never stops an active instance. After a successful incident
+   transition, rollback remains the ordinary `RestoreReady` action against the
+   same validated escrow. After quarantine, use the cleanup receipt's exact
+   `cleanup_mode`: for `Observe`, run `RestoreReady` with the candidate as the
+   current installer; for `Execute`, run it in `Execute` with the old installer
+   and escrow release supplied as both the current and restored identities.
+   Both forms start from the authenticated disabled definition and preserve the
+   shared v1 state/log. A cleanup failure is not rollback-ready and requires
+   fresh read-only task/XML/release authentication before any recovery action.
+   For the old release's exact live failure contract, state and log carry code
+   `BOARD_HEADER_INVALID` but message `board_header_invalid`. The sole
+   `poll_started` must have level `info`, empty work/row/code/message base
+   fields, and exactly `{mode:'Execute'}` details. The sole `run_error.details`
+   object must contain exactly the five string fields
+   `attempt:'1'`, `transport_exit:'0'`, `http_status:'200'`,
+   `content_type_class:'json'`, and a positive, bounded, canonical
+   `elapsed_ms` with an invariant dot separator and at most two decimal places.
+   The candidate worker formats that timing string explicitly with invariant
+   culture. Missing, additional,
+   differently typed, or unsuccessful-sidecar values fail before mutation.
+   `poll_started` may follow Scheduler `LastRunTime` by at most 30 seconds to
+   allow bounded PowerShell/task startup; it may precede it only within the
+   existing two-second clock tolerance. The exact caller-pinned run ID and
+   trailing-run/state evidence, not timestamp proximity alone, bind identity.
 8. Build the six-file archive from one caller-pinned commit with
    `build_order_release_archive.ps1`. Supply an absolute Git repository path,
    the full 40-character lowercase hexadecimal release ID (the caller-pinned
@@ -189,13 +262,20 @@ repair mode and cannot create, update, or delete Azure resources.
     authentication leaves the surviving exact candidate or restored task
     disabled; a `Running` or `Queued` candidate is quarantined and never
     stopped, restored over, or treated as rollback-ready.
-13. Require one causally fresh natural 15-minute poll from the restored task,
-    then run the outer runbook manually. The Automation job must be new, bind
+13. For an ordinary rollback rehearsal to a known-good restored task, require
+    one causally fresh natural 15-minute poll, then run the outer runbook
+    manually. The Automation job must be new, bind
     the exact runbook and six parameters, finish `Completed`, and contain exactly
     one terminal outer JSON record. Require the guest task `Ready`, result `0`,
     an advanced `LastRunTime`, and zero board delta. `-Start` returning, a
     Managed Run Command success state, or an outer `PASS` without those causal
-    read-backs is not completion proof.
+    read-backs is not completion proof. Skip this natural-poll step after the
+    documented `BOARD_HEADER_INVALID` incident transition: the escrowed release
+    is the known failing worker. Instead, while both Azure Automation schedules
+    remain disabled, treat the guest task as enabled and `Ready` after
+    `RestoreReady` but do not manually start it. Require more than 240 seconds of
+    natural-trigger margin and immediately continue with step 14; do not run the
+    outer supervisor against the restored worker.
 14. Run `InstallObserveAndDrain`. It first proves the restored enabled task and
     escrow, disables it and proves that only the Enabled state changed, installs
     the same immutable candidate in Observe without `-Start`, validates the

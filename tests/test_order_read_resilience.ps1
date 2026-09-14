@@ -25,6 +25,22 @@ function Assert-True {
     }
 }
 
+function Test-CanonicalElapsedMillisecondsText {
+    param([AllowNull()]$Value)
+
+    if ($Value -isnot [string] -or
+        [string]$Value -cnotmatch '^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,2})?$') {
+        return $false
+    }
+    $parsed = 0.0
+    return [double]::TryParse(
+        [string]$Value,
+        [Globalization.NumberStyles]::AllowDecimalPoint,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$parsed
+    ) -and $parsed -gt 0
+}
+
 # WHICH SHELL THE CHILD RUNS IN.
 #
 # Every case here launches scripts/bus.ps1 in a CHILD process, and that child was
@@ -1146,7 +1162,7 @@ try {
     Assert-True 'retry event carries safe response fingerprint and elapsed time' (
         [int]$retryEvents[0].details.content_length -gt 0 -and
         [string]$retryEvents[0].details.content_sha256 -cmatch '^[0-9a-f]{64}$' -and
-        -not [string]::IsNullOrWhiteSpace([string]$retryEvents[0].details.elapsed_ms)
+        (Test-CanonicalElapsedMillisecondsText -Value $retryEvents[0].details.elapsed_ms)
     )
     Assert-True 'retry event never records raw response body' (-not $malformedThenValid.log_text.Contains('ORDER_READ_BODY_CANARY'))
     Assert-True 'no write or Claude occurs before valid parse' (
@@ -1485,7 +1501,7 @@ try {
         $twiceRunErrors[0].details.attempt -ceq '2' -and
         [int]$twiceRunErrors[0].details.content_length -eq $expectedSecondLength -and
         $twiceRunErrors[0].details.content_sha256 -ceq $expectedSecondHash -and
-        -not [string]::IsNullOrWhiteSpace([string]$twiceRunErrors[0].details.elapsed_ms)
+        (Test-CanonicalElapsedMillisecondsText -Value $twiceRunErrors[0].details.elapsed_ms)
     )
     Assert-True 'malformed-twice never writes or invokes Claude' (
         @($malformedTwice.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
@@ -1612,6 +1628,62 @@ try {
             $node.Name -ceq 'Test-TransientBoardReadFailure'
     }, $true))
     if ($classifierDefinitions.Count -eq 1) { Invoke-Expression $classifierDefinitions[0].Extent.Text }
+    $elapsedFormatterDefinitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'ConvertTo-OrderElapsedMillisecondsText'
+    }, $true))
+    if ($elapsedFormatterDefinitions.Count -eq 1) { Invoke-Expression $elapsedFormatterDefinitions[0].Extent.Text }
+    $preAdmissionDefinitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Read-BoardPreAdmission'
+    }, $true))
+    $preAdmissionText = if ($preAdmissionDefinitions.Count -eq 1) {
+        [string]$preAdmissionDefinitions[0].Extent.Text
+    } else {
+        ''
+    }
+    Assert-True 'retry and terminal paths share one explicitly invariant elapsed string' (
+        $elapsedFormatterDefinitions.Count -eq 1 -and
+        $preAdmissionDefinitions.Count -eq 1 -and
+        ([regex]::Matches($preAdmissionText, 'ConvertTo-OrderElapsedMillisecondsText')).Count -eq 1 -and
+        $preAdmissionText.Contains("`$_.Exception.Data['elapsed_ms'] = `$elapsedText") -and
+        $preAdmissionText.Contains('elapsed_ms = $elapsedText')
+    )
+
+    $savedCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+    $savedUiCulture = [Threading.Thread]::CurrentThread.CurrentUICulture
+    try {
+        foreach ($cultureName in @('fr-FR', 'de-DE')) {
+            $culture = New-Object Globalization.CultureInfo($cultureName)
+            [Threading.Thread]::CurrentThread.CurrentCulture = $culture
+            [Threading.Thread]::CurrentThread.CurrentUICulture = $culture
+            $elapsedExact = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3874.97
+            $elapsedTenth = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3874.9
+            $elapsedInteger = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 3875.0
+            $elapsedZero = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 0
+            $elapsedSubCent = ConvertTo-OrderElapsedMillisecondsText -Milliseconds 0.004
+            Assert-True ('elapsed formatter is canonical under ' + $cultureName) (
+                $elapsedExact -is [string] -and $elapsedExact -ceq '3874.97' -and
+                $elapsedTenth -ceq '3874.9' -and $elapsedInteger -ceq '3875' -and
+                $elapsedZero -ceq '0.01' -and $elapsedSubCent -ceq '0.01' -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedExact) -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedZero) -and
+                (Test-CanonicalElapsedMillisecondsText -Value $elapsedSubCent)
+            ) ($elapsedExact + ',' + $elapsedTenth + ',' + $elapsedInteger + ',' +
+                $elapsedZero + ',' + $elapsedSubCent)
+
+            $localeSensitiveMutant = ([Math]::Round(3874.97, 2)).ToString()
+            Assert-True ('locale-sensitive elapsed mutant is rejected under ' + $cultureName) (
+                $localeSensitiveMutant -ceq '3874,97' -and
+                -not (Test-CanonicalElapsedMillisecondsText -Value $localeSensitiveMutant)
+            ) $localeSensitiveMutant
+        }
+    } finally {
+        [Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture
+        [Threading.Thread]::CurrentThread.CurrentUICulture = $savedUiCulture
+    }
     $lowercaseRowsMissingError = try { throw 'board_rows_missing' } catch { $_ }
     $uppercaseRowsMissingError = try { throw 'BOARD_ROWS_MISSING' } catch { $_ }
     $refusedError = try { throw 'board_read_refused' } catch { $_ }
