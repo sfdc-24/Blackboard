@@ -33,6 +33,7 @@ on:
       - 'tests/test_tts_canary_contract.py'
       - 'tests/fixtures/site-p0-tts-canary.gs.template'
       - 'tests/test_governor_voice.cjs'
+      - 'tests/test_reception_popblock.cjs'
       - 'docs/SITE-P0-TTS-CANARY.md'
       - 'tests/test_build_health.cjs'
       - 'apps-script/governor-page-api/Code.gs'
@@ -120,6 +121,17 @@ jobs:
           node --test tests/test_clasp_json_contract.cjs
       - name: Test Google callback claims with mocked token exchange
         run: node --test tests/test_governor_auth.cjs tests/test_governor_tenant_boundary.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs
+
+      # tests/test_reception_popblock.cjs arrived with this PR and NO workflow
+      # referenced it, so all three of the PR's green checks passed without ever
+      # loading it. That is PR74's failure a third time: a committed test that no
+      # job invokes is not coverage, it is a file that happens to hold assertions.
+      #
+      # It belongs here rather than in governor-voice because it exercises
+      # Reception.html's DOM behaviour, which is what the other governor .cjs
+      # suites in this job cover.
+      - name: Test the reception voice-link block
+        run: node --test tests/test_reception_popblock.cjs
 
       # scripts/gas_baseline_check.py has compared the committed mirror against
       # deployed source since 2026-09-06, and NO workflow has ever invoked it.
