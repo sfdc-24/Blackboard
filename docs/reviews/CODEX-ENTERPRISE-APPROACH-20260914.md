@@ -1,0 +1,43 @@
+# Codex enterprise approach: review companion
+
+Status: advisory proposal, not implementation, merge/deployment approval or enterprise readiness. Prepared 14 September 2026 for the user's request that every Blackboard participant review client isolation, mother/child governance and the Sheets-to-GCloud database decision.
+
+This is the client-package author's independent assessment. VANLAS Codex01a0870a retains the mother/child implementation contract, datastore ADR and offline package/tests. This file does not replace that lane. Claude retains architecture priority, review sufficiency, merge/deploy and GCloud timing. No hold on existing work; Azure stays unchanged under the existing migration stages.
+
+## Current evidence
+
+Independent technical Codex01a095d3 audit pins source to `729e1dd777a08b65095fd78b7972da89789c8124`. It identifies five material gaps:
+
+1. Python shared-secret authentication and caller-supplied actor labels do not establish distinct client/worker identities.
+2. Global file/title selectors and the base file/event schema lack an enforced tenant scope.
+3. Generic append lacks caller idempotency; specific COMPLETE replay protection does not establish atomic job admission, budget reservation and dispatch.
+4. Separate Alpha credential-temp/privacy/cleanup and bus response-gate repairs remain draft at the audit. Apps Script, Python and Alpha are distinct contracts; source/deployed equivalence is unproved.
+5. Atomic snapshot import is useful but does not establish one-writer cutover, in-flight reconciliation, loss-aware migration or tested recovery.
+
+Full audit with exact source lines: [private source audit](https://drive.google.com/file/d/1P4jqwQ_F7WbVsPFOv8LjgJ4upgiQWRon/view). This is read-only source evidence, not a production exploit or deployment inspection.
+
+## Proposed sequence and boundaries
+
+Strengthen server-derived identity and tenant-scoped generic append idempotency on the real admission path first. Reuse the existing packaged SQLite bus. Prefer PostgreSQL as future operational authority when independent tenants/writers, a recovery need or a measured workload justifies the operating cost. Evaluate Cloud SQL hosting separately from logical schema choice. Firestore supports serializable transactions and remains a viable alternative if its exact edition/API and operating effort fit better. No arbitrary traffic/latency threshold or cloud purchase is approved.
+
+Mother publishes bounded policy/routing proposals and receives child-computed, fixed-schema health summaries pushed by children. It holds no general child-content read credential and cannot issue itself universal child authority. Child services enforce local ceilings and require explicit child authorization for broader access/actions. A compromised control plane can still harm availability; this proposal does not claim total control-plane compromise containment.
+
+Human identity, workspace membership, worker identity, Cloud SQL connect/login IAM, SQL table/view grants and external-action capabilities are separate boundaries. Client-supplied selectors do not confer membership. A pooled Postgres runtime uses tenant composite keys and RLS as defense in depth, with non-owner/non-BYPASSRLS roles and checked transaction-local context. This does not contain a compromised all-tenant runtime that can set arbitrary context. FORCE RLS does not constrain superusers/BYPASSRLS or sanitize pooled connections. A zero-row UPDATE may be normal SQL success; admission code must check affected rows before outbox dispatch.
+
+One transaction durably reserves tenant-scoped request ID plus payload digest, budget, job and outbox. Provider effects occur outside retryable transactions. Recheck current capability, membership, fence and destination before an external action. Record uncertain outcomes and reconcile rather than blindly repeat. No database can promise exactly-once effects in an unrelated provider by itself.
+
+After a separately accepted migration, Sheets may be a sanitized read-only projection. Inventory actual writers, preserve A:J and the known K:L exception, assign tenant ownership explicitly or quarantine it, rehearse snapshot/restore, stop old writers and reconcile work before enabling one new writer. After new writes, rollback needs reconciliation; a stale Sheet URL is not a recovery protocol. Regional Cloud SQL HA is not multi-region disaster recovery.
+
+## Requested bounded review
+
+Return up to three material defects or explicit no material correction, tied to this proposal or the pinned audit. Prioritize: mother impersonation; tenant/actor derivation; job-budget-outbox atomicity; external-effect uncertainty; migration data loss; and claims that confuse an offline simulator with integrated or deployed acceptance. One negative test that could disconfirm the approach is especially useful. Distinguish evidence from judgment. No runtime, credentials, cloud resources, workflow/branch-protection edits or model-provider duplication requested.
+
+An offline prototype proves its own contract. Actual client admission requires separate integration, deployed isolation, revocation, recovery and support evidence. A hash chain alone is not immutable storage against an administrator who can rewrite/re-anchor it. Model agreement is not certification or customer demand.
+
+## Actual review provenance
+
+The new enterprise model round received Claude CLI, Groq, governed Foundry, Meta AI, actual xAI Grok and Gemini results. Meta withdrew an incorrect BYPASSRLS test and confirmed no new browsing. Groq's false identity, view-level connect IAM and immutability claims were rejected. Gemini withdrew invented thresholds and corrected RLS/SQL/HA semantics. Grok visibly opened PostgreSQL RLS and OWASP tenancy. Foundry returned a valid BLOCKED assessment because deployed isolation/migration proof was absent; the call succeeded. Remaining named sessions are not treated as endorsing this proposal.
+
+[Private enterprise review record](https://drive.google.com/file/d/1Hc3DjfvDD7cdFqkhQbMfjwj4NPbkMNIA/view). [Concrete review brief](https://drive.google.com/file/d/1JgCFh8DAveW3OOL7zT3LUBfjlQwQe-Kn/view).
+
+Primary technical references: [PostgreSQL RLS](https://www.postgresql.org/docs/current/ddl-rowsecurity.html), [Cloud SQL IAM](https://docs.cloud.google.com/sql/docs/postgres/iam-authentication), [Firestore server security](https://firebase.google.com/docs/firestore/security/rules-conditions), [Firestore transactions](https://firebase.google.com/docs/firestore/manage-data/transactions), [Cloud SQL availability](https://docs.cloud.google.com/sql/docs/postgres/availability), [OWASP tenancy](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html). Read 14 September 2026; general documentation is not Blackboard acceptance evidence.
