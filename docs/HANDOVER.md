@@ -415,11 +415,26 @@ issuer by equality rather than `indexOf` (a substring test would accept a
 lookalike host), and fails **closed** on a missing `email_verified` where the
 deployment's `=== false` fails open.
 
-What the deployment has and the repo does not is the *older mechanism the repo
-replaced*, not work the repo lost: the `?vid=` query parameter (the repo derives
-the session id from the signed token, so the parameter is gone entirely) and the
-pre-token `sessionStorage` id in `Reception.html`. Verified by reading both
-sides rather than inferred from the byte counts.
+Most of what the deployment has and the repo does not is the *older mechanism the
+repo replaced*, not work the repo lost: the `?vid=` query parameter (the repo
+derives the session id from the signed token, so the parameter is gone entirely)
+and the pre-token `sessionStorage` id in `Reception.html`.
+
+**But that was not the whole of it, and the first version of this note said it
+was.** The deployment also carried the reception voice-link fix — the one Mr.
+Salam reported on 2026-09-07 after asking to talk and being handed a keyboard
+shortcut — and `main` did not. It was sitting in an unmerged PR (#33, merged
+2026-09-14 as `aac5b0c`) while being live in production the whole time.
+Deploying the repo before that merge would have silently reverted a fix he had
+personally asked for. That is exactly the failure this whole page warns about,
+and the analysis missed it because "the deployment has lines the repo lacks" was
+read as one category when it was two: superseded mechanism *and* shipped fixes
+that never made it back into the mirror.
+
+**So when a file drifts, enumerate the deployment-only hunks and classify each
+one.** A per-file verdict is not enough; the direction can differ hunk by hunk
+inside a single file. `Reception.html` was simultaneously ahead (conversation
+tokens) and behind (the voice-link fix).
 
 **So this is a RELEASE decision, not a sync.** Deploying it is six days of
 unshipped behaviour change reaching a live console at once, and `Reception.html`
