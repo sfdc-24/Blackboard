@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upgrade-path test: build 1.0.1, upgrade over the running 1.0.0 install,
+# Upgrade-path test: build 1.1.0, upgrade over the running 1.0.1 install,
 # verify the service restarted onto new code and the data survived. Run as root.
 set -euo pipefail
 REPO=/mnt/c/users/akatiawam/blackboard
@@ -8,12 +8,12 @@ export BUS_SECRET="$(cat /tmp/bus-test-secret)"
 echo "== before: running version =="
 curl -s http://127.0.0.1:8787/ | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])"
 
-echo "== build 1.0.1 (as abdus so \$HOME/build stays consistent) =="
+echo "== build 1.1.0 (as abdus so \$HOME/build stays consistent) =="
 runuser -u abdus -- bash "$REPO/packaging/build-deb.sh" >/dev/null
-ls -l /home/abdus/build/blackboard-bus_1.0.1_all.deb
+ls -l /home/abdus/build/blackboard-bus_1.1.0_all.deb
 
 echo "== upgrade in place =="
-apt-get install -y /home/abdus/build/blackboard-bus_1.0.1_all.deb 2>&1 | tail -3
+apt-get install -y /home/abdus/build/blackboard-bus_1.1.0_all.deb 2>&1 | tail -3
 
 echo "== after: version, active, data intact =="
 sleep 1

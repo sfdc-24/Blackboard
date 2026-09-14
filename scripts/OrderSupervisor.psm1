@@ -6,6 +6,15 @@ $script:BoardHeader = @(
     'Row_ID', 'Timestamp', 'Source_Tag', 'Target_Surface', 'Action_Type',
     'Payload', 'Category', 'Project Tag', 'Gist', 'Sub-Gist'
 )
+$script:KnownTrailingCellRowIdentity = [ordered]@{
+    row_id = '24bf9422-bb33-4943-b38a-77e2f023816d'
+    timestamp = '2026-09-09T03:13:51.0000000Z'
+    source = 'chatgpt-codex-desktop-01a0839e'
+    target = 'claude-code-cli,vm-claude-code-cli,ALL'
+    action = 'RESULT'
+    category = 'DONE'
+    project = 'Blackboard'
+}
 $script:WorkerSourceTag = 'vm-order-worker'
 $script:OrderResultSchema = 'order_supervisor_result.v2'
 $script:OrderResultSummaryMaximumLength = 500
@@ -58,11 +67,36 @@ function Write-Utf8NoBom {
 function ConvertFrom-JsonPreserveStrings {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Json)
 
+    # BOARD CELLS ARE STRINGS AND MUST STAY STRINGS.
+    #
+    # PowerShell 7's ConvertFrom-Json silently converts anything that looks like
+    # ISO-8601 into [DateTime]. A board Timestamp cell then stops being the text
+    # the admission rules compare, and every row is judged ineligible - with
+    # ok=true and status=no_eligible_order. Silent, and wrong in the direction
+    # where the supervisor simply never picks up work.
+    #
+    # -DateKind String prevents it, and this function was written for exactly
+    # that. But -DateKind arrived in PowerShell 7.5, so on 6.0 through 7.4 the
+    # feature check FELL THROUGH to plain ConvertFrom-Json and reintroduced the
+    # bug it exists to stop. A cross-host fixture diff caught it on 7.4.6:
+    # Windows 5.1 parsed the Timestamp cell as String, Linux parsed it as
+    # DateTime, and the two hosts disagreed about admission.
+    #
+    # Windows PowerShell 5.1 does not coerce, so it needs no parameter. Any
+    # edition that coerces and cannot be told not to is REFUSED rather than
+    # quietly trusted - a host that cannot read the board correctly must say so.
     $command = Get-Command ConvertFrom-Json
     if ($command.Parameters.ContainsKey('DateKind')) {
         return $Json | ConvertFrom-Json -DateKind String
     }
-    return $Json | ConvertFrom-Json
+    if ($PSVersionTable.PSEdition -ceq 'Desktop') {
+        return $Json | ConvertFrom-Json          # 5.1: preserves strings already
+    }
+    $failure = [NotSupportedException]::new('BOARD_JSON_DATE_COERCION_UNSAFE')
+    $failure.Data['ps_version'] = [string]$PSVersionTable.PSVersion
+    $failure.Data['ps_edition'] = [string]$PSVersionTable.PSEdition
+    $failure.Data['remedy'] = 'PowerShell 7.5 or later provides ConvertFrom-Json -DateKind String'
+    throw $failure
 }
 
 function Write-AtomicJson {
@@ -214,6 +248,28 @@ function ConvertTo-UtcCursorTimestamp {
     }
 }
 
+function Test-KnownTrailingCellRow {
+    param([Parameter(Mandatory = $true)][object[]]$Cells)
+
+    # Match the stable A:J identity independently of whether Google Sheets
+    # projects the row at the canonical width or pads it to the A:L used
+    # range. This lets the caller enforce that the historical identity occurs
+    # exactly once before any row is projected or admitted.
+    if ($Cells.Count -ne 10 -and $Cells.Count -ne 12) { return $false }
+    $stamp = ConvertTo-UtcCursorTimestamp -Timestamp ([string]$Cells[1])
+    if (-not $stamp) { return $false }
+
+    return (
+        [string]::Equals([string]$Cells[0], [string]$script:KnownTrailingCellRowIdentity.row_id, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$stamp.Value, [string]$script:KnownTrailingCellRowIdentity.timestamp, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[2], [string]$script:KnownTrailingCellRowIdentity.source, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[3], [string]$script:KnownTrailingCellRowIdentity.target, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[4], [string]$script:KnownTrailingCellRowIdentity.action, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[6], [string]$script:KnownTrailingCellRowIdentity.category, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$Cells[7], [string]$script:KnownTrailingCellRowIdentity.project, [StringComparison]::Ordinal)
+    )
+}
+
 function ConvertFrom-BcbPayload {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Payload)
 
@@ -284,12 +340,25 @@ function Get-BoardRowsFromJson {
     $rawRows = @($response.rows)
     if ($rawRows.Count -lt 1) { throw 'board_header_missing' }
     $header = @($rawRows[0])
-    if ($header.Count -ne $script:BoardHeader.Count) { throw 'board_header_invalid' }
+    # Google Sheets returns every row at the width of the sheet's used range.
+    # One historical malformed append widened Alpha DB from canonical A:J to
+    # A:L, so the live response now carries two empty padding cells on every
+    # otherwise-valid row. Accept only that known shape and project it back to
+    # the ten-cell contract; any populated schema outside A:J remains invalid.
+    if ($header.Count -ne $script:BoardHeader.Count -and $header.Count -ne 12) {
+        throw 'board_header_invalid'
+    }
     for ($column = 0; $column -lt $script:BoardHeader.Count; $column++) {
         if (-not [string]::Equals([string]$header[$column], $script:BoardHeader[$column], [StringComparison]::Ordinal)) {
             throw 'board_header_invalid'
         }
     }
+    for ($column = $script:BoardHeader.Count; $column -lt $header.Count; $column++) {
+        if (-not [string]::IsNullOrEmpty([string]$header[$column])) {
+            throw 'board_header_invalid'
+        }
+    }
+    $knownTrailingRowCount = 0
     for ($index = 1; $index -lt $rawRows.Count; $index++) {
         $raw = $rawRows[$index]
         $cells = @()
@@ -298,11 +367,40 @@ function Get-BoardRowsFromJson {
         } else {
             $cells = @([string]$raw)
         }
-        if ($cells.Count -ne 10) {
+        $returnedCellCount = $cells.Count
+        if ($returnedCellCount -ne 10 -and $returnedCellCount -ne 12) {
             $result.Add([pscustomobject]@{
-                valid = $false; reason = 'cell_count'; cell_count = $cells.Count; index = $index; cells = @($cells)
+                valid = $false; reason = 'cell_count'; cell_count = $returnedCellCount; index = $index; cells = @()
             })
             continue
+        }
+        if (Test-KnownTrailingCellRow -Cells $cells) {
+            $knownTrailingRowCount++
+            if ($knownTrailingRowCount -ne 1) {
+                throw 'board_trailing_cells_invalid'
+            }
+        }
+        if ($returnedCellCount -eq 12) {
+            $hasNonemptyTrailingCell = $false
+            for ($column = 10; $column -lt $returnedCellCount; $column++) {
+                if (-not [string]::IsNullOrEmpty([string]$cells[$column])) {
+                    $hasNonemptyTrailingCell = $true
+                    break
+                }
+            }
+            if ($hasNonemptyTrailingCell) {
+                # Only the one observed historical append is a compatibility
+                # exception. Any identity drift or second occurrence fails the
+                # whole read before admission. K:L values are never retained.
+                if (-not (Test-KnownTrailingCellRow -Cells $cells)) {
+                    throw 'board_trailing_cells_invalid'
+                }
+                $result.Add([pscustomobject]@{
+                    valid = $false; reason = 'known_trailing_cells'; cell_count = $returnedCellCount; index = $index; cells = @()
+                })
+                continue
+            }
+            $cells = @($cells[0..9])
         }
         $stamp = ConvertTo-UtcCursorTimestamp -Timestamp $cells[1]
         if (-not $stamp -or [string]::IsNullOrWhiteSpace($cells[0])) {
@@ -476,30 +574,63 @@ function Get-OrderSelection {
         [string]$RequiredAuthorityToken = 'operator-direct'
     )
 
-    $valid = @($Rows | Where-Object { $_.valid })
-    for ($i = 1; $i -lt $valid.Count; $i++) {
-        $item = $valid[$i]
+    $scannedValid = @($Rows | Where-Object { $_.valid })
+    for ($i = 1; $i -lt $scannedValid.Count; $i++) {
+        $item = $scannedValid[$i]
         $j = $i - 1
         while ($j -ge 0) {
-            if ([Int64]$valid[$j].timestamp_ticks -lt [Int64]$item.timestamp_ticks) {
+            if ([Int64]$scannedValid[$j].timestamp_ticks -lt [Int64]$item.timestamp_ticks) {
                 $cmp = -1
-            } elseif ([Int64]$valid[$j].timestamp_ticks -gt [Int64]$item.timestamp_ticks) {
+            } elseif ([Int64]$scannedValid[$j].timestamp_ticks -gt [Int64]$item.timestamp_ticks) {
                 $cmp = 1
             } else {
-                $cmp = [string]::CompareOrdinal([string]$valid[$j].row_id, [string]$item.row_id)
+                $cmp = [string]::CompareOrdinal([string]$scannedValid[$j].row_id, [string]$item.row_id)
             }
             if ($cmp -le 0) { break }
-            $valid[$j + 1] = $valid[$j]
+            $scannedValid[$j + 1] = $scannedValid[$j]
             $j--
         }
-        $valid[$j + 1] = $item
+        $scannedValid[$j + 1] = $item
     }
-    for ($i = 1; $i -lt $valid.Count; $i++) {
-        if ([Int64]$valid[$i - 1].timestamp_ticks -eq [Int64]$valid[$i].timestamp_ticks -and
-            [string]::Equals([string]$valid[$i - 1].row_id, [string]$valid[$i].row_id, [StringComparison]::Ordinal)) {
-            throw 'board_cursor_tuple_duplicate'
+
+    # A board read can contain the same physical row more than once. Resolve every
+    # cursor-tuple group across the complete scanned window before admission so an
+    # earlier eligible row cannot hide a later collision. Only cell-for-cell
+    # ordinal-identical sets of all ten strings collapse. Reuse of one
+    # Row_ID at a different timestamp remains a distinct cursor tuple.
+    $canonical = New-Object System.Collections.Generic.List[object]
+    $exactDuplicateGroupCount = 0
+    $exactDuplicateRowCount = 0
+    for ($i = 0; $i -lt $scannedValid.Count;) {
+        $first = $scannedValid[$i]
+        $firstCells = @($first.cells)
+        $groupCount = 1
+        $next = $i + 1
+        while ($next -lt $scannedValid.Count -and
+               [Int64]$scannedValid[$next].timestamp_ticks -eq [Int64]$first.timestamp_ticks -and
+               [string]::Equals([string]$scannedValid[$next].row_id, [string]$first.row_id, [StringComparison]::Ordinal)) {
+            $candidateCells = @($scannedValid[$next].cells)
+            $cellsEqual = $firstCells.Count -eq 10 -and $candidateCells.Count -eq 10
+            if ($cellsEqual) {
+                for ($column = 0; $column -lt 10; $column++) {
+                    if (-not [string]::Equals([string]$firstCells[$column], [string]$candidateCells[$column], [StringComparison]::Ordinal)) {
+                        $cellsEqual = $false
+                        break
+                    }
+                }
+            }
+            if (-not $cellsEqual) { throw 'board_cursor_tuple_collision' }
+            $groupCount++
+            $next++
         }
+        $canonical.Add($first)
+        if ($groupCount -gt 1) {
+            $exactDuplicateGroupCount++
+            $exactDuplicateRowCount += $groupCount - 1
+        }
+        $i = $next
     }
+    $valid = @($canonical.ToArray())
     $after = @($valid | Where-Object { Test-CursorAfter -Row $_ -Cursor $Cursor })
     $diagnostics = New-Object System.Collections.Generic.List[object]
     $selected = $null
@@ -525,9 +656,15 @@ function Get-OrderSelection {
         newest_seen = $(if ($valid.Count -gt 0) {
             [pscustomobject][ordered]@{ timestamp = $valid[$valid.Count - 1].timestamp; row_id = $valid[$valid.Count - 1].row_id }
         } else { $null })
-        valid_count = $valid.Count
+        valid_count = $scannedValid.Count
+        canonical_valid_count = $valid.Count
         malformed_count = @($Rows | Where-Object { -not $_.valid }).Count
+        known_trailing_row_count = @($Rows | Where-Object {
+            -not $_.valid -and [string]::Equals([string]$_.reason, 'known_trailing_cells', [StringComparison]::Ordinal)
+        }).Count
         after_cursor_count = $after.Count
+        exact_duplicate_group_count = $exactDuplicateGroupCount
+        exact_duplicate_row_count = $exactDuplicateRowCount
         diagnostics = $diagnostics.ToArray()
     }
 }

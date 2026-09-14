@@ -18,7 +18,7 @@ USAGE (any working directory; paths are resolved from this script's location)
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action time
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action read -Title "SFDC24 — Dispatch (Work Queue)" -OutFile out.json
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "SFDC24 — Inbox · claude-code-cli" -TextFile entry.txt
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "Claude Instance - check in sheet" -SheetRowJson '["claude-code-cli","Working","Instance unification","2026-08-26 3:00 PM EDT","","<targets>","<intent>"]'
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action append -Title "Claude Instance - check in sheet" -SheetRowJson '["claude-code-cli","Working","Instance unification","2026-08-26T19:00:00Z","","<targets>","<intent>"]'
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action replace -Title "SFDC24 — SESSION STATE · claude-code-cli" -TextFile state.txt   (bus v2+)
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bus.ps1 -Action list   (bus v2+)
 
@@ -26,7 +26,7 @@ RULES THIS SCRIPT DOES NOT RELAX
   D-4: read-back is the only proof of a write. This script prints the response; it
   verifies nothing. Never blind-retry an append -- read the target back first.
   ISSUE 010: for a Sheet, always send -SheetRowJson (a native array), never -Text.
-  ISSUE 006: put timestamps in the form "2026-08-26 3:00 PM EDT" (EDT suffix).
+  ISSUE 006: put timestamps in invariant UTC ISO-8601 form ending in Z.
 #>
 param(
   # 'upload' here is a DEPLOY PROBE, not a working uploader -- this client cannot
@@ -222,6 +222,75 @@ if ($SheetRowJson) {
   if ($cells.Count -lt 2) {
     throw "SheetRowJson produced $($cells.Count) cell(s) -- expected a JSON array of cells such as a bracketed list of quoted strings. Refusing to write a malformed row (ISSUE 010 / REQ-C4NDX7)."
   }
+
+  # A canonical Blackboard control-bus full row is exactly A:J, with its timestamp
+  # in cell B and a BCB envelope in cell F. Read-side blank K:L padding, truncated
+  # rows, and shifted envelopes are not write shapes. Reject them before
+  # serialization or transport instead of allowing a different width to bypass
+  # this guard. The self-hosted server supports an eight-content-cell shorthand,
+  # but Apps Script v1 appends those eight cells verbatim; this portable client
+  # therefore cannot opt into that backend-specific behavior implicitly.
+  # Non-BCB rows sent to other sheets keep their existing compatibility behavior.
+  $isAlphaBoardTitle = [string]::Equals(
+    [string]$Title,
+    'Blackboard - Alpha DB',
+    [StringComparison]::Ordinal
+  )
+  $hasBcbEnvelope = $false
+  foreach ($cell in $cells) {
+    if (([string]$cell).StartsWith('BCB|', [StringComparison]::Ordinal)) {
+      $hasBcbEnvelope = $true
+      break
+    }
+  }
+  $isFullBcbRow = $cells.Count -gt 5 -and
+    ([string]$cells[5]).StartsWith('BCB|', [StringComparison]::Ordinal)
+  $isCanonicalBcbRow = $cells.Count -eq 10 -and $isFullBcbRow
+  if (($isAlphaBoardTitle -and $cells.Count -ne 10) -or
+      ($hasBcbEnvelope -and -not $isCanonicalBcbRow)) {
+    throw [InvalidOperationException]::new(
+      'BOARD_ROW_SHAPE_INVALID: Blackboard BCB writes require exactly 10 logical A:J cells with the envelope in cell F (index 5). Read-side padding, truncated rows, shifted rows, and backend-specific shorthand are not portable write shapes. Refusing transport.'
+    )
+  }
+  if ($isCanonicalBcbRow) {
+    $boardTimestamp = [string]$cells[1]
+    $boardTimestampPattern = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$'
+    if ($boardTimestamp -cnotmatch $boardTimestampPattern) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require invariant UTC ISO-8601 in cell B (index 1), ending in uppercase Z with zero to seven fractional digits. Refusing transport.'
+      )
+    }
+
+    $boardTimestampFormats = [string[]]@(
+      "yyyy-MM-dd'T'HH:mm:ss'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.f'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",
+      "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'"
+    )
+    $parsedBoardTimestamp = [DateTimeOffset]::MinValue
+    $boardTimestampStyles = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+      [Globalization.DateTimeStyles]::AdjustToUniversal
+    if (-not [DateTimeOffset]::TryParseExact(
+      $boardTimestamp,
+      $boardTimestampFormats,
+      [Globalization.CultureInfo]::InvariantCulture,
+      $boardTimestampStyles,
+      [ref]$parsedBoardTimestamp
+    )) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_INVALID: canonical 10-cell BCB rows require a real invariant UTC calendar timestamp in cell B (index 1). Refusing transport.'
+      )
+    }
+    if ($parsedBoardTimestamp -gt [DateTimeOffset]::UtcNow.AddMinutes(2)) {
+      throw [InvalidOperationException]::new(
+        'BOARD_TIMESTAMP_FUTURE: canonical 10-cell BCB row timestamp is more than two minutes ahead of the local UTC clock. Refusing transport.'
+      )
+    }
+  }
   $payload.sheetRow = @($cells)
 }
 
@@ -245,7 +314,21 @@ $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 # The no-follow contract from REQ-PR4EXZ is unchanged -- only the client is.
 $location = $null
 $content  = $null
-$curl = (Get-Command curl.exe -ErrorAction SilentlyContinue)
+# curl.exe on Windows, curl on Linux and macOS. Looking only for curl.exe meant
+# the PREFERRED, well-tested two-hop path was silently unavailable off Windows,
+# and every read fell through to the Invoke-WebRequest fallback - which then
+# failed on the 302 for a different reason entirely (see the catch below).
+#
+# -CommandType Application is load-bearing, not tidiness. In Windows PowerShell
+# 5.1 `curl` is an ALIAS FOR Invoke-WebRequest, so a bare `Get-Command curl`
+# resolves to the very cmdlet this branch exists to avoid, and the "curl path"
+# would quietly be the fallback path wearing its name.
+$curl = $null
+foreach ($candidate in @('curl.exe', 'curl')) {
+    $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($found) { $curl = $found; break }
+}
 $readTransportExit = $null
 $readHttpStatus = $null
 $readContentTypeClass = $null
@@ -275,22 +358,101 @@ if ($curl) {
     Remove-Item -LiteralPath $tmpHead -Force -ErrorAction SilentlyContinue
   }
 } else {
+  # THE 302 IS NOT AN EXCEPTION ON 5.1 UNLESS WE MAKE IT ONE.
+  #
+  # Measured on Windows PowerShell 5.1.26100.9444 against a local HttpListener
+  # returning a 302, which is the same shape the bus returns:
+  #
+  #   -MaximumRedirection 0 emits a NON-TERMINATING InvalidOperationException
+  #   ("The maximum redirection count has been exceeded") AND STILL RETURNS the
+  #   response, StatusCode 302 with Location intact.
+  #
+  # $ErrorActionPreference = 'Stop' at the top of this script is what turned that
+  # into a terminating error and threw the response away. The exception it raises
+  # is InvalidOperationException, which has no .Response property at all -- exactly
+  # what the 2026-08-28 regression note ~50 lines above records. So no catch block
+  # can recover the Location on 5.1: by the time control reaches one, the only
+  # object that ever held the header is gone.
+  #
+  # -ErrorAction SilentlyContinue keeps the error non-terminating for THIS call
+  # only, so the response survives and the ordinary success path below reads the
+  # 302 the way the curl branch does. -ErrorVariable keeps the error inspectable
+  # rather than discarded.
+  #
+  # This is why the fallback was dead on Windows and why making it a
+  # two-edition catch could not have revived it.
+  # The catch is KEPT for editions that raise a genuine terminating error for the
+  # same 302 -- PowerShell 7 is reported to raise HttpResponseException carrying an
+  # HttpResponseMessage. -ErrorAction SilentlyContinue only downgrades NON-terminating
+  # errors, so a truly terminating one still arrives here. This surface has no pwsh
+  # installed, so the 7.x branch below is written defensively and is NOT verified
+  # here; the 5.1 path above is measured.
+  $iwrError = $null
   try {
     $r1 = Invoke-WebRequest -Uri $cfg.BUS_URL -Method Post -Body $bytes `
           -ContentType 'application/json; charset=utf-8' -MaximumRedirection 0 `
-          -UseBasicParsing -TimeoutSec 120
+          -UseBasicParsing -TimeoutSec 120 `
+          -ErrorAction SilentlyContinue -ErrorVariable iwrError
+
+    if ($null -eq $r1) {
+      # No response object at all: a real transport failure, not a suppressed 302.
+      if ($iwrError -and @($iwrError).Count -gt 0) { throw @($iwrError)[0] }
+      throw "BUS_IWR_NO_RESPONSE: Invoke-WebRequest returned nothing for hop 1."
+    }
+
     $readHttpStatus = [int]$r1.StatusCode
     $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$r1.Headers['Content-Type'])
-    if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) { $location = $r1.Headers['Location'] }
-    else { $content = $r1.Content }
-  } catch [System.Net.WebException] {
-    $resp = $_.Exception.Response
-    if ($resp) {
-      $readHttpStatus = [int]$resp.StatusCode
-      $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType ([string]$resp.Headers['Content-Type'])
+    if ([int]$r1.StatusCode -ge 300 -and [int]$r1.StatusCode -lt 400) {
+      $location = $r1.Headers['Location']
+      if (-not $location) {
+        throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $([int]$r1.StatusCode) with no Location header."
+      }
     }
-    if ($resp -and [int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
-      $location = $resp.Headers['Location']
+    else { $content = $r1.Content }
+  } catch {
+    $resp = $null
+    try { $resp = $_.Exception.Response } catch { $resp = $null }
+    if (-not $resp) { throw }
+
+    $status = 0
+    try { $status = [int]$resp.StatusCode } catch { $status = 0 }
+
+    $contentType = ''
+    $locationValue = $null
+    # DUCK-TYPE, never a type literal. `-is [System.Net.Http.Headers.HttpResponseHeaders]`
+    # cannot be evaluated on Windows PowerShell 5.1 at all: System.Net.Http is not
+    # loaded at startup and this script does not Add-Type it, so the literal raises
+    # "Unable to find type" and takes the whole branch with it. Comparing the type
+    # NAME needs no assembly to be loaded and behaves the same on both editions.
+    try {
+      $headerTypeName = ''
+      if ($null -ne $resp.Headers) { $headerTypeName = $resp.Headers.GetType().FullName }
+      if ($headerTypeName -eq 'System.Net.Http.Headers.HttpResponseHeaders') {
+        if ($resp.Headers.Location) { $locationValue = [string]$resp.Headers.Location }
+        if ($resp.Content -and $resp.Content.Headers -and $resp.Content.Headers.ContentType) {
+          $contentType = [string]$resp.Content.Headers.ContentType
+        }
+      } elseif ($headerTypeName) {
+        # HttpWebResponse and the 5.1 dictionary shapes: indexed access.
+        $locationValue = [string]$resp.Headers['Location']
+        $contentType = [string]$resp.Headers['Content-Type']
+      }
+    } catch {
+      # Do NOT swallow silently. An unreadable header collection is a fact hop 2
+      # needs, and the previous empty catch turned it into a wrong answer.
+      Write-Warning "BUS_IWR_HEADER_READ_FAILED: $($_.Exception.Message)"
+    }
+
+    if ($status) { $readHttpStatus = $status }
+    if ($contentType) { $readContentTypeClass = ConvertTo-BusContentTypeClass -ContentType $contentType }
+    if ($status -ge 300 -and $status -lt 400 -and $locationValue) {
+      $location = $locationValue
+    } elseif ($status -ge 300 -and $status -lt 400) {
+      # Same contract failure as the non-terminating path above, so it gets the
+      # same name. Rethrowing the original transport exception here would report
+      # a redirect-with-no-usable-Location as whatever the edition happened to
+      # raise, which is the one thing a caller cannot act on.
+      throw "BUS_IWR_REDIRECT_NO_LOCATION: hop 1 returned $status with no readable Location header."
     } else { throw }
   }
 }

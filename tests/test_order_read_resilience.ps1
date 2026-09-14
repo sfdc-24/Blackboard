@@ -1,5 +1,8 @@
 #Requires -Version 5.1
-param([switch]$KeepArtifacts)
+param(
+    [switch]$KeepArtifacts,
+    [switch]$SimulateJsonDateCoercion
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -22,6 +25,87 @@ function Assert-True {
     }
 }
 
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# Every case here launches scripts/bus.ps1 in a CHILD process, and that child was
+# hardcoded to powershell.exe in ten places. So the whole suite only ever exercised
+# bus.ps1 under Windows PowerShell 5.1 -- even when the suite itself was started
+# from pwsh. bus.ps1's hop-1 error handling differs by EDITION, which meant the
+# PowerShell 7 path had no coverage anywhere in CI, and adding this file to the
+# pwsh job would not have changed that.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child. Unset, this behaves exactly as before.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
+# HOW THIS HARNESS READS JSON, AND WHY NOT WITH A BARE ConvertFrom-Json.
+#
+# PowerShell 7 turns any ISO-8601-shaped string into [DateTime] on the way in. The
+# PRODUCT already refuses to read a board that way -- OrderSupervisor.psm1 has
+# ConvertFrom-JsonPreserveStrings for exactly this, after two hosts disagreed about
+# admission over it -- but this HARNESS was still calling the bare cmdlet. So under
+# pwsh the cursor it read back from the state file was a [DateTime], four exact
+# -ceq assertions failed, and the code under test had done nothing wrong: the
+# harness was measuring its own parser. It also loses precision, which is the part
+# that would not have looked like a parser bug at all -- a round trip turns
+# 2026-09-07T08:01:00.0000000Z into 2026-09-07T08:01:00Z.
+#
+# Splatting the parameter onto the same cmdlet, rather than wrapping it in a helper,
+# keeps pipeline and array-unrolling behaviour byte-identical to what every call
+# site here already relied on. 5.1 does not coerce and needs no parameter.
+#
+# -DateKind arrived in PowerShell 7.5. An edition that coerces and cannot be told
+# not to is REFUSED here, as the product refuses it, rather than running a suite
+# whose failures would describe the harness instead of the bus client.
+$script:JsonDateArgs = @{}
+if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    $script:JsonDateArgs = @{ DateKind = 'String' }
+} elseif ($PSVersionTable.PSEdition -cne 'Desktop') {
+    throw ('This harness cannot read board JSON on ' + $PSVersionTable.PSEdition + ' ' +
+           $PSVersionTable.PSVersion + ' without coercing ISO-8601 cells to [DateTime]. ' +
+           'PowerShell 7.5 or later provides ConvertFrom-Json -DateKind String. Refusing ' +
+           'rather than reporting assertions that measured the harness.')
+}
+
+function ConvertTo-FlowedText {
+    # PowerShell wraps error records to the CONSOLE WIDTH before they reach the
+    # pipeline, so an assertion that matches a long phrase in captured error
+    # output is really asserting on the width of whoever ran it. Measured on one
+    # machine, one commit, real 5.1: at a 74-column console the hop-2 phrase check
+    # below FAILS; at 200 columns the identical run passes. Collapsing every run of
+    # whitespace to one space removes the wrap and leaves the phrase intact.
+    #
+    # Width is not the only thing that gets between an error message and a match.
+    # PowerShell 7 renders errors in a BOX, and its continuation lines carry a
+    # gutter -- optional line number, a vertical bar, then the text. Collapsing
+    # whitespace leaves that bar embedded, so the fixed hop-2 message arrives as
+    # '...following up to | 5 redirects' and a Contains check fails against a
+    # product that did nothing wrong. Measured with the child on pwsh 7.6.6: one
+    # assertion failed on both parent editions, with no canary leaked.
+    #
+    # The gutter is stripped only at the START of a line, and only here. This
+    # helper feeds POSITIVE phrase assertions; every canary-ABSENCE check runs on
+    # ConvertTo-SquashedText, which stays strict. Loosening this one cannot make a
+    # leak check pass, and that separation is the point of having two functions.
+    param([AllowNull()][object[]]$Lines)
+    $text = (@($Lines | ForEach-Object { [string]$_ }) -join "`n")
+    $text = $text -replace '(?m)^[ \t]*\d*[ \t]*\|[ \t]?', ''
+    return ($text -replace '\s+', ' ')
+}
+
+function ConvertTo-SquashedText {
+    # For canary-ABSENCE checks, collapsing to a space is not enough: a wrap can
+    # land INSIDE a long token, and `-not $text.Contains('SOME_LONG_CANARY')` then
+    # passes because the canary was split across two lines. A negative assertion
+    # that a leaked secret is absent must not be satisfiable by console width.
+    # Removing whitespace entirely rejoins any hard-wrapped token before matching.
+    param([AllowNull()][object[]]$Lines)
+    return ((@($Lines | ForEach-Object { [string]$_ }) -join "`n") -replace '\s+', '')
+}
+
 function Write-TestUtf8 {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -32,6 +116,56 @@ function Write-TestUtf8 {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+# HOW THE FAKE curl.exe GETS BUILT, AND WHY NOT WITH Add-Type.
+#
+# The two actual-bus cases need a REAL executable named curl.exe ahead of the system
+# one on PATH. It has to be that exact name: bus.ps1 asks for 'curl.exe' before it
+# asks for 'curl', so a .cmd or .ps1 shim loses the lookup to C:\Windows\System32\
+# curl.exe and the case would silently exercise the real curl instead of the fake.
+#
+# This used to be Add-Type -OutputType ConsoleApplication. PowerShell 7 removed that
+# -- it refuses both ConsoleApplication and WindowsApplication -- so this file died
+# 0.2 seconds in under pwsh, on the edition the ORDER worker is being migrated to.
+# The suite that guards the bus client had therefore never run on the target edition.
+#
+# The C# source is unchanged and now goes to the .NET Framework C# compiler, which is
+# what Add-Type was driving underneath on 5.1 anyway. csc.exe ships with .NET
+# Framework 4 and is present on every supported Windows and on the hosted windows
+# runners. Both editions now take THE SAME build path: no edition gets a skip, and no
+# edition gets a second implementation of the fake that could drift from the first.
+#
+# This does NOT make the suite runnable on Linux. There curl has no .exe in its name
+# and there is no csc.exe; that needs its own change and its own evidence.
+function New-FakeCurlExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $csc = @(
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+
+    if (-not $csc) {
+        # Fail loudly. A skip here would report a green suite that never built the
+        # fake and therefore never tested the bus client's curl path at all.
+        throw ('No .NET Framework csc.exe found under ' + $env:WINDIR +
+               '\Microsoft.NET. The fake curl.exe cannot be built, so the actual-bus ' +
+               'cases cannot run and must not be reported as passing.')
+    }
+
+    $sourcePath = [IO.Path]::ChangeExtension($Path, '.cs')
+    Write-TestUtf8 -Path $sourcePath -Text $Source
+
+    $output = & $csc /nologo /target:exe ('/out:' + $Path) $sourcePath 2>&1
+    $code = $LASTEXITCODE
+    if ($code -ne 0 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw ('csc.exe exited ' + $code + ' building the fake curl: ' +
+               (ConvertTo-FlowedText -Lines @($output)))
+    }
 }
 
 function New-BoardJson {
@@ -97,7 +231,13 @@ $metadata = [ordered]@{
 }
 $failurePath = Join-Path $root ('failure-' + $count + '.json')
 if (Test-Path -LiteralPath $failurePath -PathType Leaf) {
-    $spec = [IO.File]::ReadAllText($failurePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    # This runs in the CHILD process and cannot see the parent's variables, so it
+    # works out the same date-coercion guard for itself.
+    $childJsonDateArgs = @{}
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+        $childJsonDateArgs = @{ DateKind = 'String' }
+    }
+    $spec = [IO.File]::ReadAllText($failurePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @childJsonDateArgs
     $clientErrorProperty = $spec.PSObject.Properties['client_error']
     if ($clientErrorProperty -and [bool]$clientErrorProperty.Value) {
         throw [InvalidOperationException]::new('simulated_local_client_failure')
@@ -131,7 +271,8 @@ function Invoke-ReadCase {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Responses,
         [ValidateSet('Observe', 'Execute')][string]$Mode = 'Execute',
-        [hashtable]$FailureByAttempt = @{}
+        [hashtable]$FailureByAttempt = @{},
+        [object[]]$InitialWork = @()
     )
 
     $caseRoot = Join-Path $script:TestRoot $Name
@@ -163,6 +304,7 @@ function Invoke-ReadCase {
     $state.initialized = $true
     $state.cursor.timestamp = '2026-09-07T08:00:00.0000000Z'
     $state.cursor.row_id = 'cursor-before-read'
+    $state.work = @($InitialWork)
     Save-OrderState -Path $statePath -State $state
 
     $previousRoot = [Environment]::GetEnvironmentVariable('ORDER_READ_TEST_ROOT', 'Process')
@@ -180,7 +322,7 @@ function Invoke-ReadCase {
             '-WorkspacePath', $workspace,
             '-ClaudeCommand', $fakeClaudePath
         )
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& $script:ResolvedChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_READ_TEST_ROOT', $previousRoot, 'Process')
@@ -188,12 +330,12 @@ function Invoke-ReadCase {
     }
 
     $jsonLine = @($output | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
-    $result = if ($jsonLine.Count -eq 1) { $jsonLine[0] | ConvertFrom-Json } else { $null }
-    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $result = if ($jsonLine.Count -eq 1) { $jsonLine[0] | ConvertFrom-Json @script:JsonDateArgs } else { $null }
+    $savedState = [IO.File]::ReadAllText($statePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
     $events = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
         @([IO.File]::ReadAllLines($logPath, [Text.Encoding]::UTF8) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { [string]$_ | ConvertFrom-Json })
+            ForEach-Object { [string]$_ | ConvertFrom-Json @script:JsonDateArgs })
     } else { @() }
     $readCountPath = Join-Path $caseRoot 'read-count.txt'
     $readCount = if (Test-Path -LiteralPath $readCountPath -PathType Leaf) {
@@ -255,7 +397,7 @@ public static class FakeCurl {
     }
 }
 '@
-    Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_CANARY
@@ -280,7 +422,7 @@ BUS_SECRET=BUS_SECRET_CANARY
         )
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_BODY', '<html>ACTUAL_BUS_BODY_CANARY</html>', 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_FAKE_CURL_EXIT', '7', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -299,7 +441,7 @@ BUS_SECRET=BUS_SECRET_CANARY
         exit_code = $exitCode
         output = @($output)
         metadata_text = $metadataText
-        metadata = $metadataText | ConvertFrom-Json
+        metadata = $metadataText | ConvertFrom-Json @script:JsonDateArgs
     }
 }
 
@@ -371,7 +513,7 @@ public static class FakeSecondRedirectCurl {
     }
 }
 '@
-    Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+    New-FakeCurlExecutable -Source $fakeCurlSource -Path $fakeCurlPath
     Write-TestUtf8 -Path $envPath -Text @'
 BUS_URL=https://BUS_URL_REDIRECT_CANARY.invalid/private
 BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
@@ -391,7 +533,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         [Environment]::SetEnvironmentVariable('PATH', ($fakeBin + [IO.Path]::PathSeparator + $previous.PATH), 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_ROOT', $caseRoot, 'Process')
         [Environment]::SetEnvironmentVariable('ORDER_READ_REDIRECT_FINAL_STATUS', '200', 'Process')
-        $output = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $output = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -Action read `
             -Title 'test board' `
@@ -405,7 +547,7 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         $previousErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
                 -File (Join-Path $RepoRoot 'scripts\bus.ps1') `
                 -Action read `
                 -Title 'test board' `
@@ -449,12 +591,12 @@ BUS_SECRET=BUS_SECRET_REDIRECT_CANARY
         body = [IO.File]::ReadAllText($outPath, [Text.Encoding]::UTF8)
         expected_body = $expectedBody
         metadata_text = $metadataText
-        metadata = $metadataText | ConvertFrom-Json
+        metadata = $metadataText | ConvertFrom-Json @script:JsonDateArgs
         failure_exit_code = $failureExitCode
         failure_output = @($failureOutput)
         failure_call_count = $failureCallCount
         failure_metadata_text = $failureMetadataText
-        failure_metadata = $failureMetadataText | ConvertFrom-Json
+        failure_metadata = $failureMetadataText | ConvertFrom-Json @script:JsonDateArgs
     }
 }
 
@@ -473,7 +615,7 @@ param(
     [Parameter(Mandatory = $true)][string]$MetadataPath,
     [Parameter(Mandatory = $true)][string]$TracePath,
     [Parameter(Mandatory = $true)][string]$EmptyPath,
-    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location')][string]$Scenario
+    [Parameter(Mandatory = $true)][ValidateSet('success', 'network-failure', 'second-redirect', 'insecure-location', 'empty-location', 'realistic-5-1-redirect')][string]$Scenario
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -498,6 +640,25 @@ function Invoke-WebRequest {
         body_present = ($null -ne $Body)
     })
     if ($Method -ceq 'Post') {
+        if ($Scenario -ceq 'realistic-5-1-redirect') {
+            # WHAT THE REAL CMDLET DOES, which every other scenario here skips.
+            # Measured on Windows PowerShell 5.1.26100.9444 against a local
+            # HttpListener: -MaximumRedirection 0 on a 302 emits a NON-TERMINATING
+            # InvalidOperationException and STILL RETURNS the response. The other
+            # scenarios return the 302 silently, so they exercise the success path
+            # and never reach hop 1's error handling at all -- which is why a
+            # handler that cannot work on 5.1 passed this suite.
+            #
+            # Write-Error honours the CALLER's -ErrorAction through CmdletBinding.
+            # bus.ps1 passes -ErrorAction SilentlyContinue, so this stays
+            # non-terminating and the response below is used. Remove that
+            # parameter from bus.ps1 and $ErrorActionPreference='Stop' promotes
+            # this to terminating, the response is discarded, and the read dies --
+            # which is exactly the regression this case exists to catch.
+            Write-Error -Exception ([System.InvalidOperationException]::new(
+                'The maximum redirection count has been exceeded. To increase the number of redirections allowed, supply a higher value to the -MaximumRedirection parameter.'
+            )) -Category InvalidOperation
+        }
         return [pscustomobject]@{
             StatusCode = 302
             Headers = @{
@@ -571,7 +732,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $successOutPath = Join-Path $successRoot 'response.txt'
     $successMetadataPath = Join-Path $successRoot 'metadata.json'
     $successTracePath = Join-Path $successRoot 'trace.json'
-    $successOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+    $successOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
         -File $wrapperPath `
         -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
         -EnvPath $envPath `
@@ -590,7 +751,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $failureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $failureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -612,7 +773,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $redirectOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $redirectOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -634,7 +795,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $insecureOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $insecureOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -656,7 +817,7 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $emptyLocationOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        $emptyLocationOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $wrapperPath `
             -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
             -EnvPath $envPath `
@@ -670,6 +831,32 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         $ErrorActionPreference = $previousErrorActionPreference
     }
 
+    $realisticRoot = Join-Path $caseRoot 'realistic-5-1-redirect'
+    New-Item -ItemType Directory -Path $realisticRoot -Force | Out-Null
+    $realisticOutPath = Join-Path $realisticRoot 'response.txt'
+    $realisticMetadataPath = Join-Path $realisticRoot 'metadata.json'
+    $realisticTracePath = Join-Path $realisticRoot 'trace.json'
+    # $ErrorActionPreference='Continue' around the call, as every other
+    # failure-capable scenario here does. Without it a regression makes the
+    # child's stderr a terminating NativeCommandError and the whole SUITE
+    # aborts, so the guard reads as a crash instead of a named FAIL.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $realisticOutput = @(& $script:ResolvedChildShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $wrapperPath `
+            -BusPath (Join-Path $RepoRoot 'scripts\bus.ps1') `
+            -EnvPath $envPath `
+            -OutPath $realisticOutPath `
+            -MetadataPath $realisticMetadataPath `
+            -TracePath $realisticTracePath `
+            -EmptyPath $emptyPath `
+            -Scenario realistic-5-1-redirect 2>&1)
+        $realisticExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
     $successMetadataText = [IO.File]::ReadAllText($successMetadataPath, [Text.Encoding]::UTF8)
     $failureMetadataText = [IO.File]::ReadAllText($failureMetadataPath, [Text.Encoding]::UTF8)
     $redirectMetadataText = [IO.File]::ReadAllText($redirectMetadataPath, [Text.Encoding]::UTF8)
@@ -679,34 +866,60 @@ BUS_SECRET=BUS_SECRET_IWR_CANARY
         success_exit_code = $successExitCode
         success_output = @($successOutput)
         success_body = [IO.File]::ReadAllText($successOutPath, [Text.Encoding]::UTF8)
-        success_metadata = $successMetadataText | ConvertFrom-Json
-        success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        success_metadata = $successMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        success_trace = [IO.File]::ReadAllText($successTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         failure_exit_code = $failureExitCode
         failure_output = @($failureOutput)
         failure_metadata_text = $failureMetadataText
-        failure_metadata = $failureMetadataText | ConvertFrom-Json
-        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        failure_metadata = $failureMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        failure_trace = [IO.File]::ReadAllText($failureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         redirect_exit_code = $redirectExitCode
         redirect_output = @($redirectOutput)
         redirect_metadata_text = $redirectMetadataText
-        redirect_metadata = $redirectMetadataText | ConvertFrom-Json
-        redirect_trace = [IO.File]::ReadAllText($redirectTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        redirect_metadata = $redirectMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        redirect_trace = [IO.File]::ReadAllText($redirectTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         insecure_exit_code = $insecureExitCode
         insecure_output = @($insecureOutput)
         insecure_metadata_text = $insecureMetadataText
-        insecure_metadata = $insecureMetadataText | ConvertFrom-Json
-        insecure_trace = [IO.File]::ReadAllText($insecureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        insecure_metadata = $insecureMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        insecure_trace = [IO.File]::ReadAllText($insecureTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
         empty_location_exit_code = $emptyLocationExitCode
         empty_location_output = @($emptyLocationOutput)
         empty_location_metadata_text = $emptyLocationMetadataText
-        empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json
-        empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        empty_location_metadata = $emptyLocationMetadataText | ConvertFrom-Json @script:JsonDateArgs
+        empty_location_trace = [IO.File]::ReadAllText($emptyLocationTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs
+        realistic_exit_code = $realisticExitCode
+        realistic_output = @($realisticOutput)
+        realistic_body = $(if (Test-Path -LiteralPath $realisticOutPath) { [IO.File]::ReadAllText($realisticOutPath, [Text.Encoding]::UTF8) } else { '' })
+        realistic_metadata = $(if (Test-Path -LiteralPath $realisticMetadataPath) { [IO.File]::ReadAllText($realisticMetadataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
+        realistic_trace = $(if (Test-Path -LiteralPath $realisticTracePath) { [IO.File]::ReadAllText($realisticTracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json @script:JsonDateArgs } else { $null })
     }
 }
 
 $script:TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-read-resilience-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $script:TestRoot | Out-Null
 try {
+    # The harness checks its own reader before it checks anything else. Four
+    # assertions below compare a cursor to an exact timestamp string, and if this
+    # reader ever goes back to coercing, those four fail in a way that reads like a
+    # product bug. This one fails in a way that reads like what it is.
+    $script:DateProbe = if ($SimulateJsonDateCoercion) {
+        # 5.1 does not naturally coerce this JSON, so inject the bad type directly
+        # to keep the failure oracle deterministic on every supported engine.
+        [pscustomobject]@{ t = [datetime]'2026-09-07T08:00:00Z' }
+    } else {
+        '{"t":"2026-09-07T08:00:00.0000000Z"}' | ConvertFrom-Json @script:JsonDateArgs
+    }
+    $dateReaderSafe = (
+        $script:DateProbe.t -is [string] -and
+        $script:DateProbe.t -ceq '2026-09-07T08:00:00.0000000Z'
+    )
+    Assert-True 'harness reads ISO-8601 board cells as strings, on this edition' $dateReaderSafe
+    if (-not $dateReaderSafe) {
+        Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
+        exit 1
+    }
+
     $validEmpty = New-BoardJson
     $eligible = New-BoardJson -DataRows (, (New-EligibleOrderRow))
 
@@ -777,7 +990,8 @@ try {
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('CANONICAL_REDIRECT_CANARY') -and
         -not ([string]$actualBusSecondRedirect.output[0]).Contains('BUS_SECRET_REDIRECT_CANARY')
     )
-    $secondRedirectFailureText = @($actualBusSecondRedirect.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    $secondRedirectFailureText = ConvertTo-FlowedText -Lines $actualBusSecondRedirect.failure_output
+    $secondRedirectFailureSquashed = ConvertTo-SquashedText -Lines $actualBusSecondRedirect.failure_output
     Assert-True 'failed final hop 2 preserves sanitized metadata before returning nonzero' (
         $actualBusSecondRedirect.failure_exit_code -ne 0 -and
         $actualBusSecondRedirect.failure_call_count -eq 2 -and
@@ -791,10 +1005,10 @@ try {
     )
     Assert-True 'failed final hop 2 exposes only the fixed bounded error' (
         $secondRedirectFailureText.Contains('hop 2 did not reach a successful final response after following up to 5 redirects') -and
-        -not $secondRedirectFailureText.Contains('ONE_SHOT_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('CANONICAL_REDIRECT_CANARY') -and
-        -not $secondRedirectFailureText.Contains('FINAL_REDIRECT_BODY_CANARY') -and
-        -not $secondRedirectFailureText.Contains('BUS_SECRET_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('ONE_SHOT_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('CANONICAL_REDIRECT_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('FINAL_REDIRECT_BODY_CANARY') -and
+        -not $secondRedirectFailureSquashed.Contains('BUS_SECRET_REDIRECT_CANARY') -and
         -not $actualBusSecondRedirect.failure_metadata_text.Contains('FINAL_REDIRECT_BODY_CANARY')
     )
 
@@ -817,7 +1031,30 @@ try {
         $actualBusIwrFallback.success_metadata.content_type_class -ceq 'json' -and
         $null -eq $actualBusIwrFallback.success_trace.exception_type
     )
-    $iwrFailureOutputText = @($actualBusIwrFallback.failure_output | ForEach-Object { [string]$_ }) -join "`n"
+    # The 302 exactly as Windows PowerShell 5.1 really delivers it: a
+    # non-terminating InvalidOperationException alongside the response. Every
+    # other IWR scenario above returns the 302 silently, so none of them reach
+    # hop 1's error handling; this is the only case that does.
+    Assert-True 'realistic 5.1 non-terminating 302 still completes the read' (
+        $actualBusIwrFallback.realistic_exit_code -eq 0 -and
+        @($actualBusIwrFallback.realistic_trace.calls).Count -eq 2 -and
+        $actualBusIwrFallback.realistic_trace.calls[0].method -ceq 'Post' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[0].maximum_redirection -eq 0 -and
+        $actualBusIwrFallback.realistic_trace.calls[1].method -ceq 'Get' -and
+        [int]$actualBusIwrFallback.realistic_trace.calls[1].maximum_redirection -eq 0 -and
+        $null -eq $actualBusIwrFallback.realistic_trace.exception_type
+    )
+    Assert-True 'realistic 5.1 302 reaches hop 2 and keeps its body and metadata' (
+        $actualBusIwrFallback.realistic_body.Contains('"ok":true') -and
+        [int]$actualBusIwrFallback.realistic_metadata.http_status -eq 200 -and
+        $actualBusIwrFallback.realistic_metadata.content_type_class -ceq 'json'
+    )
+    Assert-True 'realistic 5.1 302 leaks no secret or one-shot URL' (
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('BUS_SECRET_IWR_CANARY') -and
+        -not (ConvertTo-SquashedText -Lines $actualBusIwrFallback.realistic_output).Contains('ONE_SHOT_IWR_CANARY')
+    )
+
+    $iwrFailureOutputText = ConvertTo-SquashedText -Lines $actualBusIwrFallback.failure_output
     Assert-True 'IWR pre-response failure clears stale hop 1 metadata and remains retry-classifiable' (
         $actualBusIwrFallback.failure_exit_code -ne 0 -and
         @($actualBusIwrFallback.failure_trace.calls).Count -eq 2 -and
@@ -952,7 +1189,233 @@ try {
     )
     Assert-True 'HTTP retry logs no raw body' (-not $httpThenValid.log_text.Contains('HTTP_BODY_CANARY'))
 
-    foreach ($permanentStatus in @(401, 403)) {
+    $notFoundThenValidCanary = '<html>NOT_FOUND_THEN_VALID_BODY_CANARY</html>'
+    $notFoundThenValid = Invoke-ReadCase `
+        -Name 'http-404-then-valid' `
+        -Responses @($notFoundThenValidCanary, $validEmpty) `
+        -FailureByAttempt @{ 1 = [ordered]@{
+            transport_exit = 0
+            http_status = 404
+            content_type_class = 'html'
+        } }
+    $notFoundRetry = @($notFoundThenValid.events | Where-Object event -ceq 'board_read_retry')
+    $notFoundRetryDetailNames = @($notFoundRetry[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedNotFoundRetryDetailNames = @(
+        'attempt', 'code', 'content_length', 'content_sha256', 'content_type_class',
+        'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'HTTP 404 retries one whole read then completes normally with no eligible order' (
+        $notFoundThenValid.exit_code -eq 0 -and
+        $notFoundThenValid.result -and
+        $notFoundThenValid.result.status -ceq 'no_eligible_order' -and
+        $notFoundThenValid.state.last_poll.status -ceq 'no_eligible_order' -and
+        $notFoundThenValid.read_count -eq 2 -and
+        @($notFoundThenValid.actions).Count -eq 2 -and
+        @($notFoundThenValid.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $notFoundThenValid.claude_called
+    )
+    Assert-True 'HTTP 404 recovery emits one safe retry warning' (
+        $notFoundRetry.Count -eq 1 -and
+        $notFoundRetry[0].level -ceq 'warning' -and
+        $notFoundRetry[0].code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundRetry[0].work_id -ceq '' -and
+        $notFoundRetry[0].row_id -ceq '' -and
+        $notFoundRetry[0].details.attempt -ceq '1' -and
+        $notFoundRetry[0].details.code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundRetry[0].details.transport_exit -ceq '0' -and
+        $notFoundRetry[0].details.http_status -ceq '404' -and
+        $notFoundRetry[0].details.content_type_class -ceq 'html' -and
+        [int]$notFoundRetry[0].details.content_length -gt 0 -and
+        [string]$notFoundRetry[0].details.content_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        -not [string]::IsNullOrWhiteSpace([string]$notFoundRetry[0].details.elapsed_ms) -and
+        $notFoundRetryDetailNames.Count -eq $expectedNotFoundRetryDetailNames.Count -and
+        @($expectedNotFoundRetryDetailNames | Where-Object { $notFoundRetryDetailNames -cnotcontains $_ }).Count -eq 0 -and
+        -not $notFoundThenValid.log_text.Contains('NOT_FOUND_THEN_VALID_BODY_CANARY')
+    )
+
+    $preservedWork = [pscustomobject][ordered]@{
+        input_row_id = 'preserved-input-row'
+        work_id = 'PRESERVED-WORK'
+        status = 'claim_confirmed'
+        result_status = ''
+        output_sha256 = ''
+        updated_at = '2026-09-07T08:01:00.0000000Z'
+    }
+    $preservedWorkJson = $preservedWork | ConvertTo-Json -Compress
+    $notFoundTwiceCanaryOne = '<html>NOT_FOUND_TWICE_FIRST_BODY_CANARY</html>'
+    $notFoundTwiceCanaryTwo = '<html>NOT_FOUND_TWICE_SECOND_BODY_CANARY</html>'
+    $notFoundTwice = Invoke-ReadCase `
+        -Name 'http-404-twice' `
+        -Responses @($notFoundTwiceCanaryOne, $notFoundTwiceCanaryTwo) `
+        -FailureByAttempt @{
+            1 = [ordered]@{ transport_exit = 0; http_status = 404; content_type_class = 'html' }
+            2 = [ordered]@{ transport_exit = 0; http_status = 404; content_type_class = 'html' }
+        } `
+        -InitialWork (, $preservedWork)
+    $notFoundTwiceRetries = @($notFoundTwice.events | Where-Object event -ceq 'board_read_retry')
+    $notFoundTwiceRunErrors = @($notFoundTwice.events | Where-Object event -ceq 'run_error')
+    Assert-True 'two HTTP 404 responses stop after the existing one-retry bound' (
+        $notFoundTwice.exit_code -eq 20 -and
+        $notFoundTwice.result -and
+        $notFoundTwice.result.status -ceq 'error' -and
+        $notFoundTwice.result.error_code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwice.state.error.code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwice.read_count -eq 2 -and
+        $notFoundTwiceRetries.Count -eq 1 -and
+        $notFoundTwiceRunErrors.Count -eq 1 -and
+        $notFoundTwiceRunErrors[0].code -ceq 'BOARD_READ_HTTP_ERROR' -and
+        $notFoundTwiceRunErrors[0].details.attempt -ceq '2' -and
+        $notFoundTwiceRunErrors[0].details.http_status -ceq '404'
+    )
+    Assert-True 'two HTTP 404 responses preserve cursor and work with no write or inference' (
+        [bool]$notFoundTwice.state.initialized -and
+        $notFoundTwice.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $notFoundTwice.state.cursor.row_id -ceq 'cursor-before-read' -and
+        @($notFoundTwice.state.work).Count -eq 1 -and
+        (@($notFoundTwice.state.work)[0] | ConvertTo-Json -Compress) -ceq $preservedWorkJson -and
+        @($notFoundTwice.actions).Count -eq 2 -and
+        @($notFoundTwice.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $notFoundTwice.claude_called -and
+        -not $notFoundTwice.log_text.Contains('NOT_FOUND_TWICE_FIRST_BODY_CANARY') -and
+        -not $notFoundTwice.log_text.Contains('NOT_FOUND_TWICE_SECOND_BODY_CANARY')
+    )
+
+    $missingRowsJson = '{"ok":true}'
+    $missingRowsThenEmpty = Invoke-ReadCase `
+        -Name 'missing-rows-then-empty' `
+        -Responses @($missingRowsJson, $validEmpty)
+    $missingRowsEmptyRetries = @($missingRowsThenEmpty.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsEmptyPropertyNames = @($missingRowsEmptyRetries[0].PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missingRowsEmptyDetailNames = @($missingRowsEmptyRetries[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedRetryPropertyNames = @(
+        'at', 'code', 'details', 'event', 'level', 'message', 'row_id', 'run_id', 'work_id'
+    )
+    $expectedMissingRowsDetailNames = @(
+        'attempt', 'code', 'content_type_class', 'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'missing rows retries one whole read then completes normally with no eligible order' (
+        $missingRowsThenEmpty.exit_code -eq 0 -and
+        $missingRowsThenEmpty.result -and
+        $missingRowsThenEmpty.result.status -ceq 'no_eligible_order' -and
+        $missingRowsThenEmpty.state.last_poll.status -ceq 'no_eligible_order' -and
+        $missingRowsThenEmpty.read_count -eq 2 -and
+        @($missingRowsThenEmpty.actions).Count -eq 2
+    )
+    Assert-True 'missing rows recovery emits one exact lowercase safe retry warning' (
+        $missingRowsEmptyRetries.Count -eq 1 -and
+        $missingRowsEmptyRetries[0].level -ceq 'warning' -and
+        $missingRowsEmptyRetries[0].code -ceq 'board_rows_missing' -and
+        $missingRowsEmptyRetries[0].message -ceq 'A transient pre-admission board read failed; retrying once.' -and
+        $missingRowsEmptyRetries[0].work_id -ceq '' -and
+        $missingRowsEmptyRetries[0].row_id -ceq '' -and
+        $missingRowsEmptyRetries[0].details.attempt -ceq '1' -and
+        $missingRowsEmptyRetries[0].details.code -ceq 'board_rows_missing' -and
+        $missingRowsEmptyRetries[0].details.transport_exit -ceq '0' -and
+        $missingRowsEmptyRetries[0].details.http_status -ceq '200' -and
+        $missingRowsEmptyRetries[0].details.content_type_class -ceq 'json' -and
+        -not [string]::IsNullOrWhiteSpace([string]$missingRowsEmptyRetries[0].details.elapsed_ms) -and
+        $missingRowsEmptyPropertyNames.Count -eq $expectedRetryPropertyNames.Count -and
+        @($expectedRetryPropertyNames | Where-Object { $missingRowsEmptyPropertyNames -cnotcontains $_ }).Count -eq 0 -and
+        $missingRowsEmptyDetailNames.Count -eq $expectedMissingRowsDetailNames.Count -and
+        @($expectedMissingRowsDetailNames | Where-Object { $missingRowsEmptyDetailNames -cnotcontains $_ }).Count -eq 0
+    )
+    Assert-True 'missing rows recovery logs no raw response and has no write or inference side effect' (
+        -not $missingRowsThenEmpty.log_text.Contains($missingRowsJson) -and
+        @($missingRowsThenEmpty.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        -not $missingRowsThenEmpty.claude_called
+    )
+
+    $missingRowsThenEligible = Invoke-ReadCase `
+        -Name 'missing-rows-then-eligible-observe' `
+        -Responses @($missingRowsJson, $eligible) `
+        -Mode Observe
+    $missingRowsEligibleRetries = @($missingRowsThenEligible.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsCandidates = @($missingRowsThenEligible.events | Where-Object event -ceq 'candidate_observed')
+    Assert-True 'missing rows then eligible Observe admits the candidate exactly once' (
+        $missingRowsThenEligible.exit_code -eq 0 -and
+        $missingRowsThenEligible.result -and
+        $missingRowsThenEligible.result.status -ceq 'candidate_observed' -and
+        $missingRowsThenEligible.result.work_id -ceq 'ORDER-READ-RETRY' -and
+        $missingRowsThenEligible.state.last_poll.status -ceq 'candidate_observed' -and
+        [int]$missingRowsThenEligible.state.counts.selected -eq 1 -and
+        $missingRowsThenEligible.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $missingRowsThenEligible.state.cursor.row_id -ceq 'cursor-before-read' -and
+        $missingRowsThenEligible.read_count -eq 2 -and
+        $missingRowsEligibleRetries.Count -eq 1 -and
+        $missingRowsCandidates.Count -eq 1
+    )
+    Assert-True 'missing rows then eligible Observe performs no synthesis, write, or inference' (
+        $missingRowsEligibleRetries[0].code -ceq 'board_rows_missing' -and
+        @($missingRowsThenEligible.state.work).Count -eq 0 -and
+        @($missingRowsThenEligible.actions).Count -eq 2 -and
+        @($missingRowsThenEligible.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        @($missingRowsThenEligible.events | Where-Object {
+            @('claim_confirmed', 'receipt_confirmed', 'invocation_started', 'result_confirmed') -ccontains [string]$_.event
+        }).Count -eq 0 -and
+        -not $missingRowsThenEligible.log_text.Contains($missingRowsJson) -and
+        -not $missingRowsThenEligible.claude_called
+    )
+
+    $missingRowsBodyCanary = 'ROWS_MISSING_BODY_CANARY'
+    $missingRowsCanaryJson = '{"ok":true,"diagnostic":"' + $missingRowsBodyCanary + '"}'
+    $missingRowsTwice = Invoke-ReadCase `
+        -Name 'missing-rows-twice' `
+        -Responses @($missingRowsCanaryJson, $missingRowsJson) `
+        -InitialWork (, $preservedWork)
+    $missingRowsTwiceRetries = @($missingRowsTwice.events | Where-Object event -ceq 'board_read_retry')
+    $missingRowsTwiceRunErrors = @($missingRowsTwice.events | Where-Object event -ceq 'run_error')
+    $missingRowsTwiceRetryDetailNames = @($missingRowsTwiceRetries[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $missingRowsTwiceRunErrorDetailNames = @($missingRowsTwiceRunErrors[0].details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $expectedMissingRowsRunErrorDetailNames = @(
+        'attempt', 'content_type_class', 'elapsed_ms', 'http_status', 'transport_exit'
+    )
+    Assert-True 'two missing rows envelopes stop after the existing one-retry bound with the public code' (
+        $missingRowsTwice.exit_code -eq 20 -and
+        $missingRowsTwice.result -and
+        $missingRowsTwice.result.status -ceq 'error' -and
+        $missingRowsTwice.result.error_code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwice.state.error.code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwice.read_count -eq 2 -and
+        $missingRowsTwiceRetries.Count -eq 1 -and
+        $missingRowsTwiceRunErrors.Count -eq 1
+    )
+    Assert-True 'missing rows retry stays lowercase while terminal run_error stays public uppercase' (
+        $missingRowsTwiceRetries[0].code -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRetries[0].details.attempt -ceq '1' -and
+        $missingRowsTwiceRetries[0].details.code -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRetries[0].message -ceq 'A transient pre-admission board read failed; retrying once.' -and
+        $missingRowsTwiceRetryDetailNames.Count -eq $expectedMissingRowsDetailNames.Count -and
+        @($expectedMissingRowsDetailNames | Where-Object { $missingRowsTwiceRetryDetailNames -cnotcontains $_ }).Count -eq 0 -and
+        $missingRowsTwiceRunErrors[0].code -ceq 'BOARD_ROWS_MISSING' -and
+        $missingRowsTwiceRunErrors[0].message -ceq 'board_rows_missing' -and
+        $missingRowsTwiceRunErrors[0].details.attempt -ceq '2' -and
+        $missingRowsTwiceRunErrors[0].details.http_status -ceq '200' -and
+        $missingRowsTwiceRunErrors[0].details.content_type_class -ceq 'json' -and
+        $missingRowsTwiceRunErrorDetailNames.Count -eq $expectedMissingRowsRunErrorDetailNames.Count -and
+        @($expectedMissingRowsRunErrorDetailNames | Where-Object {
+            $missingRowsTwiceRunErrorDetailNames -cnotcontains $_
+        }).Count -eq 0
+    )
+    Assert-True 'two missing rows envelopes preserve the exact cursor and work record' (
+        [bool]$missingRowsTwice.state.initialized -and
+        $missingRowsTwice.state.cursor.timestamp -ceq '2026-09-07T08:00:00.0000000Z' -and
+        $missingRowsTwice.state.cursor.row_id -ceq 'cursor-before-read' -and
+        [int]$missingRowsTwice.state.counts.selected -eq 0 -and
+        @($missingRowsTwice.state.work).Count -eq 1 -and
+        (@($missingRowsTwice.state.work)[0] | ConvertTo-Json -Compress) -ceq $preservedWorkJson
+    )
+    Assert-True 'two missing rows envelopes expose no raw canary and cause no write or inference' (
+        @($missingRowsTwice.actions).Count -eq 2 -and
+        @($missingRowsTwice.actions | Where-Object { $_ -cne 'read' }).Count -eq 0 -and
+        @($missingRowsTwice.events | Where-Object {
+            @('candidate_observed', 'poll_complete') -ccontains [string]$_.event
+        }).Count -eq 0 -and
+        -not $missingRowsTwice.log_text.Contains($missingRowsBodyCanary) -and
+        -not $missingRowsTwice.log_text.Contains($missingRowsJson) -and
+        -not $missingRowsTwice.claude_called
+    )
+
+    foreach ($permanentStatus in @(401, 403, 418)) {
         $permanentHttp = Invoke-ReadCase `
             -Name ('http-' + $permanentStatus + '-no-retry') `
             -Responses @('<html>PERMANENT_HTTP_BODY_CANARY</html>', $validEmpty) `
@@ -1067,7 +1530,8 @@ try {
 
     foreach ($logicalCase in @(
         [pscustomobject]@{ name = 'logical-refusal'; response = '{"ok":false,"rows":[]}'; code = 'BOARD_READ_REFUSED' },
-        [pscustomobject]@{ name = 'schema-missing-rows'; response = '{"ok":true}'; code = 'BOARD_ROWS_MISSING' }
+        [pscustomobject]@{ name = 'header-missing'; response = '{"ok":true,"rows":[]}'; code = 'BOARD_HEADER_MISSING' },
+        [pscustomobject]@{ name = 'header-invalid'; response = '{"ok":true,"rows":[["bad"]]}'; code = 'BOARD_HEADER_INVALID' }
     )) {
         $logical = Invoke-ReadCase `
             -Name $logicalCase.name `
@@ -1093,6 +1557,54 @@ try {
         $runnerSource.Contains('$current = @(Read-Board)') -and
         $runnerSource.Contains('$readOperation = { Read-Board }')
     )
+    $runnerTokens = $null
+    $runnerParseErrors = $null
+    $runnerAst = [Management.Automation.Language.Parser]::ParseFile($RunnerPath, [ref]$runnerTokens, [ref]$runnerParseErrors)
+    $classifierDefinitions = @($runnerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Test-TransientBoardReadFailure'
+    }, $true))
+    if ($classifierDefinitions.Count -eq 1) { Invoke-Expression $classifierDefinitions[0].Extent.Text }
+    $lowercaseRowsMissingError = try { throw 'board_rows_missing' } catch { $_ }
+    $uppercaseRowsMissingError = try { throw 'BOARD_ROWS_MISSING' } catch { $_ }
+    $refusedError = try { throw 'board_read_refused' } catch { $_ }
+    $headerMissingError = try { throw 'board_header_missing' } catch { $_ }
+    $headerInvalidError = try { throw 'board_header_invalid' } catch { $_ }
+    Assert-True 'transient classifier adds only the exact lowercase real-parser missing-rows message' (
+        @($runnerParseErrors).Count -eq 0 -and
+        $classifierDefinitions.Count -eq 1 -and
+        [bool](Test-TransientBoardReadFailure -ErrorRecord $lowercaseRowsMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $uppercaseRowsMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $refusedError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerMissingError) -and
+        -not [bool](Test-TransientBoardReadFailure -ErrorRecord $headerInvalidError)
+    )
+
+    if (-not $SimulateJsonDateCoercion) {
+        # Re-run only the prerequisite under this same engine. The child exits at
+        # the reader gate, and this explicit guard prevents recursive self-tests.
+        $currentShell = (Get-Process -Id $PID -ErrorAction Stop).Path
+        $dateReaderFailureOutput = @(& $currentShell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+            -File $PSCommandPath -SimulateJsonDateCoercion 2>&1)
+        $dateReaderFailureExitCode = $LASTEXITCODE
+        $dateReaderFailureLines = @($dateReaderFailureOutput | ForEach-Object { [string]$_ })
+        $dateReaderFailurePassLines = @($dateReaderFailureLines | Where-Object { $_ -like 'PASS *' })
+        $dateReaderFailureFailLines = @($dateReaderFailureLines | Where-Object { $_ -like 'FAIL *' })
+        $dateReaderFailureResultLines = @($dateReaderFailureLines | Where-Object { $_ -like 'RESULT *' })
+        Assert-True 'date-reader negative control stops at the harness boundary' (
+            $dateReaderFailureExitCode -eq 1 -and
+            $dateReaderFailurePassLines.Count -eq 0 -and
+            $dateReaderFailureFailLines.Count -eq 1 -and
+            $dateReaderFailureFailLines[0] -ceq
+                'FAIL harness reads ISO-8601 board cells as strings, on this edition' -and
+            $dateReaderFailureResultLines.Count -eq 1 -and
+            $dateReaderFailureResultLines[0] -ceq 'RESULT passed=0 failed=1'
+        ) ('exit=' + $dateReaderFailureExitCode +
+           ' pass_lines=' + $dateReaderFailurePassLines.Count +
+           ' fail_lines=' + $dateReaderFailureFailLines.Count +
+           ' result_lines=' + $dateReaderFailureResultLines.Count)
+    }
 } finally {
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $script:TestRoot -PathType Container)) {
         Remove-Item -LiteralPath $script:TestRoot -Recurse -Force

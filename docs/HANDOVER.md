@@ -372,6 +372,63 @@ Compare the scratch export with the candidate commit and leave it untracked.
 Existing local `gas/` snapshots may be retained for evidence, but they are not
 proof of what is currently deployed and must never be pushed.
 
+**`clasp push` writes HEAD; a web app serves a PINNED version. These are not
+the same surface, and confusing them makes a deploy claim either false or
+needlessly frightening.** Measured on the Governor project, 2026-09-13:
+`clasp list-deployments` returns two — one `@HEAD`, and the console pinned at
+`@33`. So a push changes the project's saved code and leaves the pinned console
+untouched. Which of the two a change reaches depends entirely on how the code is
+invoked:
+
+| invoked by | runs | so a `clasp push` is |
+| --- | --- | --- |
+| installable trigger (e.g. `monitorTick`) | HEAD | live on the next run |
+| web app `/exec` on a pinned deployment | that version | inert until a redeploy |
+
+Therefore "I pushed it" is **not** the same claim as "the console changed", and
+"the console is unchanged" is not evidence the push failed. Say which surface
+you mean. Verifying a push means pulling the project back and diffing against a
+snapshot taken *before* it — `clasp`'s own success line says a file was
+transmitted, not that the thing you meant to change now behaves differently.
+`clasp` cannot list triggers at all, so whether a trigger exists and is enabled
+is outside what this tooling can prove; do not assert it from a successful push.
+
+**The committed mirror differs from deployed source — and the repo is AHEAD, not
+stale.** `scripts/gas_baseline_check.py` compares them by content hash; run it
+the easy way with `scripts/gas_drift_watch.ps1`, which fetches, compares and
+then deletes the pulled production source in a `finally` block.
+
+Reconciled 2026-09-13, file by file:
+
+| file | verdict |
+| --- | --- |
+| `Index`, `Monitor`, `PublicInbox` | identical |
+| `appsscript.json` | **was a false positive** — same six keys and values, different key order. The checker now canonicalises JSON before hashing. |
+| `Auth`, `Code`, `Reception` | the repo holds reviewed work from 2026-09-06/07 that was never deployed |
+
+What the repo has and the deployment does not: signed conversation identity
+(`b915a9d`, `f076a49`), forward-ported paid-voice guards with explicit
+`TTS_SESSION_CAP` / `TTS_DAILY_CAP` (`9160293`), and budget hardening
+(`2979d08`, `1b12764`). The repo's `Auth` is also strictly stricter than the
+deployment's on every shared check — it requires `claims.sub`, matches the
+issuer by equality rather than `indexOf` (a substring test would accept a
+lookalike host), and fails **closed** on a missing `email_verified` where the
+deployment's `=== false` fails open.
+
+What the deployment has and the repo does not is the *older mechanism the repo
+replaced*, not work the repo lost: the `?vid=` query parameter (the repo derives
+the session id from the signed token, so the parameter is gone entirely) and the
+pre-token `sessionStorage` id in `Reception.html`. Verified by reading both
+sides rather than inferred from the byte counts.
+
+**So this is a RELEASE decision, not a sync.** Deploying it is six days of
+unshipped behaviour change reaching a live console at once, and `Reception.html`
+and `Code.gs` must go together or the page breaks. It needs Mr. Salam's word and
+the staging pipeline in `.github/workflows/staging-deploy.yml`, not an ad-hoc
+`clasp push`. Until then, a `clasp push` from that directory is still the wrong
+move — but because it would ship an unreviewed release, not because it would
+destroy something precious.
+
 ---
 
 ## Quarantine is LIVE — Version 14, verified 2026-09-03

@@ -1,0 +1,27 @@
+[Unit]
+Description=Run the Blackboard ORDER supervisor on an interval
+Documentation=file:/opt/blackboard/docs/ORDER-PORT-PLAN.md
+
+[Timer]
+# The Windows Scheduled Task fires every five minutes. Matching it exactly
+# matters for the fixture comparison: a different cadence would make any
+# behavioural difference between the two hosts impossible to attribute.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+# NON-OVERLAPPING. systemd will not start the service while the previous
+# activation is still running, so this is the property the Scheduled Task
+# gets from "do not start a new instance" - but only because the service is
+# Type=oneshot. A Type=simple service would report "started" immediately and
+# the guarantee would evaporate.
+AccuracySec=15s
+
+# Without this, every host that boots at the same time hits the Apps Script bus
+# in the same second. The live bus already fails full reads under load - that
+# was observed at 02:44Z - so spreading the load is not decoration.
+RandomizedDelaySec=30
+
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -274,31 +274,49 @@ class EndpointAndCliTests(unittest.TestCase):
             foundry._validate_cli(args)
         self.assertEqual(caught.exception.code, "OUTPUT_OVERWRITES_PACKET")
 
-    def test_governed_agent_requires_and_carries_version_pin(self) -> None:
-        with self.assertRaises(foundry.AdapterError) as caught:
-            foundry.resolve_target(
-                requested_agent="reviewer",
-                requested_model=None,
-                requested_agent_version=None,
-                config={},
-                governed=True,
-            )
-        self.assertEqual(caught.exception.code, "UNPINNED_AGENT")
+    def test_governed_agent_is_rejected_with_or_without_version_pin(self) -> None:
+        for version in (None, "7"):
+            with self.subTest(version=version):
+                with self.assertRaises(foundry.AdapterError) as caught:
+                    foundry.resolve_target(
+                        requested_agent="reviewer",
+                        requested_model=None,
+                        requested_agent_version=version,
+                        config={},
+                        governed=True,
+                    )
+                self.assertEqual(
+                    caught.exception.code, "GOVERNED_AGENT_UNSUPPORTED"
+                )
+                self.assertEqual(caught.exception.exit_code, 3)
+                self.assertEqual(
+                    caught.exception.details["required_target_type"],
+                    "model_deployment",
+                )
 
+        with self.assertRaises(foundry.AdapterError) as caught:
+            foundry.build_governed_payload(
+                make_packet(),
+                target={"type": "agent", "name": "reviewer", "version": "7"},
+                digest="a" * 64,
+                max_output_tokens=900,
+            )
+        self.assertEqual(caught.exception.code, "GOVERNED_AGENT_UNSUPPORTED")
+
+    def test_governed_target_prefers_configured_model_over_agent(self) -> None:
         target = foundry.resolve_target(
-            requested_agent="reviewer",
+            requested_agent=None,
             requested_model=None,
-            requested_agent_version="7",
-            config={},
+            requested_agent_version=None,
+            config={
+                "FOUNDRY_AGENT_NAME": "configured-agent",
+                "FOUNDRY_MODEL": "configured-model",
+            },
             governed=True,
         )
-        payload = foundry.build_governed_payload(
-            make_packet(),
-            target=target,
-            digest="a" * 64,
-            max_output_tokens=900,
+        self.assertEqual(
+            target, {"type": "model_deployment", "name": "configured-model"}
         )
-        self.assertEqual(payload["agent_reference"]["version"], "7")
 
     def test_rejects_control_characters_in_target(self) -> None:
         with self.assertRaises(foundry.AdapterError) as caught:
@@ -442,39 +460,90 @@ class ResultContractTests(unittest.TestCase):
             foundry.validate_response_identity(response, target)
         self.assertEqual(caught.exception.code, "MISSING_RESPONSE_MODEL")
 
-    def test_governed_agent_identity_requires_exact_pin_match(self) -> None:
+    def test_response_identity_rejects_agent_target(self) -> None:
         target = {"type": "agent", "name": "reviewer", "version": "7"}
         response = {
             "id": "resp-agent-1",
             "status": "completed",
             "model": "reported-model",
+            "agent_reference": {"name": "reviewer", "version": "7"},
         }
         with self.assertRaises(foundry.AdapterError) as caught:
             foundry.validate_response_identity(response, target)
-        self.assertEqual(caught.exception.code, "MISSING_REPORTED_AGENT_IDENTITY")
-
-        response["agent_reference"] = {"name": "other-agent", "version": "7"}
-        with self.assertRaises(foundry.AdapterError) as caught:
-            foundry.validate_response_identity(response, target)
-        self.assertEqual(caught.exception.code, "AGENT_IDENTITY_MISMATCH")
-        self.assertEqual(caught.exception.details["mismatched_fields"], ["name"])
-
-        response["agent_reference"] = {"name": "reviewer", "version": "8"}
-        with self.assertRaises(foundry.AdapterError) as caught:
-            foundry.validate_response_identity(response, target)
-        self.assertEqual(caught.exception.code, "AGENT_IDENTITY_MISMATCH")
-        self.assertEqual(caught.exception.details["mismatched_fields"], ["version"])
-
-        response["agent_reference"] = {"name": "reviewer", "version": "7"}
-        identity = foundry.validate_response_identity(response, target)
-        self.assertEqual(
-            identity["requested_target"],
-            {"type": "agent", "name": "reviewer", "version": "7"},
-        )
-        self.assertEqual(identity["reported_target"], identity["requested_target"])
+        self.assertEqual(caught.exception.code, "GOVERNED_AGENT_UNSUPPORTED")
+        self.assertEqual(caught.exception.exit_code, 3)
 
 
 class MockedHttpTests(unittest.TestCase):
+    def test_governed_agent_fails_before_credential_or_http(self) -> None:
+        packet = make_packet()
+        cases = (
+            (
+                ["--agent", "reviewer", "--agent-version", "7"],
+                {
+                    "FOUNDRY_PROJECT_ENDPOINT": (
+                        "https://unit.services.ai.azure.com/api/projects/blackboard"
+                    ),
+                    "FOUNDRY_API_KEY": "mock-secret-never-log",
+                    "FOUNDRY_MODEL": "configured-model",
+                },
+            ),
+            (
+                [],
+                {
+                    "FOUNDRY_PROJECT_ENDPOINT": (
+                        "https://unit.services.ai.azure.com/api/projects/blackboard"
+                    ),
+                    "FOUNDRY_API_KEY": "mock-secret-never-log",
+                    "FOUNDRY_AGENT_NAME": "configured-agent",
+                    "FOUNDRY_AGENT_VERSION": "7",
+                },
+            ),
+            (
+                ["--agent", "reviewer", "--agent-version", "7"],
+                {},
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            packet_path = pathlib.Path(directory) / "packet.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            for extra_args, config in cases:
+                with self.subTest(extra_args=extra_args):
+                    config_reads: list[bool] = []
+
+                    def config_loader(*, include_api_key=True):
+                        config_reads.append(include_api_key)
+                        if include_api_key:
+                            raise AssertionError(
+                                "unsupported agent mode must not load API-key config"
+                            )
+                        return config
+
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            foundry, "load_config", side_effect=config_loader
+                        ),
+                        mock.patch.object(foundry, "resolve_credential") as credential,
+                        mock.patch.object(foundry, "request_json") as request,
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        exit_code = foundry.main(
+                            ["--packet", str(packet_path), *extra_args]
+                        )
+
+                    self.assertEqual(exit_code, 3)
+                    self.assertEqual(config_reads, [False])
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(
+                        json.loads(stderr.getvalue())["error"]["code"],
+                        "GOVERNED_AGENT_UNSUPPORTED",
+                    )
+                    credential.assert_not_called()
+                    request.assert_not_called()
+
     def test_governed_cli_builds_safe_request_and_artifact(self) -> None:
         packet = make_packet()
         remote = {
@@ -513,15 +582,24 @@ class MockedHttpTests(unittest.TestCase):
             packet_path.write_text(json.dumps(packet), encoding="utf-8")
             stdout = io.StringIO()
             stderr = io.StringIO()
-            config = {
+            safe_config = {
                 "FOUNDRY_PROJECT_ENDPOINT": (
                     "https://unit.services.ai.azure.com/api/projects/blackboard"
                 ),
-                "FOUNDRY_API_KEY": "mock-secret-never-log",
                 "FOUNDRY_MODEL": "model-deployment-test",
             }
+            full_config = {
+                **safe_config,
+                "FOUNDRY_API_KEY": "mock-secret-never-log",
+            }
+            config_reads: list[bool] = []
+
+            def config_loader(*, include_api_key=True):
+                config_reads.append(include_api_key)
+                return full_config if include_api_key else safe_config
+
             with (
-                mock.patch.object(foundry, "load_config", return_value=config),
+                mock.patch.object(foundry, "load_config", side_effect=config_loader),
                 mock.patch.object(foundry.HTTP_OPENER, "open", side_effect=fake_urlopen),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
@@ -531,6 +609,7 @@ class MockedHttpTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
+            self.assertEqual(config_reads, [False, True])
             artifact = json.loads(stdout.getvalue())
             written = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual(artifact, written)
@@ -580,6 +659,8 @@ class MockedHttpTests(unittest.TestCase):
         self.assertEqual(body["max_output_tokens"], foundry.DEFAULT_MAX_OUTPUT_TOKENS)
         self.assertEqual(body["tool_choice"], "none")
         self.assertIn("instruction_authority=NONE", body["instructions"])
+        self.assertEqual(body["model"], "model-deployment-test")
+        self.assertNotIn("agent_reference", body)
         self.assertEqual(body["text"]["format"]["type"], "json_schema")
         self.assertTrue(body["text"]["format"]["strict"])
         self.assertEqual(

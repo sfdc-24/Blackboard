@@ -1,0 +1,97 @@
+name: Browser identification tools on Windows
+
+# WHY THIS EXISTS
+#   tools/browser/identify_claude_browsers.ps1 parses Chrome's LevelDB by hand.
+#   That parsing has been wrong four times already, and every single time it
+#   FAILED QUIETLY - it skipped the files Chrome holds open, it missed a key
+#   whose first byte LevelDB overwrites, it once returned ":" as a browser name,
+#   and it reported three confident "not here" verdicts on a machine where it
+#   had extracted nothing at all to compare against.
+#
+#   None of those threw. All four produced a plausible wrong answer. A tool
+#   whose entire job is attribution cannot be left to hand-running.
+#
+#   The suite needs no browser, no extension and no network - it builds fixture
+#   profile trees in TEMP - so there is no excuse for it not being here. And a
+#   committed test that no job invokes is not coverage: that is the note at the
+#   top of walkthrough-tools.yml and the whole of PR74.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/browser-tools.yml'
+      - 'tools/browser/**'
+      - 'tests/test_identify_claude_browsers.ps1'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/browser-tools.yml'
+      - 'tools/browser/**'
+      - 'tests/test_identify_claude_browsers.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-tools:
+    name: Browser identification contracts on Windows PowerShell 5.1
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The tool reads Windows browser profile layouts and is written for the
+      # edition that ships on the machines it runs on. Asserting the edition
+      # here keeps a future runner change from quietly testing something else.
+      - name: Refuse to report a Windows 5.1 result from another edition
+        shell: powershell
+        run: |
+          $v = $PSVersionTable.PSVersion
+          Write-Output "edition=$($PSVersionTable.PSEdition) version=$v"
+          if ($PSVersionTable.PSEdition -ne 'Desktop') {
+            throw "this job must run on Windows PowerShell (Desktop), got $($PSVersionTable.PSEdition)"
+          }
+
+      - name: Both scripts parse
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in @('tools\browser\identify_claude_browsers.ps1',
+                           'tests\test_identify_claude_browsers.ps1')) {
+            $null = [System.Management.Automation.PSParser]::Tokenize(
+                      (Get-Content $f -Raw), [ref]$null)
+            Write-Output "  ok $f"
+          }
+
+      # The real assertions. The suite builds its own fixture trees, so this is
+      # the whole contract and not a smoke test.
+      - name: Browser identification contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = & .\tests\test_identify_claude_browsers.ps1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+
+          # passed >= 1, not passed >= 0.
+          #
+          # `RESULT passed=0 failed=0` is what a suite reports when its setup
+          # failed quietly and every check was skipped, and a guard written as
+          # passed=[0-9]* accepts it as green. That exact hole was found in
+          # walkthrough-tools.yml; this is the same guard written correctly the
+          # first time. When assert_suite_result.sh reaches main it should
+          # replace this, rather than a third copy of the check being kept.
+          $result = @($output | Where-Object { $_ -match '^RESULT passed=' })
+          if ($result.Count -ne 1) {
+            throw "expected exactly one RESULT line, got $($result.Count) - none means the suite died before reporting"
+          }
+          if ($result[0] -notmatch '^RESULT passed=([1-9][0-9]*) failed=0$') {
+            throw "suite did not pass cleanly with at least one assertion: $($result[0])"
+          }
+          if ($code -ne 0) {
+            throw "the suite printed a clean RESULT line but exited $code - trust the exit code"
+          }
+          Write-Output "  ok $($result[0])"
