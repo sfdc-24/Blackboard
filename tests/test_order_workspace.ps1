@@ -13,6 +13,49 @@ $FixturePath = Join-Path $PSScriptRoot 'fixtures\order_supervisor_board.json'
 $script:Passed = 0
 $script:Failed = 0
 
+# WHICH SHELL THE CHILD RUNS IN.
+#
+# ORDER_TEST_CHILD_SHELL is the knob PR62 established and PR69 applied to four other
+# suites. Unset, this behaves exactly as before: powershell.exe.
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) { $script:ChildShell = 'powershell.exe' }
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
+function New-TestDirectoryLink {
+    # STAGES THE REPARSE ATTACK ON WHICHEVER PLATFORM WE ARE ON.
+    #
+    # These fixtures exist to prove the adapter refuses a config directory that is a
+    # reparse point. They were written with -ItemType Junction, which is NTFS-only, so
+    # on Linux the fixture THREW, the attack never staged, the adapter had nothing to
+    # refuse, and the assertion failed for the wrong reason. Read quickly that looks
+    # like a broken test; it is an unproven security control.
+    #
+    # A Linux symbolic link carries the same [IO.FileAttributes]::ReparsePoint the
+    # product checks - measured, not assumed - so the substitution is sound.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+
+    # $IsWindows exists only in PowerShell 6+; under 5.1 with Set-StrictMode 2.0,
+    # reading it directly THROWS rather than returning $null. scripts/order_supervisor.ps1
+    # carries the same guard.
+    $onWindows = if (Test-Path Variable:IsWindows) { [bool]$IsWindows } else { $true }
+    $itemType = if ($onWindows) { 'Junction' } else { 'SymbolicLink' }
+    New-Item -ItemType $itemType -Path $Path -Target $Target | Out-Null
+
+    # Never let a fixture report success without staging the attack. A link that is not
+    # a reparse point leaves the guard under test with nothing to refuse, which is the
+    # precise failure this helper exists to prevent.
+    $created = Get-Item -LiteralPath $Path -Force
+    if (($created.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        throw ('test_directory_link_is_not_a_reparse_point:' + $Path + ':' + $created.Attributes)
+    }
+    return $created
+}
+
 function Assert-True {
     param([string]$Name, [bool]$Condition)
     if ($Condition) {
@@ -335,7 +378,15 @@ function Write-ConfigCapture([string]$Phase) {
         if (-not [string]::IsNullOrWhiteSpace($env:ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET)) {
             $escapePath = Join-Path $configPath 'escape'
             if (-not (Test-Path -LiteralPath $escapePath)) {
-                New-Item -ItemType Junction -Path $escapePath -Target $env:ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET | Out-Null
+                # This runs inside the FAKE ADAPTER, a separate child process, so it
+                # cannot call New-TestDirectoryLink from the suite's scope - the
+                # platform choice has to be made here. Junction is NTFS-only; on Linux
+                # a symbolic link carries the same ReparsePoint attribute the product
+                # checks for. Test-Path Variable:IsWindows because reading $IsWindows
+                # directly throws under Windows PowerShell 5.1 with StrictMode.
+                $onWindows = if (Test-Path Variable:IsWindows) { [bool]$IsWindows } else { $true }
+                $escapeType = if ($onWindows) { 'Junction' } else { 'SymbolicLink' }
+                New-Item -ItemType $escapeType -Path $escapePath -Target $env:ORDER_ADAPTER_FAKE_CONFIG_REPARSE_TARGET | Out-Null
             }
         }
     }
@@ -529,8 +580,28 @@ exit $requestedExitCode
             @(Compare-Object @($adapterOutput.settings.permissions.allow) @('Read', 'Edit', 'PowerShell')).Count -eq 0 -and
             @($adapterOutput.settings.permissions.allow).Count -eq 3
         )
+        # THE EXPECTED DENY PATH IS PLATFORM-SHAPED, AND THIS ONLY KNEW WINDOWS.
+        #
+        # ConvertTo-ClaudeEnvDenyPath in scripts/invoke_order_claude.ps1 documents both
+        # forms:  Windows  C:\a\b\.env -> //c/a/b/.env
+        #         POSIX    /a/b/.env   -> /a/b/.env
+        #
+        # The old expectation applied the drive-letter transform unconditionally. On
+        # Linux GetFullPath returns /tmp/..., so Substring(0,1) is '/' and Substring(2)
+        # eats the first two characters, producing '///mp/...' - a value the product
+        # could never emit and never should. The PRODUCT was right; this line was wrong.
+        #
+        # Built from the documented contract rather than by calling the function under
+        # test, because an expectation computed by the implementation agrees with it by
+        # construction and would pass even if both were wrong together.
+        $onWindowsHost = if (Test-Path Variable:IsWindows) { [bool]$IsWindows } else { $true }
         $expectedEnvPermissionPath = ([IO.Path]::GetFullPath($adapterEnvFile) -replace '\\', '/')
-        $expectedEnvPermissionPath = '//' + $expectedEnvPermissionPath.Substring(0, 1).ToLowerInvariant() + $expectedEnvPermissionPath.Substring(2).TrimEnd('/')
+        if ($onWindowsHost) {
+            $expectedEnvPermissionPath = '//' + $expectedEnvPermissionPath.Substring(0, 1).ToLowerInvariant() + $expectedEnvPermissionPath.Substring(2).TrimEnd('/')
+        }
+        else {
+            $expectedEnvPermissionPath = $expectedEnvPermissionPath.TrimEnd('/')
+        }
         Assert-True 'ephemeral settings denies the exact configured env file' (
             @(Compare-Object @($adapterOutput.settings.permissions.deny) @(
                 ('Read(' + $expectedEnvPermissionPath + ')')
@@ -961,7 +1032,7 @@ ANTHROPIC_MODEL='claude-test-model'
     $adapterHelperJunction = Join-Path $adapterHelperParent ('claude-config-' + ('e' * 32))
     New-Item -ItemType Directory -Path $adapterHelperTarget | Out-Null
     [IO.File]::WriteAllText((Join-Path $adapterHelperTarget 'must-survive.txt'), 'target', (New-Object Text.UTF8Encoding($false)))
-    New-Item -ItemType Junction -Path $adapterHelperJunction -Target $adapterHelperTarget | Out-Null
+    $null = New-TestDirectoryLink -Path $adapterHelperJunction -Target $adapterHelperTarget
     $adapterJunctionRejected = $false
     try {
         $null = Assert-OwnedClaudeConfigDirectory -Path $adapterHelperJunction -ParentPath $adapterHelperParent
@@ -1068,7 +1139,7 @@ ANTHROPIC_MODEL='claude-test-model'
     $junctionRunPath = Join-Path $junctionTarget $junctionRunName
     New-Item -ItemType Directory -Path $junctionRunPath -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $junctionRunPath 'marker.txt'), 'marker', (New-Object Text.UTF8Encoding($false)))
-    New-Item -ItemType Junction -Path $junctionParent -Target $junctionTarget | Out-Null
+    $null = New-TestDirectoryLink -Path $junctionParent -Target $junctionTarget
     $junctionRejected = $false
     try {
         Remove-OwnedRunDirectory `
@@ -1235,7 +1306,19 @@ param(
         )
 
         $psi = New-Object Diagnostics.ProcessStartInfo
-        $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        # WHICH SHELL THE CHILD RUNS IN.
+        #
+        # This was Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'.
+        # On Linux $env:SystemRoot is null, so Join-Path throws "Cannot bind argument to
+        # parameter 'Path' because it is null" and the suite ABORTS here - 318 assertions
+        # in, with no RESULT line, so neither a human nor the readiness harness learns
+        # what the other ~40 would have said.
+        #
+        # I left this line alone in PR69 on the grounds that execution never reached it.
+        # That was true then and is not now: fixing the junction fixtures above means the
+        # suite gets this far, which is the ordinary way a second defect surfaces behind
+        # a first. Resolving through Get-Command finds the shell the way the OS does.
+        $psi.FileName = $script:ResolvedChildShell
         $psi.Arguments = $serializedArguments
         $psi.WorkingDirectory = $WorkspacePath
         $psi.UseShellExecute = $false

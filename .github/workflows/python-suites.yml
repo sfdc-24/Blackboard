@@ -1,0 +1,183 @@
+# Hosted CI for the self-contained Python suites.
+#
+# WHY THIS EXISTS
+#   Both PR55 (xray-score-v1) and PR56 (open_for_me) were blocked on the same
+#   finding: the suites pass when run directly and there is no hosted check, so
+#   a reviewer has to take the author's word for a number. "Green is not proof"
+#   cuts both ways - an unrunnable test is not evidence either.
+#
+# WHY IT RUNS THE FILES DIRECTLY
+#   These suites are plain scripts that print results and call sys.exit(1) on
+#   failure. `unittest discover` does NOT collect them and exits 0 having run
+#   nothing, which is worse than no CI: a green tick over zero assertions.
+#   Running the file is what actually honours its exit code.
+#
+# WHY EACH SUITE IS NAMED RATHER THAN GLOBBED
+#   tests/ also holds node:test suites, PowerShell suites and network-touching
+#   scripts. A glob would drag those in and either fail or, worse, make a
+#   network call from CI. Every suite listed here is offline by construction -
+#   no remote org, board, bus, or credentials - and that is PROVED by running
+#   them in an empty network namespace rather than asserted in a comment.
+name: python-suites
+
+on:
+  pull_request:
+    paths:
+      - "scripts/xray_score.py"
+      - "scripts/open_for_me.py"
+      - "tests/test_xray_score.py"
+      - "tests/test_open_for_me.py"
+      - "scripts/bus_benchmark.py"
+      - "tests/test_bus_benchmark.py"
+      - "scripts/append.py"
+      - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
+      - "scripts/bcb_lint.py"
+      - "tests/test_bcb_lint.py"
+      - ".github/workflows/python-suites.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/xray_score.py"
+      - "scripts/open_for_me.py"
+      - "tests/test_xray_score.py"
+      - "tests/test_open_for_me.py"
+      - "scripts/bus_benchmark.py"
+      - "tests/test_bus_benchmark.py"
+      - "scripts/append.py"
+      - "tests/test_append_payload_guard.py"
+      - "src/bus_server.py"
+      - "tests/test_bus.py"
+      - "scripts/bcb_lint.py"
+      - "tests/test_bcb_lint.py"
+      - ".github/workflows/python-suites.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # PINNED TO COMMIT SHAs, not tags. `actions/checkout@v4` is a MUTABLE
+      # reference - the tag is repointed by its maintainers, so the code this
+      # workflow runs can change without a commit here. These suites gate safety
+      # claims about holds and credentials; the reviewed workflow and the
+      # executed workflow must be the same thing.
+      #
+      # persist-credentials: false because nothing after checkout pushes, tags
+      # or calls the API, and the default leaves a usable GITHUB_TOKEN in
+      # .git/config for every later step that runs test code.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Show what will run
+        run: |
+          set -euo pipefail
+          echo "python: $(python3 --version)"
+          for t in tests/test_xray_score.py tests/test_open_for_me.py \
+                   tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
+                   tests/test_bus.py tests/test_bcb_lint.py; do
+            if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
+          done
+
+      # Each suite is its own step so a failure names the suite in the UI rather
+      # than hiding inside a loop. `if [ -f ]` because the two suites arrive on
+      # different branches; a branch carrying only one must not fail on the
+      # other's absence.
+      # Each suite runs inside an EMPTY NETWORK NAMESPACE (`unshare -n`), so
+      # "these tests need no network" is proved by execution rather than
+      # asserted. If a future edit adds a real call, the suite fails here.
+      #
+      # The first version of this workflow grepped the suites for "urlopen" and
+      # friends instead. It failed immediately - on a test whose whole job is to
+      # assert that the ENGINE contains exactly one urlopen, so the word appears
+      # in a string literal. A substring cannot tell "calls urlopen" from
+      # "asserts about urlopen", and the behavioural check does not have to.
+      - name: xray-score-v1 (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_xray_score.py ]; then
+            sudo unshare -n python3 tests/test_xray_score.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: open_for_me (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_open_for_me.py ]; then
+            sudo unshare -n python3 tests/test_open_for_me.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: bus_benchmark (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_benchmark.py ]; then
+            sudo unshare -n python3 tests/test_bus_benchmark.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: append payload guard (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_append_payload_guard.py ]; then
+            sudo unshare -n python3 tests/test_append_payload_guard.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: bcb linter (no network)
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- "$python_bin" tests/test_bcb_lint.py
+
+      # The bus suite starts its own server and scratch database. Enable only
+      # loopback in a fresh namespace, and retain setup-python's exact binary
+      # across sudo rather than silently switching to the system interpreter.
+      - name: bus API and migration imports (isolated loopback)
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec "$1" tests/test_bus.py src/bus_server.py
+          ' _ "$python_bin"
+
+      # A workflow that skips everything and reports success is the failure mode
+      # this file exists to prevent. If no eligible suite is present, fail.
+      - name: Refuse a green tick over nothing
+        run: |
+          set -euo pipefail
+          if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
+             && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
+             && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ]; then
+            echo "No eligible suite is present, so this check proved nothing." >&2
+            echo "A passing check over zero assertions is worse than no check." >&2
+            exit 1
+          fi
+          echo "at least one eligible suite is present"
+
+      # A negative control for the isolation itself. If `unshare -n` silently
+      # stopped isolating, every "no network" claim above would be worthless and
+      # nothing would say so.
+      - name: Prove the isolation actually isolates
+        run: |
+          set -euo pipefail
+          if sudo unshare -n python3 -c "import urllib.request; urllib.request.urlopen('http://example.com', timeout=5)" 2>/dev/null; then
+            echo "unshare -n did NOT isolate the network; the offline claims above prove nothing" >&2
+            exit 1
+          fi
+          echo "confirmed: no network inside the namespace the suites ran in"

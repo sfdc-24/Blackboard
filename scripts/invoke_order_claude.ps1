@@ -37,6 +37,51 @@ if (-not (Test-Path -LiteralPath (Join-Path $WorkspacePath '.git') -PathType Con
     throw 'execute_workspace_git_directory_missing'
 }
 
+function ConvertTo-ClaudeEnvDenyPath {
+    <#
+        The env file as an ABSOLUTE path in the shape Claude's permission
+        matcher expects, so the deny rule names one exact file.
+
+        Windows: C:\a\b\.env  ->  //c/a/b/.env
+        POSIX  : /a/b/.env    ->  /a/b/.env
+
+        This used to accept ONLY the drive-letter form, so on Linux every
+        invocation died with claude_env_file_drive_root_required before the
+        provider was reached.
+
+        EXTRACTED SO IT CAN BE TESTED DIRECTLY, and that is the point. My first
+        test for this drove the whole adapter and asserted that two error
+        strings were ABSENT - which an earlier, unrelated failure satisfies just
+        as well as success. The adapter threw anthropic_api_key_missing long
+        before this line and the test reported 9/0. Codex caught it.
+
+        That was the third test I wrote in one day whose assertion was "the bad
+        thing did not appear", and all three passed because execution never
+        reached the code under test. A function that returns a value can be
+        asserted POSITIVELY, which is the only shape that cannot be satisfied by
+        never getting there.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$EnvFile,
+        [Parameter(Mandatory = $true)][bool]$OnWindows
+    )
+
+    $path = $EnvFile -replace '\\', '/'
+    if ($path -match '^(?<drive>[A-Za-z]):/(?<tail>.*)$') {
+        return '//' + $matches['drive'].ToLowerInvariant() + '/' + $matches['tail'].TrimEnd('/')
+    }
+    if (-not $OnWindows -and $path.StartsWith('/')) {
+        # TrimEnd matches the Windows branch, so a trailing slash cannot produce
+        # two different deny rules for one file depending on the host.
+        $trimmed = $path.TrimEnd('/')
+        if (-not $trimmed) { throw 'claude_env_file_absolute_path_required' }
+        return $trimmed
+    }
+    # A relative path does not name one exact file, so it can never be the
+    # subject of a deny rule.
+    throw 'claude_env_file_drive_root_required'
+}
+
 function Test-ReparsePoint {
     param([Parameter(Mandatory = $true)]$Item)
     return ([int]$Item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0
@@ -236,11 +281,9 @@ try {
     }
     $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
-    $envPermissionPath = $EnvFile -replace '\\', '/'
-    if ($envPermissionPath -notmatch '^(?<drive>[A-Za-z]):/(?<tail>.*)$') {
-        throw 'claude_env_file_drive_root_required'
-    }
-    $envPermissionPath = '//' + $matches['drive'].ToLowerInvariant() + '/' + $matches['tail'].TrimEnd('/')
+    $onWindows = $true
+    if (Test-Path Variable:IsWindows) { $onWindows = [bool]$IsWindows }
+    $envPermissionPath = ConvertTo-ClaudeEnvDenyPath -EnvFile $EnvFile -OnWindows $onWindows
     $settingsDocument = [ordered]@{
         env = [ordered]@{
             CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1'

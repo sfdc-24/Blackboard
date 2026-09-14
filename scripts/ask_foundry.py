@@ -20,7 +20,10 @@ Examples:
     python scripts/ask_foundry.py --auth entra --models
     python scripts/ask_foundry.py --prompt "Return exactly: OK"
     python scripts/ask_foundry.py --packet examples/foundry/work_packet.v1.example.json
-    python scripts/ask_foundry.py --packet packet.json --agent NAME --agent-version 2
+    python scripts/ask_foundry.py --packet packet.json --model DEPLOYMENT
+
+``--agents`` remains read-only inventory; persisted prompt-agent invocation is
+rejected because it cannot carry the governed request controls.
 """
 from __future__ import annotations
 
@@ -63,6 +66,12 @@ MAX_OUTPUT_TOKENS_LIMIT = 8_192
 MAX_TIMEOUT_SECONDS = 600
 ENTRA_RESOURCE = "https://ai.azure.com"
 AUTH_MODES = ("api-key", "entra")
+GOVERNED_AGENT_UNSUPPORTED_MESSAGE = (
+    "Governed packet execution requires a model deployment. "
+    "Foundry prompt agents reject the per-request instructions and strict "
+    "structured-output controls required by this contract; use --model or "
+    "FOUNDRY_MODEL."
+)
 
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -740,12 +749,13 @@ def resolve_target(
             "--agent-version requires an agent target.",
             exit_code=2,
         )
-    if governed and agent and not version:
+    if governed and agent:
         raise AdapterError(
             "CONFIG",
-            "UNPINNED_AGENT",
-            "Governed packet execution requires an explicit agent version.",
+            "GOVERNED_AGENT_UNSUPPORTED",
+            GOVERNED_AGENT_UNSUPPORTED_MESSAGE,
             exit_code=3,
+            details={"required_target_type": "model_deployment"},
         )
     if agent:
         target = {"type": "agent", "name": agent}
@@ -762,6 +772,14 @@ def build_governed_payload(
     digest: str,
     max_output_tokens: int,
 ) -> dict[str, Any]:
+    if target.get("type") != "model_deployment":
+        raise AdapterError(
+            "CONFIG",
+            "GOVERNED_AGENT_UNSUPPORTED",
+            GOVERNED_AGENT_UNSUPPORTED_MESSAGE,
+            exit_code=3,
+            details={"required_target_type": "model_deployment"},
+        )
     payload: dict[str, Any] = {
         "instructions": GOVERNED_INSTRUCTIONS,
         "input": [{"role": "user", "content": canonical_json(packet)}],
@@ -784,14 +802,7 @@ def build_governed_payload(
             }
         },
     }
-    if target["type"] == "agent":
-        payload["agent_reference"] = {
-            "type": "agent_reference",
-            "name": target["name"],
-            "version": target["version"],
-        }
-    else:
-        payload["model"] = target["name"]
+    payload["model"] = target["name"]
     return payload
 
 
@@ -1116,6 +1127,14 @@ def validate_response_identity(
     response: dict[str, Any], target: dict[str, str]
 ) -> dict[str, Any]:
     """Fail closed on absent or conflicting response and target identity."""
+    if target.get("type") != "model_deployment":
+        raise AdapterError(
+            "CONFIG",
+            "GOVERNED_AGENT_UNSUPPORTED",
+            GOVERNED_AGENT_UNSUPPORTED_MESSAGE,
+            exit_code=3,
+            details={"required_target_type": "model_deployment"},
+        )
     _completed_response(response)
     response_id = _required_response_string(
         response.get("id"),
@@ -1132,73 +1151,24 @@ def validate_response_identity(
         maximum=512,
     )
     requested_target = {
-        "type": target["type"],
+        "type": "model_deployment",
         "name": target["name"],
-        "version": target.get("version"),
+        "version": None,
     }
 
-    if target["type"] == "agent":
-        reference = response.get("agent_reference")
-        if not isinstance(reference, dict):
-            raise AdapterError(
-                "RESULT",
-                "MISSING_REPORTED_AGENT_IDENTITY",
-                "Governed agent response is missing its reported agent identity.",
-                exit_code=6,
-            )
-        reported_name = _required_response_string(
-            reference.get("name"),
-            label="response.agent_reference.name",
-            missing_code="MISSING_REPORTED_AGENT_IDENTITY",
-            invalid_code="INVALID_REPORTED_AGENT_IDENTITY",
-            maximum=256,
-        )
-        reported_version = _required_response_string(
-            reference.get("version"),
-            label="response.agent_reference.version",
-            missing_code="MISSING_REPORTED_AGENT_IDENTITY",
-            invalid_code="INVALID_REPORTED_AGENT_IDENTITY",
-            maximum=128,
-        )
-        mismatched_fields = []
-        if reported_name != target["name"]:
-            mismatched_fields.append("name")
-        if reported_version != target.get("version"):
-            mismatched_fields.append("version")
-        if mismatched_fields:
-            raise AdapterError(
-                "RESULT",
-                "AGENT_IDENTITY_MISMATCH",
-                "Reported Foundry agent identity does not match the pinned request.",
-                exit_code=6,
-                details={"mismatched_fields": mismatched_fields},
-            )
-        reported_target = {
-            "type": "agent",
-            "name": reported_name,
-            "version": reported_version,
-        }
-    elif target["type"] == "model_deployment":
-        reference = response.get("agent_reference")
-        if reference not in (None, {}):
-            raise AdapterError(
-                "RESULT",
-                "UNEXPECTED_REPORTED_AGENT",
-                "Model deployment response unexpectedly reported an agent identity.",
-                exit_code=6,
-            )
-        reported_target = {
-            "type": "response_model",
-            "name": response_model,
-            "version": None,
-        }
-    else:
+    reference = response.get("agent_reference")
+    if reference not in (None, {}):
         raise AdapterError(
-            "CONFIG",
-            "INVALID_TARGET",
-            "Foundry target type is invalid.",
-            exit_code=3,
+            "RESULT",
+            "UNEXPECTED_REPORTED_AGENT",
+            "Model deployment response unexpectedly reported an agent identity.",
+            exit_code=6,
         )
+    reported_target = {
+        "type": "response_model",
+        "name": response_model,
+        "version": None,
+    }
 
     return {
         "response_id": response_id,
@@ -1336,11 +1306,16 @@ def build_parser() -> StructuredArgumentParser:
     )
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
-        "--agent", help="invoke a persisted prompt agent in governed packet mode"
+        "--agent",
+        help=(
+            "reserved prompt-agent target; governed invocation fails closed because "
+            "prompt agents cannot accept the required request controls"
+        ),
     )
     target.add_argument("--model", help="invoke a stateless model deployment")
     parser.add_argument(
-        "--agent-version", help="pin a governed persisted-agent version"
+        "--agent-version",
+        help="reserved prompt-agent version; not valid for governed execution",
     )
     parser.add_argument(
         "--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS
@@ -1431,15 +1406,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_cli(args)
         safe_config = load_config(include_api_key=False)
         auth_mode = resolve_auth_mode(args.auth, safe_config)
-        config = (
-            load_config(include_api_key=True)
-            if auth_mode == "api-key"
-            else safe_config
-        )
-        endpoint = validate_endpoint(require(config, "FOUNDRY_PROJECT_ENDPOINT"))
-        credential = resolve_credential(auth_mode, config, timeout=args.timeout)
 
         if args.agents:
+            endpoint = validate_endpoint(
+                require(safe_config, "FOUNDRY_PROJECT_ENDPOINT")
+            )
+            config = (
+                load_config(include_api_key=True)
+                if auth_mode == "api-key"
+                else safe_config
+            )
+            credential = resolve_credential(auth_mode, config, timeout=args.timeout)
             emit_json(
                 sys.stdout,
                 list_agents(endpoint, credential, args.timeout, auth_mode),
@@ -1447,6 +1424,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.models:
+            endpoint = validate_endpoint(
+                require(safe_config, "FOUNDRY_PROJECT_ENDPOINT")
+            )
+            config = (
+                load_config(include_api_key=True)
+                if auth_mode == "api-key"
+                else safe_config
+            )
+            credential = resolve_credential(auth_mode, config, timeout=args.timeout)
             emit_json(
                 sys.stdout,
                 list_models(endpoint, credential, args.timeout, auth_mode),
@@ -1459,8 +1445,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             requested_agent=args.agent,
             requested_model=args.model,
             requested_agent_version=args.agent_version,
-            config=config,
+            config=safe_config,
             governed=governed,
+        )
+        endpoint = validate_endpoint(
+            require(safe_config, "FOUNDRY_PROJECT_ENDPOINT")
         )
 
         if governed:
@@ -1472,6 +1461,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 digest=digest,
                 max_output_tokens=args.max_output_tokens,
             )
+            config = (
+                load_config(include_api_key=True)
+                if auth_mode == "api-key"
+                else safe_config
+            )
+            credential = resolve_credential(auth_mode, config, timeout=args.timeout)
             started = time.monotonic()
             response = request_json(
                 f"{endpoint}/openai/v1/responses",
@@ -1522,6 +1517,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = build_prompt_payload(
             prompt, target=target, max_output_tokens=args.max_output_tokens
         )
+        config = (
+            load_config(include_api_key=True)
+            if auth_mode == "api-key"
+            else safe_config
+        )
+        credential = resolve_credential(auth_mode, config, timeout=args.timeout)
         started = time.monotonic()
         response = request_json(
             f"{endpoint}/openai/v1/responses",

@@ -1,0 +1,40 @@
+# Line endings for files Linux EXECUTES.
+#
+# The blobs in this repository are LF. That is not enough. Most of this fleet
+# works on Windows with core.autocrlf=true, which rewrites these files to CRLF
+# on checkout AND in `git archive` - so a Windows agent building the Ubuntu
+# package ships CRLF into it without ever seeing a modified file in git status.
+#
+# A shebang line ending in \r makes the kernel look for an interpreter literally
+# named "bash\r". Measured 2026-09-09 on this laptop:
+#   packaging/build-deb.sh: line 3: set: pipefail: invalid option name
+# and the same defect in packaging/DEBIAN/postinst is a package that installs
+# and then fails to configure, on the GCloud instance, at the end of the runbook.
+#
+# eol=lf pins the working-tree form regardless of the checkout platform.
+#
+# This file is the UNION of two branches that each added rules for the same
+# reason: PR52 for the Debian packaging, and the walkthrough work for the shell
+# tools and their fixtures. Neither set is redundant, so both are kept.
+
+*.sh                             text eol=lf
+*.bash                           text eol=lf
+*.py                             text eol=lf
+
+# Debian maintainer scripts and control files: dpkg runs these as /bin/sh.
+packaging/DEBIAN/preinst         text eol=lf
+packaging/DEBIAN/postinst        text eol=lf
+packaging/DEBIAN/prerm           text eol=lf
+packaging/DEBIAN/postrm          text eol=lf
+packaging/DEBIAN/control         text eol=lf
+packaging/DEBIAN/conffiles       text eol=lf
+
+# Installed onto the target as an executable and a unit file.
+packaging/blackboard-bus         text eol=lf
+packaging/blackboard-bus.service text eol=lf
+packaging/env.example            text eol=lf
+
+# Fixtures compared byte-for-byte by tests. A CRLF rewrite here does not break
+# an interpreter, it breaks an assertion, and the failure names the wrong cause.
+/tests/fixtures/order_supervisor_board.json  text eol=lf
+/tools/walkthrough/fixtures/*.txt            text eol=lf

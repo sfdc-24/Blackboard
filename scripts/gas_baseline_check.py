@@ -40,8 +40,15 @@ NORMALISATION, and why each one is deliberate
   * CRLF vs LF — git may check out CRLF on Windows while Apps Script stores LF.
     Line endings are normalised before hashing. A real change is still caught;
     a checkout artefact is not.
-  Nothing else is normalised. Whitespace and comments count, because a mirror
-  that is "nearly" the deployed source is not evidence of anything.
+  * JSON key ORDER — a .json file is parsed and re-serialised with sorted keys
+    before hashing. Apps Script reads the parsed manifest, not the bytes, so a
+    reordered appsscript.json is the same manifest. Measured 2026-09-13: the
+    committed and deployed manifests were semantically identical and this
+    checker called them DRIFT anyway, permanently and unclearably. Values are
+    NOT normalised — a changed scope, timezone or access level still reads as
+    drift — and malformed JSON falls back to byte comparison.
+  Nothing else is normalised. Whitespace and comments count in SOURCE, because a
+  mirror that is "nearly" the deployed source is not evidence of anything.
 
 USAGE
   python scripts/gas_baseline_check.py --baseline apps-script/governor-page-api --version 30
@@ -69,8 +76,37 @@ SOURCE_SUFFIXES = {".js", ".gs", ".html", ".json"}
 
 
 def digest(path: Path) -> str:
-    """SHA-256 of the file with line endings normalised to LF."""
+    """SHA-256 of the file with line endings normalised to LF.
+
+    JSON is additionally canonicalised — parsed, then re-serialised with sorted
+    keys — so that key ORDER alone never reads as drift.
+
+    WHY THIS ONE EXCEPTION EXISTS, measured 2026-09-13. The committed
+    appsscript.json and the deployed one are semantically identical: same six
+    keys, same values, different order. Apps Script reads the parsed manifest,
+    not the bytes, so those two files ARE the same manifest — and yet this
+    checker reported DRIFT on them permanently, and would have gone on doing so
+    after every possible reconciliation, because re-serialising the manifest is
+    the deploy pipeline's own doing and not something a baseline can pin.
+
+    A permanent false positive is not a harmless one. This file's own preamble
+    argues that a marker test for a string that never existed makes a
+    false-positive detector, and that "a drift check nobody trusts is worse than
+    none". A DRIFT line nobody can ever clear trains its reader to skim past the
+    real ones underneath it.
+
+    Values are NOT normalised, so changing a scope, a timezone or an access
+    level still reads as drift. Malformed JSON falls back to byte hashing rather
+    than being silently treated as equal to anything.
+    """
     raw = path.read_bytes().replace(b"\r\n", b"\n")
+    if path.suffix.lower() == ".json":
+        try:
+            parsed = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError):
+            pass  # not parseable: compare the bytes and let it read as drift
+        else:
+            raw = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 

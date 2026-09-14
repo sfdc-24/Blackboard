@@ -1,0 +1,115 @@
+name: ORDER Linux containment (offline)
+
+# WHY THIS EXISTS
+#   Both existing ORDER workflows are runs-on: windows-latest. The Linux port -
+#   which is the entire migration - had NO CI coverage at all. A green badge on
+#   the migration branch was saying nothing whatsoever about Linux, which is the
+#   platform being migrated to.
+#
+#   Nothing here touches a mailbox, a bus, a provider, a live board, a
+#   credential or Azure. The suites run offline against fixtures and against
+#   process groups they create themselves.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/order-linux-containment.yml'
+      - 'scripts/order_supervisor.ps1'
+      - 'scripts/OrderSupervisor.psm1'
+      - 'scripts/invoke_order_claude.ps1'
+      - 'scripts/order_supervisor_result.schema.json'
+      - 'tests/test_order_linux_host.ps1'
+      - 'tests/test_order_linux_containment.ps1'
+      - 'tests/test_order_linux_execute.ps1'
+      - 'tests/test_order_group_drain.ps1'
+      - 'tests/test_order_setsid_escape.ps1'
+      # Both added after codex found them missing. Omitting the guard means a
+      # change to the guard itself does not run it; omitting the unit means a
+      # change to the very file the guard exists to protect does not run it
+      # either - which is the more serious half.
+      - 'tests/test_order_unit_containment.ps1'
+      - 'packaging/systemd/blackboard-order.service'
+  push:
+    paths:
+      - '.github/workflows/order-linux-containment.yml'
+      - 'scripts/order_supervisor.ps1'
+      - 'tests/test_order_linux_host.ps1'
+      - 'tests/test_order_linux_containment.ps1'
+      - 'tests/test_order_linux_execute.ps1'
+      - 'tests/test_order_group_drain.ps1'
+      - 'tests/test_order_setsid_escape.ps1'
+      # Both added after codex found them missing. Omitting the guard means a
+      # change to the guard itself does not run it; omitting the unit means a
+      # change to the very file the guard exists to protect does not run it
+      # either - which is the more serious half.
+      - 'tests/test_order_unit_containment.ps1'
+      - 'packaging/systemd/blackboard-order.service'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-containment:
+    name: Process-group containment on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # THE GUARD THAT MAKES THIS JOB MEAN SOMETHING.
+      #
+      # test_order_group_drain.ps1 prints SKIP and exits 0 when /proc is absent,
+      # which is correct behaviour for a POSIX-only suite - and it means the
+      # same suite would report success on a Windows runner having measured
+      # nothing. So the platform is asserted BEFORE the suites run. If this step
+      # ever fails, the job below was never a Linux result.
+      - name: Refuse to report a Linux result from a non-Linux runner
+        shell: pwsh
+        run: |
+          $edition = $PSVersionTable.PSEdition
+          $version = $PSVersionTable.PSVersion.ToString()
+          Write-Output "edition=$edition version=$version"
+          Write-Output "IsLinux=$IsLinux procPresent=$(Test-Path -LiteralPath '/proc')"
+          Write-Output "setsid=$(Test-Path -LiteralPath '/usr/bin/setsid')"
+          if (-not $IsLinux) { throw 'this job must run on Linux' }
+          if (-not (Test-Path -LiteralPath '/proc')) { throw '/proc is required' }
+          if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7+ is required' }
+
+      - name: Host and platform detection
+        shell: pwsh
+        run: ./tests/test_order_linux_host.ps1
+
+      - name: Containment, including the fork-after-scan case
+        shell: pwsh
+        run: ./tests/test_order_linux_containment.ps1
+
+      - name: Group kill drain proof, with its negative control
+        shell: pwsh
+        run: ./tests/test_order_group_drain.ps1
+
+      # Characterises a KNOWN limit rather than a fix: a child that calls setsid
+      # leaves the group, so the kill returns 0 with that descendant still
+      # running. It also exercises the cgroup remedy where a systemd --user
+      # session exists, and says so loudly where one does not.
+      # ORDER_REQUIRE_CGROUP_REMEDY makes an unexercised remedy a FAILURE here.
+      # Without it, a runner that quietly lacked a systemd --user session would
+      # pass this step having never tested the remedy at all - the same
+      # skip-that-passes shape the platform guard above exists to prevent.
+      - name: The setsid escape, and the cgroup that contains it
+        shell: pwsh
+        env:
+          ORDER_REQUIRE_CGROUP_REMEDY: '1'
+        run: ./tests/test_order_setsid_escape.ps1
+
+      # The unit file is where that escape is actually bounded, so the
+      # directives that bound it are asserted rather than trusted. Pure file
+      # parsing - no processes, no platform requirement.
+      - name: The unit directives that bound an escaped descendant
+        shell: pwsh
+        run: ./tests/test_order_unit_containment.ps1
+
+      - name: Adapter invocation and wall timeout
+        shell: pwsh
+        run: ./tests/test_order_linux_execute.ps1

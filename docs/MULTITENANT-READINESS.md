@@ -86,6 +86,27 @@ conversation on each turn.
 
 ## Coupled staging and rollback plan
 
+The version 31 evidence above is historical. On 2026-09-08 at 16:05 UTC,
+immutable production read-back verified **version 33**, with file-set SHA-256
+`03bf71ee87f1ee2fae6efec5adb1e387fa9bea682691969088bc6b43ad1ad3d7`.
+Its `Code.gs` and the other five non-Reception files are unchanged from v31;
+its Reception adds the link to the top-level `/voice/` page. Returning to v31
+would remove that visitor fix. [PR33](https://github.com/sfdc-24/Blackboard/pull/33)
+ports that no-microphone branch into the canonical source; include
+the accepted port in the next candidate instead of copying the older live
+Reception over the signed-token client.
+
+Before each cutover, record the then-current production deployment binding,
+immutable source hashes and site commit as the rollback pair. Refresh this
+evidence if either target moves. Store the complete pair in the release receipt
+before executing the cutover; an absent binding, hash or site commit means the
+rollback prerequisites are incomplete. This plan is not that release receipt.
+Verify before cutover that the recorded site commit serves `/voice/` when the
+recorded backend's Reception links there; an incompatible pair cannot be used
+as the accepted rollback target.
+The v33 read-back here is a reference, not permission to overwrite a later
+production release.
+
 1. Merge neither repository until both PRs are green and reviewed together.
 2. Deploy the Apps Script source to the production-distinct Governor staging
    script as a new immutable version. Do not repoint production.
@@ -99,9 +120,12 @@ conversation on each turn.
 6. For a production release, publish the backend first and the `ct`-aware site
    client immediately after. The backend remains spend-bounded for old clients,
    but old clients do not retain anonymous history.
-7. Roll back the site to its prior immutable commit first, then repoint Apps
-   Script to version 31. Version 31 reads the legacy daily counter maintained by
-   the repaired version. Read back both targets and verify the public fallback.
+7. Roll back the site to the recorded pre-cutover immutable commit first, then
+   repoint Apps Script to the recorded pre-cutover immutable version. The v33
+   `Code.gs`, unchanged from v31, reads the legacy daily counter maintained by
+   the repaired version. Revalidate that compatibility
+   if the recorded baseline has changed. Read back both targets and verify the
+   public reception, its `/voice/` fallback and the voice page in a browser.
 
 ## Residual boundary
 

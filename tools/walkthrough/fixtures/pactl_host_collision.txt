@@ -1,0 +1,16 @@
+### short sources
+87	vmic.monitor	PipeWire	float32le 2ch 48000Hz	IDLE
+94	vmic_src	PipeWire	float32le 2ch 48000Hz	RUNNING
+### source-outputs
+Source Output #137
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 126
+	Source: 94
+	Sample Specification: s16le 1ch 48000Hz
+	Properties:
+		application.name = "parec"
+		application.process.binary = "parec"
+		application.process.host = "zoom-presenter-tmp"
+		node.name = "zoom-presenter-tmp.parec"
+		media.name = "Record Stream"
