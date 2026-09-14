@@ -80,3 +80,11 @@ gas/*
 # SQLite file holds live board rows, so it is working data, not repository
 # content -- same rule as data/ above.
 bus.db*
+
+# Zoom agent OAuth tokens — never commit
+zoom-agent/.tokens.json
+.tokens.json
+
+# The templates are not secrets - they are how you know what to fill in.
+!.env.example
+!**/.env.example
