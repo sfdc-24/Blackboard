@@ -96,13 +96,16 @@ repair mode and cannot create, update, or delete Azure resources.
    requires `-TrustedFileHashesBase64`: Base64 of a BOM-free UTF-8 JSON object
    containing exactly the six canonical `scripts\...` keys in release order
    and their lowercase SHA-256 values. Generate that map from the independently
-    verified exact Git release/package, never from the guest directory being
-    escrowed. `Validate` and `Restore` bind to the trusted map recorded in the
-    escrow and do not accept a replacement map. Windows Task Scheduler can omit
-    the optional XML `LogonType` for its canonical `S-1-5-18` SYSTEM principal;
-    the escrow accepts only that exact omission while still requiring the live
-    task principal to read back as SYSTEM with `ServiceAccount`. Explicit,
-    duplicate, or namespace-shadowed alternatives fail closed.
+   verified exact Git release/package, never from the guest directory being
+   escrowed. `Validate` and `Restore` bind to the trusted map recorded in the
+   escrow and do not accept a replacement map. Windows Task Scheduler can omit
+   the optional XML `LogonType` for its canonical `S-1-5-18` SYSTEM principal;
+   the escrow accepts only that exact omission while still requiring the live
+   task principal to read back as SYSTEM with `ServiceAccount`. Its exported
+   trigger identities are the unqualified lowercase `id` attributes
+   `AtBoot` and `Every15Minutes`; child-element or namespace-shadowed
+   lookalikes fail closed. Explicit, duplicate, or namespace-shadowed principal
+   alternatives fail closed too.
 7. Deliver the exact reviewed `order_cutover_phase.ps1` as a BOM-free Managed
    Run Command source and read its source digest back. Use a new 32-lowercase-
    hex `OperationId` for every action. The driver captures all child output and

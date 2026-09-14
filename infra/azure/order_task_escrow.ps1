@@ -706,6 +706,31 @@ function Get-OrderXmlText {
     return [string]$nodes[0].InnerText
 }
 
+function Get-OrderXmlTriggerId {
+    param(
+        [Parameter(Mandatory = $true)][Xml.XmlElement]$Trigger,
+        [Parameter(Mandatory = $true)][string]$ErrorCode
+    )
+
+    # Task Scheduler serializes the CIM trigger Id as the unqualified lowercase
+    # XML attribute `id`, not as an <Id> child element.  Inspect every attribute
+    # and child namespace so a foreign-namespace lookalike cannot be accepted as
+    # either the canonical attribute or harmless omission.
+    $idAttributes = @($Trigger.Attributes | Where-Object { $_.LocalName -ceq 'id' })
+    $idElements = @($Trigger.ChildNodes | Where-Object {
+        $_.NodeType -eq [Xml.XmlNodeType]::Element -and
+        [string]::Equals([string]$_.LocalName, 'id', [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($Trigger.Attributes.Count -ne 1 -or
+        $idAttributes.Count -ne 1 -or
+        [string]$idAttributes[0].NamespaceURI -cne '' -or
+        $idElements.Count -ne 0 -or
+        [string]::IsNullOrWhiteSpace([string]$idAttributes[0].Value)) {
+        throw $ErrorCode
+    }
+    return [string]$idAttributes[0].Value
+}
+
 function Assert-OrderTaskXml {
     param(
         [Parameter(Mandatory = $true)][string]$XmlText,
@@ -777,11 +802,22 @@ function Assert-OrderTaskXml {
         throw 'task_xml_run_level_invalid'
     }
 
-    $triggers = @(Get-OrderXmlNodes -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Triggers/*' -Count 2 -ErrorCode 'task_xml_trigger_count_invalid')
-    $boot = @($triggers | Where-Object { $_.LocalName -ceq 'BootTrigger' -and $_.SelectSingleNode('t:Id', $namespace).InnerText -ceq 'AtBoot' })
-    $interval = @($triggers | Where-Object { $_.LocalName -ceq 'TimeTrigger' -and $_.SelectSingleNode('t:Id', $namespace).InnerText -ceq 'Every15Minutes' })
+    $triggerContainers = @(Get-OrderXmlNodes -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Triggers' -Count 1 -ErrorCode 'task_xml_trigger_count_invalid')
+    $triggers = @($triggerContainers[0].ChildNodes | Where-Object { $_.NodeType -eq [Xml.XmlNodeType]::Element })
+    if ($triggers.Count -ne 2 -or
+        @($triggers | Where-Object { [string]$_.NamespaceURI -cne $script:OrderEscrowTaskNamespace }).Count -ne 0) {
+        throw 'task_xml_trigger_count_invalid'
+    }
+    $boot = @($triggers | Where-Object { $_.LocalName -ceq 'BootTrigger' })
+    $interval = @($triggers | Where-Object { $_.LocalName -ceq 'TimeTrigger' })
     if ($boot.Count -ne 1) { throw 'task_xml_boot_trigger_invalid' }
     if ($interval.Count -ne 1) { throw 'task_xml_interval_trigger_invalid' }
+    if ((Get-OrderXmlTriggerId -Trigger $boot[0] -ErrorCode 'task_xml_boot_trigger_id_invalid') -cne 'AtBoot') {
+        throw 'task_xml_boot_trigger_id_invalid'
+    }
+    if ((Get-OrderXmlTriggerId -Trigger $interval[0] -ErrorCode 'task_xml_interval_trigger_id_invalid') -cne 'Every15Minutes') {
+        throw 'task_xml_interval_trigger_id_invalid'
+    }
     $repetition = $interval[0].SelectSingleNode('t:Repetition/t:Interval', $namespace)
     if ($null -eq $repetition -or [string]$repetition.InnerText -cne 'PT15M') { throw 'task_xml_interval_invalid' }
 
