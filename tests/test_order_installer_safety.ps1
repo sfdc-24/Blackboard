@@ -99,6 +99,7 @@ $pathPreprocessingIndex = $installerText.IndexOf('$WorkspacePathWasExplicit =', 
 Assert-True 'action casing is canonicalized before action-sensitive preprocessing' (
     $actionNormalizationIndex -ge 0 -and
     $pathPreprocessingIndex -gt $actionNormalizationIndex -and
+    $installerText.Contains("'installfromdisablednostop' { 'InstallFromDisabledNoStop' }") -and
     $installerText.Contains("'rollback' { 'Rollback' }")
 )
 
@@ -110,6 +111,7 @@ $requiredFunctions = @(
     'Stop-ManagedTask',
     'Get-StatusObject',
     'Invoke-InstallAction',
+    'Invoke-InstallFromDisabledNoStopAction',
     'Invoke-UninstallAction',
     'Invoke-RollbackAction'
 )
@@ -122,6 +124,56 @@ foreach ($functionName in $requiredFunctions) {
     Assert-True ('installer defines one ' + $functionName) ($definitions.Count -eq 1)
     if ($definitions.Count -eq 1) { Invoke-Expression $definitions[0].Extent.Text }
 }
+
+$installerFunctionDefinitions = @{}
+foreach ($definition in @($installerAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst]
+}, $true))) {
+    $installerFunctionDefinitions[[string]$definition.Name] = $definition
+}
+$noStopDefinitions = @($installerFunctionDefinitions['Invoke-InstallFromDisabledNoStopAction'])
+$forbiddenNoStopCommands = @(
+    'Stop-ManagedTask',
+    'Stop-ScheduledTask',
+    'Restore-PreviousTask',
+    'Start-ScheduledTask',
+    'Unregister-ScheduledTask',
+    'Stop-Process',
+    'taskkill',
+    'taskkill.exe',
+    'schtasks',
+    'schtasks.exe'
+)
+$reachableForbiddenCommands = @()
+if ($noStopDefinitions.Count -eq 1) {
+    $pendingFunctions = New-Object System.Collections.Generic.Stack[string]
+    $visitedFunctions = @{}
+    $pendingFunctions.Push('Invoke-InstallFromDisabledNoStopAction')
+    while ($pendingFunctions.Count -gt 0) {
+        $currentFunctionName = $pendingFunctions.Pop()
+        if ($visitedFunctions.ContainsKey($currentFunctionName)) { continue }
+        $visitedFunctions[$currentFunctionName] = $true
+        $currentFunction = $installerFunctionDefinitions[$currentFunctionName]
+        foreach ($command in @($currentFunction.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst]
+        }, $true))) {
+            $commandName = [string]$command.GetCommandName()
+            if ([string]::IsNullOrWhiteSpace($commandName)) { continue }
+            if ($forbiddenNoStopCommands -ccontains $commandName) {
+                $reachableForbiddenCommands += ($currentFunctionName + '->' + $commandName)
+            }
+            if ($installerFunctionDefinitions.ContainsKey($commandName) -and
+                -not $visitedFunctions.ContainsKey($commandName)) {
+                $pendingFunctions.Push($commandName)
+            }
+        }
+    }
+}
+Assert-True 'disabled no-stop action transitively contains no task or process stop start unregister or restore command' (
+    $noStopDefinitions.Count -eq 1 -and $reachableForbiddenCommands.Count -eq 0
+) ($reachableForbiddenCommands -join ',')
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-installer-safety-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -376,6 +428,149 @@ try {
     Assert-True 'install plus rollback failure is fixed and visible' (
         $combinedError -ceq 'task_install_failed_and_rollback_failed'
     ) $combinedError
+
+    # The incident-only installer action is a structurally separate contract.
+    # It starts only from a managed Disabled task, re-reads that state just
+    # before registration, and deliberately has no automatic rollback path.
+    $script:NoStopPreflightCalls = 0
+    $script:NoStopMutations = New-Object System.Collections.Generic.List[string]
+    function Assert-InstallPreflight { $script:NoStopPreflightCalls++ }
+    function Test-Managed { param($Task) return $Task -and [bool]$Task.managed }
+    function New-ExpectedDefinition { return [pscustomobject]@{ definition = 'candidate' } }
+    function Save-PreviousTask { param($Existing) $script:NoStopMutations.Add('backup') }
+    function Register-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $InputObject, [switch]$Force)
+        $script:NoStopMutations.Add('register')
+        if ($script:NoStopRegisterFailure) { throw $script:NoStopRegisterFailure }
+    }
+    function Compare-Definition {
+        param($Task)
+        if ($script:NoStopDefinitionDrift) { return @('definition_drift') }
+        return @()
+    }
+    function Get-StatusObject { return [pscustomobject]@{ status = $script:NoStopStatus } }
+    function Stop-ManagedTask { param($Task) $script:NoStopMutations.Add('stop-managed') }
+    function Stop-ScheduledTask { $script:NoStopMutations.Add('stop-scheduled') }
+    function Restore-PreviousTask { $script:NoStopMutations.Add('restore') }
+    function Start-ScheduledTask { $script:NoStopMutations.Add('start') }
+    function Unregister-ScheduledTask { $script:NoStopMutations.Add('unregister') }
+
+    $Mode = 'Execute'
+    $Start = $false
+    $script:NoStopPreflightCalls = 0
+    $script:NoStopStatus = 'READY'
+    $wrongModeError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects Execute before preflight' (
+        $wrongModeError -ceq 'disabled_no_stop_requires_observe' -and $script:NoStopPreflightCalls -eq 0
+    ) $wrongModeError
+
+    $Mode = 'Observe'
+    $Start = $true
+    $script:NoStopPreflightCalls = 0
+    $startError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action rejects Start before preflight' (
+        $startError -ceq 'disabled_no_stop_forbids_start' -and $script:NoStopPreflightCalls -eq 0
+    ) $startError
+
+    $Start = $false
+    foreach ($initialCase in @(
+        [pscustomobject]@{ name = 'missing'; task = $null; expected = 'disabled_no_stop_requires_existing_task' },
+        [pscustomobject]@{ name = 'unmanaged'; task = [pscustomobject]@{ managed = $false; State = 'Disabled' }; expected = 'refusing_to_overwrite_unmanaged_task' },
+        [pscustomobject]@{ name = 'Ready'; task = [pscustomobject]@{ managed = $true; State = 'Ready' }; expected = 'disabled_no_stop_requires_disabled_task' },
+        [pscustomobject]@{ name = 'Running'; task = [pscustomobject]@{ managed = $true; State = 'Running' }; expected = 'disabled_no_stop_requires_disabled_task' },
+        [pscustomobject]@{ name = 'Queued'; task = [pscustomobject]@{ managed = $true; State = 'Queued' }; expected = 'disabled_no_stop_requires_disabled_task' },
+        [pscustomobject]@{ name = 'Unknown'; task = [pscustomobject]@{ managed = $true; State = 'Unknown' }; expected = 'disabled_no_stop_requires_disabled_task' }
+    )) {
+        $script:NoStopCurrentTask = $initialCase.task
+        function Get-RootTask { return $script:NoStopCurrentTask }
+        $script:NoStopMutations.Clear()
+        $script:NoStopPreflightCalls = 0
+        $script:NoStopRegisterFailure = ''
+        $script:NoStopDefinitionDrift = $false
+        $initialError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+        Assert-True ('disabled no-stop action rejects initial ' + $initialCase.name + ' before mutation') (
+            $initialError -ceq [string]$initialCase.expected -and
+            $script:NoStopPreflightCalls -eq 1 -and
+            $script:NoStopMutations.Count -eq 0
+        ) ($initialError + '; ' + ($script:NoStopMutations -join ','))
+    }
+
+    $script:NoStopReadCount = 0
+    function Get-RootTask {
+        $script:NoStopReadCount++
+        if ($script:NoStopReadCount -eq 1) {
+            return [pscustomobject]@{ managed = $true; State = 'Disabled' }
+        }
+        return [pscustomobject]@{ managed = $true; State = 'Running' }
+    }
+    $script:NoStopMutations.Clear()
+    $script:NoStopRegisterFailure = ''
+    $script:NoStopDefinitionDrift = $false
+    $preRegisterRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop action refuses a pre-register Running race without stop or register' (
+        $preRegisterRaceError -ceq 'disabled_no_stop_task_changed_before_register' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup'
+    ) ($preRegisterRaceError + '; ' + ($script:NoStopMutations -join ','))
+
+    function Get-RootTask { return [pscustomobject]@{ managed = $true; State = 'Disabled' } }
+    $script:NoStopMutations.Clear()
+    $script:NoStopRegisterFailure = 'register_race_failure'
+    $registerRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop registration failure never stops or auto-restores' (
+        $registerRaceError -ceq 'register_race_failure' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup,register'
+    ) ($registerRaceError + '; ' + ($script:NoStopMutations -join ','))
+
+    $script:NoStopReadCount = 0
+    function Get-RootTask {
+        $script:NoStopReadCount++
+        if ($script:NoStopReadCount -le 2) {
+            return [pscustomobject]@{ managed = $true; State = 'Disabled' }
+        }
+        return [pscustomobject]@{ managed = $true; State = 'Running' }
+    }
+    $script:NoStopMutations.Clear()
+    $script:NoStopRegisterFailure = ''
+    $script:NoStopDefinitionDrift = $true
+    $postRegisterRaceError = Invoke-ExpectedFailure -ScriptBlock { Invoke-InstallFromDisabledNoStopAction | Out-Null }
+    Assert-True 'disabled no-stop readback failure leaves quarantine to the driver without stop or restore' (
+        $postRegisterRaceError -ceq 'task_readback_drift:definition_drift' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup,register'
+    ) ($postRegisterRaceError + '; ' + ($script:NoStopMutations -join ','))
+
+    $script:NoStopReadCount = 0
+    function Get-RootTask {
+        $script:NoStopReadCount++
+        if ($script:NoStopReadCount -le 2) {
+            return [pscustomobject]@{ managed = $true; State = 'Disabled' }
+        }
+        return [pscustomobject]@{ managed = $true; State = 'Running' }
+    }
+    $script:NoStopMutations.Clear()
+    $script:NoStopDefinitionDrift = $false
+    $script:NoStopStatus = 'RUNNING'
+    $runningNoStopResult = Invoke-InstallFromDisabledNoStopAction
+    Assert-True 'disabled no-stop action reports a matching post-register Running race without stop or restore' (
+        [string]$runningNoStopResult.status -ceq 'RUNNING' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup,register'
+    ) ($script:NoStopMutations -join ',')
+
+    $script:NoStopReadCount = 0
+    function Get-RootTask {
+        $script:NoStopReadCount++
+        if ($script:NoStopReadCount -le 2) {
+            return [pscustomobject]@{ managed = $true; State = 'Disabled' }
+        }
+        return [pscustomobject]@{ managed = $true; State = 'Ready' }
+    }
+    $script:NoStopMutations.Clear()
+    $script:NoStopDefinitionDrift = $false
+    $script:NoStopStatus = 'READY'
+    $noStopResult = Invoke-InstallFromDisabledNoStopAction
+    Assert-True 'disabled no-stop action backs up and force-registers exactly once on success' (
+        [string]$noStopResult.status -ceq 'READY' -and
+        ($script:NoStopMutations -join ',') -ceq 'backup,register'
+    ) ($script:NoStopMutations -join ',')
 
     # Reload the real status function after the orchestration mocks.
     $statusDefinition = @($installerAst.FindAll({

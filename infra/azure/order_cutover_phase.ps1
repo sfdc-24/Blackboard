@@ -544,7 +544,7 @@ function Invoke-CutoverInstaller {
     $result = Invoke-CutoverChildScript `
         -ScriptPath $ScriptPath `
         -Arguments (Get-CutoverInstallerArguments -Context $Context -RequestedAction $RequestedAction -RequestedMode $RequestedMode) `
-        -TimeoutSeconds $(if ($RequestedAction -ceq 'Install') { 180 } else { 60 }) `
+        -TimeoutSeconds $(if (@('Install', 'InstallFromDisabledNoStop') -ccontains $RequestedAction) { 180 } else { 60 }) `
         -FailureCode 'INSTALLER_CHILD_FAILED'
     if ($result.exit_code -ne 0 -or -not [string]::IsNullOrWhiteSpace($result.stderr)) {
         Throw-Cutover -Code 'INSTALLER_CHILD_FAILED'
@@ -2356,7 +2356,7 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
         $install = Invoke-CutoverInstaller `
             -Context $Context `
             -ScriptPath $Context.installer_path `
-            -RequestedAction 'Install' `
+            -RequestedAction 'InstallFromDisabledNoStop' `
             -RequestedMode 'Observe'
         $null = Assert-CutoverInstallerStatus `
             -Status $install `
@@ -2402,6 +2402,7 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             pre_task_state = 'Ready'
             post_disable_task_state = 'Disabled'
             candidate_task_state = 'Ready'
+            candidate_install_action = 'InstallFromDisabledNoStop'
             task_stopped = $false
             enabled_escrow_xml_utf8_sha256 = $failedXml.utf8_text_sha256
             post_disable_xml_utf8_sha256 = $disabledXml.utf8_text_sha256

@@ -382,6 +382,17 @@ function Test-TransientBoardReadFailure {
     return $status -in @(404, 408, 425, 429) -or ($status -ge 500 -and $status -le 599)
 }
 
+function ConvertTo-OrderElapsedMillisecondsText {
+    param([Parameter(Mandatory = $true)][double]$Milliseconds)
+
+    $rounded = [Math]::Round($Milliseconds, 2)
+    return [string]::Format(
+        [Globalization.CultureInfo]::InvariantCulture,
+        '{0:0.##}',
+        $rounded
+    )
+}
+
 function Read-BoardPreAdmission {
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -391,14 +402,16 @@ function Read-BoardPreAdmission {
             $timer.Stop()
             $code = [string]$_.Exception.Message
             $isTransient = Test-TransientBoardReadFailure -ErrorRecord $_
+            $elapsedText = ConvertTo-OrderElapsedMillisecondsText `
+                -Milliseconds $timer.Elapsed.TotalMilliseconds
             $_.Exception.Data['attempt'] = [string]$attempt
-            $_.Exception.Data['elapsed_ms'] = [string][Math]::Round($timer.Elapsed.TotalMilliseconds, 2)
+            $_.Exception.Data['elapsed_ms'] = $elapsedText
             if ($attempt -ge 2 -or -not $isTransient) { throw }
 
             $details = @{
                 attempt = $attempt
                 code = $code
-                elapsed_ms = [Math]::Round($timer.Elapsed.TotalMilliseconds, 2)
+                elapsed_ms = $elapsedText
             }
             foreach ($key in @('transport_exit', 'http_status', 'content_type_class', 'content_length', 'content_sha256')) {
                 if ($_.Exception.Data.Contains($key)) {

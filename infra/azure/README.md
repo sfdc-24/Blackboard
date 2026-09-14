@@ -137,12 +137,18 @@ repair mode and cannot create, update, or delete Azure resources.
    byte-identical state/log checkpoints. All of that authentication and a
    second stable `Ready`/result-`20` read occur before mutation or cleanup is
    authorized. It then disables without stopping, reads the old definition
-   back as `Disabled`/result `20`, proves only `Enabled` changed, installs the
-   exact candidate as `Observe` without `-Start`, obtains a separate
-   `Ready`/result-`0` status readback, verifies the disabled XML backup and
-   unchanged state/log through candidate installation, and runs the ordinary
-   bounded Observe drain, which then advances state and appends its own log
-   evidence. The success receipt therefore scopes those proofs as
+   back as `Disabled`/result `20`, proves only `Enabled` changed, and invokes the
+   candidate installer's dedicated `InstallFromDisabledNoStop` action in
+   `Observe` without `-Start`. That action is valid only inside this transition's
+   quarantine wrapper: it requires a managed `Disabled` task, rechecks that state
+   immediately before replacement, and has no reachable stop, start, unregister,
+   or automatic-rollback path. If replacement or readback fails, the installer
+   deliberately leaves recovery to the outer quarantine, which disables the
+   authenticated survivor and waits for any active instance to finish naturally.
+   The driver then obtains a separate `Ready`/result-`0` status readback, verifies
+   the disabled XML backup and unchanged state/log through candidate installation,
+   and runs the ordinary bounded Observe drain, which then advances state and
+   appends its own log evidence. The success receipt therefore scopes those proofs as
    `old_definition_preserved_except_enabled` and
    `state_and_log_preserved_through_candidate_install`; neither field claims
    that the installed candidate still has the old definition or that the drain
@@ -165,7 +171,9 @@ repair mode and cannot create, update, or delete Azure resources.
    object must contain exactly the five string fields
    `attempt:'1'`, `transport_exit:'0'`, `http_status:'200'`,
    `content_type_class:'json'`, and a positive, bounded, canonical
-   `elapsed_ms` with at most two decimal places. Missing, additional,
+   `elapsed_ms` with an invariant dot separator and at most two decimal places.
+   The candidate worker formats that timing string explicitly with invariant
+   culture. Missing, additional,
    differently typed, or unsuccessful-sidecar values fail before mutation.
    `poll_started` may follow Scheduler `LastRunTime` by at most 30 seconds to
    allow bounded PowerShell/task startup; it may precede it only within the

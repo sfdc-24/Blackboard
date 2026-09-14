@@ -346,6 +346,7 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentTriggerFailureCode = ''
     $script:IncidentInstallFailureCode = ''
     $script:IncidentInstallReceiptFailureCode = ''
+    $script:IncidentInstallReceiptStatus = 'READY'
     $script:IncidentCandidateStatusFailureCode = ''
     $script:IncidentBackupFailureCode = ''
     $script:IncidentDrainFailureCode = ''
@@ -353,6 +354,10 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentPreDisableXml = ''
     $script:IncidentDisabledXml = ''
     $script:IncidentDefinitionUnknown = $false
+    $script:IncidentCleanupInitialState = 'Disabled'
+    $script:IncidentCleanupObservedInitialState = ''
+    $script:IncidentCleanupActiveStatus = ''
+    $script:IncidentCleanupTaskStopped = $false
     $script:IncidentCleanupSequence = New-Object 'System.Collections.Generic.List[string]'
     $script:IncidentStatusSequence = New-Object 'System.Collections.Generic.List[string]'
 }
@@ -767,8 +772,12 @@ try {
     $escrowContext.escrow_tool_path = $toolPath
     $escrowContext.expected_escrow_tool_sha256 = $toolSha
     $script:ChildStdout = (New-TestEscrowReceipt | ConvertTo-Json -Compress)
+    $script:ChildArguments = @()
+    $script:ChildTimeout = 0
     Set-TestMock 'Invoke-CutoverChildScript' {
         param($ScriptPath, $Arguments, $TimeoutSeconds, $FailureCode)
+        $script:ChildArguments = @($Arguments)
+        $script:ChildTimeout = $TimeoutSeconds
         [pscustomobject]@{ exit_code = 0; stdout = $script:ChildStdout; stderr = '' }
     }
     $realEscrowReceipt = Invoke-CutoverEscrow -Context $escrowContext -RequestedAction Validate
@@ -800,6 +809,12 @@ try {
     Assert-True 'candidate and restored installer children recheck their distinct pins' (
         [bool]$candidateChild.ok -and [bool]$restoredChild.ok
     )
+    $noStopChild = Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction InstallFromDisabledNoStop -RequestedMode Observe
+    Assert-True 'incident installer child receives the dedicated no-stop action and install timeout' (
+        [bool]$noStopChild.ok -and
+        ($script:ChildArguments -join '|').Contains('-Action|InstallFromDisabledNoStop|-Mode|Observe') -and
+        $script:ChildTimeout -eq 180
+    ) (($script:ChildArguments -join '|') + '; timeout=' + $script:ChildTimeout)
     [IO.File]::WriteAllBytes($installerPath, [Text.Encoding]::UTF8.GetBytes('changed-installer'))
     Assert-ThrowsCode 'candidate installer child rechecks pinned digest immediately before execution' {
         Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction Status -RequestedMode Observe | Out-Null
@@ -1099,6 +1114,7 @@ try {
         [pscustomobject]@{ name = 'nonexact successful HTTP'; property = 'http_status'; value = '204'; extra = $false },
         [pscustomobject]@{ name = 'non-JSON content'; property = 'content_type_class'; value = 'html'; extra = $false },
         [pscustomobject]@{ name = 'zero elapsed time'; property = 'elapsed_ms'; value = '0'; extra = $false },
+        [pscustomobject]@{ name = 'comma decimal elapsed time'; property = 'elapsed_ms'; value = '3874,97'; extra = $false },
         [pscustomobject]@{ name = 'noncanonical elapsed precision'; property = 'elapsed_ms'; value = '3874.970'; extra = $false },
         [pscustomobject]@{ name = 'unknown property'; property = 'unexpected'; value = 'x'; extra = $true }
     )) {
@@ -1716,12 +1732,15 @@ try {
         $script:IncidentInstallMode = $RequestedMode
         if ($script:IncidentInstallFailureCode) { Throw-Cutover -Code $script:IncidentInstallFailureCode }
         $script:IncidentCandidateInstalled = $true
-        [pscustomobject]@{ status = 'READY' }
+        [pscustomobject]@{ status = $script:IncidentInstallReceiptStatus }
     }
     Set-TestMock 'Assert-CutoverInstallerStatus' {
         param($Status, $Context, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
         if ($script:IncidentInstallReceiptFailureCode) {
             Throw-Cutover -Code $script:IncidentInstallReceiptFailureCode
+        }
+        if ([string]$Status.status -cne 'READY') {
+            Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
         }
         New-TestExactStatus -Last $script:IncidentStart -State Ready -LastTaskResult 0
     }
@@ -1760,10 +1779,15 @@ try {
         if ($Installer -ceq $Context.installer_path -and -not $script:IncidentCandidateInstalled) {
             Throw-Cutover -Code 'FAILURE_CLEANUP_DEFINITION_NOT_VERIFIED'
         }
+        $script:IncidentCleanupObservedInitialState = $script:IncidentCleanupInitialState
+        $script:IncidentCleanupActiveStatus = $(if ($script:IncidentCleanupInitialState -ceq 'Running') { 'FINISHED_NATURALLY' } else { 'NONE' })
         [pscustomobject]@{
             mode = $(if ($Installer -ceq $Context.restored_installer_path) { 'Execute' } else { 'Observe' })
-            initial_task_state = 'Disabled'; final_task_state = 'Disabled'; disable_performed = $false
-            future_triggers_disabled = $true; definition_preserved_except_enabled = $true; task_stopped = $false
+            initial_task_state = $script:IncidentCleanupInitialState; final_task_state = 'Disabled'
+            disable_performed = ($script:IncidentCleanupInitialState -cne 'Disabled')
+            future_triggers_disabled = $true; definition_preserved_except_enabled = $true
+            task_stopped = $script:IncidentCleanupTaskStopped
+            active_instance_status = $script:IncidentCleanupActiveStatus
         }
     }
 
@@ -1781,7 +1805,7 @@ try {
     Assert-True 'failed Execute transition passes exact governed action arguments' (
         $script:IncidentEscrowAction -ceq 'Validate' -and
         $script:IncidentInstallPath -ceq $incidentContext.installer_path -and
-        $script:IncidentInstallAction -ceq 'Install' -and
+        $script:IncidentInstallAction -ceq 'InstallFromDisabledNoStop' -and
         $script:IncidentInstallMode -ceq 'Observe' -and
         $script:IncidentDrainInstaller -ceq $incidentContext.installer_path -and
         $script:IncidentCandidateInstalled
@@ -1803,6 +1827,7 @@ try {
         $incidentReceipt.pre_task_state -ceq 'Ready' -and
         $incidentReceipt.post_disable_task_state -ceq 'Disabled' -and
         $incidentReceipt.candidate_task_state -ceq 'Ready' -and
+        $incidentReceipt.candidate_install_action -ceq 'InstallFromDisabledNoStop' -and
         $incidentReceipt.rollback_action -ceq 'RestoreReady' -and
         $incidentReceipt.old_definition_preserved_except_enabled -and
         $incidentReceipt.backup_matches_post_disable_xml -and
@@ -1982,6 +2007,14 @@ try {
             setup = { $script:IncidentInstallReceiptFailureCode = 'CANDIDATE_INSTALL_RECEIPT_INVALID' }
         },
         [pscustomobject]@{
+            name = 'matching candidate becomes Running after registration'; code = 'INSTALLER_STATUS_MISMATCH'
+            cleanup_calls = 1
+            setup = {
+                $script:IncidentInstallReceiptStatus = 'RUNNING'
+                $script:IncidentCleanupInitialState = 'Running'
+            }
+        },
+        [pscustomobject]@{
             name = 'failed distinct candidate Status readback'; code = 'CANDIDATE_STATUS_INVALID'
             cleanup_calls = 1
             setup = { $script:IncidentCandidateStatusFailureCode = 'CANDIDATE_STATUS_INVALID' }
@@ -2019,8 +2052,18 @@ try {
             $script:IncidentCleanupCalls -eq $postAuthCase.cleanup_calls -and
             ($script:IncidentCleanupSequence.ToArray() -join ',') -ceq $expectedCleanupSequence -and
             $script:IncidentCandidateInstalled -eq ($postAuthCase.cleanup_calls -eq 1) -and
-            $script:IncidentStartCalls -eq 0
+            $script:IncidentStartCalls -eq 0 -and
+            -not $script:IncidentCleanupTaskStopped
         )
+        if ($postAuthCase.name -ceq 'matching candidate becomes Running after registration') {
+            Assert-True 'matching post-register Running candidate is quarantined and allowed to finish naturally' (
+                $script:IncidentCleanupObservedInitialState -ceq 'Running' -and
+                $script:IncidentCleanupActiveStatus -ceq 'FINISHED_NATURALLY' -and
+                $script:IncidentCleanupCalls -eq 1 -and
+                -not $script:IncidentCleanupTaskStopped -and
+                $script:IncidentStartCalls -eq 0
+            )
+        }
     }
 
     Reset-TestFailedExecuteScenario

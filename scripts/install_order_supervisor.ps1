@@ -1,14 +1,16 @@
 #Requires -Version 5.1
 <#
 Install, inspect, uninstall, or roll back the SYSTEM scheduled task for the
-one-shot Blackboard ORDER worker. Status is the non-mutating default.
+one-shot Blackboard ORDER worker. Status is the non-mutating default. The
+incident-only InstallFromDisabledNoStop action replaces a disabled definition
+without calling any task stop, start, unregister, or automatic rollback path.
 
 Rollback restores only the prior Task Scheduler definition. It does not copy or
 delete runner files, so the referenced prior immutable runner must still exist.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Install', 'Status', 'Uninstall', 'Rollback')][string]$Action = 'Status',
+    [ValidateSet('Install', 'InstallFromDisabledNoStop', 'Status', 'Uninstall', 'Rollback')][string]$Action = 'Status',
     [ValidateSet('Observe', 'Execute')][string]$Mode = 'Observe',
     [string]$UserProfilePath = 'C:\Users\akatiawam',
     [string]$WorkspacePath,
@@ -24,11 +26,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $Action = switch ($Action.ToLowerInvariant()) {
     'install' { 'Install' }
+    'installfromdisablednostop' { 'InstallFromDisabledNoStop' }
     'status' { 'Status' }
     'uninstall' { 'Uninstall' }
     'rollback' { 'Rollback' }
 }
 $Mode = if ($Mode -ieq 'Execute') { 'Execute' } else { 'Observe' }
+$IsInstallAction = @('Install', 'InstallFromDisabledNoStop') -ccontains $Action
 
 $TaskName = 'SFDC24 Blackboard Order Worker'
 $TaskPath = '\'
@@ -38,9 +42,9 @@ $RepoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $RunnerPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'order_supervisor.ps1'))
 $WorkspacePathWasExplicit = -not [string]::IsNullOrWhiteSpace($WorkspacePath)
 if ($WorkspacePathWasExplicit) {
-    # Only Install consumes the candidate workspace. Recovery actions must be
-    # able to operate even when that candidate checkout is gone or unusable.
-    if ($Action -ceq 'Install' -and -not [IO.Path]::IsPathRooted($WorkspacePath)) {
+    # Only installation actions consume the candidate workspace. Recovery
+    # actions must operate even when that candidate checkout is gone or unusable.
+    if ($IsInstallAction -and -not [IO.Path]::IsPathRooted($WorkspacePath)) {
         throw 'workspace_path_must_be_absolute'
     }
     if ([IO.Path]::IsPathRooted($WorkspacePath)) {
@@ -746,6 +750,38 @@ function Invoke-InstallAction {
     return (Get-StatusObject)
 }
 
+function Invoke-InstallFromDisabledNoStopAction {
+    # This is intentionally a separate action rather than an option on ordinary
+    # Install. Its call graph must contain no stop, start, unregister, or
+    # automatic-restore path even if the disabled task becomes active after the
+    # final child-side read. The outer cutover driver owns quarantine on failure.
+    if ($Mode -cne 'Observe') { throw 'disabled_no_stop_requires_observe' }
+    if ($Start) { throw 'disabled_no_stop_forbids_start' }
+
+    Assert-InstallPreflight
+    $existing = Get-RootTask
+    if (-not $existing) { throw 'disabled_no_stop_requires_existing_task' }
+    if (-not (Test-Managed $existing)) { throw 'refusing_to_overwrite_unmanaged_task' }
+    if ([string]$existing.State -cne 'Disabled') { throw 'disabled_no_stop_requires_disabled_task' }
+
+    $expected = New-ExpectedDefinition
+    Save-PreviousTask -Existing $existing
+
+    # Save-PreviousTask performs filesystem I/O, so re-read immediately before
+    # registration. This narrows the race; structural absence of a stop path is
+    # what keeps the no-stop guarantee valid across the remaining TOCTOU window.
+    $current = Get-RootTask
+    if (-not $current) { throw 'disabled_no_stop_task_changed_before_register' }
+    if (-not (Test-Managed $current)) { throw 'disabled_no_stop_task_changed_before_register' }
+    if ([string]$current.State -cne 'Disabled') { throw 'disabled_no_stop_task_changed_before_register' }
+
+    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -InputObject $expected -Force -ErrorAction Stop | Out-Null
+    $registered = Get-RootTask
+    $problems = @(Compare-Definition $registered)
+    if ($problems.Count) { throw ('task_readback_drift:' + ($problems -join ',')) }
+    return (Get-StatusObject)
+}
+
 function Invoke-UninstallAction {
     Assert-MutationAuthorityPreflight
     $existing = Get-RootTask
@@ -769,6 +805,10 @@ if ($Action -ceq 'Status') {
 }
 if ($Action -ceq 'Install') {
     Invoke-InstallAction | ConvertTo-Json -Depth 10
+    exit 0
+}
+if ($Action -ceq 'InstallFromDisabledNoStop') {
+    Invoke-InstallFromDisabledNoStopAction | ConvertTo-Json -Depth 10
     exit 0
 }
 if ($Action -ceq 'Uninstall') {
