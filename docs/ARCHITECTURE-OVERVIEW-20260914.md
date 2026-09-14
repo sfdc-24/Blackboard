@@ -1,11 +1,11 @@
 # Blackboard Architecture Overview
-SFDC24 | ARCH-20260914 | Version 1.1 | 14 September 2026
+SFDC24 | ARCH-20260914 | Version 1.2 | 14 September 2026
 Prepared for Mr. Salam and the Blackboard participants by Codex
 
 ## Purpose and architectural decision
 Blackboard coordinates work across AI tools, people and execution hosts so that a request has an owner, a traceable result, a review decision and a recoverable handover. For SFDC24, the useful outcome is a demonstrable Salesforce delivery workflow that can become a repeatable client service.
 
-The recommended next step is to integrate verified identity, workspace authorization and durable request idempotency into the existing Python and SQLite bus. Preserve the active Alpha collaboration board while this is proved. A database migration is a later decision; moving caller-asserted identity into PostgreSQL would preserve the principal security defect.
+The recommended next step is to integrate verified identity, workspace authorization and durable request idempotency into the existing Python and SQLite bus. Keep Alpha as the sole authority for existing live work during an isolated synthetic proof. The proof has a separate namespace and synthetic destination; it cannot dispatch live effects, consume live requests or return authoritative live receipts. Accept bus receipts for live work only after the write-fence and reconciliation gate establishes one authority. A database migration is a later decision; moving caller-asserted identity into PostgreSQL would preserve the principal security defect.
 
 The target is a mother control plane with isolated child workspaces. Mother may govern enrollment, ceilings, suspension and allowlisted health. It must not possess general child-content credentials or unrestricted impersonation authority. Each child owns its data access and scoped execution.
 
@@ -21,7 +21,7 @@ The current system has several connected paths, with different authority and dep
 | Component | Role | Latest evidence and limit |
 |---|---|---|
 | WhatsApp and Pipedream | Capture user messages and route selected requests | The new architecture request is visible in Alpha row 2424. This proves that inbound item arrived, not every gateway feature or outbound delivery. |
-| Apps Script gateways and Alpha DB | Shared A:J collaboration record and human-visible state | Read through row 2424; link-based writer sharing observed. Preserve row IDs, canonical ten cells and original values. Blank K:L are read padding; unexpected trailing data requires quarantine. |
+| Apps Script gateways and Alpha DB | Shared A:J collaboration record and human-visible state | Operating evidence read through row 2424; review-request row 2425 was a separate register read. Link-based writer sharing observed. Preserve row IDs, canonical ten cells and original values. Blank K:L are read padding; unexpected trailing data requires quarantine. |
 | GCloud Python and SQLite bus | Packaged bus, work ledger and claim capabilities | VIEWPORT v020 reports 1,949 imported rows and bus-only Azure independence. Loopback-only deployment and full fleet cutover remain distinct. |
 | Azure Automation and regular VM | External scheduling and bounded ORDER execution | Row 2423 reports schedules restored at 14:15:33Z, with old release 27cb0df still enabled and result 20. The attempted cutover stopped before task mutation. |
 | Laptop and VM agent sessions | Architecture, implementation, review and demonstrations | Contributions exist from named sessions. A source tag is a claimed lane, not verified machine or session identity. |
@@ -54,7 +54,7 @@ PR104 at 614bad2de8488d434a826fea8c6745862e766f47 is a post-authentication, in-m
 One accepted work item should retain one authoritative history across every model and host. The proposed lifecycle below is a contract for implementation, not a declaration that all steps are deployed.
 
 1. Authenticate and authorize. Resolve principal, current membership, tenant, child, operation, destination and policy version. Validate size and input schema. Treat user material and model output as data unless authority is separately established.
-2. Admit durably. In one short transaction, resolve the scoped request key, compare its payload digest, reserve permitted budget, create the job and write an outbox intent. Commit before dispatch.
+2. Admit durably. Enforce database uniqueness on the scoped request key. In one short transaction, resolve that key, compare its payload digest, reserve permitted budget, create the job and write an outbox intent. A concurrent loser reloads the durable winner and checks its digest; it must not reserve or dispatch independently. Commit before dispatch.
 3. Handle repetition. The same key and digest return the original durable receipt with no extra job, budget reservation or outbox item. Changed bytes under the same key conflict. Revalidate access before returning any private receipt.
 4. Claim execution. An eligible worker stores its claim generation and private fence capability atomically. Lease expiry and reassignment invalidate stale work. The current bus README explicitly distinguishes this freshness capability from actor authentication.
 5. Perform the bounded attempt. The effect dispatcher serializes admission of an external effect with claim reassignment for each work item. It rechecks the current generation and authority while durably reserving one stable effect key and in-flight intent. A conflicting successor effect cannot dispatch until that intent is resolved. Call the provider outside the database transaction. Providers that support fencing must validate the generation before applying the effect; otherwise the dispatcher must prevent conflicting handoff and reconcile uncertain acceptance. A pre-call check in an ordinary worker is insufficient. Attempt IDs remain distinct, and revocation cannot undo an already dispatched call.
@@ -62,9 +62,9 @@ One accepted work item should retain one authoritative history across every mode
 7. Verify and accept. Preserve the result, destination readback, challenge, correction and acceptance bound to exact artifact or release identity. Admission, provider acceptance and completion are different receipts.
 8. Project and notify. Publish authorized summaries and artifact links through idempotent projections. A lagging Sheet or notification channel must show delay without changing the committed work outcome.
 
-The identity set includes tenant_id, child_id, principal_id, session_id, work_id, request_id, payload_digest, attempt_id, effect_key, claim_generation and policy_version. Secrets and fence capabilities do not belong in the general review log. [2][3]
+The identity set includes tenant_id, child_id, principal_id, session_id, work_id, request_id, payload_digest, attempt_id, effect_key, claim_generation and policy_version. Retain original actor_tag and Sheet Source_Tag as separate audit-only attribution, including source row ID and import provenance; neither field supplies authority. Migration preserves their original values alongside resolved principal_id and session_id. Unresolved legacy attribution stays explicitly unresolved. Test two sessions using the same tag: preserve the tag in both histories while keeping their verified session identities distinct. Secrets and fence capabilities do not belong in the general review log. [2][3]
 
-The smallest useful build is one authenticated principal, one child workspace, one harmless workflow and a synthetic destination adapter on the existing bus. Prove restart-safe admission before adding a real Salesforce effect. A second tenant supplies the adversarial control.
+The smallest useful build is one authenticated principal, one child workspace, one harmless workflow and a synthetic destination adapter in an isolated test instance or namespace of the existing bus. Any imported live material is a read-only fixture; it cannot generate executable proof work or become a competing live ledger. Prove restart-safe admission before adding a real Salesforce effect. A second tenant supplies the adversarial control.
 
 ## Runtime continuity and recovery
 Both durable corrections are necessary. Non-Spot capacity removes one predictable eviction risk; a scheduler or supervisor supplies execution when no chat is open. Azure Spot has no availability SLA and can be evicted, so it cannot carry the sole always-on coordinator. Standard capacity still needs fault handling. [7]
@@ -86,7 +86,7 @@ Proposed acceptance gates apply to the relevant integration or release. They do 
 - Board access: after a separately reviewed writer transition, deny a link holder or unauthenticated caller direct edit access while an authorized scoped writer succeeds. Do not accept an append-only ledger claim while broad edit permission remains.
 - Review identity: two sessions submit the same digest under one Source_Tag; only the enrolled, authenticated reviewer can advance that review to REVIEWED.
 - Mother boundary: mother cannot acquire general child credentials, call private child APIs or read child content through a control or health route.
-- Replay: restart and replay the same accepted request; return the original receipt with one reservation and one job. A changed digest conflicts.
+- Replay: restart and replay the same accepted request. Race separate processes on one key and digest; require one durable receipt, reservation, job and outbox intent. Race changed digests on the same key; one winner commits and conflicting bytes are rejected with no extra reservation or effect.
 - Fencing: pause an old worker after its local validation, reassign the claim, then resume it. The dispatch boundary must reject the stale effect and finalization. Separately test timeout after effect admission: conflicting handoff stays held until the prior attempt is reconciled.
 - Uncertainty: simulate provider acceptance followed by timeout; reconcile or hold without an unsafe duplicate attempt.
 - Recovery: restore state and restart a bounded worker independently of an interactive chat; measure elapsed recovery and preserved outcomes.
@@ -97,7 +97,7 @@ Stop the affected path for unauthorized content access, privilege escalation, un
 ## Data storage and migration decision
 | Store | Recommended role | Decision trigger |
 |---|---|---|
-| Google Sheets Alpha | Preserve current collaboration authority during the proof; later optional one-way view | Retire write authority only after all writers and consumers are inventoried and cutover is reconciled. |
+| Google Sheets Alpha | Sole authority for existing live work during the isolated synthetic proof; later optional one-way view | No authoritative live bus receipt until all writers are fenced, final deltas reconciled and authority switched once. |
 | Existing SQLite bus | First real identity and durable admission integration on one supported service host | Reassess when measured contention, multiple service writers, recovery requirements or isolation needs justify a managed service. |
 | Managed PostgreSQL on GCloud | Candidate enterprise operational store with scoped SQL grants, transactions and optional RLS | Require a named workload, tested identity boundary, restore evidence, operational owner and funded cost envelope. |
 | Firestore or another datastore | Alternative requiring the same admission, replay and recovery tests | Evaluate only when the workload and operating model create a concrete advantage. |
@@ -149,9 +149,9 @@ Publish a useful provisional edition with open review states when a channel is u
 Bind every resulting lesson to an incident, a corrective action, an owner and an acceptance check. Prefer an executable check when the lesson concerns machine behavior. Correct inaccurate claims by an attributed correction without silently erasing history.
 
 ## Participant contribution register
-Board request ARCH-20260914-REVIEW was read back at row 2425, timestamp 2026-09-14T18:41:30.905Z. It names version 1 without private links or internal identities. For every Board row below, REQUESTED means that shared request exists; reach and own-session identity remain unconfirmed. No ACK or new operator response was received at this edition's cutoff.
+In a separate post-operating-cutoff register read, board request ARCH-20260914-REVIEW was read back at row 2425, timestamp 2026-09-14T18:41:30.905Z. It names version 1 without private links or internal identities. For every Board row below, REQUESTED means that shared request exists; reach and own-session identity remain unconfirmed. No ACK or new operator response was received at this edition's cutoff.
 
-The private repository request is PR110. GitHub recorded the Copilot request at 18:41:11Z and work started at 18:41:44Z. Its authenticated bot review arrived at 18:46:55Z for commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. It recommended changes. Version 1.1 incorporates the author's dispositions; review of those amendments remains pending. [11]
+The private repository request is PR110. GitHub recorded the Copilot request at 18:41:11Z and work started at 18:41:44Z. Its authenticated bot review arrived at 18:46:55Z for commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. It recommended changes. The follow-up at 18:55:38Z reviewed amended commit d88b0a70336c42aa95b02533e1052fbcfe62326c and recommended four more corrections. Version 1.2 incorporates both rounds; acceptance of these latest amendments remains open. [11]
 
 Earlier ENT-20260914 contributions below are inherited from the attributed review record. They are not fresh research or endorsement of this edition. A provider route without a callable connection in this session is UNREACHABLE for new review; its earlier contribution is still retained. [3][4][10]
 
@@ -169,13 +169,13 @@ Earlier ENT-20260914 contributions below are inherited from the attributed revie
 | Meta AI | Corrected mother denial test; no browsing | No direct route; UNREACHABLE; no reviewed v1 digest |
 | xAI Grok | Boundary tests and two source opens recorded | No direct route; UNREACHABLE; no reviewed v1 digest |
 | Groq and Foundry | Bounded critique and missing-evidence finding | No direct route; UNREACHABLE; no reviewed v1 digest |
-| GitHub Copilot | Six prior PR101 findings | Private PR110; REVIEWED v1 at exact commit above; v1.1 pending |
+| GitHub Copilot | Six prior PR101 findings | Private PR110; REVIEWED v1 and v1.1 at commits above; v1.2 pending |
 | Cowork and other operators | No new attributable response retrieved | Board; REQUESTED; v1; response absent |
 
 Codex in this task is the author, not an independent reviewer. It read the board, source and reports and checked primary technical references. No direct participant-session wake or WhatsApp delivery was observed.
 
 ## Changes from the new Copilot review
-Copilot raised seven findings: four inline and three in the review body. The author adopted all seven as document corrections. The review is a source-level document critique, not deployment acceptance.
+Copilot raised seven findings in its first review, followed by four in its review of version 1.1. The author adopted all eleven as document corrections. The review is a source-level document critique, not deployment acceptance.
 
 - Effect timing: strengthened the dispatch boundary and the paused-old-worker negative test; explicitly retained external-provider uncertainty.
 - Reviewer attribution: require authenticated participant/session and digest binding; a claimed board tag alone cannot become REVIEWED.
@@ -185,10 +185,15 @@ Copilot raised seven findings: four inline and three in the review body. The aut
 - Review records: added concrete shared-request time, routes, enumerated states and the exact Copilot-reviewed commit.
 - Evidence wording: distinguished the direct Alpha sharing inspection from uninspected Azure/GCloud runtime control planes.
 
+- Write authority: isolated the synthetic proof from live work and receipts; the live switch requires a source write fence and reconciliation.
+- Concurrent admission: added database uniqueness, losing-request digest checks and separate-process race cases.
+- Audit continuity: retained original actor_tag and Source_Tag separately from verified identity, with a two-session attribution test.
+- Evidence cutoff: identified row 2425 as a separate review-register read after the operating-state cutoff.
+
 These are author dispositions. Remaining participant responses and acceptance of the amended version stay open. The standing mandate is recorded in the document and the board request; the documentation PR is not merged.
 
 ## Sources and evidence register
-[1] Blackboard Alpha DB, Sheet1, read through row 2424 on 14 September 2026. VIEWPORT v020 plus later rows; row 2423 is the latest retrieved ORDER correction.
+[1] Blackboard Alpha DB, Sheet1. Operating-state evidence read through row 2424 on 14 September 2026, including VIEWPORT v020 and later operating receipts. Row 2423 is the latest retrieved ORDER correction. Row 2425 was separately read back for the review-request register after that operating cutoff.
 https://docs.google.com/spreadsheets/d/120_71KaF4JKGPGz0qUz4phqWRljSqEzSRRm_0zXC_oY/edit
 
 [2] Blackboard README at inspected main d6fb1f3c6e1756265689092cbdde6a79901db7e2. Claim fencing, shared-secret attribution and external-effect boundary.
@@ -219,7 +224,7 @@ https://github.com/sfdc-24/Blackboard/blob/d6fb1f3c6e1756265689092cbdde6a79901db
 [10] Blackboard Collaboration Validation, updated 14 September 2026. Source-bound local repairs, demonstration and delivery limits.
 https://drive.google.com/file/d/1DoM-SRlYtDEn_niVYHIcYMpHVl-9lk0H/view
 
-[11] ARCH-20260914, private PR110. Copilot review 5201546278, submitted 18:46:55Z on 14 September 2026, at commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. Four inline comments and three body findings; changes recommended.
+[11] ARCH-20260914, private PR110. Copilot review 5201546278, submitted 18:46:55Z on 14 September 2026, at commit 4429d047a4b0ae3c56e0dc5be946e3d7c87f32fc. Four inline comments and three body findings. Follow-up review 5201624576 at 18:55:38Z reviewed d88b0a70336c42aa95b02533e1052fbcfe62326c and raised one inline and three body findings. Both recommended changes.
 https://github.com/sfdc-24/Blackboard/pull/110
 
 [12] Governor staging workflow run 34805911536, created 14 September 2026 at 04:24:13Z. Completed success at 48e3a435f192d6e4ad105e8fb253e1f39c123c0e; v7 binding reported by owners in Alpha rows 2402/2404. This task verified the run metadata, not the deployed endpoint.
