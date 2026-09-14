@@ -67,11 +67,36 @@ function Write-Utf8NoBom {
 function ConvertFrom-JsonPreserveStrings {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Json)
 
+    # BOARD CELLS ARE STRINGS AND MUST STAY STRINGS.
+    #
+    # PowerShell 7's ConvertFrom-Json silently converts anything that looks like
+    # ISO-8601 into [DateTime]. A board Timestamp cell then stops being the text
+    # the admission rules compare, and every row is judged ineligible - with
+    # ok=true and status=no_eligible_order. Silent, and wrong in the direction
+    # where the supervisor simply never picks up work.
+    #
+    # -DateKind String prevents it, and this function was written for exactly
+    # that. But -DateKind arrived in PowerShell 7.5, so on 6.0 through 7.4 the
+    # feature check FELL THROUGH to plain ConvertFrom-Json and reintroduced the
+    # bug it exists to stop. A cross-host fixture diff caught it on 7.4.6:
+    # Windows 5.1 parsed the Timestamp cell as String, Linux parsed it as
+    # DateTime, and the two hosts disagreed about admission.
+    #
+    # Windows PowerShell 5.1 does not coerce, so it needs no parameter. Any
+    # edition that coerces and cannot be told not to is REFUSED rather than
+    # quietly trusted - a host that cannot read the board correctly must say so.
     $command = Get-Command ConvertFrom-Json
     if ($command.Parameters.ContainsKey('DateKind')) {
         return $Json | ConvertFrom-Json -DateKind String
     }
-    return $Json | ConvertFrom-Json
+    if ($PSVersionTable.PSEdition -ceq 'Desktop') {
+        return $Json | ConvertFrom-Json          # 5.1: preserves strings already
+    }
+    $failure = [NotSupportedException]::new('BOARD_JSON_DATE_COERCION_UNSAFE')
+    $failure.Data['ps_version'] = [string]$PSVersionTable.PSVersion
+    $failure.Data['ps_edition'] = [string]$PSVersionTable.PSEdition
+    $failure.Data['remedy'] = 'PowerShell 7.5 or later provides ConvertFrom-Json -DateKind String'
+    throw $failure
 }
 
 function Write-AtomicJson {

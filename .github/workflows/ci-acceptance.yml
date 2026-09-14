@@ -9,6 +9,9 @@ on:
       - 'docs/HANDOVER.md'
       - 'scripts/gas_version_assert.py'
       - 'scripts/gas_deployment_audit.py'
+      - 'scripts/gas_baseline_check.py'
+      - 'scripts/gas_drift_watch.ps1'
+      - 'scripts/alpha.ps1'
       - 'tests/test_gas_*_acceptance.py'
       - 'apps-script/governor-page-api/Auth.gs'
       - 'apps-script/governor-page-api/Reception.html'
@@ -22,6 +25,7 @@ on:
       - 'scripts/gas_build_identity.py'
       - 'scripts/baseline_verify.py'
       - 'tests/test_baseline_verify.py'
+      - 'tests/test_gas_baseline_check.py'
       - 'tests/fixtures/governor-v31-manifest.json'
       - 'scripts/gas_tts_canary.py'
       - 'scripts/gas_tts_canary_target.json'
@@ -29,6 +33,7 @@ on:
       - 'tests/test_tts_canary_contract.py'
       - 'tests/fixtures/site-p0-tts-canary.gs.template'
       - 'tests/test_governor_voice.cjs'
+      - 'tests/test_reception_popblock.cjs'
       - 'docs/SITE-P0-TTS-CANARY.md'
       - 'tests/test_build_health.cjs'
       - 'apps-script/governor-page-api/Code.gs'
@@ -103,6 +108,7 @@ jobs:
         run: |
           python -B -m unittest discover -s tests -p 'test_build_identity.py' -v
           python -B -m unittest discover -s tests -p 'test_baseline_verify.py' -v
+          python -B -m unittest discover -s tests -p 'test_gas_baseline_check.py' -v
           node --test tests/test_build_health.cjs
       - name: Test isolated TTS canary build, target and receipt contracts
         run: |
@@ -115,3 +121,46 @@ jobs:
           node --test tests/test_clasp_json_contract.cjs
       - name: Test Google callback claims with mocked token exchange
         run: node --test tests/test_governor_auth.cjs tests/test_governor_tenant_boundary.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs
+
+      # tests/test_reception_popblock.cjs arrived with this PR and NO workflow
+      # referenced it, so all three of the PR's green checks passed without ever
+      # loading it. That is PR74's failure a third time: a committed test that no
+      # job invokes is not coverage, it is a file that happens to hold assertions.
+      #
+      # It belongs here rather than in governor-voice because it exercises
+      # Reception.html's DOM behaviour, which is what the other governor .cjs
+      # suites in this job cover.
+      - name: Test the reception voice-link block
+        run: node --test tests/test_reception_popblock.cjs
+
+      # scripts/gas_baseline_check.py has compared the committed mirror against
+      # deployed source since 2026-09-06, and NO workflow has ever invoked it.
+      # On 2026-09-13 the same drift it was written to catch was rediscovered by
+      # hand, one `clasp push` away from reverting the live Governor console.
+      #
+      # This step cannot read deployed source - that needs production
+      # credentials CI does not have and should not be given lightly. What it
+      # CAN check is the wrapper's decision table, and the assertion that earns
+      # its place is that a fetch returning ZERO files is reported UNKNOWN
+      # rather than IN_SYNC: an empty comparison finds no differences, which is
+      # the shape of a pass and the substance of a run that never happened.
+      - name: Apps Script drift-watch decision contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v pwsh >/dev/null || { echo "pwsh is not on this runner" >&2; exit 1; }
+          output=$(pwsh -NoProfile -File scripts/gas_drift_watch.ps1 -SelfTest)
+          echo "$output"
+          # Assert the exit code rather than inheriting it, and assert the
+          # summary separately - a green summary over a red exit and a red
+          # summary over a green exit are the same disease facing opposite ways.
+          result=$(printf '%s\n' "$output" | grep -c '^RESULT passed=' || true)
+          test "$result" -eq 1 || { echo "expected exactly one RESULT line, got $result" >&2; exit 1; }
+          printf '%s\n' "$output" | grep -q '^RESULT passed=[0-9]* failed=0$' \
+            || { echo "the suite reported failures" >&2; exit 1; }
+          # Refuse a green tick over nothing. Two of the eleven assertions are
+          # Windows-only and announce themselves as skipped on Linux, so nine is
+          # the floor here, not eleven.
+          count=$(printf '%s\n' "$output" | sed -n 's/^RESULT passed=\([0-9]*\) .*/\1/p')
+          test "${count:-0}" -ge 9 \
+            || { echo "only ${count:-0} assertions ran; this suite should have at least 9 on Linux" >&2; exit 1; }

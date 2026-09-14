@@ -9,6 +9,12 @@ on:
       - "tests/test_beat1_runtime.js"
       - "tests/test_build_page.js"
       - "tests/test_sketch_contract.js"
+      - "tests/test_domain_lookup.js"
+      - "scripts/wa_watch.ps1"
+      - "scripts/fleet_watch.ps1"
+      - "scripts/watch_state.ps1"
+      - "tests/test_watch_state.ps1"
+      - "tests/test_watch_harness.ps1"
       - ".github/workflows/beat1-prototype-tests.yml"
 
 permissions:
@@ -27,6 +33,7 @@ jobs:
           node-version: "22"
       - name: Run Beat-1 offline contract and runtime tests
         run: |
+          node --check prototype/beat1/domains.js
           node --check prototype/beat1/serve.js
           node --check prototype/beat1/sketch.js
           node --check prototype/beat1/build.js
@@ -36,3 +43,27 @@ jobs:
           node tests/test_beat1_history.js
           node tests/test_beat1_provider.js
           node tests/test_beat1_runtime.js
+          node tests/test_domain_lookup.js
+      - name: Watcher watermark state (PowerShell, offline)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/test_watch_state.ps1
+      - name: Real watcher entrypoints against a stub bus (PowerShell, offline)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/test_watch_harness.ps1
+
+  watchers-windows:
+    # Added because a RESULT row of mine claimed both suites ran in CI on
+    # WinPS 5.1 and pwsh when the workflow had only ubuntu/pwsh. The fix is the
+    # job, not a softer sentence.
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Watcher state module (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_watch_state.ps1
+      - name: Real watcher entrypoints against a stub bus (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_watch_harness.ps1

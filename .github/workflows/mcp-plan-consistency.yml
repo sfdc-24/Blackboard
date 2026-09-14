@@ -1,0 +1,122 @@
+name: mcp-plan-consistency
+
+# The plan has to agree with itself, and until this workflow existed nothing
+# checked that it did.
+#
+# Three review rounds found the same class of defect three times — a stated
+# count the table contradicted, a worked example that did not satisfy its own
+# schema, an `unknown` value outside the set the schema declares closed. The
+# tests that catch those were added in the last round and then ran nowhere, so
+# they were not a gate; they were a file. A reviewer found that too.
+#
+# TWO PYTHON VERSIONS ON PURPOSE. The suite was invoked as
+# `python -m unittest tests.<module>`, which fails on 3.12 for every module in
+# tests/ because there is no __init__.py — so the mutation harness caught 0 of 6
+# there and said nothing was wrong. A single-version matrix would have kept
+# saying nothing was wrong.
+#
+# BOTH LINE-ENDING CONVENTIONS ON PURPOSE. The harness rewrites the document and
+# restores it, and on a CRLF checkout it used to restore different bytes than it
+# found and score 5/6 on anchors that were perfectly fine. The `crlf` leg
+# converts the tree first and asserts the digest is unchanged afterwards, so a
+# harness that edits the repository as a side effect of checking it fails here.
+
+on:
+  pull_request:
+    paths:
+      - "docs/SALESFORCE-MCP-PLAN.md"
+      # tests/** and not a hand-listed set. On the site repo the same shape of
+      # workflow RAN a control file while omitting it from the triggers, so the
+      # gate's own control could be neutered with no check running. A glob
+      # cannot be forgotten; a list gains an entry every round and eventually
+      # misses one.
+      - "tests/**"
+      - ".github/workflows/mcp-plan-consistency.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/SALESFORCE-MCP-PLAN.md"
+      # tests/** and not a hand-listed set. On the site repo the same shape of
+      # workflow RAN a control file while omitting it from the triggers, so the
+      # gate's own control could be neutered with no check running. A glob
+      # cannot be forgotten; a list gains an entry every round and eventually
+      # misses one.
+      - "tests/**"
+      - ".github/workflows/mcp-plan-consistency.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+        endings: [lf, crlf]
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Convert the tree to CRLF
+        if: matrix.endings == 'crlf'
+        run: |
+          python - <<'PY'
+          import pathlib
+          # Globbed for the same reason the path filter is: a CRLF leg that
+          # converts a hand-listed subset silently tests LF copies of whatever
+          # was forgotten, and proves nothing about the convention it exists for.
+          for name in ["docs/SALESFORCE-MCP-PLAN.md",
+                       *sorted(str(q) for q in pathlib.Path("tests").glob("*.py"))]:
+              p = pathlib.Path(name)
+              p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+          print("converted")
+          PY
+
+      - name: Record the document digest before anything touches it
+        run: python -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('docs/SALESFORCE-MCP-PLAN.md').read_bytes()).hexdigest())" > /tmp/before.sha
+
+      # The discovery form, which is what the rest of this repository uses. The
+      # dotted form fails on 3.12 and that is precisely how this went unnoticed.
+      - name: The plan agrees with itself
+        run: python -B -m unittest discover -s tests -p 'test_mcp_plan_consistency.py' -v
+
+      # Green is not evidence. Three of these six cases are verbatim states the
+      # document was actually in while nothing caught them.
+      - name: Mutation gate
+        run: python tests/mutate_mcp_plan.py
+
+      # Added after review round eight. The suite above and the harness above
+      # were both healthy and both irrelevant to the finding: EIGHT SEMANTIC
+      # INVERSIONS of the plan left 12/12 green on all four legs, because every
+      # assertion was a substring and a substring cannot carry a negation.
+      # The contract bullets are OUTPUT. If the committed document does not match
+      # what the generator produces, someone hand-edited the contract - which is
+      # the exact defect round ten used, and the reason generation replaced a
+      # parser that read only the leading value of each bullet.
+      - name: The contract prose is what the blocks generate
+        run: python tests/render_contracts.py --check
+
+      - name: The gates mean what they say
+        run: python -B -m unittest discover -s tests -p 'test_mcp_gate_semantics.py' -v
+
+      # Each case here inverts a MEANING and names the test that must catch it.
+      # Four of them invert prose and typed block together, so a self-consistent
+      # lie is caught by the graph rather than by the two halves disagreeing.
+      - name: Semantic mutation gate
+        run: python tests/mutate_gate_semantics.py
+
+      - name: The harness put the document back byte for byte
+        run: |
+          python -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('docs/SALESFORCE-MCP-PLAN.md').read_bytes()).hexdigest())" > /tmp/after.sha
+          diff /tmp/before.sha /tmp/after.sha || {
+            echo "The mutation harness did not restore the document exactly."
+            echo "A tool that edits the repository as a side effect of checking it is worse than no tool."
+            exit 1
+          }

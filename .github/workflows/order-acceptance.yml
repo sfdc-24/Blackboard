@@ -27,6 +27,7 @@ on:
       - 'tests/test_order_state_preservation.ps1'
       - 'tests/test_order_installer_safety.ps1'
       - 'tests/test_order_release_installer.ps1'
+      - 'tests/test_order_release_manifest_string_preservation.ps1'
       - 'tests/test_order_system_adapter_smoke.ps1'
       - 'tests/test_order_job_schedule_link_validator.ps1'
       - 'tests/test_order_task_escrow.ps1'
@@ -58,9 +59,34 @@ jobs:
       - name: Test ORDER deterministic release packager
         shell: pwsh
         run: .\tests\test_order_release_packager.ps1
+      - name: Test ORDER release-manifest string preservation
+        shell: pwsh
+        run: .\tests\test_order_release_manifest_string_preservation.ps1
       - name: Test Blackboard writer timestamp contract
         shell: pwsh
         run: .\tests\test_bus_timestamp_contract.ps1
+      - name: Test bounded ORDER board-read resilience
+        shell: pwsh
+        run: .\tests\test_order_read_resilience.ps1
+      # The step above runs the SUITE on PowerShell 7. It still launches bus.ps1 in a
+      # child process, and that child defaults to powershell.exe -- so on its own it
+      # proves nothing about the bus client on the edition being migrated to. This
+      # step moves the child too, and then refuses to pass unless the child really
+      # moved: a misspelt variable name would otherwise run 5.1 and report green.
+      - name: Test bounded ORDER board-read resilience with the bus client on PowerShell 7
+        shell: pwsh
+        env:
+          ORDER_TEST_CHILD_SHELL: pwsh
+        run: |
+          $output = .\tests\test_order_read_resilience.ps1
+          $suiteExit = $LASTEXITCODE
+          $output
+          $childShell = @($output | Where-Object { $_ -like 'CHILD_SHELL *' })
+          if ($childShell.Count -ne 1 -or $childShell[0] -notmatch 'pwsh') {
+            throw ("This leg exists to exercise bus.ps1 under PowerShell 7. The child " +
+                   "shell was: " + ($childShell -join ' '))
+          }
+          if ($suiteExit -ne 0) { exit $suiteExit }
 
   windows-powershell-51:
     name: ORDER and Azure contracts on Windows PowerShell 5.1
@@ -88,6 +114,9 @@ jobs:
       - name: Test ORDER immutable release installer
         shell: powershell
         run: .\tests\test_order_release_installer.ps1
+      - name: Test ORDER release-manifest string preservation
+        shell: powershell
+        run: .\tests\test_order_release_manifest_string_preservation.ps1
       - name: Test provider-free ORDER SYSTEM adapter smoke
         shell: powershell
         run: .\tests\test_order_system_adapter_smoke.ps1
@@ -118,3 +147,87 @@ jobs:
       - name: Test Azure supervisor contracts
         shell: powershell
         run: .\tests\test_azure_vm_supervisor.ps1
+
+  powershell-7-release-manifest-linux:
+    name: ORDER release-manifest string preservation on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Require the intended Linux PowerShell host
+        shell: pwsh
+        run: |
+          $hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+          if (-not $IsLinux -or -not $hasDateKind) {
+            throw "This job requires Linux and ConvertFrom-Json -DateKind (PowerShell 7.5+)."
+          }
+      - name: Test ORDER release-manifest string preservation
+        shell: pwsh
+        run: ./tests/test_order_release_manifest_string_preservation.ps1
+
+  powershell-7-workspace-linux:
+    name: ORDER workspace contracts on Linux PowerShell 7
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test complete ORDER workspace contract on Linux
+        shell: pwsh
+        env:
+          ORDER_TEST_CHILD_SHELL: pwsh
+        run: |
+          $hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+          if (-not $IsLinux -or -not $hasDateKind) {
+            throw 'This job requires Linux and ConvertFrom-Json -DateKind (PowerShell 7.5+).'
+          }
+
+          $priorErrorActionPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $rawOutput = @(
+              & pwsh -NoLogo -NoProfile -NonInteractive `
+                -File ./tests/test_order_workspace.ps1 2>&1
+            )
+            $suiteExit = $LASTEXITCODE
+          }
+          finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+          }
+
+          [string[]]$output = @($rawOutput | ForEach-Object { [string]$_ })
+          $output | ForEach-Object { Write-Output $_ }
+
+          $childShellLines = @($output | Where-Object { $_ -clike 'CHILD_SHELL *' })
+          $passLines = @($output | Where-Object { $_ -clike 'PASS *' })
+          $failLines = @($output | Where-Object { $_ -clike 'FAIL *' })
+          $resultLines = @($output | Where-Object { $_ -clike 'RESULT *' })
+          $nonblankLines = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          $terminalLine = if ($nonblankLines.Count -gt 0) { $nonblankLines[-1] } else { '' }
+
+          $problems = New-Object System.Collections.Generic.List[string]
+          if ($suiteExit -ne 0) {
+            $problems.Add('suite_exit=' + $suiteExit)
+          }
+          if ($childShellLines.Count -ne 1 -or
+              $childShellLines[0] -cnotmatch '^CHILD_SHELL .*/pwsh$') {
+            $problems.Add('child_shell=' + ($childShellLines -join ','))
+          }
+          if ($passLines.Count -ne 324) {
+            $problems.Add('pass_count=' + $passLines.Count)
+          }
+          if ($failLines.Count -ne 0) {
+            $problems.Add('fail_count=' + $failLines.Count)
+          }
+          if ($resultLines.Count -ne 1) {
+            $problems.Add('result_count=' + $resultLines.Count)
+          }
+          if ($terminalLine -cne 'RESULT passed=324 failed=0') {
+            $problems.Add('terminal_result=' + $terminalLine)
+          }
+          if ($problems.Count -gt 0) {
+            throw ('linux_workspace_contract_failed: ' + ($problems -join '; '))
+          }

@@ -1,102 +1,332 @@
 #Requires -Version 5.1
 <#
-SFDC24 — watch the board for Mr. Salam's WhatsApp messages and surface them
-claude-code-cli, 2026-09-06
+SFDC24 - watch the board for Mr. Salam's messages and surface them
+claude-code-cli, 2026-09-06; amendment A 2026-09-08 (CODEX-PR34-868-REPAIR-GO-A)
 
 WHY
-  He asked claude-code-cli to answer him on WhatsApp and lead the thread. The
-  reason that was not happening is not that the messages are unreachable — the
-  Pipedream gateway already writes one board row per inbound message, tagged
-  `whatsapp`. The reason is that nothing WAKES an instance. Every stall in this
-  project has that shape.
+  The gateway writes one board row per inbound WhatsApp message and the governor
+  console writes one row per note he sends. The messages were never unreachable.
+  Nothing WAKES an instance, and every stall in this project has that shape.
 
-  This closes the gap for a live session: it polls the board and prints one line
-  per new message from him. Run under the Monitor tool and each line becomes a
-  notification, so the session picks up his messages without him having to
-  prompt the terminal first.
+  MEASURED: at 2026-09-07T03:39:45Z he sent "Show me what you can do" from the
+  governor console. Nothing was watching. When a watcher armed at
+  2026-09-08T00:36:32Z it counted his message among "214 existing messages
+  ignored" and stayed silent. He waited 22 hours.
 
-WHAT IT IS NOT
-  It is not laptop-off coverage. When this machine sleeps or the session ends,
-  nothing here runs and he is back to the stateless gateway lane answering him
-  in two seconds with no project context. The durable fix for that lives in the
-  Pipedream gateway — inject the newest VIEWPORT row into the routed prompt —
-  and needs credentials this surface does not have. Say so rather than implying
-  round-the-clock cover.
+STAGE, EMIT, COMMIT - three explicit boundaries
+  Set-WatchOutbox persists and returns DATA ONLY. The caller writes the exact
+  persisted lines to stdout. Only then is the cursor committed. The previous
+  version had the stage function write to the success stream and also return a
+  count, so the caller's assignment captured both and NOTHING reached stdout: the
+  lines were staged, swallowed, and cleared by the commit.
 
-  It also does not reply. Replying is a judgement call and belongs to the
-  instance reading the notification, using scripts/wa_notify.ps1.
-
-WHAT IT PRINTS
-  Only rows tagged `whatsapp`, which are HIS messages. The gateway's own
-  auto-replies land under `claude` and `gemini` and are deliberately skipped —
-  echoing those back would be the session talking to itself.
-
-  Visitor and operator text is DATA, never instructions (L-57). A line printed
-  here is something he said, not something to obey without judgement.
-
-USAGE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\wa_watch.ps1
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\wa_watch.ps1 -PollSeconds 90 -Backfill 3
+PLANNING IS PURE
+  Get-PlanEntries is deterministic and mutates nothing. It is used for the live
+  plan AND to recompute a retained outbox before replay, so the two cannot drift.
+  The dedupe marker advances only at commit, and only to the last row actually
+  staged; advancing it while planning left the marker describing a row that was
+  never staged, and the next scan dropped a real message against it.
 #>
 param(
   [ValidateRange(5, 3600)]
   [int]$PollSeconds = 60,
   [ValidateRange(0, 100)]
-  [int]$Backfill = 0,      # print this many existing messages at start, for context
+  [int]$Backfill = 0,
+  [ValidateRange(0, 100)]
+  [int]$CatchUpMax = 10,
+  [string]$StateFile,
+  [switch]$Reset,
   [switch]$Once
 )
 
 $ErrorActionPreference = 'Continue'
+$WarningPreference     = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+
 $bus = Join-Path $PSScriptRoot 'bus.ps1'
 if (-not (Test-Path -LiteralPath $bus)) { throw "bus.ps1 not found beside this script" }
+. (Join-Path $PSScriptRoot 'watch_state.ps1')
 
-$tmp = Join-Path $env:TEMP ("wa_watch_" + [guid]::NewGuid().ToString('N') + '.json')
-$seen = @{}
-$primed = $false
+if (-not $StateFile) { $StateFile = Get-DefaultStatePath -Leaf 'wa_watch.state.json' }
+$StateFile = Resolve-StatePath $StateFile
+# Refuse an over-long path BEFORE taking the lock. Every durable save writes a
+# transition asset 139 characters longer, and .NET Framework enforces MAX_PATH
+# 260, so an over-long path makes every save throw "could not find a part of the
+# path" - which reads as a missing directory and hides the real cause.
+Assert-WatchStatePathFits -Path $StateFile
+
+$lock = Enter-WatchLock -Path $StateFile
+if (-not $lock.ok) { throw ("WA watch CANNOT START - " + $lock.reason) }
+
+$ResetRequested = [bool]$Reset
+$ResetDone = $false
+
+# Startup uses the SAME state machine as every save. It may self-heal, but only
+# by proving which side of the replace the disk is on and then proving the asset
+# is gone; anything it cannot prove stops the watcher with every file preserved.
+# It used to refuse on the mere PRESENCE of a rollback file, which turned a
+# blocked cleanup after a perfectly good save into an unexplained outage.
+$tx = Resolve-PendingTransition -Path $StateFile
+if (-not $tx.canProceed) {
+  Exit-WatchLock $lock
+  throw ("WA watch CANNOT START - " + $tx.reason)
+}
+if ($tx.status -ne 'clean') {
+  Write-Output ("WA watch RECOVERED an interrupted state transition [" + $tx.status + "] - " + $tx.reason + ".")
+}
+
+$loaded = Read-WatchState -Path $StateFile
+if ($loaded.disposition -eq 'unusable' -and -not $ResetRequested) {
+  Exit-WatchLock $lock
+  throw ("WA watch CANNOT START - " + $loaded.reason +
+         ". A cursor existed and cannot be read, so priming would skip whatever arrived since it was written. Nothing has been reported and nothing has been overwritten. Re-prime deliberately with -Reset.")
+}
+$state = $loaded.state
+$warm = ($loaded.disposition -eq 'ok')
+
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("wa_watch_" + [guid]::NewGuid().ToString('N') + '.json')
 
 function Read-Board {
-  # A failed poll must never kill the watcher: the board is a network call and a
-  # transient failure is normal. Return $null and try again next tick.
   try {
-    & $bus -Action read -Title "Blackboard - Alpha DB" -OutFile $tmp 2>$null | Out-Null
+    & $bus -Action read -Title "Blackboard - Alpha DB" -OutFile $tmp 2>$null 3>$null 4>$null 5>$null 6>$null | Out-Null
     return (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8 | ConvertFrom-Json)
   } catch { return $null }
+}
+
+function Test-RowQualifies {
+  # The source tag separates his words from ours -- NOT the tag= field inside the
+  # payload, which is free text any writer can set to GOVERNOR and which three
+  # vm-chrome rows on this board already do.
+  param($Row)
+  $tag = [string]$Row[2]
+  $pay = [string]$Row[5]
+  if ($tag -eq 'whatsapp') { return $true }
+  return (($pay -like 'GOV|kind=feed*') -and ($tag -eq 'governor-page'))
+}
+
+function Format-Line {
+  param($Row, [string]$Prefix)
+  $t = ([string]$Row[5]) -replace '\s+', ' '
+  if (([string]$Row[5]) -like 'GOV|kind=feed*') {
+    $t = $t -replace '^GOV\|kind=feed\|', ''
+    $t = $t -replace '^(project=[^|]*\|)?tag=[^|]*\|text=', ''
+    $t = $t -replace '\|project=[^|]*$', ''
+    return (Limit-WatchLine -Line ($Prefix + "GOVERNOR PAGE - MR SALAM [" + $Row[1] + "] " + $t.Trim()))
+  }
+  # Bounded HERE rather than at the call site, so a future caller cannot
+  # reintroduce an unbounded line the outbox will silently refuse to stage.
+  return (Limit-WatchLine -Line ($Prefix + "WA FROM MR SALAM [" + $Row[1] + "] " + $t.Trim()))
+}
+
+function Get-ModePrefix { param([string]$Mode)
+  if ($Mode -eq 'cold') { return '(recent) ' }
+  if ($Mode -eq 'warm') { return '(missed while offline) ' }
+  return ''
+}
+
+function Get-PlanEntries {
+  <#
+    PURE and DETERMINISTIC. Same board and same evidence, same ordered plan.
+    Used for the live plan and to recompute a retained outbox before replay, so
+    the two can never drift apart.
+  #>
+  param($Rows, [int]$From, [int]$To, [string]$Mode, [int]$Limit, [string]$EmitKey, [string]$EmitTs)
+  $elig = @()
+  for ($i = $From; $i -le $To; $i++) {
+    if ($i -ge 1 -and $i -lt @($Rows).Count -and (Test-RowQualifies -Row $Rows[$i])) { $elig += ,@{ i = $i; row = $Rows[$i] } }
+  }
+  if ($Mode -eq 'cold' -or $Mode -eq 'warm') {
+    if ($Limit -le 0) { $elig = @() }
+    elseif ($elig.Count -gt $Limit) { $elig = $elig[($elig.Count - $Limit)..($elig.Count - 1)] }
+  }
+  $prefix = Get-ModePrefix -Mode $Mode
+  $k = $EmitKey; $t = $EmitTs
+  $plan = @()
+  foreach ($e in $elig) {
+    $r = $e.row
+    $key = Get-WatchEmitKey -Row $r
+    if (Test-KeyIsDuplicate -PrevKey $k -PrevTs $t -Key $key -RowTs ([string]$r[1])) { continue }
+    $k = $key; $t = [string]$r[1]
+    $plan += ,@{ line = (Format-Line -Row $r -Prefix $prefix); rowIndex = [int]$e.i; rowId = [string]$r[0]; key = $key; ts = [string]$r[1] }
+  }
+  return $plan
+}
+
+$recompute = {
+  param($from, $to, $mode, $limit, $emitKey, $emitTs)
+  $p = Get-PlanEntries -Rows $script:currentRows -From $from -To $to -Mode $mode -Limit $limit -EmitKey $emitKey -EmitTs $emitTs
+  return @(@($p) | ForEach-Object { $_.rowId })
 }
 
 try {
   while ($true) {
     $board = Read-Board
-    if ($board -and $board.rows) {
-      $rows = $board.rows
-      $fresh = @()
-      for ($i = 1; $i -lt $rows.Count; $i++) {
-        $r = $rows[$i]
-        if ([string]$r[2] -ne 'whatsapp') { continue }
-        $id = [string]$r[0]
-        if ($seen.ContainsKey($id)) { continue }
-        $seen[$id] = $true
-        $fresh += ,$r
-      }
+    if (-not $board -or -not $board.rows) {
+      # FAIL LOUD. -Once once exited 0 with no output and no state, so a failed
+      # poll was indistinguishable from a clean one.
+      if ($Once) { throw "WA watch COULD NOT READ THE BOARD - no rows returned. Nothing was reported and the cursor did not move." }
+      Start-Sleep -Seconds $PollSeconds
+      continue
+    }
 
-      if (-not $primed) {
-        # First pass establishes the watermark. Without this every existing message
-        # fires at once and the session is buried in history it has already read.
-        $primed = $true
-        if ($Backfill -gt 0 -and $fresh.Count -gt 0) {
-          $tail = $fresh[[Math]::Max(0, $fresh.Count - $Backfill)..($fresh.Count - 1)]
-          foreach ($r in $tail) {
-            $t = ([string]$r[5]) -replace '\s+', ' '
-            Write-Output ("WA (recent) [" + $r[1] + "] " + $t.Trim())
-          }
-        }
-        Write-Output ("WA watch armed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
-                      " - " + $fresh.Count + " existing messages ignored, polling every " + $PollSeconds + "s")
-      } else {
-        foreach ($r in $fresh) {
-          $t = ([string]$r[5]) -replace '\s+', ' '
-          Write-Output ("WA FROM MR SALAM [" + $r[1] + "] " + $t.Trim())
+    $rows = $board.rows
+    $script:currentRows = $rows
+    $boardId = [string]$board.fileId
+    $lastData = @($rows).Count - 1
+
+    if (-not $boardId) {
+      throw "WA watch CANNOT PROCEED - the board read carried no identity, so there is no way to know this is the same board the cursor belongs to. Nothing was reported."
+    }
+
+    if ($ResetRequested -and -not $ResetDone) {
+      # Reset uses THE SAME verified transition as every other write. It used
+      # to hand-roll its own WriteAllBytes restore, which was a second and weaker
+      # writer, and its recovery branch used thrown exceptions as control flow so
+      # a .NET IO failure took the rethrow path and the UNKNOWN receipt was
+      # unreachable. Save-StateBytes preserves and restores the prior itself.
+      $fresh = New-WatchState
+      $fresh.boardId = $boardId
+      $fresh.resetAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+      $fresh = Set-CommittedCursor -State $fresh -Rows $rows -Index $lastData
+      $rs = Save-WatchState -State $fresh -Path $StateFile
+      $rsStop = Get-SaveStopReason $rs
+      if ($rsStop) {
+        if ($rs.committed) { throw ("WA watch RESET COMMITTED BUT CANNOT CONTINUE - " + $rsStop) }
+        throw ("WA watch RESET FAILED - " + $rsStop + ".")
+      }
+      $state = $fresh
+      $ResetDone = $true
+      $warm = $false
+      Write-Output ("WA watch RESET at " + $fresh.resetAt + " - cursor re-primed at row " + $lastData +
+                    " for board " + $boardId + ". Anything that arrived before this point will NOT be replayed.")
+      if ($Once) { break }
+      Start-Sleep -Seconds $PollSeconds
+      continue
+    }
+
+    # ---- validate a retained outbox against a RECOMPUTED plan, before output --
+    $pv = Test-PendingMatchesPlan -State $state -Rows $rows -BoardId $boardId -Recompute $recompute
+    if (-not $pv.ok) {
+      throw ("WA watch RETAINED OUTBOX IS STALE - " + $pv.reason +
+             ". Nothing was replayed and nothing was overwritten, so those lines are still on disk. Decide what to do about them, then -Reset.")
+    }
+    $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
+    if (-not $cont.ok) {
+      throw ("WA watch CANNOT RESUME - " + $cont.reason +
+             ". Nothing was reported and the cursor was not moved, so nothing has been skipped yet. Re-prime deliberately with -Reset.")
+    }
+
+    if (Test-HasOutbox -State $state) {
+      Write-Output ("WA watch POSSIBLE REPLAY - the previous run persisted " + @($state.pendingLines).Count +
+                    " line(s) and may have exited before showing them. Repeating them now; anything you have already seen is a duplicate, not a new message.")
+      foreach ($line in @($state.pendingLines)) { Write-Output $line }
+      # The marker advances with the chunk it belongs to.
+      $lastIdx = @($state.pendingRowIds).Count - 1
+      $lastId = $(if ($lastIdx -ge 0) { [string]@($state.pendingRowIds)[$lastIdx] } else { '' })
+      $mk = $state.lastEmitKey; $mt = $state.lastEmitTs
+      for ($i = 1; $i -le $lastData; $i++) {
+        if (([string]$rows[$i][0]) -eq $lastId) {
+          $mk = Get-WatchEmitKey -Row $rows[$i]
+          $mt = [string]$rows[$i][1]
+          break
         }
       }
+      $state = Complete-WatchOutbox -State $state -EmitKey $mk -EmitTs $mt
+      $rc = Save-WatchState -State $state -Path $StateFile
+      $rcStop = Get-SaveStopReason $rc
+      if ($rcStop) {
+        if ($rc.committed) {
+          throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $rcStop +
+                 " The replayed lines above were reported and the cursor did advance, so nothing is lost.")
+        }
+        throw ("WA watch COULD NOT COMMIT AFTER REPLAY - " + $rcStop +
+               ". The outbox is retained, so the next start replays the same lines rather than skipping them.")
+      }
+      $cont = Test-BoardContinuity -State $state -Rows $rows -BoardId $boardId
+      if (-not $cont.ok) { throw ("WA watch CANNOT RESUME AFTER REPLAY - " + $cont.reason + ".") }
+    }
+
+    # ---- plan ---------------------------------------------------------------
+    $mode = 'steady'; $limit = 0; $from = $cont.startIndex
+    if ($cont.prime) {
+      if (-not $state) { $state = New-WatchState; $state.boardId = $boardId }
+      $mode = 'cold'; $limit = $Backfill; $from = 1
+    } elseif ($warm) {
+      $mode = 'warm'; $limit = $CatchUpMax
+    }
+    $plan = @(Get-PlanEntries -Rows $rows -From $from -To $lastData -Mode $mode -Limit $limit `
+                -EmitKey $state.lastEmitKey -EmitTs $state.lastEmitTs)
+
+    if ($warm) {
+      $warm = $false
+      $eligible = 0
+      for ($i = $from; $i -le $lastData; $i++) { if (Test-RowQualifies -Row $rows[$i]) { $eligible++ } }
+      if ($eligible -gt 0) {
+        if ($CatchUpMax -le 0) {
+          Write-Output ("WA watch resumed - " + $eligible + " message(s) arrived while nothing was listening; -CatchUpMax 0 so none are replayed")
+        } elseif ($eligible -gt $CatchUpMax) {
+          Write-Output ("WA watch resumed - " + $eligible + " messages arrived while nothing was listening, showing the newest " + $CatchUpMax)
+        } else {
+          Write-Output ("WA watch resumed - " + $eligible + " message(s) arrived while nothing was listening")
+        }
+      } else {
+        Write-Output ("WA watch resumed at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                      " - nothing missed, polling every " + $PollSeconds + "s")
+      }
+    }
+
+    # ---- STAGE (data only) --------------------------------------------------
+    $r = Set-WatchOutbox -State $state -Rows $rows -Plan $plan -FallbackIndex $lastData `
+           -Mode $mode -Limit $limit -From $from -PlanEmitKey $state.lastEmitKey -PlanEmitTs $state.lastEmitTs
+    $state = $r.state
+    $staged = @($r.staged)
+
+    if ($staged.Count -eq 0) {
+      $state = Set-CommittedCursor -State $state -Rows $rows -Index $lastData
+      $sv = Save-WatchState -State $state -Path $StateFile
+      $svStop = Get-SaveStopReason $sv
+      if ($svStop) {
+        if ($sv.committed) { throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $svStop + " Nothing was reported.") }
+        throw ("WA watch COULD NOT COMMIT - " + $svStop + ". Nothing was reported.")
+      }
+    } else {
+      $ps = Save-WatchState -State $state -Path $StateFile
+      $psStop = Get-SaveStopReason $ps
+      if ($psStop) {
+        if ($ps.committed) {
+          # The outbox IS durable. Stop BEFORE emitting: the commit that would
+          # follow is guaranteed to be refused, and replaying from a durable
+          # outbox costs a duplicate, which the contract already allows.
+          throw ("WA watch STAGED ITS OUTBOX THEN STOPPED - " + $psStop +
+                 " Nothing was reported yet, and the next start replays those lines rather than losing them.")
+        }
+        throw ("WA watch COULD NOT STAGE ITS OUTBOX - " + $psStop +
+               ". Nothing was reported and the cursor did not move, so the next start re-reads exactly this.")
+      }
+      # ---- EMIT, from the caller, after the durable save --------------------
+      foreach ($line in @($r.lines)) { Write-Output $line }
+      # ---- COMMIT, advancing the marker only to the last STAGED row ---------
+      $last = $staged[$staged.Count - 1]
+      $state = Complete-WatchOutbox -State $state -EmitKey ([string]$last.key) -EmitTs ([string]$last.ts)
+      $cs = Save-WatchState -State $state -Path $StateFile
+      $csStop = Get-SaveStopReason $cs
+      if ($csStop) {
+        if ($cs.committed) {
+          throw ("WA watch STOPPING AFTER A GOOD COMMIT - " + $csStop +
+                 " The lines above were reported and the cursor did advance, so nothing is lost and nothing is replayed.")
+        }
+        throw ("WA watch COULD NOT COMMIT - " + $csStop +
+               ". The outbox is retained, so the next start replays those lines rather than skipping them.")
+      }
+      if ($r.remaining -gt 0) {
+        Write-Output ("WA watch - " + $r.remaining + " more line(s) held for the next poll; the cursor advanced only through what was made durable.")
+      }
+    }
+
+    if ($cont.prime) {
+      Write-Output ("WA watch armed COLD at " + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') +
+                    " - cursor set at row " + $lastData + ", polling every " + $PollSeconds + "s")
     }
 
     if ($Once) { break }
@@ -104,4 +334,5 @@ try {
   }
 } finally {
   if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+  Exit-WatchLock $lock
 }

@@ -2,7 +2,7 @@
 # Build blackboard-bus_<version>_all.deb. Run inside Ubuntu (WSL or a VM).
 set -euo pipefail
 
-VERSION=1.0.1
+VERSION=1.1.0
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${HOME}/build"
 BUILD="${OUT}/blackboard-bus_${VERSION}"

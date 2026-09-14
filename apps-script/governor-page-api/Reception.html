@@ -264,11 +264,44 @@ button.rec .dot{animation:b .8s step-end infinite}
   function stopVoice(){ if (rec && listening) { try { rec.stop() } catch(e){} } setMic(false); $("interim").textContent = "" }
 
   mic.addEventListener("click", function(){
-    if (!MIC_OK) {                        // this page is not allowed a microphone — use the device's own
-      el("sys", "", "Voice isn't wired into this page yet. Your device can still do it: "
-        + "on a phone, tap the microphone on your keyboard; on Windows press Win+H; on a Mac press the dictation key. "
-        + "It types straight into the box below and you can watch it land.");
-      $("hint").textContent = "use your device's dictation — it types in the box";
+    if (!MIC_OK) {
+      // This page genuinely cannot hold a microphone: Apps Script serves it
+      // inside a sandboxFrame whose `allow` attribute omits microphone, so
+      // SpeechRecognition is unreachable and no permission prompt will ever
+      // appear. That part is unfixable here and always was.
+      // (L-89 is the board's rule ID for this finding, not a line number here.)
+      //
+      // What WAS wrong is what we did about it. This used to tell the visitor
+      // to use their keyboard's dictation -- advice written before
+      // sfdc24.com/voice/ existed. It exists now, it is a top-level page, and
+      // it holds a microphone perfectly well. So the answer to "I want to talk"
+      // is a door to the room where talking works, not a workaround.
+      //
+      // Reported by Mr. Salam on 2026-09-07 after hitting it himself: he asked
+      // to talk and was handed a keyboard shortcut. The dictation tip stays as
+      // the second option, because it is still the fastest route for someone
+      // who would rather not change page.
+      var m = el("sys", "", "This box can't hear you — but the voice page can. ");
+      try {
+        var a = document.createElement("a");
+        a.href = "https://www.sfdc24.com/voice/";
+        a.target = "_top";                       // we are in a frame; open the real page, not inside it
+        a.rel = "noopener";
+        a.textContent = "Open it and just talk →";
+        // It must LOOK like a link. Inheriting the colour with no underline
+        // rendered it as bold text inside a sentence, so the one control that
+        // solves the visitor's problem was invisible -- Copilot caught this on
+        // PR33. The underline is what makes it unmistakable on any background,
+        // which matters because this block renders on the sys style, not ours.
+        a.style.cssText = "color:inherit;font-weight:600;text-decoration:underline;text-underline-offset:2px";
+        m.appendChild(a);
+        m.appendChild(document.createTextNode(
+          " Or dictate straight into the box below: tap the microphone on your phone's keyboard, "
+          + "press Win+H on Windows, or the dictation key on a Mac."));
+      } catch (e) {
+        m.textContent = "This box can't hear you. Open https://www.sfdc24.com/voice/ and just talk.";
+      }
+      $("hint").textContent = "voice lives on its own page — or dictate into the box";
       box.focus(); bottom();
       return;
     }
@@ -329,14 +362,52 @@ button.rec .dot{animation:b .8s step-end infinite}
       if (p !== null && typeof SELF_URL === "string" && SELF_URL && VIEWS.hasOwnProperty(p)) {
         location.href = SELF_URL + VIEWS[p]; return;
       }
-      var w=null; try{ w = window.open(href,"_blank","noopener") }catch(x){}
-      if(!w && !document.getElementById("popblock")){
-        var n=document.createElement("div"); n.id="popblock"; n.className="empty";
-        n.style.marginTop="10px";
-        n.innerHTML='<span class="c">//</span> your browser blocked the new tab.<br>'+
-          '<span class="kv">open this address directly:</span><br>'+esc(href);
-        (a.closest(".wrap")||document.body).appendChild(n);
+      // window.open with "noopener" returns null BY SPECIFICATION -- on success
+      // as much as on failure -- so the handle proves nothing about navigation.
+      // The old code read null as "blocked" and then called esc(), which is not
+      // defined in this scope, so a link that had WORKED threw ReferenceError.
+      // Found by vm-chatgpt in a live browser: the voice tab opened and the
+      // reception threw anyway. Two cases, and only one of them is knowable:
+      //   threw -> the open definitely failed, so say so;
+      //   null  -> unknowable, so offer the address without claiming anything.
+      // The return value is deliberately discarded to make that explicit.
+      var threw = false;
+      try { window.open(href, "_blank", "noopener"); } catch (x) { threw = true; }
+      // Create OR UPDATE, never create-once.
+      //
+      // The guard here used to be `if (!getElementById("popblock"))`, which built
+      // the block on the first click and then never touched it again. Click the
+      // voice link, then Sign out, and the page still offered the VOICE address
+      // under "open this address directly" - a confidently wrong address, which
+      // is worse than no address at all.
+      //
+      // The guard predates this PR, but it had never RENDERED before, because
+      // esc() threw first. Fixing that crash promoted a latent bug into a live
+      // wrong answer. Found by vm-claude-code-cli reviewing 77ec7e3, who said
+      // plainly that this defect is less severe than the crash it fixes; it is
+      // still a wrong address shown to a visitor.
+      var n = document.getElementById("popblock"), lead, addr;
+      if (n) {
+        lead = n.querySelector(".kv");
+        addr = n.querySelector(".popaddr");
+      } else {
+        n = document.createElement("div");
+        n.id = "popblock"; n.className = "empty"; n.style.marginTop = "10px";
+        lead = document.createElement("span");
+        lead.className = "kv";
+        addr = document.createElement("div");
+        addr.className = "popaddr";
+        n.appendChild(lead); n.appendChild(addr);
       }
+      lead.textContent = threw
+        ? "Your browser blocked the new tab. Open this address directly:"
+        : "If the new tab did not open, open this address directly:";
+      // textContent, never innerHTML: the address is data, and this block used
+      // to build markup out of it through a helper that did not exist here.
+      addr.textContent = href;
+      // Re-appending an existing node MOVES it, which is what we want: the block
+      // belongs beside the link the visitor just clicked, not beside the first one.
+      (a.closest(".wrap") || document.body).appendChild(n);
     }, true);
   })();
   // ---- boot ----
