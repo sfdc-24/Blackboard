@@ -1551,6 +1551,52 @@ try {
         )
     }
 
+    # A MALFORMED CELL MUST REFUSE ITS OWN ROW, NOT THE WHOLE READ.
+    #
+    # ConvertTo-UtcCursorTimestamp took a Mandatory [string], which rejects ''
+    # at BINDING time - so an unparseable-but-present stamp fell through to
+    # `return $null` and was recorded as reason='timestamp' exactly as designed,
+    # while an EMPTY stamp threw a raw .NET binding exception and took the
+    # entire board read down with it. The guard's own fallback was unreachable
+    # for the one input it most obviously exists to handle.
+    #
+    # Measured 2026-09-14 against the live Alpha DB: four rows carry an empty
+    # Timestamp with a human date string in the Row_ID column (the writer
+    # timestamp-coercion defect in VIEWPORT v020), and the read aborted at the
+    # first of them - discarding every later row, valid or not.
+    # Asserted through the EXPORTED contract, Get-BoardRowsFromJson, rather than
+    # by reaching into module scope for the internal converter. The exported
+    # surface is what the supervisor actually calls, so it is what must hold.
+    $stampHeader = '["Row_ID","Timestamp","Source_Tag","Target_Surface","Action_Type","Payload","Category","Project Tag","Gist","Sub-Gist"]'
+    $stampGood   = '["r1","2026-09-14T04:00:00Z","s","t","APPEND","p","c","pr","g","sg"]'
+    $stampLater  = '["r2","2026-09-14T05:00:00Z","s","t","APPEND","p","c","pr","g","sg"]'
+    foreach ($stampCase in @(
+        [pscustomobject]@{ name = 'empty';       cell = '' },
+        [pscustomobject]@{ name = 'whitespace';  cell = '   ' },
+        [pscustomobject]@{ name = 'human date';  cell = 'Saturday, September 12, 2026 at 12:21 AM' },
+        [pscustomobject]@{ name = 'wrong shape'; cell = '2026-09-14 04:00:00' }
+    )) {
+        $badRow = '["bad-' + $stampCase.name.Replace(' ', '-') + '","' + $stampCase.cell + '","","t","APPEND","p","c","pr","g","sg"]'
+        $stampJson = '{"ok":true,"rows":[' + $stampHeader + ',' + $stampGood + ',' + $badRow + ',' + $stampLater + ']}'
+        $stampThrew = $false
+        $stampRows = @()
+        try { $stampRows = @(Get-BoardRowsFromJson -Json $stampJson) } catch { $stampThrew = $true }
+
+        Assert-True ('an unusable timestamp (' + $stampCase.name + ') does not abort the read') (-not $stampThrew)
+        Assert-True ('an unusable timestamp (' + $stampCase.name + ') is refused by name') (
+            @($stampRows | Where-Object { -not $_.valid -and $_.reason -ceq 'timestamp' }).Count -eq 1
+        )
+        # The row AFTER the malformed one is the point. A throw discarded it.
+        Assert-True ('rows after an unusable timestamp (' + $stampCase.name + ') are still admitted') (
+            @($stampRows | Where-Object { $_.valid }).Count -eq 2 -and
+            @($stampRows | Where-Object { $_.valid -and $_.row_id -ceq 'r2' }).Count -eq 1
+        )
+    }
+    $stampCleanJson = '{"ok":true,"rows":[' + $stampHeader + ',' + $stampGood + ',' + $stampLater + ']}'
+    Assert-True 'a board of well-formed timestamps still admits every row' (
+        @(@(Get-BoardRowsFromJson -Json $stampCleanJson) | Where-Object { $_.valid }).Count -eq 2
+    )
+
     $runnerSource = [IO.File]::ReadAllText($RunnerPath, [Text.Encoding]::UTF8)
     Assert-True 'retry wrapper is used only for initial pre-admission read' (
         ([regex]::Matches($runnerSource, '\$rows\s*=\s*@\(Read-BoardPreAdmission\)')).Count -eq 1 -and
