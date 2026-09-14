@@ -85,8 +85,8 @@ try {
     <Description>$Description</Description>
   </RegistrationInfo>
   <Triggers>
-    <BootTrigger><Enabled>true</Enabled><Id>AtBoot</Id></BootTrigger>
-    <TimeTrigger><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2026-09-06T00:00:00</StartBoundary><Enabled>true</Enabled><Id>Every15Minutes</Id></TimeTrigger>
+    <BootTrigger id="AtBoot"><Enabled>true</Enabled></BootTrigger>
+    <TimeTrigger id="Every15Minutes"><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2026-09-06T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author"><UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal>
@@ -277,6 +277,89 @@ try {
         $systemXmlWithoutLogonTypeError = [string]$_.Exception.Message
     }
     Assert-True 'Exported SYSTEM task XML may omit optional LogonType' ([string]::IsNullOrEmpty($systemXmlWithoutLogonTypeError))
+
+    $canonicalTriggerDocument = New-Object Xml.XmlDocument
+    $canonicalTriggerDocument.LoadXml($systemXmlWithoutLogonType)
+    $canonicalTriggerNamespace = New-Object Xml.XmlNamespaceManager($canonicalTriggerDocument.NameTable)
+    $canonicalTriggerNamespace.AddNamespace('t', $script:OrderEscrowTaskNamespace)
+    $canonicalBoot = $canonicalTriggerDocument.SelectSingleNode('/t:Task/t:Triggers/t:BootTrigger', $canonicalTriggerNamespace)
+    $canonicalInterval = $canonicalTriggerDocument.SelectSingleNode('/t:Task/t:Triggers/t:TimeTrigger', $canonicalTriggerNamespace)
+    Assert-True 'Task XML fixture models the native unqualified lowercase trigger id attributes' (
+        [string]$canonicalBoot.GetAttribute('id') -ceq 'AtBoot' -and
+        [string]$canonicalInterval.GetAttribute('id') -ceq 'Every15Minutes' -and
+        @($canonicalBoot.SelectNodes('*[local-name()="Id"]')).Count -eq 0 -and
+        @($canonicalInterval.SelectNodes('*[local-name()="Id"]')).Count -eq 0
+    )
+
+    $nativeSparseTriggersXml = $systemXmlWithoutLogonType.Replace(
+        '<BootTrigger id="AtBoot"><Enabled>true</Enabled></BootTrigger>',
+        '<BootTrigger id="AtBoot" />'
+    ).Replace(
+        '<TimeTrigger id="Every15Minutes"><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2026-09-06T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>',
+        '<TimeTrigger id="Every15Minutes"><StartBoundary>2026-09-06T00:00:00</StartBoundary><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>'
+    )
+    $nativeSparseTriggerError = ''
+    try {
+        Assert-OrderTaskXml -XmlText $nativeSparseTriggersXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } catch {
+        $nativeSparseTriggerError = [string]$_.Exception.Message
+    }
+    Assert-True 'Native sparse exported triggers validate with exact id attributes' ([string]::IsNullOrEmpty($nativeSparseTriggerError))
+
+    $legacyTriggerElementXml = $systemXmlWithoutLogonType.Replace(
+        '<BootTrigger id="AtBoot"><Enabled>true</Enabled></BootTrigger>',
+        '<BootTrigger><Enabled>true</Enabled><Id>AtBoot</Id></BootTrigger>'
+    )
+    Assert-ThrowsCode 'A child Id element cannot impersonate the native trigger id attribute' {
+        Assert-OrderTaskXml -XmlText $legacyTriggerElementXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $missingBootTriggerIdXml = $systemXmlWithoutLogonType.Replace(' id="AtBoot"', '')
+    Assert-ThrowsCode 'A missing boot trigger id attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $missingBootTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $mixedCaseBootTriggerIdXml = $systemXmlWithoutLogonType.Replace('id="AtBoot"', 'Id="AtBoot"')
+    Assert-ThrowsCode 'A mixed-case boot trigger Id attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $mixedCaseBootTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $extraBootTriggerAttributeXml = $systemXmlWithoutLogonType.Replace('id="AtBoot"', 'id="AtBoot" extra="unexpected"')
+    Assert-ThrowsCode 'An extra unqualified boot trigger attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $extraBootTriggerAttributeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $wrongIntervalTriggerIdXml = $systemXmlWithoutLogonType.Replace('id="Every15Minutes"', 'id="Every30Minutes"')
+    Assert-ThrowsCode 'An incorrect interval trigger id attribute fails closed' {
+        Assert-OrderTaskXml -XmlText $wrongIntervalTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_interval_trigger_id_invalid'
+
+    $foreignTriggerIdXml = $systemXmlWithoutLogonType.Replace(
+        '<BootTrigger id="AtBoot">',
+        '<BootTrigger xmlns:x="urn:not-task" id="AtBoot" x:id="AtBoot">'
+    )
+    Assert-ThrowsCode 'A foreign-namespace trigger id lookalike fails closed' {
+        Assert-OrderTaskXml -XmlText $foreignTriggerIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $ancestorForeignTriggerChildXml = $systemXmlWithoutLogonType.Replace(
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task" xmlns:x="urn:not-task">'
+    ).Replace(
+        '<BootTrigger id="AtBoot"><Enabled>true</Enabled></BootTrigger>',
+        '<BootTrigger id="AtBoot"><Enabled>true</Enabled><x:id>AtBoot</x:id></BootTrigger>'
+    )
+    Assert-ThrowsCode 'An ancestor-declared foreign lowercase id child cannot shadow the trigger attribute' {
+        Assert-OrderTaskXml -XmlText $ancestorForeignTriggerChildXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_boot_trigger_id_invalid'
+
+    $foreignTriggerNodeXml = $systemXmlWithoutLogonType.Replace(
+        '</Triggers>',
+        '<BootTrigger xmlns="urn:not-task" id="AtBoot" /></Triggers>'
+    )
+    Assert-ThrowsCode 'A foreign-namespace trigger node cannot hide outside the exact inventory' {
+        Assert-OrderTaskXml -XmlText $foreignTriggerNodeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_trigger_count_invalid'
 
     $systemAliasXmlWithoutLogonType = $systemXmlWithoutLogonType.Replace('<UserId>S-1-5-18</UserId>', '<UserId>SYSTEM</UserId>')
     Assert-ThrowsCode 'Omitted XML LogonType is bound to canonical S-1-5-18' {
