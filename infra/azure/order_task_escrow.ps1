@@ -750,8 +750,27 @@ function Assert-OrderTaskXml {
 
     $principals = @(Get-OrderXmlNodes -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Principals/t:Principal' -Count 1 -ErrorCode 'task_xml_principal_count_invalid')
     $principalId = Get-OrderXmlText -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Principals/t:Principal/t:UserId' -ErrorCode 'task_xml_principal_missing'
-    if (@('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains $principalId) { throw 'task_xml_principal_invalid' }
-    if ((Get-OrderXmlText -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Principals/t:Principal/t:LogonType' -ErrorCode 'task_xml_logon_type_missing') -cne 'ServiceAccount') {
+    $principalIdElements = @($principals[0].ChildNodes | Where-Object {
+        $_.NodeType -eq [Xml.XmlNodeType]::Element -and $_.LocalName -ceq 'UserId'
+    })
+    if ($principalIdElements.Count -ne 1 -or
+        [string]$principalIdElements[0].NamespaceURI -cne $script:OrderEscrowTaskNamespace -or
+        @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -cnotcontains $principalId) {
+        throw 'task_xml_principal_invalid'
+    }
+    # Export-ScheduledTask can omit the optional LogonType element for the
+    # canonical S-1-5-18 identity even though the live CIM principal reports
+    # the required ServiceAccount value.  The live-task check above remains
+    # strict. Treat foreign-namespace lookalikes as invalid, and permit true
+    # omission only for the observed canonical SID representation.
+    $logonTypeElements = @($principals[0].ChildNodes | Where-Object {
+        $_.NodeType -eq [Xml.XmlNodeType]::Element -and $_.LocalName -ceq 'LogonType'
+    })
+    if ($logonTypeElements.Count -eq 0) {
+        if ($principalId -cne 'S-1-5-18') { throw 'task_xml_logon_type_missing' }
+    } elseif ($logonTypeElements.Count -ne 1 -or
+        [string]$logonTypeElements[0].NamespaceURI -cne $script:OrderEscrowTaskNamespace -or
+        [string]$logonTypeElements[0].InnerText -cne 'ServiceAccount') {
         throw 'task_xml_logon_type_invalid'
     }
     if ((Get-OrderXmlText -Document $document -NamespaceManager $namespace -XPath '/t:Task/t:Principals/t:Principal/t:RunLevel' -ErrorCode 'task_xml_run_level_missing') -cne 'HighestAvailable') {

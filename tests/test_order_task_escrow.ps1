@@ -252,6 +252,74 @@ try {
         Assert-OrderLiveTaskSafe -Task $trailingLineFeedTask -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
     } 'task_action_arguments_invalid'
 
+    $missingLiveLogonTypeTask = New-TestTask -ReleaseId $oldRelease
+    $missingLiveLogonTypeTask.Principal.LogonType = $null
+    Assert-ThrowsCode 'Live task validation still requires ServiceAccount logon type' {
+        Assert-OrderLiveTaskSafe -Task $missingLiveLogonTypeTask -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_principal_invalid'
+
+    $systemXmlWithoutLogonType = (New-TestTaskXml -ReleaseId $oldRelease).Replace(
+        '<LogonType>ServiceAccount</LogonType>',
+        ''
+    )
+    $omittedLogonDocument = New-Object Xml.XmlDocument
+    $omittedLogonDocument.LoadXml($systemXmlWithoutLogonType)
+    $omittedLogonNamespace = New-Object Xml.XmlNamespaceManager($omittedLogonDocument.NameTable)
+    $omittedLogonNamespace.AddNamespace('t', $script:OrderEscrowTaskNamespace)
+    Assert-True 'Omitted-LogonType fixture has canonical SID and no LogonType element in any namespace' (
+        @($omittedLogonDocument.SelectNodes('/t:Task/t:Principals/t:Principal/*[local-name()="LogonType"]', $omittedLogonNamespace)).Count -eq 0 -and
+        [string]$omittedLogonDocument.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $omittedLogonNamespace).InnerText -ceq 'S-1-5-18'
+    )
+    $systemXmlWithoutLogonTypeError = ''
+    try {
+        Assert-OrderTaskXml -XmlText $systemXmlWithoutLogonType -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } catch {
+        $systemXmlWithoutLogonTypeError = [string]$_.Exception.Message
+    }
+    Assert-True 'Exported SYSTEM task XML may omit optional LogonType' ([string]::IsNullOrEmpty($systemXmlWithoutLogonTypeError))
+
+    $systemAliasXmlWithoutLogonType = $systemXmlWithoutLogonType.Replace('<UserId>S-1-5-18</UserId>', '<UserId>SYSTEM</UserId>')
+    Assert-ThrowsCode 'Omitted XML LogonType is bound to canonical S-1-5-18' {
+        Assert-OrderTaskXml -XmlText $systemAliasXmlWithoutLogonType -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_logon_type_missing'
+
+    $nonSystemXmlWithoutLogonType = $systemXmlWithoutLogonType.Replace('<UserId>S-1-5-18</UserId>', '<UserId>LOCAL SERVICE</UserId>')
+    Assert-ThrowsCode 'Missing XML LogonType is never accepted for a non-SYSTEM principal' {
+        Assert-OrderTaskXml -XmlText $nonSystemXmlWithoutLogonType -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_principal_invalid'
+
+    $wrongLogonTypeXml = (New-TestTaskXml -ReleaseId $oldRelease).Replace(
+        '<LogonType>ServiceAccount</LogonType>',
+        '<LogonType>Password</LogonType>'
+    )
+    Assert-ThrowsCode 'An explicit non-ServiceAccount XML LogonType remains invalid' {
+        Assert-OrderTaskXml -XmlText $wrongLogonTypeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_logon_type_invalid'
+
+    $duplicateLogonTypeXml = (New-TestTaskXml -ReleaseId $oldRelease).Replace(
+        '<LogonType>ServiceAccount</LogonType>',
+        '<LogonType>ServiceAccount</LogonType><LogonType>ServiceAccount</LogonType>'
+    )
+    Assert-ThrowsCode 'Duplicate XML LogonType elements remain invalid' {
+        Assert-OrderTaskXml -XmlText $duplicateLogonTypeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_logon_type_invalid'
+
+    $foreignNamespaceLogonTypeXml = (New-TestTaskXml -ReleaseId $oldRelease).Replace(
+        '<LogonType>ServiceAccount</LogonType>',
+        '<LogonType xmlns="">Password</LogonType>'
+    )
+    Assert-ThrowsCode 'A foreign-namespace LogonType lookalike is invalid rather than omitted' {
+        Assert-OrderTaskXml -XmlText $foreignNamespaceLogonTypeXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_logon_type_invalid'
+
+    $duplicatePrincipalIdXml = (New-TestTaskXml -ReleaseId $oldRelease).Replace(
+        '<UserId>S-1-5-18</UserId>',
+        '<UserId>S-1-5-18</UserId><UserId>S-1-5-18</UserId>'
+    )
+    Assert-ThrowsCode 'Duplicate XML UserId elements remain invalid' {
+        Assert-OrderTaskXml -XmlText $duplicatePrincipalIdXml -Context (Get-OrderEscrowContext) -ReleaseId $oldRelease
+    } 'task_xml_principal_missing'
+
     $badTrustedJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($trustedHashesBase64)) | ConvertFrom-Json
     $badTrustedJson.PSObject.Properties[$script:OrderEscrowReleaseFiles[0]].Value = ('0' * 64)
     $badTrustedBase64 = [Convert]::ToBase64String(
@@ -264,6 +332,18 @@ try {
         -not (Test-Path -LiteralPath (Join-Path (Join-Path $tempRoot 'SFDC24\OrderSupervisor\acceptance') 'bad-trusted-map'))
     )
 
+    Reset-TestScheduler
+    $script:MockTasks[0].Principal.LogonType = $null
+    $script:MockExportXml = $systemXmlWithoutLogonType
+    Assert-ThrowsCode 'Create rejects an unsafe live principal before writing an escrow bundle' {
+        New-OrderTaskEscrow -Id 'bad-live-principal' -ReleaseId $oldRelease -TrustedHashesBase64 $trustedHashesBase64
+    } 'task_principal_invalid'
+    Assert-True 'Unsafe live principal refusal creates no escrow bundle' (
+        -not (Test-Path -LiteralPath (Join-Path (Join-Path $tempRoot 'SFDC24\OrderSupervisor\acceptance') 'bad-live-principal'))
+    )
+
+    Reset-TestScheduler
+    $script:MockExportXml = $systemXmlWithoutLogonType
     $created = New-OrderTaskEscrow -Id $testEscrowId -ReleaseId $oldRelease -TrustedHashesBase64 $trustedHashesBase64
     $bundlePath = Join-Path (Join-Path $tempRoot 'SFDC24\OrderSupervisor\acceptance') $testEscrowId
     $manifestPath = Join-Path $bundlePath 'manifest.json'
@@ -522,11 +602,11 @@ try {
     )
     Assert-True 'Restore accepts a different managed candidate without knowing its release id' (
         [string]$restored.expected_release_id -ceq $oldRelease -and
-        $script:MockRegisteredXml -ceq (New-TestTaskXml -ReleaseId $oldRelease)
+        $script:MockRegisteredXml -ceq $systemXmlWithoutLogonType
     )
 
     Reset-TestScheduler -CurrentRelease $candidateRelease -CurrentState 'Running'
-    $script:MockReadbackOverride = (New-TestTaskXml -ReleaseId $oldRelease) + "`r`n"
+    $script:MockReadbackOverride = $systemXmlWithoutLogonType + "`r`n"
     Assert-ThrowsCode 'Exact post-registration XML readback mismatch is surfaced' {
         Restore-OrderTaskEscrow -Id $testEscrowId -ReleaseId $oldRelease
     } 'restore_task_xml_readback_mismatch'
