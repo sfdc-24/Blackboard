@@ -77,8 +77,6 @@ $script:CutoverMetadataRelativePath = 'SFDC24\OrderSupervisor'
 $script:CutoverEscrowToolPrefix = 'order_task_escrow.'
 $script:CutoverEscrowToolSuffix = '.ps1'
 $script:CutoverInstallerRelativePath = 'scripts\install_order_supervisor.ps1'
-$script:CutoverLegacyPrettyStatusReleaseId = '27cb0df325b5ef39ba24b87937e029f7a573f4c2'
-$script:CutoverLegacyPrettyStatusInstallerSha256 = 'dea2f804af8bbe0a5c157f62f69dd9a7a44594efd6cfef8853b85ac144006c8a'
 $script:CutoverChildMaximumCharacters = 16384
 $script:CutoverStateMaximumBytes = 1048576
 $script:CutoverLogMaximumBytes = 67108864
@@ -419,16 +417,31 @@ function ConvertFrom-CutoverSingleJsonDocument {
     return $value
 }
 
+# WHY THE CARVEOUT IS KEYED ON THE ACTION AND NOT ON A PINNED RELEASE.
+#
+# Pinning it to one exact legacy release and digest is the narrower rule,
+# and it was the first shape of this repair.  What ruled it out is the
+# failure mode when a constant is wrong: measured, one byte off in either
+# value falls straight through to the one-line rule and reproduces the
+# identical INSTALLER_RECEIPT_INVALID being fixed here - discovered only
+# after another Managed Run Command round trip against the guest.  Neither
+# value is recorded anywhere in this repository, so neither can be checked
+# before that round trip is spent.
+#
+# Keying on the action costs almost nothing in narrowness.  Status is
+# read-only, and every MUTATING action keeps the one-physical-line
+# contract, which is safe because mutating actions are only ever issued
+# against $Context.installer_path - the candidate release - and that
+# installer now emits -Compress.  A pretty Status receipt is accepted on
+# its own merits instead of on a promise about which release wrote it:
+# exactly one JSON document, no duplicate object keys, a PSCustomObject
+# root, and a hard size bound.
 function ConvertFrom-CutoverInstallerReceipt {
     param(
         [AllowEmptyString()][string]$Text,
-        [Parameter(Mandatory = $true)][string]$RequestedAction,
-        [Parameter(Mandatory = $true)][string]$InstallerReleaseId,
-        [Parameter(Mandatory = $true)][string]$ExpectedInstallerSha256
+        [Parameter(Mandatory = $true)][string]$RequestedAction
     )
-    if ($RequestedAction -ceq 'Status' -and
-        $InstallerReleaseId -ceq $script:CutoverLegacyPrettyStatusReleaseId -and
-        $ExpectedInstallerSha256 -ceq $script:CutoverLegacyPrettyStatusInstallerSha256) {
+    if ($RequestedAction -ceq 'Status') {
         return ConvertFrom-CutoverSingleJsonDocument -Text $Text -Code 'INSTALLER_RECEIPT_INVALID'
     }
     return ConvertFrom-CutoverSingleJsonLine -Text $Text -Code 'INSTALLER_RECEIPT_INVALID'
@@ -574,11 +587,9 @@ function Invoke-CutoverInstaller {
     )
     if ($ScriptPath -ceq $Context.installer_path) {
         $expectedSha256 = $Context.expected_installer_sha256
-        $installerReleaseId = $Context.release_id
         $prefix = 'INSTALLER'
     } elseif ($ScriptPath -ceq $Context.restored_installer_path) {
         $expectedSha256 = $Context.expected_restored_installer_sha256
-        $installerReleaseId = $Context.escrow_release_id
         $prefix = 'RESTORED_INSTALLER'
     } else {
         Throw-Cutover -Code 'INSTALLER_PATH_IDENTITY_MISMATCH'
@@ -600,15 +611,11 @@ function Invoke-CutoverInstaller {
     if ($result.exit_code -ne 0 -or -not [string]::IsNullOrWhiteSpace($result.stderr)) {
         Throw-Cutover -Code 'INSTALLER_CHILD_FAILED'
     }
-    # The exact immutable 27cb installer emits its Status receipt as one
-    # pretty-printed JSON object.  Bind that compatibility exception to both
-    # its release and already rechecked file digest.  Every current receipt and
-    # every mutating action remains subject to the one-physical-line contract.
+    # Read-only Status may arrive pretty-printed; every mutating action
+    # still owes exactly one physical line.
     return ConvertFrom-CutoverInstallerReceipt `
         -Text $result.stdout `
-        -RequestedAction $RequestedAction `
-        -InstallerReleaseId $installerReleaseId `
-        -ExpectedInstallerSha256 $expectedSha256
+        -RequestedAction $RequestedAction
 }
 
 function ConvertTo-CutoverUtcDateTime {
