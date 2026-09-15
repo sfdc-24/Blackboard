@@ -615,27 +615,175 @@ try {
             ConvertFrom-CutoverSingleJsonDocument -Text ([string]$invalidInstallerJsonCase.Value) -Code 'CHILD_JSON_INVALID' | Out-Null
         } 'CHILD_JSON_INVALID'
     }
-    $legacyPrettyReceipt = ConvertFrom-CutoverInstallerReceipt `
-        -Text $prettyInstallerJson `
-        -RequestedAction Status `
-        -InstallerReleaseId $script:CutoverLegacyPrettyStatusReleaseId `
-        -ExpectedInstallerSha256 $script:CutoverLegacyPrettyStatusInstallerSha256
-    Assert-True 'installer receipt parser accepts pretty Status only for exact legacy identity' (
-        [bool]$legacyPrettyReceipt.ok -and [string]$legacyPrettyReceipt.status -ceq 'READY'
-    )
-    $legacyCompatibilityMismatchCases = [ordered]@{
-        mutating_action = @('Install', $script:CutoverLegacyPrettyStatusReleaseId, $script:CutoverLegacyPrettyStatusInstallerSha256)
-        wrong_release = @('Status', ('0' * 40), $script:CutoverLegacyPrettyStatusInstallerSha256)
-        wrong_digest = @('Status', $script:CutoverLegacyPrettyStatusReleaseId, ('0' * 64))
+    # Acceptance cases run through this helper rather than calling the parser
+    # directly.  Measured: a direct call turns a regression into an unhandled
+    # terminating error, which aborts the run before the RESULT line is ever
+    # written - so the suite reports NO failure count at all, and the reader
+    # sees a crash in the finally block instead of the assertion that broke.
+    function Invoke-TestCapture {
+        param([Parameter(Mandatory = $true)][scriptblock]$Body)
+        try { return [pscustomobject]@{ ok = $true; value = (& $Body); error = '' } }
+        catch { return [pscustomobject]@{ ok = $false; value = $null; error = [string]$_.Exception.Message } }
     }
-    foreach ($legacyCompatibilityMismatch in $legacyCompatibilityMismatchCases.GetEnumerator()) {
-        Assert-ThrowsCode ('installer receipt parser rejects pretty output for ' + $legacyCompatibilityMismatch.Key) {
+
+    $prettyStatusReceipt = Invoke-TestCapture {
+        ConvertFrom-CutoverInstallerReceipt -Text $prettyInstallerJson -RequestedAction Status
+    }
+    Assert-True 'installer receipt parser accepts a pretty Status receipt' (
+        $prettyStatusReceipt.ok -and
+        [bool]$prettyStatusReceipt.value.ok -and
+        [string]$prettyStatusReceipt.value.status -ceq 'READY') -Detail $prettyStatusReceipt.error
+
+    # Status is read-only and is the ONLY action allowed to arrive pretty.
+    # Every mutating action still owes exactly one physical line, which stays
+    # safe because mutating actions are only ever issued against
+    # $Context.installer_path - the candidate release - and that installer
+    # emits -Compress.
+    foreach ($mutatingInstallerAction in @('Install', 'InstallFromDisabledNoStop', 'Uninstall', 'Rollback')) {
+        Assert-ThrowsCode ('installer receipt parser rejects pretty output for ' + $mutatingInstallerAction) {
             ConvertFrom-CutoverInstallerReceipt `
                 -Text $prettyInstallerJson `
-                -RequestedAction ([string]$legacyCompatibilityMismatch.Value[0]) `
-                -InstallerReleaseId ([string]$legacyCompatibilityMismatch.Value[1]) `
-                -ExpectedInstallerSha256 ([string]$legacyCompatibilityMismatch.Value[2]) | Out-Null
+                -RequestedAction $mutatingInstallerAction | Out-Null
         } 'INSTALLER_RECEIPT_INVALID'
+    }
+
+    # A larger hand-built object than the three-line one above.  It is still a
+    # hand-built object and is NOT evidence about what the installer writes -
+    # the real receipt in both of its shapes is executed further down.  This
+    # only covers nesting and an empty array surviving the round trip.
+    $fullStatusContext = New-TestContext
+    $fullStatusJson = (New-TestInstallerStatusReceipt -Context $fullStatusContext) | ConvertTo-Json -Depth 10
+    Assert-True 'the larger fixture is pretty-printed rather than compressed' (
+        @($fullStatusJson -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 1)
+    $fullStatusReceipt = Invoke-TestCapture {
+        ConvertFrom-CutoverInstallerReceipt -Text $fullStatusJson -RequestedAction Status
+    }
+    Assert-True 'installer receipt parser accepts the full pretty Status shape' (
+        $fullStatusReceipt.ok -and
+        [string]$fullStatusReceipt.value.task_name -ceq 'SFDC24 Blackboard Order Worker' -and
+        [string]$fullStatusReceipt.value.status -ceq 'READY') -Detail $fullStatusReceipt.error
+
+    # Blank child output must come back as the bounded CODE.  Downstream the
+    # byte conversion feeds a Mandatory [byte[]], and PowerShell rejects an
+    # empty array at BINDING time; whitespace-only gets past that and dies on a
+    # null document element.  Measured, by removing the guard: the two leak
+    # "Cannot bind argument to parameter 'Bytes'" and "The property 'NodeType'
+    # cannot be found on this object" into a receipt instead of a failure code.
+    $blankChildOutputCases = [ordered]@{
+        empty = ''
+        spaces = '   '
+        blank_lines = ('   ' + "`r`n" + '  ')
+    }
+    foreach ($blankChildOutputCase in $blankChildOutputCases.GetEnumerator()) {
+        Assert-ThrowsCode ('single JSON document parser rejects blank output ' + $blankChildOutputCase.Key) {
+            ConvertFrom-CutoverSingleJsonDocument -Text ([string]$blankChildOutputCase.Value) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
+
+    # The escrow tool emits -Compress and keeps the stricter one-line contract.
+    # The installer repair must not have loosened it on the way past.
+    Assert-ThrowsCode 'escrow parser still refuses a multi-line document' {
+        ConvertFrom-CutoverSingleJsonLine -Text $fullStatusJson -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    # FRAMING: only the four characters JSON itself calls whitespace may wrap a
+    # receipt.  Argument-less String.Trim() strips everything char.IsWhiteSpace
+    # accepts, which is a far larger set.  Measured under 5.1 before the fix:
+    # U+000B, U+000C, U+0085, U+00A0, U+2028 and U+3000 were all stripped and
+    # the wrapped receipt parsed clean instead of failing closed.
+    $jsonWhitespaceWrappers = [ordered]@{ space = 0x20; tab = 0x09; cr = 0x0D; lf = 0x0A }
+    foreach ($jsonWhitespaceWrapper in $jsonWhitespaceWrappers.GetEnumerator()) {
+        $jsonWrapper = [string][char][int]$jsonWhitespaceWrapper.Value
+        $jsonWrapped = Invoke-TestCapture {
+            ConvertFrom-CutoverSingleJsonDocument -Text ($jsonWrapper + '{"ok":true}' + $jsonWrapper) -Code 'CHILD_JSON_INVALID'
+        }
+        Assert-True ('document parser accepts JSON whitespace framing ' + $jsonWhitespaceWrapper.Key) (
+            $jsonWrapped.ok -and [bool]$jsonWrapped.value.ok) -Detail $jsonWrapped.error
+    }
+    $nonJsonWhitespaceWrappers = [ordered]@{
+        vertical_tab = 0x0B
+        form_feed = 0x0C
+        next_line = 0x85
+        no_break_space = 0xA0
+        line_separator = 0x2028
+        ideographic_space = 0x3000
+    }
+    foreach ($nonJsonWhitespaceWrapper in $nonJsonWhitespaceWrappers.GetEnumerator()) {
+        $nonJsonWrapper = [string][char][int]$nonJsonWhitespaceWrapper.Value
+        Assert-ThrowsCode ('document parser rejects non-JSON framing ' + $nonJsonWhitespaceWrapper.Key) {
+            ConvertFrom-CutoverSingleJsonDocument -Text ($nonJsonWrapper + '{"ok":true}' + $nonJsonWrapper) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
+
+    # NOT A FIXTURE.  The two receipt shapes this repair is about, produced by
+    # the shipped installer itself and read back through the real child pipe.
+    #
+    # A hand-built object cannot prove this: it carries whatever fields the test
+    # author remembered, so it agrees with the parser for the same reason the
+    # parser agrees with it.  Get-StatusObject decides the real field set, and
+    # the only honest way to know what it writes is to run it.  The pretty shape
+    # is the same shipped source with -Compress removed from its five emitters,
+    # which is exactly what every release before that change contained.
+    #
+    # The byte counts measured by hand - 568 characters over 15 non-blank lines
+    # pretty, 318 over one compressed - are deliberately NOT asserted: they are
+    # this host's ABSENT status with this host's paths in it, so pinning them
+    # would fail on any other machine for a reason that has nothing to do with
+    # framing.  What is asserted is what actually has to hold anywhere: the
+    # compressed form is exactly one line, the pretty form is more than one,
+    # both parse, and both carry the same status.
+    Reset-TestMocks
+    $shippedInstallerPath = Join-Path $repoRoot 'scripts\install_order_supervisor.ps1'
+    $shippedInstallerText = [IO.File]::ReadAllText($shippedInstallerPath)
+    $prettyInstallerText = $shippedInstallerText.Replace(
+        ' | ConvertTo-Json -Depth 10 -Compress', ' | ConvertTo-Json -Depth 10')
+    Assert-True 'the shipped installer really does compress its receipts' (
+        $prettyInstallerText -cne $shippedInstallerText)
+    $prettyInstallerPath = Join-Path $temporaryRoot 'pretty_install_order_supervisor.ps1'
+    [IO.File]::WriteAllText($prettyInstallerPath, $prettyInstallerText, (New-Object Text.UTF8Encoding($false)))
+    $realStatusArguments = @(
+        '-Action', 'Status',
+        '-Mode', 'Observe',
+        '-UserProfilePath', $env:USERPROFILE,
+        '-WorkspacePath', $repoRoot,
+        '-EnvFile', (Join-Path $repoRoot '.env'),
+        '-StatePath', (Join-Path $temporaryRoot 'state.json'),
+        '-LogPath', (Join-Path $temporaryRoot 'events.jsonl'),
+        '-WallTimeoutSeconds', '720',
+        '-ClaudeCommand', (Join-Path $temporaryRoot 'claude.exe')
+    )
+    $compressedRun = Invoke-TestCapture {
+        Invoke-CutoverChildScript -ScriptPath $shippedInstallerPath -Arguments $realStatusArguments -TimeoutSeconds 90 -FailureCode 'REAL_STATUS_FAILED'
+    }
+    $prettyRun = Invoke-TestCapture {
+        Invoke-CutoverChildScript -ScriptPath $prettyInstallerPath -Arguments $realStatusArguments -TimeoutSeconds 90 -FailureCode 'REAL_STATUS_FAILED'
+    }
+    Assert-True 'both real installer Status runs succeed with empty stderr' (
+        $compressedRun.ok -and $prettyRun.ok -and
+        $compressedRun.value.exit_code -eq 0 -and $prettyRun.value.exit_code -eq 0 -and
+        [string]::IsNullOrWhiteSpace($compressedRun.value.stderr) -and
+        [string]::IsNullOrWhiteSpace($prettyRun.value.stderr)
+    ) -Detail ($compressedRun.error + ' ' + $prettyRun.error + ' ' + [string]$compressedRun.value.stderr + ' ' + [string]$prettyRun.value.stderr)
+    if ($compressedRun.ok -and $prettyRun.ok) {
+        $compressedLines = @([string]$compressedRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $prettyLines = @([string]$prettyRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        Assert-True 'the shipped installer writes exactly one physical line' (
+            $compressedLines.Count -eq 1) -Detail ('lines=' + $compressedLines.Count)
+        Assert-True 'the pre-compression installer writes a genuinely multi-line receipt' (
+            $prettyLines.Count -gt 1) -Detail ('lines=' + $prettyLines.Count)
+        $compressedReceipt = Invoke-TestCapture {
+            ConvertFrom-CutoverInstallerReceipt -Text ([string]$compressedRun.value.stdout) -RequestedAction Status
+        }
+        $prettyReceipt = Invoke-TestCapture {
+            ConvertFrom-CutoverInstallerReceipt -Text ([string]$prettyRun.value.stdout) -RequestedAction Status
+        }
+        Assert-True 'the driver parses a real receipt in both shapes and reads the same status' (
+            $compressedReceipt.ok -and $prettyReceipt.ok -and
+            -not [string]::IsNullOrWhiteSpace([string]$prettyReceipt.value.status) -and
+            [string]$prettyReceipt.value.status -ceq [string]$compressedReceipt.value.status
+        ) -Detail ($compressedReceipt.error + ' ' + $prettyReceipt.error)
+        Assert-ThrowsCode 'the escrow one-line contract still refuses that real pretty receipt' {
+            ConvertFrom-CutoverSingleJsonLine -Text ([string]$prettyRun.value.stdout) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
     }
 
     # Static surface: the driver itself has no cloud/bus transport and owns no
@@ -854,9 +1002,11 @@ try {
         [bool]$candidateChild.ok -and [bool]$restoredChild.ok
     )
     $script:ChildStdout = "{`r`n  `"ok`": true`r`n}`r`n"
-    Assert-ThrowsCode 'candidate installer rejects pretty Status without exact legacy identity' {
-        Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction Status -RequestedMode Observe | Out-Null
-    } 'INSTALLER_RECEIPT_INVALID'
+    $prettyCandidateStatus = Invoke-TestCapture {
+        Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction Status -RequestedMode Observe
+    }
+    Assert-True 'candidate installer accepts a pretty Status receipt from any release' (
+        $prettyCandidateStatus.ok -and [bool]$prettyCandidateStatus.value.ok) -Detail $prettyCandidateStatus.error
     $script:ChildStdout = '{"ok":true}'
     $noStopExpectedXmlSha256 = ('a' * 64)
     $noStopChild = Invoke-CutoverInstaller `
@@ -880,37 +1030,41 @@ try {
         Invoke-CutoverInstaller -Context $installerContext -ScriptPath $restoredInstallerPath -RequestedAction Status -RequestedMode Execute | Out-Null
     } 'RESTORED_INSTALLER_SHA256_MISMATCH'
 
-    # The compatibility carveout follows the exact legacy release and digest,
-    # regardless of whether that release is the primary pre-cutover installer
-    # or the restored rollback installer.  The real pin checks above prove the
-    # immediate pre-execution digest behavior; this mock isolates role routing.
+    # The carveout follows the ACTION, so it reaches both installer roles and
+    # needs no release or digest constant to get there.  That is the whole
+    # point: a constant that has to match the guest is one more input that can
+    # be wrong, and when it is wrong it fails as INSTALLER_RECEIPT_INVALID -
+    # indistinguishable from the defect being repaired, and only discoverable
+    # after another Managed Run Command round trip.  The real pin checks above
+    # prove the immediate pre-execution digest behavior; this mock isolates
+    # role routing only.
     Set-TestMock 'Assert-CutoverPinnedFile' {
         param($Path, $ExpectedSha256, $ExpectedPath, $Prefix)
         return $Path
     }
-    $legacyInstallerContext = New-TestContext
-    $legacyInstallerContext.release_id = $script:CutoverLegacyPrettyStatusReleaseId
-    $legacyInstallerContext.expected_installer_sha256 = $script:CutoverLegacyPrettyStatusInstallerSha256
-    $legacyInstallerContext.escrow_release_id = $script:CutoverLegacyPrettyStatusReleaseId
-    $legacyInstallerContext.expected_restored_installer_sha256 = $script:CutoverLegacyPrettyStatusInstallerSha256
+    $anyReleaseContext = New-TestContext
     $script:ChildStdout = "{`r`n  `"ok`": true`r`n}`r`n"
-    $legacyPrimaryStatus = Invoke-CutoverInstaller `
-        -Context $legacyInstallerContext `
-        -ScriptPath $legacyInstallerContext.installer_path `
-        -RequestedAction Status `
-        -RequestedMode Execute
-    $legacyRestoredStatus = Invoke-CutoverInstaller `
-        -Context $legacyInstallerContext `
-        -ScriptPath $legacyInstallerContext.restored_installer_path `
-        -RequestedAction Status `
-        -RequestedMode Execute
-    Assert-True 'exact legacy pretty Status compatibility follows primary and restored roles' (
-        [bool]$legacyPrimaryStatus.ok -and [bool]$legacyRestoredStatus.ok
-    )
-    Assert-ThrowsCode 'exact legacy identity cannot broaden pretty compatibility to mutation' {
+    $primaryPrettyStatus = Invoke-TestCapture {
         Invoke-CutoverInstaller `
-            -Context $legacyInstallerContext `
-            -ScriptPath $legacyInstallerContext.installer_path `
+            -Context $anyReleaseContext `
+            -ScriptPath $anyReleaseContext.installer_path `
+            -RequestedAction Status `
+            -RequestedMode Execute
+    }
+    $restoredPrettyStatus = Invoke-TestCapture {
+        Invoke-CutoverInstaller `
+            -Context $anyReleaseContext `
+            -ScriptPath $anyReleaseContext.restored_installer_path `
+            -RequestedAction Status `
+            -RequestedMode Execute
+    }
+    Assert-True 'pretty Status compatibility reaches primary and restored roles' (
+        $primaryPrettyStatus.ok -and $restoredPrettyStatus.ok
+    ) -Detail ($primaryPrettyStatus.error + ' ' + $restoredPrettyStatus.error)
+    Assert-ThrowsCode 'pretty compatibility does not broaden to mutation in either role' {
+        Invoke-CutoverInstaller `
+            -Context $anyReleaseContext `
+            -ScriptPath $anyReleaseContext.installer_path `
             -RequestedAction Install `
             -RequestedMode Observe | Out-Null
     } 'INSTALLER_RECEIPT_INVALID'
