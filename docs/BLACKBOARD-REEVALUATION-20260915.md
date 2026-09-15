@@ -137,11 +137,16 @@ Rules as data give three things plain scripts do not:
 CLIPS is mature, embeddable from Python through `clipspy` (1.0.6 on PyPI, checked 2026-09-15), and
 small enough for the e2-micro.
 
-**The honest cost.** CLIPS is a niche skill. The first three rules below could be written as a
-Python rules table in a day. Recommendation: start with `clipspy`, keep the rule base small and
-incident-bound, and replace it with a Python table if after P2 the explanation trace has not been
-used. A rule engine that measures what is easy to measure will steer attention there. Every rule
-needs a real incident and a negative test.
+**The honest cost, corrected after review.** Codex's review of this document
+(`COLLAB-20260915-PR112-R1`) makes a point that stands: explanation traces and declared priorities
+are **not** exclusive to a rule engine. A small Python policy table can emit the same trace. So the
+dependency has to be earned, not assumed:
+
+- **Build the Python policy table first**, on the same incident fixtures, in P1.
+- Adopt `clipspy` only if the CLIPS version demonstrably beats it on those fixtures — fewer lines to
+  express the same rules, or a trace that answers a question the table cannot.
+- Either way keep the rule base small and incident-bound. A rule engine that measures what is easy
+  to measure will steer attention there, so every rule needs a real incident and a negative test.
 
 ### 4.2 First rules: each tied to an incident on the board
 
@@ -153,6 +158,23 @@ needs a real incident and a negative test.
 | R4 worker health | ORDER last success older than 2 h, or last task result ≠ 0 | ALERT row | Result 20 every 15 minutes since at least 14 Sep |
 | R5 malformed row | Empty timestamp or unparseable BCB (reuse `scripts/bcb_lint.py`) | HYGIENE row | Four empty-timestamp rows that stopped the supervisor reading past row 2171 |
 | R6 doctrine scoring | L-97 (head moved during review), L-98 (card changed after the message) | SCORE row, daily | Both broke repeatedly on 8–9 Sep; they are rules with no mechanism (POKA-YOKE) |
+
+**What R must not do without the architecture's controls.** Codex's review of this document is right
+on the sharpest point: a COLLISION row cannot recall a duplicate that has already dispatched, and
+silence does not prove a worker's last effect stopped. So R1–R3 stay **diagnostic** until the
+admission contract in ARCH-20260914 is in force for the lane they touch — verified request authority
+and current membership, durable admission with a budget reservation, an atomic claim generation, and
+effect dispatch serialised with reassignment. An accepted-but-unresolved effect is reconciled or
+held before any successor dispatches; while it is unresolved, R emits a suspected-stall alert and
+nothing else. Closing the Sheet's broad writer access does not authenticate the rows already
+imported: those stay non-executable evidence until separately admitted.
+
+**Negative test for P2, adopted from that review.** Worker A's effect is accepted and its response is
+lost. Pause A, fire R3, restart the rules process, and admit a successor B. Assert one durable work
+history and no second conflicting effect: stale A cannot finalise, and B stays held until
+authoritative reconciliation. Where the destination offers neither lookup nor an idempotent replay
+contract, the state stays UNKNOWN for review. Add a forged source-tag row as a control: it must
+produce no executable admission.
 
 ### 4.3 What moves where
 
