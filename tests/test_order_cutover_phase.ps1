@@ -757,12 +757,29 @@ try {
     $prettyRun = Invoke-TestCapture {
         Invoke-CutoverChildScript -ScriptPath $prettyInstallerPath -Arguments $realStatusArguments -TimeoutSeconds 90 -FailureCode 'REAL_STATUS_FAILED'
     }
+    # Build the detail BEFORE asserting, and only from what actually exists.
+    # -Detail is an ordinary argument, so it is evaluated eagerly - it does not
+    # get the short-circuit protection the condition above enjoys.  When a
+    # capture fails, Invoke-TestCapture returns value = $null by design, and
+    # reaching through it under Set-StrictMode throws from the FAILURE-REPORTING
+    # path itself: the suite dies before the RESULT line, which is precisely the
+    # abort the capture helper exists to prevent.
+    $realRunDetail = 'compressed_error=' + [string]$compressedRun.error +
+        ' pretty_error=' + [string]$prettyRun.error
+    if ($compressedRun.ok) {
+        $realRunDetail += ' compressed_exit=' + [string]$compressedRun.value.exit_code +
+            ' compressed_stderr=' + [string]$compressedRun.value.stderr
+    }
+    if ($prettyRun.ok) {
+        $realRunDetail += ' pretty_exit=' + [string]$prettyRun.value.exit_code +
+            ' pretty_stderr=' + [string]$prettyRun.value.stderr
+    }
     Assert-True 'both real installer Status runs succeed with empty stderr' (
         $compressedRun.ok -and $prettyRun.ok -and
         $compressedRun.value.exit_code -eq 0 -and $prettyRun.value.exit_code -eq 0 -and
         [string]::IsNullOrWhiteSpace($compressedRun.value.stderr) -and
         [string]::IsNullOrWhiteSpace($prettyRun.value.stderr)
-    ) -Detail ($compressedRun.error + ' ' + $prettyRun.error + ' ' + [string]$compressedRun.value.stderr + ' ' + [string]$prettyRun.value.stderr)
+    ) -Detail $realRunDetail
     if ($compressedRun.ok -and $prettyRun.ok) {
         $compressedLines = @([string]$compressedRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         $prettyLines = @([string]$prettyRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
