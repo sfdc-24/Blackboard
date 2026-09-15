@@ -401,7 +401,12 @@ function ConvertFrom-CutoverSingleJsonDocument {
         [Parameter(Mandatory = $true)][string]$Code
     )
     if ([string]::IsNullOrWhiteSpace($Text)) { Throw-Cutover -Code $Code }
-    $trimmed = $Text.Trim()
+    # JSON whitespace only (RFC 8259: space, tab, LF, CR). A parameterless Trim()
+    # also strips VT, FF, NBSP, U+2028 and the rest of Unicode whitespace, so a
+    # wrapper that is not JSON framing was removed and the object accepted (codex,
+    # CODEX-FINDING-PR111-JSON-WHITESPACE-20260915). Left in place, the parsers
+    # below refuse those wrappers themselves.
+    $trimmed = $Text.Trim([char[]]@([char]0x20, [char]0x09, [char]0x0A, [char]0x0D))
     if ($trimmed.Length -eq 0 -or [int][char]$trimmed[0] -eq 0xfeff) {
         Throw-Cutover -Code $Code
     }
@@ -620,7 +625,9 @@ function Invoke-CutoverInstaller {
 
 function ConvertTo-CutoverUtcDateTime {
     param(
-        [Parameter(Mandatory = $true)]$Value,
+        # AllowNull so a missing time reaches the named code below instead of
+        # dying in parameter binding with an uncoded message.
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
         [Parameter(Mandatory = $true)][string]$Code
     )
     try { return ([DateTime]$Value).ToUniversalTime() }

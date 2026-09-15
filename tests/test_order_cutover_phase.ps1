@@ -609,6 +609,12 @@ try {
         scalar_root = 'true'
         utf8_bom = ([string][char]0xfeff + '{"ok":true}')
         oversized = ('{"value":"' + ('x' * $script:CutoverChildMaximumCharacters) + '"}')
+        # Non-JSON whitespace around the object. Each was accepted at PR111 head
+        # 46c5965 because a bare Trim() removed it (CODEX-FINDING-PR111-JSON-WHITESPACE).
+        vertical_tab_wrapper = ([string][char]0x0B + '{"ok":true}' + [string][char]0x0B)
+        form_feed_wrapper = ([string][char]0x0C + '{"ok":true}' + [string][char]0x0C)
+        nbsp_wrapper = ([string][char]0x00A0 + '{"ok":true}' + [string][char]0x00A0)
+        line_separator_wrapper = ([string][char]0x2028 + '{"ok":true}' + [string][char]0x2028)
     }
     foreach ($invalidInstallerJsonCase in $invalidInstallerJsonCases.GetEnumerator()) {
         Assert-ThrowsCode ('single JSON document parser rejects ' + $invalidInstallerJsonCase.Key) {
@@ -969,6 +975,82 @@ try {
             -RequestedAction Install `
             -RequestedMode Observe | Out-Null
     } 'INSTALLER_RECEIPT_INVALID'
+
+    # Positive control for the non-JSON whitespace wrappers refused earlier: the
+    # four JSON whitespace characters are still framing, so those refusals are
+    # about the character and not about wrapping as such.
+    $jsonWhitespaceWrapped = Invoke-TestCapture {
+        ConvertFrom-CutoverSingleJsonDocument -Text (" `t`r`n" + '{"ok":true}' + "`r`n`t ") -Code 'CHILD_JSON_INVALID'
+    }
+    Assert-True 'single JSON document parser accepts the four JSON whitespace characters as framing' (
+        $jsonWhitespaceWrapped.ok -and [bool]$jsonWhitespaceWrapped.value.ok
+    ) -Detail $jsonWhitespaceWrapped.error
+
+    # A MISSING TIME FAILS BY NAME. ConvertTo-CutoverUtcDateTime took a mandatory
+    # untyped $Value, which rejects null during parameter binding, so a status or
+    # task read with no last or next run produced "Cannot bind argument to
+    # parameter 'Value' because it is null." instead of a cutover code. Hardening,
+    # not a cutover gate: on the ORDER host (2026-09-15) all 7 disabled tasks with
+    # a repeating TimeTrigger still report a next run. These run the real
+    # Invoke-CutoverInstaller, Assert-CutoverInstallerStatus and
+    # Get-CutoverTaskRuntime, which the rest of the suite mocks.
+    foreach ($realName in @('Invoke-CutoverInstaller', 'Assert-CutoverInstallerStatus', 'Get-CutoverTaskRuntime')) {
+        Set-Item -LiteralPath ('Function:script:' + $realName) -Value $script:OriginalFunctions[$realName]
+    }
+    Set-TestMock 'Invoke-CutoverChildScript' {
+        param($ScriptPath, $Arguments, $TimeoutSeconds, $FailureCode)
+        [pscustomobject]@{ exit_code = 0; stdout = $script:ChildStdout; stderr = '' }
+    }
+    $knownLastRun = [DateTime]::new(2026, 9, 14, 13, 0, 0, [DateTimeKind]::Utc)
+    $knownNextRun = [DateTime]::new(2026, 9, 15, 22, 0, 0, [DateTimeKind]::Utc)
+    $disabledStatus = New-TestInstallerStatusReceipt -Context $anyReleaseContext -Mode Execute -State Disabled
+    $disabledStatus.last_run_time = $knownLastRun
+    $disabledStatus.next_run_time = $knownNextRun
+    # Pretty, as the deployed 27cb release prints its Status receipt.
+    $script:ChildStdout = ($disabledStatus | ConvertTo-Json -Depth 10) + "`r`n"
+    $disabledResult = Invoke-TestCapture {
+        $parsedDisabled = Invoke-CutoverInstaller -Context $anyReleaseContext -ScriptPath $anyReleaseContext.installer_path -RequestedAction Status -RequestedMode Execute
+        Assert-CutoverInstallerStatus -Status $parsedDisabled -Context $anyReleaseContext -ExpectedMode Execute -ExpectedTaskState Disabled
+    }
+    Assert-True 'a pretty Disabled Status receipt passes the real status assertion' (
+        $disabledResult.ok -and $disabledResult.value.last_run_utc -eq $knownLastRun -and
+        $disabledResult.value.next_run_utc -eq $knownNextRun
+    ) -Detail $disabledResult.error
+
+    foreach ($missingCase in @(
+        @('Ready', 'next_run_time', 'TASK_NEXT_RUN_TIME_INVALID'),
+        @('Disabled', 'next_run_time', 'TASK_NEXT_RUN_TIME_INVALID'),
+        @('Disabled', 'last_run_time', 'TASK_LAST_RUN_TIME_INVALID')
+    )) {
+        $missingStatus = New-TestInstallerStatusReceipt -Context $anyReleaseContext -Mode Execute -State $missingCase[0]
+        $missingStatus.($missingCase[1]) = $null
+        Assert-ThrowsCode ('a ' + $missingCase[0] + ' status with no ' + $missingCase[1] + ' is refused by name') {
+            Assert-CutoverInstallerStatus -Status $missingStatus -Context $anyReleaseContext -ExpectedMode Execute -ExpectedTaskState $missingCase[0] | Out-Null
+        } $missingCase[2]
+    }
+
+    # The runtime reader feeds the failure-cleanup poll; a missing next run must
+    # come back as the code there too, in either state.
+    $script:TestTaskState = 'Disabled'
+    function script:Get-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName)
+        [pscustomobject]@{ TaskName = 'SFDC24 Blackboard Order Worker'; TaskPath = '\'; State = $script:TestTaskState }
+    }
+    function script:Get-ScheduledTaskInfo {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+        [pscustomobject]@{ LastRunTime = $knownLastRun; NextRunTime = $null; LastTaskResult = 0 }
+    }
+    try {
+        foreach ($runtimeState in @('Disabled', 'Ready')) {
+            $script:TestTaskState = $runtimeState
+            Assert-ThrowsCode ('task runtime reader refuses a missing next run by name when ' + $runtimeState) {
+                Get-CutoverTaskRuntime | Out-Null
+            } 'TASK_NEXT_RUN_TIME_INVALID'
+        }
+    } finally {
+        Remove-Item -LiteralPath 'Function:script:Get-ScheduledTask' -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'Function:script:Get-ScheduledTaskInfo' -ErrorAction SilentlyContinue
+    }
     Reset-TestMocks
 
     # XML evidence explicitly separates UTF-8 text hashes from the escrow's
