@@ -78,6 +78,7 @@ $script:CutoverEscrowToolPrefix = 'order_task_escrow.'
 $script:CutoverEscrowToolSuffix = '.ps1'
 $script:CutoverInstallerRelativePath = 'scripts\install_order_supervisor.ps1'
 $script:CutoverChildMaximumCharacters = 16384
+$script:CutoverChildMaximumLines = 1024
 $script:CutoverStateMaximumBytes = 1048576
 $script:CutoverLogMaximumBytes = 67108864
 $script:CutoverLogDeltaMaximumBytes = 1048576
@@ -379,20 +380,57 @@ function Invoke-CutoverProcess {
     }
 }
 
+# ACCEPTS A PRETTY-PRINTED CHILD RECEIPT, AND STILL ONLY ONE OF THEM.
+#
+# The pinned release installer ends every action with ConvertTo-Json -Depth 10
+# and no -Compress, which in Windows PowerShell 5.1 is MULTI-LINE by default.
+# Measured against the real installer through the real child pipe: 15 non-blank
+# CRLF lines, 568 characters, exit 0, empty stderr, no byte-order mark.  The
+# one-line rule below therefore refused a correct receipt, which is the
+# INSTALLER_RECEIPT_INVALID that stopped the guest cutover before
+# Disable-CutoverTask was ever reachable.  The installer is pinned by digest at
+# a shipped release, so the driver is what has to read what it actually emits.
+#
+# What survives is the part that carries the safety: exactly ONE JSON document,
+# no duplicate object keys, a PSCustomObject root, and a hard size bound.  Do
+# not assume the duplicate-key reader also enforces the ONE part - it does not.
+# Measured in 5.1: JsonReaderWriterFactory accepts both '{}{}' and two objects
+# separated by a newline, because XmlDocument.Load stops at the first root and
+# never looks at the tail.  ConvertFrom-Json is what rejects a second document,
+# and ConvertFrom-Json is in turn the one that happily accepts duplicate keys.
+# Each layer covers the other's blind spot, so neither may be dropped.
+function ConvertFrom-CutoverBoundedJsonDocument {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Code
+    )
+    if ($Text.Length -gt $script:CutoverChildMaximumCharacters) { Throw-Cutover -Code $Code }
+    $allLines = @($Text -split "`r?`n")
+    if ($allLines.Count -gt $script:CutoverChildMaximumLines) { Throw-Cutover -Code $Code }
+    # Refuse empty and whitespace-only HERE rather than downstream: the byte
+    # conversion feeds a Mandatory [byte[]], and PowerShell rejects an empty
+    # array at BINDING time, which escapes as a raw .NET message instead of a
+    # bounded failure code.
+    $content = @($allLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($content.Count -lt 1) { Throw-Cutover -Code $Code }
+    $value = ConvertFrom-CutoverJsonText -Text $Text -Code $Code
+    if ($null -eq $value -or $value.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
+        Throw-Cutover -Code $Code
+    }
+    return $value
+}
+
+# The escrow tool is ours and emits ConvertTo-Json -Compress, so it keeps the
+# stricter contract.  A tool that has never needed a second line does not get
+# permission to grow one as a side effect of the installer's repair.
 function ConvertFrom-CutoverSingleJsonLine {
     param(
         [AllowEmptyString()][string]$Text,
         [Parameter(Mandatory = $true)][string]$Code
     )
     $lines = @($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($lines.Count -ne 1 -or $lines[0].Length -gt $script:CutoverChildMaximumCharacters) {
-        Throw-Cutover -Code $Code
-    }
-    $value = ConvertFrom-CutoverJsonText -Text $lines[0] -Code $Code
-    if ($null -eq $value -or $value.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
-        Throw-Cutover -Code $Code
-    }
-    return $value
+    if ($lines.Count -ne 1) { Throw-Cutover -Code $Code }
+    return ConvertFrom-CutoverBoundedJsonDocument -Text $lines[0] -Code $Code
 }
 
 function Get-CutoverWindowsPowerShell {
@@ -559,7 +597,7 @@ function Invoke-CutoverInstaller {
     if ($result.exit_code -ne 0 -or -not [string]::IsNullOrWhiteSpace($result.stderr)) {
         Throw-Cutover -Code 'INSTALLER_CHILD_FAILED'
     }
-    return ConvertFrom-CutoverSingleJsonLine -Text $result.stdout -Code 'INSTALLER_RECEIPT_INVALID'
+    return ConvertFrom-CutoverBoundedJsonDocument -Text $result.stdout -Code 'INSTALLER_RECEIPT_INVALID'
 }
 
 function ConvertTo-CutoverUtcDateTime {

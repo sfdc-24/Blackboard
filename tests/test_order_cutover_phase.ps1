@@ -594,6 +594,134 @@ try {
     Assert-ThrowsCode 'single JSON parser rejects duplicate object keys' {
         ConvertFrom-CutoverSingleJsonLine -Text '{"ok":true,"ok":false}' -Code 'CHILD_JSON_INVALID' | Out-Null
     } 'CHILD_JSON_INVALID'
+    # THE INSTALLER RECEIPT IS MULTI-LINE AND ALWAYS WAS.
+    #
+    # The pinned installer ends every action with ConvertTo-Json -Depth 10 and
+    # no -Compress, which is pretty-printed in 5.1.  The one-line rule refused
+    # it, and that refusal is the INSTALLER_RECEIPT_INVALID that stopped the
+    # guest cutover.  What follows covers the repair AND re-proves, one by one,
+    # every guarantee the line count used to provide as a side effect.
+    #
+    # Acceptance cases run through Invoke-TestCapture rather than calling the
+    # parser directly.  A direct call turns a regression into an unhandled
+    # terminating error, which aborts the run before the RESULT line is ever
+    # written - so the suite reports NO failure count at all, and the reader
+    # sees a crash in the finally block instead of the assertion that broke.
+    # Measured: reverting the installer receipt to the one-line rule did
+    # exactly that.  A test that cannot report its own failure is not a test.
+    function Invoke-TestCapture {
+        param([Parameter(Mandatory = $true)][scriptblock]$Body)
+        try { return [pscustomobject]@{ ok = $true; value = (& $Body); error = '' } }
+        catch { return [pscustomobject]@{ ok = $false; value = $null; error = [string]$_.Exception.Message } }
+    }
+
+    $receiptContext = New-TestContext
+    $prettyStatus = (New-TestInstallerStatusReceipt -Context $receiptContext) | ConvertTo-Json -Depth 10
+    # Guard the fixture before trusting what it proves: a single-line fixture
+    # would make every assertion below pass for entirely the wrong reason.
+    Assert-True 'the installer fixture is genuinely multi-line' (
+        @($prettyStatus -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 1)
+    $pretty = Invoke-TestCapture { ConvertFrom-CutoverBoundedJsonDocument -Text $prettyStatus -Code 'CHILD_JSON_INVALID' }
+    Assert-True 'document parser accepts a pretty multi-line receipt' (
+        $pretty.ok -and
+        [string]$pretty.value.task_name -ceq 'SFDC24 Blackboard Order Worker' -and
+        [string]$pretty.value.status -ceq 'READY') -Detail $pretty.error
+
+    # Independent of ConvertTo-Json: the exact CRLF shape measured from the real
+    # installer child pipe, including its escaped backslash value.
+    $backslash = [string][char]92
+    $literalPretty = '{' + "`r`n" +
+        '    "status":  "ABSENT",' + "`r`n" +
+        '    "task_path":  "' + $backslash + $backslash + '"' + "`r`n" + '}'
+    $literal = Invoke-TestCapture { ConvertFrom-CutoverBoundedJsonDocument -Text $literalPretty -Code 'CHILD_JSON_INVALID' }
+    Assert-True 'document parser accepts a hand-written CRLF receipt' (
+        $literal.ok -and
+        [string]$literal.value.status -ceq 'ABSENT' -and
+        [string]$literal.value.task_path -ceq $backslash) -Detail $literal.error
+
+    # The line count was carrying these refusals.  It no longer can, so they are
+    # asserted directly.  Note WHICH layer catches which: the strict duplicate-key
+    # reader accepts a stacked second document, because XmlDocument.Load stops at
+    # the first root and never looks at the tail, while ConvertFrom-Json accepts
+    # duplicate keys.  Only together do they cover both, so both must stay.
+    Assert-ThrowsCode 'document parser rejects two receipts on separate lines' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('{"a":1}' + "`r`n" + '{"b":2}') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects two concatenated receipts' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text '{"a":1}{"b":2}' -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects trailing content after the receipt' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('{"a":1}' + "`r`n" + 'trailing') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects content before the receipt' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('warning' + "`r`n" + '{"a":1}') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects duplicate keys spread across lines' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('{' + "`r`n" + '  "ok": true,' + "`r`n" + '  "ok": false' + "`r`n" + '}') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects a multi-line array root' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('[' + "`r`n" + '1,' + "`r`n" + '2' + "`r`n" + ']') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+
+    # Empty and whitespace-only must come back as the bounded CODE.  The byte
+    # conversion downstream feeds a Mandatory [byte[]], and PowerShell rejects an
+    # empty array at BINDING time; whitespace-only gets past that and dies later
+    # on a null document element.  Measured, by removing the guard: the two leak
+    # "Cannot bind argument to parameter 'Bytes'" and "The property 'NodeType'
+    # cannot be found on this object" into a receipt instead of a failure code.
+    Assert-ThrowsCode 'document parser rejects empty child output as a code' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text '' -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    Assert-ThrowsCode 'document parser rejects whitespace-only child output as a code' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('   ' + "`r`n" + '  ') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+
+    # Bounded, and proved bounded by moving only the bound.  The control case is
+    # the same document under the limit, so a pass cannot be explained away by
+    # the document simply being malformed.
+    Assert-ThrowsCode 'document parser rejects a receipt over the character bound' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('{"a":"' + ('x' * ($script:CutoverChildMaximumCharacters + 1)) + '"}') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+    $paddedUnderBound = '{' + ("`r`n" * ($script:CutoverChildMaximumLines - 3)) + '"a":1' + "`r`n" + '}'
+    $padded = Invoke-TestCapture { ConvertFrom-CutoverBoundedJsonDocument -Text $paddedUnderBound -Code 'CHILD_JSON_INVALID' }
+    Assert-True 'blank-line padding under the line bound is still a valid receipt' (
+        $padded.ok -and [int]$padded.value.a -eq 1) -Detail $padded.error
+    Assert-ThrowsCode 'document parser rejects blank-line padding over the line bound' {
+        ConvertFrom-CutoverBoundedJsonDocument -Text ('{' + ("`r`n" * ($script:CutoverChildMaximumLines + 1)) + '"a":1' + "`r`n" + '}') -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+
+    # The escrow tool emits -Compress and keeps the stricter contract.  The
+    # installer repair must not have loosened it on the way past.
+    Assert-ThrowsCode 'escrow parser still refuses a multi-line document' {
+        ConvertFrom-CutoverSingleJsonLine -Text $prettyStatus -Code 'CHILD_JSON_INVALID' | Out-Null
+    } 'CHILD_JSON_INVALID'
+
+    # End to end through the real Invoke-CutoverInstaller with only the child
+    # process replaced, because a parser proved in isolation is not the thing
+    # that failed on the guest.
+    Reset-TestMocks
+    $stagedInstallerRoot = Join-Path $temporaryRoot 'installer-receipt'
+    New-Item -ItemType Directory -Path $stagedInstallerRoot -Force | Out-Null
+    $stagedInstaller = [IO.Path]::GetFullPath((Join-Path $stagedInstallerRoot 'install_order_supervisor.ps1'))
+    $stagedInstallerBytes = [Text.Encoding]::UTF8.GetBytes('# staged installer')
+    [IO.File]::WriteAllBytes($stagedInstaller, $stagedInstallerBytes)
+    $receiptContext.installer_path = $stagedInstaller
+    $receiptContext.expected_installer_sha256 = Get-CutoverBytesSha256 -Bytes $stagedInstallerBytes
+    $script:TestChildStdout = $prettyStatus
+    Set-TestMock 'Invoke-CutoverChildScript' {
+        param($ScriptPath, $Arguments, $TimeoutSeconds, $FailureCode)
+        return [pscustomobject][ordered]@{ exit_code = 0; stdout = $script:TestChildStdout; stderr = '' }
+    }
+    $installed = Invoke-TestCapture {
+        Invoke-CutoverInstaller -Context $receiptContext -ScriptPath $stagedInstaller -RequestedAction 'Status' -RequestedMode 'Execute'
+    }
+    Assert-True 'Invoke-CutoverInstaller accepts the real multi-line receipt' (
+        $installed.ok -and [string]$installed.value.status -ceq 'READY') -Detail $installed.error
+    $script:TestChildStdout = $prettyStatus + "`r`n" + $prettyStatus
+    Assert-ThrowsCode 'Invoke-CutoverInstaller still refuses two stacked receipts' {
+        Invoke-CutoverInstaller -Context $receiptContext -ScriptPath $stagedInstaller -RequestedAction 'Status' -RequestedMode 'Execute' | Out-Null
+    } 'INSTALLER_RECEIPT_INVALID'
+    Reset-TestMocks
 
     # Static surface: the driver itself has no cloud/bus transport and owns no
     # task register/stop path.  Restore and Install remain inside pinned tools.
