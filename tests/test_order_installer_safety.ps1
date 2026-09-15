@@ -102,6 +102,18 @@ Assert-True 'action casing is canonicalized before action-sensitive preprocessin
     $installerText.Contains("'installfromdisablednostop' { 'InstallFromDisabledNoStop' }") -and
     $installerText.Contains("'rollback' { 'Rollback' }")
 )
+$compactReceiptSerializers = @(
+    'Get-StatusObject | ConvertTo-Json -Depth 10 -Compress',
+    'Invoke-InstallAction | ConvertTo-Json -Depth 10 -Compress',
+    'Invoke-InstallFromDisabledNoStopAction | ConvertTo-Json -Depth 10 -Compress',
+    'Invoke-UninstallAction | ConvertTo-Json -Depth 10 -Compress',
+    'Invoke-RollbackAction | ConvertTo-Json -Depth 10 -Compress'
+)
+foreach ($compactReceiptSerializer in $compactReceiptSerializers) {
+    Assert-True ('installer emits one compact receipt via ' + $compactReceiptSerializer.Split(' ')[0]) (
+        $installerText.Contains($compactReceiptSerializer)
+    )
+}
 
 $requiredFunctions = @(
     'Get-Sha256',

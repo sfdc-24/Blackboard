@@ -61,6 +61,7 @@ $mockNames = @(
     'Assert-CutoverPinnedExecutables',
     'Get-CutoverProtectedSnapshot',
     'Invoke-CutoverGitRead',
+    'Assert-CutoverPinnedFile',
     'Disable-CutoverTaskAfterFailure',
     'Invoke-CutoverOneRun',
     'Start-CutoverTask',
@@ -594,6 +595,48 @@ try {
     Assert-ThrowsCode 'single JSON parser rejects duplicate object keys' {
         ConvertFrom-CutoverSingleJsonLine -Text '{"ok":true,"ok":false}' -Code 'CHILD_JSON_INVALID' | Out-Null
     } 'CHILD_JSON_INVALID'
+    $prettyInstallerJson = "{`r`n  `"ok`": true,`r`n  `"status`": `"READY`"`r`n}`r`n"
+    $prettyInstallerObject = ConvertFrom-CutoverSingleJsonDocument -Text $prettyInstallerJson -Code 'CHILD_JSON_INVALID'
+    Assert-True 'single JSON document parser accepts one pretty-printed object' (
+        [bool]$prettyInstallerObject.ok -and [string]$prettyInstallerObject.status -ceq 'READY'
+    )
+    $invalidInstallerJsonCases = [ordered]@{
+        multiple_documents = "{}`n{}"
+        banner = "banner`n{`"ok`":true}"
+        trailer = "{`"ok`":true}`ntrailer"
+        duplicate_key = '{"ok":true,"ok":false}'
+        array_root = '[{"ok":true}]'
+        scalar_root = 'true'
+        utf8_bom = ([string][char]0xfeff + '{"ok":true}')
+        oversized = ('{"value":"' + ('x' * $script:CutoverChildMaximumCharacters) + '"}')
+    }
+    foreach ($invalidInstallerJsonCase in $invalidInstallerJsonCases.GetEnumerator()) {
+        Assert-ThrowsCode ('single JSON document parser rejects ' + $invalidInstallerJsonCase.Key) {
+            ConvertFrom-CutoverSingleJsonDocument -Text ([string]$invalidInstallerJsonCase.Value) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
+    $legacyPrettyReceipt = ConvertFrom-CutoverInstallerReceipt `
+        -Text $prettyInstallerJson `
+        -RequestedAction Status `
+        -InstallerReleaseId $script:CutoverLegacyPrettyStatusReleaseId `
+        -ExpectedInstallerSha256 $script:CutoverLegacyPrettyStatusInstallerSha256
+    Assert-True 'installer receipt parser accepts pretty Status only for exact legacy identity' (
+        [bool]$legacyPrettyReceipt.ok -and [string]$legacyPrettyReceipt.status -ceq 'READY'
+    )
+    $legacyCompatibilityMismatchCases = [ordered]@{
+        mutating_action = @('Install', $script:CutoverLegacyPrettyStatusReleaseId, $script:CutoverLegacyPrettyStatusInstallerSha256)
+        wrong_release = @('Status', ('0' * 40), $script:CutoverLegacyPrettyStatusInstallerSha256)
+        wrong_digest = @('Status', $script:CutoverLegacyPrettyStatusReleaseId, ('0' * 64))
+    }
+    foreach ($legacyCompatibilityMismatch in $legacyCompatibilityMismatchCases.GetEnumerator()) {
+        Assert-ThrowsCode ('installer receipt parser rejects pretty output for ' + $legacyCompatibilityMismatch.Key) {
+            ConvertFrom-CutoverInstallerReceipt `
+                -Text $prettyInstallerJson `
+                -RequestedAction ([string]$legacyCompatibilityMismatch.Value[0]) `
+                -InstallerReleaseId ([string]$legacyCompatibilityMismatch.Value[1]) `
+                -ExpectedInstallerSha256 ([string]$legacyCompatibilityMismatch.Value[2]) | Out-Null
+        } 'INSTALLER_RECEIPT_INVALID'
+    }
 
     # Static surface: the driver itself has no cloud/bus transport and owns no
     # task register/stop path.  Restore and Install remain inside pinned tools.
@@ -807,9 +850,14 @@ try {
     $script:ChildStdout = '{"ok":true}'
     $candidateChild = Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction Status -RequestedMode Observe
     $restoredChild = Invoke-CutoverInstaller -Context $installerContext -ScriptPath $restoredInstallerPath -RequestedAction Status -RequestedMode Execute
-    Assert-True 'candidate and restored installer children recheck their distinct pins' (
+    Assert-True 'candidate and restored installer children accept compact receipts and recheck distinct pins' (
         [bool]$candidateChild.ok -and [bool]$restoredChild.ok
     )
+    $script:ChildStdout = "{`r`n  `"ok`": true`r`n}`r`n"
+    Assert-ThrowsCode 'candidate installer rejects pretty Status without exact legacy identity' {
+        Invoke-CutoverInstaller -Context $installerContext -ScriptPath $installerPath -RequestedAction Status -RequestedMode Observe | Out-Null
+    } 'INSTALLER_RECEIPT_INVALID'
+    $script:ChildStdout = '{"ok":true}'
     $noStopExpectedXmlSha256 = ('a' * 64)
     $noStopChild = Invoke-CutoverInstaller `
         -Context $installerContext `
@@ -831,6 +879,41 @@ try {
     Assert-ThrowsCode 'restored installer child rechecks pinned digest immediately before execution' {
         Invoke-CutoverInstaller -Context $installerContext -ScriptPath $restoredInstallerPath -RequestedAction Status -RequestedMode Execute | Out-Null
     } 'RESTORED_INSTALLER_SHA256_MISMATCH'
+
+    # The compatibility carveout follows the exact legacy release and digest,
+    # regardless of whether that release is the primary pre-cutover installer
+    # or the restored rollback installer.  The real pin checks above prove the
+    # immediate pre-execution digest behavior; this mock isolates role routing.
+    Set-TestMock 'Assert-CutoverPinnedFile' {
+        param($Path, $ExpectedSha256, $ExpectedPath, $Prefix)
+        return $Path
+    }
+    $legacyInstallerContext = New-TestContext
+    $legacyInstallerContext.release_id = $script:CutoverLegacyPrettyStatusReleaseId
+    $legacyInstallerContext.expected_installer_sha256 = $script:CutoverLegacyPrettyStatusInstallerSha256
+    $legacyInstallerContext.escrow_release_id = $script:CutoverLegacyPrettyStatusReleaseId
+    $legacyInstallerContext.expected_restored_installer_sha256 = $script:CutoverLegacyPrettyStatusInstallerSha256
+    $script:ChildStdout = "{`r`n  `"ok`": true`r`n}`r`n"
+    $legacyPrimaryStatus = Invoke-CutoverInstaller `
+        -Context $legacyInstallerContext `
+        -ScriptPath $legacyInstallerContext.installer_path `
+        -RequestedAction Status `
+        -RequestedMode Execute
+    $legacyRestoredStatus = Invoke-CutoverInstaller `
+        -Context $legacyInstallerContext `
+        -ScriptPath $legacyInstallerContext.restored_installer_path `
+        -RequestedAction Status `
+        -RequestedMode Execute
+    Assert-True 'exact legacy pretty Status compatibility follows primary and restored roles' (
+        [bool]$legacyPrimaryStatus.ok -and [bool]$legacyRestoredStatus.ok
+    )
+    Assert-ThrowsCode 'exact legacy identity cannot broaden pretty compatibility to mutation' {
+        Invoke-CutoverInstaller `
+            -Context $legacyInstallerContext `
+            -ScriptPath $legacyInstallerContext.installer_path `
+            -RequestedAction Install `
+            -RequestedMode Observe | Out-Null
+    } 'INSTALLER_RECEIPT_INVALID'
     Reset-TestMocks
 
     # XML evidence explicitly separates UTF-8 text hashes from the escrow's

@@ -105,7 +105,13 @@ repair mode and cannot create, update, or delete Azure resources.
    trigger identities are the unqualified lowercase `id` attributes
    `AtBoot` and `Every15Minutes`; child-element or namespace-shadowed
    lookalikes fail closed. Explicit, duplicate, or namespace-shadowed principal
-   alternatives fail closed too.
+   alternatives fail closed too. The exact immutable `27cb0df` installer
+   serializes its `Status` object as pretty-printed JSON. Only that release and
+   pinned installer digest receive a compatibility exception for insignificant
+   whitespace inside exactly one bounded JSON object; banners, trailing output,
+   multiple documents, arrays, scalars, duplicate keys, and oversized decoded
+   output fail closed. Current installers emit one compressed receipt, and all
+   their receipts plus every mutating action retain the one-physical-line rule.
 7. Deliver the exact reviewed `order_cutover_phase.ps1` as a BOM-free Managed
    Run Command source and read its source digest back. Use a new 32-lowercase-
    hex `OperationId` for every action. The driver captures all child output and
