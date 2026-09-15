@@ -595,6 +595,50 @@ try {
     Assert-ThrowsCode 'single JSON parser rejects duplicate object keys' {
         ConvertFrom-CutoverSingleJsonLine -Text '{"ok":true,"ok":false}' -Code 'CHILD_JSON_INVALID' | Out-Null
     } 'CHILD_JSON_INVALID'
+
+    # FRAMING, ON THE STRICT SIDE TOO. The line parser dropped every
+    # Char.IsWhiteSpace-only line, so a receipt like VT + CRLF + {"ok":true} came
+    # back as one line and was accepted. Measured on the base of this branch: VT,
+    # FF, NBSP and U+2028 lines were all discarded that way. This parser governs
+    # the escrow receipt and every mutating installer action, so the gap mattered
+    # most exactly where the contract is strictest. Found by Copilot on PR114.
+    $nonJsonWhitespaceLines = [ordered]@{ vertical_tab = 0x0B; form_feed = 0x0C; nbsp = 0x00A0; line_separator = 0x2028; next_line = 0x0085; ideographic_space = 0x3000 }
+    foreach ($nonJsonWhitespaceLine in $nonJsonWhitespaceLines.GetEnumerator()) {
+        $blankish = [string][char][int]$nonJsonWhitespaceLine.Value
+        Assert-ThrowsCode ('single JSON parser rejects a ' + $nonJsonWhitespaceLine.Key + ' line beside the object') {
+            ConvertFrom-CutoverSingleJsonLine -Text ($blankish + "`r`n" + '{"ok":true}' + "`r`n" + $blankish) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
+    # Positive control: lines that are blank by JSON's own definition still are.
+    # Captured with try/catch rather than Invoke-TestCapture, which is defined
+    # further down this file - calling it here is an unrecognised command, and
+    # under this file's ErrorActionPreference that ends the run before the RESULT
+    # line, which is the very failure the helper exists to prevent.
+    $jsonBlankLines = $null
+    try { $jsonBlankLines = ConvertFrom-CutoverSingleJsonLine -Text ("   `r`n`t`r`n" + '{"ok":true}' + "`r`n   ") -Code 'CHILD_JSON_INVALID' }
+    catch { $jsonBlankLines = [string]$_.Exception.Message }
+    Assert-True 'single JSON parser still drops JSON-whitespace-only lines' (
+        $null -ne $jsonBlankLines -and $jsonBlankLines -isnot [string] -and [bool]$jsonBlankLines.ok
+    ) ('actual=' + $jsonBlankLines)
+
+    # A MISSING TIME FAILS BY NAME, not through parameter binding. The mandatory
+    # untyped $Value rejected $null at binding, so the failure carried no code.
+    # These assertions hold whatever the cast does with $null: measured, it
+    # throws on both 5.1.19041 and pwsh 7.5.4, so they pass on either, and they
+    # would still pass if a future runtime returned DateTime.MinValue instead.
+    foreach ($missingTime in @($null, '', '   ')) {
+        $label = if ($null -eq $missingTime) { 'null' } elseif ($missingTime -eq '') { 'empty' } else { 'whitespace' }
+        Assert-ThrowsCode ('a ' + $label + ' time is refused by name') {
+            ConvertTo-CutoverUtcDateTime -Value $missingTime -Code 'TASK_NEXT_RUN_TIME_INVALID' | Out-Null
+        } 'TASK_NEXT_RUN_TIME_INVALID'
+    }
+    $realTime = $null
+    try { $realTime = ConvertTo-CutoverUtcDateTime -Value '2026-09-14T13:00:00Z' -Code 'TASK_NEXT_RUN_TIME_INVALID' }
+    catch { $realTime = [string]$_.Exception.Message }
+    Assert-True 'a real time still converts to UTC' (
+        $null -ne $realTime -and $realTime -isnot [string] -and
+        $realTime -eq [DateTime]::new(2026, 9, 14, 13, 0, 0, [DateTimeKind]::Utc)
+    ) ('actual=' + $realTime)
     $prettyInstallerJson = "{`r`n  `"ok`": true,`r`n  `"status`": `"READY`"`r`n}`r`n"
     $prettyInstallerObject = ConvertFrom-CutoverSingleJsonDocument -Text $prettyInstallerJson -Code 'CHILD_JSON_INVALID'
     Assert-True 'single JSON document parser accepts one pretty-printed object' (
