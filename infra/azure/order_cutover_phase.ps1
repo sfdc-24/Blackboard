@@ -401,7 +401,18 @@ function ConvertFrom-CutoverSingleJsonDocument {
         [Parameter(Mandatory = $true)][string]$Code
     )
     if ([string]::IsNullOrWhiteSpace($Text)) { Throw-Cutover -Code $Code }
-    $trimmed = $Text.Trim()
+    # TRIM ONLY WHAT JSON ITSELF CALLS WHITESPACE.
+    #
+    # Argument-less String.Trim() strips every character char.IsWhiteSpace
+    # accepts, which is a much larger set than RFC 8259's four.  Measured
+    # under Windows PowerShell 5.1, it silently removes U+000B, U+000C,
+    # U+0085, U+00A0, U+2028 and U+3000, none of which JSON permits as
+    # framing - so a receipt wrapped in them parsed clean instead of failing
+    # closed.  Routing every Status receipt through here widens that gap to
+    # every release, so it is closed first.  Naming the four explicitly also
+    # keeps the rule readable: space, tab, carriage return, line feed.
+    $trimmed = $Text.Trim(
+        [char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
     if ($trimmed.Length -eq 0 -or [int][char]$trimmed[0] -eq 0xfeff) {
         Throw-Cutover -Code $Code
     }

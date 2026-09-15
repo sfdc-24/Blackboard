@@ -647,15 +647,14 @@ try {
         } 'INSTALLER_RECEIPT_INVALID'
     }
 
-    # The fixture above is a hand-written three-line object.  What the pinned
-    # installer actually writes is a fifteen-field Status: measured through the
-    # real child pipe at 568 characters over 15 non-blank CRLF lines, exit 0,
-    # empty stderr, no byte-order mark.  Prove the parser against that shape
-    # rather than against a toy that happens to be pretty-printed.
+    # A larger hand-built object than the three-line one above.  It is still a
+    # hand-built object and is NOT evidence about what the installer writes -
+    # the real receipt in both of its shapes is executed further down.  This
+    # only covers nesting and an empty array surviving the round trip.
     $fullStatusContext = New-TestContext
     $fullStatusJson = (New-TestInstallerStatusReceipt -Context $fullStatusContext) | ConvertTo-Json -Depth 10
-    Assert-True 'the full Status fixture is genuinely multi-line' (
-        @($fullStatusJson -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 10)
+    Assert-True 'the larger fixture is pretty-printed rather than compressed' (
+        @($fullStatusJson -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 1)
     $fullStatusReceipt = Invoke-TestCapture {
         ConvertFrom-CutoverInstallerReceipt -Text $fullStatusJson -RequestedAction Status
     }
@@ -686,6 +685,106 @@ try {
     Assert-ThrowsCode 'escrow parser still refuses a multi-line document' {
         ConvertFrom-CutoverSingleJsonLine -Text $fullStatusJson -Code 'CHILD_JSON_INVALID' | Out-Null
     } 'CHILD_JSON_INVALID'
+    # FRAMING: only the four characters JSON itself calls whitespace may wrap a
+    # receipt.  Argument-less String.Trim() strips everything char.IsWhiteSpace
+    # accepts, which is a far larger set.  Measured under 5.1 before the fix:
+    # U+000B, U+000C, U+0085, U+00A0, U+2028 and U+3000 were all stripped and
+    # the wrapped receipt parsed clean instead of failing closed.
+    $jsonWhitespaceWrappers = [ordered]@{ space = 0x20; tab = 0x09; cr = 0x0D; lf = 0x0A }
+    foreach ($jsonWhitespaceWrapper in $jsonWhitespaceWrappers.GetEnumerator()) {
+        $jsonWrapper = [string][char][int]$jsonWhitespaceWrapper.Value
+        $jsonWrapped = Invoke-TestCapture {
+            ConvertFrom-CutoverSingleJsonDocument -Text ($jsonWrapper + '{"ok":true}' + $jsonWrapper) -Code 'CHILD_JSON_INVALID'
+        }
+        Assert-True ('document parser accepts JSON whitespace framing ' + $jsonWhitespaceWrapper.Key) (
+            $jsonWrapped.ok -and [bool]$jsonWrapped.value.ok) -Detail $jsonWrapped.error
+    }
+    $nonJsonWhitespaceWrappers = [ordered]@{
+        vertical_tab = 0x0B
+        form_feed = 0x0C
+        next_line = 0x85
+        no_break_space = 0xA0
+        line_separator = 0x2028
+        ideographic_space = 0x3000
+    }
+    foreach ($nonJsonWhitespaceWrapper in $nonJsonWhitespaceWrappers.GetEnumerator()) {
+        $nonJsonWrapper = [string][char][int]$nonJsonWhitespaceWrapper.Value
+        Assert-ThrowsCode ('document parser rejects non-JSON framing ' + $nonJsonWhitespaceWrapper.Key) {
+            ConvertFrom-CutoverSingleJsonDocument -Text ($nonJsonWrapper + '{"ok":true}' + $nonJsonWrapper) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
+
+    # NOT A FIXTURE.  The two receipt shapes this repair is about, produced by
+    # the shipped installer itself and read back through the real child pipe.
+    #
+    # A hand-built object cannot prove this: it carries whatever fields the test
+    # author remembered, so it agrees with the parser for the same reason the
+    # parser agrees with it.  Get-StatusObject decides the real field set, and
+    # the only honest way to know what it writes is to run it.  The pretty shape
+    # is the same shipped source with -Compress removed from its five emitters,
+    # which is exactly what every release before that change contained.
+    #
+    # The byte counts measured by hand - 568 characters over 15 non-blank lines
+    # pretty, 318 over one compressed - are deliberately NOT asserted: they are
+    # this host's ABSENT status with this host's paths in it, so pinning them
+    # would fail on any other machine for a reason that has nothing to do with
+    # framing.  What is asserted is what actually has to hold anywhere: the
+    # compressed form is exactly one line, the pretty form is more than one,
+    # both parse, and both carry the same status.
+    Reset-TestMocks
+    $shippedInstallerPath = Join-Path $repoRoot 'scripts\install_order_supervisor.ps1'
+    $shippedInstallerText = [IO.File]::ReadAllText($shippedInstallerPath)
+    $prettyInstallerText = $shippedInstallerText.Replace(
+        ' | ConvertTo-Json -Depth 10 -Compress', ' | ConvertTo-Json -Depth 10')
+    Assert-True 'the shipped installer really does compress its receipts' (
+        $prettyInstallerText -cne $shippedInstallerText)
+    $prettyInstallerPath = Join-Path $temporaryRoot 'pretty_install_order_supervisor.ps1'
+    [IO.File]::WriteAllText($prettyInstallerPath, $prettyInstallerText, (New-Object Text.UTF8Encoding($false)))
+    $realStatusArguments = @(
+        '-Action', 'Status',
+        '-Mode', 'Observe',
+        '-UserProfilePath', $env:USERPROFILE,
+        '-WorkspacePath', $repoRoot,
+        '-EnvFile', (Join-Path $repoRoot '.env'),
+        '-StatePath', (Join-Path $temporaryRoot 'state.json'),
+        '-LogPath', (Join-Path $temporaryRoot 'events.jsonl'),
+        '-WallTimeoutSeconds', '720',
+        '-ClaudeCommand', (Join-Path $temporaryRoot 'claude.exe')
+    )
+    $compressedRun = Invoke-TestCapture {
+        Invoke-CutoverChildScript -ScriptPath $shippedInstallerPath -Arguments $realStatusArguments -TimeoutSeconds 90 -FailureCode 'REAL_STATUS_FAILED'
+    }
+    $prettyRun = Invoke-TestCapture {
+        Invoke-CutoverChildScript -ScriptPath $prettyInstallerPath -Arguments $realStatusArguments -TimeoutSeconds 90 -FailureCode 'REAL_STATUS_FAILED'
+    }
+    Assert-True 'both real installer Status runs succeed with empty stderr' (
+        $compressedRun.ok -and $prettyRun.ok -and
+        $compressedRun.value.exit_code -eq 0 -and $prettyRun.value.exit_code -eq 0 -and
+        [string]::IsNullOrWhiteSpace($compressedRun.value.stderr) -and
+        [string]::IsNullOrWhiteSpace($prettyRun.value.stderr)
+    ) -Detail ($compressedRun.error + ' ' + $prettyRun.error + ' ' + [string]$compressedRun.value.stderr + ' ' + [string]$prettyRun.value.stderr)
+    if ($compressedRun.ok -and $prettyRun.ok) {
+        $compressedLines = @([string]$compressedRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $prettyLines = @([string]$prettyRun.value.stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        Assert-True 'the shipped installer writes exactly one physical line' (
+            $compressedLines.Count -eq 1) -Detail ('lines=' + $compressedLines.Count)
+        Assert-True 'the pre-compression installer writes a genuinely multi-line receipt' (
+            $prettyLines.Count -gt 1) -Detail ('lines=' + $prettyLines.Count)
+        $compressedReceipt = Invoke-TestCapture {
+            ConvertFrom-CutoverInstallerReceipt -Text ([string]$compressedRun.value.stdout) -RequestedAction Status
+        }
+        $prettyReceipt = Invoke-TestCapture {
+            ConvertFrom-CutoverInstallerReceipt -Text ([string]$prettyRun.value.stdout) -RequestedAction Status
+        }
+        Assert-True 'the driver parses a real receipt in both shapes and reads the same status' (
+            $compressedReceipt.ok -and $prettyReceipt.ok -and
+            -not [string]::IsNullOrWhiteSpace([string]$prettyReceipt.value.status) -and
+            [string]$prettyReceipt.value.status -ceq [string]$compressedReceipt.value.status
+        ) -Detail ($compressedReceipt.error + ' ' + $prettyReceipt.error)
+        Assert-ThrowsCode 'the escrow one-line contract still refuses that real pretty receipt' {
+            ConvertFrom-CutoverSingleJsonLine -Text ([string]$prettyRun.value.stdout) -Code 'CHILD_JSON_INVALID' | Out-Null
+        } 'CHILD_JSON_INVALID'
+    }
 
     # Static surface: the driver itself has no cloud/bus transport and owns no
     # task register/stop path.  Restore and Install remain inside pinned tools.
