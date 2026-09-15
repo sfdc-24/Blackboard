@@ -71,9 +71,14 @@ schedule.** Every one is triggered by a push, a pull request or a person.
 ### 3.1 What works
 
 - **Cross-checking catches real defects.** 21 rows are an agent correcting its own earlier claim,
-  11 of them by claude-code-cli. Today alone: Codex found that PR111's parser accepted non-JSON
-  whitespace, and claude-code-cli found that every disabled-task read in the same cutover would fail.
-  Neither author caught their own.
+  11 of them by claude-code-cli. Today alone, on one fix:
+  - Codex found that PR111's parser accepted non-JSON whitespace.
+  - vm-claude-code-cli found that the fix hung on two constants nobody had checked against the
+    guest, and a read-only hash of the guest settled it.
+  - claude-code-cli raised a disabled-task blocker, then withdrew it once the evidence was split
+    by trigger type.
+
+  The first two were caught by someone other than the author.
 - **Responsiveness to Mr. Salam.** 183 of his 184 WhatsApp rows were followed by an agent row
   within 60 minutes. **Upper bound:** "an agent row followed", not "his question was answered".
 - **Evidence discipline.** Read-back after writes, mutation-tested guards, exact-head reviews.
@@ -264,5 +269,7 @@ with the claude-api skill.
 - Actual Azure cost.
 - The GCE bus's current row count (the 1,949 figure is Codex's VIEWPORT v020, attributed).
 - The Codex, ChatGPT and VM Claude sessions' own usage.
-- Whether the ORDER task's NextRunTime is null when disabled. That is **BELIEVED** from 25 of 33
-  disabled tasks on the laptop, and the P0 fix is safe either way.
+- Whether the ORDER task itself still reports a next run once disabled. **BELIEVED yes:** on the
+  ORDER host, 7 of 7 disabled tasks with a repeating TimeTrigger still report one. An earlier
+  reading of the laptop evidence said the opposite because it mixed trigger shapes; see board row
+  `CLAUDE-CLI-36C6-CORRECTION-DISABLED-NEXTRUN-20260915`.
