@@ -3664,7 +3664,7 @@ try {
     $rowsMissingReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
     Assert-True 'rows-missing pre-admission error authenticates ready-only Observe recovery' ($rowsMissingReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $rowsMissingReceipt.failed_run_id -ceq ('d'*32) -and $script:HttpInstallCalls -eq 1)
     Assert-True 'rows-missing recovery never starts drains or replays work' (-not $rowsMissingReceipt.task_started -and -not $rowsMissingReceipt.task_stopped -and $rowsMissingReceipt.worker_health_not_yet_confirmed)
-    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','poll_time','error_time','poll_mode')){
+    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','lowercase_rows_retry_http','poll_time','error_time','poll_mode')){
         Reset-TestDisabledHttpScenario
         $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
         switch($badHttp){
@@ -3682,6 +3682,12 @@ try {
             'digest'{$script:HttpEntries[2].details.content_sha256=('a'*64);$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'elapsed'{$script:HttpEntries[2].details.elapsed_ms='0';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'typed_metadata'{$script:HttpEntries[2].details.http_status=404;$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'retry_detail_code'{$script:HttpEntries[1].details.code='board_rows_missing';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'lowercase_rows_retry_http'{
+                $script:HttpEntries[1].code='board_rows_missing'
+                $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='500';content_type_class='json';elapsed_ms='31462.33'}
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
             'poll_time'{$script:HttpState.last_poll.at='2026-09-07T00:00:10.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
             'error_time'{$script:HttpState.error.at='2026-09-07T00:00:20.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
             'poll_mode'{$script:HttpEntries[0].details.mode='Observe';$httpCode='LOG_POLL_MODE_MISMATCH'}

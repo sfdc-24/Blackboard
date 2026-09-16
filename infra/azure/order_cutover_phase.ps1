@@ -3238,8 +3238,10 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
 
 function Assert-CutoverCurrentDisabledHttpReadRun {
     param($Context, $State, $ExactStatus, $LogCheckpoint)
-    # Authenticate this specific two-read, pre-admission 404 incident. This is
-    # not a generic permission to recover arbitrary nonzero Execute results.
+    # Authenticate this specific two-read, pre-admission board-read incident:
+    # either two 404/HTML transport failures, or a retry that reached JSON but
+    # found no rows. This is not a generic permission to recover arbitrary
+    # nonzero Execute results.
     $null = Assert-CutoverStateShape -State $State
     $poll = Get-CutoverLastPoll -State $State -ExpectedMode Execute -ExpectedUserProfile $Context.user_profile_path
     $expectedFailureCode = [string]$Context.expected_current_failure_code
@@ -3269,36 +3271,39 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_ADMISSION_NOT_ABSENT'
         }
     }
+    $retryCode = [string]$entries[1].code
     if ($entries[0].level -cne 'info' -or $entries[0].code -cne '' -or $entries[0].message -cne '' -or
-        $entries[1].level -cne 'warning' -or @('BOARD_READ_HTTP_ERROR','board_rows_missing') -cnotcontains [string]$entries[1].code -or
+        $entries[1].level -cne 'warning' -or @('BOARD_READ_HTTP_ERROR','BOARD_ROWS_MISSING','board_rows_missing') -cnotcontains $retryCode -or
         $entries[1].message -cne 'A transient pre-admission board read failed; retrying once.' -or
         $terminal.message -cne $State.error.message) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_LOG_EVIDENCE_INVALID' }
     foreach ($index in 1..2) {
         $detailsProperty = $entries[$index].PSObject.Properties['details']
         $details = if ($null -ne $detailsProperty) { $detailsProperty.Value } else { $null }
         $entryCode = [string]$entries[$index].code
+        $isHttp404 = $entryCode -ceq 'BOARD_READ_HTTP_ERROR'
+        $isRowsMissing = $entryCode -ceq 'BOARD_ROWS_MISSING' -or $entryCode -ceq 'board_rows_missing'
         $expected = @('attempt', 'transport_exit', 'http_status', 'content_type_class', 'elapsed_ms')
-        if ($entryCode -ceq 'BOARD_READ_HTTP_ERROR') { $expected += 'content_length', 'content_sha256' }
+        if ($isHttp404) { $expected += 'content_length', 'content_sha256' }
         if ($index -eq 1) { $expected += 'code' }
         if ($null -eq $details -or @($details.PSObject.Properties).Count -ne $expected.Count -or
             @($expected | Where-Object { $null -eq $details.PSObject.Properties[$_] }).Count -ne 0) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }
         foreach ($name in $expected) {
-        if ($details.PSObject.Properties[$name].Value -isnot [string]) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID' }
+            if ($details.PSObject.Properties[$name].Value -isnot [string]) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID' }
         }
         if ($details.attempt -cne [string]$index -or $details.transport_exit -cne '0' -or
             $details.elapsed_ms -cnotmatch '^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,2})?$' -or
             [double]::Parse($details.elapsed_ms, [Globalization.CultureInfo]::InvariantCulture) -le 0 -or
-            ($index -eq 1 -and @('BOARD_READ_HTTP_ERROR','board_rows_missing') -cnotcontains [string]$details.code)) {
+            ($index -eq 1 -and [string]$details.code -cne $entryCode)) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }
-        if ($entryCode -ceq 'BOARD_READ_HTTP_ERROR' -and
+        if ($isHttp404 -and
             ($details.http_status -cne '404' -or $details.content_type_class -cne 'html' -or
              $details.content_length -cne '0' -or $details.content_sha256 -cne 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }
-        if ($entryCode -ceq 'BOARD_ROWS_MISSING' -and
+        if ($isRowsMissing -and
             ($details.http_status -cne '200' -or $details.content_type_class -cne 'json')) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }

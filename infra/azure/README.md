@@ -589,24 +589,32 @@ read the destination task, state, log and board before another command or GO.
 Recovery intentionally changes the definition to Observe with a future boundary;
 it does not claim definition-preserved-except-Enabled.
 
-### Ready-only recovery after two pre-admission HTTP 404 reads
+### Ready-only recovery after pre-admission board-read failure
 
 `InstallObserveReadyFromDisabledHttpError` addresses a different incident: the
-reviewed Execute task exited 20 after both authenticated board transport reads
-failed, and failure cleanup has already disabled its definition. The preceding
-healthy-only action and the old header-incompatibility bridge are unchanged.
+reviewed Execute task exited 20 before any work/row was admitted, and failure
+cleanup has already disabled its definition. The admitted failure evidence is
+limited to either two HTTP404/html board transport failures or a retry that
+reached HTTP200/json but found no `rows` payload. The preceding healthy-only
+action and the old header-incompatibility bridge are unchanged.
 
 Supply Mode=Observe, the independently read-back ExpectedDisabledXmlSha256,
-ExpectedCurrentTaskResult=20, ExpectedCurrentFailureCode=BOARD_READ_HTTP_ERROR,
-and the exact ExpectedCurrentRunId. Retain TimeoutSeconds=420,
+ExpectedCurrentTaskResult=20, ExpectedCurrentFailureCode set to the exact
+state error (`BOARD_READ_HTTP_ERROR` or `BOARD_ROWS_MISSING`), and the exact
+ExpectedCurrentRunId. Retain TimeoutSeconds=420,
 NaturalTriggerMarginSeconds=60 and MaxRuns=8. No target/work/row/result inputs
 are permitted. The driver requires an exact current three-event run:
 poll_started Execute, board_read_retry attempt 1, and run_error attempt 2.
-Both sanitized sidecars must say HTTP404, html, transport exit 0, empty content
-with its known SHA256, and a positive canonical elapsed time. State, scheduler
-time, run ID and terminal timestamps must agree; every event and state error
-has blank admitted work/row identity. Other failure codes, transport results,
-event shapes, selected work or ambiguous evidence are not admitted.
+For HTTP failure recovery, both sanitized sidecars must say HTTP404, html,
+transport exit 0, empty content with its known SHA256, and a positive canonical
+elapsed time. For rows-missing recovery, the retry warning may be the original
+HTTP404/html transport failure or a lowercase `board_rows_missing` HTTP200/json
+retry, while the terminal run_error and state error must be `BOARD_ROWS_MISSING`
+with message `board_rows_missing` and HTTP200/json sidecar evidence. Retry
+sidecar `code` must exactly match the retry event code. State, scheduler time,
+run ID and terminal timestamps must agree; every event and state error has
+blank admitted work/row identity. Other failure codes, transport results, event
+shapes, selected work or ambiguous evidence are not admitted.
 
 This action installs only a future Observe definition through the same pinned
 InstallFromDisabledNoStop installer. It never starts, drains or enables the old
