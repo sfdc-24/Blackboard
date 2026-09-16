@@ -518,7 +518,10 @@ full remaining trigger window. The admitted scheduler LastRunTime, run ID and
 state/log checkpoints are carried into the real drain; an intervening run or
 checkpoint change is rejected before starting a run, never adopted as a baseline.
 The first real OneRun rechecks the original state/log hashes after the drain's
-last Ready read, directly before Start. It then rechecks the remaining total
+last Ready read, directly before Start. The original protected fingerprint is
+also carried into that gate and rechecked before the state/log hashes, so a
+slow protected-tree read cannot leave those checkpoints unverified. Missing,
+blank or non-string protected admissions fail closed. It then rechecks the remaining total
 deadline and natural-trigger window after those hash reads. This binding applies
 only to the first recovery start; later stale iterations retain the established
 per-run transition and log-prefix contract. Future Observe XML must explicitly
@@ -544,7 +547,7 @@ receipt and actual guest/board read-back, resolve the named cause, then qualify
 any new action independently.
 
 Recovery requires TimeoutSeconds=420 and NaturalTriggerMarginSeconds=60,
-with MaxRuns between 1 and 8 (retain 8 for the current cutover). Both CLI
+with integer MaxRuns between 1 and 8 (retain 8 for the current cutover). Both CLI
 admission and direct recovery invocation reject other limits before mutation.
 Never-run scheduler timestamps (year 1601 or earlier) are not run evidence.
 The protected tree is rechecked after the backup read, before the drain.

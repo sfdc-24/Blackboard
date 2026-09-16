@@ -2004,12 +2004,16 @@ function Invoke-CutoverOneRun {
         Throw-Cutover -Code 'STATE_BASELINE_RUN_ID_MISMATCH'
     }
     if ($null -ne $AdmittedBaseline) {
+        $admittedProtected = $AdmittedBaseline.PSObject.Properties['protected_fingerprint']
         if ($ExpectedMode -cne 'Observe' -or $PreviousRunId -cne [string]$AdmittedBaseline.run_id -or
-            $PreviousLastRunUtc.Ticks -ne $AdmittedBaseline.last_run_utc.Ticks) {
+            $PreviousLastRunUtc.Ticks -ne $AdmittedBaseline.last_run_utc.Ticks -or
+            $null -eq $admittedProtected -or $admittedProtected.Value -isnot [string] -or
+            [string]::IsNullOrEmpty($admittedProtected.Value)) {
             Throw-Cutover -Code 'OBSERVE_FIRST_START_ADMISSION_INVALID'
         }
         # The drain's native Ready read may be slow. Recheck original hashes
         # HERE, after that read and this state read, immediately before start.
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $admittedProtected.Value) { Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START' }
         Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'
         Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'
         if ([DateTime]::UtcNow -ge $DeadlineUtc) { Throw-Cutover -Code 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED' }
@@ -2315,7 +2319,7 @@ function Invoke-CutoverDrainObserve {
         $deadline = [DateTime]::UtcNow.AddSeconds($Context.timeout_seconds)
         $firstStartAdmission = $null
         if ($null -ne $AdmittedBaseline) {
-            $firstStartAdmission = [pscustomobject]@{run_id=$AdmittedBaseline.run_id;last_run_utc=$AdmittedBaseline.last_run_utc;state_checkpoint=$AdmittedBaseline.state_checkpoint;log_checkpoint=$AdmittedBaseline.log_checkpoint;next_run_utc=$preStart.next_run_utc}
+            $firstStartAdmission = [pscustomobject]@{run_id=$AdmittedBaseline.run_id;last_run_utc=$AdmittedBaseline.last_run_utc;state_checkpoint=$AdmittedBaseline.state_checkpoint;log_checkpoint=$AdmittedBaseline.log_checkpoint;protected_fingerprint=$AdmittedBaseline.protected_fingerprint;next_run_utc=$preStart.next_run_utc}
         }
         $runs = 0
         $appendedBytes = [long]0
@@ -3043,6 +3047,7 @@ function Assert-CutoverFutureObserveDefinition {
 function Assert-CutoverDisabledObserveRecoveryLimits {
     param([Parameter(Mandatory = $true)]$Context)
     if ($Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or
+        ($Context.max_runs -isnot [int] -and $Context.max_runs -isnot [long]) -or
         $Context.max_runs -lt 1 -or $Context.max_runs -gt 8) {
         Throw-Cutover -Code 'OBSERVE_RECOVERY_LIMITS_INVALID'
     }
@@ -3068,8 +3073,8 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
         $null = Assert-CutoverStateTerminal -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedStatus 'no_eligible_order' -ExpectedUserProfile $Context.user_profile_path
         $log = Get-CutoverLogCheckpoint -Path $Context.log_path
         $currentRun = Assert-CutoverCurrentTerminalRun -Context $Context -State $state.value -ExactStatus $initial -LogCheckpoint $log -ExpectedMode ([string]$state.value.mode) -ExpectedStatus 'no_eligible_order'
-        $admitted = [pscustomobject]@{run_id=[string]$currentRun.run_id;last_run_utc=$initial.last_run_utc;state_checkpoint=$state.checkpoint;log_checkpoint=$log}
         $protected = Get-CutoverProtectedSnapshot -Context $Context
+        $admitted = [pscustomobject]@{run_id=[string]$currentRun.run_id;last_run_utc=$initial.last_run_utc;state_checkpoint=$state.checkpoint;log_checkpoint=$log;protected_fingerprint=$protected}
         $preInstall = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
         $preXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if ($preInstall.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks -or $preXml.enabled -or $preXml.utf8_text_sha256 -cne $xml.utf8_text_sha256) { Throw-Cutover -Code 'TASK_CHANGED_BEFORE_OBSERVE_RECOVERY' }

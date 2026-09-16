@@ -2269,7 +2269,7 @@ try {
     Assert-True 'DrainObserve transitions Execute baseline to Observe no-eligible' ($drain.status -ceq 'OBSERVE_DRAINED' -and $drain.runs -eq 2 -and $drain.final_worker_status -ceq 'no_eligible_order')
     Assert-True 'DrainObserve accumulates bounded append evidence' ($drain.log_appended_bytes -eq 20)
 
-    $admission = [pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};log_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}
+    $admission = [pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};log_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};protected_fingerprint='protected-same'}
     $script:RunSequenceIndex=0
     $boundDrain=Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission
     Assert-True 'real Observe drain accepts the exact admitted baseline and still drains stale work' ($boundDrain.runs -eq 2 -and $boundDrain.final_worker_status -ceq 'no_eligible_order')
@@ -3116,42 +3116,47 @@ try {
     $script:FirstStartCleanLog=([pscustomobject]@{event='prior';run_id=('a'*32)}|ConvertTo-Json -Compress)+"`n"
     Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) [pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
     Set-TestMock 'Start-CutoverTask' {$script:FirstStartCalls++;throw 'TEST_FIRST_START_REACHED'}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) if($script:FirstStartProtectedChanged){'protected-changed'}else{'protected-same'}}
     Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$AllowInheritedTaskResult)
         $script:FirstStartReadyReads++
         if($script:FirstStartReadyReads -eq 2){
             if($script:FirstStartDrift -ceq 'state'){
                 $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++
                 [IO.File]::WriteAllText($script:FirstStartContext.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+            }elseif($script:FirstStartDrift -ceq 'protected'){
+                $script:FirstStartProtectedChanged=$true
             }elseif($script:FirstStartDrift -ceq 'log'){
                 [IO.File]::AppendAllText($script:FirstStartContext.log_path,('{"event":"unexpected","run_id":"'+('b'*32)+'"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
             }
         }
         New-TestExactStatus
     }
-    foreach($firstStartDrift in @('none','state','log')){
+    foreach($firstStartDrift in @('none','state','log','protected')){
         $script:FirstStartDrift=$firstStartDrift;$script:FirstStartReadyReads=0;$script:FirstStartCalls=0
+        $script:FirstStartProtectedChanged=$false
         [IO.File]::WriteAllText($firstStartContext.state_path,($script:FirstStartCleanState|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
         [IO.File]::WriteAllText($firstStartContext.log_path,$script:FirstStartCleanLog,(New-Object Text.UTF8Encoding($false)))
-        $firstStartAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path)}
-        $firstStartCode=switch($firstStartDrift){'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
+        $firstStartAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same'}
+        $firstStartCode=switch($firstStartDrift){'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};'protected'{'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
         Assert-ThrowsCode ('real drain and OneRun first-start interleaving '+$firstStartDrift) {Invoke-CutoverDrainObserve -Context $firstStartContext -Installer $firstStartContext.installer_path -AdmittedBaseline $firstStartAdmission} $firstStartCode
         Assert-True ('first-start '+$firstStartDrift+' starts only the unchanged positive baseline') ($script:FirstStartCalls -eq $(if($firstStartDrift -ceq 'none'){1}else{0}))
     }
+    $script:FirstStartProtectedChanged=$false
     foreach($boundaryTiming in @('deadline','trigger')){
         $script:FirstStartCalls=0
-        $timingAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);next_run_utc=$(if($boundaryTiming -ceq 'trigger'){[DateTime]::UtcNow.AddSeconds(-1)}else{(New-TestExactStatus).next_run_utc})}
+        $timingAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';next_run_utc=$(if($boundaryTiming -ceq 'trigger'){[DateTime]::UtcNow.AddSeconds(-1)}else{(New-TestExactStatus).next_run_utc})}
         $timingDeadline=if($boundaryTiming -ceq 'deadline'){[DateTime]::UtcNow.AddSeconds(-1)}else{[DateTime]::UtcNow.AddSeconds(420)}
         $timingCode=if($boundaryTiming -ceq 'deadline'){'OBSERVE_FIRST_START_DEADLINE_EXCEEDED'}else{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'}
         Assert-ThrowsCode ('real OneRun rechecks '+$boundaryTiming+' after checkpoint reads') {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc $timingDeadline -PreviousLastRunUtc $timingAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $timingAdmission.log_checkpoint -AdmittedBaseline $timingAdmission} $timingCode
         Assert-True ('expired '+$boundaryTiming+' cannot start Observe') ($script:FirstStartCalls -eq 0)
     }
 
-    foreach($badFirstAdmission in @('mode','run_id','last_run')){
+    foreach($badFirstAdmission in @('mode','run_id','last_run','missing_protected','blank_protected','typed_protected')){
         $script:FirstStartCalls=0
-        $mismatchAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);next_run_utc=(New-TestExactStatus).next_run_utc}
+        $mismatchAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';next_run_utc=(New-TestExactStatus).next_run_utc}
         $admissionPreviousLast=(New-TestExactStatus).last_run_utc
         $admissionExpectedMode='Observe'
-        switch($badFirstAdmission){'mode'{$admissionExpectedMode='Execute'};'run_id'{$mismatchAdmission.run_id=('b'*32)};'last_run'{$mismatchAdmission.last_run_utc=$admissionPreviousLast.AddSeconds(1)}}
+        switch($badFirstAdmission){'mode'{$admissionExpectedMode='Execute'};'run_id'{$mismatchAdmission.run_id=('b'*32)};'last_run'{$mismatchAdmission.last_run_utc=$admissionPreviousLast.AddSeconds(1)};'missing_protected'{$mismatchAdmission.PSObject.Properties.Remove('protected_fingerprint')};'blank_protected'{$mismatchAdmission.protected_fingerprint=''};'typed_protected'{$mismatchAdmission.protected_fingerprint=1}}
         Assert-ThrowsCode ('real OneRun rejects mismatched first admission '+$badFirstAdmission) {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode $admissionExpectedMode -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(420)) -PreviousLastRunUtc $admissionPreviousLast -PreviousRunId ('a'*32) -LogBefore $mismatchAdmission.log_checkpoint -AdmittedBaseline $mismatchAdmission} 'OBSERVE_FIRST_START_ADMISSION_INVALID'
         Assert-True ('invalid first admission '+$badFirstAdmission+' never starts a task') ($script:FirstStartCalls -eq 0)
     }
@@ -3196,7 +3201,7 @@ try {
     Set-TestMock 'Invoke-CutoverDrainObserve' {
         param($Context,$Installer,$AllowInheritedTaskResult,$AdmittedBaseline)
         if($Context.mode -cne 'Observe' -or $Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or $Context.max_runs -ne 8){throw 'OBSERVE_DRAIN_CONTRACT_CHANGED'}
-        if($null -eq $AdmittedBaseline -or $AdmittedBaseline.run_id -cne ('a'*32) -or $AdmittedBaseline.last_run_utc.Ticks -ne (New-TestExactStatus).last_run_utc.Ticks -or $AdmittedBaseline.state_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.log_checkpoint.sha256 -cne ('a'*64)){throw 'OBSERVE_DRAIN_ADMISSION_NOT_BOUND'}
+        if($null -eq $AdmittedBaseline -or $AdmittedBaseline.run_id -cne ('a'*32) -or $AdmittedBaseline.last_run_utc.Ticks -ne (New-TestExactStatus).last_run_utc.Ticks -or $AdmittedBaseline.state_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.log_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.protected_fingerprint -cne 'protected-same'){throw 'OBSERVE_DRAIN_ADMISSION_NOT_BOUND'}
         $script:ObserveRecoveryDrains++
         [pscustomobject]@{status='OBSERVE_DRAINED';runs=2;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00.000Z';log_appended_bytes=100}
     }
@@ -3325,9 +3330,9 @@ try {
     Set-TestMock 'Invoke-CutoverDrainObserve' {param($Context,$Installer) throw 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'}
     Assert-ThrowsCode 'fresh unrelated candidate is observed not executed and requires resolution' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'
     Assert-True 'unrelated fresh candidate failure disables Observe and never claims success' (-not $script:ObserveRecoveryInstalled)
-    foreach($badDirectLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
+    foreach($badDirectLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs','fractional_runs','text_runs','bool_runs')){
         $limitContext=New-TestContext;$limitContext.mode='Observe';$limitContext.timeout_seconds=420;$limitContext.expected_disabled_xml_sha256=$savedPin
-        switch($badDirectLimit){'short_timeout'{$limitContext.timeout_seconds=240};'long_timeout'{$limitContext.timeout_seconds=600};'short_margin'{$limitContext.natural_trigger_margin_seconds=30};'long_margin'{$limitContext.natural_trigger_margin_seconds=61};'max_runs'{$limitContext.max_runs=20}}
+        switch($badDirectLimit){'short_timeout'{$limitContext.timeout_seconds=240};'long_timeout'{$limitContext.timeout_seconds=600};'short_margin'{$limitContext.natural_trigger_margin_seconds=30};'long_margin'{$limitContext.natural_trigger_margin_seconds=61};'max_runs'{$limitContext.max_runs=20};'fractional_runs'{$limitContext.max_runs=1.5};'text_runs'{$limitContext.max_runs='1'};'bool_runs'{$limitContext.max_runs=$true}}
         $beforeLimitInstalls=$script:ObserveRecoveryInstalls;$beforeLimitDrains=$script:ObserveRecoveryDrains
         Assert-ThrowsCode ('direct Observe recovery rejects '+$badDirectLimit) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $limitContext} 'OBSERVE_RECOVERY_LIMITS_INVALID'
         Assert-True ('direct '+$badDirectLimit+' cannot install or drain') ($script:ObserveRecoveryInstalls -eq $beforeLimitInstalls -and $script:ObserveRecoveryDrains -eq $beforeLimitDrains)
