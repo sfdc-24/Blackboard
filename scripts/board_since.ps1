@@ -137,7 +137,16 @@ try {
 
     # Addressed to me, cc'd to me, or broadcast -- by EXACT token, never by
     # substring. `-Tag codex` must not consume mail for chatgpt-codex-desktop.
-    if (-not (Test-BoardAddressed -Payload $payload -Tag $Tag)) { continue }
+    #
+    # BOTH addressing surfaces, not just the payload. Cell 3 is Target_Surface,
+    # and a row whose recipients live only there -- a plain-prose row with no
+    # to=/cc= tokens -- was invisible to every reader using this function. On
+    # 2026-09-16 that hid CODEX-01A09BF0-PROTOTYPE-CONTRACT-REVIEW-20260916 from
+    # claude-code-cli while the summary line confidently reported "3 rows".
+    # Guarded on Count the way Get-BoardRowPayload guards cell 5: a short row
+    # must not throw, it must simply carry no column addressing.
+    $target = if ($r.Count -gt 3) { [string]$r[3] } else { '' }
+    if (-not (Test-BoardAddressed -Payload $payload -Tag $Tag -TargetSurface $target)) { continue }
 
     [void]$selected.Add([pscustomobject]@{
       Ts = $ts; Writer = $writer; Payload = $payload

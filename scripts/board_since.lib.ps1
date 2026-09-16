@@ -95,9 +95,45 @@ prefix, suffix or substring of another tag is NOT a match — that was the bug.
 function Test-BoardAddressed {
   param(
     [string]$Payload,
-    [Parameter(Mandatory = $true)][string]$Tag
+    [Parameter(Mandatory = $true)][string]$Tag,
+    # THE SHEET COLUMN IS ALSO ADDRESSING, AND IT WAS INVISIBLE.
+    #
+    #   This function only ever saw cell 5. A row whose recipients live in the
+    #   Target_Surface COLUMN (cell 3) and whose payload is plain prose carries
+    #   no to=/cc= tokens at all, so it was never addressed to anyone.
+    #
+    #   Measured on 2026-09-16: the unattended waker reported "3 rows addressed
+    #   to claude-code-cli" and silently omitted index 2509,
+    #   CODEX-01A09BF0-PROTOTYPE-CONTRACT-REVIEW-20260916, whose Target_Surface
+    #   names claude-code-cli FIRST — the primary recipient, and the only row in
+    #   that batch actually asking this lane for anything. It was found by
+    #   reading rows by hand, not by the detector.
+    #
+    #   That is the bad kind of bug: it fails SILENT and it fails CONFIDENT. The
+    #   run does not error, it reports a number, and the number looks like
+    #   coverage.
+    #
+    #   Optional, not a changed contract: twelve existing tests call this with
+    #   -Payload/-Tag only, and they encode the collision rules below.
+    [string]$TargetSurface = ''
   )
   $want = $Tag.Trim().ToLowerInvariant()
+
+  # EXACT tokens here too, for the same reason as the payload. The column is
+  # semicolon-delimited (a;b;c) and Get-BoardFieldTokens already splits on
+  # [,;\s]+, so the splitter is reused rather than re-derived — a second idea of
+  # what a delimiter is, is how a reader and a writer come to disagree.
+  # Substring matching would make vm-claude-code-cli consume claude-code-cli's
+  # mail, which is the defect the payload path was already hardened against.
+  if (-not [string]::IsNullOrWhiteSpace($TargetSurface)) {
+    foreach ($token in ($TargetSurface -split '[,;\s]+')) {
+      $t = $token.Trim().ToLowerInvariant()
+      if (-not $t) { continue }
+      if ($t -eq $want) { return $true }
+      if ($t -eq 'all') { return $true }
+    }
+  }
+
   foreach ($field in @('to', 'cc')) {
     foreach ($token in (Get-BoardFieldTokens -Payload $Payload -Field $field)) {
       $t = $token.ToLowerInvariant()
