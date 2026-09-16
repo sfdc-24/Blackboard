@@ -3242,14 +3242,16 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
     # not a generic permission to recover arbitrary nonzero Execute results.
     $null = Assert-CutoverStateShape -State $State
     $poll = Get-CutoverLastPoll -State $State -ExpectedMode Execute -ExpectedUserProfile $Context.user_profile_path
+    $expectedFailureCode = [string]$Context.expected_current_failure_code
+    $expectedFailureMessage = if ($expectedFailureCode -ceq 'BOARD_ROWS_MISSING') { 'board_rows_missing' } else { $expectedFailureCode }
     if ($ExactStatus.raw.state -cne 'Disabled' -or
         ($ExactStatus.raw.last_task_result -isnot [int] -and $ExactStatus.raw.last_task_result -isnot [long]) -or
         [int64]$ExactStatus.raw.last_task_result -ne 20 -or
         ($Context.expected_current_task_result -isnot [int] -and $Context.expected_current_task_result -isnot [long]) -or
-        $Context.expected_current_task_result -ne 20 -or $Context.expected_current_failure_code -cne 'BOARD_READ_HTTP_ERROR' -or
+        $Context.expected_current_task_result -ne 20 -or @('BOARD_READ_HTTP_ERROR','BOARD_ROWS_MISSING') -cnotcontains $expectedFailureCode -or
         $Context.expected_current_run_id -cnotmatch '^[0-9a-f]{32}$' -or $poll.run_id -cne $Context.expected_current_run_id -or
-        $poll.status -cne 'error' -or $null -eq $State.error -or $State.error.code -cne 'BOARD_READ_HTTP_ERROR' -or
-        $State.error.message -cne 'BOARD_READ_HTTP_ERROR' -or -not [string]::IsNullOrEmpty([string]$State.error.work_id) -or
+        $poll.status -cne 'error' -or $null -eq $State.error -or $State.error.code -cne $expectedFailureCode -or
+        $State.error.message -cne $expectedFailureMessage -or -not [string]::IsNullOrEmpty([string]$State.error.work_id) -or
         -not [string]::IsNullOrEmpty([string]$State.error.row_id) -or [int64]$State.counts.errors -lt 1) {
         Throw-Cutover -Code 'DISABLED_HTTP_ERROR_IDENTITY_INVALID'
     }
@@ -3259,7 +3261,7 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
         Throw-Cutover -Code 'DISABLED_HTTP_ERROR_LOG_SHAPE_INVALID'
     }
     $terminal = Assert-CutoverLogRun -Entries $entries -RunId $poll.run_id -Status error -ExpectedMode Execute `
-        -ExpectedWorkId '' -ExpectedRowId '' -ExpectedErrorCode BOARD_READ_HTTP_ERROR `
+        -ExpectedWorkId '' -ExpectedRowId '' -ExpectedErrorCode $expectedFailureCode `
         -RunWindowStartUtc $ExactStatus.last_run_utc -RunWindowEndUtc ([DateTime]::UtcNow)
     foreach ($index in 0..2) {
         if (-not [string]::IsNullOrEmpty([string]$entries[$index].work_id) -or
@@ -3268,27 +3270,36 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
         }
     }
     if ($entries[0].level -cne 'info' -or $entries[0].code -cne '' -or $entries[0].message -cne '' -or
-        $entries[1].level -cne 'warning' -or $entries[1].code -cne 'BOARD_READ_HTTP_ERROR' -or
+        $entries[1].level -cne 'warning' -or @('BOARD_READ_HTTP_ERROR','board_rows_missing') -cnotcontains [string]$entries[1].code -or
         $entries[1].message -cne 'A transient pre-admission board read failed; retrying once.' -or
         $terminal.message -cne $State.error.message) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_LOG_EVIDENCE_INVALID' }
     foreach ($index in 1..2) {
         $detailsProperty = $entries[$index].PSObject.Properties['details']
         $details = if ($null -ne $detailsProperty) { $detailsProperty.Value } else { $null }
-        $expected = @('attempt', 'transport_exit', 'http_status', 'content_type_class', 'elapsed_ms', 'content_length', 'content_sha256')
+        $entryCode = [string]$entries[$index].code
+        $expected = @('attempt', 'transport_exit', 'http_status', 'content_type_class', 'elapsed_ms')
+        if ($entryCode -ceq 'BOARD_READ_HTTP_ERROR') { $expected += 'content_length', 'content_sha256' }
         if ($index -eq 1) { $expected += 'code' }
         if ($null -eq $details -or @($details.PSObject.Properties).Count -ne $expected.Count -or
             @($expected | Where-Object { $null -eq $details.PSObject.Properties[$_] }).Count -ne 0) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }
         foreach ($name in $expected) {
-            if ($details.PSObject.Properties[$name].Value -isnot [string]) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID' }
+        if ($details.PSObject.Properties[$name].Value -isnot [string]) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID' }
         }
         if ($details.attempt -cne [string]$index -or $details.transport_exit -cne '0' -or
-            $details.http_status -cne '404' -or $details.content_type_class -cne 'html' -or
-            $details.content_length -cne '0' -or $details.content_sha256 -cne 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' -or
             $details.elapsed_ms -cnotmatch '^(?:0|[1-9][0-9]{0,5})(?:\.[0-9]{1,2})?$' -or
             [double]::Parse($details.elapsed_ms, [Globalization.CultureInfo]::InvariantCulture) -le 0 -or
-            ($index -eq 1 -and $details.code -cne 'BOARD_READ_HTTP_ERROR')) {
+            ($index -eq 1 -and @('BOARD_READ_HTTP_ERROR','board_rows_missing') -cnotcontains [string]$details.code)) {
+            Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+        }
+        if ($entryCode -ceq 'BOARD_READ_HTTP_ERROR' -and
+            ($details.http_status -cne '404' -or $details.content_type_class -cne 'html' -or
+             $details.content_length -cne '0' -or $details.content_sha256 -cne 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')) {
+            Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+        }
+        if ($entryCode -ceq 'BOARD_ROWS_MISSING' -and
+            ($details.http_status -cne '200' -or $details.content_type_class -cne 'json')) {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
         }
     }
@@ -3470,7 +3481,7 @@ function New-CutoverContext {
         }
     } elseif ($RequestedAction -ceq 'InstallObserveReadyFromDisabledHttpError') {
         $context.expected_current_task_result = ConvertTo-CutoverInteger -Value ([string]$Values.ExpectedCurrentTaskResult) -Minimum 20 -Maximum 20 -Code 'EXPECTED_CURRENT_TASK_RESULT_INVALID'
-        if ([string]$Values.ExpectedCurrentFailureCode -cne 'BOARD_READ_HTTP_ERROR') { Throw-Cutover -Code 'EXPECTED_CURRENT_FAILURE_CODE_INVALID' }
+        if (@('BOARD_READ_HTTP_ERROR','BOARD_ROWS_MISSING') -cnotcontains [string]$Values.ExpectedCurrentFailureCode) { Throw-Cutover -Code 'EXPECTED_CURRENT_FAILURE_CODE_INVALID' }
         if ([string]$Values.ExpectedCurrentRunId -cnotmatch '^[0-9a-f]{32}$') { Throw-Cutover -Code 'EXPECTED_CURRENT_RUN_ID_INVALID' }
         $context.expected_current_failure_code = [string]$Values.ExpectedCurrentFailureCode
         $context.expected_current_run_id = [string]$Values.ExpectedCurrentRunId
