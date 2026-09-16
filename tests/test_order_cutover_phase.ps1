@@ -66,7 +66,12 @@ $mockNames = @(
     'Invoke-CutoverOneRun',
     'Start-CutoverTask',
     'Wait-CutoverTaskRun',
-    'Get-CutoverLogDelta'
+    'Get-CutoverLogDelta',
+    'Enable-CutoverTask',
+    'Get-CutoverUtcNow',
+    'Wait-CutoverQuietPoll',
+    'Wait-CutoverDisabledQuietWindow',
+    'Invoke-CutoverStartAndAwait'
 )
 $script:OriginalFunctions = @{}
 foreach ($name in $mockNames) {
@@ -116,6 +121,9 @@ function New-TestContext {
         expected_current_task_result = 0
         expected_current_failure_code = ''
         expected_current_run_id = ''
+        expected_disabled_xml_sha256 = ''
+        dispatch_utc = [DateTime]::MinValue
+        quiet_window_wait_seconds = 900
         git_path = 'C:\Program Files\Git\cmd\git.exe'
         expected_git_sha256 = ('3' * 64)
         expected_claude_sha256 = ('4' * 64)
@@ -909,11 +917,14 @@ try {
     foreach ($forbidden in @('Invoke-RestMethod', 'Invoke-WebRequest', 'az rest', 'bus.ps1', 'Register-ScheduledTask', 'Stop-ScheduledTask')) {
         Assert-True ('driver excludes direct surface ' + $forbidden) ($source.IndexOf($forbidden, [StringComparison]::OrdinalIgnoreCase) -lt 0)
     }
-    Assert-True 'driver exposes all seven bounded actions' (@(
+    Assert-True 'driver exposes all eight bounded actions' (@(
         'ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain',
-        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait' |
+        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait', 'StartAndAwaitFromDisabled' |
             Where-Object { $source.IndexOf($_, [StringComparison]::Ordinal) -ge 0 }
-    ).Count -eq 7)
+    ).Count -eq 8)
+    foreach ($recoveryParameter in @('ExpectedDisabledXmlSha256', 'ExpectedDispatchTimestamp', 'QuietWindowWaitSeconds')) {
+        Assert-True ('real command entry forwards recovery parameter ' + $recoveryParameter) ($source.Contains($recoveryParameter + ' = $' + $recoveryParameter))
+    }
     Assert-True 'receipt byte cap is literal 3072' ($source.Contains('$script:CutoverReceiptMaximumBytes = 3072'))
     Assert-True 'log and protected inputs have finite byte caps' (
         $source.Contains('$script:CutoverLogMaximumBytes = 67108864') -and
@@ -3060,6 +3071,120 @@ try {
     Assert-ThrowsCode 'trigger window rejects a natural-run race' {
         Assert-CutoverTriggerWindow -NextRunUtc ([DateTime]::UtcNow.AddSeconds(10)) -RequiredSeconds 60
     } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+
+    # Recovery waits while disabled; no work deadline or natural margin is reduced.
+    Reset-TestMocks
+    $quietContext = New-TestContext
+    $quietContext.mode = 'Execute'
+    $quietContext.timeout_seconds = 420
+    $quietContext.expected_terminal_status = 'no_eligible_order'
+    $script:QuietNow = [DateTime]::SpecifyKind([DateTime]'2026-09-16T10:04:00', [DateTimeKind]::Utc)
+    $quietInitial = New-TestExactStatus -Next ([DateTime]::SpecifyKind([DateTime]'2026-09-16T10:07:52', [DateTimeKind]::Utc)) -State Disabled
+    Set-TestMock 'Get-CutoverUtcNow' { $script:QuietNow }
+    $script:QuietSleeps = 0
+    Set-TestMock 'Wait-CutoverQuietPoll' { $script:QuietSleeps++; $script:QuietNow = $script:QuietNow.AddSeconds(30) }
+    Set-TestMock 'Get-CutoverTaskRuntime' { [pscustomobject]@{state='Disabled';last_task_result=0;last_run_utc=[DateTime]'2026-09-07T00:00:00Z'} }
+    Wait-CutoverDisabledQuietWindow -Context $quietContext -Initial $quietInitial
+    Assert-True 'disabled quiet wait crosses skipped occurrence without starting task' ($script:QuietSleeps -gt 0 -and $script:QuietNow -ge $quietInitial.next_run_utc)
+    Assert-True 'disabled quiet wait preserves full seven-minute work allowance and margin' ($quietContext.timeout_seconds -eq 420 -and $quietContext.natural_trigger_margin_seconds -eq 60)
+    $intervalNext = Get-CutoverNextDisabledIntervalUtc -ReferenceUtc $quietInitial.next_run_utc -NowUtc $quietInitial.next_run_utc.AddMinutes(15)
+    Assert-True 'disabled interval advances at exact occurrence, not to a past time' ($intervalNext -eq $quietInitial.next_run_utc.AddMinutes(30))
+    Assert-ThrowsCode 'disabled interval rejects unknown task reference' { Get-CutoverNextDisabledIntervalUtc -ReferenceUtc ([DateTime]::MinValue) -NowUtc $script:QuietNow } 'DISABLED_INTERVAL_REFERENCE_INVALID'
+    $script:QuietNow = $quietInitial.next_run_utc.AddMinutes(-2)
+    $quietContext.quiet_window_wait_seconds = 10
+    Assert-ThrowsCode 'quiet wait is finite and fails closed' { Wait-CutoverDisabledQuietWindow -Context $quietContext -Initial $quietInitial } 'DISABLED_QUIET_WINDOW_TIMEOUT'
+    $quietContext.quiet_window_wait_seconds = 900
+    Set-TestMock 'Get-CutoverTaskRuntime' { [pscustomobject]@{state='Running';last_task_result=0;last_run_utc=[DateTime]'2026-09-07T00:00:00Z'} }
+    Assert-ThrowsCode 'quiet wait rejects unexpectedly active task without stopping it' { Wait-CutoverDisabledQuietWindow -Context $quietContext -Initial $quietInitial } 'TASK_CHANGED_DURING_DISABLED_WAIT'
+    $quietContext.expected_terminal_status = 'result_confirmed'
+    $quietContext.dispatch_utc = $script:QuietNow.AddMinutes(-59)
+    Assert-ThrowsCode 'recovery rejects dispatch without remaining full completion allowance' { Assert-CutoverPendingDispatchWindow -Context $quietContext -NowUtc $script:QuietNow } 'DISPATCH_COMPLETION_WINDOW_UNAVAILABLE'
+    $quietContext.dispatch_utc = $script:QuietNow.AddSeconds(3)
+    Assert-ThrowsCode 'recovery rejects future-dated dispatch' { Assert-CutoverPendingDispatchWindow -Context $quietContext -NowUtc $script:QuietNow } 'DISPATCH_COMPLETION_WINDOW_UNAVAILABLE'
+
+    Reset-TestMocks
+    $context = New-TestContext
+    $context.mode = 'Execute'
+    $context.timeout_seconds = 420
+    $context.expected_terminal_status = 'result_confirmed'
+    $context.expected_work_id = 'CANARY-RECOVERY'
+    $context.expected_row_id = '99999999-9999-4999-8999-999999999999'
+    $context.expected_result_status = 'completed'
+    $context.dispatch_utc = [DateTime]::UtcNow
+    $script:RecoveryDisabledXml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><TimeTrigger><StartBoundary>2026-09-16T09:52:52Z</StartBoundary><Repetition><Interval>PT15M</Interval></Repetition></TimeTrigger></Triggers><Settings><Enabled>false</Enabled></Settings></Task>'
+    $script:RecoveryEnabledXml = $script:RecoveryDisabledXml.Replace('<Enabled>false</Enabled>', '<Enabled>true</Enabled>')
+    $context.expected_disabled_xml_sha256 = (Get-CutoverTaskXmlEvidence -Text $script:RecoveryDisabledXml).utf8_text_sha256
+    $script:RecoveryEnabled = $false; $script:RecoveryCoreCalls = 0; $script:RecoveryWaitCalls = 0; $script:RecoveryCleanupCalls = 0
+    Set-TestMock 'Assert-CutoverPinnedExecutables' { param($Context) }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' { param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState }
+    Set-TestMock 'Export-CutoverTaskXml' { if($script:RecoveryEnabled){$script:RecoveryEnabledXml}else{$script:RecoveryDisabledXml} }
+    Set-TestMock 'Get-CutoverState' { param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}} }
+    Set-TestMock 'Get-CutoverLogCheckpoint' {param($Path) [pscustomobject]@{length=1;sha256=('a'*64)}}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code)}
+    Set-TestMock 'Wait-CutoverDisabledQuietWindow' {param($Context,$Initial) $script:RecoveryWaitCalls++}
+    Set-TestMock 'Enable-CutoverTask' {$script:RecoveryEnabled=$true}
+    Set-TestMock 'Assert-CutoverTriggerWindow' {param($NextRunUtc,$RequiredSeconds) if($RequiredSeconds -ne 600){throw 'GUARD_CHANGED'}}
+    Set-TestMock 'Invoke-CutoverStartAndAwait' {
+        param($Context)
+        $script:RecoveryCoreCalls++
+        if($Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or $Context.expected_work_id -cne 'CANARY-RECOVERY' -or $Context.expected_row_id -cne $script:RecoveryResultRow){throw 'CORE_CONTRACT_CHANGED'}
+        [pscustomobject]@{schema=$script:CutoverSchema;ok=$true;action='StartAndAwait';operation_id=$Context.operation_id;status='RUN_CONFIRMED';worker_status='result_confirmed';protected_fingerprints_unchanged=$true;log_prefix_preserved=$true}
+    }
+    $script:RecoveryResultRow=$context.expected_row_id
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) $script:RecoveryCleanupCalls++;$script:RecoveryEnabled=$false;[pscustomobject]@{mode='Execute';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
+    $recovered = Invoke-CutoverStartAndAwaitFromDisabled -Context $context
+    Assert-True 'recovery calls existing acceptance gateway once, with original full contract' ($script:RecoveryCoreCalls -eq 1 -and $script:RecoveryWaitCalls -eq 1 -and $recovered.action -ceq 'StartAndAwaitFromDisabled')
+    Assert-True 'recovery receipt preserves original protected and log proof plus enable evidence' ($recovered.protected_fingerprints_unchanged -and $recovered.log_prefix_preserved -and $recovered.recovery_definition_preserved_except_enabled -and $recovered.recovery_state_and_log_preserved_before_start)
+    $script:RecoveryEnabled=$false;$context.expected_disabled_xml_sha256=('f'*64)
+    Assert-ThrowsCode 'recovery authenticates exact caller-pinned disabled definition before enable' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISABLED_TASK_XML_NOT_AUTHENTICATED'
+    Assert-True 'failed disabled authentication never enables or executes work' (-not $script:RecoveryEnabled -and $script:RecoveryCoreCalls -eq 1)
+    $context.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:RecoveryDisabledXml).utf8_text_sha256
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code) if($Code -ceq 'STATE_CHANGED_DURING_DISABLED_WAIT'){throw $Code}}
+    Assert-ThrowsCode 'recovery rejects state drift during quiet wait before enable' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'STATE_CHANGED_DURING_DISABLED_WAIT'
+    Assert-True 'drift fails closed without work execution' (-not $script:RecoveryEnabled -and $script:RecoveryCoreCalls -eq 1)
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code) if($Code -ceq 'LOG_CHANGED_DURING_DISABLED_WAIT'){throw $Code}}
+    Assert-ThrowsCode 'recovery rejects log drift before enable' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'LOG_CHANGED_DURING_DISABLED_WAIT'
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code)}
+    $script:RecoveryProtectedCalls=0
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:RecoveryProtectedCalls++;if($script:RecoveryProtectedCalls -eq 1){'before'}else{'after'}}
+    Assert-ThrowsCode 'recovery rejects protected drift before enable' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'PROTECTED_CHANGED_DURING_DISABLED_WAIT'
+    $script:RecoveryProtectedCalls=0
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:RecoveryProtectedCalls++;if($script:RecoveryProtectedCalls -lt 3){'before'}else{'after'}}
+    Assert-ThrowsCode 'recovery rejects protected drift during enable before core captures baseline' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'PROTECTED_CHANGED_DURING_ENABLE'
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+    $context.expected_row_id='11111111-1111-1111-1111-111111111111'
+    Assert-ThrowsCode 'recovery never replays a dispatch already at the cursor' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISPATCH_ALREADY_SEEN_BY_WORKER'
+    $context.expected_row_id=$script:RecoveryResultRow
+    $badInterval=$script:RecoveryDisabledXml.Replace('PT15M','PT5M')
+    $script:RecoverySavedXml=$script:RecoveryDisabledXml;$script:RecoveryDisabledXml=$badInterval
+    $context.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $badInterval).utf8_text_sha256
+    Assert-ThrowsCode 'recovery rejects pinned but non-fifteen-minute interval' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISABLED_INTERVAL_NOT_AUTHENTICATED'
+    $script:RecoveryDisabledXml=$script:RecoverySavedXml
+    $context.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:RecoveryDisabledXml).utf8_text_sha256
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) if($ExpectedTaskState -ceq 'Ready'){New-TestExactStatus -State Ready -Last ([DateTime]'2026-09-07T00:00:01Z')}else{New-TestExactStatus -State Disabled}}
+    Assert-ThrowsCode 'recovery detects task run during enable and disables future triggers' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'TASK_RAN_DURING_ENABLE'
+    Assert-True 'all recovery rejection controls preserve one original core call' ($script:RecoveryCoreCalls -eq 1 -and -not $script:RecoveryEnabled)
+    Reset-TestMocks
+
+    $env:ProgramData=$fakeProgramData
+    $recoveryValues=$contextValues.Clone()
+    $recoveryValues.InstallerPath=$wiredIncidentContext.installer_path
+    $recoveryValues.ExpectedReleaseId=$wiredIncidentContext.release_id
+    $recoveryValues.ExpectedInstallerSha256=(Get-FileHash -LiteralPath $wiredIncidentContext.installer_path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $recoveryValues.Mode='Execute';$recoveryValues.ExpectedCurrentTaskResult='';$recoveryValues.ExpectedCurrentFailureCode='';$recoveryValues.ExpectedCurrentRunId=''
+    $recoveryValues.ExpectedTerminalStatus='result_confirmed';$recoveryValues.ExpectedWorkId='CANARY-RECOVERY';$recoveryValues.ExpectedRowId='99999999-9999-4999-8999-999999999999';$recoveryValues.ExpectedResultStatus='completed'
+    $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.ExpectedDispatchTimestamp=[DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'");$recoveryValues.QuietWindowWaitSeconds='900'
+    $wiredRecovery=New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $recoveryValues
+    Assert-True 'recovery context wires caller pin, canonical dispatch time and bounded wait' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.dispatch_utc.Kind -eq [DateTimeKind]::Utc -and $wiredRecovery.quiet_window_wait_seconds -eq 900)
+    $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDisabledXmlSha256=('A'*64)
+    Assert-ThrowsCode 'recovery context rejects malformed disabled SHA pin' {New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $badRecovery} 'EXPECTED_DISABLED_XML_SHA256_INVALID'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDispatchTimestamp=''
+    Assert-ThrowsCode 'recovery context requires canary dispatch timestamp' {New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $badRecovery} 'EXPECTED_DISPATCH_TIMESTAMP_INVALID'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.QuietWindowWaitSeconds='901'
+    Assert-ThrowsCode 'recovery context rejects unbounded quiet wait' {New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $badRecovery} 'QUIET_WINDOW_WAIT_SECONDS_INVALID'
+    Assert-ThrowsCode 'normal start rejects disabled recovery inputs' {New-CutoverContext -RequestedAction StartAndAwait -Values $recoveryValues} 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
+    $env:ProgramData=$oldProgramData
 
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.
     $workflow = [IO.File]::ReadAllText((Join-Path $repoRoot '.github\workflows\order-acceptance.yml'))

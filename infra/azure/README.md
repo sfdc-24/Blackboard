@@ -347,6 +347,28 @@ repair mode and cannot create, update, or delete Azure resources.
     has no bus access, so independently read
     the full board and require exactly the canary DISPATCH plus one deterministic
     CLAIM, RECEIPT, and RESULT.
+    If control-plane delivery consumes that window and verified failure cleanup
+    leaves the exact Execute task `Disabled`, do not replay the failed command
+    or redispatch its canary. After preserving the terminal failure, independently
+    authenticate the current disabled XML and confirm the canary has no worker
+    lifecycle rows. A **new** command identity may use
+    `StartAndAwaitFromDisabled`, `ExpectedDisabledXmlSha256`, and the original
+    canonical UTC `ExpectedDispatchTimestamp`. This recovery requires the pinned
+    disabled definition, task result `0`, healthy prior state, and an unseen
+    dispatch. It waits read-only while disabled for at most
+    `QuietWindowWaitSeconds` (maximum 900), deriving the fifteen-minute phase
+    from the authenticated XML. It never shortens `TimeoutSeconds` or
+    `NaturalTriggerMarginSeconds`. State, log, definition, protected files and
+    last-run identity must remain unchanged before enabling future triggers.
+    Actual enabled `NextRunTime` is then checked again before delegating to the
+    same full `StartAndAwait` acceptance gateway. Leave the full runtime and
+    margin before the order's sixty-minute expiry; an expired/previously seen
+    order fails closed. Use a finite Managed Run Command platform timeout
+    covering both the disabled wait and the original execution allowance
+    (1800 seconds for a 900-second wait and 420-second execution allowance).
+    This action never stops/registers a task or resets state. Failure uses the
+    existing verified future-trigger disable cleanup. The no-eligible variant
+    requires empty work, row, result and dispatch-time inputs.
 18. Run a second `StartAndAwait` for exact `no_eligible_order`. Require another
     `LastRunTime` and run-ID advance, no new lifecycle rows, and global canary
     counts still exactly `1/1/1`. Task result `0` alone is never acceptance.
