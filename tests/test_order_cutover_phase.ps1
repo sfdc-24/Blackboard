@@ -3194,6 +3194,35 @@ try {
     Assert-True 'disabled recovery installs only Observe via caller-pinned no-stop installer' ($script:ObserveRecoveryInstalls -eq 1 -and $observeRecovery.old_execute_task_not_enabled -and -not $observeRecovery.task_stopped -and $observeRecovery.candidate_install_action -ceq 'InstallFromDisabledNoStop')
     Assert-True 'disabled recovery requires bounded Observe drain ending no eligible' ($script:ObserveRecoveryDrains -eq 1 -and $observeRecovery.runs -eq 2 -and $observeRecovery.final_worker_status -ceq 'no_eligible_order' -and $observeRecovery.state_not_restored -and $observeRecovery.protected_fingerprints_unchanged)
     Assert-True 'disabled recovery receipt preserves exact disabled backup and future Observe definition' ($observeRecovery.authenticated_disabled_xml_sha256 -ceq $context.expected_disabled_xml_sha256 -and $observeRecovery.backup_matches_authenticated_disabled_xml -and $observeRecovery.state_and_log_preserved_through_install -and $observeRecovery.observe_start_boundary_utc -ceq '2099-01-01T00:00:00.0000000Z')
+    # Waker supplement: these wrapper guards are masked by the downstream real
+    # drain. Pin EACH exact code using actual file drift after the backup read.
+    $checkpointMocks=@{}
+    foreach($n in @('Get-CutoverState','Get-CutoverLogCheckpoint','Assert-CutoverFileCheckpointUnchanged','Invoke-CutoverDrainObserve','Assert-CutoverBackupMatchesExpectedXml')){$checkpointMocks[$n]=(Get-Item ('Function:'+ $n)).ScriptBlock}
+    $checkpointContext=New-TestContext
+    $checkpointContext.mode='Observe';$checkpointContext.timeout_seconds=420;$checkpointContext.max_runs=8
+    $checkpointContext.expected_disabled_xml_sha256=$context.expected_disabled_xml_sha256
+    $checkpointContext.state_path=Join-Path $temporaryRoot 'post-backup-state.json'
+    $checkpointContext.log_path=Join-Path $temporaryRoot 'post-backup-log.jsonl'
+    Set-TestMock 'Get-CutoverState' $script:OriginalFunctions['Get-CutoverState']
+    Set-TestMock 'Get-CutoverLogCheckpoint' $script:OriginalFunctions['Get-CutoverLogCheckpoint']
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' $script:OriginalFunctions['Assert-CutoverFileCheckpointUnchanged']
+    Set-TestMock 'Invoke-CutoverDrainObserve' {param($Context,$Installer,$AdmittedBaseline) $script:PostBackupDrains++;[pscustomobject]@{status='OBSERVE_DRAINED';runs=1;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00Z';log_appended_bytes=1}}
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256)
+        if($script:PostBackupDrift -ceq 'state'){
+            $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++
+            [IO.File]::WriteAllText($Context.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        }else{[IO.File]::AppendAllText($Context.log_path,('{"event":"unexpected"}'+"`n"),(New-Object Text.UTF8Encoding($false)))}
+    }
+    foreach($postBackupDrift in @('state','log')){
+        $script:PostBackupDrift=$postBackupDrift;$script:PostBackupDrains=0;$script:ObserveRecoveryInstalled=$false
+        [IO.File]::WriteAllText($checkpointContext.state_path,((New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order)|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($checkpointContext.log_path,('{"event":"prior"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
+        $postBackupCode=if($postBackupDrift -ceq 'state'){'STATE_CHANGED_BEFORE_OBSERVE_DRAIN'}else{'LOG_CHANGED_BEFORE_OBSERVE_DRAIN'}
+        Assert-ThrowsCode ('post-backup actual '+$postBackupDrift+' drift pins exact wrapper guard') {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $checkpointContext} $postBackupCode
+        Assert-True ('post-backup '+$postBackupDrift+' drift never delegates and quarantines') ($script:PostBackupDrains -eq 0 -and -not $script:ObserveRecoveryInstalled)
+    }
+    foreach($n in $checkpointMocks.Keys){Set-TestMock $n $checkpointMocks[$n]}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryInstalls=1;$script:ObserveRecoveryDrains=1
     $savedRecoveryStateMock = (Get-Item Function:Get-CutoverState).ScriptBlock
     $savedRecoveryStatusMock = (Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
     $savedRecoveryBackupMock = (Get-Item Function:Assert-CutoverBackupMatchesExpectedXml).ScriptBlock
