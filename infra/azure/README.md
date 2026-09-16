@@ -524,17 +524,19 @@ The first real OneRun rechecks the original state/log hashes after the drain's
 last Ready read, directly before Start. The original protected fingerprint is
 also carried into that gate and rechecked before the state/log hashes, so a
 slow protected-tree read cannot leave those checkpoints unverified. Missing,
-blank or non-string protected admissions fail closed. It then rechecks the remaining total
+blank or non-string protected admissions fail closed.
 Before those final state/log hashes, OneRun independently rereads exact
 Observe/Ready/result-0 status, requires the original scheduler LastRunTime and
 compares the full normalized Observe XML fingerprint (plus Enabled=true).
 The same fingerprint is rechecked after the wrapper's last Ready read and
 carried through the drain. Canonical omitted Enabled=true remains equivalent;
 catch-up settings, runner/actions and triggers cannot be silently substituted.
-State/log checkpoints are checked after the final status/XML reads, and the
+The protected fingerprint is rechecked after those final native status/XML
+reads, before the state/log checkpoints, so drift during those reads is rejected.
+State/log checkpoints are checked after that final protected-tree read, and the
 pre-install checks follow the slow protected-tree read. The admitted and newly
 read native trigger windows both have to cover the remaining total deadline.
-deadline and natural-trigger window after those hash reads. This binding applies
+Deadline and natural-trigger checks follow all those hash reads. This binding applies
 only to the first recovery start; later stale iterations retain the established
 per-run transition and log-prefix contract. Future Observe XML must explicitly
 contain exactly one StartWhenAvailable setting with value true.

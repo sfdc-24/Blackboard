@@ -2021,6 +2021,9 @@ function Invoke-CutoverOneRun {
         if ($firstStartReady.last_run_utc.Ticks -ne $AdmittedBaseline.last_run_utc.Ticks) { Throw-Cutover -Code 'OBSERVE_FIRST_START_TASK_CHANGED' }
         $firstStartXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if (-not $firstStartXml.enabled -or $firstStartXml.normalized_sha256 -cne $admittedDefinition.Value) { Throw-Cutover -Code 'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START' }
+        # The native status and XML reads can outlast the earlier fingerprint.
+        # Recheck it here, then authenticate state/log after this slow tree read.
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $admittedProtected.Value) { Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START' }
         Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'
         Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'
         if ([DateTime]::UtcNow -ge $DeadlineUtc) { Throw-Cutover -Code 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED' }

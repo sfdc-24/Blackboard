@@ -3140,6 +3140,7 @@ try {
                 'result'{$native.last_task_result=[long]37}
                 'last_run'{$native.last_run_time=(New-TestExactStatus).last_run_utc.AddSeconds(1)}
                 'window'{$native.next_run_time=[DateTime]::UtcNow.AddSeconds(1)}
+                'protected'{$script:FirstStartProtectedChanged=$true}
                 'state'{$s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++;[IO.File]::WriteAllText($Context.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))}
                 'log'{[IO.File]::AppendAllText($Context.log_path,('{"event":"during-final-native-read"}'+"`n"),(New-Object Text.UTF8Encoding($false)))}
             }
@@ -3169,13 +3170,14 @@ try {
         Assert-True ('first-start '+$firstStartDrift+' starts only the unchanged positive baseline') ($script:FirstStartCalls -eq $(if($firstStartDrift -ceq 'none'){1}else{0}))
     }
     $script:FirstStartProtectedChanged=$false
-    foreach($firstBoundaryCase in @('mode','running','result','last_run','window','xml_action','xml_catchup','state','log','omitted_enabled')){
+    foreach($firstBoundaryCase in @('mode','running','result','last_run','window','xml_action','xml_catchup','state','log','protected','omitted_enabled')){
         $script:FirstBoundaryActive=$true;$script:FirstBoundaryFinalRead=$false;$script:FirstBoundaryCase=$firstBoundaryCase;$script:FirstBoundaryNativeReads=0;$script:FirstStartCalls=0
+        $script:FirstStartProtectedChanged=$false
         [IO.File]::WriteAllText($firstStartContext.state_path,($script:FirstStartCleanState|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
         [IO.File]::WriteAllText($firstStartContext.log_path,$script:FirstStartCleanLog,(New-Object Text.UTF8Encoding($false)))
         $script:FirstStartTaskXml=$script:FirstStartBaseXml
         $finalAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}
-        $finalCode=switch($firstBoundaryCase){'mode'{'INSTALLER_STATUS_MISMATCH'};'running'{'INSTALLER_STATUS_MISMATCH'};'result'{'INSTALLER_STATUS_MISMATCH'};'last_run'{'OBSERVE_FIRST_START_TASK_CHANGED'};'window'{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'};'xml_action'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'xml_catchup'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
+        $finalCode=switch($firstBoundaryCase){'mode'{'INSTALLER_STATUS_MISMATCH'};'running'{'INSTALLER_STATUS_MISMATCH'};'result'{'INSTALLER_STATUS_MISMATCH'};'last_run'{'OBSERVE_FIRST_START_TASK_CHANGED'};'window'{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'};'xml_action'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'xml_catchup'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};'protected'{'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
         Assert-ThrowsCode ('real OneRun final native-definition boundary '+$firstBoundaryCase) {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(420)) -PreviousLastRunUtc $finalAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $finalAdmission.log_checkpoint -AdmittedBaseline $finalAdmission} $finalCode
         Assert-True ('final boundary '+$firstBoundaryCase+' only starts canonical enabled positive control') ($script:FirstStartCalls -eq $(if($firstBoundaryCase -ceq 'omitted_enabled'){1}else{0}))
     }
