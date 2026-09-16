@@ -3271,9 +3271,10 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
             Throw-Cutover -Code 'DISABLED_HTTP_ERROR_ADMISSION_NOT_ABSENT'
         }
     }
+    $allowedRetryCodes = if ($expectedFailureCode -ceq 'BOARD_ROWS_MISSING') { @('BOARD_READ_HTTP_ERROR', 'board_rows_missing') } else { @('BOARD_READ_HTTP_ERROR') }
     $retryCode = [string]$entries[1].code
     if ($entries[0].level -cne 'info' -or $entries[0].code -cne '' -or $entries[0].message -cne '' -or
-        $entries[1].level -cne 'warning' -or @('BOARD_READ_HTTP_ERROR','BOARD_ROWS_MISSING','board_rows_missing') -cnotcontains $retryCode -or
+        $entries[1].level -cne 'warning' -or $allowedRetryCodes -cnotcontains $retryCode -or
         $entries[1].message -cne 'A transient pre-admission board read failed; retrying once.' -or
         $terminal.message -cne $State.error.message) { Throw-Cutover -Code 'DISABLED_HTTP_ERROR_LOG_EVIDENCE_INVALID' }
     foreach ($index in 1..2) {

@@ -3604,7 +3604,7 @@ try {
     # Disabled pre-admission HTTP recovery is a new, ready-only Observe lane.
     # The healthy-only recovery and the single Execute start remain unchanged.
     function Reset-TestDisabledHttpScenario {
-        param([string]$FailureCode='BOARD_READ_HTTP_ERROR')
+        param([string]$FailureCode='BOARD_READ_HTTP_ERROR', [string]$RetryShape='')
         Reset-TestMocks
         $script:HttpContext=New-TestContext
         $script:HttpContext.mode='Observe';$script:HttpContext.timeout_seconds=420;$script:HttpContext.max_runs=8
@@ -3617,7 +3617,15 @@ try {
         $errorMessage=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'board_rows_missing'}else{'BOARD_READ_HTTP_ERROR'}
         $script:HttpState=New-TestState -Mode Execute -RunId ('d'*32) -Status error -ErrorCode $FailureCode -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
         $script:HttpState.error.message=$errorMessage
-        $retry=[pscustomobject]@{attempt='1';code='BOARD_READ_HTTP_ERROR';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='31462.33';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        if([string]::IsNullOrEmpty($RetryShape)){$RetryShape=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'rows_missing'}else{'http404'}}
+        if(@('http404','rows_missing') -cnotcontains $RetryShape){throw 'TEST_RETRY_SHAPE_INVALID'}
+        if($RetryShape -ceq 'rows_missing'){
+            $retryCode='board_rows_missing'
+            $retry=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='31462.33'}
+        }else{
+            $retryCode='BOARD_READ_HTTP_ERROR'
+            $retry=[pscustomobject]@{attempt='1';code='BOARD_READ_HTTP_ERROR';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='31462.33';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        }
         $errorDetails=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){
             [pscustomobject]@{attempt='2';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='54303.56'}
         }else{
@@ -3625,7 +3633,7 @@ try {
         }
         $script:HttpEntries=@(
             (New-TestLogEntry -Event poll_started -RunId ('d'*32) -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{mode='Execute'})),
-            (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code BOARD_READ_HTTP_ERROR -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
+            (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code $retryCode -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
             (New-TestLogEntry -Event run_error -RunId ('d'*32) -Level error -Code $FailureCode -Message $errorMessage -At '2026-09-07T00:00:45.000Z' -Details $errorDetails)
         )
         $script:HttpInstalled=$false;$script:HttpInstallCalls=0;$script:HttpCleanupCalls=0;$script:HttpStatusCalls=0
@@ -3662,9 +3670,12 @@ try {
     Assert-True 'HTTP recovery receipt is correlated and bounded' ((ConvertTo-CutoverBoundedReceipt -Receipt $httpReceipt).Length -lt 3072 -and $httpReceipt.operation_id -ceq $script:HttpContext.operation_id)
     Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
     $rowsMissingReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
-    Assert-True 'rows-missing pre-admission error authenticates ready-only Observe recovery' ($rowsMissingReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $rowsMissingReceipt.failed_run_id -ceq ('d'*32) -and $script:HttpInstallCalls -eq 1)
-    Assert-True 'rows-missing recovery never starts drains or replays work' (-not $rowsMissingReceipt.task_started -and -not $rowsMissingReceipt.task_stopped -and $rowsMissingReceipt.worker_health_not_yet_confirmed)
-    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','lowercase_rows_retry_http','poll_time','error_time','poll_mode')){
+    Assert-True 'canonical rows-missing pre-admission error authenticates ready-only Observe recovery' ($rowsMissingReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $rowsMissingReceipt.failed_run_id -ceq ('d'*32) -and $script:HttpInstallCalls -eq 1 -and $script:HttpEntries[1].code -ceq 'board_rows_missing' -and $script:HttpEntries[1].details.http_status -ceq '200')
+    Assert-True 'canonical rows-missing recovery never starts drains or replays work' (-not $rowsMissingReceipt.task_started -and -not $rowsMissingReceipt.task_stopped -and $rowsMissingReceipt.worker_health_not_yet_confirmed)
+    Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING -RetryShape http404
+    $rowsMissingAfterHttpReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
+    Assert-True 'rows-missing after initial HTTP 404 also authenticates the live guest shape' ($rowsMissingAfterHttpReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $script:HttpEntries[1].code -ceq 'BOARD_READ_HTTP_ERROR' -and $script:HttpEntries[2].code -ceq 'BOARD_ROWS_MISSING')
+    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','http_context_rows_retry','lowercase_rows_retry_http','poll_time','error_time','poll_mode')){
         Reset-TestDisabledHttpScenario
         $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
         switch($badHttp){
@@ -3683,7 +3694,13 @@ try {
             'elapsed'{$script:HttpEntries[2].details.elapsed_ms='0';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'typed_metadata'{$script:HttpEntries[2].details.http_status=404;$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'retry_detail_code'{$script:HttpEntries[1].details.code='board_rows_missing';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'http_context_rows_retry'{
+                $script:HttpEntries[1].code='board_rows_missing'
+                $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='31462.33'}
+                $httpCode='DISABLED_HTTP_ERROR_LOG_EVIDENCE_INVALID'
+            }
             'lowercase_rows_retry_http'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
                 $script:HttpEntries[1].code='board_rows_missing'
                 $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='500';content_type_class='json';elapsed_ms='31462.33'}
                 $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
