@@ -513,6 +513,9 @@ installer's `InstallFromDisabledNoStop` in Observe mode, replacing the old
 definition with a new future PT15M interval. The authenticated disabled XML is
 backed up and verified; state, log, release bytes, profile/configuration and
 repository fingerprints are not restored or edited by the driver.
+Run this phase with one guest/task-definition owner; other fleet writers remain
+off the guest. These are point-in-time admission checks, not a lock against an
+out-of-band privileged writer. A merge or a successful installer is not delivery.
 After the protected-tree and backup reads, it rechecks the exact Ready run and
 full remaining trigger window. The admitted scheduler LastRunTime, run ID and
 state/log checkpoints are carried into the real drain; an intervening run or
@@ -522,6 +525,15 @@ last Ready read, directly before Start. The original protected fingerprint is
 also carried into that gate and rechecked before the state/log hashes, so a
 slow protected-tree read cannot leave those checkpoints unverified. Missing,
 blank or non-string protected admissions fail closed. It then rechecks the remaining total
+Before those final state/log hashes, OneRun independently rereads exact
+Observe/Ready/result-0 status, requires the original scheduler LastRunTime and
+compares the full normalized Observe XML fingerprint (plus Enabled=true).
+The same fingerprint is rechecked after the wrapper's last Ready read and
+carried through the drain. Canonical omitted Enabled=true remains equivalent;
+catch-up settings, runner/actions and triggers cannot be silently substituted.
+State/log checkpoints are checked after the final status/XML reads, and the
+pre-install checks follow the slow protected-tree read. The admitted and newly
+read native trigger windows both have to cover the remaining total deadline.
 deadline and natural-trigger window after those hash reads. This binding applies
 only to the first recovery start; later stale iterations retain the established
 per-run transition and log-prefix contract. Future Observe XML must explicitly
