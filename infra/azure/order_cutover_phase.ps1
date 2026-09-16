@@ -83,6 +83,7 @@ $script:CutoverLogMaximumBytes = 67108864
 $script:CutoverLogDeltaMaximumBytes = 1048576
 $script:CutoverTreeMaximumEntries = 50000
 $script:CutoverProtectedFileMaximumBytes = 268435456
+$script:CutoverPinnedExecutableMaximumBytes = 536870912
 $script:CutoverProtectedTreeMaximumBytes = 536870912
 $script:CutoverClockToleranceSeconds = 2
 $script:CutoverTaskStartupMaximumSeconds = 30
@@ -2063,13 +2064,16 @@ function Invoke-CutoverOneRun {
 }
 
 function Get-CutoverFileFingerprint {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateRange(1, 536870912)][long]$MaximumBytes = $script:CutoverProtectedFileMaximumBytes
+    )
     Assert-CutoverPathChainSafe -Path $Path -Code 'PROTECTED_PATH_UNSAFE'
     if (-not (Test-Path -LiteralPath $Path)) { return 'MISSING' }
     Assert-CutoverSafeFile -Path $Path -MissingCode 'PROTECTED_PATH_MISSING' -UnsafeCode 'PROTECTED_PATH_UNSAFE'
     try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
     catch { Throw-Cutover -Code 'PROTECTED_PATH_READ_FAILED' }
-    if ($item.Length -lt 0 -or $item.Length -gt $script:CutoverProtectedFileMaximumBytes) {
+    if ($item.Length -lt 0 -or $item.Length -gt $MaximumBytes) {
         Throw-Cutover -Code 'PROTECTED_FILE_TOO_LARGE'
     }
     return Get-CutoverTextSha256 -Text ('F|{0}|{1}|{2}' -f $item.Length, $item.LastWriteTimeUtc.Ticks, (Get-CutoverFileSha256 -Path $Path))
@@ -2165,8 +2169,11 @@ function Get-CutoverProtectedSnapshot {
         git_hooks = (Get-CutoverTreeFingerprint -Path (Join-Path $Context.workspace_path '.git\hooks'))
         env_file = (Get-CutoverFileFingerprint -Path $Context.env_file)
         release_tree = (Get-CutoverTreeFingerprint -Path $releasePath)
-        claude_file = (Get-CutoverFileFingerprint -Path $Context.claude_command)
-        git_file = (Get-CutoverFileFingerprint -Path $Context.git_path)
+        # These two files were independently SHA-256 pinned before this snapshot.
+        # Claude Code 2.1.241 is 337745056 bytes; retain the smaller limit for
+        # unpinned configuration files and every protected tree entry.
+        claude_file = (Get-CutoverFileFingerprint -Path $Context.claude_command -MaximumBytes $script:CutoverPinnedExecutableMaximumBytes)
+        git_file = (Get-CutoverFileFingerprint -Path $Context.git_path -MaximumBytes $script:CutoverPinnedExecutableMaximumBytes)
         profile_claude = (Get-CutoverTreeFingerprint -Path (Join-Path $Context.user_profile_path '.claude'))
         profile_claude_json = (Get-CutoverFileFingerprint -Path (Join-Path $Context.user_profile_path '.claude.json'))
         workspace_claude = (Get-CutoverTreeFingerprint -Path (Join-Path $Context.workspace_path '.claude'))

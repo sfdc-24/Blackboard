@@ -937,6 +937,55 @@ try {
     )
 
     # Path/hash binding uses the exact ProgramData identities for both tools.
+    # Exercise the real protected snapshot at the measured guest executable
+    # size, not a mocked snapshot that masks the byte-bound contract.
+    Reset-TestMocks
+    $sizeContext = New-TestContext
+    $sizeContext.metadata_root = Join-Path $temporaryRoot 'size-metadata'
+    $sizeContext.workspace_path = Join-Path $temporaryRoot 'size-workspace'
+    $sizeContext.user_profile_path = Join-Path $temporaryRoot 'size-profile'
+    $sizeRelease = Join-Path $temporaryRoot 'size-release'
+    foreach ($directory in @($sizeContext.metadata_root, $sizeContext.workspace_path, $sizeContext.user_profile_path, (Join-Path $sizeRelease 'scripts'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $sizeContext.installer_path = Join-Path $sizeRelease 'scripts\install.ps1'
+    $sizeContext.env_file = Join-Path $temporaryRoot 'size-env'
+    $sizeContext.git_path = Join-Path $temporaryRoot 'size-git.exe'
+    $sizeContext.claude_command = Join-Path $temporaryRoot 'size-claude.exe'
+    [IO.File]::WriteAllBytes($sizeContext.env_file, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($sizeContext.git_path, [byte[]]@(4, 5, 6))
+    $sizeStream = [IO.File]::Create($sizeContext.claude_command)
+    try { $sizeStream.SetLength(337745056) } finally { $sizeStream.Dispose() }
+    Assert-ThrowsCode 'unpinned file retains 256MiB bound at measured Claude size' {
+        Get-CutoverFileFingerprint -Path $sizeContext.claude_command | Out-Null
+    } 'PROTECTED_FILE_TOO_LARGE'
+    Set-TestMock 'Invoke-CutoverGitRead' {
+        param($Context, $Arguments, $AllowedExitCodes)
+        $stdout = if ($Arguments -contains 'rev-parse') { ('a' * 40) + "`n" }
+                  elseif ($Arguments -contains 'symbolic-ref') { "refs/heads/test`n" }
+                  else { '' }
+        [pscustomobject]@{ exit_code = 0; stdout = $stdout; stderr = '' }
+    }
+    $sizeSnapshot = Invoke-TestCapture { Get-CutoverProtectedSnapshot -Context $sizeContext }
+    Assert-True 'real protected snapshot accepts measured 337745056-byte pinned executable' (
+        $sizeSnapshot.ok -and [string]$sizeSnapshot.value -cmatch '^[0-9a-f]{64}$'
+    ) -Detail $sizeSnapshot.error
+    [IO.File]::WriteAllBytes($sizeContext.git_path, [byte[]]@(7, 8, 9))
+    $changedSizeSnapshot = Invoke-TestCapture { Get-CutoverProtectedSnapshot -Context $sizeContext }
+    Assert-True 'real protected snapshot still detects executable content mutation' (
+        $changedSizeSnapshot.ok -and [string]$changedSizeSnapshot.value -cne [string]$sizeSnapshot.value
+    ) -Detail $changedSizeSnapshot.error
+    $sizeStream = [IO.File]::OpenWrite($sizeContext.claude_command)
+    try { $sizeStream.SetLength(536870913) } finally { $sizeStream.Dispose() }
+    Assert-ThrowsCode 'pinned executable still rejects above finite 512MiB bound' {
+        Get-CutoverFileFingerprint -Path $sizeContext.claude_command -MaximumBytes $script:CutoverPinnedExecutableMaximumBytes | Out-Null
+    } 'PROTECTED_FILE_TOO_LARGE'
+    Assert-True 'ordinary files and protected tree bounds remain unchanged' (
+        $script:CutoverProtectedFileMaximumBytes -eq 268435456 -and
+        $script:CutoverProtectedTreeMaximumBytes -eq 536870912
+    )
+    Reset-TestMocks
+
     $oldProgramData = $env:ProgramData
     $fakeProgramData = Join-Path $temporaryRoot 'ProgramData'
     $env:ProgramData = $fakeProgramData
