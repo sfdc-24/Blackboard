@@ -3452,6 +3452,128 @@ try {
     Assert-ThrowsCode 'normal Execute no eligible start rejects disabled recovery pin' {New-CutoverContext -RequestedAction StartAndAwait -Values $badRecovery} 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
     $env:ProgramData=$oldProgramData
 
+    # Disabled pre-admission HTTP recovery is a new, ready-only Observe lane.
+    # The healthy-only recovery and the single Execute start remain unchanged.
+    function Reset-TestDisabledHttpScenario {
+        Reset-TestMocks
+        $script:HttpContext=New-TestContext
+        $script:HttpContext.mode='Observe';$script:HttpContext.timeout_seconds=420;$script:HttpContext.max_runs=8
+        $script:HttpContext.expected_current_task_result=20
+        $script:HttpContext.expected_current_failure_code='BOARD_READ_HTTP_ERROR'
+        $script:HttpContext.expected_current_run_id=('d'*32)
+        $script:HttpDisabledXml=$futureXml.Replace('<Enabled>true</Enabled>','<Enabled>false</Enabled>')
+        $script:HttpObserveXml=$futureXml
+        $script:HttpContext.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:HttpDisabledXml).utf8_text_sha256
+        $script:HttpState=New-TestState -Mode Execute -RunId ('d'*32) -Status error -ErrorCode BOARD_READ_HTTP_ERROR -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
+        $retry=[pscustomobject]@{attempt='1';code='BOARD_READ_HTTP_ERROR';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='31462.33';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        $errorDetails=[pscustomobject]@{attempt='2';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='13711.96';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        $script:HttpEntries=@(
+            (New-TestLogEntry -Event poll_started -RunId ('d'*32) -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{mode='Execute'})),
+            (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code BOARD_READ_HTTP_ERROR -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
+            (New-TestLogEntry -Event run_error -RunId ('d'*32) -Level error -Code BOARD_READ_HTTP_ERROR -Message BOARD_READ_HTTP_ERROR -At '2026-09-07T00:00:45.000Z' -Details $errorDetails)
+        )
+        $script:HttpInstalled=$false;$script:HttpInstallCalls=0;$script:HttpCleanupCalls=0;$script:HttpStatusCalls=0
+        $script:HttpTaskResult=20;$script:HttpFinalLast=(New-TestExactStatus).last_run_utc
+        Set-TestMock 'Get-CutoverTrailingLogRun' {param($Path,$Checkpoint,$RunId) $script:HttpEntries}
+        Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=$script:HttpState;checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+        Set-TestMock 'Get-CutoverLogCheckpoint' {param($Path) [pscustomobject]@{length=1;sha256=('a'*64)}}
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {
+            param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$RequireResultZero,$AllowInheritedTaskResult)
+            $script:HttpStatusCalls++
+            if($script:HttpInstalled -and -not $AllowInheritedTaskResult){throw 'HTTP_RECOVERY_INHERITED_FLAG_MISSING'}
+            New-TestExactStatus -State $ExpectedTaskState -LastTaskResult $script:HttpTaskResult -Last $script:HttpFinalLast
+        }
+        Set-TestMock 'Export-CutoverTaskXml' {if($script:HttpInstalled){$script:HttpObserveXml}else{$script:HttpDisabledXml}}
+        Set-TestMock 'Assert-CutoverPinnedExecutables' {param($Context)}
+        Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+        Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code)}
+        Set-TestMock 'Invoke-CutoverInstaller' {
+            param($Context,$ScriptPath,$RequestedAction,$RequestedMode,$ExpectedCurrentTaskXmlSha256)
+            if($RequestedAction -cne 'InstallFromDisabledNoStop' -or $RequestedMode -cne 'Observe' -or $ExpectedCurrentTaskXmlSha256 -cne $script:HttpContext.expected_disabled_xml_sha256){throw 'HTTP_RECOVERY_INSTALL_CONTRACT_CHANGED'}
+            $script:HttpInstallCalls++;$script:HttpInstalled=$true
+            New-TestInstallerStatusReceipt -Context $Context -Mode Observe -LastTaskResult 20
+        }
+        Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) if($ExpectedUtf8TextSha256 -cne $script:HttpContext.expected_disabled_xml_sha256){throw 'HTTP_BACKUP_PIN_CHANGED'}}
+        Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) $script:HttpCleanupCalls++;[pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
+        Set-TestMock 'Start-CutoverTask' {throw 'HTTP_READY_RECOVERY_MUST_NOT_START'}
+        Set-TestMock 'Invoke-CutoverDrainObserve' {throw 'HTTP_READY_RECOVERY_MUST_NOT_DRAIN'}
+    }
+    Reset-TestDisabledHttpScenario
+    $httpReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
+    Assert-True 'two 404 pre-admission errors authenticate ready-only Observe recovery' ($httpReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $httpReceipt.failed_run_id -ceq ('d'*32) -and $httpReceipt.inherited_task_result -eq 20)
+    Assert-True 'HTTP recovery uses one pinned no-stop Observe install and never starts or drains' ($script:HttpInstallCalls -eq 1 -and $httpReceipt.old_execute_task_not_enabled -and -not $httpReceipt.task_started -and -not $httpReceipt.task_stopped -and $script:HttpCleanupCalls -eq 0)
+    Assert-True 'HTTP recovery preserves failure bytes and does not claim worker health' ($httpReceipt.state_and_log_preserved -and $httpReceipt.state_not_restored -and $httpReceipt.worker_health_not_yet_confirmed -and $httpReceipt.backup_matches_authenticated_disabled_xml -and $httpReceipt.protected_fingerprints_unchanged)
+    Assert-True 'HTTP recovery receipt is correlated and bounded' ((ConvertTo-CutoverBoundedReceipt -Receipt $httpReceipt).Length -lt 3072 -and $httpReceipt.operation_id -ceq $script:HttpContext.operation_id)
+    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','poll_time','error_time','poll_mode')){
+        Reset-TestDisabledHttpScenario
+        $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
+        switch($badHttp){
+            'run'{$script:HttpContext.expected_current_run_id=('e'*32)}
+            'state_work'{$script:HttpState.error.work_id='ADMITTED'}
+            'status'{$script:HttpState.last_poll.status='no_eligible_order'}
+            'result'{$script:HttpTaskResult=0}
+            'shape'{$script:HttpEntries=@($script:HttpEntries[0],$script:HttpEntries[2]);$httpCode='DISABLED_HTTP_ERROR_LOG_SHAPE_INVALID'}
+            'poll_work'{$script:HttpEntries[0].work_id='ADMITTED';$httpCode='DISABLED_HTTP_ERROR_ADMISSION_NOT_ABSENT'}
+            'extra_event'{$script:HttpEntries+=New-TestLogEntry -Event row_ignored -RunId ('d'*32);$httpCode='DISABLED_HTTP_ERROR_LOG_SHAPE_INVALID'}
+            'attempt'{$script:HttpEntries[2].details.attempt='1';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'http'{$script:HttpEntries[2].details.http_status='401';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'transport'{$script:HttpEntries[2].details.transport_exit='7';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'content'{$script:HttpEntries[2].details.content_type_class='json';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'digest'{$script:HttpEntries[2].details.content_sha256=('a'*64);$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'elapsed'{$script:HttpEntries[2].details.elapsed_ms='0';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'typed_metadata'{$script:HttpEntries[2].details.http_status=404;$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'poll_time'{$script:HttpState.last_poll.at='2026-09-07T00:00:10.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
+            'error_time'{$script:HttpState.error.at='2026-09-07T00:00:20.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
+            'poll_mode'{$script:HttpEntries[0].details.mode='Observe';$httpCode='LOG_POLL_MODE_MISMATCH'}
+        }
+        Assert-ThrowsCode ('HTTP recovery rejects '+$badHttp+' BEFORE install') {Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext} $httpCode
+        Assert-True ('HTTP '+$badHttp+' rejection has zero installer calls') ($script:HttpInstallCalls -eq 0)
+    }
+    foreach($httpDrift in @('pre_state','pre_log','post_state','post_log','backup','definition','last_run','task_result','boundary','protected')){
+        Reset-TestDisabledHttpScenario
+        $httpCode=''
+        switch($httpDrift){
+            'pre_state'{$httpCode='STATE_CHANGED_BEFORE_OBSERVE_RECOVERY'}
+            'pre_log'{$httpCode='LOG_CHANGED_BEFORE_OBSERVE_RECOVERY'}
+            'post_state'{$httpCode='STATE_CHANGED_DURING_OBSERVE_RECOVERY'}
+            'post_log'{$httpCode='LOG_CHANGED_DURING_OBSERVE_RECOVERY'}
+            'backup'{$httpCode='BACKUP_EXPECTED_XML_MISMATCH';Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {throw 'BACKUP_EXPECTED_XML_MISMATCH'}}
+            'definition'{$httpCode='TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN';Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {$script:HttpObserveXml=$script:HttpObserveXml.Replace('PT15M','PT5M')}}
+            'last_run'{$httpCode='TASK_RAN_DURING_OBSERVE_RECOVERY';Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {$script:HttpFinalLast=$script:HttpFinalLast.AddSeconds(1)}}
+            'task_result'{$httpCode='TASK_RAN_DURING_OBSERVE_RECOVERY';Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {$script:HttpTaskResult=0}}
+            'boundary'{$httpCode='NATURAL_TRIGGER_WINDOW_UNAVAILABLE';$script:HttpObserveXml=$script:HttpObserveXml.Replace('2099-01-01T00:00:00Z','2026-01-01T00:00:00Z')}
+            'protected'{$httpCode='PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY';Set-TestMock 'Get-CutoverProtectedSnapshot' {if($script:HttpInstalled){'changed'}else{'protected-same'}}}
+        }
+        if($httpDrift -match '^(pre|post)_(state|log)$'){
+            $script:HttpDriftCode=$httpCode
+            Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code) if($Code -ceq $script:HttpDriftCode){throw $Code}}
+        }
+        Assert-ThrowsCode ('HTTP ready-only recovery rejects '+$httpDrift) {Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext} $httpCode
+        Assert-True ('HTTP '+$httpDrift+' failure quarantines without Stop or Restore') ($script:HttpCleanupCalls -eq 1)
+    }
+    Reset-TestDisabledHttpScenario
+    $script:HttpContext.mode='Execute'
+    Assert-ThrowsCode 'HTTP ready-only recovery forbids direct Execute mode' {Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext} 'ACTION_REQUIRES_OBSERVE_MODE'
+    $script:HttpContext.mode='Observe';$script:HttpContext.expected_work_id='NO-REPLAY'
+    Assert-ThrowsCode 'HTTP ready-only recovery forbids direct work replay target' {Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    $script:HttpContext.expected_work_id='';$script:HttpContext.timeout_seconds=240
+    Assert-ThrowsCode 'HTTP ready-only recovery preserves full42060 allowance' {Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext} 'OBSERVE_RECOVERY_LIMITS_INVALID'
+    $httpFunction=(Get-Item Function:Invoke-CutoverInstallObserveReadyFromDisabledHttpError).ScriptBlock.ToString()
+    Assert-True 'HTTP ready-only wrapper has structurally no Start Drain Enable or Restore call' (-not ($httpFunction -match '(?im)^\s*(Start-CutoverTask|Invoke-CutoverDrainObserve|Enable-ScheduledTask|Invoke-CutoverEscrow)\b'))
+    Reset-TestMocks
+
+    $env:ProgramData=$fakeProgramData
+    $httpValues=$recoveryValues.Clone();$httpValues.ExpectedCurrentTaskResult='20';$httpValues.ExpectedCurrentFailureCode='BOARD_READ_HTTP_ERROR';$httpValues.ExpectedCurrentRunId=('d'*32)
+    $wiredHttp=New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledHttpError -Values $httpValues
+    Assert-True 'HTTP recovery context binds exact error run result and disabled XML' ($wiredHttp.expected_current_task_result -eq 20 -and $wiredHttp.expected_current_run_id -ceq ('d'*32) -and $wiredHttp.expected_disabled_xml_sha256 -ceq ('a'*64))
+    foreach($badInput in @('result','code','run','mode','xml','target')){
+        $badHttpValues=$httpValues.Clone();$httpCode=''
+        switch($badInput){'result'{$badHttpValues.ExpectedCurrentTaskResult='0';$httpCode='EXPECTED_CURRENT_TASK_RESULT_INVALID'};'code'{$badHttpValues.ExpectedCurrentFailureCode='BOARD_HEADER_INVALID';$httpCode='EXPECTED_CURRENT_FAILURE_CODE_INVALID'};'run'{$badHttpValues.ExpectedCurrentRunId='';$httpCode='EXPECTED_CURRENT_RUN_ID_INVALID'};'mode'{$badHttpValues.Mode='Execute';$httpCode='ACTION_REQUIRES_OBSERVE_MODE'};'xml'{$badHttpValues.ExpectedDisabledXmlSha256=('A'*64);$httpCode='EXPECTED_DISABLED_XML_SHA256_INVALID'};'target'{$badHttpValues.ExpectedWorkId='NO-REPLAY';$httpCode='OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'}}
+        Assert-ThrowsCode ('HTTP recovery context rejects '+$badInput) {New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledHttpError -Values $badHttpValues} $httpCode
+    }
+    Assert-True 'HTTP ready-only action is explicitly admitted' ((Get-CutoverSafeAction -Value InstallObserveReadyFromDisabledHttpError) -ceq 'InstallObserveReadyFromDisabledHttpError')
+    $env:ProgramData=$oldProgramData
+
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.
     $workflow = [IO.File]::ReadAllText((Join-Path $repoRoot '.github\workflows\order-acceptance.yml'))
     # This assertion becomes true after the workflow patch below and protects it
