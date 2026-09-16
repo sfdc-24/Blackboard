@@ -1156,6 +1156,52 @@ try {
     } 'TASK_XML_ENABLED_INVALID'
     Assert-True 'UTF8 text and UTF16 BOM XML hashes remain distinct' ($enabledEvidence.utf8_text_sha256 -cne $enabledEvidence.utf16le_bom_sha256)
 
+    # The fixtures above use a Settings element with ONE child, where "remove
+    # Enabled and re-append it" and "leave Enabled where it is" are the same
+    # operation - there is nowhere else for the node to go. Task Scheduler
+    # exports Enabled ninth among its siblings, and the live cutover compares a
+    # pre-XML that OMITS Enabled against a post-XML that carries it in schema
+    # position. Canonicalizing those to different positions still passes every
+    # single-child assertion above and fails only on the guest, as a spurious
+    # definition-changed on the exact path this driver exists to repair. So the
+    # position has to be pinned against a realistic shape, not a minimal one.
+    $realSettingsBody = @(
+        '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+        '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+        '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+        '<AllowHardTerminate>true</AllowHardTerminate>'
+        '<StartWhenAvailable>false</StartWhenAvailable>'
+        '<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>'
+        '<IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>'
+        '<AllowStartOnDemand>true</AllowStartOnDemand>'
+        '<Enabled>true</Enabled>'
+        '<Hidden>false</Hidden>'
+        '<RunOnlyIfIdle>false</RunOnlyIfIdle>'
+        '<WakeToRun>false</WakeToRun>'
+        '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+        '<Priority>7</Priority>'
+    ) -join ''
+    $realTaskPrefix = '<?xml version="1.0"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings>'
+    $realTaskSuffix = '</Settings></Task>'
+    $siblingEnabled = $realTaskPrefix + $realSettingsBody + $realTaskSuffix
+    $siblingOmitted = $realTaskPrefix + $realSettingsBody.Replace('<Enabled>true</Enabled>', '') + $realTaskSuffix
+    $siblingDisabled = $realTaskPrefix + $realSettingsBody.Replace('<Enabled>true</Enabled>', '<Enabled>false</Enabled>') + $realTaskSuffix
+    $siblingOtherSetting = $realTaskPrefix + $realSettingsBody.Replace('<Priority>7</Priority>', '<Priority>5</Priority>') + $realTaskSuffix
+    $siblingEnabledEvidence = Get-CutoverTaskXmlEvidence -Text $siblingEnabled
+    $siblingOmittedEvidence = Get-CutoverTaskXmlEvidence -Text $siblingOmitted
+    $siblingDisabledEvidence = Get-CutoverTaskXmlEvidence -Text $siblingDisabled
+    $siblingOtherEvidence = Get-CutoverTaskXmlEvidence -Text $siblingOtherSetting
+    Assert-True 'omitted Enabled among siblings still reads as enabled' (
+        $siblingOmittedEvidence.enabled -and -not $siblingDisabledEvidence.enabled
+    )
+    Assert-True 'Enabled position does not change the normalized digest' (
+        $siblingOmittedEvidence.normalized_sha256 -ceq $siblingEnabledEvidence.normalized_sha256 -and
+        $siblingOmittedEvidence.normalized_sha256 -ceq $siblingDisabledEvidence.normalized_sha256
+    )
+    Assert-True 'a changed sibling setting still moves the normalized digest' (
+        $siblingOtherEvidence.normalized_sha256 -cne $siblingEnabledEvidence.normalized_sha256
+    )
+
     # Real backup representation check: manifest stores a UTF-8 text hash while
     # the escrow and backup file bind UTF-16LE bytes including the BOM.
     $backupRoot = Join-Path $temporaryRoot 'backup'
