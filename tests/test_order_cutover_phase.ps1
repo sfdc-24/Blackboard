@@ -116,6 +116,7 @@ function New-TestContext {
         expected_current_task_result = 0
         expected_current_failure_code = ''
         expected_current_run_id = ''
+        expected_disabled_xml_sha256 = ''
         git_path = 'C:\Program Files\Git\cmd\git.exe'
         expected_git_sha256 = ('3' * 64)
         expected_claude_sha256 = ('4' * 64)
@@ -132,8 +133,8 @@ function New-TestExactStatus {
     )
     return [pscustomobject][ordered]@{
         raw = [pscustomobject]@{ state = $State; last_task_result = $LastTaskResult }
-        last_run_utc = $Last
-        next_run_utc = $Next
+        last_run_utc = $Last.ToUniversalTime()
+        next_run_utc = $Next.ToUniversalTime()
     }
 }
 
@@ -695,6 +696,20 @@ try {
         $null -ne $realTime -and $realTime -isnot [string] -and
         $realTime -eq [DateTime]::new(2026, 9, 14, 13, 0, 0, [DateTimeKind]::Utc)
     ) ('actual=' + $realTime)
+    $disabledStatusContext=New-TestContext
+    foreach($nextShape in @('absent','null')){
+        $disabledStatus=New-TestInstallerStatusReceipt -Context $disabledStatusContext -State Disabled
+        if($nextShape -ceq 'absent'){$disabledStatus.PSObject.Properties.Remove('next_run_time')}else{$disabledStatus.next_run_time=$null}
+        $disabledReadback=Assert-CutoverInstallerStatus -Status $disabledStatus -Context $disabledStatusContext -ExpectedMode Execute -ExpectedTaskState Disabled
+        Assert-True ('disabled installer status accepts '+$nextShape+' next run without using it') ($disabledReadback.next_run_utc -eq [DateTime]::MinValue -and $disabledReadback.last_run_utc -eq ([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime())
+    }
+    $readyMissingNext=New-TestInstallerStatusReceipt -Context $disabledStatusContext -State Ready
+    $readyMissingNext.next_run_time=$null
+    Assert-ThrowsCode 'Ready installer status still requires actual next run time' {Assert-CutoverInstallerStatus -Status $readyMissingNext -Context $disabledStatusContext -ExpectedMode Execute -ExpectedTaskState Ready} 'TASK_NEXT_RUN_TIME_INVALID'
+    $disabledRuntime=ConvertTo-CutoverTaskRuntimeInfo -State Disabled -Info ([pscustomobject]@{LastTaskResult=0;LastRunTime=[DateTime]'2026-09-07T00:00:00Z'})
+    Assert-True 'disabled runtime accepts absent next run and preserves last run/result' ($disabledRuntime.state -ceq 'Disabled' -and $disabledRuntime.last_task_result -eq 0 -and $disabledRuntime.next_run_utc -eq [DateTime]::MinValue)
+    Assert-ThrowsCode 'Ready runtime still rejects null next run' {ConvertTo-CutoverTaskRuntimeInfo -State Ready -Info ([pscustomobject]@{LastTaskResult=0;LastRunTime=[DateTime]'2026-09-07T00:00:00Z';NextRunTime=$null})} 'TASK_NEXT_RUN_TIME_INVALID'
+    Assert-True 'real native runtime forwards validated task info to disabled-safe converter' ([IO.File]::ReadAllText($driverPath).Contains('return ConvertTo-CutoverTaskRuntimeInfo -State ([string]$matches[0].State) -Info $info'))
     $prettyInstallerJson = "{`r`n  `"ok`": true,`r`n  `"status`": `"READY`"`r`n}`r`n"
     $prettyInstallerObject = ConvertFrom-CutoverSingleJsonDocument -Text $prettyInstallerJson -Code 'CHILD_JSON_INVALID'
     Assert-True 'single JSON document parser accepts one pretty-printed object' (
@@ -909,11 +924,11 @@ try {
     foreach ($forbidden in @('Invoke-RestMethod', 'Invoke-WebRequest', 'az rest', 'bus.ps1', 'Register-ScheduledTask', 'Stop-ScheduledTask')) {
         Assert-True ('driver excludes direct surface ' + $forbidden) ($source.IndexOf($forbidden, [StringComparison]::OrdinalIgnoreCase) -lt 0)
     }
-    Assert-True 'driver exposes all seven bounded actions' (@(
+    Assert-True 'driver exposes all eight bounded actions' (@(
         'ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain',
-        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait' |
+        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait', 'InstallObserveAndDrainFromDisabledExecute' |
             Where-Object { $source.IndexOf($_, [StringComparison]::Ordinal) -ge 0 }
-    ).Count -eq 7)
+    ).Count -eq 8)
     Assert-True 'receipt byte cap is literal 3072' ($source.Contains('$script:CutoverReceiptMaximumBytes = 3072'))
     Assert-True 'log and protected inputs have finite byte caps' (
         $source.Contains('$script:CutoverLogMaximumBytes = 67108864') -and
@@ -2254,6 +2269,33 @@ try {
     Assert-True 'DrainObserve transitions Execute baseline to Observe no-eligible' ($drain.status -ceq 'OBSERVE_DRAINED' -and $drain.runs -eq 2 -and $drain.final_worker_status -ceq 'no_eligible_order')
     Assert-True 'DrainObserve accumulates bounded append evidence' ($drain.log_appended_bytes -eq 20)
 
+    $admission = [pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};log_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};protected_fingerprint='protected-same';observe_definition_sha256=('e'*64)}
+    $script:RunSequenceIndex=0
+    $boundDrain=Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission
+    Assert-True 'real Observe drain accepts the exact admitted baseline and still drains stale work' ($boundDrain.runs -eq 2 -and $boundDrain.final_worker_status -ceq 'no_eligible_order')
+    $savedDrainStateMock=(Get-Item Function:Get-CutoverState).ScriptBlock
+    $savedDrainStatusMock=(Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
+    $savedDrainLogMock=(Get-Item Function:Get-CutoverLogCheckpoint).ScriptBlock
+    $savedDrainCleanupCalls=$script:DrainCleanupCalls
+    foreach($admissionDrift in @('run_id','last_run','state','log')){
+        $script:RunSequenceIndex=0;$script:AdmissionDrift=$admissionDrift
+        Set-TestMock 'Get-CutoverState' {param($Path)
+            $run=if($script:AdmissionDrift -ceq 'run_id'){('b'*32)}else{('a'*32)}
+            [pscustomobject]@{value=(New-TestState -Mode Execute -RunId $run);checkpoint=[pscustomobject]@{length=1;sha256=$(if($script:AdmissionDrift -ceq 'state'){('b'*64)}else{('a'*64)})}}
+        }
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$AllowInheritedTaskResult)
+            if($script:AdmissionDrift -ceq 'last_run'){New-TestExactStatus -Last (([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime().AddSeconds(1))}else{New-TestExactStatus}
+        }
+        Set-TestMock 'Get-CutoverLogCheckpoint' {param($Path) [pscustomobject]@{length=1;sha256=$(if($script:AdmissionDrift -ceq 'log'){('b'*64)}else{('a'*64)})}}
+        $expectedAdmissionCode=switch($admissionDrift){'state'{'OBSERVE_DRAIN_ADMITTED_STATE_CHANGED'};'log'{'OBSERVE_DRAIN_ADMITTED_LOG_CHANGED'};default{'OBSERVE_DRAIN_ADMITTED_RUN_CHANGED'}}
+        Assert-ThrowsCode ('real Observe drain rejects intervening admitted '+$admissionDrift) {Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission} $expectedAdmissionCode
+        Assert-True ('admitted '+$admissionDrift+' drift never starts an Observe run') ($script:RunSequenceIndex -eq 0)
+    }
+    Set-TestMock 'Get-CutoverState' $savedDrainStateMock
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedDrainStatusMock
+    Set-TestMock 'Get-CutoverLogCheckpoint' $savedDrainLogMock
+    $script:DrainCleanupCalls=$savedDrainCleanupCalls
+
     # THE REAL DRAIN, NOT A MOCKED ONE.
     #
     # Asserting that the transition passes True to a MOCKED
@@ -3060,6 +3102,355 @@ try {
     Assert-ThrowsCode 'trigger window rejects a natural-run race' {
         Assert-CutoverTriggerWindow -NextRunUtc ([DateTime]::UtcNow.AddSeconds(10)) -RequiredSeconds 60
     } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+
+    # The former disabled Execute enable/replay action is intentionally absent.
+    # A real drain delegates to the REAL OneRun. Drift is injected by its
+    # SECOND Ready read, after initial admission hashes already matched.
+    Reset-TestMocks
+    $firstStartContext=New-TestContext
+    $firstStartContext.mode='Observe';$firstStartContext.timeout_seconds=420
+    $firstStartContext.state_path=Join-Path $temporaryRoot 'first-start-state.json'
+    $firstStartContext.log_path=Join-Path $temporaryRoot 'first-start-events.jsonl'
+    $script:FirstStartContext=$firstStartContext
+    $script:FirstStartBaseXml='<Task><Settings><Enabled>true</Enabled><StartWhenAvailable>true</StartWhenAvailable></Settings><Actions><Exec><Command>Observe</Command></Exec></Actions></Task>'
+    $script:FirstStartTaskXml=$script:FirstStartBaseXml
+    $script:FirstStartDefinitionSha=(Get-CutoverTaskXmlEvidence -Text $script:FirstStartBaseXml).normalized_sha256
+    $script:FirstBoundaryActive=$false;$script:FirstBoundaryFinalRead=$false
+    Set-TestMock 'Export-CutoverTaskXml' {$script:FirstStartTaskXml}
+    $script:FirstStartCleanState=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order
+    $script:FirstStartCleanLog=([pscustomobject]@{event='prior';run_id=('a'*32)}|ConvertTo-Json -Compress)+"`n"
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) [pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
+    Set-TestMock 'Start-CutoverTask' {$script:FirstStartCalls++;throw 'TEST_FIRST_START_REACHED'}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context)
+        if($script:FirstBoundaryActive){
+            $script:FirstBoundaryFinalRead=$true
+            if($script:FirstBoundaryCase -ceq 'xml_action'){$script:FirstStartTaskXml=$script:FirstStartBaseXml.Replace('Observe','Execute')}
+            elseif($script:FirstBoundaryCase -ceq 'xml_catchup'){$script:FirstStartTaskXml=$script:FirstStartBaseXml.Replace('<StartWhenAvailable>true','<StartWhenAvailable>false')}
+            elseif($script:FirstBoundaryCase -ceq 'omitted_enabled'){$script:FirstStartTaskXml=$script:FirstStartBaseXml.Replace('<Enabled>true</Enabled>','')}
+        }
+        if($script:FirstStartProtectedChanged){'protected-changed'}else{'protected-same'}
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$AllowInheritedTaskResult)
+        if($script:FirstBoundaryActive -and $script:FirstBoundaryFinalRead){
+            $script:FirstBoundaryNativeReads++
+            $native=New-TestInstallerStatusReceipt -Context $Context -Mode Observe -State Ready
+            switch($script:FirstBoundaryCase){
+                'mode'{$native.mode='Execute'}
+                'running'{$native.state='Running';$native.status='RUNNING'}
+                'result'{$native.last_task_result=[long]37}
+                'last_run'{$native.last_run_time=(New-TestExactStatus).last_run_utc.AddSeconds(1)}
+                'window'{$native.next_run_time=[DateTime]::UtcNow.AddSeconds(1)}
+                'protected'{$script:FirstStartProtectedChanged=$true}
+                'state'{$s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++;[IO.File]::WriteAllText($Context.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))}
+                'log'{[IO.File]::AppendAllText($Context.log_path,('{"event":"during-final-native-read"}'+"`n"),(New-Object Text.UTF8Encoding($false)))}
+            }
+            return Assert-CutoverInstallerStatus -Status $native -Context $Context -ExpectedMode $ExpectedMode -ExpectedTaskState $ExpectedTaskState
+        }
+        $script:FirstStartReadyReads++
+        if($script:FirstStartReadyReads -eq 2){
+            if($script:FirstStartDrift -ceq 'state'){
+                $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++
+                [IO.File]::WriteAllText($script:FirstStartContext.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+            }elseif($script:FirstStartDrift -ceq 'protected'){
+                $script:FirstStartProtectedChanged=$true
+            }elseif($script:FirstStartDrift -ceq 'log'){
+                [IO.File]::AppendAllText($script:FirstStartContext.log_path,('{"event":"unexpected","run_id":"'+('b'*32)+'"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
+            }
+        }
+        New-TestExactStatus
+    }
+    foreach($firstStartDrift in @('none','state','log','protected')){
+        $script:FirstStartDrift=$firstStartDrift;$script:FirstStartReadyReads=0;$script:FirstStartCalls=0
+        $script:FirstStartProtectedChanged=$false
+        [IO.File]::WriteAllText($firstStartContext.state_path,($script:FirstStartCleanState|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($firstStartContext.log_path,$script:FirstStartCleanLog,(New-Object Text.UTF8Encoding($false)))
+        $firstStartAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha}
+        $firstStartCode=switch($firstStartDrift){'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};'protected'{'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
+        Assert-ThrowsCode ('real drain and OneRun first-start interleaving '+$firstStartDrift) {Invoke-CutoverDrainObserve -Context $firstStartContext -Installer $firstStartContext.installer_path -AdmittedBaseline $firstStartAdmission} $firstStartCode
+        Assert-True ('first-start '+$firstStartDrift+' starts only the unchanged positive baseline') ($script:FirstStartCalls -eq $(if($firstStartDrift -ceq 'none'){1}else{0}))
+    }
+    $script:FirstStartProtectedChanged=$false
+    foreach($firstBoundaryCase in @('mode','running','result','last_run','window','xml_action','xml_catchup','state','log','protected','omitted_enabled')){
+        $script:FirstBoundaryActive=$true;$script:FirstBoundaryFinalRead=$false;$script:FirstBoundaryCase=$firstBoundaryCase;$script:FirstBoundaryNativeReads=0;$script:FirstStartCalls=0
+        $script:FirstStartProtectedChanged=$false
+        [IO.File]::WriteAllText($firstStartContext.state_path,($script:FirstStartCleanState|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($firstStartContext.log_path,$script:FirstStartCleanLog,(New-Object Text.UTF8Encoding($false)))
+        $script:FirstStartTaskXml=$script:FirstStartBaseXml
+        $finalAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}
+        $finalCode=switch($firstBoundaryCase){'mode'{'INSTALLER_STATUS_MISMATCH'};'running'{'INSTALLER_STATUS_MISMATCH'};'result'{'INSTALLER_STATUS_MISMATCH'};'last_run'{'OBSERVE_FIRST_START_TASK_CHANGED'};'window'{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'};'xml_action'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'xml_catchup'{'TASK_XML_CHANGED_BEFORE_OBSERVE_FIRST_START'};'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};'protected'{'PROTECTED_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
+        Assert-ThrowsCode ('real OneRun final native-definition boundary '+$firstBoundaryCase) {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(420)) -PreviousLastRunUtc $finalAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $finalAdmission.log_checkpoint -AdmittedBaseline $finalAdmission} $finalCode
+        Assert-True ('final boundary '+$firstBoundaryCase+' only starts canonical enabled positive control') ($script:FirstStartCalls -eq $(if($firstBoundaryCase -ceq 'omitted_enabled'){1}else{0}))
+    }
+    $script:FirstBoundaryActive=$false;$script:FirstBoundaryFinalRead=$false;$script:FirstStartTaskXml=$script:FirstStartBaseXml
+    foreach($boundaryTiming in @('deadline','trigger')){
+        $script:FirstStartCalls=0
+        $timingAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=$(if($boundaryTiming -ceq 'trigger'){[DateTime]::UtcNow.AddSeconds(-1)}else{(New-TestExactStatus).next_run_utc})}
+        $timingDeadline=if($boundaryTiming -ceq 'deadline'){[DateTime]::UtcNow.AddSeconds(-1)}else{[DateTime]::UtcNow.AddSeconds(420)}
+        $timingCode=if($boundaryTiming -ceq 'deadline'){'OBSERVE_FIRST_START_DEADLINE_EXCEEDED'}else{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'}
+        Assert-ThrowsCode ('real OneRun rechecks '+$boundaryTiming+' after checkpoint reads') {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc $timingDeadline -PreviousLastRunUtc $timingAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $timingAdmission.log_checkpoint -AdmittedBaseline $timingAdmission} $timingCode
+        Assert-True ('expired '+$boundaryTiming+' cannot start Observe') ($script:FirstStartCalls -eq 0)
+    }
+
+    # Model scheduler/preemption delay during the final TWO real window checks.
+    # The test must reach both checks; an earlier deadline rejection cannot pass.
+    $script:FirstStartCalls=0;$script:LateWindowCalls=0
+    $lateAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}
+    $script:LateWindowDeadline=[DateTime]::UtcNow.AddSeconds(3)
+    Set-TestMock 'Assert-CutoverTriggerWindow' {param($NextRunUtc,$RequiredSeconds)
+        $null=& $script:OriginalFunctions['Assert-CutoverTriggerWindow'] -NextRunUtc $NextRunUtc -RequiredSeconds $RequiredSeconds
+        $script:LateWindowCalls++
+        if($script:LateWindowCalls -eq 2){while([DateTime]::UtcNow -lt $script:LateWindowDeadline.AddMilliseconds(20)){[Threading.Thread]::Sleep(5)}}
+    }
+    Assert-ThrowsCode 'real OneRun rejects deadline expiry during final window checks' {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc $script:LateWindowDeadline -PreviousLastRunUtc $lateAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $lateAdmission.log_checkpoint -AdmittedBaseline $lateAdmission} 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED'
+    Assert-True 'deadline expiry after final windows never starts Observe' ($script:FirstStartCalls -eq 0)
+    Assert-True 'late deadline control actually reached both real window checks' ($script:LateWindowCalls -eq 2)
+    Set-TestMock 'Assert-CutoverTriggerWindow' $script:OriginalFunctions['Assert-CutoverTriggerWindow']
+
+    foreach($badFirstAdmission in @('mode','run_id','last_run','missing_protected','blank_protected','typed_protected','missing_xml','malformed_xml')){
+        $script:FirstStartCalls=0
+        $mismatchAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}
+        $admissionPreviousLast=(New-TestExactStatus).last_run_utc
+        $admissionExpectedMode='Observe'
+        switch($badFirstAdmission){'mode'{$admissionExpectedMode='Execute'};'run_id'{$mismatchAdmission.run_id=('b'*32)};'last_run'{$mismatchAdmission.last_run_utc=$admissionPreviousLast.AddSeconds(1)};'missing_protected'{$mismatchAdmission.PSObject.Properties.Remove('protected_fingerprint')};'blank_protected'{$mismatchAdmission.protected_fingerprint=''};'typed_protected'{$mismatchAdmission.protected_fingerprint=1};'missing_xml'{$mismatchAdmission.PSObject.Properties.Remove('observe_definition_sha256')};'malformed_xml'{$mismatchAdmission.observe_definition_sha256=('g'*64)}}
+        Assert-ThrowsCode ('real OneRun rejects mismatched first admission '+$badFirstAdmission) {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode $admissionExpectedMode -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(420)) -PreviousLastRunUtc $admissionPreviousLast -PreviousRunId ('a'*32) -LogBefore $mismatchAdmission.log_checkpoint -AdmittedBaseline $mismatchAdmission} 'OBSERVE_FIRST_START_ADMISSION_INVALID'
+        Assert-True ('invalid first admission '+$badFirstAdmission+' never starts a task') ($script:FirstStartCalls -eq 0)
+    }
+
+    # The new recovery installs Observe; even fresh unrelated work cannot infer
+    # or append worker lifecycle rows. The existing Execute gateway stays single.
+    Reset-TestMocks
+    Assert-True 'unsafe disabled Execute action is not admitted' ((Get-CutoverSafeAction -Value StartAndAwaitFromDisabled) -ceq 'Invalid')
+    Assert-True 'command entry forwards exact disabled XML caller pin' ($source.Contains('ExpectedDisabledXmlSha256 = $ExpectedDisabledXmlSha256'))
+    $futureContext = New-TestContext
+    $futureContext.timeout_seconds = 420
+    $futureXml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><BootTrigger id="AtBoot"/><TimeTrigger id="Every15Minutes"><StartBoundary>2099-01-01T00:00:00Z</StartBoundary><Repetition><Interval>PT15M</Interval></Repetition></TimeTrigger></Triggers><Settings><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled></Settings></Task>'
+    $futureEvidence = Assert-CutoverFutureObserveDefinition -Text $futureXml -Context $futureContext
+    Assert-True 'Observe recovery accepts production boot interval and catch-up setting with future boundary' ($futureEvidence.Kind -eq [DateTimeKind]::Utc -and $futureEvidence.Year -eq 2099)
+    Assert-ThrowsCode 'future definition rejects stale boundary before drain' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('2099-01-01T00:00:00Z','2026-01-01T00:00:00Z')) -Context $futureContext} 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+    Assert-ThrowsCode 'future definition rejects non-fifteen-minute interval' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('PT15M','PT5M')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    Assert-ThrowsCode 'future definition rejects unexpected registration trigger' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<BootTrigger id="AtBoot"/>','<RegistrationTrigger/>')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    Assert-ThrowsCode 'future definition rejects Boot plus Event instead of Time' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('TimeTrigger','EventTrigger')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    Assert-ThrowsCode 'future definition enforces production StartWhenAvailable true' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<StartWhenAvailable>true</StartWhenAvailable>','<StartWhenAvailable>false</StartWhenAvailable>')) -Context $futureContext} 'OBSERVE_RECOVERY_SETTINGS_INVALID'
+
+    $context = New-TestContext
+    $context.mode='Observe';$context.timeout_seconds=420;$context.max_runs=8
+    $script:DisabledRecoveryXml=$futureXml.Replace('<Enabled>true</Enabled>','<Enabled>false</Enabled>')
+    $script:ObserveRecoveryXml=$futureXml
+    $context.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:DisabledRecoveryXml).utf8_text_sha256
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryInstalls=0;$script:ObserveRecoveryDrains=0;$script:ObserveRecoveryCleanup=0
+    Set-TestMock 'Assert-CutoverPinnedExecutables' {param($Context)}
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState}
+    Set-TestMock 'Export-CutoverTaskXml' {if($script:ObserveRecoveryInstalled){$script:ObserveRecoveryXml}else{$script:DisabledRecoveryXml}}
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    Set-TestMock 'Get-CutoverLogCheckpoint' {param($Path) [pscustomobject]@{length=1;sha256=('a'*64)}}
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code)}
+    Set-TestMock 'Invoke-CutoverInstaller' {
+        param($Context,$ScriptPath,$RequestedAction,$RequestedMode,$ExpectedCurrentTaskXmlSha256)
+        if($RequestedAction -cne 'InstallFromDisabledNoStop' -or $RequestedMode -cne 'Observe' -or $ExpectedCurrentTaskXmlSha256 -cne (Get-CutoverTaskXmlEvidence -Text $script:DisabledRecoveryXml).utf8_text_sha256){throw 'RECOVERY_INSTALL_CONTRACT_CHANGED'}
+        $script:ObserveRecoveryInstalls++;$script:ObserveRecoveryInstalled=$true
+        New-TestInstallerStatusReceipt -Context $Context -Mode Observe
+    }
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) if($ExpectedUtf8TextSha256 -cne (Get-CutoverTaskXmlEvidence -Text $script:DisabledRecoveryXml).utf8_text_sha256){throw 'BACKUP_PIN_CHANGED'}}
+    Set-TestMock 'Invoke-CutoverDrainObserve' {
+        param($Context,$Installer,$AllowInheritedTaskResult,$AdmittedBaseline)
+        if($Context.mode -cne 'Observe' -or $Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or $Context.max_runs -ne 8){throw 'OBSERVE_DRAIN_CONTRACT_CHANGED'}
+        if($null -eq $AdmittedBaseline -or $AdmittedBaseline.run_id -cne ('a'*32) -or $AdmittedBaseline.last_run_utc.Ticks -ne (New-TestExactStatus).last_run_utc.Ticks -or $AdmittedBaseline.state_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.log_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.protected_fingerprint -cne 'protected-same'){throw 'OBSERVE_DRAIN_ADMISSION_NOT_BOUND'}
+        $definitionProperty=$AdmittedBaseline.PSObject.Properties['observe_definition_sha256']
+        $script:WrapperSeenDefinitionSha=if($null -ne $definitionProperty){$definitionProperty.Value}else{''}
+        $script:ObserveRecoveryDrains++
+        [pscustomobject]@{status='OBSERVE_DRAINED';runs=2;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00.000Z';log_appended_bytes=100}
+    }
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) $script:ObserveRecoveryCleanup++;$script:ObserveRecoveryInstalled=$false;[pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
+    $observeRecovery=Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context
+    Assert-True 'disabled recovery installs only Observe via caller-pinned no-stop installer' ($script:ObserveRecoveryInstalls -eq 1 -and $observeRecovery.old_execute_task_not_enabled -and -not $observeRecovery.task_stopped -and $observeRecovery.candidate_install_action -ceq 'InstallFromDisabledNoStop')
+    Assert-True 'disabled recovery requires bounded Observe drain ending no eligible' ($script:ObserveRecoveryDrains -eq 1 -and $observeRecovery.runs -eq 2 -and $observeRecovery.final_worker_status -ceq 'no_eligible_order' -and $observeRecovery.state_not_restored -and $observeRecovery.protected_fingerprints_unchanged)
+    Assert-True 'disabled recovery receipt preserves exact disabled backup and future Observe definition' ($observeRecovery.authenticated_disabled_xml_sha256 -ceq $context.expected_disabled_xml_sha256 -and $observeRecovery.backup_matches_authenticated_disabled_xml -and $observeRecovery.state_and_log_preserved_through_install -and $observeRecovery.observe_start_boundary_utc -ceq '2099-01-01T00:00:00.0000000Z')
+    Assert-True 'wrapper forwards the authenticated normalized Observe definition into real drain' ($script:WrapperSeenDefinitionSha -ceq (Get-CutoverTaskXmlEvidence -Text $futureXml).normalized_sha256)
+    # Waker supplement: these wrapper guards are masked by the downstream real
+    # drain. Pin EACH exact code using actual file drift after the backup read.
+    $checkpointMocks=@{}
+    foreach($n in @('Get-CutoverState','Get-CutoverLogCheckpoint','Assert-CutoverFileCheckpointUnchanged','Invoke-CutoverDrainObserve','Assert-CutoverBackupMatchesExpectedXml')){$checkpointMocks[$n]=(Get-Item ('Function:'+ $n)).ScriptBlock}
+    $checkpointContext=New-TestContext
+    $checkpointContext.mode='Observe';$checkpointContext.timeout_seconds=420;$checkpointContext.max_runs=8
+    $checkpointContext.expected_disabled_xml_sha256=$context.expected_disabled_xml_sha256
+    $checkpointContext.state_path=Join-Path $temporaryRoot 'post-backup-state.json'
+    $checkpointContext.log_path=Join-Path $temporaryRoot 'post-backup-log.jsonl'
+    Set-TestMock 'Get-CutoverState' $script:OriginalFunctions['Get-CutoverState']
+    Set-TestMock 'Get-CutoverLogCheckpoint' $script:OriginalFunctions['Get-CutoverLogCheckpoint']
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' $script:OriginalFunctions['Assert-CutoverFileCheckpointUnchanged']
+    Set-TestMock 'Invoke-CutoverDrainObserve' {param($Context,$Installer,$AdmittedBaseline) $script:PostBackupDrains++;[pscustomobject]@{status='OBSERVE_DRAINED';runs=1;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00Z';log_appended_bytes=1}}
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256)
+        if($script:PostBackupDrift -ceq 'state'){
+            $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++
+            [IO.File]::WriteAllText($Context.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        }else{[IO.File]::AppendAllText($Context.log_path,('{"event":"unexpected"}'+"`n"),(New-Object Text.UTF8Encoding($false)))}
+    }
+    foreach($postBackupDrift in @('state','log')){
+        $script:PostBackupDrift=$postBackupDrift;$script:PostBackupDrains=0;$script:ObserveRecoveryInstalled=$false
+        [IO.File]::WriteAllText($checkpointContext.state_path,((New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order)|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($checkpointContext.log_path,('{"event":"prior"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
+        $postBackupCode=if($postBackupDrift -ceq 'state'){'STATE_CHANGED_BEFORE_OBSERVE_DRAIN'}else{'LOG_CHANGED_BEFORE_OBSERVE_DRAIN'}
+        Assert-ThrowsCode ('post-backup actual '+$postBackupDrift+' drift pins exact wrapper guard') {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $checkpointContext} $postBackupCode
+        Assert-True ('post-backup '+$postBackupDrift+' drift never delegates and quarantines') ($script:PostBackupDrains -eq 0 -and -not $script:ObserveRecoveryInstalled)
+    }
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256)}
+    foreach($preProtectedDrift in @('state','log')){
+        $script:PreProtectedDrift=$preProtectedDrift;$script:PreProtectedReads=0;$script:PostBackupDrains=0;$script:ObserveRecoveryInstalled=$false
+        $beforeProtectedInstalls=$script:ObserveRecoveryInstalls
+        [IO.File]::WriteAllText($checkpointContext.state_path,((New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order)|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($checkpointContext.log_path,('{"event":"prior"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
+        Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context)
+            $script:PreProtectedReads++
+            if($script:PreProtectedReads -eq 2){
+                if($script:PreProtectedDrift -ceq 'state'){$s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++;[IO.File]::WriteAllText($Context.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))}
+                else{[IO.File]::AppendAllText($Context.log_path,('{"event":"during-protected-read"}'+"`n"),(New-Object Text.UTF8Encoding($false)))}
+            }
+            'protected-same'
+        }
+        $preProtectedCode=if($preProtectedDrift -ceq 'state'){'STATE_CHANGED_BEFORE_OBSERVE_RECOVERY'}else{'LOG_CHANGED_BEFORE_OBSERVE_RECOVERY'}
+        Assert-ThrowsCode ('actual '+$preProtectedDrift+' drift during pre-install protected read') {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $checkpointContext} $preProtectedCode
+        Assert-True ('pre-install protected-read '+$preProtectedDrift+' drift cannot register or drain') ($script:ObserveRecoveryInstalls -eq $beforeProtectedInstalls -and $script:PostBackupDrains -eq 0)
+    }
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+    foreach($n in $checkpointMocks.Keys){Set-TestMock $n $checkpointMocks[$n]}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryInstalls=1;$script:ObserveRecoveryDrains=1
+    $savedRecoveryStateMock = (Get-Item Function:Get-CutoverState).ScriptBlock
+    $savedRecoveryStatusMock = (Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
+    $savedRecoveryBackupMock = (Get-Item Function:Assert-CutoverBackupMatchesExpectedXml).ScriptBlock
+    foreach($neverRunLast in @([DateTime]::MinValue, [DateTime]::FromFileTimeUtc(0))){
+        $script:RecoveryNeverRunLast=$neverRunLast;$script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+        $beforeNeverRunInstalls=$script:ObserveRecoveryInstalls
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState -Last $script:RecoveryNeverRunLast}
+        Assert-ThrowsCode ('Observe recovery rejects never-run scheduler year '+$neverRunLast.Year) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_TASK_NEVER_RUN'
+        Assert-True ('never-run scheduler year '+$neverRunLast.Year+' cannot install or drain') ($script:ObserveRecoveryInstalls -eq $beforeNeverRunInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedRecoveryStatusMock
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    Set-TestMock 'Get-CutoverState' {param($Path) $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.success.event='candidate_observed';[pscustomobject]@{value=$s;checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $beforeCorruptInstalls=$script:ObserveRecoveryInstalls
+    Assert-ThrowsCode 'Observe recovery rejects state-only terminal corruption before installation' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'STATE_NO_ELIGIBLE_EVIDENCE_INVALID'
+    Assert-True 'corrupt terminal evidence cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeCorruptInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Execute -RunId ('a'*32) -Status result_confirmed -WorkId WORK -RowId ROW);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    $beforeResultInstalls=$script:ObserveRecoveryInstalls
+    Assert-ThrowsCode 'Observe-only recovery refuses result-confirmed baseline without target inputs' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
+    Assert-True 'result-confirmed baseline cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeResultInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Get-CutoverState' $savedRecoveryStateMock
+    foreach($finalFailure in @('NATURAL_TRIGGER_WINDOW_UNAVAILABLE','TASK_CHANGED_BEFORE_OBSERVE_DRAIN','TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN')){
+        $script:RecoveryBackupReadComplete=$false;$script:RecoveryFinalFailure=$finalFailure
+        $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+        Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) $script:RecoveryBackupReadComplete=$true}
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState)
+            if($script:RecoveryBackupReadComplete -and $ExpectedTaskState -ceq 'Ready'){
+                if($script:RecoveryFinalFailure -ceq 'TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN'){$script:ObserveRecoveryXml=$script:ObserveRecoveryXml.Replace('<StartWhenAvailable>true','<StartWhenAvailable>false');New-TestExactStatus}
+                elseif($script:RecoveryFinalFailure -ceq 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'){New-TestExactStatus -Next ([DateTime]::UtcNow.AddSeconds(1))}
+                else{New-TestExactStatus -Last (([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime().AddSeconds(1))}
+            }else{New-TestExactStatus -State $ExpectedTaskState}
+        }
+        Assert-ThrowsCode ('Observe recovery rechecks final handoff '+$finalFailure+' after backup') {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} $finalFailure
+        Assert-True ('final handoff '+$finalFailure+' never delegates to drain') ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedRecoveryStatusMock
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' $savedRecoveryBackupMock
+    $script:ObserveRecoveryXml=$futureXml
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryInstalls=1;$script:ObserveRecoveryDrains=1
+    $script:ObserveRecoveryInstalled=$false
+    $savedPin=$context.expected_disabled_xml_sha256;$context.expected_disabled_xml_sha256=('f'*64)
+    Assert-ThrowsCode 'Observe recovery rejects wrong original disabled definition' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_TASK_XML_NOT_AUTHENTICATED'
+    Assert-True 'wrong pin never installs or drains' ($script:ObserveRecoveryInstalls -eq 1 -and $script:ObserveRecoveryDrains -eq 1)
+    $script:ObserveRecoveryInstalls=1;$script:ObserveRecoveryDrains=1;$script:ObserveRecoveryInstalled=$false
+    $context.expected_disabled_xml_sha256=$savedPin
+    foreach($driftCode in @('STATE_CHANGED_BEFORE_OBSERVE_RECOVERY','LOG_CHANGED_BEFORE_OBSERVE_RECOVERY','STATE_CHANGED_DURING_OBSERVE_RECOVERY','LOG_CHANGED_DURING_OBSERVE_RECOVERY')){
+        $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1;$script:RecoveryDriftCode=$driftCode
+        Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code) if($Code -ceq $script:RecoveryDriftCode){throw $Code}}
+        Assert-ThrowsCode ('Observe recovery rejects '+$driftCode) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} $driftCode
+        Assert-True ($driftCode+' cannot reach drain and disables on failure') ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    }
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {param($Before,$Path,$MaximumBytes,$Code)}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) if($ExpectedTaskState -ceq 'Ready'){New-TestExactStatus -State Ready -Last (([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime().AddSeconds(1))}else{New-TestExactStatus -State Disabled}}
+    Assert-ThrowsCode 'Observe recovery rejects a task run during definition replacement' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'TASK_RAN_DURING_OBSERVE_RECOVERY'
+    Assert-True 'intervening task run never drains again' ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState}
+    foreach($protectedDriftStage in @(2,3,4,5)){
+        $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1;$script:ObserveProtectedCalls=0;$script:ObserveProtectedDriftStage=$protectedDriftStage
+        Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:ObserveProtectedCalls++;if($script:ObserveProtectedCalls -eq $script:ObserveProtectedDriftStage){'changed'}else{'protected-same'}}
+        $protectedCode=switch($protectedDriftStage){2{'PROTECTED_CHANGED_BEFORE_OBSERVE_RECOVERY'};3{'PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY'};4{'PROTECTED_CHANGED_BEFORE_OBSERVE_DRAIN'};5{'PROTECTED_FINGERPRINT_CHANGED'}}
+        Assert-ThrowsCode ('Observe recovery rejects protected drift stage '+$protectedDriftStage) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} $protectedCode
+        Assert-True ('protected drift stage '+$protectedDriftStage+' never reports success and disables') (-not $script:ObserveRecoveryInstalled -and $script:ObserveRecoveryDrains -eq $(if($protectedDriftStage -eq 5){2}else{1}))
+    }
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    $savedObserveXml=$script:ObserveRecoveryXml
+    $script:ObserveRecoveryXml=$savedObserveXml.Replace('<Enabled>true</Enabled>','<Enabled>false</Enabled>')
+    Assert-ThrowsCode 'Observe recovery rejects disabled post-registration definition' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'RECOVERY_OBSERVE_TASK_NOT_ENABLED'
+    Assert-True 'disabled post-registration definition never drains' ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    $script:ObserveRecoveryXml=$savedObserveXml
+    $script:ObserveRecoveryXml=$savedObserveXml.Replace('2099-01-01T00:00:00Z','2026-01-01T00:00:00Z')
+    Assert-ThrowsCode 'Observe recovery refuses a past start boundary before drain' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+    Assert-True 'past start boundary never drains and disables Observe' ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    $script:ObserveRecoveryXml=$savedObserveXml
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) throw 'BACKUP_XML_HASH_MISMATCH'}
+    Assert-ThrowsCode 'Observe recovery rejects unauthenticated backup before any drain' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'BACKUP_XML_HASH_MISMATCH'
+    Assert-True 'backup failure never drains and disables Observe' ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256)}
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) throw 'LOG_CURRENT_RUN_INVALID'}
+    $installBaseline=$script:ObserveRecoveryInstalls
+    Assert-ThrowsCode 'Observe recovery requires independently current baseline log and run' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'LOG_CURRENT_RUN_INVALID'
+    Assert-True 'invalid baseline log never installs or drains' ($script:ObserveRecoveryInstalls -eq $installBaseline -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status stale_order_ignored);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    Assert-ThrowsCode 'Observe recovery refuses stale baseline without a terminal healthy current run' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
+    Assert-True 'unhealthy baseline never installs or drains' ($script:ObserveRecoveryInstalls -eq $installBaseline -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    Set-TestMock 'Invoke-CutoverDrainObserve' {param($Context,$Installer) throw 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'}
+    Assert-ThrowsCode 'fresh unrelated candidate is observed not executed and requires resolution' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'
+    Assert-True 'unrelated fresh candidate failure disables Observe and never claims success' (-not $script:ObserveRecoveryInstalled)
+    foreach($badDirectLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs','fractional_runs','text_runs','bool_runs')){
+        $limitContext=New-TestContext;$limitContext.mode='Observe';$limitContext.timeout_seconds=420;$limitContext.expected_disabled_xml_sha256=$savedPin
+        switch($badDirectLimit){'short_timeout'{$limitContext.timeout_seconds=240};'long_timeout'{$limitContext.timeout_seconds=600};'short_margin'{$limitContext.natural_trigger_margin_seconds=30};'long_margin'{$limitContext.natural_trigger_margin_seconds=61};'max_runs'{$limitContext.max_runs=20};'fractional_runs'{$limitContext.max_runs=1.5};'text_runs'{$limitContext.max_runs='1'};'bool_runs'{$limitContext.max_runs=$true}}
+        $beforeLimitInstalls=$script:ObserveRecoveryInstalls;$beforeLimitDrains=$script:ObserveRecoveryDrains
+        Assert-ThrowsCode ('direct Observe recovery rejects '+$badDirectLimit) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $limitContext} 'OBSERVE_RECOVERY_LIMITS_INVALID'
+        Assert-True ('direct '+$badDirectLimit+' cannot install or drain') ($script:ObserveRecoveryInstalls -eq $beforeLimitInstalls -and $script:ObserveRecoveryDrains -eq $beforeLimitDrains)
+    }
+    $context.mode='Execute'
+    Assert-ThrowsCode 'direct recovery invocation rejects Execute mode before installer' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'ACTION_REQUIRES_OBSERVE_MODE'
+    $context.mode='Observe';$context.expected_work_id='ALREADY-PRUNED-WORK'
+    Assert-ThrowsCode 'direct recovery cannot replay a target even with pruned durable work' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    $context.expected_work_id='';$context.expected_row_id='99999999-9999-4999-8999-999999999999'
+    Assert-ThrowsCode 'direct recovery forbids board-only receipt target identities' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    Reset-TestMocks
+
+    $env:ProgramData=$fakeProgramData
+    $recoveryValues=$contextValues.Clone()
+    $recoveryValues.InstallerPath=$wiredIncidentContext.installer_path
+    $recoveryValues.ExpectedReleaseId=$wiredIncidentContext.release_id
+    $recoveryValues.ExpectedInstallerSha256=(Get-FileHash -LiteralPath $wiredIncidentContext.installer_path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $recoveryValues.Mode='Observe';$recoveryValues.ExpectedCurrentTaskResult='';$recoveryValues.ExpectedCurrentFailureCode='';$recoveryValues.ExpectedCurrentRunId=''
+    $recoveryValues.ExpectedTerminalStatus='';$recoveryValues.ExpectedWorkId='';$recoveryValues.ExpectedRowId='';$recoveryValues.ExpectedResultStatus=''
+    $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.TimeoutSeconds='420'
+    $wiredRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $recoveryValues
+    Assert-True 'new recovery context binds exact disabled pin and Observe-only full allowance' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.mode -ceq 'Observe' -and $wiredRecovery.timeout_seconds -eq 420)
+    foreach($badRecoveryLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
+        $badRecovery=$recoveryValues.Clone()
+        switch($badRecoveryLimit){'short_timeout'{$badRecovery.TimeoutSeconds='240'};'long_timeout'{$badRecovery.TimeoutSeconds='600'};'short_margin'{$badRecovery.NaturalTriggerMarginSeconds='30'};'long_margin'{$badRecovery.NaturalTriggerMarginSeconds='61'};'max_runs'{$badRecovery.MaxRuns='20'}}
+        Assert-ThrowsCode ('new recovery context rejects '+$badRecoveryLimit) {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_LIMITS_INVALID'
+    }
+    $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDisabledXmlSha256=('A'*64)
+    Assert-ThrowsCode 'new recovery context rejects malformed disabled pin' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'EXPECTED_DISABLED_XML_SHA256_INVALID'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.Mode='Execute'
+    Assert-ThrowsCode 'new recovery context rejects Execute before mutation' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'ACTION_REQUIRES_OBSERVE_MODE'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedWorkId='EXPIRED-OR-PRUNED'
+    Assert-ThrowsCode 'new recovery context forbids any dispatch target replay' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.TimeoutSeconds='780'
+    Assert-ThrowsCode 'new recovery context rejects impossible interval window' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL'
+    Assert-ThrowsCode 'normal Execute start rejects disabled recovery pin' {New-CutoverContext -RequestedAction StartAndAwait -Values $recoveryValues} 'ACTION_REQUIRES_EXECUTE_MODE'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.Mode='Execute';$badRecovery.ExpectedTerminalStatus='no_eligible_order'
+    Assert-ThrowsCode 'normal Execute no eligible start rejects disabled recovery pin' {New-CutoverContext -RequestedAction StartAndAwait -Values $badRecovery} 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
+    $env:ProgramData=$oldProgramData
 
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.
     $workflow = [IO.File]::ReadAllText((Join-Path $repoRoot '.github\workflows\order-acceptance.yml'))

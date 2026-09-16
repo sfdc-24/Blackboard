@@ -500,6 +500,89 @@ An unquoted exact `KEY:`, `TOKEN:`, `SECRET:`, or `PASSWORD:` is always a
 rejected mapping shape; ordinary prose must omit that colon, for example
 `Token rotation completed` or `Key status is green`.
 
+### Recovery from an already-disabled Execute task
+
+Use the incident-only action
+`InstallObserveAndDrainFromDisabledExecute` with `-Mode Observe` and the
+independently read-back exact `ExpectedDisabledXmlSha256`. It authenticates the
+current candidate Disabled/Execute/result-0 definition and a fully consistent
+`no_eligible_order` state terminal plus current log/run before any mutation.
+`result_confirmed` is deliberately not admitted by this target-free action.
+It then calls the same pinned release
+installer's `InstallFromDisabledNoStop` in Observe mode, replacing the old
+definition with a new future PT15M interval. The authenticated disabled XML is
+backed up and verified; state, log, release bytes, profile/configuration and
+repository fingerprints are not restored or edited by the driver.
+Run this phase with one guest/task-definition owner; other fleet writers remain
+off the guest. These are point-in-time admission checks, not a lock against an
+out-of-band privileged writer. A merge or a successful installer is not delivery.
+After the protected-tree and backup reads, it rechecks the exact Ready run and
+full remaining trigger window. The admitted scheduler LastRunTime, run ID and
+state/log checkpoints are carried into the real drain; an intervening run or
+checkpoint change is rejected before starting a run, never adopted as a baseline.
+The first real OneRun rechecks the original state/log hashes after the drain's
+last Ready read, directly before Start. The original protected fingerprint is
+also carried into that gate and rechecked before the state/log hashes, so a
+slow protected-tree read cannot leave those checkpoints unverified. Missing,
+blank or non-string protected admissions fail closed.
+Before those final state/log hashes, OneRun independently rereads exact
+Observe/Ready/result-0 status, requires the original scheduler LastRunTime and
+compares the full normalized Observe XML fingerprint (plus Enabled=true).
+The same fingerprint is rechecked after the wrapper's last Ready read and
+carried through the drain. Canonical omitted Enabled=true remains equivalent;
+catch-up settings, runner/actions and triggers cannot be silently substituted.
+The protected fingerprint is rechecked after those final native status/XML
+reads, before the state/log checkpoints, so drift during those reads is rejected.
+State/log checkpoints are checked after that final protected-tree read, and the
+pre-install checks follow the slow protected-tree read. The admitted and newly
+read native trigger windows both have to cover the remaining total deadline.
+Deadline and natural-trigger checks follow all those hash reads. This binding applies
+only to the first recovery start; later stale iterations retain the established
+per-run transition and log-prefix contract. Future Observe XML must explicitly
+contain exactly one StartWhenAvailable setting with value true.
+
+Do not enable the old Execute definition to recover a missed interval.
+Production uses StartWhenAvailable, which can queue delayed catch-up work.
+The former proposed `StartAndAwaitFromDisabled` action is deliberately not
+admitted. This recovery has no target dispatch, timestamp or work/result identity
+inputs: it cannot replay an old command whose durable work was pruned, nor an
+identity that exists only as board CLAIM/RECEIPT/RESULT evidence. Observe cannot
+invoke Claude or append worker lifecycle rows even if a catch-up or unrelated
+fresh order is encountered.
+
+The existing Observe drain proves every run's scheduler time, new run identity,
+append-only log and state/cursor/counter transition under one original total
+deadline and MaxRuns bound. Only an exact final no_eligible_order is success.
+A fresh candidate is observed, not executed or discarded; recovery fails visibly
+as OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION and disables future triggers.
+Do not redispatch, replay an expired order, reset the cursor or blindly create
+another managed command after any failure. Preserve the full operation-correlated
+receipt and actual guest/board read-back, resolve the named cause, then qualify
+any new action independently.
+
+Recovery requires TimeoutSeconds=420 and NaturalTriggerMarginSeconds=60,
+with integer MaxRuns between 1 and 8 (retain 8 for the current cutover). Both CLI
+admission and direct recovery invocation reject other limits before mutation.
+Never-run scheduler timestamps (year 1601 or earlier) are not run evidence.
+The protected tree is rechecked after the backup read, before the drain.
+Recovery also rejects a runtime plus
+margin plus 120-second pre-drain reserve that cannot fit the 15-minute interval.
+The platform timeout must cover installer preflight/registration, fingerprints,
+the entire drain and cleanup (use a finite 1800 seconds). Azure command delivery
+is outside this guest deadline; it is not assumed constant.
+
+After actual Observe no-eligible and stale/cursor proof, use the existing separate
+InstallExecuteReady action, publish a genuinely fresh canary once with native
+read-back, then the normal single-run StartAndAwait acceptance gateway. This
+change does not relax Execute identity, output digest, log, protected fingerprint,
+natural-trigger margin or final scheduled-job promotion requirements.
+
+An abrupt process/host death after Observe registration cannot run catch cleanup;
+it can leave Observe enabled, never a successful recovery receipt. Independently
+read the destination task, state, log and board before another command or GO.
+Recovery intentionally changes the definition to Observe with a future boundary;
+it does not claim definition-preserved-except-Enabled.
+
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task
