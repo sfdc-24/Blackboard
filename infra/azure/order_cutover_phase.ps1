@@ -384,7 +384,17 @@ function ConvertFrom-CutoverSingleJsonLine {
         [AllowEmptyString()][string]$Text,
         [Parameter(Mandatory = $true)][string]$Code
     )
-    $lines = @($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    # A BLANK LINE IS BLANK ONLY BY JSON'S DEFINITION, HERE TOO.
+    #
+    # IsNullOrWhiteSpace drops every Char.IsWhiteSpace-only line, so a receipt
+    # such as VT + CRLF + {"ok":true} + CRLF + VT was reduced to one line and
+    # accepted. Measured on this exact base: VT, FF, NBSP and U+2028 lines were
+    # all discarded that way, and this parser governs the escrow receipt and
+    # every mutating installer action - the strict side of the contract. The
+    # document parser's trim was narrowed for the same reason; this closes the
+    # same gap one filter to the left. Found by Copilot on PR114.
+    $jsonWhitespace = [char[]]@([char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
+    $lines = @($Text -split "`r?`n" | Where-Object { $_.Trim($jsonWhitespace).Length -gt 0 })
     if ($lines.Count -ne 1 -or $lines[0].Length -gt $script:CutoverChildMaximumCharacters) {
         Throw-Cutover -Code $Code
     }
@@ -631,9 +641,23 @@ function Invoke-CutoverInstaller {
 
 function ConvertTo-CutoverUtcDateTime {
     param(
-        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
         [Parameter(Mandatory = $true)][string]$Code
     )
+    # A MISSING TIME IS A NAMED FAILURE, NOT A BINDING ERROR.
+    #
+    # The mandatory untyped parameter rejected $null during binding, so a status
+    # or task read with no last or next run failed with "Cannot bind argument to
+    # parameter 'Value' because it is null." - no cutover code, from a path no
+    # caller can name. AllowNull lets it reach the cast, which refuses it, and
+    # the catch turns that into $Code like every other malformed value.
+    #
+    # Copilot (PR114) argued the cast maps $null to DateTime.MinValue, which
+    # would make this a fail-open needing an explicit guard. Measured, it does
+    # not: [datetime]$null throws on Windows PowerShell 5.1.19041 and on pwsh
+    # 7.5.4, as do '' and whitespace. An explicit guard was written and then
+    # removed, because no test on either runtime could fail it - the shape this
+    # repository calls a guard that cannot fail.
     try { return ([DateTime]$Value).ToUniversalTime() }
     catch { Throw-Cutover -Code $Code }
 }
