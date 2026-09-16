@@ -3675,7 +3675,7 @@ try {
     Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING -RetryShape http404
     $rowsMissingAfterHttpReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
     Assert-True 'rows-missing after initial HTTP 404 also authenticates the live guest shape' ($rowsMissingAfterHttpReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $script:HttpEntries[1].code -ceq 'BOARD_READ_HTTP_ERROR' -and $script:HttpEntries[2].code -ceq 'BOARD_ROWS_MISSING')
-    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','http_context_rows_retry','lowercase_rows_retry_http','poll_time','error_time','poll_mode')){
+    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','http_context_rows_retry','lowercase_rows_retry_http','rows_terminal_http','rows_terminal_content','poll_time','error_time','poll_mode')){
         Reset-TestDisabledHttpScenario
         $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
         switch($badHttp){
@@ -3703,6 +3703,16 @@ try {
                 Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
                 $script:HttpEntries[1].code='board_rows_missing'
                 $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='500';content_type_class='json';elapsed_ms='31462.33'}
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
+            'rows_terminal_http'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+                $script:HttpEntries[2].details.http_status='404'
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
+            'rows_terminal_content'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+                $script:HttpEntries[2].details.content_type_class='html'
                 $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
             }
             'poll_time'{$script:HttpState.last_poll.at='2026-09-07T00:00:10.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
