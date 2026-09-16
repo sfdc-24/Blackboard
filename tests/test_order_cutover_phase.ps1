@@ -3146,6 +3146,16 @@ try {
         Assert-True ('expired '+$boundaryTiming+' cannot start Observe') ($script:FirstStartCalls -eq 0)
     }
 
+    foreach($badFirstAdmission in @('mode','run_id','last_run')){
+        $script:FirstStartCalls=0
+        $mismatchAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);next_run_utc=(New-TestExactStatus).next_run_utc}
+        $admissionPreviousLast=(New-TestExactStatus).last_run_utc
+        $admissionExpectedMode='Observe'
+        switch($badFirstAdmission){'mode'{$admissionExpectedMode='Execute'};'run_id'{$mismatchAdmission.run_id=('b'*32)};'last_run'{$mismatchAdmission.last_run_utc=$admissionPreviousLast.AddSeconds(1)}}
+        Assert-ThrowsCode ('real OneRun rejects mismatched first admission '+$badFirstAdmission) {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode $admissionExpectedMode -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(420)) -PreviousLastRunUtc $admissionPreviousLast -PreviousRunId ('a'*32) -LogBefore $mismatchAdmission.log_checkpoint -AdmittedBaseline $mismatchAdmission} 'OBSERVE_FIRST_START_ADMISSION_INVALID'
+        Assert-True ('invalid first admission '+$badFirstAdmission+' never starts a task') ($script:FirstStartCalls -eq 0)
+    }
+
     # The new recovery installs Observe; even fresh unrelated work cannot infer
     # or append worker lifecycle rows. The existing Execute gateway stays single.
     Reset-TestMocks
