@@ -81,6 +81,145 @@ Assert-True 'ALLOCATE is not the ALL broadcast' (
   -not (Test-BoardAddressed -Payload 'BCB|v=1|to=ALLOCATE|from=x' -Tag 'claude-code-cli')
 ) 'the old \bALL\b regex was word-bounded, but token equality is what is meant'
 
+# ── Addressing also lives in the Target_Surface COLUMN ───────────────────────
+#
+# Cell 3 is addressing too. A row whose recipients live only there -- a
+# plain-prose payload carrying no to=/cc= tokens -- was invisible to every
+# reader using this function.
+#
+# Measured on 2026-09-16: the unattended waker reported "3 rows addressed to
+# claude-code-cli" and silently omitted index 2509,
+# CODEX-01A09BF0-PROTOTYPE-CONTRACT-REVIEW-20260916, whose Target_Surface names
+# claude-code-cli FIRST. It was the only row in that batch actually asking this
+# lane for something, and it was found by reading rows by hand.
+#
+# The column is semicolon-delimited, so these cases also pin that the SAME exact
+# -token rule applies there. Widening addressing is precisely where a
+# mis-delivery bug would enter, so every collision case above is repeated here
+# in column form.
+
+$prose = 'Claude-code-cli this is first lead for sfdc24.com - see description below.'
+
+Assert-True 'a prose row addressed only by the column is visible' (
+  Test-BoardAddressed -Payload $prose -Tag 'claude-code-cli' -TargetSurface 'claude-code-cli;vm-claude-code-cli;ALL'
+) 'the payload has no to= at all; the column is the only addressing'
+
+Assert-True 'a semicolon list matches on any exact member' (
+  Test-BoardAddressed -Payload $prose -Tag 'chat-mobile' -TargetSurface 'claude-code-cli;chat-mobile'
+)
+
+Assert-True 'a suffix tag does not consume column mail' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'claude-code-cli' -TargetSurface 'vm-claude-code-cli')
+) 'claude-code-cli must not match vm-claude-code-cli in the column either'
+
+Assert-True 'the reverse column collision is also refused' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'vm-claude-code-cli' -TargetSurface 'claude-code-cli')
+)
+
+Assert-True 'a prefix tag does not consume column mail' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'codex' -TargetSurface 'chatgpt-codex-desktop')
+)
+
+Assert-True 'ALL in the column broadcasts' (
+  Test-BoardAddressed -Payload $prose -Tag 'anyone' -TargetSurface 'someone-else;ALL'
+)
+
+Assert-True 'ALLOCATE in the column is not the ALL broadcast' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'claude-code-cli' -TargetSurface 'ALLOCATE')
+) 'token equality in the column too, not a word-bounded ALL'
+
+Assert-True 'a column naming nobody relevant is still skipped' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'claude-code-cli' -TargetSurface 'vm-chrome;glasses-uploader')
+)
+
+Assert-True 'an absent column changes nothing for payload addressing' (
+  Test-BoardAddressed -Payload 'BCB|v=1|to=claude-code-cli|from=x' -Tag 'claude-code-cli' -TargetSurface ''
+) 'the twelve payload-only assertions above must keep holding'
+
+Assert-True 'a column that names nobody does not rescue an unaddressed payload' (
+  -not (Test-BoardAddressed -Payload 'BCB|v=1|to=vm-chrome|from=x' -Tag 'claude-code-cli' -TargetSurface '')
+)
+
+# ── A surface NAME is not a recipient list ───────────────────────────────────
+#
+# Column D is not always addressing. Writers also put free-form surface names
+# there: pipedream_wa_inbound.js sends 'Blackboard Alpha DB' (the WhatsApp
+# inbound path) and alpha.ps1 documents 'V2 Sandbox'.
+#
+# MEASURED on the live board 2026-09-16: 478 rows carry 'Blackboard Alpha DB',
+# 159 'Pipedream Cloud Agent', 8 'V2 Sandbox', 1 'Meta AI'. Splitting the column
+# on whitespace turns those place names into recipients -- a lane tagged `db`
+# would have consumed 482 rows meant for the board surface.
+#
+# No CURRENT fleet tag collides, so this was latent rather than active. It is
+# fixed anyway: 'Meta AI' fabricates `meta`, and Meta is on the roster.
+
+Assert-True 'a multi-word surface name does not address a lane named by one of its words' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'db' -TargetSurface 'Blackboard Alpha DB')
+) 'Blackboard Alpha DB is a place, not a list containing db'
+
+Assert-True 'nor by its first word' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'blackboard' -TargetSurface 'Blackboard Alpha DB')
+)
+
+Assert-True 'Pipedream Cloud Agent does not deliver to a lane called agent' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'agent' -TargetSurface 'Pipedream Cloud Agent')
+)
+
+Assert-True 'Meta AI does not deliver to a lane called meta' (
+  -not (Test-BoardAddressed -Payload $prose -Tag 'meta' -TargetSurface 'Meta AI')
+) 'a real row is addressed to Meta AI; a meta lane must not consume it'
+
+Assert-True 'a semicolon list still matches when written with spaces' (
+  Test-BoardAddressed -Payload $prose -Tag 'chat-mobile' -TargetSurface 'claude-code-cli; chat-mobile'
+) 'spaces around the separator are formatting, not extra recipients'
+
+Assert-True 'a comma list in the column still matches' (
+  Test-BoardAddressed -Payload $prose -Tag 'vm-cli' -TargetSurface 'codex,vm-cli'
+)
+
+# ── The production loop reads cell 3, and is covered rather than asserted ─────
+#
+# Every column assertion above calls Test-BoardAddressed directly. None drove
+# board_since.ps1's row loop, so a regression to the cell index or the Count
+# guard would leave them all green while reintroducing the reported miss. The
+# extraction now lives in the library, so these cover the cell choice itself.
+#
+# The fixture is the REAL row that was missed, not an invented one.
+
+$columnOnlyRow = @(
+  'CODEX-01A09BF0-PROTOTYPE-CONTRACT-REVIEW-20260916', '2026-09-16T05:21:26Z',
+  'chatgpt-codex-desktop-01a09bf0',
+  'claude-code-cli;vm-claude-code-cli;chatgpt-codex-desktop-01a0a7b3',
+  'REVIEW', 'Scoped source review, not a design pass or release instruction.',
+  'CONTROLLED', 'Blackboard', 'prototype contract review', 'sub'
+)
+
+Assert-True 'the target surface comes from cell 3' (
+  (Get-BoardRowTargetSurface -Row $columnOnlyRow) -eq 'claude-code-cli;vm-claude-code-cli;chatgpt-codex-desktop-01a0a7b3'
+) ("got: " + (Get-BoardRowTargetSurface -Row $columnOnlyRow))
+
+Assert-True 'the row that was actually missed is delivered once both surfaces are read' (
+  Test-BoardAddressed -Payload (Get-BoardRowPayload -Row $columnOnlyRow) -Tag 'claude-code-cli' -TargetSurface (Get-BoardRowTargetSurface -Row $columnOnlyRow)
+) 'this is index 2509; it was invisible while the run reported a confident count'
+
+Assert-True 'a short row carries no column addressing rather than throwing' (
+  (Get-BoardRowTargetSurface -Row @('a', 'b')) -eq ''
+)
+
+Assert-True 'a prose row reports its Row_ID, not its Project Tag' (
+  (Get-BoardRowIdentifier -Row $columnOnlyRow -Payload (Get-BoardRowPayload -Row $columnOnlyRow)) -eq 'CODEX-01A09BF0-PROTOTYPE-CONTRACT-REVIEW-20260916'
+) 'cell 7 is Project Tag; printing it names the wrong thing for every prose row'
+
+$bcbRow = @(
+  'r-bcb', '2026-09-16T05:00:00Z', 'other', 'claude-code-cli', 'APPEND',
+  'BCB|v=1|id=REAL-ID-001|to=claude-code-cli', 'OPEN', 'ProjectTagHere', 'gist', 'sub'
+)
+
+Assert-True 'a BCB row still reports its payload id' (
+  (Get-BoardRowIdentifier -Row $bcbRow -Payload (Get-BoardRowPayload -Row $bcbRow)) -eq 'REAL-ID-001'
+) 'the id= field still wins when it is present'
+
 # ── The payload comes from the fixed cell, never the longest one ─────────────
 
 # A real row: short BCB payload in cell 5, a long human gist in cell 8. The old
