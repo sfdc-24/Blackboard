@@ -38,3 +38,12 @@ packaging/env.example            text eol=lf
 # an interpreter, it breaks an assertion, and the failure names the wrong cause.
 /tests/fixtures/order_supervisor_board.json  text eol=lf
 /tools/walkthrough/fixtures/*.txt            text eol=lf
+
+# CLIPS rule files, for the same reason as those fixtures rather than for tidiness.
+# tools/board_governor/governor.py READS collision.clp and concatenates it into the
+# generated program, and tests/mutate_board_governor.py deletes guards from it by
+# EXACT substring match. CRLF would not break the rule engine - it would make every
+# mutation anchor miss, so the harness reports ANCHOR-MISS instead of a verdict and
+# a silently untested guard looks identical to a tested one. Every sibling .py here
+# is already pinned; this file was the one unpinned text file in the tool.
+*.clp                            text eol=lf
