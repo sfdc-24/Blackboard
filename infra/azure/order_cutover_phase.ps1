@@ -3040,6 +3040,14 @@ function Assert-CutoverFutureObserveDefinition {
     return $startUtc
 }
 
+function Assert-CutoverDisabledObserveRecoveryLimits {
+    param([Parameter(Mandatory = $true)]$Context)
+    if ($Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or
+        $Context.max_runs -lt 1 -or $Context.max_runs -gt 8) {
+        Throw-Cutover -Code 'OBSERVE_RECOVERY_LIMITS_INVALID'
+    }
+}
+
 function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
     param([Parameter(Mandatory = $true)]$Context)
     # Never enable the old Execute definition: StartWhenAvailable may replay
@@ -3047,11 +3055,13 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
     if ($Context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
     if ($Context.expected_terminal_status -or $Context.expected_work_id -or $Context.expected_row_id -or $Context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
     if ($Context.expected_disabled_xml_sha256 -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
+    Assert-CutoverDisabledObserveRecoveryLimits -Context $Context
     try {
         Assert-CutoverPinnedExecutables -Context $Context
         $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
         $xml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if ($xml.enabled -or $xml.utf8_text_sha256 -cne $Context.expected_disabled_xml_sha256) { Throw-Cutover -Code 'DISABLED_TASK_XML_NOT_AUTHENTICATED' }
+        if ($initial.last_run_utc.Year -le 1601) { Throw-Cutover -Code 'DISABLED_TASK_NEVER_RUN' }
         $state = Get-CutoverState -Path $Context.state_path
         $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedUserProfile $Context.user_profile_path
         if ([string]$baseline.status -cne 'no_eligible_order') { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
@@ -3079,6 +3089,7 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
         Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_OBSERVE_RECOVERY'
         if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY' }
         Assert-CutoverBackupMatchesExpectedXml -Context $Context -ExpectedUtf8TextSha256 $xml.utf8_text_sha256 -ExpectedUtf16LeBomSha256 $xml.utf16le_bom_sha256
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_OBSERVE_DRAIN' }
         # Slow protected-tree/backup reads do not consume an assumed reserve.
         # Validate the exact admitted Ready identity and remaining window again.
         Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_DRAIN'
@@ -3244,6 +3255,7 @@ function New-CutoverContext {
         if ($disabledInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
         if ($context.expected_terminal_status -or $context.expected_work_id -or $context.expected_row_id -or $context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
         if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
+        Assert-CutoverDisabledObserveRecoveryLimits -Context $context
         $context.expected_disabled_xml_sha256 = $disabledInput
     } elseif ($disabledInput) { Throw-Cutover -Code 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH' }
     return $context

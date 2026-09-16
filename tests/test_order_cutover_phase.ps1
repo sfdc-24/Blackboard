@@ -3169,6 +3169,7 @@ try {
     Assert-ThrowsCode 'future definition rejects stale boundary before drain' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('2099-01-01T00:00:00Z','2026-01-01T00:00:00Z')) -Context $futureContext} 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
     Assert-ThrowsCode 'future definition rejects non-fifteen-minute interval' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('PT15M','PT5M')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
     Assert-ThrowsCode 'future definition rejects unexpected registration trigger' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<BootTrigger id="AtBoot"/>','<RegistrationTrigger/>')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    Assert-ThrowsCode 'future definition rejects Boot plus Event instead of Time' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('TimeTrigger','EventTrigger')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
     Assert-ThrowsCode 'future definition enforces production StartWhenAvailable true' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<StartWhenAvailable>true</StartWhenAvailable>','<StartWhenAvailable>false</StartWhenAvailable>')) -Context $futureContext} 'OBSERVE_RECOVERY_SETTINGS_INVALID'
 
     $context = New-TestContext
@@ -3236,6 +3237,14 @@ try {
     $savedRecoveryStateMock = (Get-Item Function:Get-CutoverState).ScriptBlock
     $savedRecoveryStatusMock = (Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
     $savedRecoveryBackupMock = (Get-Item Function:Assert-CutoverBackupMatchesExpectedXml).ScriptBlock
+    foreach($neverRunLast in @([DateTime]::MinValue, [DateTime]::FromFileTimeUtc(0))){
+        $script:RecoveryNeverRunLast=$neverRunLast;$script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+        $beforeNeverRunInstalls=$script:ObserveRecoveryInstalls
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState -Last $script:RecoveryNeverRunLast}
+        Assert-ThrowsCode ('Observe recovery rejects never-run scheduler year '+$neverRunLast.Year) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_TASK_NEVER_RUN'
+        Assert-True ('never-run scheduler year '+$neverRunLast.Year+' cannot install or drain') ($script:ObserveRecoveryInstalls -eq $beforeNeverRunInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedRecoveryStatusMock
     $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
     Set-TestMock 'Get-CutoverState' {param($Path) $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.success.event='candidate_observed';[pscustomobject]@{value=$s;checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
     $beforeCorruptInstalls=$script:ObserveRecoveryInstalls
@@ -3281,12 +3290,12 @@ try {
     Assert-ThrowsCode 'Observe recovery rejects a task run during definition replacement' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'TASK_RAN_DURING_OBSERVE_RECOVERY'
     Assert-True 'intervening task run never drains again' ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
     Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState) New-TestExactStatus -State $ExpectedTaskState}
-    foreach($protectedDriftStage in @(2,3,4)){
+    foreach($protectedDriftStage in @(2,3,4,5)){
         $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1;$script:ObserveProtectedCalls=0;$script:ObserveProtectedDriftStage=$protectedDriftStage
         Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:ObserveProtectedCalls++;if($script:ObserveProtectedCalls -eq $script:ObserveProtectedDriftStage){'changed'}else{'protected-same'}}
-        $protectedCode=switch($protectedDriftStage){2{'PROTECTED_CHANGED_BEFORE_OBSERVE_RECOVERY'};3{'PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY'};4{'PROTECTED_FINGERPRINT_CHANGED'}}
+        $protectedCode=switch($protectedDriftStage){2{'PROTECTED_CHANGED_BEFORE_OBSERVE_RECOVERY'};3{'PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY'};4{'PROTECTED_CHANGED_BEFORE_OBSERVE_DRAIN'};5{'PROTECTED_FINGERPRINT_CHANGED'}}
         Assert-ThrowsCode ('Observe recovery rejects protected drift stage '+$protectedDriftStage) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} $protectedCode
-        Assert-True ('protected drift stage '+$protectedDriftStage+' never reports success and disables') (-not $script:ObserveRecoveryInstalled -and $script:ObserveRecoveryDrains -eq $(if($protectedDriftStage -eq 4){2}else{1}))
+        Assert-True ('protected drift stage '+$protectedDriftStage+' never reports success and disables') (-not $script:ObserveRecoveryInstalled -and $script:ObserveRecoveryDrains -eq $(if($protectedDriftStage -eq 5){2}else{1}))
     }
     Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
     $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
@@ -3316,6 +3325,13 @@ try {
     Set-TestMock 'Invoke-CutoverDrainObserve' {param($Context,$Installer) throw 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'}
     Assert-ThrowsCode 'fresh unrelated candidate is observed not executed and requires resolution' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'
     Assert-True 'unrelated fresh candidate failure disables Observe and never claims success' (-not $script:ObserveRecoveryInstalled)
+    foreach($badDirectLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
+        $limitContext=New-TestContext;$limitContext.mode='Observe';$limitContext.timeout_seconds=420;$limitContext.expected_disabled_xml_sha256=$savedPin
+        switch($badDirectLimit){'short_timeout'{$limitContext.timeout_seconds=240};'long_timeout'{$limitContext.timeout_seconds=600};'short_margin'{$limitContext.natural_trigger_margin_seconds=30};'long_margin'{$limitContext.natural_trigger_margin_seconds=61};'max_runs'{$limitContext.max_runs=20}}
+        $beforeLimitInstalls=$script:ObserveRecoveryInstalls;$beforeLimitDrains=$script:ObserveRecoveryDrains
+        Assert-ThrowsCode ('direct Observe recovery rejects '+$badDirectLimit) {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $limitContext} 'OBSERVE_RECOVERY_LIMITS_INVALID'
+        Assert-True ('direct '+$badDirectLimit+' cannot install or drain') ($script:ObserveRecoveryInstalls -eq $beforeLimitInstalls -and $script:ObserveRecoveryDrains -eq $beforeLimitDrains)
+    }
     $context.mode='Execute'
     Assert-ThrowsCode 'direct recovery invocation rejects Execute mode before installer' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'ACTION_REQUIRES_OBSERVE_MODE'
     $context.mode='Observe';$context.expected_work_id='ALREADY-PRUNED-WORK'
@@ -3334,6 +3350,11 @@ try {
     $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.TimeoutSeconds='420'
     $wiredRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $recoveryValues
     Assert-True 'new recovery context binds exact disabled pin and Observe-only full allowance' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.mode -ceq 'Observe' -and $wiredRecovery.timeout_seconds -eq 420)
+    foreach($badRecoveryLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
+        $badRecovery=$recoveryValues.Clone()
+        switch($badRecoveryLimit){'short_timeout'{$badRecovery.TimeoutSeconds='240'};'long_timeout'{$badRecovery.TimeoutSeconds='600'};'short_margin'{$badRecovery.NaturalTriggerMarginSeconds='30'};'long_margin'{$badRecovery.NaturalTriggerMarginSeconds='61'};'max_runs'{$badRecovery.MaxRuns='20'}}
+        Assert-ThrowsCode ('new recovery context rejects '+$badRecoveryLimit) {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_LIMITS_INVALID'
+    }
     $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDisabledXmlSha256=('A'*64)
     Assert-ThrowsCode 'new recovery context rejects malformed disabled pin' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'EXPECTED_DISABLED_XML_SHA256_INVALID'
     $badRecovery=$recoveryValues.Clone();$badRecovery.Mode='Execute'

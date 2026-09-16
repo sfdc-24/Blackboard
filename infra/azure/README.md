@@ -543,8 +543,12 @@ another managed command after any failure. Preserve the full operation-correlate
 receipt and actual guest/board read-back, resolve the named cause, then qualify
 any new action independently.
 
-For the current bounded cutover, retain TimeoutSeconds=420,
-NaturalTriggerMarginSeconds=60 and MaxRuns=8. Recovery rejects a runtime plus
+Recovery requires TimeoutSeconds=420 and NaturalTriggerMarginSeconds=60,
+with MaxRuns between 1 and 8 (retain 8 for the current cutover). Both CLI
+admission and direct recovery invocation reject other limits before mutation.
+Never-run scheduler timestamps (year 1601 or earlier) are not run evidence.
+The protected tree is rechecked after the backup read, before the drain.
+Recovery also rejects a runtime plus
 margin plus 120-second pre-drain reserve that cannot fit the 15-minute interval.
 The platform timeout must cover installer preflight/registration, fingerprints,
 the entire drain and cleanup (use a finite 1800 seconds). Azure command delivery
