@@ -540,12 +540,27 @@ function Read-ValidatedRollbackBackup {
     $principals = @($document.SelectNodes('/t:Task/t:Principals/t:Principal', $namespaceManager))
     $actions = @($document.SelectNodes('/t:Task/t:Actions/*', $namespaceManager))
     $execActions = @($document.SelectNodes('/t:Task/t:Actions/t:Exec', $namespaceManager))
+    $actionIdNodes = @()
+    if ($execActions.Count -eq 1) {
+        $actionIdNodes = @($execActions[0].SelectNodes('@*[local-name()="id"]'))
+    }
+    $actionIdCount = @($actionIdNodes).Count
+    $actionId = if ($actionIdCount -eq 1) { [Xml.XmlAttribute]@($actionIdNodes)[0] } else { $null }
+    # Task Scheduler can omit an Exec action's optional id when exporting a
+    # registered task. Accept only true omission or the one canonical
+    # unqualified id; reject wrong values and namespace lookalikes.
+    $actionIdValid = (
+        $actionIdCount -eq 0 -or
+        ($actionIdCount -eq 1 -and
+            [string]$actionId.NamespaceURI -ceq '' -and
+            [string]$actionId.Value -ceq 'OrderSupervisor')
+    )
     if ($descriptions.Count -ne 1 -or
         -not ([string]$descriptions[0].InnerText).Contains($ManagedMarker) -or
         $uris.Count -ne 1 -or [string]$uris[0].InnerText -cne ('\' + $TaskName) -or
         $principals.Count -ne 1 -or
         $actions.Count -ne 1 -or $execActions.Count -ne 1 -or
-        [string]$execActions[0].GetAttribute('id') -cne 'OrderSupervisor') {
+        -not $actionIdValid) {
         throw 'rollback_xml_identity_invalid'
     }
     $userIdNodes = @($principals[0].SelectNodes('t:UserId', $namespaceManager))

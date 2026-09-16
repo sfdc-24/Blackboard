@@ -275,24 +275,29 @@ try {
         '      <LogonType>ServiceAccount</LogonType>',
         ''
     )
+    $systemBackupWithoutOptionalExports = $systemBackupWithoutLogonType.Replace(
+        '    <Exec id="OrderSupervisor">',
+        '    <Exec>'
+    )
     $omittedLogonDocument = New-Object Xml.XmlDocument
-    $omittedLogonDocument.LoadXml($systemBackupWithoutLogonType)
+    $omittedLogonDocument.LoadXml($systemBackupWithoutOptionalExports)
     $omittedLogonNamespace = New-Object Xml.XmlNamespaceManager($omittedLogonDocument.NameTable)
     $omittedLogonNamespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
-    Assert-True 'omitted-LogonType fixture has canonical SID and no LogonType element in any namespace' (
+    Assert-True 'Task Scheduler omission fixture has canonical SID and no optional LogonType or Exec id' (
         @($omittedLogonDocument.SelectNodes('/t:Task/t:Principals/t:Principal/*[local-name()="LogonType"]', $omittedLogonNamespace)).Count -eq 0 -and
-        [string]$omittedLogonDocument.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $omittedLogonNamespace).InnerText -ceq 'S-1-5-18'
+        [string]$omittedLogonDocument.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $omittedLogonNamespace).InnerText -ceq 'S-1-5-18' -and
+        @($omittedLogonDocument.SelectNodes('/t:Task/t:Actions/t:Exec/@*[local-name()="id"]', $omittedLogonNamespace)).Count -eq 0
     )
-    $script:BackupXmlForMock = $systemBackupWithoutLogonType
+    $script:BackupXmlForMock = $systemBackupWithoutOptionalExports
     $safeExistingTask = [pscustomobject]@{
         Principal = [pscustomobject]@{ UserId = 'SYSTEM'; LogonType = 'ServiceAccount' }
     }
     $systemBackupWithoutLogonTypeError = Invoke-ExpectedFailure -ScriptBlock {
         Save-PreviousTask -Existing $safeExistingTask
         $savedBackup = Read-ValidatedRollbackBackup
-        if ([string]$savedBackup.xml -cne $systemBackupWithoutLogonType) { throw 'saved_xml_mismatch' }
+        if ([string]$savedBackup.xml -cne $systemBackupWithoutOptionalExports) { throw 'saved_xml_mismatch' }
     }
-    Assert-True 'backup capture and validation accept canonical SYSTEM XML with omitted optional LogonType' (
+    Assert-True 'backup capture and validation accept canonical SYSTEM XML with omitted optional exports' (
         $systemBackupWithoutLogonTypeError -ceq 'NO_ERROR' -and
         $script:MutationLog.Count -eq 0 -and $script:RootTaskReads -eq 0
     ) $systemBackupWithoutLogonTypeError
@@ -354,6 +359,27 @@ try {
             expected = 'rollback_xml_identity_invalid'
             setup = {
                 $script:CaseXml = $backupXml.Replace($ManagedMarker, 'managed-by=someone-else')
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'wrong action id'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace('id="OrderSupervisor"', 'id="OtherAction"')
+                [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
+                Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
+            }
+        },
+        [pscustomobject]@{
+            name = 'foreign namespace action id lookalike'
+            expected = 'rollback_xml_identity_invalid'
+            setup = {
+                $script:CaseXml = $backupXml.Replace(
+                    '<Exec id="OrderSupervisor">',
+                    '<Exec xmlns:foreign="urn:not-task" foreign:id="OrderSupervisor">'
+                )
                 [IO.File]::WriteAllText($BackupXmlPath, $script:CaseXml, [Text.Encoding]::Unicode)
                 Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $script:CaseXml)
             }
@@ -446,8 +472,8 @@ try {
 
     # A valid prior definition replaces the live task without any unregister
     # gap and is accepted only after byte-exact export readback.
-    [IO.File]::WriteAllText($BackupXmlPath, $systemBackupWithoutLogonType, [Text.Encoding]::Unicode)
-    Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $systemBackupWithoutLogonType)
+    [IO.File]::WriteAllText($BackupXmlPath, $systemBackupWithoutOptionalExports, [Text.Encoding]::Unicode)
+    Write-BackupManifest -PreviousExisted $true -XmlSha256 (Get-Sha256 $systemBackupWithoutOptionalExports)
     $script:RegisteredXmlForMock = $null
     $script:ExportXmlOverrideForMock = $null
     $script:RegisterSawForce = $false
@@ -490,7 +516,7 @@ try {
     ) ($script:MutationLog -join ',')
     Assert-True 'valid rollback has no unregister gap' (-not $script:MutationLog.Contains('unregister'))
     Assert-True 'valid rollback registers exact validated XML with Force' (
-        $script:RegisterSawForce -and $script:RegisteredXmlForMock -ceq $systemBackupWithoutLogonType
+        $script:RegisterSawForce -and $script:RegisteredXmlForMock -ceq $systemBackupWithoutOptionalExports
     )
 
     $script:MutationLog.Clear()
@@ -503,7 +529,7 @@ try {
 
     $script:MutationLog.Clear()
     $script:RestoredPrincipalLogonType = 'ServiceAccount'
-    $script:ExportXmlOverrideForMock = $systemBackupWithoutLogonType + [Environment]::NewLine
+    $script:ExportXmlOverrideForMock = $systemBackupWithoutOptionalExports + [Environment]::NewLine
     $readbackMismatch = Invoke-ExpectedFailure -ScriptBlock { Restore-PreviousTask }
     Assert-True 'rollback rejects a non-exact registered definition readback' (
         $readbackMismatch -ceq 'rollback_restore_definition_mismatch'
@@ -566,7 +592,8 @@ try {
 
     # Exercise the production Save -> Validate boundary through the incident
     # no-stop action using the canonical Task Scheduler export that omits
-    # LogonType. All scheduler effects remain mocked and bounded.
+    # LogonType and the Exec action id. All scheduler effects remain mocked
+    # and bounded.
     Invoke-Expression $installerFunctionDefinitions['Save-PreviousTask'].Extent.Text
     Invoke-Expression $installerFunctionDefinitions['Read-ValidatedRollbackBackup'].Extent.Text
     $script:RealNoStopCurrentReads = 0
@@ -587,7 +614,7 @@ try {
     function Export-ScheduledTask {
         [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
         $script:RealNoStopExportReads++
-        return $systemBackupWithoutLogonType
+        return $systemBackupWithoutOptionalExports
     }
     function New-ExpectedDefinition { return [pscustomobject]@{ definition = 'candidate' } }
     function Register-ScheduledTask {
@@ -599,17 +626,17 @@ try {
     function Get-StatusObject { return [pscustomobject]@{ status = 'READY' } }
     $Mode = 'Observe'
     $Start = $false
-    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $systemBackupWithoutLogonType
+    $ExpectedCurrentTaskXmlSha256 = Get-Sha256 -Text $systemBackupWithoutOptionalExports
     $realNoStopError = Invoke-ExpectedFailure -ScriptBlock {
         $script:RealNoStopResult = Invoke-InstallFromDisabledNoStopAction
     }
-    Assert-True 'disabled no-stop production backup path accepts canonical omitted LogonType and registers once' (
+    Assert-True 'disabled no-stop production backup path accepts canonical omitted optional exports and registers once' (
         $realNoStopError -ceq 'NO_ERROR' -and
         [string]$script:RealNoStopResult.status -ceq 'READY' -and
         $script:RealNoStopCurrentReads -eq 3 -and
         $script:RealNoStopExportReads -eq 3 -and
         ($script:RealNoStopMutations -join ',') -ceq 'register' -and
-        [IO.File]::ReadAllText($BackupXmlPath, [Text.Encoding]::Unicode) -ceq $systemBackupWithoutLogonType
+        [IO.File]::ReadAllText($BackupXmlPath, [Text.Encoding]::Unicode) -ceq $systemBackupWithoutOptionalExports
     ) ($realNoStopError + '; reads=' + $script:RealNoStopCurrentReads + '; exports=' + $script:RealNoStopExportReads + '; mutations=' + ($script:RealNoStopMutations -join ','))
 
     # The incident-only installer action is a structurally separate contract.
