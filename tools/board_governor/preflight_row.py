@@ -30,11 +30,15 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_SCRIPTS = Path(
-    r"C:\Users\salam\AppData\Local\Temp\claude"
-    r"\C--Users-salam-Quantum-Blackboard"
-    r"\36c6e94a-0f8c-4834-ab2b-db4d33ba6fb8\scratchpad\main\scripts"
-)
+# Resolved from this file, never hardcoded. The previous default pointed at a
+# per-session scratchpad directory, so it could not resolve on any machine but
+# the session that wrote it - and would stop resolving there too once that
+# temporary directory was cleaned. A preflight that exits 1 on its default
+# teaches a lane to skip the preflight rather than discover the flag, which is
+# the opposite of what this script is for.
+# This file lives at <repo>/tools/board_governor/, so parents[2] is the repo
+# root and append.py sits at <repo>/scripts/. --scripts still overrides.
+DEFAULT_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 SCHEMA = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
           "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
