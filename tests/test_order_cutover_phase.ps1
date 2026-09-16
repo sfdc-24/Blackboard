@@ -3337,6 +3337,35 @@ try {
     $beforeResultInstalls=$script:ObserveRecoveryInstalls
     Assert-ThrowsCode 'Observe-only recovery refuses result-confirmed baseline without target inputs' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
     Assert-True 'result-confirmed baseline cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeResultInstalls -and $script:ObserveRecoveryDrains -eq 1)
+
+    $resultContext=New-TestContext
+    $resultContext.mode='Observe';$resultContext.timeout_seconds=420;$resultContext.max_runs=8
+    $resultContext.expected_disabled_xml_sha256=$context.expected_disabled_xml_sha256
+    $resultContext.expected_terminal_status='result_confirmed'
+    $resultContext.expected_work_id='WORK-RESULT-1'
+    $resultContext.expected_row_id='99999999-9999-4999-8999-999999999999'
+    $resultContext.expected_result_status='blocked'
+    $script:ObserveRecoveryInstalled=$false
+    $script:ObserveRecoveryDrains=1
+    $script:ResultRecoveryLogPin=''
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Execute -RunId ('a'*32) -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId '99999999-9999-4999-8999-999999999999' -ResultStatus blocked);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {
+        param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus,$ExpectedWorkId,$ExpectedRowId,$ExpectedResultStatus)
+        $script:ResultRecoveryLogPin=($ExpectedMode,$ExpectedStatus,$ExpectedWorkId,$ExpectedRowId,$ExpectedResultStatus -join '|')
+        [pscustomobject]@{run_id=('a'*32)}
+    }
+    $resultRecovery=Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $resultContext
+    Assert-True 'Observe recovery admits exact disabled result-confirmed baseline without enabling Execute' (
+        $resultRecovery.baseline_status -ceq 'result_confirmed' -and
+        $resultRecovery.recovered_work_id -ceq 'WORK-RESULT-1' -and
+        $resultRecovery.recovered_row_id -ceq '99999999-9999-4999-8999-999999999999' -and
+        $resultRecovery.recovered_result_status -ceq 'blocked' -and
+        $resultRecovery.recovered_output_sha256 -ceq ('8'*64) -and
+        $resultRecovery.old_execute_task_not_enabled -and
+        -not $resultRecovery.task_stopped -and
+        $script:ResultRecoveryLogPin -ceq 'Execute|result_confirmed|WORK-RESULT-1|99999999-9999-4999-8999-999999999999|blocked'
+    )
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
     Set-TestMock 'Get-CutoverState' $savedRecoveryStateMock
     foreach($finalFailure in @('NATURAL_TRIGGER_WINDOW_UNAVAILABLE','TASK_CHANGED_BEFORE_OBSERVE_DRAIN','TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN')){
         $script:RecoveryBackupReadComplete=$false;$script:RecoveryFinalFailure=$finalFailure
@@ -3434,6 +3463,19 @@ try {
     $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.TimeoutSeconds='420'
     $wiredRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $recoveryValues
     Assert-True 'new recovery context binds exact disabled pin and Observe-only full allowance' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.mode -ceq 'Observe' -and $wiredRecovery.timeout_seconds -eq 420)
+    $targetedRecovery=$recoveryValues.Clone()
+    $targetedRecovery.ExpectedTerminalStatus='result_confirmed'
+    $targetedRecovery.ExpectedWorkId='WORK-RESULT-1'
+    $targetedRecovery.ExpectedRowId='99999999-9999-4999-8999-999999999999'
+    $targetedRecovery.ExpectedResultStatus='blocked'
+    $wiredTargetedRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $targetedRecovery
+    Assert-True 'new recovery context admits exact result-confirmed identity without enabling Execute' (
+        $wiredTargetedRecovery.expected_terminal_status -ceq 'result_confirmed' -and
+        $wiredTargetedRecovery.expected_work_id -ceq 'WORK-RESULT-1' -and
+        $wiredTargetedRecovery.expected_row_id -ceq '99999999-9999-4999-8999-999999999999' -and
+        $wiredTargetedRecovery.expected_result_status -ceq 'blocked' -and
+        $wiredTargetedRecovery.mode -ceq 'Observe'
+    )
     foreach($badRecoveryLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
         $badRecovery=$recoveryValues.Clone()
         switch($badRecoveryLimit){'short_timeout'{$badRecovery.TimeoutSeconds='240'};'long_timeout'{$badRecovery.TimeoutSeconds='600'};'short_margin'{$badRecovery.NaturalTriggerMarginSeconds='30'};'long_margin'{$badRecovery.NaturalTriggerMarginSeconds='61'};'max_runs'{$badRecovery.MaxRuns='20'}}
@@ -3445,6 +3487,8 @@ try {
     Assert-ThrowsCode 'new recovery context rejects Execute before mutation' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'ACTION_REQUIRES_OBSERVE_MODE'
     $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedWorkId='EXPIRED-OR-PRUNED'
     Assert-ThrowsCode 'new recovery context forbids any dispatch target replay' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    $badRecovery=$targetedRecovery.Clone();$badRecovery.ExpectedResultStatus='missing'
+    Assert-ThrowsCode 'new recovery context rejects malformed result identity status' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'EXPECTED_RESULT_STATUS_INVALID'
     $badRecovery=$recoveryValues.Clone();$badRecovery.TimeoutSeconds='780'
     Assert-ThrowsCode 'new recovery context rejects impossible interval window' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL'
     Assert-ThrowsCode 'normal Execute start rejects disabled recovery pin' {New-CutoverContext -RequestedAction StartAndAwait -Values $recoveryValues} 'ACTION_REQUIRES_EXECUTE_MODE'
