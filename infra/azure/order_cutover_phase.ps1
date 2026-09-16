@@ -384,7 +384,17 @@ function ConvertFrom-CutoverSingleJsonLine {
         [AllowEmptyString()][string]$Text,
         [Parameter(Mandatory = $true)][string]$Code
     )
-    $lines = @($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    # A BLANK LINE IS BLANK ONLY BY JSON'S DEFINITION, HERE TOO.
+    #
+    # IsNullOrWhiteSpace drops every Char.IsWhiteSpace-only line, so a receipt
+    # such as VT + CRLF + {"ok":true} + CRLF + VT was reduced to one line and
+    # accepted. Measured on this exact base: VT, FF, NBSP and U+2028 lines were
+    # all discarded that way, and this parser governs the escrow receipt and
+    # every mutating installer action - the strict side of the contract. The
+    # document parser's trim was narrowed for the same reason; this closes the
+    # same gap one filter to the left. Found by Copilot on PR114.
+    $jsonWhitespace = [char[]]@([char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
+    $lines = @($Text -split "`r?`n" | Where-Object { $_.Trim($jsonWhitespace).Length -gt 0 })
     if ($lines.Count -ne 1 -or $lines[0].Length -gt $script:CutoverChildMaximumCharacters) {
         Throw-Cutover -Code $Code
     }
@@ -393,6 +403,69 @@ function ConvertFrom-CutoverSingleJsonLine {
         Throw-Cutover -Code $Code
     }
     return $value
+}
+
+function ConvertFrom-CutoverSingleJsonDocument {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Code
+    )
+    if ([string]::IsNullOrWhiteSpace($Text)) { Throw-Cutover -Code $Code }
+    # TRIM ONLY WHAT JSON ITSELF CALLS WHITESPACE.
+    #
+    # Argument-less String.Trim() strips every character char.IsWhiteSpace
+    # accepts, which is a much larger set than RFC 8259's four.  Measured
+    # under Windows PowerShell 5.1, it silently removes U+000B, U+000C,
+    # U+0085, U+00A0, U+2028 and U+3000, none of which JSON permits as
+    # framing - so a receipt wrapped in them parsed clean instead of failing
+    # closed.  Routing every Status receipt through here widens that gap to
+    # every release, so it is closed first.  Naming the four explicitly also
+    # keeps the rule readable: space, tab, carriage return, line feed.
+    $trimmed = $Text.Trim(
+        [char]0x20, [char]0x09, [char]0x0D, [char]0x0A)
+    if ($trimmed.Length -eq 0 -or [int][char]$trimmed[0] -eq 0xfeff) {
+        Throw-Cutover -Code $Code
+    }
+    try { [byte[]]$bytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($trimmed) }
+    catch { Throw-Cutover -Code $Code }
+    if ($bytes.Length -eq 0 -or $bytes.Length -gt $script:CutoverChildMaximumCharacters) {
+        Throw-Cutover -Code $Code
+    }
+    $value = ConvertFrom-CutoverJsonText -Text $trimmed -Code $Code
+    if ($null -eq $value -or $value.GetType().FullName -cne 'System.Management.Automation.PSCustomObject') {
+        Throw-Cutover -Code $Code
+    }
+    return $value
+}
+
+# WHY THE CARVEOUT IS KEYED ON THE ACTION AND NOT ON A PINNED RELEASE.
+#
+# Pinning it to one exact legacy release and digest is the narrower rule,
+# and it was the first shape of this repair.  What ruled it out is the
+# failure mode when a constant is wrong: measured, one byte off in either
+# value falls straight through to the one-line rule and reproduces the
+# identical INSTALLER_RECEIPT_INVALID being fixed here - discovered only
+# after another Managed Run Command round trip against the guest.  Neither
+# value is recorded anywhere in this repository, so neither can be checked
+# before that round trip is spent.
+#
+# Keying on the action costs almost nothing in narrowness.  Status is
+# read-only, and every MUTATING action keeps the one-physical-line
+# contract, which is safe because mutating actions are only ever issued
+# against $Context.installer_path - the candidate release - and that
+# installer now emits -Compress.  A pretty Status receipt is accepted on
+# its own merits instead of on a promise about which release wrote it:
+# exactly one JSON document, no duplicate object keys, a PSCustomObject
+# root, and a hard size bound.
+function ConvertFrom-CutoverInstallerReceipt {
+    param(
+        [AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$RequestedAction
+    )
+    if ($RequestedAction -ceq 'Status') {
+        return ConvertFrom-CutoverSingleJsonDocument -Text $Text -Code 'INSTALLER_RECEIPT_INVALID'
+    }
+    return ConvertFrom-CutoverSingleJsonLine -Text $Text -Code 'INSTALLER_RECEIPT_INVALID'
 }
 
 function Get-CutoverWindowsPowerShell {
@@ -559,14 +632,32 @@ function Invoke-CutoverInstaller {
     if ($result.exit_code -ne 0 -or -not [string]::IsNullOrWhiteSpace($result.stderr)) {
         Throw-Cutover -Code 'INSTALLER_CHILD_FAILED'
     }
-    return ConvertFrom-CutoverSingleJsonLine -Text $result.stdout -Code 'INSTALLER_RECEIPT_INVALID'
+    # Read-only Status may arrive pretty-printed; every mutating action
+    # still owes exactly one physical line.
+    return ConvertFrom-CutoverInstallerReceipt `
+        -Text $result.stdout `
+        -RequestedAction $RequestedAction
 }
 
 function ConvertTo-CutoverUtcDateTime {
     param(
-        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
         [Parameter(Mandatory = $true)][string]$Code
     )
+    # A MISSING TIME IS A NAMED FAILURE, NOT A BINDING ERROR.
+    #
+    # The mandatory untyped parameter rejected $null during binding, so a status
+    # or task read with no last or next run failed with "Cannot bind argument to
+    # parameter 'Value' because it is null." - no cutover code, from a path no
+    # caller can name. AllowNull lets it reach the cast, which refuses it, and
+    # the catch turns that into $Code like every other malformed value.
+    #
+    # Copilot (PR114) argued the cast maps $null to DateTime.MinValue, which
+    # would make this a fail-open needing an explicit guard. Measured, it does
+    # not: [datetime]$null throws on Windows PowerShell 5.1.19041 and on pwsh
+    # 7.5.4, as do '' and whitespace. An explicit guard was written and then
+    # removed, because no test on either runtime could fail it - the shape this
+    # repository calls a guard that cannot fail.
     try { return ([DateTime]$Value).ToUniversalTime() }
     catch { Throw-Cutover -Code $Code }
 }

@@ -867,22 +867,22 @@ function Invoke-RollbackAction {
 }
 
 if ($Action -ceq 'Status') {
-    Get-StatusObject | ConvertTo-Json -Depth 10
+    Get-StatusObject | ConvertTo-Json -Depth 10 -Compress
     exit 0
 }
 if ($Action -ceq 'Install') {
-    Invoke-InstallAction | ConvertTo-Json -Depth 10
+    Invoke-InstallAction | ConvertTo-Json -Depth 10 -Compress
     exit 0
 }
 if ($Action -ceq 'InstallFromDisabledNoStop') {
-    Invoke-InstallFromDisabledNoStopAction | ConvertTo-Json -Depth 10
+    Invoke-InstallFromDisabledNoStopAction | ConvertTo-Json -Depth 10 -Compress
     exit 0
 }
 if ($Action -ceq 'Uninstall') {
-    Invoke-UninstallAction | ConvertTo-Json -Depth 10
+    Invoke-UninstallAction | ConvertTo-Json -Depth 10 -Compress
     exit 0
 }
 if ($Action -ceq 'Rollback') {
-    Invoke-RollbackAction | ConvertTo-Json -Depth 10
+    Invoke-RollbackAction | ConvertTo-Json -Depth 10 -Compress
     exit 0
 }

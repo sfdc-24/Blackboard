@@ -105,7 +105,26 @@ repair mode and cannot create, update, or delete Azure resources.
    trigger identities are the unqualified lowercase `id` attributes
    `AtBoot` and `Every15Minutes`; child-element or namespace-shadowed
    lookalikes fail closed. Explicit, duplicate, or namespace-shadowed principal
-   alternatives fail closed too.
+   alternatives fail closed too. Any installer predating the compressed receipt
+   serializes its `Status` object as pretty-printed JSON, so the read-only
+   `Status` action accepts insignificant whitespace inside exactly one bounded
+   JSON object, from any release; banners, trailing output, multiple documents,
+   arrays, scalars, duplicate keys, and oversized decoded output fail closed.
+   That exception is keyed on the ACTION and deliberately not on a pinned
+   release or digest: a constant that has to match the guest is one more input
+   that can be wrong, and when it is wrong it fails as
+   `INSTALLER_RECEIPT_INVALID`, which is indistinguishable from the defect it
+   exists to repair and is only discoverable after another Managed Run Command
+   round trip. Every MUTATING action keeps the one-physical-line rule.
+
+   That last rule is also a **release precondition**, because mutating actions
+   are only ever issued against the candidate installer:
+   `scripts\install_order_supervisor.ps1` is one of the six canonical release
+   files, so a candidate staged from a commit before the `-Compress` change is
+   pretty-printed on its `Install` receipt as well. The cutover would refuse
+   that receipt *after* `Disable-CutoverTask` has already run. Build and stage
+   the candidate release from a commit whose installer emits `-Compress`, and
+   do not reuse an earlier staged archive.
 7. Deliver the exact reviewed `order_cutover_phase.ps1` as a BOM-free Managed
    Run Command source and read its source digest back. Use a new 32-lowercase-
    hex `OperationId` for every action. The driver captures all child output and
