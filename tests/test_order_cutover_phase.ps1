@@ -623,9 +623,11 @@ try {
 
     # A MISSING TIME FAILS BY NAME, not through parameter binding. The mandatory
     # untyped $Value rejected $null at binding, so the failure carried no code.
-    # These assertions hold whatever the cast does with $null: measured, it
-    # throws on both 5.1.19041 and pwsh 7.5.4, so they pass on either, and they
-    # would still pass if a future runtime returned DateTime.MinValue instead.
+    # Measured, the cast refuses all three values on 5.1.19041 and on pwsh 7.5.4,
+    # which is why the named code comes back. These cases are also the detector
+    # for the fail-open Copilot raised: on a runtime where [datetime]$null
+    # returned DateTime.MinValue instead of throwing, the null case would report
+    # NO_ERROR and fail here rather than passing quietly.
     foreach ($missingTime in @($null, '', '   ')) {
         $label = if ($null -eq $missingTime) { 'null' } elseif ($missingTime -eq '') { 'empty' } else { 'whitespace' }
         Assert-ThrowsCode ('a ' + $label + ' time is refused by name') {
