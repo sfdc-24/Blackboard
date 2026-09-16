@@ -33,6 +33,10 @@ on:
       - "tests/test_append_payload_guard.py"
       - "src/bus_server.py"
       - "tests/test_bus.py"
+      - "src/mother_child_contract.py"
+      - "tests/test_mother_child_contract.py"
+      - "docs/MOTHER-CHILD-BUS-ARCHITECTURE.md"
+      - ".gitattributes"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
       - ".github/workflows/python-suites.yml"
@@ -49,6 +53,10 @@ on:
       - "tests/test_append_payload_guard.py"
       - "src/bus_server.py"
       - "tests/test_bus.py"
+      - "src/mother_child_contract.py"
+      - "tests/test_mother_child_contract.py"
+      - "docs/MOTHER-CHILD-BUS-ARCHITECTURE.md"
+      - ".gitattributes"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
       - ".github/workflows/python-suites.yml"
@@ -84,7 +92,8 @@ jobs:
           echo "python: $(python3 --version)"
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
-                   tests/test_bus.py tests/test_bcb_lint.py; do
+                   tests/test_bus.py tests/test_mother_child_contract.py \
+                   tests/test_bcb_lint.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -143,6 +152,12 @@ jobs:
           python_bin="$(command -v python3)"
           sudo unshare -n -- "$python_bin" tests/test_bcb_lint.py
 
+      - name: mother-child isolation contract (no network)
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- "$python_bin" tests/test_mother_child_contract.py
+
       # The bus suite starts its own server and scratch database. Enable only
       # loopback in a fresh namespace, and retain setup-python's exact binary
       # across sudo rather than silently switching to the system interpreter.
@@ -163,7 +178,8 @@ jobs:
           set -euo pipefail
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
-             && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ]; then
+             && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_mother_child_contract.py ] \
+             && [ ! -f tests/test_bcb_lint.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1

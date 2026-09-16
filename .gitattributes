@@ -20,6 +20,7 @@
 *.sh                             text eol=lf
 *.bash                           text eol=lf
 *.py                             text eol=lf
+/.github/workflows/*.yml         text eol=lf
 
 # Debian maintainer scripts and control files: dpkg runs these as /bin/sh.
 packaging/DEBIAN/preinst         text eol=lf

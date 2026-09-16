@@ -27,6 +27,22 @@ LEDGER SCHEMA v1 event ledger (`event` / `inbox` / `work`).
 | `packaging/blackboard-bus.service` | hardened systemd unit (secret via `/etc/blackboard-bus/env`) |
 | `docs/DEPLOY-GCP.md` | GCP runbook: create VM, install, HTTPS options, seed, migrate clients |
 | `scripts/bcb_lint.py` | BCB board grammar validator (GPT-BCBLINT-001) — also works against this bus |
+| `src/mother_child_contract.py` | offline post-auth reference gate for identity-bound tenant/child commands, policy ceilings, trusted-store invitations, currently authorized replay and work-scoped fences; not wired into the live server |
+| `tests/test_mother_child_contract.py` | adversarial, credential-free contract suite, including 100-way invitation and replay races |
+| `docs/MOTHER-CHILD-BUS-ARCHITECTURE.md` | proposed control/data-plane boundary, Cloud SQL datastore ADR, migration gates and enterprise negative controls |
+
+### Mother/child post-auth admission is proposed, not deployed
+
+The current bus remains a single-node service authorized by one shared bearer
+secret. Passing the offline mother/child suite does **not** make that service
+multi-tenant. The proposed contract derives tenant and child scope from a
+separately verified principal, prevents a mother/control identity from reading
+or writing child data, requires the intersection of parent ceiling and child
+grant, and makes a bounded post-auth subset of invitation, replay and
+work-fence failures executable before an online integration exists. Directional
+control/health protocols, identity transport, persistence and effects remain
+future gates. See the
+[architecture and datastore decision](docs/MOTHER-CHILD-BUS-ARCHITECTURE.md).
 
 ### Claim fencing contract
 
@@ -91,4 +107,5 @@ sudo systemctl enable --now blackboard-bus
 curl -s http://127.0.0.1:8787/
 ```
 
-Tests: `python3 tests/test_bus.py` (no install needed).
+Tests: `python3 tests/test_bus.py` and
+`python3 tests/test_mother_child_contract.py` (no install needed).
