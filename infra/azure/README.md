@@ -271,7 +271,10 @@ repair mode and cannot create, update, or delete Azure resources.
     `DrainObserve` retry cannot satisfy its `Ready` precondition.
     `tail_seeded`, `overlap_suppressed`, a reused run ID, or result `0` without
     the matching state and log evidence is a failure. Observe must produce zero
-    board writes.
+    board writes. Counts-only `board_duplicate_rows_collapsed` and
+    `board_schema_incident` warnings are permitted as nonterminal evidence only
+    in their exact worker-defined shapes: at most one of each, blank work/row and
+    message fields, fixed warning codes, and canonical bounded count details.
 12. Rehearse rollback with `RestoreReady`. It must validate the exact rollback
     escrow and the exact current pinned candidate in either `Observe` or
     `Execute`. The candidate must be quiescent and exactly `Ready` or `Disabled`:
