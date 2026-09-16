@@ -87,6 +87,40 @@ function Get-BoardRowPayload {
 }
 
 <#
+The Target_Surface cell of a board row.
+
+FIXED at index 3 by the board schema, and extracted HERE rather than inline in
+board_since.ps1 so that the cell choice is itself under test. Every assertion
+added with column addressing called Test-BoardAddressed directly; not one drove
+the production loop, so a regression to the index or to the Count guard would
+have left all of them green while reintroducing the exact miss they were
+written for. A guard no test can fail is not a guard.
+#>
+function Get-BoardRowTargetSurface {
+  param([object[]]$Row)
+  if (-not $Row) { return '' }
+  if ($Row.Count -le 3) { return '' }
+  return [string]$Row[3]
+}
+
+<#
+The identifier to print for a row: its BCB `id=` when it has one, else its Row_ID.
+
+CELL 0, NOT CELL 7. Column addressing newly admits plain-prose rows, and such a
+row carries no `id=` token by definition, so every one of them reaches this
+fallback. Index 7 is Project Tag in the A:J schema - so the reader printed a
+project name, or a blank, as the identity of precisely the messages this change
+exists to surface.
+#>
+function Get-BoardRowIdentifier {
+  param([object[]]$Row, [string]$Payload)
+  if ($Payload -match 'id=([^|]*)') { return $matches[1] }
+  if (-not $Row) { return '' }
+  if ($Row.Count -le 0) { return '' }
+  return [string]$Row[0]
+}
+
+<#
 Is this payload addressed to $Tag?
 
 EXACT token match, case-insensitive, plus the ALL broadcast. A tag that is a
@@ -119,14 +153,30 @@ function Test-BoardAddressed {
   )
   $want = $Tag.Trim().ToLowerInvariant()
 
-  # EXACT tokens here too, for the same reason as the payload. The column is
-  # semicolon-delimited (a;b;c) and Get-BoardFieldTokens already splits on
-  # [,;\s]+, so the splitter is reused rather than re-derived — a second idea of
-  # what a delimiter is, is how a reader and a writer come to disagree.
+  # EXACT tokens here too, for the same reason as the payload. But the column is
+  # split on SEMICOLONS AND COMMAS ONLY - never on whitespace.
+  #
+  #   The first version of this reused Get-BoardFieldTokens' [,;\s]+ splitter,
+  #   on the reasoning that one idea of a delimiter is better than two. That was
+  #   wrong, because column D is not always a recipient list: writers also put
+  #   free-form SURFACE NAMES there. scripts/pipedream_wa_inbound.js sends
+  #   'Blackboard Alpha DB' - that is the WhatsApp inbound path - and
+  #   scripts/alpha.ps1 documents 'V2 Sandbox'.
+  #
+  #   MEASURED on the live board 2026-09-16: 478 rows carry 'Blackboard Alpha
+  #   DB', 159 'Pipedream Cloud Agent', 8 'V2 Sandbox', 1 'Meta AI'. Splitting
+  #   those on whitespace invents recipients, and a lane tagged `db` would have
+  #   consumed 482 rows addressed to the board surface. No CURRENT fleet tag
+  #   collides, so the defect was latent - but 'Meta AI' fabricates `meta`, and
+  #   Meta is on the roster.
+  #
+  #   The payload keeps [,;\s]+ because `to=a, b` genuinely is a tag list and no
+  #   tag contains a space. Same rule, different evidence, so: different split.
+  #
   # Substring matching would make vm-claude-code-cli consume claude-code-cli's
   # mail, which is the defect the payload path was already hardened against.
   if (-not [string]::IsNullOrWhiteSpace($TargetSurface)) {
-    foreach ($token in ($TargetSurface -split '[,;\s]+')) {
+    foreach ($token in ($TargetSurface -split '[;,]+')) {
       $t = $token.Trim().ToLowerInvariant()
       if (-not $t) { continue }
       if ($t -eq $want) { return $true }
