@@ -3604,22 +3604,37 @@ try {
     # Disabled pre-admission HTTP recovery is a new, ready-only Observe lane.
     # The healthy-only recovery and the single Execute start remain unchanged.
     function Reset-TestDisabledHttpScenario {
+        param([string]$FailureCode='BOARD_READ_HTTP_ERROR', [string]$RetryShape='')
         Reset-TestMocks
         $script:HttpContext=New-TestContext
         $script:HttpContext.mode='Observe';$script:HttpContext.timeout_seconds=420;$script:HttpContext.max_runs=8
         $script:HttpContext.expected_current_task_result=20
-        $script:HttpContext.expected_current_failure_code='BOARD_READ_HTTP_ERROR'
+        $script:HttpContext.expected_current_failure_code=$FailureCode
         $script:HttpContext.expected_current_run_id=('d'*32)
         $script:HttpDisabledXml=$futureXml.Replace('<Enabled>true</Enabled>','<Enabled>false</Enabled>')
         $script:HttpObserveXml=$futureXml
         $script:HttpContext.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:HttpDisabledXml).utf8_text_sha256
-        $script:HttpState=New-TestState -Mode Execute -RunId ('d'*32) -Status error -ErrorCode BOARD_READ_HTTP_ERROR -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
-        $retry=[pscustomobject]@{attempt='1';code='BOARD_READ_HTTP_ERROR';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='31462.33';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
-        $errorDetails=[pscustomobject]@{attempt='2';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='13711.96';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        $errorMessage=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'board_rows_missing'}else{'BOARD_READ_HTTP_ERROR'}
+        $script:HttpState=New-TestState -Mode Execute -RunId ('d'*32) -Status error -ErrorCode $FailureCode -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
+        $script:HttpState.error.message=$errorMessage
+        if([string]::IsNullOrEmpty($RetryShape)){$RetryShape=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'rows_missing'}else{'http404'}}
+        if(@('http404','rows_missing') -cnotcontains $RetryShape){throw 'TEST_RETRY_SHAPE_INVALID'}
+        if($RetryShape -ceq 'rows_missing'){
+            $retryCode='board_rows_missing'
+            $retry=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='31462.33'}
+        }else{
+            $retryCode='BOARD_READ_HTTP_ERROR'
+            $retry=[pscustomobject]@{attempt='1';code='BOARD_READ_HTTP_ERROR';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='31462.33';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        }
+        $errorDetails=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){
+            [pscustomobject]@{attempt='2';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='54303.56'}
+        }else{
+            [pscustomobject]@{attempt='2';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='13711.96';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
+        }
         $script:HttpEntries=@(
             (New-TestLogEntry -Event poll_started -RunId ('d'*32) -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{mode='Execute'})),
-            (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code BOARD_READ_HTTP_ERROR -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
-            (New-TestLogEntry -Event run_error -RunId ('d'*32) -Level error -Code BOARD_READ_HTTP_ERROR -Message BOARD_READ_HTTP_ERROR -At '2026-09-07T00:00:45.000Z' -Details $errorDetails)
+            (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code $retryCode -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
+            (New-TestLogEntry -Event run_error -RunId ('d'*32) -Level error -Code $FailureCode -Message $errorMessage -At '2026-09-07T00:00:45.000Z' -Details $errorDetails)
         )
         $script:HttpInstalled=$false;$script:HttpInstallCalls=0;$script:HttpCleanupCalls=0;$script:HttpStatusCalls=0
         $script:HttpTaskResult=20;$script:HttpFinalLast=(New-TestExactStatus).last_run_utc
@@ -3653,7 +3668,14 @@ try {
     Assert-True 'HTTP recovery uses one pinned no-stop Observe install and never starts or drains' ($script:HttpInstallCalls -eq 1 -and $httpReceipt.old_execute_task_not_enabled -and -not $httpReceipt.task_started -and -not $httpReceipt.task_stopped -and $script:HttpCleanupCalls -eq 0)
     Assert-True 'HTTP recovery preserves failure bytes and does not claim worker health' ($httpReceipt.state_and_log_preserved -and $httpReceipt.state_not_restored -and $httpReceipt.worker_health_not_yet_confirmed -and $httpReceipt.backup_matches_authenticated_disabled_xml -and $httpReceipt.protected_fingerprints_unchanged)
     Assert-True 'HTTP recovery receipt is correlated and bounded' ((ConvertTo-CutoverBoundedReceipt -Receipt $httpReceipt).Length -lt 3072 -and $httpReceipt.operation_id -ceq $script:HttpContext.operation_id)
-    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','poll_time','error_time','poll_mode')){
+    Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+    $rowsMissingReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
+    Assert-True 'canonical rows-missing pre-admission error authenticates ready-only Observe recovery' ($rowsMissingReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $rowsMissingReceipt.failed_run_id -ceq ('d'*32) -and $script:HttpInstallCalls -eq 1 -and $script:HttpEntries[1].code -ceq 'board_rows_missing' -and $script:HttpEntries[1].details.http_status -ceq '200')
+    Assert-True 'canonical rows-missing recovery never starts drains or replays work' (-not $rowsMissingReceipt.task_started -and -not $rowsMissingReceipt.task_stopped -and $rowsMissingReceipt.worker_health_not_yet_confirmed)
+    Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING -RetryShape http404
+    $rowsMissingAfterHttpReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
+    Assert-True 'rows-missing after initial HTTP 404 also authenticates the live guest shape' ($rowsMissingAfterHttpReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $script:HttpEntries[1].code -ceq 'BOARD_READ_HTTP_ERROR' -and $script:HttpEntries[2].code -ceq 'BOARD_ROWS_MISSING')
+    foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','http_context_rows_retry','lowercase_rows_retry_http','rows_terminal_http','rows_terminal_content','poll_time','error_time','poll_mode')){
         Reset-TestDisabledHttpScenario
         $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
         switch($badHttp){
@@ -3671,6 +3693,28 @@ try {
             'digest'{$script:HttpEntries[2].details.content_sha256=('a'*64);$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'elapsed'{$script:HttpEntries[2].details.elapsed_ms='0';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
             'typed_metadata'{$script:HttpEntries[2].details.http_status=404;$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'retry_detail_code'{$script:HttpEntries[1].details.code='board_rows_missing';$httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'}
+            'http_context_rows_retry'{
+                $script:HttpEntries[1].code='board_rows_missing'
+                $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='200';content_type_class='json';elapsed_ms='31462.33'}
+                $httpCode='DISABLED_HTTP_ERROR_LOG_EVIDENCE_INVALID'
+            }
+            'lowercase_rows_retry_http'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+                $script:HttpEntries[1].code='board_rows_missing'
+                $script:HttpEntries[1].details=[pscustomobject]@{attempt='1';code='board_rows_missing';transport_exit='0';http_status='500';content_type_class='json';elapsed_ms='31462.33'}
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
+            'rows_terminal_http'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+                $script:HttpEntries[2].details.http_status='404'
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
+            'rows_terminal_content'{
+                Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING
+                $script:HttpEntries[2].details.content_type_class='html'
+                $httpCode='DISABLED_HTTP_ERROR_TRANSPORT_EVIDENCE_INVALID'
+            }
             'poll_time'{$script:HttpState.last_poll.at='2026-09-07T00:00:10.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
             'error_time'{$script:HttpState.error.at='2026-09-07T00:00:20.000Z';$httpCode='DISABLED_HTTP_ERROR_TIME_INVALID'}
             'poll_mode'{$script:HttpEntries[0].details.mode='Observe';$httpCode='LOG_POLL_MODE_MISMATCH'}
@@ -3715,6 +3759,9 @@ try {
     $httpValues=$recoveryValues.Clone();$httpValues.ExpectedCurrentTaskResult='20';$httpValues.ExpectedCurrentFailureCode='BOARD_READ_HTTP_ERROR';$httpValues.ExpectedCurrentRunId=('d'*32)
     $wiredHttp=New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledHttpError -Values $httpValues
     Assert-True 'HTTP recovery context binds exact error run result and disabled XML' ($wiredHttp.expected_current_task_result -eq 20 -and $wiredHttp.expected_current_run_id -ceq ('d'*32) -and $wiredHttp.expected_disabled_xml_sha256 -ceq ('a'*64))
+    $rowsMissingValues=$httpValues.Clone();$rowsMissingValues.ExpectedCurrentFailureCode='BOARD_ROWS_MISSING'
+    $wiredRowsMissing=New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledHttpError -Values $rowsMissingValues
+    Assert-True 'HTTP recovery context admits rows-missing pre-admission read failure' ($wiredRowsMissing.expected_current_failure_code -ceq 'BOARD_ROWS_MISSING')
     foreach($badInput in @('result','code','run','mode','xml','target')){
         $badHttpValues=$httpValues.Clone();$httpCode=''
         switch($badInput){'result'{$badHttpValues.ExpectedCurrentTaskResult='0';$httpCode='EXPECTED_CURRENT_TASK_RESULT_INVALID'};'code'{$badHttpValues.ExpectedCurrentFailureCode='BOARD_HEADER_INVALID';$httpCode='EXPECTED_CURRENT_FAILURE_CODE_INVALID'};'run'{$badHttpValues.ExpectedCurrentRunId='';$httpCode='EXPECTED_CURRENT_RUN_ID_INVALID'};'mode'{$badHttpValues.Mode='Execute';$httpCode='ACTION_REQUIRES_OBSERVE_MODE'};'xml'{$badHttpValues.ExpectedDisabledXmlSha256=('A'*64);$httpCode='EXPECTED_DISABLED_XML_SHA256_INVALID'};'target'{$badHttpValues.ExpectedWorkId='NO-REPLAY';$httpCode='OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'}}
