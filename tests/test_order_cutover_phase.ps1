@@ -920,6 +920,22 @@ try {
         $source.Contains('$script:CutoverProtectedTreeMaximumBytes = 536870912')
     )
 
+    # A clean Git status is the empty string. Hashing it is legitimate SHA-256
+    # input, not a missing mandatory value. The pre-fix helper rejected the
+    # resulting empty byte array before StartAndAwait could start the task.
+    $emptySha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    $emptyBytesDigest = Invoke-TestCapture { Get-CutoverBytesSha256 -Bytes ([byte[]]@()) }
+    Assert-True 'byte digest accepts empty input and returns known SHA256' (
+        $emptyBytesDigest.ok -and [string]$emptyBytesDigest.value -ceq $emptySha256
+    ) -Detail $emptyBytesDigest.error
+    $emptyTextDigest = Invoke-TestCapture { Get-CutoverTextSha256 -Text '' }
+    Assert-True 'text digest accepts clean-status empty string and returns known SHA256' (
+        $emptyTextDigest.ok -and [string]$emptyTextDigest.value -ceq $emptySha256
+    ) -Detail $emptyTextDigest.error
+    Assert-True 'nonempty text digest retains known SHA256' (
+        (Get-CutoverTextSha256 -Text 'abc') -ceq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    )
+
     # Path/hash binding uses the exact ProgramData identities for both tools.
     $oldProgramData = $env:ProgramData
     $fakeProgramData = Join-Path $temporaryRoot 'ProgramData'
@@ -1073,6 +1089,18 @@ try {
     Assert-ThrowsCode 'Execute protected baseline rejects a dirty workspace' {
         Get-CutoverGitSnapshot -Context (New-TestContext) | Out-Null
     } 'GIT_WORKSPACE_NOT_CLEAN'
+    Set-TestMock 'Invoke-CutoverGitRead' {
+        param($Context, $Arguments, $AllowedExitCodes)
+        $verb = [string]$Arguments[2]
+        if ($verb -ceq 'rev-parse') { [pscustomobject]@{ stdout = (('a' * 40) + "`n") } }
+        elseif ($verb -ceq 'symbolic-ref') { [pscustomobject]@{ stdout = "refs/heads/main`n" } }
+        else { [pscustomobject]@{ stdout = '' } }
+    }
+    $cleanGitSnapshot = Invoke-TestCapture { Get-CutoverGitSnapshot -Context (New-TestContext) }
+    $expectedCleanGitSnapshot = Get-CutoverTextSha256 -Text ((('a' * 40), 'refs/heads/main', $emptySha256) -join '|')
+    Assert-True 'Execute protected baseline hashes a clean Git status through real digest helper' (
+        $cleanGitSnapshot.ok -and [string]$cleanGitSnapshot.value -ceq $expectedCleanGitSnapshot
+    ) -Detail $cleanGitSnapshot.error
 
     # Exercise the real escrow child-receipt gate: the tool path is pinned by
     # context and the receipt must also bind the exact acceptance directory.
