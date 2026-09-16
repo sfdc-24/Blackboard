@@ -379,6 +379,12 @@ field. The cutover driver performs both checks and labels its pre/post task
 digests `*_xml_utf8_sha256`; its `escrow_xml_sha256` retains the escrow's
 UTF-16LE-with-BOM representation.
 
+Task Scheduler may omit `Settings/Enabled` when exporting an enabled task; the
+schema default is `true`. For the enable-only definition comparison, the driver
+treats an omitted value as enabled and canonicalizes omitted, explicit `true`,
+and explicit `false` forms through one explicit `true` node. Multiple nodes or
+any explicit value other than lowercase `true` or `false` still fail closed.
+
 `order_system_adapter_smoke.ps1` is the reusable step-15 artifact. Stage its
 reviewed bytes outside every immutable release and verify its transport hash
 before execution. Invoke it only through Windows PowerShell 5.1 as SYSTEM and

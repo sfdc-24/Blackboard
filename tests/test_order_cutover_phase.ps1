@@ -1137,10 +1137,23 @@ try {
     # UTF-16LE-with-BOM file representation.
     $xmlEnabled = '<?xml version="1.0"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings><Enabled>true</Enabled></Settings></Task>'
     $xmlDisabled = $xmlEnabled.Replace('<Enabled>true</Enabled>', '<Enabled>false</Enabled>')
+    $xmlEnabledDefault = $xmlEnabled.Replace('<Enabled>true</Enabled>', '')
     $enabledEvidence = Get-CutoverTaskXmlEvidence -Text $xmlEnabled
     $disabledEvidence = Get-CutoverTaskXmlEvidence -Text $xmlDisabled
+    $defaultEnabledEvidence = Get-CutoverTaskXmlEvidence -Text $xmlEnabledDefault
     Assert-True 'task XML detects enabled and disabled states' ($enabledEvidence.enabled -and -not $disabledEvidence.enabled)
     Assert-True 'normalization proves only Enabled changed' ($enabledEvidence.normalized_sha256 -ceq $disabledEvidence.normalized_sha256)
+    Assert-True 'omitted Enabled uses the scheduler schema true default' $defaultEnabledEvidence.enabled
+    Assert-True 'omitted Enabled normalizes with explicit enabled and disabled forms' (
+        $defaultEnabledEvidence.normalized_sha256 -ceq $enabledEvidence.normalized_sha256 -and
+        $defaultEnabledEvidence.normalized_sha256 -ceq $disabledEvidence.normalized_sha256
+    )
+    Assert-ThrowsCode 'duplicate Enabled nodes remain invalid' {
+        Get-CutoverTaskXmlEvidence -Text $xmlEnabled.Replace('</Settings>', '<Enabled>true</Enabled></Settings>') | Out-Null
+    } 'TASK_XML_ENABLED_INVALID'
+    Assert-ThrowsCode 'invalid explicit Enabled text remains invalid' {
+        Get-CutoverTaskXmlEvidence -Text $xmlEnabled.Replace('>true<', '>True<') | Out-Null
+    } 'TASK_XML_ENABLED_INVALID'
     Assert-True 'UTF8 text and UTF16 BOM XML hashes remain distinct' ($enabledEvidence.utf8_text_sha256 -cne $enabledEvidence.utf16le_bom_sha256)
 
     # Real backup representation check: manifest stores a UTF-8 text hash while

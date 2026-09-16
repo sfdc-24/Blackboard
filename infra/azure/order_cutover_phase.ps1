@@ -986,15 +986,36 @@ function Get-CutoverTaskXmlEvidence {
     $document.XmlResolver = $null
     try { $document.LoadXml($Text) }
     catch { Throw-Cutover -Code 'TASK_XML_INVALID' }
+    $settings = @($document.SelectNodes('/*[local-name()="Task"]/*[local-name()="Settings"]'))
     $enabled = @($document.SelectNodes('/*[local-name()="Task"]/*[local-name()="Settings"]/*[local-name()="Enabled"]'))
-    if ($enabled.Count -ne 1 -or @('true', 'false') -cnotcontains [string]$enabled[0].InnerText) {
+    if ($settings.Count -ne 1 -or $enabled.Count -gt 1 -or
+        ($enabled.Count -eq 1 -and @('true', 'false') -cnotcontains [string]$enabled[0].InnerText)) {
         Throw-Cutover -Code 'TASK_XML_ENABLED_INVALID'
     }
-    $normalized = $document.Clone()
+    # Task Scheduler can omit Enabled from an exported enabled task even though
+    # the schema's default is true. Canonicalize omitted and explicit values to
+    # one explicit true node before comparing pre/post definitions. Reloading
+    # without insignificant whitespace keeps an omitted enabled line and an
+    # explicit disabled line comparable after the scheduler materializes it.
+    $normalized = New-Object Xml.XmlDocument
+    $normalized.PreserveWhitespace = $false
+    $normalized.XmlResolver = $null
+    try { $normalized.LoadXml($Text) }
+    catch { Throw-Cutover -Code 'TASK_XML_INVALID' }
+    $normalizedSettings = @($normalized.SelectNodes('/*[local-name()="Task"]/*[local-name()="Settings"]'))
     $normalizedEnabled = @($normalized.SelectNodes('/*[local-name()="Task"]/*[local-name()="Settings"]/*[local-name()="Enabled"]'))
-    $normalizedEnabled[0].InnerText = 'true'
+    if ($normalizedSettings.Count -ne 1 -or $normalizedEnabled.Count -gt 1) {
+        Throw-Cutover -Code 'TASK_XML_ENABLED_INVALID'
+    }
+    if ($normalizedEnabled.Count -eq 1) {
+        $null = $normalizedSettings[0].RemoveChild($normalizedEnabled[0])
+    }
+    $canonicalEnabled = $normalized.CreateElement('Enabled', [string]$normalizedSettings[0].NamespaceURI)
+    $canonicalEnabled.InnerText = 'true'
+    $null = $normalizedSettings[0].AppendChild($canonicalEnabled)
+    $isEnabled = ($enabled.Count -eq 0 -or [string]$enabled[0].InnerText -ceq 'true')
     return [pscustomobject][ordered]@{
-        enabled = ([string]$enabled[0].InnerText -ceq 'true')
+        enabled = $isEnabled
         utf8_text_sha256 = (Get-CutoverTextSha256 -Text $Text)
         utf16le_bom_sha256 = (Get-CutoverUnicodeTextSha256 -Text $Text)
         normalized_sha256 = (Get-CutoverTextSha256 -Text $normalized.OuterXml)
