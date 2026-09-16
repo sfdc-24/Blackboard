@@ -583,6 +583,52 @@ read the destination task, state, log and board before another command or GO.
 Recovery intentionally changes the definition to Observe with a future boundary;
 it does not claim definition-preserved-except-Enabled.
 
+### Ready-only recovery after two pre-admission HTTP 404 reads
+
+`InstallObserveReadyFromDisabledHttpError` addresses a different incident: the
+reviewed Execute task exited 20 after both authenticated board transport reads
+failed, and failure cleanup has already disabled its definition. The preceding
+healthy-only action and the old header-incompatibility bridge are unchanged.
+
+Supply Mode=Observe, the independently read-back ExpectedDisabledXmlSha256,
+ExpectedCurrentTaskResult=20, ExpectedCurrentFailureCode=BOARD_READ_HTTP_ERROR,
+and the exact ExpectedCurrentRunId. Retain TimeoutSeconds=420,
+NaturalTriggerMarginSeconds=60 and MaxRuns=8. No target/work/row/result inputs
+are permitted. The driver requires an exact current three-event run:
+poll_started Execute, board_read_retry attempt 1, and run_error attempt 2.
+Both sanitized sidecars must say HTTP404, html, transport exit 0, empty content
+with its known SHA256, and a positive canonical elapsed time. State, scheduler
+time, run ID and terminal timestamps must agree; every event and state error
+has blank admitted work/row identity. Other failure codes, transport results,
+event shapes, selected work or ambiguous evidence are not admitted.
+
+This action installs only a future Observe definition through the same pinned
+InstallFromDisabledNoStop installer. It never starts, drains or enables the old
+Execute task, and never invokes Stop, unregister or an automatic restore path.
+It verifies backup identity, executable pins, original LastRunTime/result20,
+future interval, protected fingerprints and state/log preservation, including
+after slow backup/tree/native reads. Failures quarantine future triggers.
+The success receipt is OBSERVE_READY_INHERITED_ERROR and explicitly records
+worker_health_not_yet_confirmed=true: an installer success is not worker health.
+Abrupt host death can leave Observe registered without a success receipt;
+independent destination read-back remains mandatory.
+
+Before a new managed action, preserve the failed operation's full source and
+receipt, diagnose actual guest and board state and separately qualify healthy
+cold reads. Never retry its MRC identity or erase the failed state/log. A fresh
+candidate in Observe is only observed; its cursor and work history are not
+advanced. Do not manually DrainObserve while such a candidate remains active,
+since the existing drain correctly fails and disables future triggers on it.
+Wait for actual stale/cursor retirement and a new result0/no_eligible_order
+Observe run before the existing InstallExecuteReady and genuinely fresh canary
+acceptance. Keep both Azure schedules disabled until the original promotion
+gates, including a first new scheduled PASS, are independently satisfied.
+
+This narrowly authenticated recovery is not an availability fix for Google's
+content-delivery service. Later healthy probes do not prove the earlier 404 was
+caused by caching, a consumed redirect token or rate limiting. It adds no read
+retries, shortens no runtime/margin and changes no immutable release bytes.
+
 ## Rollback
 
 Disable the two Azure schedules before changing coordinator identity. The task
