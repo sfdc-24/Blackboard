@@ -505,12 +505,18 @@ rejected mapping shape; ordinary prose must omit that colon, for example
 Use the incident-only action
 `InstallObserveAndDrainFromDisabledExecute` with `-Mode Observe` and the
 independently read-back exact `ExpectedDisabledXmlSha256`. It authenticates the
-current candidate Disabled/Execute/result-0 definition and the current healthy
-state/log run before any mutation. It then calls the same pinned release
+current candidate Disabled/Execute/result-0 definition and a fully consistent
+`no_eligible_order` state terminal plus current log/run before any mutation.
+`result_confirmed` is deliberately not admitted by this target-free action.
+It then calls the same pinned release
 installer's `InstallFromDisabledNoStop` in Observe mode, replacing the old
 definition with a new future PT15M interval. The authenticated disabled XML is
 backed up and verified; state, log, release bytes, profile/configuration and
 repository fingerprints are not restored or edited by the driver.
+After the protected-tree and backup reads, it rechecks the exact Ready run and
+full remaining trigger window. The admitted scheduler LastRunTime, run ID and
+state/log checkpoints are carried into the real drain; an intervening run or
+checkpoint change is rejected before starting a run, never adopted as a baseline.
 
 Do not enable the old Execute definition to recover a missed interval.
 Production uses StartWhenAvailable, which can queue delayed catch-up work.

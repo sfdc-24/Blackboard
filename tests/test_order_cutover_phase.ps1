@@ -2269,6 +2269,33 @@ try {
     Assert-True 'DrainObserve transitions Execute baseline to Observe no-eligible' ($drain.status -ceq 'OBSERVE_DRAINED' -and $drain.runs -eq 2 -and $drain.final_worker_status -ceq 'no_eligible_order')
     Assert-True 'DrainObserve accumulates bounded append evidence' ($drain.log_appended_bytes -eq 20)
 
+    $admission = [pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)};log_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}
+    $script:RunSequenceIndex=0
+    $boundDrain=Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission
+    Assert-True 'real Observe drain accepts the exact admitted baseline and still drains stale work' ($boundDrain.runs -eq 2 -and $boundDrain.final_worker_status -ceq 'no_eligible_order')
+    $savedDrainStateMock=(Get-Item Function:Get-CutoverState).ScriptBlock
+    $savedDrainStatusMock=(Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
+    $savedDrainLogMock=(Get-Item Function:Get-CutoverLogCheckpoint).ScriptBlock
+    $savedDrainCleanupCalls=$script:DrainCleanupCalls
+    foreach($admissionDrift in @('run_id','last_run','state','log')){
+        $script:RunSequenceIndex=0;$script:AdmissionDrift=$admissionDrift
+        Set-TestMock 'Get-CutoverState' {param($Path)
+            $run=if($script:AdmissionDrift -ceq 'run_id'){('b'*32)}else{('a'*32)}
+            [pscustomobject]@{value=(New-TestState -Mode Execute -RunId $run);checkpoint=[pscustomobject]@{length=1;sha256=$(if($script:AdmissionDrift -ceq 'state'){('b'*64)}else{('a'*64)})}}
+        }
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$AllowInheritedTaskResult)
+            if($script:AdmissionDrift -ceq 'last_run'){New-TestExactStatus -Last (([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime().AddSeconds(1))}else{New-TestExactStatus}
+        }
+        Set-TestMock 'Get-CutoverLogCheckpoint' {param($Path) [pscustomobject]@{length=1;sha256=$(if($script:AdmissionDrift -ceq 'log'){('b'*64)}else{('a'*64)})}}
+        $expectedAdmissionCode=switch($admissionDrift){'state'{'OBSERVE_DRAIN_ADMITTED_STATE_CHANGED'};'log'{'OBSERVE_DRAIN_ADMITTED_LOG_CHANGED'};default{'OBSERVE_DRAIN_ADMITTED_RUN_CHANGED'}}
+        Assert-ThrowsCode ('real Observe drain rejects intervening admitted '+$admissionDrift) {Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission} $expectedAdmissionCode
+        Assert-True ('admitted '+$admissionDrift+' drift never starts an Observe run') ($script:RunSequenceIndex -eq 0)
+    }
+    Set-TestMock 'Get-CutoverState' $savedDrainStateMock
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedDrainStatusMock
+    Set-TestMock 'Get-CutoverLogCheckpoint' $savedDrainLogMock
+    $script:DrainCleanupCalls=$savedDrainCleanupCalls
+
     # THE REAL DRAIN, NOT A MOCKED ONE.
     #
     # Asserting that the transition passes True to a MOCKED
@@ -3113,8 +3140,9 @@ try {
     }
     Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) if($ExpectedUtf8TextSha256 -cne (Get-CutoverTaskXmlEvidence -Text $script:DisabledRecoveryXml).utf8_text_sha256){throw 'BACKUP_PIN_CHANGED'}}
     Set-TestMock 'Invoke-CutoverDrainObserve' {
-        param($Context,$Installer,$AllowInheritedTaskResult)
+        param($Context,$Installer,$AllowInheritedTaskResult,$AdmittedBaseline)
         if($Context.mode -cne 'Observe' -or $Context.timeout_seconds -ne 420 -or $Context.natural_trigger_margin_seconds -ne 60 -or $Context.max_runs -ne 8){throw 'OBSERVE_DRAIN_CONTRACT_CHANGED'}
+        if($null -eq $AdmittedBaseline -or $AdmittedBaseline.run_id -cne ('a'*32) -or $AdmittedBaseline.last_run_utc.Ticks -ne (New-TestExactStatus).last_run_utc.Ticks -or $AdmittedBaseline.state_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.log_checkpoint.sha256 -cne ('a'*64)){throw 'OBSERVE_DRAIN_ADMISSION_NOT_BOUND'}
         $script:ObserveRecoveryDrains++
         [pscustomobject]@{status='OBSERVE_DRAINED';runs=2;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00.000Z';log_appended_bytes=100}
     }
@@ -3123,6 +3151,36 @@ try {
     Assert-True 'disabled recovery installs only Observe via caller-pinned no-stop installer' ($script:ObserveRecoveryInstalls -eq 1 -and $observeRecovery.old_execute_task_not_enabled -and -not $observeRecovery.task_stopped -and $observeRecovery.candidate_install_action -ceq 'InstallFromDisabledNoStop')
     Assert-True 'disabled recovery requires bounded Observe drain ending no eligible' ($script:ObserveRecoveryDrains -eq 1 -and $observeRecovery.runs -eq 2 -and $observeRecovery.final_worker_status -ceq 'no_eligible_order' -and $observeRecovery.state_not_restored -and $observeRecovery.protected_fingerprints_unchanged)
     Assert-True 'disabled recovery receipt preserves exact disabled backup and future Observe definition' ($observeRecovery.authenticated_disabled_xml_sha256 -ceq $context.expected_disabled_xml_sha256 -and $observeRecovery.backup_matches_authenticated_disabled_xml -and $observeRecovery.state_and_log_preserved_through_install -and $observeRecovery.observe_start_boundary_utc -ceq '2099-01-01T00:00:00.0000000Z')
+    $savedRecoveryStateMock = (Get-Item Function:Get-CutoverState).ScriptBlock
+    $savedRecoveryStatusMock = (Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
+    $savedRecoveryBackupMock = (Get-Item Function:Assert-CutoverBackupMatchesExpectedXml).ScriptBlock
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    Set-TestMock 'Get-CutoverState' {param($Path) $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.success.event='candidate_observed';[pscustomobject]@{value=$s;checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $beforeCorruptInstalls=$script:ObserveRecoveryInstalls
+    Assert-ThrowsCode 'Observe recovery rejects state-only terminal corruption before installation' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'STATE_NO_ELIGIBLE_EVIDENCE_INVALID'
+    Assert-True 'corrupt terminal evidence cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeCorruptInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Execute -RunId ('a'*32) -Status result_confirmed -WorkId WORK -RowId ROW);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+    $beforeResultInstalls=$script:ObserveRecoveryInstalls
+    Assert-ThrowsCode 'Observe-only recovery refuses result-confirmed baseline without target inputs' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
+    Assert-True 'result-confirmed baseline cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeResultInstalls -and $script:ObserveRecoveryDrains -eq 1)
+    Set-TestMock 'Get-CutoverState' $savedRecoveryStateMock
+    foreach($finalFailure in @('NATURAL_TRIGGER_WINDOW_UNAVAILABLE','TASK_CHANGED_BEFORE_OBSERVE_DRAIN')){
+        $script:RecoveryBackupReadComplete=$false;$script:RecoveryFinalFailure=$finalFailure
+        $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryDrains=1
+        Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {param($Context,$ExpectedUtf8TextSha256,$ExpectedUtf16LeBomSha256) $script:RecoveryBackupReadComplete=$true}
+        Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState)
+            if($script:RecoveryBackupReadComplete -and $ExpectedTaskState -ceq 'Ready'){
+                if($script:RecoveryFinalFailure -ceq 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'){New-TestExactStatus -Next ([DateTime]::UtcNow.AddSeconds(1))}
+                else{New-TestExactStatus -Last (([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime().AddSeconds(1))}
+            }else{New-TestExactStatus -State $ExpectedTaskState}
+        }
+        Assert-ThrowsCode ('Observe recovery rechecks final handoff '+$finalFailure+' after backup') {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} $finalFailure
+        Assert-True ('final handoff '+$finalFailure+' never delegates to drain') ($script:ObserveRecoveryDrains -eq 1 -and -not $script:ObserveRecoveryInstalled)
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' $savedRecoveryStatusMock
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' $savedRecoveryBackupMock
+    $script:ObserveRecoveryInstalled=$false;$script:ObserveRecoveryInstalls=1;$script:ObserveRecoveryDrains=1
     $script:ObserveRecoveryInstalled=$false
     $savedPin=$context.expected_disabled_xml_sha256;$context.expected_disabled_xml_sha256=('f'*64)
     Assert-ThrowsCode 'Observe recovery rejects wrong original disabled definition' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_TASK_XML_NOT_AUTHENTICATED'
@@ -3168,7 +3226,7 @@ try {
     $installBaseline=$script:ObserveRecoveryInstalls
     Assert-ThrowsCode 'Observe recovery requires independently current baseline log and run' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'LOG_CURRENT_RUN_INVALID'
     Assert-True 'invalid baseline log never installs or drains' ($script:ObserveRecoveryInstalls -eq $installBaseline -and $script:ObserveRecoveryDrains -eq 1)
-    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus)}
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
     Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status stale_order_ignored);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
     Assert-ThrowsCode 'Observe recovery refuses stale baseline without a terminal healthy current run' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
     Assert-True 'unhealthy baseline never installs or drains' ($script:ObserveRecoveryInstalls -eq $installBaseline -and $script:ObserveRecoveryDrains -eq 1)
