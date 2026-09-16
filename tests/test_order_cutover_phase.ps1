@@ -1323,6 +1323,70 @@ try {
         Assert-CutoverLogRun -Entries $noEligibleEntries -RunId $runId -Status no_eligible_order -ExpectedMode Execute | Out-Null
     } catch { $logNoEligibleOkay = $false }
     Assert-True 'log accepts exact no-eligible details contract' $logNoEligibleOkay
+
+    # The live board can legitimately produce both bounded, counts-only
+    # diagnostics before the no-eligible terminal record.  They are worker
+    # contract events, not terminal outcomes and not arbitrary warnings.
+    $liveDiagnosticEntries = @(
+        (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+        (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '2'; exact_duplicate_row_count = '3' })),
+        (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ row_count = '1' })),
+        (New-TestLogEntry -Event row_ignored -RunId $runId -Level warning -Code source_not_allowlisted -Message 'Row failed deterministic ORDER admission.' -At '2026-09-07T00:00:04.000Z'),
+        (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:05.000Z' -Details ([pscustomobject]@{ malformed = '25'; status = 'no_eligible_order' }))
+    )
+    $liveDiagnosticsOkay = $true
+    try {
+        Assert-CutoverLogRun `
+            -Entries $liveDiagnosticEntries `
+            -RunId $runId `
+            -Status no_eligible_order `
+            -ExpectedMode Observe | Out-Null
+    } catch { $liveDiagnosticsOkay = $false }
+    Assert-True 'log accepts the exact live duplicate and known-schema diagnostics as nonterminal evidence' $liveDiagnosticsOkay
+
+    foreach ($badDiagnosticCase in @(
+        [pscustomobject]@{
+            name = 'duplicate diagnostic wrong code'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code WRONG -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic impossible count relation'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '2'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic nonexact row count'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = '2' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic repeated'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:04.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        }
+    )) {
+        Assert-ThrowsCode ('log rejects ' + $badDiagnosticCase.name) {
+            Assert-CutoverLogRun `
+                -Entries $badDiagnosticCase.entries `
+                -RunId $runId `
+                -Status no_eligible_order `
+                -ExpectedMode Observe | Out-Null
+        } 'LOG_DIAGNOSTIC_EVENT_INVALID'
+    }
     $resultEntries = @(
         (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Execute' })),
         (New-TestLogEntry -Event result_confirmed -RunId $runId -WorkId CANARY-1 -RowId '11111111-1111-1111-1111-111111111111' -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ output_sha256 = ('8' * 64); status = 'completed' }))

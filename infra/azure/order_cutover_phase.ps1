@@ -1452,6 +1452,7 @@ function Assert-CutoverLogRun {
     )
     $allowedEvents = @(
         'poll_started', 'board_read_retry', 'row_ignored', 'poll_complete',
+        'board_duplicate_rows_collapsed', 'board_schema_incident',
         'tail_seeded', 'overlap_suppressed', 'candidate_observed',
         'duplicate_suppressed', 'result_confirmed', 'run_error'
     )
@@ -1507,6 +1508,51 @@ function Assert-CutoverLogRun {
             $detailsProperty.Value.mode -isnot [string] -or
             [string]$detailsProperty.Value.mode -cne $ExpectedMode) {
             Throw-Cutover -Code 'LOG_POLL_MODE_MISMATCH'
+        }
+    }
+    $duplicateDiagnostics = @($Entries | Where-Object { [string]$_.event -ceq 'board_duplicate_rows_collapsed' })
+    if ($duplicateDiagnostics.Count -gt 1) { Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID' }
+    if ($duplicateDiagnostics.Count -eq 1) {
+        $diagnostic = $duplicateDiagnostics[0]
+        $details = $diagnostic.details
+        $detailProperties = @()
+        if ($null -ne $details) {
+            $detailProperties = @($details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+        }
+        if ([string]$diagnostic.level -cne 'warning' -or
+            [string]$diagnostic.code -cne 'BOARD_CURSOR_DUPLICATES_COLLAPSED' -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.work_id) -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.row_id) -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.message) -or
+            $null -eq $details -or $detailProperties.Count -ne 2 -or
+            $detailProperties -cnotcontains 'exact_duplicate_group_count' -or
+            $detailProperties -cnotcontains 'exact_duplicate_row_count' -or
+            $details.exact_duplicate_group_count -isnot [string] -or
+            [string]$details.exact_duplicate_group_count -cnotmatch '^[1-9][0-9]{0,9}$' -or
+            $details.exact_duplicate_row_count -isnot [string] -or
+            [string]$details.exact_duplicate_row_count -cnotmatch '^[1-9][0-9]{0,9}$' -or
+            [int64]$details.exact_duplicate_row_count -lt [int64]$details.exact_duplicate_group_count) {
+            Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID'
+        }
+    }
+    $schemaDiagnostics = @($Entries | Where-Object { [string]$_.event -ceq 'board_schema_incident' })
+    if ($schemaDiagnostics.Count -gt 1) { Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID' }
+    if ($schemaDiagnostics.Count -eq 1) {
+        $diagnostic = $schemaDiagnostics[0]
+        $details = $diagnostic.details
+        $detailProperties = @()
+        if ($null -ne $details) {
+            $detailProperties = @($details.PSObject.Properties | ForEach-Object { [string]$_.Name })
+        }
+        if ([string]$diagnostic.level -cne 'warning' -or
+            [string]$diagnostic.code -cne 'BOARD_KNOWN_TRAILING_ROW_IGNORED' -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.work_id) -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.row_id) -or
+            -not [string]::IsNullOrEmpty([string]$diagnostic.message) -or
+            $null -eq $details -or $detailProperties.Count -ne 1 -or
+            $detailProperties -cnotcontains 'row_count' -or
+            $details.row_count -isnot [string] -or [string]$details.row_count -cne '1') {
+            Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID'
         }
     }
     $terminalEntries = @($Entries | Where-Object {
