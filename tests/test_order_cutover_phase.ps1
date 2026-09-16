@@ -3032,6 +3032,15 @@ try {
         Invoke-CutoverStartAndAwait -Context $context | Out-Null
     } 'PROTECTED_FINGERPRINT_CHANGED'
     Assert-True 'StartAndAwait disables and verifies after acceptance failure' ($script:StartCleanupCalls -eq 1)
+    $context | Add-Member -NotePropertyName action -NotePropertyValue 'StartAndAwaitFromDisabled'
+    $context.dispatch_utc=[DateTime]::UtcNow
+    $script:GatewayNow=$context.dispatch_utc
+    $script:ExpiredGatewayStarts=0
+    Set-TestMock 'Get-CutoverUtcNow' {$script:GatewayNow}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:GatewayNow=$Context.dispatch_utc.AddMinutes(59);'protected-same'}
+    Set-TestMock 'Invoke-CutoverOneRun' {param($Context) $script:ExpiredGatewayStarts++;throw 'UNEXPECTED_START_AFTER_EXPIRY'}
+    Assert-ThrowsCode 'real recovery gateway rechecks expiry after its own snapshots before task start' {Invoke-CutoverStartAndAwait -Context $context} 'DISPATCH_COMPLETION_WINDOW_UNAVAILABLE'
+    Assert-True 'expired gateway performs no task start' ($script:ExpiredGatewayStarts -eq 0)
 
     # Invoke-CutoverOneRun independently rejects a non-advancing task result and
     # a reused state run id even when the scheduler reports result zero.
@@ -3156,6 +3165,22 @@ try {
     $context.expected_row_id='11111111-1111-1111-1111-111111111111'
     Assert-ThrowsCode 'recovery never replays a dispatch already at the cursor' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISPATCH_ALREADY_SEEN_BY_WORKER'
     $context.expected_row_id=$script:RecoveryResultRow
+    foreach($failedIdentity in @('work_id','row_id')){
+        $script:RecoveryFailedIdentity=$failedIdentity
+        Set-TestMock 'Get-CutoverState' {param($Path) $testState=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$testState.error=[pscustomobject]@{work_id='OTHER';row_id='22222222-2222-4222-8222-222222222222'};if($script:RecoveryFailedIdentity -ceq 'work_id'){$testState.error.work_id='CANARY-RECOVERY'}else{$testState.error.row_id=$script:RecoveryResultRow};[pscustomobject]@{value=$testState;checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+        Assert-ThrowsCode ('healthy later poll still rejects persisted failed '+$failedIdentity) {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISPATCH_ALREADY_SEEN_BY_WORKER'
+    }
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $script:BeforeEnableExpiry=[DateTime]::UtcNow
+    $context.dispatch_utc=$script:BeforeEnableExpiry
+    $script:EnableExpiryNow=$script:BeforeEnableExpiry
+    Set-TestMock 'Get-CutoverUtcNow' {$script:EnableExpiryNow}
+    $script:ExpiryProtectedCalls=0
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) $script:ExpiryProtectedCalls++;if($script:ExpiryProtectedCalls -eq 3){$script:EnableExpiryNow=$Context.dispatch_utc.AddMinutes(59)};'protected-same'}
+    Assert-ThrowsCode 'recovery rechecks expiry after enabled readbacks before delegating' {Invoke-CutoverStartAndAwaitFromDisabled -Context $context} 'DISPATCH_COMPLETION_WINDOW_UNAVAILABLE'
+    Assert-True 'expired enabled readback fails disabled without second core call' (-not $script:RecoveryEnabled -and $script:RecoveryCoreCalls -eq 1)
+    Set-TestMock 'Get-CutoverUtcNow' {[DateTime]::UtcNow}
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {param($Context) 'protected-same'}
     $badInterval=$script:RecoveryDisabledXml.Replace('PT15M','PT5M')
     $script:RecoverySavedXml=$script:RecoveryDisabledXml;$script:RecoveryDisabledXml=$badInterval
     $context.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $badInterval).utf8_text_sha256
@@ -3175,6 +3200,7 @@ try {
     $recoveryValues.Mode='Execute';$recoveryValues.ExpectedCurrentTaskResult='';$recoveryValues.ExpectedCurrentFailureCode='';$recoveryValues.ExpectedCurrentRunId=''
     $recoveryValues.ExpectedTerminalStatus='result_confirmed';$recoveryValues.ExpectedWorkId='CANARY-RECOVERY';$recoveryValues.ExpectedRowId='99999999-9999-4999-8999-999999999999';$recoveryValues.ExpectedResultStatus='completed'
     $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.ExpectedDispatchTimestamp=[DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'");$recoveryValues.QuietWindowWaitSeconds='900'
+    $recoveryValues.TimeoutSeconds='420'
     $wiredRecovery=New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $recoveryValues
     Assert-True 'recovery context wires caller pin, canonical dispatch time and bounded wait' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.dispatch_utc.Kind -eq [DateTimeKind]::Utc -and $wiredRecovery.quiet_window_wait_seconds -eq 900)
     $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDisabledXmlSha256=('A'*64)
@@ -3184,6 +3210,10 @@ try {
     $badRecovery=$recoveryValues.Clone();$badRecovery.QuietWindowWaitSeconds='901'
     Assert-ThrowsCode 'recovery context rejects unbounded quiet wait' {New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $badRecovery} 'QUIET_WINDOW_WAIT_SECONDS_INVALID'
     Assert-ThrowsCode 'normal start rejects disabled recovery inputs' {New-CutoverContext -RequestedAction StartAndAwait -Values $recoveryValues} 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.TimeoutSeconds='780'
+    Assert-ThrowsCode 'recovery rejects timing allowance that cannot fit PT15M' {New-CutoverContext -RequestedAction StartAndAwaitFromDisabled -Values $badRecovery} 'DISABLED_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL'
+    $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedDisabledXmlSha256='';$badRecovery.ExpectedDispatchTimestamp='';$badRecovery.QuietWindowWaitSeconds='1'
+    Assert-ThrowsCode 'normal start rejects non-default recovery-only quiet wait' {New-CutoverContext -RequestedAction StartAndAwait -Values $badRecovery} 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
     $env:ProgramData=$oldProgramData
 
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.

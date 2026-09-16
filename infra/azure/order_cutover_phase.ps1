@@ -2983,6 +2983,9 @@ function Invoke-CutoverStartAndAwait {
             -Readback $preStart `
             -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds) `
             -DriftCode 'TASK_CHANGED_BEFORE_START'
+        if ($Context.PSObject.Properties['action'] -and $Context.action -ceq 'StartAndAwaitFromDisabled') {
+            Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
+        }
         $deadline = [DateTime]::UtcNow.AddSeconds($Context.timeout_seconds)
         $run = Invoke-CutoverOneRun `
             -Context $Context `
@@ -3053,6 +3056,8 @@ function Invoke-CutoverStartAndAwaitFromDisabled {
         if (@('no_eligible_order', 'result_confirmed') -cnotcontains [string]$baseline.status) { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
         if ($Context.expected_terminal_status -ceq 'result_confirmed' -and
             ([string]$state.value.cursor.row_id -ceq $Context.expected_row_id -or
+             ($null -ne $state.value.error -and
+              ([string]$state.value.error.work_id -ceq $Context.expected_work_id -or [string]$state.value.error.row_id -ceq $Context.expected_row_id)) -or
              @($state.value.work | Where-Object { [string]$_.work_id -ceq $Context.expected_work_id -or [string]$_.input_row_id -ceq $Context.expected_row_id }).Count -ne 0)) {
             Throw-Cutover -Code 'DISPATCH_ALREADY_SEEN_BY_WORKER'
         }
@@ -3080,6 +3085,7 @@ function Invoke-CutoverStartAndAwaitFromDisabled {
         Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_ENABLE'
         Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_ENABLE'
         if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_ENABLE' }
+        Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
         $receipt = Invoke-CutoverStartAndAwait -Context $Context
         $receipt.action = 'StartAndAwaitFromDisabled'
         $receipt | Add-Member -NotePropertyName recovery_definition_preserved_except_enabled -NotePropertyValue $true
@@ -3245,11 +3251,12 @@ function New-CutoverContext {
         if ($disabledInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
         $context.expected_disabled_xml_sha256 = $disabledInput
         $context.quiet_window_wait_seconds = ConvertTo-CutoverInteger -Value $quietInput -Minimum 1 -Maximum 900 -Code 'QUIET_WINDOW_WAIT_SECONDS_INVALID'
+        if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'DISABLED_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
         if ($context.expected_terminal_status -ceq 'result_confirmed') {
             if (-not (Test-CutoverUtcStamp -Value $dispatchInput)) { Throw-Cutover -Code 'EXPECTED_DISPATCH_TIMESTAMP_INVALID' }
             $context.dispatch_utc = ConvertTo-CutoverUtcDateTime -Value $dispatchInput -Code 'EXPECTED_DISPATCH_TIMESTAMP_INVALID'
         } elseif (-not [string]::IsNullOrEmpty($dispatchInput)) { Throw-Cutover -Code 'NO_ELIGIBLE_DISPATCH_TIMESTAMP_FORBIDDEN' }
-    } elseif (-not [string]::IsNullOrEmpty($disabledInput) -or -not [string]::IsNullOrEmpty($dispatchInput)) {
+    } elseif (-not [string]::IsNullOrEmpty($disabledInput) -or -not [string]::IsNullOrEmpty($dispatchInput) -or $quietInput -cne '900') {
         Throw-Cutover -Code 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
     }
     return $context
