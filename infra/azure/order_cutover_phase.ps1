@@ -684,7 +684,23 @@ function Assert-CutoverInstallerStatus {
         [Parameter(Mandatory = $true)]$Context,
         [Parameter(Mandatory = $true)][string]$ExpectedMode,
         [Parameter(Mandatory = $true)][string]$ExpectedTaskState,
-        [bool]$RequireResultZero = $true
+        [bool]$RequireResultZero = $true,
+        # THE RESULT A REPLACED TASK INHERITS IS NOT THE CANDIDATE'S RESULT.
+        #
+        # InstallFromDisabledNoStop replaces the definition without
+        # unregistering it, and Task Scheduler keeps LastTaskResult from the
+        # worker that ran before.  So immediately after the candidate is
+        # installed the task still reports the OLD failure - 20 on the guest
+        # - and demanding 0 there threw INSTALLER_STATUS_MISMATCH after the
+        # disable and after the install, which is a post-mutation failure.
+        #
+        # This does NOT relax the rule to 'any non-zero'.  That would accept a
+        # NEW failure appearing between the disable and the install, which is
+        # exactly the drift these reads exist to catch.  The only tolerated
+        # value is the one already pinned in expected_current_task_result and
+        # checked twice against the exact failed run before the disable.  Once
+        # the candidate has actually run, 0 is required again.
+        [bool]$AllowInheritedTaskResult = $false
     )
     $expectedStatus = switch ($ExpectedTaskState) {
         'Ready' { 'READY' }
@@ -694,6 +710,16 @@ function Assert-CutoverInstallerStatus {
         default { Throw-Cutover -Code 'EXPECTED_TASK_STATE_INVALID' }
     }
     $lastTaskResultTypeValid = ($Status.last_task_result -is [long] -or $Status.last_task_result -is [int])
+    # Decided here rather than inside the -or chain below so the type check
+    # still guards the cast: the chain short-circuits, and reordering it would
+    # cast a value that has not been proved numeric yet.
+    $taskResultAccepted = $true
+    if ($lastTaskResultTypeValid -and $RequireResultZero) {
+        $taskResultAccepted = ([int64]$Status.last_task_result -eq 0)
+        if (-not $taskResultAccepted -and $AllowInheritedTaskResult) {
+            $taskResultAccepted = ([int64]$Status.last_task_result -eq [int64]$Context.expected_current_task_result)
+        }
+    }
     if ($Status.status -isnot [string] -or [string]$Status.status -cne $expectedStatus -or
         $Status.task_name -isnot [string] -or [string]$Status.task_name -cne $script:CutoverTaskName -or
         $Status.task_path -isnot [string] -or [string]$Status.task_path -cne $script:CutoverTaskPath -or
@@ -705,7 +731,7 @@ function Assert-CutoverInstallerStatus {
         $Status.log_path -isnot [string] -or [string]$Status.log_path -cne $Context.log_path -or
         $Status.wall_timeout_seconds -isnot [int] -or [int]$Status.wall_timeout_seconds -ne $Context.wall_timeout_seconds -or
         -not $lastTaskResultTypeValid -or
-        ($RequireResultZero -and [int64]$Status.last_task_result -ne 0) -or
+        -not $taskResultAccepted -or
         $Status.runner_exists -isnot [bool] -or -not [bool]$Status.runner_exists -or
         $Status.env_file_exists -isnot [bool] -or -not [bool]$Status.env_file_exists -or
         $null -eq $Status.drift -or @($Status.drift).Count -ne 0 -or
@@ -732,7 +758,8 @@ function Get-CutoverExactInstallerStatus {
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [Parameter(Mandatory = $true)][string]$ExpectedMode,
         [Parameter(Mandatory = $true)][string]$ExpectedTaskState,
-        [bool]$RequireResultZero = $true
+        [bool]$RequireResultZero = $true,
+        [bool]$AllowInheritedTaskResult = $false
     )
     $status = Invoke-CutoverInstaller -Context $Context -ScriptPath $ScriptPath -RequestedAction 'Status' -RequestedMode $ExpectedMode
     return Assert-CutoverInstallerStatus `
@@ -740,7 +767,8 @@ function Get-CutoverExactInstallerStatus {
         -Context $Context `
         -ExpectedMode $ExpectedMode `
         -ExpectedTaskState $ExpectedTaskState `
-        -RequireResultZero $RequireResultZero
+        -RequireResultZero $RequireResultZero `
+        -AllowInheritedTaskResult $AllowInheritedTaskResult
 }
 
 function Get-CutoverExactInstallerStatusAnyState {
@@ -749,7 +777,8 @@ function Get-CutoverExactInstallerStatusAnyState {
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [Parameter(Mandatory = $true)][string]$ExpectedMode,
         [Parameter(Mandatory = $true)][string[]]$AllowedStates,
-        [bool]$RequireResultZero = $true
+        [bool]$RequireResultZero = $true,
+        [bool]$AllowInheritedTaskResult = $false
     )
     $states = @($AllowedStates | Select-Object -Unique)
     if ($states.Count -lt 1 -or
@@ -769,7 +798,8 @@ function Get-CutoverExactInstallerStatusAnyState {
         -Context $Context `
         -ExpectedMode $ExpectedMode `
         -ExpectedTaskState ([string]$status.state) `
-        -RequireResultZero $RequireResultZero
+        -RequireResultZero $RequireResultZero `
+        -AllowInheritedTaskResult $AllowInheritedTaskResult
 }
 
 function Get-CutoverTaskRuntime {
@@ -2155,9 +2185,13 @@ function Assert-CutoverBackupMatchesExpectedXml {
 function Invoke-CutoverDrainObserve {
     param(
         [Parameter(Mandatory = $true)]$Context,
-        [Parameter(Mandatory = $true)][string]$Installer
+        [Parameter(Mandatory = $true)][string]$Installer,
+        # Applies to the two reads BEFORE the first bounded run only.  Every
+        # read after Invoke-CutoverOneRun describes a task the candidate has
+        # actually run, so those keep requiring 0 and are untouched here.
+        [bool]$AllowInheritedTaskResult = $false
     )
-    $initialStatus = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+    $initialStatus = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready' -AllowInheritedTaskResult $AllowInheritedTaskResult
     try {
         $stateResult = Get-CutoverState -Path $Context.state_path
         $baselineState = $stateResult.value
@@ -2172,7 +2206,7 @@ function Invoke-CutoverDrainObserve {
         $previousLastRun = $initialStatus.last_run_utc
         $firstLastRun = $previousLastRun
         $logCheckpoint = Get-CutoverLogCheckpoint -Path $Context.log_path
-        $preStart = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+        $preStart = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready' -AllowInheritedTaskResult $AllowInheritedTaskResult
         Assert-CutoverStableReadyReadback `
             -Initial $initialStatus `
             -Readback $preStart `
@@ -2485,12 +2519,14 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             -Status $install `
             -Context $Context `
             -ExpectedMode 'Observe' `
-            -ExpectedTaskState 'Ready'
+            -ExpectedTaskState 'Ready' `
+            -AllowInheritedTaskResult $true
         $null = Get-CutoverExactInstallerStatus `
             -Context $Context `
             -ScriptPath $Context.installer_path `
             -ExpectedMode 'Observe' `
-            -ExpectedTaskState 'Ready'
+            -ExpectedTaskState 'Ready' `
+            -AllowInheritedTaskResult $true
         Assert-CutoverFileCheckpointUnchanged `
             -Before $stateBeforeInstall `
             -Path $Context.state_path `
@@ -2506,7 +2542,7 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             -ExpectedUtf8TextSha256 $disabledXml.utf8_text_sha256 `
             -ExpectedUtf16LeBomSha256 $disabledXml.utf16le_bom_sha256
 
-        $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path
+        $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path -AllowInheritedTaskResult $true
         $receipt = [pscustomobject][ordered]@{
             schema = $script:CutoverSchema
             ok = $true

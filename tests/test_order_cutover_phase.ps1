@@ -337,6 +337,7 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentInstallMode = ''
     $script:IncidentExpectedCurrentTaskXmlSha256 = ''
     $script:IncidentDrainInstaller = ''
+    $script:IncidentDrainInherited = ''
     $script:IncidentBackupUtf8Sha256 = ''
     $script:IncidentBackupUtf16LeBomSha256 = ''
     $script:IncidentDrainCalls = 0
@@ -586,6 +587,58 @@ try {
             -RequireResultZero $false
     } catch { $incidentStatusOkay = $false }
     Assert-True 'nonzero status requires an explicit specialist opt-out' $incidentStatusOkay
+
+    # THE RESULT A REPLACED TASK INHERITS IS NOT THE CANDIDATE'S RESULT.
+    #
+    # Measured on the guest 2026-09-16: OWCutoverPR119 installed the
+    # candidate and disabled cleanly, then failed INSTALLER_STATUS_MISMATCH
+    # because the replaced task still reported the OLD worker's
+    # last_task_result of 20.  InstallFromDisabledNoStop replaces the
+    # definition without unregistering it, and Task Scheduler keeps that
+    # value until the task runs again - so the first reads after the install
+    # describe a task the candidate has not run yet.
+    $inheritedContext = New-TestContext
+    $inheritedContext.expected_current_task_result = 20
+    $inheritedStatus = New-TestInstallerStatusReceipt -Context $inheritedContext -Mode Observe -State Ready -LastTaskResult 20
+    Assert-ThrowsCode 'the guest failure reproduces without the inherited-result opt-in' {
+        Assert-CutoverInstallerStatus -Status $inheritedStatus -Context $inheritedContext -ExpectedMode Observe -ExpectedTaskState Ready | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
+    $inheritedOkay = $true
+    try {
+        $null = Assert-CutoverInstallerStatus `
+            -Status $inheritedStatus `
+            -Context $inheritedContext `
+            -ExpectedMode Observe `
+            -ExpectedTaskState Ready `
+            -AllowInheritedTaskResult $true
+    } catch { $inheritedOkay = $false }
+    Assert-True 'the exact pinned inherited result is accepted before the first run' $inheritedOkay
+
+    # The tolerance is for ONE exact value, not for 'non-zero'.  A different
+    # result means a NEW failure appeared between the disable and the
+    # install, which is precisely the drift these reads exist to catch.
+    $unexpectedResultStatus = New-TestInstallerStatusReceipt -Context $inheritedContext -Mode Observe -State Ready -LastTaskResult 21
+    Assert-ThrowsCode 'a result other than the pinned inherited one still fails closed' {
+        Assert-CutoverInstallerStatus -Status $unexpectedResultStatus -Context $inheritedContext -ExpectedMode Observe -ExpectedTaskState Ready -AllowInheritedTaskResult $true | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
+    $inheritedZeroOkay = $true
+    try {
+        $null = Assert-CutoverInstallerStatus `
+            -Status (New-TestInstallerStatusReceipt -Context $inheritedContext -Mode Observe -State Ready -LastTaskResult 0) `
+            -Context $inheritedContext `
+            -ExpectedMode Observe `
+            -ExpectedTaskState Ready `
+            -AllowInheritedTaskResult $true
+    } catch { $inheritedZeroOkay = $false }
+    Assert-True 'zero is still accepted while the inherited value is tolerated' $inheritedZeroOkay
+
+    # And the opt-in must not quietly become a second spelling of
+    # RequireResultZero false: against a context that pins zero it tolerates
+    # nothing at all.
+    $zeroPinnedContext = New-TestContext
+    Assert-ThrowsCode 'the opt-in tolerates nothing when the context pins zero' {
+        Assert-CutoverInstallerStatus -Status (New-TestInstallerStatusReceipt -Context $zeroPinnedContext -Mode Observe -State Ready -LastTaskResult 20) -Context $zeroPinnedContext -ExpectedMode Observe -ExpectedTaskState Ready -AllowInheritedTaskResult $true | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
 
     $quoted = ConvertTo-CutoverCommandLineArgument -Value 'C:\A path\file.ps1'
     Assert-True 'native argument quoting wraps spaces' ($quoted -ceq '"C:\A path\file.ps1"')
@@ -2032,12 +2085,21 @@ try {
         $script:IncidentEscrowAction = $RequestedAction
         New-TestEscrowReceipt -Action Validate -XmlSha256 $script:IncidentEscrowHash
     }
+    # DECLARING $AllowInheritedTaskResult HERE IS NOT OPTIONAL.
+    #
+    # Measured under 5.1: a function created from a scriptblock SILENTLY
+    # ACCEPTS a named parameter its param() block never declared.  A mock that
+    # omits one therefore keeps passing while observing nothing, and a
+    # regression that stopped passing this gate would look exactly like a
+    # green run.  Record it so the sequence assertion can see it.
     Set-TestMock 'Get-CutoverExactInstallerStatus' {
-        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero, $AllowInheritedTaskResult)
         $explicitResultGate = $PSBoundParameters.ContainsKey('RequireResultZero')
+        $explicitInherited = $PSBoundParameters.ContainsKey('AllowInheritedTaskResult')
         $script:IncidentStatusSequence.Add(
             $ExpectedMode + ':' + $ExpectedTaskState + ':' +
-            $(if ($explicitResultGate) { [string][bool]$RequireResultZero } else { 'default' })
+            $(if ($explicitResultGate) { [string][bool]$RequireResultZero } else { 'default' }) + ':' +
+            $(if ($explicitInherited) { [string][bool]$AllowInheritedTaskResult } else { 'default' })
         )
         if ($ScriptPath -ceq $Context.restored_installer_path -and $ExpectedTaskState -ceq 'Ready') {
             $script:IncidentStatusCall++
@@ -2120,9 +2182,11 @@ try {
         if ($script:IncidentBackupFailureCode) { Throw-Cutover -Code $script:IncidentBackupFailureCode }
     }
     Set-TestMock 'Invoke-CutoverDrainObserve' {
-        param($Context, $Installer)
+        param($Context, $Installer, $AllowInheritedTaskResult)
         $script:IncidentDrainCalls++
         $script:IncidentDrainInstaller = $Installer
+        $script:IncidentDrainInherited = $(
+            if ($PSBoundParameters.ContainsKey('AllowInheritedTaskResult')) { [string][bool]$AllowInheritedTaskResult } else { 'default' })
         if ($script:IncidentDrainFailureCode) {
             $exception = New-Object InvalidOperationException($script:IncidentDrainFailureCode)
             if ($script:IncidentDrainFailureCode -ceq 'OBSERVE_DRAIN_ALREADY_QUARANTINED') {
@@ -2162,9 +2226,15 @@ try {
     $expectedDisabledXml = Get-CutoverTaskXmlEvidence -Text $script:XmlDisabled
     $incidentReceipt = Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext
     $incidentReceiptJson = ConvertTo-CutoverBoundedReceipt -Receipt $incidentReceipt
-    Assert-True 'failed Execute transition pins old result reads and candidate result-zero readback' (
+    # The candidate readback now carries the inherited-result tolerance, and
+    # the three pre-disable reads deliberately do not: they describe the OLD
+    # task, where result 20 is bound by expected_current_task_result instead.
+    Assert-True 'failed Execute transition pins old result reads and tolerates only the inherited candidate result' (
         ($script:IncidentStatusSequence.ToArray() -join ',') -ceq
-            'Execute:Ready:False,Execute:Ready:False,Execute:Disabled:False,Observe:Ready:default'
+            'Execute:Ready:False:default,Execute:Ready:False:default,Execute:Disabled:False:default,Observe:Ready:default:True'
+    )
+    Assert-True 'failed Execute transition carries the tolerance into the drain' (
+        $script:IncidentDrainInherited -ceq 'True'
     )
     Assert-True 'failed Execute transition disables once then installs Observe without Start' (
         $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
