@@ -430,7 +430,10 @@ function Get-SmokeTaskEvidence {
         '-WallTimeoutSeconds 720',
         ('-ClaudeCommand "' + $ExpectedClaude + '"')
     ) -join ' '
-    if ([string]$action.Id -cne 'OrderSupervisor' -or
+    # Task Scheduler can omit the optional action id after registration, even
+    # when New-ScheduledTaskAction supplied the canonical value. This is the
+    # same exported shape accepted by the installer rollback validator.
+    if (@('', 'OrderSupervisor') -cnotcontains [string]$action.Id -or
         [string]$action.Execute -cne $script:WindowsPowerShell -or
         [string]$action.WorkingDirectory -cne $ExpectedWorkspace -or
         [string]$action.Arguments -cne $expectedArguments) {
