@@ -178,10 +178,13 @@ repair mode and cannot create, update, or delete Azure resources.
    or readback fails, the installer
    deliberately leaves recovery to the outer quarantine, which disables the
    authenticated survivor and waits for any active instance to finish naturally.
-   The driver then obtains a separate `Ready`/result-`0` status readback, verifies
+   Task Scheduler retains the authenticated old result `20` when the disabled
+   definition is replaced. The driver therefore obtains a separate `Ready`
+   status readback that must retain exactly that result and `LastRunTime`, verifies
    the disabled XML backup and unchanged state/log through candidate installation,
-   and runs the ordinary bounded Observe drain, which then advances state and
-   appends its own log evidence. The success receipt therefore scopes those proofs as
+   and runs the bounded Observe drain with the same pre-start history pin. The
+   first candidate run must then advance the history, return result `0`, and
+   append its own log evidence. The success receipt therefore scopes those proofs as
    `old_definition_preserved_except_enabled` and
    `state_and_log_preserved_through_candidate_install`; neither field claims
    that the installed candidate still has the old definition or that the drain
@@ -280,8 +283,11 @@ repair mode and cannot create, update, or delete Azure resources.
     retain the historical nonzero result that caused its quarantine. That result
     is surfaced in the receipt. It then invokes the pinned escrow Restore and
     accepts exactly one Restore receipt with `task_stopped:false`. It then reads
-    the enabled known-good task back as
-    `Ready`, result `0`, SYSTEM, and byte-identical to the escrow representation.
+    the enabled known-good task back as `Ready`, SYSTEM, and byte-identical to the
+    escrow representation. Task Scheduler must retain the authenticated candidate
+    `LastRunTime` and result across that registration; a disabled quarantined
+    candidate may therefore leave a historical nonzero result until the restored
+    task's first successful natural run.
     It also proves `state.json` and the append-only worker log did not change.
     Never restore an older state file: releases share the v1 state, and rolling
     its cursor backward can replay an ORDER. Any failure after candidate

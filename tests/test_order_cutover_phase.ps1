@@ -350,6 +350,10 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentInstallReceiptFailureCode = ''
     $script:IncidentInstallReceiptStatus = 'READY'
     $script:IncidentCandidateStatusFailureCode = ''
+    $script:IncidentCandidateResult = [int64]20
+    $script:IncidentInstallReceiptRequireResultZero = $null
+    $script:IncidentDrainRequireInitialResultZero = $null
+    $script:IncidentDrainExpectedInitialTaskResult = $null
     $script:IncidentBackupFailureCode = ''
     $script:IncidentDrainFailureCode = ''
     $script:IncidentEscrowHash = ''
@@ -1788,7 +1792,7 @@ try {
                 param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
                 New-TestExactStatus `
                     -State $ExpectedTaskState `
-                    -LastTaskResult $(if ($ExpectedTaskState -ceq 'Disabled') { $script:RestoreCandidateLastResult } else { 0 })
+                    -LastTaskResult $script:RestoreCandidateLastResult
             }
             Set-TestMock 'Assert-CutoverTriggerWindow' { param($NextRunUtc, $RequiredSeconds) }
             $script:RestoreStateValidated = 0
@@ -1820,12 +1824,52 @@ try {
                 $restoreReceipt.candidate_mode -ceq $candidateMode -and
                 $restoreReceipt.pre_task_state -ceq $candidateState -and
                 $restoreReceipt.candidate_last_task_result -eq $script:RestoreCandidateLastResult -and
+                $restoreReceipt.restored_last_task_result -eq $script:RestoreCandidateLastResult -and
                 $script:RestoreStateValidated -eq 1 -and
                 [bool]$restoreReceipt.candidate_disable_performed -eq ($candidateState -ceq 'Ready') -and
                 -not $restoreReceipt.task_stopped -and $restoreReceipt.state_and_log_preserved
             )
         }
     }
+
+    Reset-TestMocks
+    $context = New-TestContext
+    $script:TestXmlHash = $xmlHash
+    $script:RestoreExactStatusCall = 0
+    Set-TestMock 'Invoke-CutoverEscrow' {
+        param($Context, $RequestedAction)
+        New-TestEscrowReceipt -Action $RequestedAction -XmlSha256 $script:TestXmlHash -TaskStopped:$false
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatusAnyState' {
+        param($Context, $ScriptPath, $ExpectedMode, $AllowedStates, $RequireResultZero)
+        New-TestExactStatus -State Disabled -LastTaskResult 20
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        $script:RestoreExactStatusCall++
+        if ($ExpectedTaskState -ceq 'Disabled') {
+            return New-TestExactStatus -State Disabled -LastTaskResult 20
+        }
+        return New-TestExactStatus -State Ready -LastTaskResult 0
+    }
+    Set-TestMock 'Get-CutoverState' {
+        param($Path)
+        [pscustomobject]@{ value = (New-TestState -Mode Execute); checkpoint = [pscustomobject]@{ length = 10; sha256 = ('d' * 64) } }
+    }
+    Set-TestMock 'Get-CutoverLogCheckpoint' { param($Path) [pscustomobject]@{ length = 20; sha256 = ('e' * 64) } }
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' { param($Before, $Path, $MaximumBytes, $Code) }
+    $script:XmlCall = 0
+    Set-TestMock 'Export-CutoverTaskXml' {
+        $script:XmlCall++
+        if ($script:XmlCall -le 2) { $script:XmlDisabled } else { $script:XmlEnabled }
+    }
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {
+        param($Context, $Installer, $ExpectedModes)
+        [pscustomobject]@{ mode = 'Execute'; future_triggers_disabled = $true; definition_preserved_except_enabled = $true; task_stopped = $false }
+    }
+    Assert-ThrowsCode 'RestoreReady rejects a restored task that does not retain the authenticated Scheduler history' {
+        Invoke-CutoverRestoreReady -Context $context | Out-Null
+    } 'RESTORE_HISTORY_READBACK_MISMATCH'
 
     Reset-TestMocks
     $context = New-TestContext
@@ -1915,7 +1959,13 @@ try {
     # external resolution and quarantines the task after the first such run.
     Reset-TestMocks
     $context = New-TestContext
-    Set-TestMock 'Get-CutoverExactInstallerStatus' { param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState) New-TestExactStatus }
+    $script:DrainInitialResult = [int64]0
+    $script:DrainInitialResultGates = New-Object 'System.Collections.Generic.List[string]'
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        $script:DrainInitialResultGates.Add([string][bool]$RequireResultZero)
+        New-TestExactStatus -LastTaskResult $script:DrainInitialResult
+    }
     Set-TestMock 'Assert-CutoverTriggerWindow' { param($NextRunUtc, $RequiredSeconds) }
     Set-TestMock 'Get-CutoverState' {
         param($Path)
@@ -1945,6 +1995,33 @@ try {
     $drain = Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path
     Assert-True 'DrainObserve transitions Execute baseline to Observe no-eligible' ($drain.status -ceq 'OBSERVE_DRAINED' -and $drain.runs -eq 2 -and $drain.final_worker_status -ceq 'no_eligible_order')
     Assert-True 'DrainObserve accumulates bounded append evidence' ($drain.log_appended_bytes -eq 20)
+    Assert-True 'ordinary DrainObserve requires result zero on both stable pre-run reads' (
+        ($script:DrainInitialResultGates.ToArray() -join ',') -ceq 'True,True'
+    )
+
+    $script:DrainInitialResult = [int64]20
+    $script:DrainInitialResultGates.Clear()
+    $script:RunSequence = @('no_eligible_order')
+    $script:RunSequenceIndex = 0
+    $inheritedDrain = Invoke-CutoverDrainObserve `
+        -Context $context `
+        -Installer $context.installer_path `
+        -RequireInitialResultZero $false `
+        -ExpectedInitialTaskResult 20
+    Assert-True 'failed Execute drain pins inherited result twenty until its first Observe run' (
+        $inheritedDrain.status -ceq 'OBSERVE_DRAINED' -and
+        ($script:DrainInitialResultGates.ToArray() -join ',') -ceq 'False,False'
+    )
+
+    $script:DrainInitialResultGates.Clear()
+    Assert-ThrowsCode 'failed Execute drain rejects a different inherited task result before Start' {
+        Invoke-CutoverDrainObserve `
+            -Context $context `
+            -Installer $context.installer_path `
+            -RequireInitialResultZero $false `
+            -ExpectedInitialTaskResult 1 | Out-Null
+    } 'INSTALLER_STATUS_MISMATCH'
+    $script:DrainInitialResult = [int64]0
 
     $script:RunSequence = @('overlap_suppressed')
     $script:RunSequenceIndex = 0
@@ -2052,7 +2129,7 @@ try {
         if ($script:IncidentCandidateStatusFailureCode) {
             Throw-Cutover -Code $script:IncidentCandidateStatusFailureCode
         }
-        return New-TestExactStatus -Last $script:IncidentStart -Next $script:IncidentInitialNext -State Ready -LastTaskResult 0
+        return New-TestExactStatus -Last $script:IncidentStart -Next $script:IncidentInitialNext -State Ready -LastTaskResult $script:IncidentCandidateResult
     }
     Set-TestMock 'Get-CutoverState' {
         param($Path)
@@ -2104,13 +2181,14 @@ try {
     }
     Set-TestMock 'Assert-CutoverInstallerStatus' {
         param($Status, $Context, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        $script:IncidentInstallReceiptRequireResultZero = [bool]$RequireResultZero
         if ($script:IncidentInstallReceiptFailureCode) {
             Throw-Cutover -Code $script:IncidentInstallReceiptFailureCode
         }
         if ([string]$Status.status -cne 'READY') {
             Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
         }
-        New-TestExactStatus -Last $script:IncidentStart -State Ready -LastTaskResult 0
+        New-TestExactStatus -Last $script:IncidentStart -State Ready -LastTaskResult $script:IncidentCandidateResult
     }
     Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' {
         param($Context, $ExpectedUtf8TextSha256, $ExpectedUtf16LeBomSha256)
@@ -2120,9 +2198,11 @@ try {
         if ($script:IncidentBackupFailureCode) { Throw-Cutover -Code $script:IncidentBackupFailureCode }
     }
     Set-TestMock 'Invoke-CutoverDrainObserve' {
-        param($Context, $Installer)
+        param($Context, $Installer, $RequireInitialResultZero, $ExpectedInitialTaskResult)
         $script:IncidentDrainCalls++
         $script:IncidentDrainInstaller = $Installer
+        $script:IncidentDrainRequireInitialResultZero = [bool]$RequireInitialResultZero
+        $script:IncidentDrainExpectedInitialTaskResult = [int64]$ExpectedInitialTaskResult
         if ($script:IncidentDrainFailureCode) {
             $exception = New-Object InvalidOperationException($script:IncidentDrainFailureCode)
             if ($script:IncidentDrainFailureCode -ceq 'OBSERVE_DRAIN_ALREADY_QUARANTINED') {
@@ -2162,9 +2242,12 @@ try {
     $expectedDisabledXml = Get-CutoverTaskXmlEvidence -Text $script:XmlDisabled
     $incidentReceipt = Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext
     $incidentReceiptJson = ConvertTo-CutoverBoundedReceipt -Receipt $incidentReceipt
-    Assert-True 'failed Execute transition pins old result reads and candidate result-zero readback' (
+    Assert-True 'failed Execute transition pins the inherited result through candidate pre-run readback' (
         ($script:IncidentStatusSequence.ToArray() -join ',') -ceq
-            'Execute:Ready:False,Execute:Ready:False,Execute:Disabled:False,Observe:Ready:default'
+            'Execute:Ready:False,Execute:Ready:False,Execute:Disabled:False,Observe:Ready:False' -and
+        $script:IncidentInstallReceiptRequireResultZero -eq $false -and
+        $script:IncidentDrainRequireInitialResultZero -eq $false -and
+        $script:IncidentDrainExpectedInitialTaskResult -eq 20
     )
     Assert-True 'failed Execute transition disables once then installs Observe without Start' (
         $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
@@ -2206,6 +2289,20 @@ try {
         $script:IncidentBackupCalls -eq 1 -and $script:IncidentCleanupCalls -eq 0 -and
         [Text.Encoding]::UTF8.GetByteCount($incidentReceiptJson) -le 3072
     )
+
+    foreach ($badCandidateResult in @(0, 1, 31)) {
+        Reset-TestFailedExecuteScenario
+        $script:IncidentEscrowHash = $script:TestXmlHash
+        $incidentContext.expected_current_run_id = $script:IncidentRunId
+        $script:IncidentCandidateResult = [int64]$badCandidateResult
+        Assert-ThrowsCode ('failed Execute transition rejects candidate inherited result ' + $badCandidateResult) {
+            Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $incidentContext | Out-Null
+        } 'INSTALLER_STATUS_MISMATCH'
+        Assert-True ('candidate inherited-result mismatch quarantines without starting ' + $badCandidateResult) (
+            $script:IncidentCandidateInstalled -and $script:IncidentStartCalls -eq 0 -and
+            $script:IncidentDrainCalls -eq 0 -and $script:IncidentCleanupCalls -eq 1
+        )
+    }
 
     foreach ($badInitialResult in @(0, 1, 31)) {
         Reset-TestFailedExecuteScenario

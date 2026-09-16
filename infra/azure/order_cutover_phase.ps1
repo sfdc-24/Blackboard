@@ -2155,9 +2155,20 @@ function Assert-CutoverBackupMatchesExpectedXml {
 function Invoke-CutoverDrainObserve {
     param(
         [Parameter(Mandatory = $true)]$Context,
-        [Parameter(Mandatory = $true)][string]$Installer
+        [Parameter(Mandatory = $true)][string]$Installer,
+        [bool]$RequireInitialResultZero = $true,
+        [int64]$ExpectedInitialTaskResult = 0
     )
-    $initialStatus = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+    $initialStatus = Get-CutoverExactInstallerStatus `
+        -Context $Context `
+        -ScriptPath $Installer `
+        -ExpectedMode 'Observe' `
+        -ExpectedTaskState 'Ready' `
+        -RequireResultZero $RequireInitialResultZero
+    if (-not $RequireInitialResultZero -and
+        [int64]$initialStatus.raw.last_task_result -ne $ExpectedInitialTaskResult) {
+        Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
+    }
     try {
         $stateResult = Get-CutoverState -Path $Context.state_path
         $baselineState = $stateResult.value
@@ -2172,7 +2183,16 @@ function Invoke-CutoverDrainObserve {
         $previousLastRun = $initialStatus.last_run_utc
         $firstLastRun = $previousLastRun
         $logCheckpoint = Get-CutoverLogCheckpoint -Path $Context.log_path
-        $preStart = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Installer -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+        $preStart = Get-CutoverExactInstallerStatus `
+            -Context $Context `
+            -ScriptPath $Installer `
+            -ExpectedMode 'Observe' `
+            -ExpectedTaskState 'Ready' `
+            -RequireResultZero $RequireInitialResultZero
+        if (-not $RequireInitialResultZero -and
+            [int64]$preStart.raw.last_task_result -ne $ExpectedInitialTaskResult) {
+            Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
+        }
         Assert-CutoverStableReadyReadback `
             -Initial $initialStatus `
             -Readback $preStart `
@@ -2481,16 +2501,24 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             -RequestedAction 'InstallFromDisabledNoStop' `
             -RequestedMode 'Observe' `
             -ExpectedCurrentTaskXmlSha256 $disabledXml.utf8_text_sha256
-        $null = Assert-CutoverInstallerStatus `
+        $candidateInstallStatus = Assert-CutoverInstallerStatus `
             -Status $install `
             -Context $Context `
             -ExpectedMode 'Observe' `
-            -ExpectedTaskState 'Ready'
-        $null = Get-CutoverExactInstallerStatus `
+            -ExpectedTaskState 'Ready' `
+            -RequireResultZero $false
+        if ([int64]$candidateInstallStatus.raw.last_task_result -ne [int64]$Context.expected_current_task_result) {
+            Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
+        }
+        $candidateReadback = Get-CutoverExactInstallerStatus `
             -Context $Context `
             -ScriptPath $Context.installer_path `
             -ExpectedMode 'Observe' `
-            -ExpectedTaskState 'Ready'
+            -ExpectedTaskState 'Ready' `
+            -RequireResultZero $false
+        if ([int64]$candidateReadback.raw.last_task_result -ne [int64]$Context.expected_current_task_result) {
+            Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
+        }
         Assert-CutoverFileCheckpointUnchanged `
             -Before $stateBeforeInstall `
             -Path $Context.state_path `
@@ -2506,7 +2534,11 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
             -ExpectedUtf8TextSha256 $disabledXml.utf8_text_sha256 `
             -ExpectedUtf16LeBomSha256 $disabledXml.utf16le_bom_sha256
 
-        $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path
+        $drain = Invoke-CutoverDrainObserve `
+            -Context $Context `
+            -Installer $Context.installer_path `
+            -RequireInitialResultZero $false `
+            -ExpectedInitialTaskResult $Context.expected_current_task_result
         $receipt = [pscustomobject][ordered]@{
             schema = $script:CutoverSchema
             ok = $true
@@ -2769,7 +2801,16 @@ function Invoke-CutoverRestoreReady {
         Assert-CutoverFileCheckpointUnchanged -Before $logBefore -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_DISABLE'
         $restore = Invoke-CutoverEscrow -Context $Context -RequestedAction 'Restore'
         if ([bool]$restore.task_stopped) { Throw-Cutover -Code 'RESTORE_STOPPED_ACTIVE_TASK' }
-        $restored = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.restored_installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Ready'
+        $restored = Get-CutoverExactInstallerStatus `
+            -Context $Context `
+            -ScriptPath $Context.restored_installer_path `
+            -ExpectedMode 'Execute' `
+            -ExpectedTaskState 'Ready' `
+            -RequireResultZero $false
+        if ([int64]$restored.raw.last_task_result -ne [int64]$candidate.raw.last_task_result -or
+            $restored.last_run_utc.Ticks -ne $candidate.last_run_utc.Ticks) {
+            Throw-Cutover -Code 'RESTORE_HISTORY_READBACK_MISMATCH'
+        }
         $restoredXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if (-not $restoredXml.enabled -or $restoredXml.utf16le_bom_sha256 -cne [string]$escrow.task_xml_sha256 -or
             [string]$restore.task_xml_sha256 -cne [string]$escrow.task_xml_sha256) {
@@ -2795,6 +2836,7 @@ function Invoke-CutoverRestoreReady {
             candidate_disabled = $true
             candidate_disable_performed = $disablePerformed
             task_stopped = $false
+            restored_last_task_result = [int64]$restored.raw.last_task_result
             restored_last_run_utc = $restored.last_run_utc.ToString('o')
             state_and_log_preserved = $true
         }
