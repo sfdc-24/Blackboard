@@ -338,6 +338,7 @@ function Reset-TestFailedExecuteScenario {
     $script:IncidentExpectedCurrentTaskXmlSha256 = ''
     $script:IncidentDrainInstaller = ''
     $script:IncidentDrainInherited = ''
+    $script:IncidentAssertInherited = ''
     $script:IncidentBackupUtf8Sha256 = ''
     $script:IncidentBackupUtf16LeBomSha256 = ''
     $script:IncidentDrainCalls = 0
@@ -1999,6 +2000,35 @@ try {
     Assert-True 'DrainObserve transitions Execute baseline to Observe no-eligible' ($drain.status -ceq 'OBSERVE_DRAINED' -and $drain.runs -eq 2 -and $drain.final_worker_status -ceq 'no_eligible_order')
     Assert-True 'DrainObserve accumulates bounded append evidence' ($drain.log_appended_bytes -eq 20)
 
+    # THE REAL DRAIN, NOT A MOCKED ONE.
+    #
+    # Asserting that the transition passes True to a MOCKED
+    # Invoke-CutoverDrainObserve proves the call site and nothing about the
+    # drain itself.  Reproduced before writing this: removing the tolerance
+    # from either of the drain's two pre-run reads left the suite green.
+    # These two exercise the real drain and record what it forwards.
+    $script:DrainForwarded = New-Object 'System.Collections.Generic.List[string]'
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState, $RequireResultZero, $AllowInheritedTaskResult)
+        $script:DrainForwarded.Add($(
+            if ($PSBoundParameters.ContainsKey('AllowInheritedTaskResult')) { [string][bool]$AllowInheritedTaskResult } else { 'absent' }))
+        New-TestExactStatus
+    }
+    $script:RunSequence = @('no_eligible_order')
+    $script:RunSequenceIndex = 0
+    $null = Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AllowInheritedTaskResult $true
+    Assert-True 'the real drain forwards the tolerance to both pre-run reads' (
+        ($script:DrainForwarded.ToArray() -join ',') -ceq 'True,True'
+    ) -Detail ($script:DrainForwarded.ToArray() -join ',')
+    $script:DrainForwarded = New-Object 'System.Collections.Generic.List[string]'
+    $script:RunSequence = @('no_eligible_order')
+    $script:RunSequenceIndex = 0
+    $null = Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path
+    Assert-True 'the real drain defaults both pre-run reads to no tolerance' (
+        ($script:DrainForwarded.ToArray() -join ',') -ceq 'False,False'
+    ) -Detail ($script:DrainForwarded.ToArray() -join ',')
+    Set-TestMock 'Get-CutoverExactInstallerStatus' { param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState) New-TestExactStatus }
+
     $script:RunSequence = @('overlap_suppressed')
     $script:RunSequenceIndex = 0
     Assert-ThrowsCode 'DrainObserve rejects overlap as an intermediate success' {
@@ -2164,8 +2194,14 @@ try {
         $script:IncidentCandidateInstalled = $true
         [pscustomobject]@{ status = $script:IncidentInstallReceiptStatus }
     }
+    # Declares $AllowInheritedTaskResult for the same reason the status mock
+    # does.  This is the read that actually failed on the guest, and while
+    # this mock omitted the parameter, removing the tolerance from the
+    # post-install Assert call left the whole suite green.
     Set-TestMock 'Assert-CutoverInstallerStatus' {
-        param($Status, $Context, $ExpectedMode, $ExpectedTaskState, $RequireResultZero)
+        param($Status, $Context, $ExpectedMode, $ExpectedTaskState, $RequireResultZero, $AllowInheritedTaskResult)
+        $script:IncidentAssertInherited = $(
+            if ($PSBoundParameters.ContainsKey('AllowInheritedTaskResult')) { [string][bool]$AllowInheritedTaskResult } else { 'absent' })
         if ($script:IncidentInstallReceiptFailureCode) {
             Throw-Cutover -Code $script:IncidentInstallReceiptFailureCode
         }
@@ -2236,6 +2272,9 @@ try {
     Assert-True 'failed Execute transition carries the tolerance into the drain' (
         $script:IncidentDrainInherited -ceq 'True'
     )
+    Assert-True 'failed Execute transition tolerates the inherited result on the install receipt' (
+        $script:IncidentAssertInherited -ceq 'True'
+    ) -Detail $script:IncidentAssertInherited
     Assert-True 'failed Execute transition disables once then installs Observe without Start' (
         $script:IncidentDisableCalls -eq 1 -and $script:IncidentInstallCalls -eq 1 -and
         $script:IncidentStartCalls -eq 0 -and $script:IncidentDrainCalls -eq 1
