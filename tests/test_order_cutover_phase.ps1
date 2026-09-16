@@ -3191,6 +3191,21 @@ try {
         Assert-True ('expired '+$boundaryTiming+' cannot start Observe') ($script:FirstStartCalls -eq 0)
     }
 
+    # Model scheduler/preemption delay during the final TWO real window checks.
+    # The test must reach both checks; an earlier deadline rejection cannot pass.
+    $script:FirstStartCalls=0;$script:LateWindowCalls=0
+    $lateAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}
+    $script:LateWindowDeadline=[DateTime]::UtcNow.AddSeconds(3)
+    Set-TestMock 'Assert-CutoverTriggerWindow' {param($NextRunUtc,$RequiredSeconds)
+        $null=& $script:OriginalFunctions['Assert-CutoverTriggerWindow'] -NextRunUtc $NextRunUtc -RequiredSeconds $RequiredSeconds
+        $script:LateWindowCalls++
+        if($script:LateWindowCalls -eq 2){while([DateTime]::UtcNow -lt $script:LateWindowDeadline.AddMilliseconds(20)){[Threading.Thread]::Sleep(5)}}
+    }
+    Assert-ThrowsCode 'real OneRun rejects deadline expiry during final window checks' {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc $script:LateWindowDeadline -PreviousLastRunUtc $lateAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $lateAdmission.log_checkpoint -AdmittedBaseline $lateAdmission} 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED'
+    Assert-True 'deadline expiry after final windows never starts Observe' ($script:FirstStartCalls -eq 0)
+    Assert-True 'late deadline control actually reached both real window checks' ($script:LateWindowCalls -eq 2)
+    Set-TestMock 'Assert-CutoverTriggerWindow' $script:OriginalFunctions['Assert-CutoverTriggerWindow']
+
     foreach($badFirstAdmission in @('mode','run_id','last_run','missing_protected','blank_protected','typed_protected','missing_xml','malformed_xml')){
         $script:FirstStartCalls=0
         $mismatchAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);protected_fingerprint='protected-same';observe_definition_sha256=$script:FirstStartDefinitionSha;next_run_utc=(New-TestExactStatus).next_run_utc}

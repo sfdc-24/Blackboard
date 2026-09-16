@@ -2029,6 +2029,8 @@ function Invoke-CutoverOneRun {
         if ([DateTime]::UtcNow -ge $DeadlineUtc) { Throw-Cutover -Code 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED' }
         Assert-CutoverTriggerWindow -NextRunUtc $AdmittedBaseline.next_run_utc -RequiredSeconds ([Math]::Ceiling(($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds) + $Context.natural_trigger_margin_seconds)
         Assert-CutoverTriggerWindow -NextRunUtc $firstStartReady.next_run_utc -RequiredSeconds ([Math]::Ceiling(($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds) + $Context.natural_trigger_margin_seconds)
+        # Window checks can be preempted; admit no start after the total deadline.
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { Throw-Cutover -Code 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED' }
     }
     $runWindowStartUtc = [DateTime]::UtcNow
     Start-CutoverTask
