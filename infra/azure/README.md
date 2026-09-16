@@ -347,42 +347,6 @@ repair mode and cannot create, update, or delete Azure resources.
     has no bus access, so independently read
     the full board and require exactly the canary DISPATCH plus one deterministic
     CLAIM, RECEIPT, and RESULT.
-    If control-plane delivery consumes that window and verified failure cleanup
-    leaves the exact Execute task `Disabled`, do not replay the failed command
-    or redispatch its canary. After preserving the terminal failure, independently
-    authenticate the current disabled XML and confirm the canary has no worker
-    lifecycle rows. A **new** command identity may use
-    `StartAndAwaitFromDisabled`, `ExpectedDisabledXmlSha256`, and the original
-    canonical UTC `ExpectedDispatchTimestamp`. This recovery requires the pinned
-    disabled definition, task result `0`, healthy prior state, and an unseen
-    dispatch. It waits read-only while disabled for at most
-    `QuietWindowWaitSeconds` (maximum 900), deriving the fifteen-minute phase
-    from the authenticated XML. It never shortens `TimeoutSeconds` or
-    `NaturalTriggerMarginSeconds`. State, log, definition, protected files and
-    last-run identity must remain unchanged before enabling future triggers.
-    Actual enabled `NextRunTime` is then checked again before delegating to the
-    same full `StartAndAwait` acceptance gateway. Leave the full runtime and
-    margin before the order's sixty-minute expiry; an expired/previously seen
-    order fails closed. Use a finite Managed Run Command platform timeout
-    covering both the disabled wait and the original execution allowance
-    (1800 seconds for a 900-second wait and 420-second execution allowance).
-    This action never stops/registers a task or resets state. Failure uses the
-    existing verified future-trigger disable cleanup. The no-eligible variant
-    requires empty work, row, result and dispatch-time inputs.
-    Only the recovery no-eligible variant may drain already expired orders:
-    every intermediate must be independently validated `stale_order_ignored`
-    by the existing one-run acceptance machinery (unchanged work set, advancing
-    cursor/counters, exact task/run identity and append-only log). It is bounded
-    by `MaxRuns` and one original total execution deadline, never a fresh deadline
-    per poll, and must finish with exact `no_eligible_order`. Any other intermediate
-    fails closed. Result-confirmation and normal starts still run exactly once.
-    Recovery carries its admitted last-run and worker-run identities into the
-    actual execution gateway: a run during the enable-to-start handoff must not
-    become a replacement baseline. Disabled reads need no `NextRunTime`; enabled
-    reads still require the actual future timestamp. After enable, an abrupt
-    process loss cannot execute catch cleanup. Independently read destination
-    state and lifecycle evidence before any further command or promotion; do
-    not assume cleanup ran because a control-plane request ended.
 18. Run a second `StartAndAwait` for exact `no_eligible_order`. Require another
     `LastRunTime` and run-ID advance, no new lifecycle rows, and global canary
     counts still exactly `1/1/1`. Task result `0` alone is never acceptance.
@@ -535,6 +499,56 @@ are rejected, while `sort_key`, `cache_key`, `public_key`, and an unknown
 An unquoted exact `KEY:`, `TOKEN:`, `SECRET:`, or `PASSWORD:` is always a
 rejected mapping shape; ordinary prose must omit that colon, for example
 `Token rotation completed` or `Key status is green`.
+
+### Recovery from an already-disabled Execute task
+
+Use the incident-only action
+`InstallObserveAndDrainFromDisabledExecute` with `-Mode Observe` and the
+independently read-back exact `ExpectedDisabledXmlSha256`. It authenticates the
+current candidate Disabled/Execute/result-0 definition and the current healthy
+state/log run before any mutation. It then calls the same pinned release
+installer's `InstallFromDisabledNoStop` in Observe mode, replacing the old
+definition with a new future PT15M interval. The authenticated disabled XML is
+backed up and verified; state, log, release bytes, profile/configuration and
+repository fingerprints are not restored or edited by the driver.
+
+Do not enable the old Execute definition to recover a missed interval.
+Production uses StartWhenAvailable, which can queue delayed catch-up work.
+The former proposed `StartAndAwaitFromDisabled` action is deliberately not
+admitted. This recovery has no target dispatch, timestamp or work/result identity
+inputs: it cannot replay an old command whose durable work was pruned, nor an
+identity that exists only as board CLAIM/RECEIPT/RESULT evidence. Observe cannot
+invoke Claude or append worker lifecycle rows even if a catch-up or unrelated
+fresh order is encountered.
+
+The existing Observe drain proves every run's scheduler time, new run identity,
+append-only log and state/cursor/counter transition under one original total
+deadline and MaxRuns bound. Only an exact final no_eligible_order is success.
+A fresh candidate is observed, not executed or discarded; recovery fails visibly
+as OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION and disables future triggers.
+Do not redispatch, replay an expired order, reset the cursor or blindly create
+another managed command after any failure. Preserve the full operation-correlated
+receipt and actual guest/board read-back, resolve the named cause, then qualify
+any new action independently.
+
+For the current bounded cutover, retain TimeoutSeconds=420,
+NaturalTriggerMarginSeconds=60 and MaxRuns=8. Recovery rejects a runtime plus
+margin plus 120-second pre-drain reserve that cannot fit the 15-minute interval.
+The platform timeout must cover installer preflight/registration, fingerprints,
+the entire drain and cleanup (use a finite 1800 seconds). Azure command delivery
+is outside this guest deadline; it is not assumed constant.
+
+After actual Observe no-eligible and stale/cursor proof, use the existing separate
+InstallExecuteReady action, publish a genuinely fresh canary once with native
+read-back, then the normal single-run StartAndAwait acceptance gateway. This
+change does not relax Execute identity, output digest, log, protected fingerprint,
+natural-trigger margin or final scheduled-job promotion requirements.
+
+An abrupt process/host death after Observe registration cannot run catch cleanup;
+it can leave Observe enabled, never a successful recovery receipt. Independently
+read the destination task, state, log and board before another command or GO.
+Recovery intentionally changes the definition to Observe with a future boundary;
+it does not claim definition-preserved-except-Enabled.
 
 ## Rollback
 

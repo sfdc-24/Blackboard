@@ -60,8 +60,6 @@ param(
     [string]$ExpectedCurrentRunId = '',
 
     [string]$ExpectedDisabledXmlSha256 = '',
-    [string]$ExpectedDispatchTimestamp = '',
-    [string]$QuietWindowWaitSeconds = '900',
 
     [string]$GitPath = '',
     [string]$ExpectedGitSha256 = '',
@@ -107,7 +105,7 @@ function Get-CutoverSafeAction {
         'InstallExecuteReady',
         'RestoreReady',
         'StartAndAwait',
-        'StartAndAwaitFromDisabled'
+        'InstallObserveAndDrainFromDisabledExecute'
     )) {
         if ($Value -ieq $known) { return $known }
     }
@@ -823,6 +821,7 @@ function Get-CutoverTaskRuntime {
     return ConvertTo-CutoverTaskRuntimeInfo -State ([string]$matches[0].State) -Info $info
 }
 
+
 function ConvertTo-CutoverTaskRuntimeInfo {
     param([Parameter(Mandatory = $true)][string]$State, [Parameter(Mandatory = $true)]$Info)
     return [pscustomobject][ordered]@{
@@ -841,60 +840,6 @@ function Start-CutoverTask {
 function Disable-CutoverTask {
     try { Disable-ScheduledTask -TaskName $script:CutoverTaskName -TaskPath $script:CutoverTaskPath -ErrorAction Stop | Out-Null }
     catch { Throw-Cutover -Code 'TASK_DISABLE_FAILED' }
-}
-
-function Enable-CutoverTask {
-    try { Enable-ScheduledTask -TaskName $script:CutoverTaskName -TaskPath $script:CutoverTaskPath -ErrorAction Stop | Out-Null }
-    catch { Throw-Cutover -Code 'TASK_ENABLE_FAILED' }
-}
-
-function Get-CutoverUtcNow { return [DateTime]::UtcNow }
-
-function Wait-CutoverQuietPoll { Start-Sleep -Milliseconds 500 }
-
-function Get-CutoverNextDisabledIntervalUtc {
-    param([Parameter(Mandatory = $true)][DateTime]$ReferenceUtc, [Parameter(Mandatory = $true)][DateTime]$NowUtc)
-    if ($ReferenceUtc.Kind -ne [DateTimeKind]::Utc -or $NowUtc.Kind -ne [DateTimeKind]::Utc -or $ReferenceUtc.Year -lt 2000) {
-        Throw-Cutover -Code 'DISABLED_INTERVAL_REFERENCE_INVALID'
-    }
-    # Only used after the exact disabled task XML proves a PT15M interval.
-    # Disabled Task Scheduler information can retain an already passed occurrence.
-    $elapsedTicks = $NowUtc.Ticks - $ReferenceUtc.Ticks
-    if ($elapsedTicks -lt 0) { return $ReferenceUtc }
-    $intervalTicks = [TimeSpan]::FromMinutes(15).Ticks
-    $steps = [int64]([Math]::Floor([double]$elapsedTicks / [double]$intervalTicks)) + 1
-    try { return $ReferenceUtc.AddTicks($steps * $intervalTicks) }
-    catch { Throw-Cutover -Code 'DISABLED_INTERVAL_REFERENCE_INVALID' }
-}
-
-function Assert-CutoverPendingDispatchWindow {
-    param([Parameter(Mandatory = $true)]$Context, [Parameter(Mandatory = $true)][DateTime]$NowUtc)
-    if ($Context.expected_terminal_status -cne 'result_confirmed') { return }
-    $stamp = $Context.dispatch_utc
-    if (($stamp - $NowUtc).TotalSeconds -gt $script:CutoverClockToleranceSeconds -or
-        ($stamp.AddMinutes(60) - $NowUtc).TotalSeconds -le ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)) {
-        Throw-Cutover -Code 'DISPATCH_COMPLETION_WINDOW_UNAVAILABLE'
-    }
-}
-
-function Wait-CutoverDisabledQuietWindow {
-    param([Parameter(Mandatory = $true)]$Context, [Parameter(Mandatory = $true)]$Initial)
-    $deadline = (Get-CutoverUtcNow).AddSeconds($Context.quiet_window_wait_seconds)
-    while ($true) {
-        $now = Get-CutoverUtcNow
-        Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc $now
-        if ($now -ge $deadline) { Throw-Cutover -Code 'DISABLED_QUIET_WINDOW_TIMEOUT' }
-        $runtime = Get-CutoverTaskRuntime
-        if ($runtime.state -cne 'Disabled' -or $runtime.last_task_result -ne 0 -or
-            $runtime.last_run_utc.Ticks -ne $Initial.last_run_utc.Ticks) {
-            Throw-Cutover -Code 'TASK_CHANGED_DURING_DISABLED_WAIT'
-        }
-        $next = Get-CutoverNextDisabledIntervalUtc -ReferenceUtc $Initial.next_run_utc -NowUtc $now
-        # Reserve additional time for the existing start gateway's snapshots and
-        # status checks. Its original timeout+natural-margin guards still run.
-        if (($next - $now).TotalSeconds -ge ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds + 120)) { return }
-        Wait-CutoverQuietPoll
-    }
 }
 
 function Disable-CutoverTaskAfterFailure {
@@ -2970,19 +2915,9 @@ function Invoke-CutoverRestoreReady {
 }
 
 function Invoke-CutoverStartAndAwait {
-    param(
-        [Parameter(Mandatory = $true)]$Context,
-        [DateTime]$RecoveryBaselineLastRunUtc = [DateTime]::MinValue,
-        [string]$RecoveryBaselineRunId = ''
-    )
+    param([Parameter(Mandatory = $true)]$Context)
     $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $Context.mode -ExpectedTaskState 'Ready'
     try {
-        $isRecovery = $Context.PSObject.Properties['action'] -and $Context.action -ceq 'StartAndAwaitFromDisabled'
-        if ($isRecovery -and
-            ($RecoveryBaselineLastRunUtc.Kind -ne [DateTimeKind]::Utc -or $RecoveryBaselineLastRunUtc.Year -lt 2000 -or
-             $RecoveryBaselineRunId -cnotmatch '^[a-f0-9]{32}$' -or $initial.last_run_utc.Ticks -ne $RecoveryBaselineLastRunUtc.Ticks)) {
-            Throw-Cutover -Code 'RECOVERY_BASELINE_CHANGED_BEFORE_GATEWAY'
-        }
         Assert-CutoverTriggerWindow -NextRunUtc $initial.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)
         $stateBefore = Get-CutoverState -Path $Context.state_path
         if ($stateBefore.value.mode -isnot [string] -or @('Observe', 'Execute') -cnotcontains [string]$stateBefore.value.mode) {
@@ -2992,9 +2927,6 @@ function Invoke-CutoverStartAndAwait {
             -State $stateBefore.value `
             -ExpectedMode ([string]$stateBefore.value.mode) `
             -ExpectedUserProfile $Context.user_profile_path
-        if ($isRecovery -and [string]$baselineLastPoll.run_id -cne $RecoveryBaselineRunId) {
-            Throw-Cutover -Code 'RECOVERY_BASELINE_CHANGED_BEFORE_GATEWAY'
-        }
         Assert-CutoverPinnedExecutables -Context $Context
         $protectedBefore = Get-CutoverProtectedSnapshot -Context $Context
         $logBefore = Get-CutoverLogCheckpoint -Path $Context.log_path
@@ -3004,44 +2936,19 @@ function Invoke-CutoverStartAndAwait {
             -Readback $preStart `
             -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds) `
             -DriftCode 'TASK_CHANGED_BEFORE_START'
-        if ($Context.PSObject.Properties['action'] -and $Context.action -ceq 'StartAndAwaitFromDisabled') {
-            Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
-        }
         $deadline = [DateTime]::UtcNow.AddSeconds($Context.timeout_seconds)
-        $drainStale = $isRecovery -and $Context.expected_terminal_status -ceq 'no_eligible_order'
-        $runs = 0; $appendedBytes = [long]0
-        $previousLastRun = $preStart.last_run_utc
-        $previousRunId = [string]$baselineLastPoll.run_id
-        $logCheckpoint = $logBefore
-        while ($true) {
-            if ($drainStale -and ($runs -ge $Context.max_runs -or [DateTime]::UtcNow -ge $deadline)) { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_BOUND_EXCEEDED' }
-            $expectedStatus = if ($drainStale) { '' } else { $Context.expected_terminal_status }
-            $run = Invoke-CutoverOneRun `
-                -Context $Context `
-                -Installer $Context.installer_path `
-                -ExpectedMode $Context.mode `
-                -DeadlineUtc $deadline `
-                -PreviousLastRunUtc $previousLastRun `
-                -PreviousRunId $previousRunId `
-                -LogBefore $logCheckpoint `
-                -ExpectedStatus $expectedStatus `
-                -ExpectedWorkId $Context.expected_work_id `
-                -ExpectedRowId $Context.expected_row_id `
-                -ExpectedResultStatus $Context.expected_result_status
-            $runs++; $appendedBytes += $run.log_appended_bytes
-            if (-not $drainStale -or $run.status -ceq 'no_eligible_order') { break }
-            # OneRun independently proves stale LastRun/run identity, log,
-            # counter/cursor advance and unchanged work. No other intermediate
-            # status is allowed and the original total deadline never resets.
-            if ($run.status -cne 'stale_order_ignored') { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_INTERMEDIATE_INVALID' }
-            if ($runs -ge $Context.max_runs -or [DateTime]::UtcNow -ge $deadline) { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_BOUND_EXCEEDED' }
-            $previousLastRun = $run.last_run_utc
-            $previousRunId = $run.run_id
-            $logCheckpoint = $run.log_checkpoint
-            $nextReadback = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $Context.mode -ExpectedTaskState 'Ready'
-            if ($nextReadback.last_run_utc.Ticks -ne $previousLastRun.Ticks) { Throw-Cutover -Code 'TASK_CHANGED_BETWEEN_STALE_DRAIN_RUNS' }
-            Assert-CutoverTriggerWindow -NextRunUtc $nextReadback.next_run_utc -RequiredSeconds (($deadline - [DateTime]::UtcNow).TotalSeconds + $Context.natural_trigger_margin_seconds)
-        }
+        $run = Invoke-CutoverOneRun `
+            -Context $Context `
+            -Installer $Context.installer_path `
+            -ExpectedMode $Context.mode `
+            -DeadlineUtc $deadline `
+            -PreviousLastRunUtc $preStart.last_run_utc `
+            -PreviousRunId ([string]$baselineLastPoll.run_id) `
+            -LogBefore $logBefore `
+            -ExpectedStatus $Context.expected_terminal_status `
+            -ExpectedWorkId $Context.expected_work_id `
+            -ExpectedRowId $Context.expected_row_id `
+            -ExpectedResultStatus $Context.expected_result_status
         $protectedAfter = Get-CutoverProtectedSnapshot -Context $Context
         if ($protectedAfter -cne $protectedBefore) { Throw-Cutover -Code 'PROTECTED_FINGERPRINT_CHANGED' }
         $receipt = [pscustomobject][ordered]@{
@@ -3062,14 +2969,10 @@ function Invoke-CutoverStartAndAwait {
             result_status = $Context.expected_result_status
             last_run_before_utc = $initial.last_run_utc.ToString('o')
             last_run_after_utc = $run.last_run_utc.ToString('o')
-            log_appended_bytes = $appendedBytes
+            log_appended_bytes = $run.log_appended_bytes
             log_prefix_preserved = $true
             protected_fingerprints_unchanged = $true
             isolation_residue_absent = $true
-        }
-        if ($drainStale) {
-            $receipt | Add-Member -NotePropertyName recovery_verified_runs -NotePropertyValue $runs
-            $receipt | Add-Member -NotePropertyName recovery_stale_orders_skipped -NotePropertyValue ($runs - 1)
         }
         $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
         return $receipt
@@ -3082,69 +2985,79 @@ function Invoke-CutoverStartAndAwait {
     }
 }
 
-function Invoke-CutoverStartAndAwaitFromDisabled {
+function Assert-CutoverFutureObserveDefinition {
+    param([Parameter(Mandatory = $true)][string]$Text, [Parameter(Mandatory = $true)]$Context)
+    $doc = New-Object Xml.XmlDocument
+    $doc.XmlResolver = $null
+    try { $doc.LoadXml($Text) } catch { Throw-Cutover -Code 'OBSERVE_RECOVERY_XML_INVALID' }
+    $triggers = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*'))
+    $starts = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="StartBoundary"]'))
+    $intervals = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="Repetition"]/*[local-name()="Interval"]'))
+    if ($triggers.Count -ne 2 -or @($triggers | Where-Object { $_.LocalName -ceq 'BootTrigger' }).Count -ne 1 -or
+        $starts.Count -ne 1 -or $intervals.Count -ne 1 -or $intervals[0].InnerText -cne 'PT15M') {
+        Throw-Cutover -Code 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    }
+    $startUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$starts[0].InnerText) -Code 'OBSERVE_RECOVERY_START_BOUNDARY_INVALID'
+    Assert-CutoverTriggerWindow -NextRunUtc $startUtc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds + 120)
+    return $startUtc
+}
+
+function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
     param([Parameter(Mandatory = $true)]$Context)
+    # Never enable the old Execute definition: StartWhenAvailable may replay
+    # missed work. The pinned no-stop installer replaces it with future Observe.
+    if ($Context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
+    if ($Context.expected_terminal_status -or $Context.expected_work_id -or $Context.expected_row_id -or $Context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
+    if ($Context.expected_disabled_xml_sha256 -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
     try {
         Assert-CutoverPinnedExecutables -Context $Context
         $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
-        $disabledText = Export-CutoverTaskXml
-        $xml = Get-CutoverTaskXmlEvidence -Text $disabledText
+        $xml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if ($xml.enabled -or $xml.utf8_text_sha256 -cne $Context.expected_disabled_xml_sha256) { Throw-Cutover -Code 'DISABLED_TASK_XML_NOT_AUTHENTICATED' }
-        $doc = New-Object Xml.XmlDocument
-        $doc.XmlResolver = $null
-        $doc.LoadXml($disabledText)
-        $intervals = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="Repetition"]/*[local-name()="Interval"]'))
-        if ($intervals.Count -ne 1 -or $intervals[0].InnerText -cne 'PT15M') { Throw-Cutover -Code 'DISABLED_INTERVAL_NOT_AUTHENTICATED' }
-        $starts = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="StartBoundary"]'))
-        if ($starts.Count -ne 1) { Throw-Cutover -Code 'DISABLED_INTERVAL_REFERENCE_INVALID' }
-        $reference = ConvertTo-CutoverUtcDateTime -Value ([string]$starts[0].InnerText) -Code 'DISABLED_INTERVAL_REFERENCE_INVALID'
         $state = Get-CutoverState -Path $Context.state_path
         $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedUserProfile $Context.user_profile_path
         if (@('no_eligible_order', 'result_confirmed') -cnotcontains [string]$baseline.status) { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
-        if ($Context.expected_terminal_status -ceq 'result_confirmed' -and
-            ([string]$state.value.cursor.row_id -ceq $Context.expected_row_id -or
-             ($null -ne $state.value.error -and
-              ([string]$state.value.error.work_id -ceq $Context.expected_work_id -or [string]$state.value.error.row_id -ceq $Context.expected_row_id)) -or
-             @($state.value.work | Where-Object { [string]$_.work_id -ceq $Context.expected_work_id -or [string]$_.input_row_id -ceq $Context.expected_row_id }).Count -ne 0)) {
-            Throw-Cutover -Code 'DISPATCH_ALREADY_SEEN_BY_WORKER'
-        }
         $log = Get-CutoverLogCheckpoint -Path $Context.log_path
+        $null = Assert-CutoverCurrentTerminalRun -Context $Context -State $state.value -ExactStatus $initial -LogCheckpoint $log -ExpectedMode ([string]$state.value.mode) -ExpectedStatus ([string]$baseline.status)
         $protected = Get-CutoverProtectedSnapshot -Context $Context
-        # Compute the wait from the caller-authenticated XML, not a disabled
-        # task's absent/stale NextRunTime. After enabling, real status guards
-        # independently prove the actual future trigger before any task Start.
-        $waitInitial = [pscustomobject]@{last_run_utc=$initial.last_run_utc;next_run_utc=$reference}
-        Wait-CutoverDisabledQuietWindow -Context $Context -Initial $waitInitial
-        $preEnable = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
-        if ($preEnable.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks) { Throw-Cutover -Code 'TASK_CHANGED_BEFORE_ENABLE' }
+        $preInstall = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
         $preXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
-        if ($preXml.enabled -or $preXml.utf8_text_sha256 -cne $xml.utf8_text_sha256) { Throw-Cutover -Code 'TASK_CHANGED_BEFORE_ENABLE' }
-        Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_DISABLED_WAIT'
-        Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_DISABLED_WAIT'
-        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_DISABLED_WAIT' }
-        Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
-        Enable-CutoverTask
-        $enabled = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Ready'
-        if ($enabled.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks) { Throw-Cutover -Code 'TASK_RAN_DURING_ENABLE' }
-        $enabledXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
-        if (-not $enabledXml.enabled -or $enabledXml.normalized_sha256 -cne $xml.normalized_sha256) { Throw-Cutover -Code 'TASK_ENABLE_DEFINITION_DRIFT' }
-        Assert-CutoverTriggerWindow -NextRunUtc $enabled.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds + 120)
-        Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_ENABLE'
-        Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_ENABLE'
-        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_ENABLE' }
-        Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
-        $receipt = Invoke-CutoverStartAndAwait -Context $Context -RecoveryBaselineLastRunUtc $initial.last_run_utc -RecoveryBaselineRunId ([string]$baseline.run_id)
-        $receipt.action = 'StartAndAwaitFromDisabled'
-        $receipt | Add-Member -NotePropertyName recovery_definition_preserved_except_enabled -NotePropertyValue $true
-        $receipt | Add-Member -NotePropertyName recovery_state_and_log_preserved_before_start -NotePropertyValue $true
-        $receipt | Add-Member -NotePropertyName recovery_disabled_xml_sha256 -NotePropertyValue $xml.utf8_text_sha256
-        # Validation only: serializing enforces the byte cap without mutating the
-        # typed receipt, which the command entry serializes again for delivery.
+        if ($preInstall.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks -or $preXml.enabled -or $preXml.utf8_text_sha256 -cne $xml.utf8_text_sha256) { Throw-Cutover -Code 'TASK_CHANGED_BEFORE_OBSERVE_RECOVERY' }
+        Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_RECOVERY'
+        Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_OBSERVE_RECOVERY'
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_OBSERVE_RECOVERY' }
+        $install = Invoke-CutoverInstaller -Context $Context -ScriptPath $Context.installer_path -RequestedAction 'InstallFromDisabledNoStop' -RequestedMode 'Observe' -ExpectedCurrentTaskXmlSha256 $xml.utf8_text_sha256
+        $null = Assert-CutoverInstallerStatus -Status $install -Context $Context -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+        $ready = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+        if ($ready.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks) { Throw-Cutover -Code 'TASK_RAN_DURING_OBSERVE_RECOVERY' }
+        $observeText = Export-CutoverTaskXml
+        $observeXml = Get-CutoverTaskXmlEvidence -Text $observeText
+        if (-not $observeXml.enabled) { Throw-Cutover -Code 'RECOVERY_OBSERVE_TASK_NOT_ENABLED' }
+        $startUtc = Assert-CutoverFutureObserveDefinition -Text $observeText -Context $Context
+        Assert-CutoverTriggerWindow -NextRunUtc $ready.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds + 120)
+        Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_OBSERVE_RECOVERY'
+        Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_OBSERVE_RECOVERY'
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_OBSERVE_RECOVERY' }
+        Assert-CutoverBackupMatchesExpectedXml -Context $Context -ExpectedUtf8TextSha256 $xml.utf8_text_sha256 -ExpectedUtf16LeBomSha256 $xml.utf16le_bom_sha256
+        $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path
+        if ($drain.status -cne 'OBSERVE_DRAINED' -or $drain.final_worker_status -cne 'no_eligible_order') { Throw-Cutover -Code 'OBSERVE_RECOVERY_NOT_DRAINED' }
+        if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_FINGERPRINT_CHANGED' }
+        $receipt = [pscustomobject][ordered]@{
+            schema = $script:CutoverSchema; ok = $true; action = 'InstallObserveAndDrainFromDisabledExecute'
+            operation_id = $Context.operation_id; status = 'OBSERVE_DRAINED'; release_id = $Context.release_id
+            pre_mode = 'Execute'; post_mode = 'Observe'; pre_task_state = 'Disabled'; post_task_state = 'Ready'
+            task_stopped = $false; old_execute_task_not_enabled = $true; candidate_install_action = 'InstallFromDisabledNoStop'
+            authenticated_disabled_xml_sha256 = $xml.utf8_text_sha256; observe_xml_sha256 = $observeXml.utf8_text_sha256
+            observe_start_boundary_utc = $startUtc.ToString('o'); backup_matches_authenticated_disabled_xml = $true
+            state_and_log_preserved_through_install = $true; protected_fingerprints_unchanged = $true; state_not_restored = $true
+            runs = $drain.runs; final_run_id = $drain.final_run_id; final_worker_status = $drain.final_worker_status
+            final_last_run_utc = $drain.final_last_run_utc; log_appended_bytes = $drain.log_appended_bytes
+        }
         $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
         return $receipt
     } catch {
         if ($_.Exception.Data.Contains('cleanup_status')) { throw }
-        Throw-CutoverAfterCleanup -FailureRecord $_ -Context $Context -Installer $Context.installer_path -ExpectedModes @('Execute')
+        Throw-CutoverAfterCleanup -FailureRecord $_ -Context $Context -Installer $Context.installer_path -ExpectedModes @('Observe', 'Execute')
     }
 }
 
@@ -3153,21 +3066,8 @@ function New-CutoverContext {
         [Parameter(Mandatory = $true)][string]$RequestedAction,
         [Parameter(Mandatory = $true)][hashtable]$Values
     )
-    # Older in-process callers use PSObjects without the new optional fields.
-    $disabledInput = ''; $dispatchInput = ''; $quietInput = '900'
-    foreach ($inputName in @('ExpectedDisabledXmlSha256', 'ExpectedDispatchTimestamp', 'QuietWindowWaitSeconds')) {
-        $inputValue = $null
-        if ($Values -is [Collections.IDictionary]) {
-            if ($Values.Contains($inputName)) { $inputValue = $Values[$inputName] }
-        } elseif ($Values.PSObject.Properties[$inputName]) { $inputValue = $Values.$inputName }
-        if ($null -ne $inputValue) {
-            switch ($inputName) {
-                'ExpectedDisabledXmlSha256' { $disabledInput = [string]$inputValue }
-                'ExpectedDispatchTimestamp' { $dispatchInput = [string]$inputValue }
-                'QuietWindowWaitSeconds' { $quietInput = [string]$inputValue }
-            }
-        }
-    }
+    $disabledInput = ''
+    if ($Values.Contains('ExpectedDisabledXmlSha256')) { $disabledInput = [string]$Values.ExpectedDisabledXmlSha256 }
     if ($PSVersionTable.PSEdition -cne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) {
         Throw-Cutover -Code 'WINDOWS_POWERSHELL_5_1_REQUIRED'
     }
@@ -3209,8 +3109,6 @@ function New-CutoverContext {
         expected_current_failure_code = ''
         expected_current_run_id = ''
         expected_disabled_xml_sha256 = ''
-        dispatch_utc = [DateTime]::MinValue
-        quiet_window_wait_seconds = 900
         metadata_root = ''
     }
     $programData = Resolve-CutoverAbsolutePath -Value $env:ProgramData -Code 'PROGRAM_DATA_INVALID' -ForbidVolumeRoot
@@ -3238,7 +3136,7 @@ function New-CutoverContext {
         'InstallExecuteReady',
         'RestoreReady',
         'StartAndAwait',
-        'StartAndAwaitFromDisabled'
+        'InstallObserveAndDrainFromDisabledExecute'
     ) -ccontains $RequestedAction) {
         $context.installer_path = Resolve-CutoverInstaller -Path $Values.InstallerPath -ExpectedSha256 $Values.ExpectedInstallerSha256 -ReleaseId $Values.ExpectedReleaseId -Prefix 'INSTALLER'
     }
@@ -3278,7 +3176,7 @@ function New-CutoverContext {
     if ($RequestedAction -ceq 'InstallExecuteReady' -and $context.mode -cne 'Execute') {
         Throw-Cutover -Code 'ACTION_REQUIRES_EXECUTE_MODE'
     }
-    if (@('StartAndAwait', 'StartAndAwaitFromDisabled') -ccontains $RequestedAction) {
+    if ($RequestedAction -ceq 'StartAndAwait') {
         if ($context.mode -cne 'Execute') { Throw-Cutover -Code 'ACTION_REQUIRES_EXECUTE_MODE' }
         if (@('result_confirmed', 'no_eligible_order') -cnotcontains $Values.ExpectedTerminalStatus) {
             Throw-Cutover -Code 'EXPECTED_TERMINAL_STATUS_INVALID'
@@ -3295,19 +3193,13 @@ function New-CutoverContext {
             Throw-Cutover -Code 'NO_ELIGIBLE_IDENTITY_MUST_BE_EMPTY'
         }
     }
-    if ($RequestedAction -ceq 'StartAndAwaitFromDisabled') {
-        if ($context.mode -cne 'Execute') { Throw-Cutover -Code 'ACTION_REQUIRES_EXECUTE_MODE' }
+    if ($RequestedAction -ceq 'InstallObserveAndDrainFromDisabledExecute') {
+        if ($context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
         if ($disabledInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
+        if ($context.expected_terminal_status -or $context.expected_work_id -or $context.expected_row_id -or $context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
+        if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
         $context.expected_disabled_xml_sha256 = $disabledInput
-        $context.quiet_window_wait_seconds = ConvertTo-CutoverInteger -Value $quietInput -Minimum 1 -Maximum 900 -Code 'QUIET_WINDOW_WAIT_SECONDS_INVALID'
-        if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'DISABLED_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
-        if ($context.expected_terminal_status -ceq 'result_confirmed') {
-            if (-not (Test-CutoverUtcStamp -Value $dispatchInput)) { Throw-Cutover -Code 'EXPECTED_DISPATCH_TIMESTAMP_INVALID' }
-            $context.dispatch_utc = ConvertTo-CutoverUtcDateTime -Value $dispatchInput -Code 'EXPECTED_DISPATCH_TIMESTAMP_INVALID'
-        } elseif (-not [string]::IsNullOrEmpty($dispatchInput)) { Throw-Cutover -Code 'NO_ELIGIBLE_DISPATCH_TIMESTAMP_FORBIDDEN' }
-    } elseif (-not [string]::IsNullOrEmpty($disabledInput) -or -not [string]::IsNullOrEmpty($dispatchInput) -or $quietInput -cne '900') {
-        Throw-Cutover -Code 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH'
-    }
+    } elseif ($disabledInput) { Throw-Cutover -Code 'DISABLED_RECOVERY_INPUTS_ACTION_MISMATCH' }
     return $context
 }
 
@@ -3327,7 +3219,7 @@ function Invoke-OrderCutoverPhase {
         'InstallExecuteReady' { return Invoke-CutoverInstallExecuteReady -Context $context }
         'RestoreReady' { return Invoke-CutoverRestoreReady -Context $context }
         'StartAndAwait' { return Invoke-CutoverStartAndAwait -Context $context }
-        'StartAndAwaitFromDisabled' { return Invoke-CutoverStartAndAwaitFromDisabled -Context $context }
+        'InstallObserveAndDrainFromDisabledExecute' { return Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context }
     }
     Throw-Cutover -Code 'ACTION_INVALID'
 }
@@ -3427,8 +3319,6 @@ if ($MyInvocation.InvocationName -cne '.') {
         ExpectedCurrentFailureCode = $ExpectedCurrentFailureCode
         ExpectedCurrentRunId = $ExpectedCurrentRunId
         ExpectedDisabledXmlSha256 = $ExpectedDisabledXmlSha256
-        ExpectedDispatchTimestamp = $ExpectedDispatchTimestamp
-        QuietWindowWaitSeconds = $QuietWindowWaitSeconds
         GitPath = $GitPath
         ExpectedGitSha256 = $ExpectedGitSha256
         ExpectedClaudeSha256 = $ExpectedClaudeSha256
