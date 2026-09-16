@@ -35,6 +35,9 @@ on:
       - "tests/test_bus.py"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
+      - "tools/board_governor/board_facts.py"
+      - "tools/board_governor/governor.py"
+      - "tests/test_board_governor.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -51,6 +54,9 @@ on:
       - "tests/test_bus.py"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
+      - "tools/board_governor/board_facts.py"
+      - "tools/board_governor/governor.py"
+      - "tests/test_board_governor.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -84,7 +90,8 @@ jobs:
           echo "python: $(python3 --version)"
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
-                   tests/test_bus.py tests/test_bcb_lint.py; do
+                   tests/test_bus.py tests/test_bcb_lint.py \
+                   tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -143,6 +150,25 @@ jobs:
           python_bin="$(command -v python3)"
           sudo unshare -n -- "$python_bin" tests/test_bcb_lint.py
 
+      # The governor's FACT EXTRACTOR and OUTPUT PARSER only.
+      #
+      # The CLIPS engine itself is deliberately NOT covered here: governor.py
+      # shells out to CLIPSDOS.exe under C:\Program Files, which cannot exist on
+      # ubuntu-latest. The suite says that in its own docstring rather than
+      # skipping the engine while reporting green, and the rules are exercised by
+      # tests/mutate_board_governor.py on a machine that has CLIPS. So this check
+      # means "the facts and the contract lines are right", never "the governor
+      # works" - a distinction this workflow exists to keep honest.
+      - name: board governor facts and parser (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_board_governor.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_board_governor.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bus suite starts its own server and scratch database. Enable only
       # loopback in a fresh namespace, and retain setup-python's exact binary
       # across sudo rather than silently switching to the system interpreter.
@@ -163,7 +189,8 @@ jobs:
           set -euo pipefail
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
-             && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ]; then
+             && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
+             && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
