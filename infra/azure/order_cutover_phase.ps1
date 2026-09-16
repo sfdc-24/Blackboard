@@ -1514,7 +1514,8 @@ function Assert-CutoverLogRun {
     if ($duplicateDiagnostics.Count -gt 1) { Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID' }
     if ($duplicateDiagnostics.Count -eq 1) {
         $diagnostic = $duplicateDiagnostics[0]
-        $details = $diagnostic.details
+        $detailsProperty = $diagnostic.PSObject.Properties['details']
+        $details = if ($null -eq $detailsProperty) { $null } else { $detailsProperty.Value }
         $detailProperties = @()
         if ($null -ne $details) {
             $detailProperties = @($details.PSObject.Properties | ForEach-Object { [string]$_.Name })
@@ -1539,7 +1540,8 @@ function Assert-CutoverLogRun {
     if ($schemaDiagnostics.Count -gt 1) { Throw-Cutover -Code 'LOG_DIAGNOSTIC_EVENT_INVALID' }
     if ($schemaDiagnostics.Count -eq 1) {
         $diagnostic = $schemaDiagnostics[0]
-        $details = $diagnostic.details
+        $detailsProperty = $diagnostic.PSObject.Properties['details']
+        $details = if ($null -eq $detailsProperty) { $null } else { $detailsProperty.Value }
         $detailProperties = @()
         if ($null -ne $details) {
             $detailProperties = @($details.PSObject.Properties | ForEach-Object { [string]$_.Name })

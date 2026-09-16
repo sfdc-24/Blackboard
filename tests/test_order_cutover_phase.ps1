@@ -1377,6 +1377,119 @@ try {
                 (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
                 (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:04.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
             )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic missing details'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z'),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic wrong level'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level info -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic nonblank work identity'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -WorkId LEAK -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic nonblank row identity'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -RowId LEAK -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic nonblank message'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -Message LEAK -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic extra detail property'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '1'; extra = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic numeric count'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = 1; exact_duplicate_row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'duplicate diagnostic out-of-bound count'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_duplicate_rows_collapsed -RunId $runId -Level warning -Code BOARD_CURSOR_DUPLICATES_COLLAPSED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ exact_duplicate_group_count = '1'; exact_duplicate_row_count = '10000000000' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic missing details'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:02.000Z'),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic wrong level and code'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level info -Code WRONG -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic nonblank identity and message'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -WorkId LEAK -RowId LEAK -Message LEAK -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic extra detail property'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = '1'; extra = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic numeric count'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = 1 })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
+        },
+        [pscustomobject]@{
+            name = 'known-schema diagnostic repeated'
+            entries = @(
+                (New-TestLogEntry -Event poll_started -RunId $runId -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{ mode = 'Observe' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:02.000Z' -Details ([pscustomobject]@{ row_count = '1' })),
+                (New-TestLogEntry -Event board_schema_incident -RunId $runId -Level warning -Code BOARD_KNOWN_TRAILING_ROW_IGNORED -At '2026-09-07T00:00:03.000Z' -Details ([pscustomobject]@{ row_count = '1' })),
+                (New-TestLogEntry -Event poll_complete -RunId $runId -At '2026-09-07T00:00:04.000Z' -Details ([pscustomobject]@{ malformed = '0'; status = 'no_eligible_order' }))
+            )
         }
     )) {
         Assert-ThrowsCode ('log rejects ' + $badDiagnosticCase.name) {
