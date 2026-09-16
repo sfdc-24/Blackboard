@@ -222,6 +222,7 @@ function New-DefaultFixture {
         LastTaskResult = 0
         QuietSeconds = 600
         ActionCount = 1
+        ActionId = ''
         ActionWorkspace = ''
         Managed = $true
         PrincipalId = 'NT AUTHORITY\SYSTEM'
@@ -369,7 +370,7 @@ $arguments = @(
 ) -join ' '
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $action = [pscustomobject]@{
-    Id = 'OrderSupervisor'
+    Id = [string]$script:Fixture.ActionId
     Execute = $windowsPowerShell
     WorkingDirectory = $actionWorkspace
     Arguments = $arguments
@@ -532,6 +533,18 @@ try {
     ) -Detail $success.stdout
     Test-Case -Name 'protected file contents remain byte-identical' -Condition ($protectedAfter -ceq $protectedBefore)
     Test-Case -Name 'successful run removes its exact owned temporary root' -Condition (@(Get-OwnedSmokeResidue).Count -eq 0)
+
+    Reset-TestRelease
+    $fixture = New-DefaultFixture
+    $fixture.ActionId = 'OrderSupervisor'
+    $run = Invoke-SmokeCase -Name 'canonical-action-id' -Parameters (New-DefaultParameters) -Fixture $fixture
+    Test-Case -Name 'canonical named task action id remains accepted' -Condition ($run.exit_code -eq 0 -and [bool]$run.receipt.pass) -Detail $run.stdout
+
+    Reset-TestRelease
+    $fixture = New-DefaultFixture
+    $fixture.ActionId = 'WrongAction'
+    $run = Invoke-SmokeCase -Name 'wrong-action-id' -Parameters (New-DefaultParameters) -Fixture $fixture
+    Assert-FailureCase -Name 'noncanonical task action id is rejected' -Run $run -Code 'TASK_ACTION_CONTRACT_INVALID'
 
     Reset-TestRelease
     $parameters = New-DefaultParameters

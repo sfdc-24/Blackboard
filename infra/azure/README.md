@@ -401,6 +401,10 @@ Claude and Git executable paths, plus independently verified lowercase SHA-256
 values for those exact executables. The smoke requires the root task to be
 `Ready`, in `Observe`, last result `0`, and outside the configured quiet
 window; it never waits for or starts the task.
+Task Scheduler may omit the action's optional `Id` after registering the
+installer's canonical `OrderSupervisor` action. The smoke accepts only that
+true empty projection or the canonical `OrderSupervisor` value; every other
+action ID remains drift.
 
 The smoke hashes the real environment file for its protected before/after
 fingerprint but never parses, imports, or passes that file to a child. It
