@@ -1987,6 +1987,56 @@ try {
     Assert-True 'current Observe terminal gate binds state task time and trailing log run' (
         $currentRunEvidence.run_id -ceq $currentRunId
     )
+
+    $currentResultLogPath = Join-Path $temporaryRoot 'current-result-run.jsonl'
+    $currentResultRunId = 'ffffffffffffffffffffffffffffffff'
+    $currentResultRow = '88888888-8888-4888-8888-888888888888'
+    $currentResultStart = [DateTime]::UtcNow.AddSeconds(-8)
+    $currentResultEnd = $currentResultStart.AddSeconds(1)
+    $currentResultStartText = $currentResultStart.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $currentResultEndText = $currentResultEnd.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $currentResultLines = @(
+        (New-TestLogEntry -Event poll_started -RunId $currentResultRunId -At $currentResultStartText -Details ([pscustomobject]@{ mode = 'Execute' })),
+        (New-TestLogEntry -Event result_confirmed -RunId $currentResultRunId -At $currentResultEndText -WorkId 'WORK-RESULT-1' -RowId $currentResultRow -Details ([pscustomobject]@{ status = 'blocked'; output_sha256 = ('8' * 64) }))
+    ) | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }
+    [IO.File]::WriteAllText($currentResultLogPath, (($currentResultLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+    $currentResultState = New-TestState -Mode Execute -RunId $currentResultRunId -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId $currentResultRow -ResultStatus blocked -PollAt $currentResultStartText
+    $currentResultContext = New-TestContext
+    $currentResultContext.log_path = $currentResultLogPath
+    $currentResultStatus = New-TestExactStatus -Last $currentResultStart
+    $currentResultCheckpoint = Get-CutoverLogCheckpoint -Path $currentResultLogPath
+    $currentResultEvidence = Assert-CutoverCurrentTerminalRun `
+        -Context $currentResultContext `
+        -State $currentResultState `
+        -ExactStatus $currentResultStatus `
+        -LogCheckpoint $currentResultCheckpoint `
+        -ExpectedMode Execute `
+        -ExpectedStatus result_confirmed `
+        -ExpectedWorkId 'WORK-RESULT-1' `
+        -ExpectedRowId $currentResultRow `
+        -ExpectedResultStatus blocked
+    Assert-True 'current result terminal gate compares state and log output digests' (
+        $currentResultEvidence.output_sha256 -ceq ('8' * 64)
+    )
+    $mismatchedResultLines = @(
+        (New-TestLogEntry -Event poll_started -RunId $currentResultRunId -At $currentResultStartText -Details ([pscustomobject]@{ mode = 'Execute' })),
+        (New-TestLogEntry -Event result_confirmed -RunId $currentResultRunId -At $currentResultEndText -WorkId 'WORK-RESULT-1' -RowId $currentResultRow -Details ([pscustomobject]@{ status = 'blocked'; output_sha256 = ('9' * 64) }))
+    ) | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }
+    [IO.File]::WriteAllText($currentResultLogPath, (($mismatchedResultLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+    $mismatchedResultCheckpoint = Get-CutoverLogCheckpoint -Path $currentResultLogPath
+    Assert-ThrowsCode 'current result terminal gate rejects state/log output digest mismatch' {
+        Assert-CutoverCurrentTerminalRun `
+            -Context $currentResultContext `
+            -State $currentResultState `
+            -ExactStatus $currentResultStatus `
+            -LogCheckpoint $mismatchedResultCheckpoint `
+            -ExpectedMode Execute `
+            -ExpectedStatus result_confirmed `
+            -ExpectedWorkId 'WORK-RESULT-1' `
+            -ExpectedRowId $currentResultRow `
+            -ExpectedResultStatus blocked | Out-Null
+    } 'STATE_LOG_RESULT_DIGEST_MISMATCH'
+
     $overlapAt = $currentRunStart.AddSeconds(5)
     $overlapLine = New-TestLogEntry -Event overlap_suppressed -RunId $laterOverlapRunId -At $overlapAt.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') -Code LOCAL_MUTEX_BUSY -Level warning
     [IO.File]::AppendAllText($currentRunLogPath, (($overlapLine | ConvertTo-Json -Depth 5 -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
@@ -2273,6 +2323,43 @@ try {
     $script:RunSequenceIndex=0
     $boundDrain=Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $admission
     Assert-True 'real Observe drain accepts the exact admitted baseline and still drains stale work' ($boundDrain.runs -eq 2 -and $boundDrain.final_worker_status -ceq 'no_eligible_order')
+    $resultRowForDrain = '77777777-7777-4777-8777-777777777777'
+    $resultAdmission = [pscustomobject]@{
+        run_id=('a'*32)
+        last_run_utc=(New-TestExactStatus).last_run_utc
+        state_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}
+        log_checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}
+        protected_fingerprint='protected-same'
+        observe_definition_sha256=('e'*64)
+        baseline_status='result_confirmed'
+        work_id='WORK-RESULT-1'
+        row_id=$resultRowForDrain
+        result_status='blocked'
+        output_sha256=('8'*64)
+    }
+    Set-TestMock 'Get-CutoverState' {
+        param($Path)
+        [pscustomobject]@{
+            value=(New-TestState -Mode Execute -RunId ('a'*32) -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId $script:ResultRowForDrain -ResultStatus blocked)
+            checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}
+        }
+    }
+    $script:ResultRowForDrain = $resultRowForDrain
+    $script:RunSequence = @('no_eligible_order')
+    $script:RunSequenceIndex = 0
+    $boundResultDrain=Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $resultAdmission
+    Assert-True 'real Observe drain accepts exact admitted result-confirmed baseline before first start' ($boundResultDrain.runs -eq 1 -and $boundResultDrain.final_worker_status -ceq 'no_eligible_order')
+    $badDigestAdmission = $resultAdmission.PSObject.Copy()
+    $badDigestAdmission.output_sha256 = ('9'*64)
+    $script:RunSequenceIndex = 0
+    Assert-ThrowsCode 'real Observe drain rejects admitted result digest drift before first start' {
+        Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path -AdmittedBaseline $badDigestAdmission | Out-Null
+    } 'OBSERVE_DRAIN_ADMITTED_RESULT_DIGEST_CHANGED'
+    Assert-True 'admitted result digest drift never starts Observe' ($script:RunSequenceIndex -eq 0)
+    Set-TestMock 'Get-CutoverState' {
+        param($Path)
+        [pscustomobject]@{ value = (New-TestState -Mode Execute -RunId ('a' * 32)); checkpoint = [pscustomobject]@{ length = 1; sha256 = ('a' * 64) } }
+    }
     $savedDrainStateMock=(Get-Item Function:Get-CutoverState).ScriptBlock
     $savedDrainStatusMock=(Get-Item Function:Get-CutoverExactInstallerStatus).ScriptBlock
     $savedDrainLogMock=(Get-Item Function:Get-CutoverLogCheckpoint).ScriptBlock
@@ -2333,10 +2420,11 @@ try {
 
     $script:RunSequence = @('candidate_observed')
     $script:RunSequenceIndex = 0
+    $candidateCleanupBaseline = $script:DrainCleanupCalls
     Assert-ThrowsCode 'DrainObserve stops at first unresolved candidate' {
         Invoke-CutoverDrainObserve -Context $context -Installer $context.installer_path | Out-Null
     } 'OBSERVE_CANDIDATE_REQUIRES_EXTERNAL_RESOLUTION'
-    Assert-True 'candidate drain cannot loop or falsely report drained' ($script:RunSequenceIndex -eq 1 -and $script:DrainCleanupCalls -eq 2)
+    Assert-True 'candidate drain cannot loop or falsely report drained' ($script:RunSequenceIndex -eq 1 -and $script:DrainCleanupCalls -eq ($candidateCleanupBaseline + 1))
 
     $context.max_runs = 1
     $script:RunSequence = @('stale_order_ignored')
@@ -3259,6 +3347,9 @@ try {
         if($null -eq $AdmittedBaseline -or $AdmittedBaseline.run_id -cne ('a'*32) -or $AdmittedBaseline.last_run_utc.Ticks -ne (New-TestExactStatus).last_run_utc.Ticks -or $AdmittedBaseline.state_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.log_checkpoint.sha256 -cne ('a'*64) -or $AdmittedBaseline.protected_fingerprint -cne 'protected-same'){throw 'OBSERVE_DRAIN_ADMISSION_NOT_BOUND'}
         $definitionProperty=$AdmittedBaseline.PSObject.Properties['observe_definition_sha256']
         $script:WrapperSeenDefinitionSha=if($null -ne $definitionProperty){$definitionProperty.Value}else{''}
+        $script:WrapperSeenBaselineStatus=if($null -ne $AdmittedBaseline.PSObject.Properties['baseline_status']){[string]$AdmittedBaseline.baseline_status}else{''}
+        $script:WrapperSeenBaselineWork=if($null -ne $AdmittedBaseline.PSObject.Properties['work_id']){[string]$AdmittedBaseline.work_id}else{''}
+        $script:WrapperSeenBaselineDigest=if($null -ne $AdmittedBaseline.PSObject.Properties['output_sha256']){[string]$AdmittedBaseline.output_sha256}else{''}
         $script:ObserveRecoveryDrains++
         [pscustomobject]@{status='OBSERVE_DRAINED';runs=2;final_run_id=('b'*32);final_worker_status='no_eligible_order';final_last_run_utc='2026-09-16T11:00:00.000Z';log_appended_bytes=100}
     }
@@ -3337,6 +3428,49 @@ try {
     $beforeResultInstalls=$script:ObserveRecoveryInstalls
     Assert-ThrowsCode 'Observe-only recovery refuses result-confirmed baseline without target inputs' {Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context} 'DISABLED_BASELINE_NOT_HEALTHY'
     Assert-True 'result-confirmed baseline cannot install or drain' ($script:ObserveRecoveryInstalls -eq $beforeResultInstalls -and $script:ObserveRecoveryDrains -eq 1)
+
+    $resultContext=New-TestContext
+    $resultContext.mode='Observe';$resultContext.timeout_seconds=420;$resultContext.max_runs=8
+    $resultContext.expected_disabled_xml_sha256=$context.expected_disabled_xml_sha256
+    $resultContext.expected_terminal_status='result_confirmed'
+    $resultContext.expected_work_id='WORK-RESULT-1'
+    $resultContext.expected_row_id='99999999-9999-4999-8999-999999999999'
+    $resultContext.expected_result_status='blocked'
+    $script:ObserveRecoveryInstalled=$false
+    $script:ObserveRecoveryDrains=1
+    $script:ResultRecoveryLogPin=''
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Execute -RunId ('a'*32) -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId '99999999-9999-4999-8999-999999999999' -ResultStatus blocked);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {
+        param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus,$ExpectedWorkId,$ExpectedRowId,$ExpectedResultStatus)
+        $script:ResultRecoveryLogPin=($ExpectedMode,$ExpectedStatus,$ExpectedWorkId,$ExpectedRowId,$ExpectedResultStatus -join '|')
+        [pscustomobject]@{run_id=('a'*32)}
+    }
+    $resultRecovery=Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $resultContext
+    Assert-True 'Observe recovery admits exact disabled result-confirmed baseline without enabling Execute' (
+        $resultRecovery.baseline_status -ceq 'result_confirmed' -and
+        $resultRecovery.recovered_work_id -ceq 'WORK-RESULT-1' -and
+        $resultRecovery.recovered_row_id -ceq '99999999-9999-4999-8999-999999999999' -and
+        $resultRecovery.recovered_result_status -ceq 'blocked' -and
+        $resultRecovery.recovered_output_sha256 -ceq ('8'*64) -and
+        $resultRecovery.old_execute_task_not_enabled -and
+        -not $resultRecovery.task_stopped -and
+        $script:ResultRecoveryLogPin -ceq 'Execute|result_confirmed|WORK-RESULT-1|99999999-9999-4999-8999-999999999999|blocked' -and
+        $script:WrapperSeenBaselineStatus -ceq 'result_confirmed' -and
+        $script:WrapperSeenBaselineWork -ceq 'WORK-RESULT-1' -and
+        $script:WrapperSeenBaselineDigest -ceq ('8'*64)
+    )
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId '99999999-9999-4999-8999-999999999999' -ResultStatus blocked);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $script:ObserveRecoveryInstalled=$false
+    $beforeObserveModeInstalls=$script:ObserveRecoveryInstalls
+    $beforeObserveModeDrains=$script:ObserveRecoveryDrains
+    Assert-ThrowsCode 'Observe recovery rejects impossible Observe-mode result-confirmed baseline' {
+        Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $resultContext | Out-Null
+    } 'DISABLED_RESULT_BASELINE_MODE_INVALID'
+    Assert-True 'Observe-mode result baseline cannot install or drain' (
+        $script:ObserveRecoveryInstalls -eq $beforeObserveModeInstalls -and
+        $script:ObserveRecoveryDrains -eq $beforeObserveModeDrains
+    )
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
     Set-TestMock 'Get-CutoverState' $savedRecoveryStateMock
     foreach($finalFailure in @('NATURAL_TRIGGER_WINDOW_UNAVAILABLE','TASK_CHANGED_BEFORE_OBSERVE_DRAIN','TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN')){
         $script:RecoveryBackupReadComplete=$false;$script:RecoveryFinalFailure=$finalFailure
@@ -3434,6 +3568,19 @@ try {
     $recoveryValues.ExpectedDisabledXmlSha256=('a'*64);$recoveryValues.TimeoutSeconds='420'
     $wiredRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $recoveryValues
     Assert-True 'new recovery context binds exact disabled pin and Observe-only full allowance' ($wiredRecovery.expected_disabled_xml_sha256 -ceq ('a'*64) -and $wiredRecovery.mode -ceq 'Observe' -and $wiredRecovery.timeout_seconds -eq 420)
+    $targetedRecovery=$recoveryValues.Clone()
+    $targetedRecovery.ExpectedTerminalStatus='result_confirmed'
+    $targetedRecovery.ExpectedWorkId='WORK-RESULT-1'
+    $targetedRecovery.ExpectedRowId='99999999-9999-4999-8999-999999999999'
+    $targetedRecovery.ExpectedResultStatus='blocked'
+    $wiredTargetedRecovery=New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $targetedRecovery
+    Assert-True 'new recovery context admits exact result-confirmed identity without enabling Execute' (
+        $wiredTargetedRecovery.expected_terminal_status -ceq 'result_confirmed' -and
+        $wiredTargetedRecovery.expected_work_id -ceq 'WORK-RESULT-1' -and
+        $wiredTargetedRecovery.expected_row_id -ceq '99999999-9999-4999-8999-999999999999' -and
+        $wiredTargetedRecovery.expected_result_status -ceq 'blocked' -and
+        $wiredTargetedRecovery.mode -ceq 'Observe'
+    )
     foreach($badRecoveryLimit in @('short_timeout','long_timeout','short_margin','long_margin','max_runs')){
         $badRecovery=$recoveryValues.Clone()
         switch($badRecoveryLimit){'short_timeout'{$badRecovery.TimeoutSeconds='240'};'long_timeout'{$badRecovery.TimeoutSeconds='600'};'short_margin'{$badRecovery.NaturalTriggerMarginSeconds='30'};'long_margin'{$badRecovery.NaturalTriggerMarginSeconds='61'};'max_runs'{$badRecovery.MaxRuns='20'}}
@@ -3445,6 +3592,8 @@ try {
     Assert-ThrowsCode 'new recovery context rejects Execute before mutation' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'ACTION_REQUIRES_OBSERVE_MODE'
     $badRecovery=$recoveryValues.Clone();$badRecovery.ExpectedWorkId='EXPIRED-OR-PRUNED'
     Assert-ThrowsCode 'new recovery context forbids any dispatch target replay' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+    $badRecovery=$targetedRecovery.Clone();$badRecovery.ExpectedResultStatus='missing'
+    Assert-ThrowsCode 'new recovery context rejects malformed result identity status' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'EXPECTED_RESULT_STATUS_INVALID'
     $badRecovery=$recoveryValues.Clone();$badRecovery.TimeoutSeconds='780'
     Assert-ThrowsCode 'new recovery context rejects impossible interval window' {New-CutoverContext -RequestedAction InstallObserveAndDrainFromDisabledExecute -Values $badRecovery} 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL'
     Assert-ThrowsCode 'normal Execute start rejects disabled recovery pin' {New-CutoverContext -RequestedAction StartAndAwait -Values $recoveryValues} 'ACTION_REQUIRES_EXECUTE_MODE'

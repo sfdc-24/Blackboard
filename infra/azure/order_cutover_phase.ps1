@@ -1426,19 +1426,41 @@ function Assert-CutoverCurrentTerminalRun {
         [Parameter(Mandatory = $true)]$ExactStatus,
         [Parameter(Mandatory = $true)]$LogCheckpoint,
         [Parameter(Mandatory = $true)][string]$ExpectedMode,
-        [Parameter(Mandatory = $true)][string]$ExpectedStatus
+        [Parameter(Mandatory = $true)][string]$ExpectedStatus,
+        [AllowEmptyString()][string]$ExpectedWorkId = '',
+        [AllowEmptyString()][string]$ExpectedRowId = '',
+        [AllowEmptyString()][string]$ExpectedResultStatus = ''
     )
     $lastPoll = Get-CutoverLastPoll -State $State -ExpectedMode $ExpectedMode -ExpectedUserProfile $Context.user_profile_path
     if ([string]$lastPoll.status -cne $ExpectedStatus) { Throw-Cutover -Code 'STATE_TERMINAL_STATUS_MISMATCH' }
     $entries = @(Get-CutoverTrailingLogRun -Path $Context.log_path -Checkpoint $LogCheckpoint -RunId ([string]$lastPoll.run_id))
     $runWindowEndUtc = [DateTime]::UtcNow
-    $null = Assert-CutoverLogRun `
+    $logTerminal = Assert-CutoverLogRun `
         -Entries $entries `
         -RunId ([string]$lastPoll.run_id) `
         -Status $ExpectedStatus `
+        -ExpectedWorkId $ExpectedWorkId `
+        -ExpectedRowId $ExpectedRowId `
+        -ExpectedResultStatus $ExpectedResultStatus `
         -ExpectedMode $ExpectedMode `
         -RunWindowStartUtc $ExactStatus.last_run_utc `
         -RunWindowEndUtc $runWindowEndUtc
+    $terminal = Assert-CutoverStateTerminal `
+        -State $State `
+        -ExpectedMode $ExpectedMode `
+        -ExpectedStatus $ExpectedStatus `
+        -ExpectedWorkId $ExpectedWorkId `
+        -ExpectedRowId $ExpectedRowId `
+        -ExpectedResultStatus $ExpectedResultStatus `
+        -ExpectedUserProfile $Context.user_profile_path
+    $resultDigest = ''
+    if ($ExpectedStatus -ceq 'result_confirmed') {
+        $resultDigest = if ($null -ne $logTerminal.details) { [string]$logTerminal.details.output_sha256 } else { '' }
+        if ($resultDigest -cnotmatch '^[0-9a-f]{64}$' -or
+            $resultDigest -cne [string]$terminal.output_sha256) {
+            Throw-Cutover -Code 'STATE_LOG_RESULT_DIGEST_MISMATCH'
+        }
+    }
     $pollStartedAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$entries[0].at) -Code 'LOG_CURRENT_RUN_INVALID'
     $statePollAtUtc = ConvertTo-CutoverUtcDateTime -Value ([string]$lastPoll.at) -Code 'STATE_LAST_POLL_INVALID'
     if ([Math]::Abs(($statePollAtUtc - $pollStartedAtUtc).TotalSeconds) -gt $script:CutoverClockToleranceSeconds) {
@@ -1448,6 +1470,7 @@ function Assert-CutoverCurrentTerminalRun {
         run_id = [string]$lastPoll.run_id
         last_run_utc = $ExactStatus.last_run_utc
         log_checkpoint = $LogCheckpoint
+        output_sha256 = $resultDigest
     }
 }
 
@@ -2312,7 +2335,25 @@ function Invoke-CutoverDrainObserve {
                 $previousRunId -cne [string]$AdmittedBaseline.run_id) {
                 Throw-Cutover -Code 'OBSERVE_DRAIN_ADMITTED_RUN_CHANGED'
             }
-            $null = Assert-CutoverStateTerminal -State $baselineState -ExpectedMode ([string]$baselineState.mode) -ExpectedStatus 'no_eligible_order' -ExpectedUserProfile $Context.user_profile_path
+            $admittedStatusProperty = $AdmittedBaseline.PSObject.Properties['baseline_status']
+            $admittedStatus = if ($null -eq $admittedStatusProperty -or [string]::IsNullOrEmpty([string]$admittedStatusProperty.Value)) { 'no_eligible_order' } else { [string]$admittedStatusProperty.Value }
+            $admittedWorkId = if ($null -eq $AdmittedBaseline.PSObject.Properties['work_id']) { '' } else { [string]$AdmittedBaseline.work_id }
+            $admittedRowId = if ($null -eq $AdmittedBaseline.PSObject.Properties['row_id']) { '' } else { [string]$AdmittedBaseline.row_id }
+            $admittedResultStatus = if ($null -eq $AdmittedBaseline.PSObject.Properties['result_status']) { '' } else { [string]$AdmittedBaseline.result_status }
+            $admittedOutputSha256 = if ($null -eq $AdmittedBaseline.PSObject.Properties['output_sha256']) { '' } else { [string]$AdmittedBaseline.output_sha256 }
+            $admittedStateTerminal = Assert-CutoverStateTerminal `
+                -State $baselineState `
+                -ExpectedMode ([string]$baselineState.mode) `
+                -ExpectedStatus $admittedStatus `
+                -ExpectedWorkId $admittedWorkId `
+                -ExpectedRowId $admittedRowId `
+                -ExpectedResultStatus $admittedResultStatus `
+                -ExpectedUserProfile $Context.user_profile_path
+            if ($admittedStatus -ceq 'result_confirmed' -and
+                ($admittedOutputSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                 [string]$admittedStateTerminal.output_sha256 -cne $admittedOutputSha256)) {
+                Throw-Cutover -Code 'OBSERVE_DRAIN_ADMITTED_RESULT_DIGEST_CHANGED'
+            }
             if ($stateResult.checkpoint.length -ne $AdmittedBaseline.state_checkpoint.length -or
                 $stateResult.checkpoint.sha256 -cne $AdmittedBaseline.state_checkpoint.sha256) {
                 Throw-Cutover -Code 'OBSERVE_DRAIN_ADMITTED_STATE_CHANGED'
@@ -3072,7 +3113,22 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
     # Never enable the old Execute definition: StartWhenAvailable may replay
     # missed work. The pinned no-stop installer replaces it with future Observe.
     if ($Context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
-    if ($Context.expected_terminal_status -or $Context.expected_work_id -or $Context.expected_row_id -or $Context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
+    $expectedBaselineStatus = 'no_eligible_order'
+    $targetedResult = $false
+    if ([string]::IsNullOrEmpty([string]$Context.expected_terminal_status)) {
+        if ($Context.expected_work_id -or $Context.expected_row_id -or $Context.expected_result_status) {
+            Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+        }
+    } elseif ([string]$Context.expected_terminal_status -ceq 'result_confirmed') {
+        $expectedBaselineStatus = 'result_confirmed'
+        $targetedResult = $true
+        if ($Context.expected_work_id -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$') { Throw-Cutover -Code 'EXPECTED_WORK_ID_INVALID' }
+        $rowGuid = [Guid]::Empty
+        if (-not [Guid]::TryParseExact([string]$Context.expected_row_id, 'D', [ref]$rowGuid)) { Throw-Cutover -Code 'EXPECTED_ROW_ID_INVALID' }
+        if (@('completed', 'blocked', 'rejected') -cnotcontains [string]$Context.expected_result_status) { Throw-Cutover -Code 'EXPECTED_RESULT_STATUS_INVALID' }
+    } else {
+        Throw-Cutover -Code 'EXPECTED_TERMINAL_STATUS_INVALID'
+    }
     if ($Context.expected_disabled_xml_sha256 -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
     Assert-CutoverDisabledObserveRecoveryLimits -Context $Context
     try {
@@ -3082,11 +3138,35 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
         if ($xml.enabled -or $xml.utf8_text_sha256 -cne $Context.expected_disabled_xml_sha256) { Throw-Cutover -Code 'DISABLED_TASK_XML_NOT_AUTHENTICATED' }
         if ($initial.last_run_utc.Year -le 1601) { Throw-Cutover -Code 'DISABLED_TASK_NEVER_RUN' }
         $state = Get-CutoverState -Path $Context.state_path
-        $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedUserProfile $Context.user_profile_path
-        if ([string]$baseline.status -cne 'no_eligible_order') { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
-        $null = Assert-CutoverStateTerminal -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedStatus 'no_eligible_order' -ExpectedUserProfile $Context.user_profile_path
+        $baselineMode = [string]$state.value.mode
+        if ($targetedResult -and $baselineMode -cne 'Execute') {
+            Throw-Cutover -Code 'DISABLED_RESULT_BASELINE_MODE_INVALID'
+        }
+        $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode $baselineMode -ExpectedUserProfile $Context.user_profile_path
+        if ([string]$baseline.status -cne $expectedBaselineStatus) { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
+        $terminal = Assert-CutoverStateTerminal `
+            -State $state.value `
+            -ExpectedMode $baselineMode `
+            -ExpectedStatus $expectedBaselineStatus `
+            -ExpectedWorkId ([string]$Context.expected_work_id) `
+            -ExpectedRowId ([string]$Context.expected_row_id) `
+            -ExpectedResultStatus ([string]$Context.expected_result_status) `
+            -ExpectedUserProfile $Context.user_profile_path
         $log = Get-CutoverLogCheckpoint -Path $Context.log_path
-        $currentRun = Assert-CutoverCurrentTerminalRun -Context $Context -State $state.value -ExactStatus $initial -LogCheckpoint $log -ExpectedMode ([string]$state.value.mode) -ExpectedStatus 'no_eligible_order'
+        $currentRunArguments = @{
+            Context = $Context
+            State = $state.value
+            ExactStatus = $initial
+            LogCheckpoint = $log
+            ExpectedMode = $baselineMode
+            ExpectedStatus = $expectedBaselineStatus
+        }
+        if ($targetedResult) {
+            $currentRunArguments.ExpectedWorkId = [string]$Context.expected_work_id
+            $currentRunArguments.ExpectedRowId = [string]$Context.expected_row_id
+            $currentRunArguments.ExpectedResultStatus = [string]$Context.expected_result_status
+        }
+        $currentRun = Assert-CutoverCurrentTerminalRun @currentRunArguments
         $protected = Get-CutoverProtectedSnapshot -Context $Context
         if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_OBSERVE_RECOVERY' }
         $preInstall = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode 'Execute' -ExpectedTaskState 'Disabled'
@@ -3116,7 +3196,19 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
         if (-not $handoffXml.enabled -or $handoffXml.normalized_sha256 -cne $observeXml.normalized_sha256) { Throw-Cutover -Code 'TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN' }
         Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_DRAIN'
         Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_OBSERVE_DRAIN'
-        $admitted = [pscustomobject]@{run_id=[string]$currentRun.run_id;last_run_utc=$initial.last_run_utc;state_checkpoint=$state.checkpoint;log_checkpoint=$log;protected_fingerprint=$protected;observe_definition_sha256=$observeXml.normalized_sha256}
+        $admitted = [pscustomobject]@{
+            run_id=[string]$currentRun.run_id
+            last_run_utc=$initial.last_run_utc
+            state_checkpoint=$state.checkpoint
+            log_checkpoint=$log
+            protected_fingerprint=$protected
+            observe_definition_sha256=$observeXml.normalized_sha256
+            baseline_status=$expectedBaselineStatus
+            work_id=$(if ($targetedResult) { [string]$terminal.work_id } else { '' })
+            row_id=$(if ($targetedResult) { [string]$terminal.row_id } else { '' })
+            result_status=$(if ($targetedResult) { [string]$Context.expected_result_status } else { '' })
+            output_sha256=$(if ($targetedResult) { [string]$terminal.output_sha256 } else { '' })
+        }
         $drain = Invoke-CutoverDrainObserve -Context $Context -Installer $Context.installer_path -AdmittedBaseline $admitted
         if ($drain.status -cne 'OBSERVE_DRAINED' -or $drain.final_worker_status -cne 'no_eligible_order') { Throw-Cutover -Code 'OBSERVE_RECOVERY_NOT_DRAINED' }
         if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_FINGERPRINT_CHANGED' }
@@ -3128,6 +3220,11 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
             authenticated_disabled_xml_sha256 = $xml.utf8_text_sha256; observe_xml_sha256 = $observeXml.utf8_text_sha256
             observe_start_boundary_utc = $startUtc.ToString('o'); backup_matches_authenticated_disabled_xml = $true
             state_and_log_preserved_through_install = $true; protected_fingerprints_unchanged = $true; state_not_restored = $true
+            baseline_status = $expectedBaselineStatus
+            recovered_work_id = $(if ($targetedResult) { [string]$terminal.work_id } else { '' })
+            recovered_row_id = $(if ($targetedResult) { [string]$terminal.row_id } else { '' })
+            recovered_result_status = $(if ($targetedResult) { [string]$Context.expected_result_status } else { '' })
+            recovered_output_sha256 = $(if ($targetedResult) { [string]$terminal.output_sha256 } else { '' })
             runs = $drain.runs; final_run_id = $drain.final_run_id; final_worker_status = $drain.final_worker_status
             final_last_run_utc = $drain.final_last_run_utc; log_appended_bytes = $drain.log_appended_bytes
         }
@@ -3408,7 +3505,24 @@ function New-CutoverContext {
     if (@('InstallObserveAndDrainFromDisabledExecute','InstallObserveReadyFromDisabledHttpError') -ccontains $RequestedAction) {
         if ($context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
         if ($disabledInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
-        if ($context.expected_terminal_status -or $context.expected_work_id -or $context.expected_row_id -or $context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
+        if ($RequestedAction -ceq 'InstallObserveAndDrainFromDisabledExecute') {
+            if ([string]::IsNullOrEmpty([string]$Values.ExpectedTerminalStatus)) {
+                if (-not [string]::IsNullOrEmpty($Values.ExpectedWorkId) -or
+                    -not [string]::IsNullOrEmpty($Values.ExpectedRowId) -or
+                    -not [string]::IsNullOrEmpty($Values.ExpectedResultStatus)) {
+                    Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+                }
+            } elseif ([string]$Values.ExpectedTerminalStatus -ceq 'result_confirmed') {
+                if ($Values.ExpectedWorkId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$') { Throw-Cutover -Code 'EXPECTED_WORK_ID_INVALID' }
+                $rowGuid = [Guid]::Empty
+                if (-not [Guid]::TryParseExact($Values.ExpectedRowId, 'D', [ref]$rowGuid)) { Throw-Cutover -Code 'EXPECTED_ROW_ID_INVALID' }
+                if (@('completed', 'blocked', 'rejected') -cnotcontains $Values.ExpectedResultStatus) { Throw-Cutover -Code 'EXPECTED_RESULT_STATUS_INVALID' }
+            } else {
+                Throw-Cutover -Code 'EXPECTED_TERMINAL_STATUS_INVALID'
+            }
+        } elseif ($context.expected_terminal_status -or $context.expected_work_id -or $context.expected_row_id -or $context.expected_result_status) {
+            Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'
+        }
         if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
         Assert-CutoverDisabledObserveRecoveryLimits -Context $context
         $context.expected_disabled_xml_sha256 = $disabledInput

@@ -507,7 +507,12 @@ Use the incident-only action
 independently read-back exact `ExpectedDisabledXmlSha256`. It authenticates the
 current candidate Disabled/Execute/result-0 definition and a fully consistent
 `no_eligible_order` state terminal plus current log/run before any mutation.
-`result_confirmed` is deliberately not admitted by this target-free action.
+If the disabled Execute baseline is instead a completed worker attempt, the same
+Observe-only recovery is admitted only when the caller supplies
+`ExpectedTerminalStatus=result_confirmed` plus the exact `ExpectedWorkId`,
+`ExpectedRowId`, and `ExpectedResultStatus`; the state success, cursor, durable
+work history, and append-only log all have to match that identity. A bare
+board-only target remains rejected.
 It then calls the same pinned release
 installer's `InstallFromDisabledNoStop` in Observe mode, replacing the old
 definition with a new future PT15M interval. The authenticated disabled XML is
@@ -545,10 +550,11 @@ Do not enable the old Execute definition to recover a missed interval.
 Production uses StartWhenAvailable, which can queue delayed catch-up work.
 The former proposed `StartAndAwaitFromDisabled` action is deliberately not
 admitted. This recovery has no target dispatch, timestamp or work/result identity
-inputs: it cannot replay an old command whose durable work was pruned, nor an
-identity that exists only as board CLAIM/RECEIPT/RESULT evidence. Observe cannot
-invoke Claude or append worker lifecycle rows even if a catch-up or unrelated
-fresh order is encountered.
+inputs unless the current disabled state and log already prove the exact
+`result_confirmed` identity: it cannot replay an old command whose durable work
+was pruned, nor an identity that exists only as board CLAIM/RECEIPT/RESULT
+evidence. Observe cannot invoke Claude or append worker lifecycle rows even if a
+catch-up or unrelated fresh order is encountered.
 
 The existing Observe drain proves every run's scheduler time, new run identity,
 append-only log and state/cursor/counter transition under one original total
