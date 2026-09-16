@@ -3459,6 +3459,17 @@ try {
         $script:WrapperSeenBaselineWork -ceq 'WORK-RESULT-1' -and
         $script:WrapperSeenBaselineDigest -ceq ('8'*64)
     )
+    Set-TestMock 'Get-CutoverState' {param($Path) [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status result_confirmed -WorkId 'WORK-RESULT-1' -RowId '99999999-9999-4999-8999-999999999999' -ResultStatus blocked);checkpoint=[pscustomobject]@{length=1;sha256=('a'*64)}}}
+    $script:ObserveRecoveryInstalled=$false
+    $beforeObserveModeInstalls=$script:ObserveRecoveryInstalls
+    $beforeObserveModeDrains=$script:ObserveRecoveryDrains
+    Assert-ThrowsCode 'Observe recovery rejects impossible Observe-mode result-confirmed baseline' {
+        Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $resultContext | Out-Null
+    } 'DISABLED_RESULT_BASELINE_MODE_INVALID'
+    Assert-True 'Observe-mode result baseline cannot install or drain' (
+        $script:ObserveRecoveryInstalls -eq $beforeObserveModeInstalls -and
+        $script:ObserveRecoveryDrains -eq $beforeObserveModeDrains
+    )
     Set-TestMock 'Assert-CutoverCurrentTerminalRun' {param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus) [pscustomobject]@{run_id=('a'*32)}}
     Set-TestMock 'Get-CutoverState' $savedRecoveryStateMock
     foreach($finalFailure in @('NATURAL_TRIGGER_WINDOW_UNAVAILABLE','TASK_CHANGED_BEFORE_OBSERVE_DRAIN','TASK_XML_CHANGED_BEFORE_OBSERVE_DRAIN')){

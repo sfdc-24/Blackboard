@@ -3138,11 +3138,15 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
         if ($xml.enabled -or $xml.utf8_text_sha256 -cne $Context.expected_disabled_xml_sha256) { Throw-Cutover -Code 'DISABLED_TASK_XML_NOT_AUTHENTICATED' }
         if ($initial.last_run_utc.Year -le 1601) { Throw-Cutover -Code 'DISABLED_TASK_NEVER_RUN' }
         $state = Get-CutoverState -Path $Context.state_path
-        $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode ([string]$state.value.mode) -ExpectedUserProfile $Context.user_profile_path
+        $baselineMode = [string]$state.value.mode
+        if ($targetedResult -and $baselineMode -cne 'Execute') {
+            Throw-Cutover -Code 'DISABLED_RESULT_BASELINE_MODE_INVALID'
+        }
+        $baseline = Get-CutoverLastPoll -State $state.value -ExpectedMode $baselineMode -ExpectedUserProfile $Context.user_profile_path
         if ([string]$baseline.status -cne $expectedBaselineStatus) { Throw-Cutover -Code 'DISABLED_BASELINE_NOT_HEALTHY' }
         $terminal = Assert-CutoverStateTerminal `
             -State $state.value `
-            -ExpectedMode ([string]$state.value.mode) `
+            -ExpectedMode $baselineMode `
             -ExpectedStatus $expectedBaselineStatus `
             -ExpectedWorkId ([string]$Context.expected_work_id) `
             -ExpectedRowId ([string]$Context.expected_row_id) `
@@ -3154,7 +3158,7 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
             State = $state.value
             ExactStatus = $initial
             LogCheckpoint = $log
-            ExpectedMode = ([string]$state.value.mode)
+            ExpectedMode = $baselineMode
             ExpectedStatus = $expectedBaselineStatus
         }
         if ($targetedResult) {
