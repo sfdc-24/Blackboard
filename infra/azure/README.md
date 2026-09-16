@@ -369,6 +369,20 @@ repair mode and cannot create, update, or delete Azure resources.
     This action never stops/registers a task or resets state. Failure uses the
     existing verified future-trigger disable cleanup. The no-eligible variant
     requires empty work, row, result and dispatch-time inputs.
+    Only the recovery no-eligible variant may drain already expired orders:
+    every intermediate must be independently validated `stale_order_ignored`
+    by the existing one-run acceptance machinery (unchanged work set, advancing
+    cursor/counters, exact task/run identity and append-only log). It is bounded
+    by `MaxRuns` and one original total execution deadline, never a fresh deadline
+    per poll, and must finish with exact `no_eligible_order`. Any other intermediate
+    fails closed. Result-confirmation and normal starts still run exactly once.
+    Recovery carries its admitted last-run and worker-run identities into the
+    actual execution gateway: a run during the enable-to-start handoff must not
+    become a replacement baseline. Disabled reads need no `NextRunTime`; enabled
+    reads still require the actual future timestamp. After enable, an abrupt
+    process loss cannot execute catch cleanup. Independently read destination
+    state and lifecycle evidence before any further command or promotion; do
+    not assume cleanup ran because a control-plane request ended.
 18. Run a second `StartAndAwait` for exact `no_eligible_order`. Require another
     `LastRunTime` and run-ID advance, no new lifecycle rows, and global canary
     counts still exactly `1/1/1`. Task result `0` alone is never acceptance.

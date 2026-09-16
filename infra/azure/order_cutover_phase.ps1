@@ -750,7 +750,10 @@ function Assert-CutoverInstallerStatus {
         Throw-Cutover -Code 'INSTALLER_STATUS_MISMATCH'
     }
     $last = ConvertTo-CutoverUtcDateTime -Value $Status.last_run_time -Code 'TASK_LAST_RUN_TIME_INVALID'
-    $next = ConvertTo-CutoverUtcDateTime -Value $Status.next_run_time -Code 'TASK_NEXT_RUN_TIME_INVALID'
+    $next = [DateTime]::MinValue
+    if ($ExpectedTaskState -cne 'Disabled') {
+        $next = ConvertTo-CutoverUtcDateTime -Value $Status.next_run_time -Code 'TASK_NEXT_RUN_TIME_INVALID'
+    }
     return [pscustomobject][ordered]@{
         raw = $Status
         last_run_utc = $last
@@ -817,11 +820,16 @@ function Get-CutoverTaskRuntime {
     }
     try { $info = Get-ScheduledTaskInfo -TaskName $script:CutoverTaskName -TaskPath $script:CutoverTaskPath -ErrorAction Stop }
     catch { Throw-Cutover -Code 'TASK_INFO_FAILED' }
+    return ConvertTo-CutoverTaskRuntimeInfo -State ([string]$matches[0].State) -Info $info
+}
+
+function ConvertTo-CutoverTaskRuntimeInfo {
+    param([Parameter(Mandatory = $true)][string]$State, [Parameter(Mandatory = $true)]$Info)
     return [pscustomobject][ordered]@{
-        state = [string]$matches[0].State
-        last_run_utc = (ConvertTo-CutoverUtcDateTime -Value $info.LastRunTime -Code 'TASK_LAST_RUN_TIME_INVALID')
-        next_run_utc = (ConvertTo-CutoverUtcDateTime -Value $info.NextRunTime -Code 'TASK_NEXT_RUN_TIME_INVALID')
-        last_task_result = [int64]$info.LastTaskResult
+        state = $State
+        last_run_utc = (ConvertTo-CutoverUtcDateTime -Value $Info.LastRunTime -Code 'TASK_LAST_RUN_TIME_INVALID')
+        next_run_utc = $(if ($State -ceq 'Disabled') { [DateTime]::MinValue } else { ConvertTo-CutoverUtcDateTime -Value $Info.NextRunTime -Code 'TASK_NEXT_RUN_TIME_INVALID' })
+        last_task_result = [int64]$Info.LastTaskResult
     }
 }
 
@@ -2962,9 +2970,19 @@ function Invoke-CutoverRestoreReady {
 }
 
 function Invoke-CutoverStartAndAwait {
-    param([Parameter(Mandatory = $true)]$Context)
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [DateTime]$RecoveryBaselineLastRunUtc = [DateTime]::MinValue,
+        [string]$RecoveryBaselineRunId = ''
+    )
     $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $Context.mode -ExpectedTaskState 'Ready'
     try {
+        $isRecovery = $Context.PSObject.Properties['action'] -and $Context.action -ceq 'StartAndAwaitFromDisabled'
+        if ($isRecovery -and
+            ($RecoveryBaselineLastRunUtc.Kind -ne [DateTimeKind]::Utc -or $RecoveryBaselineLastRunUtc.Year -lt 2000 -or
+             $RecoveryBaselineRunId -cnotmatch '^[a-f0-9]{32}$' -or $initial.last_run_utc.Ticks -ne $RecoveryBaselineLastRunUtc.Ticks)) {
+            Throw-Cutover -Code 'RECOVERY_BASELINE_CHANGED_BEFORE_GATEWAY'
+        }
         Assert-CutoverTriggerWindow -NextRunUtc $initial.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)
         $stateBefore = Get-CutoverState -Path $Context.state_path
         if ($stateBefore.value.mode -isnot [string] -or @('Observe', 'Execute') -cnotcontains [string]$stateBefore.value.mode) {
@@ -2974,6 +2992,9 @@ function Invoke-CutoverStartAndAwait {
             -State $stateBefore.value `
             -ExpectedMode ([string]$stateBefore.value.mode) `
             -ExpectedUserProfile $Context.user_profile_path
+        if ($isRecovery -and [string]$baselineLastPoll.run_id -cne $RecoveryBaselineRunId) {
+            Throw-Cutover -Code 'RECOVERY_BASELINE_CHANGED_BEFORE_GATEWAY'
+        }
         Assert-CutoverPinnedExecutables -Context $Context
         $protectedBefore = Get-CutoverProtectedSnapshot -Context $Context
         $logBefore = Get-CutoverLogCheckpoint -Path $Context.log_path
@@ -2987,18 +3008,40 @@ function Invoke-CutoverStartAndAwait {
             Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
         }
         $deadline = [DateTime]::UtcNow.AddSeconds($Context.timeout_seconds)
-        $run = Invoke-CutoverOneRun `
-            -Context $Context `
-            -Installer $Context.installer_path `
-            -ExpectedMode $Context.mode `
-            -DeadlineUtc $deadline `
-            -PreviousLastRunUtc $preStart.last_run_utc `
-            -PreviousRunId ([string]$baselineLastPoll.run_id) `
-            -LogBefore $logBefore `
-            -ExpectedStatus $Context.expected_terminal_status `
-            -ExpectedWorkId $Context.expected_work_id `
-            -ExpectedRowId $Context.expected_row_id `
-            -ExpectedResultStatus $Context.expected_result_status
+        $drainStale = $isRecovery -and $Context.expected_terminal_status -ceq 'no_eligible_order'
+        $runs = 0; $appendedBytes = [long]0
+        $previousLastRun = $preStart.last_run_utc
+        $previousRunId = [string]$baselineLastPoll.run_id
+        $logCheckpoint = $logBefore
+        while ($true) {
+            if ($drainStale -and ($runs -ge $Context.max_runs -or [DateTime]::UtcNow -ge $deadline)) { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_BOUND_EXCEEDED' }
+            $expectedStatus = if ($drainStale) { '' } else { $Context.expected_terminal_status }
+            $run = Invoke-CutoverOneRun `
+                -Context $Context `
+                -Installer $Context.installer_path `
+                -ExpectedMode $Context.mode `
+                -DeadlineUtc $deadline `
+                -PreviousLastRunUtc $previousLastRun `
+                -PreviousRunId $previousRunId `
+                -LogBefore $logCheckpoint `
+                -ExpectedStatus $expectedStatus `
+                -ExpectedWorkId $Context.expected_work_id `
+                -ExpectedRowId $Context.expected_row_id `
+                -ExpectedResultStatus $Context.expected_result_status
+            $runs++; $appendedBytes += $run.log_appended_bytes
+            if (-not $drainStale -or $run.status -ceq 'no_eligible_order') { break }
+            # OneRun independently proves stale LastRun/run identity, log,
+            # counter/cursor advance and unchanged work. No other intermediate
+            # status is allowed and the original total deadline never resets.
+            if ($run.status -cne 'stale_order_ignored') { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_INTERMEDIATE_INVALID' }
+            if ($runs -ge $Context.max_runs -or [DateTime]::UtcNow -ge $deadline) { Throw-Cutover -Code 'EXECUTE_STALE_DRAIN_BOUND_EXCEEDED' }
+            $previousLastRun = $run.last_run_utc
+            $previousRunId = $run.run_id
+            $logCheckpoint = $run.log_checkpoint
+            $nextReadback = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $Context.mode -ExpectedTaskState 'Ready'
+            if ($nextReadback.last_run_utc.Ticks -ne $previousLastRun.Ticks) { Throw-Cutover -Code 'TASK_CHANGED_BETWEEN_STALE_DRAIN_RUNS' }
+            Assert-CutoverTriggerWindow -NextRunUtc $nextReadback.next_run_utc -RequiredSeconds (($deadline - [DateTime]::UtcNow).TotalSeconds + $Context.natural_trigger_margin_seconds)
+        }
         $protectedAfter = Get-CutoverProtectedSnapshot -Context $Context
         if ($protectedAfter -cne $protectedBefore) { Throw-Cutover -Code 'PROTECTED_FINGERPRINT_CHANGED' }
         $receipt = [pscustomobject][ordered]@{
@@ -3019,10 +3062,14 @@ function Invoke-CutoverStartAndAwait {
             result_status = $Context.expected_result_status
             last_run_before_utc = $initial.last_run_utc.ToString('o')
             last_run_after_utc = $run.last_run_utc.ToString('o')
-            log_appended_bytes = $run.log_appended_bytes
+            log_appended_bytes = $appendedBytes
             log_prefix_preserved = $true
             protected_fingerprints_unchanged = $true
             isolation_residue_absent = $true
+        }
+        if ($drainStale) {
+            $receipt | Add-Member -NotePropertyName recovery_verified_runs -NotePropertyValue $runs
+            $receipt | Add-Member -NotePropertyName recovery_stale_orders_skipped -NotePropertyValue ($runs - 1)
         }
         $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
         return $receipt
@@ -3086,11 +3133,13 @@ function Invoke-CutoverStartAndAwaitFromDisabled {
         Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_ENABLE'
         if ((Get-CutoverProtectedSnapshot -Context $Context) -cne $protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_ENABLE' }
         Assert-CutoverPendingDispatchWindow -Context $Context -NowUtc (Get-CutoverUtcNow)
-        $receipt = Invoke-CutoverStartAndAwait -Context $Context
+        $receipt = Invoke-CutoverStartAndAwait -Context $Context -RecoveryBaselineLastRunUtc $initial.last_run_utc -RecoveryBaselineRunId ([string]$baseline.run_id)
         $receipt.action = 'StartAndAwaitFromDisabled'
         $receipt | Add-Member -NotePropertyName recovery_definition_preserved_except_enabled -NotePropertyValue $true
         $receipt | Add-Member -NotePropertyName recovery_state_and_log_preserved_before_start -NotePropertyValue $true
         $receipt | Add-Member -NotePropertyName recovery_disabled_xml_sha256 -NotePropertyValue $xml.utf8_text_sha256
+        # Validation only: serializing enforces the byte cap without mutating the
+        # typed receipt, which the command entry serializes again for delivery.
         $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
         return $receipt
     } catch {
