@@ -3104,6 +3104,48 @@ try {
     } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
 
     # The former disabled Execute enable/replay action is intentionally absent.
+    # A real drain delegates to the REAL OneRun. Drift is injected by its
+    # SECOND Ready read, after initial admission hashes already matched.
+    Reset-TestMocks
+    $firstStartContext=New-TestContext
+    $firstStartContext.mode='Observe';$firstStartContext.timeout_seconds=420
+    $firstStartContext.state_path=Join-Path $temporaryRoot 'first-start-state.json'
+    $firstStartContext.log_path=Join-Path $temporaryRoot 'first-start-events.jsonl'
+    $script:FirstStartContext=$firstStartContext
+    $script:FirstStartCleanState=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order
+    $script:FirstStartCleanLog=([pscustomobject]@{event='prior';run_id=('a'*32)}|ConvertTo-Json -Compress)+"`n"
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {param($Context,$Installer,$ExpectedModes) [pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}}
+    Set-TestMock 'Start-CutoverTask' {$script:FirstStartCalls++;throw 'TEST_FIRST_START_REACHED'}
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$AllowInheritedTaskResult)
+        $script:FirstStartReadyReads++
+        if($script:FirstStartReadyReads -eq 2){
+            if($script:FirstStartDrift -ceq 'state'){
+                $s=New-TestState -Mode Observe -RunId ('a'*32) -Status no_eligible_order;$s.counts.polls++
+                [IO.File]::WriteAllText($script:FirstStartContext.state_path,($s|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+            }elseif($script:FirstStartDrift -ceq 'log'){
+                [IO.File]::AppendAllText($script:FirstStartContext.log_path,('{"event":"unexpected","run_id":"'+('b'*32)+'"}'+"`n"),(New-Object Text.UTF8Encoding($false)))
+            }
+        }
+        New-TestExactStatus
+    }
+    foreach($firstStartDrift in @('none','state','log')){
+        $script:FirstStartDrift=$firstStartDrift;$script:FirstStartReadyReads=0;$script:FirstStartCalls=0
+        [IO.File]::WriteAllText($firstStartContext.state_path,($script:FirstStartCleanState|ConvertTo-Json -Depth 10),(New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($firstStartContext.log_path,$script:FirstStartCleanLog,(New-Object Text.UTF8Encoding($false)))
+        $firstStartAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path)}
+        $firstStartCode=switch($firstStartDrift){'state'{'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'};'log'{'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'};default{'TEST_FIRST_START_REACHED'}}
+        Assert-ThrowsCode ('real drain and OneRun first-start interleaving '+$firstStartDrift) {Invoke-CutoverDrainObserve -Context $firstStartContext -Installer $firstStartContext.installer_path -AdmittedBaseline $firstStartAdmission} $firstStartCode
+        Assert-True ('first-start '+$firstStartDrift+' starts only the unchanged positive baseline') ($script:FirstStartCalls -eq $(if($firstStartDrift -ceq 'none'){1}else{0}))
+    }
+    foreach($boundaryTiming in @('deadline','trigger')){
+        $script:FirstStartCalls=0
+        $timingAdmission=[pscustomobject]@{run_id=('a'*32);last_run_utc=(New-TestExactStatus).last_run_utc;state_checkpoint=(Get-CutoverState -Path $firstStartContext.state_path).checkpoint;log_checkpoint=(Get-CutoverLogCheckpoint -Path $firstStartContext.log_path);next_run_utc=$(if($boundaryTiming -ceq 'trigger'){[DateTime]::UtcNow.AddSeconds(-1)}else{(New-TestExactStatus).next_run_utc})}
+        $timingDeadline=if($boundaryTiming -ceq 'deadline'){[DateTime]::UtcNow.AddSeconds(-1)}else{[DateTime]::UtcNow.AddSeconds(420)}
+        $timingCode=if($boundaryTiming -ceq 'deadline'){'OBSERVE_FIRST_START_DEADLINE_EXCEEDED'}else{'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'}
+        Assert-ThrowsCode ('real OneRun rechecks '+$boundaryTiming+' after checkpoint reads') {Invoke-CutoverOneRun -Context $firstStartContext -Installer $firstStartContext.installer_path -ExpectedMode Observe -DeadlineUtc $timingDeadline -PreviousLastRunUtc $timingAdmission.last_run_utc -PreviousRunId ('a'*32) -LogBefore $timingAdmission.log_checkpoint -AdmittedBaseline $timingAdmission} $timingCode
+        Assert-True ('expired '+$boundaryTiming+' cannot start Observe') ($script:FirstStartCalls -eq 0)
+    }
+
     # The new recovery installs Observe; even fresh unrelated work cannot infer
     # or append worker lifecycle rows. The existing Execute gateway stays single.
     Reset-TestMocks
@@ -3117,6 +3159,7 @@ try {
     Assert-ThrowsCode 'future definition rejects stale boundary before drain' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('2099-01-01T00:00:00Z','2026-01-01T00:00:00Z')) -Context $futureContext} 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
     Assert-ThrowsCode 'future definition rejects non-fifteen-minute interval' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('PT15M','PT5M')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
     Assert-ThrowsCode 'future definition rejects unexpected registration trigger' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<BootTrigger id="AtBoot"/>','<RegistrationTrigger/>')) -Context $futureContext} 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
+    Assert-ThrowsCode 'future definition enforces production StartWhenAvailable true' {Assert-CutoverFutureObserveDefinition -Text ($futureXml.Replace('<StartWhenAvailable>true</StartWhenAvailable>','<StartWhenAvailable>false</StartWhenAvailable>')) -Context $futureContext} 'OBSERVE_RECOVERY_SETTINGS_INVALID'
 
     $context = New-TestContext
     $context.mode='Observe';$context.timeout_seconds=420;$context.max_runs=8

@@ -517,6 +517,12 @@ After the protected-tree and backup reads, it rechecks the exact Ready run and
 full remaining trigger window. The admitted scheduler LastRunTime, run ID and
 state/log checkpoints are carried into the real drain; an intervening run or
 checkpoint change is rejected before starting a run, never adopted as a baseline.
+The first real OneRun rechecks the original state/log hashes after the drain's
+last Ready read, directly before Start. It then rechecks the remaining total
+deadline and natural-trigger window after those hash reads. This binding applies
+only to the first recovery start; later stale iterations retain the established
+per-run transition and log-prefix contract. Future Observe XML must explicitly
+contain exactly one StartWhenAvailable setting with value true.
 
 Do not enable the old Execute definition to recover a missed interval.
 Production uses StartWhenAvailable, which can queue delayed catch-up work.

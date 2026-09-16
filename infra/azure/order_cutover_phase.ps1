@@ -1991,7 +1991,8 @@ function Invoke-CutoverOneRun {
         [AllowEmptyString()][string]$ExpectedStatus = '',
         [AllowEmptyString()][string]$ExpectedWorkId = '',
         [AllowEmptyString()][string]$ExpectedRowId = '',
-        [AllowEmptyString()][string]$ExpectedResultStatus = ''
+        [AllowEmptyString()][string]$ExpectedResultStatus = '',
+        $AdmittedBaseline = $null
     )
     $beforeStateResult = Get-CutoverState -Path $Context.state_path
     $beforeState = $beforeStateResult.value
@@ -2001,6 +2002,18 @@ function Invoke-CutoverOneRun {
         -ExpectedUserProfile $Context.user_profile_path
     if ([string]$beforeLastPoll.run_id -cne $PreviousRunId) {
         Throw-Cutover -Code 'STATE_BASELINE_RUN_ID_MISMATCH'
+    }
+    if ($null -ne $AdmittedBaseline) {
+        if ($ExpectedMode -cne 'Observe' -or $PreviousRunId -cne [string]$AdmittedBaseline.run_id -or
+            $PreviousLastRunUtc.Ticks -ne $AdmittedBaseline.last_run_utc.Ticks) {
+            Throw-Cutover -Code 'OBSERVE_FIRST_START_ADMISSION_INVALID'
+        }
+        # The drain's native Ready read may be slow. Recheck original hashes
+        # HERE, after that read and this state read, immediately before start.
+        Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_OBSERVE_FIRST_START'
+        Assert-CutoverFileCheckpointUnchanged -Before $AdmittedBaseline.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_OBSERVE_FIRST_START'
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { Throw-Cutover -Code 'OBSERVE_FIRST_START_DEADLINE_EXCEEDED' }
+        Assert-CutoverTriggerWindow -NextRunUtc $AdmittedBaseline.next_run_utc -RequiredSeconds ([Math]::Ceiling(($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds) + $Context.natural_trigger_margin_seconds)
     }
     $runWindowStartUtc = [DateTime]::UtcNow
     Start-CutoverTask
@@ -2300,6 +2313,10 @@ function Invoke-CutoverDrainObserve {
         $previousLastRun = $preStart.last_run_utc
         $firstLastRun = $previousLastRun
         $deadline = [DateTime]::UtcNow.AddSeconds($Context.timeout_seconds)
+        $firstStartAdmission = $null
+        if ($null -ne $AdmittedBaseline) {
+            $firstStartAdmission = [pscustomobject]@{run_id=$AdmittedBaseline.run_id;last_run_utc=$AdmittedBaseline.last_run_utc;state_checkpoint=$AdmittedBaseline.state_checkpoint;log_checkpoint=$AdmittedBaseline.log_checkpoint;next_run_utc=$preStart.next_run_utc}
+        }
         $runs = 0
         $appendedBytes = [long]0
         while ($runs -lt $Context.max_runs -and [DateTime]::UtcNow -lt $deadline) {
@@ -2310,7 +2327,8 @@ function Invoke-CutoverDrainObserve {
                 -DeadlineUtc $deadline `
                 -PreviousLastRunUtc $previousLastRun `
                 -PreviousRunId $previousRunId `
-                -LogBefore $logCheckpoint
+                -LogBefore $logCheckpoint `
+                -AdmittedBaseline $(if ($runs -eq 0) { $firstStartAdmission } else { $null })
             $runs++
             $previousLastRun = $run.last_run_utc
             $previousRunId = $run.run_id
@@ -3011,6 +3029,8 @@ function Assert-CutoverFutureObserveDefinition {
     $triggers = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*'))
     $starts = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="StartBoundary"]'))
     $intervals = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*[local-name()="TimeTrigger"]/*[local-name()="Repetition"]/*[local-name()="Interval"]'))
+    $catchup = @($doc.SelectNodes('/*[local-name()="Task"]/*[local-name()="Settings"]/*[local-name()="StartWhenAvailable"]'))
+    if ($catchup.Count -ne 1 -or $catchup[0].InnerText -cne 'true') { Throw-Cutover -Code 'OBSERVE_RECOVERY_SETTINGS_INVALID' }
     if ($triggers.Count -ne 2 -or @($triggers | Where-Object { $_.LocalName -ceq 'BootTrigger' }).Count -ne 1 -or
         $starts.Count -ne 1 -or $intervals.Count -ne 1 -or $intervals[0].InnerText -cne 'PT15M') {
         Throw-Cutover -Code 'OBSERVE_RECOVERY_TRIGGER_SHAPE_INVALID'
