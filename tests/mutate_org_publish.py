@@ -3,22 +3,27 @@
 
 WHY THIS EXISTS
 ---------------
-The publisher decides what leaves a private org for a public repository, and
-what numbers a page states about data a reader cannot check. Its suite reports
-passed=65 failed=0, which on its own is compatible with a suite that cannot
-fail at all. This breaks the publisher eight ways on a COPY of the tree and
-requires the suite to go red on the assertion that NAMES each defect.
+Two files decide what the public page says: scripts/org_publish.py, which
+decides what may leave a private org for a world-readable repository, and
+scripts/org_diff_guard.py, which decides whether a build may be published at
+all. Their suite reports passed=82 failed=0, which on its own is equally
+consistent with a suite that cannot fail. This breaks both files on a COPY of
+the tree and requires the suite to go red on the assertion that NAMES each
+defect.
 
-It has already earned its place once. The suite's first run failed five
-assertions and they were right: project() checked the row it had just built
-rather than the raw record, so an unlisted field coming out of the org was
-silently dropped instead of refused. Safe by accident - the field never
-reached the file - but a drifted SELECT would have sailed through unnoticed.
+It has already earned its place twice. The suite's first run failed five
+assertions and was right: project() checked the row it had just built rather
+than the raw record, so an unlisted field coming out of the org was silently
+dropped instead of refused - safe by accident, and blind to a drifted SELECT.
+Then this harness itself reported ten unproven mutations, because the mutant
+tree was missing org_diff_guard.py once the suite started importing it. A
+mutation control that cannot build the tree proves nothing about the code.
 
-Two of the cases below are not leaks at all but WRONG NUMBERS: an industry
-bucket quietly dropped, a largest-deal figure computed over the wrong set.
-Those matter as much here. A page that states a total nobody can reconcile is
-the failure this project keeps paying for.
+Not every case is a leak. Two are WRONG NUMBERS - an industry bucket quietly
+dropped, a largest-deal figure taken over the wrong set - and one is a guard
+that treats an unreadable live page as an empty org. A page that states a
+total nobody can reconcile, and a build that publishes over something it could
+not read, are the two failures this project keeps paying for.
 
 Run:  python tests/mutate_org_publish.py     (from anywhere)
 """
@@ -33,20 +38,29 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SOURCE = os.path.join(REPO, "scripts", "org_publish.py")
+GUARD = os.path.join(REPO, "scripts", "org_diff_guard.py")
 RAIL = os.path.join(REPO, "scripts", "sf360.py")
 SUITE = os.path.join(HERE, "test_org_publish.py")
 FIXTURE = os.path.join(HERE, "fixtures", "org_desk_published_20260917.json")
 
-# (name, old, new, the assertion that MUST be the one to fail)
+# Built rather than written literally: a doubled backslash in a source edit has
+# been collapsed by the tooling on this box before, which turns an anchor into
+# text that matches nothing and reports a covered behaviour as uncovered.
+BS = chr(92)
+NEWLINE_KWARG = 'newline="' + BS + 'n"'
+
+# (name, file, old, new, the assertion that MUST be the one to fail)
 MUTATIONS = [
     (
         "an unlisted field out of the org is dropped instead of refused",
+        "org_publish.py",
         "    extra = set(record) - allowed\n    if extra:",
         "    extra = set()\n    if extra:",
         "an unlisted field is refused, not stripped",
     ),
     (
         "accounts with no industry vanish from the breakdown",
+        "org_publish.py",
         '        key = account.get("Industry") or NO_INDUSTRY\n'
         "        by_industry[key] = by_industry.get(key, 0) + 1",
         '        key = account.get("Industry")\n'
@@ -56,18 +70,21 @@ MUTATIONS = [
     ),
     (
         "closed-lost counts every deal that was not won",
+        "org_publish.py",
         '    lost = [o for o in opportunities if o["IsClosed"] and not o["IsWon"]]',
         '    lost = [o for o in opportunities if not o["IsWon"]]',
         "matches the published lost_count",
     ),
     (
         "the largest deal is taken over closed ones too",
+        "org_publish.py",
         '        ("largest_open", float(max([_amount(o) for o in open_opps] or [0]))),',
         '        ("largest_open", float(max([_amount(o) for o in opportunities] or [0]))),',
         "matches the published largest_open",
     ),
     (
         "the withheld-field sweep stops at the top level",
+        "org_publish.py",
         "    elif isinstance(payload, list):\n"
         "        for index, item in enumerate(payload[:200]):\n"
         '            scan_for_withheld(item, "%s[%d]" % (path, index))',
@@ -77,21 +94,38 @@ MUTATIONS = [
     ),
     (
         "a truncated read is published as if it were the whole org",
+        "org_publish.py",
         '        if result.get("truncated"):',
         "        if False:",
         "a capped read refuses to publish a partial org",
     ),
     (
         "org.js and org.json are serialised separately and can disagree",
-        "    return body + \"\\n\", JS_HEADER + body + \";\\n\"",
-        "    return body + \"\\n\", JS_HEADER + json.dumps(payload) + \";\\n\"",
+        "org_publish.py",
+        '    return body + "' + BS + 'n", JS_HEADER + body + ";' + BS + 'n"',
+        '    return body + "' + BS + 'n", JS_HEADER + json.dumps(payload) + ";' + BS + 'n"',
         "org.js carries byte-identical json to org.json",
     ),
     (
         "the snapshot claims an api version it did not call",
+        "org_publish.py",
         '        ("api", "v" + str(config.get("api_version", sf360.DEFAULT_API_VERSION))),',
         '        ("api", "v62.0"),',
         "meta reports the api version the session used, not a literal",
+    ),
+    (
+        "the guard stops noticing that records disappeared",
+        "org_diff_guard.py",
+        '            shrank.append("%s %d -> %d" % (section, before, after))',
+        "            pass",
+        "a shrink refuses the publish",
+    ),
+    (
+        "an unreadable live page is treated as an empty org",
+        "org_diff_guard.py",
+        "            % (label, path, exc))\n        return None",
+        "            % (label, path, exc))\n        return {}",
+        "an unreadable live page is UNKNOWN, not empty",
     ),
 ]
 
@@ -106,13 +140,15 @@ def run_suite(tree):
     return proc.returncode, failures, proc.stdout, proc.stderr
 
 
-def build_tree(source_text):
+def build_tree(texts):
+    """texts maps a script filename to its (possibly mutated) contents."""
     tree = tempfile.mkdtemp(prefix="org-publish-mutant-")
     os.makedirs(os.path.join(tree, "scripts"))
     os.makedirs(os.path.join(tree, "tests", "fixtures"))
-    with open(os.path.join(tree, "scripts", "org_publish.py"), "w",
-              encoding="utf-8", newline="\n") as fh:
-        fh.write(source_text)
+    for name, body in texts.items():
+        with open(os.path.join(tree, "scripts", name), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
     shutil.copyfile(RAIL, os.path.join(tree, "scripts", "sf360.py"))
     shutil.copyfile(SUITE, os.path.join(tree, "tests", "test_org_publish.py"))
     shutil.copyfile(FIXTURE, os.path.join(tree, "tests", "fixtures",
@@ -121,13 +157,15 @@ def build_tree(source_text):
 
 
 def main():
-    with open(SOURCE, encoding="utf-8") as fh:
-        original = fh.read()
+    originals = {}
+    for path in (SOURCE, GUARD):
+        with open(path, encoding="utf-8") as fh:
+            originals[os.path.basename(path)] = fh.read()
 
     bad = 0
 
     print("== control: the unmutated copy must pass ==")
-    tree = build_tree(original)
+    tree = build_tree(dict(originals))
     try:
         code, failures, out, err = run_suite(tree)
     finally:
@@ -141,15 +179,17 @@ def main():
         print(err[-1500:])
 
     print("== mutations: each must fail the assertion that names it ==")
-    for name, old, new, expected in MUTATIONS:
-        occurrences = original.count(old)
+    for name, filename, old, new, expected in MUTATIONS:
+        occurrences = originals[filename].count(old)
         if occurrences != 1:
             bad += 1
-            print("  FAIL %s  --> the anchor text occurs %d times, not once; "
-                  "org_publish.py changed and this case no longer edits what it "
-                  "claims" % (name, occurrences))
+            print("  FAIL %s  --> the anchor occurs %d times in %s, not once; "
+                  "the file changed and this case no longer edits what it claims"
+                  % (name, occurrences, filename))
             continue
-        tree = build_tree(original.replace(old, new))
+        texts = dict(originals)
+        texts[filename] = originals[filename].replace(old, new)
+        tree = build_tree(texts)
         try:
             code, failures, out, err = run_suite(tree)
         finally:

@@ -105,32 +105,11 @@ jobs:
       - name: Say what this run would change
         run: |
           set -euo pipefail
-          curl -fsS --max-time 30 https://www.sfdc24.com/data/org.json -o live-org.json \
-            || { echo "could not read the live page; treating this as unknown, not as zero"; exit 1; }
-          ALLOW_SHRINK="${{ inputs.allow_shrink }}" python3 - <<'PY'
-          import json, os, sys
-          live = json.load(open("live-org.json", encoding="utf-8"))
-          new = json.load(open("build/data/org.json", encoding="utf-8"))
-          allow = os.environ.get("ALLOW_SHRINK", "false") == "true"
-          print("live page generated %s, this build %s"
-                % (live["_meta"]["generated"], new["_meta"]["generated"]))
-          shrank = []
-          for section, count in new["_meta"]["counts"].items():
-              before = live["_meta"]["counts"].get(section)
-              arrow = "unchanged" if before == count else "%s -> %s" % (before, count)
-              print("  %-14s %s" % (section, arrow))
-              if isinstance(before, int) and count < before:
-                  shrank.append("%s %d -> %d" % (section, before, count))
-          for key in ("pipeline_open", "closed_won"):
-              print("  %-14s %s -> %s" % (key, live["summary"].get(key),
-                                          new["summary"].get(key)))
-          if shrank and not allow:
-              print("REFUSING: records disappeared since the live page: "
-                    + "; ".join(shrank), file=sys.stderr)
-              print("If that is genuinely what the org now holds, re-run with "
-                    "allow_shrink checked.", file=sys.stderr)
-              sys.exit(1)
-          PY
+          curl -fsS --max-time 30 --retry 2 https://www.sfdc24.com/data/org.json -o live-org.json
+          python3 scripts/org_diff_guard.py \
+            --live live-org.json \
+            --built build/data/org.json \
+            ${{ inputs.allow_shrink && '--allow-shrink' || '' }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:

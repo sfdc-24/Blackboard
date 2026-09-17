@@ -33,7 +33,9 @@ WHAT THIS SUITE DOES NOT PROVE
 RUN
   python3 tests/test_org_publish.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -48,6 +50,14 @@ spec = importlib.util.spec_from_file_location(
     "org_publish_mod", os.path.join(SCRIPTS, "org_publish.py"))
 op = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(op)
+
+_guard_spec = importlib.util.spec_from_file_location(
+    "org_diff_guard_mod", os.path.join(SCRIPTS, "org_diff_guard.py"))
+guard_mod = importlib.util.module_from_spec(_guard_spec)
+_guard_spec.loader.exec_module(guard_mod)
+
+# Sentinel for "write a file that is not JSON", distinct from "no file at all".
+RAW_TEXT_MARKER = object()
 
 PASS = 0
 FAIL = 0
@@ -298,6 +308,89 @@ try:
           os.path.dirname(json_path) == os.path.dirname(js_path))
     check("the written json round-trips to the same structure",
           json.load(open(json_path, encoding="utf-8"))["summary"]["opportunities"] == 3)
+
+    # ----------------------------------------------------------------------
+    print("== the guard that decides whether publishing is allowed at all ==")
+
+    def guard(live_obj, built_obj, allow=False):
+        """Run org_diff_guard.main over two snapshots; return (code, out, err)."""
+        live_path = os.path.join(TMP, "live.json")
+        built_path = os.path.join(TMP, "built.json")
+        for path, obj in ((live_path, live_obj), (built_path, built_obj)):
+            if obj is RAW_TEXT_MARKER:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("{not json at all")
+            elif obj is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(obj, fh)
+        argv = ["--live", live_path, "--built", built_path]
+        if allow:
+            argv.append("--allow-shrink")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = guard_mod.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def snapshot(accounts, contacts, opportunities, generated="2026-09-17T22:00:00Z",
+                 pipeline=0.0):
+        return {"_meta": {"generated": generated,
+                          "counts": {"accounts": accounts, "contacts": contacts,
+                                     "opportunities": opportunities}},
+                "summary": {"pipeline_open": pipeline, "closed_won": 0.0}}
+
+    code, out, err = guard(snapshot(29, 26, 32), snapshot(29, 26, 32))
+    check("an unchanged org publishes", code == guard_mod.OK, (code, err))
+    check("the report says what was compared", "unchanged at 29" in out, out)
+
+    code, out, err = guard(snapshot(29, 26, 32), snapshot(31, 30, 40))
+    check("growth publishes without asking", code == guard_mod.OK, (code, err))
+    check("growth is still reported", "29 -> 31" in out, out)
+
+    code, out, err = guard(snapshot(29, 26, 32), snapshot(9, 1, 0))
+    check("a shrink refuses the publish", code == guard_mod.REFUSED, (code, out))
+    check("the refusal names every section that lost records",
+          all(s in err for s in ("accounts 29 -> 9", "contacts 26 -> 1",
+                                 "opportunities 32 -> 0")), err)
+    check("the refusal says how to override it", "allow_shrink" in err, err)
+
+    code, out, err = guard(snapshot(29, 26, 32), snapshot(9, 1, 0), allow=True)
+    check("allow_shrink publishes the smaller org", code == guard_mod.OK, (code, err))
+    check("and says out loud that it did",
+          "publishing a smaller org" in out, out)
+
+    dropped = snapshot(29, 26, 32)
+    del dropped["_meta"]["counts"]["opportunities"]
+    code, out, err = guard(snapshot(29, 26, 32), dropped)
+    check("a section that disappears entirely is a shrink",
+          code == guard_mod.REFUSED and "disappeared" in err, (code, err))
+
+    grown = snapshot(29, 26, 32)
+    grown["_meta"]["counts"]["cases"] = 12
+    code, out, err = guard(snapshot(29, 26, 32), grown)
+    check("a brand new section is not a shrink", code == guard_mod.OK, (code, err))
+    check("the new section is called out", "new section" in out, out)
+
+    code, out, err = guard(None, snapshot(9, 1, 0))
+    check("an unreadable live page is UNKNOWN, not empty",
+          code == guard_mod.UNREADABLE, (code, err))
+    check("and it says so in those terms",
+          "not a page with nothing on it" in err, err)
+    code, out, err = guard(RAW_TEXT_MARKER, snapshot(9, 1, 0))
+    check("a malformed live page is also unknown", code == guard_mod.UNREADABLE, code)
+
+    # The real case, with the real fixture: what a scheduled run would have hit
+    # on 2026-09-17 while the org was being re-seeded.
+    today = {"_meta": {"generated": "2026-09-17T22:14:42Z",
+                       "counts": {"accounts": 9, "contacts": 1, "opportunities": 0}},
+             "summary": {"pipeline_open": 0.0, "closed_won": 0.0}}
+    code, out, err = guard(PUBLISHED, today)
+    check("the live page versus the re-seeded org is refused",
+          code == guard_mod.REFUSED, (code, out))
+    check("the report shows the pipeline going to zero",
+          "2155000.0 -> 0.0" in out, out)
 
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
