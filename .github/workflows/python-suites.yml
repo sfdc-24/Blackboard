@@ -38,6 +38,9 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "scripts/sf360.py"
+      - "tests/test_sf360.py"
+      - "tests/mutate_sf360.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -57,6 +60,9 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "scripts/sf360.py"
+      - "tests/test_sf360.py"
+      - "tests/mutate_sf360.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -91,7 +97,8 @@ jobs:
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
-                   tests/test_board_governor.py; do
+                   tests/test_board_governor.py tests/test_sf360.py \
+                   tests/mutate_sf360.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -169,6 +176,32 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The sf360 rail into the Salesforce dev org. Every Salesforce call in
+      # the suite is driven by a fake opener, so no org, credential or network
+      # is involved - but it binds a REAL socket on 127.0.0.1 to exercise the
+      # proxy the browser will talk to, so it needs loopback and nothing else.
+      #
+      # The mutation control runs in the same step and is the part that makes
+      # the suite's passed=114 mean something: it breaks the rail eight ways on
+      # a copy of the tree - prefix-matched CORS origins, a read-only guard that
+      # accepts DELETE, a proxy route that runs caller-supplied SOQL, a token
+      # cache that writes the client secret - and requires the suite to fail on
+      # the assertion that NAMES each one. A suite that cannot fail is not a test.
+      - name: sf360 read-only rail and its mutation control (isolated loopback)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_sf360.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- bash -c '
+              set -euo pipefail
+              ip link set lo up
+              "$1" tests/test_sf360.py
+              exec "$1" tests/mutate_sf360.py
+            ' _ "$python_bin"
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bus suite starts its own server and scratch database. Enable only
       # loopback in a fresh namespace, and retain setup-python's exact binary
       # across sudo rather than silently switching to the system interpreter.
@@ -190,7 +223,8 @@ jobs:
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
-             && [ ! -f tests/test_board_governor.py ]; then
+             && [ ! -f tests/test_board_governor.py ] \
+             && [ ! -f tests/test_sf360.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
