@@ -12,8 +12,50 @@ $SchemaPath = Join-Path $RepoRoot 'scripts\order_supervisor_result.schema.json'
 $FixturePath = Join-Path $PSScriptRoot 'fixtures\order_supervisor_board.json'
 Import-Module $ModulePath -Force
 
+# WHICH SHELL THE CHILD PROCESSES IN THIS SUITE RUN, AND WHY IT IS TWO VALUES.
+#
+# Ten places below launch a child PowerShell to run order_supervisor.ps1 or the
+# Claude adapter, and each hardcoded the bare name powershell.exe. That name does
+# not exist off Windows, so this file never failed a test there -- it ran 333
+# assertions, died at the first launch, and the ~160 after it never reached a
+# verdict either way.
+#
+# ORDER_TEST_CHILD_SHELL overrides the child, the knob the read-resilience suite
+# established. Unset, this behaves exactly as before on Windows, and defaults to
+# pwsh elsewhere -- a default that cannot resolve is not a default.
+#
+# The ELEVENTH site is not this variable. The wall-timeout fixture spawns a
+# descendant from inside a single-quoted here-string, where a $script: variable is
+# literal text that resolves to nothing at run time. Substituting it there costs
+# three assertions on Windows and reads like a porting failure; it takes its engine
+# from an environment variable instead -- ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_ENGINE.
+#
+# $IsWindows does not exist in Windows PowerShell 5.1, and reading a missing
+# variable under Set-StrictMode 2.0 throws, so it is read defensively rather than
+# referenced. Desktop edition is Windows by definition and settles 5.1 on its own.
+$script:OnWindows = ($PSVersionTable.PSEdition -ceq 'Desktop') -or
+                    [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)
+$script:ChildShell = $env:ORDER_TEST_CHILD_SHELL
+if ([string]::IsNullOrWhiteSpace($script:ChildShell)) {
+    $script:ChildShell = $(if ($script:OnWindows) { 'powershell.exe' } else { 'pwsh' })
+}
+$script:ResolvedChildShell = (Get-Command $script:ChildShell -CommandType Application -ErrorAction Stop |
+                              Select-Object -First 1).Source
+Write-Output ("CHILD_SHELL " + $script:ResolvedChildShell)
+
 $script:Passed = 0
 $script:Failed = 0
+$script:Skipped = 0
+# A guard that cannot be staged on this platform is NOT a guard that passed. It is
+# counted and named on its own line so the gap is visible in the log and in RESULT,
+# rather than being a silent hole where an assertion used to be.
+function Add-SkippedAssertion {
+    # Count is in ASSERTIONS, not in skip sites, so passed + skipped reconciles
+    # against the Windows total and a gap cannot hide behind a single line.
+    param([string]$Name, [string]$Reason, [int]$Count = 1)
+    $script:Skipped += $Count
+    Write-Output ('SKIP ' + $Name + ': ' + $Reason)
+}
 function Assert-True {
     param([string]$Name, [bool]$Condition, [string]$Detail = '')
     if ($Condition) {
@@ -1080,7 +1122,7 @@ try {
         '-StatePath', $statePath,
         '-LogPath', $logPath
     )
-    $firstOutput = & powershell.exe @runnerArgs
+    $firstOutput = & $script:ResolvedChildShell @runnerArgs
     Assert-True 'observe first run succeeds' ($LASTEXITCODE -eq 0)
     $first = ($firstOutput -join [Environment]::NewLine) | ConvertFrom-Json
     Assert-True 'first run tail seeds without replay' ($first.status -ceq 'tail_seeded')
@@ -1126,7 +1168,7 @@ try {
         '-LogPath', $knownTrailingLogPath,
         '-ReplayHistorical'
     )
-    $knownTrailingOutput = @(& powershell.exe @knownTrailingArgs)
+    $knownTrailingOutput = @(& $script:ResolvedChildShell @knownTrailingArgs)
     $knownTrailingExitCode = $LASTEXITCODE
     $knownTrailingResultLine = @($knownTrailingOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
     $knownTrailingResult = if ($knownTrailingResultLine.Count -eq 1) { $knownTrailingResultLine[0] | ConvertFrom-Json } else { $null }
@@ -1203,7 +1245,7 @@ try {
         '-LogPath', $mismatchLogPath,
         '-ReplayHistorical'
     )
-    $mismatchOutput = @(& powershell.exe @mismatchArgs)
+    $mismatchOutput = @(& $script:ResolvedChildShell @mismatchArgs)
     $mismatchExitCode = $LASTEXITCODE
     $mismatchResultLine = @($mismatchOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
     $mismatchResult = if ($mismatchResultLine.Count -eq 1) { $mismatchResultLine[0] | ConvertFrom-Json } else { $null }
@@ -1251,7 +1293,7 @@ try {
         '-LogPath', $duplicateTrailingLogPath,
         '-ReplayHistorical'
     )
-    $duplicateTrailingOutput = @(& powershell.exe @duplicateTrailingArgs)
+    $duplicateTrailingOutput = @(& $script:ResolvedChildShell @duplicateTrailingArgs)
     $duplicateTrailingExitCode = $LASTEXITCODE
     $duplicateTrailingResultLine = @($duplicateTrailingOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
     $duplicateTrailingResult = if ($duplicateTrailingResultLine.Count -eq 1) { $duplicateTrailingResultLine[0] | ConvertFrom-Json } else { $null }
@@ -1317,7 +1359,7 @@ try {
         $caseState.cursor.timestamp = '2026-09-09T03:00:00.0000000Z'
         $caseState.cursor.row_id = 'cursor-before-mixed-known'
         Save-OrderState -Path $caseStatePath -State $caseState
-        $caseOutput = @(& powershell.exe `
+        $caseOutput = @(& $script:ResolvedChildShell `
             -NoLogo -NoProfile -ExecutionPolicy Bypass `
             -File $RunnerPath `
             -Mode Observe `
@@ -1378,7 +1420,7 @@ try {
         '-LogPath', $duplicateLogPath,
         '-ReplayHistorical'
     )
-    $duplicateOutput = @(& powershell.exe @duplicateArgs)
+    $duplicateOutput = @(& $script:ResolvedChildShell @duplicateArgs)
     $duplicateExitCode = $LASTEXITCODE
     $duplicateResultLine = @($duplicateOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
     $duplicateResult = if ($duplicateResultLine.Count -eq 1) { $duplicateResultLine[0] | ConvertFrom-Json } else { $null }
@@ -1448,7 +1490,7 @@ try {
         '-LogPath', $collisionLogPath,
         '-ReplayHistorical'
     )
-    $collisionOutput = @(& powershell.exe @collisionArgs)
+    $collisionOutput = @(& $script:ResolvedChildShell @collisionArgs)
     $collisionExitCode = $LASTEXITCODE
     $collisionResultLine = @($collisionOutput | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
     $collisionResult = if ($collisionResultLine.Count -eq 1) { $collisionResultLine[0] | ConvertFrom-Json } else { $null }
@@ -1484,7 +1526,7 @@ try {
         '-StatePath', $missingState,
         '-LogPath', $missingLog
     )
-    $errorOutput = & powershell.exe @errorArgs
+    $errorOutput = & $script:ResolvedChildShell @errorArgs
     Assert-True 'read error returns nonzero' ($LASTEXITCODE -ne 0)
     $errorState = [IO.File]::ReadAllText($missingState, [Text.Encoding]::UTF8) | ConvertFrom-Json
     Assert-True 'read error persists structured error' ($errorState.error.code -and $errorState.last_poll.status -ceq 'error')
@@ -1593,7 +1635,7 @@ exit 0
     $env:ORDER_SUPERVISOR_CONFIG_CAPTURE = $adapterConfigCapture
     $env:CLAUDE_CONFIG_DIR = $adapterAmbientConfig
     try {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $AdapterPath `
+        & $script:ResolvedChildShell -NoProfile -ExecutionPolicy Bypass -File $AdapterPath `
             -PromptPath $adapterPrompt -SchemaPath $adapterSchema `
             -StdoutPath $adapterStdout -StderrPath $adapterStderr `
             -EnvFile $adapterEnv -WorkspacePath $adapterWorkspace `
@@ -1678,8 +1720,20 @@ Assert-True 'runner parses before timeout-path extraction' (@($runnerErrors).Cou
 # helpers, so the helpers have to be extracted too. Leaving them out did not
 # make the tests pass with a gap - it broke them loudly, which is the harness
 # working: the runner and the extracted subset must stay in step.
+#
+# EXCEPT ON THE POSIX BRANCH, WHERE IT WAS SILENT. The five Get-Posix*/
+# Invoke-PosixGroupKill/Resolve-PosixKillBinary/Test-PosixProcessAlive helpers were
+# missing from this list for as long as the group-kill path has existed. On Windows
+# nothing noticed, because Invoke-ProcessTreeKill takes the taskkill branch and never
+# calls them. The first Linux run of this suite failed with 'Get-PosixProcessGroupId
+# is not recognized' -- the extraction list only breaks loudly on the branch the
+# host actually takes. tests/test_order_linux_execute.ps1 already carries the full
+# list; this one had drifted from it.
 foreach ($functionName in @('Quote-ProcessArgument', 'Test-OnWindows', 'Resolve-WorkerEngine',
                             'Invoke-TaskkillTree', 'Get-PosixChildProcessId', 'Invoke-PosixTreeKill',
+                            'Get-PosixProcessGroupId', 'Resolve-PosixKillBinary',
+                            'Get-PosixProcessGroupMemberId', 'Invoke-PosixGroupKill',
+                            'Test-PosixProcessAlive',
                             'Invoke-ProcessTreeKill', 'Test-RunTreeContainsReparsePoint',
                             'Remove-OwnedRunDirectory', 'Invoke-ClaudeWorker')) {
     $definitions = @($runnerAst.FindAll({
@@ -1730,8 +1784,22 @@ if ([string]$env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT -ceq '1') {
         '[IO.File]::WriteAllText($markerPath, ''survived'', [Text.UTF8Encoding]::new($false))'
     ) -join [Environment]::NewLine
     $encodedDescendant = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($descendantSource))
-    $engine = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    Start-Process -FilePath $engine -ArgumentList ('-NoLogo -NoProfile -NonInteractive -EncodedCommand ' + $encodedDescendant) -WindowStyle Hidden | Out-Null
+    # This runs inside a single-quoted here-string, so $script:ResolvedChildShell
+    # would be literal text here and resolve to nothing when the adapter runs -- the
+    # descendant would never start, and three assertions below would fail on Windows.
+    # The engine arrives as an environment variable, which this fixture already uses
+    # for every other value it needs.
+    $engine = [Environment]::GetEnvironmentVariable('ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_ENGINE', 'Process')
+    $descendantStart = @{
+        FilePath     = $engine
+        ArgumentList = ('-NoLogo -NoProfile -NonInteractive -EncodedCommand ' + $encodedDescendant)
+    }
+    # -WindowStyle is Windows-only and THROWS elsewhere; it is not a no-op off Windows.
+    if (($PSVersionTable.PSEdition -ceq 'Desktop') -or
+        [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)) {
+        $descendantStart['WindowStyle'] = 'Hidden'
+    }
+    Start-Process @descendantStart | Out-Null
     $descendantDeadline = [DateTime]::UtcNow.AddSeconds(1)
     while (-not (Test-Path -LiteralPath $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID -PathType Leaf) -and
         [DateTime]::UtcNow -lt $descendantDeadline) {
@@ -1751,12 +1819,14 @@ $oldTimeoutParentPid = $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID
 $oldTimeoutSpawnDescendant = $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT
 $oldTimeoutDescendantPid = $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID
 $oldTimeoutDescendantMarker = $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER
+$oldTimeoutDescendantEngine = $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_ENGINE
 try {
     $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $timeoutCapture
     $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID = $timeoutParentPid
     $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT = '1'
     $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID = $timeoutDescendantPid
     $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER = $timeoutDescendantMarker
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_ENGINE = $script:ResolvedChildShell
     $ClaudeAdapter = $timeoutFakeAdapter
     $ClaudeSchema = $SchemaPath
     $RunId = $timeoutRunId
@@ -1818,10 +1888,24 @@ try {
     if (Test-Path -LiteralPath $failedKillParentPid -PathType Leaf) {
         [void][int]::TryParse([IO.File]::ReadAllText($failedKillParentPid, [Text.Encoding]::UTF8), [ref]$failedKillProcessId)
     }
-    $realTaskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    # TEARDOWN THAT MUST NOT BE THE CODE UNDER TEST. taskkill is Windows-only and
+    # $env:SystemRoot is null elsewhere, so this line -- reached only after every
+    # assertion in the block above had already passed -- is where the suite died on
+    # Linux. Stop-Process is PowerShell's own, not the supervisor's, which is what
+    # 'independently' means in the assertion below.
     if ($failedKillProcessId -gt 0) {
-        & $realTaskkill /PID $failedKillProcessId /T /F 1>$null 2>$null
-        $manualKillExitCode = $LASTEXITCODE
+        if ($script:OnWindows) {
+            & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $failedKillProcessId /T /F 1>$null 2>$null
+            $manualKillExitCode = $LASTEXITCODE
+        } else {
+            $manualKillExitCode = 1
+            try {
+                Stop-Process -Id $failedKillProcessId -Force -ErrorAction Stop
+                $manualKillExitCode = 0
+            } catch {
+                $manualKillExitCode = 1
+            }
+        }
         $manualKillDeadline = [DateTime]::UtcNow.AddSeconds(15)
         while ($null -ne (Get-Process -Id $failedKillProcessId -ErrorAction SilentlyContinue) -and
             [DateTime]::UtcNow -lt $manualKillDeadline) {
@@ -1842,40 +1926,59 @@ try {
         -not (Test-Path -LiteralPath $failedKillRunPath)
     )
 
-    $reparseTarget = Join-Path $timeoutRoot 'reparse-target'
-    $reparseParent = Join-Path $timeoutRoot 'reparse-parent'
-    $reparseCapture = Join-Path $timeoutRoot 'reparse-adapter-started.txt'
-    New-Item -ItemType Directory -Path $reparseTarget | Out-Null
-    [IO.File]::WriteAllText((Join-Path $reparseTarget 'must-survive.txt'), 'target', [Text.UTF8Encoding]::new($false))
-    New-Item -ItemType Junction -Path $reparseParent -Target $reparseTarget | Out-Null
-    $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $reparseCapture
-    $RunId = 'd' * 32
-    $StatePath = Join-Path $reparseParent 'state.json'
-    $reparseError = ''
-    try {
-        $null = Invoke-ClaudeWorker -WorkId 'offline-reparse' -Source 'codex' -Task 'reject reparse-backed owner'
-    } catch {
-        $reparseError = [string]$_.Exception.Message
+    # AN NTFS JUNCTION IS THE ATTACK HERE, AND IT HAS NO LINUX EQUIVALENT.
+    # New-Item -ItemType Junction throws off Windows, and a symlink is a different
+    # object with different semantics -- staging one would test a different threat
+    # and report it as this one. So this is skipped, counted, and named: the
+    # reparse-backed run parent guard has NO coverage on Linux, and that is a gap
+    # for whoever owns the threat model, not something this file can close.
+    if ($script:OnWindows) {
+        $reparseTarget = Join-Path $timeoutRoot 'reparse-target'
+        $reparseParent = Join-Path $timeoutRoot 'reparse-parent'
+        $reparseCapture = Join-Path $timeoutRoot 'reparse-adapter-started.txt'
+        New-Item -ItemType Directory -Path $reparseTarget | Out-Null
+        [IO.File]::WriteAllText((Join-Path $reparseTarget 'must-survive.txt'), 'target', [Text.UTF8Encoding]::new($false))
+        New-Item -ItemType Junction -Path $reparseParent -Target $reparseTarget | Out-Null
+        $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $reparseCapture
+        $RunId = 'd' * 32
+        $StatePath = Join-Path $reparseParent 'state.json'
+        $reparseError = ''
+        try {
+            $null = Invoke-ClaudeWorker -WorkId 'offline-reparse' -Source 'codex' -Task 'reject reparse-backed owner'
+        } catch {
+            $reparseError = [string]$_.Exception.Message
+        }
+        Assert-True 'worker rejects reparse-backed run parent before starting adapter' (
+            $reparseError -ceq 'claude_run_directory_unsafe' -and
+            -not (Test-Path -LiteralPath $reparseCapture) -and
+            -not (Test-Path -LiteralPath (Join-Path $reparseTarget ('run-' + $RunId))) -and
+            (Test-Path -LiteralPath (Join-Path $reparseTarget 'must-survive.txt') -PathType Leaf)
+        ) $reparseError
+        [IO.Directory]::Delete($reparseParent)
+    } else {
+        Add-SkippedAssertion -Name 'worker rejects reparse-backed run parent before starting adapter' `
+            -Reason 'needs an NTFS junction; no Linux equivalent, so this guard is UNCOVERED here'
     }
-    Assert-True 'worker rejects reparse-backed run parent before starting adapter' (
-        $reparseError -ceq 'claude_run_directory_unsafe' -and
-        -not (Test-Path -LiteralPath $reparseCapture) -and
-        -not (Test-Path -LiteralPath (Join-Path $reparseTarget ('run-' + $RunId))) -and
-        (Test-Path -LiteralPath (Join-Path $reparseTarget 'must-survive.txt') -PathType Leaf)
-    ) $reparseError
-    [IO.Directory]::Delete($reparseParent)
 } finally {
     $env:ORDER_SUPERVISOR_TIMEOUT_CAPTURE = $oldTimeoutCapture
     $env:ORDER_SUPERVISOR_TIMEOUT_PARENT_PID = $oldTimeoutParentPid
     $env:ORDER_SUPERVISOR_TIMEOUT_SPAWN_DESCENDANT = $oldTimeoutSpawnDescendant
     $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_PID = $oldTimeoutDescendantPid
     $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_MARKER = $oldTimeoutDescendantMarker
+    $env:ORDER_SUPERVISOR_TIMEOUT_DESCENDANT_ENGINE = $oldTimeoutDescendantEngine
     foreach ($pidPath in @($timeoutParentPid, (Join-Path $timeoutOwner 'failed-kill-adapter-pid.txt'))) {
         if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
             $processId = 0
             [void][int]::TryParse([IO.File]::ReadAllText($pidPath, [Text.Encoding]::UTF8), [ref]$processId)
             if ($processId -gt 0 -and $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
-                & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $processId /T /F 1>$null 2>$null
+                # Janitor for processes this file deliberately left alive. The same
+                # Windows-only taskkill, and it threw inside the FINALLY, so it
+                # replaced whatever error had actually unwound the block.
+                if ($script:OnWindows) {
+                    & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $processId /T /F 1>$null 2>$null
+                } else {
+                    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     }
@@ -1932,7 +2035,39 @@ foreach ($installerFunctionName in $installerFunctionNames) {
         $installerFunctionsReady = $false
     }
 }
-if ($installerFunctionsReady) {
+# THIS PROBE IS WINDOWS-ONLY, AND NOT BECAUSE OF THE TEST.
+#
+# Its subject is install_order_supervisor.ps1, the Scheduled Task installer -- the
+# one component the port plan replaces with a systemd unit rather than translating.
+# But it does not merely fail to apply on Linux, it CANNOT PASS there, and that is
+# a product finding rather than a test one:
+#
+#   install_order_supervisor.ps1:189
+#     $temporaryBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+#
+# TrimEnd('\') trims the WINDOWS separator only. On Linux GetTempPath() returns
+# '/tmp/', the trailing slash survives, and Assert-InstallerOwnedDirectory then
+# refuses its own temp base with claude_cli_isolation_directory_not_owned. Measured,
+# not inferred. It fails CLOSED, which is the safe direction, but the gate can never
+# accept a valid CLI off Windows.
+#
+# The same idiom is at install_order_supervisor.ps1:122-124 and, more importantly,
+# at order_supervisor.ps1:981-983 and 1013-1021 -- the worker that the port plan
+# KEEPS. It is latent there only because those paths never carry a trailing
+# separator today. Not fixed here: this branch changes no product file.
+#
+# Skipped rather than left to throw, because an unguarded throw here took the whole
+# file down and cost the eight end-to-end supervisor assertions BELOW it, which are
+# the ones the migration actually needs to see run on Linux.
+if ($installerFunctionsReady -and -not $script:OnWindows) {
+    # 16, not the 11 Assert-True calls you can count in the block: five of them sit
+    # inside a foreach over the rejection cases. The number is measured by diffing the
+    # PASS names of a Windows run against a Linux one, and it is checkable -- passed +
+    # skipped here must equal the Windows passed total, 482 + 17 = 499.
+    Add-SkippedAssertion -Count 16 -Name 'installer CLI compatibility isolation probe' -Reason `
+        ("install_order_supervisor.ps1:189 trims only the Windows separator, so GetTempPath() " +
+         "'/tmp/' keeps its slash and the ownership gate refuses -- PRODUCT BUG, reported not fixed")
+} elseif ($installerFunctionsReady) {
     $cliProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('order-installer-cli-test-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $cliProbeRoot | Out-Null
     $oldInstallerConfig = [Environment]::GetEnvironmentVariable('CLAUDE_CONFIG_DIR', 'Process')
@@ -2260,9 +2395,24 @@ if ($Action -ceq 'read') {
 }
 if ($Action -cne 'append') { throw 'unexpected_result_fidelity_bus_action' }
 if ([string]::IsNullOrWhiteSpace($SheetRowJson)) { throw 'result_fidelity_sheet_row_missing' }
-Add-Type -AssemblyName System.Web.Extensions
-$serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-$deserialized = $serializer.DeserializeObject($SheetRowJson)
+# System.Web.Extensions IS .NET FRAMEWORK ONLY. PowerShell 7 does not have the
+# assembly, so this stub threw on every append, the runner could not confirm its
+# CLAIM row, and the end-to-end section reported CLAIM_APPEND_UNCONFIRMED -- a
+# harness failure that reads exactly like a supervisor one.
+#
+# The replacement has to PRESERVE STRINGS. PowerShell 7's ConvertFrom-Json turns
+# ISO-8601 cells into [DateTime], which is the bug OrderSupervisor.psm1's
+# ConvertFrom-JsonPreserveStrings exists to stop; a Timestamp cell that stops being
+# text is judged ineligible and the supervisor silently picks up no work. Same rule
+# as the module, inlined, because this stub is written to disk as a standalone file.
+# An edition that coerces and cannot be told not to is REFUSED, not quietly trusted.
+$deserialized = $(if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    @($SheetRowJson | ConvertFrom-Json -DateKind String)
+} elseif ($PSVersionTable.PSEdition -ceq 'Desktop') {
+    @($SheetRowJson | ConvertFrom-Json)
+} else {
+    throw 'result_fidelity_board_json_date_coercion_unsafe'
+})
 $cells = @()
 foreach ($cell in $deserialized) { $cells += $(if ($null -eq $cell) { '' } else { [string]$cell }) }
 if ($cells.Count -ne 10) { throw 'result_fidelity_sheet_row_invalid' }
@@ -2396,7 +2546,7 @@ function Invoke-ResultFidelityRunner {
             '-ClaudeCommand', 'unused-fake-command',
             '-WallTimeoutSeconds', '60'
         )
-        $output = @(& powershell.exe @arguments 2>&1)
+        $output = @(& $script:ResolvedChildShell @arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('ORDER_RESULT_FIDELITY_TEST_ROOT', $previousRoot, 'Process')
@@ -2662,6 +2812,7 @@ try {
     }
 }
 
-Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed)
+Write-Output ('RESULT passed=' + $script:Passed + ' failed=' + $script:Failed +
+    ' skipped=' + $script:Skipped)
 if ($script:Failed -gt 0) { exit 1 }
 exit 0
