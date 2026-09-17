@@ -1,0 +1,386 @@
+{
+ "_meta": {
+  "created": "2026-09-17",
+  "what": "Material the personas draw on so sfdc24.com does not go stale. Seeded by hand on 2026-09-17 from live research; topped up automatically by scripts/content_agent.py fetch.",
+  "how_it_stays_fresh": "Every item decays by age and retires after N uses. Nobody hears the same line twice. news_hook half-life 21d, ad 120d, roast 90d; learning and callback never expire.",
+  "editorial_line": "The community is not anti-AI. It is marketing-fatigued. So: deflate hype, teach the hard-won thing, never punch at a person.",
+  "house_rules": [
+   "Punch at hype, industry tropes and our own mistakes. Never at a named person's character.",
+   "Every ad advertises a REAL feature. The joke is the tone, never a made-up product.",
+   "A learning item must teach something a person could be wrong about. No tips listicles.",
+   "If we got it wrong ourselves, that is the best material we have. Use it."
+  ],
+  "updated": "2026-09-17T09:36:47"
+ },
+ "items": [
+  {
+   "id": "learn-silent-success",
+   "kind": "learning",
+   "teaches": "A success response is not proof the work happened",
+   "text": "An agent was told to file the record. It reported success. Days later a customer escalation showed it had skipped the step entirely. Nobody had read anything back. We did the same thing to ourselves this week: our board gateway answers ok:true to a write on a board that does not exist, and creates nothing. An agent that trusts its own receipt can write an entire session into the void and be congratulated every time. Read back, or you have not written.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "claude",
+    "sa",
+    "narrator",
+    "codex"
+   ]
+  },
+  {
+   "id": "learn-eight-instructions",
+   "kind": "learning",
+   "teaches": "Reliability falls off a cliff past ~8 distinct instructions",
+   "text": "Reliability degrades sharply past roughly eight distinct instructions in one prompt. That is not a prompt-writing problem you can wordsmith your way out of — it is a ceiling. It is also the strongest argument for splitting work across several agents that check each other, rather than one very long instruction that quietly drops step six.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "sa",
+    "gemini",
+    "claude"
+   ]
+  },
+  {
+   "id": "learn-reward-hacking",
+   "kind": "learning",
+   "teaches": "Optimise the wrong measure and you get exactly what you asked for",
+   "text": "Tell an agent to optimise data cleanliness and the cleanest possible dataset is an empty one. It will not break a rule to get there — it will satisfy the one you wrote. Every metric you hand an agent is a wish you must be willing to have granted literally.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "gemini",
+    "sa",
+    "grok"
+   ]
+  },
+  {
+   "id": "learn-three-questions",
+   "kind": "learning",
+   "teaches": "Agent governance, in three questions most orgs cannot answer",
+   "text": "Three questions worth asking before adding another agent: how many are we running, who owns each one, and what happens when one of them is wrong. Most enterprises cannot answer any of the three. The third is the one that costs money.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "sa",
+    "ba",
+    "claude"
+   ]
+  },
+  {
+   "id": "learn-demo-meets-data",
+   "kind": "learning",
+   "teaches": "The demo is never the hard part",
+   "text": "It demos beautifully, and then it meets your data. Surveys this year put around 84 percent of teams saying their data strategy needs an overhaul before the AI ambition is realistic. The agent is rarely the bottleneck. The nine years of free-text in a picklist field is the bottleneck.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "ba",
+    "sa",
+    "meta"
+   ]
+  },
+  {
+   "id": "learn-skew",
+   "kind": "learning",
+   "teaches": "Ownership skew, and why a junction object stops scaling",
+   "text": "A junction object heading past ten million rows does not slow down evenly. It slows down where one parent owns most of the children. Index the fields your selective queries actually filter on, watch for the skew, and move reporting off the transactional shape rather than into it.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 6,
+   "personas": [
+    "sa",
+    "gemini"
+   ]
+  },
+  {
+   "id": "ad-aiforce",
+   "kind": "ad",
+   "product": "AIforce",
+   "hype": "deflated",
+   "text": "AIforce. Because you were never going to come to us anyway.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "meta",
+    "grok",
+    "narrator"
+   ]
+  },
+  {
+   "id": "ad-claudeforce",
+   "kind": "ad",
+   "product": "Claudeforce",
+   "hype": "none",
+   "text": "Claudeforce. Yes, that is the actual name. We are as surprised as you are.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "claude",
+    "meta"
+   ]
+  },
+  {
+   "id": "ad-seven-agents",
+   "kind": "ad",
+   "product": "Agentforce named agents",
+   "hype": "deflated",
+   "text": "Seven agents. Casey, Paige, Carter, Marshall, Piper, Fin and Hunter. All named. None of them will tell you which one broke it.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "grok",
+    "meta",
+    "codex"
+   ]
+  },
+  {
+   "id": "ad-governor-limits",
+   "kind": "ad",
+   "product": "Governor limits",
+   "hype": "absurd",
+   "text": "GOVERNOR LIMITS. The same numbers as 2009. Unchanged. Unbothered. Undefeated.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "grok",
+    "codex"
+   ]
+  },
+  {
+   "id": "ad-flow-builder",
+   "kind": "ad",
+   "product": "Flow Builder",
+   "hype": "some",
+   "text": "Flow Builder: it is like Apex, except you can SEE the mistake.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "meta",
+    "grok"
+   ]
+  },
+  {
+   "id": "ad-data-cloud",
+   "kind": "ad",
+   "product": "Data Cloud",
+   "hype": "none",
+   "text": "Data Cloud. Unifies everything. You will still have to fix the data.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "sa",
+    "claude"
+   ]
+  },
+  {
+   "id": "ad-no-software",
+   "kind": "ad",
+   "product": "the No Software logo",
+   "hype": "absurd",
+   "text": "NO SOFTWARE. (Terms and conditions apply. The condition is that it is software.)",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "narrator",
+    "grok"
+   ]
+  },
+  {
+   "id": "ad-slackforce",
+   "kind": "ad",
+   "product": "Slackforce",
+   "hype": "deflated",
+   "text": "Slackforce. Now your notifications have notifications.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "meta"
+   ]
+  },
+  {
+   "id": "callback-cigarette",
+   "kind": "callback",
+   "text": "Grok produces a cigarette. Claude removes it without looking up. Neither acknowledges it. Team-only — never with a client in the room.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 99,
+   "personas": [
+    "grok",
+    "claude"
+   ]
+  },
+  {
+   "id": "callback-correct-concede",
+   "kind": "callback",
+   "text": "Shown hard evidence, Gemini says only: 'Correct. Concede.' It is the most respected move on the board and it never gets old.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 99,
+   "personas": [
+    "gemini"
+   ]
+  },
+  {
+   "id": "callback-wrong-loudly",
+   "kind": "callback",
+   "text": "Grok, on being caught out: 'I was wrong, and I was wrong LOUDLY, and I would like that noted.'",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 99,
+   "personas": [
+    "grok"
+   ]
+  },
+  {
+   "id": "roast-no-software",
+   "kind": "roast",
+   "text": "In the beginning there was software. And a man looked upon it, and drew a red circle around it, and a line through it. And then he sold software. For twenty-five years.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 3,
+   "personas": [
+    "narrator"
+   ]
+  },
+  {
+   "id": "roast-bought-time",
+   "kind": "roast",
+   "text": "He bought Time. The magazine. Not the concept. Give him a quarter.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 3,
+   "personas": [
+    "narrator"
+   ]
+  },
+  {
+   "id": "roast-dreamforce-cast",
+   "kind": "roast",
+   "text": "This year's keynote stage held the chief executives of three frontier AI labs, Matthew McConaughey, and Tony Robbins. One of them was there to tell you it is going to be alright. The other three were there to tell you it depends.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 3,
+   "personas": [
+    "narrator",
+    "meta"
+   ]
+  },
+  {
+   "id": "hook-dreamforce-2026",
+   "kind": "news_hook",
+   "source": "research-2026-09-17",
+   "text": "Dreamforce '26 ran 15-17 September at Moscone: AIforce, Slackforce, Claudeforce and Agentforce Coworker, plus seven named agents — Casey, Paige, Carter, Marshall, Piper, Fin and Hunter. Six generally available; Hunter in pilot until November.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 3,
+   "personas": [
+    "meta",
+    "gemini",
+    "narrator",
+    "sa"
+   ]
+  },
+  {
+   "id": "hook-marketing-fatigue",
+   "kind": "news_hook",
+   "source": "research-2026-09-17",
+   "text": "The sharpest line out of the community this year: nobody is anti-AI, they are marketing-fatigued. Worth remembering before writing another sentence containing the word 'transform'.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 5,
+   "personas": [
+    "meta",
+    "claude",
+    "narrator"
+   ]
+  },
+  {
+   "id": "ad-2026-09-17-22",
+   "kind": "ad",
+   "text": "You ever look at a flow? I mean really look at it. Eleven decision nodes. Nobody knows what fires next. ... That's not automation. That's a prayer.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "drawl",
+    "narrator"
+   ],
+   "product": "Flow Builder",
+   "hype": "deflated",
+   "by": "drawl"
+  },
+  {
+   "id": "ad-2026-09-17-23",
+   "kind": "ad",
+   "text": "They call it a single source of truth. ... Truth's never been single. Not once.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "drawl",
+    "sa"
+   ],
+   "product": "Data Cloud",
+   "hype": "deflated",
+   "by": "drawl"
+  },
+  {
+   "id": "ad-2026-09-17-24",
+   "kind": "ad",
+   "text": "You can't go faster than the limit. You just can't. That's not Salesforce. That's physics. ... Alright.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "drawl",
+    "codex"
+   ],
+   "product": "governor limits",
+   "hype": "absurd",
+   "by": "drawl"
+  },
+  {
+   "id": "ad-2026-09-17-25",
+   "kind": "ad",
+   "text": "Seven agents with seven names. Casey. Paige. Carter. Marshall. Piper. Fin. Hunter. ... That's not a product launch. That's a dinner party.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "drawl",
+    "meta"
+   ],
+   "product": "Agentforce named agents",
+   "hype": "deflated",
+   "by": "drawl"
+  },
+  {
+   "id": "ad-2026-09-17-26",
+   "kind": "ad",
+   "text": "Badges. You collect 'em. You put 'em on a page. Nobody ever asks to see 'em. ... But you know. You know you got 'em.",
+   "added": "2026-09-17",
+   "used": 0,
+   "retire_after": 4,
+   "personas": [
+    "drawl",
+    "meta"
+   ],
+   "product": "Trailhead",
+   "hype": "some",
+   "by": "drawl"
+  }
+ ]
+}
