@@ -41,6 +41,10 @@ on:
       - "scripts/sf360.py"
       - "tests/test_sf360.py"
       - "tests/mutate_sf360.py"
+      - "scripts/org_publish.py"
+      - "tests/test_org_publish.py"
+      - "tests/mutate_org_publish.py"
+      - "tests/fixtures/org_desk_published_20260917.json"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -63,6 +67,10 @@ on:
       - "scripts/sf360.py"
       - "tests/test_sf360.py"
       - "tests/mutate_sf360.py"
+      - "scripts/org_publish.py"
+      - "tests/test_org_publish.py"
+      - "tests/mutate_org_publish.py"
+      - "tests/fixtures/org_desk_published_20260917.json"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -98,7 +106,8 @@ jobs:
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
                    tests/test_board_governor.py tests/test_sf360.py \
-                   tests/mutate_sf360.py; do
+                   tests/mutate_sf360.py tests/test_org_publish.py \
+                   tests/mutate_org_publish.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -202,6 +211,27 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The publisher that decides what leaves a private org for the PUBLIC
+      # site repository. Entirely offline - a fake session answers every
+      # query - so it runs in an empty namespace with no loopback at all.
+      #
+      # Its mutation control runs here too, and two of its eight cases are not
+      # leaks but WRONG NUMBERS: an industry bucket silently dropped, a
+      # largest-deal figure taken over the wrong set. The suite checks its
+      # arithmetic against tests/fixtures/org_desk_published_20260917.json,
+      # a byte copy of what www.sfdc24.com was serving, so the numbers are
+      # judged against the page rather than against numbers invented here.
+      - name: org publisher and its mutation control (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_org_publish.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_org_publish.py
+            sudo unshare -n -- "$python_bin" tests/mutate_org_publish.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bus suite starts its own server and scratch database. Enable only
       # loopback in a fresh namespace, and retain setup-python's exact binary
       # across sudo rather than silently switching to the system interpreter.
@@ -224,7 +254,8 @@ jobs:
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
              && [ ! -f tests/test_board_governor.py ] \
-             && [ ! -f tests/test_sf360.py ]; then
+             && [ ! -f tests/test_sf360.py ] \
+             && [ ! -f tests/test_org_publish.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2
             exit 1
