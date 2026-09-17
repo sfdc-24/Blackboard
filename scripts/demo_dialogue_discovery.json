@@ -1,0 +1,26 @@
+[
+  {
+    "persona": "ba",
+    "text": "Thanks for making the time today. Before we talk about Salesforce at all - walk me through what happens when a new lead comes in. Who touches it first, and where does it usually get stuck?"
+  },
+  {
+    "persona": "ba",
+    "text": "So today that lives in a spreadsheet, and the handoff to sales is a Slack message that sometimes gets missed. That's the pain: leads go quiet because nobody owns the follow-up. Did I get that right?"
+  },
+  {
+    "persona": "sa",
+    "text": "Two ways to build that. A Flow-based assignment with an escalation timer gets you live in about a week. Custom Apex routing scales past fifty thousand records a month but costs more to maintain."
+  },
+  {
+    "persona": "sa",
+    "text": "Given your volume, I'd start with Flow and design the data model so Apex can take over later without a migration. The one risk it carries: Flow debugging is weaker, so we add logging from day one."
+  },
+  {
+    "persona": "ba",
+    "text": "So the readback: must-have is that no lead sits unowned for more than an hour. Nice-to-have is the manager dashboard. Anything I missed before we score your current org against that?"
+  },
+  {
+    "persona": "sa",
+    "text": "And while we were talking, the assessment already started. When we come back, you'll see your org's score and the three things dragging it - not a proposal, the actual findings."
+  }
+]
