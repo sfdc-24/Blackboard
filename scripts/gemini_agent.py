@@ -49,12 +49,16 @@ KEY_NAMES = ["GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"]
 
 
 def load_env():
+    # `with` — the bare open() leaked a file handle on every call. Same fix as
+    # foundry_agent.load_env; these two were copied from one another, so a bug
+    # in one is a bug in both.
     kv = {}
     if os.path.exists(ENV):
-        for line in open(ENV, encoding="utf-8", errors="replace"):
-            m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
-            if m:
-                kv[m.group(1)] = m.group(2)
+        with open(ENV, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
+                if m:
+                    kv[m.group(1)] = m.group(2)
     return kv
 
 
