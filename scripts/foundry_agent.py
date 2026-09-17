@@ -65,7 +65,11 @@ ENV = os.path.join(REPO, ".env")
 
 RESOURCE = "abdus-2123-resource"
 RESOURCE_GROUP = "copilot-dev-rg"
-HOST = "https://%s.services.ai.azure.com" % RESOURCE
+# Fallback only. The authority is FOUNDRY_PROJECT_ENDPOINT in .env — see host().
+# Hardcoding this was already brittle and became visibly so on 2026-09-17, when
+# unused resources were deleted from the subscription and the fleet's only record
+# of which one to call was a constant in this file.
+DEFAULT_HOST = "https://%s.services.ai.azure.com" % RESOURCE
 
 OPENAI_PATH = "/models/chat/completions?api-version=2024-05-01-preview"
 ANTHROPIC_PATH = "/anthropic/v1/messages"
@@ -81,12 +85,17 @@ KNOWN = ["claude-opus-5", "gpt-4o", "text-embedding-3-large"]
 
 
 def load_env():
+    # `with`, because host() calls this on every request and the bare open()
+    # leaked a handle per call — surfaced as a ResourceWarning on all five
+    # host() tests. Harmless in a one-shot CLI, not harmless in anything that
+    # loops, and invisible until something asked the question.
     kv = {}
     if os.path.exists(ENV):
-        for line in open(ENV, encoding="utf-8", errors="replace"):
-            m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
-            if m:
-                kv[m.group(1)] = m.group(2)
+        with open(ENV, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
+                if m:
+                    kv[m.group(1)] = m.group(2)
     return kv
 
 
@@ -98,6 +107,23 @@ def api_key():
         if os.environ.get(n):
             return n, os.environ[n]
     return None, None
+
+
+def host():
+    """Origin to call, taken from .env rather than from a constant in here.
+
+    FOUNDRY_PROJECT_ENDPOINT is the project/agents URL
+    (https://<res>.services.ai.azure.com/api/projects/<project>), which is NOT
+    the inference URL — the paths in this file hang off its ORIGIN. So take the
+    scheme and host and discard the path, instead of storing the origin twice
+    and letting the two drift.
+    """
+    ep = load_env().get("FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT")
+    if ep:
+        m = re.match(r"^(https?://[^/]+)", ep.strip())
+        if m:
+            return m.group(1)
+    return DEFAULT_HOST
 
 
 def is_anthropic(model):
@@ -169,13 +195,14 @@ def ask(prompt, model=None, max_tokens=1024):
         return None, "NO CREDENTIAL — %s absent from .env" % "/".join(KEY_NAMES)
 
     anthropic = is_anthropic(model)
+    base = host()
     if anthropic:
-        url = HOST + ANTHROPIC_PATH
+        url = base + ANTHROPIC_PATH
         headers = {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}
         payload = {"model": model, "max_tokens": max_tokens,
                    "messages": [{"role": "user", "content": prompt}]}
     else:
-        url = HOST + OPENAI_PATH
+        url = base + OPENAI_PATH
         headers = {"api-key": key}
         payload = {"model": model,
                    "messages": [{"role": "user", "content": prompt}]}
@@ -194,10 +221,39 @@ def ask(prompt, model=None, max_tokens=1024):
     text = extract_anthropic(d) if anthropic else extract_openai(d)
     if not text:
         # A 200 carrying no prose. Say so; do not hand back an empty string.
-        return None, ("200 on %s but NO TEXT BLOCK — top-level keys %s. "
-                      "If this is an anthropic response, the prose block is "
-                      "missing, not merely at another index."
-                      % (route, list(d.keys())))
+        #
+        # The first version of this message printed only the top-level keys —
+        # which proved the response was well-formed and said nothing about why
+        # it was empty. The two fields that actually diagnose it are
+        # stop_reason and the block types, so print those. A guard that blocks
+        # the right call while withholding the reason just moves the debugging
+        # somewhere else.
+        blocks = [(b or {}).get("type") for b in (d.get("content") or [])]
+        u = ask.last_usage or {}
+        stop = d.get("stop_reason")
+        # Observed 2026-09-17, and not what the first hint text guessed:
+        #   max_tokens=1024 -> stop_reason "refusal", ZERO content blocks, out=0
+        #   max_tokens=4096 -> stop_reason "end_turn", full answer, SAME prompt
+        # So a refusal here was not a budget problem and not a content problem
+        # about the prompt — the identical text succeeded moments later. The
+        # honest hint is "retry", not a diagnosis invented to fit one field.
+        hints = {
+            "max_tokens": ("the budget was spent before any prose was emitted "
+                           "(thinking counts against it): raise --max-tokens."),
+            "refusal": ("the model declined to emit content. Observed to be "
+                        "RETRYABLE: the identical prompt succeeded at a larger "
+                        "max_tokens minutes later, so treat a single refusal as "
+                        "transient and retry once before concluding anything "
+                        "about the prompt."),
+        }
+        hint = hints.get(stop, "top-level keys: %s" % list(d.keys()))
+        return None, ("200 on %s but NO TEXT BLOCK.\n"
+                      "       stop_reason : %s\n"
+                      "       blocks      : %s\n"
+                      "       tokens      : out %s of max %s (thinking %s)\n"
+                      "       %s"
+                      % (route, stop, blocks or "(none)",
+                         u.get("out"), max_tokens, u.get("thought"), hint))
     return text, route
 
 
