@@ -179,7 +179,13 @@ Three things, and only the first costs money:
    streams* → Endpoint URL. It is not a secret we can derive; it must be copied.
 3. **A Linux host.** `@zoom/rtms` is a native module that refuses to install on
    Windows (`npm error notsup`), which is why this project originally lived on
-   WSL Ubuntu — an environment that no longer exists on this laptop. The VM is
+   WSL Ubuntu — an environment that has since been rebuilt. **This blocker is CLEARED as of
+2026-09-16:** WSL Ubuntu on the laptop runs it. Measured, not assumed -
+`npm ci` from the committed lockfile installs `@zoom/rtms` 1.1.0 on node
+v22.22.1, `test/linux-sdk-probe.mjs` reports `PASS dynamic import and client
+construction succeeded on linux`, and `npm test` is 50 passed / 1 skipped,
+where the single skip is *because* the SDK is present and the absent-SDK path
+therefore cannot be exercised there. The VM is
    the right home: it already runs continuously and the laptop lid closes.
 
 It needs **no public URL, no ngrok, no inbound firewall rule.** Events arrive
