@@ -149,8 +149,14 @@ def extract_text(d):
 
 
 def usage_of(d):
-    """Per-call token usage. Foundry was meant to supply this and 401s on every
-    endpoint; it turns out every Gemini call carries it for free."""
+    """Per-call token usage — every Gemini call carries it for free.
+
+    An earlier version of this docstring said Foundry "401s on every endpoint".
+    That was wrong, and it was wrong in a way worth leaving a note about: the
+    requests really did 401, but the cause was a key in .env belonging to a
+    DIFFERENT resource, not a broken service. Corrected 2026-09-17 after the
+    real key produced HTTP 200 on the first try. A failure I have reproduced
+    many times is still only evidence about my request."""
     u = (d or {}).get("usage") or {}
     return {
         "total": u.get("total_tokens"),
@@ -223,13 +229,12 @@ def cmd_check(args):
         if u:
             print("  TOKENS : %s total  (in %s, out %s, thought %s)"
                   % (u.get("total"), u.get("in"), u.get("out"), u.get("thought")))
-            print("           per-agent token usage, free on every call —")
-            print("           the thing FOUNDRY_API_KEY was meant to provide and 401s on.")
+            print("           per-agent token usage, free on every call.")
         print("\n  => gemini is REACHABLE. Flip it live on the site and in voices.json.")
         return 0
     print("  FAILED : %s" % route)
     print("\n  => a credential exists but the call did not succeed. Present is not working —")
-    print("     the same trap as FOUNDRY_API_KEY, which is present and 401s on every endpoint.")
+    print("     the same trap FOUNDRY_API_KEY fell into: a real key, for the wrong resource.")
     return 1
 
 
