@@ -47,6 +47,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -91,25 +92,70 @@ def creds():
     return dom, cid, sec, None
 
 
-def token(dom, cid, sec):
+def token(dom, cid, sec, attempts=4):
+    """Get a client-credentials token, retrying a transient failure.
+
+    WHY THE RETRY. On 2026-09-17 this call returned HTTP 404 once, minutes after
+    succeeding twice against the same host with the same credentials, and then
+    succeeded three more times immediately afterwards through three different
+    clients. A raw POST with redirects disabled answered 200 with no Location
+    header, so it was neither urllib's redirect handling nor an org-side change
+    — the two causes worth suspecting. The cause is UNCONFIRMED; what is certain
+    is that a single blip killed the entire run, because there was no retry.
+
+    The board gateway on this same fleet needed three attempts that same hour to
+    get past a stub response. Two flaky endpoints in one evening is enough to
+    treat one-shot network calls as the defect rather than the norm.
+
+    A 400/401 is NOT retried: bad credentials do not improve with repetition,
+    and retrying them looks like a brute-force attempt from the org's side.
+    """
     body = urllib.parse.urlencode({
         "grant_type": "client_credentials", "client_id": cid, "client_secret": sec
     }).encode()
-    req = urllib.request.Request(dom + "/services/oauth2/token", data=body, method="POST")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+    last = None
+    for i in range(1, attempts + 1):
+        req = urllib.request.Request(dom + "/services/oauth2/token", data=body, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if i > 1:
+                    print("  token   : OK on attempt %d" % i)
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            last = "HTTP %s" % e.code
+            if e.code in (400, 401, 403):
+                # Credential or permission problem. Say so once and stop.
+                raise RuntimeError("%s — credentials or scopes, not transient: %s"
+                                   % (last, e.read().decode("utf-8", "replace")[:200]))
+            print("  token   : attempt %d got %s, retrying" % (i, last))
+        except Exception as exc:
+            last = repr(exc)
+            print("  token   : attempt %d failed (%s), retrying" % (i, last))
+        time.sleep(1.5 * i)
+    raise RuntimeError("token failed after %d attempts; last was %s" % (attempts, last))
 
 
-def query(inst, tok, soql):
+def query(inst, tok, soql, attempts=3):
+    """Run one SOQL query, retrying a transient failure for the same reason
+    token() does. A 400 (malformed SOQL) or 401/403 (scope) is returned
+    immediately — those are answers about the request, not weather."""
     url = "%s/services/data/%s/query?q=%s" % (inst, API, urllib.parse.quote(soql))
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
-    try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            return json.loads(r.read().decode("utf-8", "replace")), None
-    except urllib.error.HTTPError as e:
-        return None, "HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:200])
-    except Exception as exc:
-        return None, str(exc)
+    last = None
+    for i in range(1, attempts + 1):
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.loads(r.read().decode("utf-8", "replace")), None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            if e.code in (400, 401, 403):
+                return None, "HTTP %s: %s" % (e.code, detail)
+            last = "HTTP %s: %s" % (e.code, detail)
+        except Exception as exc:
+            last = str(exc)
+        if i < attempts:
+            time.sleep(1.5 * i)
+    return None, "%s (after %d attempts)" % (last, attempts)
 
 
 # Narrow ON PURPOSE. Everything selected here becomes world-readable.
