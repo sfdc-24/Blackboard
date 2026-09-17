@@ -73,3 +73,6 @@ build/
 # (vm-cli found this on AkatiaVM. Read commands are unaffected.)
 gas/*
 !gas/.gitkeep
+
+# Fetched headlines: regenerable input, not curated material.
+content/hooks.json
