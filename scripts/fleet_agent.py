@@ -182,10 +182,10 @@ AGENTS = [
     ("vm-cli",                  "alloy", "ANTHROPIC_API_KEY", "VM worker tag used by claude_board_worker.ps1"),
     ("chatgpt-codex-desktop-*", "echo",  "OPENAI_API_KEY",    "codex desktop, one tag per session"),
     ("codex",                   "echo",  "OPENAI_API_KEY",    "codex, short tag"),
-    ("gemini",                  "fable", None,                "82 rows to 2026-09-08 then silent — key withdrawn"),
+    ("gemini",                  "fable", "GEMINI_API_KEY",    "82 rows to 2026-09-08, dark nine days, key restored 2026-09-17 — answering"),
     ("whatsapp",                None,    "WA_TOKEN",          "inbound lane via Pipedream; writes rows, reads none"),
     ("glasses-uploader",        None,    "GLASSES_URL",       "capture pipeline; last wrote 2026-09-05"),
-    ("foundry",                 None,    "FOUNDRY_API_KEY",   "3 rows; key present but 401 on every probe"),
+    ("foundry",                 None,    "FOUNDRY_API_KEY",   "WORKING 2026-09-17: claude-opus-5 and gpt-4o, two routes, token usage"),
     ("vm-order-worker",         None,    None,                "board-only worker"),
     ("vm-chrome",               None,    None,                "board-only, browser"),
     ("chat-mobile",             None,    None,                "board-only, phone"),
@@ -212,8 +212,21 @@ def cmd_keys(args):
             cred = key
         print("  %-20s %-8s %-26s %s" % (name, voice or "-", cred, status))
     print()
-    print("  FOUNDRY_API_KEY is present but returned 401 on all six probes")
-    print("  (2026-09-17) — present is not the same as working.")
+    # THIS USED TO PRINT "FOUNDRY_API_KEY is present but returned 401 on all
+    # six probes — present is not the same as working." It was false, and a
+    # status command stating a stale falsehood as current fact is worse than one
+    # that says nothing: anyone reading it stops looking.
+    #
+    # The probes really did 401. The cause was the credential, not the service:
+    # the value in .env was 32 characters and belonged to a DIFFERENT resource,
+    # while abdus-2123-resource issues 84-character keys. With the right key the
+    # first call returned 200 against three models that had been deployed the
+    # whole time. Corrected 2026-09-17 after four green runs.
+    print("  foundry answers on BOTH routes: claude-opus-5 on /anthropic/v1/messages")
+    print("  with x-api-key, gpt-4o on /models/chat/completions with api-key.")
+    print("  Cross the two and it is 401 or 404, which is what made the key look")
+    print("  like a service outage. Ask which resource a key is from, first.")
+    print("  Still needing a credential: grok (no agent behind it), meta (6 rows).")
     return 0
 
 
