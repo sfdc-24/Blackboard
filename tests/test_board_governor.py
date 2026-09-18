@@ -132,6 +132,20 @@ with tempfile.TemporaryDirectory() as tmp:
     check("answers splits on commas and trims", bcb.answers == ["A-1", "B-2"],
           repr(bcb.answers))
     check("a row with no answers yields an empty list", prose.answers == [])
+    # grok-bot joined 2026-09-18 writing SEMICOLON lists, which the comma-only
+    # split read as one token that answered nothing. Same rule as the other two
+    # readers on this board: comma, semicolon or whitespace.
+    semi = board_file([
+        row("R3", "2026-09-18T06:44:18Z", "grok-bot", "claude-code-cli;vm-claude-code-cli",
+            "APPEND", "BCB|v=1|id=SEMI|phase=RESULT|answers=A-1;B-2"),
+        row("R4", "2026-09-18T06:45:00Z", "chatgpt-codex-desktop", "ALL",
+            "APPEND", "BCB|v=1|id=SPACED|phase=RESULT|answers=WRK-3cd5f324 (row2350)"),
+    ], tmp)
+    semi_rows, _ = load_rows(semi)
+    check("answers splits on semicolons too", semi_rows[0].answers == ["A-1", "B-2"],
+          repr(semi_rows[0].answers))
+    check("and a parenthetical annotation leaves the id matchable",
+          semi_rows[1].answers[0] == "WRK-3cd5f324", repr(semi_rows[1].answers))
     # Source_Tag is server-stamped; the payload's from= is caller-supplied text.
     check("the column tag outranks the payload from=",
           bcb.from_tag == "claude-code-cli", bcb.from_tag)
