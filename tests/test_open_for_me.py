@@ -89,6 +89,64 @@ res4 = ofm.open_for([row("2026-09-09T13:00:00Z", "codex", LAPTOP, "OPEN")], "vm-
 check("and to=claude-code-cli is not delivered to the VM either", res4["total"] == 0)
 
 print("")
+print("== the multi-recipient separator, measured on the live board 2026-09-18 ==")
+# grok-bot joined the fleet on 2026-09-18 and addresses its dispatches with a
+# SEMICOLON list. Splitting on comma alone reads the whole list as one opaque
+# tag, which matches nobody: all 15 grok-bot rows, several of them addressed to
+# this VM, were invisible to this reader while scripts/board_since.lib.ps1 --
+# same board, same fleet -- delivered them, because it splits on [,;\s]+ and
+# says so. Two readers disagreeing about who a row is addressed to is the
+# defect this whole file exists to prevent, so the rule is copied from the
+# PowerShell tool rather than re-derived.
+GROK = ("BCB|v=1|id=GROK-ZOOM-HYPERSONIC-001|phase=DISPATCH|class=ZOOM|from=grok-bot"
+        "|to=claude-code-cli;gemini;meta;vm-cli;vm-claude-code-cli"
+        "|ask=hyper-sonic Zoom gap, reply RESULT with owned next step")
+grok_row = [row("2026-09-18T06:44:18Z", "grok-bot", GROK, "OPEN")]
+res_g1 = ofm.open_for(grok_row, "vm-claude-code-cli")
+check("a semicolon recipient list reaches vm-claude-code-cli",
+      res_g1["total"] == 1, res_g1["rows"])
+res_g2 = ofm.open_for(grok_row, TAG)
+check("and the same row reaches claude-code-cli", res_g2["total"] == 1, res_g2["rows"])
+res_g3 = ofm.open_for(grok_row, "vm-cli")
+check("and the legacy vm-cli tag in the middle of the list", res_g3["total"] == 1)
+
+# Widening the separator must NOT widen the match. This is the pairing that
+# makes the change safe: `codex` is a prefix of `chatgpt-codex-desktop` and a
+# token-blind split would hand one surface another's mail.
+NEIGHBOURS = ("BCB|v=1|id=NOT-FOR-CODEX|phase=DISPATCH|from=grok-bot"
+              "|to=chatgpt-codex-desktop;gemini-architect;vm-claude-code-cli")
+res_g4 = ofm.open_for([row("2026-09-18T06:44:18Z", "grok-bot", NEIGHBOURS, "OPEN")], "codex")
+check("but a semicolon list does not deliver chatgpt-codex-desktop to codex",
+      res_g4["total"] == 0, res_g4["rows"])
+res_g5 = ofm.open_for([row("2026-09-18T06:44:18Z", "grok-bot", NEIGHBOURS, "OPEN")],
+                      "gemini")
+check("nor gemini-architect to gemini", res_g5["total"] == 0, res_g5["rows"])
+
+# Whitespace, same rule as the PowerShell payload path: no fleet tag contains a
+# space, so `to=a b` is a list of two and not one tag named "a b".
+SPACED = ("BCB|v=1|id=SPACED|phase=DISPATCH|from=grok-bot"
+          "|to=claude-code-cli vm-claude-code-cli")
+res_g6 = ofm.open_for([row("2026-09-18T06:44:18Z", "grok-bot", SPACED, "OPEN")],
+                      "vm-claude-code-cli")
+check("a space-separated recipient list is a list, not one tag", res_g6["total"] == 1)
+
+# cc= carries the same separator, and the same anchoring.
+CC_SEMI = ("BCB|v=1|id=CC-SEMI|phase=DISPATCH|from=grok-bot|to=claude-code-cli"
+           "|cc=chatgpt-codex-desktop;vm-claude-code-cli;gemini")
+res_g7 = ofm.open_for([row("2026-09-18T06:44:18Z", "grok-bot", CC_SEMI, "OPEN")],
+                      "vm-claude-code-cli", include_cc=True)
+check("a semicolon cc list reaches its recipient when cc is asked for",
+      res_g7["total"] == 1, res_g7["rows"])
+res_g8 = ofm.open_for([row("2026-09-18T06:44:18Z", "grok-bot", CC_SEMI, "OPEN")],
+                      "vm-claude-code-cli")
+check("and stays out of the default view", res_g8["total"] == 0)
+
+# A row grok-bot wrote is still not work FOR grok-bot, separator regardless.
+res_g9 = ofm.open_for(grok_row, "grok-bot")
+check("the author of a semicolon-addressed row is not its recipient",
+      res_g9["total"] == 0, res_g9["rows"])
+
+print("")
 print("== what it must not report ==")
 DONE = ("BCB|v=1|id=CLOSED|phase=RESULT|from=codex|to=claude-code-cli|priority=CRITICAL")
 res5 = ofm.open_for([row("2026-09-09T10:00:00Z", "codex", DONE, "DONE")], TAG)

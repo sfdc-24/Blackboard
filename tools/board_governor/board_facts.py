@@ -99,8 +99,20 @@ class Row:
 
     @property
     def answers(self):
+        # Comma, SEMICOLON or whitespace, the same list rule as
+        # scripts/board_since.lib.ps1 and scripts/open_for_me.py. Comma alone
+        # read `answers=A;B` as one token that matches no ask, so a reply
+        # written in the semicolon style current on this board scored as
+        # answering nothing -- and this governor's whole output is the
+        # answered/unanswered accounting.
+        #
+        # Whitespace earns its place here on live evidence rather than
+        # symmetry: row 2350 carries `answers=WRK-3cd5f324 (row2350)`, whose
+        # single comma-split token could never match the ask it names. Split
+        # wider and the id matches; the trailing `(row2350)` becomes a token
+        # that equals no id, which is exactly what it should do.
         raw = field(self.payload, "answers")
-        return [part.strip() for part in raw.split(",") if part.strip()] if raw else []
+        return [part for part in (p.strip() for p in re.split(r"[,;\s]+", raw)) if part] if raw else []
 
     @property
     def from_tag(self) -> str:
