@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SFDC24 — Cool stage (option)</title>
+<meta name="description" content="Alternative SFDC24 face: characters, personalities, voices, a little magic. Showcase option — live homepage preserved in archive.">
+<meta name="robots" content="noindex">
+<link rel="canonical" href="https://www.sfdc24.com/cool/">
+<style>
+:root{--paper:#0b1220;--line:#2a3b57;--gold:#f0c36a;--mint:#5dffb0;--pink:#ff7ab8;--sky:#6ecbff;--lava:#ff8f6b;--ui:"Segoe UI",system-ui,sans-serif;--display:Georgia,serif}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--paper);color:#e8eef8;font:16px/1.5 var(--ui)}
+body{background:radial-gradient(1200px 600px at 10% -10%,#1a3a6a55,transparent 60%),radial-gradient(900px 500px at 90% 0%,#6a1a4a44,transparent 55%),var(--paper);overflow-x:hidden}
+.spark{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.55}
+.top{position:relative;z-index:2;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 20px;background:#032D60ee;border-bottom:1px solid #14507F}
+.mark{font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#fff;text-decoration:none}.mark span{color:#57C1FF}
+.chip{font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);border:1px solid #8a6a2f;padding:5px 8px;border-radius:999px}
+.top a{color:#cfe9ff;text-decoration:none;font-size:13px;margin-left:auto}
+.wrap{position:relative;z-index:2;max-width:1100px;margin:0 auto;padding:28px 20px 64px}
+h1{font:600 clamp(28px,5vw,46px)/1.12 var(--display);margin:8px 0 10px;letter-spacing:-.02em}
+.lede{max-width:54ch;color:#b7c4d8;font-size:17px;margin:0 0 22px}.lede strong{color:var(--mint);font-weight:600}
+.stage{position:relative;border:1px solid var(--line);border-radius:18px;padding:18px;background:linear-gradient(180deg,#182640,#101a2c);box-shadow:0 20px 60px #0008;overflow:hidden;margin-bottom:22px}
+.stage::before{content:"";position:absolute;inset:-40%;background:conic-gradient(from 120deg,transparent,#6ecbff22,transparent 40%,#ff7ab822,transparent 70%);animation:spin 18s linear infinite;opacity:.7}
+@keyframes spin{to{transform:rotate(1turn)}}
+.stage-inner{position:relative;z-index:1;display:grid;gap:12px}
+.prompt-row{display:flex;gap:8px;flex-wrap:wrap}
+.prompt-row input{flex:1 1 240px;border:1px solid var(--line);border-radius:999px;padding:12px 16px;background:#0c1526;color:#fff;font:15px/1.3 var(--ui)}
+.prompt-row button{border:0;border-radius:999px;padding:12px 18px;font:700 13px/1 var(--ui);background:linear-gradient(90deg,var(--pink),var(--lava));color:#1a0a10;cursor:pointer}
+.cast{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.char{border:1px solid var(--line);border-radius:14px;padding:12px;background:#0f1a2dcc;cursor:pointer;transition:transform .18s,border-color .18s;text-align:left;color:inherit;font:inherit}
+.char:hover,.char:focus-visible{transform:translateY(-3px);border-color:var(--sky);outline:none}
+.char.on{border-color:var(--mint);box-shadow:0 0 0 1px var(--mint)}
+.avatar{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font:800 15px/1 var(--ui);margin-bottom:8px;color:#0b1220}
+.char h3{margin:0 0 2px;font-size:14px}.char .role{font-size:11px;color:#8fa3c0;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.char p{margin:0;font-size:12.5px;color:#c5d0e2;min-height:3.6em}
+.bubble{display:none;margin-top:10px;padding:10px 12px;border-radius:10px;background:#09101d;border:1px solid var(--line);font-size:13px}
+.char.on .bubble{display:block}
+.log{font:12px/1.45 ui-monospace,Menlo,monospace;background:#070d18;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:90px;max-height:160px;overflow:auto;color:#9ecbff}
+.log .say{color:var(--mint)}.log .magic{color:var(--gold)}.log .warn{color:var(--lava)}
+.note{margin-top:18px;font-size:12.5px;color:#8fa3c0;max-width:70ch}.note a{color:var(--sky)}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
+.controls button{border:1px solid var(--line);background:#121c30;color:#d7e4f7;border-radius:999px;padding:8px 12px;font:600 12px/1 var(--ui);cursor:pointer}
+.controls button.primary{background:#1b3a5c;border-color:#2f5075}
+</style>
+</head>
+<body>
+<canvas class="spark" id="spark" aria-hidden="true"></canvas>
+<header class="top"><a class="mark" href="/">SFDC<span>24</span></a><span class="chip">cool stage · option</span><a href="/">Live homepage (unchanged)</a></header>
+<main class="wrap">
+<h1>Meet the crew.<br>They talk back.</h1>
+<p class="lede">Not a brochure. Tap a character — hear their voice. Type a need and watch <strong>polymorphism</strong> route the lane. Live site stays archived; this is the fun option.</p>
+<section class="stage" aria-label="Interactive crew stage"><div class="stage-inner">
+<div class="prompt-row"><input id="need" placeholder="What hurts… e.g. leads die in a spreadsheet" aria-label="Need"><button type="button" id="cast">Cast the scene</button></div>
+<div class="cast" id="castGrid"></div>
+<div class="controls"><button type="button" class="primary" id="intro">Hear the cold open</button><button type="button" id="hush">Stop talking</button></div>
+<div class="log" id="log" aria-live="polite"></div>
+</div></section>
+<p class="note">Browser speech maps to fleet personas (free). Neural TTS stays gated. Compare <a href="/">live home</a> · <a href="/archive/homepage-2026-09-18/">archive</a>.</p>
+</main>
+<script>
+(function(){
+ var CREW=[
+  {id:'grok',name:'Grok',role:'Ringmaster',color:'#f0c36a',pitch:1.05,rate:1.05,line:'I keep the board honest and the show moving.',open:'Welcome to the cool stage. Dry slides stay archived. Fun lives here.'},
+  {id:'ba',name:'BA',role:'The listener',color:'#ff7ab8',pitch:1.15,rate:0.95,line:'So today that lives in a spreadsheet… what must be true by Friday?',open:'I hear you first. No jargon until you use it.'},
+  {id:'sa',name:'SA',role:'The anchor',color:'#6ecbff',pitch:0.85,rate:0.88,line:'Option, cost, recommendation. Verdict first.',open:'Smallest true shape. We can glam later.'},
+  {id:'claude',name:'Claude',role:'Salesforce lane',color:'#5dffb0',pitch:1.1,rate:1.08,line:'Headless and OmniStudio when the trust surface fits.',open:'Salesforce-shaped? I am primary. Peer-checked.'},
+  {id:'codex',name:'Codex',role:'Release gate',color:'#b8c0ff',pitch:1.0,rate:1.12,line:'Green checks. Small PRs. I break review ties.',open:'Cool page is a feeling branch — not a silent main merge.'},
+  {id:'meta',name:'Meta',role:'WhatsApp door',color:'#7ddea8',pitch:0.95,rate:1.0,line:'Prefix Grok on WhatsApp. I carry the doorway.',open:'Messaging lane online.'},
+  {id:'gemini',name:'Gemini',role:'Story pulse',color:'#ff8f6b',pitch:1.2,rate:1.0,line:'Melody when the others stay flat.',open:'Alive and still honest.'},
+  {id:'vm',name:'VM',role:'Ops heartbeat',color:'#9aa7bd',pitch:0.8,rate:0.92,line:'Azure and Ubuntu stay up. Boring on purpose.',open:'Telemetry steady. Keep the lights warm.'}
+ ];
+ var grid=document.getElementById('castGrid'),logEl=document.getElementById('log'),need=document.getElementById('need'),active=null;
+ function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;logEl.appendChild(d);logEl.scrollTop=logEl.scrollHeight}
+ function hush(){if(window.speechSynthesis)speechSynthesis.cancel()}
+ function speak(char,text){hush();if(!window.speechSynthesis){log('No speechSynthesis — text still works.','warn');return}var u=new SpeechSynthesisUtterance(text);u.pitch=char.pitch;u.rate=char.rate;var vs=speechSynthesis.getVoices();if(vs&&vs.length){u.voice=vs[Math.abs(char.id.split('').reduce(function(a,c){return a+c.charCodeAt(0)},0))%vs.length]}speechSynthesis.speak(u);log(char.name+' — '+text,'say')}
+ function render(){grid.innerHTML='';CREW.forEach(function(c){var b=document.createElement('button');b.type='button';b.className='char'+(active===c.id?' on':'');b.innerHTML='<div class="avatar" style="background:'+c.color+'">'+c.name.slice(0,2).toUpperCase()+'</div><h3>'+c.name+'</h3><div class="role">'+c.role+'</div><p>'+c.line+'</p><div class="bubble" id="bub-'+c.id+'"></div>';b.onclick=function(){active=c.id;render();document.getElementById('bub-'+c.id).textContent=c.open;speak(c,c.open);burst(c.color)};grid.appendChild(b)})}
+ function route(t){t=(t||'').toLowerCase();if(/whatsapp|wa business|meta/.test(t))return['meta','grok','claude'];if(/salesforce|omni|flow|apex|headless/.test(t))return['claude','sa','codex','ba'];if(/server|vm|ubuntu|azure|ops/.test(t))return['vm','codex','grok'];if(/story|cool|fun|brand/.test(t))return['gemini','grok','ba'];return['grok','ba','sa','codex']}
+ document.getElementById('cast').onclick=function(){var text=(need.value||'').trim();if(!text){need.focus();log('Give the stage a sentence.','warn');return}var ids=route(text);log('Polymorph → '+ids.join(' · '),'magic');var i=0;function next(){if(i>=ids.length)return;var c=CREW.find(function(x){return x.id===ids[i++]});if(!c)return next();active=c.id;render();var line=c.id==='ba'?('Hearing: "'+text.slice(0,80)+'"'):c.open;document.getElementById('bub-'+c.id).textContent=line;speak(c,line);burst(c.color);setTimeout(next,2000)}next()};
+ document.getElementById('intro').onclick=function(){var g=CREW[0];active=g.id;render();speak(g,'SFDC24 cool stage. Characters, not clipboard copy. You choose or blend.');burst(g.color)};
+ document.getElementById('hush').onclick=hush;
+ var canvas=document.getElementById('spark'),ctx=canvas.getContext('2d'),parts=[];
+ function resize(){canvas.width=innerWidth;canvas.height=innerHeight}
+ function burst(color){for(var i=0;i<24;i++)parts.push({x:innerWidth*(.3+Math.random()*.4),y:innerHeight*.35,vx:(Math.random()-.5)*6,vy:(Math.random()-.8)*5,life:40+Math.random()*30,color:color||'#f0c36a',r:1+Math.random()*2.5})}
+ function tick(){ctx.clearRect(0,0,canvas.width,canvas.height);parts=parts.filter(function(p){return p.life>0});parts.forEach(function(p){p.life--;p.x+=p.vx;p.y+=p.vy;p.vy+=.06;ctx.beginPath();ctx.fillStyle=p.color;ctx.globalAlpha=Math.max(p.life/60,0);ctx.arc(p.x,p.y,p.r,0,6.28);ctx.fill();ctx.globalAlpha=1});requestAnimationFrame(tick)}
+ addEventListener('resize',resize);resize();tick();setInterval(function(){if(parts.length<12)burst('#2a3b57')},1800);
+ if(window.speechSynthesis)speechSynthesis.getVoices();render();log('Stage ready · live homepage untouched','magic');
+})();
+</script>
+</body>
+</html>
