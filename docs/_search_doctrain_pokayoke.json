@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-09-18T15:56:00-04:00",
+  "generated_by": "grok-bot",
+  "query": ["doc train", "issue list", "PokaYoke/pokayoke", "Claude/Codex/Gemini strategic learnings"],
+  "note": "'doc train' maps to SFDC24 — READ DOC (BOOT). No literal filename 'doc train'.",
+  "hits_summary": {
+    "doc_train": "SFDC24 — READ DOC (BOOT) id=1W3mvkyKNM3zL5VD674bAlE1TVSeOcmJoIdiK9yn4uN4 STATUS=STALE_REFERENCED mtime=2026-09-03 in_wiki=false ADD",
+    "issue_list_drive": "SFDC24 — Issue Journal id=1zKxgEcZ8wWc-5jhvzbC7gLG9NmBsabsK082L9lkVEdY STATUS=STALE_REFERENCED mtime=2026-09-04 in_wiki=false ADD",
+    "issue_list_repo": "docs/ISSUES.md STATUS=STALE_REFERENCED in_wiki=true",
+    "pokayoke_repo": "docs/POKA-YOKE.md STATUS=CURRENT in_wiki=true",
+    "pokayoke_ledger": "SFDC24 — LEARNINGS (Poka-Yoke Ledger) id=1OtV7sYYsxYMD2cuDlOrLRxJcWul84kQQhulQZxByERk STATUS=STALE_REFERENCED mtime=2026-09-12 in_wiki=false ADD",
+    "rules_sheet": "SFDC24 — LEARNINGS (Rules Sheet) id=1puGMjcIg1D6_d-YEobzvvNb9TutazVsELtzg6WUA1fk STATUS=CURRENT mtime=2026-09-13 in_wiki=false ADD CRITICAL",
+    "doctrine": "SFDC24 — DOCTRINE (read first) id=1uVw4LKg97s67R8ch68OmLD_mONIS7NBfFYGgAkxp7PQ STATUS=STALE_REFERENCED mtime=2026-09-12 in_wiki=false ADD",
+    "onboarding": "docs/ONBOARDING.md STATUS=CURRENT in_wiki=true"
+  },
+  "full_path_on_box": "/workspace/mindmap-work/out/_search_doctrain_pokayoke.json",
+  "vanlas_target": "C:\\Users\\salam\\Quantum\\Blackboard\\docs\\_search_doctrain_pokayoke.json",
+  "principles": [
+    "Wake: BOOT → VIEWPORT → Rules Sheet; do not pull full Dispatch/Issue Journal",
+    "D-4 read-back only proof of write",
+    "L-80 never blind-retry bus write",
+    "L-82 one writer per tag",
+    "Poka-yoke > rules (docs/POKA-YOKE.md)",
+    "TESTED vs BELIEVED",
+    "Board APPEND from=grok-bot; secrets never in Drive (D-18)"
+  ]
+}
