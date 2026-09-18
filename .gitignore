@@ -88,3 +88,8 @@ zoom-agent/.tokens.json
 # The templates are not secrets - they are how you know what to fill in.
 !.env.example
 !**/.env.example
+
+# Local transcripts of the direct Grok channel (scripts/grok_thread.py). Working
+# notes between two agents, not fleet record - the board still carries anything
+# the fleet must act on.
+.grok_threads/
