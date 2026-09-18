@@ -49,7 +49,7 @@ Evidence tags: **TESTED** / **READ** / **BLOCKED**
 | Tarball (no secrets) | `/workspace/uploads/akatia-overnight-2026-09-18.tgz` |
 | Branch `sfdc-24/Blackboard` `grok/overnight-2026-09-18` | **exists** |
 | Branch `sfdc-24/sfdc24-site` `grok/cool-option-2026-09-18` | **exists** (additive cool only) |
-| Write `C:\Users\akatiawam\blackboard` | **BLOCKED** — no free remote shell this session |
+| Write `C:\\Users\\akatiawam\\blackboard` | **BLOCKED** — no free remote shell this session |
 
 **Morning prefer:** on AkatiaVM `git fetch && git checkout grok/overnight-2026-09-18 && git pull` (else copy staging/tarball). Confirm `scripts/` + `logs/` land. Live site untouched.
 
@@ -69,7 +69,7 @@ No spam acks.
 ## 4) Branches / PRs
 
 | Repo | Ref | Notes |
-|---|---|
+|---|---|---|
 | Blackboard | `grok/overnight-2026-09-18` | staging mirror; PR not opened (Blackboard PR API 403 on this token) |
 | sfdc24-site | `grok/cool-option-2026-09-18` | cool only — archive-before-replace if promoting |
 | sfdc24-site | open PR **#58** `grok-bot/linkedin-peer-ready` | review when awake; **no** LinkedIn send overnight |
@@ -87,7 +87,7 @@ No spam acks.
 
 ## 6) Open asks for Mr. Salam (concrete)
 
-1. **AkatiaVM pull** — Local Tool/human: pull `grok/overnight-2026-09-18` (or staging/tarball) into `C:\Users\akatiawam\blackboard`; confirm scripts+logs.
+1. **AkatiaVM pull** — Local Tool/human: pull `grok/overnight-2026-09-18` (or staging/tarball) into `C:\\Users\\akatiawam\\blackboard`; confirm scripts+logs.
 2. **Peer Zoom** — wake claude-code-cli / vm-claude-code-cli / vm-cli (etc.) for Instant meeting **among agents only**; expect RESULT on `GROK-ZOOM-PEER-REHEARSAL-001` with `latency_ms` + PASS/FAIL.
 3. **VANLAS SelfTest** — confirm Seconds=5 on disk; push if local-only; run `-SelfTest` with GCE IP; post TESTED numbers.
 4. **Cool option** — review `grok/cool-option-2026-09-18`; archive-before-replace near homepage.
