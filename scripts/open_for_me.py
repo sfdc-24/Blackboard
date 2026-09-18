@@ -92,6 +92,32 @@ def field(payload, name):
 
 BCB_VERSION = "1"
 
+# A BCB list field is delimited by comma, SEMICOLON or whitespace.
+#
+# WHY THE SEPARATOR IS NOT JUST A COMMA
+#   scripts/board_since.lib.ps1 has split these fields on [,;\s]+ since the
+#   substring-addressing repair, and documents why: no fleet tag contains a
+#   space, so `to=a b` is a list of two rather than one tag named "a b".
+#   This reader split on comma alone, so a semicolon list collapsed into ONE
+#   opaque token and matched nobody. Measured against the live 2700-row board
+#   on 2026-09-18: grok-bot joined that morning addressing its dispatches
+#   `to=claude-code-cli;gemini;meta;vm-cli;vm-claude-code-cli`, and all 15 of
+#   its rows were invisible here while the PowerShell reader delivered them.
+#   The tool whose whole purpose is "rows addressed to me that the wake read
+#   cannot see" could not see them either, and reported exit 0.
+#
+#   Splitting wider does NOT match wider: every token is still compared for
+#   EQUALITY, never containment, so `codex` still refuses
+#   `chatgpt-codex-desktop`. The separator decides where a tag ends; the
+#   comparison decides whether it is yours. Those are different questions and
+#   conflating them is what produced the original substring defect.
+LIST_SEPARATOR = re.compile(r"[,;\s]+")
+
+
+def tokens(payload, name):
+    """One BCB list field as exact tokens, in order, empties dropped."""
+    return [t for t in (p.strip() for p in LIST_SEPARATOR.split(field(payload, name))) if t]
+
 
 def fields(payload, name):
     """EVERY value written for a key, not just the first one."""
@@ -395,7 +421,10 @@ def hold_lifecycle(hold_id, hold_pr, hold_when, hold_from, hold_head, rows):
         # rather than leaving it in a comment nobody reads.
         authorised = bool(hold_from) and row_from == hold_from and row_tag == hold_from
 
-        names_it = any(hold_id in [v.strip() for v in field(payload, key).split(",")]
+        # Same separator rule as addressing: a GO row that writes
+        # `clears=ID-A;ID-B` must clear both, or a hold stays up forever on a
+        # technicality of punctuation.
+        names_it = any(hold_id in tokens(payload, key)
                        for key in ("clears", "supersedes"))
         if names_it:
             who = field(payload, "id") or cell(r, COL_ROWID)
@@ -466,9 +495,9 @@ def open_for(rows, tag, include_cc=False, include_all=False, min_priority=None, 
         # A row this tag WROTE is not work for this tag.
         if cell(r, COL_SOURCE) == tag or field(payload, "from") == tag:
             continue
-        targets = [t.strip() for t in field(payload, "to").split(",") if t.strip()]
+        targets = tokens(payload, "to")
         if include_cc:
-            targets += [t.strip() for t in field(payload, "cc").split(",") if t.strip()]
+            targets += tokens(payload, "cc")
         # Exact match, never a substring: `to=vm-claude-code-cli` contains the
         # literal text `claude-code-cli` and is a different instance entirely.
         if tag not in targets and not (include_all and "ALL" in targets):
