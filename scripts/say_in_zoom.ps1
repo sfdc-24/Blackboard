@@ -44,7 +44,7 @@ param(
   [ValidateSet('tts-1','tts-1-hd','gpt-4o-mini-tts')]
   [string]$Model = 'gpt-4o-mini-tts',
   # Only gpt-4o-mini-tts honours this. It steers delivery, not words.
-  [string]$Direction = 'Calm, warm and articulate. Unhurried, like someone thinking while they speak. Never salesy, never bright.',
+  [string]$Direction = 'Energetic, engaged colleague in a live debate. Clear conviction, natural emphasis, vary pace. Sound interested and human - never flat, never monotone, never robotic.',
   [ValidateRange(1, 3500)][int]$MaxChars = 1200,
   [string]$SshKey = 'C:\Users\salam\.ssh\google_compute_engine',
   [string]$EnvFile = 'C:\Users\salam\Quantum\Blackboard\.env',
@@ -164,10 +164,17 @@ if ("$remoteSize".Trim() -ne "$size") {
 }
 Write-Host "shipped $remoteSize bytes, byte-identical on the box"
 
-# presenter_say.sh still owns the Zoom binding check and the refusal to claim it
-# spoke. This only hands it a better recording.
-& $SSH -i $SshKey -o StrictHostKeyChecking=accept-new "user@$Ip" "PRESENTER_WAV=$remote bash /home/user/presenter_say.sh; rc=`$?; rm -f $remote; exit `$rc"
+# presenter_play.sh owns the Zoom binding check, the mute guard, and the refusal
+# to claim it spoke. This only hands it a better recording.
+#
+# IT USED TO SAY presenter_say.sh, AND THAT NAME IS NOW GONE ON PURPOSE.
+# presenter_say.sh held two jobs: espeak synthesis, and playback with all the
+# guards. It was deleted on 2026-09-18 to remove the robotic voice, and the
+# voice went down with it - this line failed with exit 127 into a live meeting.
+# The guards moved to presenter_play.sh verbatim; only the synthesiser was left
+# behind. A file that does one thing cannot be half-deleted.
+& $SSH -i $SshKey -o StrictHostKeyChecking=accept-new "user@$Ip" "PRESENTER_WAV=$remote bash /home/user/presenter_play.sh; rc=`$?; rm -f $remote; exit `$rc"
 $rc = $LASTEXITCODE
 if (-not $KeepLocal) { Remove-Item -LiteralPath $wav -Force -ErrorAction SilentlyContinue }
-if ($rc -ne 0) { Write-Host "presenter_say.sh returned $rc - it refused, or Zoom is not bound to the virtual mic"; exit $rc }
+if ($rc -ne 0) { Write-Host "presenter_play.sh returned $rc - it refused, or Zoom is not bound to the virtual mic"; exit $rc }
 exit 0
