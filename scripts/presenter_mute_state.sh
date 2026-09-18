@@ -65,10 +65,39 @@ THRESHOLD="${PRESENTER_MUTE_THRESHOLD:-20}"
 PEEK_FLAG="${OVERLAY_PEEK_FLAG:-/tmp/overlay_mute_peek}"
 PEEK_WAIT="${PRESENTER_PEEK_WAIT:-6}"
 SHOT="$(mktemp /tmp/mute-XXXXXX.png)"
+REPARK="$(dirname "$0")/overlay_repark.sh"
+PEEKED=0
+tb=""
 
-# The flag must come down whatever happens below, including a failed capture or
-# an interrupt. Leaving it up re-parks Zoom's toolbar over the shared screen.
-cleanup() { rm -f "$SHOT"; rm -f "$PEEK_FLAG"; }
+# CLEARING THE FLAG IS NOT ENOUGH - LOWER THE TOOLBAR OURSELVES.
+#
+# The first version only removed the flag file and left the toolbar at 0,0 for
+# the repark loop to collect on its next pass. Measured across three runs, that
+# is wrong in a way a viewer sees: run 2 reported peeked=0 with the toolbar
+# already at 0,0, which means run 1 had left it RAISED and the loop had not yet
+# come round. Every mute check was flashing Zoom's toolbar onto the shared
+# screen for up to a full loop interval - re-creating, intermittently, the exact
+# bars on the share that the repark loop exists to remove.
+#
+# So this puts it back itself, and takes the off-screen coordinate FROM the
+# parker rather than hardcoding one, which is the single-source-of-truth rule.
+# It also means the guard behaves correctly when no repark loop is running.
+cleanup() {
+    rm -f "$SHOT"
+    rm -f "$PEEK_FLAG"
+    if [ "${PEEKED}" = "1" ] && [ -n "${tb}" ]; then
+        OFFX=-3000
+        OFFY=-3000
+        if [ -r "${REPARK}" ]; then
+            W="$(bash "${REPARK}" where 2>/dev/null)"
+            X_TRY="$(printf '%s' "$W" | sed -n 's/.*off_x=\(-\{0,1\}[0-9]\{1,\}\).*/\1/p')"
+            Y_TRY="$(printf '%s' "$W" | sed -n 's/.*off_y=\(-\{0,1\}[0-9]\{1,\}\).*/\1/p')"
+            [ -n "${X_TRY}" ] && OFFX="${X_TRY}"
+            [ -n "${Y_TRY}" ] && OFFY="${Y_TRY}"
+        fi
+        xdotool windowmove "${tb}" "${OFFX}" "${OFFY}" 2>/dev/null || true
+    fi
+}
 trap cleanup EXIT INT TERM
 
 tb=$(timeout 8 xdotool search --onlyvisible --name '^as_toolbar$' 2>/dev/null | head -1)
