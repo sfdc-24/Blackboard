@@ -115,8 +115,19 @@ def main() -> int:
     # The POST result is not the verdict. Read the board back and look for the id.
     code2, body2 = bus(env, {"secret": env["BUS_SECRET"], "action": "read", "title": BOARD})
     if not body2.lstrip().startswith("{"):
-        print("READBACK UNVERIFIED - board read returned a page, not data")
-        return 1
+        # SAME MEANING AS THE MISSING-ROWS BRANCH BELOW, SO SAY THE SAME THING.
+        # This returned 1 the first time it fired, which reads as "failed" next
+        # to a MISS - and the natural response to a failed write on an
+        # append-only board is to write it again. But the POST had returned
+        # ok:true with an append timestamp; the gateway simply degraded between
+        # the write and the read. Resending would have duplicated a RESULT, the
+        # exact thing that turned one GROK-ZOOM-HYPERSONIC-001 into four.
+        # Unknown is not failure. Exit 2 and say so.
+        print("READBACK UNVERIFIED  rid=%s  board read returned a page, not data."
+              % rid)
+        print("The row may well have landed - the POST above is the evidence. "
+              "DO NOT RESEND. Read the board again and search for this id.")
+        return 2
 
     data = json.loads(body2)
 
