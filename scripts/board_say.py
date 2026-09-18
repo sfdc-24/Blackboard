@@ -117,7 +117,23 @@ def main() -> int:
     if not body2.lstrip().startswith("{"):
         print("READBACK UNVERIFIED - board read returned a page, not data")
         return 1
-    rows = [r for r in (json.loads(body2).get("rows") or []) if isinstance(r, list)]
+
+    data = json.loads(body2)
+
+    # UNKNOWN IS NOT MISS, and here the difference is expensive. This gateway
+    # sometimes answers a read with its health payload - {"ok", "service",
+    # "time", "_httpStatus"} and no rows key. Coercing that to an empty list
+    # would report MISS on a row that had in fact landed, and on an append-only
+    # board the natural response to MISS is to write it again. That is how one
+    # dispatch becomes two.
+    if "rows" not in data:
+        print("READBACK UNVERIFIED  rid=%s  gateway returned %s with no rows key."
+              % (rid, sorted(data.keys())))
+        print("The row may well have landed. DO NOT RESEND - read the board "
+              "again and look for this id before writing anything further.")
+        return 2
+
+    rows = [r for r in (data.get("rows") or []) if isinstance(r, list)]
     landed = [r for r in rows if r and str(r[0]) == rid]
     print("READBACK %s  rid=%s  board now %d rows" %
           ("OK" if landed else "MISS", rid, len(rows)))

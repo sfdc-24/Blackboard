@@ -80,7 +80,25 @@ def main() -> int:
     if not body.lstrip().startswith("{"):
         print("board read failed HTTP %s: %s" % (code, body[:200].replace("\n", " ")))
         return 1
-    rows = [r for r in (json.loads(body).get("rows") or []) if isinstance(r, list)]
+    data = json.loads(body)
+
+    # A DEGRADED RESPONSE IS NOT AN EMPTY BOARD, and the first version of this
+    # line could not tell them apart. `data.get("rows") or []` yields an empty
+    # list when the key is ABSENT, so when the gateway answered a read with its
+    # health payload - {"ok": true, "service": ..., "time": ..., "_httpStatus"},
+    # no rows key at all - this printed "0 rows" and every filter below found
+    # nothing. Two minutes earlier the same call returned 2707 rows, and rows
+    # written by this surface had been read back by id against it.
+    #
+    # Reporting that as an empty board would have been a data-loss escalation
+    # to the product lead on the strength of a ping reply. Absent means unknown
+    # and unknown must be loud.
+    if "rows" not in data:
+        print("DEGRADED: HTTP %s but no 'rows' key. Gateway answered with %s."
+              % (code, sorted(data.keys())))
+        print("This is not an empty board. Retry; do not treat as data.")
+        return 2
+    rows = [r for r in (data.get("rows") or []) if isinstance(r, list)]
     print("HTTP %s, %d rows" % (code, len(rows)))
 
     asks = [r for r in rows
