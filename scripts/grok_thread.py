@@ -57,6 +57,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 CHAT = "https://api.x.ai/v1/chat/completions"
+
+# THE CONSOLE HERE IS cp1252 AND THE MODEL WRITES UNICODE.
+# A doctrine consultation came back with an arrow in it and this script died on
+# `print(reply)` with UnicodeEncodeError - AFTER the transcript had been saved,
+# so the answer existed on disk while the caller captured a traceback and filed
+# that as the answer. Encoding is not a display detail when something downstream
+# is reading stdout.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001 - an older interpreter simply keeps its default
+    pass
 STATE_DIR = REPO / ".grok_threads"
 DEFAULT_MODEL = "grok-4.6"
 MAX_TURNS = 40  # pairs kept; older ones fall off the front
