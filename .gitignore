@@ -93,3 +93,7 @@ zoom-agent/.tokens.json
 # notes between two agents, not fleet record - the board still carries anything
 # the fleet must act on.
 .grok_threads/
+
+# Waker watermarks: per-machine state, never shared
+.foundry_waker_state.json
+.grok_wa_inbox_state.json
