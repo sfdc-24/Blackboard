@@ -1,0 +1,158 @@
+# Refresh the public org desk from the live dev org.
+#
+# WHY THIS EXISTS AND WHY THERE IS NO SERVER
+#   www.sfdc24.com is served by GitHub Pages from sfdc-24/sfdc24-site, which is
+#   static and PUBLIC. A static page cannot hold a client secret, so the
+#   browser can never call Salesforce. The alternative to hosting a proxy is
+#   this: the credential stays in THIS repository, which is private, the read
+#   happens on the runner, and only DATA crosses to the public repo. No server,
+#   no CORS allowlist, no token in the page, nothing for a visitor to call.
+#
+#   The cost is freshness. What the page shows is as old as the last run of
+#   this workflow, which is why the data carries its own "snapshot, not live"
+#   caveat and the page renders it verbatim.
+#
+# WHY THERE IS NO `schedule:` YET
+#   Deliberate, not forgotten. On 2026-09-17 every Opportunity in the org was
+#   deleted, and whether that was intentional is unanswered. An armed cron
+#   would have replaced a page showing 32 opportunities and 2,155,000 in open
+#   pipeline with zeros, correctly and unannounced. Arm the schedule once the
+#   org's contents are settled, and read the shrink guard below before doing it.
+#
+# WHAT A RUN COSTS
+#   Three SELECTs plus two identity calls, so roughly five of the org's 15,000
+#   daily API calls. A 15-minute cron would be about 480 a day.
+name: org-data-refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the rebuilt data to sfdc24-site (otherwise build only)"
+        type: boolean
+        default: false
+      allow_shrink:
+        description: "Permit publishing even if a section lost records since the live page"
+        type: boolean
+        default: false
+
+# One at a time. Two concurrent runs would race on the same branch of the site
+# repo, and the loser would either fail the push or silently overwrite the
+# winner's data depending on timing.
+concurrency:
+  group: org-data-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pinned to commit SHAs rather than tags: a tag is a mutable reference and
+      # this job holds a credential that can read the whole org.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # STEP ONE IS IDENTITY, NOT DATA.
+      #
+      # `check` prints which org and which run-as user actually answered and
+      # exits non-zero if the org is not the expected one. A green build against
+      # the WRONG org is the failure this project keeps paying for, and it is
+      # invisible in every later step.
+      #
+      # This is also the first real test of whether the client credentials grant
+      # works from a GitHub runner at all: the connected app may enforce IP
+      # restrictions, and a runner's egress address is not the machine this was
+      # developed on. If that is the blocker, it surfaces here with the org's own
+      # error rather than as a confusing empty page.
+      - name: Prove which org answers
+        env:
+          SF360_CLIENT_ID: ${{ secrets.SF360_CLIENT_ID }}
+          SF360_CLIENT_SECRET: ${{ secrets.SF360_CLIENT_SECRET }}
+          SF360_DOMAIN: ${{ vars.SF360_DOMAIN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/sf360.py check
+
+      # The publisher refuses to emit any field it does not explicitly list, so
+      # a SELECT that drifts fails the build instead of publishing something to
+      # a world-readable repository. It writes org.json and org.js together
+      # because committing one without the other ships a stale page.
+      - name: Build the snapshot
+        env:
+          SF360_CLIENT_ID: ${{ secrets.SF360_CLIENT_ID }}
+          SF360_CLIENT_SECRET: ${{ secrets.SF360_CLIENT_SECRET }}
+          SF360_DOMAIN: ${{ vars.SF360_DOMAIN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/org_publish.py --out-dir build/data --print-summary
+
+      # WHAT WOULD CHANGE, stated before anything is pushed.
+      #
+      # The live file is fetched from the real domain rather than from the site
+      # repo, because the domain is what a visitor actually gets. A section that
+      # LOST records stops the run unless allow_shrink is set: records vanishing
+      # is exactly what happened on 2026-09-17, and a workflow that publishes
+      # that silently is a workflow that tells you nothing when it matters most.
+      - name: Say what this run would change
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 30 --retry 2 https://www.sfdc24.com/data/org.json -o live-org.json
+          python3 scripts/org_diff_guard.py \
+            --live live-org.json \
+            --built build/data/org.json \
+            ${{ inputs.allow_shrink && '--allow-shrink' || '' }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: org-data
+          path: build/data
+          if-no-files-found: error
+
+      # Only on request. The deploy key is write-scoped to sfdc24-site alone, so
+      # this job cannot reach any other repository even if something later in the
+      # file goes wrong.
+      - name: Publish to sfdc24-site
+        if: ${{ inputs.publish }}
+        env:
+          SITE_DEPLOY_KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SITE_DEPLOY_KEY" > ~/.ssh/site_deploy
+          chmod 600 ~/.ssh/site_deploy
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/site_deploy -o IdentitiesOnly=yes"
+
+          git clone --depth 1 git@github.com:sfdc-24/sfdc24-site.git site
+          cp build/data/org.json build/data/org.js site/data/
+
+          cd site
+          if git diff --quiet -- data/org.json data/org.js; then
+            echo "the org has not changed since the published snapshot; nothing to push"
+            exit 0
+          fi
+          COUNTS="$(python3 -c "import json;m=json.load(open('data/org.json'))['_meta'];print(', '.join('%s %d' % kv for kv in m['counts'].items()))")"
+          git -c user.name="blackboard-org-data-push" \
+              -c user.email="abdus@sfdc24.com" \
+              commit -m "Refresh the org desk snapshot: ${COUNTS}" \
+                     -m "Built by Blackboard org-data-refresh from ${SOURCE_SHA}." \
+                     -- data/org.json data/org.js
+          git push origin HEAD:main
+          echo "pushed $(git rev-parse HEAD) to sfdc24-site"
+
+      # The key never needs to outlive the step, but the runner is reused within
+      # a job, so remove it rather than relying on the VM being discarded.
+      - name: Remove the deploy key from the runner
+        if: ${{ always() }}
+        run: rm -f ~/.ssh/site_deploy
