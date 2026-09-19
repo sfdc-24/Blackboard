@@ -25,7 +25,7 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 | answered by | asked | correct | partly | wrong | open | dissented | dissent right |
 |---|---|---|---|---|---|---|---|
 | gemini | 1 | 0 | 0 | 0 | 1 | 1 | **0** |
-| grok | 4 | 2 | 1 | 0 | 1 | 1 | **1** |
+| grok | 5 | 2 | 1 | 0 | 2 | 1 | **1** |
 
 ## Lessons, which is what the wrong ones are for
 
@@ -38,10 +38,11 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 
 | when (UTC) | answered by | outcome | dissent | subject |
 |---|---|---|---|---|
+| 2026-09-19T05:12:47Z | grok | unverified | unscored | [Operating doctrine for the agency (1 of 1)](2026-09-19-operating-doctrine-for-the-agency-1-of-1.md) |
 | 2026-09-19T05:03:42Z | gemini | unverified | yes | [Editing the live WhatsApp Pipedream step to add a prefix reply](2026-09-19-editing-the-live-whatsapp-pipedream-step-to-add-a-prefix-rep.md) |
 | 2026-09-19T05:03:11Z | grok | partly | no | [Site doctrine and execution split with grok (4 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-4-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | unverified | unscored | [Site doctrine and execution split with grok (3 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-3-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | correct | no | [Site doctrine and execution split with grok (2 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-2-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | correct | yes | [Site doctrine and execution split with grok (1 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-1-of-4.md) |
 
-5 consultations recorded.
+6 consultations recorded.

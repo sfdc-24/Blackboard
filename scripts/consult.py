@@ -125,24 +125,32 @@ def now() -> datetime:
 
 
 def ask_grok(question: str, thread: str) -> tuple:
-    """Through grok_thread.py so the standing conversation keeps its context."""
+    """Through grok_thread.py so the standing conversation keeps its context.
+
+    THE ANSWER IS READ FROM THE TRANSCRIPT, NOT FROM STDOUT, and that is not a
+    style preference. The first doctrine consultation came back with a unicode
+    arrow in it, grok_thread died printing it to a cp1252 console, and this
+    function filed the TRACEBACK as grok's answer - while the real answer sat
+    safely in the transcript the whole time. Parsing a console when the data is
+    already on disk is a decision to read the least reliable copy.
+    """
     tmp = REPO / ".consult_q.txt"
     tmp.write_text(question, encoding="utf-8", newline="\n")
+    transcript = REPO / ".grok_threads" / ("%s.json" % thread)
+    before = len(json.loads(transcript.read_text(encoding="utf-8"))) if transcript.exists() else 0
     try:
         p = subprocess.run(
             [sys.executable, str(SCRIPTS / "grok_thread.py"), "say",
              "-t", thread, "--file", str(tmp), "--max-tokens", "1400"],
             capture_output=True, text=True, timeout=600, cwd=str(REPO))
-        body = (p.stdout or "").strip()
-        # grok_thread prints a trailing accounting line; keep it as metadata
-        # rather than pretending the answer included it.
-        meta = ""
-        if "\n--- thread" in body:
-            body, _, meta = body.rpartition("\n--- thread")
-            meta = "thread" + meta
-        if not body:
-            body = (p.stderr or "").strip() or "(no output)"
-        return body.strip(), (meta.strip() or "grok-4.6 via scripts/grok_thread.py")
+        if transcript.exists():
+            turns = json.loads(transcript.read_text(encoding="utf-8"))
+            if len(turns) > before and turns[-1].get("role") == "assistant":
+                return turns[-1]["content"].strip(), "grok-4.6 via scripts/grok_thread.py"
+        # No new turn means the call itself failed. Say so plainly rather than
+        # filing whatever the console happened to contain.
+        err = (p.stderr or p.stdout or "").strip()[:800]
+        return "CALL FAILED, no answer recorded. %s" % (err or "no output"), "failed"
     finally:
         try:
             tmp.unlink()
@@ -285,9 +293,9 @@ def scoreboard(records: list) -> list:
         dissent = r["meta"].get("dissent", "unscored") == "yes"
         if dissent:
             s["dissent"] += 1
-        if outcome in ("correct", "partly", "wrong"):
-            s[outcome] += 1
-            if dissent and outcome in ("correct", "partly"):
+        if outcome in ("correct", "partly", "wrong", "refused"):
+            s[outcome if outcome != "refused" else "correct"] += 1
+            if dissent and outcome in ("correct", "partly", "refused"):
                 s["dissent_right"] += 1
         else:
             s["open"] += 1
@@ -402,13 +410,24 @@ def cmd_verdict(args) -> int:
     path = OUT / args.record if not Path(args.record).exists() else Path(args.record)
     if not path.exists():
         raise SystemExit("no record at %s" % path)
-    if args.outcome in ("correct", "partly", "wrong") and not (args.evidence or "").strip():
+    if args.outcome in ("correct", "partly", "wrong", "refused") and not (args.evidence or "").strip():
         # THE WHOLE POINT, ENFORCED RATHER THAN ASKED FOR. "The right or wrong
         # answer is only determined after the implementation runs."
+        #
+        # BUT A REFUSAL IS ALSO A VERDICT, and the first version of this check
+        # forbade it. grok-bot caught it: requiring a run to score anything
+        # forbids the most valuable answer there is - do not run this. A
+        # credential in a public page or a test string on a public path is wrong
+        # BEFORE a deploy, and a scorer that only credits things that shipped
+        # teaches agents to ship in order to be graded. So `refused` scores too,
+        # and its evidence is a named blast radius and the cheaper probe that
+        # settled it rather than a deployment version.
+        what = ("a named blast radius and the cheaper probe that settled it"
+                if args.outcome == "refused"
+                else "a commit, a deployment version, a measurement, or a log line")
         raise SystemExit(
-            "refusing to score %s without --evidence. A verdict names the run: a "
-            "commit, a deployment version, a measurement, or a log line. Without "
-            "one this is an opinion about an opinion." % args.outcome)
+            "refusing to score %s without --evidence. A verdict names %s. "
+            "Without one this is an opinion about an opinion." % (args.outcome, what))
     set_verdict(path, args.outcome, args.happened, args.lesson,
                 args.evidence or "", args.dissent or "", args.ask_lesson or "")
     rebuild_index()
@@ -483,7 +502,7 @@ def main() -> int:
     v = sub.add_parser("verdict", help="score a record, after it ran")
     v.add_argument("record")
     v.add_argument("--outcome", required=True,
-                   choices=["built", "correct", "partly", "wrong", "unused", "unverified"])
+                   choices=["built", "correct", "partly", "wrong", "refused", "unused", "unverified"])
     v.add_argument("--happened", default="")
     v.add_argument("--lesson", default="")
     v.add_argument("--evidence", default="")
