@@ -11,7 +11,7 @@ import json
 import re
 import sys
 
-from bus import fetch, load_env, read_board
+from bus import fetch, load_env, read_rows
 
 TITLE = "Blackboard - Alpha DB"
 
@@ -113,9 +113,27 @@ def main():
 
     # read back — ok:true is not proof, and an exception is not proof of absence
     # (ISSUE 020 and its inverse). Reads are idempotent, so retry those freely.
+    #
+    # THE READ-BACK IS FILTERED, AND THAT IS A CORRECTNESS FIX, NOT A SPEED TWEAK.
+    # This loop used to call read_board(), pulling the whole sheet up to three
+    # times. On 2026-09-19 the board was 2951 rows / 4.3 MB, the Azure lane took
+    # over 120 s per unfiltered read, and appending row
+    # VMCCC-SFDC-LEADS-UI-20260919T0750Z died on a timeout *inside this loop* —
+    # AFTER the row had already landed. The operator therefore saw a failure for
+    # a successful append, which is precisely the state that tempts a blind
+    # re-run, and a blind re-run is how a duplicate reaches an append-only
+    # board. A verification step slow enough to time out is a verification step
+    # that produces the bug it exists to prevent.
+    #
+    # match= narrows the transport only. It is a case-insensitive substring over
+    # the WHOLE row, so a later row that merely QUOTES this row_id in its payload
+    # comes back too — measured at 3 hits for one id on 2026-09-19. The exact
+    # Row_ID comparison below stays the authority and the duplicate check keeps
+    # its original meaning; counting match hits instead would invent duplicates
+    # and exit 2 on a healthy append.
     for attempt in range(3):
         try:
-            obj = read_board(env)
+            obj = read_rows(env, match=spec["row_id"])
         except Exception as exc:  # noqa: BLE001
             print("read-back attempt %d failed: %s" % (attempt + 1, exc))
             continue

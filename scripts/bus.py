@@ -106,6 +106,12 @@ def fetch(url, data=None, tries=None):
 
 
 def read_board(env, title="Blackboard - Alpha DB", tries=4):
+    """Read the WHOLE board. rows[0] is the header row.
+
+    This is the unfiltered read and it is getting expensive by construction: the
+    board passed 2950 rows / 4.3 MB on 2026-09-19 and only grows. Prefer
+    read_rows() for anything that already knows what it is looking for.
+    """
     url = env["BUS_URL"]
     payload = {"action": "read", "secret": env["BUS_SECRET"], "title": title}
     for attempt in range(tries):
@@ -118,6 +124,89 @@ def read_board(env, title="Blackboard - Alpha DB", tries=4):
         if "rows" in obj:
             return obj
         print(f"[attempt {attempt+1}] health blob, retrying", file=sys.stderr)
+    raise SystemExit("bus never returned rows")
+
+
+def read_rows(env, title="Blackboard - Alpha DB", tries=4,
+              since=None, limit=None, match=None):
+    """Read a FILTERED slice of the board. Returns data rows only, no header.
+
+    WHY THIS IS A SEPARATE FUNCTION AND NOT A read_board(since=...) KWARG
+      The two calls do not return the same SHAPE. An unfiltered read puts the
+      header at rows[0]; a filtered read omits the header entirely, so rows[0]
+      is a real row. Measured against the live bus on 2026-09-19. Hiding that
+      behind an optional argument means scripts/board_summary.py, which does
+      `hdr = rows[0]` and `len(rows) - 1`, would print a data row as the header
+      and undercount by one the moment anybody passed a filter. Two shapes want
+      two names.
+
+    WHY IT EXISTS AT ALL
+      read_board() pulled 2951 rows / 4.3 MB and blew a 120 s timeout twice on
+      the Azure lane on 2026-09-19, which is what made scripts/append.py time
+      out in its READ-BACK phase after the row had already landed. An append
+      that looks like a failure invites a blind re-run, and a blind re-run is
+      how a duplicate reaches an append-only board. Measured on the same box in
+      the same minute: since= returned 78 rows / 89,960 bytes in 2.9 s.
+
+    THE FILTERS, as the v1 bus actually implements them
+      since  ISO-8601 timestamp; rows newer than it.
+      limit  the n MOST RECENT rows, not the first n.
+      match  case-INSENSITIVE substring, tested across the whole row and NOT
+             just the Row_ID column. This one bites: match on a row id returned
+             3 rows on 2026-09-19 - one being that row, two being later rows
+             that merely QUOTED the id in their payload. A caller identifying a
+             single row must still compare Row_ID exactly. Treat match as a
+             transport-level narrowing, never as an identity test.
+
+    NO SILENT CAPS
+      The reply carries `total` (every row on the sheet, header included) and
+      `filtered` (how many came back). Both pass straight through so a caller
+      can say what it did not look at. A filtered read is never evidence about
+      the rest of the board.
+    """
+    if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+    payload = {"action": "read", "secret": env["BUS_SECRET"], "title": title}
+    if since is not None:
+        payload["since"] = str(since)
+    if limit is not None:
+        payload["limit"] = limit
+    if match is not None:
+        payload["match"] = str(match)
+    asked = [k for k in ("since", "limit", "match") if k in payload]
+
+    for attempt in range(tries):
+        body = fetch(env["BUS_URL"], payload)
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            print(f"[attempt {attempt+1}] non-JSON: {body[:200]}", file=sys.stderr)
+            continue
+        if "rows" not in obj:
+            print(f"[attempt {attempt+1}] health blob, retrying", file=sys.stderr)
+            continue
+        # An older bus deployment ignores unknown keys and answers a filtered
+        # request with the ENTIRE board. Passing that back is the worst outcome
+        # available: the caller believes it holds recent rows and actually holds
+        # all of history. Refuse rather than guess.
+        if asked and "filtered" not in obj:
+            raise SystemExit(
+                "bus answered a filtered read without a 'filtered' count, so it "
+                "almost certainly ignored " + ", ".join(asked) + " and returned "
+                "the whole board. Refusing to pass that off as a filtered slice."
+            )
+        rows = [r for r in obj.get("rows") or [] if r]
+        # Defensive: should a future deployment ever include the header in a
+        # filtered reply, drop it rather than hand the caller a fake data row.
+        if rows and str((list(rows[0]) + [""])[0]).strip() == "Row_ID":
+            rows = rows[1:]
+        return {
+            "rows": rows,
+            "total": obj.get("total"),
+            "filtered": obj.get("filtered", len(rows)),
+            "title": obj.get("title", title),
+        }
     raise SystemExit("bus never returned rows")
 
 
