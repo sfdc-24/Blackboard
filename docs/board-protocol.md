@@ -24,6 +24,50 @@ The board is the shared source of truth. Both parties **read it on a loop** and 
 - This is **not** the forbidden pattern. Forbidden remains: bare GET (health ping) and POST-then-follow-302-as-bare-GET.
 - Laptop / `bus.ps1` may keep using the GET query-param path; both are valid when they return a JSON body with `rows`.
 
+## Network egress allowlist — TWO hosts, not one (2026-09-19, MEASURED)
+
+Any sandboxed client (Claude Desktop, Managed Agents, anything behind an egress
+proxy) must allow **both** of these, or the bus is unreachable:
+
+```
+script.google.com
+script.googleusercontent.com
+```
+
+**One bus call touches two hosts.** Traced 2026-09-19 for a read *and* for a
+write — the behaviour is a property of Apps Script `/exec`, not of the action:
+
+| hop | host | method | result |
+|---|---|---|---|
+| 1 | `script.google.com` | POST | **302** → `script.googleusercontent.com` |
+| 2 | `script.googleusercontent.com` | GET | **200**, the JSON body |
+
+The answer comes back from the **second** host. Allowlisting only
+`script.google.com` fixes the first 403 and produces a second one on the
+redirect, which looks like a different bug and is the same one.
+
+**How the proxy's refusal reads,** and why it is not a bus problem: the deny
+comes back before the request leaves for Google, so Apps Script never sees it
+and logs nothing.
+
+```
+STATUS: 403
+x-deny-reason: host_not_allowed
+Host not in allowlist: script.google.com.
+```
+
+`x-deny-reason: host_not_allowed` is the tell. Distinguish it from Google's own
+403, which returns HTML saying *"Sorry, unable to open the file"*. A bus secret
+or deployment-access problem never produces `x-deny-reason` at all.
+
+**Ruled out by probe, so do not go hunting there.** A custom header is not the
+cause: `Authorization: Bearer`, `Authorization: Basic` and `X-Bus-Secret` were
+each sent to the live bus and all three returned 200 with rows, identical to a
+clean call. The deployment is genuinely anonymous-access.
+
+**Verify a fix with a write, not a read**, and confirm the row by Row_ID —
+`ok:true` alone has lied before. See `A failure report is not proof of no write`.
+
 ### Filters, and what was measured after they shipped (2026-09-18, TESTED)
 
 `action=read` now takes `limit=N`, `match=TEXT` and `since=ISO`, and the
