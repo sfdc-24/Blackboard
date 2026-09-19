@@ -168,6 +168,93 @@ def check_board(state: dict) -> tuple:
         len(fresh), ME, data.get("total")), fresh
 
 
+def check_whatsapp(state: dict) -> tuple:
+    """Messages Mr Salam sent by WhatsApp that nobody has answered.
+
+    THE GAP THIS CLOSES, AND IT IS NOT A SMALL ONE. On 2026-09-19 he said: "I've
+    been writing to everyone in whatsapp and no one is responding including
+    you." He was right, and the inbound pipeline was never the problem -
+    Pipedream writes every message he sends onto the board under the writer tag
+    `whatsapp`, and they were all there. Measured: three of them, including
+    "Claude-code-cli - support Grok and onboard into blackboard fully", sitting
+    OPEN.
+
+    Nothing read them. scripts/grok_wa_inbox.py polls that tag but only picks up
+    rows whose text starts with "grok", and this surface filtered the board for
+    BCB rows addressed to its own tag - a shape his messages do not have. So the
+    one human on this fleet was the only writer nobody was listening to.
+
+    Every message from him counts as news. He is not an agent with a lane; there
+    is one of him, and anything he writes is for whoever can act on it.
+    """
+    env = load_env()
+    since = state.get("wa_watermark") or state.get("watermark") or ""
+    params = {"action": "read", "title": BOARD, "match": "whatsapp", "limit": 30}
+    code, body = bus_get(env, params)
+    if not body.lstrip().startswith("{"):
+        return "UNKNOWN", "whatsapp read returned a page, not data (HTTP %s)" % code, []
+    data = json.loads(body)
+    if "rows" not in data:
+        return "UNKNOWN", "gateway answered with %s and no rows key" % sorted(data.keys()), []
+
+    acked = set(state.get("wa_acked") or [])
+    fresh = []
+    for r in data["rows"]:
+        if not isinstance(r, list) or len(r) < 6:
+            continue
+        tag = str(r[2] or "").strip().lower()
+        if tag != "whatsapp":
+            continue                      # rows that merely MENTION whatsapp
+        rid = str(r[0] or "")
+        text = str(r[5] or "")
+        ts = str(r[1])[:19]
+        if rid in acked:
+            continue
+        if since and ts and ts <= since[:19]:
+            continue
+        fresh.append({"id": rid, "ts": ts, "text": text[:500]})
+    return ("NEWS" if fresh else "QUIET"), "%d unanswered from him" % len(fresh), fresh
+
+
+def ack_whatsapp(fresh: list) -> str:
+    """One line back to him, naming the instance that read it.
+
+    ONE MESSAGE PER RUN, NOT PER ROW. He asked for identification on every
+    message he receives - several surfaces write to him and an unsigned reply
+    tells him nothing about who to hold to it - and wa_notify.ps1 prefixes the
+    tag unless -Raw is passed, so -Raw is never passed here.
+
+    This is a RECEIPT, not an answer. It says the message landed and who has it.
+    The answer comes from a session that can actually do the work, and saying
+    "received" is not the same as saying "done" - a receipt that reads like a
+    completion is worse than silence.
+    """
+    first = fresh[0]["text"].strip().replace("\n", " ")[:70]
+    text = ("read %d message%s on the board just now. First one: “%s”. "
+            "Picking it up - a real answer follows from the live session, not "
+            "this receipt." % (len(fresh), "" if len(fresh) == 1 else "s", first))
+    tmp = REPO / ".waker_wa.txt"
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        p = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(SCRIPTS / "wa_notify.ps1"),
+             # STATUS, not the default BLOCKED. The prefix is the first thing he
+             # reads and nothing here is blocked - a receipt that shouts BLOCKED
+             # is a false alarm every 23 minutes.
+             "-TextFile", str(tmp), "-Tag", ME, "-Kind", "STATUS"],
+            capture_output=True, text=True, timeout=180, cwd=str(REPO))
+        out = (p.stdout or p.stderr or "").strip().splitlines()
+        return out[-1][:200] if out else ("exit %s" % p.returncode)
+    except Exception as exc:  # noqa: BLE001
+        return "ack failed: %s" % exc
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def check_main_green() -> tuple:
     ok, out = gh(["run", "list", "--repo", "sfdc-24/sfdc24-site", "--branch", "main",
                   "--limit", "6", "--json", "name,status,conclusion,headSha"])
@@ -298,16 +385,38 @@ def main() -> int:
 
     if args.peek:
         status, note, fresh = check_board(state)
-        print("%s  %s" % (status, note))
+        # A MESSAGE FROM HIM IS ALWAYS NEWS. The peek decides whether a session
+        # is worth starting, and the one thing that is always worth starting a
+        # session for is the human asking a question and getting silence.
+        wa_status, wa_note, wa_fresh = check_whatsapp(state)
+        both = "NEWS" if (status == "NEWS" or wa_status == "NEWS") else (
+            "UNKNOWN" if "UNKNOWN" in (status, wa_status) else "QUIET")
+        print("%s  %s; whatsapp: %s" % (both, note, wa_note))
+        for w in wa_fresh[:3]:
+            print("  WA %s  %s" % (w["ts"], w["text"][:160]))
         for f in fresh[:5]:
             print("  %s  %s" % (f["ts"], f["payload"][:160]))
-        return 10 if status == "NEWS" else (2 if status == "UNKNOWN" else 0)
+        return 10 if both == "NEWS" else (2 if both == "UNKNOWN" else 0)
     lines, alarms = [], []
 
     board_status, board_note, fresh = check_board(state)
     lines.append("board      %-8s %s" % (board_status, board_note))
     for f in fresh:
         lines.append("           %s  %s" % (f["ts"], f["payload"][:200]))
+
+    # HIS MESSAGES COME FIRST, whatever else this run finds.
+    wa_status, wa_note, wa_fresh = check_whatsapp(state)
+    lines.append("whatsapp   %-8s %s" % (wa_status, wa_note))
+    for w in wa_fresh:
+        lines.append("           %s  %s" % (w["ts"], w["text"][:200]))
+    if wa_fresh and not args.peek:
+        lines.append("ack        SENT     " + ack_whatsapp(wa_fresh))
+        acked = set(state.get("wa_acked") or [])
+        acked.update(w["id"] for w in wa_fresh)
+        # Bounded: the last 200 ids are plenty to stop a repeat and keep the
+        # state file small enough to read by eye when something looks wrong.
+        state["wa_acked"] = sorted(acked)[-200:]
+        state["wa_watermark"] = now_iso()
 
     ci_status, ci_note = check_main_green()
     lines.append("ci         %-8s %s" % (ci_status, ci_note))
