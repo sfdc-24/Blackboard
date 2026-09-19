@@ -598,13 +598,25 @@ limited to either two HTTP404/html board transport failures or a retry that
 reached HTTP200/json but found no `rows` payload. The preceding healthy-only
 action and the old header-incompatibility bridge are unchanged.
 
+`InstallObserveReadyFromDisabledObserveHttpError` is a separate continuation
+for the narrower fail-closed state produced when that qualified Observe
+recovery itself reaches the same pre-admission board-read failure and leaves
+the task Disabled in Observe mode. It is not a retry of the prior MRC: use a
+new operation identity only after preserving and reading back its terminal
+receipt. It requires the same exact disabled XML, result 20, failure code and
+run ID, but authenticates `poll_started Observe` and a disabled Observe
+installer status. It accepts neither an Execute pre-state nor a target work,
+row or result identity.
+
 Supply Mode=Observe, the independently read-back ExpectedDisabledXmlSha256,
 ExpectedCurrentTaskResult=20, ExpectedCurrentFailureCode set to the exact
 state error (`BOARD_READ_HTTP_ERROR` or `BOARD_ROWS_MISSING`), and the exact
 ExpectedCurrentRunId. Retain TimeoutSeconds=420,
 NaturalTriggerMarginSeconds=60 and MaxRuns=8. No target/work/row/result inputs
 are permitted. The driver requires an exact current three-event run:
-poll_started Execute, board_read_retry attempt 1, and run_error attempt 2.
+poll_started in the action's authenticated pre-mode (Execute for the first
+action, Observe for the continuation), board_read_retry attempt 1, and
+run_error attempt 2.
 For HTTP failure recovery, both sanitized sidecars must say HTTP404, html,
 transport exit 0, empty content with its known SHA256, and a positive canonical
 elapsed time. For rows-missing recovery, the retry warning may be the original
@@ -616,9 +628,9 @@ run ID and terminal timestamps must agree; every event and state error has
 blank admitted work/row identity. Other failure codes, transport results, event
 shapes, selected work or ambiguous evidence are not admitted.
 
-This action installs only a future Observe definition through the same pinned
+Either action installs only a future Observe definition through the same pinned
 InstallFromDisabledNoStop installer. It never starts, drains or enables the old
-Execute task, and never invokes Stop, unregister or an automatic restore path.
+definition, and never invokes Stop, unregister or an automatic restore path.
 It verifies backup identity, executable pins, original LastRunTime/result20,
 future interval, protected fingerprints and state/log preservation, including
 after slow backup/tree/native reads. Failures quarantine future triggers.

@@ -3645,6 +3645,8 @@ try {
         Set-TestMock 'Get-CutoverExactInstallerStatus' {
             param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$RequireResultZero,$AllowInheritedTaskResult)
             $script:HttpStatusCalls++
+            $requiredMode=if($script:HttpInstalled){'Observe'}else{$PreMode}
+            if($ExpectedMode -cne $requiredMode){throw 'HTTP_RECOVERY_PRE_MODE_AUTHENTICATION_MISMATCH'}
             if($script:HttpInstalled -and -not $AllowInheritedTaskResult){throw 'HTTP_RECOVERY_INHERITED_FLAG_MISSING'}
             New-TestExactStatus -State $ExpectedTaskState -LastTaskResult $script:HttpTaskResult -Last $script:HttpFinalLast
         }
