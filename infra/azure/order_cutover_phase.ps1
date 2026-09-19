@@ -106,7 +106,8 @@ function Get-CutoverSafeAction {
         'RestoreReady',
         'StartAndAwait',
         'InstallObserveAndDrainFromDisabledExecute',
-        'InstallObserveReadyFromDisabledHttpError'
+        'InstallObserveReadyFromDisabledHttpError',
+        'InstallObserveReadyFromDisabledObserveHttpError'
     )) {
         if ($Value -ieq $known) { return $known }
     }
@@ -3237,13 +3238,13 @@ function Invoke-CutoverInstallObserveAndDrainFromDisabledExecute {
 }
 
 function Assert-CutoverCurrentDisabledHttpReadRun {
-    param($Context, $State, $ExactStatus, $LogCheckpoint)
+    param($Context, $State, $ExactStatus, $LogCheckpoint, [ValidateSet('Execute','Observe')][string]$ExpectedMode = 'Execute')
     # Authenticate this specific two-read, pre-admission board-read incident:
     # either two 404/HTML transport failures, or a retry that reached JSON but
     # found no rows. This is not a generic permission to recover arbitrary
     # nonzero Execute results.
     $null = Assert-CutoverStateShape -State $State
-    $poll = Get-CutoverLastPoll -State $State -ExpectedMode Execute -ExpectedUserProfile $Context.user_profile_path
+    $poll = Get-CutoverLastPoll -State $State -ExpectedMode $ExpectedMode -ExpectedUserProfile $Context.user_profile_path
     $expectedFailureCode = [string]$Context.expected_current_failure_code
     $expectedFailureMessage = if ($expectedFailureCode -ceq 'BOARD_ROWS_MISSING') { 'board_rows_missing' } else { $expectedFailureCode }
     if ($ExactStatus.raw.state -cne 'Disabled' -or
@@ -3262,7 +3263,7 @@ function Assert-CutoverCurrentDisabledHttpReadRun {
         $entries[1].event -cne 'board_read_retry' -or $entries[2].event -cne 'run_error') {
         Throw-Cutover -Code 'DISABLED_HTTP_ERROR_LOG_SHAPE_INVALID'
     }
-    $terminal = Assert-CutoverLogRun -Entries $entries -RunId $poll.run_id -Status error -ExpectedMode Execute `
+    $terminal = Assert-CutoverLogRun -Entries $entries -RunId $poll.run_id -Status error -ExpectedMode $ExpectedMode `
         -ExpectedWorkId '' -ExpectedRowId '' -ExpectedErrorCode $expectedFailureCode `
         -RunWindowStartUtc $ExactStatus.last_run_utc -RunWindowEndUtc ([DateTime]::UtcNow)
     foreach ($index in 0..2) {
@@ -3332,15 +3333,18 @@ function Invoke-CutoverInstallObserveReadyFromDisabledHttpError {
     Assert-CutoverDisabledObserveRecoveryLimits -Context $Context
     if ($Context.expected_disabled_xml_sha256 -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
     try {
+        $preMode = if ($Context.PSObject.Properties['expected_recovery_pre_mode']) { [string]$Context.expected_recovery_pre_mode } else { 'Execute' }
+        if (@('Execute','Observe') -cnotcontains $preMode) { Throw-Cutover -Code 'RECOVERY_PRE_MODE_INVALID' }
+        $receiptAction = if ($Context.PSObject.Properties['action']) { [string]$Context.action } else { 'InstallObserveReadyFromDisabledHttpError' }
         Assert-CutoverPinnedExecutables -Context $Context
-        $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode Execute -ExpectedTaskState Disabled -RequireResultZero $false
+        $initial = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $preMode -ExpectedTaskState Disabled -RequireResultZero $false
         $xml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if ($xml.enabled -or $xml.utf8_text_sha256 -cne $Context.expected_disabled_xml_sha256) { Throw-Cutover -Code 'DISABLED_TASK_XML_NOT_AUTHENTICATED' }
         $state = Get-CutoverState -Path $Context.state_path
         $log = Get-CutoverLogCheckpoint -Path $Context.log_path
-        $failed = Assert-CutoverCurrentDisabledHttpReadRun -Context $Context -State $state.value -ExactStatus $initial -LogCheckpoint $log
+        $failed = Assert-CutoverCurrentDisabledHttpReadRun -Context $Context -State $state.value -ExactStatus $initial -LogCheckpoint $log -ExpectedMode $preMode
         $protected = Get-CutoverProtectedSnapshot -Context $Context
-        $pre = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode Execute -ExpectedTaskState Disabled -RequireResultZero $false
+        $pre = Get-CutoverExactInstallerStatus -Context $Context -ScriptPath $Context.installer_path -ExpectedMode $preMode -ExpectedTaskState Disabled -RequireResultZero $false
         $preXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if ($pre.last_run_utc.Ticks -ne $initial.last_run_utc.Ticks -or [int64]$pre.raw.last_task_result -ne 20 -or
             $preXml.enabled -or $preXml.utf8_text_sha256 -cne $xml.utf8_text_sha256) { Throw-Cutover -Code 'TASK_CHANGED_BEFORE_OBSERVE_RECOVERY' }
@@ -3366,18 +3370,27 @@ function Invoke-CutoverInstallObserveReadyFromDisabledHttpError {
         Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_OBSERVE_RECOVERY'
         Assert-CutoverTriggerWindow -NextRunUtc $final.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)
         $receipt = [pscustomobject][ordered]@{
-            schema=$script:CutoverSchema;ok=$true;action='InstallObserveReadyFromDisabledHttpError';operation_id=$Context.operation_id
-            status='OBSERVE_READY_INHERITED_ERROR';release_id=$Context.release_id;pre_task_state='Disabled';post_task_state='Ready';post_mode='Observe'
+            schema=$script:CutoverSchema;ok=$true;action=$receiptAction;operation_id=$Context.operation_id
+            status='OBSERVE_READY_INHERITED_ERROR';release_id=$Context.release_id;pre_task_state='Disabled';pre_mode=$preMode;post_task_state='Ready';post_mode='Observe'
             failed_run_id=$failed.run_id;inherited_task_result=20;last_run_utc=$failed.last_run_utc.ToString('o')
             authenticated_disabled_xml_sha256=$xml.utf8_text_sha256;observe_xml_sha256=$finalXml.utf8_text_sha256;observe_start_boundary_utc=$boundary.ToString('o')
             backup_matches_authenticated_disabled_xml=$true;state_and_log_preserved=$true;protected_fingerprints_unchanged=$true
-            old_execute_task_not_enabled=$true;task_started=$false;task_stopped=$false;state_not_restored=$true;worker_health_not_yet_confirmed=$true
+            old_execute_task_not_enabled=($preMode -ceq 'Execute');task_started=$false;task_stopped=$false;state_not_restored=$true;worker_health_not_yet_confirmed=$true
         }
         $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
         return $receipt
     } catch {
         Throw-CutoverAfterCleanup -FailureRecord $_ -Context $Context -Installer $Context.installer_path -ExpectedModes @('Observe','Execute')
     }
+}
+
+function Invoke-CutoverInstallObserveReadyFromDisabledObserveHttpError {
+    param([Parameter(Mandatory = $true)]$Context)
+    # This is intentionally a separate admission action: it can only continue
+    # a fail-closed Observe recovery after the same authenticated pre-admission
+    # board-read failure. It never enables, starts, drains, or replays Execute.
+    $Context | Add-Member -NotePropertyName expected_recovery_pre_mode -NotePropertyValue 'Observe' -Force
+    return Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $Context
 }
 
 function New-CutoverContext {
@@ -3456,7 +3469,8 @@ function New-CutoverContext {
         'RestoreReady',
         'StartAndAwait',
         'InstallObserveAndDrainFromDisabledExecute',
-        'InstallObserveReadyFromDisabledHttpError'
+        'InstallObserveReadyFromDisabledHttpError',
+        'InstallObserveReadyFromDisabledObserveHttpError'
     ) -ccontains $RequestedAction) {
         $context.installer_path = Resolve-CutoverInstaller -Path $Values.InstallerPath -ExpectedSha256 $Values.ExpectedInstallerSha256 -ReleaseId $Values.ExpectedReleaseId -Prefix 'INSTALLER'
     }
@@ -3485,7 +3499,7 @@ function New-CutoverContext {
         if ([string]$context.release_id -ceq [string]$context.escrow_release_id) {
             Throw-Cutover -Code 'FAILED_EXECUTE_RELEASE_NOT_ADVANCED'
         }
-    } elseif ($RequestedAction -ceq 'InstallObserveReadyFromDisabledHttpError') {
+    } elseif (@('InstallObserveReadyFromDisabledHttpError','InstallObserveReadyFromDisabledObserveHttpError') -ccontains $RequestedAction) {
         $context.expected_current_task_result = ConvertTo-CutoverInteger -Value ([string]$Values.ExpectedCurrentTaskResult) -Minimum 20 -Maximum 20 -Code 'EXPECTED_CURRENT_TASK_RESULT_INVALID'
         if (@('BOARD_READ_HTTP_ERROR','BOARD_ROWS_MISSING') -cnotcontains [string]$Values.ExpectedCurrentFailureCode) { Throw-Cutover -Code 'EXPECTED_CURRENT_FAILURE_CODE_INVALID' }
         if ([string]$Values.ExpectedCurrentRunId -cnotmatch '^[0-9a-f]{32}$') { Throw-Cutover -Code 'EXPECTED_CURRENT_RUN_ID_INVALID' }
@@ -3519,7 +3533,7 @@ function New-CutoverContext {
             Throw-Cutover -Code 'NO_ELIGIBLE_IDENTITY_MUST_BE_EMPTY'
         }
     }
-    if (@('InstallObserveAndDrainFromDisabledExecute','InstallObserveReadyFromDisabledHttpError') -ccontains $RequestedAction) {
+    if (@('InstallObserveAndDrainFromDisabledExecute','InstallObserveReadyFromDisabledHttpError','InstallObserveReadyFromDisabledObserveHttpError') -ccontains $RequestedAction) {
         if ($context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
         if ($disabledInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_DISABLED_XML_SHA256_INVALID' }
         if ($RequestedAction -ceq 'InstallObserveAndDrainFromDisabledExecute') {
@@ -3565,6 +3579,7 @@ function Invoke-OrderCutoverPhase {
         'StartAndAwait' { return Invoke-CutoverStartAndAwait -Context $context }
         'InstallObserveAndDrainFromDisabledExecute' { return Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context }
         'InstallObserveReadyFromDisabledHttpError' { return Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $context }
+        'InstallObserveReadyFromDisabledObserveHttpError' { return Invoke-CutoverInstallObserveReadyFromDisabledObserveHttpError -Context $context }
     }
     Throw-Cutover -Code 'ACTION_INVALID'
 }
