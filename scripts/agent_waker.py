@@ -70,6 +70,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -467,11 +468,22 @@ def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
     signature test, not an error path.
     """
     mod = __import__(cfg["module"])
+    # ASK THE SIGNATURE, DO NOT PROVOKE A TypeError.
+    #
+    # The first version called ask(prompt, max_tokens=...) and fell back to
+    # ask(prompt) on TypeError. gemini_agent.ask genuinely takes no max_tokens,
+    # so the fallback fired for the right reason there - but a TypeError raised
+    # INSIDE any adapter looks identical from outside, and the fallback then
+    # calls the model a SECOND time and bills for it. Reading the signature
+    # cannot confuse "wrong arguments" with "went wrong".
     try:
-        try:
+        takes_budget = "max_tokens" in inspect.signature(mod.ask).parameters
+    except (TypeError, ValueError):
+        takes_budget = False
+    try:
+        if takes_budget:
             return mod.ask(prompt, max_tokens=max_tokens)
-        except TypeError:
-            return mod.ask(prompt)
+        return mod.ask(prompt)
     except SystemExit as exc:
         # grok_agent raises SystemExit when a reply carries no choices, and an
         # uncaught one ends the whole pass: one provider hiccup would stop the
@@ -484,7 +496,14 @@ def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
 
 # ----------------------------------------------------------------------- main
 
-def main() -> int:
+def main(argv=None) -> int:
+    """argv is a parameter so a test can drive a whole pass.
+
+    It was not, which is why the watermark path had no coverage: every existing
+    test exercised select() and addressed_to() directly, and nothing ever ran
+    the loop that decides what to remember. grok_agent.py already takes argv;
+    this matches it.
+    """
     ap = argparse.ArgumentParser(description="Answer board rows addressed to an API-only agent")
     ap.add_argument("--agent", required=True, choices=sorted(AGENTS),
                     help="which tag to answer as")
@@ -505,7 +524,7 @@ def main() -> int:
                          "a thinking block and no prose at all." % DEFAULT_MAX_TOKENS)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     me = args.agent
     cfg = AGENTS[me]
@@ -534,6 +553,25 @@ def main() -> int:
         return 0
 
     newest_ts = state["watermark"]
+    # THE EARLIEST ROW THIS PASS COULD NOT ANSWER.
+    #
+    # Found by chatgpt-codex-desktop on 2026-09-20 with a live repro of the
+    # 16:01:44Z grok pass: WRK-0ba298fa posted, CCC-RW-PROOF-001 failed on an
+    # HTTP 429, CCC-CONSOLE-403-001 then posted. The watermark advanced to the
+    # LATER success while the failed row never reached answered_ids - so on the
+    # next pass it fell before `since` and was never selected again. Answered
+    # rows are remembered; failed ones were simply lost.
+    #
+    # The POST-failure path below already breaks for exactly this reason, and
+    # its comment says so. Catching adapter failures to keep the pass alive
+    # opened the same hole without the same protection.
+    #
+    # Breaking on first failure would close it too, and would undo the thing
+    # the catch is for: one 429 taking the doorbell down for every later row.
+    # A floor keeps both. Re-reading a row that is already in answered_ids
+    # costs a wider window and nothing else - answered_ids is the dedupe, the
+    # watermark is only the window.
+    floor_ts = None
     for item in pending[: args.max]:
         row = item["row"]
         src_id = bcb_id(row)
@@ -559,6 +597,8 @@ def main() -> int:
             fail = "    %s could not answer: %s" % (me, route)
             print(fail)
             log(me, fail)
+            if floor_ts is None or item["ts"] < floor_ts:
+                floor_ts = item["ts"]
             continue
 
         body = " ".join(text.split())
@@ -596,6 +636,21 @@ def main() -> int:
         tail = "  %d more addressed to %s, left for the next pass" % (left, me)
         print(tail)
         log(me, tail)
+
+    if floor_ts is not None and newest_ts:
+        # One second before the earliest failure, so that row is still inside
+        # the window next time. Never moves the watermark BACKWARD past where
+        # it already was: a floor older than the previous watermark would
+        # re-open rows this agent has already dealt with.
+        cap = (floor_ts - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if cap < newest_ts:
+            held = max(cap, state["watermark"] or cap)
+            note = ("  watermark held at %s (earliest unanswered row was %s) "
+                    "instead of %s" % (held, floor_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                       newest_ts))
+            print(note)
+            log(me, note)
+            newest_ts = held
 
     if not args.dry_run and newest_ts:
         state["watermark"] = newest_ts

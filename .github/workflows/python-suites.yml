@@ -39,6 +39,7 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - "tests/test_waker_watermark.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
@@ -68,6 +69,7 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - "tests/test_waker_watermark.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
@@ -111,6 +113,7 @@ jobs:
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
+                   tests/test_waker_watermark.py \
                    tests/test_waker_dependencies.py \
                    tests/test_foundry_host.py \
                    tests/test_wa_media.py \
@@ -193,6 +196,19 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # A row that fails once must still be there on the next pass.
+      # chatgpt-codex-desktop found the watermark advancing past a failed
+      # row with a live repro; the row then fell out of the window for ever.
+      - name: waker watermark floor and adapter signature (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_waker_watermark.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_waker_watermark.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The dependency check that did not exist. agent_waker.py reached main
       # naming three adapter modules and shelling out to a fourth file, none
       # of which were in the repository, and passed every check twice -
@@ -271,6 +287,7 @@ jobs:
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
+             && [ ! -f tests/test_waker_watermark.py ] \
              && [ ! -f tests/test_waker_dependencies.py ] \
              && [ ! -f tests/test_wa_media.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
