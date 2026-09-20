@@ -24,11 +24,12 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 
 | answered by | asked | correct | partly | wrong | open | dissented | dissent right |
 |---|---|---|---|---|---|---|---|
-| gemini | 1 | 0 | 0 | 0 | 1 | 1 | **0** |
+| gemini | 1 | 1 | 0 | 0 | 0 | 1 | **1** |
 | grok | 5 | 2 | 1 | 0 | 2 | 1 | **1** |
 
 ## Lessons, which is what the wrong ones are for
 
+- **Editing the live WhatsApp Pipedream step to add a prefix reply** (gemini, refused) — gemini's fourth refusal was the right call and I took it. A prefix gate on inbound TEXT alone would have replied to anyone who messages the business number; the gate needs sender, message type and prefix together. And moving the model calls off the default path - my own idea, to stop paying for discarded answers - would have made the board write depend on model latency, so a slow or failed model would mean the message never reaches the board at all. Both faults were in my plan and neither was in my head before asking.
 - **Site doctrine and execution split with grok (1 of 4)** (grok, correct) — It overruled me and it was right. I was going to link assets/site.css into all six pages, which carries a :root, a body background and a type scale - a silent redesign of six pages no suite renders. Ask before a change whose blast radius is pages nothing tests.
 - **Site doctrine and execution split with grok (2 of 4)** (grok, correct) — Agreed with my own position, so this consultation returned nothing I did not already have. Worth recording as such: a peer that agrees is not evidence, and the scoreboard should show how often that happens.
 - **Site doctrine and execution split with grok (4 of 4)** (grok, partly) — A peer answers from the context it has, not from the repository. Brief it on what has LANDED before asking what to do next, or two thirds of the answer is work that already exists.
@@ -39,7 +40,7 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 | when (UTC) | answered by | outcome | dissent | subject |
 |---|---|---|---|---|
 | 2026-09-19T05:12:47Z | grok | unverified | unscored | [Operating doctrine for the agency (1 of 1)](2026-09-19-operating-doctrine-for-the-agency-1-of-1.md) |
-| 2026-09-19T05:03:42Z | gemini | unverified | yes | [Editing the live WhatsApp Pipedream step to add a prefix reply](2026-09-19-editing-the-live-whatsapp-pipedream-step-to-add-a-prefix-rep.md) |
+| 2026-09-19T05:03:42Z | gemini | refused | yes | [Editing the live WhatsApp Pipedream step to add a prefix reply](2026-09-19-editing-the-live-whatsapp-pipedream-step-to-add-a-prefix-rep.md) |
 | 2026-09-19T05:03:11Z | grok | partly | no | [Site doctrine and execution split with grok (4 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-4-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | unverified | unscored | [Site doctrine and execution split with grok (3 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-3-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | correct | no | [Site doctrine and execution split with grok (2 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-2-of-4.md) |

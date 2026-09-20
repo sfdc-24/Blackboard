@@ -4,7 +4,7 @@ answered_by: gemini
 at: 2026-09-19T05:03:42Z
 transport: gemini via scripts/gemini_agent.py
 subject: Editing the live WhatsApp Pipedream step to add a prefix reply
-outcome: unverified
+outcome: refused
 dissent: yes
 public: no
 ---
@@ -184,10 +184,10 @@ Do not rewrite or restructure the 327 lines in place. Treat this as an emergency
 
 ## Verdict
 
-**UNVERIFIED**, scored 2026-09-19T05:04:35Z.
+**REFUSED**, scored 2026-09-19T05:34:15Z.
 
-**Evidence it ran:** 
+**Evidence it ran:** Blast radius: the send_whatsapp_reply step is the ONLY inbound path for the whole fleet - it writes the board row and would carry the reply in the same 327 lines, with the Meta token and four model keys as plaintext literals. Cheaper probe available and not yet run: confirm the step calls $.respond() before any live edit, because without it a runtime error mid-edit returns no ACK and Meta retries, turning one message into a storm at four model calls each. The probe costs one source read in daylight; the failure costs the channel every agent reaches him through.
 
-**What actually happened:** 
+**What actually happened:** Not deployed. I opened the builder, confirmed v265 Active, two steps, and one benign notification - step may need to be retested, not the broken draft the notes warned about - then exited build mode without deploying anything. The browser tooling could not read the source narrowly enough to answer the $.respond question without dumping a file that carries live credentials into a transcript, which is its own failure.
 
-**Lesson:** 
+**Lesson:** gemini's fourth refusal was the right call and I took it. A prefix gate on inbound TEXT alone would have replied to anyone who messages the business number; the gate needs sender, message type and prefix together. And moving the model calls off the default path - my own idea, to stop paying for discarded answers - would have made the board write depend on model latency, so a slow or failed model would mean the message never reaches the board at all. Both faults were in my plan and neither was in my head before asking.
