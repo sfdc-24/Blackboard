@@ -101,6 +101,28 @@ HOW TO ANSWER:
 - Plain ASCII. No markdown headers, no bullet characters, no pipes - the reply
   is written into a pipe-delimited board row."""
 
+# THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
+#
+# Every Foundry pass on 2026-09-20 came back "200 ... but NO TEXT BLOCK":
+#
+#     stop_reason : max_tokens
+#     blocks      : ['thinking']
+#     tokens      : out 700 of max 700 (thinking 700)
+#
+# claude-opus-5 on the Foundry anthropic route emits a thinking block first, and
+# thinking counts against max_tokens. At 700 the whole budget was spent before
+# one word of prose, so the doorbell rang, the model was billed, and the caller
+# got silence - the same silence this file was written to end.
+#
+# foundry_agent.py had the measurement written down at its own call site since
+# 2026-09-17: max_tokens=1024 came back EMPTY, max_tokens=4096 answered the SAME
+# prompt in full. 700 was below even the figure already known to fail. Nobody
+# read the note that was one file away.
+#
+# The spend ceiling keeps its shape: --max still caps rows answered per pass, so
+# a pass is still at most three calls. Only the ceiling per call moved.
+DEFAULT_MAX_TOKENS = 4096
+
 AGENTS = {
     "foundry": {
         "module": "foundry_agent",
@@ -345,11 +367,15 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     return ok
 
 
-def call_agent(cfg: dict, prompt: str):
-    """Normalise the two adapters, which do not take the same arguments."""
+def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
+    """Normalise the two adapters, which do not take the same arguments.
+
+    gemini_agent.ask takes no max_tokens at all, so the TypeError fallback is a
+    signature test, not an error path.
+    """
     mod = __import__(cfg["module"])
     try:
-        return mod.ask(prompt, max_tokens=700)
+        return mod.ask(prompt, max_tokens=max_tokens)
     except TypeError:
         return mod.ask(prompt)
 
@@ -370,6 +396,11 @@ def main() -> int:
                          "at 3 a pass would spend a day saying stale things to "
                          "a board that rolls over at 2000 rows. Raise it "
                          "explicitly if the backlog is what you want.")
+    ap.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                    dest="max_tokens",
+                    help="token budget per model call (default %d). Thinking "
+                         "counts against it: below ~1024, claude-opus-5 returns "
+                         "a thinking block and no prose at all." % DEFAULT_MAX_TOKENS)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -421,7 +452,7 @@ def main() -> int:
             print("    [dry-run] would ask %s and post the reply" % me)
             continue
 
-        text, route = call_agent(cfg, prompt)
+        text, route = call_agent(cfg, prompt, args.max_tokens)
         if not text:
             fail = "    %s could not answer: %s" % (me, route)
             print(fail)

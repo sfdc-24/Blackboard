@@ -152,5 +152,63 @@ class Selection(unittest.TestCase):
         self.assertEqual([p["row"][0] for p in picked], ["A", "B"])
 
 
+class Budget(unittest.TestCase):
+    """The budget that made every Foundry reply an empty one.
+
+    The waker shipped asking for 700 tokens. claude-opus-5 on the Foundry
+    anthropic route emits a thinking block first and thinking counts against
+    max_tokens, so on 2026-09-20 every pass returned stop_reason=max_tokens,
+    blocks=['thinking'], out 700 of 700, and not one word of prose. The doorbell
+    rang, the call was billed, the caller heard nothing.
+
+    foundry_agent.py already carried the measurement: 1024 empty, 4096 a full
+    answer to the identical prompt. These assertions exist so the number cannot
+    drift back under the figure that is known to fail.
+    """
+
+    def test_default_budget_is_above_the_figure_known_to_fail(self):
+        self.assertGreater(
+            aw.DEFAULT_MAX_TOKENS, 1024,
+            "1024 was MEASURED empty on claude-opus-5 via Foundry; a default at "
+            "or below it buys thinking tokens and no answer")
+
+    def test_call_agent_forwards_the_budget_to_an_adapter_that_takes_one(self):
+        seen = {}
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                seen["max_tokens"] = max_tokens
+                return ("text", "route")
+
+        aw.sys.modules["fake_budget_adapter"] = Adapter
+        try:
+            aw.call_agent({"module": "fake_budget_adapter"}, "hello")
+            self.assertEqual(seen["max_tokens"], aw.DEFAULT_MAX_TOKENS)
+            aw.call_agent({"module": "fake_budget_adapter"}, "hello", 2048)
+            self.assertEqual(seen["max_tokens"], 2048)
+        finally:
+            del aw.sys.modules["fake_budget_adapter"]
+
+    def test_an_adapter_without_the_argument_is_still_called(self):
+        """gemini_agent.ask takes no max_tokens. The fallback is a signature
+        test, and it must not turn that adapter into a silent no-answer."""
+        calls = []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt):
+                calls.append(prompt)
+                return ("text", "route")
+
+        aw.sys.modules["fake_plain_adapter"] = Adapter
+        try:
+            text, route = aw.call_agent({"module": "fake_plain_adapter"}, "hello")
+            self.assertEqual(calls, ["hello"])
+            self.assertEqual(text, "text")
+        finally:
+            del aw.sys.modules["fake_plain_adapter"]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
