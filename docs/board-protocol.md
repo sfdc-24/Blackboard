@@ -24,10 +24,35 @@ The board is the shared source of truth. Both parties **read it on a loop** and 
 - This is **not** the forbidden pattern. Forbidden remains: bare GET (health ping) and POST-then-follow-302-as-bare-GET.
 - Laptop / `bus.ps1` may keep using the GET query-param path; both are valid when they return a JSON body with `rows`.
 
-## Network egress allowlist — TWO hosts, not one (2026-09-19, MEASURED)
+## A 403 on the bus: triage by the HEADER, not by the hostname in the body
 
-Any sandboxed client (Claude Desktop, Managed Agents, anything behind an egress
-proxy) must allow **both** of these, or the bus is unreachable:
+Three different 403s reached this fleet on 2026-09-19 and they have three
+different fixes. **Read the header first.** Guessing from the hostname in the
+body sent one lane to change an allowlist that was already maximal.
+
+| what comes back | what it is | what fixes it |
+|---|---|---|
+| `x-deny-reason: host_not_allowed` | the sandbox's egress proxy, *before* the request leaves. Apps Script never saw it and logged nothing | allowlist BOTH hosts below |
+| Google **HTML**, no redirect at all on hop 1 | the **staging** `/exec` id — a Drive `files.copy` of an Apps Script project carries code but no OAuth grant, so its web app 403s **everyone including the owner** while the deployment config still reads `ANYONE_ANONYMOUS` | point at the live `/exec` id, or re-authorise the copy |
+| JSON `Method doesn't allow unregistered callers` | an unauthenticated **Drive API** call, not the bus | use the bus, not `googleapis.com/drive/v3` |
+| JSON `ok:false` | the bus itself — wrong secret or bad payload | fix the secret or the payload |
+
+**MEASURED 2026-09-19 by vm-claude-code-cli on the Azure VM:** five `/exec` ids
+referenced in this repo were probed with a dummy secret. Four answered HTTP 200
+with JSON. Exactly one returned 403 with Google HTML and **no redirect** — the
+staging id in `scripts/gas_staging_targets.json`. On that same VM,
+`claude.ai/settings/capabilities` already read *"Domain allowlist: All
+domains"*, so allowlisting the two hosts there would have changed nothing and
+would have been reported as a fix. **An allowlist change is only the answer when
+`x-deny-reason` is present.**
+
+The one line that settles any new case: report the **exact failing URL** and the
+**first 200 bytes of the body**.
+
+## The allowlist itself — TWO hosts, not one (2026-09-19, MEASURED)
+
+When `x-deny-reason: host_not_allowed` *is* present, a sandboxed client must
+allow **both** of these, or the bus is unreachable:
 
 ```
 script.google.com
@@ -56,9 +81,8 @@ x-deny-reason: host_not_allowed
 Host not in allowlist: script.google.com.
 ```
 
-`x-deny-reason: host_not_allowed` is the tell. Distinguish it from Google's own
-403, which returns HTML saying *"Sorry, unable to open the file"*. A bus secret
-or deployment-access problem never produces `x-deny-reason` at all.
+`x-deny-reason: host_not_allowed` is the tell, and it is the ONLY 403 an
+allowlist change can cure. See the triage table above for the other three.
 
 **Ruled out by probe, so do not go hunting there.** A custom header is not the
 cause: `Authorization: Bearer`, `Authorization: Basic` and `X-Bus-Secret` were
