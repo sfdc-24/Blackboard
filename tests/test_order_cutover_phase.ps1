@@ -924,11 +924,12 @@ try {
     foreach ($forbidden in @('Invoke-RestMethod', 'Invoke-WebRequest', 'az rest', 'bus.ps1', 'Register-ScheduledTask', 'Stop-ScheduledTask')) {
         Assert-True ('driver excludes direct surface ' + $forbidden) ($source.IndexOf($forbidden, [StringComparison]::OrdinalIgnoreCase) -lt 0)
     }
-    Assert-True 'driver exposes all eight bounded actions' (@(
+    Assert-True 'driver exposes all ten bounded actions' (@(
         'ValidateEscrowAndDisable', 'DrainObserve', 'InstallObserveAndDrain',
-        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait', 'InstallObserveAndDrainFromDisabledExecute' |
+        'InstallObserveAndDrainFromFailedExecute', 'InstallExecuteReady', 'RestoreReady', 'StartAndAwait', 'InstallObserveAndDrainFromDisabledExecute',
+        'InstallObserveReadyFromDisabledHttpError', 'InstallObserveReadyFromDisabledObserveHttpError' |
             Where-Object { $source.IndexOf($_, [StringComparison]::Ordinal) -ge 0 }
-    ).Count -eq 8)
+    ).Count -eq 10)
     Assert-True 'receipt byte cap is literal 3072' ($source.Contains('$script:CutoverReceiptMaximumBytes = 3072'))
     Assert-True 'log and protected inputs have finite byte caps' (
         $source.Contains('$script:CutoverLogMaximumBytes = 67108864') -and
@@ -3604,7 +3605,7 @@ try {
     # Disabled pre-admission HTTP recovery is a new, ready-only Observe lane.
     # The healthy-only recovery and the single Execute start remain unchanged.
     function Reset-TestDisabledHttpScenario {
-        param([string]$FailureCode='BOARD_READ_HTTP_ERROR', [string]$RetryShape='')
+        param([string]$FailureCode='BOARD_READ_HTTP_ERROR', [string]$RetryShape='', [ValidateSet('Execute','Observe')][string]$PreMode='Execute')
         Reset-TestMocks
         $script:HttpContext=New-TestContext
         $script:HttpContext.mode='Observe';$script:HttpContext.timeout_seconds=420;$script:HttpContext.max_runs=8
@@ -3615,7 +3616,7 @@ try {
         $script:HttpObserveXml=$futureXml
         $script:HttpContext.expected_disabled_xml_sha256=(Get-CutoverTaskXmlEvidence -Text $script:HttpDisabledXml).utf8_text_sha256
         $errorMessage=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'board_rows_missing'}else{'BOARD_READ_HTTP_ERROR'}
-        $script:HttpState=New-TestState -Mode Execute -RunId ('d'*32) -Status error -ErrorCode $FailureCode -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
+        $script:HttpState=New-TestState -Mode $PreMode -RunId ('d'*32) -Status error -ErrorCode $FailureCode -PollAt '2026-09-07T00:00:01.000Z' -ErrorAt '2026-09-07T00:00:45.000Z'
         $script:HttpState.error.message=$errorMessage
         if([string]::IsNullOrEmpty($RetryShape)){$RetryShape=if($FailureCode -ceq 'BOARD_ROWS_MISSING'){'rows_missing'}else{'http404'}}
         if(@('http404','rows_missing') -cnotcontains $RetryShape){throw 'TEST_RETRY_SHAPE_INVALID'}
@@ -3632,7 +3633,7 @@ try {
             [pscustomobject]@{attempt='2';transport_exit='0';http_status='404';content_type_class='html';elapsed_ms='13711.96';content_length='0';content_sha256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'}
         }
         $script:HttpEntries=@(
-            (New-TestLogEntry -Event poll_started -RunId ('d'*32) -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{mode='Execute'})),
+            (New-TestLogEntry -Event poll_started -RunId ('d'*32) -At '2026-09-07T00:00:01.000Z' -Details ([pscustomobject]@{mode=$PreMode})),
             (New-TestLogEntry -Event board_read_retry -RunId ('d'*32) -Level warning -Code $retryCode -Message 'A transient pre-admission board read failed; retrying once.' -At '2026-09-07T00:00:32.000Z' -Details $retry),
             (New-TestLogEntry -Event run_error -RunId ('d'*32) -Level error -Code $FailureCode -Message $errorMessage -At '2026-09-07T00:00:45.000Z' -Details $errorDetails)
         )
@@ -3644,6 +3645,8 @@ try {
         Set-TestMock 'Get-CutoverExactInstallerStatus' {
             param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState,$RequireResultZero,$AllowInheritedTaskResult)
             $script:HttpStatusCalls++
+            $requiredMode=if($script:HttpInstalled){'Observe'}else{$PreMode}
+            if($ExpectedMode -cne $requiredMode){throw 'HTTP_RECOVERY_PRE_MODE_AUTHENTICATION_MISMATCH'}
             if($script:HttpInstalled -and -not $AllowInheritedTaskResult){throw 'HTTP_RECOVERY_INHERITED_FLAG_MISSING'}
             New-TestExactStatus -State $ExpectedTaskState -LastTaskResult $script:HttpTaskResult -Last $script:HttpFinalLast
         }
@@ -3675,6 +3678,11 @@ try {
     Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING -RetryShape http404
     $rowsMissingAfterHttpReceipt=Invoke-CutoverInstallObserveReadyFromDisabledHttpError -Context $script:HttpContext
     Assert-True 'rows-missing after initial HTTP 404 also authenticates the live guest shape' ($rowsMissingAfterHttpReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $script:HttpEntries[1].code -ceq 'BOARD_READ_HTTP_ERROR' -and $script:HttpEntries[2].code -ceq 'BOARD_ROWS_MISSING')
+    Reset-TestDisabledHttpScenario -FailureCode BOARD_ROWS_MISSING -PreMode Observe
+    $script:HttpContext | Add-Member -NotePropertyName action -NotePropertyValue 'InstallObserveReadyFromDisabledObserveHttpError'
+    $observeFailedReceipt=Invoke-CutoverInstallObserveReadyFromDisabledObserveHttpError -Context $script:HttpContext
+    Assert-True 'disabled Observe rows-missing failure authenticates a distinct ready-only continuation' ($observeFailedReceipt.action -ceq 'InstallObserveReadyFromDisabledObserveHttpError' -and $observeFailedReceipt.pre_mode -ceq 'Observe' -and $observeFailedReceipt.status -ceq 'OBSERVE_READY_INHERITED_ERROR' -and $script:HttpInstallCalls -eq 1)
+    Assert-True 'disabled Observe continuation never claims to re-enable Execute or start work' (-not $observeFailedReceipt.old_execute_task_not_enabled -and -not $observeFailedReceipt.task_started -and -not $observeFailedReceipt.task_stopped -and $observeFailedReceipt.worker_health_not_yet_confirmed)
     foreach($badHttp in @('run','state_work','status','result','shape','poll_work','extra_event','attempt','http','transport','content','digest','elapsed','typed_metadata','retry_detail_code','http_context_rows_retry','lowercase_rows_retry_http','rows_terminal_http','rows_terminal_content','poll_time','error_time','poll_mode')){
         Reset-TestDisabledHttpScenario
         $httpCode='DISABLED_HTTP_ERROR_IDENTITY_INVALID'
@@ -3768,6 +3776,9 @@ try {
         Assert-ThrowsCode ('HTTP recovery context rejects '+$badInput) {New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledHttpError -Values $badHttpValues} $httpCode
     }
     Assert-True 'HTTP ready-only action is explicitly admitted' ((Get-CutoverSafeAction -Value InstallObserveReadyFromDisabledHttpError) -ceq 'InstallObserveReadyFromDisabledHttpError')
+    $wiredObserveHttp=New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledObserveHttpError -Values $rowsMissingValues
+    Assert-True 'disabled Observe HTTP continuation binds the same exact failure identity without a target' ($wiredObserveHttp.action -ceq 'InstallObserveReadyFromDisabledObserveHttpError' -and $wiredObserveHttp.expected_current_failure_code -ceq 'BOARD_ROWS_MISSING' -and [string]::IsNullOrEmpty($wiredObserveHttp.expected_work_id))
+    Assert-True 'disabled Observe HTTP continuation is explicitly admitted' ((Get-CutoverSafeAction -Value InstallObserveReadyFromDisabledObserveHttpError) -ceq 'InstallObserveReadyFromDisabledObserveHttpError')
     $env:ProgramData=$oldProgramData
 
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.
