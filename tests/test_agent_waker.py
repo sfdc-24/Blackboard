@@ -289,5 +289,75 @@ class HisMessagesFirst(unittest.TestCase):
         self.assertEqual([p["row"][0] for p in aw.select(rows, set(), "grok")], ["A", "B"])
 
 
+class PeerEcho(unittest.TestCase):
+    """Three agents paying for each other's conversation, for ever.
+
+    Replies are posted `to=<sender>;ALL`. foundry answers a row from grok and
+    addresses it to grok; grok reads it as mail and answers THAT, addressed to
+    foundry. Measured on the live board within an hour of grok being
+    registered, and legible in the Row_IDs it left:
+
+        GROK-WAKE-FOUNDRY-WAKE-GROK-OVERNIGHT-FLEET-1312
+        FOUNDRY-WAKE-GROK-WAKE-FOUNDRY-WAKE-GROK-OVERNIGHT-FL
+
+    `is_from` only ever stopped an agent answering ITSELF.
+    """
+
+    def test_a_peers_reply_is_not_an_ask(self):
+        for tag in TAGS:
+            for peer in TAGS:
+                if peer == tag:
+                    continue
+                with self.subTest(tag=tag, peer=peer):
+                    r = row(peer, "%s;ALL" % tag,
+                            "%s|answers=X|evidence=STATED|route=y|REPLY: ..."
+                            % aw.WAKER_REPLY_MARK)
+                    self.assertTrue(aw.is_waker_reply(r))
+                    self.assertEqual(aw.select([r], set(), tag), [])
+
+    def test_rows_written_before_the_marker_existed_are_still_caught(self):
+        """The board already holds these. The marker cannot reach backwards."""
+        r = row("foundry", "grok;ALL", "answers=GROK-OVERNIGHT-FLEET-1312|evidence=STATED|y")
+        self.assertTrue(aw.is_waker_reply(r))
+        self.assertEqual(aw.select([r], set(), "grok"), [])
+
+    def test_it_does_not_gag_claude_code_cli_answering_him(self):
+        """`answers=` alone is not the signal - the SENDER carries it.
+
+        claude-code-cli writes `answers=WRK-...` when replying to Mr Salam, and
+        those rows SHOULD be answered by the agents. Gating on the substring
+        alone would silence exactly the traffic that matters.
+        """
+        r = row("claude-code-cli", "whatsapp;grok;ALL",
+                "answers=WRK-477e7897|evidence=MEASURED|what was fixed today")
+        self.assertFalse(aw.is_waker_reply(r))
+        self.assertEqual(len(aw.select([r], set(), "grok")), 1)
+
+    def test_a_genuine_ask_between_agents_still_gets_through(self):
+        """Peers may still ask each other things. Only REPLIES are gagged."""
+        r = row("grok", "foundry", "BCB|v=1|id=ASK-1|ask=benchmark this build")
+        self.assertFalse(aw.is_waker_reply(r))
+        self.assertEqual(len(aw.select([r], set(), "foundry")), 1)
+
+    def test_his_whatsapp_is_never_mistaken_for_an_echo(self):
+        r = row("whatsapp", "Blackboard Alpha DB", "Grok can you reply?")
+        self.assertFalse(aw.is_waker_reply(r))
+
+
+class SourceHygiene(unittest.TestCase):
+    def test_no_control_bytes_in_the_module(self):
+        """The escape that got written instead of escaped.
+
+        A \b typed into a regex through a shell heredoc reached this file as a
+        real 0x08 byte. The guard then matched nothing, and grep printed the
+        line as though it were fine, because a backspace renders as nothing.
+        Cheap to assert; invisible to read.
+        """
+        src = open(aw.__file__, encoding="utf-8").read()
+        allowed = {chr(9), chr(10), chr(13)}
+        bad = sorted({c for c in src if ord(c) < 32 and c not in allowed})
+        self.assertEqual(bad, [], "control bytes in source: %r" % bad)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

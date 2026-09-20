@@ -310,6 +310,49 @@ def bcb_id(row) -> str:
     return m.group(1) if m else str(row[C_ROW_ID])
 
 
+WAKER_REPLY_MARK = "wakerreply=1"
+
+
+def is_waker_reply(row) -> bool:
+    """True when this row is one waker answering another - never an ask.
+
+    THE LOOP THIS STOPS, measured on the live board 2026-09-20.
+
+    Replies are posted `to=<sender>;ALL`. So foundry answers a row from grok
+    and addresses the answer to grok; grok reads it as mail addressed to grok
+    and answers THAT, addressed to foundry; and so on. The chain is legible in
+    the Row_IDs it left behind:
+
+        GROK-WAKE-FOUNDRY-WAKE-GROK-OVERNIGHT-FLEET-1312
+        FOUNDRY-WAKE-GROK-WAKE-FOUNDRY-WAKE-GROK-OVERNIGHT-FL
+
+    Depth three within one hour of grok being registered. Bounded per pass by
+    --max, unbounded over time: at a fifteen-minute cadence this is three
+    agents paying for each other's conversation for ever, and it grows a board
+    that rolls over at 2000 rows.
+
+    The existing echo guard is `is_from(row, me)` - it stops an agent answering
+    ITSELF and says nothing about answering a PEER. The file's own docstring
+    warns about the first and not the second.
+
+    TWO TESTS, because the board already holds rows written before the marker
+    existed:
+      - WAKER_REPLY_MARK, a closed token, for everything written from now on
+      - `answers=` from a sender that is itself a registered agent, for the
+        rows already there
+
+    The second condition needs BOTH halves. `answers=` alone would gag
+    claude-code-cli, which writes `answers=WRK-...` when replying to Mr Salam -
+    and those rows SHOULD be answered by the agents. A substring cannot carry
+    that distinction; the sender is what carries it.
+    """
+    payload = str(row[C_PAYLOAD] if len(row) > C_PAYLOAD else "")
+    if WAKER_REPLY_MARK in payload:
+        return True
+    sender = str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower()
+    return sender in AGENTS and "answers=" in payload
+
+
 def is_from(row, me: str) -> bool:
     return str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower() == me
 
@@ -324,7 +367,8 @@ def select(rows, answered_ids, me: str):
     groups = {}
     seen_count = {}
     for row in rows:
-        if len(row) <= C_PAYLOAD or is_from(row, me) or not addressed_to(row, me):
+        if (len(row) <= C_PAYLOAD or is_from(row, me)
+                or is_waker_reply(row) or not addressed_to(row, me)):
             continue
         ts = parse_ts(row[C_TS])
         if ts is None:
@@ -519,7 +563,9 @@ def main() -> int:
 
         body = " ".join(text.split())
         reply = (
-            "answers=%s|evidence=STATED|route=%s|" % (src_id, route)
+            # WAKER_REPLY_MARK first, so the guard can see it without parsing
+            # the rest. See is_waker_reply for what it stops.
+            "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
               "what it says. %s is a model endpoint: no shell, no repo, no cloud "
