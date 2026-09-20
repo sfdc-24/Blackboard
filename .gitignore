@@ -98,3 +98,9 @@ zoom-agent/.tokens.json
 .foundry_waker_state.json
 .grok_wa_inbox_state.json
 .gemini_waker_state.json
+
+# WhatsApp media fetched by scripts/wa_media.py. This is HIS content -
+# conference photographs, voice notes - pulled from Meta's media API into
+# the working tree so agents can read it. It is not repository content and
+# a push is not undoable the way a local delete is.
+media/
