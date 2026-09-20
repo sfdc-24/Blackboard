@@ -25,7 +25,7 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 | answered by | asked | correct | partly | wrong | open | dissented | dissent right |
 |---|---|---|---|---|---|---|---|
 | gemini | 2 | 1 | 0 | 0 | 1 | 1 | **1** |
-| grok | 5 | 2 | 1 | 0 | 2 | 1 | **1** |
+| grok | 6 | 2 | 1 | 0 | 3 | 1 | **1** |
 
 ## Lessons, which is what the wrong ones are for
 
@@ -40,6 +40,7 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 | when (UTC) | answered by | outcome | dissent | subject |
 |---|---|---|---|---|
 | 2026-09-20T19:06:38Z | gemini | unverified | unscored | [Choice-design architecture for a static low-traffic site](2026-09-20-choice-design-architecture-for-a-static-low-traffic-site.md) |
+| 2026-09-20T18:57:32Z | grok | unverified | unscored | [Handover of sfdc24.com, and the attributes of the offer](2026-09-20-handover-of-sfdc24-com-and-the-attributes-of-the-offer.md) |
 | 2026-09-19T05:12:47Z | grok | unverified | unscored | [Operating doctrine for the agency (1 of 1)](2026-09-19-operating-doctrine-for-the-agency-1-of-1.md) |
 | 2026-09-19T05:03:42Z | gemini | refused | yes | [Editing the live WhatsApp Pipedream step to add a prefix reply](2026-09-19-editing-the-live-whatsapp-pipedream-step-to-add-a-prefix-rep.md) |
 | 2026-09-19T05:03:11Z | grok | partly | no | [Site doctrine and execution split with grok (4 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-4-of-4.md) |
@@ -47,4 +48,4 @@ A peer that DISAGREED and turned out right is the entire return on asking.
 | 2026-09-19T05:03:11Z | grok | correct | no | [Site doctrine and execution split with grok (2 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-2-of-4.md) |
 | 2026-09-19T05:03:11Z | grok | correct | yes | [Site doctrine and execution split with grok (1 of 4)](2026-09-19-site-doctrine-and-execution-split-with-grok-1-of-4.md) |
 
-7 consultations recorded.
+8 consultations recorded.
