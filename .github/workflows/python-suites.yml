@@ -35,6 +35,12 @@ on:
       - "tests/test_bus.py"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
+      - "scripts/foundry_agent.py"
+      - "scripts/gemini_agent.py"
+      - "scripts/grok_agent.py"
+      - "scripts/fleet_agent.py"
+      - "tests/test_waker_dependencies.py"
+      - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
       - "tests/test_wa_media.py"
       - "scripts/agent_waker.py"
@@ -58,6 +64,12 @@ on:
       - "tests/test_bus.py"
       - "scripts/bcb_lint.py"
       - "tests/test_bcb_lint.py"
+      - "scripts/foundry_agent.py"
+      - "scripts/gemini_agent.py"
+      - "scripts/grok_agent.py"
+      - "scripts/fleet_agent.py"
+      - "tests/test_waker_dependencies.py"
+      - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
       - "tests/test_wa_media.py"
       - "scripts/agent_waker.py"
@@ -99,6 +111,8 @@ jobs:
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
+                   tests/test_waker_dependencies.py \
+                   tests/test_foundry_host.py \
                    tests/test_wa_media.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
@@ -179,6 +193,31 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The dependency check that did not exist. agent_waker.py reached main
+      # naming three adapter modules and shelling out to a fourth file, none
+      # of which were in the repository, and passed every check twice -
+      # because its own suite injects fake adapters on purpose.
+      - name: waker dependencies are actually present (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_waker_dependencies.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_waker_dependencies.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The Foundry adapter's own contract suite.
+      - name: foundry host contract (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_foundry_host.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_foundry_host.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # Inbound WhatsApp media. The board records an id and nothing else, so
       # a voice note addressed to an agent by name sat unread for seventeen
       # hours. This suite pins the one rule that made it readable: the row's
@@ -232,6 +271,7 @@ jobs:
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
+             && [ ! -f tests/test_waker_dependencies.py ] \
              && [ ! -f tests/test_wa_media.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
