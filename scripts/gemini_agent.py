@@ -242,8 +242,20 @@ def cmd_check(args):
     return 1
 
 
+def read_prompt(args) -> str:
+    """argv or a file, exactly one, and never silently empty."""
+    if getattr(args, "prompt_file", None):
+        with open(args.prompt_file, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = args.prompt or ""
+    if not text.strip():
+        raise SystemExit("empty question: pass text, or --file with a path that has some")
+    return text
+
+
 def cmd_say(args):
-    text, route = ask(args.prompt, args.model)
+    text, route = ask(read_prompt(args), args.model)
     if not text:
         print("  no answer: %s" % route)
         return 1
@@ -275,7 +287,16 @@ def main():
     p = argparse.ArgumentParser(description="gemini adapter: key route, then ADC, then a loud failure")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check"); c.set_defaults(fn=cmd_check)
-    s = sub.add_parser("say"); s.add_argument("prompt"); s.add_argument("--model", default=None)
+    s = sub.add_parser("say")
+    # A long question MUST be able to arrive as a path. Passing prose through
+    # argv is how consult.py filed a blank gemini consultation on 2026-09-20:
+    # a 2,979-byte question went through the Windows command line, the adapter
+    # printed its route header and no body, and the record was written anyway.
+    # foundry_agent and grok_thread both take --file already.
+    s.add_argument("prompt", nargs="?", default=None)
+    s.add_argument("--file", dest="prompt_file", default=None,
+                   help="read the question from this path instead of argv")
+    s.add_argument("--model", default=None)
     s.set_defaults(fn=cmd_say)
     b = sub.add_parser("board"); b.add_argument("prompt"); b.add_argument("--model", default=None)
     b.add_argument("--to", default="claude-code-cli;ALL"); b.add_argument("--prefix", default=None)

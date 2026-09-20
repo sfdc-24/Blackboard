@@ -159,11 +159,39 @@ def ask_grok(question: str, thread: str) -> tuple:
 
 
 def ask_gemini(question: str) -> tuple:
-    p = subprocess.run(
-        [sys.executable, str(SCRIPTS / "gemini_agent.py"), "say", question],
-        capture_output=True, text=True, timeout=600, cwd=str(REPO))
-    body = (p.stdout or "").strip() or (p.stderr or "").strip() or "(no output)"
-    return body, "gemini via scripts/gemini_agent.py"
+    """IN-PROCESS. No argv, no console, no encoding in the path at all.
+
+    This function has now failed twice for two different reasons, and both were
+    the console.
+
+    First, the question went out as an argv element. A 2,979-byte architecture
+    question through a Windows command line produced a record containing only
+    `[api-key (GEMINI_API_KEY)]` - the adapter's route header, filed as gemini's
+    opinion.
+
+    Passing it by --file fixed that half and exposed the other: gemini's answer
+    contained U+2502, a box-drawing character, and `print()` to a cp1252 console
+    raised UnicodeEncodeError partway through. The subprocess died mid-answer
+    and the caller captured whatever had already flushed.
+
+    ask_grok above records the identical failure from 2026-09-19 - a unicode
+    arrow, grok_thread dying on a cp1252 console, the TRACEBACK filed as the
+    answer - and concludes that parsing a console when the data is available
+    another way is a decision to read the least reliable copy. It reads grok's
+    answer off the transcript on disk.
+
+    gemini keeps no transcript, so the reliable copy is the return value.
+    Importing the adapter and calling ask() removes argv, the console, and the
+    encoding from the path in one move. agent_waker.py already calls its
+    adapters this way.
+    """
+    sys.path.insert(0, str(SCRIPTS))
+    import gemini_agent  # imported here so consult.py still runs without it
+    text, route = gemini_agent.ask(question)
+    return (text or "").strip(), "gemini via gemini_agent.ask (in-process): %s" % route
+
+
+MIN_ANSWER_CHARS = 40
 
 
 ASKERS = {"grok": ask_grok, "gemini": ask_gemini}
@@ -376,10 +404,48 @@ def cmd_ask(args) -> int:
         raise SystemExit("nothing to ask")
     fn = ASKERS[args.to]
     answer, how = fn(question, args.thread) if args.to == "grok" else fn(question)
+
+    # A BLANK IS NOT AN ANSWER, AND MUST NOT BECOME A RECORD.
+    #
+    # On 2026-09-20 this tool filed a gemini consultation whose entire body was
+    # the adapter's route header. Nothing errored. The index counted it, the
+    # verdict block invited a score, and the record said gemini had been asked
+    # a 2,979-byte architecture question and had replied with nothing. The same
+    # question asked in-process returned 8,657 characters.
+    #
+    # The file's own promise is "traceability by construction, not by
+    # discipline". A tool that writes an empty record keeps the ceremony and
+    # loses the thing - worse than not logging, because it looks logged. So it
+    # refuses, prints what it got, and leaves the caller to retry.
+    body = (answer or "").strip()
+    if len(body) < MIN_ANSWER_CHARS:
+        print("REFUSING TO FILE. %s returned %d characters, which is not an answer."
+              % (args.to, len(body)), file=sys.stderr)
+        if body:
+            print("  what came back: %r" % body[:300], file=sys.stderr)
+        print("  how: %s" % how, file=sys.stderr)
+        print("  the question is intact; nothing was written. Retry, or ask the "
+              "adapter directly to see the failure.", file=sys.stderr)
+        return 3
+
     path = write_record(args.to, args.subject, question, answer, how,
                         my_position=args.my_position)
     rebuild_index()
-    print(answer)
+    # THE RECORD IS ALREADY ON DISK. Do not let a console lose the exit code.
+    #
+    # This exact line crashed with UnicodeEncodeError on a cp1252 console when
+    # the answer contained U+2502, AFTER the record had been written and the
+    # index rebuilt - turning a successful consultation into a traceback and a
+    # non-zero exit. The console is the least capable thing in this path and it
+    # is the last thing in it; it does not get to decide whether the call
+    # succeeded.
+    try:
+        print(answer)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(answer.encode(enc, "replace").decode(enc, "replace"))
+        print("  (characters this console cannot render were replaced above; "
+              "the record on disk is intact)", file=sys.stderr)
     print("\n--- recorded: %s ---" % path.relative_to(REPO))
     return 0
 
