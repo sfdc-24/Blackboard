@@ -27,7 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import agent_waker as aw  # noqa: E402
 
-TAGS = ["foundry", "gemini"]
+TAGS = ["foundry", "gemini", "grok"]
+
+# A sender that is NOT one of the agents above. These fixtures used to say
+# "grok" for this, which was fine while grok was only ever a bystander; the
+# moment grok became a registered tag, "a row from another agent" and "a row
+# from me" became the same fixture and the echo guard was no longer tested.
+OTHER = "cowork-chrome"
 
 
 def row(source, target, payload, ts="2026-09-19T12:00:00Z", rid="R1"):
@@ -88,27 +94,27 @@ class Addressing(unittest.TestCase):
         for tag in TAGS:
             with self.subTest(tag=tag):
                 self.assertTrue(aw.addressed_to(
-                    row("grok", "claude-code-cli", "BCB|v=1|to=%s;ALL|ask=x" % tag), tag))
+                    row(OTHER, "claude-code-cli", "BCB|v=1|to=%s;ALL|ask=x" % tag), tag))
                 self.assertTrue(aw.addressed_to(
-                    row("grok", "claude-code-cli", "BCB|v=1|to=grok|cc=%s|ask=x" % tag), tag))
+                    row(OTHER, "claude-code-cli", "BCB|v=1|to=%s|cc=%s|ask=x" % (OTHER, tag)), tag))
                 self.assertTrue(aw.addressed_to(
-                    row("grok", "%s;ALL" % tag, "BCB|v=1|ask=x"), tag))
+                    row(OTHER, "%s;ALL" % tag, "BCB|v=1|ask=x"), tag))
 
     def test_not_addressed(self):
         for tag in TAGS:
             with self.subTest(tag=tag):
                 self.assertFalse(aw.addressed_to(
-                    row("grok", "codex", "BCB|v=1|to=codex;chatgpt|ask=x"), tag))
+                    row(OTHER, "codex", "BCB|v=1|to=codex;chatgpt|ask=x"), tag))
 
     def test_own_rows_are_recognised(self):
         """Without this the waker answers itself forever."""
         for tag in TAGS:
             with self.subTest(tag=tag):
-                self.assertTrue(aw.is_from(row(tag, "grok", "anything"), tag))
-                self.assertFalse(aw.is_from(row("grok", tag, "anything"), tag))
+                self.assertTrue(aw.is_from(row(tag, OTHER, "anything"), tag))
+                self.assertFalse(aw.is_from(row(OTHER, tag, "anything"), tag))
 
     def test_one_agent_does_not_answer_the_others_mail(self):
-        r = row("grok", "foundry", "BCB|v=1|to=foundry|ask=x")
+        r = row(OTHER, "foundry", "BCB|v=1|to=foundry|ask=x")
         self.assertTrue(aw.addressed_to(r, "foundry"))
         self.assertFalse(aw.addressed_to(r, "gemini"))
 
@@ -123,11 +129,11 @@ class Selection(unittest.TestCase):
     def test_repeat_asks_collapse_to_the_newest(self):
         """Six grok nudges under one BCB id must not become six replies."""
         rows = [
-            row("grok", "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
+            row(OTHER, "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
                 ts="2026-09-19T09:00:00Z", rid="A"),
-            row("grok", "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
+            row(OTHER, "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
                 ts="2026-09-19T11:00:00Z", rid="B"),
-            row("grok", "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
+            row(OTHER, "foundry", "BCB|v=1|id=NUDGE-1|ask=wake up",
                 ts="2026-09-19T13:00:00Z", rid="C"),
         ]
         picked = aw.select(rows, set(), "foundry")
@@ -136,20 +142,151 @@ class Selection(unittest.TestCase):
         self.assertEqual(picked[0]["reasks"], 2, "and it says how many it collapsed")
 
     def test_already_answered_ids_are_skipped(self):
-        rows = [row("grok", "gemini", "BCB|v=1|id=DONE-1|ask=x", rid="A")]
+        rows = [row(OTHER, "gemini", "BCB|v=1|id=DONE-1|ask=x", rid="A")]
         self.assertEqual(aw.select(rows, {"DONE-1"}, "gemini"), [])
 
     def test_unparseable_timestamp_is_skipped_not_guessed(self):
-        rows = [row("grok", "gemini", "BCB|v=1|id=Z|ask=x", ts="Friday, September 4", rid="A")]
+        rows = [row(OTHER, "gemini", "BCB|v=1|id=Z|ask=x", ts="Friday, September 4", rid="A")]
         self.assertEqual(aw.select(rows, set(), "gemini"), [])
 
     def test_oldest_first_so_the_backlog_drains_in_order(self):
         rows = [
-            row("grok", "gemini", "BCB|v=1|id=B2|ask=x", ts="2026-09-19T13:00:00Z", rid="B"),
-            row("grok", "gemini", "BCB|v=1|id=A1|ask=x", ts="2026-09-19T09:00:00Z", rid="A"),
+            row(OTHER, "gemini", "BCB|v=1|id=B2|ask=x", ts="2026-09-19T13:00:00Z", rid="B"),
+            row(OTHER, "gemini", "BCB|v=1|id=A1|ask=x", ts="2026-09-19T09:00:00Z", rid="A"),
         ]
         picked = aw.select(rows, set(), "gemini")
         self.assertEqual([p["row"][0] for p in picked], ["A", "B"])
+
+
+class Budget(unittest.TestCase):
+    """The budget that made every Foundry reply an empty one.
+
+    The waker shipped asking for 700 tokens. claude-opus-5 on the Foundry
+    anthropic route emits a thinking block first and thinking counts against
+    max_tokens, so on 2026-09-20 every pass returned stop_reason=max_tokens,
+    blocks=['thinking'], out 700 of 700, and not one word of prose. The doorbell
+    rang, the call was billed, the caller heard nothing.
+
+    foundry_agent.py already carried the measurement: 1024 empty, 4096 a full
+    answer to the identical prompt. These assertions exist so the number cannot
+    drift back under the figure that is known to fail.
+    """
+
+    def test_default_budget_is_above_the_figure_known_to_fail(self):
+        self.assertGreater(
+            aw.DEFAULT_MAX_TOKENS, 1024,
+            "1024 was MEASURED empty on claude-opus-5 via Foundry; a default at "
+            "or below it buys thinking tokens and no answer")
+
+    def test_call_agent_forwards_the_budget_to_an_adapter_that_takes_one(self):
+        seen = {}
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                seen["max_tokens"] = max_tokens
+                return ("text", "route")
+
+        aw.sys.modules["fake_budget_adapter"] = Adapter
+        try:
+            aw.call_agent({"module": "fake_budget_adapter"}, "hello")
+            self.assertEqual(seen["max_tokens"], aw.DEFAULT_MAX_TOKENS)
+            aw.call_agent({"module": "fake_budget_adapter"}, "hello", 2048)
+            self.assertEqual(seen["max_tokens"], 2048)
+        finally:
+            del aw.sys.modules["fake_budget_adapter"]
+
+    def test_an_adapter_without_the_argument_is_still_called(self):
+        """gemini_agent.ask takes no max_tokens. The fallback is a signature
+        test, and it must not turn that adapter into a silent no-answer."""
+        calls = []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt):
+                calls.append(prompt)
+                return ("text", "route")
+
+        aw.sys.modules["fake_plain_adapter"] = Adapter
+        try:
+            text, route = aw.call_agent({"module": "fake_plain_adapter"}, "hello")
+            self.assertEqual(calls, ["hello"])
+            self.assertEqual(text, "text")
+        finally:
+            del aw.sys.modules["fake_plain_adapter"]
+
+
+class TagBoundaries(unittest.TestCase):
+    """grok is a PREFIX of grok-bot, and they are different lanes.
+
+    grok is the xAI API route this waker drives. grok-bot is the Grok Bot
+    desktop app that drives the laptop itself. Before these assertions, every
+    addressing field was matched with `me in field`, so the moment grok was
+    registered it began claiming grok-bot's mail - answering as the wrong party,
+    with a doctrine that describes a different set of powers.
+    """
+
+    def test_grok_does_not_answer_grok_bots_mail(self):
+        self.assertFalse(aw.addressed_to(row("claude-code-cli", "grok-bot", "x"), "grok"))
+        self.assertFalse(
+            aw.addressed_to(row("claude-code-cli", "ALL", "BCB|v=1|to=grok-bot|ask=x"), "grok"))
+
+    def test_grok_still_answers_its_own(self):
+        self.assertTrue(aw.addressed_to(row("claude-code-cli", "grok", "x"), "grok"))
+        self.assertTrue(
+            aw.addressed_to(row("claude-code-cli", "ALL", "BCB|v=1|to=grok;foundry|ask=x"), "grok"))
+        self.assertTrue(
+            aw.addressed_to(row("claude-code-cli", "ALL",
+                                "BCB|v=1|to=codex|cc=vm-cowork;grok;ALL|ask=x"), "grok"))
+
+    def test_a_multi_tag_target_still_matches_each_tag(self):
+        r = row("claude-code-cli", "foundry;gemini;chat-mobile", "x")
+        for tag in ("foundry", "gemini"):
+            with self.subTest(tag=tag):
+                self.assertTrue(aw.addressed_to(r, tag))
+        self.assertFalse(aw.addressed_to(r, "grok"))
+
+    def test_his_whatsapp_prefix_reaches_grok(self):
+        """2026-09-19T22:59Z, unanswered for sixteen hours: "Grok can you reply?"."""
+        r = row("whatsapp", "Blackboard Alpha DB", "Grok can you reply?")
+        self.assertTrue(aw.addressed_to(r, "grok"))
+        self.assertFalse(aw.addressed_to(r, "gemini"))
+
+
+class GrokLane(unittest.TestCase):
+    def test_grok_doctrine_separates_the_api_from_the_desktop_app(self):
+        """The one confusion that would make a grok reply actively misleading."""
+        d = aw.AGENTS["grok"]["doctrine"]
+        self.assertIn("desktop app", d.lower())
+        self.assertIn("cannot", d.lower())
+
+    def test_grok_state_file_is_not_the_whatsapp_pollers(self):
+        self.assertTrue(aw.state_path("grok").endswith(".grok_waker_state.json"),
+                        "must not collide with .grok_wa_inbox_state.json")
+
+
+class HisMessagesFirst(unittest.TestCase):
+    """A person waiting is not a queue of agent notes."""
+
+    def test_whatsapp_outranks_older_fleet_chatter(self):
+        rows = [
+            row("claude-code-cli", "grok", "BCB|v=1|id=OLD-1|ask=x",
+                ts="2026-09-18T09:00:00Z", rid="OLD"),
+            row("whatsapp", "Blackboard Alpha DB", "Grok can you reply?",
+                ts="2026-09-19T22:59:00Z", rid="HIM"),
+        ]
+        picked = aw.select(rows, set(), "grok")
+        self.assertEqual(picked[0]["row"][0], "HIM",
+                         "his message must not wait behind the backlog")
+
+    def test_two_of_his_still_drain_oldest_first(self):
+        rows = [
+            row("whatsapp", "Blackboard Alpha DB", "Grok second",
+                ts="2026-09-19T23:10:00Z", rid="B"),
+            row("whatsapp", "Blackboard Alpha DB", "Grok first",
+                ts="2026-09-19T22:59:00Z", rid="A"),
+        ]
+        self.assertEqual([p["row"][0] for p in aw.select(rows, set(), "grok")], ["A", "B"])
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ personally.
 #>
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('foundry', 'gemini')]
+  [ValidateSet('foundry', 'gemini', 'grok')]
   [string]$Agent,
 
   [int]$Max = 3

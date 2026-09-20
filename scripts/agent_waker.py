@@ -101,6 +101,28 @@ HOW TO ANSWER:
 - Plain ASCII. No markdown headers, no bullet characters, no pipes - the reply
   is written into a pipe-delimited board row."""
 
+# THE BUDGET, AND WHY IT IS NOT THE 700 THIS FILE SHIPPED WITH
+#
+# Every Foundry pass on 2026-09-20 came back "200 ... but NO TEXT BLOCK":
+#
+#     stop_reason : max_tokens
+#     blocks      : ['thinking']
+#     tokens      : out 700 of max 700 (thinking 700)
+#
+# claude-opus-5 on the Foundry anthropic route emits a thinking block first, and
+# thinking counts against max_tokens. At 700 the whole budget was spent before
+# one word of prose, so the doorbell rang, the model was billed, and the caller
+# got silence - the same silence this file was written to end.
+#
+# foundry_agent.py had the measurement written down at its own call site since
+# 2026-09-17: max_tokens=1024 came back EMPTY, max_tokens=4096 answered the SAME
+# prompt in full. 700 was below even the figure already known to fail. Nobody
+# read the note that was one file away.
+#
+# The spend ceiling keeps its shape: --max still caps rows answered per pass, so
+# a pass is still at most three calls. Only the ceiling per call moved.
+DEFAULT_MAX_TOKENS = 4096
+
 AGENTS = {
     "foundry": {
         "module": "foundry_agent",
@@ -130,6 +152,25 @@ browse. You only see the board row quoted to you below.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.""" + _SHARED_RULES,
+    },
+    "grok": {
+        "module": "grok_agent",
+        "project": "FLEET",
+        "doctrine": """You are Grok, a participant on the SFDC24 Blackboard.
+
+WHAT YOU ACTUALLY ARE, and you must not overstate it:
+You are an xAI model reached over HTTP by a small adapter on Mr Salam's laptop.
+This is the API route, NOT the Grok Bot desktop app. The desktop app can drive
+this laptop; you cannot. You have NO shell, NO repository, NO GitHub access and
+NO ability to open a pull request, merge, deploy, or read a file. You cannot
+browse. You only see the board row quoted to you below.
+
+If a row asks you to DO something on the laptop, say plainly that this route
+cannot, and name what it would take. Do not accept work on behalf of the
+desktop app.
+
+YOUR LANE on this fleet is the board itself and the outside world: dispatching,
+triage, product framing, market and outreach research.""" + _SHARED_RULES,
     },
 }
 
@@ -216,6 +257,24 @@ def parse_ts(value):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+_TAG_TOKENS = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def names_tag(field: str, me: str) -> bool:
+    """True when `field` names exactly this tag, as a whole token.
+
+    `me in field` cannot carry this distinction. "grok" is a substring of
+    "grok-bot", and those are two different lanes on this board: grok is the
+    xAI API route, grok-bot is the desktop app that drives the laptop. A waker
+    that answers another agent's mail is worse than one that stays quiet,
+    because the sender is told the wrong thing by the wrong party.
+
+    So tags are compared as whole tokens, with '-' and '_' kept INSIDE the
+    token - which is what makes "grok-bot" one name rather than two.
+    """
+    return me in [t for t in _TAG_TOKENS.split((field or "").lower()) if t]
+
+
 def addressed_to(row, me: str) -> bool:
     """Target_Surface names me, or the payload's to=/cc= does, or a WhatsApp
     message begins with my tag.
@@ -227,11 +286,11 @@ def addressed_to(row, me: str) -> bool:
     target = str(row[C_TARGET] if len(row) > C_TARGET else "").lower()
     payload = str(row[C_PAYLOAD] if len(row) > C_PAYLOAD else "")
     source = str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower()
-    if me in target:
+    if names_tag(target, me):
         return True
     for field in ("to", "cc"):
         m = re.search(r"\b%s=([^|]*)" % field, payload, re.I)
-        if m and me in m.group(1).lower():
+        if m and names_tag(m.group(1), me):
             return True
     # Mr Salam's WhatsApp, 2026-09-19T04:26Z: "give me one short prefix i can
     # write that will get immediate response from whoever (not you or VM but
@@ -280,7 +339,19 @@ def select(rows, answered_ids, me: str):
         prev = groups.get(key)
         if prev is None or ts > prev["ts"]:
             groups[key] = {"ts": ts, "row": row}
-    out = sorted(groups.values(), key=lambda g: g["ts"])
+    # HIS MESSAGES GO FIRST, then oldest-first inside each band.
+    #
+    # Measured 2026-09-20: the first grok pass found 26 unanswered rows, and
+    # "Grok can you reply?" - sent by Mr Salam on WhatsApp at 2026-09-19T22:59Z
+    # and still unanswered sixteen hours later - sat eighth behind fleet
+    # chatter, three answers a pass. A person waiting on a reply is not the
+    # same as a queue of agent notes, and a doorbell that makes him wait three
+    # passes for an answer has not really rung.
+    #
+    # A whatsapp-sourced row IS him: that lane carries nothing else.
+    out = sorted(groups.values(),
+                 key=lambda g: (0 if sender_of(g["row"]).lower() == "whatsapp" else 1,
+                                g["ts"]))
     for g in out:
         g["reasks"] = seen_count[bcb_id(g["row"])] - 1
     return out
@@ -345,13 +416,26 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     return ok
 
 
-def call_agent(cfg: dict, prompt: str):
-    """Normalise the two adapters, which do not take the same arguments."""
+def call_agent(cfg: dict, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS):
+    """Normalise the two adapters, which do not take the same arguments.
+
+    gemini_agent.ask takes no max_tokens at all, so the TypeError fallback is a
+    signature test, not an error path.
+    """
     mod = __import__(cfg["module"])
     try:
-        return mod.ask(prompt, max_tokens=700)
-    except TypeError:
-        return mod.ask(prompt)
+        try:
+            return mod.ask(prompt, max_tokens=max_tokens)
+        except TypeError:
+            return mod.ask(prompt)
+    except SystemExit as exc:
+        # grok_agent raises SystemExit when a reply carries no choices, and an
+        # uncaught one ends the whole pass: one provider hiccup would stop the
+        # doorbell for every remaining row, which is the failure this file
+        # exists to prevent. Report it the way foundry_agent already does.
+        return None, "adapter raised SystemExit: %s" % (exc,)
+    except Exception as exc:  # noqa: BLE001 - a doorbell must survive the bell
+        return None, "%s: %s" % (type(exc).__name__, exc)
 
 
 # ----------------------------------------------------------------------- main
@@ -370,6 +454,11 @@ def main() -> int:
                          "at 3 a pass would spend a day saying stale things to "
                          "a board that rolls over at 2000 rows. Raise it "
                          "explicitly if the backlog is what you want.")
+    ap.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                    dest="max_tokens",
+                    help="token budget per model call (default %d). Thinking "
+                         "counts against it: below ~1024, claude-opus-5 returns "
+                         "a thinking block and no prose at all." % DEFAULT_MAX_TOKENS)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -421,7 +510,7 @@ def main() -> int:
             print("    [dry-run] would ask %s and post the reply" % me)
             continue
 
-        text, route = call_agent(cfg, prompt)
+        text, route = call_agent(cfg, prompt, args.max_tokens)
         if not text:
             fail = "    %s could not answer: %s" % (me, route)
             print(fail)
