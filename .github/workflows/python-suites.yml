@@ -39,6 +39,8 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - "scripts/consult.py"
+      - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
@@ -69,6 +71,8 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - "scripts/consult.py"
+      - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
@@ -113,6 +117,7 @@ jobs:
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
+                   tests/test_consult_never_files_a_blank.py \
                    tests/test_waker_watermark.py \
                    tests/test_waker_dependencies.py \
                    tests/test_foundry_host.py \
@@ -192,6 +197,19 @@ jobs:
           if [ -f tests/test_board_governor.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_board_governor.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The consultation log filed a route header as gemini's opinion, twice,
+      # for two different console reasons. The adapter is called in-process
+      # now and a blank can never become a record.
+      - name: consult never files a blank (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_consult_never_files_a_blank.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_consult_never_files_a_blank.py
           else
             echo "not on this branch; skipping"
           fi
@@ -287,6 +305,7 @@ jobs:
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
+             && [ ! -f tests/test_consult_never_files_a_blank.py ] \
              && [ ! -f tests/test_waker_watermark.py ] \
              && [ ! -f tests/test_waker_dependencies.py ] \
              && [ ! -f tests/test_wa_media.py ] \
