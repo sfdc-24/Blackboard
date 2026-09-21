@@ -393,6 +393,35 @@ def main() -> int:
 
     state = load_state()
 
+    # The runner calls this only after the model process has completed the
+    # addressed rows it peeked.  This must remain a narrow, bounded commit:
+    # running the normal health pass here means an unrelated CI/site/assistant
+    # request can hold the single-writer lock after a clean model exit and
+    # prevent the cursor from being recorded.  It must not send a WhatsApp
+    # acknowledgement or post an alarm either; those actions belong to the
+    # regular health pass before a peek.
+    if args.advance:
+        # A WhatsApp receipt can arrive while the model is working.  If no
+        # independent boundary exists yet, `check_whatsapp()` normally inherits
+        # the board watermark.  Freeze that inherited value before moving the
+        # board cursor so this commit cannot hide a new, unacknowledged receipt.
+        # This is deliberately a state-only operation: advance must not read or
+        # send on the WhatsApp lane.
+        state.setdefault("wa_watermark", state.get("watermark") or "")
+        board_status, _board_note, fresh = check_board(state)
+        if board_status == "UNKNOWN":
+            # A failed read is never permission to skip work.  Leave the
+            # cursor unchanged so the next natural run can safely see it.
+            return 2
+        if fresh:
+            state["watermark"] = now_iso()
+        state["last_run"] = now_iso()
+        last_status = state.get("last_status") or {}
+        last_status["board"] = board_status
+        state["last_status"] = last_status
+        save_state(state)
+        return 0
+
     if args.peek:
         status, note, fresh = check_board(state)
         # A MESSAGE FROM HIM IS ALWAYS NEWS. The peek decides whether a session
@@ -454,16 +483,6 @@ def main() -> int:
     if say_status == "BAD":
         alarms.append("the visitor assistant is not answering properly: " + say_note)
 
-    # THE WATERMARK MOVES ON --advance AND NOWHERE ELSE.
-    #   The first wiring advanced it whenever the health pass saw new rows, and
-    #   the health pass runs before the peek - so the peek, forty seconds later,
-    #   reported QUIET against rows nobody had read. A watcher that marks work
-    #   as seen on behalf of a session that never ran is worse than no watcher:
-    #   it is the doorbell answering the door and walking away.
-    #   Only a clean woken session advances it, which is the same rule the
-    #   PowerShell peek was built on.
-    if args.advance and fresh:
-        state["watermark"] = now_iso()
     state["last_run"] = now_iso()
     state["last_status"] = {"board": board_status, "ci": ci_status,
                             "site": site_status, "assistant": say_status}

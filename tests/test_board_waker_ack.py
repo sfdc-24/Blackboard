@@ -92,6 +92,12 @@ class WhatsAppAcknowledgement(unittest.TestCase):
              mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
              mock.patch.object(bw, "post_alarm", return_value=""), \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertEqual(state["watermark"], "2026-09-20T23:00:00Z")
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
             with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
                 self.assertEqual(bw.main(), 0)
         state = bw.load_state()
@@ -100,7 +106,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         self.assertNotIn("WRK-ack-test", state.get("wa_acked", []))
         self.assert_whatsapp_row_is_retriable(state)
 
-    def test_failed_ack_without_prior_cursor_survives_general_advance(self):
+    def test_failed_ack_without_prior_cursor_survives_advance(self):
         """An intentional empty WA boundary must not fall back after advance."""
         with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
              mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
@@ -110,6 +116,12 @@ class WhatsAppAcknowledgement(unittest.TestCase):
              mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
              mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
              mock.patch.object(bw, "post_alarm", return_value=""), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertNotIn("watermark", state)
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
             with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
                 self.assertEqual(bw.main(), 0)
@@ -122,6 +134,53 @@ class WhatsAppAcknowledgement(unittest.TestCase):
     def test_explicit_empty_wa_cursor_does_not_fall_back_to_general_cursor(self):
         state = {"wa_watermark": "", "watermark": "2026-09-21T00:02:00Z"}
         self.assert_whatsapp_row_is_retriable(state)
+
+    def test_advance_commits_board_cursor_without_running_health_or_ack(self):
+        """A clean model exit cannot be held by unrelated health work."""
+        fresh = [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}]
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", fresh)), \
+             mock.patch.object(bw, "check_whatsapp") as whatsapp, \
+             mock.patch.object(bw, "ack_whatsapp") as ack, \
+             mock.patch.object(bw, "check_main_green") as ci, \
+             mock.patch.object(bw, "check_live_site") as site, \
+             mock.patch.object(bw, "check_assistant") as assistant, \
+             mock.patch.object(bw, "post_alarm") as alarm, \
+             mock.patch.object(bw, "write_digest") as digest, \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+                self.assertEqual(bw.main(), 0)
+        self.assertEqual(bw.load_state()["watermark"], "2026-09-21T00:02:00Z")
+        for dependency in (whatsapp, ack, ci, site, assistant, alarm, digest):
+            dependency.assert_not_called()
+
+    def test_advance_unknown_board_leaves_cursor_unchanged_and_does_not_write(self):
+        """An untrusted read must not turn a clean model exit into skipped work."""
+        before = {"watermark": "2026-09-20T23:00:00Z", "last_status": {"ci": "OK"}}
+        bw.save_state(before)
+        with mock.patch.object(bw, "check_board", return_value=("UNKNOWN", "network", [])), \
+             mock.patch.object(bw, "save_state") as save:
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+                self.assertEqual(bw.main(), 2)
+        save.assert_not_called()
+        self.assertEqual(bw.load_state(), before)
+
+    def test_advance_freezes_inherited_wa_boundary_for_a_message_arriving_during_model(self):
+        """A new receipt must not inherit the board cursor written after it arrived."""
+        bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
+        fresh = [{"ts": "2026-09-21T00:00:30Z", "payload": "to=claude-code-cli"}]
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", fresh)), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
+        self.assertEqual(state["wa_watermark"], "2026-09-21T00:00:00Z")
+        arrived = [["WA-arrived-during-model", "2026-09-21T00:01:00Z", "whatsapp", "ALL", "APPEND", "hello"]]
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", return_value=(200, __import__("json").dumps({"rows": arrived, "total": 1}))):
+            status, _, pending = bw.check_whatsapp(state)
+        self.assertEqual(status, "NEWS")
+        self.assertEqual([row["id"] for row in pending], ["WA-arrived-during-model"])
 
     @mock.patch.object(bw, "subprocess")
     def test_ack_exception_is_not_recorded_as_acknowledged(self, subprocess_mock):
