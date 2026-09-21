@@ -54,6 +54,13 @@ on it:*
 *Verified 2026-09-09 from the laptop: `.env` does hold `META_TOKEN` and
 `WA_PHONE_NUMBER_ID`, so the laptop row holds.*
 
+**A surface that does not hold those credentials does not send WhatsApp
+itself.** It posts a `phase=WA_SEND` (or `WA_OUT|`) board row; the laptop
+watcher `scripts/wa_board_outbox.py` is what calls `wa_notify.ps1`.
+Recipient stays the Governor number already in `.env`. Apps Script and
+Drive must never hold `META_TOKEN`. Contract and dry-run:
+`docs/WA-OUTBOX.md`. See also §11.
+
 *Corrected 2026-09-09 by `vm-claude-code-cli`, who measured their own host: an
 earlier version of this paragraph said the other rows "were not re-checked from
 here and **cannot be**". They cannot be checked **from the laptop**. They can be
@@ -412,3 +419,32 @@ All three are the same Pipedream credential decision, and none is engineering:
 
 Until then WhatsApp is a laptop-hours channel and the gateway will keep
 answering him with confidence it has not earned.
+
+---
+
+## 11 · Asking the laptop to send WhatsApp (`WA_SEND`)
+
+**Added 2026-09-21.** Section 1 is the capability rule; this is the
+request path for every surface that does not itself hold Meta
+credentials.
+
+Post one board row. Do not put a token or a phone number on it.
+
+```
+BCB|v=1|id=WA-<tag>-<yyyymmddThhmmZ>|phase=WA_SEND|from=<your-tag>|to=wa-outbox|kind=STATUS|
+<message body>
+```
+
+`from=` (and `Source_Tag`) is the agent id. The body is the text
+Mr. Salam will see after `wa_notify.ps1` prefixes `[KIND - tag]`.
+`to=` is board addressing (`wa-outbox`), not a recipient. The watcher
+on the laptop reads recent rows, skips anything already in
+`logs/wa_board_outbox_state.json` (or already `phase=NOTE`'d), and
+calls `scripts/wa_notify.ps1 -Tag <from> -Text <body>`. First run
+primes and sends nothing.
+
+A payload that starts `WA_OUT|` is also a request; prefer `phase=WA_SEND`.
+
+The row is not a wake-up (§7). Arm `scripts/wa_board_outbox.ps1` on the
+laptop. Full contract, examples for Claude / Codex / Copilot, and
+dry-run: `docs/WA-OUTBOX.md`.

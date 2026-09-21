@@ -19,6 +19,18 @@ class OperatorScriptGuardTests(unittest.TestCase):
         self.assertIn("$recipient = ([string]$cfg.WA_TO", source)
         self.assertIn('$body = "[$Kind - $Tag]`n$Text"', source)
 
+    def test_board_outbox_delegates_send_and_cannot_choose_a_recipient(self) -> None:
+        source = self.source("scripts/wa_board_outbox.py")
+        self.assertNotIn('env.get("META_TOKEN")', source)
+        self.assertNotIn("env['META_TOKEN']", source)
+        self.assertNotIn("graph.facebook.com", source)
+        self.assertIn("wa_notify.ps1", source)
+        self.assertIn("-Tag", source)
+        self.assertIn("WA_SEND", source)
+        self.assertIn("WA_OUT|", source)
+        self.assertNotIn('add_argument("--to"', source)
+        self.assertNotIn('add_argument("--recipient"', source)
+
     def test_board_worker_invokes_claude_without_tools_or_persistence(self) -> None:
         source = self.source("scripts/claude_board_worker.ps1")
         for guard in ("'--tools', ''", "'--permission-prompts', 'none'", "'--safe-mode'",
