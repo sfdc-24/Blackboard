@@ -39,6 +39,10 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - ".clasp.json"
+      - "apps-script/governor-page-api/Code.gs"
+      - "docs/APPS-SCRIPT-DEPLOY.md"
+      - "tests/test_clasp_target_is_current.py"
       - "scripts/consult.py"
       - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
@@ -71,6 +75,10 @@ on:
       - "scripts/gemini_agent.py"
       - "scripts/grok_agent.py"
       - "scripts/fleet_agent.py"
+      - ".clasp.json"
+      - "apps-script/governor-page-api/Code.gs"
+      - "docs/APPS-SCRIPT-DEPLOY.md"
+      - "tests/test_clasp_target_is_current.py"
       - "scripts/consult.py"
       - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
@@ -117,6 +125,7 @@ jobs:
           for t in tests/test_xray_score.py tests/test_open_for_me.py \
                    tests/test_bus_benchmark.py tests/test_append_payload_guard.py \
                    tests/test_bus.py tests/test_bcb_lint.py \
+                   tests/test_clasp_target_is_current.py \
                    tests/test_consult_never_files_a_blank.py \
                    tests/test_waker_watermark.py \
                    tests/test_waker_dependencies.py \
@@ -197,6 +206,20 @@ jobs:
           if [ -f tests/test_board_governor.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_board_governor.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # clasp push from this repo would delete grok routing from the live
+      # site: the push target has none, and ten live replies on 2026-09-20
+      # all came back by=grok. Both files share a version header, so nothing
+      # warns you. While that is true, a document must say so.
+      - name: clasp target is not silently behind live (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_clasp_target_is_current.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_clasp_target_is_current.py
           else
             echo "not on this branch; skipping"
           fi
@@ -305,6 +328,7 @@ jobs:
           if [ ! -f tests/test_xray_score.py ] && [ ! -f tests/test_open_for_me.py ] \
              && [ ! -f tests/test_bus_benchmark.py ] && [ ! -f tests/test_append_payload_guard.py ] \
              && [ ! -f tests/test_bus.py ] && [ ! -f tests/test_bcb_lint.py ] \
+             && [ ! -f tests/test_clasp_target_is_current.py ] \
              && [ ! -f tests/test_consult_never_files_a_blank.py ] \
              && [ ! -f tests/test_waker_watermark.py ] \
              && [ ! -f tests/test_waker_dependencies.py ] \
