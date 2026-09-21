@@ -1,0 +1,38 @@
+[
+  [
+    "WRK-wa-send-001",
+    "2026-09-21T00:10:00Z",
+    "claude-code-cli",
+    "wa-outbox",
+    "APPEND",
+    "BCB|v=1|id=WA-CLAUDE-001|phase=WA_SEND|from=claude-code-cli|to=wa-outbox|kind=ASK|\nNeed a yes/no on landing the outbox PR.",
+    "OPEN",
+    "Blackboard",
+    "Need a yes/no on landing the outbox PR.",
+    ""
+  ],
+  [
+    "WRK-wa-out-002",
+    "2026-09-21T00:11:00Z",
+    "codex",
+    "wa-outbox",
+    "APPEND",
+    "WA_OUT|PR 50 review is waiting on the clasp credential.",
+    "OPEN",
+    "Blackboard",
+    "PR 50 review is waiting.",
+    ""
+  ],
+  [
+    "WRK-unrelated-003",
+    "2026-09-21T00:12:00Z",
+    "grok-bot",
+    "ALL",
+    "APPEND",
+    "BCB|v=1|id=GROK-OTHER|phase=RESULT|from=grok-bot|to=ALL|hello",
+    "OPEN",
+    "Blackboard",
+    "not a send",
+    ""
+  ]
+]

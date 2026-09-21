@@ -54,6 +54,9 @@ on:
       - 'scripts/pudding_harness.py'
       - 'scripts/snow.ps1'
       - 'scripts/wa_notify.ps1'
+      - 'scripts/wa_board_outbox.py'
+      - 'scripts/wa_board_outbox.ps1'
+      - 'tests/test_wa_board_outbox.py'
       - 'scripts/wa_watch.ps1'
       - 'scripts/README-board-clients.md'
       - 'scripts/append.py'
@@ -98,6 +101,8 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_staging_target.py' -v
       - name: Test operator helper trust boundaries
         run: python -B -m unittest discover -s tests -p 'test_operator_script_guards.py' -v
+      - name: Test WhatsApp board outbox contract
+        run: python -B -m unittest discover -s tests -p 'test_wa_board_outbox.py' -v
       - name: Test board client read and append safety contracts
         run: python -B -m unittest discover -s tests -p 'test_board_clients.py' -v
       - name: Test single production deploy source contract
