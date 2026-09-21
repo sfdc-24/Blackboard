@@ -1,58 +1,71 @@
-# Do not run `clasp push` from this repository yet
+# The Apps Script in this repository is the one sfdc24.com runs
 
-**Status as of 2026-09-20: the push target is behind the live deployment, and
-pushing it would silently remove a model provider from sfdc24.com.**
+**Status as of 2026-09-21: RECONCILED.** `apps-script/governor-page-api/` now
+holds a verbatim `clasp pull` of the live script, so `clasp push` is a no-op
+rather than a disaster. What follows is what it was, because the shape of the
+mistake is worth keeping.
 
-## What was measured
+## What it was, and it was not hypothetical
 
-`.clasp.json` at the repository root:
+`.clasp.json` names script `1lTbqTZ3...` with `rootDir:
+apps-script/governor-page-api`. Mr Salam confirmed on 2026-09-21 that the live
+`/exec` the homepage calls - deployment `AKfycbx0D-5DAnMq...` - belongs to
+**that exact script**, named *SFDC24 - Governor Page API*.
 
-```json
-{ "scriptId": "1lTbqTZ3…", "rootDir": "apps-script/governor-page-api" }
-```
+So the push target was the live site's Apps Script, and every one of its seven
+files disagreed with what was deployed:
 
-So `clasp push` uploads `apps-script/governor-page-api/Code.gs`. That file
-contains **zero** references to `XAI_API_KEY`, `api.x.ai` or `askGrok_`.
+| file | was in the repo | live | delta |
+|---|---|---|---|
+| `Code` | 55,247 | 58,181 | **-2,934, and no grok routing at all** |
+| `Auth` | 16,982 | 12,683 | +4,299 |
+| `Index.html` | 33,284 | 36,591 | -3,307 |
+| `Reception.html` | 23,642 | 19,908 | +3,734 |
+| `Monitor` | 14,965 | 14,646 | +319 |
+| `appsscript.json` | 586 | 567 | +19 |
+| `PublicInbox` | 7,443 | 7,443 | same size, still not identical |
 
-The live site demonstrably routes to grok. Ten real questions were put through
-the live `/exec` endpoint on 2026-09-20 and **every one came back
-`by=grok`**, at 13–59 seconds. A deployment cannot answer as grok using a
-source that has no grok in it.
+Not "slightly behind" - a different generation, differing in **both
+directions** across six of seven files. A `clasp push` would have replaced the
+live reception page, the governor auth, the monitor and the chat engine
+wholesale, and removed a model provider on the way past.
 
-There is a second, newer source in the working tree — `gas/Code.js`, which
-`.gitignore` deliberately keeps untracked — carrying six references to that
-routing, the `agent=` hint handling, and the provider-order comment that
-explains the design. It matches live behaviour. It is not in this repository
-and this document does not reproduce it.
+**And nothing warned you.** The old `Code.gs` and the live `Code.js` both open
+with the identical line, `SFDC24 - site engine (v3 . 2026-09-02)`. A header
+match is not evidence of sameness, and it is the check a person reaches for
+first.
 
-**Both files open with the identical header, `SFDC24 — site engine (v3 ·
-2026-09-02)`, so the version line gives no warning whatsoever.**
+## How it was proved, rather than argued
 
-## The consequence
+1. Ten real questions through the live `/exec` on 2026-09-20 all returned
+   `by=grok`. A deployment cannot answer as grok from a source with no grok in
+   it.
+2. `clasp pull` into a scratch directory - never over the repo - returned seven
+   files, and its `Code.js` is **byte-identical** to the untracked `gas/Code.js`
+   that had been sitting in one laptop's working tree. That file was the only
+   faithful copy of production anywhere.
+3. An anchored key-shape scan across all seven returns zero. Every credential
+   comes from Script Properties at run time; the only literals are the Alpha DB
+   id and the `/exec` URL, both already public here.
 
-`clasp push` would overwrite the live script with a source that cannot route to
-grok. The visible result would not be an error. The site would keep answering —
-as claude, every time — and the only evidence would be the `by` field on
-replies nobody is reading. A provider would be gone and nothing would say so.
+**`clasp pull` refuses a symlinked path** - *"Security Error: Content directory
+is a symlink."* Run it from a real canonical-case directory, not a temp path.
 
-## What has to happen before anyone pushes
+## The rule that stays
 
-1. **Establish which script the live `/exec` is.** The homepage calls
-   deployment `AKfycbx0D-5DAnMq…`. `.clasp.json` names script
-   `1lTbqTZ3…`. A deployment id is not a script id, and nothing in this
-   repository maps one to the other. Until that mapping is confirmed, every
-   statement about "the deployed source" is a guess.
-2. **Reconcile the two sources**, in whichever direction the answer to (1)
-   requires — then delete the loser rather than leaving two files that disagree
-   and look identical at the top.
-3. **Only then** consider whether `gas/Code.js` should be tracked. `.gitignore`
-   holds it back "until it has been read and cleared". It *has* now been read
-   and cleared: an anchored scan for key shapes returns zero, and every
-   credential is fetched from Script Properties at run time. The one literal is
-   the Alpha DB spreadsheet id, which is already public in this repository and
-   is an accepted risk. **But this repository is PUBLIC**, and committing that
-   file publishes the governor authentication logic and the chat cap logic
-   along with it. That is a decision for Mr Salam, not a cleanup.
+1. **Pull before you push, every time.** This directory mirrors a live system
+   that can be edited in a browser by someone who never touches git. If
+   `clasp pull` produces a diff, production moved without the repository, and
+   that diff is the news - read it before overwriting it.
+2. **Push the whole project or none of it.** `clasp push` sends the rootDir as
+   the entire script. A rootDir holding fewer files than the live project
+   deletes the difference - here that would have been the reception page, the
+   governor auth and the monitor.
+3. **Never leave `Auth.gs` beside `Auth.js`.** Two copies of one server file in
+   one rootDir, and the older can win.
+4. **`gas/` is redundant now** and stays gitignored. These seven files are the
+   tracked copy, and they were already tracked and public before this
+   reconciliation - what changed is that they are now true.
 
 ## Why the routing change of 2026-09-20 did not need a deploy
 

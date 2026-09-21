@@ -56,7 +56,7 @@ class TheHazardIsWrittenDown(unittest.TestCase):
         missing = [name for name, marker in PROVIDERS_THE_LIVE_SITE_USES.items()
                    if marker not in src]
         if not missing:
-            return  # reconciled; nothing to warn about
+            return  # reconciled on 2026-09-21; nothing to warn about
 
         self.assertTrue(
             os.path.isfile(DEPLOY_DOC),
@@ -73,14 +73,20 @@ class TheHazardIsWrittenDown(unittest.TestCase):
                     "%s routing is absent from the push target and unmentioned "
                     "in the deploy doc" % name)
 
-    def test_the_doc_tells_a_reader_not_to_push(self):
+    def test_the_doc_states_the_standing_rule(self):
+        """It used to have to say "do not push". Now it must say what
+        replaced that: pull first, because this directory mirrors a live
+        system that can be edited in a browser by someone who never touches
+        git."""
         if not os.path.isfile(DEPLOY_DOC):
             self.skipTest("no deploy doc, and the test above owns that case")
         with open(DEPLOY_DOC, encoding="utf-8") as fh:
             doc = fh.read().lower()
         self.assertIn("clasp push", doc)
-        self.assertTrue(re.search(r"\bdo not\b|\bunsafe\b|\bbefore anyone pushes\b", doc),
-                        "the doc must actually say not to push, not merely describe")
+        self.assertIn("clasp pull", doc)
+        self.assertIn("pull before you push", doc,
+                      "the standing rule has to be in the document, not in "
+                      "somebody's memory")
 
 
 class TheVersionHeaderCannotBeTrusted(unittest.TestCase):
@@ -97,6 +103,57 @@ class TheVersionHeaderCannotBeTrusted(unittest.TestCase):
         self.assertIn("site engine", src,
                       "if this header changes, re-check the assumption this "
                       "suite is built on")
+
+
+class ThePushTargetIsTheLiveScript(unittest.TestCase):
+    """Confirmed by Mr Salam 2026-09-21, so these are no longer precautions.
+
+    The live /exec the homepage calls - deployment AKfycbx0D-5DAnMq... - belongs
+    to script 1lTbqTZ3..., which is exactly the scriptId in .clasp.json. So this
+    directory is not a copy of production; pushing it IS a deploy.
+    """
+
+    def test_every_provider_the_live_site_uses_is_in_the_push_target(self):
+        """Before reconciliation the target had no grok at all, while ten live
+        replies came back by=grok. A push would have removed a provider."""
+        src = clasp_target_source()
+        for name, marker in sorted(PROVIDERS_THE_LIVE_SITE_USES.items()):
+            with self.subTest(provider=name):
+                self.assertIn(marker, src,
+                              "%s routing is missing from the clasp push target; "
+                              "pushing would remove it from sfdc24.com" % name)
+
+    def test_the_target_is_a_whole_project_not_one_file(self):
+        """clasp push sends the rootDir as the entire project. A rootDir holding
+        fewer files than the live script deletes the rest - the reception page,
+        the governor auth, the monitor."""
+        import json as _json
+        with open(os.path.join(REPO, ".clasp.json"), encoding="utf-8") as fh:
+            root = _json.load(fh).get("rootDir", "")
+        d = os.path.join(REPO, root)
+        names = {n for n in os.listdir(d)
+                 if n.endswith((".js", ".gs", ".html", ".json"))}
+        for required in ("appsscript.json",):
+            self.assertIn(required, names)
+        self.assertGreaterEqual(
+            len(names), 7,
+            "the live script has 7 files; a rootDir with fewer would delete the "
+            "difference on push. Found: %s" % sorted(names))
+
+    def test_no_stale_duplicate_extension_is_left_behind(self):
+        """Auth.gs and Auth.js in one rootDir is two copies of one server file.
+        clasp would push both and the older can win."""
+        import json as _json
+        with open(os.path.join(REPO, ".clasp.json"), encoding="utf-8") as fh:
+            root = _json.load(fh).get("rootDir", "")
+        d = os.path.join(REPO, root)
+        stems = {}
+        for n in os.listdir(d):
+            stem, dot, ext = n.rpartition(".")
+            if ext in ("js", "gs"):
+                stems.setdefault(stem, []).append(ext)
+        dupes = {k: v for k, v in stems.items() if len(v) > 1}
+        self.assertEqual(dupes, {}, "same server file twice: %s" % dupes)
 
 
 if __name__ == "__main__":
