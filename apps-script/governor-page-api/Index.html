@@ -167,6 +167,15 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
       </div>
     </main>
     <aside>
+      <!-- THE WORK VIEW. Read-only on purpose: no merge button, no dispatch,
+           no reply. A one-tap merge from here, against a repository that
+           deploys on merge, is how a bad change reaches the public. -->
+      <h2>work <span class="kv" id="workwhen"></span></h2>
+      <div class="dcard" style="padding:6px 15px">
+        <div id="prs"><div class="kv">loading…</div></div>
+        <div id="boardtail" style="margin-top:10px"><div class="kv">loading…</div></div>
+      </div>
+
       <h2>activity</h2>
       <div class="dcard" style="padding:6px 15px"><ul class="feed" id="feed"><li class="kv">loading…</li></ul></div>
     </aside>
@@ -336,7 +345,59 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
     if(current)payload+="|project="+current;
     return call("postRow",payload,pass).then(function(j){if(!j||!j.ok)throw new Error((j&&j.error)||"write failed");return j});
   }
+  // ---- the work view ----
+  // EVERY FAILURE SHOWS. The three states this panel can be in - here is the
+  // work, GitHub would not answer, and the read broke - look different on
+  // screen, because an empty list and an unknown list mean opposite things and
+  // today the difference was a claim sitting live on the public site for an
+  // hour while everything reported success.
+  function renderWork(w){
+    var prs=$("prs"), tail=$("boardtail");
+    if(!w||!w.ok){ prs.innerHTML='<div class="kv">work view: '+esc((w&&w.error)||"unavailable")+'</div>'; tail.innerHTML=""; return }
+    $("workwhen").textContent = "· read "+fmt(Date.now());
+
+    var p=w.prs||{};
+    if(!p.ok){
+      prs.innerHTML='<div class="kv"><b>open PRs: unknown.</b> '+esc(p.error||"GitHub did not answer")+
+                    (p.rateLimited?" Try again in a few minutes.":"")+'</div>';
+    } else if(!(p.prs||[]).length){
+      prs.innerHTML='<div class="kv">no open pull requests on '+esc(p.repo)+'. '+esc(p.note||"")+'</div>';
+    } else {
+      var h='<div class="kv" style="margin-bottom:4px">open pull requests · '+esc(p.repo)+
+            (p.cached?' · cached':'')+'</div><ul class="feed">';
+      p.prs.forEach(function(pr){
+        var c=pr.checks||{}, dot={green:"var(--ok,#2e7d32)",red:"#b3261e",running:"#b26a00"}[c.state]||"var(--faint,#888)";
+        var note = c.state==="green" ? (c.total+" green")
+                 : c.state==="red"   ? (c.failed+" failing")
+                 : c.state==="running" ? (c.running+" running")
+                 : ("checks "+esc(c.note||c.state));
+        h+='<li><span style="color:'+dot+'">●</span> <b>#'+pr.number+'</b> '+esc(pr.title)+
+           (pr.draft?' <span class="kv">draft</span>':'')+' <span class="kv">'+note+'</span></li>';
+      });
+      h+='</ul><div class="kv">'+esc(p.note||"")+'</div>';
+      prs.innerHTML=h;
+    }
+
+    var b=w.board||{};
+    if(!b.ok){ tail.innerHTML='<div class="kv">board tail: '+esc(b.error||"unavailable")+'</div>'; return }
+    if(!(b.rows||[]).length){ tail.innerHTML='<div class="kv">the board is empty, which has never been true — check it.</div>'; return }
+    var t='<div class="kv" style="margin-bottom:4px">board · last '+b.rows.length+' of '+b.total+'</div><ul class="feed">';
+    b.rows.forEach(function(r){
+      t+='<li><span class="kv">'+esc(String(r.ts).slice(5,16).replace("T"," "))+'</span> '+
+         '<b>'+esc(r.from||"?")+'</b>'+(r.to?' <span class="kv">→ '+esc(String(r.to).split(";")[0])+'</span>':'')+
+         ' '+esc(r.gist)+'</li>';
+    });
+    tail.innerHTML=t+'</ul>';
+  }
+
+  function loadWork(){
+    call("getWorkView",pass).then(renderWork).catch(function(e){
+      renderWork({ok:false,error:e.message});
+    });
+  }
+
   function load(){
+    loadWork();
     call("getState",pass).then(function(j){
       if(!j||!j.ok)throw new Error((j&&j.error)||"bad response");
       user=j.user||{}; user.canAct=!!(user.isGovernor||(pass&&j.passOk)); SCOPED=!!j.scoped;
