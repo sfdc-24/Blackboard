@@ -46,6 +46,8 @@ on:
       - "scripts/consult.py"
       - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
+      - "scripts/board_waker.py"
+      - "tests/test_board_waker_ack.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
@@ -86,6 +88,8 @@ on:
       - "scripts/consult.py"
       - "tests/test_consult_never_files_a_blank.py"
       - "tests/test_waker_watermark.py"
+      - "scripts/board_waker.py"
+      - "tests/test_board_waker_ack.py"
       - "tests/test_waker_dependencies.py"
       - "tests/test_foundry_host.py"
       - "scripts/wa_media.py"
@@ -136,6 +140,7 @@ jobs:
                    tests/test_clasp_target_is_current.py \
                    tests/test_consult_never_files_a_blank.py \
                    tests/test_waker_watermark.py \
+                   tests/test_board_waker_ack.py \
                    tests/test_waker_dependencies.py \
                    tests/test_foundry_host.py \
                    tests/test_wa_media.py \
@@ -259,6 +264,16 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      - name: waker WhatsApp acknowledgement state contract (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_board_waker_ack.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_board_waker_ack.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The dependency check that did not exist. agent_waker.py reached main
       # naming three adapter modules and shelling out to a fourth file, none
       # of which were in the repository, and passed every check twice -
@@ -354,6 +369,7 @@ jobs:
              && [ ! -f tests/test_clasp_target_is_current.py ] \
              && [ ! -f tests/test_consult_never_files_a_blank.py ] \
              && [ ! -f tests/test_waker_watermark.py ] \
+             && [ ! -f tests/test_board_waker_ack.py ] \
              && [ ! -f tests/test_waker_dependencies.py ] \
              && [ ! -f tests/test_wa_media.py ] \
              && [ ! -f tests/test_wa_board_outbox.py ] \

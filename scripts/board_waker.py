@@ -188,7 +188,11 @@ def check_whatsapp(state: dict) -> tuple:
     is one of him, and anything he writes is for whoever can act on it.
     """
     env = load_env()
-    since = state.get("wa_watermark") or state.get("watermark") or ""
+    # An explicitly stored empty WA boundary means "start from the beginning".
+    # Do not treat it as absent: after a failed receipt, a later general-board
+    # advance may be newer than the failed WhatsApp row.  Only a missing key
+    # may inherit the general board boundary.
+    since = state["wa_watermark"] if "wa_watermark" in state else state.get("watermark") or ""
     params = {"action": "read", "title": BOARD, "match": "whatsapp", "limit": 30}
     code, body = bus_get(env, params)
     if not body.lstrip().startswith("{"):
@@ -216,7 +220,7 @@ def check_whatsapp(state: dict) -> tuple:
     return ("NEWS" if fresh else "QUIET"), "%d unanswered from him" % len(fresh), fresh
 
 
-def ack_whatsapp(fresh: list) -> str:
+def ack_whatsapp(fresh: list) -> tuple[bool, str]:
     """One line back to him, naming the instance that read it.
 
     ONE MESSAGE PER RUN, NOT PER ROW. He asked for identification on every
@@ -242,12 +246,18 @@ def ack_whatsapp(fresh: list) -> str:
              # STATUS, not the default BLOCKED. The prefix is the first thing he
              # reads and nothing here is blocked - a receipt that shouts BLOCKED
              # is a false alarm every 23 minutes.
-             "-TextFile", str(tmp), "-Tag", ME, "-Kind", "STATUS"],
+             "-TextFile", str(tmp), "-Tag", ME, "-Kind", "STATUS",
+             # The notifier resolves a bare .env relative to this separate
+             # scheduled checkout.  Credentials deliberately live only in the
+             # home Blackboard directory, so pass the known path rather than
+             # copying a file or relying on the process working directory.
+             "-EnvFile", str(HOME_ENV)],
             capture_output=True, text=True, timeout=180, cwd=str(REPO))
         out = (p.stdout or p.stderr or "").strip().splitlines()
-        return out[-1][:200] if out else ("exit %s" % p.returncode)
+        detail = out[-1][:200] if out else ("exit %s" % p.returncode)
+        return p.returncode == 0, detail
     except Exception as exc:  # noqa: BLE001
-        return "ack failed: %s" % exc
+        return False, "ack failed: %s" % exc
     finally:
         try:
             tmp.unlink()
@@ -410,13 +420,24 @@ def main() -> int:
     for w in wa_fresh:
         lines.append("           %s  %s" % (w["ts"], w["text"][:200]))
     if wa_fresh and not args.peek:
-        lines.append("ack        SENT     " + ack_whatsapp(wa_fresh))
-        acked = set(state.get("wa_acked") or [])
-        acked.update(w["id"] for w in wa_fresh)
-        # Bounded: the last 200 ids are plenty to stop a repeat and keep the
-        # state file small enough to read by eye when something looks wrong.
-        state["wa_acked"] = sorted(acked)[-200:]
-        state["wa_watermark"] = now_iso()
+        ack_ok, ack_note = ack_whatsapp(wa_fresh)
+        lines.append("ack        %-8s %s" % ("SENT" if ack_ok else "FAILED", ack_note))
+        if ack_ok:
+            acked = set(state.get("wa_acked") or [])
+            acked.update(w["id"] for w in wa_fresh)
+            # Bounded: the last 200 ids are plenty to stop a repeat and keep
+            # the state file small enough to read by eye when something looks
+            # wrong. Failed delivery must remain eligible for a later natural
+            # run; marking it acknowledged would silently lose the receipt.
+            state["wa_acked"] = sorted(acked)[-200:]
+            state["wa_watermark"] = now_iso()
+        else:
+            # `check_whatsapp()` falls back to the general board watermark
+            # when this key is absent.  A later successful `--advance` for
+            # addressed board work would then jump past this failed receipt.
+            # Pin an independent boundary at the previous general boundary so
+            # this WhatsApp row remains eligible on the next natural run.
+            state.setdefault("wa_watermark", state.get("watermark") or "")
 
     ci_status, ci_note = check_main_green()
     lines.append("ci         %-8s %s" % (ci_status, ci_note))

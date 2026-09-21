@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Regression coverage for the scheduled Waker's WhatsApp receipt path."""
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
+import board_waker as bw  # noqa: E402
+
+
+class WhatsAppAcknowledgement(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state.json"
+        self.message = [{"id": "WRK-ack-test", "ts": "2026-09-21T00:00:00Z", "text": "hello"}]
+        self.real_repo, self.real_scripts, self.real_state, self.real_home = (
+            bw.REPO, bw.SCRIPTS, bw.STATE, bw.HOME_ENV)
+        bw.REPO = Path(self.tmp.name)
+        bw.SCRIPTS = REPO / "scripts"
+        bw.STATE = self.state
+        bw.HOME_ENV = Path(r"C:\canonical\Blackboard\.env")
+
+    def tearDown(self):
+        bw.REPO, bw.SCRIPTS, bw.STATE, bw.HOME_ENV = (
+            self.real_repo, self.real_scripts, self.real_state, self.real_home)
+        self.tmp.cleanup()
+
+    def assert_whatsapp_row_is_retriable(self, state):
+        rows = [["WRK-ack-test", "2026-09-21T00:00:00Z", "whatsapp", "ALL", "APPEND", "hello"]]
+        def fake_get(_env, _params):
+            return 200, __import__("json").dumps({"rows": rows, "total": 1})
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", side_effect=fake_get):
+            status, _, retry = bw.check_whatsapp(state)
+        self.assertEqual(status, "NEWS")
+        self.assertEqual(retry[0]["id"], "WRK-ack-test")
+
+    @mock.patch.object(bw, "subprocess")
+    def test_ack_passes_canonical_environment_path(self, subprocess_mock):
+        subprocess_mock.run.return_value = type("Result", (), {"returncode": 0, "stdout": "sent\n", "stderr": ""})()
+        ok, detail = bw.ack_whatsapp(self.message)
+        args = subprocess_mock.run.call_args.args[0]
+        self.assertTrue(ok)
+        self.assertEqual(detail, "sent")
+        self.assertEqual(args[args.index("-EnvFile") + 1], r"C:\canonical\Blackboard\.env")
+
+    def test_successful_ack_records_id_and_advances_wa_boundary(self):
+        with mock.patch.object(bw, "check_board", return_value=("QUIET", "none", [])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp", return_value=(True, "sent")), \
+             mock.patch.object(bw, "check_main_green", return_value=("OK", "green")), \
+             mock.patch.object(bw, "check_live_site", return_value=("OK", "clean")), \
+             mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
+             mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
+             mock.patch.object(bw, "post_alarm", return_value=""), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertIn("WRK-ack-test", state["wa_acked"])
+        self.assertEqual(state["wa_watermark"], "2026-09-21T00:02:00Z")
+
+    def test_failed_ack_is_not_recorded_as_acknowledged(self):
+        with mock.patch.object(bw, "check_board", return_value=("QUIET", "none", [])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp", return_value=(False, "env file not found")), \
+             mock.patch.object(bw, "check_main_green", return_value=("OK", "green")), \
+             mock.patch.object(bw, "check_live_site", return_value=("OK", "clean")), \
+             mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
+             mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
+             mock.patch.object(bw, "post_alarm", return_value=""):
+            with mock.patch.object(sys, "argv", ["board_waker.py"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertNotIn("WRK-ack-test", state.get("wa_acked", []))
+        self.assertEqual(state.get("wa_watermark"), "")
+
+    def test_failed_ack_keeps_an_independent_retry_boundary_after_advance(self):
+        """A later general advance must not hide a failed WhatsApp receipt."""
+        bw.save_state({"watermark": "2026-09-20T23:00:00Z"})
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp", return_value=(False, "sender failed")), \
+             mock.patch.object(bw, "check_main_green", return_value=("OK", "green")), \
+             mock.patch.object(bw, "check_live_site", return_value=("OK", "clean")), \
+             mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
+             mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
+             mock.patch.object(bw, "post_alarm", return_value=""), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
+        self.assertEqual(state["wa_watermark"], "2026-09-20T23:00:00Z")
+        self.assertNotIn("WRK-ack-test", state.get("wa_acked", []))
+        self.assert_whatsapp_row_is_retriable(state)
+
+    def test_failed_ack_without_prior_cursor_survives_general_advance(self):
+        """An intentional empty WA boundary must not fall back after advance."""
+        with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp", return_value=(False, "sender failed")), \
+             mock.patch.object(bw, "check_main_green", return_value=("OK", "green")), \
+             mock.patch.object(bw, "check_live_site", return_value=("OK", "clean")), \
+             mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
+             mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
+             mock.patch.object(bw, "post_alarm", return_value=""), \
+             mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+                self.assertEqual(bw.main(), 0)
+        state = bw.load_state()
+        self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
+        self.assertIn("wa_watermark", state)
+        self.assertEqual(state["wa_watermark"], "")
+        self.assert_whatsapp_row_is_retriable(state)
+
+    def test_explicit_empty_wa_cursor_does_not_fall_back_to_general_cursor(self):
+        state = {"wa_watermark": "", "watermark": "2026-09-21T00:02:00Z"}
+        self.assert_whatsapp_row_is_retriable(state)
+
+    @mock.patch.object(bw, "subprocess")
+    def test_ack_exception_is_not_recorded_as_acknowledged(self, subprocess_mock):
+        subprocess_mock.run.side_effect = TimeoutError("sender timed out")
+        self.assertEqual(bw.ack_whatsapp(self.message), (False, "ack failed: sender timed out"))
+        with mock.patch.object(bw, "check_board", return_value=("QUIET", "none", [])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp", return_value=(False, "ack failed: sender timed out")), \
+             mock.patch.object(bw, "check_main_green", return_value=("OK", "green")), \
+             mock.patch.object(bw, "check_live_site", return_value=("OK", "clean")), \
+             mock.patch.object(bw, "check_assistant", return_value=("OK", "healthy")), \
+             mock.patch.object(bw, "write_digest", return_value=Path(self.tmp.name) / "digest"), \
+             mock.patch.object(bw, "post_alarm", return_value=""):
+            with mock.patch.object(sys, "argv", ["board_waker.py"]):
+                self.assertEqual(bw.main(), 0)
+        self.assertNotIn("WRK-ack-test", bw.load_state().get("wa_acked", []))
+
+    def test_peek_never_sends_or_mutates_state(self):
+        before = {"watermark": "2026-09-20T23:00:00Z"}
+        bw.save_state(before)
+        with mock.patch.object(bw, "check_board", return_value=("QUIET", "none", [])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             mock.patch.object(bw, "ack_whatsapp") as ack:
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--peek"]):
+                self.assertEqual(bw.main(), 10)
+        ack.assert_not_called()
+        self.assertEqual(bw.load_state(), before)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
