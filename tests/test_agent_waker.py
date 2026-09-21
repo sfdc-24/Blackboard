@@ -359,5 +359,67 @@ class SourceHygiene(unittest.TestCase):
         self.assertEqual(bad, [], "control bytes in source: %r" % bad)
 
 
+class StandbyForHimOnly(unittest.TestCase):
+    """claude-api answers HIS messages to claude-code-cli, and nothing else.
+
+    He wrote "Claude-code-cli can you answers questions on health science?" on
+    WhatsApp at 2026-09-20T21:23Z. It reached the board and sat three hours,
+    because foundry, gemini and grok each have a doorbell and the
+    claude-code-cli tag has none.
+
+    The standby is deliberately narrow. The fleet writes to claude-code-cli
+    constantly - every waker reply is addressed to it, and codex sends it long
+    technical reviews that want a lane with a shell, not a model. Answering
+    those would be noise and spend. His messages are the only ones with nobody
+    else watching them.
+    """
+
+    HIS = "Claude-code-cli can you answers questions on health science?"
+
+    def test_his_whatsapp_message_reaches_the_standby(self):
+        r = row("whatsapp", "Blackboard Alpha DB", self.HIS)
+        self.assertTrue(aw.addressed_to(r, "claude-api"))
+        self.assertEqual(len(aw.select([r], set(), "claude-api")), 1)
+
+    def test_a_row_addressed_to_it_directly_still_works(self):
+        self.assertTrue(aw.addressed_to(row("whatsapp", "claude-api", "x"), "claude-api"))
+
+    def test_codex_reviews_to_claude_code_cli_are_left_alone(self):
+        """These want the lane with a shell. A model answering them is noise."""
+        r = row("chatgpt-codex-desktop", "claude-code-cli,ALL",
+                "BCB|v=1|to=claude-code-cli|a long technical review")
+        self.assertFalse(aw.addressed_to(r, "claude-api"))
+
+    def test_waker_replies_to_claude_code_cli_are_left_alone(self):
+        r = row("gemini", "claude-code-cli;ALL",
+                "%s|answers=X|evidence=STATED|y" % aw.WAKER_REPLY_MARK)
+        self.assertFalse(aw.addressed_to(r, "claude-api"))
+
+    def test_it_does_not_take_another_agents_prefix(self):
+        """He addresses one agent at a time. Grok's mail stays grok's."""
+        r = row("whatsapp", "Blackboard Alpha DB", "Grok can you reply?")
+        self.assertFalse(aw.addressed_to(r, "claude-api"))
+        self.assertTrue(aw.addressed_to(r, "grok"))
+
+    def test_the_standby_is_not_the_lane_it_stands_in_for(self):
+        """The doctrine must say so. claude-code-cli means a shell and a PR;
+        a model endpoint answering under that name is the false-capability
+        claim every doctrine here exists to stop."""
+        d = aw.AGENTS["claude-api"]["doctrine"]
+        self.assertIn("claude-api", d)
+        self.assertIn("NOT", d)
+        self.assertIn("claude-code-cli", d)
+        for cannot in ("no shell", "no repository"):
+            self.assertIn(cannot, d.lower())
+
+    def test_only_the_standby_has_standby_config(self):
+        for tag, cfg in aw.AGENTS.items():
+            with self.subTest(tag=tag):
+                if tag == "claude-api":
+                    self.assertEqual(cfg["standby_when_sender"], ("whatsapp",))
+                else:
+                    self.assertNotIn("standby_for", cfg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

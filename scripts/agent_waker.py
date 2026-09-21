@@ -173,6 +173,47 @@ desktop app.
 YOUR LANE on this fleet is the board itself and the outside world: dispatching,
 triage, product framing, market and outreach research.""" + _SHARED_RULES,
     },
+    "claude-api": {
+        "module": "claude_agent",
+        "project": "FLEET",
+        # THE STANDBY RULE, AND WHY IT IS THIS NARROW.
+        #
+        # Mr Salam wrote "Claude-code-cli can you answers questions on health
+        # science?" on WhatsApp at 2026-09-20T21:23Z. It reached the board and
+        # sat unanswered for three hours: foundry, gemini and grok each have a
+        # doorbell, and the claude-code-cli tag has none.
+        #
+        # So this agent also picks up rows addressed to claude-code-cli - but
+        # ONLY when the sender is whatsapp, which on this board means HIM. Two
+        # reasons for the narrowness. The fleet writes to claude-code-cli
+        # constantly: every waker reply is addressed to it, and codex sends it
+        # long technical reviews. Answering those would be noise and spend, and
+        # the reviews want the lane with a shell, not a model. And his messages
+        # are the only ones with nobody else watching them.
+        "standby_for": ("claude-code-cli",),
+        "standby_when_sender": ("whatsapp",),
+        "doctrine": """You are Claude on the Anthropic API, a participant on the SFDC24 Blackboard.
+
+WHAT YOU ACTUALLY ARE, and the distinction here is not cosmetic:
+Your tag is `claude-api`. You are NOT `claude-code-cli`. That is a different
+lane on this fleet - a Claude Code session on Mr Salam's laptop with a shell, a
+checkout of the repositories, and the ability to run tests, open a pull request
+and merge it. You are a model endpoint reached over HTTP by a small adapter.
+You have NO shell, NO repository, NO GitHub access and NO ability to open a
+pull request, merge, deploy, or read a file. You cannot browse. You only see
+the board row quoted to you below.
+
+You are answering because Mr Salam addressed claude-code-cli and no session was
+open. SAY SO, in one short line, before your answer - something like: the
+claude-code-cli lane is not open right now, this is the API standby. Then
+answer his question properly. If what he asked for needs the laptop - a code
+change, a PR, a deploy, reading a file, checking a live page - say plainly that
+this route cannot do it and that it needs the claude-code-cli session, rather
+than describing what someone could do as though you were doing it.
+
+YOUR LANE is answering him at any hour: explanation, analysis, drafting,
+judgement. Be useful and be brief.""" + _SHARED_RULES,
+    },
 }
 
 
@@ -289,6 +330,20 @@ def addressed_to(row, me: str) -> bool:
     source = str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower()
     if names_tag(target, me):
         return True
+
+    # A standby agent also answers rows addressed to the tag it stands in for,
+    # but only from the senders named in its config. See AGENTS["claude-api"].
+    cfg = AGENTS.get(me) or {}
+    standby_for = cfg.get("standby_for") or ()
+    if standby_for and source in (cfg.get("standby_when_sender") or ()):
+        for other in standby_for:
+            if names_tag(target, other) or re.match(
+                    r"^\s*%s\b" % re.escape(other), payload, re.I):
+                return True
+            for field in ("to", "cc"):
+                m = re.search(r"\b%s=([^|]*)" % field, payload, re.I)
+                if m and names_tag(m.group(1), other):
+                    return True
     for field in ("to", "cc"):
         m = re.search(r"\b%s=([^|]*)" % field, payload, re.I)
         if m and names_tag(m.group(1), me):
