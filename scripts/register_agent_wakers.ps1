@@ -20,7 +20,7 @@ triggers of an existing task rather than deleting and recreating it.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [string[]]$Agent = @('foundry', 'gemini', 'grok'),
+  [string[]]$Agent = @('foundry', 'gemini', 'grok', 'claude-api'),
   [int]$IntervalMinutes = 15
 )
 $ErrorActionPreference = 'Stop'
@@ -29,7 +29,7 @@ $runner = Join-Path $PSScriptRoot 'agent_waker_once.ps1'
 if (-not (Test-Path $runner)) { throw "runner not found: $runner" }
 
 # Stagger the two agents so they do not hit the board in the same second.
-$startAt = @{ foundry = '00:05'; gemini = '00:12'; grok = '00:19' }
+$startAt = @{ foundry = '00:05'; gemini = '00:12'; grok = '00:19'; 'claude-api' = '00:26' }
 
 foreach ($a in $Agent) {
   $name = 'SFDC24-' + ((Get-Culture).TextInfo.ToTitleCase($a)) + 'Waker'
