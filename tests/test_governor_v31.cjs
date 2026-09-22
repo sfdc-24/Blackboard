@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { gasPath } = require('./gas_source.cjs');
 
 const project = path.join(__dirname, '..', 'apps-script/governor-page-api');
 
@@ -29,7 +30,7 @@ function monitor(initial = {}) {
     Logger: { log: () => {} },
     requireGovernor_: () => {},
   });
-  vm.runInContext(fs.readFileSync(path.join(project, 'Monitor.gs'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(gasPath(project, 'Monitor'), 'utf8'), context);
   properties.MONITOR_STATE = JSON.stringify({ ...context.monitorDefaultState_(),
     www: 'up', apex: 'up', silence: 'active', ...initial });
   context.checkSite_ = () => site;
@@ -58,7 +59,7 @@ function siteCheck({ wwwCode = 200, wwwBody = '', apexCode = 200 } = {}) {
       throw new Error(`unexpected URL: ${url}`);
     } },
   });
-  vm.runInContext(fs.readFileSync(path.join(project, 'Monitor.gs'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(gasPath(project, 'Monitor'), 'utf8'), context);
   return {
     marker: context.MON_SITE_MARKER,
     result: JSON.parse(JSON.stringify(context.checkSite_())),

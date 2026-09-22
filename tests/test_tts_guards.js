@@ -39,10 +39,12 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const crypto = require('crypto');
+const { gasPath } = require('./gas_source.cjs');
 
-const CODE_PATH = path.join(__dirname, '..', 'apps-script', 'governor-page-api', 'Code.gs');
-if (!fs.existsSync(CODE_PATH)) {
-  console.error('SKIP-AS-FAILURE: ' + CODE_PATH + ' not found.');
+let CODE_PATH;
+try { CODE_PATH = gasPath('governor-page-api', 'Code'); }
+catch (e) {
+  console.error('SKIP-AS-FAILURE: ' + e.message);
   console.error('The tracked Governor source tree is incomplete.');
   process.exit(2);
 }
@@ -167,7 +169,7 @@ function makeRuntime(opts) {
   if (opts.legacyMint && src === SOURCE) {
     throw new Error('legacy-mint rewrite matched nothing -- the guard under test has moved; fix this harness before trusting it');
   }
-  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Code.gs' });
+  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Code.js' });
 
   // The pre-fix claim: read, then delete, with nothing in between holding the
   // two together. Restored verbatim in shape so the witness tests describe the

@@ -3,13 +3,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { gasPath } = require('./gas_source.cjs');
 
 function load(properties = {}) {
   const context = vm.createContext({ PropertiesService: { getScriptProperties: () => ({
     getProperty: key => properties[key] || null,
   }) } });
-  for (const file of ['Code.gs', 'Monitor.gs']) {
-    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'apps-script/governor-page-api', file), 'utf8'), context);
+  for (const base of ['Code', 'Monitor']) {
+    vm.runInContext(fs.readFileSync(gasPath('governor-page-api', base), 'utf8'), context);
   }
   return context;
 }

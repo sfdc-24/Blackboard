@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { gasPath } = require('./gas_source.cjs');
 
 for (const project of ['governor-page-api', 'glasses-intake-uploader']) {
   function load(stamped) {
@@ -11,7 +12,7 @@ for (const project of ['governor-page-api', 'glasses-intake-uploader']) {
     const context = vm.createContext({ PropertiesService: forbidden, UrlFetchApp: forbidden,
       DriveApp: forbidden, SpreadsheetApp: forbidden, Session: forbidden, CacheService: forbidden,
       ScriptApp: forbidden, HtmlService: forbidden });
-    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'apps-script', project, 'Code.gs'), 'utf8'), context);
+    vm.runInContext(fs.readFileSync(gasPath(project, 'Code'), 'utf8'), context);
     context.json_ = value => value;
     if (stamped) context.sfdc24BuildIdentity_ = () => ({ schema: 1, service: 'sfdc24-build',
       project, commit: 'a'.repeat(40), sourceSha256: 'b'.repeat(64) });

@@ -189,10 +189,23 @@ function authCompleteCallback_(e) {
   // The checks that actually matter.
   var wantAud = props.getProperty(AUTH_CLIENT_ID_KEY);
   if (claims.aud !== wantAud) return { ok: false, error: 'token audience mismatch' };
-  if (String(claims.iss).indexOf('accounts.google.com') < 0) return { ok: false, error: 'unexpected issuer' };
+  // THREE CHECKS THAT WERE WRITTEN, TESTED AND NEVER DEPLOYED. The version of
+  // this file tracked in the repository until 2026-09-21 had all three; the
+  // live script did not, and nobody could see the gap because the suite that
+  // asserts them could not open the file it was reading. Restored 2026-09-22.
+  //
+  // ISSUER: indexOf is a substring test, so 'https://accounts.google.com.example'
+  // passed it. Two literal values are the whole grammar; match them exactly.
+  if (claims.iss !== 'accounts.google.com' && claims.iss !== 'https://accounts.google.com')
+    return { ok: false, error: 'unexpected issuer' };
   if (!claims.exp || (claims.exp * 1000) < Date.now()) return { ok: false, error: 'token expired' };
-  if (claims.email_verified === false) return { ok: false, error: 'email not verified by Google' };
+  // VERIFIED: `=== false` rejects only the literal. Absent, 'false', 0 and null
+  // all passed. The claim has to be present AND boolean true.
+  if (claims.email_verified !== true) return { ok: false, error: 'email not verified by Google' };
   if (!claims.email) return { ok: false, error: 'no email in token' };
+  // SUBJECT: the only immutable identifier Google gives. An email address can
+  // be reassigned; sub cannot. mintSession_ stores it, so it must exist.
+  if (!claims.sub) return { ok: false, error: 'no subject in token' };
 
   return {
     ok: true,

@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { gasPath } = require('./gas_source.cjs');
 
-const source = fs.readFileSync(path.join(__dirname, '../apps-script/governor-page-api/Auth.gs'), 'utf8');
+const source = fs.readFileSync(gasPath('governor-page-api', 'Auth'), 'utf8');
 
 function complete(overrides = {}) {
   const claims = { aud: 'test-client', iss: 'https://accounts.google.com',

@@ -4,12 +4,13 @@ const { createHash, createHmac } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { gasPath } = require('./gas_source.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const PROJECT = path.join(ROOT, 'apps-script', 'governor-page-api');
-const AUTH = fs.readFileSync(path.join(PROJECT, 'Auth.gs'), 'utf8');
-const CODE = fs.readFileSync(path.join(PROJECT, 'Code.gs'), 'utf8');
-const INBOX = fs.readFileSync(path.join(PROJECT, 'PublicInbox.gs'), 'utf8');
+const AUTH = fs.readFileSync(gasPath(PROJECT, 'Auth'), 'utf8');
+const CODE = fs.readFileSync(gasPath(PROJECT, 'Code'), 'utf8');
+const INBOX = fs.readFileSync(gasPath(PROJECT, 'PublicInbox'), 'utf8');
 const RECEPTION = fs.readFileSync(path.join(PROJECT, 'Reception.html'), 'utf8');
 const VOICE = fs.readFileSync(path.join(ROOT, 'site', 'voice', 'index.html'), 'utf8');
 
@@ -152,9 +153,9 @@ function createHarness(initialProperties = {}) {
     },
   });
 
-  vm.runInContext(AUTH, context, { filename: 'Auth.gs' });
-  vm.runInContext(CODE, context, { filename: 'Code.gs' });
-  vm.runInContext(INBOX, context, { filename: 'PublicInbox.gs' });
+  vm.runInContext(AUTH, context, { filename: 'Auth.js' });
+  vm.runInContext(CODE, context, { filename: 'Code.js' });
+  vm.runInContext(INBOX, context, { filename: 'PublicInbox.js' });
   harness.context = context;
   return harness;
 }
