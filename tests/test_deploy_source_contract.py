@@ -10,12 +10,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_SCRIPT_ID = "1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp"
 CANONICAL_ROOT = "apps-script/governor-page-api"
+# clasp writes server-side JavaScript as .js, so the verbatim pull in #167
+# renamed all four script files. The extension is part of the contract: a
+# rootDir holding Code.gs BESIDE Code.js is the hazard docs/APPS-SCRIPT-DEPLOY.md
+# warns about under "Never leave Auth.gs beside Auth.js" - two copies of one
+# server file, and the older can win.
 EXPECTED_SOURCE = {
-    "Auth.gs",
-    "Code.gs",
+    "Auth.js",
+    "Code.js",
     "Index.html",
-    "Monitor.gs",
-    "PublicInbox.gs",
+    "Monitor.js",
+    "PublicInbox.js",
     "Reception.html",
     "appsscript.json",
 }

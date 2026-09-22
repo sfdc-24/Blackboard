@@ -38,11 +38,13 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const { gasPath } = require('./gas_source.cjs');
 
 const GOVERNOR = path.join(__dirname, '..', 'apps-script', 'governor-page-api');
-for (const f of ['Monitor.gs', 'Code.gs']) {
-  if (!fs.existsSync(path.join(GOVERNOR, f))) {
-    console.error('SKIP-AS-FAILURE: tracked Governor source ' + f + ' not found.');
+for (const base of ['Monitor', 'Code']) {
+  try { gasPath(GOVERNOR, base); }
+  catch (e) {
+    console.error('SKIP-AS-FAILURE: tracked Governor source ' + base + ' not found.');
     process.exit(2);
   }
 }
@@ -108,12 +110,12 @@ function makeRuntime(rows, opts) {
   const ctx = vm.createContext(sandbox);
   // iso_ lives in Code.gs. Pull in just that one line rather than the whole
   // file, which would drag the reception stack in with it.
-  const isoLine = fs.readFileSync(path.join(GOVERNOR, 'Code.gs'), 'utf8')
+  const isoLine = fs.readFileSync(gasPath(GOVERNOR, 'Code'), 'utf8')
     .split('\n').find((l) => l.indexOf('function iso_(') === 0);
   if (!isoLine) throw new Error('iso_ not found in tracked Code.gs -- fix this harness before trusting it');
-  vm.runInContext(isoLine, ctx, { filename: 'apps-script/governor-page-api/Code.gs#iso_' });
+  vm.runInContext(isoLine, ctx, { filename: 'apps-script/governor-page-api/Code.js#iso_' });
 
-  let src = fs.readFileSync(path.join(GOVERNOR, 'Monitor.gs'), 'utf8');
+  let src = fs.readFileSync(gasPath(GOVERNOR, 'Monitor'), 'utf8');
   if (opts.legacyScan) {
     const before = src;
     src = src.replace(
@@ -127,7 +129,7 @@ function makeRuntime(rows, opts) {
        if (!isNaN(_ms)) res.ageHours = _ms / 3600000;`);
     if (src === before) throw new Error('legacy-scan rewrite matched nothing -- scanBoard_ has moved; fix this harness');
   }
-  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Monitor.gs' });
+  vm.runInContext(src, ctx, { filename: 'apps-script/governor-page-api/Monitor.js' });
 
   return { ctx, sent, props, scan: () => ctx.scanBoard_() };
 }

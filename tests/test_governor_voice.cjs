@@ -2,11 +2,12 @@ const assert = require("node:assert/strict");
 const { createHash } = require("node:crypto");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
+const { gasPath } = require("./gas_source.cjs");
 const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "..");
-const CODE_PATH = path.join(ROOT, "apps-script", "governor-page-api", "Code.gs");
+const CODE_PATH = gasPath("governor-page-api", "Code");
 const RECEPTION_PATH = path.join(ROOT, "apps-script", "governor-page-api", "Reception.html");
 const CODE = readFileSync(CODE_PATH, "utf8");
 

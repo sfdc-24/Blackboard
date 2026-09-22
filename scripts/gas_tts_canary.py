@@ -23,7 +23,7 @@ from gas_build_identity import canonical, canonical_files, digest, parse_json
 PROJECT = 'governor-page-api'
 TARGETS = Path(__file__).with_name('gas_tts_canary_target.json')
 TEMPLATE_PATH = 'tests/fixtures/site-p0-tts-canary.gs.template'
-SOURCE_PATH = 'apps-script/governor-page-api/Code.gs'
+SOURCE_PATH = 'apps-script/governor-page-api/Code.js'
 SCRIPT_ID = re.compile(r'[A-Za-z0-9_-]{20,}', re.ASCII)
 RUN_ID = re.compile(r'[a-f0-9]{24}', re.ASCII)
 FULL_SHA = re.compile(r'[a-f0-9]{40}', re.ASCII)
