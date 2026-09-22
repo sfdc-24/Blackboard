@@ -142,18 +142,22 @@ def gh(args: list) -> tuple:
 
 def check_board(state: dict) -> tuple:
     """New rows addressed to this surface since the watermark."""
-    env = load_env()
     since = state.get("watermark") or ""
     params = {"action": "read", "title": BOARD, "match": ME, "limit": 25}
     if since:
         params["since"] = since
-    code, body = bus_get(env, params)
-    if not body.lstrip().startswith("{"):
-        return "UNKNOWN", "board read returned a page, not data (HTTP %s)" % code, []
-    data = json.loads(body)
-    if "rows" not in data:
-        # Absent is unknown. Never an empty board.
-        return "UNKNOWN", "gateway answered with %s and no rows key" % sorted(data.keys()), []
+    try:
+        env = load_env()
+        code, body = bus_get(env, params)
+        if code != 200:
+            return "UNKNOWN", "board read failed (HTTP %s)" % code, []
+        data = json.loads(body)
+    except Exception:  # Transport, environment, and decoding failures are not quiet.
+        return "UNKNOWN", "board read failed or returned invalid JSON", []
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        return "UNKNOWN", "board response must be an object with a rows list", []
+    if any(not isinstance(row, list) for row in data["rows"]):
+        return "UNKNOWN", "board response contains malformed rows", []
     rows = [r for r in data["rows"] if isinstance(r, list)]
     fresh = []
     for r in rows:
@@ -395,6 +399,8 @@ def main() -> int:
         ap.error("--advance cannot be combined with --peek or --wake")
     if args.advance:
         try:
+            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", args.advance_through or ""):
+                raise ValueError("noncanonical cutoff")
             cutoff = datetime.strptime(args.advance_through or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             if cutoff > datetime.now(timezone.utc):
                 raise ValueError("future cutoff")

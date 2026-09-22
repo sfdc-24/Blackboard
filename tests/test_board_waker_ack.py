@@ -240,7 +240,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
     def test_advance_without_consumed_cutoff_fails_without_read_or_write(self):
         bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
         before = self.state.read_bytes()
-        for cutoff in (None, "bad", "2999-01-01T00:00:00Z"):
+        for cutoff in (None, "bad", "2999-01-01T00:00:00Z", "2026-9-21T00:01:29Z", "2026-09-21T0:1:29Z"):
             args = ["board_waker.py", "--advance"]
             if cutoff is not None:
                 args += ["--advance-through", cutoff]
@@ -248,6 +248,25 @@ class WhatsAppAcknowledgement(unittest.TestCase):
                 self.assertEqual(bw.main(), 2)
                 read.assert_not_called()
             self.assertEqual(self.state.read_bytes(), before)
+
+    def test_advance_malformed_or_failed_board_read_never_saves(self):
+        bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
+        before = self.state.read_bytes()
+        responses = [(200, body) for body in ('{', '[]', 'null', '{}', '{"rows":null}', '{"rows":{}}', '{"rows":""}', '{"rows":[{}]}')]
+        responses.append((503, '{"rows":[]}'))
+        for response in responses + [TimeoutError("offline transport failure")]:
+            with self.subTest(response=response), \
+                 mock.patch.object(bw, "load_env", return_value={}), \
+                 mock.patch.object(bw, "bus_get") as bus, \
+                 mock.patch.object(bw, "save_state") as save, \
+                 mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:01:29Z"]):
+                if isinstance(response, Exception):
+                    bus.side_effect = response
+                else:
+                    bus.return_value = response
+                self.assertEqual(bw.main(), 2)
+                save.assert_not_called()
+                self.assertEqual(self.state.read_bytes(), before)
 
 
 if __name__ == "__main__":
