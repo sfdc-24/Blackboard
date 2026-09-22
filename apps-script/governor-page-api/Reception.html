@@ -131,6 +131,13 @@ button.rec .dot{animation:b .8s step-end infinite}
   // Session token, rendered server-side. Sent with each turn so the
   // reception can record WHO said it. Empty when signed out.
   var SESSION = "<?!= sessionToken ?>";
+  // The conversation identity. Server-signed and server-issued: this page
+  // never invents one. It is replaced from res.ct on every reply, so an
+  // expired or cross-identity token costs no model call to correct.
+  var CONVERSATION = "<?!= conversationToken ?>";
+  // From the parent frame. Carries no identity and grants nothing; it exists
+  // only so the parent can tell this page apart from a Google error document.
+  var READY_NONCE = "<?!= readyNonce ?>";
   var WANT_VOICE = "<?!= voice ?>" === "1";
   // The microphone is only usable where the hosting frame's permissions policy allows it.
   // Google Sites embeds and Apps Script's own sandbox frame both withhold it, so we detect
@@ -148,10 +155,11 @@ button.rec .dot{animation:b .8s step-end infinite}
   var thread = $("thread"), box = $("box"), send = $("send"), mic = $("mic");
   var history = [], busy = false, typing = false;
 
-  // ---- session id (per browser tab) ----
-  var sid = "";
-  try { sid = sessionStorage.getItem("sfdc_sid") || ""; } catch(e){}
-  if (!sid) { sid = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2,8); try { sessionStorage.setItem("sfdc_sid", sid) } catch(e){} }
+  // ---- session id ----
+  // There is no longer one here. A browser-chosen id was the storage and
+  // spend key for the whole conversation, so rotating it reset the cap and
+  // colliding it steered another conversation history. CONVERSATION above
+  // is issued and signed by the server instead.
 
   // ---- rendering ----
   function el(cls, tag, text){
@@ -228,6 +236,8 @@ button.rec .dot{animation:b .8s step-end infinite}
           history.push({ role: "assistant", text: reply });
           busy = false; sync(); box.focus();
         });
+        // Every branch returns a usable token, including the refusals.
+        if (res && res.ct) CONVERSATION = res.ct;
         if (res && res.degraded) $("hint").textContent = "replying offline — your message is saved";
       })
       .withFailureHandler(function(err){
@@ -236,7 +246,7 @@ button.rec .dot{animation:b .8s step-end infinite}
         wait.textContent = "couldn't reach the server: " + (err && err.message || err) + " — your message wasn't lost, try again.";
         busy = false; sync();
       })
-      .reception(sid, text, history.slice(0, -1), SESSION);
+      .reception(CONVERSATION, text, history.slice(0, -1), SESSION);
   }
 
   // ---- voice ----
@@ -358,6 +368,19 @@ button.rec .dot{animation:b .8s step-end infinite}
   })();
   // ---- boot ----
   start();
+  // The parent ignores iframe load events because Google error documents load
+  // too. This nonce came from the parent and contains no identity or
+  // capability, so it is safe to send to the top-level page even through
+  // Google's nested wrappers.
+  if (/^[A-Za-z0-9_-]{16,64}$/.test(READY_NONCE)) {
+    try {
+      window.top.postMessage({
+        type: "sfdc24:assistant-ready",
+        version: 1,
+        nonce: READY_NONCE
+      }, "*");
+    } catch(e) {}
+  }
 })();
 </script>
 </body></html>
