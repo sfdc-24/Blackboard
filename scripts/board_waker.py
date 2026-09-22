@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -53,34 +54,15 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from board_say import load_env as _load_env_local, bus_get, BOARD  # noqa: E402
+from board_say import load_env, bus_get, BOARD  # noqa: E402
 
 ME = "claude-code-cli"
 
-# THE .env LIVES IN THE HOME REPO AND NOWHERE ELSE.
-# The waker runs from its own checkout under C:\Users\salam\.blackboard-waker,
-# which deliberately has no .env - credentials are machine state, not source,
-# and are not in any checkout. board_say.load_env() looks beside ITS OWN file,
-# so from that checkout it finds nothing and throws. Measured on the first
-# scheduled dry run: "health pass could not run: Traceback".
-HOME_ENV = Path(r"C:\Users\salam\Quantum\Blackboard\.env")
-
-
-def load_env() -> dict:
-    try:
-        return _load_env_local()
-    except FileNotFoundError:
-        if not HOME_ENV.exists():
-            raise
-        env = {}
-        for line in HOME_ENV.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
-        return env
-STATE = REPO / ".waker_state.json"
+# Credential files are machine state, never source. Local installations may
+# point BLACKBOARD_ENV at a gitignored file. Cloud runtimes inject BUS_URL and
+# BUS_SECRET directly; board_say.load_env() enforces that both are present.
+HOME_ENV = Path(os.environ.get("BLACKBOARD_ENV") or (REPO / ".env"))
+STATE = Path(os.environ.get("BLACKBOARD_STATE_DIR") or REPO) / ".waker_state.json"
 LOGDIR = REPO / "logs" / "waker"
 SITE = "https://www.sfdc24.com"
 SAY_EXEC = ("https://script.google.com/macros/s/"
@@ -107,6 +89,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(state, indent=1), encoding="utf-8", newline="\n")
 
 

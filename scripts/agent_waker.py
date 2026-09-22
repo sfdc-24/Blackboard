@@ -81,6 +81,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
+from bus import load_env as _load_bus_env
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
@@ -225,15 +227,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def load_env() -> dict:
-    env = {}
-    path = os.path.join(REPO, ".env")
-    for line in open(path, encoding="utf-8", errors="replace").read().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
+    """Use the same injected-secret or BLACKBOARD_ENV contract as the bus."""
+    return _load_bus_env()
 
 
 def _fetch(url: str, payload: dict, hops: int = 8) -> str:
@@ -460,7 +455,9 @@ def select(rows, answered_ids, me: str):
 # -------------------------------------------------------------------- state
 
 def state_path(me: str) -> str:
-    return os.path.join(REPO, ".%s_waker_state.json" % me)
+    root = os.environ.get("BLACKBOARD_STATE_DIR") or REPO
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, ".%s_waker_state.json" % me)
 
 
 def load_state(me: str) -> dict:
