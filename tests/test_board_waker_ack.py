@@ -2,6 +2,10 @@
 """Regression coverage for the scheduled Waker's WhatsApp receipt path."""
 
 import sys
+import contextlib
+import io
+import json
+from datetime import datetime, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -98,7 +102,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         self.assertEqual(state["watermark"], "2026-09-20T23:00:00Z")
         with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
-            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:02:00Z"]):
                 self.assertEqual(bw.main(), 0)
         state = bw.load_state()
         self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
@@ -123,7 +127,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         self.assertNotIn("watermark", state)
         with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", [{"ts": "2026-09-21T00:01:00Z", "payload": "to=claude-code-cli"}])), \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
-            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:02:00Z"]):
                 self.assertEqual(bw.main(), 0)
         state = bw.load_state()
         self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
@@ -147,7 +151,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
              mock.patch.object(bw, "post_alarm") as alarm, \
              mock.patch.object(bw, "write_digest") as digest, \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
-            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:02:00Z"]):
                 self.assertEqual(bw.main(), 0)
         self.assertEqual(bw.load_state()["watermark"], "2026-09-21T00:02:00Z")
         for dependency in (whatsapp, ack, ci, site, assistant, alarm, digest):
@@ -159,7 +163,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         bw.save_state(before)
         with mock.patch.object(bw, "check_board", return_value=("UNKNOWN", "network", [])), \
              mock.patch.object(bw, "save_state") as save:
-            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:02:00Z"]):
                 self.assertEqual(bw.main(), 2)
         save.assert_not_called()
         self.assertEqual(bw.load_state(), before)
@@ -170,7 +174,7 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         fresh = [{"ts": "2026-09-21T00:00:30Z", "payload": "to=claude-code-cli"}]
         with mock.patch.object(bw, "check_board", return_value=("NEWS", "one", fresh)), \
              mock.patch.object(bw, "now_iso", return_value="2026-09-21T00:02:00Z"):
-            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance"]):
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:02:00Z"]):
                 self.assertEqual(bw.main(), 0)
         state = bw.load_state()
         self.assertEqual(state["watermark"], "2026-09-21T00:02:00Z")
@@ -208,6 +212,42 @@ class WhatsAppAcknowledgement(unittest.TestCase):
                 self.assertEqual(bw.main(), 10)
         ack.assert_not_called()
         self.assertEqual(bw.load_state(), before)
+
+    def test_consumed_peek_cutoff_keeps_row_arriving_during_model(self):
+        before = {"watermark": "2026-09-21T00:00:00Z"}
+        bw.save_state(before)
+        rows = [["A", "2026-09-21T00:01:00Z", "codex", "claude-code-cli", "APPEND", "first"]]
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 21, 0, 1, 30, tzinfo=timezone.utc)
+        output = io.StringIO()
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", side_effect=lambda *_: (200, json.dumps({"rows": rows, "total": len(rows)}))), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("QUIET", "none", [])):
+            with mock.patch.object(bw, "datetime", Clock), contextlib.redirect_stdout(output), \
+                 mock.patch.object(sys, "argv", ["board_waker.py", "--peek"]):
+                self.assertEqual(bw.main(), 10)
+            cutoff = next(line.split()[1] for line in output.getvalue().splitlines() if line.startswith("ADVANCE_THROUGH "))
+            rows.append(["B", "2026-09-21T00:02:00Z", "codex", "claude-code-cli", "APPEND", "second"])
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", cutoff]):
+                self.assertEqual(bw.main(), 0)
+            status, _, fresh = bw.check_board(bw.load_state())
+        self.assertEqual(status, "NEWS")
+        self.assertEqual([row["payload"] for row in fresh], ["second"])
+        self.assertEqual(bw.load_state()["watermark"], cutoff)
+
+    def test_advance_without_consumed_cutoff_fails_without_read_or_write(self):
+        bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
+        before = self.state.read_bytes()
+        for cutoff in (None, "bad", "2999-01-01T00:00:00Z"):
+            args = ["board_waker.py", "--advance"]
+            if cutoff is not None:
+                args += ["--advance-through", cutoff]
+            with mock.patch.object(sys, "argv", args), mock.patch.object(bw, "check_board") as read:
+                self.assertEqual(bw.main(), 2)
+                read.assert_not_called()
+            self.assertEqual(self.state.read_bytes(), before)
 
 
 if __name__ == "__main__":

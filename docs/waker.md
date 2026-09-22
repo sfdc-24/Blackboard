@@ -74,6 +74,24 @@ It posts **one** board row, only when a check has already failed.
 `--peek` never moves it. The health pass never moves it. Only `--advance`, which
 the runner calls after a model session exits **0**.
 
+The peek emits `ADVANCE_THROUGH <UTC timestamp>` captured before its read,
+rounded conservatively to the previous whole second. The runner must retain
+that value for this model invocation and pass it as
+`--advance --advance-through <timestamp>` only after successful completion.
+Advance never uses the model's completion time. Rows appended during the model
+remain eligible. This timestamp protocol assumes append timestamps reflect
+arrival; it does not support backdated insertions behind the existing cursor.
+
+Deployment requires a matching runner update under its existing single-writer
+lock: parse exactly one cutoff from the successful peek; preserve it through
+the model run; bound the advance subprocess; check its exit code and read the
+state back before logging completion. Missing cutoff, nonzero exit, timeout,
+or inconsistent state readback must report failure without a manual cursor
+write. A quiet advance may leave the cursor unchanged. Do not deploy only the
+Python change with the old machine-local runner, which passes no cutoff and
+unconditionally logs success. Keep failed model runs on the existing path that
+does not invoke advance. No additional worker or lock owner is introduced.
+
 The first wiring advanced it whenever the health pass saw new rows — and the
 health pass runs before the peek, so the peek reported `QUIET` forty seconds
 later against rows nobody had read. A watcher that marks work as seen on behalf

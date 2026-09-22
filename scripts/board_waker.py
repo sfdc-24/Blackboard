@@ -46,7 +46,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -380,8 +380,8 @@ def main() -> int:
     ap.add_argument("--wake", action="store_true",
                     help="allow a headless session when a check FAILS")
     ap.add_argument("--advance", action="store_true",
-                    help="mark the board as read up to now. Only a session that "
-                         "actually read the rows may pass this.")
+                    help="commit the cutoff captured before the consumed peek")
+    ap.add_argument("--advance-through", help="UTC cutoff emitted by the consumed peek; required with --advance")
     ap.add_argument("--peek", action="store_true",
                     help="is there board news for this surface? exit 10 if yes, "
                          "0 if quiet, 2 if the read could not be trusted. Runs no "
@@ -390,6 +390,19 @@ def main() -> int:
                          "arriving between the peek and the run is seen next "
                          "tick instead of being skipped in silence.")
     args = ap.parse_args()
+
+    if args.advance and (args.peek or args.wake):
+        ap.error("--advance cannot be combined with --peek or --wake")
+    if args.advance:
+        try:
+            cutoff = datetime.strptime(args.advance_through or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if cutoff > datetime.now(timezone.utc):
+                raise ValueError("future cutoff")
+        except ValueError:
+            print("UNKNOWN  advance requires a valid non-future --advance-through cutoff")
+            return 2
+    elif args.advance_through:
+        ap.error("--advance-through requires --advance")
 
     state = load_state()
 
@@ -414,7 +427,10 @@ def main() -> int:
             # cursor unchanged so the next natural run can safely see it.
             return 2
         if fresh:
-            state["watermark"] = now_iso()
+            # Never commit completion time: rows arriving during the model run
+            # were not necessarily consumed. Never move an existing cursor back.
+            if not state.get("watermark") or args.advance_through[:19] > state["watermark"][:19]:
+                state["watermark"] = args.advance_through
         state["last_run"] = now_iso()
         last_status = state.get("last_status") or {}
         last_status["board"] = board_status
@@ -423,6 +439,9 @@ def main() -> int:
         return 0
 
     if args.peek:
+        # check_board compares whole seconds. Keep the boundary second eligible
+        # so a row appended during this read in that second cannot be skipped.
+        peek_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         status, note, fresh = check_board(state)
         # A MESSAGE FROM HIM IS ALWAYS NEWS. The peek decides whether a session
         # is worth starting, and the one thing that is always worth starting a
@@ -431,6 +450,8 @@ def main() -> int:
         both = "NEWS" if (status == "NEWS" or wa_status == "NEWS") else (
             "UNKNOWN" if "UNKNOWN" in (status, wa_status) else "QUIET")
         print("%s  %s; whatsapp: %s" % (both, note, wa_note))
+        if both != "UNKNOWN":
+            print("ADVANCE_THROUGH " + peek_cutoff)
         for w in wa_fresh[:3]:
             print("  WA %s  %s" % (w["ts"], w["text"][:160]))
         for f in fresh[:5]:
