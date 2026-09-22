@@ -3,8 +3,8 @@
 // THE DEFECT THIS EXISTS TO REMOVE
 //   reception() truncates the query server-side:
 //
-//     var CHAT_MAX_INPUT = 1000;                 // Code.gs:34
-//     var text = String(p.q || '').slice(0, CHAT_MAX_INPUT);   // Code.gs:196
+//     var CHAT_MAX_INPUT = 1000;                 // Code.js:41
+//     var text = String(p.q || '').slice(0, CHAT_MAX_INPUT);   // Code.js:377
 //
 //   The agent was sending up to 400 transcript lines in one `q`. A real
 //   hour-long call is tens of thousands of characters, so what arrived was the
@@ -24,7 +24,7 @@
 //   back, never silently dropped.
 
 /**
- * Mirrors CHAT_MAX_INPUT in apps-script/governor-page-api/Code.gs:34.
+ * Mirrors CHAT_MAX_INPUT in apps-script/governor-page-api/Code.js:41.
  * If that constant changes server-side this one must change with it — which is
  * why the number appears here once and is imported everywhere else.
  */
