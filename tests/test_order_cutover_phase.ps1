@@ -3199,6 +3199,7 @@ try {
     $script:ReplacementFault=''
     $script:ReplacementDisabled=$false
     $script:ReplacementInstalled=$false
+    $script:ReplacementPostReads=0
     $script:ReplacementCleanup=0
     $script:ReplacementStarts=0
     Set-TestMock 'Get-CutoverReadyObserveReplacementAdmission' { $script:ReplacementAdmission }
@@ -3206,6 +3207,7 @@ try {
     Set-TestMock 'Get-CutoverExactInstallerStatus' {
         param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState)
         if($ExpectedMode -cne 'Observe'){throw 'TEST_EXECUTE_FORBIDDEN'}
+        if($script:ReplacementInstalled){$script:ReplacementPostReads++}
         New-TestExactStatus -State $ExpectedTaskState
     }
     Set-TestMock 'Export-CutoverTaskXml' { if($script:ReplacementDisabled -and -not $script:ReplacementInstalled){$script:XmlDisabled}else{$script:XmlEnabled} }
@@ -3221,10 +3223,14 @@ try {
     Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {
         param($Before,$Path,$MaximumBytes,$Code)
         if($Code -ceq $script:ReplacementFault){throw $Code}
+        if($script:ReplacementFault -ceq 'late_backup' -and $script:ReplacementPostReads -ge 2 -and $Code -ceq 'OBSERVE_BACKUP_CHANGED'){throw $Code}
     }
     Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' { if($script:ReplacementFault -ceq 'backup'){throw 'BACKUP_XML_MISMATCH'} }
-    Set-TestMock 'Get-CutoverProtectedSnapshot' { if($script:ReplacementFault -ceq 'protected'){'changed'}else{'protected'} }
-    Set-TestMock 'Invoke-CutoverEscrow' { [pscustomobject]@{task_xml_sha256=('b'*64)} }
+    Set-TestMock 'Get-CutoverProtectedSnapshot' { if($script:ReplacementFault -ceq 'protected' -or ($script:ReplacementFault -ceq 'late_protected' -and $script:ReplacementPostReads -ge 2)){'changed'}else{'protected'} }
+    Set-TestMock 'Invoke-CutoverEscrow' { [pscustomobject]@{task_xml_sha256=$(if($script:ReplacementFault -ceq 'late_escrow' -and $script:ReplacementPostReads -ge 2){'c'*64}else{'b'*64})} }
+    Set-TestMock 'Get-CutoverTaskRuntime' {
+        [pscustomobject]@{state=$(if($script:ReplacementFault -ceq 'late_running'){'Running'}else{'Ready'});last_task_result=0;last_run_utc=([DateTime]'2026-09-07T00:00:00Z').ToUniversalTime();next_run_utc=([DateTime]'2099-01-01T00:00:00Z').ToUniversalTime()}
+    }
     Set-TestMock 'Start-CutoverTask' { $script:ReplacementStarts++ }
     Set-TestMock 'Disable-CutoverTaskAfterFailure' {
         param($Context,$Installer,$ExpectedModes)
@@ -3236,9 +3242,9 @@ try {
     $replacement=Invoke-CutoverInstallObserveReadyFromReadyObserve @replacementArgs
     Assert-True 'Observe replacement transaction remains ready-only without claiming worker health' ($replacement.status -ceq 'OBSERVE_READY_HEALTH_UNCONFIRMED' -and -not $replacement.worker_health_confirmed -and -not $replacement.task_started -and -not $replacement.task_stopped)
     Assert-True 'Observe replacement installs only through no-stop Observe contract' ($script:ReplacementDisabled -and $script:ReplacementInstalled -and $script:ReplacementStarts -eq 0 -and $script:ReplacementCleanup -eq 0)
-    foreach($fault in @('STATE_CHANGED_BEFORE_REPLACEMENT','STATE_CHANGED_DURING_DISABLE','LOG_CHANGED_DURING_INSTALL','OBSERVE_BACKUP_CHANGED','installer','backup','protected')){
-        $script:ReplacementFault=$fault;$script:ReplacementDisabled=$false;$script:ReplacementInstalled=$false;$script:ReplacementCleanup=0
-        $expectedFault=switch($fault){'installer'{'INSTALLER_CHILD_FAILED'};'backup'{'BACKUP_XML_MISMATCH'};'protected'{'PROTECTED_CHANGED_DURING_INSTALL'};default{$fault}}
+    foreach($fault in @('STATE_CHANGED_BEFORE_REPLACEMENT','STATE_CHANGED_DURING_DISABLE','STATE_CHANGED_DURING_INSTALL','LOG_CHANGED_DURING_INSTALL','OBSERVE_BACKUP_CHANGED','installer','backup','protected','late_protected','late_escrow','late_backup','late_running')){
+        $script:ReplacementFault=$fault;$script:ReplacementDisabled=$false;$script:ReplacementInstalled=$false;$script:ReplacementCleanup=0;$script:ReplacementPostReads=0
+        $expectedFault=switch($fault){'installer'{'INSTALLER_CHILD_FAILED'};'backup'{'BACKUP_XML_MISMATCH'};'protected'{'PROTECTED_CHANGED_DURING_INSTALL'};'late_protected'{'PROTECTED_CHANGED_DURING_INSTALL'};'late_escrow'{'ESCROW_CHANGED_DURING_INSTALL'};'late_backup'{'OBSERVE_BACKUP_CHANGED'};'late_running'{'TASK_CHANGED_DURING_INSTALL'};default{$fault}}
         Assert-ThrowsCode ('Observe replacement fails closed on '+$fault) {Invoke-CutoverInstallObserveReadyFromReadyObserve @replacementArgs | Out-Null} $expectedFault
         $preMutation=@('STATE_CHANGED_BEFORE_REPLACEMENT','OBSERVE_BACKUP_CHANGED') -ccontains $fault
         Assert-True ('Observe replacement cleanup only after mutation '+$fault) ($script:ReplacementCleanup -eq $(if($preMutation){0}else{1}) -and $script:ReplacementStarts -eq 0)

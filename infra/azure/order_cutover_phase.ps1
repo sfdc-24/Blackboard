@@ -2900,6 +2900,19 @@ function Invoke-CutoverInstallObserveReadyFromReadyObserve {
         Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_INSTALL'
         $postXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
         if (-not $postXml.enabled) { Throw-Cutover -Code 'CANDIDATE_OBSERVE_TASK_NOT_ENABLED' }
+        $finalEscrow = Invoke-CutoverEscrow -Context $Context -RequestedAction Validate
+        if ($finalEscrow.task_xml_sha256 -cne $admitted.escrow_xml_sha256) { Throw-Cutover -Code 'ESCROW_CHANGED_DURING_INSTALL' }
+        if ((Get-CutoverProtectedSnapshot -Context $latest.current_context) -cne $admitted.current_protected -or
+            (Get-CutoverProtectedSnapshot -Context $Context) -cne $admitted.candidate_protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_INSTALL' }
+        Assert-CutoverFileCheckpointUnchanged -Before $backup.checkpoint -Path $backup.path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'OBSERVE_BACKUP_CHANGED'
+        # Recheck native runtime after the slow final integrity reads, without
+        # launching another child process. Never adopt an intervening run.
+        $handoffRuntime = Get-CutoverTaskRuntime
+        if ($handoffRuntime.state -cne 'Ready' -or $handoffRuntime.last_task_result -ne 0 -or
+            $handoffRuntime.last_run_utc -ne $post.last_run_utc -or $handoffRuntime.next_run_utc -ne $post.next_run_utc) { Throw-Cutover -Code 'TASK_CHANGED_DURING_INSTALL' }
+        Assert-CutoverTriggerWindow -NextRunUtc $handoffRuntime.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_INSTALL'
         $receipt = [pscustomobject][ordered]@{
             schema=$script:CutoverSchema;ok=$true;action='InstallObserveReadyFromReadyObserve';operation_id=$Context.operation_id
             status='OBSERVE_READY_HEALTH_UNCONFIRMED';release_id=$Context.release_id;previous_release_id=$ExpectedCurrentReleaseId
