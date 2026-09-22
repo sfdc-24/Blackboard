@@ -237,6 +237,35 @@ class WhatsAppAcknowledgement(unittest.TestCase):
         self.assertEqual([row["payload"] for row in fresh], ["second"])
         self.assertEqual(bw.load_state()["watermark"], cutoff)
 
+    def test_uncapped_peek_exposes_all_pending_rows_before_advancing(self):
+        bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
+        rows = [[str(i), "2026-09-21T00:01:00Z", "codex", "claude-code-cli", "APPEND", "pending-%02d" % i] for i in range(26)]
+        def transport(env, params):
+            matching = [row for row in rows if row[1] >= params.get("since", "")]
+            limit = int(params.get("limit", 0))
+            returned = matching[-limit:] if limit > 0 else matching
+            return 200, json.dumps({"rows": returned, "filtered": len(returned)})
+        output = io.StringIO()
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", side_effect=transport), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("QUIET", "none", [])):
+            with contextlib.redirect_stdout(output), mock.patch.object(sys, "argv", ["board_waker.py", "--peek"]):
+                self.assertEqual(bw.main(), 10)
+            for row in rows:
+                self.assertIn(row[5], output.getvalue())
+            cutoff = next(line.split()[1] for line in output.getvalue().splitlines() if line.startswith("ADVANCE_THROUGH "))
+            with mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", cutoff]):
+                self.assertEqual(bw.main(), 0)
+            self.assertEqual(bw.check_board(bw.load_state())[0], "QUIET")
+
+    def test_unknown_board_with_whatsapp_news_does_not_issue_cutoff(self):
+        output = io.StringIO()
+        with mock.patch.object(bw, "check_board", return_value=("UNKNOWN", "failed", [])), \
+             mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
+             contextlib.redirect_stdout(output), mock.patch.object(sys, "argv", ["board_waker.py", "--peek"]):
+            self.assertEqual(bw.main(), 2)
+        self.assertNotIn("ADVANCE_THROUGH", output.getvalue())
+
     def test_advance_without_consumed_cutoff_fails_without_read_or_write(self):
         bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
         before = self.state.read_bytes()

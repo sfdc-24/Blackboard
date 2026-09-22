@@ -82,6 +82,14 @@ Advance never uses the model's completion time. Rows appended during the model
 remain eligible. This timestamp protocol assumes append timestamps reflect
 arrival; it does not support backdated insertions behind the existing cursor.
 
+The addressed board read is uncapped: the bus applies `since` and `match` but
+must not tail-slice the matching set. Its `filtered` field counts returned rows,
+not all matches before a limit. Peek prints every returned pending board summary,
+not merely the first five. These summaries are discovery hints (payloads remain
+bounded); the model must retrieve full work before completing it. Any UNKNOWN
+read suppresses the cutoff even if the other inbox reports NEWS. Runner output
+truncation or incomplete model processing must not authorize advance.
+
 Deployment requires a matching runner update under its existing single-writer
 lock: parse exactly one cutoff from the successful peek; preserve it through
 the model run; bound the advance subprocess; check its exit code and read the

@@ -143,7 +143,9 @@ def gh(args: list) -> tuple:
 def check_board(state: dict) -> tuple:
     """New rows addressed to this surface since the watermark."""
     since = state.get("watermark") or ""
-    params = {"action": "read", "title": BOARD, "match": ME, "limit": 25}
+    # A cutoff acknowledges every earlier matching row. A capped tail can
+    # silently omit older pending work; the bus returns all matches without limit.
+    params = {"action": "read", "title": BOARD, "match": ME}
     if since:
         params["since"] = since
     try:
@@ -453,15 +455,15 @@ def main() -> int:
         # is worth starting, and the one thing that is always worth starting a
         # session for is the human asking a question and getting silence.
         wa_status, wa_note, wa_fresh = check_whatsapp(state)
-        both = "NEWS" if (status == "NEWS" or wa_status == "NEWS") else (
-            "UNKNOWN" if "UNKNOWN" in (status, wa_status) else "QUIET")
+        both = "UNKNOWN" if "UNKNOWN" in (status, wa_status) else (
+            "NEWS" if "NEWS" in (status, wa_status) else "QUIET")
         print("%s  %s; whatsapp: %s" % (both, note, wa_note))
         if both != "UNKNOWN":
             print("ADVANCE_THROUGH " + peek_cutoff)
         for w in wa_fresh[:3]:
             print("  WA %s  %s" % (w["ts"], w["text"][:160]))
-        for f in fresh[:5]:
-            print("  %s  %s" % (f["ts"], f["payload"][:160]))
+        for f in fresh:
+            print("  %s  %s" % (f["ts"], f["payload"]))
         return 10 if both == "NEWS" else (2 if both == "UNKNOWN" else 0)
     lines, alarms = [], []
 
