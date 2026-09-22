@@ -60,6 +60,8 @@ param(
     [string]$ExpectedCurrentRunId = '',
 
     [string]$ExpectedDisabledXmlSha256 = '',
+    [string]$ExpectedCurrentReleaseId = '',
+    [string]$ExpectedCurrentXmlSha256 = '',
 
     [string]$GitPath = '',
     [string]$ExpectedGitSha256 = '',
@@ -103,6 +105,7 @@ function Get-CutoverSafeAction {
         'InstallObserveAndDrain',
         'InstallObserveAndDrainFromFailedExecute',
         'InstallExecuteReady',
+        'InstallObserveReadyFromReadyObserve',
         'RestoreReady',
         'StartAndAwait',
         'InstallObserveAndDrainFromDisabledExecute',
@@ -2814,6 +2817,106 @@ function Get-CutoverReadyObserveReplacementAdmission {
     }
 }
 
+function Save-CutoverObserveDefinitionEvidence {
+    param([Parameter(Mandatory = $true)]$Context, [Parameter(Mandatory = $true)][string]$Xml, [Parameter(Mandatory = $true)][string]$ExpectedSha256)
+    if ($Context.operation_id -cnotmatch '^[0-9a-f]{32}$') { Throw-Cutover -Code 'OPERATION_ID_INVALID' }
+    Assert-CutoverSafeDirectory -Path $Context.metadata_root -MissingCode 'METADATA_ROOT_MISSING' -UnsafeCode 'METADATA_ROOT_UNSAFE'
+    $evidence = Get-CutoverTaskXmlEvidence -Text $Xml
+    if (-not $evidence.enabled -or $evidence.utf8_text_sha256 -cne $ExpectedSha256) { Throw-Cutover -Code 'CURRENT_OBSERVE_XML_MISMATCH' }
+    $path = Join-Path $Context.metadata_root ('observe-before-' + $Context.operation_id + '.xml')
+    Assert-CutoverPathChainSafe -Path $path -Code 'OBSERVE_BACKUP_UNSAFE'
+    if (Test-Path -LiteralPath $path) { Throw-Cutover -Code 'OBSERVE_BACKUP_ALREADY_EXISTS' }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Xml)
+    # CreateNew makes operation identity one-use even across a concurrent writer.
+    # A partial file on failure stays as evidence; never overwrite or delete it.
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } catch { Throw-Cutover -Code 'OBSERVE_BACKUP_WRITE_FAILED' }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+    $checkpoint = Get-CutoverFileCheckpoint -Path $path -MaximumBytes $script:CutoverStateMaximumBytes -MissingCode 'OBSERVE_BACKUP_MISSING' -InvalidCode 'OBSERVE_BACKUP_INVALID'
+    if ($checkpoint.sha256 -cne $ExpectedSha256 -or $checkpoint.length -ne $bytes.Length) { Throw-Cutover -Code 'OBSERVE_BACKUP_READBACK_MISMATCH' }
+    return [pscustomobject]@{path=$path;checkpoint=$checkpoint}
+}
+
+function Invoke-CutoverInstallObserveReadyFromReadyObserve {
+    # Separate Observe-only release replacement; never replay a stale Execute.
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [Parameter(Mandatory = $true)][string]$CurrentInstallerPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentInstallerSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentReleaseId,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentXmlSha256
+    )
+    $admissionArgs = @{Context=$Context;CurrentInstallerPath=$CurrentInstallerPath;ExpectedCurrentInstallerSha256=$ExpectedCurrentInstallerSha256;ExpectedCurrentReleaseId=$ExpectedCurrentReleaseId;ExpectedCurrentXmlSha256=$ExpectedCurrentXmlSha256}
+    $admitted = Get-CutoverReadyObserveReplacementAdmission @admissionArgs
+    $backup = Save-CutoverObserveDefinitionEvidence -Context $Context -Xml (Export-CutoverTaskXml) -ExpectedSha256 $ExpectedCurrentXmlSha256
+    # Backup I/O can race a natural run. Re-admit, but never adopt a changed run
+    # or checkpoint as the baseline merely because that later run was healthy.
+    $latest = Get-CutoverReadyObserveReplacementAdmission @admissionArgs
+    if ($latest.current_run.run_id -cne $admitted.current_run.run_id -or
+        $latest.current_status.last_run_utc -ne $admitted.current_status.last_run_utc -or
+        $latest.current_protected -cne $admitted.current_protected -or
+        $latest.candidate_protected -cne $admitted.candidate_protected -or
+        $latest.escrow_xml_sha256 -cne $admitted.escrow_xml_sha256) { Throw-Cutover -Code 'OBSERVE_ADMISSION_CHANGED' }
+    Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_REPLACEMENT'
+    Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_REPLACEMENT'
+    Assert-CutoverFileCheckpointUnchanged -Before $backup.checkpoint -Path $backup.path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'OBSERVE_BACKUP_CHANGED'
+    $final = Get-CutoverExactInstallerStatus -Context $latest.current_context -ScriptPath $CurrentInstallerPath -ExpectedMode Observe -ExpectedTaskState Ready
+    Assert-CutoverStableReadyReadback -Initial $latest.current_status -Readback $final -RequiredSeconds (180 + $Context.natural_trigger_margin_seconds) -DriftCode 'TASK_CHANGED_BEFORE_DISABLE'
+    $finalXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+    if (-not $finalXml.enabled -or $finalXml.utf8_text_sha256 -cne $ExpectedCurrentXmlSha256) { Throw-Cutover -Code 'CURRENT_OBSERVE_XML_MISMATCH' }
+    $transaction = $Context.PSObject.Copy()
+    $transaction.restored_installer_path = $CurrentInstallerPath
+    $transaction.expected_restored_installer_sha256 = $ExpectedCurrentInstallerSha256
+    try {
+        Disable-CutoverTask
+        $disabled = Get-CutoverExactInstallerStatus -Context $latest.current_context -ScriptPath $CurrentInstallerPath -ExpectedMode Observe -ExpectedTaskState Disabled
+        if ($disabled.last_run_utc -ne $final.last_run_utc) { Throw-Cutover -Code 'TASK_CHANGED_DURING_DISABLE' }
+        $disabledXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+        if ($disabledXml.enabled -or $disabledXml.normalized_sha256 -cne $finalXml.normalized_sha256) { Throw-Cutover -Code 'TASK_DISABLE_DEFINITION_DRIFT' }
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_DISABLE'
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_DISABLE'
+        $installed = Invoke-CutoverInstaller -Context $transaction -ScriptPath $Context.installer_path -RequestedAction InstallFromDisabledNoStop -RequestedMode Observe -ExpectedCurrentTaskXmlSha256 $disabledXml.utf8_text_sha256
+        $null = Assert-CutoverInstallerStatus -Status $installed -Context $transaction -ExpectedMode Observe -ExpectedTaskState Ready
+        $post = Get-CutoverExactInstallerStatus -Context $transaction -ScriptPath $Context.installer_path -ExpectedMode Observe -ExpectedTaskState Ready
+        if ($post.last_run_utc -ne $final.last_run_utc) { Throw-Cutover -Code 'TASK_CHANGED_DURING_INSTALL' }
+        Assert-CutoverTriggerWindow -NextRunUtc $post.next_run_utc -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds)
+        Assert-CutoverBackupMatchesExpectedXml -Context $transaction -ExpectedUtf8TextSha256 $disabledXml.utf8_text_sha256 -ExpectedUtf16LeBomSha256 $disabledXml.utf16le_bom_sha256
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged -Before $backup.checkpoint -Path $backup.path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'OBSERVE_BACKUP_CHANGED'
+        if ((Get-CutoverProtectedSnapshot -Context $latest.current_context) -cne $admitted.current_protected -or
+            (Get-CutoverProtectedSnapshot -Context $Context) -cne $admitted.candidate_protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_INSTALL' }
+        $escrow = Invoke-CutoverEscrow -Context $Context -RequestedAction Validate
+        if ($escrow.task_xml_sha256 -cne $admitted.escrow_xml_sha256) { Throw-Cutover -Code 'ESCROW_CHANGED_DURING_INSTALL' }
+        # Snapshot/escrow checks can be slow. Do not report an old Ready read
+        # after a natural candidate run or trigger change during that work.
+        $finalPost = Get-CutoverExactInstallerStatus -Context $transaction -ScriptPath $Context.installer_path -ExpectedMode Observe -ExpectedTaskState Ready
+        Assert-CutoverStableReadyReadback -Initial $post -Readback $finalPost -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds) -DriftCode 'TASK_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_INSTALL'
+        Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_INSTALL'
+        $postXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+        if (-not $postXml.enabled) { Throw-Cutover -Code 'CANDIDATE_OBSERVE_TASK_NOT_ENABLED' }
+        $receipt = [pscustomobject][ordered]@{
+            schema=$script:CutoverSchema;ok=$true;action='InstallObserveReadyFromReadyObserve';operation_id=$Context.operation_id
+            status='OBSERVE_READY_HEALTH_UNCONFIRMED';release_id=$Context.release_id;previous_release_id=$ExpectedCurrentReleaseId
+            pre_mode='Observe';post_mode='Observe';pre_task_state='Ready';post_task_state='Ready';task_stopped=$false
+            enabled_definition_backup=$backup.path;enabled_definition_sha256=$ExpectedCurrentXmlSha256
+            disabled_definition_sha256=$disabledXml.utf8_text_sha256;candidate_definition_sha256=$postXml.utf8_text_sha256
+            backup_matches_post_disable_xml=$true;state_and_log_preserved=$true;protected_unchanged=$true;escrow_preserved=$true
+            task_started=$false;worker_health_confirmed=$false;previous_run_id=$admitted.current_run.run_id
+            last_run_utc=$post.last_run_utc.ToString('o');next_run_utc=$post.next_run_utc.ToString('o')
+        }
+        $null = ConvertTo-CutoverBoundedReceipt -Receipt $receipt
+        return $receipt
+    } catch {
+        Throw-CutoverAfterCleanup -FailureRecord $_ -Context $transaction -Installer $Context.installer_path -ExpectedModes @('Observe') -FallbackInstaller $CurrentInstallerPath -FallbackModes @('Observe')
+    }
+}
+
 function Invoke-CutoverInstallExecuteReady {
     param([Parameter(Mandatory = $true)]$Context)
     Assert-CutoverPinnedExecutables -Context $Context
@@ -3502,6 +3605,8 @@ function New-CutoverContext {
         expected_current_failure_code = ''
         expected_current_run_id = ''
         expected_disabled_xml_sha256 = ''
+        expected_current_release_id = ''
+        expected_current_xml_sha256 = ''
         metadata_root = ''
     }
     $programData = Resolve-CutoverAbsolutePath -Value $env:ProgramData -Code 'PROGRAM_DATA_INVALID' -ForbidVolumeRoot
@@ -3513,6 +3618,7 @@ function New-CutoverContext {
         'ValidateEscrowAndDisable',
         'InstallObserveAndDrain',
         'InstallObserveAndDrainFromFailedExecute',
+        'InstallObserveReadyFromReadyObserve',
         'RestoreReady'
     ) -ccontains $RequestedAction) {
         if ($Values.EscrowId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or
@@ -3527,6 +3633,7 @@ function New-CutoverContext {
         'InstallObserveAndDrain',
         'InstallObserveAndDrainFromFailedExecute',
         'InstallExecuteReady',
+        'InstallObserveReadyFromReadyObserve',
         'RestoreReady',
         'StartAndAwait',
         'InstallObserveAndDrainFromDisabledExecute',
@@ -3535,6 +3642,18 @@ function New-CutoverContext {
     ) -ccontains $RequestedAction) {
         $context.installer_path = Resolve-CutoverInstaller -Path $Values.InstallerPath -ExpectedSha256 $Values.ExpectedInstallerSha256 -ReleaseId $Values.ExpectedReleaseId -Prefix 'INSTALLER'
     }
+    $currentReleaseInput = [string]$Values['ExpectedCurrentReleaseId']
+    $currentXmlInput = [string]$Values['ExpectedCurrentXmlSha256']
+    if ($RequestedAction -ceq 'InstallObserveReadyFromReadyObserve') {
+        if ($context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
+        if ($currentReleaseInput -cnotmatch '^[0-9a-f]{40}$' -or $currentReleaseInput -ceq $context.release_id) { Throw-Cutover -Code 'OBSERVE_REPLACEMENT_RELEASE_INVALID' }
+        if (($context.timeout_seconds + $context.natural_trigger_margin_seconds + 120) -ge 900) { Throw-Cutover -Code 'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL' }
+        if ($currentXmlInput -cnotmatch '^[0-9a-f]{64}$') { Throw-Cutover -Code 'EXPECTED_CURRENT_XML_SHA256_INVALID' }
+        if ($context.expected_terminal_status -or $context.expected_work_id -or $context.expected_row_id -or $context.expected_result_status) { Throw-Cutover -Code 'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY' }
+        $context.expected_current_release_id = $currentReleaseInput
+        $context.expected_current_xml_sha256 = $currentXmlInput
+        $context.restored_installer_path = Resolve-CutoverInstaller -Path $Values.RestoredInstallerPath -ExpectedSha256 $Values.ExpectedRestoredInstallerSha256 -ReleaseId $currentReleaseInput -Prefix 'CURRENT_INSTALLER'
+    } elseif ($currentReleaseInput -or $currentXmlInput) { Throw-Cutover -Code 'CURRENT_OBSERVE_INPUTS_ACTION_MISMATCH' }
     if (@('InstallObserveAndDrain', 'InstallObserveAndDrainFromFailedExecute', 'RestoreReady') -ccontains $RequestedAction) {
         $context.restored_installer_path = Resolve-CutoverInstaller `
             -Path $Values.RestoredInstallerPath `
@@ -3636,6 +3755,7 @@ function Invoke-OrderCutoverPhase {
         'InstallObserveAndDrain' { return Invoke-CutoverInstallObserveAndDrain -Context $context }
         'InstallObserveAndDrainFromFailedExecute' { return Invoke-CutoverInstallObserveAndDrainFromFailedExecute -Context $context }
         'InstallExecuteReady' { return Invoke-CutoverInstallExecuteReady -Context $context }
+        'InstallObserveReadyFromReadyObserve' { return Invoke-CutoverInstallObserveReadyFromReadyObserve -Context $context -CurrentInstallerPath $context.restored_installer_path -ExpectedCurrentInstallerSha256 $context.expected_restored_installer_sha256 -ExpectedCurrentReleaseId $context.expected_current_release_id -ExpectedCurrentXmlSha256 $context.expected_current_xml_sha256 }
         'RestoreReady' { return Invoke-CutoverRestoreReady -Context $context }
         'StartAndAwait' { return Invoke-CutoverStartAndAwait -Context $context }
         'InstallObserveAndDrainFromDisabledExecute' { return Invoke-CutoverInstallObserveAndDrainFromDisabledExecute -Context $context }
@@ -3740,6 +3860,8 @@ if ($MyInvocation.InvocationName -cne '.') {
         ExpectedCurrentFailureCode = $ExpectedCurrentFailureCode
         ExpectedCurrentRunId = $ExpectedCurrentRunId
         ExpectedDisabledXmlSha256 = $ExpectedDisabledXmlSha256
+        ExpectedCurrentReleaseId = $ExpectedCurrentReleaseId
+        ExpectedCurrentXmlSha256 = $ExpectedCurrentXmlSha256
         GitPath = $GitPath
         ExpectedGitSha256 = $ExpectedGitSha256
         ExpectedClaudeSha256 = $ExpectedClaudeSha256

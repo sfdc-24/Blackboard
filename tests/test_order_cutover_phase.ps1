@@ -40,6 +40,8 @@ $driverPath = Join-Path $repoRoot 'infra\azure\order_cutover_phase.ps1'
 . $driverPath
 
 $mockNames = @(
+    'Get-CutoverReadyObserveReplacementAdmission',
+    'Save-CutoverObserveDefinitionEvidence',
     'Resolve-CutoverInstaller',
     'Invoke-CutoverEscrow',
     'Invoke-CutoverChildScript',
@@ -3177,6 +3179,71 @@ try {
     Assert-ThrowsCode 'Observe replacement rejects imminent trigger without mutation' { Get-CutoverReadyObserveReplacementAdmission @admissionArgs | Out-Null } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
     Assert-True 'Observe replacement admission never mutates task' ($script:AdmissionMutationCalls -eq 0)
 
+    Reset-TestMocks
+    $context=New-TestContext
+    $context.metadata_root=$temporaryRoot
+    $backupHash=(Get-CutoverTaskXmlEvidence -Text $script:XmlEnabled).utf8_text_sha256
+    $savedDefinition=Save-CutoverObserveDefinitionEvidence -Context $context -Xml $script:XmlEnabled -ExpectedSha256 $backupHash
+    Assert-True 'Observe definition backup exact bytes read back' ([IO.File]::ReadAllText($savedDefinition.path) -ceq $script:XmlEnabled -and $savedDefinition.checkpoint.sha256 -ceq $backupHash)
+    Assert-ThrowsCode 'Observe definition backup rejects operation reuse' {Save-CutoverObserveDefinitionEvidence -Context $context -Xml $script:XmlEnabled -ExpectedSha256 $backupHash | Out-Null} 'OBSERVE_BACKUP_ALREADY_EXISTS'
+    Assert-True 'Observe definition collision preserves prior evidence' ((Get-CutoverFileSha256 -Path $savedDefinition.path) -ceq $backupHash)
+
+    $script:ReplacementContext=New-TestContext
+    $script:ReplacementAdmission=[pscustomobject]@{
+        current_context=$script:ReplacementContext;current_status=(New-TestExactStatus)
+        current_run=[pscustomobject]@{run_id=('a'*32)}
+        state_checkpoint=[pscustomobject]@{length=10;sha256=('d'*64)}
+        log_checkpoint=[pscustomobject]@{length=20;sha256=('e'*64)}
+        current_protected='protected';candidate_protected='protected';escrow_xml_sha256=('b'*64)
+    }
+    $script:ReplacementFault=''
+    $script:ReplacementDisabled=$false
+    $script:ReplacementInstalled=$false
+    $script:ReplacementCleanup=0
+    $script:ReplacementStarts=0
+    Set-TestMock 'Get-CutoverReadyObserveReplacementAdmission' { $script:ReplacementAdmission }
+    Set-TestMock 'Save-CutoverObserveDefinitionEvidence' { [pscustomobject]@{path='C:\test\immutable.xml';checkpoint=[pscustomobject]@{length=10;sha256=('d'*64)}} }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context,$ScriptPath,$ExpectedMode,$ExpectedTaskState)
+        if($ExpectedMode -cne 'Observe'){throw 'TEST_EXECUTE_FORBIDDEN'}
+        New-TestExactStatus -State $ExpectedTaskState
+    }
+    Set-TestMock 'Export-CutoverTaskXml' { if($script:ReplacementDisabled -and -not $script:ReplacementInstalled){$script:XmlDisabled}else{$script:XmlEnabled} }
+    Set-TestMock 'Disable-CutoverTask' { $script:ReplacementDisabled=$true }
+    Set-TestMock 'Invoke-CutoverInstaller' {
+        param($Context,$ScriptPath,$RequestedAction,$RequestedMode,$ExpectedCurrentTaskXmlSha256)
+        if($RequestedAction -cne 'InstallFromDisabledNoStop' -or $RequestedMode -cne 'Observe' -or $ExpectedCurrentTaskXmlSha256 -cne (Get-CutoverTaskXmlEvidence -Text $script:XmlDisabled).utf8_text_sha256){throw 'TEST_INSTALL_CONTRACT_INVALID'}
+        if($script:ReplacementFault -ceq 'installer'){throw 'INSTALLER_CHILD_FAILED'}
+        $script:ReplacementInstalled=$true
+        [pscustomobject]@{status='READY'}
+    }
+    Set-TestMock 'Assert-CutoverInstallerStatus' { New-TestExactStatus }
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' {
+        param($Before,$Path,$MaximumBytes,$Code)
+        if($Code -ceq $script:ReplacementFault){throw $Code}
+    }
+    Set-TestMock 'Assert-CutoverBackupMatchesExpectedXml' { if($script:ReplacementFault -ceq 'backup'){throw 'BACKUP_XML_MISMATCH'} }
+    Set-TestMock 'Get-CutoverProtectedSnapshot' { if($script:ReplacementFault -ceq 'protected'){'changed'}else{'protected'} }
+    Set-TestMock 'Invoke-CutoverEscrow' { [pscustomobject]@{task_xml_sha256=('b'*64)} }
+    Set-TestMock 'Start-CutoverTask' { $script:ReplacementStarts++ }
+    Set-TestMock 'Disable-CutoverTaskAfterFailure' {
+        param($Context,$Installer,$ExpectedModes)
+        $script:ReplacementCleanup++
+        if(($ExpectedModes -join ',') -cne 'Observe'){throw 'TEST_CLEANUP_EXECUTE_FORBIDDEN'}
+        [pscustomobject]@{mode='Observe';future_triggers_disabled=$true;definition_preserved_except_enabled=$true;task_stopped=$false}
+    }
+    $replacementArgs=@{Context=$context;CurrentInstallerPath=$context.restored_installer_path;ExpectedCurrentInstallerSha256=('7'*64);ExpectedCurrentReleaseId=('1'*40);ExpectedCurrentXmlSha256=$backupHash}
+    $replacement=Invoke-CutoverInstallObserveReadyFromReadyObserve @replacementArgs
+    Assert-True 'Observe replacement transaction remains ready-only without claiming worker health' ($replacement.status -ceq 'OBSERVE_READY_HEALTH_UNCONFIRMED' -and -not $replacement.worker_health_confirmed -and -not $replacement.task_started -and -not $replacement.task_stopped)
+    Assert-True 'Observe replacement installs only through no-stop Observe contract' ($script:ReplacementDisabled -and $script:ReplacementInstalled -and $script:ReplacementStarts -eq 0 -and $script:ReplacementCleanup -eq 0)
+    foreach($fault in @('STATE_CHANGED_BEFORE_REPLACEMENT','STATE_CHANGED_DURING_DISABLE','LOG_CHANGED_DURING_INSTALL','OBSERVE_BACKUP_CHANGED','installer','backup','protected')){
+        $script:ReplacementFault=$fault;$script:ReplacementDisabled=$false;$script:ReplacementInstalled=$false;$script:ReplacementCleanup=0
+        $expectedFault=switch($fault){'installer'{'INSTALLER_CHILD_FAILED'};'backup'{'BACKUP_XML_MISMATCH'};'protected'{'PROTECTED_CHANGED_DURING_INSTALL'};default{$fault}}
+        Assert-ThrowsCode ('Observe replacement fails closed on '+$fault) {Invoke-CutoverInstallObserveReadyFromReadyObserve @replacementArgs | Out-Null} $expectedFault
+        $preMutation=@('STATE_CHANGED_BEFORE_REPLACEMENT','OBSERVE_BACKUP_CHANGED') -ccontains $fault
+        Assert-True ('Observe replacement cleanup only after mutation '+$fault) ($script:ReplacementCleanup -eq $(if($preMutation){0}else{1}) -and $script:ReplacementStarts -eq 0)
+    }
+
     # StartAndAwait is the only Execute board-effects gateway.  It starts once,
     # binds exact task-local identity/status, proves append-only log evidence,
     # and compares the complete protected snapshot after the worker exits.
@@ -3845,6 +3912,26 @@ try {
     $wiredObserveHttp=New-CutoverContext -RequestedAction InstallObserveReadyFromDisabledObserveHttpError -Values $rowsMissingValues
     Assert-True 'disabled Observe HTTP continuation binds the same exact failure identity without a target' ($wiredObserveHttp.action -ceq 'InstallObserveReadyFromDisabledObserveHttpError' -and $wiredObserveHttp.expected_current_failure_code -ceq 'BOARD_ROWS_MISSING' -and [string]::IsNullOrEmpty($wiredObserveHttp.expected_work_id))
     Assert-True 'disabled Observe HTTP continuation is explicitly admitted' ((Get-CutoverSafeAction -Value InstallObserveReadyFromDisabledObserveHttpError) -ceq 'InstallObserveReadyFromDisabledObserveHttpError')
+    $readyObserveValues=$recoveryValues.Clone()
+    # Earlier negative control deliberately corrupted this private fixture.
+    [IO.File]::WriteAllBytes($toolPath, $toolBytes)
+    $readyObserveValues.ExpectedDisabledXmlSha256=''
+    $readyObserveValues.ExpectedCurrentReleaseId=$readyObserveValues.ExpectedEscrowReleaseId
+    $readyObserveValues.ExpectedCurrentXmlSha256=('c'*64)
+    $wiredReadyObserve=New-CutoverContext -RequestedAction InstallObserveReadyFromReadyObserve -Values $readyObserveValues
+    Assert-True 'Ready Observe replacement binds separate current release and exact enabled XML' ($wiredReadyObserve.expected_current_release_id -ceq $readyObserveValues.ExpectedCurrentReleaseId -and $wiredReadyObserve.expected_current_xml_sha256 -ceq ('c'*64) -and $wiredReadyObserve.mode -ceq 'Observe')
+    Assert-True 'Ready Observe replacement is explicitly admitted' ((Get-CutoverSafeAction -Value InstallObserveReadyFromReadyObserve) -ceq 'InstallObserveReadyFromReadyObserve')
+    foreach($badReadyField in @('mode','release','xml','target','window')){
+        $badReady=$readyObserveValues.Clone()
+        $badReadyCode=switch($badReadyField){
+            'mode'{$badReady.Mode='Execute';'ACTION_REQUIRES_OBSERVE_MODE'}
+            'release'{$badReady.ExpectedCurrentReleaseId=$badReady.ExpectedReleaseId;'OBSERVE_REPLACEMENT_RELEASE_INVALID'}
+            'xml'{$badReady.ExpectedCurrentXmlSha256='';'EXPECTED_CURRENT_XML_SHA256_INVALID'}
+            'target'{$badReady.ExpectedWorkId='NO-REPLAY';'OBSERVE_RECOVERY_FORBIDS_TARGET_IDENTITY'}
+            'window'{$badReady.TimeoutSeconds='780';'OBSERVE_RECOVERY_WINDOW_CANNOT_FIT_INTERVAL'}
+        }
+        Assert-ThrowsCode ('Ready Observe context rejects '+$badReadyField) {New-CutoverContext -RequestedAction InstallObserveReadyFromReadyObserve -Values $badReady} $badReadyCode
+    }
     $env:ProgramData=$oldProgramData
 
     # Main workflow wiring must invoke this suite on Windows PowerShell 5.1.

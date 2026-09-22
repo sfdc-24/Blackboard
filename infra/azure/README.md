@@ -695,3 +695,30 @@ coordinator tasks in Execute mode.
   manual supervisor PASS before enabling either schedule.
 - The Automation account provisioned as `Basic`. Schedules are bounded to the
   90-day evaluation window to keep the experiment finite.
+
+### Replacing a healthy Ready Observe release
+
+`InstallObserveReadyFromReadyObserve` is a distinct Observe-only cutover action.
+It requires the candidate installer/release pins, existing escrow pins, and the
+current installer via `RestoredInstallerPath`/`ExpectedRestoredInstallerSha256`.
+`ExpectedCurrentReleaseId` identifies that current installer independently of
+the original escrow release; `ExpectedCurrentXmlSha256` pins the enabled task's
+exact UTF-8 definition. The candidate must be a different release. Work/result
+targets and disabled/error-recovery inputs are not accepted.
+
+The current task must be Ready Observe with result zero and a correlated
+no-eligible state/log run. The action writes a create-only, operation-specific
+`observe-before-<operation_id>.xml` and reads its exact hash back before any
+disable. Reusing that operation, including after partial backup failure, is
+rejected. Existing evidence is never overwritten. After re-admission and race
+checks it disables only Observe, authenticates the disabled definition, and
+uses `InstallFromDisabledNoStop` in Observe mode. It verifies the installer's
+prior-definition backup, preserved state/log/last-run/protected data and escrow,
+and the candidate's future trigger. It never starts, stops, or restores a task.
+
+The receipt is `OBSERVE_READY_HEALTH_UNCONFIRMED`: inherited prior success is
+not new-release health. Require a subsequent natural candidate Observe run and
+actual stale-order/cursor proof before Execute installation or a fresh canary.
+Source review, hosted checks, exact committed LF driver/ARM equality and unique
+operation-correlated receipts remain mandatory. A local passing test suite is
+not authorization to deploy an unreviewed driver.
