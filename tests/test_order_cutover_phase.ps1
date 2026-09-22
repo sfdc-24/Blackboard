@@ -40,6 +40,7 @@ $driverPath = Join-Path $repoRoot 'infra\azure\order_cutover_phase.ps1'
 . $driverPath
 
 $mockNames = @(
+    'Resolve-CutoverInstaller',
     'Invoke-CutoverEscrow',
     'Invoke-CutoverChildScript',
     'Get-CutoverExactInstallerStatus',
@@ -3110,6 +3111,71 @@ try {
     Assert-ThrowsCode 'InstallExecuteReady rejects an undrained observed candidate' {
         Invoke-CutoverInstallExecuteReady -Context $context | Out-Null
     } 'STATE_TERMINAL_STATUS_MISMATCH'
+
+    # Ready-Observe release replacement admission is read-only and authenticates
+    # the prior release separately from the candidate and original escrow.
+    Reset-TestMocks
+    $context = New-TestContext
+    $script:AdmissionXml = $script:XmlEnabled
+    $admissionHash = (Get-CutoverTaskXmlEvidence -Text $script:AdmissionXml).utf8_text_sha256
+    $script:AdmissionNext = [DateTime]'2099-01-01T00:00:00Z'
+    $script:AdmissionStateStatus = 'no_eligible_order'
+    $script:AdmissionMutationCalls = 0
+    $script:AdmissionRunChecks = 0
+    $script:AdmissionEscrowCalls = 0
+    $script:AdmissionContexts = New-Object 'System.Collections.Generic.List[string]'
+    Set-TestMock 'Resolve-CutoverInstaller' {
+        param($Path, $ExpectedSha256, $ReleaseId, $Prefix)
+        if ($ExpectedSha256 -cne ('7'*64) -or $ReleaseId -cne ('1'*40) -or $Prefix -cne 'CURRENT_INSTALLER') { throw 'TEST_CURRENT_PIN_INVALID' }
+        $Path
+    }
+    Set-TestMock 'Assert-CutoverPinnedExecutables' { param($Context) }
+    Set-TestMock 'Invoke-CutoverEscrow' {
+        param($Context, $RequestedAction)
+        if ($RequestedAction -cne 'Validate') { throw 'TEST_ESCROW_MUTATION' }
+        $script:AdmissionEscrowCalls++
+        [pscustomobject]@{task_xml_sha256=('b'*64)}
+    }
+    Set-TestMock 'Get-CutoverExactInstallerStatus' {
+        param($Context, $ScriptPath, $ExpectedMode, $ExpectedTaskState)
+        if ($Context.release_id -cne ('1'*40) -or $ExpectedMode -cne 'Observe' -or $ExpectedTaskState -cne 'Ready') { throw 'TEST_PRIOR_STATUS_INVALID' }
+        New-TestExactStatus -Next $script:AdmissionNext
+    }
+    Set-TestMock 'Export-CutoverTaskXml' { $script:AdmissionXml }
+    Set-TestMock 'Get-CutoverState' {
+        param($Path)
+        [pscustomobject]@{value=(New-TestState -Mode Observe -RunId ('a'*32) -Status $script:AdmissionStateStatus);checkpoint=[pscustomobject]@{length=10;sha256=('d'*64)}}
+    }
+    Set-TestMock 'Get-CutoverLogCheckpoint' { param($Path) [pscustomobject]@{length=20;sha256=('e'*64)} }
+    Set-TestMock 'Assert-CutoverCurrentTerminalRun' {
+        param($Context,$State,$ExactStatus,$LogCheckpoint,$ExpectedMode,$ExpectedStatus)
+        $script:AdmissionRunChecks++
+        [pscustomobject]@{run_id=('a'*32);last_run_utc=$ExactStatus.last_run_utc}
+    }
+    Set-TestMock 'Get-CutoverProtectedSnapshot' {
+        param($Context)
+        $script:AdmissionContexts.Add($Context.release_id)
+        $Context.release_id
+    }
+    Set-TestMock 'Assert-CutoverFileCheckpointUnchanged' { param($Before,$Path,$MaximumBytes,$Code) }
+    Set-TestMock 'Disable-CutoverTask' { $script:AdmissionMutationCalls++ }
+    Set-TestMock 'Invoke-CutoverInstaller' { $script:AdmissionMutationCalls++ }
+    Set-TestMock 'Start-CutoverTask' { $script:AdmissionMutationCalls++ }
+    $admissionArgs = @{Context=$context;CurrentInstallerPath=$context.restored_installer_path;ExpectedCurrentInstallerSha256=('7'*64);ExpectedCurrentReleaseId=('1'*40);ExpectedCurrentXmlSha256=$admissionHash}
+    $admission = Get-CutoverReadyObserveReplacementAdmission @admissionArgs
+    Assert-True 'Observe replacement admission authenticates separate old release without changing candidate context' ($admission.current_context.release_id -ceq ('1'*40) -and $context.release_id -ceq ('2'*40))
+    $expectedAdmissionContexts = @(('1'*40),('2'*40),('1'*40),('2'*40)) -join ','
+    Assert-True 'Observe replacement admission proves both protected snapshots twice' (($script:AdmissionContexts.ToArray() -join ',') -ceq $expectedAdmissionContexts)
+    Assert-True 'Observe replacement admission validates escrow and correlated terminal run' ($script:AdmissionEscrowCalls -eq 1 -and $script:AdmissionRunChecks -eq 1 -and $admission.escrow_xml_sha256 -ceq ('b'*64))
+    $badAdmission=$admissionArgs.Clone();$badAdmission.ExpectedCurrentXmlSha256=('f'*64)
+    Assert-ThrowsCode 'Observe replacement rejects wrong enabled XML' { Get-CutoverReadyObserveReplacementAdmission @badAdmission | Out-Null } 'CURRENT_OBSERVE_XML_MISMATCH'
+    $badAdmission=$admissionArgs.Clone();$badAdmission.ExpectedCurrentReleaseId=$context.release_id
+    Assert-ThrowsCode 'Observe replacement rejects same release' { Get-CutoverReadyObserveReplacementAdmission @badAdmission | Out-Null } 'OBSERVE_REPLACEMENT_RELEASE_INVALID'
+    $script:AdmissionStateStatus='candidate_observed'
+    Assert-ThrowsCode 'Observe replacement rejects undrained candidate' { Get-CutoverReadyObserveReplacementAdmission @admissionArgs | Out-Null } 'STATE_TERMINAL_STATUS_MISMATCH'
+    $script:AdmissionStateStatus='no_eligible_order';$script:AdmissionNext=[DateTime]::UtcNow.AddSeconds(10)
+    Assert-ThrowsCode 'Observe replacement rejects imminent trigger without mutation' { Get-CutoverReadyObserveReplacementAdmission @admissionArgs | Out-Null } 'NATURAL_TRIGGER_WINDOW_UNAVAILABLE'
+    Assert-True 'Observe replacement admission never mutates task' ($script:AdmissionMutationCalls -eq 0)
 
     # StartAndAwait is the only Execute board-effects gateway.  It starts once,
     # binds exact task-local identity/status, proves append-only log evidence,

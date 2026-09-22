@@ -2753,6 +2753,67 @@ function Invoke-CutoverInstallObserveAndDrainFromFailedExecute {
     }
 }
 
+function Get-CutoverReadyObserveReplacementAdmission {
+    # Read-only admission for a future, separately wired release-replacement
+    # action. No disable/install/cleanup is permitted until this proof returns.
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [Parameter(Mandatory = $true)][string]$CurrentInstallerPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentInstallerSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentReleaseId,
+        [Parameter(Mandatory = $true)][string]$ExpectedCurrentXmlSha256
+    )
+    if ($Context.mode -cne 'Observe') { Throw-Cutover -Code 'ACTION_REQUIRES_OBSERVE_MODE' }
+    if ($ExpectedCurrentReleaseId -cnotmatch '^[0-9a-f]{40}$' -or
+        $ExpectedCurrentReleaseId -ceq $Context.release_id) {
+        Throw-Cutover -Code 'OBSERVE_REPLACEMENT_RELEASE_INVALID'
+    }
+    if ($ExpectedCurrentXmlSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        Throw-Cutover -Code 'EXPECTED_CURRENT_XML_SHA256_INVALID'
+    }
+    $currentPath = Resolve-CutoverInstaller -Path $CurrentInstallerPath -ExpectedSha256 $ExpectedCurrentInstallerSha256 -ReleaseId $ExpectedCurrentReleaseId -Prefix 'CURRENT_INSTALLER'
+    $current = $Context.PSObject.Copy()
+    $current.installer_path = $currentPath
+    $current.expected_installer_sha256 = $ExpectedCurrentInstallerSha256
+    $current.release_id = $ExpectedCurrentReleaseId
+    Assert-CutoverPinnedExecutables -Context $Context
+    $escrow = Invoke-CutoverEscrow -Context $Context -RequestedAction 'Validate'
+    $initial = Get-CutoverExactInstallerStatus -Context $current -ScriptPath $currentPath -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+    $xml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+    if (-not $xml.enabled -or $xml.utf8_text_sha256 -cne $ExpectedCurrentXmlSha256) {
+        Throw-Cutover -Code 'CURRENT_OBSERVE_XML_MISMATCH'
+    }
+    $state = Get-CutoverState -Path $Context.state_path
+    $null = Assert-CutoverStateTerminal -State $state.value -ExpectedMode 'Observe' -ExpectedStatus 'no_eligible_order' -ExpectedUserProfile $Context.user_profile_path
+    $log = Get-CutoverLogCheckpoint -Path $Context.log_path
+    $run = Assert-CutoverCurrentTerminalRun -Context $current -State $state.value -ExactStatus $initial -LogCheckpoint $log -ExpectedMode 'Observe' -ExpectedStatus 'no_eligible_order'
+    $currentProtected = Get-CutoverProtectedSnapshot -Context $current
+    $candidateProtected = Get-CutoverProtectedSnapshot -Context $Context
+    $readback = Get-CutoverExactInstallerStatus -Context $current -ScriptPath $currentPath -ExpectedMode 'Observe' -ExpectedTaskState 'Ready'
+    Assert-CutoverStableReadyReadback -Initial $initial -Readback $readback -RequiredSeconds (180 + $Context.natural_trigger_margin_seconds) -DriftCode 'TASK_CHANGED_BEFORE_REPLACEMENT'
+    $xmlReadback = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+    if (-not $xmlReadback.enabled -or $xmlReadback.utf8_text_sha256 -cne $ExpectedCurrentXmlSha256) {
+        Throw-Cutover -Code 'CURRENT_OBSERVE_XML_MISMATCH'
+    }
+    Assert-CutoverFileCheckpointUnchanged -Before $state.checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_BEFORE_REPLACEMENT'
+    Assert-CutoverFileCheckpointUnchanged -Before $log -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_BEFORE_REPLACEMENT'
+    if ((Get-CutoverProtectedSnapshot -Context $current) -cne $currentProtected -or
+        (Get-CutoverProtectedSnapshot -Context $Context) -cne $candidateProtected) {
+        Throw-Cutover -Code 'PROTECTED_CHANGED_BEFORE_REPLACEMENT'
+    }
+    return [pscustomobject]@{
+        current_context = $current
+        current_status = $readback
+        current_xml = $xmlReadback
+        state_checkpoint = $state.checkpoint
+        log_checkpoint = $log
+        current_run = $run
+        current_protected = $currentProtected
+        candidate_protected = $candidateProtected
+        escrow_xml_sha256 = [string]$escrow.task_xml_sha256
+    }
+}
+
 function Invoke-CutoverInstallExecuteReady {
     param([Parameter(Mandatory = $true)]$Context)
     Assert-CutoverPinnedExecutables -Context $Context
