@@ -46,9 +46,11 @@ flattened a four-megabyte body to one row on its default `-Depth`. The fleet
 moved its readers to Python for exactly this reason and this lane was left
 behind — which is why the waker was **deaf**, not merely unscheduled.
 
-`board_waker.py --peek` asks the gateway with `match=` and `limit=` (three
-kilobytes, not four megabytes) and keeps the old contract: exit **10** there is
-news, **0** quiet, **2** the read could not be trusted.
+`board_waker.py --peek` reads the addressed board with `match=` and, when a
+cursor exists, `since=`, without a row limit. Response size grows with pending
+work; there is no three-kilobyte guarantee. It also checks the WhatsApp inbox.
+Exit **10** means news, **0** quiet, and **2** an untrusted read. It never moves
+the watermark; the paired runner must use the cutoff protocol below.
 
 ## What it will not do
 

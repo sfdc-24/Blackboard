@@ -403,11 +403,10 @@ def main() -> int:
     ap.add_argument("--advance-through", help="UTC cutoff emitted by the consumed peek; required with --advance")
     ap.add_argument("--peek", action="store_true",
                     help="is there board news for this surface? exit 10 if yes, "
-                         "0 if quiet, 2 if the read could not be trusted. Runs no "
-                         "other check, posts nothing, and does NOT move the "
-                         "watermark - only a clean full run does that, so a row "
-                         "arriving between the peek and the run is seen next "
-                         "tick instead of being skipped in silence.")
+                         "0 if quiet, 2 if either board or WhatsApp read is "
+                         "untrusted. Posts nothing and does not move the "
+                         "watermark. After successful model completion, the "
+                         "runner must pass this peek's cutoff to --advance.")
     args = ap.parse_args()
 
     if args.advance and (args.peek or args.wake):
