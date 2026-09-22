@@ -278,11 +278,26 @@ class WhatsAppAcknowledgement(unittest.TestCase):
                 read.assert_not_called()
             self.assertEqual(self.state.read_bytes(), before)
 
+    def test_board_accepts_supported_utc_timestamp_shapes(self):
+        for timestamp in ("2026-09-21T00:01:30", "2026-09-21T00:01:30Z", "2026-09-21T00:01:30.750Z"):
+            with self.subTest(timestamp=timestamp), mock.patch.object(bw, "load_env", return_value={}), \
+                 mock.patch.object(bw, "bus_get", return_value=(200, json.dumps({"ok": True, "rows": [["A", timestamp, "codex", "target", "APPEND", "pending"]]}))):
+                status, _, fresh = bw.check_board({"watermark": "2026-09-21T00:01:29Z"})
+                self.assertEqual(status, "NEWS")
+                self.assertEqual(len(fresh), 1)
+
     def test_advance_malformed_or_failed_board_read_never_saves(self):
         bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
         before = self.state.read_bytes()
         responses = [(200, body) for body in ('{', '[]', 'null', '{}', '{"rows":null}', '{"rows":{}}', '{"rows":""}', '{"rows":[{}]}')]
         responses.append((503, '{"rows":[]}'))
+        valid = ["A", "2026-09-21T00:01:00Z", "codex", "claude-code-cli", "APPEND", "pending"]
+        for failure in ({"ok": False}, {"_httpStatus": 500}, {"error": "failed"}):
+            responses.append((200, json.dumps(dict(failure, rows=[valid]))))
+        for row in ([], ["id"], ["id", "bad", "codex", "target", "APPEND", "pending"],
+                    ["id", "2026-02-30T00:01:00Z", "codex", "target", "APPEND", "pending"],
+                    ["id", "2026-9-21T00:01:00Z", "codex", "target", "APPEND", "pending"]):
+            responses.append((200, json.dumps({"ok": True, "rows": [row]})))
         for response in responses + [TimeoutError("offline transport failure")]:
             with self.subTest(response=response), \
                  mock.patch.object(bw, "load_env", return_value={}), \

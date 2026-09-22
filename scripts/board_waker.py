@@ -158,9 +158,22 @@ def check_board(state: dict) -> tuple:
         return "UNKNOWN", "board read failed or returned invalid JSON", []
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
         return "UNKNOWN", "board response must be an object with a rows list", []
-    if any(not isinstance(row, list) for row in data["rows"]):
-        return "UNKNOWN", "board response contains malformed rows", []
-    rows = [r for r in data["rows"] if isinstance(r, list)]
+    if ("ok" in data and data["ok"] is not True) or data.get("error") or (
+        "_httpStatus" in data and (type(data["_httpStatus"]) is not int or data["_httpStatus"] != 200)
+    ):
+        return "UNKNOWN", "board response reports failure", []
+    rows = data["rows"]
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6 or not isinstance(row[1], str):
+            return "UNKNOWN", "board response contains malformed rows", []
+        # Board strings may omit Z; GAS Date cells include it and milliseconds.
+        # Offsets/noncanonical values cannot safely use the lexical UTC cursor.
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z?", row[1]):
+            return "UNKNOWN", "board row timestamp is invalid", []
+        try:
+            datetime.strptime(row[1][:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return "UNKNOWN", "board row timestamp is invalid", []
     fresh = []
     for r in rows:
         payload = str(r[5]) if len(r) > 5 and r[5] is not None else ""
