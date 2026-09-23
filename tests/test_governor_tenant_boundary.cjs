@@ -45,6 +45,7 @@ function createHarness(initialProperties = {}) {
     providerSawLock: false,
     onProviderFetch: null,
     failProvider: false,
+    openaiResponseBody: null,
     uuid: 0,
   };
 
@@ -148,7 +149,8 @@ function createHarness(initialProperties = {}) {
         const openai = url.includes('api.openai.com');
         return {
           getResponseCode: () => 200,
-          getContentText: () => JSON.stringify(openai ? {
+          getContentText: () => JSON.stringify(openai ? (harness.openaiResponseBody || {
+            status: 'completed',
             output: [
               { type: 'reasoning', summary: [] },
               { type: 'message', content: [
@@ -156,7 +158,7 @@ function createHarness(initialProperties = {}) {
                 { type: 'output_text', text: 'Codex reply.' },
               ] },
             ],
-          } : { content: [{ type: 'text', text: 'A bounded test reply.' }] }),
+          }) : { content: [{ type: 'text', text: 'A bounded test reply.' }] }),
         };
       },
     },
@@ -421,6 +423,31 @@ test('an unknown or retired provider hint cannot select an undeclared backend', 
   assert.equal(result.ok, true);
   assert.equal(result.by, 'claude');
   assert.deepEqual(h.providerUrls, ['https://api.anthropic.com/v1/messages']);
+});
+
+test('incomplete, refused, and malformed Codex envelopes fall back to Claude', () => {
+  const cases = [
+    { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ content: [{ type: 'output_text', text: 'partial must not ship' }] }] },
+    { status: 'incomplete', incomplete_details: { reason: 'content_filter' }, output: [] },
+    { status: 'completed', output: {} },
+    { status: 'completed', output: [{ content: {} }] },
+    { status: 'completed', output: [{ content: [{ type: 'refusal', refusal: 'No.' }] }] },
+    {},
+  ];
+  for (const body of cases) {
+    const h = createHarness({ OPENAI_KEY: 'test-openai-key' });
+    h.openaiResponseBody = body;
+    const identity = h.context.conversationIdentity_('', '');
+    const result = h.context.reception(identity.token, 'Review this design', [], '', 'codex');
+    assert.equal(result.ok, true);
+    assert.equal(result.by, 'claude');
+    assert.equal(result.reply, 'A bounded test reply.');
+    assert.deepEqual(h.providerUrls, [
+      'https://api.openai.com/v1/responses',
+      'https://api.anthropic.com/v1/messages',
+    ]);
+  }
 });
 
 test('numeric caps and both clients retain the signed-token contract', () => {

@@ -808,10 +808,18 @@ function askCodex_(key, props, msgs) {
     var msg = (body && body.error && (body.error.message || body.error)) || res.getContentText().slice(0, 300);
     return { ok: false, error: 'api ' + res.getResponseCode() + ': ' + msg };
   }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'malformed response' };
+  }
+  if (body.status !== 'completed') {
+    return { ok: false, error: 'response ' + String(body.status || 'missing-status') };
+  }
+  if (!Array.isArray(body.output)) return { ok: false, error: 'malformed output' };
   var text = '';
-  ((body && body.output) || []).forEach(function (item) {
-    ((item && item.content) || []).forEach(function (part) {
-      if (part && part.type === 'output_text') text += String(part.text || '');
+  body.output.forEach(function (item) {
+    var content = item && Array.isArray(item.content) ? item.content : [];
+    content.forEach(function (part) {
+      if (part && part.type === 'output_text' && typeof part.text === 'string') text += part.text;
     });
   });
   text = text.trim();

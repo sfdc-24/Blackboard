@@ -142,6 +142,7 @@ function makeRuntime(opts) {
             return response(opts.codexStatus, JSON.stringify({ error: { message: 'mocked Codex failure' } }));
           }
           return response(200, JSON.stringify({
+            status: 'completed',
             output: [{ type: 'message', content: [{ type: 'output_text', text: 'A real Codex reply.' }] }]
           }));
         }
