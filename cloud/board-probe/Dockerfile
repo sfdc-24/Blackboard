@@ -16,6 +16,9 @@ COPY scripts/bus.py /app/bus.py
 # board_say holds bus_get, the query-string read transport. bus.py comes with
 # it because board_say imports load_env from it.
 COPY scripts/board_say.py /app/board_say.py
+# The durable cursor. Stdlib only, auth from the metadata server, so it adds
+# no pip install and nothing to the image but one file.
+COPY scripts/state_store.py /app/state_store.py
 COPY cloud/board-probe/main.py /app/main.py
 
 # Unbuffered so a Cloud Run Job that is killed mid-run still leaves its output in

@@ -23,6 +23,7 @@
 /scripts/*
 !/scripts/bus.py
 !/scripts/board_say.py
+!/scripts/state_store.py
 
 # Belt and braces. If a future edit above accidentally re-admits the root, these
 # still never go up. An ignore rule that is redundant today is not wasted.

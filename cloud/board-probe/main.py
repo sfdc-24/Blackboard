@@ -52,6 +52,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # that path. See the note in its docstring.
 import board_say as board  # noqa: E402
 
+# Optional so the probe still runs with no state configured at all. A
+# missing store must degrade to 'no cursor', never to a crash - the probe's
+# first job is the parity read, and bookkeeping must not be able to stop it.
+try:
+    import state_store  # noqa: E402
+except Exception:  # noqa: BLE001
+    state_store = None
+
 BOARD = os.environ.get("BOARD_TITLE", "Blackboard - Alpha DB")
 ME = os.environ.get("AGENT_TAG", "claude-code-cli")
 
@@ -72,6 +80,11 @@ CUTOFF = (os.environ.get("COMPARED_THROUGH") or "").strip()
 # reason. The sleep is linear rather than exponential so the worst case stays
 # inside a task timeout that can be reasoned about: 5 attempts, 2+4+6+8s of
 # waiting, plus however long each hop takes.
+# Its OWN cursor, named separately from any waker's. Sharing a state document
+# with the waker would make this probe a second writer to the cursor the live
+# doorbell depends on, which is the collision class the store exists to make
+# safe rather than one to walk into.
+CURSOR_NAME = os.environ.get("CURSOR_NAME") or "board_probe"
 ATTEMPTS = int(os.environ.get("READ_ATTEMPTS") or 5)
 RETRY_SLEEP = int(os.environ.get("RETRY_SLEEP") or 2)
 
@@ -226,11 +239,49 @@ def fingerprint() -> dict:
     }
 
 
+def carry_the_cursor(fp: dict) -> dict:
+    """Advance a durable cursor to the newest row this run saw.
+
+    WHAT THIS PROVES THAT A UNIT TEST CANNOT
+        Every Cloud Run execution is a fresh container, so two executions are a
+        restart. If the second one reports the first one's watermark as
+        `previous`, state survived the container - which is the whole of cutover
+        step 4 and cannot be demonstrated with a fake.
+
+    WHY IT IS NOT A BOARD WRITE
+        The read-only guard governs what this probe does to THE BOARD. This is the
+        probe's own bookkeeping in its own GCS object - a different resource, a
+        different permission. The job still cannot write a board row and the guard
+        still proves it.
+
+    WHY A FAILURE HERE IS REPORTED RATHER THAN RAISED
+        The parity read is the job. Bookkeeping must not be able to stop it, so a
+        broken or unreachable store degrades to a reported reason.
+    """
+    uri = os.environ.get("BLACKBOARD_STATE_URI") or ""
+    if not uri:
+        return {"backend": None, "reason": "BLACKBOARD_STATE_URI not set"}
+    if state_store is None:
+        return {"backend": uri, "reason": "state_store did not import"}
+    newest = fp.get("newest")
+    if not newest:
+        return {"backend": uri, "reason": "nothing dateable to record"}
+    try:
+        store = state_store.open_store(uri)
+        result = state_store.advance(store, CURSOR_NAME, "watermark", newest)
+        result["backend"] = store.describe()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {"backend": uri, "reason": "%s: %s" % (type(exc).__name__, exc)}
+
+
 def main() -> int:
     refuse_if_this_module_can_write()
     fp = fingerprint()
+    fp["cursor"] = carry_the_cursor(fp)
     # One line of JSON, so the laptop side can diff it by equality rather than by
-    # eye. Cloud Run Jobs put stdout straight into Cloud Logging.
+    # eye. Cloud Run Jobs put stdout straight into Cloud Logging, which parses a
+    # single JSON line into jsonPayload rather than textPayload.
     print(json.dumps(fp, sort_keys=True))
     return 0
 
