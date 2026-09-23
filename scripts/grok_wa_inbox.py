@@ -2,8 +2,12 @@
 """SFDC24 — free Grok WhatsApp inbox (no LLM).
 
 Pipedream already writes inbound WhatsApp to Alpha DB (writer tag: whatsapp).
-This script polls the board, finds rows addressed to Grok, ACKs via wa_notify.ps1
-if asked, and keeps a local cursor so repeats are free.
+This script polls the board, finds rows addressed to Grok, ACKs via
+scripts/wa_notify.py if asked, and keeps a local cursor so repeats are free.
+
+The ACK used to shell out to powershell.exe. It no longer does, so the ONLY
+PowerShell left on this path is the scheduled-task launcher below - a wrapper,
+not a dependency. This file itself now runs anywhere Python does.
 
 Usage:
   python scripts/grok_wa_inbox.py once
@@ -18,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -170,38 +173,30 @@ def append_log(entry: dict) -> None:
 
 
 def ack_whatsapp(text: str) -> tuple[bool, str]:
-    """Free-form Meta send via existing laptop script — no LLM."""
-    ps1 = REPO / "scripts" / "wa_notify.ps1"
-    if not ps1.is_file():
-        return False, "wa_notify.ps1 missing"
-    # Pass text via env-less temp file to avoid PowerShell quoting pain
-    tmp = REPO / "logs" / "_grok_wa_ack.txt"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(text, encoding="utf-8")
-    cmd = [
-        "powershell",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(ps1),
-        "-TextFile",
-        str(tmp),
-        # NOT the tag of the lane being addressed. This receipt comes from the
-        # poller on the laptop; stamping it grok-bot made an automatic ACK look
-        # like Grok had answered, which is the confusion Mr Salam named on
-        # 2026-09-07 when he asked every message to identify its sender.
-        "-Tag",
-        "wa-poller",
-        "-Kind",
-        "STATUS",
-    ]
+    """Free-form Meta send. Python, no shell.
+
+    This used to run powershell.exe against wa_notify.ps1 with the body passed
+    through a temp file to dodge quoting. scripts/wa_notify.py is that script's
+    contract in stdlib Python - same prefix, same caps, same Graph version - so
+    the shell, the temp file and the quoting all go away, and this caller stops
+    being one that cannot run anywhere but Windows.
+
+    THE TAG IS NOT THE LANE BEING ADDRESSED. This receipt comes from the poller
+    on the laptop; stamping it grok-bot made an automatic ACK look like Grok had
+    answered, which is the confusion Mr Salam named on 2026-09-07 when he asked
+    every message to identify its sender.
+    """
     try:
-        p = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True, timeout=90)
-        out = (p.stdout or "") + (p.stderr or "")
-        return p.returncode == 0, out[-500:]
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        sys.path.insert(0, str(REPO / "scripts"))
+        from wa_notify import notify as _wa_notify
+    except Exception as exc:  # noqa: BLE001
+        return False, "wa_notify.py unavailable: %s" % exc
+    try:
+        return _wa_notify(text, kind="STATUS", tag="wa-poller")
+    except SystemExit as exc:        # credentials missing: a refusal, not a crash
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return False, "%s: %s" % (type(exc).__name__, exc)
 
 
 def cmd_list(rows, last: int) -> int:
