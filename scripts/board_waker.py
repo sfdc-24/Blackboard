@@ -123,8 +123,21 @@ def gh(args: list) -> tuple:
 
 # ---------------------------------------------------------------- the checks
 
-def check_board(state: dict) -> tuple:
-    """New rows addressed to this surface since the watermark."""
+def check_board(state: dict, strict: bool = False) -> tuple:
+    """New rows addressed to this surface since the watermark.
+
+    strict=True is the ADVANCE path's contract: a row nobody can date makes the
+    whole read UNKNOWN, so no cursor moves past it. That matters there because a
+    row whose timestamp is merely MALFORMED - a Feb 30, an unpadded month - would
+    become readable if its writer were fixed, and a cursor already advanced past
+    it has lost it for good.
+
+    strict=False is the PEEK's contract: skip what cannot be dated, count it, and
+    say so in the verdict line. The peek only decides whether starting a session
+    is worth it, and refusing to ring the doorbell is the worse error - measured
+    on 2026-09-23, one row written on 2026-09-03 held it shut on every
+    invocation.
+    """
     since = state.get("watermark") or ""
     # A cutoff acknowledges every earlier matching row. A capped tail can
     # silently omit older pending work; the bus returns all matches without limit.
@@ -146,19 +159,53 @@ def check_board(state: dict) -> tuple:
     ):
         return "UNKNOWN", "board response reports failure", []
     rows = data["rows"]
+    # A ROW NOBODY CAN DATE IS A DATA DEFECT, NOT A FAILED READ.
+    #
+    # This loop used to return UNKNOWN for the whole read on the first row whose
+    # timestamp would not parse. Measured consequence, on 2026-09-23: --peek
+    # exited 2 on every invocation, and run-waker.ps1 aborts on any exit code
+    # that is not 0 or 10, so no model started at all.
+    #
+    # The cause is index 317 of the 2,304 rows the gateway returns for
+    # match=claude-code-cli: VM-ONBOARD-001, written by vm-chrome on 2026-09-03,
+    # whose Row_ID cell holds "Thursday, September 3, 2026 at 3:52 PM EDT" and
+    # whose TIMESTAMP cell holds the entire BCB payload. Eighteen rows in that
+    # read are shaped that way, and the row itself records why: the v1 bus lands
+    # the timestamp in column A and the payload in column B, so that surface
+    # "CANNOT write a schema-correct board row".
+    #
+    # Those rows are permanent history. Failing closed on them fails closed for
+    # ever, which is worse than the skipping #168 was protecting against: a
+    # doorbell that never rings misses everything, not just the undateable.
+    #
+    # UNKNOWN still means what it should - a read that did not happen. Shape
+    # failures below keep returning it, because a response whose rows are not
+    # rows really is unreadable.
+    #
+    # THE RESIDUAL RISK, STATED: a NEW row written with a broken timestamp is
+    # skipped rather than surfaced, and only the printed count says so. The fix
+    # for that belongs at the writer, not here. Until the v1 bus can write a
+    # schema-correct row, the count is the signal.
+    undateable = 0
     for row in rows:
         if not isinstance(row, list) or len(row) < 6 or not isinstance(row[1], str):
             return "UNKNOWN", "board response contains malformed rows", []
-        # Board strings may omit Z; GAS Date cells include it and milliseconds.
-        # Offsets/noncanonical values cannot safely use the lexical UTC cursor.
-        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z?", row[1]):
-            return "UNKNOWN", "board row timestamp is invalid", []
-        try:
-            datetime.strptime(row[1][:19], "%Y-%m-%dT%H:%M:%S")
-        except ValueError:
-            return "UNKNOWN", "board row timestamp is invalid", []
     fresh = []
     for r in rows:
+        # Board strings may omit Z; GAS Date cells include it and milliseconds.
+        # Offsets/noncanonical values cannot safely use the lexical UTC cursor.
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z?", r[1]):
+            if strict:
+                return "UNKNOWN", "board row timestamp is invalid", []
+            undateable += 1
+            continue
+        try:
+            datetime.strptime(r[1][:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            if strict:
+                return "UNKNOWN", "board row timestamp is invalid", []
+            undateable += 1
+            continue
         payload = str(r[5]) if len(r) > 5 and r[5] is not None else ""
         ts = str(r[1])[:19] if len(r) > 1 else ""
         if "from=" + ME in payload:
@@ -166,8 +213,12 @@ def check_board(state: dict) -> tuple:
         if since and ts and ts <= since[:19]:
             continue
         fresh.append({"ts": ts, "payload": payload[:400]})
-    return ("NEWS" if fresh else "QUIET"), "%d new for %s of %s on the board" % (
-        len(fresh), ME, data.get("total")), fresh
+    note = "%d new for %s of %s on the board" % (len(fresh), ME, data.get("total"))
+    if undateable:
+        # Printed, not swallowed. If this number ever grows, a writer has
+        # started producing rows this fleet cannot order.
+        note += "; %d row(s) skipped - timestamp unreadable" % undateable
+    return ("NEWS" if fresh else "QUIET"), note, fresh
 
 
 def check_whatsapp(state: dict) -> tuple:
@@ -376,7 +427,35 @@ def escalate(summary: str) -> str:
         return "escalation failed: %s" % exc
 
 
+def _make_output_unkillable() -> None:
+    r"""Stop a board payload from ending the run by containing a character.
+
+    Measured 2026-09-23: --peek exited 1 with
+
+        UnicodeEncodeError: 'charmap' codec can't encode character '\u2192'
+
+    while printing a fresh row, because this console is cp1252 and the row held
+    an arrow. run-waker.ps1 treats any exit code other than 0 or 10 as ABORT, so
+    one character in someone else's board row stopped a model from starting -
+    the same outcome as a failed read, by a different route.
+
+    Board text comes from other agents and from him. It is not ASCII and cannot
+    be made so. Only the ERROR HANDLER changes here, never the encoding: the
+    launcher reads this stream back as a file and greps it for the verdict line,
+    and Windows PowerShell 5.1 would read a re-encoded UTF-8 file as ANSI.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # A stream that cannot be reconfigured is one we did not create -
+            # a pipe, a capture, a test double. Printing is not worth crashing
+            # over either way, so carry on rather than failing here.
+            pass
+
+
 def main() -> int:
+    _make_output_unkillable()
     ap = argparse.ArgumentParser(description="Watch the board and the live site.")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--wake", action="store_true",
@@ -424,7 +503,10 @@ def main() -> int:
         # This is deliberately a state-only operation: advance must not read or
         # send on the WhatsApp lane.
         state.setdefault("wa_watermark", state.get("watermark") or "")
-        board_status, _board_note, fresh = check_board(state)
+        # strict: this is the call that moves a cursor. A row nobody can date
+        # must stop it, because a malformed timestamp may be a writer bug that
+        # gets fixed, and a cursor already past the row would never see it again.
+        board_status, _board_note, fresh = check_board(state, strict=True)
         if board_status == "UNKNOWN":
             # A failed read is never permission to skip work.  Leave the
             # cursor unchanged so the next natural run can safely see it.
@@ -450,10 +532,34 @@ def main() -> int:
         # is worth starting, and the one thing that is always worth starting a
         # session for is the human asking a question and getting silence.
         wa_status, wa_note, wa_fresh = check_whatsapp(state)
-        both = "UNKNOWN" if "UNKNOWN" in (status, wa_status) else (
-            "NEWS" if "NEWS" in (status, wa_status) else "QUIET")
+        # HIS MESSAGE OUTRANKS A BROKEN BOARD READ, and until now it did not.
+        #
+        # The comment directly above says a message from him is always worth
+        # starting a session for. The line this replaces then let a board
+        # UNKNOWN swallow exactly that: NEWS on the WhatsApp lane produced a
+        # combined UNKNOWN, the peek exited 2, and the launcher aborted without
+        # starting anything. Six messages he sent between 19 and 21 September
+        # were sitting behind it - the same silence check_whatsapp was written
+        # to end, re-opened one line below it.
+        #
+        # NEWS is therefore checked FIRST. UNKNOWN still wins when neither lane
+        # has news, because then there is nothing to lose by waiting and a
+        # genuinely failed read must not advance any cursor.
+        if "NEWS" in (status, wa_status):
+            both = "NEWS"
+        elif "UNKNOWN" in (status, wa_status):
+            both = "UNKNOWN"
+        else:
+            both = "QUIET"
         print("%s  %s; whatsapp: %s" % (both, note, wa_note))
-        if both != "UNKNOWN":
+        # THE CUTOFF FOLLOWS THE BOARD READ, NOT THE WAKE DECISION.
+        #
+        # These are two different questions and conflating them is what made the
+        # first version of this fix wrong. Waking is about whether a session is
+        # worth starting; the cutoff is a promise that every row up to that
+        # instant was SEEN. A read that failed saw nothing, so it may not issue
+        # one - even when his WhatsApp message is reason enough to wake.
+        if status != "UNKNOWN":
             print("ADVANCE_THROUGH " + peek_cutoff)
         for w in wa_fresh[:3]:
             print("  WA %s  %s" % (w["ts"], w["text"][:160]))

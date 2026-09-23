@@ -259,12 +259,30 @@ class WhatsAppAcknowledgement(unittest.TestCase):
             self.assertEqual(bw.check_board(bw.load_state())[0], "QUIET")
 
     def test_unknown_board_with_whatsapp_news_does_not_issue_cutoff(self):
+        """A failed board read may not issue a cutoff - but it may still wake.
+
+        These are two separate promises and this test used to pin them together.
+
+        The cutoff assertion below is unchanged and is the important one: a read
+        that saw nothing must not claim every row up to an instant was seen.
+
+        The EXIT CODE changed on 2026-09-23, deliberately. It used to expect 2.
+        run-waker.ps1 aborts on any code that is not 0 or 10, so "the board read
+        failed AND he sent a WhatsApp message" meant no model started at all -
+        and six messages he sent between 19 and 21 September were sitting behind
+        it. check_whatsapp exists because he said "I've been writing to everyone
+        in whatsapp and no one is responding including you"; letting a broken
+        board read swallow his message re-opens that silence one line below the
+        code that closed it. His message wakes a session now, and the board
+        cursor still does not move.
+        """
         output = io.StringIO()
         with mock.patch.object(bw, "check_board", return_value=("UNKNOWN", "failed", [])), \
              mock.patch.object(bw, "check_whatsapp", return_value=("NEWS", "one", self.message)), \
              contextlib.redirect_stdout(output), mock.patch.object(sys, "argv", ["board_waker.py", "--peek"]):
-            self.assertEqual(bw.main(), 2)
+            self.assertEqual(bw.main(), 10)
         self.assertNotIn("ADVANCE_THROUGH", output.getvalue())
+        self.assertTrue(output.getvalue().startswith("NEWS"))
 
     def test_advance_without_consumed_cutoff_fails_without_read_or_write(self):
         bw.save_state({"watermark": "2026-09-21T00:00:00Z"})
