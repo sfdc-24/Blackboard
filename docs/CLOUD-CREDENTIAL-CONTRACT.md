@@ -131,5 +131,60 @@ compute service account, which is broadly privileged. A dedicated per-service
 account is the right shape, but changing the identity of a service that is on the
 live demo path is not a change to make quietly. Flagged, not done.
 
+## The unattended trigger, and why it needed no elevated shell
+
+**Approved by Mr Salam, 2026-09-23.** Dependency 1 of the migration is *"`SFDC24
+Blackboard Waker` is a Windows Task Scheduler job"*, and it had been recorded as
+waiting on his elevated PowerShell. It was not actually blocked on that: a
+trigger that lives in GCP needs no laptop at all.
+
+`scripts/gcp_scheduler_bootstrap.py` provisions it, idempotently. **Cloud
+Scheduler -> Cloud Run job**, hourly at :15 Toronto, running as a dedicated
+service account that can do exactly one thing: run one job. No secret access, no
+write role, and `run.invoker` bound **on the job** rather than on the project.
+
+### Proven, end to end
+
+Forced a fire and checked the execution count actually grew, rather than assuming
+a created job works:
+
+```
+lastAttemptTime: 2026-09-23T21:13:14.708793Z
+status: {}                                    <- empty means success
+
+NAME               SUCCEEDED_COUNT  FAILED_COUNT
+board-probe-2wpbb  1                              <- created 21:13:14, same second
+
+FINGERPRINT rows_compared=2305 digest=068234f3b64c27e7 where=cloud-run cred=injected
+```
+
+Same digest as the laptop. Scheduler to Cloud Run to Secret Manager to the live
+board, with no laptop anywhere in the path.
+
+### Two things that fail SILENTLY, both of which cost time here
+
+**1. The Cloud Scheduler service agent must be able to act as the invoker.** A
+job created with `--oauth-service-account-email` sits at `status: code: -1` with
+**no `lastAttemptTime` and no logs at all** until
+`service-96522051727@gcp-sa-cloudscheduler.iam.gserviceaccount.com` holds
+`roles/iam.serviceAccountTokenCreator` **on the invoker account**. The invoker had
+no IAM policy bindings whatsoever and nothing said so.
+
+**A missing `lastAttemptTime` means it never attempted**, which looks identical
+to "attempted and the target refused" unless you go and check. That distinction
+is the whole diagnosis.
+
+**2. Use the v2 run endpoint, not v1 `namespaces`.** `roles/run.invoker` grants
+`run.jobs.run`, which is exactly what v2 `:run` needs. The v1 form also reads the
+job, which `run.invoker` does not grant — so v1 forces the role up to
+`run.developer` for no benefit.
+
+### What this does and does not replace
+
+It replaces Task Scheduler **for this lane**. The probe is read-only and
+stateless, so it needed nothing else. **The waker is a different matter**: it
+holds a watermark, and moving that to durable storage is dependency 3 and still
+open. Until then the scheduled waker stays on the laptop.
+
 Related: `docs/OPENAI-CLOUD-MIGRATION.md`, `docs/ACCEPTANCE-CHECKLIST.md` (gap 1,
 identity is derived and never claimed), `docs/GCLOUD-MIGRATION.md`.
