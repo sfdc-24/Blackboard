@@ -728,6 +728,14 @@ function receptionWithIdentity_(identity, text, history, want) {
   // known, and never from the routing guess in the browser.
   var xaiKey  = props.getProperty('XAI_API_KEY');
   var anthKey = props.getProperty('ANTHROPIC_KEY');
+  // A KEY THAT IS PRESENT IS NOT A KEY THAT CAN ANSWER. grok ran out of
+  // allowance on 2026-09-23 and its key stayed in Script Properties, so every
+  // request still tried it first, paid a round trip to be refused, and only
+  // then reached claude. Set XAI_ENABLED to 'off' to take it out of the order
+  // entirely - including out of reach of an agent= hint, which would otherwise
+  // promote a provider that cannot serve. Clear the property when credit
+  // returns; nothing else has to change.
+  if (String(props.getProperty('XAI_ENABLED') || '').toLowerCase() === 'off') xaiKey = '';
   if (!xaiKey && !anthKey) return offline_(sid, 'no-key');
 
   // Reserve both spend ceilings inside one script lock before the provider.
@@ -748,9 +756,16 @@ function receptionWithIdentity_(identity, text, history, want) {
   // The order is the policy. Each provider is tried once; the first one that
   // returns text wins, and a failure is logged with its reason rather than
   // swallowed, so "the page went quiet" can always be traced to a provider.
+  // CLAUDE FIRST, grok behind it. The 2026-09-18 ruling put grok in front
+  // because it was the primary voice; that stopped being true the day its
+  // allowance ran out. Mr Salam, 2026-09-23: appoint claude primary responder
+  // after the python gate. The fallback is not decoration - it is what keeps
+  // the page answering when one provider is down, which is precisely the
+  // situation that prompted this, so grok stays in the list rather than being
+  // deleted from it.
   var order = [];
-  if (xaiKey)  order.push({ who: 'grok',   go: function () { return askGrok_(xaiKey, props, msgs); } });
   if (anthKey) order.push({ who: 'claude', go: function () { return askClaude_(anthKey, props, msgs); } });
+  if (xaiKey)  order.push({ who: 'grok',   go: function () { return askGrok_(xaiKey, props, msgs); } });
 
   // THE PAGE MAY ASK FOR A PARTICULAR AGENT, and it is moved to the front
   // rather than being allowed to replace the list. Three reasons, and the third
