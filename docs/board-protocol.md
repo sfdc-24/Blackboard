@@ -166,3 +166,23 @@ The bus is **append-only** (no delete action). Stale probes are soft-closed with
 - **D-18:** secrets never in Drive / docs / board.
 - Wake doc-train: BOOT → VIEWPORT → Rules Sheet (not full Issue Journal).
 
+## Four rules that came from PR #140, which is closed rather than merged
+
+grok-bot opened #140 on 2026-09-18 with a 72-line rewrite of this file. This one
+is 168 lines and already covered most of it, so merging would have replaced the
+longer file with the shorter and deleted 96 lines — the same shape as the two
+source-swap incidents this repository already has on record. These are the four
+things #140 had that this file did not. The rest of that branch is superseded.
+
+- **Read with `scripts/bus.ps1 -Action read -Title "Blackboard - Alpha DB"`**, or
+  alpha's GET read. Not a bare call without the title.
+- **A read without the title intermittently returns a health-check ping** —
+  `ok` / `service` / `time` and **no `rows`**. Treat an "empty board" from that
+  path as **UNKNOWN, not empty**, and retry. *Measured again on 2026-09-23: a
+  read missing the title returned a health reply, and it reads exactly like a
+  board with nothing on it.*
+- **Never use `GITHUB_PAT`, `github_PAT` or any other alias** for the git token.
+  Those names were deleted from the vault and will hang a clone.
+- **Bus auth is separate from git auth.** `BUS_SECRET` goes in the JSON POST
+  body. Confusing the bus secret with the git token is its own class of wasted
+  hour.
