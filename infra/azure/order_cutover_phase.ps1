@@ -2898,13 +2898,19 @@ function Invoke-CutoverInstallObserveReadyFromReadyObserve {
         Assert-CutoverStableReadyReadback -Initial $post -Readback $finalPost -RequiredSeconds ($Context.timeout_seconds + $Context.natural_trigger_margin_seconds) -DriftCode 'TASK_CHANGED_DURING_INSTALL'
         Assert-CutoverFileCheckpointUnchanged -Before $admitted.state_checkpoint -Path $Context.state_path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'STATE_CHANGED_DURING_INSTALL'
         Assert-CutoverFileCheckpointUnchanged -Before $admitted.log_checkpoint -Path $Context.log_path -MaximumBytes $script:CutoverLogMaximumBytes -Code 'LOG_CHANGED_DURING_INSTALL'
-        $postXml = Get-CutoverTaskXmlEvidence -Text (Export-CutoverTaskXml)
+        $postText = Export-CutoverTaskXml
+        $postXml = Get-CutoverTaskXmlEvidence -Text $postText
         if (-not $postXml.enabled) { Throw-Cutover -Code 'CANDIDATE_OBSERVE_TASK_NOT_ENABLED' }
+        $null = Assert-CutoverFutureObserveDefinition -Text $postText -Context $Context
         $finalEscrow = Invoke-CutoverEscrow -Context $Context -RequestedAction Validate
         if ($finalEscrow.task_xml_sha256 -cne $admitted.escrow_xml_sha256) { Throw-Cutover -Code 'ESCROW_CHANGED_DURING_INSTALL' }
         if ((Get-CutoverProtectedSnapshot -Context $latest.current_context) -cne $admitted.current_protected -or
             (Get-CutoverProtectedSnapshot -Context $Context) -cne $admitted.candidate_protected) { Throw-Cutover -Code 'PROTECTED_CHANGED_DURING_INSTALL' }
         Assert-CutoverFileCheckpointUnchanged -Before $backup.checkpoint -Path $backup.path -MaximumBytes $script:CutoverStateMaximumBytes -Code 'OBSERVE_BACKUP_CHANGED'
+        $handoffText = Export-CutoverTaskXml
+        $handoffXml = Get-CutoverTaskXmlEvidence -Text $handoffText
+        if (-not $handoffXml.enabled -or $handoffXml.normalized_sha256 -cne $postXml.normalized_sha256) { Throw-Cutover -Code 'CANDIDATE_OBSERVE_DEFINITION_CHANGED' }
+        $null = Assert-CutoverFutureObserveDefinition -Text $handoffText -Context $Context
         # Recheck native runtime after the slow final integrity reads, without
         # launching another child process. Never adopt an intervening run.
         $handoffRuntime = Get-CutoverTaskRuntime
