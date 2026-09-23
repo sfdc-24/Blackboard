@@ -1,7 +1,7 @@
 # The Apps Script in this repository is the one sfdc24.com runs
 
 **Status as of 2026-09-22: RECONCILED, and pushed for the first time since.**
-The live deployment `AKfycbx0D-5DAnMq...` is at **v45**, pushed from a fresh
+The live deployment `AKfycbx0D-5DAnMq...` is at **v49**, pushed from a fresh
 pull on 2026-09-22 — see *The first push after the reconciliation* below.
 
 **Status as of 2026-09-21: RECONCILED.** `apps-script/governor-page-api/` now

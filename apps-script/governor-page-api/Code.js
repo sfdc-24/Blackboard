@@ -44,9 +44,36 @@ var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
 var CHAT_DAILY_DEFAULT = 150;    // AI replies per UTC day, whole site
 var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and cap cost
 
+// THE SPEND CEILINGS, RESTORED 2026-09-22. All of this existed in the source
+// this repository carried until #167 and none of it was in the deployment: it
+// was written, reviewed and CI-verified against a file that was never live.
+// Until today the per-conversation chat cap was keyed on a caller-supplied
+// `vid`, so rotating one query parameter reset it, and the paid speech path
+// had no counter of its own at all.
+var CHAT_BUDGET_STATE  = 'CHAT_BUDGET_V1';
+var CHAT_SESSION_TTL_MS = 21600000; // six quiet hours, matching the old cache TTL
+var CHAT_MAX_ACTIVE_SESSIONS = 96;  // fail closed before one property can grow unbounded
+
+var TTS_SESSION_DEFAULT = 8;     // provider attempts per voice session
+var TTS_DAILY_DEFAULT   = 60;    // provider attempts per UTC day, whole site
+var TTS_KEY_TTL_SECS    = 900;
+var TTS_KEY_PROP_PREFIX = 'TTS_KEY_V1_';
+var TTS_BUDGET_STATE    = 'TTS_BUDGET_V1';
+
 // ---------- web entry points ----------
 function doGet(e) {
   var p = (e && e.parameter) || {};
+  // Public build metadata only: no board read, secret access or provider call.
+  // sfdc24BuildIdentity_ is not in this source - scripts/gas_build_identity.py
+  // stamps it in at deploy time - so the typeof guard is the whole contract:
+  // an unstamped deployment says so rather than inventing a commit.
+  if (p.health === 'build') {
+    if (typeof sfdc24BuildIdentity_ !== 'function') return json_({ ok: false, error: 'build identity unavailable' });
+    var build = sfdc24BuildIdentity_();
+    build.ok = true;
+    build.nonce = /^[0-9a-f]{32}$/.test(String(p.nonce || '')) ? String(p.nonce) : '';
+    return json_(build);
+  }
   // Machine read is Governor-only. Board rows carry live project state, so this is
   // never served to an anonymous caller. A pass is deliberately NOT accepted in the
   // query string — secrets do not belong in URLs.
@@ -72,10 +99,17 @@ function doGet(e) {
   t.selfUrl = ScriptApp.getService().getUrl();
   t.view = view;
   t.voice = p.voice === '1' ? '1' : '';
+  // Echoed only into a postMessage ready signal. The parent created this
+  // nonce; it is not authentication and grants no capability.
+  t.readyNonce = /^[A-Za-z0-9_-]{16,64}$/.test(String(p.ready_nonce || ''))
+    ? String(p.ready_nonce)
+    : '';
   // Signed-in state is rendered server-side from the token in the URL. An
   // absent or tampered token simply renders as signed out.
   var sess = readSession_(p.s);
   t.sessionToken = sess ? String(p.s) : '';
+  try { t.conversationToken = mintConversation_(sess); }
+  catch (conversationError) { t.conversationToken = ''; }
   t.visitorEmail = sess ? sess.email : '';
   t.authOn = authConfigured_() ? '1' : '';
   t.authStart = AUTH_REDIRECT_URI + '?auth=start';
@@ -330,10 +364,16 @@ function voiceReply_(p) {
   var cb = String(p.cb || '').slice(0, 40);
   if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cb)) cb = '';
 
-  // NOT p.sid. MEASURED 2026-09-04: Google's frontend rejects any /exec request
-  // carrying a `sid` query parameter with HTTP 400 before this script runs at
-  // all -- ?view=home&sid=x fails identically. `sid` is reserved. Use `vid`.
-  var sid  = String(p.vid || '').slice(0, 60);
+  // The old endpoint accepted caller-chosen `vid` and used it directly for
+  // history and spend counters. Rotating it reset the session cap; colliding it
+  // steered another conversation's cached history. Only a server-signed token
+  // is accepted now. `vid` may still arrive from an old page, but it is ignored.
+  var identity;
+  try { identity = conversationIdentity_(p.ct, p.s); }
+  catch (identityError) {
+    return jsonp_(cb, { ok: false, reason: 'conversation-unavailable' });
+  }
+  var sid = identity.key;
   var text = String(p.q || '').slice(0, CHAT_MAX_INPUT);
 
   // History is held here rather than sent on every request: a GET carrying the
@@ -344,19 +384,17 @@ function voiceReply_(p) {
   try { hist = JSON.parse(cache.get(hk) || '[]'); } catch (e) { hist = []; }
   if (!(hist instanceof Array)) hist = [];
 
-  // `agent` is the page's gatekeeper naming who it thinks should answer. It is
-  // a HINT and is treated as one: reception prefers that provider when a
-  // credential for it exists and falls back silently when it does not, and the
-  // reply always names whoever actually wrote it. Untrusted input, so it is
-  // length-capped and matched against a closed list downstream.
-  var want = String(p.agent || '').slice(0, 20);
-
   var out;
   try {
-    out = reception(sid, text, hist, p.s, want);
+    out = receptionWithIdentity_(identity, text, hist, p.agent);
   } catch (err) {
     out = { ok: false, reason: 'error' };
   }
+
+  // Return the server-issued token on every branch so a missing, expired or
+  // cross-identity token can be replaced without spending another model call.
+  out = out || { ok: false, reason: 'no-result' };
+  out.ct = identity.token;
 
   if (out && out.ok && text) {
     hist.push({ role: 'user', text: text });
@@ -369,20 +407,12 @@ function voiceReply_(p) {
   // synthesis costs a couple of seconds and the reply should appear the moment
   // it exists -- so this response hands back a key, the page renders the text
   // immediately, and the audio arrives underneath it.
-  //
-  // `!out.degraded` is the cap. `offline_` returns ok:true with a canned note,
-  // so the old condition minted a paid render for every reply the chat budget
-  // had ALREADY refused: past the session cap, past the daily cap, with no
-  // Anthropic key, after an upstream error -- and with CHAT_ENABLED=off, which
-  // stopped the model and not the bill. The caps only bound cost if the paid
-  // path is bounded by the same decision, so a canned note is spoken by the
-  // browser's own synthesiser and never bought. (P0 issue 2, 2026-09-05.)
   if (out && out.ok && out.reply && !out.degraded && ttsConfigured_()) {
-    var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
-    try { cache.put('tts_' + ak, out.reply, 900); out.ak = ak; } catch (e) {}
+    var ak = mintTtsKey_(sid, out.reply);
+    if (ak) out.ak = ak;
   }
 
-  return jsonp_(cb, out || { ok: false, reason: 'no-result' });
+  return jsonp_(cb, out);
 }
 
 /** JSONP or plain JSON, depending on whether a valid callback was supplied. */
@@ -431,32 +461,167 @@ function ttsConfigured_() {
   return !!props.getProperty('OPENAI_KEY');
 }
 
-// ONE paid render per key -- actually, rather than by comment. `get` then
-// `remove` is not atomic: two requests carrying the same ak can both read the
-// text before either deletes it, and each pays for its own render, so the key
-// was single-use only in the absence of concurrency. The script lock makes the
-// claim exclusive: the first caller takes the text and deletes it inside the
-// critical section, every other caller sees `expired`.
-//
-// HONEST LIMIT: CacheService is eventually consistent (the same property that
-// forced the v15 idempotency fix to read the sheet instead of the cache), so
-// the lock closes the window from "any two concurrent callers" to "a cache
-// replica that has not yet observed the delete". It is a large reduction, not a
-// proof of exactly-once. It is proportionate because the mint side is now
-// bounded by the chat caps: the worst case is a small multiplier on at most
-// CHAT_SESSION_CAP renders per session, not an open-ended bill. A strongly
-// consistent claim would need a sheet write per render.
-function ttsClaim_(ak) {
-  var cache = CacheService.getScriptCache();
-  var lock  = LockService.getScriptLock();
-  try { lock.waitLock(10000); } catch (e) { return null; }
+// Property-backed claims below replace the cache-only claim that was live
+// until 2026-09-22. That one bounded a key to one render under a script lock
+// but counted nothing, so the only ceiling on paid speech was the chat cap
+// that minted the keys. These are the two counters the voice suite has been
+// asserting since it was written.
+function ttsDay_(now) {
+  return Utilities.formatDate(new Date(now), 'GMT', 'yyyy-MM-dd');
+}
+
+function ttsSessionHash_(sid) {
   try {
-    var text = cache.get('tts_' + ak);
-    if (!text) return null;
-    cache.remove('tts_' + ak);
-    return text;
+    var bytes = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(sid || ''),
+      Utilities.Charset.UTF_8);
+    var out = '';
+    for (var i = 0; i < 16; i++) {
+      var n = (Number(bytes[i]) + 256) % 256;
+      out += ('0' + n.toString(16)).slice(-2);
+    }
+    return out;
+  } catch (e) {
+    // Collision here can only make two sessions share a stricter cap. It cannot
+    // increase the whole-site budget.
+    return String(sid || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'empty';
+  }
+}
+
+function ttsLimit_(props, name, fallback, maximum) {
+  var raw = props.getProperty(name);
+  if (raw === null || raw === '') return fallback;
+  var value = Number(raw);
+  if (!isFinite(value) || value < 0) return fallback;
+  return Math.min(Math.floor(value), maximum);
+}
+
+/**
+ * Read or reserve the two paid-speech budgets. The caller must hold the script
+ * lock. One JSON property keeps the current UTC day and its bounded session map;
+ * a day rollover replaces the whole value, so per-session counters do not leak
+ * into permanent Script Properties.
+ */
+function ttsBudget_(props, sessionHash, now, reserve) {
+  var day = ttsDay_(now);
+  var state = { day: day, daily: 0, sessions: {} };
+  try {
+    var parsed = JSON.parse(props.getProperty(TTS_BUDGET_STATE) || '{}');
+    if (parsed && parsed.day === day) {
+      state.daily = Math.max(0, Number(parsed.daily) || 0);
+      state.sessions = parsed.sessions && typeof parsed.sessions === 'object'
+        ? parsed.sessions
+        : {};
+    }
+  } catch (e) {}
+
+  var dailyCap = ttsLimit_(props, 'TTS_DAILY_CAP', TTS_DAILY_DEFAULT, 200);
+  var sessionCap = ttsLimit_(props, 'TTS_SESSION_CAP', TTS_SESSION_DEFAULT, 50);
+  var sessionUsed = Math.max(0, Number(state.sessions[sessionHash]) || 0);
+
+  if (state.daily >= dailyCap) return { ok: false, reason: 'tts-daily-cap' };
+  if (sessionUsed >= sessionCap) return { ok: false, reason: 'tts-session-cap' };
+
+  if (reserve) {
+    state.daily += 1;
+    sessionUsed += 1;
+    state.sessions[sessionHash] = sessionUsed;
+    // If this write fails, the caller fails closed and never reaches the provider.
+    props.setProperty(TTS_BUDGET_STATE, JSON.stringify(state));
+  }
+  return {
+    ok: true,
+    dailyUsed: state.daily,
+    dailyCap: dailyCap,
+    sessionUsed: sessionUsed,
+    sessionCap: sessionCap
+  };
+}
+
+function purgeExpiredTtsKeys_(props, now) {
+  var all = props.getProperties();
+  var names = Object.keys(all);
+  var removed = 0;
+  for (var i = 0; i < names.length && removed < 50; i++) {
+    var name = names[i];
+    if (name.indexOf(TTS_KEY_PROP_PREFIX) !== 0) continue;
+    var expiry = 0;
+    try { expiry = Number(JSON.parse(all[name] || '{}').expires) || 0; } catch (e) {}
+    if (!expiry || expiry <= now) { props.deleteProperty(name); removed += 1; }
+  }
+}
+
+function mintTtsKey_(sid, text) {
+  sid = String(sid || '').slice(0, 60);
+  text = String(text || '').slice(0, TTS_MAX_CHARS);
+  if (!sid || !text) return '';
+
+  var props = PropertiesService.getScriptProperties();
+  var cache = CacheService.getScriptCache();
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  var cacheKey = '';
+  try {
+    lock.waitLock(10000); locked = true;
+    var now = Date.now();
+    purgeExpiredTtsKeys_(props, now);
+    var sessionHash = ttsSessionHash_(sid);
+    if (!ttsBudget_(props, sessionHash, now, false).ok) return '';
+
+    var ak = 'ak' + Utilities.getUuid().replace(/-/g, '').slice(0, 16);
+    cacheKey = 'tts_' + ak;
+    cache.put(cacheKey, text, TTS_KEY_TTL_SECS);
+    props.setProperty(TTS_KEY_PROP_PREFIX + ak, JSON.stringify({
+      expires: now + TTS_KEY_TTL_SECS * 1000,
+      session: sessionHash
+    }));
+    return ak;
+  } catch (err) {
+    if (cacheKey) try { cache.remove(cacheKey); } catch (e) {}
+    return '';
   } finally {
-    try { lock.releaseLock(); } catch (e2) {}
+    if (locked) try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/**
+ * Atomically consume a key and reserve its budgets before a paid provider call.
+ * Text stays in expiring CacheService; the authoritative one-use claim and the
+ * budgets live in Script Properties under one script lock.
+ */
+function claimTts_(ak) {
+  var props = PropertiesService.getScriptProperties();
+  var cache = CacheService.getScriptCache();
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try {
+    lock.waitLock(10000); locked = true;
+    var markerName = TTS_KEY_PROP_PREFIX + ak;
+    var raw = props.getProperty(markerName);
+    if (!raw) return { ok: false, reason: 'expired' };
+
+    // This deletion is the claim. Every later caller is serialized by the same
+    // lock and sees no marker, even while the first provider request is in flight.
+    props.deleteProperty(markerName);
+
+    var marker;
+    try { marker = JSON.parse(raw); } catch (e) { marker = null; }
+    var cacheKey = 'tts_' + ak;
+    var text = cache.get(cacheKey);
+    cache.remove(cacheKey);
+    var now = Date.now();
+    if (!marker || Number(marker.expires) <= now || !marker.session || !text)
+      return { ok: false, reason: 'expired' };
+
+    var budget = ttsBudget_(props, String(marker.session), now, true);
+    if (!budget.ok) return budget;
+    budget.text = String(text).slice(0, TTS_MAX_CHARS);
+    return budget;
+  } catch (err) {
+    return { ok: false, reason: 'tts-state-failed' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e) {}
   }
 }
 
@@ -471,11 +636,11 @@ function ttsAudio_(p) {
   if (!ttsConfigured_()) return jsonp_(cb, { ok: false, reason: 'no-key' });
   var key = props.getProperty('OPENAI_KEY');
 
-  // Claim the key BEFORE spending anything. Losing the race is `expired`, the
-  // same answer a stale key gets, because a caller cannot tell the difference
-  // and does not need to.
-  var text = ttsClaim_(ak);
-  if (!text) return jsonp_(cb, { ok: false, reason: 'expired' });
+  var claim = claimTts_(ak);
+  if (!claim.ok) return jsonp_(cb, { ok: false, reason: claim.reason });
+
+  Logger.log('TTS provider attempt: daily ' + claim.dailyUsed + '/' + claim.dailyCap +
+             ', session ' + claim.sessionUsed + '/' + claim.sessionCap);
 
   var res;
   try {
@@ -487,7 +652,7 @@ function ttsAudio_(p) {
       payload: JSON.stringify({
         model: TTS_MODEL,
         voice: ttsVoice_(p.v),
-        input: String(text).slice(0, TTS_MAX_CHARS),
+        input: claim.text,
         response_format: 'mp3',
         instructions: props.getProperty('TTS_STYLE') || TTS_STYLE_()
       })
@@ -519,8 +684,20 @@ function TTS_STYLE_() {
 
 // ================= RECEPTION =================
 // One visitor turn. Returns {ok, reply} or {ok:false, reason} — never throws to the page.
-function reception(sid, text, history, token, want) {
-  sid  = String(sid || '').slice(0, 60);
+// One visitor turn. The first argument is a server-signed conversation token,
+// never a caller-chosen id.
+function reception(conversationToken, text, history, token, want) {
+  var identity;
+  try { identity = conversationIdentity_(conversationToken, token); }
+  catch (identityError) { return { ok: false, reason: 'conversation-unavailable' }; }
+  var out = receptionWithIdentity_(identity, text, history, want);
+  out = out || { ok: false, reason: 'no-result' };
+  out.ct = identity.token;
+  return out;
+}
+
+function receptionWithIdentity_(identity, text, history, want) {
+  var sid = identity.key;
   text = String(text || '').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_INPUT);
   if (!text) return { ok: false, reason: 'empty' };
 
@@ -530,7 +707,7 @@ function reception(sid, text, history, token, want) {
   // point of sign-in: an identified enquiry instead of an anonymous one.
   // It changes provenance only -- the row still carries
   // instruction_authority=NONE, because identity is not authority.
-  var sess = readSession_(token);
+  var sess = identity.session;
   logVisitor_(sid, sess ? ('visitor:' + sess.email) : 'visitor', text);
 
   if (String(props.getProperty('CHAT_ENABLED') || '').toLowerCase() === 'off')
@@ -551,17 +728,21 @@ function reception(sid, text, history, token, want) {
   // known, and never from the routing guess in the browser.
   var xaiKey  = props.getProperty('XAI_API_KEY');
   var anthKey = props.getProperty('ANTHROPIC_KEY');
+  // A KEY THAT IS PRESENT IS NOT A KEY THAT CAN ANSWER. grok ran out of
+  // allowance on 2026-09-23 and its key stayed in Script Properties, so every
+  // request still tried it first, paid a round trip to be refused, and only
+  // then reached claude. Set XAI_ENABLED to 'off' to take it out of the order
+  // entirely - including out of reach of an agent= hint, which would otherwise
+  // promote a provider that cannot serve. Clear the property when credit
+  // returns; nothing else has to change.
+  if (String(props.getProperty('XAI_ENABLED') || '').toLowerCase() === 'off') xaiKey = '';
   if (!xaiKey && !anthKey) return offline_(sid, 'no-key');
 
-  // per-session throttle
-  var cache = CacheService.getScriptCache();
-  var ck = 'rc_' + sid;
-  var used = parseInt(cache.get(ck) || '0', 10);
-  if (used >= CHAT_SESSION_CAP) return offline_(sid, 'session-cap');
-
-  // whole-site daily cap
-  var cap = parseInt(props.getProperty('CHAT_DAILY_CAP') || String(CHAT_DAILY_DEFAULT), 10);
-  if (dailyCount_() >= cap) return offline_(sid, 'daily-cap');
+  // Reserve both spend ceilings inside one script lock before the provider.
+  // A failed provider call still consumes one attempt; otherwise retries and
+  // concurrent requests could spend without being counted.
+  var budget = reserveChatBudget_(sid);
+  if (!budget.ok) return offline_(sid, budget.reason);
 
   var msgs = [];
   (history || []).slice(-CHAT_MAX_TURNS).forEach(function (m) {
@@ -575,9 +756,16 @@ function reception(sid, text, history, token, want) {
   // The order is the policy. Each provider is tried once; the first one that
   // returns text wins, and a failure is logged with its reason rather than
   // swallowed, so "the page went quiet" can always be traced to a provider.
+  // CLAUDE FIRST, grok behind it. The 2026-09-18 ruling put grok in front
+  // because it was the primary voice; that stopped being true the day its
+  // allowance ran out. Mr Salam, 2026-09-23: appoint claude primary responder
+  // after the python gate. The fallback is not decoration - it is what keeps
+  // the page answering when one provider is down, which is precisely the
+  // situation that prompted this, so grok stays in the list rather than being
+  // deleted from it.
   var order = [];
-  if (xaiKey)  order.push({ who: 'grok',   go: function () { return askGrok_(xaiKey, props, msgs); } });
   if (anthKey) order.push({ who: 'claude', go: function () { return askClaude_(anthKey, props, msgs); } });
+  if (xaiKey)  order.push({ who: 'grok',   go: function () { return askGrok_(xaiKey, props, msgs); } });
 
   // THE PAGE MAY ASK FOR A PARTICULAR AGENT, and it is moved to the front
   // rather than being allowed to replace the list. Three reasons, and the third
@@ -602,8 +790,6 @@ function reception(sid, text, history, token, want) {
   }
   if (!reply) return offline_(sid, 'api-error');
 
-  try { cache.put(ck, String(used + 1), 21600); } catch (e) {}
-  bumpDaily_();
   logVisitor_(sid, author, reply);
   return { ok: true, reply: reply, by: author };
 }
@@ -789,18 +975,126 @@ function logVisitor_(sid, who, text) {
   logVisitorQuarantined_(sid, who, text);
 }
 
-function dailyCount_() {
-  var p = PropertiesService.getScriptProperties();
-  return parseInt(p.getProperty(dailyKey_()) || '0', 10);
+function chatDailyCap_(props) {
+  var raw = props.getProperty('CHAT_DAILY_CAP');
+  if (raw === null || raw === '') return CHAT_DAILY_DEFAULT;
+  raw = String(raw);
+  if (!/^\d+$/.test(raw)) throw new Error('invalid chat daily cap');
+  var cap = Number(raw);
+  if (!isFinite(cap) || cap < 0 || Math.floor(cap) !== cap)
+    throw new Error('invalid chat daily cap');
+  return cap;
 }
-function bumpDaily_() {
-  var p = PropertiesService.getScriptProperties(), k = dailyKey_();
+
+function dailyKey_(now) {
+  var stamp = now === undefined || now === null ? Date.now() : Number(now);
+  return 'CHAT_COUNT_' + Utilities.formatDate(new Date(stamp), 'UTC', 'yyyyMMdd');
+}
+
+/**
+ * Read the authoritative chat budget while carrying forward the legacy daily
+ * counter used by v31. Active session entries survive UTC rollover until their
+ * original six-hour idle expiry. Invalid or expired entries are discarded.
+ */
+function readChatBudget_(props, now) {
+  var dayKey = dailyKey_(now);
+  var day = dayKey.slice('CHAT_COUNT_'.length);
+  var legacyRaw = props.getProperty(dayKey);
+  var legacy = 0;
+  if (legacyRaw !== null && legacyRaw !== '') {
+    legacyRaw = String(legacyRaw);
+    if (!/^\d+$/.test(legacyRaw)) throw new Error('invalid legacy daily counter');
+    legacy = Number(legacyRaw);
+    if (!isFinite(legacy) || legacy < 0 || Math.floor(legacy) !== legacy)
+      throw new Error('invalid legacy daily counter');
+  }
+
+  var state = { day: day, daily: legacy, sessions: {} };
+  var encoded = props.getProperty(CHAT_BUDGET_STATE);
+  if (encoded === null || encoded === '') return state; // v31 migration
+
+  var parsed = JSON.parse(String(encoded));
+  if (!parsed || typeof parsed !== 'object' || parsed instanceof Array ||
+      Object.keys(parsed).sort().join(',') !== 'daily,day,sessions' ||
+      typeof parsed.day !== 'string' || !/^\d{8}$/.test(parsed.day) ||
+      typeof parsed.daily !== 'number' || !isFinite(parsed.daily) ||
+      parsed.daily < 0 || Math.floor(parsed.daily) !== parsed.daily ||
+      !parsed.sessions || typeof parsed.sessions !== 'object' ||
+      parsed.sessions instanceof Array ||
+      Object.keys(parsed.sessions).length > CHAT_MAX_ACTIVE_SESSIONS) {
+    throw new Error('invalid chat budget state');
+  }
+  if (parsed.day === day) state.daily = Math.max(state.daily, parsed.daily);
+  Object.keys(parsed.sessions).forEach(function (key) {
+    if (!/^c[ga]_[a-f0-9]{32}$/.test(key))
+      throw new Error('invalid chat budget session key');
+    var entry = parsed.sessions[key];
+    if (!(entry instanceof Array) || entry.length !== 2 ||
+        typeof entry[0] !== 'number' || !isFinite(entry[0]) || entry[0] < 0 ||
+        Math.floor(entry[0]) !== entry[0] ||
+        typeof entry[1] !== 'number' || !isFinite(entry[1]) || entry[1] < 0 ||
+        Math.floor(entry[1]) !== entry[1]) {
+      throw new Error('invalid chat budget session entry');
+    }
+    if (entry[1] > now) state.sessions[key] = [entry[0], entry[1]];
+  });
+  return state;
+}
+
+/**
+ * Atomically reserve one chat provider attempt. Check and increment of both the
+ * per-conversation and whole-site ceilings happen under the same script lock,
+ * and the reservation is durable before the provider fetch starts.
+ */
+function reserveChatBudget_(conversationKey) {
+  if (!/^c[ga]_[a-f0-9]{32}$/.test(String(conversationKey || '')))
+    return { ok: false, reason: 'budget-unavailable' };
+
+  var props = PropertiesService.getScriptProperties();
   var lock = LockService.getScriptLock();
-  try { lock.waitLock(5000); p.setProperty(k, String(parseInt(p.getProperty(k) || '0', 10) + 1)); }
-  catch (e) {} finally { try { lock.releaseLock(); } catch (e2) {} }
+  var locked = false;
+  try {
+    lock.waitLock(10000);
+    locked = true;
+    var now = Date.now();
+    var state = readChatBudget_(props, now);
+    var cap = chatDailyCap_(props);
+    if (state.daily >= cap) return { ok: false, reason: 'daily-cap' };
+
+    var entry = state.sessions[conversationKey];
+    var used = entry ? Math.max(0, parseInt(entry[0], 10) || 0) : 0;
+    if (used >= CHAT_SESSION_CAP) return { ok: false, reason: 'session-cap' };
+    if (!entry && Object.keys(state.sessions).length >= CHAT_MAX_ACTIVE_SESSIONS)
+      return { ok: false, reason: 'session-capacity' };
+
+    state.daily += 1;
+    state.sessions[conversationKey] = [used + 1, now + CHAT_SESSION_TTL_MS];
+    var encoded = JSON.stringify(state);
+    // Apps Script limits one property value to roughly 9 KB. Never evict an
+    // active identity (which would reset its cap); fail closed for new spend.
+    if (encoded.length > 8500) return { ok: false, reason: 'session-capacity' };
+
+    var writes = {};
+    writes[CHAT_BUDGET_STATE] = encoded;
+    writes[dailyKey_(now)] = String(state.daily); // rollback-compatible v31 counter
+    props.setProperties(writes, false);
+    return {
+      ok: true,
+      dailyUsed: state.daily,
+      dailyCap: cap,
+      sessionUsed: used + 1,
+      sessionCap: CHAT_SESSION_CAP
+    };
+  } catch (e) {
+    return { ok: false, reason: 'budget-unavailable' };
+  } finally {
+    if (locked) try { lock.releaseLock(); } catch (e2) {}
+  }
 }
-function dailyKey_() {
-  return 'CHAT_COUNT_' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd');
+
+function dailyCount_() {
+  var props = PropertiesService.getScriptProperties();
+  return readChatBudget_(props, Date.now()).daily;
 }
 
 // ---------- identity ----------

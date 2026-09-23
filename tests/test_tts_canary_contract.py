@@ -85,9 +85,18 @@ class CanaryBuildContract(unittest.TestCase):
         self.assertNotIn('ak:', prepare)
 
     def test_changed_provider_boundary_or_extra_top_level_function_is_rejected(self):
+        # THE MUTATION HAS TO LAND INSIDE ttsAudio_, WHICH IS WHAT THE GUARD READS.
+        # This used to replace the first UrlFetchApp.fetch( in the whole file and
+        # rely on that being the OpenAI one. It was, in the source this repository
+        # carried until #167. The live generation calls the GitHub API twice from
+        # prState_ and checkState_ first, so a first-in-file mutation stopped
+        # touching the paid path and this test stopped testing anything.
+        audio = canary.extract_function(self.code, 'ttsAudio_')
+        self.assertEqual(audio.count('UrlFetchApp.fetch('), 1)
         with self.assertRaises(ValueError):
-            canary.render_bundle(self.code.replace('UrlFetchApp.fetch(', 'otherFetch(', 1),
-                                 self.template, COMMIT, SOURCE_SHA, RUN_ID)
+            canary.render_bundle(
+                self.code.replace(audio, audio.replace('UrlFetchApp.fetch(', 'otherFetch(', 1)),
+                self.template, COMMIT, SOURCE_SHA, RUN_ID)
         with self.assertRaises(ValueError):
             canary.render_bundle(self.code, self.template + '\nfunction surprise() {}\n',
                                  COMMIT, SOURCE_SHA, RUN_ID)

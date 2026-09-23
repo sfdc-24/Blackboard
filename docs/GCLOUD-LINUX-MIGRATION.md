@@ -442,7 +442,8 @@ clasp clone 1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp
 # OR use existing .clasp.json
 clasp pull  # Fetch current production source
 
-# Make changes to apps-script/governor-page-api/Code.gs
+# Make changes to apps-script/governor-page-api/Code.js
+# (clasp writes server-side JavaScript as .js - it was Code.gs until #167)
 # Test locally...
 
 # Push to Apps Script

@@ -47,7 +47,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -125,19 +125,38 @@ def gh(args: list) -> tuple:
 
 def check_board(state: dict) -> tuple:
     """New rows addressed to this surface since the watermark."""
-    env = load_env()
     since = state.get("watermark") or ""
-    params = {"action": "read", "title": BOARD, "match": ME, "limit": 25}
+    # A cutoff acknowledges every earlier matching row. A capped tail can
+    # silently omit older pending work; the bus returns all matches without limit.
+    params = {"action": "read", "title": BOARD, "match": ME}
     if since:
         params["since"] = since
-    code, body = bus_get(env, params)
-    if not body.lstrip().startswith("{"):
-        return "UNKNOWN", "board read returned a page, not data (HTTP %s)" % code, []
-    data = json.loads(body)
-    if "rows" not in data:
-        # Absent is unknown. Never an empty board.
-        return "UNKNOWN", "gateway answered with %s and no rows key" % sorted(data.keys()), []
-    rows = [r for r in data["rows"] if isinstance(r, list)]
+    try:
+        env = load_env()
+        code, body = bus_get(env, params)
+        if code != 200:
+            return "UNKNOWN", "board read failed (HTTP %s)" % code, []
+        data = json.loads(body)
+    except Exception:  # Transport, environment, and decoding failures are not quiet.
+        return "UNKNOWN", "board read failed or returned invalid JSON", []
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        return "UNKNOWN", "board response must be an object with a rows list", []
+    if ("ok" in data and data["ok"] is not True) or data.get("error") or (
+        "_httpStatus" in data and (type(data["_httpStatus"]) is not int or data["_httpStatus"] != 200)
+    ):
+        return "UNKNOWN", "board response reports failure", []
+    rows = data["rows"]
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6 or not isinstance(row[1], str):
+            return "UNKNOWN", "board response contains malformed rows", []
+        # Board strings may omit Z; GAS Date cells include it and milliseconds.
+        # Offsets/noncanonical values cannot safely use the lexical UTC cursor.
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z?", row[1]):
+            return "UNKNOWN", "board row timestamp is invalid", []
+        try:
+            datetime.strptime(row[1][:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return "UNKNOWN", "board row timestamp is invalid", []
     fresh = []
     for r in rows:
         payload = str(r[5]) if len(r) > 5 and r[5] is not None else ""
@@ -363,32 +382,83 @@ def main() -> int:
     ap.add_argument("--wake", action="store_true",
                     help="allow a headless session when a check FAILS")
     ap.add_argument("--advance", action="store_true",
-                    help="mark the board as read up to now. Only a session that "
-                         "actually read the rows may pass this.")
+                    help="commit the cutoff captured before the consumed peek")
+    ap.add_argument("--advance-through", help="UTC cutoff emitted by the consumed peek; required with --advance")
     ap.add_argument("--peek", action="store_true",
                     help="is there board news for this surface? exit 10 if yes, "
-                         "0 if quiet, 2 if the read could not be trusted. Runs no "
-                         "other check, posts nothing, and does NOT move the "
-                         "watermark - only a clean full run does that, so a row "
-                         "arriving between the peek and the run is seen next "
-                         "tick instead of being skipped in silence.")
+                         "0 if quiet, 2 if either board or WhatsApp read is "
+                         "untrusted. Posts nothing and does not move the "
+                         "watermark. After successful model completion, the "
+                         "runner must pass this peek's cutoff to --advance.")
     args = ap.parse_args()
+
+    if args.advance and (args.peek or args.wake):
+        ap.error("--advance cannot be combined with --peek or --wake")
+    if args.advance:
+        try:
+            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", args.advance_through or ""):
+                raise ValueError("noncanonical cutoff")
+            cutoff = datetime.strptime(args.advance_through or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if cutoff > datetime.now(timezone.utc):
+                raise ValueError("future cutoff")
+        except ValueError:
+            print("UNKNOWN  advance requires a valid non-future --advance-through cutoff")
+            return 2
+    elif args.advance_through:
+        ap.error("--advance-through requires --advance")
 
     state = load_state()
 
+    # The runner calls this only after the model process has completed the
+    # addressed rows it peeked.  This must remain a narrow, bounded commit:
+    # running the normal health pass here means an unrelated CI/site/assistant
+    # request can hold the single-writer lock after a clean model exit and
+    # prevent the cursor from being recorded.  It must not send a WhatsApp
+    # acknowledgement or post an alarm either; those actions belong to the
+    # regular health pass before a peek.
+    if args.advance:
+        # A WhatsApp receipt can arrive while the model is working.  If no
+        # independent boundary exists yet, `check_whatsapp()` normally inherits
+        # the board watermark.  Freeze that inherited value before moving the
+        # board cursor so this commit cannot hide a new, unacknowledged receipt.
+        # This is deliberately a state-only operation: advance must not read or
+        # send on the WhatsApp lane.
+        state.setdefault("wa_watermark", state.get("watermark") or "")
+        board_status, _board_note, fresh = check_board(state)
+        if board_status == "UNKNOWN":
+            # A failed read is never permission to skip work.  Leave the
+            # cursor unchanged so the next natural run can safely see it.
+            return 2
+        if fresh:
+            # Never commit completion time: rows arriving during the model run
+            # were not necessarily consumed. Never move an existing cursor back.
+            if not state.get("watermark") or args.advance_through[:19] > state["watermark"][:19]:
+                state["watermark"] = args.advance_through
+        state["last_run"] = now_iso()
+        last_status = state.get("last_status") or {}
+        last_status["board"] = board_status
+        state["last_status"] = last_status
+        save_state(state)
+        return 0
+
     if args.peek:
+        # check_board compares whole seconds. Keep the boundary second eligible
+        # so a row appended during this read in that second cannot be skipped.
+        peek_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         status, note, fresh = check_board(state)
         # A MESSAGE FROM HIM IS ALWAYS NEWS. The peek decides whether a session
         # is worth starting, and the one thing that is always worth starting a
         # session for is the human asking a question and getting silence.
         wa_status, wa_note, wa_fresh = check_whatsapp(state)
-        both = "NEWS" if (status == "NEWS" or wa_status == "NEWS") else (
-            "UNKNOWN" if "UNKNOWN" in (status, wa_status) else "QUIET")
+        both = "UNKNOWN" if "UNKNOWN" in (status, wa_status) else (
+            "NEWS" if "NEWS" in (status, wa_status) else "QUIET")
         print("%s  %s; whatsapp: %s" % (both, note, wa_note))
+        if both != "UNKNOWN":
+            print("ADVANCE_THROUGH " + peek_cutoff)
         for w in wa_fresh[:3]:
             print("  WA %s  %s" % (w["ts"], w["text"][:160]))
-        for f in fresh[:5]:
-            print("  %s  %s" % (f["ts"], f["payload"][:160]))
+        for f in fresh:
+            print("  %s  %s" % (f["ts"], f["payload"]))
         return 10 if both == "NEWS" else (2 if both == "UNKNOWN" else 0)
     lines, alarms = [], []
 
@@ -437,16 +507,6 @@ def main() -> int:
     if say_status == "BAD":
         alarms.append("the visitor assistant is not answering properly: " + say_note)
 
-    # THE WATERMARK MOVES ON --advance AND NOWHERE ELSE.
-    #   The first wiring advanced it whenever the health pass saw new rows, and
-    #   the health pass runs before the peek - so the peek, forty seconds later,
-    #   reported QUIET against rows nobody had read. A watcher that marks work
-    #   as seen on behalf of a session that never ran is worse than no watcher:
-    #   it is the doorbell answering the door and walking away.
-    #   Only a clean woken session advances it, which is the same rule the
-    #   PowerShell peek was built on.
-    if args.advance and fresh:
-        state["watermark"] = now_iso()
     state["last_run"] = now_iso()
     state["last_status"] = {"board": board_status, "ci": ci_status,
                             "site": site_status, "assistant": say_status}

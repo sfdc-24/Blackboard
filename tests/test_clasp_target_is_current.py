@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """`clasp push` from this repo would delete a provider from the live site.
 
-.clasp.json points at apps-script/governor-page-api/Code.gs. That file has no
+RESOLVED 2026-09-21 by #167, and the account below is kept as the record of what
+it was. Two things have changed since and neither falsifies it: the push target
+is now `Code.js`, because clasp writes server-side JavaScript as `.js`, and it
+is a verbatim pull of the live script, so it HAS the grok routing this docstring
+says it lacked. Read what follows as history, not as a description of today.
+
+.clasp.json pointed at apps-script/governor-page-api/Code.gs. That file had no
 grok routing at all. The live site answered ten real questions on 2026-09-20 and
 every single one came back by=grok, so the deployed script plainly has routing
 the push target does not.
@@ -94,8 +100,9 @@ class TheVersionHeaderCannotBeTrusted(unittest.TestCase):
         """Recorded so nobody uses the header as a freshness check again.
 
         apps-script/governor-page-api/Code.gs and the untracked gas/Code.js both
-        begin 'SFDC24 - site engine (v3 . 2026-09-02)' and differ by ~3KB,
-        including an entire model provider.
+        began 'SFDC24 - site engine (v3 . 2026-09-02)' and differed by ~3KB,
+        including an entire model provider. The tracked file is Code.js now and
+        the two agree, but the lesson is about the CHECK, not the files.
         """
         src = clasp_target_source()
         if not src:
