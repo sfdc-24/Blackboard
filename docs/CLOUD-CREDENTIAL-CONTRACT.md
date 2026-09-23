@@ -179,6 +179,52 @@ is the whole diagnosis.
 job, which `run.invoker` does not grant — so v1 forces the role up to
 `run.developer` for no benefit.
 
+## Durable state, and why compare-and-swap is the point
+
+**Dependency 3**, *"waker watermarks are local JSON files"*. A cursor on one
+laptop's disk is a cursor the fleet loses when that laptop is rebuilt, and after
+#187 and #189 it was the last thing pinning the unattended lane here.
+
+`scripts/state_store.py`, stdlib only, two backends behind one interface:
+
+| `BLACKBOARD_STATE_URI` | backend | token |
+|---|---|---|
+| unset | file, as today | mtime + size |
+| `gs://bucket/prefix` | GCS | object **generation** |
+
+**Durability is the easy half.** The half that has cost this fleet real incidents
+is two writers touching one cursor — two surfaces under one tag is the collision
+class behind three of them. So every `save` carries the token its `load`
+returned, and a stale token is **refused, not merged and not overwritten**: the
+loser is told it lost and can re-read. GCS gives this natively with
+`ifGenerationMatch`, and `ifGenerationMatch=0` makes a first write safe against
+two processes both creating it.
+
+`advance()` holds the rule in one place: a cursor may move **forward or stay,
+never back**. Backwards re-answers rows; forward past unread work loses them
+silently, which is worse and is what #168 was written to prevent.
+
+### Proven on the real thing, not a fake
+
+Two Cloud Run executions are two containers, so two runs are a restart:
+
+```
+board-probe-62qvw  22:16:57   changed=True   value=2026-09-23T21:32:33  previous=None
+board-probe-mt88k  22:19:27   changed=False  value=2026-09-23T21:32:33  reason=not newer
+
+gs://sfdc24-fleet-state/wakers/board_probe.json
+  {"watermark": "2026-09-23T21:32:33"}
+  39 bytes, generation #1790201817265979, ONE version
+```
+
+The second container read back exactly what the first wrote — had state not
+persisted it would have reported `changed=True, previous=None` like the first. And
+**one generation** means the second run genuinely declined to rewrite rather than
+writing the same value again.
+
+The bucket has uniform access, public access prevention **enforced**, and
+versioning on, so a bad cursor write is recoverable.
+
 ### What this does and does not replace
 
 It replaces Task Scheduler **for this lane**. The probe is read-only and
