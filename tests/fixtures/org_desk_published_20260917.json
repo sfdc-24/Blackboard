@@ -1,0 +1,863 @@
+{
+ "_meta": {
+  "live": false,
+  "snapshot": true,
+  "caveat": "A snapshot of a development workspace of our own, taken at the time below. Not live, and not anyone's customer data.",
+  "org_host": "dbm00000wk2ibeac-dev-ed.develop.my.salesforce.com",
+  "org_kind": "developer edition, our own, carrying sample data",
+  "generated": "2026-09-17T20:08:46Z",
+  "api": "v62.0",
+  "counts": {
+   "accounts": 29,
+   "contacts": 26,
+   "opportunities": 32
+  },
+  "fields_withheld": [
+   "Email",
+   "Phone",
+   "MailingAddress",
+   "OwnerId"
+  ],
+  "why_withheld": "this file is world-readable on a public site, so contact channels are never included even from sample data"
+ },
+ "summary": {
+  "accounts": 29,
+  "contacts": 26,
+  "opportunities": 32,
+  "pipeline_open": 2155000.0,
+  "closed_won": 3645000.0,
+  "closed_lost": 0,
+  "open_count": 14,
+  "won_count": 18,
+  "lost_count": 0,
+  "largest_open": 675000.0,
+  "by_stage": {
+   "Closed Won": {
+    "count": 18,
+    "amount": 3645000.0
+   },
+   "Needs Analysis": {
+    "count": 1,
+    "amount": 675000.0
+   },
+   "Negotiation/Review": {
+    "count": 2,
+    "amount": 395000.0
+   },
+   "Proposal/Price Quote": {
+    "count": 2,
+    "amount": 370000.0
+   },
+   "Value Proposition": {
+    "count": 2,
+    "amount": 330000.0
+   },
+   "Perception Analysis": {
+    "count": 1,
+    "amount": 120000.0
+   },
+   "Prospecting": {
+    "count": 1,
+    "amount": 100000.0
+   },
+   "Id. Decision Makers": {
+    "count": 3,
+    "amount": 110000.0
+   },
+   "Qualification": {
+    "count": 2,
+    "amount": 55000.0
+   }
+  },
+  "by_industry": {
+   "Energy": 4,
+   "Transportation": 2,
+   "Construction": 1,
+   "Hospitality": 1,
+   "Apparel": 1,
+   "Electronics": 2,
+   "Finance": 3,
+   "Consulting": 1,
+   "Biotechnology": 1,
+   "Other": 1,
+   "Technology": 6,
+   "(none)": 5,
+   "Education": 1
+  }
+ },
+ "accounts": [
+  {
+   "Name": "United Oil & Gas Corp.",
+   "Industry": "Energy",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": 5600000000.0,
+   "NumberOfEmployees": 145000,
+   "BillingState": "NY",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Express Logistics and Transport",
+   "Industry": "Transportation",
+   "Type": "Customer - Channel",
+   "AnnualRevenue": 950000000.0,
+   "NumberOfEmployees": 12300,
+   "BillingState": "OR",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Pyramid Construction Inc.",
+   "Industry": "Construction",
+   "Type": "Customer - Channel",
+   "AnnualRevenue": 950000000.0,
+   "NumberOfEmployees": 2680,
+   "BillingState": null,
+   "BillingCountry": "France"
+  },
+  {
+   "Name": "Grand Hotels & Resorts Ltd",
+   "Industry": "Hospitality",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": 500000000.0,
+   "NumberOfEmployees": 5600,
+   "BillingState": "Illinois",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Burlington Textiles Corp of America",
+   "Industry": "Apparel",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": 350000000.0,
+   "NumberOfEmployees": 9000,
+   "BillingState": "NC",
+   "BillingCountry": "USA"
+  },
+  {
+   "Name": "Edge Communications",
+   "Industry": "Electronics",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": 139000000.0,
+   "NumberOfEmployees": 1000,
+   "BillingState": "Texas",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Obsidian Trade Networks",
+   "Industry": "Finance",
+   "Type": null,
+   "AnnualRevenue": 76000000.0,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Dickenson plc",
+   "Industry": "Consulting",
+   "Type": "Customer - Channel",
+   "AnnualRevenue": 50000000.0,
+   "NumberOfEmployees": 120,
+   "BillingState": "KS",
+   "BillingCountry": "USA"
+  },
+  {
+   "Name": "GenePoint",
+   "Industry": "Biotechnology",
+   "Type": "Customer - Channel",
+   "AnnualRevenue": 30000000.0,
+   "NumberOfEmployees": 265,
+   "BillingState": "CA",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "LuminaCore Logistics",
+   "Industry": "Transportation",
+   "Type": null,
+   "AnnualRevenue": 25000000.0,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Acme",
+   "Industry": "Other",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": 22000000.0,
+   "NumberOfEmployees": 680,
+   "BillingState": "New York",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Edge Soft Solutions",
+   "Industry": "Electronics",
+   "Type": null,
+   "AnnualRevenue": 4500000.0,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "SFDC24",
+   "Industry": "Technology",
+   "Type": "Other",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Google",
+   "Industry": "Technology",
+   "Type": "Partner",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Microsoft Azure",
+   "Industry": "Technology",
+   "Type": "Partner",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Tax Everyday",
+   "Industry": "Finance",
+   "Type": "Prospect",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": "Ontario",
+   "BillingCountry": "Canada"
+  },
+  {
+   "Name": "Dolphin Advisory Group",
+   "Industry": "Finance",
+   "Type": "Prospect",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": "Ontario",
+   "BillingCountry": "Canada"
+  },
+  {
+   "Name": "SFDC24 Live Demo 232259",
+   "Industry": null,
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "University of Arizona",
+   "Industry": "Education",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": 39000,
+   "BillingState": "AZ",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "United Oil & Gas, UK",
+   "Industry": "Energy",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": 24000,
+   "BillingState": "UK",
+   "BillingCountry": null
+  },
+  {
+   "Name": "United Oil & Gas, Singapore",
+   "Industry": "Energy",
+   "Type": "Customer - Direct",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": 3000,
+   "BillingState": "Singapore",
+   "BillingCountry": null
+  },
+  {
+   "Name": "sForce",
+   "Industry": null,
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": "CA",
+   "BillingCountry": "US"
+  },
+  {
+   "Name": "Billy Bing",
+   "Industry": "Energy",
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": "Karnataka",
+   "BillingCountry": "India"
+  },
+  {
+   "Name": "Sample Account for Entitlements",
+   "Industry": null,
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Sarah Connor",
+   "Industry": null,
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": "California",
+   "BillingCountry": "United States"
+  },
+  {
+   "Name": "Analytical Engines Ltd",
+   "Industry": null,
+   "Type": null,
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Salesforce",
+   "Industry": "Technology",
+   "Type": "Partner",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "NameSilo",
+   "Industry": "Technology",
+   "Type": "Partner",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  },
+  {
+   "Name": "Anthropic",
+   "Industry": "Technology",
+   "Type": "Partner",
+   "AnnualRevenue": null,
+   "NumberOfEmployees": null,
+   "BillingState": null,
+   "BillingCountry": null
+  }
+ ],
+ "contacts": [
+  {
+   "Name": "Ada Lovelace",
+   "Title": null,
+   "Department": null,
+   "AccountName": "Analytical Engines Ltd"
+  },
+  {
+   "Name": "Andy Young",
+   "Title": "SVP, Operations",
+   "Department": "Internal Operations",
+   "AccountName": "Dickenson plc"
+  },
+  {
+   "Name": "Arthur Song",
+   "Title": "CEO",
+   "Department": "Executive Team",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Ashley James",
+   "Title": "VP, Finance",
+   "Department": "Finance",
+   "AccountName": "United Oil & Gas, UK"
+  },
+  {
+   "Name": "Avi Green",
+   "Title": "CFO",
+   "Department": "Finance",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Babara Levy",
+   "Title": "SVP, Operations",
+   "Department": "Operations",
+   "AccountName": "Express Logistics and Transport"
+  },
+  {
+   "Name": "Edna Frank",
+   "Title": "VP, Technology",
+   "Department": "Technology",
+   "AccountName": "GenePoint"
+  },
+  {
+   "Name": "Edward Stamos",
+   "Title": "President and CEO",
+   "Department": null,
+   "AccountName": "Acme"
+  },
+  {
+   "Name": "Howard Jones",
+   "Title": "Buyer",
+   "Department": null,
+   "AccountName": "Acme"
+  },
+  {
+   "Name": "Jack Rogers",
+   "Title": "VP, Facilities",
+   "Department": null,
+   "AccountName": "Burlington Textiles Corp of America"
+  },
+  {
+   "Name": "Jake Llorrac",
+   "Title": null,
+   "Department": null,
+   "AccountName": "sForce"
+  },
+  {
+   "Name": "Jane Grey",
+   "Title": "Dean of Administration",
+   "Department": "Administration",
+   "AccountName": "University of Arizona"
+  },
+  {
+   "Name": "Jeff Hunt",
+   "Title": "VP of Marketing",
+   "Department": "Marketing",
+   "AccountName": "Acme"
+  },
+  {
+   "Name": "John Bond",
+   "Title": "VP, Facilities",
+   "Department": "Facilities",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "Josh Davis",
+   "Title": "Director, Warehouse Mgmt",
+   "Department": "Warehouse Mgmt",
+   "AccountName": "Express Logistics and Transport"
+  },
+  {
+   "Name": "Lauren Boyle",
+   "Title": "SVP, Technology",
+   "Department": "Technology",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Leanne Tomlin",
+   "Title": "VP Customer Support",
+   "Department": "Customer Support",
+   "AccountName": "Acme"
+  },
+  {
+   "Name": "Liz D'Cruz",
+   "Title": "VP, Production",
+   "Department": "Production",
+   "AccountName": "United Oil & Gas, Singapore"
+  },
+  {
+   "Name": "Naveen Sian",
+   "Title": "Owner & CEO",
+   "Department": null,
+   "AccountName": "Tax Everyday"
+  },
+  {
+   "Name": "Pat Stumuller",
+   "Title": "SVP, Administration and Finance",
+   "Department": "Finance",
+   "AccountName": "Pyramid Construction Inc."
+  },
+  {
+   "Name": "Rose Gonzalez",
+   "Title": "SVP, Procurement",
+   "Department": "Procurement",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "Sean Forbes",
+   "Title": "CFO",
+   "Department": "Finance",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "Siddartha Nedaerk",
+   "Title": null,
+   "Department": null,
+   "AccountName": "sForce"
+  },
+  {
+   "Name": "Stella Pavlova",
+   "Title": "SVP, Production",
+   "Department": "Production",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Tim Barr",
+   "Title": "SVP, Administration and Finance",
+   "Department": "Finance",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "Tom Ripley",
+   "Title": "Regional General Manager",
+   "Department": "Executive Team",
+   "AccountName": "United Oil & Gas, Singapore"
+  }
+ ],
+ "opportunities": [
+  {
+   "Name": "United Oil Refinery Generators",
+   "StageName": "Closed Won",
+   "Amount": 915000.0,
+   "CloseDate": "2026-07-01",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil Plant Standby Generators",
+   "StageName": "Needs Analysis",
+   "Amount": 675000.0,
+   "CloseDate": "2026-06-17",
+   "Probability": 20.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil Emergency Generators",
+   "StageName": "Closed Won",
+   "Amount": 440000.0,
+   "CloseDate": "2026-05-13",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Grand Hotels Generator Installations",
+   "StageName": "Closed Won",
+   "Amount": 350000.0,
+   "CloseDate": "2026-07-06",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "United Oil Installations",
+   "StageName": "Negotiation/Review",
+   "Amount": 270000.0,
+   "CloseDate": "2026-05-20",
+   "Probability": 90.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil Refinery Generators",
+   "StageName": "Proposal/Price Quote",
+   "Amount": 270000.0,
+   "CloseDate": "2026-07-08",
+   "Probability": 75.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil Installations",
+   "StageName": "Closed Won",
+   "Amount": 270000.0,
+   "CloseDate": "2026-05-19",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Grand Hotels Guest Portable Generators",
+   "StageName": "Value Proposition",
+   "Amount": 250000.0,
+   "CloseDate": "2026-07-23",
+   "Probability": 50.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "United Oil Installations",
+   "StageName": "Closed Won",
+   "Amount": 235000.0,
+   "CloseDate": "2026-05-31",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Burlington Textiles Weaving Plant Generator",
+   "StageName": "Closed Won",
+   "Amount": 235000.0,
+   "CloseDate": "2026-05-29",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "Burlington Textiles Corp of America"
+  },
+  {
+   "Name": "Express Logistics Standby Generator",
+   "StageName": "Closed Won",
+   "Amount": 220000.0,
+   "CloseDate": "2026-04-19",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "Express Logistics and Transport"
+  },
+  {
+   "Name": "Grand Hotels Emergency Generators",
+   "StageName": "Closed Won",
+   "Amount": 210000.0,
+   "CloseDate": "2026-07-04",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "United Oil Office Portable Generators",
+   "StageName": "Negotiation/Review",
+   "Amount": 125000.0,
+   "CloseDate": "2026-05-24",
+   "Probability": 90.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil Standby Generators",
+   "StageName": "Closed Won",
+   "Amount": 120000.0,
+   "CloseDate": "2026-07-16",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "United Oil SLA",
+   "StageName": "Closed Won",
+   "Amount": 120000.0,
+   "CloseDate": "2026-07-15",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "United Oil & Gas Corp."
+  },
+  {
+   "Name": "Express Logistics SLA",
+   "StageName": "Perception Analysis",
+   "Amount": 120000.0,
+   "CloseDate": "2026-04-18",
+   "Probability": 70.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Express Logistics and Transport"
+  },
+  {
+   "Name": "Pyramid Emergency Generators",
+   "StageName": "Prospecting",
+   "Amount": 100000.0,
+   "CloseDate": "2026-06-01",
+   "Probability": 10.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": null,
+   "AccountName": "Pyramid Construction Inc."
+  },
+  {
+   "Name": "University of AZ Installations",
+   "StageName": "Proposal/Price Quote",
+   "Amount": 100000.0,
+   "CloseDate": "2026-04-20",
+   "Probability": 75.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "University of Arizona"
+  },
+  {
+   "Name": "University of AZ SLA",
+   "StageName": "Closed Won",
+   "Amount": 90000.0,
+   "CloseDate": "2026-04-27",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "University of Arizona"
+  },
+  {
+   "Name": "Grand Hotels SLA",
+   "StageName": "Closed Won",
+   "Amount": 90000.0,
+   "CloseDate": "2026-04-16",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "GenePoint Standby Generator",
+   "StageName": "Closed Won",
+   "Amount": 85000.0,
+   "CloseDate": "2026-05-27",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "GenePoint"
+  },
+  {
+   "Name": "Express Logistics Portable Truck Generators",
+   "StageName": "Value Proposition",
+   "Amount": 80000.0,
+   "CloseDate": "2026-04-17",
+   "Probability": 50.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Express Logistics and Transport"
+  },
+  {
+   "Name": "Edge Emergency Generator",
+   "StageName": "Closed Won",
+   "Amount": 75000.0,
+   "CloseDate": "2026-07-23",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "Edge SLA",
+   "StageName": "Closed Won",
+   "Amount": 60000.0,
+   "CloseDate": "2026-04-09",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "GenePoint Lab Generators",
+   "StageName": "Id. Decision Makers",
+   "Amount": 60000.0,
+   "CloseDate": "2026-07-17",
+   "Probability": 60.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": null,
+   "AccountName": "GenePoint"
+  },
+  {
+   "Name": "University of AZ Portable Generators",
+   "StageName": "Closed Won",
+   "Amount": 50000.0,
+   "CloseDate": "2026-04-23",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "New Customer",
+   "AccountName": "University of Arizona"
+  },
+  {
+   "Name": "Edge Installation",
+   "StageName": "Closed Won",
+   "Amount": 50000.0,
+   "CloseDate": "2026-05-14",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "Acme SLA Renewal",
+   "StageName": "Qualification",
+   "Amount": 40000.0,
+   "CloseDate": "2027-05-07",
+   "Probability": 10.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Replacement",
+   "AccountName": "Acme"
+  },
+  {
+   "Name": "Edge Emergency Generator",
+   "StageName": "Id. Decision Makers",
+   "Amount": 35000.0,
+   "CloseDate": "2026-07-29",
+   "Probability": 60.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Replacement",
+   "AccountName": "Edge Communications"
+  },
+  {
+   "Name": "GenePoint SLA",
+   "StageName": "Closed Won",
+   "Amount": 30000.0,
+   "CloseDate": "2026-07-20",
+   "Probability": 100.0,
+   "IsClosed": true,
+   "IsWon": true,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "GenePoint"
+  },
+  {
+   "Name": "Grand Hotels Kitchen Generator",
+   "StageName": "Id. Decision Makers",
+   "Amount": 15000.0,
+   "CloseDate": "2026-04-14",
+   "Probability": 60.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "Existing Customer - Upgrade",
+   "AccountName": "Grand Hotels & Resorts Ltd"
+  },
+  {
+   "Name": "Dickenson Mobile Generators",
+   "StageName": "Qualification",
+   "Amount": 15000.0,
+   "CloseDate": "2026-06-05",
+   "Probability": 10.0,
+   "IsClosed": false,
+   "IsWon": false,
+   "Type": "New Customer",
+   "AccountName": "Dickenson plc"
+  }
+ ]
+}
