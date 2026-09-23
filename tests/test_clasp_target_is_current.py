@@ -31,11 +31,11 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEPLOY_DOC = os.path.join(REPO, "docs", "APPS-SCRIPT-DEPLOY.md")
 
-# Measured live on 2026-09-20: ten questions, ten replies, every one by=grok.
-# The marker is the credential name, because that is what the routing branches
-# on and it cannot be renamed without someone noticing this test.
+# The production answerers are deliberately limited to Codex and Claude. The
+# marker is the credential name, because that is what the routing branches on
+# and it cannot be renamed without someone noticing this test.
 PROVIDERS_THE_LIVE_SITE_USES = {
-    "grok": "XAI_API_KEY",
+    "codex": "OPENAI_KEY",
     "claude": "ANTHROPIC_KEY",
 }
 
@@ -121,8 +121,7 @@ class ThePushTargetIsTheLiveScript(unittest.TestCase):
     """
 
     def test_every_provider_the_live_site_uses_is_in_the_push_target(self):
-        """Before reconciliation the target had no grok at all, while ten live
-        replies came back by=grok. A push would have removed a provider."""
+        """Every provider named by the production contract must be present."""
         src = clasp_target_source()
         for name, marker in sorted(PROVIDERS_THE_LIVE_SITE_USES.items()):
             with self.subTest(provider=name):
