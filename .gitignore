@@ -104,3 +104,8 @@ zoom-agent/.tokens.json
 # the working tree so agents can read it. It is not repository content and
 # a push is not undoable the way a local delete is.
 media/
+
+# Anything mapping where credentials live stays local. The rule came from
+# force-pushing docs/security-review.md off origin on 2026-09-03: a push is not
+# undoable the way a local delete is, and a repo can change visibility later.
+*.local.md
