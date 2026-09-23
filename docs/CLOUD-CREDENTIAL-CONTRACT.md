@@ -97,19 +97,34 @@ with **no accessor binding at all** — each service gets
 time. A single grant of all 27 to one service account would mean any Cloud Run
 service in the project can read every key the business holds.
 
-## Still open, and both are his
+## Rotation of `BUS_SECRET`: measured, declined, closed
 
-1. **`BUS_SECRET` has not been rotated.** The value now in Secret Manager is the
-   same 31-character secret that `BUS-ROTATE-001` has been trying to retire since
-   3 September — vm-chrome held it in session, and it is recorded as exposed.
-   **Putting an exposed secret in a vault does not un-expose it.** Rotation
-   means a new value in Apps Script Script Properties and a new version here, and
-   it is his call because it briefly breaks every holder at once.
-2. **The laptop `.env` is still a second source of truth.** Secret Manager is now
-   authoritative for anything running in the cloud; the laptop lane still reads
-   the file. They agree today because the sync copied one into the other. Making
-   the file derive from Secret Manager, rather than the reverse, is the next step
-   and needs the scheduled tasks to move first — which needs his elevated shell.
+The value in Secret Manager is the same 31-character secret `BUS-ROTATE-001` has
+been trying to retire since 3 September. **Mr Salam ruled on 2026-09-23 that it
+stays**, and the reasoning is his:
+
+> *"The work we are doing here is preliminary and not client based. As such the
+> bus secret will not benefit anyone; is not worth changing now. proceed without
+> rotating this."*
+
+That is a correct reading of the exposure. Nothing on this board is client data,
+the surfaces holding the secret are all ours, and rotation briefly breaks every
+holder at once for no gain today. **This is not an open item and should not be
+raised again as one.**
+
+**What would change it, and the check already exists.** The decision is scoped to
+*preliminary, non-client* work. The moment a client is invited onto any surface
+that reaches this bus, `docs/ACCEPTANCE-CHECKLIST.md` gap 1 and PR #75's
+principle — *clients never touch the working board* — both bite, and rotation
+becomes part of that work rather than a standing chore. Until then it is settled.
+
+## Still open, and it is his
+
+**The laptop `.env` is still a second source of truth.** Secret Manager is now
+authoritative for anything running in the cloud; the laptop lane still reads the
+file. They agree today because the sync copied one into the other. Making the
+file derive from Secret Manager, rather than the reverse, is the next step and
+needs the scheduled tasks to move first.
 
 **A note on the identity the relay runs as:** `sfdc24-stt-relay` uses the default
 compute service account, which is broadly privileged. A dedicated per-service
