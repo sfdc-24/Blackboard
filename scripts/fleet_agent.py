@@ -40,12 +40,24 @@ import gzip
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUS = os.path.join(REPO, "scripts", "bus.ps1")
+
+# THE POWERSHELL IS GONE, AND THAT IS THE POINT.
+#
+# This file used to shell out to scripts/bus.ps1 twice - once to read the
+# board and once to append a row - which made a pure-Python tool depend on a
+# Windows shell. It is dependency 4 in docs/OPENAI-CLOUD-MIGRATION.md, and
+# scripts/bus.py already does both in Python, so it was a dependency to
+# delete rather than one to migrate.
+#
+# bus.py is also the better transport here for two reasons that have both
+# cost us a day: it retries a health-blob response rather than accepting it
+# as an empty board, and it REFUSES to retry an append, because a redirect
+# failure raised client-side can arrive after the row has already landed.
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+from bus import fetch as _bus_fetch, load_env as _bus_load_env  # noqa: E402
 ENV = os.path.join(REPO, ".env")
 BOARD = "Blackboard - Alpha DB"
 BACKUPS = os.path.join(os.path.dirname(REPO), "blackboard-backups")
@@ -56,24 +68,30 @@ MIN_BOARD_BYTES = 100_000
 
 
 def read_board(attempts=4, quiet=False):
-    """Read the board, validating the SHAPE. Returns parsed JSON or None."""
-    out = os.path.join(tempfile.gettempdir(), "fleet_%d.json" % os.getpid())
+    """Read the board, validating the SHAPE. Returns parsed JSON or None.
+
+    The size check below survives the move off PowerShell on purpose. bus.py
+    already rejects a response with no `rows`, but a SMALL response that happens
+    to carry rows is the other half of the same failure and only this caller
+    knows how big a real board is.
+    """
+    env = _bus_load_env()
     for i in range(1, attempts + 1):
-        subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", BUS,
-             "-Action", "read", "-Title", BOARD, "-OutFile", out],
-            cwd=REPO, capture_output=True, text=True, timeout=300,
-        )
-        if not os.path.exists(out):
+        try:
+            body = _bus_fetch(env["BUS_URL"],
+                              {"action": "read", "secret": env["BUS_SECRET"],
+                               "title": BOARD})
+        except Exception as exc:  # noqa: BLE001 - a transport failure is not an empty board
+            if not quiet:
+                print("   attempt %d rejected: transport (%s)" % (i, exc))
             continue
-        size = os.path.getsize(out)
+        size = len(body.encode("utf-8", "replace"))
         if size < MIN_BOARD_BYTES:
             if not quiet:
                 print("   attempt %d rejected: %d bytes — the ping-payload failure" % (i, size))
             continue
         try:
-            with open(out, encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = json.loads(body)
         except Exception as exc:
             if not quiet:
                 print("   attempt %d rejected: unparseable (%s)" % (i, exc))
@@ -337,12 +355,21 @@ def cmd_post(args):
         rid, args.phase, args.klass, tag, to.replace(";", ","), args.text)
     row = [rid, now, tag, to, args.phase, payload, args.category, args.project, args.gist or args.text[:180], ""]
 
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", BUS,
-         "-Action", "append", "-Title", BOARD, "-SheetRowJson", json.dumps(row, ensure_ascii=False)],
-        cwd=REPO, capture_output=True, text=True, timeout=300,
-    )
-    print("  append said:", (out.stdout or out.stderr).strip()[:200])
+    # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
+    # googleusercontent 404 on the redirect hop can be raised client-side AFTER
+    # the row has landed - that replayed a row onto the live board once already.
+    # The read-back below is what closes the loop, not this response.
+    try:
+        body = _bus_fetch(
+            _bus_load_env()["BUS_URL"],
+            {"action": "append", "secret": _bus_load_env()["BUS_SECRET"],
+             "title": BOARD, "sheetRow": row},
+            tries=1,
+        )
+        print("  append said:", body.strip()[:200])
+    except Exception as exc:  # noqa: BLE001
+        print("  append raised %s: %s" % (type(exc).__name__, exc))
+        print("  This does NOT mean the row is absent. Reading back to find out.")
 
     # D-4: the response is not the proof. Read the row back by its own id.
     data = read_board(quiet=True)
