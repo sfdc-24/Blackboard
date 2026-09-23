@@ -417,7 +417,10 @@ function jsonp_(cb, obj) {
   var payload = JSON.stringify(obj);
   if (!cb) return ContentService.createTextOutput(payload)
                   .setMimeType(ContentService.MimeType.JSON);
-  return ContentService.createTextOutput(cb + '(' + payload + ');')
+  // A page may cancel and detach a JSONP request while Apps Script is already
+  // returning it. Guard the invocation so a deliberately removed callback is
+  // a harmless late response instead of an uncaught browser ReferenceError.
+  return ContentService.createTextOutput('typeof ' + cb + '==="function"&&' + cb + '(' + payload + ');')
                   .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 

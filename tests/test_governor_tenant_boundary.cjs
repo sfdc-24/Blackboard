@@ -177,6 +177,23 @@ function signedSession(context, sub, email = 'visitor@example.invalid') {
 
 function decode(output) { return JSON.parse(output.text); }
 
+test('JSONP safely ignores a response whose callback was cancelled', () => {
+  const h = createHarness();
+  const output = h.context.jsonp_('sttans123', { ok: true, reply: 'late' });
+  assert.equal(output.text,
+    'typeof sttans123==="function"&&sttans123({"ok":true,"reply":"late"});');
+  assert.doesNotThrow(() => vm.runInNewContext(output.text, {}));
+
+  let delivered = null;
+  vm.runInNewContext(output.text, {
+    sttans123(value) { delivered = value; },
+  });
+  assert.equal(JSON.stringify(delivered), JSON.stringify({ ok: true, reply: 'late' }));
+
+  const invalid = h.context.jsonp_('', { ok: true });
+  assert.deepEqual(decode(invalid), { ok: true });
+});
+
 test('Google subject, not email or caller id, is the stable conversation boundary', () => {
   const h = createHarness();
   const alice = signedSession(h.context, 'google-subject-alice', 'alice@example.invalid');
