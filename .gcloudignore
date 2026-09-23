@@ -1,0 +1,43 @@
+# What Cloud Build is allowed to see. An ALLOWLIST, deliberately.
+#
+# WHY NOT JUST LEAN ON .gitignore
+#   gcloud falls back to .gitignore semantics when this file is absent, and .env
+#   IS gitignored, so it would probably have been excluded. "Probably" is not the
+#   standard for a file holding 31 live credentials. This states what goes up
+#   rather than inferring what stays behind, and `gcloud meta
+#   list-files-for-upload` is run against it before every first deploy.
+#
+# It also matters for cost and speed: the repo is 332 MB, and the board probe
+# needs exactly two files.
+
+# Ignore everything at the root...
+/*
+
+# ...then re-admit only the build inputs, directory by directory, because
+# gitignore semantics cannot reach into a directory that is itself ignored.
+!/cloud
+/cloud/*
+!/cloud/board-probe
+
+!/scripts
+/scripts/*
+!/scripts/bus.py
+!/scripts/board_say.py
+
+# Belt and braces. If a future edit above accidentally re-admits the root, these
+# still never go up. An ignore rule that is redundant today is not wasted.
+#
+# The first version of this file carried `!*.env.example`, meant to protect
+# example files from the broad `*.env` rule. It did the opposite of what an
+# allowlist is for: it RE-ADMITTED .env.example to the build, which the upload
+# listing caught. Nothing here needs an example file, so the negation is gone.
+# Printing the upload list is what found it - an allowlist you have not listed
+# is a guess.
+.env
+*.env
+.env.*
+*.local.md
+.git/
+node_modules/
+__pycache__/
+*.pyc

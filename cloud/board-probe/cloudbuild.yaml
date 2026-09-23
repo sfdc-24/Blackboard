@@ -1,0 +1,33 @@
+# Build the board probe with the REPO ROOT as context.
+#
+# WHY THIS FILE EXISTS AT ALL
+#   `gcloud run jobs deploy --source` expects a Dockerfile at the root of the
+#   source it uploads. Ours is deliberately not at the repo root - and the build
+#   context cannot be cloud/board-probe/ either, because the image must copy
+#   scripts/bus.py. Keeping ONE copy of the read path matters more than avoiding
+#   this file: a second bus.py is how a reader and a writer come to disagree about
+#   what the board says, which is the bug the probe exists to detect.
+#
+#   So: context is `.`, the Dockerfile is named with -f, and /.gcloudignore is an
+#   allowlist that sends exactly three files. Verified with
+#   `gcloud meta list-files-for-upload` before the first submit - the repo is
+#   332 MB and holds a .env with 31 live credentials.
+
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/board-probe:v1
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_IMAGE}
+      - -f
+      - cloud/board-probe/Dockerfile
+      - .
+
+images:
+  - ${_IMAGE}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
