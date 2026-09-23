@@ -29,7 +29,37 @@ They share a transport and nothing else. Keeping them separate is deliberate:
 a write path into our own org must not become a precedent for a write path into
 someone else's.
 
-## The prerequisite, and only he can clear it
+## The prerequisite is CLEARED, 2026-09-23 — and it was outcome (1)
+
+The doc below said the cheapest outcome should be ruled out first: that the oid
+might belong to an org we already hold credentials for and nobody checked. **It
+does.**
+
+`oid 00Dbm00000wK2ibEAC` is the **Headless 360 dev org** — name *SFDC 24*,
+Developer Edition, not a sandbox. Confirmed by authenticating with the
+`Headless_consumer_key` already in `.env` and querying `Organization` for an
+exact id match. The giveaway was the hostname: `Headless_domain` is
+`dbm00000wk2ibeac-dev-ed.develop.my.salesforce.com` — **the org id is the
+domain**, and has been since those credentials were added.
+
+**And the business answer, which is what the question was for:**
+
+| | |
+|---|---|
+| Leads, total | 25 |
+| `LeadSource = sfdc24.com` | **3** — and all three are ours |
+| Opportunities | **0** |
+
+The three are a `test` submission from 2026-09-18, an integration verification
+from 2026-09-04, and Developer Edition sample data. The other 22 were created in
+one second on 2026-08-27. **The form works and nobody has used it.** The
+pipeline is not hidden, it is empty — which makes this a demand problem, not a
+plumbing one, and changes what item 1 of the lane is worth.
+
+The account of what it was, kept because the shape of the mistake is worth
+keeping:
+
+## What the prerequisite was, and why it survived four days
 
 **The leads are not where we could work them.** The site's Web-to-Lead posts to
 `oid 00Dbm00000wK2ibEAC` — a **third** org that no agent on this fleet can
