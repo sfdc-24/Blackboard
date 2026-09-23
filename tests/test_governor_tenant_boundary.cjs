@@ -37,6 +37,7 @@ function createHarness(initialProperties = {}) {
     cache: new ScriptCache(),
     lock: { held: false },
     providerCalls: 0,
+    providerUrls: [],
     providerPayloads: [],
     inboxRows: [],
     sheetNames: [],
@@ -44,6 +45,7 @@ function createHarness(initialProperties = {}) {
     providerSawLock: false,
     onProviderFetch: null,
     failProvider: false,
+    openaiResponseBody: null,
     uuid: 0,
   };
 
@@ -133,9 +135,10 @@ function createHarness(initialProperties = {}) {
     Utilities: utilities,
     UrlFetchApp: {
       fetch(url, options) {
-        assert.match(url, /^https:\/\/api\.anthropic\.com\/v1\/messages$/);
+        assert.match(url, /^https:\/\/api\.(?:anthropic\.com\/v1\/messages|openai\.com\/v1\/responses)$/);
         harness.providerSawLock = harness.providerSawLock || harness.lock.held;
         harness.providerCalls += 1;
+        harness.providerUrls.push(url);
         harness.providerPayloads.push(JSON.parse(options.payload));
         if (harness.onProviderFetch) {
           const callback = harness.onProviderFetch;
@@ -143,11 +146,19 @@ function createHarness(initialProperties = {}) {
           callback();
         }
         if (harness.failProvider) throw new Error('mock provider failure');
+        const openai = url.includes('api.openai.com');
         return {
           getResponseCode: () => 200,
-          getContentText: () => JSON.stringify({
-            content: [{ type: 'text', text: 'A bounded test reply.' }],
-          }),
+          getContentText: () => JSON.stringify(openai ? (harness.openaiResponseBody || {
+            status: 'completed',
+            output: [
+              { type: 'reasoning', summary: [] },
+              { type: 'message', content: [
+                { type: 'output_text', text: 'A bounded ' },
+                { type: 'output_text', text: 'Codex reply.' },
+              ] },
+            ],
+          }) : { content: [{ type: 'text', text: 'A bounded test reply.' }] }),
         };
       },
     },
@@ -165,6 +176,23 @@ function signedSession(context, sub, email = 'visitor@example.invalid') {
 }
 
 function decode(output) { return JSON.parse(output.text); }
+
+test('JSONP safely ignores a response whose callback was cancelled', () => {
+  const h = createHarness();
+  const output = h.context.jsonp_('sttans123', { ok: true, reply: 'late' });
+  assert.equal(output.text,
+    'typeof sttans123==="function"&&sttans123({"ok":true,"reply":"late"});');
+  assert.doesNotThrow(() => vm.runInNewContext(output.text, {}));
+
+  let delivered = null;
+  vm.runInNewContext(output.text, {
+    sttans123(value) { delivered = value; },
+  });
+  assert.equal(JSON.stringify(delivered), JSON.stringify({ ok: true, reply: 'late' }));
+
+  const invalid = h.context.jsonp_('', { ok: true });
+  assert.deepEqual(decode(invalid), { ok: true });
+});
 
 test('Google subject, not email or caller id, is the stable conversation boundary', () => {
   const h = createHarness();
@@ -381,6 +409,62 @@ test('identified reception keeps provenance untrusted and leaks no Governor data
   assert.equal(outbound.includes(governorMarker), false);
   assert.equal(outbound.includes('alice@example.invalid'), false);
   assert.equal(outbound.includes('private-google-subject'), false);
+});
+
+test('a Codex route uses OpenAI Responses and reports the provider that answered', () => {
+  const h = createHarness({
+    ANTHROPIC_KEY: '',
+    OPENAI_KEY: 'test-openai-key',
+    CODEX_MODEL: 'test-codex-model',
+  });
+  const identity = h.context.conversationIdentity_('', '');
+  const result = h.context.reception(identity.token, 'Review this design', [], '', 'codex');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.by, 'codex');
+  assert.equal(result.reply, 'A bounded Codex reply.');
+  assert.deepEqual(h.providerUrls, ['https://api.openai.com/v1/responses']);
+  assert.equal(h.providerPayloads[0].model, 'test-codex-model');
+  assert.equal(h.providerPayloads[0].store, false);
+  assert.equal(h.providerPayloads[0].max_output_tokens, h.context.CHAT_MAX_TOKENS);
+  assert.match(h.providerPayloads[0].instructions, /Codex, made by OpenAI/);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.providerPayloads[0].input)), [
+    { role: 'user', content: 'Review this design' },
+  ]);
+});
+
+test('an unknown or retired provider hint cannot select an undeclared backend', () => {
+  const h = createHarness({ OPENAI_KEY: 'test-openai-key' });
+  const identity = h.context.conversationIdentity_('', '');
+  const result = h.context.reception(identity.token, 'hello', [], '', 'grok');
+  assert.equal(result.ok, true);
+  assert.equal(result.by, 'claude');
+  assert.deepEqual(h.providerUrls, ['https://api.anthropic.com/v1/messages']);
+});
+
+test('incomplete, refused, and malformed Codex envelopes fall back to Claude', () => {
+  const cases = [
+    { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ content: [{ type: 'output_text', text: 'partial must not ship' }] }] },
+    { status: 'incomplete', incomplete_details: { reason: 'content_filter' }, output: [] },
+    { status: 'completed', output: {} },
+    { status: 'completed', output: [{ content: {} }] },
+    { status: 'completed', output: [{ content: [{ type: 'refusal', refusal: 'No.' }] }] },
+    {},
+  ];
+  for (const body of cases) {
+    const h = createHarness({ OPENAI_KEY: 'test-openai-key' });
+    h.openaiResponseBody = body;
+    const identity = h.context.conversationIdentity_('', '');
+    const result = h.context.reception(identity.token, 'Review this design', [], '', 'codex');
+    assert.equal(result.ok, true);
+    assert.equal(result.by, 'claude');
+    assert.equal(result.reply, 'A bounded test reply.');
+    assert.deepEqual(h.providerUrls, [
+      'https://api.openai.com/v1/responses',
+      'https://api.anthropic.com/v1/messages',
+    ]);
+  }
 });
 
 test('numeric caps and both clients retain the signed-token contract', () => {

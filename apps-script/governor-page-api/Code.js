@@ -17,10 +17,10 @@
  *   GOVERNOR_EMAILS   a@x.com,b@y.com          (default: script owner)
  *   GOVERNOR_NAME     Mr. Salam
  *   GOVERNOR_PASS     fallback passphrase for script writes
- *   ANTHROPIC_KEY     API key — the fallback voice, and the only one before 2026-09-18
+ *   ANTHROPIC_KEY     API key — Claude chat provider
  *   CHAT_MODEL        model id                 (default below)
- *   XAI_API_KEY       API key — when present, grok answers FIRST
- *   XAI_MODEL         model id                 (default below)
+ *   OPENAI_KEY        API key — Codex chat provider and text-to-speech
+ *   CODEX_MODEL       OpenAI model id          (default below)
  *   CHAT_ENABLED      set to "off" to kill reception replies instantly
  *   CHAT_DAILY_CAP    max AI replies per UTC day (default 150)
  */
@@ -31,13 +31,10 @@ var CACHE_SECS = 15;
 var MAX_ROWS   = 500;
 
 var CHAT_MODEL_DEFAULT = 'claude-sonnet-4-5';
-// grok-4.6 is a reasoning model and it is not free: measured against this same
-// system prompt on 2026-09-18, one short visitor answer cost 18,260,000 cost
-// ticks with 188 hidden reasoning tokens, against 1,918,500 for
-// grok-4.20-0309-non-reasoning on the identical question. Both answered well.
-// The id is a Script Property precisely so that trade can be changed in one
-// click, with no push and no deploy.
-var XAI_MODEL_DEFAULT  = 'grok-4.6';
+// The site only needs a short, focused second opinion here. Luna keeps that
+// route fast and inexpensive; the property makes a model change operational
+// rather than a source edit.
+var CODEX_MODEL_DEFAULT = 'gpt-6-luna';
 var CHAT_MAX_INPUT     = 1000;   // chars per visitor message
 var CHAT_MAX_TURNS     = 12;     // history sent to the model
 var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
@@ -420,7 +417,10 @@ function jsonp_(cb, obj) {
   var payload = JSON.stringify(obj);
   if (!cb) return ContentService.createTextOutput(payload)
                   .setMimeType(ContentService.MimeType.JSON);
-  return ContentService.createTextOutput(cb + '(' + payload + ');')
+  // A page may cancel and detach a JSONP request while Apps Script is already
+  // returning it. Guard the invocation so a deliberately removed callback is
+  // a harmless late response instead of an uncaught browser ReferenceError.
+  return ContentService.createTextOutput('typeof ' + cb + '==="function"&&' + cb + '(' + payload + ');')
                   .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 
@@ -713,30 +713,19 @@ function receptionWithIdentity_(identity, text, history, want) {
   if (String(props.getProperty('CHAT_ENABLED') || '').toLowerCase() === 'off')
     return offline_(sid, 'paused');
 
-  // WHO SPEAKS FOR THIS SITE. Asked for 2026-09-18 by the product lead:
-  // "Make Grok the primary model for homepage say when routed."
-  //
-  // Two keys, one order: grok first when its key is present, the Anthropic key
-  // behind it. The fallback is not decoration — it is what keeps the page
-  // answering when one provider is down, and it is why the visitor never sees a
-  // provider outage as silence.
+  // WHO SPEAKS FOR THIS SITE. The intentionally small production stack is the
+  // Python browser gate followed by exactly two cloud answerers: Claude for
+  // Salesforce/CRM work and Codex for other technical work. Both credentials
+  // already belong to this script; no laptop process participates in the path.
   //
   // The reply names its author back to the page (`by`), because the homepage
   // now draws ONE agent picking a question up. A board that says claude took it
   // while a different model wrote the words is the exact class of claim the
   // honesty suites exist to stop, so the label comes from here, where it is
   // known, and never from the routing guess in the browser.
-  var xaiKey  = props.getProperty('XAI_API_KEY');
   var anthKey = props.getProperty('ANTHROPIC_KEY');
-  // A KEY THAT IS PRESENT IS NOT A KEY THAT CAN ANSWER. grok ran out of
-  // allowance on 2026-09-23 and its key stayed in Script Properties, so every
-  // request still tried it first, paid a round trip to be refused, and only
-  // then reached claude. Set XAI_ENABLED to 'off' to take it out of the order
-  // entirely - including out of reach of an agent= hint, which would otherwise
-  // promote a provider that cannot serve. Clear the property when credit
-  // returns; nothing else has to change.
-  if (String(props.getProperty('XAI_ENABLED') || '').toLowerCase() === 'off') xaiKey = '';
-  if (!xaiKey && !anthKey) return offline_(sid, 'no-key');
+  var openaiKey = props.getProperty('OPENAI_KEY');
+  if (!openaiKey && !anthKey) return offline_(sid, 'no-key');
 
   // Reserve both spend ceilings inside one script lock before the provider.
   // A failed provider call still consumes one attempt; otherwise retries and
@@ -756,23 +745,18 @@ function receptionWithIdentity_(identity, text, history, want) {
   // The order is the policy. Each provider is tried once; the first one that
   // returns text wins, and a failure is logged with its reason rather than
   // swallowed, so "the page went quiet" can always be traced to a provider.
-  // CLAUDE FIRST, grok behind it. The 2026-09-18 ruling put grok in front
-  // because it was the primary voice; that stopped being true the day its
-  // allowance ran out. Mr Salam, 2026-09-23: appoint claude primary responder
-  // after the python gate. The fallback is not decoration - it is what keeps
-  // the page answering when one provider is down, which is precisely the
-  // situation that prompted this, so grok stays in the list rather than being
-  // deleted from it.
+  // Claude is the default after the Python gate. A routed Codex question moves
+  // Codex to the front; either provider remains a one-attempt fallback for the
+  // other so a transient outage does not turn into silence.
   var order = [];
   if (anthKey) order.push({ who: 'claude', go: function () { return askClaude_(anthKey, props, msgs); } });
-  if (xaiKey)  order.push({ who: 'grok',   go: function () { return askGrok_(xaiKey, props, msgs); } });
+  if (openaiKey) order.push({ who: 'codex', go: function () { return askCodex_(openaiKey, props, msgs); } });
 
   // THE PAGE MAY ASK FOR A PARTICULAR AGENT, and it is moved to the front
   // rather than being allowed to replace the list. Three reasons, and the third
   // is the one that matters: the value comes off a public query string, so it
   // is matched against names that exist here and ignored otherwise; the site's
-  // roster has five agents and only two of them have a credential in this
-  // script, so a hint for the other three must degrade rather than fail; and
+  // roster has two answerers and only those exact names are eligible; and
   // the fallback has to survive a hint, or one bad routing guess takes the
   // visitor's answer away entirely.
   var pref = String(want || '').toLowerCase();
@@ -799,26 +783,24 @@ function receptionWithIdentity_(identity, text, history, want) {
 // decides what a failure means, and a provider helper that can throw would take
 // the fallback down with it.
 
-// xAI speaks the OpenAI chat-completions shape, so the system prompt is the
-// FIRST MESSAGE rather than a separate field. Sending it the Anthropic way -
-// a top-level `system` key - is accepted with a 200 and the prompt silently
-// ignored, which is the worst possible failure: the site's entire voice and
-// every confidentiality rule in it would quietly stop applying while the page
-// looked healthy.
-function askGrok_(key, props, msgs) {
-  var out = [{ role: 'system', content: SYSTEM_PROMPT_('grok') }];
-  msgs.forEach(function (m) { out.push(m); });
+// Codex uses the Responses API. Store is explicitly false because the script
+// already owns the bounded conversation history and does not need a second
+// provider-side copy. Parse every output-text block rather than assuming the
+// first output item is the assistant message.
+function askCodex_(key, props, msgs) {
   var res, body;
   try {
-    res = UrlFetchApp.fetch('https://api.x.ai/v1/chat/completions', {
+    res = UrlFetchApp.fetch('https://api.openai.com/v1/responses', {
       method: 'post',
       contentType: 'application/json',
       muteHttpExceptions: true,
       headers: { Authorization: 'Bearer ' + key },
       payload: JSON.stringify({
-        model: props.getProperty('XAI_MODEL') || XAI_MODEL_DEFAULT,
-        max_tokens: CHAT_MAX_TOKENS,
-        messages: out
+        model: props.getProperty('CODEX_MODEL') || CODEX_MODEL_DEFAULT,
+        instructions: SYSTEM_PROMPT_('codex'),
+        input: msgs,
+        max_output_tokens: CHAT_MAX_TOKENS,
+        store: false
       })
     });
     body = JSON.parse(res.getContentText() || '{}');
@@ -829,8 +811,21 @@ function askGrok_(key, props, msgs) {
     var msg = (body && body.error && (body.error.message || body.error)) || res.getContentText().slice(0, 300);
     return { ok: false, error: 'api ' + res.getResponseCode() + ': ' + msg };
   }
-  var choice = (body && body.choices && body.choices[0]) || null;
-  var text = String((choice && choice.message && choice.message.content) || '').trim();
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'malformed response' };
+  }
+  if (body.status !== 'completed') {
+    return { ok: false, error: 'response ' + String(body.status || 'missing-status') };
+  }
+  if (!Array.isArray(body.output)) return { ok: false, error: 'malformed output' };
+  var text = '';
+  body.output.forEach(function (item) {
+    var content = item && Array.isArray(item.content) ? item.content : [];
+    content.forEach(function (part) {
+      if (part && part.type === 'output_text' && typeof part.text === 'string') text += part.text;
+    });
+  });
+  text = text.trim();
   if (!text) return { ok: false, error: 'empty completion' };
   return { ok: true, reply: text };
 }
@@ -897,7 +892,7 @@ function normalize_(list) {
 // An unknown provider still gets a name - "an AI assistant" - rather than
 // inheriting whichever name happened to be hardcoded.
 function SYSTEM_PROMPT_(who) {
-  var name = who === 'grok' ? 'Grok, made by xAI'
+  var name = who === 'codex' ? 'Codex, made by OpenAI'
            : who === 'claude' ? 'Claude, made by Anthropic'
            : 'an AI assistant';
   return [
@@ -905,11 +900,11 @@ function SYSTEM_PROMPT_(who) {
     "",
     // THE ROSTER WAS THREE NAMES OUT OF DATE. It read "Claude, ChatGPT, Meta AI
     // and others" while the page beside it draws claude, codex, foundry, gemini
-    // and grok on the board. A visitor who asked "name the agents on this site"
+    // and the active answerers on the board. A visitor who asked "name the agents on this site"
     // got an answer that matched nothing on screen - measured, on the live site,
     // in that wording exactly. Copy in a system prompt goes stale the same way
     // copy in a page does, and nothing renders it for a guard to catch.
-    "WHAT YOU MAY SAY SFDC24 IS: a working surface for getting real work done with AI agents — claude, codex, foundry, gemini and grok working the same projects, with a human making the consequential calls. It is run by an independent consultant in the Toronto area whose background is Salesforce operations, Lean Six Sigma and Scrum.",
+    "WHAT YOU MAY SAY SFDC24 IS: a working surface for getting real work done with a Python gate, Codex and Claude, with a human making the consequential calls. It is run by an independent consultant in the Toronto area whose background is Salesforce operations, Lean Six Sigma and Scrum.",
     "",
     "HARD LIMITS",
     "- Never describe how SFDC24 or anything behind it is built: no architecture, no data stores, no tools, no product or file names, no internal terminology, no operating rules. That is confidential. If asked how it works, say the build details are not public, then return to what the visitor needs.",
@@ -1284,12 +1279,12 @@ function json_(o) {
 // ---------- editor utilities (run by hand) ----------
 // Proves the keys and models are good. Run this after setting either key.
 // It prints WHICH provider answered, because "a reply came back" stopped being
-// the whole question the moment there were two of them: with both keys set and
-// grok first, a fallback to claude looks identical from the page.
+// the whole question the moment there were two of them: a fallback looks
+// identical from the page unless `by` and the configured providers are logged.
 function test_chat() { requireGovernor_();
   var p = PropertiesService.getScriptProperties();
-  Logger.log('xai key: ' + (!!p.getProperty('XAI_API_KEY')) +
-             ' · xai model: ' + (p.getProperty('XAI_MODEL') || XAI_MODEL_DEFAULT) +
+  Logger.log('openai key: ' + (!!p.getProperty('OPENAI_KEY')) +
+             ' · codex model: ' + (p.getProperty('CODEX_MODEL') || CODEX_MODEL_DEFAULT) +
              ' · anthropic key: ' + (!!p.getProperty('ANTHROPIC_KEY')) +
              ' · anthropic model: ' + (p.getProperty('CHAT_MODEL') || CHAT_MODEL_DEFAULT) +
              ' · today: ' + dailyCount_() + ' replies');
