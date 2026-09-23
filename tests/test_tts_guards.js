@@ -17,9 +17,9 @@
  *        both read the text and both paid.
  *
  *   The unit under test is therefore not "does it speak" but "how many times
- *   does it reach for the provider". Every assertion below counts calls to
- *   api.openai.com with the provider mocked. Nothing here touches the network,
- *   the live script, or a real key.
+ *   does it reach for the paid speech provider". Every assertion below counts
+ *   calls to OpenAI's audio endpoint separately from Codex chat calls. Nothing
+ *   here touches the network, the live script, or a real key.
  *
  * WHY THERE IS A LEGACY WITNESS
  *   A test that passes against the fix proves nothing on its own -- it might be
@@ -57,7 +57,7 @@ const SOURCE = fs.readFileSync(CODE_PATH, 'utf8');
 function makeRuntime(opts) {
   opts = opts || {};
 
-  const calls = { openai: 0, anthropic: 0 };
+  const calls = { openai: 0, codex: 0, anthropic: 0 };
   const props = new Map(Object.entries(opts.props || {}));
   const cacheStore = new Map();
   let lockHeld = false;
@@ -136,7 +136,16 @@ function makeRuntime(opts) {
           }
           return response(200, JSON.stringify({ content: [{ type: 'text', text: 'A real model reply.' }] }));
         }
-        if (String(url).indexOf('api.openai.com') >= 0) {
+        if (String(url).indexOf('api.openai.com/v1/responses') >= 0) {
+          calls.codex++;
+          if (opts.codexStatus && opts.codexStatus !== 200) {
+            return response(opts.codexStatus, JSON.stringify({ error: { message: 'mocked Codex failure' } }));
+          }
+          return response(200, JSON.stringify({
+            output: [{ type: 'message', content: [{ type: 'output_text', text: 'A real Codex reply.' }] }]
+          }));
+        }
+        if (String(url).indexOf('api.openai.com/v1/audio/speech') >= 0) {
           calls.openai++;                       // <- the number this file exists to hold down
           if (opts.onTtsFetch) opts.onTtsFetch();
           return response(200, 'fake-mp3-bytes');
@@ -256,13 +265,18 @@ section('T4 · CHAT_ENABLED=off stops the bill, not just the model');
 }
 
 // T5 ------------------------------------------------------------------------
-section('T5 · upstream failure: visitor is answered, nothing is bought');
+section('T5 · both chat providers fail: visitor is answered, no speech is bought');
 {
-  const r = makeRuntime({ props: Object.assign({}, HEALTHY), anthropicStatus: 500 });
+  const r = makeRuntime({
+    props: Object.assign({}, HEALTHY),
+    anthropicStatus: 500,
+    codexStatus: 500
+  });
   const broke = r.say({ vid: 's5', q: 'hello' });
   check('degraded=api-error', broke.degraded === 'api-error', JSON.stringify(broke).slice(0, 140));
   check('the page is NOT handed a blank reply', typeof broke.reply === 'string' && broke.reply.trim().length > 0);
   check('NO key minted', broke.ak === undefined);
+  check('the Codex fallback was attempted', r.calls.codex === 1, 'codex=' + r.calls.codex);
   check('zero paid renders', r.calls.openai === 0, 'openai=' + r.calls.openai);
 }
 
