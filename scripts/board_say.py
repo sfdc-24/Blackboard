@@ -33,20 +33,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlencode
 
+from bus import load_env as _load_bus_env
+
 REPO = Path(__file__).resolve().parents[1]
 TAG = "claude-code-cli"
 BOARD = "Blackboard - Alpha DB"
 
 
 def load_env() -> dict:
-    env = {}
-    for line in (REPO / ".env").read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
+    """Use the shared portable credential contract from bus.py."""
+    return _load_bus_env()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

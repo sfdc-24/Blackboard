@@ -20,16 +20,28 @@ ENV_PATH = os.environ.get("BLACKBOARD_ENV") or os.path.join(ROOT, ".env")
 
 
 def load_env(path=None):
-    """Read BUS_URL and BUS_SECRET from a gitignored .env (doctrine D-18).
+    """Read BUS_URL and BUS_SECRET without coupling callers to one machine.
 
-    Defaults to <repo root>/.env; override with the BLACKBOARD_ENV variable.
+    Process environment values win when both are present. This is the cloud
+    contract: a sandbox or secret broker can inject only the two bus values,
+    with no credential file copied into the checkout. Local installations keep
+    the existing gitignored-file contract: <repo root>/.env by default, or the
+    file named by BLACKBOARD_ENV.
     """
+    injected = {k: os.environ.get(k, "") for k in ("BUS_URL", "BUS_SECRET")}
+    if all(injected.values()):
+        return injected
+
     path = path or ENV_PATH
     if not os.path.exists(path):
+        partial = [k for k, v in injected.items() if v]
+        suffix = (" Process environment supplied only: %s." % ", ".join(partial)
+                  if partial else "")
         raise SystemExit(
             f"No .env at {path}.\n"
             "The bus credentials never live in the repository (doctrine D-18).\n"
-            "Create it with BUS_URL= and BUS_SECRET=, or point BLACKBOARD_ENV at one."
+            "Inject both BUS_URL and BUS_SECRET, create a gitignored file with "
+            "both values, or point BLACKBOARD_ENV at one." + suffix
         )
     env = {}
     with open(path, encoding="utf-8") as fh:
