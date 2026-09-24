@@ -24,8 +24,8 @@ sys.path.insert(0, str(CONTROLLER))
 from app.core import CommandError, StudioController, reduce_event  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
-from app.state import StateConflict, StudioRepository  # noqa: E402
-from app.tokens import verify_token  # noqa: E402
+from app.state import SessionNotFound, StateConflict, StudioRepository  # noqa: E402
+from app.tokens import mint_token, verify_token  # noqa: E402
 from app.workers.synthetic import SyntheticWorker  # noqa: E402
 from scripts.state_store import Conflict  # noqa: E402
 
@@ -691,6 +691,120 @@ class ApiTests(unittest.TestCase):
             second = client.post(url, headers=headers, json=command)
             self.assertEqual(200, first.status_code, first.text)
             self.assertEqual(first.json(), second.json())
+
+    def test_sse_missing_session_is_json_404_before_stream_headers(self):
+        app, configured = self.app()
+        token = mint_token("missing", 1600, configured.session_secret)
+        headers = {**self.origin, "Authorization": "Bearer " + token}
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get("/v1/session/missing/events", headers=headers)
+            self.assertEqual(404, response.status_code, response.text)
+            self.assertEqual({"detail": "session not found"}, response.json())
+            self.assertIn("application/json", response.headers["content-type"])
+            self.assertEqual("no-store", response.headers["cache-control"])
+            # Authentication/origin still precede any state disclosure.
+            self.assertEqual(401, client.get(
+                "/v1/session/missing/events", headers=self.origin).status_code)
+            self.assertEqual(403, client.get(
+                "/v1/session/missing/events", headers={**headers, "Origin": "https://evil.example"}
+            ).status_code)
+
+    def test_sse_repair_conflict_is_json_409_before_stream_headers(self):
+        app, configured = self.app()
+        token = mint_token("conflict", 1600, configured.session_secret)
+        with TestClient(app, raise_server_exceptions=False) as client, mock.patch.object(
+            app.state.controller, "events_after", side_effect=StateConflict("snapshot repair is busy; reconnect")
+        ) as read:
+            response = client.get("/v1/session/conflict/events", headers={
+                **self.origin, "Authorization": "Bearer " + token,
+            })
+            self.assertEqual(409, response.status_code, response.text)
+            self.assertIn("application/json", response.headers["content-type"])
+            self.assertEqual("no-store", response.headers["cache-control"])
+            self.assertEqual(1, read.call_count)
+
+    def test_sse_preflight_batch_is_reused_and_repair_generation_is_exposed(self):
+        app, _ = self.app()
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            with mock.patch.object(app.state.controller, "events_after", wraps=app.state.controller.events_after) as read:
+                response = client.get(created["events_url"], headers=headers, params={"once": "true"})
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(1, read.call_count, "preflight must not read/replay the initial batch twice")
+                self.assertEqual(1, response.text.count("id: 1\n"))
+                self.assertEqual("1", response.headers.get("x-studio-generation"))
+            repaired = client.get(created["events_url"], headers={**headers, "Last-Event-ID": "999"}, params={"once": "true"})
+            self.assertEqual(200, repaired.status_code, repaired.text)
+            self.assertEqual("2", repaired.headers.get("x-studio-generation"))
+            self.assertTrue(repaired.text.startswith("id: 1\nevent: artifact.snapshot\n"))
+            self.assertEqual(400, client.get(created["events_url"], headers={**headers, "Last-Event-ID": "not-an-integer"}).status_code)
+
+    def test_sse_midstream_state_failure_closes_without_forging_an_event(self):
+        for failure in (SessionNotFound("gone"), StateConflict("busy")):
+            with self.subTest(failure=type(failure).__name__):
+                app, _ = self.app(sse_wait_seconds=25, sse_poll_seconds=0)
+                with TestClient(app) as client:
+                    created = self.create_session(client)
+                    headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+                    initial = app.state.controller.events_after(created["session_id"], 0)
+                    with mock.patch.object(app.state.controller, "events_after", side_effect=[initial, failure]) as read:
+                        response = client.get(created["events_url"], headers=headers)
+                        self.assertEqual(200, response.status_code)
+                        self.assertEqual(2, read.call_count)
+                        frames = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                        self.assertEqual(initial[0], frames, "do not fabricate durable events or hide already-sent data")
+                    # The next connection can now receive a real HTTP refusal.
+                    with mock.patch.object(app.state.controller, "events_after", side_effect=failure):
+                        retry = client.get(created["events_url"], headers=headers)
+                        self.assertEqual(404 if isinstance(failure, SessionNotFound) else 409, retry.status_code)
+
+    def test_canonical_health_and_slash_variants_never_redirect_bearers(self):
+        app, _ = self.app()
+        # Emulate TLS termination: the application sees HTTP plus forwarded HTTPS.
+        with TestClient(app, base_url="http://service.example", follow_redirects=False) as client:
+            headers = {**self.origin, "X-Forwarded-Proto": "https", "Authorization": "Bearer synthetic-test-token"}
+            health = client.get("/health", headers=headers)
+            self.assertEqual(200, health.status_code)
+            self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file", "features": {"voice": False}}, health.json())
+            self.assertEqual(health.json(), client.get("/healthz").json())
+            for method, path in (("GET", "/health/"), ("GET", "/healthz/"),
+                                 ("POST", "/v1/auth/start/"), ("POST", "/v1/auth/verify/"),
+                                 ("POST", "/v1/session/"), ("POST", "/v1/session/test/commands/"),
+                                 ("POST", "/v1/session/test/voice/"), ("GET", "/v1/session/test/events/"),
+                                 ("POST", "/v1/maintenance/voice-sweep/")):
+                with self.subTest(path=path):
+                    response = client.request(method, path, headers=headers, json={"synthetic": "sensitive-body"})
+                    self.assertEqual(404, response.status_code)
+                    self.assertNotIn("location", response.headers)
+            self.assertEqual([], self.email_sender.calls)
+            self.assertEqual([], self.voice_client.calls)
+            self.assertEqual({}, self.store.data)
+
+    def test_refused_slash_preflight_and_health_do_not_sweep_due_voice(self):
+        app, _ = self.app(voice_enabled=True, openai_api_key="fake-provider-key", maintenance_secret="m" * 32)
+        state, _ = app.state.controller.create_session()
+        session_id = state["session_id"]
+        app.state.controller.begin_voice(session_id, "voice-test", 1000)
+        app.state.controller.activate_voice(session_id, "voice-test", "rtc_due_test")
+        StudioRepository(self.store).register_voice(session_id, 1000)
+        before = copy.deepcopy(self.store.data)
+        with TestClient(app, base_url="http://service.example", follow_redirects=False) as client:
+            for method, path in (("GET", "/health"), ("GET", "/healthz"),
+                                 ("POST", "/v1/session/"), ("OPTIONS", "/v1/auth/start/")):
+                with self.subTest(method=method, path=path):
+                    response = client.request(method, path, headers={
+                        **self.origin, "X-Forwarded-Proto": "https", "Access-Control-Request-Method": "POST",
+                    })
+                    self.assertEqual(200 if path in {"/health", "/healthz"} else 404, response.status_code)
+                    self.assertNotIn("location", response.headers)
+                    self.assertEqual([], self.voice_client.calls)
+                    self.assertEqual(before, self.store.data)
+            # The separately authenticated maintenance path still performs cleanup.
+            response = client.post("/v1/maintenance/voice-sweep", headers={"Authorization": "Bearer " + "m" * 32})
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(1, len(self.voice_client.calls))
+            self.assertEqual("ended", StudioRepository(self.store).load(session_id).state["voice_call"]["status"])
 
     def test_voice_relays_unified_sdp_and_keeps_standard_key_server_side(self):
         app, configured = self.app(
