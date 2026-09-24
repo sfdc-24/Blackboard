@@ -97,10 +97,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             await asyncio.to_thread(repository.unregister_voice, session_id)
             return True
         voice = state.get("voice_call") or {}
-        if voice.get("status") != "active" or not voice.get("call_id"):
-            if voice.get("status") in {"ended", "failed"} or not voice:
-                await asyncio.to_thread(repository.unregister_voice, session_id)
+        if voice.get("status") in {"ended", "failed"} or not voice:
+            await asyncio.to_thread(repository.unregister_voice, session_id)
             return True
+        if voice.get("status") != "active" or not voice.get("call_id"):
+            # Opening and ambiguous-provider reservations are deliberately kept
+            # pending. Without a provider call ID, the sweeper cannot prove the
+            # remote call never opened and must not report successful cleanup.
+            return False
         if (
             not force
             and not voice.get("close_requested")

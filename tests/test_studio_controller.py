@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import sys
 import threading
@@ -23,6 +25,7 @@ sys.path.insert(0, str(CONTROLLER))
 
 from app.core import CommandError, StudioController, reduce_event  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app import sweep_once  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from app.state import SessionNotFound, StateConflict, StudioRepository  # noqa: E402
 from app.tokens import mint_token, verify_token  # noqa: E402
@@ -973,6 +976,65 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(503, unavailable.status_code, unavailable.text)
             self.assertEqual(False, unavailable.json()["index_available"])
             self.assertEqual(0, unavailable.json()["completed"])
+
+    def test_maintenance_sweep_keeps_opening_and_unknown_reservations_pending(self):
+        endpoint = "/v1/maintenance/voice-sweep"
+        bearer = {"Authorization": "Bearer " + "m" * 32}
+
+        for voice_status in ("opening", "unknown"):
+            with self.subTest(voice_status=voice_status):
+                store = MemoryStore()
+                voice_client = FakeVoiceClient()
+                app = create_app(
+                    settings=settings(
+                        openai_api_key="server-key", voice_enabled=True,
+                        maintenance_secret="m" * 32,
+                    ),
+                    store=store,
+                    worker=CountingWorker(),
+                    clock=lambda: 1000,
+                    id_factory=IDs(),
+                    voice_client=voice_client,
+                    email_sender=EmailSender(),
+                )
+                state, _ = app.state.controller.create_session()
+                session_id = state["session_id"]
+                app.state.controller.begin_voice(session_id, "voice-pending", 1000)
+                if voice_status == "unknown":
+                    app.state.controller.mark_voice_unknown(session_id, "voice-pending")
+                StudioRepository(store).register_voice(session_id, 1000)
+
+                with TestClient(app) as client:
+                    response = client.post(endpoint, headers=bearer)
+                    self.assertEqual(503, response.status_code, response.text)
+                    self.assertEqual({
+                        "ok": False,
+                        "checked_at": 1000,
+                        "due": 1,
+                        "attempted": 1,
+                        "completed": 0,
+                        "pending": 1,
+                        "index_available": True,
+                    }, response.json())
+
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), self.assertRaisesRegex(
+                            RuntimeError, "HTTP 503"):
+                        sweep_once.run_once(
+                            url="https://controller.example.run.app" + endpoint,
+                            secret="m" * 32,
+                            post=lambda _url, **kwargs: client.post(
+                                endpoint, headers=kwargs["headers"]
+                            ),
+                        )
+                    self.assertEqual("", output.getvalue())
+
+                saved = StudioRepository(store).load(session_id).state
+                self.assertEqual(voice_status, saved["voice_call"]["status"])
+                self.assertIn(
+                    session_id, StudioRepository(store).due_voice_sessions(1000)
+                )
+                self.assertEqual([], voice_client.calls)
 
 
 
