@@ -281,8 +281,13 @@ doorbell, and one change at a time.
 ## Step 6: the first cloud write, and the 404 that proved the design
 
 **Cutover step 6**, *"Enable one allowlisted cloud acknowledgement with exact
-row-ID read-back."* `cloud/ack-once/` is the **only** cloud job permitted to
+row-ID read-back."* `cloud/ack-once/` was the **only** cloud job permitted to
 change the board.
+
+> **Retired 2026-09-24.** Its job was deleted and its code removed once the
+> cloud fleet was writing for real: `cloud/agent-waker` (gemini, claude-api)
+> and `cloud/wa-outbox`, started by `cloud/board-watcher`. The finding below -
+> a 404 POST whose row landed - still governs every one of them.
 
 ### What actually happened on its first real run
 

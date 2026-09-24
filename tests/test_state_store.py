@@ -81,7 +81,8 @@ class FakeGcs:
             return 200, json.dumps({"generation": str(self.next_generation)
                                     }).encode()
 
-        # GET: either ?alt=media for the body or metadata for the generation
+        # GET: metadata, or ?alt=media for the body. A generation= on the media
+        # read is that exact version, not whatever is current now.
         obj = urllib.parse.unquote(parsed.path.rsplit("/o/", 1)[-1])
         if obj not in self.objects:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
@@ -230,6 +231,34 @@ class TwoWritersRaceForOneCursor(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.a.save("w", {"x": 3}, stale)
 
+    def test_a_write_between_the_two_reads_cannot_pair_old_bytes_with_the_new_generation(self):
+        """The damaging path: load's two GETs straddle another writer's save.
+
+        Bytes from the old generation plus the new generation as the token lets
+        the stale writer save successfully and erase the update it never read.
+        """
+        self.a.save("w", {"v": 1}, None)
+        real = self.fake.request
+        fired = {"done": False}
+
+        def request(url, method="GET", body=None, ctype=None):
+            status, payload = real(url, method=method, body=body, ctype=ctype)
+            if method == "GET" and not fired["done"]:
+                fired["done"] = True
+                _, token = self.b.load("w")
+                self.b.save("w", {"v": 2}, token)
+            return status, payload
+
+        self.a._request = request
+        state, token = self.a.load("w")
+        self.assertEqual(state, {"v": 1},
+                         "the load observed the pre-write bytes")
+        with self.assertRaises(Conflict):
+            self.a.save("w", state, token)
+        live, _ = self.b.load("w")
+        self.assertEqual(live, {"v": 2},
+                         "the stale load's token was accepted and erased the other writer")
+
 
 class AdvanceNeverGoesBackwards(unittest.TestCase):
     def setUp(self):
@@ -319,11 +348,14 @@ class TheFileBackendIsTheLaptopPath(unittest.TestCase):
         self.assertIsNotNone(token)
 
     def test_a_stale_token_is_refused(self):
+        # Different sizes, not just different digits. The token is mtime plus
+        # size, and a clock that does not tick between three same-sized writes
+        # would hand the stale writer a token that still matches.
         self.store.save("w", {"x": 1}, None)
         _, stale = self.store.load("w")
-        self.store.save("w", {"x": 2}, stale)
+        self.store.save("w", {"x": 22}, stale)
         with self.assertRaises(Conflict):
-            self.store.save("w", {"x": 3}, stale)
+            self.store.save("w", {"x": 333}, stale)
 
     def test_advance_works_the_same_way_on_a_file(self):
         self.assertTrue(advance(self.store, "w", "watermark", TS_NEW)["changed"])

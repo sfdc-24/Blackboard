@@ -66,7 +66,9 @@ on:
       - "tests/test_board_probe_readonly.py"
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
-      - "tests/test_ack_once.py"
+      - "tests/test_board_watcher.py"
+      - "tests/test_wa_outbox_cloud.py"
+      - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
       - "tests/test_studio_auth.py"
@@ -78,7 +80,11 @@ on:
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
-      - "cloud/ack-once/main.py"
+      - "cloud/board-watcher/main.py"
+      - "cloud/wa-outbox/main.py"
+      - "cloud/agent-waker/main.py"
+      - "scripts/wa_board_outbox.py"
+      - "scripts/agent_waker.py"
       - "cloud/waker-shadow/main.py"
       - "scripts/state_store.py"
       - "cloud/board-probe/main.py"
@@ -135,7 +141,9 @@ on:
       - "tests/test_board_probe_readonly.py"
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
-      - "tests/test_ack_once.py"
+      - "tests/test_board_watcher.py"
+      - "tests/test_wa_outbox_cloud.py"
+      - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
       - "tests/test_studio_auth.py"
@@ -147,7 +155,11 @@ on:
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
-      - "cloud/ack-once/main.py"
+      - "cloud/board-watcher/main.py"
+      - "cloud/wa-outbox/main.py"
+      - "cloud/agent-waker/main.py"
+      - "scripts/wa_board_outbox.py"
+      - "scripts/agent_waker.py"
       - "cloud/waker-shadow/main.py"
       - "scripts/state_store.py"
       - "cloud/board-probe/main.py"
@@ -205,7 +217,9 @@ jobs:
                    tests/test_board_probe_readonly.py \
                    tests/test_state_store.py \
                    tests/test_waker_shadow.py \
-                   tests/test_ack_once.py \
+                   tests/test_board_watcher.py \
+                   tests/test_wa_outbox_cloud.py \
+                   tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
                    tests/test_studio_controller.py \
                    tests/test_studio_auth.py \
@@ -539,26 +553,37 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
-      # THE ONE CLOUD JOB THAT MAY WRITE TO THE BOARD. Everything else in
-      # cloud/ is read-only, so this suite carries the weight.
-      #
-      # Its most important test is a regression for something that HAPPENED. On
-      # the job's first real run the gateway returned HTTP 404 and the row LANDED
-      # anyway - the readback found exactly one matching row. A job that trusted
-      # the POST status would have called that a failure and resent it, and on an
-      # append-only board that is how one GROK-ZOOM-HYPERSONIC-001 became four.
-      # So: an unreadable board must never read as a missing row.
-      #
-      # Also pinned, and honestly: an AST append-count cannot see a loop around
-      # one call site. That limit is written into the test rather than papered
-      # over, because what actually bounds repeat writes is the durable
-      # idempotency record, which has its own class here.
-      - name: the one cloud writer, bounded and idempotent (no network)
+      # The cloud fleet since 2026-09-24: one board watcher starting agent and
+      # outbox jobs. What these pin is what would land on Mr Salam's phone or
+      # the board twice: a killed run resending, two ticks starting one job,
+      # a routing error read as "not for me". ack-once, the one-shot first
+      # cloud write, was retired the same day and its suite with it.
+      - name: "board watcher: one tick, no dropped or doubled ring (no network)"
         run: |
           set -euo pipefail
-          if [ -f tests/test_ack_once.py ]; then
+          if [ -f tests/test_board_watcher.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" tests/test_ack_once.py
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_board_watcher
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "cloud WhatsApp outbox: never twice, never to anyone else (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_wa_outbox_cloud.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_wa_outbox_cloud
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "cloud agent waker: durable cursor, no double answer (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_gemini_cloud_waker.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_gemini_cloud_waker
           else
             echo "not on this branch; skipping"
           fi
@@ -677,7 +702,9 @@ jobs:
              && [ ! -f tests/test_board_probe_readonly.py ] \
              && [ ! -f tests/test_state_store.py ] \
              && [ ! -f tests/test_waker_shadow.py ] \
-             && [ ! -f tests/test_ack_once.py ] \
+             && [ ! -f tests/test_board_watcher.py ] \
+             && [ ! -f tests/test_wa_outbox_cloud.py ] \
+             && [ ! -f tests/test_gemini_cloud_waker.py ] \
              && [ ! -f tests/test_soak_report.py ] \
              && [ ! -f tests/test_studio_controller.py ] \
              && [ ! -f tests/test_studio_auth.py ] \

@@ -156,6 +156,11 @@ class GcsStore:
             return r.status, r.read()
 
     def load(self, name: str):
+        # Metadata first, then the bytes of THAT generation. The other order
+        # is two requests against a moving object: the body can be the old
+        # version while the generation token is already the new one, and the
+        # next save is then told it holds the current token and silently
+        # erases the writer it never read.
         obj = urllib.parse.quote(self._object(name), safe="")
         meta_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
                     % (self.bucket, obj))
