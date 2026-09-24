@@ -225,6 +225,59 @@ writing the same value again.
 The bucket has uniform access, public access prevention **enforced**, and
 versioning on, so a bad cursor write is recoverable.
 
+## Shadow mode: the cloud decides, and cannot act
+
+**Cutover step 5**, *"Run cloud and laptop in shadow mode with cloud writes
+disabled."* `cloud/waker-shadow/` runs the **live** waker's decision logic -
+`board_waker.check_board` and `check_whatsapp`, the same file the laptop runs -
+and compares verdicts.
+
+### Writes are disabled by absence of capability, not by a flag
+
+A flag is a promise. The job is deployed with **only** `BUS_URL` and `BUS_SECRET`:
+
+- no `META_TOKEN`, so it **cannot** send Mr Salam a WhatsApp message
+- no `GH_TOKEN`, so it **cannot** touch a repository
+
+On top of that an AST guard refuses to run if the module names any waker write
+path, against an **allowlist of two** - so a new writer added to `board_waker`
+tomorrow fails the guard without anyone maintaining a denylist. The verdict output
+records `can_send_whatsapp` and `can_reach_github` so a deploy that accidentally
+injected a token would show up in the result rather than being invisible.
+
+### Agreement, three runs each side, same cursor
+
+| | board | whatsapp | combined | would_exit | fresh |
+|---|---|---|---|---|---|
+| laptop ×3 | NEWS | QUIET | NEWS | 10 | 13 / 0 |
+| cloud ×3 | NEWS | QUIET | NEWS | 10 | 13 / 0 |
+
+Identical on every field, including the row count. Both sides take their cursor
+from `SHADOW_SINCE` — run with different cursors, two verdicts differ for a reason
+that has nothing to do with where they ran.
+
+The shadow keeps its **own** cursor, never the live waker's; writing the document
+the doorbell depends on would make it a second writer to it. Three containers
+appended to it under compare-and-swap:
+
+```
+gs://sfdc24-fleet-state/wakers/waker_shadow.json   3 generations
+  runs: [00:00:34 NEWS exit=10, 00:02:33 NEWS exit=10, 00:04:08 NEWS exit=10]
+```
+
+### One finding, and it is smaller than it first looked
+
+The shadow's first local run returned `UNKNOWN — board read failed (HTTP 404)`.
+`check_board` reads through `board_say.bus_get`, which does **not** retry the
+documented redirect flap, and the launcher aborts on any exit code but 0 or 10 —
+so that read failing means a tick where no model starts.
+
+**Measured before drawing a conclusion: 10 of 10 subsequent reads succeeded.** So
+that 404 was a one-off, not the common case, and adding retry to `check_board`
+would be hardening rather than a fix. Latency varied 3–47s across the ten, which
+is worth knowing separately. Not changed here: `bus_get` is shared with the live
+doorbell, and one change at a time.
+
 ### What this does and does not replace
 
 It replaces Task Scheduler **for this lane**. The probe is read-only and
