@@ -207,6 +207,11 @@ def validate_record(record):
     if not isinstance(audit, list) or not isinstance(commands, dict) or len(audit) != record["revision"] + 1 or len(commands) != len(audit):
         raise InvalidOperation("invalid bounded operation history")
     previous, stamp = None, record["plan"]["prepared_at"]
+    milestones = {"confirmed_at": [], "attempt_reserved_at": [], "dispatch_accepted_at": []}
+    milestone_edges = {("prepared", "confirmed"): "confirmed_at",
+                       ("confirmed", "executing"): "attempt_reserved_at",
+                       ("executing", "verify_pending"): "dispatch_accepted_at"}
+    preflight_commits = []
     for revision, event in enumerate(audit):
         _closed(event, {"revision", "from", "to", "at", "command_id"})
         _id(event["command_id"])
@@ -215,6 +220,15 @@ def validate_record(record):
         if (revision == 0 and event["to"] != "prepared") or (revision and event["to"] not in EDGES.get(previous, set())):
             raise InvalidOperation("illegal durable transition")
         _integer(event["at"], stamp, record["updated_at"])
+        if revision == 0 and event["at"] != record["plan"]["prepared_at"]:
+            raise InvalidOperation("preparation timestamp does not match committed history")
+        edge = (event["from"], event["to"])
+        milestone = milestone_edges.get(edge)
+        if milestone:
+            milestones[milestone].append(event["at"])
+        if edge == ("confirmed", "confirmed") or (
+                edge == ("confirmed", "failed") and record["reason"] == "preexisting_target"):
+            preflight_commits.append(event["at"])
         previous, stamp = event["to"], event["at"]
         entry = commands.get(event["command_id"])
         _closed(entry, {"fingerprint", "revision", "receipt"})
@@ -229,6 +243,23 @@ def validate_record(record):
             raise InvalidOperation("receipt is not bound to its transition")
     if previous != record["state"] or stamp != record["updated_at"] or commands[audit[-1]["command_id"]]["receipt"] != _receipt(record):
         raise InvalidOperation("state does not match committed history")
+    # A scalar in a plausible time range is not evidence that its transition
+    # happened then. Derive lifecycle markers from the committed audit path.
+    for milestone, timestamps in milestones.items():
+        if len(timestamps) > 1 or record[milestone] != (timestamps[0] if timestamps else None):
+            raise InvalidOperation("lifecycle timestamp does not match committed transition")
+    if record["provider_attempts"] != len(milestones["attempt_reserved_at"]):
+        raise InvalidOperation("attempt count does not match committed transition")
+    if record["preflight"] is None:
+        if preflight_commits:
+            raise InvalidOperation("committed preflight evidence is missing")
+    else:
+        if len(preflight_commits) != 1:
+            raise InvalidOperation("preflight requires exactly one matching committed transition")
+        _preflight(record["preflight"], record, preflight_commits[0])
+    if (record["reason"] == "verification_mismatch" and not milestones["dispatch_accepted_at"]
+            or record["reason"] == "ambiguous_dispatch" and milestones["dispatch_accepted_at"]):
+        raise InvalidOperation("outcome reason does not match dispatch acknowledgement history")
 
 
 def validate_ledger(document):
@@ -255,6 +286,8 @@ def validate_ledger(document):
             targets[target] = operation_id
     if type(document["targets"]) is not dict or document["targets"] != targets:
         raise InvalidOperation("missing or invalid atomic target holds")
+    if document["revision"] != sum(len(record["audit"]) for record in operations.values()):
+        raise InvalidOperation("ledger revision does not match retained committed history")
 
 
 class MetadataOperationLedger:

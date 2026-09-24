@@ -97,6 +97,12 @@ The private bounded audit records legal transitions and command fingerprints.
 Same command/payload replays its historical receipt; changed payload conflicts.
 Audit/hold inconsistencies and expanded/corrupt durable schemas fail closed.
 CAS/save errors are redacted and never produce a dispatch grant.
+Lifecycle timestamps and the provider-attempt count must exactly match their
+unique committed audit transitions, not merely plausible time ranges. Preflight
+observations cannot postdate their specific preflight commit. The ledger revision
+equals the total retained audit-event count across all operations. No pruning is
+supported; inconsistent counters are rejected. The full-store backup rollback
+limitation above still applies.
 
 ## Offline validation and remaining activation requirements
 

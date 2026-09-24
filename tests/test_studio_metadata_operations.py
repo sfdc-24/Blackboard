@@ -108,6 +108,119 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(InvalidOperation):
             MetadataOperationLedger(object(), conflict_type=Conflict)
 
+    def test_lifecycle_timestamp_drift_rejected_against_matching_audit(self):
+        self.accepted()
+        for key, drifted in (("confirmed_at", 100), ("attempt_reserved_at", 102), ("dispatch_accepted_at", 103)):
+            with self.subTest(key=key):
+                bad = copy.deepcopy(self.document())
+                bad["operations"]["op_1"][key] = drifted
+                with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+                    validate_ledger(bad)
+
+    def test_missing_or_fabricated_confirmation_after_abort_rejected(self):
+        self.confirmed()
+        self.apply("abort", {"reason": "cancelled_before_dispatch"})
+        validate_ledger(self.document())
+        for stamp in (None, 100, 102):
+            bad = copy.deepcopy(self.document())
+            bad["operations"]["op_1"]["confirmed_at"] = stamp
+            with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+                validate_ledger(bad)
+        self.setUp()
+        self.apply("abort", {"reason": "cancelled_before_dispatch"})
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["confirmed_at"] = 100
+        with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+            validate_ledger(bad)
+
+    def test_unknown_requires_ack_presence_to_match_audited_path(self):
+        self.accepted()
+        self.apply("unknown", {"reason": "interrupted"})
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["dispatch_accepted_at"] = None
+        with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+            validate_ledger(bad)
+        self.setUp()
+        self.executing()
+        self.apply("unknown", {"reason": "interrupted"})
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["dispatch_accepted_at"] = 103
+        with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+            validate_ledger(bad)
+
+    def test_unknown_reason_cannot_fabricate_verification_or_ambiguous_ack(self):
+        for accepted, reason in ((False, "verification_mismatch"), (True, "ambiguous_dispatch")):
+            with self.subTest(accepted=accepted, reason=reason):
+                self.setUp()
+                self.accepted() if accepted else self.executing()
+                self.apply("unknown", {"reason": "interrupted"})
+                bad = copy.deepcopy(self.document())
+                bad["operations"]["op_1"]["reason"] = reason
+                with self.assertRaisesRegex(InvalidOperation, "acknowledgement history"):
+                    validate_ledger(bad)
+
+    def test_preflight_observation_cannot_postdate_its_commit(self):
+        self.accepted()
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["preflight"]["observed_at"] = 103
+        with self.assertRaises(InvalidOperation): validate_ledger(bad)
+        # Missing evidence for the confirmed->confirmed transition also fails,
+        # even before a provider attempt can make it otherwise mandatory.
+        self.setUp()
+        self.ready()
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["preflight"] = None
+        with self.assertRaisesRegex(InvalidOperation, "preflight evidence is missing"):
+            validate_ledger(bad)
+
+    def test_fabricated_preflight_and_erased_provider_attempt_are_rejected(self):
+        self.confirmed()
+        self.apply("abort", {"reason": "cancelled_before_dispatch"})
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["preflight"] = {**self.preflight(), "observed_at": 101}
+        with self.assertRaisesRegex(InvalidOperation, "matching committed transition"):
+            validate_ledger(bad)
+        self.setUp()
+        self.executing()
+        self.apply("dispatch_result", {"outcome": "rejected_no_change", "definitive_no_change": True})
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"].update(provider_attempts=0, attempt_reserved_at=None,
+                                           reason="precondition_rejected")
+        with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+            validate_ledger(bad)
+
+    def test_existing_preflight_is_bound_to_failed_commit(self):
+        self.confirmed()
+        self.apply("preflight", {"observation": self.preflight(True)})
+        validate_ledger(self.document())
+        bad = copy.deepcopy(self.document())
+        bad["operations"]["op_1"]["preflight"]["observed_at"] += 1
+        with self.assertRaises(InvalidOperation): validate_ledger(bad)
+
+    def test_ledger_revision_matches_all_retained_operations(self):
+        self.apply("abort", {"reason": "cancelled_before_dispatch"})
+        self.ledger.prepare("op_2", "prepare2", self.spec)
+        validate_ledger(self.document())
+        self.assertEqual(self.document()["revision"], 3)
+        for revision in (0, 2, 4):
+            bad = copy.deepcopy(self.document())
+            bad["revision"] = revision
+            with self.assertRaisesRegex(InvalidOperation, "retained committed history"):
+                validate_ledger(bad)
+
+    def test_corrupted_ack_cannot_verify_before_actual_audited_acceptance(self):
+        self.accepted()
+        record = self.document()["operations"]["op_1"]
+        self.assertEqual(record["dispatch_accepted_at"], 104)
+        record["dispatch_accepted_at"] = 103
+        observation = self.observation()
+        observation["observed_at"] = 103
+        with patch.object(self.store, "save", wraps=self.store.save) as save:
+            with self.assertRaisesRegex(InvalidOperation, "committed transition"):
+                self.apply("verify", {"observation": observation})
+            save.assert_not_called()
+        self.assertEqual(record["state"], "verify_pending")
+
     def test_strict_field_binding_and_expanded_inputs_rejected(self):
         for delta in ({"parent": "Account"}, {"name": "Interest__c"}, {"length": True},
                       {"type": "LongTextArea"}, {"required": True}, {"label": "<bad>"}):
