@@ -60,8 +60,9 @@ class Routing(unittest.TestCase):
         r = row("R3", "2026-09-24T03:50:00Z", source="gemini", target="gemini")
         self.assertEqual(w.plan([r], set(), self.routes)[0], {})
 
-    def test_foundry_and_the_claude_standby_are_routed(self):
-        self.assertIn("foundry-waker", w.plan([row("F1", "2026-09-24T03:50:00Z", target="foundry")], set(), self.routes)[0])
+    def test_the_claude_standby_is_routed_and_foundry_is_gone(self):
+        self.assertNotIn("foundry-waker", self.routes)
+        self.assertEqual(w.plan([row("F1", "2026-09-24T03:50:00Z", target="foundry")], set(), self.routes)[0], {})
         his = row("W1", "2026-09-24T03:50:00Z", source="whatsapp", target="Blackboard Alpha DB",
                   payload="claude-code-cli can you check the soak")
         self.assertIn("claude-api-waker", w.plan([his], set(), self.routes)[0])
@@ -76,8 +77,7 @@ class Routing(unittest.TestCase):
         # Mr Salam: grok "should be welcome and allowed everywhere ... create
         # tasks, approach and talk to everyone else". Not woken for routine
         # work, but what it writes is served like anyone's.
-        for tag, job in (("gemini", "gemini-waker"), ("foundry", "foundry-waker"),
-                         ("claude-api", "claude-api-waker")):
+        for tag, job in (("gemini", "gemini-waker"), ("claude-api", "claude-api-waker")):
             for src in ("grok", "grok-bot"):
                 r = row("G-%s-%s" % (src, tag), "2026-09-24T03:50:00Z", source=src, target=tag,
                         payload="BCB|v=1|id=GROK-TASK-1|phase=DISPATCH|from=%s|to=%s" % (src, tag))

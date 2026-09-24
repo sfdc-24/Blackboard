@@ -3,7 +3,7 @@ r"""An API agent's doorbell, in the cloud. One image; AGENT picks the agent.
 
 Began as Gemini's alone. Mr Salam, 2026-09-24: "add foundry, grok and claude to
 the watcher" - so the image carries every adapter agent_waker knows, and each
-Cloud Run job (gemini-waker, foundry-waker, claude-api-waker) sets
+Cloud Run job (gemini-waker, claude-api-waker) sets
 AGENT and holds only that agent's credential. The rest of this note was written
 for gemini and holds for all three: each has its own cursor, <agent>_waker.
 
@@ -59,7 +59,8 @@ import state_store  # noqa: E402
 # grok is deliberately absent. Mr Salam, 2026-09-24: it is out of usage
 # allowance and reserved for his exclusive use, "not for typical work;
 # everyone else should be servicing that".
-AGENTS = ("gemini", "foundry", "claude-api")
+# foundry dropped by Mr Salam the same day; see cloud/board-watcher/main.py.
+AGENTS = ("gemini", "claude-api")
 AGENT = (os.environ.get("AGENT") or "gemini").strip()
 CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 

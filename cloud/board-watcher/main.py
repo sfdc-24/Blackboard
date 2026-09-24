@@ -66,13 +66,14 @@ def _routes():
                     and not aw.is_waker_reply(row) and aw.addressed_to(row, tag))
         return pred
 
+    # foundry was DROPPED the same day: "it never added real value and right
+    # now we don't have time to spoonfeed it" - and its Azure resource is gone.
     # grok is deliberately NOT routed. Mr Salam, 2026-09-24: out of usage
     # allowance, reserved for his exclusive use, "not for typical work".
     # claude-api is the standby that also answers his WhatsApp rows addressed
     # to claude-code-cli - agent_waker.addressed_to carries that rule.
     return {
         "gemini-waker": for_agent("gemini"),
-        "foundry-waker": for_agent("foundry"),
         "claude-api-waker": for_agent("claude-api"),
         "wa-outbox": lambda row: ob.parse_wa_request(row) is not None,
     }

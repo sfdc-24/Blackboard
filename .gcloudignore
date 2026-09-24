@@ -34,7 +34,6 @@
 !/scripts/wa_notify.py
 !/scripts/agent_waker.py
 !/scripts/gemini_agent.py
-!/scripts/foundry_agent.py
 !/scripts/claude_agent.py
 !/scripts/fleet_agent.py
 
