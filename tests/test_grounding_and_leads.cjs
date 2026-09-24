@@ -264,3 +264,23 @@ test('the grounding rule never lets an omitted system field read as absent', () 
   assert.doesNotMatch(prompt, /is not a standard field/);
   assert.match(prompt, /cannot confirm it from here - never that it does not exist/);
 });
+
+// 2026-09-24: first-tier admin tasks. Live answers missed Data Loader on
+// "extract all records", invented "150 million records per object", and led
+// with an older route on email import.
+test('both providers get the first-tier admin reference and the numbers rule', () => {
+  const { ctx } = load();
+  for (const who of ['claude', 'codex']) {
+    const prompt = ctx.SYSTEM_PROMPT_(who);
+    assert.match(prompt, /ADMIN TASK REFERENCE/, who);
+    assert.match(prompt, /Salesforce Files[\s\S]*Upload Files/, who);
+    assert.match(prompt, /exactly one profile[\s\S]*permission sets/, who);
+    assert.match(prompt, /Data Export service[\s\S]*Data Loader's Export[\s\S]*Export All/, who);
+    assert.match(prompt, /Outlook integration[\s\S]*Gmail integration[\s\S]*Einstein Activity Capture[\s\S]*Email to Salesforce/, who);
+    assert.match(prompt, /NUMBERS ARE FACTS TOO/, who);
+    assert.ok(prompt.indexOf('ADMIN TASK REFERENCE') < prompt.indexOf('OBJECT REFERENCE -'),
+      'the task reference comes before the long object reference');
+    assert.doesNotMatch(prompt, /150 million/, who);
+  }
+});
+
