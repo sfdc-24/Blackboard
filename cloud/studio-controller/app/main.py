@@ -75,6 +75,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         repository, selected_worker, clock=clock, id_factory=id_factory,
         max_seconds=settings.max_session_seconds, daily_cap=settings.daily_session_cap,
         max_events=settings.max_events, max_commands=settings.max_commands,
+        metadata_proposals_enabled=settings.metadata_proposals_enabled,
+        metadata_org_id=settings.salesforce_org_id,
     )
 
     def voice_config() -> dict:

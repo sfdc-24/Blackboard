@@ -190,3 +190,64 @@ accumulating. It does not guarantee non-overlap. See
 3. Realtime voice only after the provider and scheduled cleanup acceptance pass.
 4. Claude worker and external connectors are enabled independently; none is a
    prerequisite for an earlier safe release.
+
+## Metadata proposal contract (offline-only increment)
+
+`STUDIO_ENABLE_METADATA_PROPOSALS` defaults to `false`. Enabling it requires an
+exact 18-character `STUDIO_SALESFORCE_ORG_ID` configuration binding but **does not
+contact Salesforce, verify org identity, read provider credentials, or enable any
+write capability**. Existing prototype/Lead routes remain unchanged when off.
+
+An authenticated Studio session can propose exactly one optional, nonunique,
+non-external-ID `Text` field on `Lead`. The natural-language grammar is deliberately
+narrow: `Plan a new field on Lead for prototype interest` creates the local draft
+`Lead.Prototype_Interest__c`, label `Prototype Interest`, length 80. Unsupported
+recognized metadata requests receive local guidance without invoking the model.
+Other utterances retain the existing worker route. This is not general semantic
+metadata intent detection. A typed `metadata.propose` command uses the existing
+command envelope plus the closed `field` object:
+
+```json
+{"parent":"Lead","name":"Prototype_Interest","label":"Prototype Interest","type":"Text","length":80,"required":false,"unique":false,"external_id":false}
+```
+
+Names are suffix-free ASCII stems, 1–32 characters, starting with a letter, with
+no doubled/trailing underscores. Labels are 1–40 trimmed printable characters
+without markup; Text length is an integer 1–255. These are application policy
+limits, not a claim to cover every Salesforce type/limit. Unknown keys and all
+other objects/types/actions are rejected by the typed contract.
+
+The controller commits a normal `confirm` event with **only** the existing Stage A
+`text`/`artifact_ids` payload and a plain-language notice. The typed
+`metadata_proposal` is a separate top-level **command response** field, not an SSE
+event/payload extension. It does not modify the artifact/version or design
+questions. The model cannot supply this reserved contract. The current proposal is
+bound to its operator, session, configured org, policy, revision, exact field data,
+expiry and nonce through its SHA-256 digest; it expires at the earlier of ten
+minutes or session expiry. A new proposal supersedes the previous one. Command
+replay restores the typed response; SSE repair remains unchanged. The target says
+its identity has not been checked and exposes neither org ID nor fingerprint.
+This is backend-contract-only: no dedicated frontend proposal card is included.
+The new typed commands are not part of the served Stage A command schema; keep
+this feature off until a coordinated frontend contract/UI increment is reviewed.
+
+`metadata.confirm_contract` takes only the ordinary command envelope and
+`confirmation` containing `plan_id`, `plan_revision`, `plan_hash` and
+`confirmation_nonce` from that payload. It rejects altered, expired, superseded,
+cross-bound or already-consumed proposals. It does not accept voice/answer-source
+fields. Natural language never consumes confirmation. A successful receipt says
+`contract_validated_not_executed` and `execution_available:false`. Existing command
+fingerprints/CAS and utterance item IDs make retries replay without generating
+another proposal or consuming confirmation twice, including across restart.
+
+**This receipt is not authorization for a future executor.** A later write slice
+must issue a new policy/plan and fresh explicit confirmation. There is no operation
+ledger, provider, org permission proof, quota for writes, deployment, deletion,
+rollback, or reconciliation in this increment. Do not label it a live metadata
+demo or silently attach an executor to this confirmation command. The current
+MCP inspection plan's HOLD is unchanged.
+
+Offline regression: `python -m unittest discover -s tests -p test_studio_metadata_contract.py`.
+Set `STUDIO_SITE_EVENT_SCHEMA` to a read-only site checkout's
+`studio/contract/events.schema.json` to also check the emitted envelope/confirm
+constraints against that file (otherwise that optional compatibility test skips).

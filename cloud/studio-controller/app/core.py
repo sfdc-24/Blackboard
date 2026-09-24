@@ -11,6 +11,7 @@ import uuid
 
 from .state import StateConflict, StudioRepository
 from .artifacts import apply_ops
+from . import metadata_contract as metadata
 
 
 class CommandError(ValueError):
@@ -126,7 +127,8 @@ class StudioController:
     def __init__(self, repository: StudioRepository, worker, *, clock=time.time,
                  id_factory=None, max_seconds: int = 600, daily_cap: int = 20,
                  max_events: int = 200, max_commands: int = 100,
-                 inflight_lease_seconds: int = 90):
+                 inflight_lease_seconds: int = 90, metadata_proposals_enabled: bool = False,
+                 metadata_org_id: str = ""):
         self.repository = repository
         self.worker = worker
         self.clock = clock
@@ -136,6 +138,8 @@ class StudioController:
         self.max_events = max_events
         self.max_commands = max_commands
         self.inflight_lease_seconds = inflight_lease_seconds
+        self.metadata_proposals_enabled = metadata_proposals_enabled
+        self.metadata_org_id = metadata_org_id
 
     def _event(self, state: dict, event_type: str, payload: dict, *,
                turn_id: str | None = None, task_revision: int | None = None,
@@ -241,6 +245,16 @@ class StudioController:
             "answers", "batch_id", "question_id", "option_id", "freeform_answer",
             "answer_source", "transcript", "item_id",
         }
+        metadata_kind = command.get("type") in {"metadata.propose", "metadata.confirm_contract"}
+        if metadata_kind:
+            if not self.metadata_proposals_enabled:
+                raise CommandError("metadata proposals are disabled", 403)
+            if not state.get("operator_subject"):
+                raise CommandError("metadata proposals require an authenticated operator", 403)
+            extra = "field" if command["type"] == "metadata.propose" else "confirmation"
+            if set(command) != required | {extra}:
+                raise CommandError("metadata command requires exactly its contract fields")
+            allowed = required | {extra}
         if set(command) - allowed:
             raise CommandError("command has unknown fields: " + ", ".join(sorted(set(command) - allowed)))
         if not all(ID_RE.fullmatch(str(command.get(key) or "")) for key in ("command_id", "session_id")):
@@ -249,12 +263,25 @@ class StudioController:
             raise CommandError("session_id mismatch", 403)
         if command["type"] not in {
             "answer", "answer_batch", "change_decision", "decide_later", "pause",
-            "resume", "stop", "utterance",
+            "resume", "stop", "utterance", "metadata.propose", "metadata.confirm_contract",
         }:
             raise CommandError("unknown command type")
         if not isinstance(command["expected_version"], int) or isinstance(command["expected_version"], bool):
             raise CommandError("expected_version must be an integer")
         kind = command["type"]
+        if metadata_kind:
+            try:
+                if kind == "metadata.propose":
+                    metadata.validate_field(command["field"])
+                else:
+                    metadata.validate_confirmation(command["confirmation"])
+                    if stateful:
+                        metadata.check_confirmation(
+                            state.get("metadata_proposal"), command["confirmation"],
+                            session_id=state["session_id"], subject=state["operator_subject"],
+                            org_id=self.metadata_org_id, now=int(self.clock()))
+            except metadata.MetadataContractError as exc:
+                raise CommandError(str(exc)) from exc
         if command.get("answer_source") not in {None, "tap", "voice", "typed"}:
             raise CommandError("answer_source is not allowed")
         if kind == "answer":
@@ -576,6 +603,25 @@ class StudioController:
         voice.update({"status": "ended", "ended_at": int(self.clock()), "end_reason": reason})
         self.repository.save(session_id, state, record.token)
 
+    def _metadata_proposal_event(self, state: dict, field: dict) -> dict:
+        previous = state.get("metadata_proposal") or {}
+        revision = (previous.get("binding") or {}).get("revision", 0) + 1
+        plan = metadata.make_plan(
+            field, session_id=state["session_id"], subject=state["operator_subject"],
+            org_id=self.metadata_org_id, plan_id=self.id_factory("plan"),
+            nonce=self.id_factory("confirmation"), revision=revision,
+            now=int(self.clock()), expires_at=state["expires_at"])
+        # Only the current proposal can be confirmed; a revision replaces it.
+        # This is deliberately not a durable write-operation ledger.
+        state["metadata_proposal"] = plan
+        public = metadata.public_plan(plan)
+        return self._event(state, "confirm", {
+            "artifact_ids": [state["artifact"]["id"]],
+            "text": ("Proposed " + public["full_name"] + " (label: " + field["label"]
+                     + ", Text, length " + str(field["length"]) + ", optional, not unique, not an external ID). "
+                     "Page layouts and field permissions are not included. " + metadata.NOTICE),
+        })
+
     def _run_reserved(self, state: dict, command: dict) -> dict:
         kind = command["type"]
         state["turn_seq"] += 1
@@ -583,8 +629,25 @@ class StudioController:
         events: list[dict] = []
         trigger = None
         answered_questions: list[dict] = []
+        proposal_result = None
 
-        if kind == "answer":
+        if kind == "metadata.propose":
+            events.append(self._metadata_proposal_event(state, command["field"]))
+            proposal_result = metadata.public_plan(state["metadata_proposal"])
+        elif kind == "metadata.confirm_contract":
+            plan = state["metadata_proposal"]
+            # Validate again at consumption. The session reservation/CAS commit
+            # binds this receipt, but it is never transferable to an executor.
+            metadata.check_confirmation(
+                plan, command["confirmation"], session_id=state["session_id"],
+                subject=state["operator_subject"], org_id=self.metadata_org_id, now=int(self.clock()))
+            plan["status"] = "contract_validated_not_executed"
+            events.append(self._event(state, "confirm", {
+                "artifact_ids": [state["artifact"]["id"]],
+                "text": "Confirmation contract validated. " + metadata.NOTICE,
+            }))
+            proposal_result = metadata.public_plan(plan)
+        elif kind == "answer":
             question = _find_question(state, command.get("question_id", ""))
             before = state["artifact_version"]
             answered = _answer(question, command, before)
@@ -632,6 +695,21 @@ class StudioController:
             state["voice_item_ids"] = state["voice_item_ids"][-self.max_commands:]
             state["transcript"].append({"role": "visitor", "text": transcript})
             trigger = {"kind": "utterance", "text": transcript, "item_id": item_id}
+            if self.metadata_proposals_enabled and metadata.is_metadata_request(transcript):
+                # Routing and plan construction belong to the controller. No
+                # model sees a metadata request or gets to assert confirmation.
+                trigger = None
+                try:
+                    field = metadata.parse_request(transcript)
+                    if field is None:
+                        raise metadata.MetadataContractError("unsupported proposal phrasing")
+                    events.append(self._metadata_proposal_event(state, field))
+                    proposal_result = metadata.public_plan(state["metadata_proposal"])
+                except metadata.MetadataContractError:
+                    events.append(self._event(state, "confirm", {
+                        "artifact_ids": [state["artifact"]["id"]],
+                        "text": 'Use "Plan a new field on Lead for prototype interest" or a structured Lead Text proposal. ' + metadata.NOTICE,
+                    }))
         elif kind == "change_decision":
             question = _find_question(state, command.get("question_id", ""))
             if question.get("status") not in {"answered", "assumed", "deferred"}:
@@ -713,6 +791,9 @@ class StudioController:
                 if not isinstance(payload, dict):
                     problems.append("worker event %r payload is not an object" % event_type)
                     continue
+                if "metadata_proposal" in payload:
+                    problems.append("worker cannot emit controller-owned metadata proposals")
+                    continue
                 if event_type == "artifact.patch":
                     state["artifact"] = apply_ops(state["artifact"], payload.get("ops") or [])
                     state["artifact_version"] += 1
@@ -733,13 +814,19 @@ class StudioController:
                     }
             emit_answers()
 
-        return {
+        result = {
             "command_id": command["command_id"],
             "session_id": state["session_id"],
             "artifact_version": state["artifact_version"],
             "events": copy.deepcopy(events),
             "problems": problems,
         }
+        if proposal_result is not None:
+            # Backend-only contract: Stage A SSE confirm payloads are closed
+            # to text/artifact_ids. A future coordinated UI slice can consume
+            # this command-response field; never tuck it into an SSE event.
+            result["metadata_proposal"] = proposal_result
+        return result
 
     def events_after(self, session_id: str, after_seq: int) -> tuple[list[dict], bool, dict]:
         """Read a replay window or atomically begin a repair generation.
