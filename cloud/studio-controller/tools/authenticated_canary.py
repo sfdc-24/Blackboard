@@ -203,10 +203,10 @@ class _Run:
                 timeout=request_deadline - started_at,
             ) as response:
                 # Synchronous HTTPX timeouts bound individual blocking I/O
-                # operations rather than pre-empting them at this elapsed-time
-                # checkpoint. Check immediately after headers, between raw
-                # bytes, and after EOF; documentation states the bounded
-                # in-flight-I/O overrun explicitly.
+                # operations rather than pre-empting the active header phase
+                # at this elapsed-time checkpoint. Check immediately after
+                # final headers, between raw bytes, and after EOF; documentation
+                # states that cooperative checks do not guarantee total runtime.
                 self._request_remaining(request_deadline, stage)
                 try:
                     actual_url = str(response.request.url)

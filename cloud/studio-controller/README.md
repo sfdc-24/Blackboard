@@ -164,16 +164,20 @@ The console reads the operator email and OTP with non-echoing `getpass`; a
 reads a non-echoing closed operator expectation containing `org_label`,
 `org_type`, `total`, `site_total`, and `site_recent`. Nothing is read from argv
 or environment for those values. Email and expectation prompt time precedes the
-bounded network sequence; after `auth/start`, OTP waiting is deliberately charged
+elapsed-budget network sequence; after `auth/start`, OTP waiting is deliberately charged
 to the elapsed whole-run budget. Each request receives HTTPX pool/connect/write/read
 inactivity limits no larger than the remaining request and whole-run budgets. The
 runner checks elapsed time immediately after response headers, between one-byte
 raw response chunks, after EOF, and between requests. Synchronous HTTPX does not
-pre-empt an I/O operation already in progress at an elapsed-time boundary, so one
-in-flight I/O may finish or reach its inactivity timeout after that boundary; the
-runner then closes the response, fails closed, and sends no follow-on request.
-This is bounded cooperative enforcement, not a hard wall-clock cancellation
-claim. No request is automatically retried:
+pre-empt an active header phase at an elapsed-time boundary. Header negotiation can
+span multiple successful reads, including informational responses, and can continue
+past both elapsed budgets while each read remains below its inactivity timeout. The
+runner closes and fails without a follow-on request once control reaches the next
+checkpoint, but it does not guarantee a finite total runtime for an active blocking
+phase. Run a live invocation under an external wall-clock process supervisor and
+interrupt or terminate it if that limit expires. These are cooperative checkpoints
+and inactivity limits, not hard wall-clock cancellation. No request is automatically
+retried:
 
 1. start and verify email authentication;
 2. create one operator-authenticated session;
