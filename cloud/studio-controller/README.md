@@ -49,16 +49,27 @@ ID, and the existing server-side `Headless_domain`, `Headless_consumer_key`, and
 Cloud Run; never pass them from the browser. Both the configured/returned host
 and the org's developer/sandbox type are checked, then the returned org ID must
 exactly match before any Lead aggregate is read. An alias alone is insufficient.
-Missing configuration, wrong org, auth/query failures and malformed counts
+When enabled, a missing or malformed org ID prevents startup; disabled mode
+does not require this setting. Missing credentials, wrong org, auth/query failures and malformed counts
 produce an explicit unavailable answer, never a model estimate or a default zero.
+LeadSource aggregates require `done: true` and unique normalized source groups;
+an incomplete envelope or duplicate group is unavailable, never a partial total.
 
 Existing durable command reservation/receipts prevent another query on replay,
 including after a controller restart. A repeated transcript item also does not
-query again. An intentionally new command/item is a new observation. The session's
+query again: item IDs are retained up to the configured session command bound
+(maximum 500), not a shorter rolling window. An intentionally new command/item
+is a new observation. The session's
 command limit bounds repeated reads; this slice does not add a global Salesforce
 quota ledger. A controller interruption retains the existing unknown/failed-command
 behavior and is not automatically retried. Query results are snapshots observed
 over separate reads, not an atomic transaction across all aggregates.
+
+The Salesforce client still uses 30-second socket timeouts per request and has
+no end-to-end deadline. Three token attempts, backoff and four queries can exceed
+the current 60-second Cloud Run request timeout (about 214.5 seconds even when
+each request is treated as a 30-second bound; slow reads are not strictly bounded
+by that arithmetic). Resolve this before enabling the feature in that runtime.
 
 This source does not enable the feature in any deployment or implement metadata
 writes. Verify an authenticated served-page count against the same-org query

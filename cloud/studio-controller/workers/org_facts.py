@@ -151,12 +151,15 @@ class OrgFacts:
         total = _count(self._query("lead_total").get("totalSize"))
         by_source = {}
         groups = self._query("lead_by_source")
-        if not isinstance(groups.get("records"), list) or groups.get("done") is False:
+        if not isinstance(groups.get("records"), list) or groups.get("done") is not True:
             raise ValueError("Salesforce Lead source aggregates are incomplete")
         for rec in groups["records"]:
             if "LeadSource" not in rec or (rec["LeadSource"] is not None and not isinstance(rec["LeadSource"], str)):
                 raise ValueError("Salesforce Lead source aggregate is malformed")
-            by_source[rec["LeadSource"] or "(none)"] = _count(rec.get("n"))
+            source = rec["LeadSource"] or "(none)"
+            if source in by_source:
+                raise ValueError("Salesforce Lead source aggregates contain duplicate groups")
+            by_source[source] = _count(rec.get("n"))
         recent = _count(self._query("lead_site_recent").get("totalSize"))
         return {
             "org_id": org.get("Id", ""), "org_name": org.get("Name", ""),

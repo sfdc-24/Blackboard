@@ -6,6 +6,7 @@ session state or returned by an endpoint.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -86,6 +87,11 @@ class Settings:
         return bool(os.environ.get("K_SERVICE"))
 
     def validate(self) -> None:
+        if self.lead_facts_enabled and (
+            not isinstance(self.salesforce_org_id, str)
+            or not re.fullmatch(r"00D[A-Za-z0-9]{15}", self.salesforce_org_id)
+        ):
+            raise RuntimeError("STUDIO_SALESFORCE_ORG_ID must be an exact 18-character 00D Organization ID")
         if not self.allowed_origins:
             raise RuntimeError("STUDIO_ALLOWED_ORIGINS must contain at least one exact origin")
         if self.max_session_seconds < 60 or self.max_session_seconds > 600:

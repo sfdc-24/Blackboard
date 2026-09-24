@@ -85,6 +85,14 @@ class LeadFactsTests(unittest.TestCase):
         self.assertTrue(configured.lead_facts_enabled)
         self.assertEqual(ORG_ID, configured.salesforce_org_id)
 
+    def test_enabled_settings_reject_invalid_org_id_before_app_initialization(self):
+        for bad in ("", None, ORG_ID[:15], ORG_ID + " ", ORG_ID + "\n", "001000000000001AAA"):
+            with self.subTest(org_id=bad):
+                settings(lead_facts_enabled=False, salesforce_org_id=bad).validate()
+                with self.assertRaisesRegex(RuntimeError, "STUDIO_SALESFORCE_ORG_ID"):
+                    settings(lead_facts_enabled=True, salesforce_org_id=bad).validate()
+        settings(lead_facts_enabled=True, salesforce_org_id=ORG_ID).validate()
+
     def test_disabled_feature_keeps_original_worker_and_does_not_read_credentials(self):
         delegate = CountingWorker()
         with mock.patch.object(OrgFacts, "from_env", side_effect=AssertionError("must not read config")) as factory:
@@ -142,7 +150,16 @@ class LeadFactsTests(unittest.TestCase):
         cases = [("lead_total", {}), ("lead_total", {"totalSize": True}),
                  ("lead_total", {"totalSize": -1}), ("lead_total", {"totalSize": "26"}),
                  ("lead_by_source", {}), ("lead_by_source", {"records": [], "done": False}),
-                 ("lead_by_source", {"records": [{"LeadSource": "sfdc24.com"}]}),
+                 ("lead_by_source", {"records": []}),
+                 ("lead_by_source", {"records": [], "done": 0}),
+                 ("lead_by_source", {"records": [], "done": 1}),
+                 ("lead_by_source", {"records": [{"LeadSource": "sfdc24.com"}], "done": True}),
+                 ("lead_by_source", {"records": [{"LeadSource": "sfdc24.com", "n": 4},
+                                                  {"LeadSource": "sfdc24.com", "n": 3}], "done": True}),
+                 ("lead_by_source", {"records": [{"LeadSource": None, "n": 4},
+                                                  {"LeadSource": None, "n": 3}], "done": True}),
+                 ("lead_by_source", {"records": [{"LeadSource": None, "n": 4},
+                                                  {"LeadSource": "(none)", "n": 3}], "done": True}),
                  ("lead_site_recent", {})]
         for name, response in cases:
             sf = Salesforce()
@@ -151,7 +168,7 @@ class LeadFactsTests(unittest.TestCase):
                     "workers.org_facts.urllib.request.build_opener", return_value=sf):
                 result = LeadFactsWorker(CountingWorker(), ORG_ID).on_turn(
                     {"artifact": {"id": "root"}}, {"kind": "utterance", "text": "Count leads"})
-            self.assertEqual(UNAVAILABLE, result["events"][0]["payload"]["text"])
+                self.assertEqual(UNAVAILABLE, result["events"][0]["payload"]["text"])
 
     def test_config_auth_and_query_failures_never_fall_back_to_model_or_leak_details(self):
         for stage in ("config", "auth", "lead_total", "wrong_org"):
@@ -207,6 +224,26 @@ class LeadFactsTests(unittest.TestCase):
             self.assertEqual("completed", saved["commands"]["lead-1"]["status"])
             if fail:
                 self.assertEqual(UNAVAILABLE, facts[0]["payload"]["text"])
+
+    def test_item_replay_after_101_distinct_items_and_restart_does_not_query_again(self):
+        sf = Salesforce()
+        controller, store, _ = make_controller(
+            worker=LeadFactsWorker(CountingWorker(), ORG_ID), max_commands=500)
+        state, _ = controller.create_session()
+        with mock.patch.dict(os.environ, ENV, clear=True), mock.patch(
+                "workers.org_facts.urllib.request.build_opener", return_value=sf):
+            for i in range(101):
+                controller.execute(state["session_id"], command(state, "lead-%d" % i, "item-%d" % i))
+            self.assertEqual(505, len(sf.requests))
+            resumed, _, _ = make_controller(
+                store=store, worker=LeadFactsWorker(CountingWorker(), ORG_ID), max_commands=500)
+            duplicate = resumed.execute(state["session_id"], command(state, "lead-repeat", "item-0"))
+            self.assertTrue(duplicate["deduplicated"])
+            self.assertEqual([], duplicate["events"])
+            self.assertEqual(505, len(sf.requests))
+        saved = resumed.repository.load(state["session_id"]).state
+        self.assertEqual(101, len(saved["voice_item_ids"]))
+        self.assertEqual(state["artifact_version"], saved["artifact_version"])
 
     def test_authenticated_http_and_sse_path_commits_fact_and_refuses_anonymous(self):
         sf = Salesforce()

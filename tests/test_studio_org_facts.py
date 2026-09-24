@@ -33,7 +33,7 @@ def fake_org(calls):
         if "FROM Organization" in q:
             body = {"records": [{"Id": ORG_ID, "Name": "SFDC 24", "OrganizationType": "Developer Edition"}]}
         elif "GROUP BY LeadSource" in q:
-            body = {"records": [{"LeadSource": "sfdc24.com", "n": 4}, {"LeadSource": None, "n": 22}]}
+            body = {"records": [{"LeadSource": "sfdc24.com", "n": 4}, {"LeadSource": None, "n": 22}], "done": True}
         elif "LAST_N_DAYS" in q:
             body = {"totalSize": 1, "records": []}
         else:
