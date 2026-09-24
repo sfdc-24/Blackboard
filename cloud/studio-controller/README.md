@@ -148,7 +148,9 @@ hostname must contain a `lead-canary` tag and end in `.a.run.app`. An exact
 `STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1` marker can deliberately admit an
 untagged `.a.run.app` service, but never a public/custom hostname. Redirects,
 proxy environment variables, HTTP retries, browser state, and credential files
-are disabled or unused.
+are disabled or unused. The client and its explicit zero-retry transport both
+disable environment trust, send `Accept-Encoding: identity`, refuse compressed
+responses, and enforce the response cap while streaming bounded raw chunks.
 
 ```powershell
 python cloud/studio-controller/tools/authenticated_canary.py `
@@ -157,18 +159,21 @@ python cloud/studio-controller/tools/authenticated_canary.py `
   --origin https://www.sfdc24.com
 ```
 
-The console reads the operator email and OTP with non-echoing `getpass`. It also
-reads a non-echoing closed JSON expectation copied from a separate same-org Lead
-receipt: `org_label`, `org_type`, `total`, `site_total`, and `site_recent`.
-Nothing is read from argv or environment for those values. The runner then uses
-one bounded sequence with no automatic retries:
+The console reads the operator email and OTP with non-echoing `getpass`; a
+`GetPassWarning` is a closed failure rather than permission to echo. It also
+reads a non-echoing closed operator expectation containing `org_label`,
+`org_type`, `total`, `site_total`, and `site_recent`. Nothing is read from argv
+or environment for those values. Email and expectation prompt time precedes the
+bounded network sequence; after `auth/start`, OTP waiting is deliberately charged
+to the whole-run deadline. Every network request also has a fixed absolute
+deadline nested inside that whole-run deadline, with no automatic retries:
 
 1. start and verify email authentication;
 2. create one operator-authenticated session;
 3. read the baseline SSE snapshot and pin its generation, root, artifact version,
    and cursor;
 4. send only `How many leads do we have?`, parse the complete known Lead formatter,
-   compare the org label/type and all three aggregates to the independent receipt,
+   compare the org label/type and all three aggregates to the operator expectation,
    and require a fresh UTC observation;
 5. read exactly that committed Lead event after the baseline cursor;
 6. replay the identical stable command receipt and prove the SSE cursor stays quiet;
@@ -177,8 +182,10 @@ one bounded sequence with no automatic retries:
 
 Standard output is one closed redacted JSON receipt. It contains only the
 evidence label, safe aggregate counts/UTC observation, generation/sequence
-numbers, and boolean comparison/replay/SSE/terminal checks. It never contains
-the email, OTP, Bearer tokens, session/command identifiers, org label/type, or
+numbers, and boolean expectation/replay/SSE/terminal checks. The expectation
+match proves only equality with operator-supplied values; it does not bind or
+independently prove an immutable Salesforce org identity. The receipt never
+contains the email, OTP, Bearer tokens, session/command identifiers, org label/type, or
 remote error/body details. A failed check emits only its allowlisted stage.
 This canary reads Lead aggregates through the already deployed controller path;
 it cannot create or modify Salesforce metadata.

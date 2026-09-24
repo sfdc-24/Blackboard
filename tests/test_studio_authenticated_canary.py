@@ -5,8 +5,10 @@ import io
 import json
 import sys
 import unittest
+import warnings
 from collections import Counter
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -15,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cloud" / "studio-controller"))
 
 from tools import authenticated_canary as canary
+from app.core import StudioController
+from app.workers.synthetic import SyntheticWorker
 
 
 TARGET = "https://studio-lead-canary-abc-uc.a.run.app"
@@ -36,7 +40,7 @@ EXPECTED_LEAD = {
 ROOT_ARTIFACT = {"id": "screen-home", "kind": "screen", "label": "Homepage", "children": []}
 
 
-def event(seq, kind, payload):
+def event(seq, kind, payload, *, artifact_version=1):
     return {
         "session_id": SESSION_ID,
         "generation": 1,
@@ -45,13 +49,16 @@ def event(seq, kind, payload):
         "type": kind,
         "task_id": "task-1",
         "task_revision": 1,
-        "artifact_version": 1,
+        "artifact_version": artifact_version,
         "turn_id": "turn-%d" % seq,
         "payload": payload,
     }
 
 
-SESSION_EVENT = event(1, "session.started", {"title": "Authenticated Lead canary"})
+SESSION_EVENT = event(
+    1, "session.started", {"title": "Authenticated Lead canary"},
+    artifact_version=0,
+)
 SNAPSHOT_EVENT = event(2, "artifact.snapshot", {"root": ROOT_ARTIFACT})
 QUESTION_EVENT = event(3, "question.asked", {"question": {"question_id": "q-cta"}})
 LEAD_EVENT = event(4, "confirm", {
@@ -73,6 +80,44 @@ def sse(*items):
         )
         for item in items
     )
+
+
+class TrackingStream(httpx.SyncByteStream):
+    def __init__(self, chunks, *, before_chunk=None):
+        self.chunks = list(chunks)
+        self.before_chunk = before_chunk
+        self.yielded = 0
+        self.closed = False
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            if self.before_chunk is not None:
+                self.before_chunk(self.yielded)
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+
+class InitialSessionRepository:
+    def __init__(self):
+        self.saved = None
+
+    def admit(self, daily_cap, session_id):
+        return 1
+
+    def create(self, state):
+        self.saved = state
+
+
+class DeterministicIds:
+    def __init__(self):
+        self.value = 0
+
+    def __call__(self, prefix):
+        self.value += 1
+        return "%s-%d" % (prefix, self.value)
 
 
 class Scenario:
@@ -109,14 +154,27 @@ class Scenario:
         if self.fail_stage == stage:
             return httpx.Response(
                 503,
-                content=b'private provider detail token=session-secret',
                 headers={"Content-Type": "text/plain"},
+                stream=httpx.ByteStream(
+                    b'private provider detail token=session-secret'
+                ),
                 request=request,
             )
         if body is not None:
-            return httpx.Response(status, json=body, request=request)
+            encoded = json.dumps(
+                body, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            return httpx.Response(
+                status,
+                headers={"Content-Type": "application/json"},
+                stream=httpx.ByteStream(encoded),
+                request=request,
+            )
         return httpx.Response(
-            status, text=text or "", headers={"Content-Type": media}, request=request,
+            status,
+            headers={"Content-Type": media},
+            stream=httpx.ByteStream((text or "").encode("utf-8")),
+            request=request,
         )
 
     def route(self, request):
@@ -309,8 +367,8 @@ class LifecycleTests(unittest.TestCase):
             "sfdc24_total": 4,
             "sfdc24_last_7_days": 2,
             "observed_at": "2026-09-24T01:02:03Z",
-            "same_org_comparison_passed": True,
-            "expected_source": "operator_supplied_same_org_receipt",
+            "operator_expectation_match_passed": True,
+            "expectation_source": "operator_supplied_lead_expectation",
             "authentication_verified": True,
             "lead_result_committed": True,
             "lead_sse_exact": True,
@@ -335,6 +393,7 @@ class LifecycleTests(unittest.TestCase):
         }), scenario.stage_counts)
         for request in scenario.calls:
             self.assertEqual(ORIGIN, request.headers["Origin"])
+            self.assertEqual("identity", request.headers["Accept-Encoding"])
             self.assertEqual("https", request.url.scheme)
             self.assertEqual("studio-lead-canary-abc-uc.a.run.app", request.url.host)
         self.assertNotIn("Authorization", scenario.calls[0].headers)
@@ -410,13 +469,94 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual("studio-lead-canary-abc-uc.a.run.app", calls[0].url.host)
 
+    def test_identity_body_limit_stops_stream_early_and_closes_it(self):
+        half = canary.MAX_RESPONSE_BYTES // 2
+        stream = TrackingStream((b"a" * half, b"b" * (half + 1), b"unread"))
+        route_calls = []
+
+        def route(request):
+            route_calls.append(request)
+            return httpx.Response(200, stream=stream, request=request)
+
+        with httpx.Client(
+            transport=httpx.MockTransport(route), follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            run = canary._Run(
+                client=client, target=TARGET, origin=ORIGIN, clock=lambda: 0.0,
+                identifier=fixed_identifier, whole_run_seconds=30.0,
+                request_seconds=7.0,
+            )
+            with self.assertRaises(canary.CanaryFailure) as caught:
+                run.request("GET", "/oversized", "auth_start", headers={})
+        self.assertEqual("auth_start", caught.exception.stage)
+        self.assertEqual(1, len(route_calls))
+        self.assertEqual(2, stream.yielded)
+        self.assertTrue(stream.closed)
+
+    def test_length_and_encoding_refusals_close_without_consuming_body(self):
+        cases = (
+            ({"Content-Length": str(canary.MAX_RESPONSE_BYTES + 1)}, "length"),
+            ({"Content-Encoding": "gzip"}, "encoding"),
+        )
+        for headers, label in cases:
+            stream = TrackingStream((b"private", b"unread"))
+
+            def route(request, *, stream=stream, headers=headers):
+                return httpx.Response(
+                    200, headers=headers, stream=stream, request=request,
+                )
+
+            with self.subTest(label=label), httpx.Client(
+                transport=httpx.MockTransport(route), follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                run = canary._Run(
+                    client=client, target=TARGET, origin=ORIGIN,
+                    clock=lambda: 0.0, identifier=fixed_identifier,
+                    whole_run_seconds=30.0, request_seconds=7.0,
+                )
+                with self.assertRaises(canary.CanaryFailure):
+                    run.request("GET", "/refused", "auth_start", headers={})
+            self.assertEqual(0, stream.yielded)
+            self.assertTrue(stream.closed)
+
+    def test_absolute_request_deadline_stops_slow_drip_and_closes_it(self):
+        now = [0.0]
+
+        def advance(_count):
+            now[0] += 0.6
+
+        stream = TrackingStream([b"x"] * 8, before_chunk=advance)
+        route_calls = []
+
+        def route(request):
+            route_calls.append(request)
+            return httpx.Response(200, stream=stream, request=request)
+
+        with httpx.Client(
+            transport=httpx.MockTransport(route), follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            run = canary._Run(
+                client=client, target=TARGET, origin=ORIGIN,
+                clock=lambda: now[0], identifier=fixed_identifier,
+                whole_run_seconds=30.0, request_seconds=1.0,
+            )
+            with self.assertRaises(canary.CanaryFailure) as caught:
+                run.request("GET", "/slow", "auth_start", headers={})
+        self.assertEqual("auth_start", caught.exception.stage)
+        self.assertEqual(1, len(route_calls))
+        self.assertEqual(2, stream.yielded)
+        self.assertTrue(stream.closed)
+
     def test_whole_run_and_each_request_share_bounded_deadline(self):
         scenario = Scenario()
         now = [10.0]
 
         def clock():
             value = now[0]
-            now[0] += 0.25
+            now[0] += 0.001
             return value
 
         run_scenario(
@@ -470,6 +610,51 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ExactEvidenceTests(unittest.TestCase):
+    def test_real_controller_version_zero_start_and_version_one_snapshot_are_accepted(self):
+        repository = InitialSessionRepository()
+        controller = StudioController(
+            repository,
+            SyntheticWorker(),
+            clock=lambda: 1000,
+            id_factory=DeterministicIds(),
+        )
+        state, admission = controller.create_session("Authenticated Lead canary")
+        self.assertEqual(1, admission)
+        self.assertEqual(
+            [("session.started", 0), ("artifact.snapshot", 1)],
+            [
+                (item["type"], item["artifact_version"])
+                for item in state["events"][:2]
+            ],
+        )
+        request = httpx.Request("GET", TARGET + "/events")
+        response = httpx.Response(
+            200,
+            text=sse(*state["events"]),
+            headers={"Content-Type": "text/event-stream"},
+            request=request,
+        )
+        parsed = canary._parse_sse(
+            response, state["session_id"], "baseline_sse"
+        )
+        root_id, generation, version, cursor = canary._baseline(parsed, state)
+        self.assertEqual(state["artifact"]["id"], root_id)
+        self.assertEqual(state["generation"], generation)
+        self.assertEqual(1, version)
+        self.assertEqual(state["last_seq"], cursor)
+
+    def test_version_zero_is_rejected_for_non_start_events_and_start_must_be_zero(self):
+        invalid = (
+            event(1, "session.started", {"title": "x"}, artifact_version=1),
+            event(1, "artifact.snapshot", {"root": ROOT_ARTIFACT}, artifact_version=0),
+            event(1, "confirm", {"text": "x", "artifact_ids": []}, artifact_version=0),
+            event(1, "session.ended", {"reason": "x"}, artifact_version=0),
+        )
+        for item in invalid:
+            with self.subTest(kind=item["type"]), self.assertRaises(
+                    canary.CanaryFailure):
+                canary._event(item, SESSION_ID, "baseline_sse")
+
     def test_closed_remote_shapes_and_live_lead_answer_are_required(self):
         cases = []
         extra = Scenario()
@@ -531,7 +716,7 @@ class ExactEvidenceTests(unittest.TestCase):
                 run_scenario(scenario)
             self.assertEqual(stage, caught.exception.stage)
 
-    def test_independent_same_org_counts_inequalities_and_fresh_utc_are_required(self):
+    def test_operator_expectation_counts_inequalities_and_fresh_utc_are_required(self):
         wrong_expected = dict(EXPECTED_LEAD, total=27)
         with self.assertRaises(canary.CanaryFailure) as caught:
             run_scenario(Scenario(), expected_lead=wrong_expected)
@@ -608,6 +793,11 @@ class CliAndCiTests(unittest.TestCase):
     def test_cli_uses_non_echoing_readers_and_emits_only_closed_redacted_receipt(self):
         scenario = Scenario()
         captured = {}
+        transport_policies = []
+
+        def transport_factory(**kwargs):
+            transport_policies.append(kwargs)
+            return httpx.HTTPTransport(**kwargs)
 
         def factory(**kwargs):
             captured.update(kwargs)
@@ -628,6 +818,7 @@ class CliAndCiTests(unittest.TestCase):
             ["--live", "--target", TARGET, "--origin", ORIGIN],
             client_factory=factory, secret_reader=secret_reader, output=output,
             wall_clock=lambda: 1790211840,
+            transport_factory=transport_factory,
         )
         self.assertEqual(0, code, output.getvalue())
         self.assertEqual([
@@ -639,7 +830,7 @@ class CliAndCiTests(unittest.TestCase):
         self.assertEqual("passed", receipt["status"])
         self.assertEqual("controller_api_canary", receipt["evidence_level"])
         self.assertEqual(26, receipt["lead_total"])
-        self.assertTrue(receipt["same_org_comparison_passed"])
+        self.assertTrue(receipt["operator_expectation_match_passed"])
         rendered = output.getvalue()
         for secret in (
             EMAIL, OTP, OPERATOR_TOKEN, SESSION_TOKEN, SESSION_ID,
@@ -649,6 +840,63 @@ class CliAndCiTests(unittest.TestCase):
         self.assertIs(captured["follow_redirects"], False)
         self.assertIs(captured["trust_env"], False)
         self.assertIsInstance(captured["transport"], httpx.HTTPTransport)
+        self.assertEqual([{"retries": 0, "trust_env": False}], transport_policies)
+
+    def test_getpass_warning_at_every_prompt_fails_closed_as_operator_input(self):
+        expected_json = json.dumps(EXPECTED_LEAD)
+        for fail_at in (1, 2, 3):
+            scenario = Scenario()
+            prompt_count = [0]
+
+            def unsafe_reader(_prompt):
+                prompt_count[0] += 1
+                if prompt_count[0] == fail_at:
+                    warnings.warn(
+                        "private terminal fallback would echo",
+                        canary.getpass.GetPassWarning,
+                    )
+                return (EMAIL, expected_json, OTP)[prompt_count[0] - 1]
+
+            def factory(**kwargs):
+                supplied = kwargs.pop("transport")
+                supplied.close()
+                kwargs["transport"] = httpx.MockTransport(scenario.route)
+                return httpx.Client(**kwargs)
+
+            output = io.StringIO()
+            with self.subTest(fail_at=fail_at), mock.patch.object(
+                    canary.getpass, "getpass", unsafe_reader):
+                code = canary.main(
+                    ["--live", "--target", TARGET, "--origin", ORIGIN],
+                    client_factory=factory, output=output,
+                )
+            self.assertEqual(1, code)
+            self.assertEqual({
+                "schema": canary.RECEIPT_SCHEMA,
+                "status": "failed",
+                "failed_check": "operator_input",
+            }, json.loads(output.getvalue()))
+            self.assertNotIn("private terminal", output.getvalue())
+            expected_network_calls = 1 if fail_at == 3 else 0
+            self.assertEqual(expected_network_calls, len(scenario.calls))
+
+    def test_successfully_read_malformed_expectation_is_expected_lead_failure(self):
+        calls = []
+        values = iter((EMAIL, "{}"))
+        output = io.StringIO()
+        code = canary.main(
+            ["--live", "--target", TARGET, "--origin", ORIGIN],
+            client_factory=lambda **kwargs: calls.append(kwargs),
+            secret_reader=lambda _prompt: next(values),
+            output=output,
+        )
+        self.assertEqual(1, code)
+        self.assertEqual([], calls)
+        self.assertEqual({
+            "schema": canary.RECEIPT_SCHEMA,
+            "status": "failed",
+            "failed_check": "expected_lead",
+        }, json.loads(output.getvalue()))
 
     def test_cli_without_live_never_prompts_or_constructs_a_client(self):
         calls = []

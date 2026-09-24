@@ -4,7 +4,7 @@ This is controller acceptance, not browser or served-page acceptance.  It is
 deliberately disconnected from the Studio application and has no credential,
 deployment, settings, route, voice, Salesforce-write, or environment lookup.
 Live execution requires ``--live`` and three non-echoing console inputs: email,
-an independent same-org Lead expectation, and the emailed OTP.
+an operator-supplied Lead expectation, and the emailed OTP.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import re
 import secrets
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -29,6 +30,9 @@ FIXED_UTTERANCE = "How many leads do we have?"
 WHOLE_RUN_SECONDS = 180.0
 REQUEST_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 512 * 1024
+# A one-byte raw iterator prevents httpx's chunker from buffering a slow trickle
+# across the absolute deadline. The total work remains capped at 512 KiB.
+STREAM_CHUNK_BYTES = 1
 EXPECTED_ORIGIN = "https://www.sfdc24.com"
 
 _HOST = re.compile(
@@ -181,30 +185,75 @@ class _Run:
     def request(self, method: str, path: str, stage: str, *, headers: dict,
                 body: dict | None = None, expected_status: int = 200) -> httpx.Response:
         remaining = self._remaining()
+        started_at = self.deadline - remaining
+        request_deadline = min(
+            self.deadline, started_at + self.request_seconds,
+        )
         expected_url = self.target + path
         try:
-            response = self.client.request(
-                method,
-                expected_url,
-                headers={"Origin": self.origin, **headers},
+            with self.client.stream(
+                method, expected_url,
+                headers={
+                    **headers,
+                    "Origin": self.origin,
+                    "Accept-Encoding": "identity",
+                },
                 json=body,
-                timeout=min(self.request_seconds, remaining),
-            )
+                timeout=request_deadline - started_at,
+            ) as response:
+                try:
+                    actual_url = str(response.request.url)
+                except Exception:
+                    raise CanaryFailure(stage) from None
+                if (
+                    response.history
+                    or response.status_code != expected_status
+                    or actual_url != expected_url
+                ):
+                    raise CanaryFailure(stage)
+                content_encoding = response.headers.get("content-encoding")
+                if (
+                    content_encoding is not None
+                    and content_encoding.lower().strip() != "identity"
+                ):
+                    raise CanaryFailure(stage)
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except (TypeError, ValueError):
+                        raise CanaryFailure(stage) from None
+                    if declared_length < 0 or declared_length > MAX_RESPONSE_BYTES:
+                        raise CanaryFailure(stage)
+                content = bytearray()
+                # Compressed responses are refused above, so bounded raw chunks
+                # are also bounded decoded chunks for this closed canary.
+                for chunk in response.iter_raw(chunk_size=STREAM_CHUNK_BYTES):
+                    self._request_remaining(request_deadline, stage)
+                    if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
+                        raise CanaryFailure(stage)
+                    content.extend(chunk)
+                self._request_remaining(request_deadline, stage)
+                buffered = httpx.Response(
+                    response.status_code,
+                    headers=response.headers,
+                    content=bytes(content),
+                    request=response.request,
+                )
+        except CanaryFailure:
+            raise
         except Exception:
             raise CanaryFailure(stage) from None
-        self._remaining()
+        return buffered
+
+    def _request_remaining(self, deadline: float, stage: str) -> float:
         try:
-            actual_url = str(response.request.url)
+            remaining = min(self.deadline, deadline) - float(self.clock())
         except Exception:
             raise CanaryFailure(stage) from None
-        if (
-            response.history
-            or response.status_code != expected_status
-            or actual_url != expected_url
-            or len(response.content) > MAX_RESPONSE_BYTES
-        ):
+        if remaining <= 0:
             raise CanaryFailure(stage)
-        return response
+        return remaining
 
     def json_request(self, method: str, path: str, stage: str, *, headers: dict,
                      body: dict | None = None, expected_status: int = 200):
@@ -226,19 +275,26 @@ def _opaque(value, stage: str, *, limit: int = 512) -> str:
 
 def _event(value, session_id: str, stage: str) -> dict:
     _closed(value, _EVENT_KEYS, stage)
+    event_type = value["type"]
+    artifact_version = value["artifact_version"]
     if (
         value["session_id"] != session_id
         or type(value["seq"]) is not int
         or value["seq"] < 1
         or type(value["generation"]) is not int
         or value["generation"] < 1
-        or type(value["artifact_version"]) is not int
-        or value["artifact_version"] < 1
+        or type(artifact_version) is not int
+        or artifact_version < 0
         or type(value["payload"]) is not dict
     ):
         raise CanaryFailure(stage)
     for key in ("op_id", "type", "task_id", "turn_id"):
         _opaque(value[key], stage)
+    # The controller emits the initial session.started event before creating
+    # artifact version 1. No other accepted event may carry version zero, and
+    # session.started may not claim a later artifact version.
+    if (artifact_version == 0) != (event_type == "session.started"):
+        raise CanaryFailure(stage)
     return value
 
 
@@ -628,8 +684,8 @@ def run_authenticated_canary(
         "lead_seq": lead_cursor,
         "terminal_seq": terminal_event["seq"],
         **lead_observation,
-        "same_org_comparison_passed": True,
-        "expected_source": "operator_supplied_same_org_receipt",
+        "operator_expectation_match_passed": True,
+        "expectation_source": "operator_supplied_lead_expectation",
         "authentication_verified": True,
         "lead_result_committed": True,
         "lead_sse_exact": True,
@@ -661,8 +717,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _read_secret(reader, prompt: str, stage: str):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            return reader(prompt)
+    except Exception:
+        raise CanaryFailure(stage) from None
+
+
 def main(argv=None, *, client_factory=None, secret_reader=None, output=None,
-         wall_clock=None) -> int:
+         wall_clock=None, transport_factory=None) -> int:
     args = _parser().parse_args(argv)
     out = output or sys.stdout
     reader = secret_reader or getpass.getpass
@@ -671,20 +736,20 @@ def main(argv=None, *, client_factory=None, secret_reader=None, output=None,
             live=args.live, target=args.target, origin=args.origin,
             safety_marker=args.safety_marker,
         )
-        try:
-            email = reader("Operator email: ")
-            expected_raw = reader(
-                "Expected Lead JSON (org_label, org_type, total, site_total, site_recent): "
-            )
-        except Exception:
-            raise CanaryFailure("operator_input") from None
+        email = _read_secret(reader, "Operator email: ", "operator_input")
+        expected_raw = _read_secret(
+            reader,
+            "Expected Lead JSON (org_label, org_type, total, site_total, site_recent): ",
+            "operator_input",
+        )
         if type(expected_raw) is not str:
             raise CanaryFailure("expected_lead")
         expected = _expected_lead(
             _json_bytes(expected_raw.encode("utf-8"), "expected_lead")
         )
         factory = client_factory or httpx.Client
-        transport = httpx.HTTPTransport(retries=0)
+        make_transport = transport_factory or httpx.HTTPTransport
+        transport = make_transport(retries=0, trust_env=False)
         with factory(
             transport=transport,
             follow_redirects=False,
@@ -697,7 +762,9 @@ def main(argv=None, *, client_factory=None, secret_reader=None, output=None,
                 origin=origin,
                 expected_lead=expected,
                 email_reader=lambda: email,
-                otp_reader=lambda: reader("Email verification code: "),
+                otp_reader=lambda: _read_secret(
+                    reader, "Email verification code: ", "operator_input"
+                ),
                 wall_clock=wall_clock or time.time,
             )
         code = 0
