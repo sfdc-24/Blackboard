@@ -283,3 +283,36 @@ unknown operations; uncertain outcomes never auto-retry. Public receipts are
 strictly allowlisted, and verified presence makes no creation-causality claim.
 See [METADATA-OPERATIONS.md](METADATA-OPERATIONS.md) for persistence, recovery,
 adapter trust boundaries and the remaining activation holds.
+
+### Inert Salesforce metadata adapter contract
+
+`app/metadata_provider.py` adds a further source-only boundary; it is not wired
+to the controller, settings, routes or a concrete provider. An immutable binding
+separates the ledger's opaque org-binding ID from the exact Salesforce org ID
+and pins a developer/sandbox origin, API version, environment and binding
+version. One sealed process-local execution budget carries the same absolute
+maximum-20-second deadline, plan expiry and cooperative cancellation signal
+through exact provider preflight, one possible create-method entry and an
+independent verification read.
+
+The injected transport has only four provider-specific callables and must
+declare no write retries and disabled redirects. Describe results require
+explicit `complete:true`; no partial/empty response proves absence. The trusted
+coordinator commits its own preflight evidence, invokes the ledger's durable
+`begin` directly, re-reads the operation and issues a non-serializable one-use
+permit only for a fresh non-replayed reservation. Raw dispatch booleans, caller
+dictionaries and portable snapshots cannot dispatch. Once the create method is
+entered, every exception, late/non-exact acknowledgement or close uncertainty
+is terminal ambiguous. Verification results are retained in the sealed budget
+and committed idempotently without accepting caller-supplied observations.
+
+There is deliberately no HTTP/SDK/subprocess implementation, credential lookup,
+provider/org call, route, UI, deployment, IAM/secret change, traffic change or
+feature activation in this increment. The cooperative signal cannot force a
+nonconforming transport to stop, and the source contract/offline tests do not
+certify a concrete Salesforce implementation. The capabilities are process-local
+misuse barriers; restart recovery/reconciliation is not implemented, and one
+immutable binding object does not prove a durable bijective org-binding registry.
+See
+[METADATA-OPERATIONS.md](METADATA-OPERATIONS.md) for the exact shapes, recovery
+rules, test command and remaining activation holds.

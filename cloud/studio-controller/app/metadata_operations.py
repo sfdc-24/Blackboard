@@ -394,6 +394,16 @@ class MetadataOperationLedger:
         record, _, _ = self._operation(operation_id, actor)
         return _receipt(record)
 
+    def execution_snapshot(self, operation_id, actor):
+        """Internal coordinator view; still closed, validated, and actor-bound.
+
+        Provider code must read this immediately around a durable transition,
+        never accept a portable caller-supplied snapshot as write authority.
+        """
+        record, _, _ = self._operation(operation_id, actor)
+        validate_record(record)
+        return copy.deepcopy(record)
+
     def confirmation_challenge(self, operation_id, actor):
         record, _, _ = self._operation(operation_id, actor)
         if record["state"] != "prepared":
