@@ -638,9 +638,16 @@ class StudioController:
             plan = state["metadata_proposal"]
             # Validate again at consumption. The session reservation/CAS commit
             # binds this receipt, but it is never transferable to an executor.
-            metadata.check_confirmation(
-                plan, command["confirmation"], session_id=state["session_id"],
-                subject=state["operator_subject"], org_id=self.metadata_org_id, now=int(self.clock()))
+            try:
+                metadata.check_confirmation(
+                    plan, command["confirmation"], session_id=state["session_id"],
+                    subject=state["operator_subject"], org_id=self.metadata_org_id,
+                    now=int(self.clock()))
+            except metadata.MetadataContractError as exc:
+                # Time/configuration can change after preflight but before the
+                # reserved command is consumed. Preserve a closed 4xx contract
+                # instead of leaking that race as an unhandled HTTP 500.
+                raise CommandError(str(exc)) from exc
             plan["status"] = "contract_validated_not_executed"
             events.append(self._event(state, "confirm", {
                 "artifact_ids": [state["artifact"]["id"]],
@@ -693,11 +700,14 @@ class StudioController:
             # command bound; a fixed 100-item window permits old items to
             # invoke providers again when max_commands is configured higher.
             state["voice_item_ids"] = state["voice_item_ids"][-self.max_commands:]
-            state["transcript"].append({"role": "visitor", "text": transcript})
-            trigger = {"kind": "utterance", "text": transcript, "item_id": item_id}
-            if self.metadata_proposals_enabled and metadata.is_metadata_request(transcript):
+            metadata_request = (
+                self.metadata_proposals_enabled
+                and metadata.is_metadata_request(transcript)
+            )
+            if metadata_request:
                 # Routing and plan construction belong to the controller. No
-                # model sees a metadata request or gets to assert confirmation.
+                # model sees a metadata request or gets to assert confirmation,
+                # including through the general transcript on a later turn.
                 trigger = None
                 try:
                     field = metadata.parse_request(transcript)
@@ -710,6 +720,9 @@ class StudioController:
                         "artifact_ids": [state["artifact"]["id"]],
                         "text": 'Use "Plan a new field on Lead for prototype interest" or a structured Lead Text proposal. ' + metadata.NOTICE,
                     }))
+            else:
+                state["transcript"].append({"role": "visitor", "text": transcript})
+                trigger = {"kind": "utterance", "text": transcript, "item_id": item_id}
         elif kind == "change_decision":
             question = _find_question(state, command.get("question_id", ""))
             if question.get("status") not in {"answered", "assumed", "deferred"}:

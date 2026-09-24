@@ -124,6 +124,22 @@ class MetadataContractTests(unittest.TestCase):
         self.execute(kind="utterance", transcript="Make the page blue", item_id="item-1")
         self.assertEqual(1, self.worker.calls)
 
+    def test_metadata_utterance_never_reaches_a_later_prototype_worker(self):
+        metadata_text = "Plan a new field on Lead for prototype interest"
+        self.execute(kind="utterance", transcript=metadata_text, item_id="item-metadata")
+        saved = self.controller.repository.load(self.state["session_id"]).state
+        self.assertNotIn(metadata_text, [item.get("text") for item in saved["transcript"]])
+
+        observed_states = []
+        self.worker.on_turn = lambda state, trigger: (
+            observed_states.append(copy.deepcopy(state))
+            or {"events": [], "problems": []}
+        )
+        self.execute(kind="utterance", command_id="prototype-later",
+                     transcript="Make the page blue", item_id="item-prototype")
+        self.assertEqual(1, len(observed_states))
+        self.assertNotIn(metadata_text, json.dumps(observed_states, sort_keys=True))
+
     def test_contract_confirmation_consumed_without_artifact_or_question_change(self):
         _, plan = self.propose()
         result = self.execute(kind="metadata.confirm_contract", command_id="confirm-1",
@@ -176,6 +192,20 @@ class MetadataContractTests(unittest.TestCase):
         tampered["binding"]["field"]["length"] = 120
         with self.assertRaises(contract.MetadataContractError):
             contract.check_confirmation(tampered, confirmation(public), **args)
+
+    def test_confirmation_expiring_after_reservation_is_a_closed_client_error(self):
+        _, public = self.propose()
+        with mock.patch.object(
+                contract, "check_confirmation",
+                side_effect=[None, contract.MetadataContractError("proposal has expired")]):
+            with self.assertRaisesRegex(CommandError, "proposal has expired") as caught:
+                self.execute(kind="metadata.confirm_contract", command_id="confirm-expiry-race",
+                             confirmation=confirmation(public))
+        self.assertEqual(400, caught.exception.status)
+        receipt = self.controller.repository.load(self.state["session_id"]).state["commands"][
+            "confirm-expiry-race"]
+        self.assertEqual("failed", receipt["status"])
+        self.assertNotIn("metadata_proposal", receipt)
 
     def test_restart_replay_and_item_dedup_do_not_regenerate_plan(self):
         cmd = command(self.state, "utterance", transcript="Plan a new field on Lead for prototype interest", item_id="item-1")
