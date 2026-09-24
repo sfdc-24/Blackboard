@@ -10,8 +10,10 @@ import hashlib
 import hmac
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from scripts.state_store import Conflict
@@ -23,6 +25,36 @@ OTP_TTL_SECONDS = 10 * 60
 SEND_WINDOW_SECONDS = 15 * 60
 MAX_SENDS_PER_WINDOW = 3
 MAX_VERIFY_ATTEMPTS = 5
+ACCEPTANCE_SECONDS = 0.25
+
+# Bound both executing and queued requests. Slow storage or email delivery must
+# neither occupy the HTTP request nor accumulate unbounded plaintext in memory.
+_START_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="studio-auth")
+_START_SLOTS = threading.BoundedSemaphore(16)
+
+
+def _dispatch_start(work: Callable[[], None]) -> None:
+    slots = _START_SLOTS
+    if not slots.acquire(blocking=False):
+        return  # Overload is indistinguishable from any other decoy acceptance.
+
+    def run():
+        try:
+            work()
+        finally:
+            slots.release()
+
+    try:
+        _START_POOL.submit(run)
+    except Exception:
+        slots.release()
+
+
+def _wait_until(deadline: float) -> None:
+    # Do not use worker completion as the wake-up signal: fast refusals and
+    # slow deliveries must have the same acceptance deadline.
+    while (remaining := deadline - time.monotonic()) > 0:
+        threading.Event().wait(remaining)
 
 _OTP_RE = re.compile(r"^[0-9]{6}$")
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
@@ -58,6 +90,9 @@ class AuthService:
         otp_generator: Callable[[], str] | None = None,
         challenge_id_generator: Callable[[], str] | None = None,
         cas_attempts: int = 8,
+        dispatch: Callable[[Callable[[], None]], None] = _dispatch_start,
+        monotonic: Callable[[], float] = time.monotonic,
+        wait_until: Callable[[float], None] = _wait_until,
     ):
         allowed = frozenset(allowed_emails)
         for email in allowed:
@@ -86,6 +121,9 @@ class AuthService:
         self.otp_generator = otp_generator or _default_otp
         self.challenge_id_generator = challenge_id_generator or _default_challenge_id
         self.cas_attempts = cas_attempts
+        self.dispatch = dispatch
+        self.monotonic = monotonic
+        self.wait_until = wait_until
 
     def _digest(self, purpose: str, value: str) -> str:
         message = purpose.encode("ascii") + b"\x00" + value.encode("utf-8")
@@ -152,14 +190,34 @@ class AuthService:
     def start(self, email: str, client_key: str) -> dict:
         """Start an OTP challenge without revealing allowlist or rate status.
 
-        Every call returns the same public shape.  For an ineligible or limited
-        address, the opaque challenge id is a decoy and no durable challenge is
-        created.  The caller must not add a delivery-status field.
+        Acceptance has a fixed deadline independent of delivery, storage,
+        eligibility and rate status. All paths submit through the same bounded
+        dispatcher before any membership test. Ineligible, limited, overloaded
+        or failed requests receive a decoy id. No delivery status is exposed.
+
+        Delivery can finish after acceptance; only receipt of the email means
+        its challenge is ready. Queued work is best effort on process shutdown.
         """
+        deadline = self.monotonic() + ACCEPTANCE_SECONDS
         challenge_id = self._new_challenge_id()
         code = self._new_code()
         public = {"challenge_id": challenge_id, "expires_in": OTP_TTL_SECONDS}
 
+        def issue():
+            try:
+                self._issue_challenge(challenge_id, code, email, client_key)
+            except Exception:  # No storage/delivery failure reveals membership.
+                pass
+
+        try:
+            self.dispatch(issue)
+        except Exception:
+            pass
+        self.wait_until(deadline)
+        return public
+
+    def _issue_challenge(self, challenge_id: str, code: str, email: str,
+                         client_key: str) -> None:
         eligible_email = (
             isinstance(email, str)
             and len(email) <= 320
@@ -168,41 +226,31 @@ class AuthService:
         )
         eligible_client = isinstance(client_key, str) and 0 < len(client_key) <= 512
         if not eligible_email or not eligible_client:
-            return public
+            return
 
         now = int(self.clock())
         subject_hash = self._subject_hash(email)
         if not self._reserve_send(subject_hash, now):
-            return public
+            return
 
         client_hash = self._client_hash(client_key)
-        stored = False
-        for _ in range(self.cas_attempts):
-            record = {
-                "version": 1,
-                "subject_hash": subject_hash,
-                "client_hash": client_hash,
-                "otp_hash": self._otp_hash(challenge_id, subject_hash, code),
-                "created_at": now,
-                "expires_at": now + OTP_TTL_SECONDS,
-                "attempts": 0,
-                "used_at": None,
-            }
-            try:
-                self.store.save(self._challenge_name(challenge_id), record, None)
-                stored = True
-                break
-            except Conflict:
-                challenge_id = self._new_challenge_id()
-                public = {"challenge_id": challenge_id, "expires_in": OTP_TTL_SECONDS}
-        if not stored:
-            return public
-
+        record = {
+            "version": 1,
+            "subject_hash": subject_hash,
+            "client_hash": client_hash,
+            "otp_hash": self._otp_hash(challenge_id, subject_hash, code),
+            "created_at": now,
+            "expires_at": now + OTP_TTL_SECONDS,
+            "attempts": 0,
+            "used_at": None,
+        }
         try:
-            self.sender(email, code)
-        except Exception:  # noqa: BLE001 - do not create an allowlist oracle.
-            pass
-        return public
+            self.store.save(self._challenge_name(challenge_id), record, None)
+        except Conflict:
+            # The public id is already chosen: never replace it after acceptance
+            # or overwrite another challenge on the extremely unlikely collision.
+            return
+        self.sender(email, code)
 
     def verify(self, challenge_id: str, email: str, code: str, client_key: str) -> dict:
         """Consume one verification attempt, returning an opaque subject on success."""

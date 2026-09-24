@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(CONTROLLER))
 
 from app.auth import (  # noqa: E402
+    ACCEPTANCE_SECONDS,
     AuthService,
     MAX_VERIFY_ATTEMPTS,
     OTP_TTL_SECONDS,
@@ -85,7 +86,8 @@ class Sender:
             raise RuntimeError("synthetic delivery failure")
 
 
-def service(*, store=None, clock=None, sender=None, otp="123456", attempts=20):
+def service(*, store=None, clock=None, sender=None, otp="123456", attempts=20,
+            **acceptance):
     store = store or MemoryStore()
     clock = clock or Clock()
     sender = sender or Sender()
@@ -98,11 +100,133 @@ def service(*, store=None, clock=None, sender=None, otp="123456", attempts=20):
         otp_generator=lambda: otp,
         challenge_id_generator=Sequence(),
         cas_attempts=attempts,
+        **{"dispatch": lambda work: work(), "wait_until": lambda deadline: None,
+           **acceptance},
     )
     return auth, store, clock, sender
 
 
 class AuthTests(unittest.TestCase):
+    def test_acceptance_does_not_wait_for_held_sender(self):
+        entered, release, completed = (threading.Event() for _ in range(3))
+        waits = []
+
+        def sender(email, code):
+            entered.set()
+            release.wait()
+            completed.set()
+
+        def acceptance_deadline(deadline):
+            waits.append(deadline)
+            self.assertTrue(entered.wait(5), "sender must be executing")
+            self.assertFalse(completed.is_set())
+
+        # Exercise the production bounded dispatcher. The injected clock/wait
+        # proves ordering, without wall-clock latency assertions or sleeps.
+        from app.auth import _dispatch_start
+        auth, _, _, _ = service(sender=sender, dispatch=_dispatch_start,
+                                monotonic=lambda: 50, wait_until=acceptance_deadline)
+        try:
+            result = auth.start(EMAIL, CLIENT)
+            unknown = auth.start("other@example.com", CLIENT)
+            self.assertFalse(completed.is_set())
+            self.assertEqual({"challenge_id", "expires_in"}, set(result))
+            self.assertEqual(set(result), set(unknown))
+            self.assertEqual([50 + ACCEPTANCE_SECONDS] * 2, waits)
+        finally:
+            release.set()
+            self.assertTrue(completed.wait(5))
+
+    def test_acceptance_does_not_wait_for_held_storage(self):
+        entered, release, delivered = (threading.Event() for _ in range(3))
+
+        class HeldStore(MemoryStore):
+            def load(self, name):
+                entered.set()
+                release.wait()
+                return super().load(name)
+
+        def acceptance_deadline(deadline):
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(delivered.is_set())
+
+        from app.auth import _dispatch_start
+        auth, _, _, _ = service(store=HeldStore(), dispatch=_dispatch_start,
+                                sender=lambda email, code: delivered.set(),
+                                wait_until=acceptance_deadline)
+        try:
+            accepted = auth.start(EMAIL, CLIENT)
+            self.assertEqual({"challenge_id", "expires_in"}, set(accepted))
+            self.assertFalse(delivered.is_set())
+        finally:
+            release.set()
+            self.assertTrue(delivered.wait(5))
+
+    def test_acceptance_precedes_all_membership_and_storage_work(self):
+        pending, deadlines = [], []
+        auth, store, _, sender = service(dispatch=pending.append,
+                                        monotonic=lambda: 100,
+                                        wait_until=deadlines.append)
+        accepted = [auth.start(email, CLIENT) for email in
+                    (EMAIL, "other@example.com", EMAIL.upper())]
+        self.assertEqual({}, store.data)
+        self.assertEqual([], sender.calls)
+        self.assertEqual(3, len(pending))
+        self.assertEqual([100 + ACCEPTANCE_SECONDS] * 3, deadlines)
+        for work in pending:
+            work()
+        self.assertEqual([(EMAIL, "123456")], sender.calls)
+        self.assertTrue(auth.verify(accepted[0]["challenge_id"], EMAIL,
+                                    "123456", CLIENT)["verified"])
+        self.assertEqual({"verified": False}, auth.verify(
+            accepted[1]["challenge_id"], "other@example.com", "123456", CLIENT))
+
+    def test_refusal_limit_sender_and_storage_failures_share_acceptance_deadline(self):
+        deadlines = []
+        auth, store, _, sender = service(monotonic=lambda: 200,
+                                        wait_until=deadlines.append)
+        responses = [auth.start(EMAIL, CLIENT) for _ in range(4)]
+        responses += [auth.start("unknown@example.com", CLIENT), auth.start(EMAIL, "")]
+        self.assertEqual(3, len(sender.calls))
+        failing, _, _, _ = service(sender=Sender(fail=True), monotonic=lambda: 200,
+                                   wait_until=deadlines.append)
+        responses.append(failing.start(EMAIL, CLIENT))
+
+        class BrokenStore(MemoryStore):
+            def load(self, name):
+                raise RuntimeError("storage unavailable")
+
+        failing, _, _, _ = service(store=BrokenStore(), monotonic=lambda: 200,
+                                   wait_until=deadlines.append)
+        responses.append(failing.start(EMAIL, CLIENT))
+        self.assertEqual([200 + ACCEPTANCE_SECONDS] * len(responses), deadlines)
+        self.assertTrue(all(set(item) == {"challenge_id", "expires_in"}
+                            for item in responses))
+
+    def test_dispatcher_saturation_is_bounded_and_returns_decoys(self):
+        from unittest import mock
+        from app import auth as auth_module
+
+        pending, deadlines = [], []
+
+        class HeldPool:
+            def submit(self, work):
+                pending.append(work)
+
+        with mock.patch.object(auth_module, "_START_POOL", HeldPool()), \
+             mock.patch.object(auth_module, "_START_SLOTS", threading.BoundedSemaphore(2)):
+            auth, store, _, sender = service(dispatch=auth_module._dispatch_start,
+                                            monotonic=lambda: 300,
+                                            wait_until=deadlines.append)
+            accepted = [auth.start(email, CLIENT) for email in
+                        (EMAIL, "other@example.com", EMAIL, "other@example.com")]
+            self.assertEqual(2, len(pending))
+            self.assertEqual([300 + ACCEPTANCE_SECONDS] * 4, deadlines)
+            for work in pending:
+                work()
+            self.assertEqual([(EMAIL, "123456")], sender.calls)
+            self.assertNotIn("studio_auth_challenge_" + accepted[2]["challenge_id"], store.data)
+
     def test_allowlist_is_exact_lowercase_and_start_is_enumeration_safe(self):
         auth, store, _, sender = service()
         allowed = auth.start(EMAIL, CLIENT)
@@ -237,6 +361,8 @@ class AuthTests(unittest.TestCase):
             sender,
             clock=Clock(),
             challenge_id_generator=Sequence(),
+            dispatch=lambda work: work(),
+            wait_until=lambda deadline: None,
         )
         result = auth.start(EMAIL, CLIENT)
         self.assertEqual({"challenge_id", "expires_in"}, set(result))
