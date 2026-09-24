@@ -6,7 +6,7 @@ evidence for how it got here is in `docs/CLOUD-CREDENTIAL-CONTRACT.md` and
 procedure.
 
 **Read live, then trust this page.** Everything in the tables below was read
-from GCP on 2026-09-24 at about 22:45 UTC. Images move with every rollout, so
+from GCP on 2026-09-24 between 22:00 and 22:30 UTC. Images move with every rollout, so
 run the three commands in *Read the live state* before acting on a row here.
 
 ## The shape
