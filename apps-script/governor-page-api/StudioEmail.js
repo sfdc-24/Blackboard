@@ -101,7 +101,7 @@ function studioEmailHandlePost_(e) {
       // each spending the same monitoring headroom while keeping the shared
       // ScriptLock out of the provider call below.
       var remaining = MailApp.getRemainingDailyQuota();
-      if (!studioEmailReserveQuota_(state, remaining, now)) {
+      if (!studioEmailReserveQuota_(state, remaining, now, request.nonce)) {
         return studioEmailResponse_(false);
       }
 
@@ -173,7 +173,7 @@ function studioEmailReadState_(raw, now) {
     return {
       version: 1,
       attempts: [],
-      quotaFence: { observedRemaining: null, pending: [] }
+      quotaFence: { pending: [] }
     };
   }
   if (typeof raw !== 'string' || raw.length > 8500) return null;
@@ -188,22 +188,20 @@ function studioEmailReadState_(raw, now) {
   }
   var fence = parsed.quotaFence;
   if (!fence || typeof fence !== 'object' || Array.isArray(fence) ||
-      Object.keys(fence).sort().join(',') !== 'observedRemaining,pending' ||
-      !(fence.observedRemaining === null ||
-        (typeof fence.observedRemaining === 'number' &&
-         isFinite(fence.observedRemaining) &&
-         Math.floor(fence.observedRemaining) === fence.observedRemaining &&
-         fence.observedRemaining >= 0 && fence.observedRemaining <= 100000)) ||
+      Object.keys(fence).join(',') !== 'pending' ||
       !Array.isArray(fence.pending) ||
       fence.pending.length > STUDIO_EMAIL_GLOBAL_LIMIT_) {
     return null;
   }
   var cutoff = now - STUDIO_EMAIL_GLOBAL_WINDOW_;
   var attempts = [];
+  var attemptTimes = {};
   for (var i = 0; i < parsed.attempts.length; i++) {
     var item = parsed.attempts[i];
     if (!item || typeof item !== 'object' || Array.isArray(item) ||
         Object.keys(item).sort().join(',') !== 'acceptedAt,keyedSubjectHash,nonce' ||
+        typeof item.nonce !== 'string' ||
+        typeof item.keyedSubjectHash !== 'string' ||
         !/^[0-9a-f]{32}$/.test(item.nonce) ||
         !/^[0-9a-f]{64}$/.test(item.keyedSubjectHash) ||
         typeof item.acceptedAt !== 'number' || !isFinite(item.acceptedAt) ||
@@ -211,49 +209,51 @@ function studioEmailReadState_(raw, now) {
         item.acceptedAt > now + 120) {
       return null;
     }
+    if (Object.prototype.hasOwnProperty.call(attemptTimes, item.nonce)) return null;
+    attemptTimes[item.nonce] = item.acceptedAt;
     if (item.acceptedAt > cutoff) attempts.push(item);
   }
   var pending = [];
+  var pendingSeen = {};
   for (var j = 0; j < fence.pending.length; j++) {
-    var reservedAt = fence.pending[j];
-    if (typeof reservedAt !== 'number' || !isFinite(reservedAt) ||
-        Math.floor(reservedAt) !== reservedAt || reservedAt < 0 ||
-        reservedAt > now + 120) {
+    var reservation = fence.pending[j];
+    if (!reservation || typeof reservation !== 'object' || Array.isArray(reservation) ||
+        Object.keys(reservation).sort().join(',') !== 'nonce,reservedAt' ||
+        typeof reservation.nonce !== 'string' ||
+        !/^[0-9a-f]{32}$/.test(reservation.nonce) ||
+        typeof reservation.reservedAt !== 'number' || !isFinite(reservation.reservedAt) ||
+        Math.floor(reservation.reservedAt) !== reservation.reservedAt ||
+        reservation.reservedAt < 0 || reservation.reservedAt > now + 120 ||
+        Object.prototype.hasOwnProperty.call(pendingSeen, reservation.nonce) ||
+        attemptTimes[reservation.nonce] !== reservation.reservedAt) {
       return null;
     }
-    if (reservedAt > cutoff) pending.push(reservedAt);
+    pendingSeen[reservation.nonce] = true;
+    if (reservation.reservedAt > cutoff) pending.push(reservation);
   }
-  if (fence.observedRemaining === null && pending.length) return null;
   return {
     version: 1,
     attempts: attempts,
-    quotaFence: {
-      observedRemaining: fence.observedRemaining,
-      pending: pending
-    }
+    quotaFence: { pending: pending }
   };
 }
 
-function studioEmailReserveQuota_(state, remaining, now) {
+function studioEmailReserveQuota_(state, remaining, now, nonce) {
   if (typeof remaining !== 'number' || !isFinite(remaining) ||
-      Math.floor(remaining) !== remaining || remaining < 0 || remaining > 100000) {
+      Math.floor(remaining) !== remaining || remaining < 0 || remaining > 100000 ||
+      typeof nonce !== 'string' || !/^[0-9a-f]{32}$/.test(nonce)) {
     return false;
   }
   var fence = state.quotaFence;
-  var observed = fence.observedRemaining;
-  if (observed === null || remaining > observed) {
-    // An increased quota indicates a provider reset or a higher current limit.
-    fence.pending = [];
-  } else if (remaining < observed && fence.pending.length) {
-    // Provider consumption now reflects at least this many prior reservations.
-    var reflected = Math.min(observed - remaining, fence.pending.length);
-    fence.pending.splice(0, reflected);
-  }
-  fence.observedRemaining = remaining;
-  if (remaining - fence.pending.length <= STUDIO_EMAIL_MONITOR_HEADROOM_) {
+  // Account-wide quota changes cannot identify which Studio execution, if any,
+  // they reflect.  Retain each bounded reservation for the full rolling day;
+  // this deliberately double-counts completed sends rather than freeing an
+  // in-flight reservation because monitoring consumed quota or a limit reset.
+  if (fence.pending.length >= STUDIO_EMAIL_GLOBAL_LIMIT_ ||
+      remaining - fence.pending.length <= STUDIO_EMAIL_MONITOR_HEADROOM_) {
     return false;
   }
-  fence.pending.push(now);
+  fence.pending.push({ nonce: nonce, reservedAt: now });
   return true;
 }
 

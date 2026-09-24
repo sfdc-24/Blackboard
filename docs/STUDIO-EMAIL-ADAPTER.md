@@ -30,15 +30,16 @@ The adapter is off unless all of these dedicated values are present:
 
 The adapter writes only `STUDIO_GOVERNOR_EMAIL_STATE_V1`. That bounded record
 contains nonces, keyed subject hashes, acceptance times, and a non-sensitive
-quota fence (the last observed remaining count and pending reservation times)—
-never a raw email address or verification code. It rejects replays, more than
-three accepted attempts for one address in 15 minutes, more than 20 accepted
-attempts globally in a rolling 24 hours, and Studio sends that would leave
-fewer than 12 recipients in the deploying account's current MailApp quota.
-The quota fence prevents overlapping Studio executions from spending the same
-snapshot; unrelated scripts can still consume the shared account quota. A
-reservation is written before mail delivery and survives a failed or ambiguous
-provider call.
+quota fence of outstanding nonce/timestamp reservations—never a raw email
+address or verification code. It rejects replays, more than three accepted
+attempts for one address in 15 minutes, more than 20 accepted attempts globally
+in a rolling 24 hours, and Studio sends that would leave fewer than 12
+recipients in the deploying account's current MailApp quota. Each quota
+reservation is conservatively retained for the full rolling day, including
+after successful or ambiguous delivery; account-wide quota changes never free
+a potentially in-flight Studio send. This prevents overlapping Studio
+executions from spending the same snapshot. Unrelated scripts can still consume
+the shared account quota independently.
 
 ## Release sequence
 

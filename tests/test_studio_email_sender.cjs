@@ -215,6 +215,8 @@ function governorHarness({
     sent, appendCalls, propertyReads, hmacCalls, properties,
     nowSeconds: () => Math.floor(nowMs / 1000),
     remainingQuota: () => quota,
+    consumeQuota: (count) => { quota = Math.max(0, quota - count); },
+    setQuota: (value) => { quota = value; },
     advanceSeconds: (seconds) => { nowMs += seconds * 1000; },
     setNextLockDelaySeconds: (seconds) => { nextLockDelayMs = seconds * 1000; },
     setBeforeMailSend: (hook) => { beforeMailSend = hook; },
@@ -318,7 +320,6 @@ test('Governor dispatcher sends signed mail without reading passphrase or touchi
   const state = JSON.parse(app.properties.get('STUDIO_GOVERNOR_EMAIL_STATE_V1'));
   assert.equal(state.version, 1);
   assert.equal(state.attempts.length, 1);
-  assert.equal(state.quotaFence.observedRemaining, 100);
   assert.equal(state.quotaFence.pending.length, 1);
   assert.equal(JSON.stringify(state).includes(email), false);
   assert.equal(JSON.stringify(state).includes(code), false);
@@ -428,8 +429,48 @@ test('Governor quota fence serializes overlapping sends without holding the prov
   assert.equal(app.remainingQuota(), 12);
   const state = JSON.parse(app.properties.get('STUDIO_GOVERNOR_EMAIL_STATE_V1'));
   assert.equal(state.attempts.length, 1);
-  assert.equal(state.quotaFence.observedRemaining, 13);
   assert.equal(state.quotaFence.pending.length, 1);
+});
+
+test('Governor quota fence never attributes account-wide quota changes to Studio', () => {
+  const decreased = governorHarness({ remainingQuota: 14 });
+  let afterMonitor;
+  decreased.setBeforeMailSend(() => {
+    decreased.consumeQuota(1); // Governor monitoring uses one recipient.
+    afterMonitor = decreased.post(governorRequest(decreased, {
+      nonce: '1'.repeat(32),
+    }), { action: 'studio-email', actions: ['studio-email'] });
+  });
+  assert.deepEqual(decreased.post(governorRequest(decreased), {
+    action: 'studio-email', actions: ['studio-email'],
+  }), { ok: true });
+  assert.deepEqual(afterMonitor, { ok: false });
+  assert.equal(decreased.sent.length, 1);
+  assert.equal(decreased.remainingQuota(), 12);
+
+  const increased = governorHarness({ remainingQuota: 13 });
+  let second;
+  let third;
+  increased.setBeforeMailSend(() => {
+    increased.setQuota(14); // Simulate a reset or provider-side limit increase.
+    second = increased.post(governorRequest(increased, {
+      nonce: '2'.repeat(32),
+    }), { action: 'studio-email', actions: ['studio-email'] });
+    third = increased.post(governorRequest(increased, {
+      nonce: '3'.repeat(32),
+    }), { action: 'studio-email', actions: ['studio-email'] });
+  });
+  assert.deepEqual(increased.post(governorRequest(increased), {
+    action: 'studio-email', actions: ['studio-email'],
+  }), { ok: true });
+  assert.deepEqual(second, { ok: true });
+  assert.deepEqual(third, { ok: false });
+  assert.equal(increased.sent.length, 2);
+  assert.equal(increased.remainingQuota(), 12);
+  const state = JSON.parse(increased.properties.get(
+    'STUDIO_GOVERNOR_EMAIL_STATE_V1'));
+  assert.equal(state.attempts.length, 2);
+  assert.equal(state.quotaFence.pending.length, 2);
 });
 
 test('Governor reservation survives ambiguous mail failure and request expiry during lock wait', () => {
@@ -474,7 +515,7 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
   const now = Math.floor(Date.now() / 1000);
   const full = JSON.stringify({
     version: 1,
-    quotaFence: { observedRemaining: null, pending: [] },
+    quotaFence: { pending: [] },
     attempts: Array.from({ length: 20 }, (_, i) => ({
       nonce: (i + 20).toString(16).padStart(32, '0'),
       keyedSubjectHash: governorSubjectHash(i % 2 ? email : 'other@example.com'),
@@ -489,7 +530,12 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
 
   const expired = JSON.stringify({
     version: 1,
-    quotaFence: { observedRemaining: null, pending: [] },
+    quotaFence: {
+      pending: Array.from({ length: 20 }, (_, i) => ({
+        nonce: (i + 40).toString(16).padStart(32, '0'),
+        reservedAt: now - 86401,
+      })),
+    },
     attempts: Array.from({ length: 20 }, (_, i) => ({
       nonce: (i + 40).toString(16).padStart(32, '0'),
       keyedSubjectHash: governorSubjectHash(email),
@@ -507,12 +553,20 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
 test('Governor adapter refuses corrupt or oversized durable limiter state', () => {
   for (const stateRaw of ['not-json', 'x'.repeat(8501), JSON.stringify({
     version: 1,
-    quotaFence: { observedRemaining: null, pending: [] },
+    quotaFence: { pending: [] },
     attempts: [{ nonce: '../bad', keyedSubjectHash: '0'.repeat(64), acceptedAt: 1 }],
   }), JSON.stringify({
     version: 1,
-    quotaFence: { observedRemaining: 13, pending: ['not-a-timestamp'] },
+    quotaFence: { pending: ['not-a-reservation'] },
     attempts: [],
+  }), JSON.stringify({
+    version: 1,
+    quotaFence: { pending: [] },
+    attempts: [{
+      nonce: ['0'.repeat(32)],
+      keyedSubjectHash: ['0'.repeat(64)],
+      acceptedAt: 1,
+    }],
   })]) {
     const app = governorHarness({ stateRaw });
     assert.deepEqual(app.post(governorRequest(app), {
