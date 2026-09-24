@@ -20,6 +20,7 @@
 !/cloud/board-probe
 !/cloud/waker-shadow
 !/cloud/ack-once
+!/cloud/gemini-waker
 
 !/scripts
 /scripts/*
@@ -27,6 +28,9 @@
 !/scripts/board_say.py
 !/scripts/state_store.py
 !/scripts/board_waker.py
+!/scripts/agent_waker.py
+!/scripts/gemini_agent.py
+!/scripts/fleet_agent.py
 
 # Belt and braces. If a future edit above accidentally re-admits the root, these
 # still never go up. An ignore rule that is redundant today is not wasted.
