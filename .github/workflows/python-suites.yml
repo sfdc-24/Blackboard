@@ -607,7 +607,9 @@ jobs:
       # are fakes.
       - name: Install pinned Studio controller test dependencies
         if: ${{ hashFiles('tests/test_studio_controller.py') != '' || hashFiles('tests/test_studio_auth.py') != '' }}
-        run: python3 -m pip install fastapi==0.115.6 httpx==0.28.1
+        # The controller's own pins, so CI tests what the image installs -
+        # including the anthropic SDK that STUDIO_WORKER=claude imports.
+        run: python3 -m pip install -r cloud/studio-controller/requirements.txt
 
       - name: "studio controller: CAS, idempotency, replay and auth (no network)"
         run: |
