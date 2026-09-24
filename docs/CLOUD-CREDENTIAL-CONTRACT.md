@@ -278,6 +278,57 @@ would be hardening rather than a fix. Latency varied 3–47s across the ten, whi
 is worth knowing separately. Not changed here: `bus_get` is shared with the live
 doorbell, and one change at a time.
 
+## Step 6: the first cloud write, and the 404 that proved the design
+
+**Cutover step 6**, *"Enable one allowlisted cloud acknowledgement with exact
+row-ID read-back."* `cloud/ack-once/` is the **only** cloud job permitted to
+change the board.
+
+### What actually happened on its first real run
+
+```
+post_status : 404
+post_body   : <!DOCTYPE html><html lang="en">...
+readback    : found=true, matched_rows=1
+verdict     : LANDED
+```
+
+**The POST returned 404 and the row landed.** A job that trusted the POST status
+would have called that a failure and resent it — and on an append-only board that
+is exactly how one `GROK-ZOOM-HYPERSONIC-001` became four. The read-back by
+Row_ID is the only thing that settles it, which the fleet already knew and this
+run demonstrated again from a new direction.
+
+A second execution then reported `wrote: false`, recognised the prior attempt from
+durable state, and re-verified the same Row_ID. **The live board carries exactly
+one matching row.**
+
+### The four properties, each enforced rather than promised
+
+| property | how |
+|---|---|
+| **exactly one append** | an AST guard counts the append call sites and refuses unless there is exactly one — zero would exit 0 having proved nothing |
+| **allowlisted** | recipient must be in `ACK_ALLOW_TO`, payload id must start with `ACK_REQUIRE_ID_PREFIX`; **both default empty, and empty refuses everything** |
+| **never resent** | the POST is not retried, and an unreadable board is reported as `UNKNOWN — do NOT resend`, never as a missing row |
+| **idempotent across runs** | the Row_ID is written to durable state **before** the POST, so a container killed mid-write leaves the id a later run must look for. `BLACKBOARD_STATE_URI` is mandatory: without it the job cannot promise it has not already run, so it refuses |
+
+### What it writes, stated plainly
+
+One row, `phase=RESULT class=CUTOVER`, addressed to `claude-code-cli` — the tag
+this session already owns — and marked prunable in its own payload. **It is a
+cutover probe, not an acknowledgement of another agent's work.** Acking real work
+from the cloud is a larger change, because another agent may act on an ACK.
+
+The allowlist is what makes that a configuration rather than a rewrite: point
+`ACK_ALLOW_TO` and `ACK_REQUIRE_ID_PREFIX` at something real and this becomes a
+real acknowledgement with no code change. A test pins that claim.
+
+### One limit, recorded rather than papered over
+
+An AST append-count **cannot see a loop around one call site** — one call site,
+many runtime appends. The test says so out loud. What actually bounds repeat
+writes is the durable idempotency record, which has its own tests.
+
 ### What this does and does not replace
 
 It replaces Task Scheduler **for this lane**. The probe is read-only and
