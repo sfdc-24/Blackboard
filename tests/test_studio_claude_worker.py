@@ -123,7 +123,9 @@ class Gate(unittest.TestCase):
                       "questions": [q("q-a"), q("q-b", affected=("hero-heading",))]})
         self.assertEqual([e["type"] for e in out["events"]], ["decision.batch"])
         batch = out["events"][0]["payload"]
-        self.assertEqual(batch["batch_id"], "b-s1-3")
+        self.assertTrue(batch["batch_id"].startswith("b-s1-"))
+        again, _ = run({"ops": [], "confirm": "", "batch_title": "x", "questions": [q("q-a"), q("q-b", affected=("hero-heading",))]})
+        self.assertNotEqual(again["events"][0]["payload"]["batch_id"], batch["batch_id"], "batch ids never repeat")
         self.assertEqual(len(batch["questions"]), 2)
 
     def test_refusal_truncation_and_non_json_change_nothing(self):
@@ -177,6 +179,92 @@ class Resolves(unittest.TestCase):
         out = self.res({"question_id": "q-cta", "option_id": "", "freeform_answer": "  "})
         self.assertIsNone(out["resolves"])
 
+
+def run_trigger(draft, questions=(), trigger=None):
+    draft = dict(draft)
+    draft.setdefault("resolves", {"question_id": "", "option_id": "", "freeform_answer": ""})
+    client = FakeClient(draft)
+    w = cw.ClaudeWorker(client=client)
+    state = {"artifact": ROOT, "questions": list(questions), "transcript": [], "session_id": "s1", "turn_seq": 1}
+    return w.on_turn(state, trigger or {"kind": "utterance", "text": "go"}), client
+
+
+def op(kind, nid, value="", node=None):
+    return {"op": kind, "node_id": nid, "value": value, "new_node": node or BLANK}
+
+
+class CodexReview200(unittest.TestCase):
+    """CODEX-PR200-REVIEW-20260924T0501Z: each finding as a regression."""
+
+    def test_p1_the_model_sees_what_the_chosen_option_means(self):
+        mk = lambda cons: dict(q(options=[
+            {"option_id": "a", "label": "Option A", "consequence": cons, "recommended": False, "recommended_because": ""},
+            {"option_id": "b", "label": "Option B", "consequence": "other", "recommended": False, "recommended_because": ""}]),
+            status="open")
+        t = {"kind": "answer", "question_id": "q-cta", "option_id": "a"}
+        _, c1 = run_trigger({"ops": [], "confirm": "", "questions": [], "batch_title": ""}, [mk("Opens scheduling")], t)
+        _, c2 = run_trigger({"ops": [], "confirm": "", "questions": [], "batch_title": ""}, [mk("Sends an email")], t)
+        m1 = c1.calls[0]["messages"][0]["content"]
+        m2 = c2.calls[0]["messages"][0]["content"]
+        self.assertNotEqual(m1, m2, "the same tap on two different option meanings must not look identical")
+        self.assertIn("Opens scheduling", m1.split("LATEST INPUT:")[1])
+        self.assertIn("hero-cta", m1.split("LATEST INPUT:")[1])
+
+    def test_p2_an_invalid_dependent_op_drops_the_whole_patch_and_its_confirmation(self):
+        out, _ = run_trigger({"ops": [op("set_label", "hero-heading", "New"), op("set_label", "ghost", "x")],
+                              "confirm": "Changed the heading and the ghost.", "questions": [], "batch_title": ""})
+        self.assertEqual(out["events"], [])
+        self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]))
+
+    def test_p2_a_question_about_a_node_the_patch_removed_is_dropped(self):
+        out, _ = run_trigger({"ops": [op("remove", "hero")], "confirm": "Removed the hero.",
+                              "questions": [q()], "batch_title": ""})
+        self.assertEqual([e["type"] for e in out["events"]], ["artifact.patch", "confirm"])
+
+    def test_p2_insert_then_remove_the_new_node_does_not_throw(self):
+        new = {"id": "tmp", "kind": "text", "label": "t", "detail": ""}
+        out, _ = run_trigger({"ops": [op("insert_child", "hero", node=new), op("remove", "tmp")],
+                              "confirm": "x", "questions": [], "batch_title": ""})
+        self.assertEqual(out["problems"], [])
+
+    def test_p2_an_answer_may_change_only_its_question_s_nodes(self):
+        asked = dict(q(), status="open")
+        t = {"kind": "answer", "question_id": "q-cta", "option_id": "describe"}
+        out, _ = run_trigger({"ops": [op("set_label", "hero-heading", "Unasked change")],
+                              "confirm": "x", "questions": [], "batch_title": ""}, [asked], t)
+        self.assertEqual(out["events"], [])
+        self.assertTrue(any("outside the answered question" in p for p in out["problems"]))
+        out, _ = run_trigger({"ops": [op("set_label", "hero-cta", "Describe a problem")],
+                              "confirm": "Using Describe a problem.", "questions": [], "batch_title": ""}, [asked], t)
+        self.assertEqual([e["type"] for e in out["events"]], ["artifact.patch", "confirm"])
+
+    def test_p2_question_ids_are_fenced(self):
+        opened = dict(q(), status="open")
+        out, _ = run_trigger({"ops": [], "confirm": "", "questions": [q()], "batch_title": ""}, [opened])
+        self.assertEqual(out["events"], [], "an open id is not reused")
+        out, _ = run_trigger({"ops": [], "confirm": "", "questions": [q("q-x"), q("q-x")], "batch_title": ""})
+        self.assertEqual([e["type"] for e in out["events"]], ["question.asked"], "a same-turn duplicate is dropped")
+        out, _ = run_trigger({"ops": [], "confirm": "", "questions": [q()], "batch_title": "",
+                              "resolves": {"question_id": "q-cta", "option_id": "book", "freeform_answer": ""}}, [opened])
+        self.assertEqual(out["resolves"], {"question_id": "q-cta", "option_id": "book"})
+        self.assertEqual(out["events"], [], "a question just resolved is not re-asked under the same id")
+
+    def test_p2_option_text_is_capped(self):
+        long = [{"option_id": "a", "label": "x" * 601, "consequence": "c", "recommended": False, "recommended_because": ""},
+                {"option_id": "b", "label": "B", "consequence": "c", "recommended": False, "recommended_because": ""}]
+        out, _ = run_trigger({"ops": [], "confirm": "", "questions": [q(options=long)], "batch_title": ""})
+        self.assertEqual(out["events"], [])
+
+    def test_p2_a_node_never_exceeds_sixty_children(self):
+        mk = lambda n: [op("insert_child", "hero", node={"id": "n%d" % i, "kind": "text", "label": "t", "detail": ""})
+                        for i in range(n)]
+        # hero starts with 2 children: 58 more is exactly 60, allowed
+        out, _ = run_trigger({"ops": mk(58), "confirm": "x", "questions": [], "batch_title": ""})
+        self.assertEqual(out["problems"], [])
+        # one more would be 61: the whole patch is refused
+        out, _ = run_trigger({"ops": mk(59), "confirm": "x", "questions": [], "batch_title": ""})
+        self.assertEqual(out["events"], [])
+        self.assertTrue(any("60 children" in p for p in out["problems"]))
 
 if __name__ == "__main__":
     unittest.main()

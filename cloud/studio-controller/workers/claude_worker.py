@@ -30,11 +30,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 
 MODEL = os.environ.get("STUDIO_WORKER_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_WORKER_EFFORT") or "low"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 TEXT_MAX = 600
+MAX_CHILDREN = 60
 KINDS = ["screen", "section", "heading", "text", "button", "image-placeholder",
          "form", "field", "list", "card", "nav", "process-step", "edge"]
 GROUPS = ["Strategy", "Audience", "Structure", "Screen", "Component", "Content",
@@ -148,81 +150,63 @@ def _txt(s):
     return isinstance(s, str) and len(s) <= TEXT_MAX
 
 
-def validate(draft: dict, artifact_root: dict, answered_ids: set,
-             open_questions: list | None = None) -> tuple[dict | None, list]:
-    """Semantic checks the schema cannot express. Returns (clean_draft, problems)."""
+def _index(tree):
+    index, parents = {}, {}
+
+    def walk(n, p=None):
+        index[n["id"]] = n
+        parents[n["id"]] = p
+        for c in n.get("children") or []:
+            walk(c, n)
+    walk(tree)
+    return index, parents
+
+
+def _subtree_ids(node):
+    out = {node["id"]}
+    for c in node.get("children") or []:
+        out |= _subtree_ids(c)
+    return out
+
+
+def _scope_question(state_questions, trigger, resolves):
+    """The question this turn answers, if any: its affected ids bound the change."""
+    by_id = {q["question_id"]: q for q in state_questions}
+    if trigger.get("kind") == "answer":
+        return by_id.get(trigger.get("question_id"))
+    if resolves:
+        return by_id.get(resolves["question_id"])
+    return None
+
+
+def validate(draft: dict, artifact_root: dict, state_questions: list,
+             trigger: dict | None = None) -> tuple[dict, list]:
+    """Everything the schema cannot express. Returns (clean_draft, problems).
+
+    Codex review of PR 200 (CODEX-PR200-REVIEW-20260924T0501Z) shaped this:
+    - the ops are ONE TRANSACTION, checked against the tree as it evolves, and
+      if any op is invalid the whole patch and its confirmation are dropped -
+      never a surviving half-change announced as the whole;
+    - when the turn answers a question, the change must stay inside that
+      question's affected nodes (their subtrees, and nodes inserted under them);
+    - question ids are fenced against every recorded question and each other;
+    - every text is capped and a node never exceeds 60 children, as the
+      contract says.
+    """
+    trigger = trigger or {}
     problems = []
-    nodes = _flatten(artifact_root, {})
-    existing = set(nodes)
-    ops_out = []
-    for i, op in enumerate(draft.get("ops") or []):
-        kind, nid = op.get("op"), op.get("node_id", "")
-        if nid not in existing:
-            problems.append("op %d targets unknown node %r" % (i, nid)); continue
-        if kind in ("set_label", "set_detail"):
-            if not _txt(op.get("value")):
-                problems.append("op %d value too long" % i); continue
-            ops_out.append({"op": kind, "node_id": nid, "value": op["value"]})
-        elif kind == "insert_child":
-            nn = op.get("new_node") or {}
-            if not ID_RE.match(nn.get("id", "")) or nn["id"] in existing:
-                problems.append("op %d new id %r missing, malformed or taken" % (i, nn.get("id"))); continue
-            if nn.get("kind") not in KINDS or not _txt(nn.get("label")) or not _txt(nn.get("detail", "")):
-                problems.append("op %d new node invalid" % i); continue
-            new = {"id": nn["id"], "kind": nn["kind"], "label": nn["label"]}
-            if nn.get("detail"):
-                new["detail"] = nn["detail"]
-            existing.add(nn["id"])
-            ops_out.append({"op": "insert_child", "node_id": nid, "node": new})
-        elif kind == "remove":
-            if nodes[nid]["parent"] is None:
-                problems.append("op %d would remove the root" % i); continue
-            ops_out.append({"op": "remove", "node_id": nid})
-        else:
-            problems.append("op %d unknown kind %r" % (i, kind))
+    recorded = {q["question_id"] for q in state_questions}
+    open_by_id = {q["question_id"]: q for q in state_questions if q.get("status") == "open"}
 
-    questions = []
-    for q in (draft.get("questions") or [])[:4]:
-        qid = q.get("question_id", "")
-        why = []
-        if not ID_RE.match(qid) or qid in answered_ids:
-            why.append("id %r malformed or already answered" % qid)
-        opts = q.get("options") or []
-        if not 2 <= len(opts) <= 3:
-            why.append("%d options" % len(opts))
-        if len({o.get("option_id") for o in opts}) != len(opts) or \
-                not all(ID_RE.match(o.get("option_id", "")) for o in opts):
-            why.append("option ids duplicate or malformed")
-        rec = [o for o in opts if o.get("recommended")]
-        if len(rec) > 1 or any(not (o.get("recommended_because") or "").strip() for o in rec):
-            why.append("recommended more than once or without a reason")
-        aff = q.get("affected_artifact_ids") or []
-        if not aff or any(a not in existing for a in aff):
-            why.append("affected ids missing or unknown")
-        for f in ("scope_path", "reason", "prompt"):
-            if not _txt(q.get(f)) or not q.get(f, "").strip():
-                why.append("%s empty or too long" % f)
-        if why:
-            problems.append("question %r dropped: %s" % (qid, "; ".join(why))); continue
-        clean_opts = []
-        for o in opts:
-            c = {"option_id": o["option_id"], "label": o["label"], "consequence": o["consequence"]}
-            if o.get("recommended"):
-                c["recommended"] = True
-                c["recommended_because"] = o["recommended_because"]
-            clean_opts.append(c)
-        # Recommended first - the page shows options in this order.
-        clean_opts.sort(key=lambda c: 0 if c.get("recommended") else 1)
-        questions.append({"question_id": qid, "group": q["group"], "scope_path": q["scope_path"],
-                          "reason": q["reason"], "prompt": q["prompt"], "options": clean_opts,
-                          "status": "open", "affected_artifact_ids": aff})
-
+    # -- resolves first: it decides the scope of the change
     resolves = None
     r = draft.get("resolves") or {}
     rqid = (r.get("question_id") or "").strip()
+    # A tap already says which question and option; resolving is for words.
+    if trigger.get("kind") in ("answer", "answer_batch"):
+        rqid = ""
     if rqid:
-        open_q = {q["question_id"]: q for q in (open_questions or [])}
-        q = open_q.get(rqid)
+        q = open_by_id.get(rqid)
         opt = (r.get("option_id") or "").strip()
         free = (r.get("freeform_answer") or "").strip()
         if q is None:
@@ -240,9 +224,122 @@ def validate(draft: dict, artifact_root: dict, answered_ids: set,
             else:
                 resolves["freeform_answer"] = free
 
+    # -- the patch, as one transaction on a candidate tree
+    tree = json.loads(json.dumps(artifact_root))
+    index, parents = _index(tree)
+    scope_q = _scope_question(state_questions, trigger, resolves)
+    allowed = None
+    if scope_q is not None:
+        allowed = set()
+        for a in scope_q.get("affected_artifact_ids") or []:
+            if a in index:
+                allowed |= _subtree_ids(index[a])
+    ops_out, txn_ok = [], True
+    for i, op in enumerate(draft.get("ops") or []):
+        kind, nid = op.get("op"), op.get("node_id", "")
+        why = None
+        if nid not in index:
+            why = "targets unknown node %r" % nid
+        elif allowed is not None and nid not in allowed:
+            why = "changes %r, outside the answered question's scope" % nid
+        elif kind in ("set_label", "set_detail"):
+            if not _txt(op.get("value")):
+                why = "value too long"
+            else:
+                index[nid]["label" if kind == "set_label" else "detail"] = op["value"]
+                ops_out.append({"op": kind, "node_id": nid, "value": op["value"]})
+        elif kind == "insert_child":
+            nn = op.get("new_node") or {}
+            if not ID_RE.match(nn.get("id", "")) or nn["id"] in index:
+                why = "new id %r missing, malformed or taken" % nn.get("id")
+            elif nn.get("kind") not in KINDS or not _txt(nn.get("label")) or not (nn.get("label") or "").strip() \
+                    or not _txt(nn.get("detail", "")):
+                why = "new node invalid"
+            elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
+                why = "%r already has %d children" % (nid, MAX_CHILDREN)
+            else:
+                new = {"id": nn["id"], "kind": nn["kind"], "label": nn["label"]}
+                if nn.get("detail"):
+                    new["detail"] = nn["detail"]
+                index[nid].setdefault("children", []).append(dict(new))
+                index[new["id"]] = index[nid]["children"][-1]
+                parents[new["id"]] = index[nid]
+                if allowed is not None:
+                    allowed.add(new["id"])
+                ops_out.append({"op": "insert_child", "node_id": nid, "node": new})
+        elif kind == "remove":
+            if parents[nid] is None:
+                why = "would remove the root"
+            else:
+                gone = _subtree_ids(index[nid])
+                p = parents[nid]
+                p["children"] = [c for c in p["children"] if c["id"] != nid]
+                for g in gone:
+                    index.pop(g, None)
+                    parents.pop(g, None)
+                ops_out.append({"op": "remove", "node_id": nid})
+        else:
+            why = "unknown op %r" % kind
+        if why:
+            problems.append("op %d %s; the whole patch is dropped" % (i, why))
+            txn_ok = False
+            break
+
     confirm = draft.get("confirm") or ""
+    if not txn_ok:
+        ops_out, confirm = [], ""
+        tree = json.loads(json.dumps(artifact_root))
+        index, parents = _index(tree)
     if not _txt(confirm):
-        problems.append("confirm too long"); confirm = ""
+        problems.append("confirm too long")
+        confirm = ""
+
+    # -- questions, fenced and capped, against the tree as it will be
+    questions, seen = [], set(recorded)
+    if resolves:
+        seen.add(resolves["question_id"])
+    for q in (draft.get("questions") or [])[:4]:
+        qid = q.get("question_id", "")
+        why = []
+        if not ID_RE.match(qid) or qid in seen:
+            why.append("id %r malformed, already recorded or repeated" % qid)
+        opts = q.get("options") or []
+        if not 2 <= len(opts) <= 3:
+            why.append("%d options" % len(opts))
+        if len({o.get("option_id") for o in opts}) != len(opts) or \
+                not all(ID_RE.match(o.get("option_id", "")) for o in opts):
+            why.append("option ids duplicate or malformed")
+        for o in opts:
+            if not (o.get("label") or "").strip() or not _txt(o.get("label")) \
+                    or not _txt(o.get("consequence")) or not _txt(o.get("recommended_because") or ""):
+                why.append("option %r text empty or too long" % o.get("option_id"))
+                break
+        rec = [o for o in opts if o.get("recommended")]
+        if len(rec) > 1 or any(not (o.get("recommended_because") or "").strip() for o in rec):
+            why.append("recommended more than once or without a reason")
+        aff = q.get("affected_artifact_ids") or []
+        if not aff or any(a not in index for a in aff):
+            why.append("affected ids missing or unknown")
+        for f in ("scope_path", "reason", "prompt"):
+            if not _txt(q.get(f)) or not (q.get(f) or "").strip():
+                why.append("%s empty or too long" % f)
+        if why:
+            problems.append("question %r dropped: %s" % (qid, "; ".join(why)))
+            continue
+        seen.add(qid)
+        clean_opts = []
+        for o in opts:
+            c = {"option_id": o["option_id"], "label": o["label"], "consequence": o["consequence"]}
+            if o.get("recommended"):
+                c["recommended"] = True
+                c["recommended_because"] = o["recommended_because"]
+            clean_opts.append(c)
+        # Recommended first - the page shows options in this order.
+        clean_opts.sort(key=lambda c: 0 if c.get("recommended") else 1)
+        questions.append({"question_id": qid, "group": q["group"], "scope_path": q["scope_path"],
+                          "reason": q["reason"], "prompt": q["prompt"], "options": clean_opts,
+                          "status": "open", "affected_artifact_ids": aff})
+
     return {"ops": ops_out, "confirm": confirm, "questions": questions,
             "batch_title": (draft.get("batch_title") or "")[:TEXT_MAX],
             "resolves": resolves}, problems
@@ -294,19 +391,51 @@ def to_drafts(clean: dict, batch_id: str) -> list[dict]:
     return out
 
 
+def _option_text(o):
+    rec = " (recommended: %s)" % o.get("recommended_because", "") if o.get("recommended") else ""
+    return "%s = %s -> %s%s" % (o["option_id"], o.get("label", ""), o.get("consequence", ""), rec)
+
+
 def _describe(state: dict, trigger: dict) -> str:
+    """Everything the model needs to act on a choice: each question's options WITH
+    their meaning, and the chosen option spelled out - an opaque id like "a" is
+    not an answer the model can enact (Codex review of PR 200, P1)."""
     nodes = _flatten(state["artifact"], {})
     lines = ["CURRENT PROTOTYPE (id | kind | label | detail | parent):"]
     for nid, n in nodes.items():
         lines.append("%s | %s | %s | %s | %s" % (nid, n["kind"], n["label"], n["detail"], n["parent"] or "-"))
+    by_id = {}
     lines.append("\nQUESTIONS SO FAR:")
     for q in state.get("questions") or []:
-        pick = q.get("selected_option") or q.get("freeform_answer") or ""
-        lines.append("%s [%s] %s -> %s" % (q["question_id"], q.get("status"), q.get("prompt"), pick))
+        by_id[q["question_id"]] = q
+        lines.append("%s [%s] %s | where: %s | affects: %s" % (
+            q["question_id"], q.get("status"), q.get("prompt"), q.get("scope_path", ""),
+            ", ".join(q.get("affected_artifact_ids") or [])))
+        for o in q.get("options") or []:
+            lines.append("    option " + _option_text(o))
+        if q.get("selected_option") or q.get("freeform_answer"):
+            chosen = next((o for o in q.get("options") or [] if o["option_id"] == q.get("selected_option")), None)
+            lines.append("    ANSWERED: " + (_option_text(chosen) if chosen else q.get("freeform_answer", "")))
     lines.append("\nRECENT CONVERSATION:")
     for t in (state.get("transcript") or [])[-12:]:
         lines.append("%s: %s" % (t.get("role", "visitor"), t.get("text", "")))
-    lines.append("\nLATEST INPUT: " + json.dumps(trigger, ensure_ascii=False))
+
+    def spelled(qid, option_id, free):
+        q = by_id.get(qid) or {}
+        o = next((x for x in q.get("options") or [] if x["option_id"] == option_id), None)
+        what = _option_text(o) if o else "their own words: %s" % (free or "")
+        return "answered %s (%s) with %s; change only: %s" % (
+            qid, q.get("prompt", "?"), what, ", ".join(q.get("affected_artifact_ids") or []))
+
+    kind = trigger.get("kind")
+    if kind == "answer":
+        latest = spelled(trigger.get("question_id"), trigger.get("option_id"), trigger.get("freeform_answer"))
+    elif kind == "answer_batch":
+        latest = "; ".join(spelled(a.get("question_id"), a.get("option_id"), a.get("freeform_answer"))
+                           for a in trigger.get("answers") or [])
+    else:
+        latest = "the visitor said: %s" % (trigger.get("text") or "")
+    lines.append("\nLATEST INPUT: " + latest)
     return "\n".join(lines)
 
 
@@ -348,11 +477,9 @@ class ClaudeWorker:
             draft = json.loads(text)
         except ValueError:
             return {"events": [], "problems": ["model output was not JSON"]}
-        answered = {q["question_id"] for q in state.get("questions") or []
-                    if q.get("status") in ("answered", "superseded")}
-        open_qs = [q for q in state.get("questions") or [] if q.get("status") == "open"]
-        clean, problems = validate(draft, state["artifact"], answered, open_qs)
-        batch_id = "b-%s-%s" % (state.get("session_id", "s"), state.get("turn_seq", 0))
+        clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger)
+        # Fresh per turn, never derived from a counter that can repeat.
+        batch_id = "b-%s-%s" % (state.get("session_id", "s"), uuid.uuid4().hex[:10])
         # `resolves` is for the controller: it owns the question record, so it
         # composes question.answered (answer_source "voice" for an utterance).
         return {"events": to_drafts(clean, batch_id), "problems": problems,
