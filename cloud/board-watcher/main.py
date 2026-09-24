@@ -21,6 +21,14 @@ WHAT IT WILL NOT DO
     catches the second writer only AFTER it has already posted. So a running
     job is skipped, and the watermark is HELD before the rows it was needed
     for: the next tick tries again rather than forgetting them.
+  - A start is not a finish. Each route keeps its own pending list until THAT
+    JOB's cursor records the id as answered (delivered, for the outbox) or
+    quarantined. While anything is still pending, the next tick starts the
+    route again, once, and not while the job is already running. How many
+    rows one run actually answers stays the job's own per-pass cap.
+  - It reads the lease back immediately before a start. A slow read can
+    outlive the 120s lease; if another tick owns it by then, this one does
+    not start the job and does not write the cursor.
   - A start that fails also holds the watermark. A doorbell that silently
     drops a ring is the failure this replaces.
 
@@ -33,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -51,6 +60,58 @@ SEEN_CAP = 1000
 # that expires while it is still starting jobs.
 LEASE = timedelta(seconds=int(os.environ.get("LEASE_SECONDS") or 120))
 RUN_API = "https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s"
+# Cursor each route's job writes. The watcher does not decide that a row is
+# done; that cursor does, when the id is answered (delivered, for the outbox)
+# or quarantined. Defaults match the cloud jobs' CURSOR_NAME.
+ROUTE_CURSORS = {
+    "gemini-waker": "gemini_waker",
+    "claude-api-waker": "claude_api_waker",
+    "wa-outbox": "wa_outbox",
+}
+
+
+def finished_ids(state, job: str) -> set:
+    """Ids this route's own cursor has answered or quarantined.
+
+    Anything else is still pending, including a row whose job was started
+    and then killed, and a row the per-pass cap did not reach.
+    """
+    if not isinstance(state, dict):
+        return set()
+    if job == "wa-outbox":
+        found = set(state.get("delivered_row_ids") or [])
+        found.update(state.get("delivered_bcb_ids") or [])
+        found.update(state.get("unknown_row_ids") or [])
+    else:
+        found = set(state.get("answered_ids") or [])
+        found.update(state.get("unknown_ids") or [])
+    return {str(item) for item in found if item}
+
+
+def reconcile(pending, store) -> tuple:
+    """Drop pending work the route has finished. Returns (still, done row ids)."""
+    still, done = {}, []
+    for job, items in (pending or {}).items():
+        cursor, _token = store.load(ROUTE_CURSORS.get(job) or job)
+        finished = finished_ids(cursor, job)
+        keep = []
+        for item in items or []:
+            if isinstance(item, str):
+                item = {"row_id": item, "work_id": item}
+            if not isinstance(item, dict):
+                continue
+            rid = str(item.get("row_id") or "").strip()
+            wid = str(item.get("work_id") or rid).strip()
+            if not rid and not wid:
+                continue
+            if rid in finished or wid in finished:
+                if rid:
+                    done.append(rid)
+                continue
+            keep.append({"row_id": rid, "work_id": wid or rid})
+        if keep:
+            still[job] = keep[-SEEN_CAP:]
+    return still, done
 
 
 # ------------------------------------------------------------------ routing
@@ -104,7 +165,11 @@ def plan(rows, seen, routes):
                     "%s: %s: %s" % (job, type(exc).__name__, str(exc)[:120]))
                 continue
             if hit:
-                wanted.setdefault(job, []).append((ts, rid))
+                # work_id is what the job records: the BCB id, or the Row_ID
+                # when the row has none. Pending is complete only when that
+                # id shows up as answered or quarantined.
+                wid = aw.bcb_id(row) if len(row) > aw.C_PAYLOAD else rid
+                wanted.setdefault(job, []).append((ts, rid, wid))
     return wanted, fresh, newest, errors
 
 
@@ -150,6 +215,7 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     if lease and lease > now.strftime("%Y-%m-%dT%H:%M:%SZ"):
         return {"ran": False, "reason": "another tick holds the lease until %s" % lease}
     state["lease_until"] = (now + LEASE).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["lease_owner"] = uuid.uuid4().hex
     try:
         token = store.save(CURSOR, state, token)
     except state_store.Conflict:
@@ -159,33 +225,97 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
         return {"ran": False, "reason": "lost the lease race"}
 
     import agent_waker as aw
+    owner = state["lease_owner"]
     wm = aw.parse_ts(state["watermark"])
     since = (wm - OVERLAP).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = read_since(since)
-    seen = set(state.get("seen") or [])
-    wanted, fresh, newest, errors = plan(rows, seen, routes)
+    # Completion is read from each route's cursor, not from the fact that
+    # an earlier tick managed to start the job. A capped pass that answered
+    # three of four leaves the fourth pending, and the next tick starts
+    # that route again.
+    pending, done_rows = reconcile(state.get("pending") or {}, store)
+    seen_ids = [str(r) for r in (state.get("seen") or []) if r]
+    for rid in done_rows:
+        if rid not in seen_ids:
+            seen_ids.append(rid)
+    wanted, fresh, newest, errors = plan(rows, set(seen_ids), routes)
+
+    def add_pending(job, hits):
+        items = list(pending.get(job) or [])
+        have = {item["row_id"] for item in items}
+        for _ts, rid, wid in hits:
+            if rid in have:
+                continue
+            items.append({"row_id": rid, "work_id": wid or rid})
+            have.add(rid)
+        if items:
+            pending[job] = items[-SEEN_CAP:]
+
+    def still_owns() -> bool:
+        # The lease was taken above. A slow read can outlive it, and the
+        # tick that then acquires it is the one allowed to start jobs.
+        current, _gen = store.load(CURSOR)
+        return (current.get("lease_owner") or "") == owner
 
     started, skipped, failed = {}, {}, {}
     hold = None  # earliest row whose job could not be started this tick
-    for ts, _ in errors.values():
+    for ts, _msgs in errors.values():
         hold = ts if hold is None else min(hold, ts)
-    for job, hits in wanted.items():
-        earliest = min(t for t, _ in hits)
-        try:
-            if running(job):
-                skipped[job] = len(hits)
+    order = list(wanted)
+    for job in pending:
+        if job not in wanted:
+            order.append(job)
+    lost = False
+    for job in order:
+        hits = wanted.get(job) or []
+        earliest = min((t for t, _rid, _wid in hits), default=None)
+        if running(job):
+            # The backoff: one copy of the job. Pending stays, so the tick
+            # after it finishes still has the work.
+            skipped[job] = len(hits) or len(pending.get(job) or [])
+            if earliest is not None:
                 hold = earliest if hold is None else min(hold, earliest)
-                continue
+            add_pending(job, hits)
+            continue
+        if not hits and not pending.get(job):
+            continue
+        if not still_owns():
+            lost = True
+            break
+        try:
             started[job] = start(job)
         except Exception as exc:  # noqa: BLE001
             failed[job] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
-            hold = earliest if hold is None else min(hold, earliest)
+            if earliest is not None:
+                hold = earliest if hold is None else min(hold, earliest)
+        # Started, skipped, or failed: the row is pending until the job's
+        # own cursor says so. Recording it here is what lets the next tick
+        # retry a capped pass after the watermark has moved on.
+        add_pending(job, hits)
 
-    # Rows whose job did not start stay OUT of seen, so the next tick routes
-    # them again; everything else is remembered.
-    held_ids = {rid for job in list(skipped) + list(failed) for _, rid in wanted[job]}
+    if lost:
+        # The other tick owns the cursor. Writing ours back would either
+        # lose the compare-and-swap or, worse, start from a stale read.
+        return {"ran": True, "reason": "lease moved before start",
+                "since": since, "rows": len(rows), "new": len(fresh),
+                "started": started, "skipped_running": skipped, "failed": failed,
+                "routed": {job: [rid for _ts, rid, _wid in hits]
+                           for job, hits in wanted.items()}}
+
+    # Rows whose job did not start stay OUT of seen, and so does every row
+    # we did start: a start is not a completion. Unrouted rows are remembered
+    # so the overlap does not offer them again.
+    routed_ids = {rid for hits in wanted.values() for _ts, rid, _wid in hits}
+    held_ids = {rid for job in list(skipped) + list(failed) for _ts, rid, _wid in wanted.get(job) or []}
     held_ids |= set(errors)
-    new_seen = (list(state.get("seen") or []) + [r for r in fresh if r not in held_ids])[-SEEN_CAP:]
+    new_seen = list(seen_ids)
+    have = set(new_seen)
+    for rid in fresh:
+        if rid in held_ids or rid in routed_ids or rid in have:
+            continue
+        new_seen.append(rid)
+        have.add(rid)
+    new_seen = new_seen[-SEEN_CAP:]
 
     target = newest if newest and newest > wm else wm
     if hold is not None:
@@ -193,11 +323,12 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     target = max(target, wm)  # never backwards
 
     new_state = {"watermark": target.strftime("%Y-%m-%dT%H:%M:%SZ"), "seen": new_seen,
+                 "pending": pending,
                  "last_tick": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
     store.save(CURSOR, new_state, token)
     return {"ran": True, "since": since, "rows": len(rows), "new": len(fresh),
             "started": started, "skipped_running": skipped, "failed": failed,
-            "routed": {job: [rid for _, rid in hits] for job, hits in wanted.items()},
+            "routed": {job: [rid for _ts, rid, _wid in hits] for job, hits in wanted.items()},
             "route_errors": {rid: msgs for rid, (_, msgs) in errors.items()},
             "watermark": new_state["watermark"]}
 

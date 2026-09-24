@@ -229,6 +229,33 @@ class DryRunAndState(unittest.TestCase):
         self.assertNotIn("WRK-1", saved.get("delivered_row_ids") or [])
         self.assertIn("WRK-1", saved.get("unknown_row_ids") or [])
 
+    def test_a_legacy_single_id_claim_blocks_either_identity_and_is_not_delivered(self):
+        """An old inflight string is not a receipt. It blocks whichever column it matches."""
+        rows = [
+            row("ROW-B", "BCB|v=1|id=EVENT-A|phase=WA_SEND|from=codex|to=wa-outbox|text=alias"),
+            row("EVENT-A", "BCB|v=1|id=OTHER|phase=WA_SEND|from=codex|to=wa-outbox|text=same row id"),
+            row("ROW-C", "BCB|v=1|id=EVENT-C|phase=WA_SEND|from=codex|to=wa-outbox|text=unrelated"),
+        ]
+        sends = []
+
+        def fake_send(req):
+            sends.append(req["row_id"])
+            return True, "HTTP 200"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = {"delivered_row_ids": ["seed"], "delivered_bcb_ids": [],
+                     "inflight": "EVENT-A"}
+            with mock.patch.object(ox, "send_via_notify", side_effect=fake_send), \
+                 mock.patch.object(ox, "append_log"):
+                ox.run_once(rows, state, dry_run=False, send=True, note=False,
+                            state_path=state_path)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(sends, ["ROW-C"])
+        self.assertIn("EVENT-A", saved.get("unknown_row_ids") or [])
+        self.assertNotIn("EVENT-A", saved.get("delivered_row_ids") or [])
+        self.assertNotIn("EVENT-A", saved.get("delivered_bcb_ids") or [])
+
     def test_a_graph_4xx_is_released_and_a_later_pass_may_send(self):
         """A 4xx is Graph refusing the request. That one may be retried."""
         rows = [row("WRK-1", WA_SEND)]

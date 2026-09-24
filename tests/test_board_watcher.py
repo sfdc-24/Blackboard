@@ -3,6 +3,7 @@ dropped (a row nobody wakes for), a ring doubled (two copies of a job posting
 the same answer), and a cursor that moves backwards."""
 import importlib.util
 import json
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -192,6 +193,127 @@ class Tick(unittest.TestCase):
         w.tick(store, read_since=lambda s: asked.append(s) or [], routes={},
                running=lambda j: False, start=lambda j: "", now=NOW)
         self.assertEqual(asked, ["2026-09-24T03:30:00Z"])
+
+    def test_a_start_is_refused_once_the_lease_has_moved(self):
+        # A slow read can outlive the lease. The tick that then owns it is
+        # the one that may start a job; this one must not.
+        store = MemStore({"watermark": "2026-09-24T03:40:00Z", "seen": []})
+        started = []
+
+        def read_since(since):
+            current, token = store.load("board_watcher")
+            current["lease_owner"] = "rival-tick"
+            current["lease_until"] = "2026-09-24T04:05:00Z"
+            store.save("board_watcher", current, token)
+            return [row("R1", "2026-09-24T03:50:00Z")]
+
+        out = w.tick(store, read_since=read_since, routes=w._routes(),
+                     running=lambda job: False,
+                     start=lambda job: started.append(job) or "exec",
+                     now=NOW)
+        self.assertEqual(started, [])
+        self.assertEqual(out.get("reason"), "lease moved before start")
+        self.assertEqual(store.state.get("lease_owner"), "rival-tick")
+
+
+class NamedStore:
+    """One generation per cursor name, which is how the real store is keyed."""
+
+    def __init__(self, cursors):
+        self.slots = {name: [json.loads(json.dumps(state)), 1]
+                      for name, state in cursors.items()}
+
+    def load(self, name):
+        slot = self.slots.get(name)
+        if slot is None:
+            return {}, None
+        return json.loads(json.dumps(slot[0])), slot[1]
+
+    def save(self, name, state, token):
+        slot = self.slots.get(name)
+        current = None if slot is None else slot[1]
+        if token != current:
+            raise state_store.Conflict("stale %s" % name)
+        gen = (current or 0) + 1
+        self.slots[name] = [json.loads(json.dumps(state)), gen]
+        return gen
+
+
+class PendingUntilTheJobFinishes(unittest.TestCase):
+    def test_four_asks_are_woken_again_and_the_fourth_is_answered_once(self):
+        import agent_waker as aw
+        saved_env = {key: os.environ.get(key) for key in ("AGENT", "CURSOR_NAME")}
+        os.environ.pop("AGENT", None)
+        os.environ.pop("CURSOR_NAME", None)
+        spec = importlib.util.spec_from_file_location(
+            "agent_waker_cloud_for_watcher", REPO / "cloud" / "agent-waker" / "main.py")
+        cloud = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cloud)
+        asks = [row("ROW-%d" % n, "2026-09-24T03:50:%02dZ" % n,
+                    payload="BCB|v=1|id=ASK-%d|phase=DISPATCH|to=gemini|ask=number %d" % (n, n))
+                for n in range(1, 5)]
+        store = NamedStore({
+            "board_watcher": {"watermark": "2026-09-24T03:40:00Z", "seen": []},
+            cloud.CURSOR: {"watermark": "2026-09-24T03:40:00Z", "answered_ids": []},
+        })
+        posts, starts = [], []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                return ("an answer", "fake-route")
+
+        saved_module = aw.AGENTS["gemini"]["module"]
+        saved = (aw.read_since, aw.load_env, aw.log, aw.post_reply)
+        aw.sys.modules["fake_watcher_drain_adapter"] = Adapter
+        aw.AGENTS["gemini"]["module"] = "fake_watcher_drain_adapter"
+
+        def read_since(env, since, tries=3):
+            kept = [r for r in asks if str(r[1]) > since]
+            return {"rows": kept, "total": len(asks), "filtered": len(kept)}
+
+        def post_reply(me, cfg, text, to, answers, verbose):
+            posts.append(answers)
+            return True
+
+        aw.read_since = read_since
+        aw.load_env = lambda: {}
+        aw.log = lambda me, line: None
+        aw.post_reply = post_reply
+
+        def start(job):
+            starts.append(job)
+            cloud.run(store=store, waker=aw, board_contains=lambda rid: False,
+                      argv=["--agent", "gemini", "--max", "3"])
+            return "exec-%d" % len(starts)
+
+        # The second and third ticks read nothing. The fourth ask is already
+        # past the watermark; only the pending list can wake it.
+        watcher_reads = {"n": 0}
+
+        def watcher_read(since):
+            watcher_reads["n"] += 1
+            return asks if watcher_reads["n"] == 1 else []
+
+        try:
+            for _ in range(3):
+                w.tick(store, read_since=watcher_read, routes=w._routes(),
+                       running=lambda job: False, start=start, now=NOW)
+        finally:
+            aw.AGENTS["gemini"]["module"] = saved_module
+            aw.read_since, aw.load_env, aw.log, aw.post_reply = saved
+            aw.sys.modules.pop("fake_watcher_drain_adapter", None)
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertEqual(cloud.CURSOR, w.ROUTE_CURSORS["gemini-waker"])
+        self.assertEqual(starts, ["gemini-waker", "gemini-waker"])
+        self.assertEqual(posts, ["ASK-1", "ASK-2", "ASK-3", "ASK-4"])
+        answered = store.slots[cloud.CURSOR][0].get("answered_ids") or []
+        self.assertEqual(answered, ["ASK-1", "ASK-2", "ASK-3", "ASK-4"])
 
 
 if __name__ == "__main__":

@@ -35,8 +35,10 @@ that decides whether a reply is sent twice.
     before the append the owner writes phase `posting` and renews the
     lease to cover the post (400s) plus a margin. A `posting` claim is
     never reclaimed, whatever the lease says: the append may already be
-    on the wire. A later run reads the board. Reply present: mark the row
-    answered. Reply absent: quarantine it and never post it again. It is
+    on the wire. A later run reads the board. A reply is present only when
+    some row's answers= is this exact source id: the legacy Row_ID strips
+    characters and keeps 40, so it is not an identity. Reply present: mark
+    the row answered. Reply absent: quarantine it and never post it again. It is
     not marked answered before that reply is seen. Quarantined ids are
     left out of the per-pass selection window, so they do not crowd out
     a newer row, and they stay in `unknown_ids` for a person to see.
@@ -86,17 +88,57 @@ POST_TIMEOUT_SECONDS = 400
 POST_LEASE_SECONDS = POST_TIMEOUT_SECONDS + 60
 
 
-def _board_has_row(row_id: str) -> bool:
-    """True when a row with this exact Row_ID is on the board.
+def _answers_of(row) -> str:
+    """The first answers= field on a row, or empty.
 
-    `match` is a substring over the whole row, so a later note that merely
-    quotes the id is not a hit. The Row_ID column has to be that id.
+    First value wins, same as the rest of the board: a later quote of
+    answers=<something else> is not a rewrite of the reply's identity.
+    """
+    if not isinstance(row, (list, tuple)) or len(row) <= 5:
+        return ""
+    for segment in str(row[5] or "").split("|"):
+        key, sep, val = segment.partition("=")
+        if sep and key.strip().lower() == "answers":
+            return val.strip()
+    return ""
+
+
+def _rows_answer(rows, answers_id: str) -> bool:
+    """True when some row's answers= field is this exact source id.
+
+    Row_ID is not the identity. The legacy reply id strips `.` and `_`
+    and keeps 40 characters, so a receipt for one ask can share a Row_ID
+    with a different ask. The payload field is the whole id.
+    """
+    if not answers_id:
+        return False
+    for row in rows or []:
+        if _answers_of(row) == answers_id:
+            return True
+    return False
+
+
+def _board_has_answer(answers_id: str) -> bool:
+    """True when the board has a reply whose answers= is this exact id.
+
+    Search by the answers token, and also by the new and legacy Row_IDs,
+    because `match` is a substring and either form can be how the row is
+    found. A hit still has to carry this full answers= value. A row whose
+    Row_ID merely collides does not count.
     """
     import bus
+    import agent_waker
+    if not answers_id:
+        return False
     env = bus.load_env()
-    obj = bus.read_rows(env, match=row_id, limit=20)
-    for row in obj.get("rows") or []:
-        if row and str(row[0]).strip() == row_id:
+    needles = ["answers=%s" % answers_id]
+    for extra in (agent_waker.reply_row_id(AGENT, answers_id),
+                  agent_waker.legacy_reply_row_id(AGENT, answers_id)):
+        if extra and extra not in needles:
+            needles.append(extra)
+    for needle in needles:
+        obj = bus.read_rows(env, match=needle, limit=20)
+        if _rows_answer(obj.get("rows") or [], answers_id):
             return True
     return False
 
@@ -211,14 +253,23 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         clear_claim(s)
 
     def reply_visible(answers_id: str) -> bool:
+        """A reply counts only when it answers this exact source id.
+
+        `reply_rows`, when a test sets it, is the board. Otherwise a test
+        may still plant the Row_ID this run would write (`reply_on_board`
+        / `board_contains`). The live lookup reads answers= off the row.
+        """
         import agent_waker
-        rid = agent_waker.reply_row_id(AGENT, answers_id)
+        rows_of = getattr(waker, "reply_rows", None)
+        if rows_of is not None:
+            rows = rows_of() if callable(rows_of) else rows_of
+            return _rows_answer(rows, answers_id)
         finder = board_contains
         if finder is None:
             finder = getattr(waker, "reply_on_board", None)
-        if finder is None:
-            finder = _board_has_row
-        return bool(finder(rid))
+        if finder is not None:
+            return bool(finder(agent_waker.reply_row_id(AGENT, answers_id)))
+        return _board_has_answer(answers_id)
 
     def resolve_inflight():
         """A previous run owned this answers id and may already have posted.
