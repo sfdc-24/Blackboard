@@ -214,9 +214,33 @@ class AnUnknownSaysWhy(unittest.TestCase):
         _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
         self.assertTrue(criteria["shadow_unknown_reasons"][0].endswith("no note"))
 
+    def test_a_failed_board_read_is_listed_even_when_combined_is_news(self):
+        # 22:45Z, 2026-09-24: board UNKNOWN after three attempts, combined NEWS
+        # because WhatsApp had news. The combined count never saw it.
+        p = self.shadow[6]["payload"]
+        p.update({"combined": "NEWS", "board": "UNKNOWN",
+                  "board_note": "board read failed (HTTP 404)", "whatsapp": "NEWS"})
+        findings, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
+        self.assertEqual(criteria["shadow_unknown_reasons"], [])
+        failed = criteria["shadow_failed_reads"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn(self.shadow[6]["ts"][5:16], failed[0])
+        self.assertIn("board failed (combined=NEWS)", failed[0])
+        self.assertIn("HTTP 404", failed[0])
+        self.assertEqual(findings, [], "reported, not a finding: the wake decision was right")
+
+    def test_both_reads_failing_names_both(self):
+        p = self.shadow[2]["payload"]
+        p.update({"combined": "UNKNOWN", "board": "UNKNOWN", "whatsapp": "UNKNOWN",
+                  "board_note": "b404", "whatsapp_note": "w404"})
+        _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
+        self.assertIn("board+whatsapp failed (combined=UNKNOWN): b404; w404",
+                      criteria["shadow_failed_reads"][0])
+
     def test_news_runs_add_no_reasons(self):
         _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
         self.assertEqual(criteria["shadow_unknown_reasons"], [])
+        self.assertEqual(criteria["shadow_failed_reads"], [])
 
 
 class TheCriteriaAreAllReported(unittest.TestCase):
@@ -229,7 +253,7 @@ class TheCriteriaAreAllReported(unittest.TestCase):
         for expected in ("cadence:board-probe", "cadence:waker-shadow",
                          "cursor_monotonic", "board_rows_for_ack_target",
                          "all_runs_in_cloud", "shadow_verdicts",
-                         "shadow_unknown_reasons"):
+                         "shadow_unknown_reasons", "shadow_failed_reads"):
             self.assertIn(expected, criteria)
 
 
