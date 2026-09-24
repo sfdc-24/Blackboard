@@ -66,8 +66,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     settings.validate()
     store = store or open_store(settings.state_uri)
     repository = StudioRepository(store, clock=clock)
+    selected_worker = worker or _worker(settings)
+    if settings.lead_facts_enabled:
+        from .workers.lead_facts import LeadFactsWorker
+        selected_worker = LeadFactsWorker(selected_worker, settings.salesforce_org_id)
     controller = StudioController(
-        repository, worker or _worker(settings), clock=clock, id_factory=id_factory,
+        repository, selected_worker, clock=clock, id_factory=id_factory,
         max_seconds=settings.max_session_seconds, daily_cap=settings.daily_session_cap,
         max_events=settings.max_events, max_commands=settings.max_commands,
     )

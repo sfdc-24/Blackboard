@@ -618,7 +618,10 @@ class StudioController:
                 }
             transcript = command["transcript"].strip()
             state.setdefault("voice_item_ids", []).append(item_id)
-            state["voice_item_ids"] = state["voice_item_ids"][-100:]
+            # Retain every item that can be admitted under this session's
+            # command bound; a fixed 100-item window permits old items to
+            # invoke providers again when max_commands is configured higher.
+            state["voice_item_ids"] = state["voice_item_ids"][-self.max_commands:]
             state["transcript"].append({"role": "visitor", "text": transcript})
             trigger = {"kind": "utterance", "text": transcript, "item_id": item_id}
         elif kind == "change_decision":
