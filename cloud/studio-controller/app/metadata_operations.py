@@ -291,13 +291,46 @@ def validate_ledger(document):
 
 
 class MetadataOperationLedger:
+    __slots__ = ("store", "conflict_type", "_sealed")
+
     def __init__(self, store, *, conflict_type):
+        if getattr(self, "_sealed", False):
+            raise InvalidOperation("metadata ledgers cannot be reinitialized")
         # The adapter must implement atomic load/save generation CAS. Do not
         # assume the local FileStore supplies a distributed execution lock.
         if getattr(store, "atomic_generation_cas", None) is not True:
             raise InvalidOperation("explicit atomic generation-CAS adapter required")
-        self.store = store
-        self.conflict_type = conflict_type
+        object.__setattr__(self, "store", store)
+        object.__setattr__(self, "conflict_type", conflict_type)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata ledger dependencies are immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata ledger dependencies are immutable")
+        object.__delattr__(self, name)
+
+    def __copy__(self):
+        raise TypeError("metadata ledgers cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("metadata ledgers cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __getstate__(self):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __setstate__(self, state):
+        raise TypeError("metadata ledgers cannot be restored")
 
     @staticmethod
     def _name(org_binding_id):
@@ -393,6 +426,16 @@ class MetadataOperationLedger:
     def receipt(self, operation_id, actor):
         record, _, _ = self._operation(operation_id, actor)
         return _receipt(record)
+
+    def execution_snapshot(self, operation_id, actor):
+        """Internal coordinator view; still closed, validated, and actor-bound.
+
+        Provider code must read this immediately around a durable transition,
+        never accept a portable caller-supplied snapshot as write authority.
+        """
+        record, _, _ = self._operation(operation_id, actor)
+        validate_record(record)
+        return copy.deepcopy(record)
 
     def confirmation_challenge(self, operation_id, actor):
         record, _, _ = self._operation(operation_id, actor)
