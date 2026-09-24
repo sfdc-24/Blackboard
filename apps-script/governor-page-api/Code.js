@@ -43,8 +43,14 @@ var CHAT_MAX_TURNS     = 12;     // history sent to the model
 var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
 // 150 until v64. On 2026-09-24 the fleet's own grounding probes and reviews
 // used all 150 before 06:00 UTC, and every visitor got the offline reply for
-// the rest of the day. 400 leaves visitors room while tests run.
+// the rest of the day. 400 leaves visitors room while tests run - approved by
+// him 2026-09-24 ("400/day ask bar limit is fine").
 var CHAT_DAILY_DEFAULT = 400;    // AI replies per UTC day, whole site
+// Fleet test probes declare themselves with probe=1 and may use at most this
+// many of the day's replies. On 2026-09-24 the fleet's own probes spent the
+// whole day's budget before 06:00 UTC and every visitor got the offline reply.
+// No secret is needed: saying probe=1 can only get a caller refused sooner.
+var CHAT_PROBE_DAILY   = 40;
 var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and cap cost
 
 // THE SPEND CEILINGS, RESTORED 2026-09-22. All of this existed in the source
@@ -389,7 +395,7 @@ function voiceReply_(p) {
 
   var out;
   try {
-    out = receptionWithIdentity_(identity, text, hist, p.agent);
+    out = receptionWithIdentity_(identity, text, hist, p.agent, String(p.probe || '') === '1');
   } catch (err) {
     out = { ok: false, reason: 'error' };
   }
@@ -702,7 +708,7 @@ function reception(conversationToken, text, history, token, want) {
   return out;
 }
 
-function receptionWithIdentity_(identity, text, history, want) {
+function receptionWithIdentity_(identity, text, history, want, probe) {
   var sid = identity.key;
   text = String(text || '').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_INPUT);
   if (!text) return { ok: false, reason: 'empty' };
@@ -741,7 +747,7 @@ function receptionWithIdentity_(identity, text, history, want) {
   // Reserve both spend ceilings inside one script lock before the provider.
   // A failed provider call still consumes one attempt; otherwise retries and
   // concurrent requests could spend without being counted.
-  var budget = reserveChatBudget_(sid);
+  var budget = reserveChatBudget_(sid, probe === true);
   if (!budget.ok) return offline_(sid, budget.reason);
 
   var msgs = [];
@@ -1244,7 +1250,7 @@ function readChatBudget_(props, now) {
  * per-conversation and whole-site ceilings happen under the same script lock,
  * and the reservation is durable before the provider fetch starts.
  */
-function reserveChatBudget_(conversationKey) {
+function reserveChatBudget_(conversationKey, probe) {
   if (!/^c[ga]_[a-f0-9]{32}$/.test(String(conversationKey || '')))
     return { ok: false, reason: 'budget-unavailable' };
 
@@ -1258,6 +1264,11 @@ function reserveChatBudget_(conversationKey) {
     var state = readChatBudget_(props, now);
     var cap = chatDailyCap_(props);
     if (state.daily >= cap) return { ok: false, reason: 'daily-cap' };
+    // A probe's own counter lives in its own property, so a rollback to a
+    // version without it simply ignores it.
+    var probeKey = 'CHAT_PROBE_' + state.day;
+    var probeUsed = probe ? (parseInt(props.getProperty(probeKey) || '0', 10) || 0) : 0;
+    if (probe && probeUsed >= CHAT_PROBE_DAILY) return { ok: false, reason: 'probe-cap' };
 
     var entry = state.sessions[conversationKey];
     var used = entry ? Math.max(0, parseInt(entry[0], 10) || 0) : 0;
@@ -1297,6 +1308,7 @@ function reserveChatBudget_(conversationKey) {
     var writes = {};
     writes[CHAT_BUDGET_STATE] = encoded;
     writes[dailyKey_(now)] = String(state.daily); // rollback-compatible v31 counter
+    if (probe) writes[probeKey] = String(probeUsed + 1);
     props.setProperties(writes, false);
     return {
       ok: true,

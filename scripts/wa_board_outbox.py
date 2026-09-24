@@ -69,6 +69,11 @@ PREFIX = "WA_OUT|"
 STATE_CAP = 500
 DEFAULT_LIMIT = 80
 WATCHER_TAG = "wa-outbox"
+# An agent waker answering one of HIS WhatsApp rows. Until 2026-09-24 nothing
+# delivered these: this outbox sent only WA_SEND rows, and the WhatsApp poller
+# sent only "received" acks, so every agent answer to his phone stayed on the
+# board. The answer is the text after "REPLY:" in agent_waker's payload.
+WAKER_MARK = "wakerreply=1"
 
 
 def now_iso() -> str:
@@ -119,6 +124,25 @@ def parse_wa_request(row) -> dict | None:
     fields = first_kv(payload)
     phase = (fields.get("phase") or action or "").strip().upper()
     prefixed = is_wa_out_prefix(payload)
+
+    # A waker answer is a BCB row, not a substring. `wakerreply=10` contains
+    # the marker, and so does a NOTE that quotes it. The fields have to be
+    # exactly the answer: wakerreply=1, phase=DONE, a non-empty answers=.
+    # The first target token is still whatsapp, and the tag still has to be
+    # a real tag — those two kept a forged row off his phone.
+    target_first = cell(row, 3).split(";")[0].strip().lower()
+    if (fields.get("wakerreply") == "1"
+            and (fields.get("phase") or "").strip().upper() == "DONE"
+            and (fields.get("answers") or "").strip()
+            and target_first == "whatsapp"):
+        tag = cell(row, 2)
+        _, sep, answer = payload.partition("REPLY:")
+        body = answer.strip() if sep else ""
+        if not TAG_RE.match(tag) or not body:
+            return None
+        return {"row_id": cell(row, 0), "ts": cell(row, 1), "tag": tag,
+                "text": body, "kind": "STATUS",
+                "bcb_id": fields.get("id") or "", "payload": payload}
 
     if phase == PHASE_NOTE:
         return None
@@ -176,22 +200,37 @@ def load_state(path: Path = STATE_PATH) -> dict:
             if isinstance(data, dict):
                 data.setdefault("delivered_row_ids", [])
                 data.setdefault("delivered_bcb_ids", [])
+                data.setdefault("unknown_row_ids", [])
+                data.setdefault("inflight", "")
                 data.setdefault("schema", 1)
                 return data
         except (OSError, json.JSONDecodeError):
             pass
-    return {"schema": 1, "delivered_row_ids": [], "delivered_bcb_ids": []}
+    return {"schema": 1, "delivered_row_ids": [], "delivered_bcb_ids": [],
+            "unknown_row_ids": [], "inflight": ""}
 
 
 def save_state(state: dict, path: Path = STATE_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row_ids = list(dict.fromkeys(state.get("delivered_row_ids") or []))[-STATE_CAP:]
     bcb_ids = list(dict.fromkeys(state.get("delivered_bcb_ids") or []))[-STATE_CAP:]
+    inflight = state.get("inflight") or ""
+    if isinstance(inflight, dict):
+        inflight = {
+            "row_id": str(inflight.get("row_id") or ""),
+            "bcb_id": str(inflight.get("bcb_id") or ""),
+        }
+        if not (inflight["row_id"] or inflight["bcb_id"]):
+            inflight = ""
+    else:
+        inflight = str(inflight)
     out = {
         "schema": 1,
         "saved_at": now_iso(),
         "delivered_row_ids": row_ids,
         "delivered_bcb_ids": bcb_ids,
+        "unknown_row_ids": list(dict.fromkeys(state.get("unknown_row_ids") or []))[-STATE_CAP:],
+        "inflight": inflight,
         "primed_at": state.get("primed_at") or "",
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -208,6 +247,7 @@ def append_log(entry: dict) -> None:
 def known_delivered(rows, state: dict) -> set[str]:
     known = set(state.get("delivered_row_ids") or [])
     known.update(state.get("delivered_bcb_ids") or [])
+    known.update(state.get("unknown_row_ids") or [])
     for row in rows:
         known.update(delivered_markers(row))
     return known
@@ -240,6 +280,64 @@ def prime_state(rows, state: dict) -> dict:
     return state
 
 
+def claim_keys(inflight) -> list[str]:
+    """Identities a pre-send claim covers.
+
+    A current claim is ``{"row_id", "bcb_id"}`` and an uncertain outcome
+    quarantines both, so a later row that reuses either one is not sent.
+    A legacy claim is a single string. That string may be the Row_ID or
+    the BCB id; it blocks a row that carries it on either identity, and
+    it is not treated as delivered.
+    """
+    if isinstance(inflight, dict):
+        keys: list[str] = []
+        for field in ("row_id", "bcb_id"):
+            val = str(inflight.get(field) or "").strip()
+            if val and val not in keys:
+                keys.append(val)
+        return keys
+    text = str(inflight or "").strip()
+    return [text] if text else []
+
+
+def settle_inflight(state: dict, state_path: Path) -> None:
+    """A previous run claimed a send and never recorded a receipt.
+
+    A WhatsApp send cannot be read back, so this outcome is unknown. Mark
+    every identity on the claim and do not send it again; a human decides.
+    An id that already has a receipt is just a claim that outlived its
+    save — clear it, and do not call it delivered a second time.
+    """
+    keys = claim_keys(state.get("inflight"))
+    if not keys:
+        return
+    known = set(state.get("delivered_row_ids") or [])
+    known.update(state.get("delivered_bcb_ids") or [])
+    recorded = set(known)
+    recorded.update(state.get("unknown_row_ids") or [])
+    uncertain = [key for key in keys if key not in recorded]
+    if uncertain:
+        # The receipt save did not land. Quarantine every identity this
+        # claim still holds, not only the one that used to be stored.
+        unknown = list(state.get("unknown_row_ids") or [])
+        for key in keys:
+            if key not in known and key not in unknown:
+                unknown.append(key)
+        state["unknown_row_ids"] = unknown
+        shown = ",".join(keys)
+        print("UNKNOWN inflight=%s — no receipt, not resending; a human decides" % shown)
+        append_log({
+            "row_id": keys[0],
+            "bcb_id": keys[1] if len(keys) > 1 else "",
+            "unknown": True,
+            "ok": None,
+            "sent_at": now_iso(),
+            "detail": "inflight send has no receipt; not resending",
+        })
+    state["inflight"] = ""
+    save_state(state, state_path)
+
+
 def mark_delivered(state: dict, req: dict) -> None:
     if req.get("row_id"):
         state.setdefault("delivered_row_ids", []).append(req["row_id"])
@@ -267,31 +365,66 @@ def notify_argv(req: dict, text_file: Path) -> list[str]:
     ]
 
 
-def send_via_notify(req: dict) -> tuple[bool, str]:
-    if not NOTIFY.is_file():
-        return False, "wa_notify.ps1 missing"
-    (REPO / "logs").mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix="wa_outbox_", suffix=".txt", dir=str(REPO / "logs"))
-    os.close(fd)
-    tmp = Path(name)
+def send_via_notify(req: dict) -> tuple[str, str]:
+    """Send through scripts/wa_notify.py. Recipient is not a parameter.
+
+    Returns (outcome, detail). outcome is confirmed, not_sent, or unknown.
+    An import error, a missing credential, or any other failure before the
+    request leaves is not_sent: nothing was accepted, so a later pass may
+    retry. Once send() has been called, a lost response is unknown.
+    """
     try:
-        tmp.write_text(req["text"], encoding="utf-8", newline="\n")
-        cmd = notify_argv(req, tmp)
-        try:
-            proc = subprocess.run(
-                cmd, cwd=str(REPO), capture_output=True, text=True, timeout=90
-            )
-        except FileNotFoundError:
-            return False, "PowerShell is not on PATH (laptop watcher needs powershell.exe)"
-        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        return proc.returncode == 0, out[-500:]
-    except Exception as exc:  # noqa: BLE001 — report, do not mark delivered
-        return False, f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        from wa_notify import attempt
+    except Exception as exc:  # noqa: BLE001
+        return "not_sent", f"wa_notify.py unavailable: {exc}"
+    try:
+        res = attempt(req["text"], kind=req["kind"], tag=req["tag"])
+    except SystemExit as exc:
+        return "not_sent", str(exc)
+    except Exception as exc:  # noqa: BLE001 - report, do not mark delivered
+        return "not_sent", f"{type(exc).__name__}: {exc}"
+    return res["outcome"], res["detail"]
+
+
+def coerce_send(result) -> tuple[str, str]:
+    """Normalise a send result to (outcome, detail).
+
+    attempt() returns the outcome by name. Older callers, and the tests
+    that stand in for them, return (True, ...) or (False, "SEND FAILED") /
+    (False, "HTTP <status> ..."). True is a receipt. False with no HTTP
+    status failed before a request left. An HTTP status is classified the
+    same way as a live Graph response.
+    """
+    if isinstance(result, dict):
+        return str(result.get("outcome") or "unknown"), str(result.get("detail") or "")
+    if isinstance(result, tuple) and len(result) == 2:
+        first, detail = result
+        detail = str(detail or "")
+        if first in ("confirmed", "not_sent", "unknown"):
+            return first, detail
+        if first is True:
+            return "confirmed", detail
+        if first is False:
+            return _legacy_failure(detail), detail
+    return "unknown", str(result)
+
+
+def _legacy_failure(detail: str) -> str:
+    match = re.search(r"\bHTTP\s+(\d+)\b", detail or "")
+    if not match:
+        return "not_sent"
+    from wa_notify import classify_status
+    return classify_status(int(match.group(1)), detail[match.end():])
+
+
+def quarantine(state: dict, req: dict) -> None:
+    """Remember an unknown send under both ids. A later pass must not select it."""
+    unknown = list(state.get("unknown_row_ids") or [])
+    for key in (req.get("row_id"), req.get("bcb_id")):
+        if key and key not in unknown:
+            unknown.append(key)
+    state["unknown_row_ids"] = unknown
+    state["inflight"] = ""
 
 
 def note_payload(req: dict) -> str:
@@ -344,7 +477,7 @@ def read_board_rows(limit: int) -> list:
     seen: dict[str, list] = {}
     # Two matches: the bus match is a whole-row substring, so WA_SEND also
     # returns NOTE rows that quote that token (used as delivered markers).
-    for token in (PHASE_SEND, "WA_OUT"):
+    for token in (PHASE_SEND, "WA_OUT", WAKER_MARK):
         obj = read_rows(env, title=BOARD, match=token, limit=limit)
         for row in obj.get("rows") or []:
             if not isinstance(row, list) or not row:
@@ -364,6 +497,11 @@ def load_fixture(path: Path) -> list:
 
 def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
              state_path: Path) -> int:
+    # Dry-run touches neither Graph nor the state file. A live pass settles
+    # a leftover claim before it selects, so an unknown send is not pending.
+    if not dry_run:
+        settle_inflight(state, state_path)
+
     empty = not (state.get("delivered_row_ids") or state.get("delivered_bcb_ids"))
     if empty and not dry_run:
         prime_state(rows, state)
@@ -381,7 +519,18 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
         print(f"  {req['row_id'][:12]}  [{req['kind']} - {req['tag']}]  {preview}")
         if dry_run or not send:
             continue
-        ok, detail = send_via_notify(req)
+        # Own it before the send. The cloud wrapper compare-and-swaps this
+        # save, so a second run that loaded the same cursor loses here and
+        # never reaches send_via_notify. The claim carries BOTH identities:
+        # a kill after this save and before the receipt leaves them set, and
+        # the next pass quarantines both. One string was not enough — a
+        # later row with the same BCB id and a new Row_ID was sent again.
+        state["inflight"] = {
+            "row_id": req.get("row_id") or "",
+            "bcb_id": req.get("bcb_id") or "",
+        }
+        save_state(state, state_path)
+        outcome, detail = coerce_send(send_via_notify(req))
         entry = {
             "row_id": req["row_id"],
             "bcb_id": req["bcb_id"],
@@ -389,15 +538,33 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
             "kind": req["kind"],
             "ts": req["ts"],
             "sent_at": now_iso(),
-            "ok": ok,
+            "ok": True if outcome == "confirmed" else (False if outcome == "not_sent" else None),
+            "outcome": outcome,
             "detail": detail[:300],
         }
-        if not ok:
+        if outcome == "not_sent":
+            # Proven: Graph refused it (4xx), or the request never left.
+            # Release the claim so a later pass can retry. Do not mark
+            # delivered, and do not quarantine.
             failed += 1
+            state["inflight"] = ""
+            save_state(state, state_path)
             print("  SEND FAIL", detail[:160].replace("\n", " "))
             append_log(entry)
             continue
+        if outcome != "confirmed":
+            # Status 0, a timeout, a 5xx, or a 2xx with no message id.
+            # Meta may already have accepted it. Quarantine; a person
+            # decides. Never an automatic second send, and not delivered.
+            failed += 1
+            quarantine(state, req)
+            save_state(state, state_path)
+            print("  UNKNOWN", detail[:160].replace("\n", " "))
+            entry["unknown"] = True
+            append_log(entry)
+            continue
         mark_delivered(state, req)
+        state["inflight"] = ""
         save_state(state, state_path)
         sent += 1
         print("  SENT", detail[:120].replace("\n", " "))

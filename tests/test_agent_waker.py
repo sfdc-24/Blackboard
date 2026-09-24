@@ -421,5 +421,27 @@ class StandbyForHimOnly(unittest.TestCase):
                     self.assertNotIn("standby_for", cfg)
 
 
+class ReplyRowId(unittest.TestCase):
+    def test_the_readable_prefix_keeps_the_source_id_and_a_hash_of_all_of_it(self):
+        rid = aw.reply_row_id("gemini", "SYNTHETIC.ASK")
+        self.assertTrue(rid.startswith("GEMINI-WAKE-SYNTHETIC.ASK-"), rid)
+        self.assertEqual(len(rid.rsplit("-", 1)[-1]), 10)
+
+    def test_a_dot_and_an_underscore_do_not_share_a_reply_id(self):
+        first, second = "SYNTHETIC.ASK", "SYNTHETIC_ASK"
+        self.assertEqual(aw.legacy_reply_row_id("gemini", first),
+                         aw.legacy_reply_row_id("gemini", second))
+        self.assertNotEqual(aw.reply_row_id("gemini", first),
+                            aw.reply_row_id("gemini", second))
+
+    def test_two_long_ids_with_the_same_forty_character_prefix_do_not_collide(self):
+        first, second = ("L" * 40) + "ONE", ("L" * 40) + "TWO"
+        self.assertEqual(aw.legacy_reply_row_id("gemini", first),
+                         aw.legacy_reply_row_id("gemini", second))
+        self.assertNotEqual(aw.reply_row_id("gemini", first),
+                            aw.reply_row_id("gemini", second))
+        self.assertTrue(aw.reply_row_id("gemini", first).startswith("GEMINI-WAKE-" + ("L" * 40) + "-"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -55,10 +55,15 @@ CANDIDATES = [
     r"C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
 ]
 
-# Keys that must NOT be synced. WA_TO is his phone number and MODEL_PROVIDER,
-# ANTHROPIC_MODEL and OPENAI_MODEL are configuration, not credentials - putting
-# config in a secret store means a model change needs a secret rotation.
-NOT_SECRETS = {"WA_TO", "MODEL_PROVIDER", "ANTHROPIC_MODEL", "OPENAI_MODEL"}
+# Keys that must NOT be synced. MODEL_PROVIDER, ANTHROPIC_MODEL and OPENAI_MODEL
+# are configuration, not credentials - putting config in a secret store means a
+# model change needs a secret rotation.
+#
+# WA_TO WAS HERE until 2026-09-24. It is his phone number: not a credential, but
+# personal data. When the WhatsApp outbox moved to Cloud Run it needed the
+# recipient, and Mr Salam chose Secret Manager over a plain env var on the job,
+# which every project viewer can read. Accessor binding is per secret.
+NOT_SECRETS = {"MODEL_PROVIDER", "ANTHROPIC_MODEL", "OPENAI_MODEL"}
 
 
 def gcloud_bin() -> str:

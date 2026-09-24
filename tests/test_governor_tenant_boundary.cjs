@@ -501,3 +501,40 @@ test('numeric caps and both clients retain the signed-token contract', () => {
   assert.doesNotMatch(CODE, /String\(p\.vid/);
   assert.match(INBOX, /'EXTERNAL_UNTRUSTED',\s*\n\s*'NONE',\s*\n\s*'PUBLIC_RECEPTION'/);
 });
+
+// 2026-09-24: the fleet's own probes spent the whole day's replies before
+// 06:00 UTC and every visitor got the offline reply. Probes now declare
+// themselves (probe=1) and share a small allowance inside the cap.
+test('declared probes stop at their own allowance while visitors are still answered', () => {
+  const h = createHarness({ CHAT_DAILY_CAP: '50' });
+  const allowance = h.context.CHAT_PROBE_DAILY;
+  assert.ok(allowance > 0 && allowance < 50, 'the allowance must leave visitors room inside the cap');
+  for (let i = 0; i < allowance; i += 1) {
+    assert.equal(decode(h.context.voiceReply_({ q: 'probe ' + i, probe: '1' })).ok, true);
+  }
+  const refused = decode(h.context.voiceReply_({ q: 'one probe too many', probe: '1' }));
+  assert.equal(refused.degraded, 'probe-cap');
+  const visitor = decode(h.context.voiceReply_({ q: 'a real visitor' }));
+  assert.equal(visitor.ok, true);
+  assert.equal(visitor.degraded, undefined, 'a visitor is answered after the probes are refused');
+  assert.equal(h.providerCalls, allowance + 1, 'a refused probe spends nothing');
+  const state = JSON.parse(h.values.get('CHAT_BUDGET_V1'));
+  assert.equal(state.daily, allowance + 1, 'probes still count against the whole-site cap');
+});
+
+test('saying probe=1 can only get a caller refused sooner, never past the cap', () => {
+  const h = createHarness({ CHAT_DAILY_CAP: '2' });
+  assert.equal(decode(h.context.voiceReply_({ q: 'one', probe: '1' })).ok, true);
+  assert.equal(decode(h.context.voiceReply_({ q: 'two' })).ok, true);
+  assert.equal(decode(h.context.voiceReply_({ q: 'three', probe: '1' })).degraded, 'daily-cap');
+  assert.equal(h.providerCalls, 2);
+});
+
+test('the probe counter is its own property, so the budget state keeps its v59 shape', () => {
+  const h = createHarness();
+  decode(h.context.voiceReply_({ q: 'probe', probe: '1' }));
+  const state = JSON.parse(h.values.get('CHAT_BUDGET_V1'));
+  assert.deepEqual(Object.keys(state).sort(), ['daily', 'day', 'sessions']);
+  const day = state.day;
+  assert.equal(h.values.get('CHAT_PROBE_' + day), '1');
+});
