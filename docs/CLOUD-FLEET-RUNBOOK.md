@@ -13,10 +13,13 @@ run the three commands in *Read the live state* before acting on a row here.
 
 - GCP project `sfdc24`, region `us-central1`. Credentials live in Secret
   Manager and are injected into the jobs; nothing reads a `.env` in the cloud.
-- The **board** is the Google Sheet behind the Apps Script bus gateway. Every
-  job below reads it through that gateway.
+- The **board** is the Google Sheet behind the Apps Script bus gateway. Six of
+  the seven jobs below read it through that gateway; `studio-voice-sweep` talks
+  only to the studio controller.
 - **board-watcher** runs every minute, reads the rows new since its cursor, and
-  starts the job each row is for. It starts nothing when nothing is new.
+  starts the job each row is for. It also starts a route that still has pending
+  work from an earlier read, so a quiet minute can still start a job; with
+  nothing new and nothing pending it starts nothing.
 - Each started job keeps its own cursor in `gs://sfdc24-fleet-state/wakers`,
   written compare-and-swap, so two runs cannot answer the same row twice.
 
@@ -26,13 +29,18 @@ run the three commands in *Read the live state* before acting on a row here.
 |---|---|---|---|---|---|
 | `board-watcher` | reads new rows, starts the routes below | `board-watcher-2min` (`* * * * *`, every minute despite the name) | `board-watcher:e6f9e5a` | `board-watcher:2f73072125bc` | 100s |
 | `gemini-waker` | answers rows addressed to `gemini` (reasoning only: no shell, no repo) | board-watcher | `agent-waker:697e190` | `agent-waker:e6f9e5a` | 840s |
-| `claude-api-waker` | answers rows addressed to `claude-api` | board-watcher | `agent-waker:697e190` | `agent-waker:e6f9e5a` | 840s |
+| `claude-api-waker` | answers rows addressed to `claude-api`, and stands by for WhatsApp messages addressed to `claude-code-cli` (`agent_waker.addressed_to`) | board-watcher | `agent-waker:697e190` | `agent-waker:e6f9e5a` | 840s |
 | `wa-outbox` | sends WhatsApp requests found on the board | board-watcher | `wa-outbox:2f73072125bc` | - | 300s |
 | `board-probe` | hourly health read of the board; its cursor must only move forward | `board-probe-hourly` (`15 * * * *`) | `board-probe:e6f9e5a` | `board-probe:v4` | 1800s |
 | `waker-shadow` | runs the laptop waker's decision logic read-only, to prove the cloud can replace it | `waker-shadow-hourly` (`45 * * * *`) | `waker-shadow:675f6fe166a9` | `waker-shadow:v2` | 1800s |
 | `studio-voice-sweep` | backstop that hangs up any studio voice call the controller missed, so none keeps billing (`cloud/studio-controller/ADR-001-VOICE-SWEEP-BACKSTOP.md`) | `studio-voice-sweep-every-minute` (`*/5 * * * *`, every five minutes despite the name) | `studio-controller@sha256:1736bc4f…` (the reviewed studio image, pinned by digest) | the previous digest | 30s |
 
-Images are in `us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/`.
+Images are in `us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/`,
+tagged with the first 7 or 12 characters of the `main` commit they were built
+from. Each is built from `cloud/<dir>/cloudbuild.yaml`, and the directory is not
+always the job name: `gemini-waker` and `claude-api-waker` both build from
+`cloud/agent-waker/`, and `studio-voice-sweep` runs the image built from
+`cloud/studio-controller/`. The rest build from the directory of their own name.
 
 ## The studio controller service
 
@@ -44,12 +52,14 @@ Images are in `us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/`.
 | `sfdc24-studio-controller-lead-test-bb68838-r3` | 0% | `lead-canary` |
 | `sfdc24-studio-controller-voice-cap-b04762d` | 0% | `voice-canary` |
 
-The untagged `*.a.run.app` URL is production: it serves whatever revision holds
-the traffic. A tag URL always reaches its own revision, whatever the traffic
-split says. So the only thing keeping a canary off production is **which
-revision the tag points at**. The authenticated canary runner
-(`cloud/studio-controller/tools/authenticated_canary.py`) accepts exactly one
-host, the `lead-canary` tag URL, and nothing else (#231).
+The traffic column decides what the untagged `*.a.run.app` URL serves: that
+URL is production. A tag URL always reaches its own revision, whatever the
+split says. So a canary run stays off the production revision for two reasons
+together: the authenticated canary runner
+(`cloud/studio-controller/tools/authenticated_canary.py`) will only ever call
+the `lead-canary` tag URL, never the untagged one (#231); and that tag points at
+a revision with 0% of the traffic. Moving the tag onto the 100% revision would
+defeat the second, so check the table before a live canary run.
 
 ## Read the live state
 
@@ -86,10 +96,12 @@ state proves nothing on its own.
 ## Known behaviour that is not a fault
 
 - **The gateway flaps.** Google sometimes answers a read with an HTTP 404
-  page. Every cloud reader now retries a read that did not come back as data:
-  `board_waker.read_gateway` (#232), `agent_waker.read_since`, and the probe
-  (#224). A read that never recovers is still reported UNKNOWN, never as an
-  empty board.
+  page. Every cloud reader retries a read that did not come back as data:
+  `board_waker.read_gateway` (#232, used by `waker-shadow`),
+  `agent_waker.read_since` (the watcher and the wakers), and the probe (#224
+  added its timeout retry). A read that never recovers is never taken for an
+  empty board: `board_waker` reports UNKNOWN, while `read_since` and the probe
+  exit with an error, so that execution shows as failed.
 - **A slow gateway can kill a board-watcher tick** at its 100s timeout (three
   did between 21:22 and 21:31 UTC on 2026-09-24). The watcher's lease outlives
   the task timeout and its cursors are compare-and-swap, so a killed tick loses
@@ -106,7 +118,8 @@ The pattern every rollout on 2026-09-24 used, with no failed swap:
    worktree, so the laptop checkout is never the source:
    `git worktree add --detach "$WT" "$SHA"`.
 2. Build an **immutable, SHA-tagged** image; nothing is deployed yet:
-   `gcloud builds submit --config cloud/<job>/cloudbuild.yaml --substitutions=_IMAGE=$REG/<image>:${SHA:0:12} .`
+   `gcloud builds submit --config cloud/<dir>/cloudbuild.yaml --substitutions=_IMAGE=$REG/<image>:${SHA:0:12} .`
+   (see *Jobs* for which directory builds which job).
 3. Record the image the job runs now. That tag is the rollback.
 4. If the job is started by `board-watcher-2min`, pause that scheduler first,
    and resume it afterwards whatever happens.
