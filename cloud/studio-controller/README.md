@@ -41,15 +41,18 @@ events, commands, and—when separately enabled—voice. Consume SSE with
 authenticated `fetch`, not native `EventSource`: credentials never enter a
 query string or managed request logs.
 
-Use exact, slashless routes. Trailing-slash variants return404 without a
+Use exact, slashless routes. Trailing-slash variants return 404 without a
 `Location` header; the service does not infer redirect destinations from an
-untrusted or proxy-visible scheme. `GET /health` is the canonical non-sensitive
+untrusted or proxy-visible scheme. This refusal precedes CORS and request-triggered
+voice cleanup, including for OPTIONS. `GET /health` is the canonical non-sensitive
 readiness surface; `/healthz` remains a legacy application alias, but edge
 routing can intercept that path, so deployment checks must use `/health`.
+Both readiness routes are read-only; canonical traffic, background cleanup and
+authenticated maintenance retain their voice-cleanup backstops.
 
 SSE checks origin, bearer, integer cursor and session/replay state before
-committing stream headers. Missing sessions return JSON404; repair conflicts
-return JSON409. A successful stream reuses its preflight batch and exposes its
+committing stream headers. Missing sessions return JSON 404; repair conflicts
+return JSON 409. A successful stream reuses its preflight batch and exposes its
 initial `X-Studio-Generation`. Stale cursors still receive a snapshot-first
 repair generation. If state disappears or conflicts after streaming starts,
 the connection closes without inventing an event or advancing its cursor;

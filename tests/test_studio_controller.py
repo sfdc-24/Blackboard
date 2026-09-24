@@ -781,6 +781,31 @@ class ApiTests(unittest.TestCase):
             self.assertEqual([], self.voice_client.calls)
             self.assertEqual({}, self.store.data)
 
+    def test_refused_slash_preflight_and_health_do_not_sweep_due_voice(self):
+        app, _ = self.app(voice_enabled=True, openai_api_key="fake-provider-key", maintenance_secret="m" * 32)
+        state, _ = app.state.controller.create_session()
+        session_id = state["session_id"]
+        app.state.controller.begin_voice(session_id, "voice-test", 1000)
+        app.state.controller.activate_voice(session_id, "voice-test", "rtc_due_test")
+        StudioRepository(self.store).register_voice(session_id, 1000)
+        before = copy.deepcopy(self.store.data)
+        with TestClient(app, base_url="http://service.example", follow_redirects=False) as client:
+            for method, path in (("GET", "/health"), ("GET", "/healthz"),
+                                 ("POST", "/v1/session/"), ("OPTIONS", "/v1/auth/start/")):
+                with self.subTest(method=method, path=path):
+                    response = client.request(method, path, headers={
+                        **self.origin, "X-Forwarded-Proto": "https", "Access-Control-Request-Method": "POST",
+                    })
+                    self.assertEqual(200 if path in {"/health", "/healthz"} else 404, response.status_code)
+                    self.assertNotIn("location", response.headers)
+                    self.assertEqual([], self.voice_client.calls)
+                    self.assertEqual(before, self.store.data)
+            # The separately authenticated maintenance path still performs cleanup.
+            response = client.post("/v1/maintenance/voice-sweep", headers={"Authorization": "Bearer " + "m" * 32})
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(1, len(self.voice_client.calls))
+            self.assertEqual("ended", StudioRepository(self.store).load(session_id).state["voice_call"]["status"])
+
     def test_voice_relays_unified_sdp_and_keeps_standard_key_server_side(self):
         app, configured = self.app(
             openai_api_key="standard-key-must-stay-server-side", voice_enabled=True,

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     from scripts.state_store import open_store
@@ -229,7 +229,18 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     @app.middleware("http")
     async def no_store_tokens(request: Request, call_next):
-        await sweep_due_calls()
+        # Refuse noncanonical paths before CORS or request-triggered cleanup.
+        # A rejected slash variant must not become an unauthenticated cleanup
+        # trigger (or a successful OPTIONS response for a nonexistent route).
+        if request.url.path.endswith("/"):
+            return JSONResponse(
+                {"detail": "Not Found"}, status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        # Readiness probes are read-only. Canonical traffic, the background
+        # sweeper and authenticated maintenance retain the cleanup backstops.
+        if request.url.path not in {"/health", "/healthz"}:
+            await sweep_due_calls()
         response = await call_next(request)
         if request.url.path.startswith("/v1/"):
             response.headers["Cache-Control"] = "no-store"
