@@ -72,9 +72,20 @@ KINDS = ("BLOCKED", "ANDON", "STATUS", "DONE", "ASK")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
+ENV_KEYS = ("META_TOKEN", "WA_TOKEN", "WA_PHONE_NUMBER_ID", "WA_TO",
+            "WA_GRAPH_VERSION")
+
+
 def load_env(path: Path | None = None) -> dict:
+    explicit = path is not None
     path = path or (ROOT / ".env")
     if not path.is_file():
+        # A cloud runtime injects these from Secret Manager and has no .env.
+        # Only when no file was asked for by name: a named file that is
+        # missing is a mistake, not a hint to look elsewhere.
+        injected = {k: os.environ[k] for k in ENV_KEYS if os.environ.get(k)}
+        if not explicit and injected:
+            return injected
         raise SystemExit("env file not found: %s" % path)
     env = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():

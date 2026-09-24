@@ -1,0 +1,13 @@
+# Repo root as context; see the Dockerfile.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/wa-outbox:v1
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, '${_IMAGE}', -f, cloud/wa-outbox/Dockerfile, .]
+
+images:
+  - '${_IMAGE}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

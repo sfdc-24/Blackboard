@@ -69,6 +69,11 @@ PREFIX = "WA_OUT|"
 STATE_CAP = 500
 DEFAULT_LIMIT = 80
 WATCHER_TAG = "wa-outbox"
+# An agent waker answering one of HIS WhatsApp rows. Until 2026-09-24 nothing
+# delivered these: this outbox sent only WA_SEND rows, and the WhatsApp poller
+# sent only "received" acks, so every agent answer to his phone stayed on the
+# board. The answer is the text after "REPLY:" in agent_waker's payload.
+WAKER_MARK = "wakerreply=1"
 
 
 def now_iso() -> str:
@@ -119,6 +124,16 @@ def parse_wa_request(row) -> dict | None:
     fields = first_kv(payload)
     phase = (fields.get("phase") or action or "").strip().upper()
     prefixed = is_wa_out_prefix(payload)
+
+    if WAKER_MARK in payload and cell(row, 3).split(";")[0].strip().lower() == "whatsapp":
+        tag = cell(row, 2)
+        _, sep, answer = payload.partition("REPLY:")
+        body = answer.strip() if sep else ""
+        if not TAG_RE.match(tag) or not body:
+            return None
+        return {"row_id": cell(row, 0), "ts": cell(row, 1), "tag": tag,
+                "text": body, "kind": "STATUS",
+                "bcb_id": fields.get("id") or "", "payload": payload}
 
     if phase == PHASE_NOTE:
         return None
@@ -268,30 +283,22 @@ def notify_argv(req: dict, text_file: Path) -> list[str]:
 
 
 def send_via_notify(req: dict) -> tuple[bool, str]:
-    if not NOTIFY.is_file():
-        return False, "wa_notify.ps1 missing"
-    (REPO / "logs").mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix="wa_outbox_", suffix=".txt", dir=str(REPO / "logs"))
-    os.close(fd)
-    tmp = Path(name)
+    """Send through scripts/wa_notify.py. Recipient is not a parameter.
+
+    It used to shell out to powershell.exe and wa_notify.ps1, which a cloud
+    runtime does not have. wa_notify.py is the same contract in stdlib Python:
+    the "[KIND - tag]" prefix, the length cap, one attempt and never a retry.
+    """
     try:
-        tmp.write_text(req["text"], encoding="utf-8", newline="\n")
-        cmd = notify_argv(req, tmp)
-        try:
-            proc = subprocess.run(
-                cmd, cwd=str(REPO), capture_output=True, text=True, timeout=90
-            )
-        except FileNotFoundError:
-            return False, "PowerShell is not on PATH (laptop watcher needs powershell.exe)"
-        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        return proc.returncode == 0, out[-500:]
-    except Exception as exc:  # noqa: BLE001 — report, do not mark delivered
+        from wa_notify import notify
+    except Exception as exc:  # noqa: BLE001
+        return False, f"wa_notify.py unavailable: {exc}"
+    try:
+        return notify(req["text"], kind=req["kind"], tag=req["tag"])
+    except SystemExit as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 - report, do not mark delivered
         return False, f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
 
 
 def note_payload(req: dict) -> str:
@@ -344,7 +351,7 @@ def read_board_rows(limit: int) -> list:
     seen: dict[str, list] = {}
     # Two matches: the bus match is a whole-row substring, so WA_SEND also
     # returns NOTE rows that quote that token (used as delivered markers).
-    for token in (PHASE_SEND, "WA_OUT"):
+    for token in (PHASE_SEND, "WA_OUT", WAKER_MARK):
         obj = read_rows(env, title=BOARD, match=token, limit=limit)
         for row in obj.get("rows") or []:
             if not isinstance(row, list) or not row:
