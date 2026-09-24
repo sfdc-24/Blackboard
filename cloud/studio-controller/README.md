@@ -89,9 +89,14 @@ Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot
 durably immediately before each provider call-open POST. Invalid requests and
 failures before that reservation consume no slot; after a reservation succeeds,
 the slot is never refunded—even for a provider refusal or ambiguous transport
-outcome—so crashes and retries cannot exceed the UTC-day cap. Client code closes
-its peer connection at controller expiry;
-the service also hangs up on Stop or expiry. A scheduler calls
+outcome—so crashes and retries cannot exceed the UTC-day cap. If midnight UTC
+passes before provider contact, the attempt must also obtain a slot in the new
+day; the prior-day slot remains consumed. Redirects, request timeouts, conflicts,
+and every non-2xx provider response remain `unknown`, non-retryable, and indexed
+because they do not prove that no paid call opened. Each index entry is owned by
+its `voice_id`, so late cleanup cannot erase a newer call. Client code closes its
+peer connection at controller expiry; the service also hangs up on Stop or
+expiry. A scheduler calls
 `POST /v1/maintenance/voice-sweep` with the maintenance bearer as the idle
 Cloud Run backstop. Audio is never accepted or stored by this service.
 

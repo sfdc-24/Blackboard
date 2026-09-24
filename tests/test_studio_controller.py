@@ -451,16 +451,60 @@ class CoreTests(unittest.TestCase):
         store = MemoryStore()
         now = [1000]
         repository = StudioRepository(store, clock=lambda: now[0])
-        self.assertEqual(1, repository.reserve_voice_open(3, "voice-stable"))
-        self.assertEqual(1, repository.reserve_voice_open(3, "voice-stable"))
+        first_reservation = repository.reserve_voice_open(3, "voice-stable")
+        replay = repository.reserve_voice_open(3, "voice-stable")
+        self.assertEqual(("19700101", 1), (
+            first_reservation.day, first_reservation.number
+        ))
+        self.assertEqual(first_reservation, replay)
         first, _ = store.load("studio_voice_open_19700101")
         self.assertEqual(1, first["count"])
 
         now[0] += 86400
         restarted = StudioRepository(store, clock=lambda: now[0])
-        self.assertEqual(1, restarted.reserve_voice_open(3, "voice-stable"))
+        next_day = restarted.reserve_voice_open(3, "voice-stable")
+        self.assertEqual(("19700102", 1), (next_day.day, next_day.number))
         second, _ = store.load("studio_voice_open_19700102")
         self.assertEqual(1, second["count"])
+
+    def test_voice_index_removal_is_owned_by_voice_id(self):
+        store = MemoryStore()
+        repository = StudioRepository(store, clock=lambda: 1000)
+        repository.register_voice("session-stable", "voice-old", 1200)
+        with self.assertRaisesRegex(StateConflict, "owned by another call"):
+            repository.register_voice("session-stable", "voice-new", 1300)
+        self.assertFalse(repository.unregister_voice(
+            "session-stable", "voice-new"
+        ))
+        index, _ = store.load("studio_voice_index")
+        self.assertEqual(
+            {"voice_id": "voice-old", "ends_at": 1200},
+            index["sessions"]["session-stable"],
+        )
+        self.assertTrue(repository.unregister_voice(
+            "session-stable", "voice-old"
+        ))
+        self.assertEqual([], repository.due_voice_sessions(2000))
+
+    def test_voice_index_reads_and_explicitly_adopts_legacy_entries(self):
+        store = MemoryStore()
+        store.save(
+            "studio_voice_index",
+            {"sessions": {"session-legacy": 1000}, "updated_at": 900},
+            None,
+        )
+        repository = StudioRepository(store, clock=lambda: 1000)
+        self.assertEqual(["session-legacy"], repository.due_voice_sessions())
+        with self.assertRaisesRegex(StateConflict, "ownership is unknown"):
+            repository.register_voice("session-legacy", "voice-current", 1100)
+        repository.register_voice(
+            "session-legacy", "voice-current", 1100, adopt_legacy=True
+        )
+        index, _ = store.load("studio_voice_index")
+        self.assertEqual(
+            {"voice_id": "voice-current", "ends_at": 1100},
+            index["sessions"]["session-legacy"],
+        )
 
     def test_reducer_fences_session_generation_revision_and_artifact(self):
         controller, _, _ = make_controller()
@@ -831,7 +875,7 @@ class ApiTests(unittest.TestCase):
         session_id = state["session_id"]
         app.state.controller.begin_voice(session_id, "voice-test", 1000)
         app.state.controller.activate_voice(session_id, "voice-test", "rtc_due_test")
-        StudioRepository(self.store).register_voice(session_id, 1000)
+        StudioRepository(self.store).register_voice(session_id, "voice-test", 1000)
         before = copy.deepcopy(self.store.data)
         with TestClient(app, base_url="http://service.example", follow_redirects=False) as client:
             for method, path in (("GET", "/health"), ("GET", "/healthz"),
@@ -925,6 +969,58 @@ class ApiTests(unittest.TestCase):
         index, _ = self.store.load("studio_voice_index")
         self.assertNotIn(created[-1]["session_id"], index.get("sessions") or {})
 
+    def test_prior_day_reservation_cannot_authorize_a_new_day_provider_post(self):
+        now = [86400]
+        self.store = MemoryStore()
+        repository = StudioRepository(self.store, clock=lambda: now[0])
+        for index in range(3):
+            repository.reserve_voice_open(3, "new-day-existing-%d" % index)
+        now[0] = 86399
+        self.ids = IDs()
+        self.voice_client = FakeVoiceClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: now[0],
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        original_reserve = StudioRepository.reserve_voice_open
+        first_reservation = [True]
+
+        def reserve_then_cross_midnight(repository, limit, reservation_id):
+            result = original_reserve(repository, limit, reservation_id)
+            if first_reservation[0]:
+                first_reservation[0] = False
+                now[0] = 86400
+            return result
+
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            with mock.patch.object(
+                    StudioRepository, "reserve_voice_open",
+                    new=reserve_then_cross_midnight):
+                response = client.post(url, headers=headers, json={"sdp": "offer"})
+        self.assertEqual(429, response.status_code, response.text)
+        self.assertEqual([], self.voice_client.calls)
+        old_day, _ = self.store.load("studio_voice_open_19700101")
+        new_day, _ = self.store.load("studio_voice_open_19700102")
+        self.assertEqual(1, old_day["count"])
+        self.assertEqual(3, new_day["count"])
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertNotIn("voice_call", saved)
+        index, _ = self.store.load("studio_voice_index")
+        self.assertNotIn(created["session_id"], index.get("sessions") or {})
+
     def test_invalid_voice_requests_never_debit_open_capacity(self):
         app, _ = self.app(
             openai_api_key="server-key", voice_enabled=True,
@@ -949,11 +1045,11 @@ class ApiTests(unittest.TestCase):
             name.startswith("studio_voice_open_") for name in self.store.data
         ))
 
-    def test_provider_refusals_consume_capacity_without_refund(self):
+    def test_provider_rejections_consume_capacity_and_are_non_retryable(self):
         class RefusingVoiceClient(FakeVoiceClient):
             async def post(self, url, **kwargs):
                 self.calls.append((url, kwargs))
-                return FakeResponse(status_code=503)
+                return FakeResponse(status_code=400)
 
         self.store = MemoryStore()
         self.ids = IDs()
@@ -973,15 +1069,148 @@ class ApiTests(unittest.TestCase):
             email_sender=self.email_sender,
         )
         with TestClient(app) as client:
-            created = self.create_session(client)
-            url = "/v1/session/%s/voice" % created["session_id"]
-            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
-            responses = [client.post(url, headers=headers, json={"sdp": "offer"})
-                         for _ in range(4)]
+            operator_token = self.authenticate(client)
+            created = []
+            for index in range(4):
+                admitted = client.post(
+                    "/v1/session",
+                    headers={
+                        **self.origin,
+                        "Authorization": "Bearer " + operator_token,
+                    },
+                    json={
+                        "title": "Test",
+                        "creation_id": "voice-rejection-%d" % index,
+                    },
+                )
+                self.assertEqual(200, admitted.status_code, admitted.text)
+                created.append(admitted.json())
+            responses = [client.post(
+                "/v1/session/%s/voice" % item["session_id"],
+                headers={**self.origin, "Authorization": "Bearer " + item["token"]},
+                json={"sdp": "offer-%d" % index},
+            ) for index, item in enumerate(created)]
         self.assertEqual([502, 502, 502, 429], [item.status_code for item in responses])
         self.assertEqual(3, len(self.voice_client.calls))
         ledger, _ = self.store.load("studio_voice_open_19700101")
         self.assertEqual(3, ledger["count"])
+        for item in created[:3]:
+            saved = StudioRepository(self.store).load(item["session_id"]).state
+            self.assertEqual("unknown", saved["voice_call"]["status"])
+            self.assertIn(
+                item["session_id"], StudioRepository(self.store).due_voice_sessions(1600)
+            )
+        denied = StudioRepository(self.store).load(created[-1]["session_id"]).state
+        self.assertNotIn("voice_call", denied)
+
+    def test_pre_provider_cleanup_retains_reservation_until_index_is_removed(self):
+        self.store = MemoryStore()
+        repository = StudioRepository(self.store, clock=lambda: 1000)
+        for index in range(3):
+            repository.reserve_voice_open(3, "capacity-existing-%d" % index)
+        self.ids = IDs()
+        self.voice_client = FakeVoiceClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: 1000,
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        index_removed = threading.Event()
+        allow_session_release = threading.Event()
+        original_unregister = StudioRepository.unregister_voice
+
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+
+            def block_after_owned_index_removal(
+                    repository, session_id, voice_id=None, *, force=False):
+                removed = original_unregister(
+                    repository, session_id, voice_id, force=force
+                )
+                if session_id == created["session_id"] and voice_id:
+                    index_removed.set()
+                    if not allow_session_release.wait(5):
+                        raise RuntimeError("test barrier timed out")
+                return removed
+
+            with mock.patch.object(
+                    StudioRepository, "unregister_voice",
+                    new=block_after_owned_index_removal):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        client.post, url, headers=headers, json={"sdp": "offer"}
+                    )
+                    self.assertTrue(index_removed.wait(5))
+                    during = StudioRepository(self.store).load(
+                        created["session_id"]
+                    ).state
+                    self.assertEqual("opening", during["voice_call"]["status"])
+                    with self.assertRaisesRegex(
+                            CommandError, "already has a voice call"):
+                        app.state.controller.begin_voice(
+                            created["session_id"], "voice-racing", 1600
+                        )
+                    index, _ = self.store.load("studio_voice_index")
+                    self.assertNotIn(
+                        created["session_id"], index.get("sessions") or {}
+                    )
+                    allow_session_release.set()
+                    response = pending.result(timeout=5)
+        self.assertEqual(429, response.status_code, response.text)
+        after = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertNotIn("voice_call", after)
+        self.assertEqual([], self.voice_client.calls)
+
+    def test_provider_5xx_is_ambiguous_indexed_and_non_retryable(self):
+        class AmbiguousVoiceClient(FakeVoiceClient):
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse(status_code=503)
+
+        self.store = MemoryStore()
+        self.ids = IDs()
+        self.voice_client = AmbiguousVoiceClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: 1000,
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            first = client.post(url, headers=headers, json={"sdp": "offer"})
+            second = client.post(url, headers=headers, json={"sdp": "retry"})
+        self.assertEqual(502, first.status_code, first.text)
+        self.assertEqual(409, second.status_code, second.text)
+        self.assertEqual(1, len(self.voice_client.calls))
+        ledger, _ = self.store.load("studio_voice_open_19700101")
+        self.assertEqual(1, ledger["count"])
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertEqual("unknown", saved["voice_call"]["status"])
+        self.assertIn(
+            created["session_id"], StudioRepository(self.store).due_voice_sessions(1600)
+        )
 
     def test_malformed_provider_success_is_ambiguous_and_non_retryable(self):
         class MissingCallIdClient(FakeVoiceClient):
@@ -1083,6 +1312,27 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("voice_call", saved)
         index, _ = self.store.load("studio_voice_index")
         self.assertNotIn(created["session_id"], index.get("sessions") or {})
+
+    def test_voice_index_failure_releases_opening_before_provider(self):
+        app, _ = self.app(
+            openai_api_key="server-key", voice_enabled=True,
+            maintenance_secret="m" * 32, voice_mint_cap=3,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            with mock.patch.object(
+                    StudioRepository, "register_voice",
+                    side_effect=StateConflict("index unavailable")):
+                response = client.post(url, headers=headers, json={"sdp": "offer"})
+        self.assertEqual(503, response.status_code, response.text)
+        self.assertEqual([], self.voice_client.calls)
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertNotIn("voice_call", saved)
+        self.assertFalse(any(
+            name.startswith("studio_voice_open_") for name in self.store.data
+        ))
 
     def test_activation_failure_requires_confirmed_provider_hangup(self):
         class ActivationVoiceClient(FakeVoiceClient):
@@ -1267,7 +1517,7 @@ class ApiTests(unittest.TestCase):
         session_id = state["session_id"]
         app.state.controller.begin_voice(session_id, "voice-pending", 1000)
         app.state.controller.activate_voice(session_id, "voice-pending", "rtc_pending")
-        StudioRepository(store).register_voice(session_id, 1000)
+        StudioRepository(store).register_voice(session_id, "voice-pending", 1000)
 
         endpoint = "/v1/maintenance/voice-sweep"
         bearer = {"Authorization": "Bearer " + "m" * 32}
@@ -1320,7 +1570,9 @@ class ApiTests(unittest.TestCase):
                 app.state.controller.begin_voice(session_id, "voice-pending", 1000)
                 if voice_status == "unknown":
                     app.state.controller.mark_voice_unknown(session_id, "voice-pending")
-                StudioRepository(store).register_voice(session_id, 1000)
+                StudioRepository(store).register_voice(
+                    session_id, "voice-pending", 1000
+                )
 
                 with TestClient(app) as client:
                     response = client.post(endpoint, headers=bearer)

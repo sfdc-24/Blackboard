@@ -541,14 +541,23 @@ class StudioController:
         })
         self.repository.save(session_id, state, record.token)
 
-    def fail_voice(self, session_id: str, voice_id: str) -> None:
-        record = self.repository.load(session_id)
-        state = record.state
-        voice = state.get("voice_call") or {}
-        if voice.get("voice_id") != voice_id or voice.get("status") != "opening":
-            return
-        state.pop("voice_call", None)
-        self.repository.save(session_id, state, record.token)
+    def fail_voice(self, session_id: str, voice_id: str) -> bool:
+        """Release the exact opening after its owned index entry is gone."""
+        for _ in range(self.repository.attempts):
+            record = self.repository.load(session_id)
+            state = record.state
+            voice = state.get("voice_call") or {}
+            if not voice:
+                return True
+            if voice.get("voice_id") != voice_id or voice.get("status") != "opening":
+                return False
+            state.pop("voice_call", None)
+            try:
+                self.repository.save(session_id, state, record.token)
+                return True
+            except StateConflict:
+                continue
+        raise StateConflict("voice release is busy; keep the reservation closed")
 
     def finish_voice(self, session_id: str, call_id: str, reason: str) -> None:
         record = self.repository.load(session_id)
