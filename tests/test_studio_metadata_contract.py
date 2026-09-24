@@ -153,6 +153,15 @@ class MetadataContractTests(unittest.TestCase):
             "Add a footer that explains Salesforce fields",
             "Change the content so it mentions Salesforce schema",
             "Create a heading about Salesforce custom objects",
+            "Change the heading to say Create a Salesforce custom object",
+            "Update the footer text to say Add Salesforce metadata",
+            'Change the heading to say "Create a Salesforce custom object"',
+            "Change the heading to say Add a field to Salesforce",
+            "Please update the button text to say Delete the field from Salesforce",
+            "Create a page that says Add a field on the Lead object",
+            "Rewrite our copy to say Update the schema in Salesforce",
+            "Change the hero to say Add a field to Salesforce",
+            "Add a section that says Delete the field from Salesforce",
         )
         for i, text in enumerate(negatives):
             with self.subTest(text=text):
@@ -177,6 +186,9 @@ class MetadataContractTests(unittest.TestCase):
             "Create a Salesforce custom object named Project",
             "Create a Salesforce custom object named Project and show it on the website form",
             "Create a Salesforce custom object named Project, then add it to the app",
+            "Create a Salesforce custom object for the website form",
+            "Please create a Salesforce custom object for the website form",
+            "Could you please update Salesforce metadata for the Lead object",
             "Update Salesforce metadata for the Lead object",
             "Add a Text field to the Salesforce Lead object",
             "Delete the field from our Salesforce org",

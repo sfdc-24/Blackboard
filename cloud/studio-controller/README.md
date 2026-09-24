@@ -215,8 +215,12 @@ from Salesforce` do not make a prototype form field an org target.
 `from Salesforce` identifies a data source for UI creation/addition requests;
 deletion/removal of a component `from Salesforce` stays local. Bare destinations
 such as `Add a field to Salesforce` and schema operations are also recognized.
-Branded component names must be the direct action target, not later references
-in heading/copy/footer instructions. An explicit org creation followed by
+Branded component names must be the opening action's direct target (polite
+prefixes are accepted), not quoted/later actions in heading/copy/footer text.
+An anchored primary UI-target check precedes all explicit-target searches, so
+`Change the heading to say Add a field to Salesforce` remains a prototype ask.
+An explicit object/metadata/schema target stays local even when its purpose is
+a website form. An explicit org creation followed by
 `and`/`then` showing it in the UI stays local; adding a Salesforce field directly
 to a prototype form still follows the prototype route.
 Unsupported explicit org operations, including deletion, remain local guidance only. Other

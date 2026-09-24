@@ -21,6 +21,7 @@ PLAN_INTENT_RE = re.compile(PLAN_PREFIX, re.IGNORECASE)
 PLAN_REQUEST_RE = re.compile(PLAN_PREFIX + r" ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?", re.IGNORECASE)
 COMPONENT = r"\b(?:fields?|objects?|metadata|schema)(?:\s+(?:named|called)\s+[A-Za-z][A-Za-z0-9_]*)?"
 STANDARD_OBJECT = r"(?:Lead|Account|Contact|Opportunity|Case|Campaign|Task|Event|User)"
+POLITE_PREFIX = r"\s*(?:(?:please|can you|could you|would you)\s+)*"
 SALESFORCE_DESTINATION = (
     r"Salesforce\b(?!-)(?=$|[.,;!?]|\s+(?:org\b|object\b|custom\s+object\b|schema\b|metadata\b|"
     r"and\b|then\b|now\b|for\b|with\b|named\b|called\b|" + STANDARD_OBJECT + r"\s+object\b))"
@@ -79,6 +80,21 @@ def is_metadata_request(text: str) -> bool:
     # parse_request's fullmatch can create a proposal; the rest gets guidance.
     if PLAN_INTENT_RE.match(text.strip()):
         return True
+    # Honor the utterance's primary UI target before scanning for any embedded
+    # metadata destination, including quoted button/heading text. Field alone
+    # is intentionally not a UI noun here: its destination still disambiguates.
+    if re.match(
+        POLITE_PREFIX + r"(?:plan|create|add|delete|remove|update|change|deploy|"
+        r"edit|rewrite|rename|replace|write|design|redesign|render|draw|build|style|make|set)\s+"
+        r"(?:(?:a|an|the|new|existing|our|my|this|that)\s+)*"
+        r"(?:(?:contact|lead|landing|website|login|registration|search|integration)\s+)?"
+        r"(?:heading|footer|header|copy|content|button|form|page|app|application|"
+        r"website|webpage|screen|prototype|mockup|label|labels|title|text|hero|section|"
+        r"card|canvas|navigation|menu|link|badge|table|list|chart|diagram|tab|modal|"
+        r"dialog|banner|caption|paragraph|tooltip|toast|sidebar|toolbar|layout|widget|"
+        r"accordion|carousel|dropdown)\b(?!\s+fields?\b)", text, re.I,
+    ):
+        return False
     if not (re.search(r"\b(?:plan|create|add|delete|remove|update|change|deploy)\b", text, re.I)
             and re.search(r"\b(?:fields?|objects?|metadata|schema)\b", text, re.I)):
         return False
@@ -113,14 +129,20 @@ def is_metadata_request(text: str) -> bool:
         return True
     # A later branded noun in heading/copy instructions is only a reference.
     # Require the action to directly govern the Salesforce component instead.
-    branded_target = re.search(
-        r"\b(?:plan|create|add|delete|remove|update|change|deploy)\s+"
+    branded_target = re.match(
+        POLITE_PREFIX +
+        r"(?:plan|create|add|delete|remove|update|change|deploy)\s+"
         r"(?:(?:a|an|the|new|existing)\s+)*Salesforce\s+"
         r"(?:(?:Lead|Account|Contact|Opportunity|custom|Text)\s+)*"
-        r"(?:fields?|objects?|metadata|schema)\b", text, re.I,
+        r"(?P<component>fields?|objects?|metadata|schema)\b", text, re.I,
     )
     if not branded_target:
         return False
+    # Unlike a form field, an explicitly targeted Salesforce object/metadata/
+    # schema operation does not become a prototype request because of its UI
+    # purpose ("Create a Salesforce custom object for the website form").
+    if branded_target["component"].lower() not in {"field", "fields"}:
+        return True
     # "Add a Salesforce field to our form" targets the prototype. Conversely,
     # "Create a Salesforce object, then show it in the app" first targets the
     # org: do not let a subsequent UI consequence hide that explicit operation.
