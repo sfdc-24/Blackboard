@@ -49,10 +49,12 @@ def clasp(args: list[str], cwd: Path) -> str:
 
 def deployed_version(deployments: str, deployment_id: str) -> int:
     for line in deployments.splitlines():
-        # The id as a whole token: "- <id> @<n>", never as a suffix of a longer id.
-        m = re.search(r"(?:^|[\s-])" + re.escape(deployment_id) + r"\s+@(\d+)(?:\s|$)", line)
-        if m:
-            return int(m.group(1))
+        # Parse the line, then compare the id EXACTLY: "- <id> @<n> [- desc]".
+        # A pattern searched inside the line let a longer id that merely ends
+        # with ours (or carries a hyphenated prefix) answer for it.
+        m = re.match(r"^\s*-\s+(\S+)\s+@(\d+)(?:\s|$)", line)
+        if m and m.group(1) == deployment_id:
+            return int(m.group(2))
     print("deployment %s not found in `clasp deployments`" % deployment_id[:12])
     raise SystemExit(2)
 
@@ -68,9 +70,17 @@ def fresh_main() -> str:
 
 
 def main_files(sha: str) -> list[str]:
-    out = subprocess.check_output(["git", "ls-tree", "--name-only", "%s:%s" % (sha, SOURCE_DIR)],
+    """Every file under the source dir, recursively, as a relative posix path.
+    NUL-separated so a name with a space stays one name."""
+    out = subprocess.check_output(["git", "ls-tree", "-r", "-z", "--name-only", "%s:%s" % (sha, SOURCE_DIR)],
                                   cwd=REPO, text=True, encoding="utf-8")
-    return sorted(n for n in out.split() if n)
+    return sorted(n for n in out.split("\0") if n)
+
+
+def live_files(root: Path) -> dict[str, Path]:
+    """Every pulled file, recursively, keyed by the same relative posix path."""
+    return {p.relative_to(root).as_posix(): p for p in root.rglob("*")
+            if p.is_file() and p.relative_to(root).as_posix() != ".clasp.json"}
 
 
 def main_source(sha: str, name: str) -> str | None:
@@ -106,7 +116,7 @@ def main() -> int:
         cfg["rootDir"] = "."
         (tmp / ".clasp.json").write_text(json.dumps(cfg), encoding="utf-8")
         clasp(["pull", "--versionNumber", str(version)], tmp)
-        live = {p.name: p for p in tmp.iterdir() if p.is_file() and p.name != ".clasp.json"}
+        live = live_files(tmp)
         if not live:
             print("the pull of version %d returned no files; cannot tell" % version)
             return 2

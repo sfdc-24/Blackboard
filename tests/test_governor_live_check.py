@@ -34,7 +34,9 @@ def run(live_files, main_files=MAIN, deployments=DEPLOYMENTS):
         if args[0] == "deployments":
             return deployments
         for name, body in live_files.items():
-            Path(cwd, name).write_text(body, encoding="utf-8")
+            target = Path(cwd, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
         return ""
 
     out = io.StringIO()
@@ -101,6 +103,49 @@ class LiveCheck(unittest.TestCase):
         self.assertNotIn("abc123", out.getvalue())
         self.assertNotIn("example.com", out.getvalue())
 
+
+class NestedAndExactIds(unittest.TestCase):
+    """Codex's second review of #227: live subdirectories were discarded and
+    main was listed non-recursively, and a hyphenated prefix still matched."""
+
+    def test_a_nested_file_only_live_is_drift(self):
+        code, text = run(dict(MAIN, **{"guards/Safety.js": "guard\n"}))
+        self.assertEqual(code, 1, text)
+        self.assertIn("guards/Safety.js", text)
+
+    def test_equal_nested_trees_match(self):
+        tree = dict(MAIN, **{"guards/Nested.js": "n\n"})
+        code, text = run(dict(tree), main_files=dict(tree))
+        self.assertEqual(code, 0, text)
+
+    def test_a_name_with_a_space_is_one_file(self):
+        tree = dict(MAIN, **{"Safety Rules.js": "r\n"})
+        code, text = run(dict(tree), main_files=dict(tree))
+        self.assertEqual(code, 0, text)
+
+    def test_a_hyphenated_longer_id_does_not_answer_for_ours(self):
+        listing = "Found 2 deployments.\n- X-%s @12 - other\n- %s @68 - ours\n" % (ID, ID)
+        self.assertEqual(glc.deployed_version(listing, ID), 68)
+
+    def test_main_files_are_listed_recursively_with_spaces_kept(self):
+        seen = {}
+
+        def fake_check_output(args, **kwargs):
+            seen["args"] = args
+            return "Code.js\0Safety Rules.js\0guards/Nested.js\0"
+        with mock.patch.object(glc.subprocess, "check_output", fake_check_output):
+            names = glc.main_files("a" * 40)
+        self.assertIn("-r", seen["args"])
+        self.assertIn("-z", seen["args"])
+        self.assertEqual(names, ["Code.js", "Safety Rules.js", "guards/Nested.js"])
+
+    def test_live_files_are_walked_recursively(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "guards").mkdir()
+        (root / "guards" / "Nested.js").write_text("n", encoding="utf-8")
+        (root / "Code.js").write_text("c", encoding="utf-8")
+        (root / ".clasp.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(sorted(glc.live_files(root)), ["Code.js", "guards/Nested.js"])
 
 if __name__ == "__main__":
     unittest.main()
