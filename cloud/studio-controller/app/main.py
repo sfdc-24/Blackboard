@@ -207,7 +207,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if app.state.close_email_client:
             await asyncio.to_thread(app.state.email_client.close)
 
-    app = FastAPI(title="SFDC24 Studio controller", version="1.0", lifespan=lifespan)
+    # Behind TLS termination the ASGI scheme can be HTTP. Never redirect a
+    # bearer-bearing POST to a slash-normalized URL inferred from that scheme.
+    # Canonical routes below are exact; slash variants fail closed with 404.
+    app = FastAPI(title="SFDC24 Studio controller", version="1.0",
+                  lifespan=lifespan, redirect_slashes=False)
     app.state.settings = settings
     app.state.controller = controller
     auth_service = AuthService(
@@ -258,7 +262,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except InvalidToken as exc:
             raise HTTPException(401, str(exc)) from exc
 
-    @app.get("/healthz")
+    @app.get("/health")
+    @app.get("/healthz", include_in_schema=False)
     async def healthz():
         backend = "gcs" if settings.state_uri.startswith("gs://") else "file"
         return {
@@ -354,18 +359,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except ValueError as exc:
             raise HTTPException(400, "Last-Event-ID must be an integer") from exc
 
+        # StreamingResponse commits HTTP 200 before iterating its body. Resolve
+        # session/replay/repair admission first so failures are real JSON HTTP
+        # refusals, not empty successful streams. Reuse this batch below: a
+        # second read could discard the initial repair snapshot or race it.
+        try:
+            initial = await asyncio.to_thread(controller.events_after, session_id, after)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
         async def stream():
             nonlocal after
             deadline = clock() + (0 if once else settings.sse_wait_seconds)
+            batch, repaired, state = initial
             while True:
-                try:
-                    batch, repaired, state = await asyncio.to_thread(
-                        controller.events_after, session_id, after
-                    )
-                except SessionNotFound as exc:
-                    raise HTTPException(404, "session not found") from exc
-                except StateConflict as exc:
-                    raise HTTPException(409, str(exc)) from exc
                 if repaired:
                     after = 0
                 for event in batch:
@@ -378,9 +387,20 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 if not batch:
                     yield ": keep-alive\n\n"
                 await asyncio.sleep(settings.sse_poll_seconds)
+                try:
+                    batch, repaired, state = await asyncio.to_thread(
+                        controller.events_after, session_id, after
+                    )
+                except (SessionNotFound, StateConflict):
+                    # Headers cannot change now. Close this bounded stream;
+                    # reconnection runs preflight and receives a real refusal
+                    # if the problem persists. Do not forge durable events or
+                    # advance the last delivered cursor for a transport error.
+                    return
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={
             "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+            "X-Studio-Generation": str(initial[2]["generation"]),
         })
 
     @app.post("/v1/session/{session_id}/commands")
