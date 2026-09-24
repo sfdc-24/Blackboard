@@ -786,5 +786,132 @@ class ApiTests(unittest.TestCase):
             self.assertEqual({"ok": True, "checked_at": 1000}, accepted.json())
 
 
+
+# ---- The Claude worker inside this controller (claude-code-cli, after #204) ----
+# A fake Anthropic client stands in for the model: no network, no key.
+
+class _FakeAnthropic:
+    def __init__(self, *drafts):
+        from types import SimpleNamespace
+        self.drafts = list(drafts)
+        self.calls = 0
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        from types import SimpleNamespace
+        draft = self.drafts[min(self.calls, len(self.drafts) - 1)]
+        self.calls += 1
+        return SimpleNamespace(stop_reason="end_turn",
+                               content=[SimpleNamespace(type="text", text=json.dumps(draft))])
+
+
+def _claude(*drafts):
+    from workers.claude_worker import ClaudeWorker
+    worker = ClaudeWorker(client=_FakeAnthropic(*drafts))
+    seed = SyntheticWorker()                    # the same bootstrap app.main uses
+    worker.initial_artifact = seed.initial_artifact
+    worker.initial_questions = seed.initial_questions
+    return worker
+
+
+_NO_NODE = {"id": "", "kind": "text", "label": "", "detail": ""}
+_BOOK_BY_VOICE = {
+    "ops": [{"op": "set_label", "node_id": "hero-cta", "value": "Book a consultation", "new_node": _NO_NODE}],
+    "confirm": "Changed the main action to Book a consultation.",
+    "questions": [], "batch_title": "",
+    "resolves": {"question_id": "q-cta", "option_id": "book", "freeform_answer": ""},
+}
+
+
+class _Resolver:
+    """Names an answer without checking it - the controller must."""
+    def __init__(self, resolves):
+        self.resolves = resolves
+
+    def initial_artifact(self):
+        return SyntheticWorker().initial_artifact()
+
+    def initial_questions(self):
+        # A second open question, so a claim can point somewhere other than
+        # the question a tap just answered.
+        other = copy.deepcopy(SyntheticWorker().initial_questions()[0])
+        other.update(question_id="q-other", affected_artifact_ids=["hero-heading"])
+        return SyntheticWorker().initial_questions() + [other]
+
+    def on_turn(self, state, trigger):
+        return {"events": [], "problems": [], "resolves": dict(self.resolves)}
+
+
+def _say(state, n, text, version):
+    return {"command_id": "spoken-%d" % n, "session_id": state["session_id"], "type": "utterance",
+            "expected_version": version, "item_id": "item-%d" % n, "transcript": text}
+
+
+class ClaudeWorkerInControllerTests(unittest.TestCase):
+    def test_a_spoken_answer_changes_the_prototype_and_closes_the_question(self):
+        controller, store, _ = make_controller(worker=_claude(_BOOK_BY_VOICE))
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], _say(state, 1, "Let them book a call", 1))
+        self.assertEqual([], result["problems"])
+        self.assertEqual(["artifact.patch", "question.answered", "confirm"],
+                         [e["type"] for e in result["events"]])
+        answered = result["events"][1]["payload"]["question"]
+        self.assertEqual(("q-cta", "answered", "book", "voice"),
+                         (answered["question_id"], answered["status"], answered["selected_option"],
+                          answered["answer_source"]))
+        self.assertEqual((1, 2), (answered["artifact_version_before"], answered["artifact_version_after"]))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", _find(saved, "q-cta")["status"])
+        self.assertEqual(2, saved["artifact_version"])
+
+    def test_a_second_claim_on_a_closed_question_is_a_problem_not_an_answer(self):
+        stale, _, _ = make_controller(worker=_Resolver({"question_id": "q-cta", "option_id": "book"}))
+        s2, _ = stale.create_session()
+        stale.execute(s2["session_id"], {"command_id": "tap-1", "session_id": s2["session_id"], "type": "answer",
+                                         "expected_version": 1, "question_id": "q-cta", "option_id": "describe"})
+        result = stale.execute(s2["session_id"], _say(s2, 2, "book it", 1))
+        self.assertEqual([], [e for e in result["events"] if e["type"] == "question.answered"])
+        self.assertTrue(any("resolves 'q-cta' refused" in p for p in result["problems"]), result["problems"])
+
+    def test_unknown_questions_and_foreign_options_are_refused(self):
+        for resolves, why in (({"question_id": "q-nope", "option_id": "book"}, "unknown question_id"),
+                              ({"question_id": "q-cta", "option_id": "delete-everything"}, "does not belong")):
+            controller, store, _ = make_controller(worker=_Resolver(resolves))
+            state, _ = controller.create_session()
+            result = controller.execute(state["session_id"], _say(state, 1, "whatever", 1))
+            self.assertTrue(any(why in p for p in result["problems"]), (resolves, result["problems"]))
+            saved = StudioRepository(store).load(state["session_id"]).state
+            self.assertEqual("open", _find(saved, "q-cta")["status"])
+
+    def test_a_tap_never_lets_resolves_answer_another_question(self):
+        controller, store, _ = make_controller(worker=_Resolver({"question_id": "q-other", "option_id": "work"}))
+        state, _ = controller.create_session()
+        controller.execute(state["session_id"], {"command_id": "tap-1", "session_id": state["session_id"],
+                                                 "type": "answer", "expected_version": 1,
+                                                 "question_id": "q-cta", "option_id": "book"})
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual(("book", "tap"), (_find(saved, "q-cta")["selected_option"],
+                                           _find(saved, "q-cta")["answer_source"]))
+        self.assertEqual("open", _find(saved, "q-other")["status"])
+
+    def test_the_image_carries_the_worker_and_its_sdk(self):
+        docker = (CONTROLLER / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY cloud/studio-controller/workers ./workers", docker)
+        reqs = (CONTROLLER / "requirements.txt").read_text(encoding="utf-8")
+        self.assertRegex(reqs, r"(?m)^anthropic==\d")
+
+    def test_studio_worker_claude_builds_through_app_main(self):
+        from app.main import _worker
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-offline-test"}):
+            worker = _worker(settings(worker="claude"))
+        from workers.claude_worker import ClaudeWorker
+        self.assertIsInstance(worker, ClaudeWorker)
+        self.assertEqual("q-cta", worker.initial_questions()[0]["question_id"])
+
+
+def _find(state, qid):
+    return next(q for q in state["questions"] if q["question_id"] == qid)
+
+
 if __name__ == "__main__":
     unittest.main()

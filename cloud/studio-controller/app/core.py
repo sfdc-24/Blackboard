@@ -604,6 +604,20 @@ class StudioController:
         if trigger is not None:
             worker_result = self.worker.on_turn(copy.deepcopy(state), trigger)
             problems = list(worker_result.get("problems") or [])
+            # A spoken turn can answer the open question ("book a call, then").
+            # The worker only NAMES the answer; the controller owns the record,
+            # so it is re-checked here against the live question and recorded
+            # with answer_source "voice". A stale or invalid claim is a problem,
+            # never a crash and never an answer.
+            resolves = worker_result.get("resolves") or {}
+            if trigger["kind"] == "utterance" and resolves.get("question_id"):
+                item = {key: resolves[key] for key in ("option_id", "freeform_answer") if resolves.get(key)}
+                item["answer_source"] = "voice"
+                try:
+                    question = _find_question(state, resolves["question_id"])
+                    answered_questions.append(_answer(question, item, state["artifact_version"]))
+                except CommandError as exc:
+                    problems.append("resolves %r refused: %s" % (resolves["question_id"], exc))
             answers_emitted = False
 
             def emit_answers():
