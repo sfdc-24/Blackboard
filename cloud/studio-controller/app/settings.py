@@ -39,6 +39,8 @@ class Settings:
     email_sender_url: str = ""
     email_sender_secret: str = ""
     voice_enabled: bool = False
+    lead_facts_enabled: bool = False
+    salesforce_org_id: str = ""
     maintenance_secret: str = ""
     openai_api_key: str = ""
     realtime_model: str = "gpt-realtime-2.1"
@@ -71,6 +73,8 @@ class Settings:
             email_sender_url=os.environ.get("STUDIO_EMAIL_SENDER_URL", "").strip(),
             email_sender_secret=os.environ.get("STUDIO_EMAIL_SENDER_SECRET", ""),
             voice_enabled=_enabled(os.environ.get("STUDIO_ENABLE_VOICE", "false")),
+            lead_facts_enabled=_enabled(os.environ.get("STUDIO_ENABLE_LEAD_FACTS", "false")),
+            salesforce_org_id=os.environ.get("STUDIO_SALESFORCE_ORG_ID", ""),
             maintenance_secret=os.environ.get("STUDIO_MAINTENANCE_SECRET", ""),
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
             realtime_model=os.environ.get("STUDIO_REALTIME_MODEL", "gpt-realtime-2.1"),

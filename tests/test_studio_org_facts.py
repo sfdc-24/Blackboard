@@ -12,6 +12,7 @@ spec = importlib.util.spec_from_file_location(
     "org_facts", REPO / "cloud" / "studio-controller" / "workers" / "org_facts.py")
 of = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(of)
+ORG_ID = "00D000000000001AAA"
 
 
 class Resp(io.BytesIO):
@@ -30,7 +31,7 @@ def fake_org(calls):
                                     "access_token": "t"}).encode())
         q = urllib.parse.unquote(req.full_url.split("q=", 1)[1])
         if "FROM Organization" in q:
-            body = {"records": [{"Id": "00Dx", "Name": "SFDC 24", "OrganizationType": "Developer Edition"}]}
+            body = {"records": [{"Id": ORG_ID, "Name": "SFDC 24", "OrganizationType": "Developer Edition"}]}
         elif "GROUP BY LeadSource" in q:
             body = {"records": [{"LeadSource": "sfdc24.com", "n": 4}, {"LeadSource": None, "n": 22}]}
         elif "LAST_N_DAYS" in q:
@@ -43,7 +44,7 @@ def fake_org(calls):
 
 class OrgFactsTest(unittest.TestCase):
     def facts(self, calls):
-        return of.OrgFacts("dbm00000wk2ibeac-dev-ed.develop.my.salesforce.com", "id", "secret", fake_org(calls))
+        return of.OrgFacts("dbm00000wk2ibeac-dev-ed.develop.my.salesforce.com", "id", "secret", fake_org(calls), expected_org_id=ORG_ID)
 
     def test_lead_counts_name_the_org_the_source_and_the_time(self):
         calls = []
@@ -70,7 +71,7 @@ class OrgFactsTest(unittest.TestCase):
 
     def test_a_customer_tenant_is_refused(self):
         with self.assertRaises(ValueError):
-            of.OrgFacts("acme.my.salesforce.com", "id", "secret", fake_org([]))
+            of.OrgFacts("acme.my.salesforce.com", "id", "secret", fake_org([]), expected_org_id=ORG_ID)
 
     def test_missing_credentials_fail_plainly(self):
         import os
@@ -100,7 +101,7 @@ class CodexReReview200OrgFacts(unittest.TestCase):
                     "https://a.develop.my.salesforce.com:8443", "https://a.develop.my.salesforce.com/path",
                     "acme.my.salesforce.com"):
             with self.assertRaises(ValueError, msg=bad):
-                of.OrgFacts(bad, "id", "secret", fake_org([]))
+                of.OrgFacts(bad, "id", "secret", fake_org([]), expected_org_id=ORG_ID)
 
     def test_an_instance_url_elsewhere_never_receives_the_bearer(self):
         calls = []
@@ -108,7 +109,7 @@ class CodexReReview200OrgFacts(unittest.TestCase):
             calls.append(req)
             return Resp(json.dumps({"instance_url": "https://customer.my.salesforce.com",
                                     "access_token": "t"}).encode())
-        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener, expected_org_id=ORG_ID)
         with self.assertRaises(ValueError):
             f.lead_counts()
         self.assertEqual(len(calls), 1, "only the token request was made")
@@ -119,16 +120,16 @@ class CodexReReview200OrgFacts(unittest.TestCase):
         def opener(req, timeout=None):
             if "FROM%20Organization" in req.full_url or "FROM Organization" in urllib.parse.unquote(req.full_url):
                 calls.append(req)
-                return Resp(json.dumps({"records": [{"Id": "00Dp", "Name": "Acme",
+                return Resp(json.dumps({"records": [{"Id": ORG_ID, "Name": "Acme",
                                                      "OrganizationType": "Enterprise Edition", "IsSandbox": False}]}).encode())
             return base(req, timeout)
-        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener, expected_org_id=ORG_ID)
         with self.assertRaises(PermissionError):
             f.lead_counts()
         self.assertFalse(any("FROM Lead" in urllib.parse.unquote(c.full_url) for c in calls if "q=" in c.full_url))
 
     def test_the_default_opener_does_not_follow_redirects(self):
-        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret")
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", expected_org_id=ORG_ID)
         self.assertIsNotNone(f._open)
         h = of._NoRedirect()
         self.assertIsNone(h.redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/"))
@@ -151,7 +152,7 @@ class TokenRetry(unittest.TestCase):
     on 2026-09-17); three reruns a minute later all answered."""
 
     def facts(self, opener):
-        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener, expected_org_id=ORG_ID)
         f._sleep = lambda s: None
         return f
 

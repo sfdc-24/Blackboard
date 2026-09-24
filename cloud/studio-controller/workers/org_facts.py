@@ -14,7 +14,7 @@ is deliberately narrow:
     Headless_domain, Headless_consumer_key, Headless_consumer_secret - the
     client-credentials connected app already used for the dev org.
 
-    facts = OrgFacts.from_env()
+    facts = OrgFacts.from_env(expected_org_id="<exact 18-character org ID>")
     answer = facts.lead_counts()        # dict with org, counts, source, observed_at
     text = describe_lead_counts(answer) # one plain sentence for the page and the voice
 """
@@ -36,6 +36,7 @@ ALLOWED_HOST_SUFFIXES = (".develop.my.salesforce.com", ".sandbox.my.salesforce.c
                          ".scratch.my.salesforce.com", ".trailblaze.my.salesforce.com")
 ALLOWED_ORG_TYPES = ("Developer Edition",)
 SITE_SOURCE = "sfdc24.com"
+ORG_ID_RE = re.compile(r"00D[A-Za-z0-9]{15}\Z")
 
 # The whole query surface. Adding a fact means adding a template here, in review.
 QUERIES = {
@@ -75,7 +76,11 @@ def _approved_origin(url: str) -> str:
 
 
 class OrgFacts:
-    def __init__(self, domain: str, client_id: str, client_secret: str, opener=None):
+    def __init__(self, domain: str, client_id: str, client_secret: str, opener=None,
+                 *, expected_org_id: str = ""):
+        if not isinstance(expected_org_id, str) or not ORG_ID_RE.fullmatch(expected_org_id):
+            raise ValueError("an exact 18-character Salesforce Organization ID is required")
+        self.expected_org_id = expected_org_id
         dom = domain.strip()
         if "://" not in dom:
             dom = "https://" + dom
@@ -87,13 +92,14 @@ class OrgFacts:
         self.host = urllib.parse.urlsplit(self.domain).hostname
 
     @classmethod
-    def from_env(cls, opener=None):
+    def from_env(cls, opener=None, *, expected_org_id: str = ""):
         missing = [k for k in ("Headless_domain", "Headless_consumer_key", "Headless_consumer_secret")
                    if not os.environ.get(k)]
         if missing:
             raise RuntimeError("org facts unavailable: %s not set" % ", ".join(missing))
         return cls(os.environ["Headless_domain"], os.environ["Headless_consumer_key"],
-                   os.environ["Headless_consumer_secret"], opener)
+                   os.environ["Headless_consumer_secret"], opener,
+                   expected_org_id=expected_org_id)
 
     def _auth(self, attempts: int = 3):
         """The token call, retried on a transient failure. The dev org's token
@@ -133,16 +139,25 @@ class OrgFacts:
 
     def lead_counts(self) -> dict:
         org = (self._query("org").get("records") or [{}])[0]
+        if org.get("Id") != self.expected_org_id:
+            raise PermissionError("Salesforce organization does not match the configured Organization ID")
         # Identity before data: a host that looks right is not proof. Refuse
         # anything but a developer org or a sandbox before a Lead is read.
         if not (org.get("IsSandbox") is True or org.get("OrganizationType") in ALLOWED_ORG_TYPES):
             raise PermissionError("refusing %s: organization type %r, sandbox %r"
                                   % (self.host, org.get("OrganizationType"), org.get("IsSandbox")))
-        total = self._query("lead_total").get("totalSize", 0)
+        if not isinstance(org.get("Name"), str) or not org["Name"].strip():
+            raise ValueError("Salesforce organization name is missing")
+        total = _count(self._query("lead_total").get("totalSize"))
         by_source = {}
-        for rec in self._query("lead_by_source").get("records") or []:
-            by_source[rec.get("LeadSource") or "(none)"] = rec.get("n", 0)
-        recent = self._query("lead_site_recent").get("totalSize", 0)
+        groups = self._query("lead_by_source")
+        if not isinstance(groups.get("records"), list) or groups.get("done") is False:
+            raise ValueError("Salesforce Lead source aggregates are incomplete")
+        for rec in groups["records"]:
+            if "LeadSource" not in rec or (rec["LeadSource"] is not None and not isinstance(rec["LeadSource"], str)):
+                raise ValueError("Salesforce Lead source aggregate is malformed")
+            by_source[rec["LeadSource"] or "(none)"] = _count(rec.get("n"))
+        recent = _count(self._query("lead_site_recent").get("totalSize"))
         return {
             "org_id": org.get("Id", ""), "org_name": org.get("Name", ""),
             "org_type": org.get("OrganizationType", ""), "host": self.host,
@@ -151,6 +166,12 @@ class OrgFacts:
             "source": "live SOQL on the Lead object",
             "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+
+
+def _count(value) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("Salesforce count is missing or invalid")
+    return value
 
 
 def describe_lead_counts(a: dict) -> str:
