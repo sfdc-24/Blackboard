@@ -169,14 +169,31 @@ def _subtree_ids(node):
     return out
 
 
-def _scope_question(state_questions, trigger, resolves):
-    """The question this turn answers, if any: its affected ids bound the change."""
+def _scope_ids(state_questions, trigger, resolves):
+    """The affected ids this turn may change, or None when the turn answers no
+    question (a new utterance may shape the page freely).
+
+    A form answers several questions at once: the scope is the UNION of their
+    affected ids. An answered id that is not a known question yields an EMPTY
+    scope - nothing may change - never an unrestricted one (Codex re-review of
+    PR 200, P2)."""
     by_id = {q["question_id"]: q for q in state_questions}
-    if trigger.get("kind") == "answer":
-        return by_id.get(trigger.get("question_id"))
-    if resolves:
-        return by_id.get(resolves["question_id"])
-    return None
+    kind = trigger.get("kind")
+    if kind == "answer":
+        qids = [trigger.get("question_id")]
+    elif kind == "answer_batch":
+        qids = [a.get("question_id") for a in trigger.get("answers") or []]
+    elif resolves:
+        qids = [resolves["question_id"]]
+    else:
+        return None
+    ids = set()
+    for qid in qids:
+        q = by_id.get(qid)
+        if q is None:
+            return set()
+        ids.update(q.get("affected_artifact_ids") or [])
+    return ids
 
 
 def validate(draft: dict, artifact_root: dict, state_questions: list,
@@ -227,11 +244,11 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     # -- the patch, as one transaction on a candidate tree
     tree = json.loads(json.dumps(artifact_root))
     index, parents = _index(tree)
-    scope_q = _scope_question(state_questions, trigger, resolves)
+    scope = _scope_ids(state_questions, trigger, resolves)
     allowed = None
-    if scope_q is not None:
+    if scope is not None:
         allowed = set()
-        for a in scope_q.get("affected_artifact_ids") or []:
+        for a in scope:
             if a in index:
                 allowed |= _subtree_ids(index[a])
     ops_out, txn_ok = [], True

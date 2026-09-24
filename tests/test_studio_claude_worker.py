@@ -266,5 +266,28 @@ class CodexReview200(unittest.TestCase):
         self.assertEqual(out["events"], [])
         self.assertTrue(any("60 children" in p for p in out["problems"]))
 
+class CodexReReview200(unittest.TestCase):
+    """CODEX-PR200-REREVIEW2-20260924T0518Z, P2: a form's answers bound the change too."""
+
+    def test_a_form_may_change_only_the_union_of_its_questions_nodes(self):
+        cta = dict(q(), status="open")
+        t = {"kind": "answer_batch", "batch_id": "b1", "answers": [{"question_id": "q-cta", "option_id": "book"}]}
+        out, _ = run_trigger({"ops": [op("set_label", "hero-heading", "Unasked")], "confirm": "x",
+                              "questions": [], "batch_title": ""}, [cta], t)
+        self.assertEqual(out["events"], [])
+        heading = dict(q("q-head", affected=("hero-heading",)), status="open")
+        t2 = {"kind": "answer_batch", "batch_id": "b1", "answers": [
+            {"question_id": "q-cta", "option_id": "book"}, {"question_id": "q-head", "option_id": "book"}]}
+        out, _ = run_trigger({"ops": [op("set_label", "hero-heading", "Asked"), op("set_label", "hero-cta", "Book")],
+                              "confirm": "x", "questions": [], "batch_title": ""}, [cta, heading], t2)
+        self.assertEqual(out["problems"], [])
+
+    def test_an_unknown_answered_id_permits_no_change_at_all(self):
+        t = {"kind": "answer_batch", "batch_id": "b1", "answers": [{"question_id": "q-nope", "option_id": "x"}]}
+        out, _ = run_trigger({"ops": [op("set_label", "hero-cta", "x")], "confirm": "x",
+                              "questions": [], "batch_title": ""}, [], t)
+        self.assertEqual(out["events"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

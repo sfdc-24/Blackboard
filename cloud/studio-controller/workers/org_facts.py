@@ -29,8 +29,11 @@ import urllib.request
 from datetime import datetime, timezone
 
 API = "v62.0"
-ALLOWED_HOST_MARKERS = ("develop.my.salesforce.com", "sandbox.my.salesforce.com",
-                        "scratch.my.salesforce.com", "trailblaze.my.salesforce.com")
+# Host SUFFIXES, matched on a dot boundary - "develop.my.salesforce.com.evil.test"
+# and "xdevelop.my.salesforce.com" must not pass (Codex re-review of PR 200, P1).
+ALLOWED_HOST_SUFFIXES = (".develop.my.salesforce.com", ".sandbox.my.salesforce.com",
+                         ".scratch.my.salesforce.com", ".trailblaze.my.salesforce.com")
+ALLOWED_ORG_TYPES = ("Developer Edition",)
 SITE_SOURCE = "sfdc24.com"
 
 # The whole query surface. Adding a fact means adding a template here, in review.
@@ -51,19 +54,35 @@ def is_lead_count_question(text: str) -> bool:
     return bool(LEAD_QUESTION.search(text or ""))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A bearer token must never follow a redirect to another host."""
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def _approved_origin(url: str) -> str:
+    """https://<host> for an approved developer or sandbox host, else ValueError.
+    No userinfo, no port, no path, no plain http."""
+    u = urllib.parse.urlsplit(url.strip())
+    host = (u.hostname or "").lower()
+    if u.scheme != "https" or u.username or u.password or u.port or u.path not in ("", "/") \
+            or u.query or u.fragment:
+        raise ValueError("refusing %r: must be a bare https origin" % url)
+    if not any(host.endswith(sfx) for sfx in ALLOWED_HOST_SUFFIXES):
+        raise ValueError("refusing %s: not a developer or sandbox org" % host)
+    return "https://" + host
+
+
 class OrgFacts:
     def __init__(self, domain: str, client_id: str, client_secret: str, opener=None):
         dom = domain.strip()
-        if not dom.startswith("http"):
+        if "://" not in dom:
             dom = "https://" + dom
-        dom = dom.rstrip("/")
-        host = urllib.parse.urlparse(dom).netloc
-        if not any(m in host for m in ALLOWED_HOST_MARKERS):
-            raise ValueError("refusing %s: not a developer or sandbox org" % host)
-        self.domain, self._cid, self._sec = dom, client_id, client_secret
-        self._open = opener or urllib.request.urlopen
+        self.domain = _approved_origin(dom)
+        self._cid, self._sec = client_id, client_secret
+        self._open = opener or urllib.request.build_opener(_NoRedirect).open
         self._token = None
-        self.host = host
+        self.host = urllib.parse.urlsplit(self.domain).hostname
 
     @classmethod
     def from_env(cls, opener=None):
@@ -82,7 +101,9 @@ class OrgFacts:
         req = urllib.request.Request(self.domain + "/services/oauth2/token", data=body, method="POST")
         with self._open(req, timeout=30) as r:
             tok = json.loads(r.read().decode("utf-8", "replace"))
-        self._token = (tok["instance_url"].rstrip("/"), tok["access_token"])
+        # The response names where to send the bearer; it gets the same check
+        # as the configured domain before a token goes anywhere.
+        self._token = (_approved_origin(tok["instance_url"]), tok["access_token"])
         return self._token
 
     def _query(self, name: str) -> dict:
@@ -95,6 +116,11 @@ class OrgFacts:
 
     def lead_counts(self) -> dict:
         org = (self._query("org").get("records") or [{}])[0]
+        # Identity before data: a host that looks right is not proof. Refuse
+        # anything but a developer org or a sandbox before a Lead is read.
+        if not (org.get("IsSandbox") is True or org.get("OrganizationType") in ALLOWED_ORG_TYPES):
+            raise PermissionError("refusing %s: organization type %r, sandbox %r"
+                                  % (self.host, org.get("OrganizationType"), org.get("IsSandbox")))
         total = self._query("lead_total").get("totalSize", 0)
         by_source = {}
         for rec in self._query("lead_by_source").get("records") or []:

@@ -90,5 +90,48 @@ class OrgFactsTest(unittest.TestCase):
             self.assertFalse(of.is_lead_count_question(no), no)
 
 
+class CodexReReview200OrgFacts(unittest.TestCase):
+    """CODEX-PR200-REREVIEW2-20260924T0518Z, P1: nothing but an approved dev/sandbox org gets the bearer."""
+
+    def test_spoofed_and_malformed_domains_are_refused(self):
+        for bad in ("develop.my.salesforce.com.evil.test", "xdevelop.my.salesforce.com",
+                    "https://user:pw@a.develop.my.salesforce.com", "http://a.develop.my.salesforce.com",
+                    "https://a.develop.my.salesforce.com:8443", "https://a.develop.my.salesforce.com/path",
+                    "acme.my.salesforce.com"):
+            with self.assertRaises(ValueError, msg=bad):
+                of.OrgFacts(bad, "id", "secret", fake_org([]))
+
+    def test_an_instance_url_elsewhere_never_receives_the_bearer(self):
+        calls = []
+        def opener(req, timeout=None):
+            calls.append(req)
+            return Resp(json.dumps({"instance_url": "https://customer.my.salesforce.com",
+                                    "access_token": "t"}).encode())
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        with self.assertRaises(ValueError):
+            f.lead_counts()
+        self.assertEqual(len(calls), 1, "only the token request was made")
+
+    def test_a_production_org_is_refused_before_any_lead_is_read(self):
+        calls = []
+        base = fake_org(calls)
+        def opener(req, timeout=None):
+            if "FROM%20Organization" in req.full_url or "FROM Organization" in urllib.parse.unquote(req.full_url):
+                calls.append(req)
+                return Resp(json.dumps({"records": [{"Id": "00Dp", "Name": "Acme",
+                                                     "OrganizationType": "Enterprise Edition", "IsSandbox": False}]}).encode())
+            return base(req, timeout)
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        with self.assertRaises(PermissionError):
+            f.lead_counts()
+        self.assertFalse(any("FROM Lead" in urllib.parse.unquote(c.full_url) for c in calls if "q=" in c.full_url))
+
+    def test_the_default_opener_does_not_follow_redirects(self):
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret")
+        self.assertIsNotNone(f._open)
+        h = of._NoRedirect()
+        self.assertIsNone(h.redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/"))
+
+
 if __name__ == "__main__":
     unittest.main()
