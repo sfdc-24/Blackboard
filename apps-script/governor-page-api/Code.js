@@ -1203,8 +1203,8 @@ function logVisitor_(sid, who, text) {
 // ONE-DAY TOP-UPS, keyed by UTC day, added only on his explicit yes and only
 // for the day named. 2026-09-24: the fleet's own unlabelled test traffic spent
 // the whole 400 by ~10:55 UTC and visitors got the offline reply; he was asked
-// on the Blockers page (BLK-056). Stale entries are harmless: a past day never
-// comes back.
+// on the Blockers page (BLK-056) and said yes at 18:25 UTC. Stale entries are
+// harmless: a past day never comes back.
 var CHAT_DAILY_TOPUP_ = { '20260924': 250 };
 
 function chatDailyCap_(props, now) {
