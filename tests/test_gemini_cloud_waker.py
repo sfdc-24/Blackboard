@@ -117,6 +117,12 @@ class _ClaimingWaker:
         self.calls, self.spawn, self.on_post, self.posts = calls, spawn, on_post, posts
 
     def post_reply(self, me, cfg, text, to, answers, verbose):
+        # The append is on the wire here. A second run that arrives now sees
+        # no reply yet; phase=posting must already have been saved.
+        if (self.spawn is not None and not self.spawn.get("done")
+                and self.spawn.get("when") == "during-post"):
+            self.spawn["done"] = True
+            self.spawn["go"]()
         if self.posts is not None:
             self.posts.append(answers)
         if self.on_post:
@@ -130,19 +136,24 @@ class _ClaimingWaker:
         # Default spawn is before the claim: both runs loaded, neither owns it yet.
         # spawn["when"] == "after-claim" is the other hole: B arrives after A
         # has saved the claim and before A's model call has returned.
-        early = self.spawn is not None and not self.spawn.get("done") and self.spawn.get("when") != "after-claim"
+        when = (self.spawn or {}).get("when")
+        # during-post fires inside the append, after phase=posting is saved.
+        early = self.spawn is not None and not self.spawn.get("done") and when not in ("after-claim", "during-post")
         if early:
             self.spawn["done"] = True
             self.spawn["go"]()
         claim = getattr(self, "claim_answer", lambda _rid: True)
         rid = "A"
-        if rid not in (state.get("answered_ids") or []):
+        if rid not in (state.get("answered_ids") or []) and rid not in (state.get("unknown_ids") or []):
             if claim(rid):
                 self.calls.append(rid)
                 if (self.spawn is not None and not self.spawn.get("done")
                         and self.spawn.get("when") == "after-claim"):
                     self.spawn["done"] = True
                     self.spawn["go"]()
+                before_post = getattr(self, "before_post", None)
+                if before_post:
+                    before_post()
                 if self.post_reply("gemini", {}, "x", "whatsapp;ALL", rid, False):
                     state.setdefault("answered_ids", []).append(rid)
         state["watermark"] = "2026-09-24T03:00:00Z"
@@ -263,6 +274,76 @@ class NoDuplicateAnswers(unittest.TestCase):
         self.assertEqual(posts, ["A"],
                          "the stale owner appended after the lease was taken: %r" % (posts,))
         self.assertIn("A", store.state.get("answered_ids") or [])
+
+    def test_a_lease_that_expires_during_the_append_is_not_taken(self):
+        """Model returns at 250s. The append takes 360s. B arrives at 610s.
+
+        A's 600s claim lease is over, and the reply is not on the board yet.
+        B must not call the model or append. A's append, already on the wire, lands.
+        """
+        from datetime import datetime, timedelta, timezone
+        start = datetime(2026, 9, 24, 5, 0, tzinfo=timezone.utc)
+        clock = {"now": start}
+
+        def now():
+            return clock["now"]
+
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls, posts = [], []
+        spawn = {"when": "during-post"}
+
+        def go():
+            clock["now"] = start + timedelta(seconds=610)
+            other = _ClaimingWaker(calls, posts=posts)
+            other.reply_on_board = lambda rid: False
+            try:
+                main.run(store=store, waker=other, now=now, lease_seconds=600)
+            except state_store.Conflict:
+                pass
+
+        spawn["go"] = go
+        first = _ClaimingWaker(calls, spawn=spawn, posts=posts)
+        first.reply_on_board = lambda rid: False
+        first.before_post = lambda: clock.__setitem__("now", start + timedelta(seconds=250))
+        try:
+            main.run(store=store, waker=first, now=now, lease_seconds=600)
+        except state_store.Conflict:
+            pass
+        self.assertEqual(calls, ["A"],
+                         "a second run called the model while the append was in flight: %r" % (calls,))
+        self.assertEqual(posts, ["A"],
+                         "a second run appended while the first append was on the wire: %r" % (posts,))
+
+    def _posting_cursor(self):
+        return {"watermark": "2026-09-24T02:00:00Z", "answered_ids": [],
+                "inflight": "A", "claim_owner": "dead-run",
+                "claim_until": "2026-09-24T05:00:00Z", "claim_phase": "posting"}
+
+    def test_a_crash_after_posting_with_no_reply_is_quarantined(self):
+        """phase=posting and no board reply. The next run must not post it again."""
+        store = MemStore(self._posting_cursor())
+        calls, posts = [], []
+        w = _ClaimingWaker(calls, posts=posts)
+        w.reply_on_board = lambda rid: False
+        main.run(store=store, waker=w, now="2026-09-24T06:00:00Z")
+        self.assertEqual(calls, [], "a posting claim was answered again: %r" % (calls,))
+        self.assertEqual(posts, [], "a posting claim was appended again: %r" % (posts,))
+        self.assertIn("A", store.state.get("unknown_ids") or [])
+        self.assertNotIn("A", store.state.get("answered_ids") or [])
+        self.assertEqual(store.state.get("claim_phase") or "", "")
+
+    def test_a_crash_after_posting_with_a_reply_is_marked_done(self):
+        """phase=posting and the reply is already on the board. Mark it answered, do not append."""
+        store = MemStore(self._posting_cursor())
+        calls, posts = [], []
+        w = _ClaimingWaker(calls, posts=posts)
+        w.reply_on_board = lambda rid: rid == "GEMINI-WAKE-A"
+        main.run(store=store, waker=w, now="2026-09-24T06:00:00Z")
+        self.assertEqual(calls, [])
+        self.assertEqual(posts, [])
+        self.assertIn("A", store.state.get("answered_ids") or [])
+        self.assertNotIn("A", store.state.get("unknown_ids") or [])
+        self.assertEqual(store.state.get("inflight") or "", "")
 
 
 if __name__ == "__main__":
