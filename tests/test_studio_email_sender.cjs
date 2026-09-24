@@ -13,7 +13,7 @@ const secret = 'studio-test-secret-at-least-thirty-two-bytes';
 const email = 'operator@example.com';
 const code = '004219';
 
-function harness() {
+function harness({ nowMs = Date.now() } = {}) {
   const sent = [];
   const logs = [];
   const cache = new Map();
@@ -22,7 +22,10 @@ function harness() {
     ['STUDIO_OPERATOR_EMAILS', email + ',other@example.com'],
   ]);
   let locked = false;
+  let nextLockDelayMs = 0;
+  let nextCacheDelayMs = 0;
   const context = {
+    Date: { now: () => nowMs },
     PropertiesService: {
       getScriptProperties: () => ({
         getProperty: (key) => properties.get(key) ?? null,
@@ -36,13 +39,23 @@ function harness() {
     },
     LockService: {
       getScriptLock: () => ({
-        waitLock: () => { assert.equal(locked, false); locked = true; },
+        waitLock: () => {
+          assert.equal(locked, false);
+          nowMs += nextLockDelayMs;
+          nextLockDelayMs = 0;
+          locked = true;
+        },
         releaseLock: () => { assert.equal(locked, true); locked = false; },
       }),
     },
     CacheService: {
       getScriptCache: () => ({
-        get: (key) => { assert.equal(locked, true); return cache.get(key) ?? null; },
+        get: (key) => {
+          assert.equal(locked, true);
+          nowMs += nextCacheDelayMs;
+          nextCacheDelayMs = 0;
+          return cache.get(key) ?? null;
+        },
         put: (key, value, ttl) => {
           assert.equal(locked, true);
           assert.equal(ttl, 300);
@@ -67,6 +80,9 @@ function harness() {
   vm.runInContext(source, context, { filename: 'Code.gs' });
   return {
     sent, logs, cache,
+    advanceSeconds: (seconds) => { nowMs += seconds * 1000; },
+    setNextLockDelaySeconds: (seconds) => { nextLockDelayMs = seconds * 1000; },
+    setNextCacheDelaySeconds: (seconds) => { nextCacheDelayMs = seconds * 1000; },
     post: (body) => JSON.parse(context.doPost({ postData: {
       contents: JSON.stringify(body),
     } }).body),
@@ -101,6 +117,34 @@ test('valid signed request sends once, replay is refused, and nothing sensitive 
   const captured = JSON.stringify(app.logs);
   assert.equal(captured.includes(email), false);
   assert.equal(captured.includes(code), false);
+});
+
+test('replay expiring during lock wait cannot reuse an evicted cache nonce', () => {
+  const initialSeconds = Math.floor(Date.now() / 1000);
+  const app = harness({ nowMs: initialSeconds * 1000 });
+  const request = signedRequest({ timestamp: String(initialSeconds) });
+  assert.deepEqual(app.post(request), { ok: true });
+  assert.equal(app.sent.length, 1);
+
+  app.advanceSeconds(119);
+  app.cache.clear(); // CacheService may evict before the requested TTL.
+  app.setNextLockDelaySeconds(5);
+  assert.deepEqual(app.post(request), { ok: false });
+  assert.equal(app.sent.length, 1);
+});
+
+test('slow cache read cannot make a replay prune its nonce reservation', () => {
+  const initialSeconds = Math.floor(Date.now() / 1000);
+  const app = harness({ nowMs: initialSeconds * 1000 });
+  const request = signedRequest({ timestamp: String(initialSeconds) });
+  assert.deepEqual(app.post(request), { ok: true });
+  assert.equal(app.sent.length, 1);
+
+  app.advanceSeconds(119);
+  app.cache.clear();
+  app.setNextCacheDelaySeconds(13);
+  assert.deepEqual(app.post(request), { ok: false });
+  assert.equal(app.sent.length, 1);
 });
 
 test('invalid HMAC, expired timestamp, and unknown email never send', () => {
