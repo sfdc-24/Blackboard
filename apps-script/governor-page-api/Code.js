@@ -1190,6 +1190,11 @@ function SYSTEM_PROMPT_(who) {
     // got the right route but not the setting that stops it re-sending on
     // every later edit of the closed case - a common production bug.
     "- Automation when a record changes: a record-triggered Flow; Workflow Rules and Process Builder are retired for new automation. For 'when X becomes true' (a case is closed, a stage is reached), set the flow to run only when a record is updated to meet the condition requirements; otherwise it runs again on every later edit of that record, and an email step sends again each time.",
+    // Second probe round, 2026-09-24: the live answer said a permission set
+    // can carry its own Login IP Ranges (it cannot), and gave a Closed Won lock
+    // formula that blocks moving INTO Closed Won - the opposite of the ask.
+    "- Login IP Ranges: set on the profile only; a permission set cannot carry IP ranges, so users who need a different range need a different profile. Trusted IP Ranges under Network Access only skip identity verification; they do not restrict where users log in from.",
+    "- Locking a record once it reaches a stage (for example Closed Won): a validation rule that fires when the saved value was already that stage, AND(NOT(ISNEW()), ISPICKVAL(PRIORVALUE(StageName), \"Closed Won\")), usually with a bypass for admins through a custom permission. A read-only page layout by record type only affects the UI.",
     "",
     "OBJECT REFERENCE - standard fields as described by a real Salesforce org, audit fields omitted. Format: Object: Field type; Lookup -> Target; Picklist [values in that org]. Never quote this list wholesale or say where it came from; use it to answer.",
     OBJECT_REFERENCE_,

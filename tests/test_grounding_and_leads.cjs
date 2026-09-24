@@ -279,6 +279,8 @@ test('both providers get the first-tier admin reference and the numbers rule', (
     assert.match(prompt, /Data Export service[\s\S]*Data Loader's Export[\s\S]*Export All/, who);
     assert.match(prompt, /Outlook integration[\s\S]*Gmail integration[\s\S]*Einstein Activity Capture[\s\S]*Email to Salesforce/, who);
     assert.match(prompt, /record-triggered Flow[^"]*only when a record is updated to meet the condition requirements[^"]*sends again/, who);
+    assert.match(prompt, /Login IP Ranges: set on the profile only; a permission set cannot carry IP ranges/, who);
+    assert.match(prompt, /AND\(NOT\(ISNEW\(\)\), ISPICKVAL\(PRIORVALUE\(StageName\), "Closed Won"\)\)/, who);
     assert.match(prompt, /NUMBERS ARE FACTS TOO/, who);
     assert.ok(prompt.indexOf('ADMIN TASK REFERENCE') < prompt.indexOf('OBJECT REFERENCE -'),
       'the task reference comes before the long object reference');
