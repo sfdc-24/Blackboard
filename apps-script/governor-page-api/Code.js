@@ -22,7 +22,7 @@
  *   OPENAI_KEY        API key — Codex chat provider and text-to-speech
  *   CODEX_MODEL       OpenAI model id          (default below)
  *   CHAT_ENABLED      set to "off" to kill reception replies instantly
- *   CHAT_DAILY_CAP    max AI replies per UTC day (default 400)
+ *   CHAT_DAILY_CAP    max AI replies per UTC day (default 150)
  */
 var ALPHA_ID   = '120_71KaF4JKGPGz0qUz4phqWRljSqEzSRRm_0zXC_oY';
 var TARGET     = 'governor-page';
@@ -41,10 +41,7 @@ var CODEX_MODEL_DEFAULT = 'gpt-5.6-luna';
 var CHAT_MAX_INPUT     = 1000;   // chars per visitor message
 var CHAT_MAX_TURNS     = 12;     // history sent to the model
 var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
-// 150 until v64. On 2026-09-24 the fleet's own grounding probes and reviews
-// used all 150 before 06:00 UTC, and every visitor got the offline reply for
-// the rest of the day. 400 leaves visitors room while tests run.
-var CHAT_DAILY_DEFAULT = 400;    // AI replies per UTC day, whole site
+var CHAT_DAILY_DEFAULT = 150;    // AI replies per UTC day, whole site
 var CHAT_MAX_TOKENS    = 420;    // short replies respect the visitor's time and cap cost
 
 // THE SPEND CEILINGS, RESTORED 2026-09-22. All of this existed in the source

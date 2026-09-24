@@ -492,7 +492,7 @@ test('incomplete, refused, and malformed Codex envelopes fall back to Claude', (
 test('numeric caps and both clients retain the signed-token contract', () => {
   const h = createHarness();
   assert.equal(h.context.CHAT_SESSION_CAP, 12);
-  assert.equal(h.context.CHAT_DAILY_DEFAULT, 400); // raised from 150 in v64 (test probes exhausted it)
+  assert.equal(h.context.CHAT_DAILY_DEFAULT, 150);
   assert.match(RECEPTION, /var CONVERSATION = "<\?!= conversationToken \?>"/);
   assert.match(RECEPTION, /\.reception\(CONVERSATION,/);
   assert.doesNotMatch(RECEPTION, /sfdc_sid/);
