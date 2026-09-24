@@ -88,6 +88,12 @@ on:
       - "tests/test_studio_metadata_contract.py"
       - "tests/test_studio_metadata_operations.py"
       - "tests/test_studio_metadata_provider.py"
+      - "tests/test_studio_voice_sweep_job.py"
+      - "tests/test_sf360.py"
+      - "scripts/sf360.py"
+      - "tests/test_org_publish.py"
+      - "scripts/org_publish.py"
+      - "scripts/org_diff_guard.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -174,6 +180,12 @@ on:
       - "tests/test_studio_metadata_contract.py"
       - "tests/test_studio_metadata_operations.py"
       - "tests/test_studio_metadata_provider.py"
+      - "tests/test_studio_voice_sweep_job.py"
+      - "tests/test_sf360.py"
+      - "scripts/sf360.py"
+      - "tests/test_org_publish.py"
+      - "scripts/org_publish.py"
+      - "scripts/org_diff_guard.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -257,6 +269,9 @@ jobs:
                    tests/test_studio_metadata_contract.py \
                    tests/test_studio_metadata_operations.py \
                    tests/test_studio_metadata_provider.py \
+                   tests/test_studio_voice_sweep_job.py \
+                   tests/test_sf360.py \
+                   tests/test_org_publish.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -704,7 +719,8 @@ jobs:
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest \
               tests.test_studio_auth tests.test_studio_controller tests.test_studio_lead_facts \
-              tests.test_studio_lead_deadline tests.test_studio_metadata_contract
+              tests.test_studio_lead_deadline tests.test_studio_metadata_contract \
+              tests.test_studio_voice_sweep_job
           else
             echo "not on this branch; skipping"
           fi
@@ -820,6 +836,23 @@ jobs:
             exit 1
           fi
           echo "at least one eligible suite is present"
+
+      # The dev-org rail (scripts/sf360.py) and the /org/ snapshot publisher
+      # (scripts/org_publish.py, org_diff_guard.py). Script-style suites that
+      # print passed=/failed= and exit 1 on any failure. Salesforce is faked;
+      # the rail's HTTP section serves itself on 127.0.0.1, so only loopback
+      # is enabled in the fresh namespace, as for the bus suite below.
+      # Until 2026-09-24 no workflow ran them.
+      - name: "dev-org rail and snapshot publisher (isolated loopback)"
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            "$1" tests/test_sf360.py
+            "$1" tests/test_org_publish.py
+          ' _ "$python_bin"
 
       # A negative control for the isolation itself. If `unshare -n` silently
       # stopped isolating, every "no network" claim above would be worthless and
