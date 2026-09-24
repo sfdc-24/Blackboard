@@ -329,6 +329,49 @@ An AST append-count **cannot see a loop around one call site** — one call site
 many runtime appends. The test says so out loud. What actually bounds repeat
 writes is the durable idempotency record, which has its own tests.
 
+## Step 7: the soak, and the thing that judges it
+
+**Cutover step 7**, *"Soak for at least 48 hours with no missed rows, duplicates,
+or laptop reads."* This is a step that has to elapse; what can be built now is the
+judge. **Started 2026-09-24T00:58:13Z**, recorded durably in
+`gs://sfdc24-fleet-state/wakers/cutover_soak.json` so "48 hours" is a fact rather
+than a recollection and a later run cannot move the goalposts.
+
+Evidence accumulates on its own: `board-probe-hourly` at :15 and
+`waker-shadow-hourly` at :45. `python scripts/soak_report.py` judges it.
+
+### Three verdicts, and NOT YET is one of them
+
+The tool can say **PASS**, **FAIL**, or **NOT YET**, and the last is a first-class
+outcome rather than a soft failure. Step 8 is Mr Salam deciding whether to disable
+the laptop scheduler, so the one thing this must never do is round "not enough
+evidence yet" up to "passed".
+
+### The four criteria, and what each would catch
+
+| criterion | what it catches |
+|---|---|
+| **cadence** | missing hours — counted as holes, never averaged. 42 runs in 48 hours with a six-hour gap still averages one an hour, and a scheduler that quietly stops looks exactly like a quiet board |
+| **no missed rows** | a cursor that went backwards, or jumped past rows — the silent failure #168 exists to prevent |
+| **no duplicates** | the ack target must have **exactly one** row. Zero is a finding too; an unreadable board is `None`, not zero |
+| **no laptop reads** | any run reporting `where != cloud-run` or `credential_source == file`. One is enough to fail — that dependency reappearing is the whole thing being tested |
+
+One isolated `UNKNOWN` is tolerated deliberately: the gateway flaps, and a soak
+that cannot survive a single 404 could never pass. A sustained pattern is a
+finding.
+
+### The judge reported FAIL on its own first run, and that was the judge's bug
+
+It measured the whole 48-hour window regardless of when the soak began, so minutes
+after starting it declared **44 missing hours — from before the jobs existed**.
+
+That is worse than a missing check. A FAIL nobody believes gets ignored; a FAIL
+somebody believes sends them chasing a scheduler that is working. Hours before the
+recorded start now carry no expectation, and a regression test pins it.
+
+The suite also runs a **clean control window** that must produce no findings —
+without it, every failure case could have been a false alarm agreeing with itself.
+
 ### What this does and does not replace
 
 It replaces Task Scheduler **for this lane**. The probe is read-only and
