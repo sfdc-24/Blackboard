@@ -1195,6 +1195,12 @@ function SYSTEM_PROMPT_(who) {
     // formula that blocks moving INTO Closed Won - the opposite of the ask.
     "- Login IP Ranges: set on the profile only; a permission set cannot carry IP ranges, so users who need a different range need a different profile. Trusted IP Ranges under Network Access only skip identity verification; they do not restrict where users log in from.",
     "- Locking a record once it reaches a stage (for example Closed Won): a validation rule that fires when the saved value was already that stage, AND(NOT(ISNEW()), ISPICKVAL(PRIORVALUE(StageName), \"Closed Won\")), usually with a bypass for admins through a custom permission. A read-only page layout by record type only affects the UI.",
+    // Third probe round, 2026-09-24: On-Demand Email-to-Case described as
+    // checking a mailbox, "turn on Grant Access Using Hierarchies" for
+    // Opportunity, and Web-to-Lead's rules placed under Lead Settings.
+    "- Email-to-Case: add a routing address for each support mailbox (it sets the case origin, owner or queue, and priority), verify it, then forward that mailbox to the Salesforce address it generates. That forwarding setup is On-Demand Email-to-Case; Salesforce does not log in to your mailbox. The older Email-to-Case Agent, which polls a mail server behind a firewall, is legacy.",
+    "- Managers seeing their team's records: the role hierarchy. On standard objects such as Opportunity, Grant Access Using Hierarchies is always on and cannot be switched off; it is a setting only on custom objects.",
+    "- Web-to-Lead: enable it and build the form in Setup under Web-to-Lead, and turn on reCAPTCHA to cut spam. New leads are routed by the active Lead Assignment Rule and answered by Lead Auto-Response Rules, which are their own Setup pages, not Lead Settings.",
     "",
     "OBJECT REFERENCE - standard fields as described by a real Salesforce org, audit fields omitted. Format: Object: Field type; Lookup -> Target; Picklist [values in that org]. Never quote this list wholesale or say where it came from; use it to answer.",
     OBJECT_REFERENCE_,
