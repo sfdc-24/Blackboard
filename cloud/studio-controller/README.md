@@ -165,8 +165,15 @@ reads a non-echoing closed operator expectation containing `org_label`,
 `org_type`, `total`, `site_total`, and `site_recent`. Nothing is read from argv
 or environment for those values. Email and expectation prompt time precedes the
 bounded network sequence; after `auth/start`, OTP waiting is deliberately charged
-to the whole-run deadline. Every network request also has a fixed absolute
-deadline nested inside that whole-run deadline, with no automatic retries:
+to the elapsed whole-run budget. Each request receives HTTPX pool/connect/write/read
+inactivity limits no larger than the remaining request and whole-run budgets. The
+runner checks elapsed time immediately after response headers, between one-byte
+raw response chunks, after EOF, and between requests. Synchronous HTTPX does not
+pre-empt an I/O operation already in progress at an elapsed-time boundary, so one
+in-flight I/O may finish or reach its inactivity timeout after that boundary; the
+runner then closes the response, fails closed, and sends no follow-on request.
+This is bounded cooperative enforcement, not a hard wall-clock cancellation
+claim. No request is automatically retried:
 
 1. start and verify email authentication;
 2. create one operator-authenticated session;

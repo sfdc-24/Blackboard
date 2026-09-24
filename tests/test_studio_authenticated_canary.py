@@ -521,7 +521,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(0, stream.yielded)
             self.assertTrue(stream.closed)
 
-    def test_absolute_request_deadline_stops_slow_drip_and_closes_it(self):
+    def test_elapsed_budget_stops_slow_drip_at_chunk_boundary_and_closes_it(self):
         now = [0.0]
 
         def advance(_count):
@@ -550,7 +550,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(2, stream.yielded)
         self.assertTrue(stream.closed)
 
-    def test_whole_run_and_each_request_share_bounded_deadline(self):
+    def test_whole_run_and_request_budgets_bound_each_io_timeout(self):
         scenario = Scenario()
         now = [10.0]
 

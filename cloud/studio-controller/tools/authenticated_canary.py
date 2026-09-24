@@ -30,8 +30,9 @@ FIXED_UTTERANCE = "How many leads do we have?"
 WHOLE_RUN_SECONDS = 180.0
 REQUEST_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 512 * 1024
-# A one-byte raw iterator prevents httpx's chunker from buffering a slow trickle
-# across the absolute deadline. The total work remains capped at 512 KiB.
+# A one-byte raw iterator exposes each slow-trickle byte to the elapsed-budget
+# check instead of letting httpx's chunker accumulate several source reads.
+# The total accumulated response remains capped at 512 KiB.
 STREAM_CHUNK_BYTES = 1
 EXPECTED_ORIGIN = "https://www.sfdc24.com"
 
@@ -201,6 +202,12 @@ class _Run:
                 json=body,
                 timeout=request_deadline - started_at,
             ) as response:
+                # Synchronous HTTPX timeouts bound individual blocking I/O
+                # operations rather than pre-empting them at this elapsed-time
+                # checkpoint. Check immediately after headers, between raw
+                # bytes, and after EOF; documentation states the bounded
+                # in-flight-I/O overrun explicitly.
+                self._request_remaining(request_deadline, stage)
                 try:
                     actual_url = str(response.request.url)
                 except Exception:
