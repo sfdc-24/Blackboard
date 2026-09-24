@@ -38,10 +38,13 @@ function doPost(e) {
     var lock = LockService.getScriptLock();
     lock.waitLock(10000);
     try {
+      // A request can cross the freshness boundary while waiting for the lock.
+      // Use this same time for freshness and pruning: cache.get can also stall.
+      var now = Date.now() / 1000;
+      if (!studioEmailFresh_(request.timestamp, now)) return studioEmailResponse_(false);
       var cache = CacheService.getScriptCache();
       var nonceKey = 'studio-email-nonce-' + request.nonce;
       if (cache.get(nonceKey) !== null) return studioEmailResponse_(false);
-      var now = Math.floor(Date.now() / 1000);
       var ledgerKey = 'STUDIO_EMAIL_USED_NONCES';
       var ledger = JSON.parse(properties.getProperty(ledgerKey) || '{}');
       if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) {
@@ -55,7 +58,9 @@ function doPost(e) {
       if (Object.prototype.hasOwnProperty.call(ledger, request.nonce)) {
         return studioEmailResponse_(false);
       }
-      ledger[request.nonce] = Number(request.timestamp) + 121;
+      // Retain through the 120-second acceptance window, the 10-second lock
+      // wait, and one second for integer-second rounding.
+      ledger[request.nonce] = Number(request.timestamp) + 131;
       properties.setProperty(ledgerKey, JSON.stringify(ledger));
       cache.put(nonceKey, '1', 300);
     } finally {
@@ -81,12 +86,16 @@ function studioEmailValidRequest_(request) {
   if (keys.join(',') !== 'code,email,nonce,signature,timestamp') return false;
   if (!keys.every(function (key) { return typeof request[key] === 'string'; })) return false;
   if (!/^[1-9][0-9]{9}$/.test(request.timestamp)) return false;
-  if (Math.abs(Date.now() / 1000 - Number(request.timestamp)) > 120) return false;
+  if (!studioEmailFresh_(request.timestamp, Date.now() / 1000)) return false;
   if (!/^[0-9a-f]{32}$/.test(request.nonce)) return false;
   if (request.email.length > 320 || request.email !== request.email.toLowerCase() ||
       !/^[^\s@]+@[^\s@]+$/.test(request.email)) return false;
   if (!/^[0-9]{6}$/.test(request.code)) return false;
   return /^[0-9a-f]{64}$/.test(request.signature);
+}
+
+function studioEmailFresh_(timestamp, now) {
+  return Math.abs(now - Number(timestamp)) <= 120;
 }
 
 function studioEmailEqual_(left, right) {
