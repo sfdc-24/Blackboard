@@ -453,13 +453,13 @@ class _Probe:
 class ReplyIdentity(unittest.TestCase):
     """A receipt closes the ask it names, not the ask that shares a Row_ID."""
 
-    def _posting(self, answers_id):
+    def _posting(self, answers_id, phase="posting"):
         return {"watermark": "2026-09-24T02:00:00Z", "answered_ids": [],
                 "inflight": answers_id, "claim_owner": "dead-run",
-                "claim_until": "2026-09-24T05:00:00Z", "claim_phase": "posting"}
+                "claim_until": "2026-09-24T05:00:00Z", "claim_phase": phase}
 
-    def _recover(self, inflight, rows):
-        store = MemStore(self._posting(inflight))
+    def _recover(self, inflight, rows, phase="posting"):
+        store = MemStore(self._posting(inflight, phase))
         probe = _Probe(inflight)
 
         def read_rows(env, title="Blackboard - Alpha DB", tries=4,
@@ -496,6 +496,90 @@ class ReplyIdentity(unittest.TestCase):
         self.assertTrue(probe.answered_at_start)
         self.assertIn(answers_id, store.state.get("answered_ids") or [])
         self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+
+    def _assert_open(self, answers_id, rows, phase):
+        store, probe = self._recover(answers_id, rows, phase)
+        self.assertFalse(probe.answered_at_start)
+        self.assertNotIn(answers_id, store.state.get("answered_ids") or [])
+        if phase == "posting":
+            self.assertIn(answers_id, store.state.get("unknown_ids") or [])
+            self.assertEqual(store.state.get("inflight") or "", "")
+        else:
+            self.assertEqual(store.state.get("inflight"), answers_id)
+            self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+
+    def _assert_closed(self, answers_id, rows, phase):
+        store, probe = self._recover(answers_id, rows, phase)
+        self.assertTrue(probe.answered_at_start)
+        self.assertIn(answers_id, store.state.get("answered_ids") or [])
+        self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+        self.assertEqual(store.state.get("inflight") or "", "")
+
+    def test_another_agents_receipt_does_not_complete_this_claim(self):
+        """A claude-api reply to a shared ask is not Gemini's reply."""
+        shared = "SHARED-ASK"
+        rows = [
+            _own_reply(shared, agent="claude-api"),
+            _own_reply(shared, agent="claude-api", legacy=True),
+        ]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_an_ordinary_note_does_not_complete_the_claim(self):
+        """A Codex NOTE that carries answers= is not this waker's reply."""
+        shared = "SHARED-ASK"
+        rows = [_codex_note(shared)]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_the_wrong_row_id_does_not_complete_the_claim(self):
+        """Producer markers are not enough when the Row_ID is not this reply."""
+        shared = "SHARED-ASK"
+        rows = [_own_reply(shared, row_id=aw.reply_row_id("gemini", "OTHER-ASK"))]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_this_agents_own_reply_still_completes_the_claim(self):
+        shared = "SHARED-ASK"
+        rows = [_own_reply(shared)]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_closed(shared, rows, phase)
+
+    def test_a_legacy_done_note_from_this_agent_still_completes_the_claim(self):
+        """Rows written before wakerreply=1 are this waker's DONE/NOTE kind."""
+        shared = "SHARED-ASK"
+        rid = aw.legacy_reply_row_id("gemini", shared)
+        payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=gemini|"
+                   "to=claude-code-cli,ALL|answers=%s|evidence=STATED|REPLY: ok"
+                   % (rid, shared))
+        rows = [_own_reply(shared, legacy=True, payload=payload)]
+        self._assert_closed(shared, rows, "posting")
+
+
+def _own_reply(answers_id, *, agent="gemini", legacy=False, source=None,
+               row_id=None, payload=None):
+    """A reply row in the shape fleet_agent writes for this agent."""
+    rid = row_id or (aw.legacy_reply_row_id(agent, answers_id) if legacy
+                     else aw.reply_row_id(agent, answers_id))
+    src = agent if source is None else source
+    if payload is None:
+        payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=%s|"
+                   "to=claude-code-cli,ALL|wakerreply=1|answers=%s|"
+                   "evidence=STATED|REPLY: ok" % (rid, src, answers_id))
+    return [rid, "2026-09-24T05:00:00Z", src, "claude-code-cli;ALL", "DONE", payload]
+
+
+def _codex_note(answers_id):
+    """An ordinary NOTE. Quoting the marker in prose does not make it a reply."""
+    rid = "CODEX-NOTE-%s" % answers_id
+    payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=codex|to=ALL|"
+               "answers=%s|evidence=STATED|REPLY: quoting wakerreply=1 is not a reply"
+               % (rid, answers_id))
+    return [rid, "2026-09-24T05:00:00Z", "codex", "ALL", "DONE", payload]
 
 
 if __name__ == "__main__":

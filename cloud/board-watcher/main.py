@@ -16,11 +16,15 @@ watcher decides only WHEN a job runs, never WHAT it sends.
 WHAT IT WILL NOT DO
   - It never answers, posts or sends anything itself. It holds the bus pair to
     read, and a metadata-server token to start jobs. No model key, no Meta token.
-  - It never starts a job that is already running. Two copies of a job answer
-    or send the same row twice - their cursors are compare-and-swap, which
+  - It never starts a job that is already running, and it never starts one
+    whose running state it could not read. Two copies of a job answer or
+    send the same row twice - their cursors are compare-and-swap, which
     catches the second writer only AFTER it has already posted. So a running
-    job is skipped, and the watermark is HELD before the rows it was needed
-    for: the next tick tries again rather than forgetting them.
+    job is skipped, and so is a job whose status lookup failed. That failure
+    stays on the route: its pending work is held, the other routes still
+    start, and the cursor is still saved. The watermark is HELD before the
+    rows a skipped or failed route was needed for: the next tick tries again
+    rather than forgetting them.
   - A start is not a finish. Each route keeps its own pending list until THAT
     JOB's cursor records the id as answered (delivered, for the outbox) or
     quarantined. While anything is still pending, the next tick starts the
@@ -269,7 +273,18 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     for job in order:
         hits = wanted.get(job) or []
         earliest = min((t for t, _rid, _wid in hits), default=None)
-        if running(job):
+        try:
+            already = running(job)
+        except Exception as exc:  # noqa: BLE001
+            # Unknown is not idle. Starting here could be a second copy, and
+            # the error belongs to this route: pending stays, later routes
+            # still run, and the cursor save below still happens.
+            failed[job] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+            if earliest is not None:
+                hold = earliest if hold is None else min(hold, earliest)
+            add_pending(job, hits)
+            continue
+        if already:
             # The backoff: one copy of the job. Pending stays, so the tick
             # after it finishes still has the work.
             skipped[job] = len(hits) or len(pending.get(job) or [])
@@ -288,9 +303,9 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
             failed[job] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
             if earliest is not None:
                 hold = earliest if hold is None else min(hold, earliest)
-        # Started, skipped, or failed: the row is pending until the job's
-        # own cursor says so. Recording it here is what lets the next tick
-        # retry a capped pass after the watermark has moved on.
+        # Started, skipped, failed, or unread: the row is pending until the
+        # job's own cursor says so. Recording it here is what lets the next
+        # tick retry a capped pass after the watermark has moved on.
         add_pending(job, hits)
 
     if lost:

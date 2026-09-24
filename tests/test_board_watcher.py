@@ -215,6 +215,35 @@ class Tick(unittest.TestCase):
         self.assertEqual(out.get("reason"), "lease moved before start")
         self.assertEqual(store.state.get("lease_owner"), "rival-tick")
 
+    def test_a_status_error_stays_on_that_route_and_the_next_still_starts(self):
+        # The first route's status lookup throws. That route stays pending.
+        # The healthy route still starts, and the cursor is saved.
+        import urllib.error
+        store = MemStore({"watermark": "2026-09-24T03:40:00Z", "seen": []})
+        rows = [row("R1", "2026-09-24T03:50:00Z", target="gemini"),
+                row("R2", "2026-09-24T03:51:00Z", target="claude-api")]
+        started = []
+
+        def running(job):
+            if job == "gemini-waker":
+                raise urllib.error.URLError("timed out")
+            return False
+
+        out = w.tick(store, read_since=lambda since: rows, routes=w._routes(),
+                     running=running,
+                     start=lambda job: started.append(job) or "exec-1",
+                     now=NOW)
+        self.assertTrue(out["ran"])
+        self.assertEqual(started, ["claude-api-waker"])
+        self.assertNotIn("gemini-waker", out["started"])
+        self.assertIn("gemini-waker", out["failed"])
+        self.assertIn("URLError", out["failed"]["gemini-waker"])
+        self.assertIn("watermark", store.state)
+        self.assertGreaterEqual(store.state["watermark"], "2026-09-24T03:40:00Z")
+        pending = store.state.get("pending") or {}
+        self.assertIn("R1", [item["row_id"] for item in pending.get("gemini-waker") or []])
+        self.assertNotIn("R1", store.state.get("seen") or [])
+
 
 class NamedStore:
     """One generation per cursor name, which is how the real store is keyed."""
