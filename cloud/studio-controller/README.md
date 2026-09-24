@@ -17,9 +17,15 @@ instance.
 - optional OpenAI Realtime WebRTC SDP relay; the standard API key, SDP, and
   audio never reach durable session state.
 
-This Phase 2 package contains only the deterministic `synthetic` worker. Keep
-`STUDIO_WORKER=synthetic`; selecting `claude` deliberately fails startup until
-the separately reviewed provider worker and SDK are added in a later release.
+The default worker is the deterministic `synthetic` one. `STUDIO_WORKER=claude`
+selects the Claude worker (`cloud/studio-controller/workers/claude_worker.py`,
+reviewed in #200; packaged in the image with the `anthropic` SDK by #206). It
+needs `ANTHROPIC_API_KEY` (Secret Manager secret of that name, with
+`roles/secretmanager.secretAccessor` on that one secret for the service's
+runtime account); without it the service fails at startup rather than serving
+a worker that cannot answer. A spoken turn that answers the open question is
+recorded by the controller with `answer_source: "voice"` after the same checks
+as a tap.
 Provider workers return event drafts; the controller alone assigns envelopes
 and versions.
 
@@ -50,7 +56,8 @@ Required secrets/environment:
 - `STUDIO_OPERATOR_EMAILS` as an exact lowercase allowlist
 - `STUDIO_EMAIL_SENDER_URL` for the HTTPS Apps Script/Pipedream mail adapter
 - `STUDIO_EMAIL_SENDER_SECRET` for request HMAC signing
-- `STUDIO_WORKER=synthetic` for this provider-free release
+- `STUDIO_WORKER=synthetic` for the provider-free release; `claude` plus
+  `ANTHROPIC_API_KEY` for the model-backed one
 - `STUDIO_ENABLE_VOICE=false` for the authentication/text release
 - `OPENAI_API_KEY` and `STUDIO_MAINTENANCE_SECRET` only after voice is enabled
 
