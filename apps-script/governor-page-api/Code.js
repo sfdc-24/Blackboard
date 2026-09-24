@@ -1197,15 +1197,27 @@ function logVisitor_(sid, who, text) {
   logVisitorQuarantined_(sid, who, text);
 }
 
-function chatDailyCap_(props) {
+// ONE-DAY TOP-UPS, keyed by UTC day, added only on his explicit yes and only
+// for the day named. 2026-09-24: the fleet's own unlabelled test traffic spent
+// the whole 400 by ~10:55 UTC and visitors got the offline reply; he was asked
+// on the Blockers page (BLK-056). Stale entries are harmless: a past day never
+// comes back.
+var CHAT_DAILY_TOPUP_ = { '20260924': 250 };
+
+function chatDailyCap_(props, now) {
   var raw = props.getProperty('CHAT_DAILY_CAP');
-  if (raw === null || raw === '') return CHAT_DAILY_DEFAULT;
-  raw = String(raw);
-  if (!/^\d+$/.test(raw)) throw new Error('invalid chat daily cap');
-  var cap = Number(raw);
-  if (!isFinite(cap) || cap < 0 || Math.floor(cap) !== cap)
-    throw new Error('invalid chat daily cap');
-  return cap;
+  var cap = CHAT_DAILY_DEFAULT;
+  // An explicit CHAT_DAILY_CAP is an owner decision and is exact: no top-up.
+  if (raw !== null && raw !== '') {
+    raw = String(raw);
+    if (!/^\d+$/.test(raw)) throw new Error('invalid chat daily cap');
+    cap = Number(raw);
+    if (!isFinite(cap) || cap < 0 || Math.floor(cap) !== cap)
+      throw new Error('invalid chat daily cap');
+    return cap;
+  }
+  var day = dailyKey_(now).slice('CHAT_COUNT_'.length);
+  return cap + (CHAT_DAILY_TOPUP_[day] || 0);
 }
 
 function dailyKey_(now) {
@@ -1280,7 +1292,7 @@ function reserveChatBudget_(conversationKey, probe) {
     locked = true;
     var now = Date.now();
     var state = readChatBudget_(props, now);
-    var cap = chatDailyCap_(props);
+    var cap = chatDailyCap_(props, now);
     if (state.daily >= cap) return { ok: false, reason: 'daily-cap' };
     // A probe's own counter lives in its own property, so a rollback to a
     // version without it simply ignores it.

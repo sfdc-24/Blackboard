@@ -538,3 +538,14 @@ test('the probe counter is its own property, so the budget state keeps its v59 s
   const day = state.day;
   assert.equal(h.values.get('CHAT_PROBE_' + day), '1');
 });
+
+test('a one-day top-up applies to its UTC day only', () => {
+  const h = createHarness();
+  const props = { getProperty: () => null };
+  assert.equal(h.context.chatDailyCap_(props, Date.UTC(2026, 8, 24, 12)), h.context.CHAT_DAILY_DEFAULT + 250);
+  assert.equal(h.context.chatDailyCap_(props, Date.UTC(2026, 8, 25, 0, 0, 1)), h.context.CHAT_DAILY_DEFAULT);
+  assert.equal(h.context.chatDailyCap_(props, Date.UTC(2026, 8, 23, 23, 59)), h.context.CHAT_DAILY_DEFAULT);
+  // an explicit owner cap is exact, even on a top-up day
+  assert.equal(h.context.chatDailyCap_({ getProperty: () => '150' }, Date.UTC(2026, 8, 24, 12)), 150);
+});
+
