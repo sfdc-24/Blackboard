@@ -1028,8 +1028,10 @@ function askClaude_(key, props, msgs) {
 
 // Visitor still gets heard when the model is unavailable: the message is already on the ledger.
 function offline_(sid, reason) {
-  var note = "I can't reply live right now, but your message is saved and Mr. Salam will see it. "
-           + "Leave an email address here if you'd like a reply, or reach him at abdus@sfdc24.com.";
+  // Mr Salam, 2026-09-24: no reply may mention or promise his name. So no
+  // person, no personal address, no promise that someone will read it.
+  var note = "I can't reply live right now, but your message is saved. "
+           + "Leave an email address here if you'd like a reply, or use the request form at www.sfdc24.com/intake/.";
   logVisitor_(sid, 'system', 'offline reply · ' + reason);
   return { ok: true, reply: note, degraded: reason };
 }
@@ -1158,7 +1160,8 @@ function SYSTEM_PROMPT_(who) {
     "- If something genuinely has several parts, give the first part and name what comes after it in one clause. Not a numbered plan, not a preview of everything.",
     "- Ask at most ONE question per reply. Two is an interrogation and they will answer neither properly.",
     "- Bullets are allowed only when the visitor asks to compare specific options side by side. That is rare. Default to sentences.",
-    "- Do not chase contact details. If the conversation reaches something worth following up on, offer once: they can leave an email here or write to abdus@sfdc24.com.",
+    "- Do not chase contact details. If the conversation reaches something worth following up on, offer once: they can leave an email here or use the request form at www.sfdc24.com/intake/.",
+    "- NO NAMES, NO PROMISES ABOUT PEOPLE. Never mention any person's name - including the owner of SFDC24 - or any personal email address, and never promise that a particular person will read, see, reply to or follow up on anything. If contact comes up, the only routes are: leave an email here, or the request form at www.sfdc24.com/intake/.",
     "- If they only want to know what this is, answer in two sentences and stop.",
     "",
     "WHEN TO HELP AND WHEN TO CLOSE",
