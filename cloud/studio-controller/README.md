@@ -96,8 +96,9 @@ unavailable due-call index, pending cleanup, or malformed success response,
 and logs no response body or credential. Deploy it with one task, parallelism
 one, a 30-second task timeout, and zero task retries; use an every-five-minute
 Scheduler trigger with a 30-second attempt deadline and zero retries. The
-five-minute cadence leaves measured cold-start headroom and prevents queued
-executions from accumulating. See
+five-minute cadence leaves headroom above the observed 67–103-second
+provisioning-plus-execution durations and reduces the risk of queued executions
+accumulating. It does not guarantee non-overlap. See
 `ADR-001-VOICE-SWEEP-BACKSTOP.md` for the alternatives and IAM boundary.
 
 ## Incremental release gates
