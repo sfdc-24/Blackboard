@@ -453,6 +453,26 @@ class AFlappingGatewayIsAskedAgain(unittest.TestCase):
         self.assertIn("HTTP 404", note)
         self.assertEqual(len(calls), 3)
 
+    def test_a_failed_read_says_how_long_each_attempt_took(self):
+        ticks = iter([0.0, 31.5, 40.0, 70.25, 80.0, 81.0])
+        with mock.patch.object(bw, "_clock", lambda: next(ticks)):
+            (status, note, _), calls, _ = self.run_check(
+                bw.check_board, [(404, GOOGLE_404)])
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("board read failed (HTTP 404); attempts: "
+                      "404 in 31.5s, 404 in 30.2s, 404 in 1.0s", note)
+
+    def test_whatsapp_failure_notes_carry_the_attempts_too(self):
+        (status, note, _), _, _ = self.run_check(bw.check_whatsapp, [(404, GOOGLE_404)])
+        self.assertEqual(status, "UNKNOWN")
+        self.assertRegex(note, r"\(HTTP 404\); attempts: 404 in [0-9.]+s, 404 in [0-9.]+s, 404 in [0-9.]+s$")
+
+    def test_a_recovered_read_leaves_only_its_own_attempts(self):
+        (status, _, _), _, _ = self.run_check(
+            bw.check_board, [(404, GOOGLE_404), self.good([row("R-1", GOOD_TS)])])
+        self.assertEqual(status, "NEWS")
+        self.assertEqual([c for c, _ in bw.last_read_attempts], [404, 200])
+
     def test_a_transport_exception_is_not_retried(self):
         calls = []
 
