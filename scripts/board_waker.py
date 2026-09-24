@@ -70,16 +70,41 @@ ME = "claude-code-cli"
 READ_TRIES = 3
 READ_PAUSES = (3.0, 8.0)
 _pause = time.sleep
+_clock = time.monotonic
+
+# HOW LONG EACH ATTEMPT TOOK, for the note on a read that never recovered. At
+# 22:45Z on 2026-09-24 three attempts failed over about four minutes. Gemini's
+# two leading causes differ in exactly this: a gateway that times out and drops
+# the response fails SLOWLY, a concurrency limit that refuses the call fails
+# FAST. The note now carries the seconds, so the soak log can tell them apart.
+last_read_attempts: list = []
 
 
 def read_gateway(env: dict, params: dict) -> tuple:
-    code, body = bus_get(env, params)
-    for pause in READ_PAUSES[:READ_TRIES - 1]:
-        if code == 200 and body.lstrip().startswith("{"):
-            break
-        _pause(pause)
+    global last_read_attempts
+    attempts = []
+
+    def attempt():
+        started = _clock()
         code, body = bus_get(env, params)
+        attempts.append((code, _clock() - started))
+        return code, body
+
+    try:
+        code, body = attempt()
+        for pause in READ_PAUSES[:READ_TRIES - 1]:
+            if code == 200 and body.lstrip().startswith("{"):
+                break
+            _pause(pause)
+            code, body = attempt()
+    finally:
+        last_read_attempts = attempts
     return code, body
+
+
+def attempts_note() -> str:
+    return "attempts: " + ", ".join(
+        "%s in %.1fs" % (code, seconds) for code, seconds in last_read_attempts)
 
 # Credential files are machine state, never source. Local installations may
 # point BLACKBOARD_ENV at a gitignored file. Cloud runtimes inject BUS_URL and
@@ -171,7 +196,7 @@ def check_board(state: dict, strict: bool = False) -> tuple:
         env = load_env()
         code, body = read_gateway(env, params)
         if code != 200:
-            return "UNKNOWN", "board read failed (HTTP %s)" % code, []
+            return "UNKNOWN", "board read failed (HTTP %s); %s" % (code, attempts_note()), []
         data = json.loads(body)
     except Exception:  # Transport, environment, and decoding failures are not quiet.
         return "UNKNOWN", "board read failed or returned invalid JSON", []
@@ -272,7 +297,8 @@ def check_whatsapp(state: dict) -> tuple:
     params = {"action": "read", "title": BOARD, "match": "whatsapp", "limit": 30}
     code, body = read_gateway(env, params)
     if not body.lstrip().startswith("{"):
-        return "UNKNOWN", "whatsapp read returned a page, not data (HTTP %s)" % code, []
+        return "UNKNOWN", "whatsapp read returned a page, not data (HTTP %s); %s" % (
+            code, attempts_note()), []
     data = json.loads(body)
     if "rows" not in data:
         return "UNKNOWN", "gateway answered with %s and no rows key" % sorted(data.keys()), []
