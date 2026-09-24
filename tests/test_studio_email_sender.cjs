@@ -116,6 +116,7 @@ function governorHarness({
   const sent = [];
   const appendCalls = [];
   const propertyReads = [];
+  const hmacCalls = [];
   const properties = new Map([
     ['GOVERNOR_PASS', 'governor-test-pass'],
     ['STUDIO_GOVERNOR_EMAIL_ENABLED', enabled],
@@ -127,6 +128,8 @@ function governorHarness({
   }
   let locked = false;
   let nextLockDelayMs = 0;
+  let quota = remainingQuota;
+  let beforeMailSend = null;
   const context = {
     Date: { now: () => nowMs },
     PropertiesService: {
@@ -143,8 +146,11 @@ function governorHarness({
     },
     Utilities: {
       Charset: { UTF_8: 'UTF-8' },
-      computeHmacSha256Signature: (message, key) =>
-        Array.from(createHmac('sha256', String(key)).update(String(message), 'utf8').digest()),
+      computeHmacSha256Signature: (message, key) => {
+        hmacCalls.push(String(message));
+        return Array.from(createHmac('sha256', String(key))
+          .update(String(message), 'utf8').digest());
+      },
     },
     LockService: {
       getScriptLock: () => ({
@@ -164,10 +170,17 @@ function governorHarness({
       }),
     },
     MailApp: {
-      getRemainingDailyQuota: () => remainingQuota,
+      getRemainingDailyQuota: () => {
+        assert.equal(locked, true, 'quota snapshot is reconciled under ScriptLock');
+        return quota;
+      },
       sendEmail: (...args) => {
         assert.equal(locked, false, 'mail delivery must not hold the shared ScriptLock');
+        const hook = beforeMailSend;
+        beforeMailSend = null;
+        if (hook) hook();
         sent.push(args);
+        quota = Math.max(0, quota - 1);
         if (mailThrows) throw new Error('ambiguous mail failure containing sensitive fixture data');
       },
     },
@@ -199,10 +212,12 @@ function governorHarness({
     return e;
   };
   return {
-    sent, appendCalls, propertyReads, properties,
+    sent, appendCalls, propertyReads, hmacCalls, properties,
     nowSeconds: () => Math.floor(nowMs / 1000),
+    remainingQuota: () => quota,
     advanceSeconds: (seconds) => { nowMs += seconds * 1000; },
     setNextLockDelaySeconds: (seconds) => { nextLockDelayMs = seconds * 1000; },
+    setBeforeMailSend: (hook) => { beforeMailSend = hook; },
     post: (body, options = {}) => output(context.doPost(event(body, options))),
     get: ({ action, actions } = {}) => {
       const e = { parameter: typeof action === 'undefined' ? {} : { action } };
@@ -303,6 +318,8 @@ test('Governor dispatcher sends signed mail without reading passphrase or touchi
   const state = JSON.parse(app.properties.get('STUDIO_GOVERNOR_EMAIL_STATE_V1'));
   assert.equal(state.version, 1);
   assert.equal(state.attempts.length, 1);
+  assert.equal(state.quotaFence.observedRemaining, 100);
+  assert.equal(state.quotaFence.pending.length, 1);
   assert.equal(JSON.stringify(state).includes(email), false);
   assert.equal(JSON.stringify(state).includes(code), false);
   assert.deepEqual(app.post(request, {
@@ -372,6 +389,49 @@ test('Governor adapter is default-off and fails closed on shape, signature, quot
   }
 });
 
+test('Governor authenticates invalid signatures before recipient membership work', () => {
+  const allowed = governorHarness();
+  const allowedRequest = governorRequest(allowed);
+  allowedRequest.signature = '0'.repeat(64);
+  assert.deepEqual(allowed.post(allowedRequest, {
+    action: 'studio-email', actions: ['studio-email'],
+  }), { ok: false });
+
+  const unlisted = governorHarness();
+  const unlistedRequest = governorRequest(unlisted, { email: 'missing@example.com' });
+  unlistedRequest.signature = '0'.repeat(64);
+  assert.deepEqual(unlisted.post(unlistedRequest, {
+    action: 'studio-email', actions: ['studio-email'],
+  }), { ok: false });
+
+  assert.equal(allowed.hmacCalls.length, 1);
+  assert.equal(unlisted.hmacCalls.length, 1);
+  assert.deepEqual(allowed.propertyReads, unlisted.propertyReads);
+  assert.equal(allowed.propertyReads.includes('STUDIO_GOVERNOR_OPERATOR_EMAILS'), false);
+  assert.equal(allowed.sent.length + unlisted.sent.length, 0);
+});
+
+test('Governor quota fence serializes overlapping sends without holding the provider lock', () => {
+  const app = governorHarness({ remainingQuota: 13 });
+  let overlapping;
+  app.setBeforeMailSend(() => {
+    overlapping = app.post(governorRequest(app, { nonce: '1'.repeat(32) }), {
+      action: 'studio-email', actions: ['studio-email'],
+    });
+  });
+
+  assert.deepEqual(app.post(governorRequest(app), {
+    action: 'studio-email', actions: ['studio-email'],
+  }), { ok: true });
+  assert.deepEqual(overlapping, { ok: false });
+  assert.equal(app.sent.length, 1);
+  assert.equal(app.remainingQuota(), 12);
+  const state = JSON.parse(app.properties.get('STUDIO_GOVERNOR_EMAIL_STATE_V1'));
+  assert.equal(state.attempts.length, 1);
+  assert.equal(state.quotaFence.observedRemaining, 13);
+  assert.equal(state.quotaFence.pending.length, 1);
+});
+
 test('Governor reservation survives ambiguous mail failure and request expiry during lock wait', () => {
   const ambiguous = governorHarness({ mailThrows: true });
   const request = governorRequest(ambiguous);
@@ -414,6 +474,7 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
   const now = Math.floor(Date.now() / 1000);
   const full = JSON.stringify({
     version: 1,
+    quotaFence: { observedRemaining: null, pending: [] },
     attempts: Array.from({ length: 20 }, (_, i) => ({
       nonce: (i + 20).toString(16).padStart(32, '0'),
       keyedSubjectHash: governorSubjectHash(i % 2 ? email : 'other@example.com'),
@@ -428,6 +489,7 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
 
   const expired = JSON.stringify({
     version: 1,
+    quotaFence: { observedRemaining: null, pending: [] },
     attempts: Array.from({ length: 20 }, (_, i) => ({
       nonce: (i + 40).toString(16).padStart(32, '0'),
       keyedSubjectHash: governorSubjectHash(email),
@@ -445,7 +507,12 @@ test('Governor adapter enforces per-recipient and global rolling limits with bou
 test('Governor adapter refuses corrupt or oversized durable limiter state', () => {
   for (const stateRaw of ['not-json', 'x'.repeat(8501), JSON.stringify({
     version: 1,
+    quotaFence: { observedRemaining: null, pending: [] },
     attempts: [{ nonce: '../bad', keyedSubjectHash: '0'.repeat(64), acceptedAt: 1 }],
+  }), JSON.stringify({
+    version: 1,
+    quotaFence: { observedRemaining: 13, pending: ['not-a-timestamp'] },
+    attempts: [],
   })]) {
     const app = governorHarness({ stateRaw });
     assert.deepEqual(app.post(governorRequest(app), {
