@@ -164,30 +164,34 @@ class GcsStore:
         obj = urllib.parse.quote(self._object(name), safe="")
         meta_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
                     % (self.bucket, obj))
-        try:
-            _, metaraw = self._request(meta_url)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return {}, None                  # None means "does not exist"
-            raise
-        generation = str(json.loads(metaraw.decode("utf-8"))["generation"])
-        media_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
-                     "?alt=media&generation=%s"
-                     % (self.bucket, obj, urllib.parse.quote(generation, safe="")))
-        try:
-            _, raw = self._request(media_url)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                raise Conflict(
-                    "gs://%s/%s generation %s disappeared between the metadata "
-                    "read and the media read"
-                    % (self.bucket, self._object(name), generation))
-            raise
-        try:
-            return json.loads(raw.decode("utf-8")), generation
-        except json.JSONDecodeError:
-            raise Conflict("gs://%s/%s is not valid JSON; refusing to treat it "
-                           "as empty" % (self.bucket, self._object(name)))
+        # Bind the body to the same immutable generation used as the CAS token.
+        # A body GET followed by a metadata GET can otherwise pair stale JSON
+        # with a fresh generation and let a later save overwrite a concurrent
+        # writer. Metadata first + generation-qualified media either returns
+        # the exact version or races with deletion/overwrite and is retried.
+        for _ in range(4):
+            try:
+                _, metaraw = self._request(meta_url)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return {}, None              # None means "does not exist"
+                raise
+            generation = str(json.loads(metaraw.decode("utf-8"))["generation"])
+            media_url = (meta_url + "?alt=media&generation="
+                         + urllib.parse.quote(generation, safe=""))
+            try:
+                _, raw = self._request(media_url)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                raise
+            try:
+                return json.loads(raw.decode("utf-8")), generation
+            except json.JSONDecodeError:
+                raise Conflict("gs://%s/%s is not valid JSON; refusing to treat it "
+                               "as empty" % (self.bucket, self._object(name)))
+        raise Conflict("gs://%s/%s changed repeatedly while being read"
+                       % (self.bucket, self._object(name)))
 
     def save(self, name: str, state: dict, token):
         # ifGenerationMatch=0 means "only if this object does not exist", which is

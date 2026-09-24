@@ -7,6 +7,8 @@ on:
       - "site/voice/index.html"
       - "tests/test_governor_tenant_boundary.cjs"
       - "tests/test_governor_voice.cjs"
+      - "tests/test_grounding_and_leads.cjs"
+      - "scripts/object_reference.py"
       - "tests/test_tts_guards.js"
       - ".github/workflows/site-p0-tests.yml"
 
@@ -25,5 +27,5 @@ jobs:
         with:
           node-version: 22
       - run: |
-          node --test tests/test_governor_voice.cjs tests/test_governor_tenant_boundary.cjs
+          node --test tests/test_governor_voice.cjs tests/test_governor_tenant_boundary.cjs tests/test_grounding_and_leads.cjs
           node tests/test_tts_guards.js

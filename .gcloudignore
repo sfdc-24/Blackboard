@@ -22,6 +22,8 @@
 !/cloud/wa-outbox
 !/cloud/board-watcher
 !/cloud/agent-waker
+!/cloud/ack-once
+!/cloud/studio-controller
 
 !/scripts
 /scripts/*

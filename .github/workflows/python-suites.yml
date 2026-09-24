@@ -70,6 +70,15 @@ on:
       - "tests/test_wa_outbox_cloud.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
+      - "tests/test_studio_controller.py"
+      - "tests/test_studio_auth.py"
+      - "tests/test_studio_email_sender.cjs"
+      - "apps-script/studio-email-sender/**"
+      - "cloud/studio-controller/**"
+      - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_org_facts.py"
+      - "cloud/studio-controller/workers/org_facts.py"
+      - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
       - "cloud/board-watcher/main.py"
       - "cloud/wa-outbox/main.py"
@@ -136,6 +145,15 @@ on:
       - "tests/test_wa_outbox_cloud.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
+      - "tests/test_studio_controller.py"
+      - "tests/test_studio_auth.py"
+      - "tests/test_studio_email_sender.cjs"
+      - "apps-script/studio-email-sender/**"
+      - "cloud/studio-controller/**"
+      - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_org_facts.py"
+      - "cloud/studio-controller/workers/org_facts.py"
+      - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
       - "cloud/board-watcher/main.py"
       - "cloud/wa-outbox/main.py"
@@ -203,6 +221,11 @@ jobs:
                    tests/test_wa_outbox_cloud.py \
                    tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
+                   tests/test_studio_controller.py \
+                   tests/test_studio_auth.py \
+                   tests/test_studio_email_sender.cjs \
+                   tests/test_studio_claude_worker.py \
+                   tests/test_studio_org_facts.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -603,6 +626,48 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # FastAPI and its in-process TestClient are needed only by the controller
+      # suite. Installation happens before the network namespace is removed;
+      # the suite itself still runs with no network and all provider clients
+      # are fakes.
+      - name: Install pinned Studio controller test dependencies
+        if: ${{ hashFiles('tests/test_studio_controller.py') != '' || hashFiles('tests/test_studio_auth.py') != '' }}
+        # The controller's own pins, so CI tests what the image installs -
+        # including the anthropic SDK that STUDIO_WORKER=claude imports.
+        run: python3 -m pip install -r cloud/studio-controller/requirements.txt
+
+      - name: "studio controller: CAS, idempotency, replay and auth (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_controller.py ] && [ -f tests/test_studio_auth.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest \
+              tests.test_studio_auth tests.test_studio_controller
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "studio email sender: signed request and replay refusal (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_email_sender.cjs ]; then
+            node --test tests/test_studio_email_sender.cjs
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The studio's Claude worker: model output is data, checked before it can
+      # reach a visitor. A fake client drives it; no network, no key, no SDK import.
+      - name: "studio Claude worker: model output gated before the page (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_claude_worker.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The bus suite starts its own server and scratch database. Enable only
       # loopback in a fresh namespace, and retain setup-python's exact binary
       # across sudo rather than silently switching to the system interpreter.
@@ -641,6 +706,11 @@ jobs:
              && [ ! -f tests/test_wa_outbox_cloud.py ] \
              && [ ! -f tests/test_gemini_cloud_waker.py ] \
              && [ ! -f tests/test_soak_report.py ] \
+             && [ ! -f tests/test_studio_controller.py ] \
+             && [ ! -f tests/test_studio_auth.py ] \
+             && [ ! -f tests/test_studio_email_sender.cjs ] \
+             && [ ! -f tests/test_studio_claude_worker.py ] \
+             && [ ! -f tests/test_studio_org_facts.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
