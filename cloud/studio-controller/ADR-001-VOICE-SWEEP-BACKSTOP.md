@@ -89,10 +89,13 @@ as job executions, and the same job can be run manually for acceptance.
 The deployed job has one task, parallelism one, a 30-second task timeout, and
 zero task retries. The helper's 20-second HTTP timeout bounds network waits but
 is not treated as the job's wall-clock deadline. Cloud Scheduler runs every
-minute with a 30-second attempt deadline and zero Scheduler retries; an
-unresolved pass fails visibly and the next scheduled minute performs the next
-bounded attempt. The controller remains idempotent under overlapping or
-repeated authenticated sweeps.
+five minutes with a 30-second attempt deadline and zero Scheduler retries; an
+unresolved pass fails visibly and the next scheduled interval performs the
+next bounded attempt. The five-minute interval is deliberate: the first live
+executions spent 67 to 103 seconds in platform provisioning plus execution,
+so an every-minute trigger briefly accumulated queued work. The controller
+remains idempotent under overlapping or repeated authenticated sweeps, but the
+normal cadence must leave cold-start headroom rather than depend on overlap.
 
 ## Consequences
 
@@ -112,6 +115,7 @@ repeated authenticated sweeps.
    caller identity.
 2. Deploy the job with the immutable Studio image at zero voice traffic.
 3. Enable voice on a tagged controller revision and manually verify the job.
-4. Create the every-minute Scheduler trigger with the explicit no-retry policy.
+4. Create the every-five-minute Scheduler trigger with the explicit no-retry
+   policy and verify that one cold execution finishes before the next trigger.
 5. Verify one genuine microphone turn, Stop, provider hangup, durable cleanup,
    and the public page before promoting the voice revision.
