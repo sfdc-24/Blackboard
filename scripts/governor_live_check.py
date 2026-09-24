@@ -40,23 +40,42 @@ def clasp(args: list[str], cwd: Path) -> str:
     out = subprocess.run([exe] + args, cwd=cwd, capture_output=True, text=True,
                          encoding="utf-8", errors="replace", timeout=180)
     if out.returncode != 0:
-        print("clasp %s failed: %s" % (" ".join(args), (out.stderr or out.stdout).strip()[:300]))
+        # Fixed text only: clasp's own output can carry account or project
+        # details, so it is never echoed.
+        print("clasp %s failed (exit %d); cannot tell" % (args[0], out.returncode))
         raise SystemExit(2)
     return out.stdout
 
 
 def deployed_version(deployments: str, deployment_id: str) -> int:
     for line in deployments.splitlines():
-        m = re.search(re.escape(deployment_id) + r"\s+@(\d+)", line)
+        # The id as a whole token: "- <id> @<n>", never as a suffix of a longer id.
+        m = re.search(r"(?:^|[\s-])" + re.escape(deployment_id) + r"\s+@(\d+)(?:\s|$)", line)
         if m:
             return int(m.group(1))
     print("deployment %s not found in `clasp deployments`" % deployment_id[:12])
     raise SystemExit(2)
 
 
-def main_source(name: str) -> str | None:
+def fresh_main() -> str:
+    """Fetch, then pin origin/main to one SHA for the whole comparison. A fetch
+    that fails would leave a stale origin/main looking current, so it is
+    UNKNOWN, not a match."""
+    if subprocess.run(["git", "fetch", "-q", "origin"], cwd=REPO).returncode != 0:
+        print("git fetch failed; cannot tell whether main is current")
+        raise SystemExit(2)
+    return subprocess.check_output(["git", "rev-parse", "origin/main"], cwd=REPO, text=True).strip()
+
+
+def main_files(sha: str) -> list[str]:
+    out = subprocess.check_output(["git", "ls-tree", "--name-only", "%s:%s" % (sha, SOURCE_DIR)],
+                                  cwd=REPO, text=True, encoding="utf-8")
+    return sorted(n for n in out.split() if n)
+
+
+def main_source(sha: str, name: str) -> str | None:
     try:
-        return subprocess.check_output(["git", "show", "origin/main:%s/%s" % (SOURCE_DIR, name)],
+        return subprocess.check_output(["git", "show", "%s:%s/%s" % (sha, SOURCE_DIR, name)],
                                        cwd=REPO, text=True, encoding="utf-8", errors="replace",
                                        stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
@@ -73,7 +92,7 @@ def main() -> int:
     ap.add_argument("--project-dir", type=Path, default=DEFAULT_PROJECT)
     args = ap.parse_args()
 
-    subprocess.run(["git", "fetch", "-q", "origin"], cwd=REPO, check=False)
+    sha = fresh_main()
     clasp_json = args.project_dir / ".clasp.json"
     if not clasp_json.exists():
         print("no .clasp.json in %s" % args.project_dir)
@@ -87,22 +106,34 @@ def main() -> int:
         cfg["rootDir"] = "."
         (tmp / ".clasp.json").write_text(json.dumps(cfg), encoding="utf-8")
         clasp(["pull", "--versionNumber", str(version)], tmp)
-        live = sorted(p for p in tmp.iterdir() if p.is_file() and p.name != ".clasp.json")
-        print("public deployment serves version %d (%d files)" % (version, len(live)))
+        live = {p.name: p for p in tmp.iterdir() if p.is_file() and p.name != ".clasp.json"}
+        if not live:
+            print("the pull of version %d returned no files; cannot tell" % version)
+            return 2
+        on_main_names = main_files(sha)
+        print("public deployment serves version %d (%d files); main is %s (%d files)"
+              % (version, len(live), sha[:12], len(on_main_names)))
         differ = 0
-        for f in live:
-            on_main = main_source(f.name)
-            if on_main is None:
-                print("  %-22s live only (not on main)" % f.name)
+        # The UNION of both sides: a file only on main is as much a drift as a
+        # file only live.
+        for name in sorted(set(live) | set(on_main_names)):
+            if name not in live:
+                print("  %-22s main only (not in the live version)" % name)
                 differ += 1
                 continue
+            on_main = main_source(sha, name)
+            if on_main is None:
+                print("  %-22s live only (not on main)" % name)
+                differ += 1
+                continue
+            f = live[name]
             a, b = norm(on_main), norm(f.read_text(encoding="utf-8", errors="replace"))
             if a == b:
-                print("  %-22s MATCH" % f.name)
+                print("  %-22s MATCH" % name)
                 continue
             changed = sum(1 for d in difflib.unified_diff(a, b, lineterm="", n=0)
                           if d[:1] in "+-" and not d.startswith(("+++", "---")))
-            print("  %-22s DIFF (%d changed lines between main and live)" % (f.name, changed))
+            print("  %-22s DIFF (%d changed lines between main and live)" % (name, changed))
             differ += 1
     print("VERDICT: %s" % ("live == main" if not differ else "live != main in %d file(s)" % differ))
     return 1 if differ else 0
