@@ -900,5 +900,199 @@ class ApiTests(unittest.TestCase):
             self.assertEqual({"ok": True, "checked_at": 1000}, accepted.json())
 
 
+
+# ---- The Claude worker inside this controller (claude-code-cli, after #204) ----
+# A fake Anthropic client stands in for the model: no network, no key.
+
+class _FakeAnthropic:
+    def __init__(self, *drafts):
+        from types import SimpleNamespace
+        self.drafts = list(drafts)
+        self.calls = 0
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        from types import SimpleNamespace
+        draft = self.drafts[min(self.calls, len(self.drafts) - 1)]
+        self.calls += 1
+        return SimpleNamespace(stop_reason="end_turn",
+                               content=[SimpleNamespace(type="text", text=json.dumps(draft))])
+
+
+def _claude(*drafts):
+    from workers.claude_worker import ClaudeWorker
+    worker = ClaudeWorker(client=_FakeAnthropic(*drafts))
+    seed = SyntheticWorker()                    # the same bootstrap app.main uses
+    worker.initial_artifact = seed.initial_artifact
+    worker.initial_questions = seed.initial_questions
+    return worker
+
+
+_NO_NODE = {"id": "", "kind": "text", "label": "", "detail": ""}
+_BOOK_BY_VOICE = {
+    "ops": [{"op": "set_label", "node_id": "hero-cta", "value": "Book a consultation", "new_node": _NO_NODE}],
+    "confirm": "Changed the main action to Book a consultation.",
+    "questions": [], "batch_title": "",
+    "resolves": {"question_id": "q-cta", "option_id": "book", "freeform_answer": ""},
+}
+
+
+class _Resolver:
+    """Names an answer without checking it - the controller must."""
+    def __init__(self, resolves):
+        self.resolves = resolves
+
+    def initial_artifact(self):
+        return SyntheticWorker().initial_artifact()
+
+    def initial_questions(self):
+        # A second open question, so a claim can point somewhere other than
+        # the question a tap just answered.
+        other = copy.deepcopy(SyntheticWorker().initial_questions()[0])
+        other.update(question_id="q-other", affected_artifact_ids=["hero-heading"])
+        return SyntheticWorker().initial_questions() + [other]
+
+    def on_turn(self, state, trigger):
+        return {"events": [], "problems": [], "resolves": dict(self.resolves)}
+
+
+def _say(state, n, text, version):
+    return {"command_id": "spoken-%d" % n, "session_id": state["session_id"], "type": "utterance",
+            "expected_version": version, "item_id": "item-%d" % n, "transcript": text}
+
+
+class ClaudeWorkerInControllerTests(unittest.TestCase):
+    def test_a_spoken_answer_changes_the_prototype_and_closes_the_question(self):
+        controller, store, _ = make_controller(worker=_claude(_BOOK_BY_VOICE))
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], _say(state, 1, "Let them book a call", 1))
+        self.assertEqual([], result["problems"])
+        self.assertEqual(["artifact.patch", "question.answered", "confirm"],
+                         [e["type"] for e in result["events"]])
+        answered = result["events"][1]["payload"]["question"]
+        self.assertEqual(("q-cta", "answered", "book", "voice"),
+                         (answered["question_id"], answered["status"], answered["selected_option"],
+                          answered["answer_source"]))
+        self.assertEqual((1, 2), (answered["artifact_version_before"], answered["artifact_version_after"]))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", _find(saved, "q-cta")["status"])
+        self.assertEqual(2, saved["artifact_version"])
+
+    def test_a_second_claim_on_a_closed_question_is_a_problem_not_an_answer(self):
+        stale, _, _ = make_controller(worker=_Resolver({"question_id": "q-cta", "option_id": "book"}))
+        s2, _ = stale.create_session()
+        stale.execute(s2["session_id"], {"command_id": "tap-1", "session_id": s2["session_id"], "type": "answer",
+                                         "expected_version": 1, "question_id": "q-cta", "option_id": "describe"})
+        result = stale.execute(s2["session_id"], _say(s2, 2, "book it", 1))
+        self.assertEqual([], [e for e in result["events"] if e["type"] == "question.answered"])
+        self.assertTrue(any("resolves 'q-cta' refused" in p for p in result["problems"]), result["problems"])
+
+    def test_unknown_questions_and_foreign_options_are_refused(self):
+        for resolves, why in (({"question_id": "q-nope", "option_id": "book"}, "unknown question_id"),
+                              ({"question_id": "q-cta", "option_id": "delete-everything"}, "does not belong")):
+            controller, store, _ = make_controller(worker=_Resolver(resolves))
+            state, _ = controller.create_session()
+            result = controller.execute(state["session_id"], _say(state, 1, "whatever", 1))
+            self.assertTrue(any(why in p for p in result["problems"]), (resolves, result["problems"]))
+            saved = StudioRepository(store).load(state["session_id"]).state
+            self.assertEqual("open", _find(saved, "q-cta")["status"])
+
+    def test_a_tap_never_lets_resolves_answer_another_question(self):
+        controller, store, _ = make_controller(worker=_Resolver({"question_id": "q-other", "option_id": "work"}))
+        state, _ = controller.create_session()
+        controller.execute(state["session_id"], {"command_id": "tap-1", "session_id": state["session_id"],
+                                                 "type": "answer", "expected_version": 1,
+                                                 "question_id": "q-cta", "option_id": "book"})
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual(("book", "tap"), (_find(saved, "q-cta")["selected_option"],
+                                           _find(saved, "q-cta")["answer_source"]))
+        self.assertEqual("open", _find(saved, "q-other")["status"])
+
+    def test_the_image_carries_the_worker_and_its_sdk(self):
+        docker = (CONTROLLER / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY cloud/studio-controller/workers ./workers", docker)
+        reqs = (CONTROLLER / "requirements.txt").read_text(encoding="utf-8")
+        self.assertRegex(reqs, r"(?m)^anthropic==\d")
+
+    def test_studio_worker_claude_builds_through_app_main(self):
+        from app.main import _worker
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-offline-test"}):
+            worker = _worker(settings(worker="claude"))
+        from workers.claude_worker import ClaudeWorker
+        self.assertIsInstance(worker, ClaudeWorker)
+        self.assertEqual("q-cta", worker.initial_questions()[0]["question_id"])
+
+
+def _find(state, qid):
+    return next(q for q in state["questions"] if q["question_id"] == qid)
+
+
+
+class _SequenceResolver(_Resolver):
+    """Starts with the two-question form BatchWorker opens, and names a
+    different answer on each turn."""
+    def __init__(self, *claims):
+        self.claims = list(claims)
+
+    def initial_questions(self):
+        return BatchWorker().initial_questions()
+
+    def on_turn(self, state, trigger):
+        claim = self.claims.pop(0) if self.claims else {}
+        return {"events": [], "problems": [], "resolves": claim}
+
+
+def _batch_cmd(state, cid, batch_id, answers, version=1):
+    return {"command_id": cid, "session_id": state["session_id"], "type": "answer_batch",
+            "expected_version": version, "batch_id": batch_id, "answers": answers}
+
+
+class CodexReview206ControllerTests(unittest.TestCase):
+    """CODEX-PR206-REVIEW-20260924T0625Z."""
+
+    def test_a_refused_change_does_not_spend_the_spoken_answer(self):
+        bad = dict(_BOOK_BY_VOICE, ops=_BOOK_BY_VOICE["ops"] + [
+            {"op": "set_label", "node_id": "no-such-node", "value": "x", "new_node": _NO_NODE}])
+        controller, store, _ = make_controller(worker=_claude(bad, _BOOK_BY_VOICE))
+        state, _ = controller.create_session()
+        first = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual([], [e for e in first["events"] if e["type"] == "question.answered"])
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual((1, "open"), (saved["artifact_version"], _find(saved, "q-cta")["status"]))
+        second = controller.execute(state["session_id"], _say(state, 2, "book a call, please", 1))
+        self.assertEqual(["artifact.patch", "question.answered", "confirm"], [e["type"] for e in second["events"]])
+
+    def test_a_voice_answer_to_one_form_question_leaves_the_rest_of_the_form(self):
+        controller, store, _ = make_controller(worker=_SequenceResolver({"question_id": "q-cta", "option_id": "book"}))
+        state, _ = controller.create_session()
+        batch_id = next(e for e in state["events"] if e["type"] == "decision.batch")["payload"]["batch_id"]
+        spoken = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual(["question.answered"], [e["type"] for e in spoken["events"]])
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual(("open", ["q-cta"]), (saved["batches"][batch_id]["status"], saved["batches"][batch_id]["answered_ids"]))
+        with self.assertRaisesRegex(CommandError, "do not match"):
+            controller.execute(state["session_id"], _batch_cmd(state, "b-all", batch_id, [
+                {"question_id": "q-cta", "option_id": "describe"}, {"question_id": "q-tone", "option_id": "calm"}]))
+        controller.execute(state["session_id"], _batch_cmd(state, "b-rest", batch_id,
+                                                           [{"question_id": "q-tone", "option_id": "calm"}]))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", saved["batches"][batch_id]["status"])
+        self.assertEqual(("book", "voice"), (_find(saved, "q-cta")["selected_option"], _find(saved, "q-cta")["answer_source"]))
+        self.assertEqual(("calm", "tap"), (_find(saved, "q-tone")["selected_option"], _find(saved, "q-tone")["answer_source"]))
+
+    def test_voice_answers_to_every_form_question_close_the_form(self):
+        controller, store, _ = make_controller(worker=_SequenceResolver(
+            {"question_id": "q-cta", "option_id": "book"}, {"question_id": "q-tone", "option_id": "bold"}))
+        state, _ = controller.create_session()
+        batch_id = next(e for e in state["events"] if e["type"] == "decision.batch")["payload"]["batch_id"]
+        controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        controller.execute(state["session_id"], _say(state, 2, "and make it bold", 1))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", saved["batches"][batch_id]["status"])
+        with self.assertRaisesRegex(CommandError, "open decision batch"):
+            controller.execute(state["session_id"], _batch_cmd(state, "b-late", batch_id,
+                                                               [{"question_id": "q-tone", "option_id": "calm"}]))
+
+
 if __name__ == "__main__":
     unittest.main()

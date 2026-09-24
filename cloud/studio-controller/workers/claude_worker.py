@@ -241,10 +241,15 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
             else:
                 resolves["freeform_answer"] = free
 
+    # A claim that failed validation is not the same as no claim: the model
+    # thought this turn answered something, so it may not reshape the page
+    # freely on the strength of it. Nothing may change (Codex review of #206).
+    claimed_but_invalid = bool(rqid) and resolves is None
+
     # -- the patch, as one transaction on a candidate tree
     tree = json.loads(json.dumps(artifact_root))
     index, parents = _index(tree)
-    scope = _scope_ids(state_questions, trigger, resolves)
+    scope = set() if claimed_but_invalid else _scope_ids(state_questions, trigger, resolves)
     allowed = None
     if scope is not None:
         allowed = set()
@@ -307,6 +312,13 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
         ops_out, confirm = [], ""
         tree = json.loads(json.dumps(artifact_root))
         index, parents = _index(tree)
+        # The answer and its change are one decision. If the change was
+        # refused, the answer is not recorded either: the question stays open
+        # and the visitor can say it again (Codex review of #206, P2).
+        if resolves:
+            problems.append("resolution of %r not recorded: its change was refused"
+                            % resolves["question_id"])
+            resolves = None
     if not _txt(confirm):
         problems.append("confirm too long")
         confirm = ""
