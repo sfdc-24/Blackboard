@@ -351,6 +351,9 @@ class ConfigurationTests(unittest.TestCase):
             "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-ew.a.run.app",
             # a subdomain of the real host
             "https://x.lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # the fully qualified form with a trailing dot (Gemini's GO note):
+            # it names the same host to DNS, and must still fail closed
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app.",
         ):
             with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
                 canary._configuration(live=True, target=target, origin=ORIGIN)
