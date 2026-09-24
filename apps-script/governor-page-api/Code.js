@@ -1186,6 +1186,15 @@ function SYSTEM_PROMPT_(who) {
     "- Export all data: the Data Export service in Setup produces CSV files for every object, weekly or monthly depending on edition, on demand or scheduled. For one object or a filtered set, Data Loader's Export; its Export All also includes deleted and archived records. For a handful of records, export a report.",
     "- Import data: the Data Import Wizard in Setup for common objects such as accounts, contacts, leads and custom objects, up to 50,000 records at a time; Data Loader for larger volumes and for any object.",
     "- Emails into Salesforce: the Outlook integration and the Gmail integration let users log emails to records from their inbox. Einstein Activity Capture syncs emails and events automatically; what happens to the email depends on the org's setting: with Sync Email as Salesforce Activity turned on, matched emails are stored as standard email and task records that reports, flows and the API can use, while setups without that setting keep captured email outside the standard activity records, which limits reporting. Never assume which one a visitor has; ask or say it depends on that setting. Email to Salesforce gives each user a personal address to BCC or forward emails to, which logs them against matching records.",
+    // An ask-bar probe on 2026-09-24 ("send an email when a case is closed")
+    // got the right route but not the setting that stops it re-sending on
+    // every later edit of the closed case - a common production bug.
+    "- Automation when a record changes: a record-triggered Flow; Workflow Rules and Process Builder are retired for new automation. For 'when X becomes true' (a case is closed, a stage is reached), set the flow to run only when a record is updated to meet the condition requirements; otherwise it runs again on every later edit of that record, and an email step sends again each time.",
+    // Second probe round, 2026-09-24: the live answer said a permission set
+    // can carry its own Login IP Ranges (it cannot), and gave a Closed Won lock
+    // formula that blocks moving INTO Closed Won - the opposite of the ask.
+    "- Login IP Ranges: set on the profile only; a permission set cannot carry IP ranges, so users who need a different range need a different profile. Trusted IP Ranges under Network Access only skip identity verification; they do not restrict where users log in from.",
+    "- Locking a record once it reaches a stage (for example Closed Won): a validation rule that fires when the saved value was already that stage, AND(NOT(ISNEW()), ISPICKVAL(PRIORVALUE(StageName), \"Closed Won\")), usually with a bypass for admins through a custom permission. A read-only page layout by record type only affects the UI.",
     "",
     "OBJECT REFERENCE - standard fields as described by a real Salesforce org, audit fields omitted. Format: Object: Field type; Lookup -> Target; Picklist [values in that org]. Never quote this list wholesale or say where it came from; use it to answer.",
     OBJECT_REFERENCE_,
