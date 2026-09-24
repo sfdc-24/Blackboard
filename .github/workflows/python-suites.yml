@@ -68,6 +68,11 @@ on:
       - "tests/test_waker_shadow.py"
       - "tests/test_ack_once.py"
       - "tests/test_soak_report.py"
+      - "tests/test_studio_controller.py"
+      - "tests/test_studio_auth.py"
+      - "tests/test_studio_email_sender.cjs"
+      - "apps-script/studio-email-sender/**"
+      - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
       - "tests/test_studio_org_facts.py"
       - "cloud/studio-controller/workers/org_facts.py"
@@ -132,6 +137,11 @@ on:
       - "tests/test_waker_shadow.py"
       - "tests/test_ack_once.py"
       - "tests/test_soak_report.py"
+      - "tests/test_studio_controller.py"
+      - "tests/test_studio_auth.py"
+      - "tests/test_studio_email_sender.cjs"
+      - "apps-script/studio-email-sender/**"
+      - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
       - "tests/test_studio_org_facts.py"
       - "cloud/studio-controller/workers/org_facts.py"
@@ -197,6 +207,9 @@ jobs:
                    tests/test_waker_shadow.py \
                    tests/test_ack_once.py \
                    tests/test_soak_report.py \
+                   tests/test_studio_controller.py \
+                   tests/test_studio_auth.py \
+                   tests/test_studio_email_sender.cjs \
                    tests/test_studio_claude_worker.py \
                    tests/test_studio_org_facts.py \
                    tests/test_agent_waker.py \
@@ -588,9 +601,34 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
-      # The bus suite starts its own server and scratch database. Enable only
-      # loopback in a fresh namespace, and retain setup-python's exact binary
-      # across sudo rather than silently switching to the system interpreter.
+      # FastAPI and its in-process TestClient are needed only by the controller
+      # suite. Installation happens before the network namespace is removed;
+      # the suite itself still runs with no network and all provider clients
+      # are fakes.
+      - name: Install pinned Studio controller test dependencies
+        if: ${{ hashFiles('tests/test_studio_controller.py') != '' || hashFiles('tests/test_studio_auth.py') != '' }}
+        run: python3 -m pip install fastapi==0.115.6 httpx==0.28.1
+
+      - name: "studio controller: CAS, idempotency, replay and auth (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_controller.py ] && [ -f tests/test_studio_auth.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest \
+              tests.test_studio_auth tests.test_studio_controller
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "studio email sender: signed request and replay refusal (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_email_sender.cjs ]; then
+            node --test tests/test_studio_email_sender.cjs
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The studio's Claude worker: model output is data, checked before it can
       # reach a visitor. A fake client drives it; no network, no key, no SDK import.
       - name: "studio Claude worker: model output gated before the page (no network)"
@@ -603,6 +641,9 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The bus suite starts its own server and scratch database. Enable only
+      # loopback in a fresh namespace, and retain setup-python's exact binary
+      # across sudo rather than silently switching to the system interpreter.
       - name: bus API and migration imports (isolated loopback)
         run: |
           set -euo pipefail
@@ -636,6 +677,9 @@ jobs:
              && [ ! -f tests/test_waker_shadow.py ] \
              && [ ! -f tests/test_ack_once.py ] \
              && [ ! -f tests/test_soak_report.py ] \
+             && [ ! -f tests/test_studio_controller.py ] \
+             && [ ! -f tests/test_studio_auth.py ] \
+             && [ ! -f tests/test_studio_email_sender.cjs ] \
              && [ ! -f tests/test_studio_claude_worker.py ] \
              && [ ! -f tests/test_studio_org_facts.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
