@@ -320,35 +320,38 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(canary.CanaryFailure):
             canary._configuration(live=False, target=TARGET, origin=ORIGIN)
 
-    def test_public_target_is_never_allowed_and_untagged_run_app_needs_marker(self):
+    def test_only_a_lead_canary_tag_url_is_ever_allowed(self):
+        # claude-code-cli review of #229: the service's untagged primary url
+        # serves the 100 percent public revision, and an override marker let
+        # the runner target it. There is no override now.
         for target in (
             "https://sfdc24.com",
             "https://www.sfdc24.com",
             "https://studio.sfdc24.com",
             "https://notcanary.sfdc24.com",
+            # the real service's primary (untagged) url - production
+            "https://sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # its public traffic tag
+            "https://claude-text---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # other tags that merely contain the words
+            "https://voice-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://leadcanary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://studio-abc-uc.a.run.app",
         ):
             with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
                 canary._configuration(live=True, target=target, origin=ORIGIN)
-            with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
-                canary._configuration(
-                    live=True, target=target, origin=ORIGIN,
-                    safety_marker=canary.LIVE_SAFETY_MARKER,
-                )
-        target = "https://studio-abc-uc.a.run.app"
-        with self.assertRaises(canary.CanaryFailure):
-            canary._configuration(live=True, target=target, origin=ORIGIN)
-        self.assertEqual(
-            (target, ORIGIN),
-                    canary._configuration(
-                        live=True, target=target, origin=ORIGIN,
-                        safety_marker=canary.LIVE_SAFETY_MARKER,
-                    ),
-                )
-        with self.assertRaises(canary.CanaryFailure):
+        self.assertFalse(hasattr(canary, "LIVE_SAFETY_MARKER"))
+        with self.assertRaises(TypeError):
             canary._configuration(
-                live=True, target=target, origin=ORIGIN,
-                safety_marker=canary.LIVE_SAFETY_MARKER + "-almost",
+                live=True, target="https://studio-abc-uc.a.run.app", origin=ORIGIN,
+                safety_marker="STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1",
             )
+        tag = "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
+        self.assertEqual((tag, ORIGIN), canary._configuration(live=True, target=tag, origin=ORIGIN))
+
+    def test_the_command_line_has_no_override_flag(self):
+        with self.assertRaises(SystemExit):
+            canary._parser().parse_args(["--live", "--safety-marker", "anything"])
 
 
 class LifecycleTests(unittest.TestCase):
