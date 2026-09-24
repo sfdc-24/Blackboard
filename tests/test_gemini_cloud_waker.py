@@ -45,11 +45,14 @@ class FakeWaker:
         path = os.path.join(os.environ["BLACKBOARD_STATE_DIR"], ".gemini_waker_state.json")
         with open(path, encoding="utf-8") as fh:
             state = json.load(fh)
+        claim = getattr(self, "claim_answer", None)
         for n, rid in enumerate(self.post_ids):
             if rid in state["answered_ids"]:
                 continue
             if self.die_after is not None and n >= self.die_after:
                 raise RuntimeError("container killed")
+            if claim is not None and not claim(rid):
+                continue
             if self.post_reply("gemini", {}, "x", "a;ALL", rid, False):
                 state["answered_ids"].append(rid)
         state["watermark"] = "2026-09-24T03:00:00Z"
@@ -102,6 +105,90 @@ class GeminiCloudWakerTest(unittest.TestCase):
         w.post_reply = racing_post
         with self.assertRaises(state_store.Conflict):
             main.run(store=store, waker=w)
+
+
+class _ClaimingWaker:
+    """Calls claim_answer before the model, which is the cloud hook.
+
+    The model call is `calls.append`. post_reply is the confirmed board append.
+    """
+
+    def __init__(self, calls, spawn=None, on_post=None):
+        self.calls, self.spawn, self.on_post = calls, spawn, on_post
+
+    def post_reply(self, me, cfg, text, to, answers, verbose):
+        if self.on_post:
+            self.on_post(me, answers)
+        return True
+
+    def main(self, argv):
+        path = os.path.join(os.environ["BLACKBOARD_STATE_DIR"], ".gemini_waker_state.json")
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        if self.spawn is not None and not self.spawn.get("done"):
+            self.spawn["done"] = True
+            self.spawn["go"]()
+        claim = getattr(self, "claim_answer", lambda _rid: True)
+        rid = "A"
+        if rid not in (state.get("answered_ids") or []):
+            if claim(rid):
+                self.calls.append(rid)
+                if self.post_reply("gemini", {}, "x", "whatsapp;ALL", rid, False):
+                    state.setdefault("answered_ids", []).append(rid)
+        state["watermark"] = "2026-09-24T03:00:00Z"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        return 0
+
+
+class NoDuplicateAnswers(unittest.TestCase):
+    def test_kill_after_confirmed_post_before_cursor_save_does_not_post_again(self):
+        """Append succeeded, cursor save did not. The retry must not answer again."""
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        board = set()
+        calls = []
+        real_save = store.save
+
+        def save(name, state, token):
+            if "A" in (state.get("answered_ids") or []):
+                raise RuntimeError("killed after confirmed post, before cursor save")
+            return real_save(name, state, token)
+
+        store.save = save
+        w = _ClaimingWaker(calls, on_post=lambda me, answers: board.add(
+            "%s-WAKE-%s" % (me.upper(), answers)))
+        w.reply_on_board = lambda rid: rid in board
+        with self.assertRaises(RuntimeError):
+            main.run(store=store, waker=w)
+        self.assertEqual(calls, ["A"])
+        self.assertNotIn("A", store.state.get("answered_ids") or [])
+
+        store.save = real_save
+        again = []
+        w2 = _ClaimingWaker(again)
+        w2.reply_on_board = lambda rid: rid in board
+        main.run(store=store, waker=w2)
+        self.assertEqual(again, [], "the confirmed reply was posted a second time")
+        self.assertIn("A", store.state.get("answered_ids") or [])
+
+    def test_two_overlapping_runs_only_the_claim_winner_calls_the_model(self):
+        store = MemStore({"watermark": "2026-09-24T02:00:00Z", "answered_ids": []})
+        calls = []
+        spawn = {}
+
+        def go():
+            try:
+                main.run(store=store, waker=_ClaimingWaker(calls))
+            except state_store.Conflict:
+                pass
+
+        spawn["go"] = go
+        try:
+            main.run(store=store, waker=_ClaimingWaker(calls, spawn=spawn))
+        except state_store.Conflict:
+            pass
+        self.assertEqual(calls, ["A"],
+                         "both overlapping runs called the model: %r" % (calls,))
 
 
 if __name__ == "__main__":

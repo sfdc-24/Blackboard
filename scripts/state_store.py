@@ -156,22 +156,35 @@ class GcsStore:
             return r.status, r.read()
 
     def load(self, name: str):
+        # Metadata first, then the bytes of THAT generation. The other order
+        # is two requests against a moving object: the body can be the old
+        # version while the generation token is already the new one, and the
+        # next save is then told it holds the current token and silently
+        # erases the writer it never read.
         obj = urllib.parse.quote(self._object(name), safe="")
-        url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s?alt=media"
-               % (self.bucket, obj))
+        meta_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
+                    % (self.bucket, obj))
         try:
-            _, raw = self._request(url)
+            _, metaraw = self._request(meta_url)
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return {}, None                  # None means "does not exist"
             raise
-        # The generation is the CAS token and it is in the metadata, not the body.
-        meta_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
-                    % (self.bucket, obj))
-        _, metaraw = self._request(meta_url)
-        generation = json.loads(metaraw.decode("utf-8"))["generation"]
+        generation = str(json.loads(metaraw.decode("utf-8"))["generation"])
+        media_url = ("https://storage.googleapis.com/storage/v1/b/%s/o/%s"
+                     "?alt=media&generation=%s"
+                     % (self.bucket, obj, urllib.parse.quote(generation, safe="")))
         try:
-            return json.loads(raw.decode("utf-8")), str(generation)
+            _, raw = self._request(media_url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise Conflict(
+                    "gs://%s/%s generation %s disappeared between the metadata "
+                    "read and the media read"
+                    % (self.bucket, self._object(name), generation))
+            raise
+        try:
+            return json.loads(raw.decode("utf-8")), generation
         except json.JSONDecodeError:
             raise Conflict("gs://%s/%s is not valid JSON; refusing to treat it "
                            "as empty" % (self.bucket, self._object(name)))

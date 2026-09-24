@@ -487,6 +487,26 @@ def log(me: str, line: str) -> None:
 
 # -------------------------------------------------------------------- posting
 
+def reply_row_id(me: str, answers: str) -> str:
+    """Row_ID of the reply post_reply will write for this answers id.
+
+    The cloud waker looks a reply up by this before it will post one again.
+    One function, so the lookup cannot drift from the id that was written.
+    """
+    return "%s-WAKE-%s" % (me.upper(), re.sub(r"[^A-Za-z0-9-]", "", str(answers or ""))[:40])
+
+
+def claim_answer(answers_id: str) -> bool:
+    """Whether this process may call the model for answers_id.
+
+    The laptop waker is the only writer of its file, so the claim is free.
+    The cloud waker replaces this with a compare-and-swap on the shared cursor
+    BEFORE the model call. False means skip the row. A lost compare-and-swap
+    raises, because the cursor this process holds is stale and must not be written.
+    """
+    return True
+
+
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool) -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
 
@@ -494,7 +514,7 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     tag in Row_ID and leaving Target_Surface empty, and a ballot drew zero
     replies because nobody was addressed.
     """
-    rid = "%s-WAKE-%s" % (me.upper(), re.sub(r"[^A-Za-z0-9-]", "", answers)[:40])
+    rid = reply_row_id(me, answers)
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
             "post", text[:1500],
             "--tag", me,
@@ -642,6 +662,21 @@ def main(argv=None) -> int:
                   + ". Answer it.\n\n---\n" + ask_text + "\n---")
         if args.dry_run:
             print("    [dry-run] would ask %s and post the reply" % me)
+            continue
+
+        # Ownership before the model. Two overlapping cloud runs both reach
+        # this line with the same cursor; only the compare-and-swap winner
+        # is allowed to call the model. A loser holding a stale token raises
+        # rather than answering. False (someone else already owns a different
+        # row, or this one is already answered) skips it and, when it is not
+        # yet answered, holds the watermark so the row is not walked past.
+        if not claim_answer(src_id):
+            if src_id not in state["answered_ids"]:
+                if floor_ts is None or item["ts"] < floor_ts:
+                    floor_ts = item["ts"]
+                note = "  %s left for the run that owns it" % src_id
+                print(note)
+                log(me, note)
             continue
 
         text, route = call_agent(cfg, prompt, args.max_tokens)

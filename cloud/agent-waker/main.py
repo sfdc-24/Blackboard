@@ -26,11 +26,18 @@ that decides whether a reply is sent twice.
   - IT REFUSES TO RUN WITHOUT ONE. A missing cursor would fall back to a
     six-hour look-back with an empty answered list, and re-answer everything
     the laptop answered in those six hours. Seeding it is a deliberate act.
-  - Each posted reply is written to the store AS IT LANDS, not only at the end.
-    A run killed between two replies must not leave the first one unrecorded,
-    or the next run posts it again.
-  - Saves are compare-and-swap. A second writer with a stale token is refused
-    and this run exits non-zero rather than merging.
+  - BEFORE the model is called, the row's answers id is written into the
+    cursor as `inflight`, compare-and-swap. Only the run whose write lands
+    may call the model. The other loses the swap and does not answer.
+  - A later run that finds `inflight` set, and that id not yet answered,
+    looks the reply up on the board by its deterministic Row_ID
+    (`<AGENT>-WAKE-<answers id>`, the id post_reply writes) before it does
+    anything else. Present: mark it answered and do not post again. Absent:
+    this run retries it. A kill between a confirmed append and the cursor
+    save is this case — the reply is on the board, so it is not posted twice.
+  - The answered id is still recorded when the post is confirmed. Saves are
+    compare-and-swap. A second writer with a stale token is refused and this
+    run exits non-zero rather than merging.
 
 ONE WRITER. From 2026-09-24 this job owns the gemini cursor. The laptop task
 SFDC24-GeminiWaker keeps its own file cursor and must STAY DISABLED: two
@@ -65,8 +72,27 @@ AGENT = (os.environ.get("AGENT") or "gemini").strip()
 CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 
 
-def run(argv=None, store=None, waker=None) -> int:
-    """Parameters are for tests: a fake store and a fake waker module."""
+def _board_has_row(row_id: str) -> bool:
+    """True when a row with this exact Row_ID is on the board.
+
+    `match` is a substring over the whole row, so a later note that merely
+    quotes the id is not a hit. The Row_ID column has to be that id.
+    """
+    import bus
+    env = bus.load_env()
+    obj = bus.read_rows(env, match=row_id, limit=20)
+    for row in obj.get("rows") or []:
+        if row and str(row[0]).strip() == row_id:
+            return True
+    return False
+
+
+def run(argv=None, store=None, waker=None, board_contains=None) -> int:
+    """Parameters are for tests: a fake store and a fake waker module.
+
+    board_contains(row_id) -> bool overrides the live board lookup. A test
+    waker may also set reply_on_board to the same effect.
+    """
     uri = (os.environ.get("BLACKBOARD_STATE_URI") or "").strip()
     if store is None:
         if not uri.startswith("gs://"):
@@ -90,25 +116,96 @@ def run(argv=None, store=None, waker=None) -> int:
         import agent_waker as waker  # noqa: F811
 
     box = {"state": {"watermark": state.get("watermark", ""),
-                     "answered_ids": list(state.get("answered_ids") or [])},
+                     "answered_ids": list(state.get("answered_ids") or []),
+                     "inflight": state.get("inflight") or ""},
            "token": token}
 
     def persist(new_state):
         box["token"] = store.save(CURSOR, new_state, box["token"])
         box["state"] = new_state
 
-    # Record each reply as it lands. The waker only saves at the end of a pass.
+    def reply_visible(answers_id: str) -> bool:
+        import agent_waker
+        rid = agent_waker.reply_row_id(AGENT, answers_id)
+        finder = board_contains
+        if finder is None:
+            finder = getattr(waker, "reply_on_board", None)
+        if finder is None:
+            finder = _board_has_row
+        return bool(finder(rid))
+
+    def resolve_inflight():
+        """A previous run owned this answers id and may already have posted.
+
+        The board is the record of a confirmed append. If the reply row is
+        there, mark the id answered and do not call the model. If it is not,
+        leave inflight set so claim_answer retries it, and only that retry.
+        """
+        inflight = box["state"].get("inflight") or ""
+        if not inflight:
+            return
+        answered = list(box["state"].get("answered_ids") or [])
+        if inflight in answered:
+            s = dict(box["state"])
+            s["inflight"] = ""
+            persist(s)
+            return
+        if reply_visible(inflight):
+            s = dict(box["state"])
+            ids = list(s.get("answered_ids") or [])
+            if inflight not in ids:
+                ids.append(inflight)
+            s["answered_ids"] = ids[-400:]
+            s["inflight"] = ""
+            persist(s)
+
+    resolve_inflight()
+
+    def claim_answer(answers_id: str) -> bool:
+        answered = list(box["state"].get("answered_ids") or [])
+        if answers_id in answered:
+            return False
+        current = box["state"].get("inflight") or ""
+        if current and current != answers_id:
+            return False
+        s = dict(box["state"])
+        s["inflight"] = answers_id
+        # Conflict propagates. The loser must not call the model.
+        persist(s)
+        return True
+
     original_post = waker.post_reply
+    original_call = getattr(waker, "call_agent", None)
+    had_claim = hasattr(waker, "claim_answer")
+    original_claim = getattr(waker, "claim_answer", None)
 
     def post_and_record(me, cfg, text, to, answers, verbose):
         ok = original_post(me, cfg, text, to, answers, verbose)
         if ok:
             s = dict(box["state"])
-            s["answered_ids"] = (list(s["answered_ids"]) + [answers])[-400:]
+            ids = list(s.get("answered_ids") or [])
+            if answers not in ids:
+                ids.append(answers)
+            s["answered_ids"] = ids[-400:]
+            if s.get("inflight") == answers:
+                s["inflight"] = ""
             persist(s)
         return ok
 
+    def call_agent(*args, **kwargs):
+        text, route = original_call(*args, **kwargs)
+        # A definite miss is not an unknown post: nothing was appended.
+        # Release the claim so the rest of this pass can own its own rows.
+        if not text and box["state"].get("inflight"):
+            s = dict(box["state"])
+            s["inflight"] = ""
+            persist(s)
+        return text, route
+
     waker.post_reply = post_and_record
+    waker.claim_answer = claim_answer
+    if original_call is not None:
+        waker.call_agent = call_agent
 
     workdir = tempfile.mkdtemp(prefix="gemini-waker-")
     os.environ["BLACKBOARD_STATE_DIR"] = workdir
@@ -120,9 +217,17 @@ def run(argv=None, store=None, waker=None) -> int:
         rc = waker.main(argv or ["--agent", AGENT, "--max", "3"])
     finally:
         waker.post_reply = original_post
+        if original_call is not None:
+            waker.call_agent = original_call
+        if had_claim:
+            waker.claim_answer = original_claim
+        elif hasattr(waker, "claim_answer"):
+            del waker.claim_answer
 
     # The pass's own view: its watermark, and answered_ids that already include
     # everything recorded above. Union, so nothing recorded mid-pass is dropped.
+    # inflight stays whatever the claims left: the file the waker rewrites does
+    # not know about a claim that outlived this pass.
     try:
         with open(path, encoding="utf-8") as fh:
             final = json.load(fh)
@@ -133,6 +238,7 @@ def run(argv=None, store=None, waker=None) -> int:
         if i not in ids:
             ids.append(i)
     final["answered_ids"] = ids[-400:]
+    final["inflight"] = box["state"].get("inflight") or ""
     if final != box["state"]:
         persist(final)
     print(json.dumps({"ran": True, "rc": rc, "watermark": final.get("watermark"),
