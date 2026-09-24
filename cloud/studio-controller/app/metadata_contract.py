@@ -111,13 +111,23 @@ def is_metadata_request(text: str) -> bool:
         text, re.I,
     ):
         return True
-    # A Salesforce mention is not itself an org target: a Salesforce-themed
-    # website/app or a lead form populated with Salesforce labels is still UI.
-    if re.search(r"\b(?:website|webpage|web page|page|app|application|prototype|mockup|form|screen)\b", text, re.I):
-        return False
-    return bool(re.search(
-        r"\bSalesforce\s+(?:(?:Lead|Account|Contact|Opportunity|custom|Text)\s+)*"
+    # A later branded noun in heading/copy instructions is only a reference.
+    # Require the action to directly govern the Salesforce component instead.
+    branded_target = re.search(
+        r"\b(?:plan|create|add|delete|remove|update|change|deploy)\s+"
+        r"(?:(?:a|an|the|new|existing)\s+)*Salesforce\s+"
+        r"(?:(?:Lead|Account|Contact|Opportunity|custom|Text)\s+)*"
         r"(?:fields?|objects?|metadata|schema)\b", text, re.I,
+    )
+    if not branded_target:
+        return False
+    # "Add a Salesforce field to our form" targets the prototype. Conversely,
+    # "Create a Salesforce object, then show it in the app" first targets the
+    # org: do not let a subsequent UI consequence hide that explicit operation.
+    primary_clause = re.split(r"\b(?:and|then)\b", text[branded_target.start():], maxsplit=1, flags=re.I)[0]
+    return not bool(re.search(
+        r"\b(?:website|webpage|web page|page|app|application|prototype|mockup|form|screen)\b",
+        primary_clause, re.I,
     ))
 
 

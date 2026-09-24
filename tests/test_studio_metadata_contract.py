@@ -148,6 +148,11 @@ class MetadataContractTests(unittest.TestCase):
             "Add an existing field from the Lead object to our contact form",
             "Delete a label and add a field from Salesforce to our contact form",
             "Remove a field from the Salesforce integration settings page",
+            "change the heading so it talks about Salesforce objects",
+            "Update the copy to describe Salesforce metadata",
+            "Add a footer that explains Salesforce fields",
+            "Change the content so it mentions Salesforce schema",
+            "Create a heading about Salesforce custom objects",
         )
         for i, text in enumerate(negatives):
             with self.subTest(text=text):
@@ -170,6 +175,8 @@ class MetadataContractTests(unittest.TestCase):
             "Create a custom field in Salesforce",
             "Create a field within our Salesforce org",
             "Create a Salesforce custom object named Project",
+            "Create a Salesforce custom object named Project and show it on the website form",
+            "Create a Salesforce custom object named Project, then add it to the app",
             "Update Salesforce metadata for the Lead object",
             "Add a Text field to the Salesforce Lead object",
             "Delete the field from our Salesforce org",
