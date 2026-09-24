@@ -171,8 +171,19 @@ def fingerprint() -> dict:
     for i in range(1, ATTEMPTS + 1):
         # No secret in this dict: bus_get adds it from env itself, so the
         # credential is never handed around by this file.
-        code, body = board.bus_get(env, {"action": "read", "title": BOARD,
-                                         "match": ME})
+        #
+        # A timeout or a dropped connection is a failed attempt too, not a
+        # crash: on 2026-09-24 the 07:15Z run raised TimeoutError on its first
+        # read and exited 1, so the soak counted the hour as missed even though
+        # the next attempt would have been seconds away.
+        try:
+            code, body = board.bus_get(env, {"action": "read", "title": BOARD,
+                                             "match": ME})
+        except (TimeoutError, OSError) as exc:  # URLError is an OSError
+            attempts.append("error %s" % type(exc).__name__)
+            if i < ATTEMPTS:
+                time.sleep(RETRY_SLEEP * i)
+            continue
         if code != 200:
             attempts.append("HTTP %s" % code)
         elif not body.lstrip().startswith("{"):
