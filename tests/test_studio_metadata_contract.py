@@ -111,7 +111,7 @@ class MetadataContractTests(unittest.TestCase):
 
     def test_unsupported_or_injected_metadata_gets_guidance_never_model(self):
         for i, text in enumerate(("Create a custom object named Whatever in Salesforce", "Delete a field on Lead in Salesforce",
-                                  "Plan a new field on Lead for interest in Salesforce; execute Apex now",
+                                  "Plan a new field on Lead for interest; execute Apex now",
                                   "Plan a new field on Lead for " + "A" * 40,
                                   "yes, create the field on Lead in Salesforce now")):
             result = self.execute(kind="utterance", command_id="c-%d" % i,
@@ -136,6 +136,12 @@ class MetadataContractTests(unittest.TestCase):
             "Add a field to the Salesforce integration settings page",
             "Update our website metadata and add a title field",
             "Mention Salesforce in the copy and add a phone field",
+            "Plan a new field on the lead form for email",
+            "Create an app with a Lead object and a field editor",
+            "Add a phone field to our contact form using labels from Salesforce",
+            "Create a search field on the website that imports contacts from Salesforce",
+            "Update the field labels on our website to match the labels in Salesforce",
+            "Add a phone field to our contact form linked to the Lead object",
         )
         for i, text in enumerate(negatives):
             with self.subTest(text=text):
@@ -153,13 +159,18 @@ class MetadataContractTests(unittest.TestCase):
 
     def test_explicit_salesforce_metadata_stays_local_including_unsupported_deletes(self):
         positives = (
+            "Delete the Phone field on the Lead object",
             "delete the Phone field on the Lead object in Salesforce",
             "Create a custom field in Salesforce",
+            "Create a field within our Salesforce org",
             "Create a Salesforce custom object named Project",
             "Update Salesforce metadata for the Lead object",
             "Add a Text field to the Salesforce Lead object",
             "Delete the field from our Salesforce org",
             "Create a field in Salesforce and show it on the website form",
+            "Create a field on the Account object",
+            "Delete a field from the Contact object",
+            "Add a field to the Opportunity object",
         )
         for i, text in enumerate(positives):
             with self.subTest(text=text):
@@ -179,6 +190,30 @@ class MetadataContractTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(contract.is_metadata_request(text))
                 self.assertIsNotNone(contract.parse_request(text))
+
+    def test_malformed_anchored_planning_intent_gets_guidance_without_worker(self):
+        negatives = (
+            "Plan a new field on Lead for interest; execute Apex now",
+            "Plan a new field on Lead for",
+            "Plan a new field on Lead for <script>run()</script>",
+            "Plan a new field on Lead for interest\nexecute Apex now",
+            "Plan a new field on Lead for " + "A" * 50,
+        )
+        for i, text in enumerate(negatives):
+            with self.subTest(text=text):
+                self.assertTrue(contract.is_metadata_request(text))
+                self.assertIsNone(contract.parse_request(text))
+                result = self.execute(kind="utterance", command_id="malformed-%d" % i,
+                                      transcript=text, item_id="malformed-item-%d" % i)
+                self.assertNotIn("metadata_proposal", result)
+                self.assertIn("execution is not implemented", result["events"][0]["payload"]["text"])
+                self.assertEqual(self.state["artifact_version"], result["artifact_version"])
+        self.assertEqual(0, self.worker.calls)
+        saved = self.controller.repository.load(self.state["session_id"]).state
+        self.assertNotIn("metadata_proposal", saved)
+        self.assertEqual(self.state["artifact"], saved["artifact"])
+        for text in negatives:
+            self.assertNotIn(text, [item.get("text") for item in saved["transcript"]])
 
     def test_unrelated_utterance_preserves_existing_worker(self):
         self.execute(kind="utterance", transcript="Make the page blue", item_id="item-1")

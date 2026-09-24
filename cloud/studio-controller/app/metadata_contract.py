@@ -16,10 +16,11 @@ ORG_RE = re.compile(r"00D[A-Za-z0-9]{15}")
 STEM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
 HASH_RE = re.compile(r"[a-f0-9]{64}")
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,80}")
-PLAN_REQUEST_RE = re.compile(
-    r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?",
-    re.IGNORECASE,
-)
+PLAN_PREFIX = r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for\b"
+PLAN_INTENT_RE = re.compile(PLAN_PREFIX, re.IGNORECASE)
+PLAN_REQUEST_RE = re.compile(PLAN_PREFIX + r" ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?", re.IGNORECASE)
+COMPONENT = r"\b(?:fields?|objects?|metadata|schema)(?:\s+(?:named|called)\s+[A-Za-z][A-Za-z0-9_]*)?"
+STANDARD_OBJECT = r"(?:Lead|Account|Contact|Opportunity|Case|Campaign|Task|Event|User)"
 FIELD_KEYS = {"parent", "name", "label", "type", "length", "required", "unique", "external_id"}
 CONFIRM_KEYS = {"plan_id", "plan_revision", "plan_hash", "confirmation_nonce"}
 NOTICE = (
@@ -70,18 +71,30 @@ def parse_request(text: str) -> dict | None:
 
 def is_metadata_request(text: str) -> bool:
     # "lead" and "custom field" also describe ordinary prototype form inputs.
-    # Only the supported anchored grammar implies Salesforce without naming it.
-    if PLAN_REQUEST_RE.fullmatch(text.strip()):
+    # Recognize the anchored intent even if its label/suffix is malformed. Only
+    # parse_request's fullmatch can create a proposal; the rest gets guidance.
+    if PLAN_INTENT_RE.match(text.strip()):
         return True
     if not (re.search(r"\b(?:plan|create|add|delete|update|change|deploy)\b", text, re.I)
-            and re.search(r"\b(?:fields?|objects?|metadata)\b", text, re.I)
-            and re.search(r"\bSalesforce\b(?!-)", text, re.I)):
+            and re.search(r"\b(?:fields?|objects?|metadata)\b", text, re.I)):
         return False
-    # Explicit org-directed operations stay local even if they also mention UI
-    # consequences. Unsupported/deleting operations get guidance, never consent.
+    # A prepositional standard-object target is explicit without the vendor
+    # name; "lead form" or "lead field" still does not imply an org operation.
     if re.search(
-        r"\b(?:in|within|from)\s+(?:(?:the|my|our)\s+)?Salesforce\b(?!-)"
-        r"|\b(?:on|to)\s+(?:(?:the|my|our)\s+)?Salesforce\s+"
+        COMPONENT + r"\s+(?:on|to|from|in|within)\s+(?:(?:the|my|our)\s+)?"
+        + STANDARD_OBJECT + r"\s+object\b",
+        text, re.I,
+    ):
+        return True
+    if not re.search(r"\bSalesforce\b(?!-)", text, re.I):
+        return False
+    # Bind the destination to the component noun, not a later reference/source
+    # clause such as "form using labels from Salesforce". Explicit operations
+    # stay local even if they also mention UI consequences.
+    if re.search(
+        COMPONENT + r"(?:\s+on\s+(?:the\s+)?" + STANDARD_OBJECT + r"(?:\s+object)?)?"
+        r"\s+(?:in|within|from)\s+(?:(?:the|my|our)\s+)?Salesforce\b(?!-)"
+        r"|" + COMPONENT + r"\s+(?:on|to)\s+(?:(?:the|my|our)\s+)?Salesforce\s+"
         r"(?:(?:Lead|Account|Contact|Opportunity|custom)\s+)?(?:object|org|schema|metadata)\b",
         text, re.I,
     ):
