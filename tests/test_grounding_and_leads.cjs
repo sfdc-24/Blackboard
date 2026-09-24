@@ -284,3 +284,18 @@ test('both providers get the first-tier admin reference and the numbers rule', (
   }
 });
 
+// Codex review of #215 (P2): Einstein Activity Capture's storage depends on
+// configuration. With "Sync Email as Salesforce Activity" matched email is
+// stored as EmailMessage + Task (current Salesforce help); only setups without
+// it keep email outside standard activities. Never assert one mode as the rule.
+test('Einstein Activity Capture is described by configuration, never as one fixed limitation', () => {
+  const { ctx } = load();
+  for (const who of ['claude', 'codex']) {
+    const prompt = ctx.SYSTEM_PROMPT_(who);
+    assert.match(prompt, /Sync Email as Salesforce Activity turned on, matched emails are stored as standard email and task records/, who);
+    assert.match(prompt, /setups without that setting keep captured email outside the standard activity records/, who);
+    assert.match(prompt, /Never assume which one a visitor has/, who);
+    assert.doesNotMatch(prompt, /what it captures is not stored as standard activity records/, who);
+  }
+});
+
