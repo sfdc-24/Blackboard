@@ -34,7 +34,10 @@ var CHAT_MODEL_DEFAULT = 'claude-sonnet-4-5';
 // The site only needs a short, focused second opinion here. Luna keeps that
 // route fast and inexpensive; the property makes a model change operational
 // rather than a source edit.
-var CODEX_MODEL_DEFAULT = 'gpt-6-luna';
+// gpt-6-luna returned HTTP 403 on every call (Codex diagnosis, 2026-09-24): this
+// project's key has no access to it. A read-only model listing the same night
+// showed gpt-5.6-luna available. CODEX_MODEL, when set, still overrides this.
+var CODEX_MODEL_DEFAULT = 'gpt-5.6-luna';
 var CHAT_MAX_INPUT     = 1000;   // chars per visitor message
 var CHAT_MAX_TURNS     = 12;     // history sent to the model
 var CHAT_SESSION_CAP   = 12;     // AI replies per browser session
