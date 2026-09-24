@@ -835,8 +835,15 @@ function chatLeadFields_(text, history) {
 // response was lost is UNKNOWN, not unsent - retrying it can create a second
 // Lead. And a cache that expires is not a durable "already sent". So each day's
 // record lives in one Script Property, LEAD_DAY_<yyyyMMdd> = {n, keys: {key:
-// state}}, bounded by the daily cap, and today's and yesterday's are both
-// checked (a conversation lives six hours, so it can span midnight):
+// state}}, bounded by the daily cap.
+//
+// Second re-review (CODEX-PR195-REREVIEW2-20260924T0518Z): a signed
+// conversation token is accepted for 14 days (Auth.js), so a conversation can
+// return long after its first lead. Every day record inside that window is
+// checked, and records older than it are deleted, so storage stays bounded
+// (at most 15 days x the daily cap). The v57-v60 state is carried forward, not
+// reset: the old LEAD_COUNT_<day> counter still counts against today's cap,
+// and an old lead_<sid> cache entry still counts as a receipt.
 //   2xx/3xx -> "sent"   4xx -> released (the server said no; the next email retries)
 //   5xx, a thrown fetch -> "unknown": never retried automatically; logged for a person.
 var LEAD_DAILY_DEFAULT = 25;
@@ -849,6 +856,8 @@ function leadDailyCap_(props) {
 function leadDayKey_(ms) {
   return 'LEAD_DAY_' + Utilities.formatDate(new Date(ms), 'UTC', 'yyyyMMdd');
 }
+
+var LEAD_WINDOW_DAYS = 15;  // the 14-day conversation token, plus the day it started
 
 function leadDayRead_(props, key) {
   try {
@@ -863,19 +872,32 @@ function captureChatLead_(sid, text, history, props) {
   var fields = chatLeadFields_(text, history);
   if (!fields) return false;
   var now = Date.now();
-  var todayKey = leadDayKey_(now), yesterdayKey = leadDayKey_(now - 86400000);
+  var todayKey = leadDayKey_(now);
+  var windowKeys = {};
+  for (var d = 0; d < LEAD_WINDOW_DAYS; d++) windowKeys[leadDayKey_(now - d * 86400000)] = true;
+  var cache = CacheService.getScriptCache();
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   var today;
   try {
+    var all = props.getProperties() || {};
+    var seenBefore = false;
+    Object.keys(all).forEach(function (k) {
+      if (k.indexOf('LEAD_DAY_') !== 0) return;
+      if (!windowKeys[k]) { props.deleteProperty(k); return; }   // outside the token window
+      if (leadDayRead_(props, k).keys[sid]) seenBefore = true;
+    });
+    // v57-v60 receipts: the cache entry a sent or pending lead left behind.
+    if (cache.get('lead_' + sid)) seenBefore = true;
+    if (seenBefore) return false;                                  // sent, pending or unknown
     today = leadDayRead_(props, todayKey);
-    var yesterday = leadDayRead_(props, yesterdayKey);
-    if (today.keys[sid] || yesterday.keys[sid]) return false;   // sent, pending or unknown
-    if (today.n >= leadDailyCap_(props)) {
+    // v57-v60 admission: that version's LEAD_COUNT counter still counts today.
+    var legacy = parseInt(all['LEAD_COUNT_' + todayKey.slice('LEAD_DAY_'.length)] || '0', 10) || 0;
+    if (Math.max(today.n, legacy) >= leadDailyCap_(props)) {
       logVisitor_(sid, 'lead', 'daily lead cap reached; not forwarded');
       return false;
     }
-    today.n += 1;
+    today.n = Math.max(today.n, legacy) + 1;
     today.keys[sid] = 'pending';
     props.setProperty(todayKey, JSON.stringify(today));
   } finally { lock.releaseLock(); }

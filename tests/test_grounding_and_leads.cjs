@@ -29,6 +29,8 @@ function load(props = {}, { status = 200 } = {}) {
     PropertiesService: { getScriptProperties: () => ({
       getProperty: k => (k in store ? store[k] : null),
       setProperty: (k, v) => { store[k] = String(v); },
+      getProperties: () => Object.assign({}, store),
+      deleteProperty: k => { delete store[k]; },
     }) },
     CacheService: { getScriptCache: () => ({
       get: k => (cache.has(k) ? cache.get(k) : null), put: (k, v) => cache.set(k, String(v)),
@@ -47,7 +49,7 @@ function load(props = {}, { status = 200 } = {}) {
   vm.createContext(ctx);
   vm.runInContext(CODE, ctx);
   ctx.logVisitor_ = () => {};
-  return { ctx, posts };
+  return { ctx, posts, store, cache };
 }
 
 test('the reference is generated, non-empty, and names the objects it covers', () => {
@@ -195,6 +197,40 @@ test('once per conversation survives losing the cache - the record is durable', 
   ctx.CacheService = { getScriptCache: () => ({ get: () => null, put() {}, remove() {} }) };
   ctx.captureChatLead_('ca_1', 'a@b.co', [], props);
   assert.equal(posts.length, 1);
+});
+
+// Second re-review of PR 195: a conversation token lives 14 days, and v57-v60
+// left their own counters and receipts behind.
+const dayKey = (daysAgo) => 'LEAD_DAY_' + new Date(Date.now() - daysAgo * 86400000)
+  .toISOString().slice(0, 10).replace(/-/g, '');
+
+test('a conversation that returns ten days later does not send a second lead', () => {
+  const { ctx, posts } = load({ [dayKey(10)]: JSON.stringify({ n: 1, keys: { ca_1: 'sent' } }) });
+  assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], ctx.PropertiesService.getScriptProperties()), false);
+  assert.equal(posts.length, 0);
+});
+
+test('an unknown outcome from days ago is still never retried', () => {
+  const { ctx, posts } = load({ [dayKey(6)]: JSON.stringify({ n: 1, keys: { ca_1: 'unknown' } }) });
+  ctx.captureChatLead_('ca_1', 'a@b.co', [], ctx.PropertiesService.getScriptProperties());
+  assert.equal(posts.length, 0);
+});
+
+test('records older than the token window are deleted, so storage stays bounded', () => {
+  const { ctx, store } = load({ [dayKey(20)]: JSON.stringify({ n: 3, keys: { old: 'sent' } }) });
+  ctx.captureChatLead_('ca_9', 'z@y.co', [], ctx.PropertiesService.getScriptProperties());
+  assert.equal(dayKey(20) in store, false);
+});
+
+test('the v57-v60 counter and cache receipt carry forward', () => {
+  const today = dayKey(0).slice('LEAD_DAY_'.length);
+  const capped = load({ ['LEAD_COUNT_' + today]: '25' });
+  assert.equal(capped.ctx.captureChatLead_('ca_1', 'a@b.co', [], capped.ctx.PropertiesService.getScriptProperties()), false);
+  assert.equal(capped.posts.length, 0, 'the old counter still counts against today');
+  const receipt = load();
+  receipt.cache.set('lead_ca_2', 'sent');
+  assert.equal(receipt.ctx.captureChatLead_('ca_2', 'a@b.co', [], receipt.ctx.PropertiesService.getScriptProperties()), false);
+  assert.equal(receipt.posts.length, 0, 'the old cache receipt still counts as sent');
 });
 
 // P2: the reference omits system and audit fields on purpose, so the prompt
