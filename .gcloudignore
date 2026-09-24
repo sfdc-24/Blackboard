@@ -19,7 +19,6 @@
 /cloud/*
 !/cloud/board-probe
 !/cloud/waker-shadow
-!/cloud/ack-once
 !/cloud/wa-outbox
 !/cloud/board-watcher
 !/cloud/agent-waker
