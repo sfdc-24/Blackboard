@@ -53,6 +53,7 @@ class FakeGcs:
 
     def __init__(self):
         self.objects = {}        # name -> (generation:int, body:bytes)
+        self.versions = {}       # (name, generation:int) -> immutable body
         self.next_generation = 1000
         self.calls = []
 
@@ -76,6 +77,7 @@ class FakeGcs:
                                              {}, None)
             self.next_generation += 1
             self.objects[name] = (self.next_generation, body)
+            self.versions[(name, self.next_generation)] = body
             return 200, json.dumps({"generation": str(self.next_generation)
                                     }).encode()
 
@@ -85,7 +87,11 @@ class FakeGcs:
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
         generation, stored = self.objects[obj]
         if q.get("alt") == ["media"]:
-            return 200, stored
+            requested = int(q.get("generation", [generation])[0])
+            version = self.versions.get((obj, requested))
+            if version is None:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return 200, version
         return 200, json.dumps({"generation": str(generation)}).encode()
 
 
@@ -118,6 +124,37 @@ class TheGcsBackendRoundTrips(unittest.TestCase):
         state, _ = self.store.load("board_waker")
         self.assertEqual(state["watermark"], TS_NEWER)
 
+    def test_body_is_bound_to_the_metadata_generation_during_a_race(self):
+        self.store.save("admission", {"count": 18}, None)
+        original = self.fake.request
+        injected = {"done": False}
+
+        def racing_request(url, method="GET", body=None, ctype=None):
+            import urllib.parse
+            result = original(url, method=method, body=body, ctype=ctype)
+            parsed = urllib.parse.urlparse(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            if method == "GET" and "alt" not in query and not injected["done"]:
+                injected["done"] = True
+                name = urllib.parse.unquote(parsed.path.rsplit("/o/", 1)[-1])
+                generation = self.fake.objects[name][0]
+                upload = (
+                    "https://storage.googleapis.com/upload/storage/v1/b/fake/o"
+                    "?uploadType=media&name=%s&ifGenerationMatch=%s"
+                    % (urllib.parse.quote(name, safe=""), generation)
+                )
+                original(upload, method="POST", body=b'{"count": 19}', ctype="application/json")
+            return result
+
+        self.store._request = racing_request  # noqa: SLF001 - deterministic race seam
+        state, stale_token = self.store.load("admission")
+        self.assertEqual(18, state["count"])
+        with self.assertRaises(Conflict):
+            self.store.save("admission", {"count": 19}, stale_token)
+        self.store._request = original  # noqa: SLF001
+        current, _ = self.store.load("admission")
+        self.assertEqual(19, current["count"])
+
     def test_the_object_name_is_namespaced_by_prefix(self):
         self.store.save("board_waker", {"a": 1}, None)
         self.assertIn("wakers/board_waker.json", self.fake.objects)
@@ -131,7 +168,7 @@ class TheGcsBackendRoundTrips(unittest.TestCase):
         is checked.
         """
         for hostile in ("../../etc/passwd", "/absolute", "a/b/c",
-                        "..\..\windows", "wakers/../secrets"):
+                        r"..\..\windows", "wakers/../secrets"):
             with self.subTest(name=hostile):
                 self.fake.objects.clear()
                 self.store.save(hostile, {"a": 1}, None)
