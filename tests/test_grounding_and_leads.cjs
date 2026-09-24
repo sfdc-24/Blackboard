@@ -38,10 +38,11 @@ function load(props = {}, { status = 200 } = {}) {
     UrlFetchApp: { fetch: (url, opts) => {
       posts.push({ url, opts });
       const code = typeof status === 'function' ? status(posts.length) : status;
+      if (code === 'throw') throw new Error('socket hang up');
       return { getResponseCode: () => code };
     } },
     ContentService: {}, HtmlService: {}, SpreadsheetApp: {}, Session: {},
-    Utilities: { formatDate: () => '20260924' },
+    Utilities: { formatDate: (d) => d.toISOString().slice(0, 10).replace(/-/g, '') },
   };
   vm.createContext(ctx);
   vm.runInContext(CODE, ctx);
@@ -166,15 +167,34 @@ test('the daily cap is a Script Property', () => {
   assert.equal(posts.length, 3);
 });
 
-// P3: the conversation was marked before the post and never released, so a
-// failed post could not be retried.
-test('a failed post is released so the next email retries; a sent one is not resent', () => {
-  const { ctx, posts } = load({}, { status: (n) => (n === 1 ? 503 : 200) });
+// P3 and the re-review's P2: a refused post may retry, but an UNKNOWN outcome
+// (5xx, or a lost response) is never retried - the Lead may already exist.
+test('a 4xx is released so the next email retries; a sent one is not resent', () => {
+  const { ctx, posts } = load({}, { status: (n) => (n === 1 ? 400 : 200) });
   const props = ctx.PropertiesService.getScriptProperties();
   assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
   assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), true);
   assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
   assert.equal(posts.length, 2);
+});
+
+test('an unknown outcome is never retried automatically', () => {
+  for (const status of [503, 'throw']) {
+    const { ctx, posts } = load({}, { status });
+    const props = ctx.PropertiesService.getScriptProperties();
+    assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
+    assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
+    assert.equal(posts.length, 1, String(status));
+  }
+});
+
+test('once per conversation survives losing the cache - the record is durable', () => {
+  const { ctx, posts } = load();
+  const props = ctx.PropertiesService.getScriptProperties();
+  ctx.captureChatLead_('ca_1', 'a@b.co', [], props);
+  ctx.CacheService = { getScriptCache: () => ({ get: () => null, put() {}, remove() {} }) };
+  ctx.captureChatLead_('ca_1', 'a@b.co', [], props);
+  assert.equal(posts.length, 1);
 });
 
 // P2: the reference omits system and audit fields on purpose, so the prompt
@@ -185,4 +205,9 @@ test('the grounding rule never lets an omitted system field read as absent', () 
   assert.match(prompt, /OwnerId/);
   assert.match(prompt, /never deny one/i);
   assert.doesNotMatch(prompt, /its list of standard fields is complete/);
+  // Re-review P2: one org's configuration is not Salesforce's defaults, and an
+  // unlisted field is unknown, not absent.
+  assert.doesNotMatch(prompt, /delivered/);
+  assert.doesNotMatch(prompt, /is not a standard field/);
+  assert.match(prompt, /cannot confirm it from here - never that it does not exist/);
 });
