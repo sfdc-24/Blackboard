@@ -233,6 +233,23 @@ test('the v57-v60 counter and cache receipt carry forward', () => {
   assert.equal(receipt.posts.length, 0, 'the old cache receipt still counts as sent');
 });
 
+// Third re-review of PR 195 (P2): the old cache receipt expires in 6 hours, the
+// token lives 14 days. A hit must become durable before the cache forgets it.
+test('an old cache receipt survives its own expiry: hit, cache expires, same token, no second lead', () => {
+  for (const legacy of ['sent', 'pending']) {
+    const { ctx, posts, cache, store } = load();
+    const props = ctx.PropertiesService.getScriptProperties();
+    cache.set('lead_ca_3', legacy);
+    assert.equal(ctx.captureChatLead_('ca_3', 'a@b.co', [], props), false);
+    cache.clear();                                            // 6h5m later
+    assert.equal(ctx.captureChatLead_('ca_3', 'a@b.co', [], props), false, legacy);
+    assert.equal(posts.length, 0, legacy + ': the same conversation never posts again');
+    const day = JSON.parse(store[dayKey(0)]);
+    assert.equal(day.keys.ca_3, legacy === 'sent' ? 'sent' : 'unknown');
+    assert.equal(day.n, 0, 'promoting a receipt takes no reservation');
+  }
+});
+
 // P2: the reference omits system and audit fields on purpose, so the prompt
 // must not call its list complete for those.
 test('the grounding rule never lets an omitted system field read as absent', () => {

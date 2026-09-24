@@ -887,9 +887,19 @@ function captureChatLead_(sid, text, history, props) {
       if (!windowKeys[k]) { props.deleteProperty(k); return; }   // outside the token window
       if (leadDayRead_(props, k).keys[sid]) seenBefore = true;
     });
-    // v57-v60 receipts: the cache entry a sent or pending lead left behind.
-    if (cache.get('lead_' + sid)) seenBefore = true;
     if (seenBefore) return false;                                  // sent, pending or unknown
+    // v57-v60 receipts: the cache entry a sent or pending lead left behind.
+    // It expires in 6 hours but the token lives 14 days, so it is promoted to
+    // a durable record now (third re-review, P2). No reservation is taken: n is
+    // unchanged. A legacy "pending" has no one left to resolve it, so it is
+    // kept as "unknown" - never retried.
+    var legacyReceipt = cache.get('lead_' + sid);
+    if (legacyReceipt) {
+      var promoted = leadDayRead_(props, todayKey);
+      promoted.keys[sid] = legacyReceipt === 'sent' ? 'sent' : 'unknown';
+      props.setProperty(todayKey, JSON.stringify(promoted));
+      return false;
+    }
     today = leadDayRead_(props, todayKey);
     // v57-v60 admission: that version's LEAD_COUNT counter still counts today.
     var legacy = parseInt(all['LEAD_COUNT_' + todayKey.slice('LEAD_DAY_'.length)] || '0', 10) || 0;
