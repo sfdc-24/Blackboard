@@ -1,0 +1,15 @@
+# Build the waker shadow with the REPO ROOT as context, so scripts/board_waker.py
+# is the one and only copy of the decision logic. See the Dockerfile for why a
+# second copy would make this shadow worthless.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/waker-shadow:v1
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, '${_IMAGE}', -f, cloud/waker-shadow/Dockerfile, .]
+
+images:
+  - '${_IMAGE}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
