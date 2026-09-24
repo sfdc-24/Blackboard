@@ -46,6 +46,8 @@ class FakeClient:
 
 
 def run(draft=None, questions=(), **fake):
+    if draft is not None and "resolves" not in draft:
+        draft = dict(draft, resolves={"question_id": "", "option_id": "", "freeform_answer": ""})
     client = FakeClient(draft, **fake)
     w = cw.ClaudeWorker(client=client)
     state = {"artifact": ROOT, "questions": list(questions), "transcript": [], "session_id": "s1", "turn_seq": 3}
@@ -134,6 +136,46 @@ class Gate(unittest.TestCase):
         # The API rejects recursive schemas; a nested node tree must never creep back in.
         self.assertNotIn("children", json.dumps(cw.OUTPUT_SCHEMA))
         self.assertNotIn("$ref", json.dumps(cw.OUTPUT_SCHEMA))
+
+
+OPEN_Q = dict(q(), status="open")
+NOTHING = {"ops": [], "confirm": "", "questions": [], "batch_title": ""}
+
+
+class Resolves(unittest.TestCase):
+    """A spoken answer: the worker names which open question it resolves; the
+    controller owns the record and emits question.answered."""
+
+    def res(self, r, questions=(OPEN_Q,)):
+        out, _ = run(dict(NOTHING, resolves=r), questions=questions)
+        return out
+
+    def test_a_clear_spoken_choice_resolves_to_that_option(self):
+        out = self.res({"question_id": "q-cta", "option_id": "book", "freeform_answer": ""})
+        self.assertEqual(out["resolves"], {"question_id": "q-cta", "option_id": "book"})
+
+    def test_their_own_words_resolve_as_freeform(self):
+        out = self.res({"question_id": "q-cta", "option_id": "", "freeform_answer": "Call us, straight to my cell"})
+        self.assertEqual(out["resolves"]["freeform_answer"], "Call us, straight to my cell")
+
+    def test_an_option_the_question_does_not_have_is_refused(self):
+        out = self.res({"question_id": "q-cta", "option_id": "teleport", "freeform_answer": ""})
+        self.assertIsNone(out["resolves"])
+        self.assertTrue(any("unknown option" in p for p in out["problems"]))
+
+    def test_only_an_open_question_can_be_resolved(self):
+        answered = dict(q(), status="answered", selected_option="book")
+        out = self.res({"question_id": "q-cta", "option_id": "book", "freeform_answer": ""}, questions=(answered,))
+        self.assertIsNone(out["resolves"])
+
+    def test_nothing_answered_means_no_resolution(self):
+        out = self.res({"question_id": "", "option_id": "", "freeform_answer": ""})
+        self.assertIsNone(out["resolves"])
+        self.assertEqual(out["problems"], [])
+
+    def test_a_resolution_with_no_answer_is_refused(self):
+        out = self.res({"question_id": "q-cta", "option_id": "", "freeform_answer": "  "})
+        self.assertIsNone(out["resolves"])
 
 
 if __name__ == "__main__":

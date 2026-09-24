@@ -89,8 +89,13 @@ OUTPUT_SCHEMA = {
         "confirm": {"type": "string"},
         "questions": {"type": "array", "items": _QUESTION},
         "batch_title": {"type": "string"},
+        "resolves": {"type": "object", "properties": {
+            "question_id": {"type": "string"},
+            "option_id": {"type": "string"},
+            "freeform_answer": {"type": "string"},
+        }, "required": ["question_id", "option_id", "freeform_answer"], "additionalProperties": False},
     },
-    "required": ["ops", "confirm", "questions", "batch_title"],
+    "required": ["ops", "confirm", "questions", "batch_title", "resolves"],
     "additionalProperties": False,
 }
 
@@ -110,6 +115,11 @@ opens Y."). Empty string if nothing changed.
 visibly change the prototype. Use two or three only when they are independent quick decisions a \
 visitor can answer together; then set batch_title to a short heading for the form. Zero when \
 nothing material is left.
+
+- resolves: when the latest input is the visitor answering an OPEN question - in their own \
+words, often spoken - set question_id to it, and option_id to the option they clearly chose, or \
+leave option_id "" and put their answer in freeform_answer when it matches no option. If the input \
+answers nothing open, all three are "". Never guess an option they did not choose.
 
 Each question: scope_path says where it fits ("Homepage > Hero > Primary action"); reason is one \
 sentence on why it matters now; 2 or 3 concrete options, each with a consequence the visitor \
@@ -138,7 +148,8 @@ def _txt(s):
     return isinstance(s, str) and len(s) <= TEXT_MAX
 
 
-def validate(draft: dict, artifact_root: dict, answered_ids: set) -> tuple[dict | None, list]:
+def validate(draft: dict, artifact_root: dict, answered_ids: set,
+             open_questions: list | None = None) -> tuple[dict | None, list]:
     """Semantic checks the schema cannot express. Returns (clean_draft, problems)."""
     problems = []
     nodes = _flatten(artifact_root, {})
@@ -206,11 +217,35 @@ def validate(draft: dict, artifact_root: dict, answered_ids: set) -> tuple[dict 
                           "reason": q["reason"], "prompt": q["prompt"], "options": clean_opts,
                           "status": "open", "affected_artifact_ids": aff})
 
+    resolves = None
+    r = draft.get("resolves") or {}
+    rqid = (r.get("question_id") or "").strip()
+    if rqid:
+        open_q = {q["question_id"]: q for q in (open_questions or [])}
+        q = open_q.get(rqid)
+        opt = (r.get("option_id") or "").strip()
+        free = (r.get("freeform_answer") or "").strip()
+        if q is None:
+            problems.append("resolves %r, which is not an open question" % rqid)
+        elif opt and opt not in {o["option_id"] for o in q.get("options") or []}:
+            problems.append("resolves %r with unknown option %r" % (rqid, opt))
+        elif not opt and not free:
+            problems.append("resolves %r with no answer" % rqid)
+        elif not _txt(free):
+            problems.append("resolves %r answer too long" % rqid)
+        else:
+            resolves = {"question_id": rqid}
+            if opt:
+                resolves["option_id"] = opt
+            else:
+                resolves["freeform_answer"] = free
+
     confirm = draft.get("confirm") or ""
     if not _txt(confirm):
         problems.append("confirm too long"); confirm = ""
     return {"ops": ops_out, "confirm": confirm, "questions": questions,
-            "batch_title": (draft.get("batch_title") or "")[:TEXT_MAX]}, problems
+            "batch_title": (draft.get("batch_title") or "")[:TEXT_MAX],
+            "resolves": resolves}, problems
 
 
 def apply_ops(root: dict, ops: list) -> dict:
@@ -282,6 +317,9 @@ class ClaudeWorker:
               "transcript": [{"role", "text"}], "session_id": str, "turn_seq": int}
     trigger: {"kind": "utterance", "text"} | {"kind": "answer", "question_id",
               "option_id" | "freeform_answer"} | {"kind": "answer_batch", "answers": [...]}
+    returns: {"events", "problems", "resolves": None | {"question_id",
+              "option_id" | "freeform_answer"}} - resolves is set when an utterance
+              answered an open question; the controller then emits question.answered.
     """
 
     def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT):
@@ -312,6 +350,10 @@ class ClaudeWorker:
             return {"events": [], "problems": ["model output was not JSON"]}
         answered = {q["question_id"] for q in state.get("questions") or []
                     if q.get("status") in ("answered", "superseded")}
-        clean, problems = validate(draft, state["artifact"], answered)
+        open_qs = [q for q in state.get("questions") or [] if q.get("status") == "open"]
+        clean, problems = validate(draft, state["artifact"], answered, open_qs)
         batch_id = "b-%s-%s" % (state.get("session_id", "s"), state.get("turn_seq", 0))
-        return {"events": to_drafts(clean, batch_id), "problems": problems}
+        # `resolves` is for the controller: it owns the question record, so it
+        # composes question.answered (answer_source "voice" for an utterance).
+        return {"events": to_drafts(clean, batch_id), "problems": problems,
+                "resolves": clean["resolves"]}
