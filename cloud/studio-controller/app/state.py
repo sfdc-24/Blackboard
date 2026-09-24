@@ -16,6 +16,10 @@ class StateConflict(RuntimeError):
     pass
 
 
+class VoiceCapacityExceeded(RuntimeError):
+    pass
+
+
 class SessionNotFound(KeyError):
     pass
 
@@ -81,6 +85,39 @@ class StudioRepository:
             except Conflict:
                 continue
         raise StateConflict("admission is busy; try again")
+
+    def reserve_voice_open(self, limit: int, reservation_id: str) -> int:
+        """Durably reserve one provider open attempt for the current UTC day.
+
+        A reservation is never refunded: once this returns, the caller is
+        authorized to make at most one outbound provider POST for that ID.
+        Persisting before network contact makes crashes fail toward a consumed
+        slot instead of allowing an unbounded retry.
+        """
+        day = dt.datetime.fromtimestamp(self.clock(), tz=dt.timezone.utc).strftime("%Y%m%d")
+        name = "studio_voice_open_" + day
+        for _ in range(self.attempts):
+            state, token = self.store.load(name)
+            count = int(state.get("count") or 0)
+            reservations = dict(state.get("reservations") or {})
+            if reservation_id in reservations:
+                return int(reservations[reservation_id])
+            if count >= limit:
+                raise VoiceCapacityExceeded("daily voice open capacity reached")
+            number = count + 1
+            reservations[reservation_id] = number
+            candidate = {
+                "day": day,
+                "count": number,
+                "reservations": reservations,
+                "updated_at": int(self.clock()),
+            }
+            try:
+                self.store.save(name, candidate, token)
+                return number
+            except Conflict:
+                continue
+        raise StateConflict("voice admission is busy; try again")
 
     def register_voice(self, session_id: str, ends_at: int) -> None:
         """Put one active/opening call in the bounded sweep index."""

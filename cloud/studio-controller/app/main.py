@@ -24,7 +24,12 @@ except ImportError:
 from .core import CommandError, StudioController
 from .auth import AuthService
 from .settings import Settings
-from .state import SessionNotFound, StateConflict, StudioRepository
+from .state import (
+    SessionNotFound,
+    StateConflict,
+    StudioRepository,
+    VoiceCapacityExceeded,
+)
 from .tokens import InvalidToken, mint_token, verify_token
 from .workers.synthetic import SyntheticWorker
 
@@ -135,6 +140,19 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except (StateConflict, SessionNotFound):
             return False
         return True
+
+    async def release_unopened_voice(session_id: str, voice_id: str) -> bool:
+        """Remove a reservation only while no provider POST can have occurred."""
+        clean = True
+        try:
+            await asyncio.to_thread(controller.fail_voice, session_id, voice_id)
+        except (SessionNotFound, StateConflict):
+            clean = False
+        try:
+            await asyncio.to_thread(repository.unregister_voice, session_id)
+        except StateConflict:
+            clean = False
+        return clean
 
     async def sweep_due_calls() -> dict:
         summary = {
@@ -491,8 +509,35 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
         if state["expires_at"] <= now or state.get("stopped"):
+            await release_unopened_voice(session_id, voice_id)
             raise HTTPException(410, "session is no longer active")
-        subject = state.get("operator_subject") or session_id
+        try:
+            await asyncio.to_thread(
+                repository.reserve_voice_open, settings.voice_mint_cap, voice_id
+            )
+        except VoiceCapacityExceeded as exc:
+            clean = await release_unopened_voice(session_id, voice_id)
+            if not clean:
+                raise HTTPException(503, "voice admission cleanup is pending") from exc
+            raise HTTPException(429, "daily voice open capacity reached") from exc
+        except Exception as exc:
+            await release_unopened_voice(session_id, voice_id)
+            raise HTTPException(503, "voice admission is unavailable") from exc
+        try:
+            latest = (await asyncio.to_thread(repository.load, session_id)).state
+        except (SessionNotFound, StateConflict) as exc:
+            await release_unopened_voice(session_id, voice_id)
+            raise HTTPException(503, "voice admission could not be confirmed") from exc
+        latest_voice = latest.get("voice_call") or {}
+        if (
+            latest.get("stopped")
+            or int(latest.get("expires_at") or 0) <= int(clock())
+            or latest_voice.get("voice_id") != voice_id
+            or latest_voice.get("status") != "opening"
+        ):
+            await release_unopened_voice(session_id, voice_id)
+            raise HTTPException(410, "session is no longer active")
+        subject = latest.get("operator_subject") or session_id
         safety_id = hashlib.sha256(("studio:" + subject).encode()).hexdigest()[:32]
         try:
             response = await request.app.state.voice_client.post(
@@ -513,24 +558,48 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             await asyncio.to_thread(controller.mark_voice_unknown, session_id, voice_id)
             raise HTTPException(502, "voice provider is unavailable") from exc
         if response.status_code >= 400:
-            await asyncio.to_thread(controller.fail_voice, session_id, voice_id)
-            await asyncio.to_thread(repository.unregister_voice, session_id)
+            await release_unopened_voice(session_id, voice_id)
             raise HTTPException(502, "voice provider refused the realtime call")
         try:
             call_id = call_id_from_location(response.headers.get("Location") or response.headers.get("location") or "")
-            await asyncio.to_thread(controller.activate_voice, session_id, voice_id, call_id)
-        except Exception:
-            if 'call_id' in locals():
-                try:
-                    await request.app.state.voice_client.post(
-                        "https://api.openai.com/v1/realtime/calls/%s/hangup" % call_id,
-                        headers={"Authorization": "Bearer " + settings.openai_api_key},
-                    )
-                except httpx.HTTPError:
-                    pass
-            await asyncio.to_thread(controller.fail_voice, session_id, voice_id)
-            await asyncio.to_thread(repository.unregister_voice, session_id)
+        except HTTPException:
+            # A successful provider response without a usable call ID is
+            # ambiguous: a billable call may exist but cannot be addressed for
+            # hangup. Keep this session and index entry closed to retries.
+            await asyncio.to_thread(controller.mark_voice_unknown, session_id, voice_id)
             raise
+        try:
+            await asyncio.to_thread(controller.activate_voice, session_id, voice_id, call_id)
+        except Exception as exc:
+            reconciled = False
+            try:
+                hangup = await request.app.state.voice_client.post(
+                    "https://api.openai.com/v1/realtime/calls/%s/hangup" % call_id,
+                    headers={"Authorization": "Bearer " + settings.openai_api_key},
+                )
+                reconciled = hangup.status_code < 400 or hangup.status_code in {404, 409}
+            except httpx.HTTPError:
+                pass
+            if reconciled:
+                settled = False
+                try:
+                    settled = await asyncio.to_thread(
+                        controller.reconcile_voice_hangup,
+                        session_id,
+                        voice_id,
+                        call_id,
+                        "activation failed after provider hangup",
+                    )
+                except (SessionNotFound, StateConflict):
+                    pass
+                if settled:
+                    try:
+                        await asyncio.to_thread(repository.unregister_voice, session_id)
+                    except StateConflict:
+                        pass
+            else:
+                await asyncio.to_thread(controller.mark_voice_unknown, session_id, voice_id)
+            raise HTTPException(502, "voice activation could not be reconciled") from exc
         return {
             "sdp": response.text,
             "voice_id": voice_id,

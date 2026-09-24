@@ -493,6 +493,41 @@ class StudioController:
         })
         self.repository.save(session_id, state, record.token)
 
+    def reconcile_voice_hangup(
+            self, session_id: str, voice_id: str, call_id: str, reason: str) -> bool:
+        """Durably settle the exact call only after provider hangup is confirmed.
+
+        Activation can fail after its state write committed but before the
+        caller received the result. Re-read under CAS and accept either the
+        original opening reservation or that already-active exact call. The
+        sweep index may be removed only after this transition returns true.
+        """
+        for _ in range(self.repository.attempts):
+            record = self.repository.load(session_id)
+            state = record.state
+            voice = state.get("voice_call") or {}
+            if voice.get("voice_id") != voice_id:
+                return False
+            status = voice.get("status")
+            if status == "ended":
+                return voice.get("call_id") == call_id
+            if status == "active" and voice.get("call_id") != call_id:
+                return False
+            if status not in {"opening", "active"}:
+                return False
+            voice.update({
+                "call_id": call_id,
+                "status": "ended",
+                "ended_at": int(self.clock()),
+                "end_reason": reason,
+            })
+            try:
+                self.repository.save(session_id, state, record.token)
+                return True
+            except StateConflict:
+                continue
+        raise StateConflict("voice hangup reconciliation is busy; retry cleanup")
+
     def request_voice_end(self, session_id: str, call_id: str, reason: str) -> None:
         record = self.repository.load(session_id)
         state = record.state

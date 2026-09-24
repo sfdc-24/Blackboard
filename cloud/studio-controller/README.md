@@ -14,6 +14,8 @@ instance.
 - strict session, generation, sequence, task-revision, and artifact-version fences;
 - bounded event replay plus a new snapshot-first generation for stale clients;
 - typed artifact nodes and patch operations only—no model HTML or code;
+- a durable UTC-day cap on outbound Realtime call-open attempts, enforced with
+  GCS generation compare-and-swap across instances;
 - optional OpenAI Realtime WebRTC SDP relay; the standard API key, SDP, and
   audio never reach durable session state.
 
@@ -78,11 +80,17 @@ Required secrets/environment:
 - `STUDIO_WORKER=synthetic` for the provider-free release; `claude` plus
   `ANTHROPIC_API_KEY` for the model-backed one
 - `STUDIO_ENABLE_VOICE=false` for the authentication/text release
+- `STUDIO_VOICE_MINT_CAP=3` for the initial voice envelope
 - `OPENAI_API_KEY` and `STUDIO_MAINTENANCE_SECRET` only after voice is enabled
 
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
-Studio session. Client code closes its peer connection at controller expiry;
+Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot
+durably immediately before each provider call-open POST. Invalid requests and
+failures before that reservation consume no slot; after a reservation succeeds,
+the slot is never refunded—even for a provider refusal or ambiguous transport
+outcome—so crashes and retries cannot exceed the UTC-day cap. Client code closes
+its peer connection at controller expiry;
 the service also hangs up on Stop or expiry. A scheduler calls
 `POST /v1/maintenance/voice-sweep` with the maintenance bearer as the idle
 Cloud Run backstop. Audio is never accepted or stored by this service.

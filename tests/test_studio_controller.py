@@ -27,7 +27,12 @@ from app.core import CommandError, StudioController, reduce_event  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app import sweep_once  # noqa: E402
 from app.settings import Settings  # noqa: E402
-from app.state import SessionNotFound, StateConflict, StudioRepository  # noqa: E402
+from app.state import (  # noqa: E402
+    SessionNotFound,
+    StateConflict,
+    StudioRepository,
+    VoiceCapacityExceeded,
+)
 from app.tokens import mint_token, verify_token  # noqa: E402
 from app.workers.synthetic import SyntheticWorker  # noqa: E402
 from scripts.state_store import Conflict  # noqa: E402
@@ -422,6 +427,40 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(5, results.count("ok"))
         state, _ = store.load("studio_admission_19700101")
         self.assertEqual(5, state["count"])
+
+    def test_voice_open_cap_is_strict_under_concurrent_reservations(self):
+        store = MemoryStore()
+
+        def reserve(index):
+            repository = StudioRepository(store, clock=lambda: 1000, attempts=50)
+            try:
+                repository.reserve_voice_open(3, "voice-%d" % index)
+                return "ok"
+            except VoiceCapacityExceeded:
+                return "full"
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(reserve, range(20)))
+        self.assertEqual(3, results.count("ok"))
+        self.assertEqual(17, results.count("full"))
+        state, _ = store.load("studio_voice_open_19700101")
+        self.assertEqual(3, state["count"])
+        self.assertEqual(3, len(state["reservations"]))
+
+    def test_voice_open_reservation_is_idempotent_and_bound_to_utc_day(self):
+        store = MemoryStore()
+        now = [1000]
+        repository = StudioRepository(store, clock=lambda: now[0])
+        self.assertEqual(1, repository.reserve_voice_open(3, "voice-stable"))
+        self.assertEqual(1, repository.reserve_voice_open(3, "voice-stable"))
+        first, _ = store.load("studio_voice_open_19700101")
+        self.assertEqual(1, first["count"])
+
+        now[0] += 86400
+        restarted = StudioRepository(store, clock=lambda: now[0])
+        self.assertEqual(1, restarted.reserve_voice_open(3, "voice-stable"))
+        second, _ = store.load("studio_voice_open_19700102")
+        self.assertEqual(1, second["count"])
 
     def test_reducer_fences_session_generation_revision_and_artifact(self):
         controller, _, _ = make_controller()
@@ -852,6 +891,285 @@ class ApiTests(unittest.TestCase):
             saved = StudioRepository(self.store).load(created["session_id"]).state
             self.assertEqual("rtc_test_call", saved["voice_call"]["call_id"])
             self.assertNotIn("v=0", json.dumps(saved))
+
+    def test_voice_open_cap_allows_exactly_three_provider_posts(self):
+        app, _ = self.app(
+            openai_api_key="server-key", voice_enabled=True,
+            maintenance_secret="m" * 32, voice_mint_cap=3,
+        )
+        with TestClient(app) as client:
+            operator_token = self.authenticate(client)
+            created = []
+            for index in range(4):
+                response = client.post(
+                    "/v1/session",
+                    headers={
+                        **self.origin,
+                        "Authorization": "Bearer " + operator_token,
+                    },
+                    json={"title": "Test", "creation_id": "voice-cap-%d" % index},
+                )
+                self.assertEqual(200, response.status_code, response.text)
+                created.append(response.json())
+            responses = [client.post(
+                "/v1/session/%s/voice" % item["session_id"],
+                headers={**self.origin, "Authorization": "Bearer " + item["token"]},
+                json={"sdp": "offer-%d" % index},
+            ) for index, item in enumerate(created)]
+        self.assertEqual([200, 200, 200, 429], [item.status_code for item in responses])
+        self.assertEqual(3, len(self.voice_client.calls))
+        ledger, _ = self.store.load("studio_voice_open_19700101")
+        self.assertEqual(3, ledger["count"])
+        denied = StudioRepository(self.store).load(created[-1]["session_id"]).state
+        self.assertNotIn("voice_call", denied)
+        index, _ = self.store.load("studio_voice_index")
+        self.assertNotIn(created[-1]["session_id"], index.get("sessions") or {})
+
+    def test_invalid_voice_requests_never_debit_open_capacity(self):
+        app, _ = self.app(
+            openai_api_key="server-key", voice_enabled=True,
+            maintenance_secret="m" * 32, voice_mint_cap=3,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            self.assertEqual(403, client.post(
+                url, headers={"Origin": "https://evil.example"}, json={"sdp": "offer"}
+            ).status_code)
+            self.assertEqual(401, client.post(
+                url, headers=self.origin, json={"sdp": "offer"}
+            ).status_code)
+            self.assertEqual(400, client.post(
+                url,
+                headers={**self.origin, "Authorization": "Bearer " + created["token"]},
+                json={"sdp": ""},
+            ).status_code)
+        self.assertEqual([], self.voice_client.calls)
+        self.assertFalse(any(
+            name.startswith("studio_voice_open_") for name in self.store.data
+        ))
+
+    def test_provider_refusals_consume_capacity_without_refund(self):
+        class RefusingVoiceClient(FakeVoiceClient):
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse(status_code=503)
+
+        self.store = MemoryStore()
+        self.ids = IDs()
+        self.voice_client = RefusingVoiceClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: 1000,
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            responses = [client.post(url, headers=headers, json={"sdp": "offer"})
+                         for _ in range(4)]
+        self.assertEqual([502, 502, 502, 429], [item.status_code for item in responses])
+        self.assertEqual(3, len(self.voice_client.calls))
+        ledger, _ = self.store.load("studio_voice_open_19700101")
+        self.assertEqual(3, ledger["count"])
+
+    def test_malformed_provider_success_is_ambiguous_and_non_retryable(self):
+        class MissingCallIdClient(FakeVoiceClient):
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse(headers={"Location": ""})
+
+        self.store = MemoryStore()
+        self.ids = IDs()
+        self.voice_client = MissingCallIdClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: 1000,
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            first = client.post(url, headers=headers, json={"sdp": "offer"})
+            second = client.post(url, headers=headers, json={"sdp": "retry"})
+        self.assertEqual(502, first.status_code, first.text)
+        self.assertEqual(409, second.status_code, second.text)
+        self.assertEqual(1, len(self.voice_client.calls))
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertEqual("unknown", saved["voice_call"]["status"])
+        self.assertIn(
+            created["session_id"], StudioRepository(self.store).due_voice_sessions(1600)
+        )
+
+    def test_provider_transport_unknown_consumes_capacity_and_is_non_retryable(self):
+        class TransportUnknownVoiceClient(FakeVoiceClient):
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                raise httpx.ReadError(
+                    "provider result was not received",
+                    request=httpx.Request("POST", url),
+                )
+
+        self.store = MemoryStore()
+        self.ids = IDs()
+        self.voice_client = TransportUnknownVoiceClient()
+        self.email_sender = EmailSender()
+        self.creation_seq = 0
+        app = create_app(
+            settings=settings(
+                openai_api_key="server-key", voice_enabled=True,
+                maintenance_secret="m" * 32, voice_mint_cap=3,
+            ),
+            store=self.store,
+            worker=CountingWorker(),
+            clock=lambda: 1000,
+            id_factory=self.ids,
+            voice_client=self.voice_client,
+            email_sender=self.email_sender,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            first = client.post(url, headers=headers, json={"sdp": "offer"})
+            second = client.post(url, headers=headers, json={"sdp": "retry"})
+        self.assertEqual(502, first.status_code, first.text)
+        self.assertEqual(409, second.status_code, second.text)
+        self.assertEqual(1, len(self.voice_client.calls))
+        ledger, _ = self.store.load("studio_voice_open_19700101")
+        self.assertEqual(1, ledger["count"])
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertEqual("unknown", saved["voice_call"]["status"])
+        self.assertIn(
+            created["session_id"], StudioRepository(self.store).due_voice_sessions(1600)
+        )
+
+    def test_voice_quota_store_failure_is_fail_closed_before_provider(self):
+        app, _ = self.app(
+            openai_api_key="server-key", voice_enabled=True,
+            maintenance_secret="m" * 32, voice_mint_cap=3,
+        )
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            with mock.patch.object(
+                    StudioRepository, "reserve_voice_open",
+                    side_effect=RuntimeError("quota unavailable")):
+                response = client.post(url, headers=headers, json={"sdp": "offer"})
+        self.assertEqual(503, response.status_code, response.text)
+        self.assertEqual([], self.voice_client.calls)
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertNotIn("voice_call", saved)
+        index, _ = self.store.load("studio_voice_index")
+        self.assertNotIn(created["session_id"], index.get("sessions") or {})
+
+    def test_activation_failure_requires_confirmed_provider_hangup(self):
+        class ActivationVoiceClient(FakeVoiceClient):
+            def __init__(self, hangup_status):
+                super().__init__()
+                self.hangup_status = hangup_status
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("/hangup"):
+                    return FakeResponse(status_code=self.hangup_status)
+                return FakeResponse()
+
+        for hangup_status, expected_state, indexed in (
+            (200, "ended", False),
+            (503, "unknown", True),
+        ):
+            with self.subTest(hangup_status=hangup_status):
+                store = MemoryStore()
+                voice_client = ActivationVoiceClient(hangup_status)
+                email_sender = EmailSender()
+                app = create_app(
+                    settings=settings(
+                        openai_api_key="server-key", voice_enabled=True,
+                        maintenance_secret="m" * 32, voice_mint_cap=3,
+                    ),
+                    store=store,
+                    worker=CountingWorker(),
+                    clock=lambda: 1000,
+                    id_factory=IDs(),
+                    voice_client=voice_client,
+                    email_sender=email_sender,
+                )
+                self.store = store
+                self.email_sender = email_sender
+                self.creation_seq = 0
+                with TestClient(app) as client:
+                    created = self.create_session(client)
+                    url = "/v1/session/%s/voice" % created["session_id"]
+                    headers = {
+                        **self.origin, "Authorization": "Bearer " + created["token"]
+                    }
+                    with mock.patch.object(
+                            app.state.controller, "activate_voice",
+                            side_effect=StateConflict("activation race")):
+                        response = client.post(
+                            url, headers=headers, json={"sdp": "offer"}
+                        )
+                self.assertEqual(502, response.status_code, response.text)
+                self.assertEqual(2, len(voice_client.calls))
+                saved = StudioRepository(store).load(created["session_id"]).state
+                self.assertEqual(expected_state, saved["voice_call"]["status"])
+                if expected_state == "ended":
+                    self.assertEqual(
+                        "activation failed after provider hangup",
+                        saved["voice_call"]["end_reason"],
+                    )
+                due = StudioRepository(store).due_voice_sessions(1600)
+                self.assertEqual(indexed, created["session_id"] in due)
+
+    def test_activation_result_loss_after_commit_settles_the_exact_hung_up_call(self):
+        app, _ = self.app(
+            openai_api_key="server-key", voice_enabled=True,
+            maintenance_secret="m" * 32, voice_mint_cap=3,
+        )
+        original_activate = app.state.controller.activate_voice
+
+        def commit_then_lose_result(*args, **kwargs):
+            original_activate(*args, **kwargs)
+            raise RuntimeError("activation result was lost")
+
+        with TestClient(app) as client:
+            created = self.create_session(client)
+            url = "/v1/session/%s/voice" % created["session_id"]
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            with mock.patch.object(
+                    app.state.controller, "activate_voice",
+                    side_effect=commit_then_lose_result):
+                response = client.post(url, headers=headers, json={"sdp": "offer"})
+        self.assertEqual(502, response.status_code, response.text)
+        self.assertEqual(2, len(self.voice_client.calls))
+        saved = StudioRepository(self.store).load(created["session_id"]).state
+        self.assertEqual("ended", saved["voice_call"]["status"])
+        self.assertEqual("rtc_test_call", saved["voice_call"]["call_id"])
+        self.assertNotIn(
+            created["session_id"], StudioRepository(self.store).due_voice_sessions(1600)
+        )
 
     def test_voice_is_one_per_session_and_unconfigured_voice_burns_no_slot(self):
         app, _ = self.app(openai_api_key="", voice_enabled=True, maintenance_secret="m" * 32)
