@@ -1,10 +1,10 @@
 # Repo root as context; see the Dockerfile for why the scripts keep their layout.
 substitutions:
-  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/gemini-waker:v1
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/agent-waker:v1
 
 steps:
   - name: gcr.io/cloud-builders/docker
-    args: [build, -t, '${_IMAGE}', -f, cloud/gemini-waker/Dockerfile, .]
+    args: [build, -t, '${_IMAGE}', -f, cloud/agent-waker/Dockerfile, .]
 
 images:
   - '${_IMAGE}'

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-r"""Gemini's doorbell, in the cloud.
+r"""An API agent's doorbell, in the cloud. One image; AGENT picks the agent.
+
+Began as Gemini's alone. Mr Salam, 2026-09-24: "add foundry, grok and claude to
+the watcher" - so the image carries every adapter agent_waker knows, and each
+Cloud Run job (gemini-waker, foundry-waker, claude-api-waker) sets
+AGENT and holds only that agent's credential. The rest of this note was written
+for gemini and holds for all three: each has its own cursor, <agent>_waker.
 
 WHY THIS EXISTS. Gemini has no process of its own. Its only doorbell was the
 laptop task SFDC24-GeminiWaker, running scripts/agent_waker.py --agent gemini
@@ -50,8 +56,12 @@ sys.path.insert(0, SCRIPTS)
 
 import state_store  # noqa: E402
 
-AGENT = "gemini"
-CURSOR = os.environ.get("CURSOR_NAME") or "gemini_waker"
+# grok is deliberately absent. Mr Salam, 2026-09-24: it is out of usage
+# allowance and reserved for his exclusive use, "not for typical work;
+# everyone else should be servicing that".
+AGENTS = ("gemini", "foundry", "claude-api")
+AGENT = (os.environ.get("AGENT") or "gemini").strip()
+CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
 
 
 def run(argv=None, store=None, waker=None) -> int:
@@ -66,10 +76,13 @@ def run(argv=None, store=None, waker=None) -> int:
         store = state_store.open_store(uri)
 
     state, token = store.load(CURSOR)
+    if AGENT not in AGENTS:
+        print(json.dumps({"ran": False, "refused": "AGENT %r is not one of %s" % (AGENT, AGENTS)}))
+        return 2
     if token is None or "answered_ids" not in state:
         print(json.dumps({"ran": False, "refused":
                           "no %s cursor in durable state; seed it from the laptop's "
-                          ".gemini_waker_state.json before the first run" % CURSOR}))
+                          ".<agent>_waker_state.json before the first run" % CURSOR}))
         return 2
 
     if waker is None:

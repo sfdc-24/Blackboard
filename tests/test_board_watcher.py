@@ -43,7 +43,7 @@ class Routing(unittest.TestCase):
         self.routes = w._routes()
 
     def test_a_row_for_gemini_starts_gemini(self):
-        wanted, _, _ = w.plan([row("R1", "2026-09-24T03:50:00Z")], set(), self.routes)
+        wanted, _, _, _ = w.plan([row("R1", "2026-09-24T03:50:00Z")], set(), self.routes)
         self.assertEqual(list(wanted), ["gemini-waker"])
 
     def test_his_whatsapp_prefix_starts_gemini(self):
@@ -59,6 +59,32 @@ class Routing(unittest.TestCase):
     def test_gemini_answering_itself_is_not_a_ring(self):
         r = row("R3", "2026-09-24T03:50:00Z", source="gemini", target="gemini")
         self.assertEqual(w.plan([r], set(), self.routes)[0], {})
+
+    def test_foundry_and_the_claude_standby_are_routed(self):
+        self.assertIn("foundry-waker", w.plan([row("F1", "2026-09-24T03:50:00Z", target="foundry")], set(), self.routes)[0])
+        his = row("W1", "2026-09-24T03:50:00Z", source="whatsapp", target="Blackboard Alpha DB",
+                  payload="claude-code-cli can you check the soak")
+        self.assertIn("claude-api-waker", w.plan([his], set(), self.routes)[0])
+
+    def test_grok_is_never_woken(self):
+        # Reserved for his exclusive use; out of allowance. A row to grok starts nothing.
+        self.assertNotIn("grok-waker", self.routes)
+        r = row("G1", "2026-09-24T03:50:00Z", target="grok")
+        self.assertEqual(w.plan([r], set(), self.routes)[0], {})
+
+    def test_grok_can_reach_everyone(self):
+        # Mr Salam: grok "should be welcome and allowed everywhere ... create
+        # tasks, approach and talk to everyone else". Not woken for routine
+        # work, but what it writes is served like anyone's.
+        for tag, job in (("gemini", "gemini-waker"), ("foundry", "foundry-waker"),
+                         ("claude-api", "claude-api-waker")):
+            for src in ("grok", "grok-bot"):
+                r = row("G-%s-%s" % (src, tag), "2026-09-24T03:50:00Z", source=src, target=tag,
+                        payload="BCB|v=1|id=GROK-TASK-1|phase=DISPATCH|from=%s|to=%s" % (src, tag))
+                self.assertIn(job, w.plan([r], set(), self.routes)[0], (src, tag))
+        send = row("G-WA", "2026-09-24T03:50:00Z", source="grok", target="wa-outbox",
+                   payload="BCB|v=1|id=GROK-WA-1|phase=WA_SEND|from=grok|to=wa-outbox|Heads up from grok")
+        self.assertIn("wa-outbox", w.plan([send], set(), self.routes)[0])
 
     def test_a_row_already_seen_is_not_routed_twice(self):
         self.assertEqual(w.plan([row("R1", "2026-09-24T03:50:00Z")], {"R1"}, self.routes)[0], {})
@@ -114,6 +140,20 @@ class Tick(unittest.TestCase):
         self.assertNotIn("R1", store.state["seen"])
         _, started = self.go(store, rows)
         self.assertEqual(started, ["gemini-waker"])
+
+    def test_a_route_that_raises_holds_the_row_and_says_why(self):
+        # Found live: a probe to foundry and claude-api was seen and started
+        # nothing, because an exception in a route read as "not for me".
+        store = MemStore({"watermark": "2026-09-24T03:40:00Z", "seen": []})
+
+        def boom(row):
+            raise KeyError("x")
+        out = w.tick(store, read_since=lambda s: [row("R1", "2026-09-24T03:50:00Z")],
+                     routes={"gemini-waker": boom}, running=lambda j: False,
+                     start=lambda j: "", now=NOW)
+        self.assertIn("R1", out["route_errors"])
+        self.assertNotIn("R1", store.state["seen"])
+        self.assertLess(store.state["watermark"], "2026-09-24T03:50:00Z")
 
     def test_the_watermark_never_moves_backwards(self):
         store = MemStore({"watermark": "2026-09-24T03:55:00Z", "seen": []})

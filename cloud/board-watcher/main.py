@@ -66,8 +66,14 @@ def _routes():
                     and not aw.is_waker_reply(row) and aw.addressed_to(row, tag))
         return pred
 
+    # grok is deliberately NOT routed. Mr Salam, 2026-09-24: out of usage
+    # allowance, reserved for his exclusive use, "not for typical work".
+    # claude-api is the standby that also answers his WhatsApp rows addressed
+    # to claude-code-cli - agent_waker.addressed_to carries that rule.
     return {
         "gemini-waker": for_agent("gemini"),
+        "foundry-waker": for_agent("foundry"),
+        "claude-api-waker": for_agent("claude-api"),
         "wa-outbox": lambda row: ob.parse_wa_request(row) is not None,
     }
 
@@ -75,10 +81,12 @@ def _routes():
 def plan(rows, seen, routes):
     """Which jobs to start, for which rows. Pure: no IO.
 
-    Returns ({job: [(ts, row_id), ...]}, new_seen_ids, newest_ts).
+    Returns ({job: [(ts, row_id), ...]}, new_seen_ids, newest_ts, errors).
+    A route that RAISES on a row is not a "no" - that swallowed ring is what
+    this watcher replaces. The row is kept out of seen and the error reported.
     """
     import agent_waker as aw
-    wanted, fresh, newest = {}, [], None
+    wanted, fresh, newest, errors = {}, [], None, {}
     for row in rows:
         rid = str(row[aw.C_ROW_ID] if row else "").strip()
         ts = aw.parse_ts(row[aw.C_TS] if len(row) > aw.C_TS else "")
@@ -90,11 +98,13 @@ def plan(rows, seen, routes):
         for job, pred in routes.items():
             try:
                 hit = pred(row)
-            except Exception:  # noqa: BLE001 - one odd row must not stop the tick
-                hit = False
+            except Exception as exc:  # noqa: BLE001 - one odd row must not stop the tick
+                errors.setdefault(rid, (ts, []))[1].append(
+                    "%s: %s: %s" % (job, type(exc).__name__, str(exc)[:120]))
+                continue
             if hit:
                 wanted.setdefault(job, []).append((ts, rid))
-    return wanted, fresh, newest
+    return wanted, fresh, newest, errors
 
 
 # --------------------------------------------------------------- run api
@@ -152,10 +162,12 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     since = (wm - OVERLAP).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = read_since(since)
     seen = set(state.get("seen") or [])
-    wanted, fresh, newest = plan(rows, seen, routes)
+    wanted, fresh, newest, errors = plan(rows, seen, routes)
 
     started, skipped, failed = {}, {}, {}
     hold = None  # earliest row whose job could not be started this tick
+    for ts, _ in errors.values():
+        hold = ts if hold is None else min(hold, ts)
     for job, hits in wanted.items():
         earliest = min(t for t, _ in hits)
         try:
@@ -171,6 +183,7 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     # Rows whose job did not start stay OUT of seen, so the next tick routes
     # them again; everything else is remembered.
     held_ids = {rid for job in list(skipped) + list(failed) for _, rid in wanted[job]}
+    held_ids |= set(errors)
     new_seen = (list(state.get("seen") or []) + [r for r in fresh if r not in held_ids])[-SEEN_CAP:]
 
     target = newest if newest and newest > wm else wm
@@ -183,6 +196,8 @@ def tick(store, read_since, routes, running, start, now=None) -> dict:
     store.save(CURSOR, new_state, token)
     return {"ran": True, "since": since, "rows": len(rows), "new": len(fresh),
             "started": started, "skipped_running": skipped, "failed": failed,
+            "routed": {job: [rid for _, rid in hits] for job, hits in wanted.items()},
+            "route_errors": {rid: msgs for rid, (_, msgs) in errors.items()},
             "watermark": new_state["watermark"]}
 
 

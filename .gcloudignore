@@ -22,7 +22,7 @@
 !/cloud/ack-once
 !/cloud/wa-outbox
 !/cloud/board-watcher
-!/cloud/gemini-waker
+!/cloud/agent-waker
 
 !/scripts
 /scripts/*
@@ -34,6 +34,8 @@
 !/scripts/wa_notify.py
 !/scripts/agent_waker.py
 !/scripts/gemini_agent.py
+!/scripts/foundry_agent.py
+!/scripts/claude_agent.py
 !/scripts/fleet_agent.py
 
 # Belt and braces. If a future edit above accidentally re-admits the root, these

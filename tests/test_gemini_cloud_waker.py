@@ -10,7 +10,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import state_store  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("gemini_cloud_main", REPO / "cloud" / "gemini-waker" / "main.py")
+spec = importlib.util.spec_from_file_location("gemini_cloud_main", REPO / "cloud" / "agent-waker" / "main.py")
 main = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(main)
 
