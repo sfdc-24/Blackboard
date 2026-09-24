@@ -162,7 +162,12 @@ def record(v: dict) -> dict:
         history = state.get("runs") or []
         history.append({k: v[k] for k in ("at", "where", "combined",
                                          "would_exit", "board", "whatsapp")})
-        state["runs"] = history[-20:]          # bounded; this is evidence, not a log
+        # 60, not 20. The soak in cutover step 7 is 48 hours and these run
+        # hourly, so a 20-run window would silently drop the first two thirds
+        # of the evidence the soak is judged on. Cloud Logging is the
+        # authoritative record either way, but a state document that cannot
+        # hold its own soak is a document that invites a wrong conclusion.
+        state["runs"] = history[-60:]
         state["last"] = v["at"]
         store.save(CURSOR, state, token)
         return {"backend": store.describe(), "runs_recorded": len(state["runs"])}

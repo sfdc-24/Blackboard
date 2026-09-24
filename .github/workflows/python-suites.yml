@@ -67,6 +67,8 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_ack_once.py"
+      - "tests/test_soak_report.py"
+      - "scripts/soak_report.py"
       - "cloud/ack-once/main.py"
       - "cloud/waker-shadow/main.py"
       - "scripts/state_store.py"
@@ -125,6 +127,8 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_ack_once.py"
+      - "tests/test_soak_report.py"
+      - "scripts/soak_report.py"
       - "cloud/ack-once/main.py"
       - "cloud/waker-shadow/main.py"
       - "scripts/state_store.py"
@@ -184,6 +188,7 @@ jobs:
                    tests/test_state_store.py \
                    tests/test_waker_shadow.py \
                    tests/test_ack_once.py \
+                   tests/test_soak_report.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -535,6 +540,26 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The soak judge, which is the evidence cutover step 8 would be decided
+      # on - step 8 being Mr Salam disabling the laptop scheduler. A judge that
+      # cannot fail is worse than no judge, so every criterion here is tested by
+      # feeding it a window that breaks exactly that one, against a CLEAN CONTROL
+      # window that must produce no findings at all.
+      #
+      # The property that matters most: NOT YET must never round up to PASS.
+      # Pinned by a regression - the first version measured the whole 48-hour
+      # window regardless of when the soak began, so minutes after starting it
+      # reported FAIL with 44 missing hours from before the jobs existed.
+      - name: the soak judge can fail, and NOT YET is not a pass (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_soak_report.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_soak_report.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # The doorbell that answers board rows as foundry, gemini or grok.
       #
       # It shipped with NO hosted check at all: the budget bug that turned
@@ -588,6 +613,7 @@ jobs:
              && [ ! -f tests/test_state_store.py ] \
              && [ ! -f tests/test_waker_shadow.py ] \
              && [ ! -f tests/test_ack_once.py ] \
+             && [ ! -f tests/test_soak_report.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
