@@ -1,0 +1,14 @@
+substitutions:
+  # BUILD_ID is immutable per build; deployment records can point to this tag
+  # or, preferably, the pushed digest. Never overwrite a generic v1 tag.
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/studio-controller:${BUILD_ID}
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, '${_IMAGE}', -f, cloud/studio-controller/Dockerfile, .]
+images:
+  - '${_IMAGE}'
+
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
