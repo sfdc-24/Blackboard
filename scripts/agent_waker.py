@@ -610,6 +610,14 @@ def main(argv=None) -> int:
 
     data = read_since(env, since)
     pending = select(data["rows"], set(state["answered_ids"]), me)
+    # Quarantine is not a receipt and not work. unknown_ids stay in the
+    # cursor so a person can still see them, and they are not copied into
+    # answered_ids. They have to leave the list BEFORE the per-pass cap:
+    # claim_answer will only refuse them, and three refusals fill --max,
+    # hold the watermark, and the new row behind them is never reached.
+    unknown = set(state.get("unknown_ids") or [])
+    if unknown:
+        pending = [item for item in pending if bcb_id(item["row"]) not in unknown]
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     header = ("=== %s [%s] === since %s | board %s rows, %s in window, %d for %s"

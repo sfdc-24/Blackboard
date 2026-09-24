@@ -346,5 +346,77 @@ class NoDuplicateAnswers(unittest.TestCase):
         self.assertEqual(store.state.get("inflight") or "", "")
 
 
+class QuarantineDoesNotStarveNewWork(unittest.TestCase):
+    """Three unknown ids must not consume the whole pass.
+
+    claim_answer already refuses them. The real loop still used to take
+    pending[:max] before that refusal, so U1, U2 and U3 filled every pass
+    and NEW was never called.
+    """
+
+    def test_one_pass_answers_the_new_row_and_leaves_the_quarantine(self):
+        import agent_waker as aw
+
+        posts, calls = [], []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                calls.append(prompt)
+                return ("an answer", "fake-route")
+
+        rows = []
+        for i, rid in enumerate(("U1", "U2", "U3", "NEW")):
+            rows.append([
+                "ROW-%s" % rid,
+                "2026-09-24T05:00:%02dZ" % i,
+                "cowork-chrome",
+                "gemini",
+                "APPEND",
+                "BCB|v=1|id=%s|to=gemini|ask=x" % rid,
+            ])
+
+        def read_since(env, since, tries=3):
+            kept = [r for r in rows if str(r[1]) > since]
+            return {"rows": kept, "total": len(rows), "filtered": len(kept)}
+
+        store = MemStore({
+            "watermark": "2026-09-24T04:59:59Z",
+            "answered_ids": [],
+            "unknown_ids": ["U1", "U2", "U3"],
+        })
+        saved_module = aw.AGENTS["gemini"]["module"]
+        saved = (aw.read_since, aw.load_env, aw.log, aw.post_reply)
+        aw.sys.modules["fake_quarantine_adapter"] = Adapter
+        aw.AGENTS["gemini"]["module"] = "fake_quarantine_adapter"
+        aw.read_since = read_since
+        aw.load_env = lambda: {}
+        aw.log = lambda me, line: None
+
+        def post_reply(me, cfg, text, to, answers, verbose):
+            posts.append(answers)
+            return True
+
+        aw.post_reply = post_reply
+        try:
+            main.run(store=store, waker=aw, board_contains=lambda rid: False,
+                     argv=["--agent", "gemini", "--max", "3"])
+            main.run(store=store, waker=aw, board_contains=lambda rid: False,
+                     argv=["--agent", "gemini", "--max", "3"])
+        finally:
+            aw.AGENTS["gemini"]["module"] = saved_module
+            aw.read_since, aw.load_env, aw.log, aw.post_reply = saved
+            aw.sys.modules.pop("fake_quarantine_adapter", None)
+
+        self.assertEqual(posts, ["NEW"],
+                         "the new row was not answered once: posts=%r calls=%d"
+                         % (posts, len(calls)))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("NEW", store.state.get("answered_ids") or [])
+        for rid in ("U1", "U2", "U3"):
+            self.assertIn(rid, store.state.get("unknown_ids") or [])
+            self.assertNotIn(rid, store.state.get("answered_ids") or [])
+
+
 if __name__ == "__main__":
     unittest.main()

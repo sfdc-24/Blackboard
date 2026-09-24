@@ -37,7 +37,9 @@ that decides whether a reply is sent twice.
     never reclaimed, whatever the lease says: the append may already be
     on the wire. A later run reads the board. Reply present: mark the row
     answered. Reply absent: quarantine it and never post it again. It is
-    not marked answered before that reply is seen.
+    not marked answered before that reply is seen. Quarantined ids are
+    left out of the per-pass selection window, so they do not crowd out
+    a newer row, and they stay in `unknown_ids` for a person to see.
   - The answered id is still recorded when the post is confirmed. Saves are
     compare-and-swap. A second writer with a stale token is refused and this
     run exits non-zero rather than merging.
