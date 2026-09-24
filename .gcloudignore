@@ -19,6 +19,7 @@
 /cloud/*
 !/cloud/board-probe
 !/cloud/waker-shadow
+!/cloud/ack-once
 
 !/scripts
 /scripts/*
