@@ -42,6 +42,7 @@ class Settings:
     email_sender_secret: str = ""
     voice_enabled: bool = False
     lead_facts_enabled: bool = False
+    metadata_proposals_enabled: bool = False
     salesforce_org_id: str = ""
     lead_facts_timeout_seconds: float = 12.0
     maintenance_secret: str = ""
@@ -77,6 +78,7 @@ class Settings:
             email_sender_secret=os.environ.get("STUDIO_EMAIL_SENDER_SECRET", ""),
             voice_enabled=_enabled(os.environ.get("STUDIO_ENABLE_VOICE", "false")),
             lead_facts_enabled=_enabled(os.environ.get("STUDIO_ENABLE_LEAD_FACTS", "false")),
+            metadata_proposals_enabled=_enabled(os.environ.get("STUDIO_ENABLE_METADATA_PROPOSALS", "false")),
             salesforce_org_id=os.environ.get("STUDIO_SALESFORCE_ORG_ID", ""),
             lead_facts_timeout_seconds=(float(os.environ.get("STUDIO_LEAD_FACTS_TIMEOUT_SECONDS", "12"))
                                         if _enabled(os.environ.get("STUDIO_ENABLE_LEAD_FACTS", "false")) else 12.0),
@@ -97,7 +99,7 @@ class Settings:
             or not 0 < self.lead_facts_timeout_seconds <= 20
         ):
             raise RuntimeError("STUDIO_LEAD_FACTS_TIMEOUT_SECONDS must be greater than 0 and at most 20")
-        if self.lead_facts_enabled and (
+        if (self.lead_facts_enabled or self.metadata_proposals_enabled) and (
             not isinstance(self.salesforce_org_id, str)
             or not re.fullmatch(r"00D[A-Za-z0-9]{15}", self.salesforce_org_id)
         ):
