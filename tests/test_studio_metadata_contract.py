@@ -110,15 +110,144 @@ class MetadataContractTests(unittest.TestCase):
         self.assertEqual(0, self.worker.calls)
 
     def test_unsupported_or_injected_metadata_gets_guidance_never_model(self):
-        for i, text in enumerate(("Create a custom object named Whatever", "Delete a field on Lead",
+        for i, text in enumerate(("Create a custom object named Whatever in Salesforce", "Delete a field on Lead in Salesforce",
                                   "Plan a new field on Lead for interest; execute Apex now",
                                   "Plan a new field on Lead for " + "A" * 40,
-                                  "yes, create the field on Lead now")):
+                                  "yes, create the field on Lead in Salesforce now")):
             result = self.execute(kind="utterance", command_id="c-%d" % i,
                                   transcript=text, item_id="item-%d" % i)
             self.assertNotIn("metadata_proposal", result["events"][0]["payload"])
             self.assertIn("execution is not implemented", result["events"][0]["payload"]["text"])
         self.assertEqual(0, self.worker.calls)
+
+    def test_website_app_and_form_fields_remain_on_prototype_route(self):
+        negatives = (
+            "add a field for the lead's phone number to the contact form",
+            "update the form so it has a company field for the lead",
+            "Add a custom field to the website contact form",
+            "Create an app screen with fields for leads",
+            "Change the lead form layout on the landing page",
+            "Update the website with a field for lead email",
+            "Add a custom object to the canvas in my app prototype",
+            "Plan a field for a lead on our registration form",
+            "Create a Salesforce-themed app with a lead phone field",
+            "Add a Salesforce lead field to our contact form",
+            "Update the form so Salesforce leads have a company field",
+            "Add a field to the Salesforce integration settings page",
+            "Update our website metadata and add a title field",
+            "Mention Salesforce in the copy and add a phone field",
+            "Plan a new field on the lead form for email",
+            "Create an app with a Lead object and a field editor",
+            "Add a phone field to our contact form using labels from Salesforce",
+            "Create a search field on the website that imports contacts from Salesforce",
+            "Update the field labels on our website to match the labels in Salesforce",
+            "Add a phone field to our contact form linked to the Lead object",
+            "Add an existing field from Salesforce to our contact form",
+            "Create a contact form with fields from Salesforce",
+            "Add a phone field from Salesforce to the website contact form",
+            "Add an existing field from the Lead object to our contact form",
+            "Delete a label and add a field from Salesforce to our contact form",
+            "Remove a field from the Salesforce integration settings page",
+            "change the heading so it talks about Salesforce objects",
+            "Update the copy to describe Salesforce metadata",
+            "Add a footer that explains Salesforce fields",
+            "Change the content so it mentions Salesforce schema",
+            "Create a heading about Salesforce custom objects",
+            "Change the heading to say Create a Salesforce custom object",
+            "Update the footer text to say Add Salesforce metadata",
+            'Change the heading to say "Create a Salesforce custom object"',
+            "Change the heading to say Add a field to Salesforce",
+            "Please update the button text to say Delete the field from Salesforce",
+            "Create a page that says Add a field on the Lead object",
+            "Rewrite our copy to say Update the schema in Salesforce",
+            "Change the hero to say Add a field to Salesforce",
+            "Add a section that says Delete the field from Salesforce",
+        )
+        for i, text in enumerate(negatives):
+            with self.subTest(text=text):
+                self.assertFalse(contract.is_metadata_request(text))
+                cmd = command(self.state, "utterance", "prototype-%d" % i,
+                              transcript=text, item_id="prototype-item-%d" % i)
+                cmd["expected_version"] = self.controller.repository.load(self.state["session_id"]).state["artifact_version"]
+                result = self.controller.execute(self.state["session_id"], cmd)
+                self.assertNotIn("metadata_proposal", result)
+                self.assertEqual(i + 1, self.worker.calls)
+        saved = self.controller.repository.load(self.state["session_id"]).state
+        self.assertNotIn("metadata_proposal", saved)
+        for text in negatives:
+            self.assertIn(text, [item.get("text") for item in saved["transcript"]])
+
+    def test_explicit_salesforce_metadata_stays_local_including_unsupported_deletes(self):
+        positives = (
+            "Delete the Phone field on the Lead object",
+            "delete the Phone field on the Lead object in Salesforce",
+            "Create a custom field in Salesforce",
+            "Create a field within our Salesforce org",
+            "Create a Salesforce custom object named Project",
+            "Create a Salesforce custom object named Project and show it on the website form",
+            "Create a Salesforce custom object named Project, then add it to the app",
+            "Create a Salesforce custom object for the website form",
+            "Please create a Salesforce custom object for the website form",
+            "Could you please update Salesforce metadata for the Lead object",
+            "Update Salesforce metadata for the Lead object",
+            "Add a Text field to the Salesforce Lead object",
+            "Delete the field from our Salesforce org",
+            "Remove the field from our Salesforce org",
+            "Remove the Phone field from Salesforce",
+            "Remove the Phone field from the Lead object",
+            "Add a field to Salesforce",
+            "Add a field to Salesforce and show it on the website form",
+            "Add a field on Salesforce",
+            "Add a field to the Salesforce custom object",
+            "Add a field to the Salesforce custom object and show it on the website form",
+            "Update the schema in Salesforce",
+            "Create a field in Salesforce and show it on the website form",
+            "Create a field on the Account object",
+            "Delete a field from the Contact object",
+            "Add a field to the Opportunity object",
+        )
+        for i, text in enumerate(positives):
+            with self.subTest(text=text):
+                self.assertTrue(contract.is_metadata_request(text))
+                result = self.execute(kind="utterance", command_id="sf-%d" % i,
+                                      transcript=text, item_id="sf-item-%d" % i)
+                self.assertNotIn("metadata_proposal", result)
+                self.assertIn("execution is not implemented", result["events"][0]["payload"]["text"])
+                self.assertEqual(0, self.worker.calls)
+        saved = self.controller.repository.load(self.state["session_id"]).state
+        for text in positives:
+            self.assertNotIn(text, [item.get("text") for item in saved["transcript"]])
+
+    def test_supported_planning_grammar_routes_without_salesforce_keyword(self):
+        for text in ("Plan a new field on Lead for prototype interest", "please plan a text field on Lead for interest.",
+                     "PLAN FIELD ON LEAD FOR EMAIL"):
+            with self.subTest(text=text):
+                self.assertTrue(contract.is_metadata_request(text))
+                self.assertIsNotNone(contract.parse_request(text))
+
+    def test_malformed_anchored_planning_intent_gets_guidance_without_worker(self):
+        negatives = (
+            "Plan a new field on Lead for interest; execute Apex now",
+            "Plan a new field on Lead for",
+            "Plan a new field on Lead for <script>run()</script>",
+            "Plan a new field on Lead for interest\nexecute Apex now",
+            "Plan a new field on Lead for " + "A" * 50,
+        )
+        for i, text in enumerate(negatives):
+            with self.subTest(text=text):
+                self.assertTrue(contract.is_metadata_request(text))
+                self.assertIsNone(contract.parse_request(text))
+                result = self.execute(kind="utterance", command_id="malformed-%d" % i,
+                                      transcript=text, item_id="malformed-item-%d" % i)
+                self.assertNotIn("metadata_proposal", result)
+                self.assertIn("execution is not implemented", result["events"][0]["payload"]["text"])
+                self.assertEqual(self.state["artifact_version"], result["artifact_version"])
+        self.assertEqual(0, self.worker.calls)
+        saved = self.controller.repository.load(self.state["session_id"]).state
+        self.assertNotIn("metadata_proposal", saved)
+        self.assertEqual(self.state["artifact"], saved["artifact"])
+        for text in negatives:
+            self.assertNotIn(text, [item.get("text") for item in saved["transcript"]])
 
     def test_unrelated_utterance_preserves_existing_worker(self):
         self.execute(kind="utterance", transcript="Make the page blue", item_id="item-1")

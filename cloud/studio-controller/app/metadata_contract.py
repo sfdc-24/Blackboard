@@ -16,6 +16,16 @@ ORG_RE = re.compile(r"00D[A-Za-z0-9]{15}")
 STEM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
 HASH_RE = re.compile(r"[a-f0-9]{64}")
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+PLAN_PREFIX = r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for\b"
+PLAN_INTENT_RE = re.compile(PLAN_PREFIX, re.IGNORECASE)
+PLAN_REQUEST_RE = re.compile(PLAN_PREFIX + r" ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?", re.IGNORECASE)
+COMPONENT = r"\b(?:fields?|objects?|metadata|schema)(?:\s+(?:named|called)\s+[A-Za-z][A-Za-z0-9_]*)?"
+STANDARD_OBJECT = r"(?:Lead|Account|Contact|Opportunity|Case|Campaign|Task|Event|User)"
+POLITE_PREFIX = r"\s*(?:(?:please|can you|could you|would you)\s+)*"
+SALESFORCE_DESTINATION = (
+    r"Salesforce\b(?!-)(?=$|[.,;!?]|\s+(?:org\b|object\b|custom\s+object\b|schema\b|metadata\b|"
+    r"and\b|then\b|now\b|for\b|with\b|named\b|called\b|" + STANDARD_OBJECT + r"\s+object\b))"
+)
 FIELD_KEYS = {"parent", "name", "label", "type", "length", "required", "unique", "external_id"}
 CONFIRM_KEYS = {"plan_id", "plan_revision", "plan_hash", "confirmation_nonce"}
 NOTICE = (
@@ -55,10 +65,7 @@ def parse_request(text: str) -> dict | None:
     Unsupported metadata requests get local guidance rather than model fallback.
     Unrelated prototype requests retain their existing route.
     """
-    match = re.fullmatch(
-        r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?",
-        text.strip(), flags=re.IGNORECASE,
-    )
+    match = PLAN_REQUEST_RE.fullmatch(text.strip())
     if match:
         label = " ".join(match[1].split()).title()
         return validate_field({"parent": "Lead", "name": label.replace(" ", "_"),
@@ -68,9 +75,82 @@ def parse_request(text: str) -> dict | None:
 
 
 def is_metadata_request(text: str) -> bool:
-    return bool(re.search(r"\b(?:plan|create|add|delete|update|change|deploy)\b", text, re.I)
-                and re.search(r"\b(?:field|object|metadata)\b", text, re.I)
-                and re.search(r"\b(?:Lead|Salesforce|custom|metadata)\b", text, re.I))
+    # "lead" and "custom field" also describe ordinary prototype form inputs.
+    # Recognize the anchored intent even if its label/suffix is malformed. Only
+    # parse_request's fullmatch can create a proposal; the rest gets guidance.
+    if PLAN_INTENT_RE.match(text.strip()):
+        return True
+    # Honor the utterance's primary UI target before scanning for any embedded
+    # metadata destination, including quoted button/heading text. Field alone
+    # is intentionally not a UI noun here: its destination still disambiguates.
+    if re.match(
+        POLITE_PREFIX + r"(?:plan|create|add|delete|remove|update|change|deploy|"
+        r"edit|rewrite|rename|replace|write|design|redesign|render|draw|build|style|make|set)\s+"
+        r"(?:(?:a|an|the|new|existing|our|my|this|that)\s+)*"
+        r"(?:(?:contact|lead|landing|website|login|registration|search|integration)\s+)?"
+        r"(?:heading|footer|header|copy|content|button|form|page|app|application|"
+        r"website|webpage|screen|prototype|mockup|label|labels|title|text|hero|section|"
+        r"card|canvas|navigation|menu|link|badge|table|list|chart|diagram|tab|modal|"
+        r"dialog|banner|caption|paragraph|tooltip|toast|sidebar|toolbar|layout|widget|"
+        r"accordion|carousel|dropdown)\b(?!\s+fields?\b)", text, re.I,
+    ):
+        return False
+    if not (re.search(r"\b(?:plan|create|add|delete|remove|update|change|deploy)\b", text, re.I)
+            and re.search(r"\b(?:fields?|objects?|metadata|schema)\b", text, re.I)):
+        return False
+    # A prepositional standard-object target is explicit without the vendor
+    # name; "lead form" or "lead field" still does not imply an org operation.
+    if re.search(
+        COMPONENT + r"\s+(?:on|to|in|within)\s+(?:(?:the|my|our)\s+)?"
+        + STANDARD_OBJECT + r"\s+object\b",
+        text, re.I,
+    ):
+        return True
+    # "from Salesforce" normally identifies an existing UI data source.
+    # Treat it as an org mutation only when delete/remove acts on that noun,
+    # not when a later source clause happens to follow another action.
+    if re.search(
+        r"\b(?:delete|remove)\s+(?:(?:the|a|an|all|existing|custom|Text)\s+)*"
+        r"(?:[A-Za-z][A-Za-z0-9_]*\s+)?" + COMPONENT
+        + r"\s+from\s+(?:(?:the|my|our)\s+)?(?:" + SALESFORCE_DESTINATION + r"|"
+        + STANDARD_OBJECT + r"\s+object\b)", text, re.I,
+    ):
+        return True
+    if not re.search(r"\bSalesforce\b(?!-)", text, re.I):
+        return False
+    # Bind the destination to the component noun, not a later reference/source
+    # clause such as "form using labels from Salesforce". Explicit operations
+    # stay local even if they also mention UI consequences.
+    if re.search(
+        COMPONENT + r"(?:\s+on\s+(?:the\s+)?" + STANDARD_OBJECT + r"(?:\s+object)?)?"
+        r"\s+(?:in|within|on|to)\s+(?:(?:the|my|our)\s+)?" + SALESFORCE_DESTINATION,
+        text, re.I,
+    ):
+        return True
+    # A later branded noun in heading/copy instructions is only a reference.
+    # Require the action to directly govern the Salesforce component instead.
+    branded_target = re.match(
+        POLITE_PREFIX +
+        r"(?:plan|create|add|delete|remove|update|change|deploy)\s+"
+        r"(?:(?:a|an|the|new|existing)\s+)*Salesforce\s+"
+        r"(?:(?:Lead|Account|Contact|Opportunity|custom|Text)\s+)*"
+        r"(?P<component>fields?|objects?|metadata|schema)\b", text, re.I,
+    )
+    if not branded_target:
+        return False
+    # Unlike a form field, an explicitly targeted Salesforce object/metadata/
+    # schema operation does not become a prototype request because of its UI
+    # purpose ("Create a Salesforce custom object for the website form").
+    if branded_target["component"].lower() not in {"field", "fields"}:
+        return True
+    # "Add a Salesforce field to our form" targets the prototype. Conversely,
+    # "Create a Salesforce object, then show it in the app" first targets the
+    # org: do not let a subsequent UI consequence hide that explicit operation.
+    primary_clause = re.split(r"\b(?:and|then)\b", text[branded_target.start():], maxsplit=1, flags=re.I)[0]
+    return not bool(re.search(
+        r"\b(?:website|webpage|web page|page|app|application|prototype|mockup|form|screen)\b",
+        primary_clause, re.I,
+    ))
 
 
 def validate_confirmation(value: dict) -> None:

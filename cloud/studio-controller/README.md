@@ -203,7 +203,28 @@ non-external-ID `Text` field on `Lead`. The natural-language grammar is delibera
 narrow: `Plan a new field on Lead for prototype interest` creates the local draft
 `Lead.Prototype_Interest__c`, label `Prototype Interest`, length 80. Unsupported
 recognized metadata requests receive local guidance without invoking the model.
-Other utterances retain the existing worker route. This is not general semantic
+Routing requires that anchored planning intent or an explicit org/object target;
+malformed suffixes after `Plan a new field on Lead for` receive local guidance,
+while only the complete validated grammar creates a proposal. An explicit target
+such as `on the Lead object` is recognized without requiring the word Salesforce.
+`lead`/`custom field` alone does not turn a website/app form request into an org
+request. UI asks mentioning Salesforce retain the prototype route unless they
+explicitly target Salesforce (for example, a field `in Salesforce` or `on the
+Salesforce Lead object`). Later source/reference clauses such as `using labels
+from Salesforce` do not make a prototype form field an org target.
+`from Salesforce` identifies a data source for UI creation/addition requests;
+deletion/removal of a component `from Salesforce` stays local. Bare destinations
+such as `Add a field to Salesforce` and schema operations are also recognized.
+Branded component names must be the opening action's direct target (polite
+prefixes are accepted), not quoted/later actions in heading/copy/footer text.
+An anchored primary UI-target check precedes all explicit-target searches, so
+`Change the heading to say Add a field to Salesforce` remains a prototype ask.
+An explicit object/metadata/schema target stays local even when its purpose is
+a website form. An explicit org creation followed by
+`and`/`then` showing it in the UI stays local; adding a Salesforce field directly
+to a prototype form still follows the prototype route.
+Unsupported explicit org operations, including deletion, remain local guidance only. Other
+utterances retain the existing worker route. This is not general semantic
 metadata intent detection. A typed `metadata.propose` command uses the existing
 command envelope plus the closed `field` object:
 
