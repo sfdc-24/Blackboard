@@ -913,5 +913,72 @@ def _find(state, qid):
     return next(q for q in state["questions"] if q["question_id"] == qid)
 
 
+
+class _SequenceResolver(_Resolver):
+    """Starts with the two-question form BatchWorker opens, and names a
+    different answer on each turn."""
+    def __init__(self, *claims):
+        self.claims = list(claims)
+
+    def initial_questions(self):
+        return BatchWorker().initial_questions()
+
+    def on_turn(self, state, trigger):
+        claim = self.claims.pop(0) if self.claims else {}
+        return {"events": [], "problems": [], "resolves": claim}
+
+
+def _batch_cmd(state, cid, batch_id, answers, version=1):
+    return {"command_id": cid, "session_id": state["session_id"], "type": "answer_batch",
+            "expected_version": version, "batch_id": batch_id, "answers": answers}
+
+
+class CodexReview206ControllerTests(unittest.TestCase):
+    """CODEX-PR206-REVIEW-20260924T0625Z."""
+
+    def test_a_refused_change_does_not_spend_the_spoken_answer(self):
+        bad = dict(_BOOK_BY_VOICE, ops=_BOOK_BY_VOICE["ops"] + [
+            {"op": "set_label", "node_id": "no-such-node", "value": "x", "new_node": _NO_NODE}])
+        controller, store, _ = make_controller(worker=_claude(bad, _BOOK_BY_VOICE))
+        state, _ = controller.create_session()
+        first = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual([], [e for e in first["events"] if e["type"] == "question.answered"])
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual((1, "open"), (saved["artifact_version"], _find(saved, "q-cta")["status"]))
+        second = controller.execute(state["session_id"], _say(state, 2, "book a call, please", 1))
+        self.assertEqual(["artifact.patch", "question.answered", "confirm"], [e["type"] for e in second["events"]])
+
+    def test_a_voice_answer_to_one_form_question_leaves_the_rest_of_the_form(self):
+        controller, store, _ = make_controller(worker=_SequenceResolver({"question_id": "q-cta", "option_id": "book"}))
+        state, _ = controller.create_session()
+        batch_id = next(e for e in state["events"] if e["type"] == "decision.batch")["payload"]["batch_id"]
+        spoken = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual(["question.answered"], [e["type"] for e in spoken["events"]])
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual(("open", ["q-cta"]), (saved["batches"][batch_id]["status"], saved["batches"][batch_id]["answered_ids"]))
+        with self.assertRaisesRegex(CommandError, "do not match"):
+            controller.execute(state["session_id"], _batch_cmd(state, "b-all", batch_id, [
+                {"question_id": "q-cta", "option_id": "describe"}, {"question_id": "q-tone", "option_id": "calm"}]))
+        controller.execute(state["session_id"], _batch_cmd(state, "b-rest", batch_id,
+                                                           [{"question_id": "q-tone", "option_id": "calm"}]))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", saved["batches"][batch_id]["status"])
+        self.assertEqual(("book", "voice"), (_find(saved, "q-cta")["selected_option"], _find(saved, "q-cta")["answer_source"]))
+        self.assertEqual(("calm", "tap"), (_find(saved, "q-tone")["selected_option"], _find(saved, "q-tone")["answer_source"]))
+
+    def test_voice_answers_to_every_form_question_close_the_form(self):
+        controller, store, _ = make_controller(worker=_SequenceResolver(
+            {"question_id": "q-cta", "option_id": "book"}, {"question_id": "q-tone", "option_id": "bold"}))
+        state, _ = controller.create_session()
+        batch_id = next(e for e in state["events"] if e["type"] == "decision.batch")["payload"]["batch_id"]
+        controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        controller.execute(state["session_id"], _say(state, 2, "and make it bold", 1))
+        saved = StudioRepository(store).load(state["session_id"]).state
+        self.assertEqual("answered", saved["batches"][batch_id]["status"])
+        with self.assertRaisesRegex(CommandError, "open decision batch"):
+            controller.execute(state["session_id"], _batch_cmd(state, "b-late", batch_id,
+                                                               [{"question_id": "q-tone", "option_id": "calm"}]))
+
+
 if __name__ == "__main__":
     unittest.main()

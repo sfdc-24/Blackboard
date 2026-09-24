@@ -289,5 +289,42 @@ class CodexReReview200(unittest.TestCase):
         self.assertEqual(out["events"], [])
 
 
+
+class CodexReview206(unittest.TestCase):
+    """CODEX-PR206-REVIEW-20260924T0625Z: an answer and its change are one decision."""
+
+    def test_an_invalid_claim_lets_nothing_change(self):
+        draft = {"ops": [{"op": "set_label", "node_id": "hero-heading", "value": "Unrelated rewrite", "new_node": BLANK}],
+                 "confirm": "Rewrote the heading.", "questions": [], "batch_title": "",
+                 "resolves": {"question_id": "q-cta", "option_id": "teleport", "freeform_answer": ""}}
+        out, _ = run(draft, questions=(OPEN_Q,))
+        self.assertIsNone(out["resolves"])
+        self.assertEqual([], [e for e in out["events"] if e["type"] in ("artifact.patch", "confirm")])
+        self.assertTrue(any("unknown option" in p for p in out["problems"]))
+
+    def test_no_claim_still_lets_an_utterance_shape_the_page(self):
+        draft = dict(NOTHING, ops=[{"op": "set_label", "node_id": "hero-heading", "value": "Clear your backlog",
+                                    "new_node": BLANK}], confirm="Heading updated.")
+        out, _ = run(draft, questions=(OPEN_Q,))
+        self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+
+    def test_a_refused_change_leaves_the_answer_unrecorded(self):
+        draft = {"ops": [{"op": "set_label", "node_id": "hero-cta", "value": "Book a call", "new_node": BLANK},
+                         {"op": "set_label", "node_id": "no-such-node", "value": "x", "new_node": BLANK}],
+                 "confirm": "Booked.", "questions": [], "batch_title": "",
+                 "resolves": {"question_id": "q-cta", "option_id": "book", "freeform_answer": ""}}
+        out, _ = run(draft, questions=(OPEN_Q,))
+        self.assertIsNone(out["resolves"], "the question must stay open so it can be answered again")
+        self.assertEqual([], [e for e in out["events"] if e["type"] in ("artifact.patch", "confirm")])
+        self.assertTrue(any("not recorded" in p for p in out["problems"]), out["problems"])
+
+    def test_a_clean_answer_with_its_change_still_resolves(self):
+        draft = {"ops": [{"op": "set_label", "node_id": "hero-cta", "value": "Book a call", "new_node": BLANK}],
+                 "confirm": "Booked.", "questions": [], "batch_title": "",
+                 "resolves": {"question_id": "q-cta", "option_id": "book", "freeform_answer": ""}}
+        out, _ = run(draft, questions=(OPEN_Q,))
+        self.assertEqual({"question_id": "q-cta", "option_id": "book"}, out["resolves"])
+
+
 if __name__ == "__main__":
     unittest.main()

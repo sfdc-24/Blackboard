@@ -36,6 +36,20 @@ def _find_question(state: dict, question_id: str) -> dict:
     raise CommandError("unknown question_id", 404)
 
 
+def _mark_batch_member(state: dict, question_id: str) -> None:
+    """A form question answered outside its form (by voice) leaves the form.
+    The member is recorded, never deleted, so the batch stays traceable; the
+    form closes when every member is answered."""
+    for batch in (state.get("batches") or {}).values():
+        if batch.get("status") != "open" or question_id not in (batch.get("question_ids") or []):
+            continue
+        answered = batch.setdefault("answered_ids", [])
+        if question_id not in answered:
+            answered.append(question_id)
+        if set(answered) >= set(batch.get("question_ids") or []):
+            batch["status"] = "answered"
+
+
 def _answer(question: dict, answer: dict, artifact_version: int) -> dict:
     if question.get("status") != "open":
         raise CommandError("question is not open", 409)
@@ -273,7 +287,10 @@ class StudioController:
                 batch = (state.get("batches") or {}).get(command["batch_id"])
                 if not batch or batch.get("status") != "open":
                     raise CommandError("answer_batch does not name an open decision batch", 409)
-                if {item["question_id"] for item in answers} != set(batch.get("question_ids") or []):
+                # A form question already answered by voice is no longer on
+                # the form: the submission names exactly the ones still open.
+                remaining = set(batch.get("question_ids") or []) - set(batch.get("answered_ids") or [])
+                if {item["question_id"] for item in answers} != remaining:
                     raise CommandError("answer_batch questions do not match the named batch", 409)
         elif kind in {"change_decision", "decide_later"}:
             if not ID_RE.fullmatch(str(command.get("question_id") or "")):
@@ -616,6 +633,7 @@ class StudioController:
                 try:
                     question = _find_question(state, resolves["question_id"])
                     answered_questions.append(_answer(question, item, state["artifact_version"]))
+                    _mark_batch_member(state, resolves["question_id"])
                 except CommandError as exc:
                     problems.append("resolves %r refused: %s" % (resolves["question_id"], exc))
             answers_emitted = False
