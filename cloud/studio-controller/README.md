@@ -262,8 +262,8 @@ fingerprints/CAS and utterance item IDs make retries replay without generating
 another proposal or consuming confirmation twice, including across restart.
 
 **This receipt is not authorization for a future executor.** A later write slice
-must issue a new policy/plan and fresh explicit confirmation. There is no operation
-ledger, provider, org permission proof, quota for writes, deployment, deletion,
+must issue a new policy/plan and fresh explicit confirmation. This proposal route
+has no operation ledger, provider, org permission proof, quota for writes, deployment, deletion,
 rollback, or reconciliation in this increment. Do not label it a live metadata
 demo or silently attach an executor to this confirmation command. The current
 MCP inspection plan's HOLD is unchanged.
@@ -272,3 +272,14 @@ Offline regression: `python -m unittest discover -s tests -p test_studio_metadat
 Set `STUDIO_SITE_EVENT_SCHEMA` to a read-only site checkout's
 `studio/contract/events.schema.json` to also check the emitted envelope/confirm
 constraints against that file (otherwise that optional compatibility test skips).
+
+### Disconnected metadata operation ledger
+
+`app/metadata_operations.py` adds offline state-machine plumbing only, not a
+controller route or Salesforce capability. It requires a separately certified
+atomic CAS adapter and a fresh execution-specific plan/confirmation. Atomic
+per-org target holds prevent different operation IDs bypassing in-flight or
+unknown operations; uncertain outcomes never auto-retry. Public receipts are
+strictly allowlisted, and verified presence makes no creation-causality claim.
+See [METADATA-OPERATIONS.md](METADATA-OPERATIONS.md) for persistence, recovery,
+adapter trust boundaries and the remaining activation holds.
