@@ -246,7 +246,9 @@ section('T3 · past the whole-site daily cap: no key, no spend');
 {
   const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   const p = Object.assign({}, HEALTHY);
-  p['CHAT_COUNT_' + today] = '150';
+  // At the cap, whatever the default is (150 until v64, 400 since): the
+  // point is that past it there is no key and no spend.
+  p['CHAT_COUNT_' + today] = '400';
   const r = makeRuntime({ props: p });
   const capped = r.say({ vid: 's3', q: 'hello' });
   check('degraded=daily-cap', capped.degraded === 'daily-cap', JSON.stringify(capped).slice(0, 140));
