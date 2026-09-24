@@ -175,21 +175,83 @@ def send(body: str, token: str, pnid: str, recipient: str, timeout: int = 60) ->
         return {"ok": False, "status": 0, "body": "%s: %s" % (type(exc).__name__, exc)}
 
 
+def _message_id(body: str) -> str:
+    """The id Graph returns when it accepted the message. Empty if it did not."""
+    try:
+        data = json.loads(body or "")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    messages = data.get("messages") or []
+    if not isinstance(messages, list) or not messages or not isinstance(messages[0], dict):
+        return ""
+    mid = messages[0].get("id")
+    return str(mid).strip() if mid else ""
+
+
+def classify_status(status, body: str) -> str:
+    """confirmed, not_sent, or unknown. The outbox treats these differently.
+
+    confirmed: a 2xx that carries a message id. That is a receipt.
+    not_sent: a 4xx. Graph refused the request; the message was not accepted.
+    unknown: status 0 (the response was lost — Meta may have accepted it),
+    a 5xx, a 3xx, or a 2xx with no message id. Never a receipt, and never
+    proof the request failed to leave.
+    """
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return "unknown"
+    if 200 <= code < 300 and _message_id(body or ""):
+        return "confirmed"
+    if 400 <= code < 500:
+        return "not_sent"
+    return "unknown"
+
+
+def _masked(res: dict, recipient: str) -> str:
+    # Meta echoes the recipient ("input", "wa_id") in its receipt, and callers
+    # print this string - on 2026-09-24 his number landed in Cloud Logging from
+    # the first cloud send. Mask it here, once, for every caller.
+    body = res.get("body") or ""
+    if recipient:
+        body = body.replace(recipient, "<WA_TO>")
+    return "HTTP %s %s" % (res.get("status"), body[:300])
+
+
+def attempt(text: str, kind: str = "BLOCKED", tag: str = "claude-code-cli",
+            raw: bool = False, env_file: str | None = None) -> dict:
+    """One send, classified. The outbox quarantines `unknown` and retries only `not_sent`.
+
+    Classification reads the raw body, before the recipient is masked out of
+    the detail string callers log.
+    """
+    env = load_env(Path(env_file) if env_file else None)
+    token, pnid, recipient, _which = credentials(env)
+    body = compose(text, kind, tag, raw)
+    res = send(body, token, pnid, recipient)
+    return {"outcome": classify_status(res["status"], res.get("body") or ""),
+            "status": res["status"],
+            "detail": _masked(res, recipient)}
+
+
 def notify(text: str, kind: str = "BLOCKED", tag: str = "claude-code-cli",
            raw: bool = False, dry_run: bool = False,
            env_file: str | None = None) -> tuple[bool, str]:
-    """One call for other Python to use instead of shelling out."""
+    """One call for other Python to use instead of shelling out.
+
+    ok is the transport's own flag: a 2xx is True even without a message id.
+    The outbox is stricter and calls attempt() — a receipt it will mark
+    delivered has to carry a message id.
+    """
     env = load_env(Path(env_file) if env_file else None)
     token, pnid, recipient, which = credentials(env)
     body = compose(text, kind, tag, raw)
     if dry_run:
         return True, "DRY RUN (%s, %d chars to %s):\n%s" % (which, len(body), recipient, body)
     res = send(body, token, pnid, recipient)
-    # Meta echoes the recipient ("input", "wa_id") in its receipt, and callers
-    # print this string - on 2026-09-24 his number landed in Cloud Logging from
-    # the first cloud send. Mask it here, once, for every caller.
-    detail = res["body"].replace(recipient, "<WA_TO>") if recipient else res["body"]
-    return bool(res["ok"]), "HTTP %s %s" % (res["status"], detail[:300])
+    return bool(res["ok"]), _masked(res, recipient)
 
 
 def main() -> int:

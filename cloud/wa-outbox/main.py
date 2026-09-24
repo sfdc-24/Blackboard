@@ -13,10 +13,16 @@ WHAT MAKES THIS SAFE TO SCHEDULE, because every mistake here lands on his phone:
   - IT REFUSES TO RUN WITHOUT ONE. The outbox primes on an empty state, which is
     safe, but a cursor lost between runs would re-prime and then silently skip -
     or worse, a partial one would resend. Seeding is a deliberate act.
-  - Every save the outbox makes - and it saves after EACH send - is written
-    through to the store immediately, compare-and-swap. A container killed after
-    a send has already recorded it, so the next run does not send it again.
-  - A stale writer is refused and the run exits non-zero rather than merging.
+  - BEFORE each send, the outbox writes that row id into the cursor as
+    `inflight` and this wrapper compare-and-swaps the save. Only the run
+    whose write lands may send. The loser is refused and exits non-zero.
+  - A WhatsApp send cannot be read back, and it is not pre-marked
+    delivered. The outcome is confirmed (a 2xx that carries a message id),
+    not_sent (a 4xx from Graph, or a failure before the request left), or
+    unknown (status 0, a timeout, a 5xx, or a 2xx with no message id).
+    Unknown is quarantined and never resent; only not_sent is released
+    for a later pass. A kill between the send returning and the receipt
+    save is unknown: the next run finds `inflight` with no receipt.
 
 ONE WRITER. From 2026-09-24 this job owns the outbox cursor. The laptop task
 SFDC24-WA-Board-Outbox keeps its own file and must STAY DISABLED: two outboxes
@@ -63,6 +69,10 @@ def run(argv=None, store=None, outbox=None) -> int:
     original_save = outbox.save_state
 
     def save_through(new_state, path=None):
+        # The outbox calls this BEFORE send_via_notify, with inflight set.
+        # The compare-and-swap therefore lands before the message does: the
+        # loser raises here and never sends. A later save records the receipt
+        # or, on the next run, the unknown id.
         original_save(new_state, path) if path is not None else original_save(new_state)
         box["token"] = store.save(CURSOR, json.loads(json.dumps(new_state)), box["token"])
 

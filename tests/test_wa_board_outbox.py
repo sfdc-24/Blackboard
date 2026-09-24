@@ -23,6 +23,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import wa_board_outbox as ox  # noqa: E402
+import wa_notify  # noqa: E402
 
 
 def row(row_id, payload, source="claude-code-cli", action="APPEND", gist=""):
@@ -196,6 +197,64 @@ class DryRunAndState(unittest.TestCase):
             if state_path.exists():
                 saved = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertNotIn("WRK-1", saved["delivered_row_ids"])
+
+    def test_a_timeout_after_the_request_left_is_not_sent_again(self):
+        """Status 0: the response was lost. Meta may already have accepted it.
+
+        Two passes must produce one Graph call, and the id must not be marked
+        delivered — a person decides, the outbox does not send it again.
+        """
+        rows = [row("WRK-1", WA_SEND)]
+        sends = []
+
+        def fake_send(body, token, pnid, recipient, timeout=60):
+            sends.append(body)
+            return {"ok": False, "status": 0, "body": "TimeoutError: timed out"}
+
+        env = {"META_TOKEN": "t", "WA_PHONE_NUMBER_ID": "123456789012345",
+               "WA_TO": "15550001111"}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = {"delivered_row_ids": ["seed"], "delivered_bcb_ids": []}
+            with mock.patch.object(wa_notify, "send", side_effect=fake_send), \
+                 mock.patch.object(wa_notify, "load_env", return_value=env), \
+                 mock.patch.object(ox, "append_log"):
+                ox.run_once(rows, state, dry_run=False, send=True, note=False,
+                            state_path=state_path)
+                again = ox.load_state(state_path)
+                ox.run_once(rows, again, dry_run=False, send=True, note=False,
+                            state_path=state_path)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(sends), 1, "a response-loss timeout was sent again")
+        self.assertNotIn("WRK-1", saved.get("delivered_row_ids") or [])
+        self.assertIn("WRK-1", saved.get("unknown_row_ids") or [])
+
+    def test_a_graph_4xx_is_released_and_a_later_pass_may_send(self):
+        """A 4xx is Graph refusing the request. That one may be retried."""
+        rows = [row("WRK-1", WA_SEND)]
+        sends = []
+
+        def fake_send(body, token, pnid, recipient, timeout=60):
+            sends.append(body)
+            return {"ok": False, "status": 400, "body": '{"error":{"code":100}}'}
+
+        env = {"META_TOKEN": "t", "WA_PHONE_NUMBER_ID": "123456789012345",
+               "WA_TO": "15550001111"}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = {"delivered_row_ids": ["seed"], "delivered_bcb_ids": []}
+            with mock.patch.object(wa_notify, "send", side_effect=fake_send), \
+                 mock.patch.object(wa_notify, "load_env", return_value=env), \
+                 mock.patch.object(ox, "append_log"):
+                ox.run_once(rows, state, dry_run=False, send=True, note=False,
+                            state_path=state_path)
+                again = ox.load_state(state_path)
+                ox.run_once(rows, again, dry_run=False, send=True, note=False,
+                            state_path=state_path)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(sends), 2, "a refused send was not retried")
+        self.assertNotIn("WRK-1", saved.get("delivered_row_ids") or [])
+        self.assertNotIn("WRK-1", saved.get("unknown_row_ids") or [])
 
     def test_first_run_primes_instead_of_sending_history(self):
         rows = [row("WRK-1", WA_SEND)]

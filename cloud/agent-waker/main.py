@@ -26,11 +26,23 @@ that decides whether a reply is sent twice.
   - IT REFUSES TO RUN WITHOUT ONE. A missing cursor would fall back to a
     six-hour look-back with an empty answered list, and re-answer everything
     the laptop answered in those six hours. Seeding it is a deliberate act.
-  - Each posted reply is written to the store AS IT LANDS, not only at the end.
-    A run killed between two replies must not leave the first one unrecorded,
-    or the next run posts it again.
-  - Saves are compare-and-swap. A second writer with a stale token is refused
-    and this run exits non-zero rather than merging.
+  - BEFORE the model is called, the row's answers id is written into the
+    cursor as `inflight`, phase `claimed`, with this run's owner id and a
+    lease expiry, compare-and-swap. Only that owner may call the model. A
+    live claim held by another run is never taken. No reply on the board
+    is not proof the owner is dead.
+  - Only phase `claimed` can be taken after the lease expires. Immediately
+    before the append the owner writes phase `posting` and renews the
+    lease to cover the post (400s) plus a margin. A `posting` claim is
+    never reclaimed, whatever the lease says: the append may already be
+    on the wire. A later run reads the board. Reply present: mark the row
+    answered. Reply absent: quarantine it and never post it again. It is
+    not marked answered before that reply is seen. Quarantined ids are
+    left out of the per-pass selection window, so they do not crowd out
+    a newer row, and they stay in `unknown_ids` for a person to see.
+  - The answered id is still recorded when the post is confirmed. Saves are
+    compare-and-swap. A second writer with a stale token is refused and this
+    run exits non-zero rather than merging.
 
 ONE WRITER. From 2026-09-24 this job owns the gemini cursor. The laptop task
 SFDC24-GeminiWaker keeps its own file cursor and must STAY DISABLED: two
@@ -50,6 +62,8 @@ import json
 import os
 import sys
 import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
 
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 sys.path.insert(0, SCRIPTS)
@@ -63,10 +77,53 @@ import state_store  # noqa: E402
 AGENTS = ("gemini", "claude-api")
 AGENT = (os.environ.get("AGENT") or "gemini").strip()
 CURSOR = os.environ.get("CURSOR_NAME") or "%s_waker" % AGENT.replace("-", "_")
+# Longer than a model call. A lease shorter than the work would let the next
+# run take a claim whose owner is still inside the model. The append has its
+# own lease: fleet_agent's post timeout is 400s, and the posting write renews
+# for that plus a margin so the lease cannot die while the append is in flight.
+CLAIM_LEASE_SECONDS = int(os.environ.get("CLAIM_LEASE_SECONDS") or 600)
+POST_TIMEOUT_SECONDS = 400
+POST_LEASE_SECONDS = POST_TIMEOUT_SECONDS + 60
 
 
-def run(argv=None, store=None, waker=None) -> int:
-    """Parameters are for tests: a fake store and a fake waker module."""
+def _board_has_row(row_id: str) -> bool:
+    """True when a row with this exact Row_ID is on the board.
+
+    `match` is a substring over the whole row, so a later note that merely
+    quotes the id is not a hit. The Row_ID column has to be that id.
+    """
+    import bus
+    env = bus.load_env()
+    obj = bus.read_rows(env, match=row_id, limit=20)
+    for row in obj.get("rows") or []:
+        if row and str(row[0]).strip() == row_id:
+            return True
+    return False
+
+
+def _stamp(value) -> str:
+    """UTC timestamp the lease is compared as text. Same shape as the board."""
+    if callable(value):
+        return _stamp(value())
+    if value is None:
+        moment = datetime.now(timezone.utc)
+    elif isinstance(value, datetime):
+        moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    elif isinstance(value, (int, float)):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+    else:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(argv=None, store=None, waker=None, board_contains=None,
+        now=None, lease_seconds=None) -> int:
+    """Parameters are for tests: a fake store and a fake waker module.
+
+    board_contains(row_id) -> bool overrides the live board lookup. A test
+    waker may also set reply_on_board to the same effect. now is a timestamp
+    or a callable returning one, so a test can expire a lease without sleeping.
+    """
     uri = (os.environ.get("BLACKBOARD_STATE_URI") or "").strip()
     if store is None:
         if not uri.startswith("gs://"):
@@ -89,26 +146,226 @@ def run(argv=None, store=None, waker=None) -> int:
     if waker is None:
         import agent_waker as waker  # noqa: F811
 
+    owner = uuid.uuid4().hex
+    seconds = int(lease_seconds if lease_seconds is not None else CLAIM_LEASE_SECONDS)
+
+    def current() -> str:
+        # Re-read every time. A test clock moves while this run is inside
+        # the model call; a lease checked once at entry would stay live.
+        return _stamp(None if now is None else now)
+
+    def expiry_after(span: int) -> str:
+        moment = datetime.fromisoformat(current().replace("Z", "+00:00"))
+        return (moment + timedelta(seconds=span)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def expiry() -> str:
+        return expiry_after(seconds)
+
     box = {"state": {"watermark": state.get("watermark", ""),
-                     "answered_ids": list(state.get("answered_ids") or [])},
+                     "answered_ids": list(state.get("answered_ids") or []),
+                     "unknown_ids": list(state.get("unknown_ids") or []),
+                     "inflight": state.get("inflight") or "",
+                     "claim_owner": state.get("claim_owner") or "",
+                     "claim_until": state.get("claim_until") or "",
+                     "claim_phase": state.get("claim_phase") or ""},
            "token": token}
 
     def persist(new_state):
         box["token"] = store.save(CURSOR, new_state, box["token"])
         box["state"] = new_state
 
-    # Record each reply as it lands. The waker only saves at the end of a pass.
+    def claim_of(s) -> dict:
+        return {"id": s.get("inflight") or "",
+                "owner": s.get("claim_owner") or "",
+                "until": s.get("claim_until") or "",
+                "phase": s.get("claim_phase") or ""}
+
+    def live(held: dict) -> bool:
+        return bool(held["id"] and held["until"] and held["until"] > current())
+
+    def clear_claim(s) -> None:
+        s["inflight"] = ""
+        s["claim_owner"] = ""
+        s["claim_until"] = ""
+        s["claim_phase"] = ""
+
+    def write_claim(s, answers_id: str) -> None:
+        s["inflight"] = answers_id
+        s["claim_owner"] = owner
+        s["claim_until"] = expiry()
+        s["claim_phase"] = "claimed"
+
+    def mark_answered(s, answers_id: str) -> None:
+        ids = list(s.get("answered_ids") or [])
+        if answers_id not in ids:
+            ids.append(answers_id)
+        s["answered_ids"] = ids[-400:]
+        clear_claim(s)
+
+    def quarantine(s, answers_id: str) -> None:
+        """The append may have landed. Do not post again, and do not call it answered."""
+        ids = list(s.get("unknown_ids") or [])
+        if answers_id not in ids:
+            ids.append(answers_id)
+        s["unknown_ids"] = ids[-400:]
+        clear_claim(s)
+
+    def reply_visible(answers_id: str) -> bool:
+        import agent_waker
+        rid = agent_waker.reply_row_id(AGENT, answers_id)
+        finder = board_contains
+        if finder is None:
+            finder = getattr(waker, "reply_on_board", None)
+        if finder is None:
+            finder = _board_has_row
+        return bool(finder(rid))
+
+    def resolve_inflight():
+        """A previous run owned this answers id and may already have posted.
+
+        phase=posting means an append was dispatched. It is never reclaimed,
+        lease or not: the post may still be on the wire. Reconcile it. A
+        reply on the board marks the row answered. No reply quarantines it.
+        Absence of a reply is not a reason to call the model again.
+
+        phase=claimed is the model call. A visible reply is recorded. No
+        reply leaves the claim for the lease: live claims stay with their
+        owner, and only an expired claimed row may be taken.
+        """
+        inflight = box["state"].get("inflight") or ""
+        if not inflight:
+            return
+        phase = box["state"].get("claim_phase") or ""
+        answered = list(box["state"].get("answered_ids") or [])
+        if inflight in answered:
+            s = dict(box["state"])
+            clear_claim(s)
+            persist(s)
+            return
+        visible = reply_visible(inflight)
+        if phase == "posting":
+            s = dict(box["state"])
+            if visible:
+                mark_answered(s, inflight)
+            else:
+                quarantine(s, inflight)
+                print(json.dumps({
+                    "unknown": inflight,
+                    "reason": "posting claim has no reply on the board; not reposting",
+                }))
+            persist(s)
+            return
+        if visible:
+            s = dict(box["state"])
+            mark_answered(s, inflight)
+            persist(s)
+
+    resolve_inflight()
+
+    # A claim saved by a run that is still inside the model. Do not enter
+    # the loop, and do not save: a watermark write here would move the
+    # generation out from under the owner before they can append.
+    # phase=posting was reconciled above; it is not a live claim to defer.
+    held = claim_of(box["state"])
+    if held["phase"] != "posting" and live(held) and held["owner"] != owner:
+        print(json.dumps({"ran": False, "reason":
+                          "live claim %s held by %s until %s"
+                          % (held["id"], held["owner"], held["until"])}))
+        return 0
+
+    def claim_answer(answers_id: str) -> bool:
+        answered = list(box["state"].get("answered_ids") or [])
+        if answers_id in answered or answers_id in (box["state"].get("unknown_ids") or []):
+            return False
+        held_now = claim_of(box["state"])
+        # A posting claim is never taken. A different id, live or expired,
+        # stays put. Starting a second row on top of either is how two answers race.
+        if held_now["phase"] == "posting":
+            return False
+        if held_now["id"] and held_now["id"] != answers_id:
+            return False
+        if held_now["id"] == answers_id and live(held_now):
+            # Ours already: keep it. Someone else's: never take it.
+            return held_now["owner"] == owner
+        s = dict(box["state"])
+        write_claim(s, answers_id)
+        # Conflict propagates. The loser must not call the model.
+        persist(s)
+        return True
+
     original_post = waker.post_reply
+    original_call = getattr(waker, "call_agent", None)
+    had_claim = hasattr(waker, "claim_answer")
+    original_claim = getattr(waker, "claim_answer", None)
+
+    def begin_post(answers_id: str) -> bool:
+        """Write phase=posting and renew the lease, then the append may start.
+
+        An ownership check after the subprocess has been launched cannot
+        pull the append back. The renewed lease is at least the post
+        timeout plus a margin, counted from this write. A lost compare-and-swap
+        or an expired claimed lease refuses the post. The stale owner is
+        not written back.
+        """
+        held_now = claim_of(box["state"])
+        phase = held_now["phase"] or "claimed"
+        if not (held_now["id"] == answers_id and held_now["owner"] == owner
+                and phase == "claimed" and live(held_now)):
+            return False
+        s = dict(box["state"])
+        s["claim_phase"] = "posting"
+        renewed = expiry_after(POST_LEASE_SECONDS)
+        if (s.get("claim_until") or "") < renewed:
+            s["claim_until"] = renewed
+        try:
+            persist(s)
+        except state_store.Conflict:
+            return False
+        held_now = claim_of(box["state"])
+        return (held_now["id"] == answers_id and held_now["owner"] == owner
+                and held_now["phase"] == "posting" and live(held_now))
 
     def post_and_record(me, cfg, text, to, answers, verbose):
+        if not begin_post(answers):
+            return False
         ok = original_post(me, cfg, text, to, answers, verbose)
         if ok:
             s = dict(box["state"])
-            s["answered_ids"] = (list(s["answered_ids"]) + [answers])[-400:]
+            # Confirmed on the board. Record that, and drop the posting claim
+            # only when this run still holds it. A takeover's claim is not ours
+            # to clear from a stale copy — the compare-and-swap refuses the write.
+            if s.get("claim_owner") in ("", owner) and s.get("inflight") in ("", answers):
+                mark_answered(s, answers)
+            else:
+                ids = list(s.get("answered_ids") or [])
+                if answers not in ids:
+                    ids.append(answers)
+                s["answered_ids"] = ids[-400:]
             persist(s)
+        # A post that did not confirm stays phase=posting. The next run
+        # reconciles it from the board. It is not claimed again.
         return ok
 
+    def call_agent(*args, **kwargs):
+        text, route = original_call(*args, **kwargs)
+        # A definite miss is not an unknown post: nothing was appended.
+        # Release only our own claim, so a lost lease is not written back.
+        s = dict(box["state"])
+        # Only a claimed row is released. phase=posting may already have
+        # an append on the wire; clearing it would let the next run post again.
+        if (not text and s.get("inflight") and s.get("claim_owner") == owner
+                and (s.get("claim_phase") or "claimed") == "claimed"):
+            clear_claim(s)
+            try:
+                persist(s)
+            except state_store.Conflict:
+                pass
+        return text, route
+
     waker.post_reply = post_and_record
+    waker.claim_answer = claim_answer
+    if original_call is not None:
+        waker.call_agent = call_agent
 
     workdir = tempfile.mkdtemp(prefix="gemini-waker-")
     os.environ["BLACKBOARD_STATE_DIR"] = workdir
@@ -120,9 +377,17 @@ def run(argv=None, store=None, waker=None) -> int:
         rc = waker.main(argv or ["--agent", AGENT, "--max", "3"])
     finally:
         waker.post_reply = original_post
+        if original_call is not None:
+            waker.call_agent = original_call
+        if had_claim:
+            waker.claim_answer = original_claim
+        elif hasattr(waker, "claim_answer"):
+            del waker.claim_answer
 
     # The pass's own view: its watermark, and answered_ids that already include
     # everything recorded above. Union, so nothing recorded mid-pass is dropped.
+    # inflight stays whatever the claims left: the file the waker rewrites does
+    # not know about a claim that outlived this pass.
     try:
         with open(path, encoding="utf-8") as fh:
             final = json.load(fh)
@@ -133,6 +398,11 @@ def run(argv=None, store=None, waker=None) -> int:
         if i not in ids:
             ids.append(i)
     final["answered_ids"] = ids[-400:]
+    final["inflight"] = box["state"].get("inflight") or ""
+    final["claim_owner"] = box["state"].get("claim_owner") or ""
+    final["claim_until"] = box["state"].get("claim_until") or ""
+    final["claim_phase"] = box["state"].get("claim_phase") or ""
+    final["unknown_ids"] = list(box["state"].get("unknown_ids") or [])
     if final != box["state"]:
         persist(final)
     print(json.dumps({"ran": True, "rc": rc, "watermark": final.get("watermark"),

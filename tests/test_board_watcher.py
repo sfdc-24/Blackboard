@@ -53,7 +53,7 @@ class Routing(unittest.TestCase):
 
     def test_a_waker_reply_to_his_whatsapp_starts_the_outbox_not_gemini(self):
         r = row("GEMINI-WAKE-R2", "2026-09-24T03:51:00Z", source="gemini", target="whatsapp;ALL",
-                payload="BCB|v=1|id=GEMINI-WAKE-R2|from=gemini|to=whatsapp,ALL|wakerreply=1|answers=R2|REPLY: ok")
+                payload="BCB|v=1|id=GEMINI-WAKE-R2|phase=DONE|class=NOTE|from=gemini|to=whatsapp,ALL|wakerreply=1|answers=R2|REPLY: ok")
         self.assertEqual(list(w.plan([r], set(), self.routes)[0]), ["wa-outbox"])
 
     def test_gemini_answering_itself_is_not_a_ring(self):

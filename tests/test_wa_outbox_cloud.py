@@ -48,6 +48,25 @@ class WakerReplyParsing(unittest.TestCase):
     def test_a_forged_tag_is_refused(self):
         self.assertIsNone(outbox.parse_wa_request(waker_row("G-1", "gemini]\n[ASK - you", "whatsapp;ALL")))
 
+    def test_wakerreply_10_is_not_an_answer(self):
+        row = waker_row("GEMINI-WAKE-WRK-1", "gemini", "whatsapp;ALL")
+        row[5] = row[5].replace("wakerreply=1", "wakerreply=10")
+        self.assertIsNone(outbox.parse_wa_request(row))
+
+    def test_a_note_quoting_the_marker_is_not_an_answer(self):
+        payload = ("BCB|v=1|id=NOTE-1|phase=NOTE|from=wa-outbox|to=whatsapp|"
+                   "the reply carried wakerreply=1 so this note quotes it|REPLY: not an answer")
+        row = ["NOTE-1", "2026-09-24T03:00:00Z", "wa-outbox", "whatsapp;ALL", "NOTE", payload]
+        self.assertIsNone(outbox.parse_wa_request(row))
+
+    def test_a_waker_reply_needs_phase_done_and_a_nonempty_answers(self):
+        missing_phase = waker_row("GEMINI-WAKE-WRK-1", "gemini", "whatsapp;ALL")
+        missing_phase[5] = missing_phase[5].replace("phase=DONE|", "")
+        self.assertIsNone(outbox.parse_wa_request(missing_phase))
+        empty_answers = waker_row("GEMINI-WAKE-WRK-1", "gemini", "whatsapp;ALL")
+        empty_answers[5] = empty_answers[5].replace("answers=WRK-1", "answers=")
+        self.assertIsNone(outbox.parse_wa_request(empty_answers))
+
     def test_his_own_inbound_row_is_never_sent_back(self):
         row = ["WRK-1", "2026-09-24T02:16:43Z", "whatsapp", "Blackboard Alpha DB", "APPEND",
                "Gemini - check the board and respond to claude"]
@@ -123,8 +142,61 @@ class CloudWrapper(unittest.TestCase):
         first = list(self.sent)
         self.assertEqual(len(first), 1)
         self.run_cloud(store)
-        self.assertEqual(len(self.sent), 2)
-        self.assertEqual(len(set(self.sent)), 2, "a message was sent twice")
+        # The first send was recorded. The second had already been claimed when
+        # the container died inside the send, so its outcome is unknown and
+        # must not go out again on its own.
+        self.assertEqual(self.sent, ["GEMINI-WAKE-WRK-9"])
+        self.assertIn("GROK-WAKE-WRK-8", store.state.get("unknown_row_ids") or [])
+
+    def test_kill_between_send_and_receipt_is_not_resent(self):
+        """Send returned, the cursor save did not. The next run must not send it."""
+        store = MemStore({"schema": 1, "delivered_row_ids": ["OLD"], "delivered_bcb_ids": []})
+        self.rows = [waker_row("GEMINI-WAKE-WRK-9", "gemini", "whatsapp;ALL")]
+        real_save = store.save
+
+        def save(name, state, token):
+            ids = state.get("delivered_row_ids") or []
+            already = (store.state or {}).get("delivered_row_ids") or []
+            if "GEMINI-WAKE-WRK-9" in ids and "GEMINI-WAKE-WRK-9" not in already:
+                raise RuntimeError("killed after send, before the receipt save")
+            return real_save(name, state, token)
+
+        store.save = save
+        with self.assertRaises(RuntimeError):
+            self.run_cloud(store)
+        self.assertEqual(self.sent, ["GEMINI-WAKE-WRK-9"])
+        self.assertNotIn("GEMINI-WAKE-WRK-9", store.state.get("delivered_row_ids") or [])
+
+        store.save = real_save
+        self.run_cloud(store)
+        self.assertEqual(self.sent, ["GEMINI-WAKE-WRK-9"],
+                         "an unknown send was resent: %r" % (self.sent,))
+        self.assertIn("GEMINI-WAKE-WRK-9", store.state.get("unknown_row_ids") or [])
+
+    def test_two_overlapping_runs_only_the_claim_winner_sends(self):
+        store = MemStore({"schema": 1, "delivered_row_ids": ["OLD"], "delivered_bcb_ids": []})
+        self.rows = [waker_row("GEMINI-WAKE-WRK-9", "gemini", "whatsapp;ALL")]
+        spawned = {"done": False}
+
+        def fake_send(req):
+            if not spawned["done"]:
+                spawned["done"] = True
+                try:
+                    self.run_cloud(store)
+                except state_store.Conflict:
+                    pass
+            self.sent.append(req["row_id"])
+            return True, "HTTP 200"
+
+        with mock.patch.object(outbox, "read_board_rows", return_value=self.rows), \
+             mock.patch.object(outbox, "send_via_notify", side_effect=fake_send), \
+             mock.patch.object(outbox, "append_log"):
+            try:
+                cloud.run(store=store, outbox=outbox)
+            except state_store.Conflict:
+                pass
+        self.assertEqual(self.sent, ["GEMINI-WAKE-WRK-9"],
+                         "overlapping runs both sent: %r" % (self.sent,))
 
 
 class ReceiptMasksTheRecipient(unittest.TestCase):
