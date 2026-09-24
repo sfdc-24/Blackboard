@@ -21,7 +21,7 @@ from app.core import StudioController
 from app.workers.synthetic import SyntheticWorker
 
 
-TARGET = "https://studio-lead-canary-abc-uc.a.run.app"
+TARGET = "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
 ORIGIN = "https://www.sfdc24.com"
 EMAIL = "operator@example.com"
 OTP = "123456"
@@ -300,14 +300,14 @@ class ConfigurationTests(unittest.TestCase):
             canary._configuration(live=True, target=TARGET, origin=ORIGIN),
         )
         bad_targets = (
-            "http://studio-lead-canary-abc-uc.a.run.app",
+            "http://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             TARGET + "/",
             TARGET + "/path",
             TARGET + "?x=1",
             TARGET + "#fragment",
-            "https://user@studio-lead-canary-abc-uc.a.run.app",
-            "https://studio-lead-canary-abc-uc.a.run.app:443",
-            "https://STUDIO-lead-canary-abc-uc.a.run.app",
+            "https://user@lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app:443",
+            "https://LEAD-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             "https://localhost",
             "https://127.0.0.1",
         )
@@ -320,35 +320,55 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(canary.CanaryFailure):
             canary._configuration(live=False, target=TARGET, origin=ORIGIN)
 
-    def test_public_target_is_never_allowed_and_untagged_run_app_needs_marker(self):
+    def test_only_a_lead_canary_tag_url_is_ever_allowed(self):
+        # claude-code-cli review of #229: the service's untagged primary url
+        # serves the 100 percent public revision, and an override marker let
+        # the runner target it. There is no override now.
         for target in (
             "https://sfdc24.com",
             "https://www.sfdc24.com",
             "https://studio.sfdc24.com",
             "https://notcanary.sfdc24.com",
+            # the real service's primary (untagged) url - production
+            "https://sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # its public traffic tag
+            "https://claude-text---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # other tags that merely contain the words
+            "https://voice-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://leadcanary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://studio-abc-uc.a.run.app",
+            # Gemini's review of #231: names, not tags, and other projects.
+            # An untagged service named lead-canary or *-lead-canary-*
+            "https://lead-canary-abc-uc.a.run.app",
+            "https://studio-lead-canary-abc-uc.a.run.app",
+            # a prefix before the tag
+            "https://my-lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # the tag on another service in our project
+            "https://lead-canary---other-service-yzet4vuplq-uc.a.run.app",
+            # our service name and tag in someone else's project
+            "https://lead-canary---sfdc24-studio-controller-attacker01-uc.a.run.app",
+            # another region
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-ew.a.run.app",
+            # a subdomain of the real host
+            "https://x.lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # the fully qualified form with a trailing dot (Gemini's GO note):
+            # it names the same host to DNS, and must still fail closed
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app.",
         ):
             with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
                 canary._configuration(live=True, target=target, origin=ORIGIN)
-            with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
-                canary._configuration(
-                    live=True, target=target, origin=ORIGIN,
-                    safety_marker=canary.LIVE_SAFETY_MARKER,
-                )
-        target = "https://studio-abc-uc.a.run.app"
-        with self.assertRaises(canary.CanaryFailure):
-            canary._configuration(live=True, target=target, origin=ORIGIN)
-        self.assertEqual(
-            (target, ORIGIN),
-                    canary._configuration(
-                        live=True, target=target, origin=ORIGIN,
-                        safety_marker=canary.LIVE_SAFETY_MARKER,
-                    ),
-                )
-        with self.assertRaises(canary.CanaryFailure):
+        self.assertFalse(hasattr(canary, "LIVE_SAFETY_MARKER"))
+        with self.assertRaises(TypeError):
             canary._configuration(
-                live=True, target=target, origin=ORIGIN,
-                safety_marker=canary.LIVE_SAFETY_MARKER + "-almost",
+                live=True, target="https://studio-abc-uc.a.run.app", origin=ORIGIN,
+                safety_marker="STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1",
             )
+        tag = "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
+        self.assertEqual((tag, ORIGIN), canary._configuration(live=True, target=tag, origin=ORIGIN))
+
+    def test_the_command_line_has_no_override_flag(self):
+        with self.assertRaises(SystemExit):
+            canary._parser().parse_args(["--live", "--safety-marker", "anything"])
 
 
 class LifecycleTests(unittest.TestCase):
@@ -395,7 +415,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(ORIGIN, request.headers["Origin"])
             self.assertEqual("identity", request.headers["Accept-Encoding"])
             self.assertEqual("https", request.url.scheme)
-            self.assertEqual("studio-lead-canary-abc-uc.a.run.app", request.url.host)
+            self.assertEqual(canary.LEAD_CANARY_HOST, request.url.host)
         self.assertNotIn("Authorization", scenario.calls[0].headers)
         self.assertNotIn("Authorization", scenario.calls[1].headers)
         self.assertEqual("Bearer " + OPERATOR_TOKEN, scenario.calls[2].headers["Authorization"])
@@ -467,7 +487,7 @@ class LifecycleTests(unittest.TestCase):
                     identifier=fixed_identifier, wall_clock=lambda: 1790211840,
                 )
         self.assertEqual(1, len(calls))
-        self.assertEqual("studio-lead-canary-abc-uc.a.run.app", calls[0].url.host)
+        self.assertEqual(canary.LEAD_CANARY_HOST, calls[0].url.host)
 
     def test_identity_body_limit_stops_stream_early_and_closes_it(self):
         half = canary.MAX_RESPONSE_BYTES // 2

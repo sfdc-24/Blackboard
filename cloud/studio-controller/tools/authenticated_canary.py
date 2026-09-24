@@ -25,7 +25,6 @@ import httpx
 
 
 RECEIPT_SCHEMA = "studio-authenticated-lead-canary.v1"
-LIVE_SAFETY_MARKER = "STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1"
 FIXED_UTTERANCE = "How many leads do we have?"
 WHOLE_RUN_SECONDS = 180.0
 REQUEST_SECONDS = 15.0
@@ -40,7 +39,13 @@ _HOST = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\."
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z"
 )
-_LEAD_CANARY_LABEL = re.compile(r"(?:^|-)lead-canary(?:-|$)")
+# The one host this runner may send a sign-in to: the lead-canary TAG of our
+# studio controller. Cloud Run writes a tag url as TAG---SERVICE-HASH-REGION,
+# and HASH is per project. Matching "lead-canary" anywhere in a label also
+# admitted an untagged service merely NAMED lead-canary-..., another service's
+# tag, and the same names in any other project, which would then receive the
+# operator's email and OTP (Gemini's review of #231). So the whole host is fixed.
+LEAD_CANARY_HOST = "lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
 _OPAQUE = re.compile(r"[A-Za-z0-9._:-]{1,512}\Z")
 _OTP = re.compile(r"[0-9]{6}\Z")
 _LEAD_TEXT = re.compile(
@@ -96,18 +101,18 @@ def _canonical_https_origin(value: str) -> tuple[str, str]:
     return canonical, host
 
 
-def _configuration(*, live: bool, target: str, origin: str,
-                   safety_marker: str = "") -> tuple[str, str]:
+def _configuration(*, live: bool, target: str, origin: str) -> tuple[str, str]:
     if live is not True:
         raise CanaryFailure("configuration")
     target, host = _canonical_https_origin(target)
     origin, _ = _canonical_https_origin(origin)
     if origin != EXPECTED_ORIGIN or not host.endswith(".a.run.app"):
         raise CanaryFailure("configuration")
-    tagged = any(_LEAD_CANARY_LABEL.search(label) for label in host.split("."))
-    # The marker is a deliberate override only for an untagged Cloud Run
-    # service. It can never authorize a public/custom production hostname.
-    if not tagged and safety_marker != LIVE_SAFETY_MARKER:
+    # Only the lead-canary TAG url. The untagged *.a.run.app url is the
+    # service's primary address and serves whatever revision holds public
+    # traffic (claude-code-cli review of #229: an override marker for untagged
+    # hosts accepted exactly that production url), so there is no override.
+    if host != LEAD_CANARY_HOST:
         raise CanaryFailure("configuration")
     return target, origin
 
@@ -720,7 +725,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--target", default="")
     parser.add_argument("--origin", default="")
-    parser.add_argument("--safety-marker", default="")
     return parser
 
 
@@ -741,7 +745,6 @@ def main(argv=None, *, client_factory=None, secret_reader=None, output=None,
     try:
         target, origin = _configuration(
             live=args.live, target=args.target, origin=args.origin,
-            safety_marker=args.safety_marker,
         )
         email = _read_secret(reader, "Operator email: ", "operator_input")
         expected_raw = _read_secret(
