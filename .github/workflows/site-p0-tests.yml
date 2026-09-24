@@ -9,6 +9,7 @@ on:
       - "tests/test_governor_voice.cjs"
       - "tests/test_grounding_and_leads.cjs"
       - "tests/test_governor_no_names.cjs"
+      - "tests/test_monitor_silence.js"
       - "scripts/object_reference.py"
       - "tests/test_tts_guards.js"
       - ".github/workflows/site-p0-tests.yml"
@@ -30,3 +31,4 @@ jobs:
       - run: |
           node --test tests/test_governor_voice.cjs tests/test_governor_tenant_boundary.cjs tests/test_grounding_and_leads.cjs tests/test_governor_no_names.cjs
           node tests/test_tts_guards.js
+          node tests/test_monitor_silence.js
