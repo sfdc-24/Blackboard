@@ -20,6 +20,7 @@
 !/cloud/board-probe
 !/cloud/waker-shadow
 !/cloud/ack-once
+!/cloud/studio-controller
 
 !/scripts
 /scripts/*
