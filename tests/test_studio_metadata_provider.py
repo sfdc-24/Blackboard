@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "cloud" / "studio-controller"))
 
 import app.metadata_provider as provider
 from app.metadata_operations import (
+    InvalidOperation,
     MetadataOperationLedger,
     PersistenceUncertain,
 )
@@ -120,6 +121,7 @@ class Transport:
 
     def __init__(self, clock):
         self.calls = []
+        self.opened_identities = []
         self.session_overrides = {}
         self.describe_overrides = {}
         self.ack_overrides = {}
@@ -141,6 +143,9 @@ class Transport:
 
     def open_verified_session(self, binding, deadline, cancellation):
         self.calls.append(("open", deadline, None, cancellation))
+        self.opened_identities.append((
+            binding.org_id, binding.origin, binding.version, binding.binding_version,
+        ))
         if self.advance_on_open:
             self._clock.advance(self.advance_on_open)
         if self.open_error:
@@ -263,6 +268,27 @@ class MetadataProviderTests(unittest.TestCase):
                              VERSION, 4, "sandbox")
         self.assertEqual(sandbox.environment, "sandbox")
 
+    def test_org_binding_reinitialization_cannot_retarget_reserved_dispatch(self):
+        harness, adapter, transport, budget, permit = self.reserved()
+        original = adapter.binding.as_mapping()
+        with self.assertRaises(MetadataProviderError):
+            adapter.binding.__init__(
+                BINDING_ID,
+                "00Dzzzzzzzzzzzzzzz",
+                "https://alternate.develop.my.salesforce.com",
+                "v63.0",
+                2,
+                "developer",
+            )
+        self.assertEqual(adapter.binding.as_mapping(), original)
+        self.assertEqual(budget._binding.as_mapping(), original)
+
+        result = adapter.dispatch_once(permit)
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(transport.opened_identities[-1], (ORG_ID, ORIGIN, VERSION, 1))
+        self.assertEqual(Counter(call[0] for call in transport.calls)["create"], 1)
+        self.assertEqual(harness.snapshot()["provider_attempts"], 1)
+
     def test_transport_capabilities_and_callable_surface_are_exact(self):
         for keys in (provider.TRANSPORT_METHODS, provider.SESSION_KEYS,
                      provider.DESCRIBE_KEYS, provider.ACK_KEYS,
@@ -280,6 +306,29 @@ class MetadataProviderTests(unittest.TestCase):
                 setattr(adapter, name, value)
             with self.subTest(delete=name), self.assertRaises(AttributeError):
                 delattr(adapter, name)
+        adapter_state = (
+            adapter.binding, adapter._transport, adapter._transport_callables,
+            adapter._clock, adapter._trusted_timestamp, adapter._owner,
+            adapter._budgeted_operations,
+        )
+        replacement_binding = OrgBinding(
+            "replacement_binding", "00Dzzzzzzzzzzzzzzz",
+            "https://alternate.develop.my.salesforce.com", "v63.0", 2,
+            "developer",
+        )
+        with self.assertRaises(MetadataProviderError):
+            adapter.__init__(
+                replacement_binding, Transport(self.mono), clock=lambda: 1,
+                trusted_timestamp=lambda: 1,
+            )
+        self.assertEqual(
+            (
+                adapter.binding, adapter._transport, adapter._transport_callables,
+                adapter._clock, adapter._trusted_timestamp, adapter._owner,
+                adapter._budgeted_operations,
+            ),
+            adapter_state,
+        )
         # Failed tampering must leave the validated transport and clocks usable.
         harness = LedgerHarness()
         budget = adapter.issue_execution_budget(
@@ -304,6 +353,39 @@ class MetadataProviderTests(unittest.TestCase):
         harness, adapter, transport, budget = self.prepared()
         self.assertIsInstance(budget, ExecutionBudget)
         self.assertNotIn(BINDING_ID, repr(budget))
+        registry = adapter._budgeted_operations
+        self.assertIsInstance(registry, frozenset)
+        with self.assertRaises(AttributeError):
+            registry.clear()
+        with self.assertRaises(AttributeError):
+            registry.add(("operation_2", "forged"))
+        budget_state = (
+            budget._owner, budget._ledger, budget._ledger_store, budget._binding,
+            budget._operation_id, budget._plan_hash, budget._field, budget._member,
+            budget._deadline, budget._phase, budget._cancellation,
+        )
+        with self.assertRaises(MetadataProviderError):
+            budget.__init__(
+                provider._BUDGET_KEY, owner=object(), ledger=harness.ledger,
+                binding=self.binding, snapshot=harness.snapshot(), field=FIELD,
+                member=MEMBER, deadline=1019, clock=lambda: 1000,
+                timestamp=lambda: 105,
+            )
+        self.assertEqual(
+            (
+                budget._owner, budget._ledger, budget._ledger_store, budget._binding,
+                budget._operation_id, budget._plan_hash, budget._field, budget._member,
+                budget._deadline, budget._phase, budget._cancellation,
+            ),
+            budget_state,
+        )
+        cancellation_state = (budget._cancellation._budget, budget._cancellation._owner)
+        with self.assertRaises(MetadataProviderError):
+            budget._cancellation.__init__(provider._BUDGET_KEY, object(), object())
+        self.assertEqual(
+            (budget._cancellation._budget, budget._cancellation._owner),
+            cancellation_state,
+        )
         for operation in (copy.copy, copy.deepcopy, pickle.dumps, json.dumps):
             with self.subTest(operation=operation), self.assertRaises(TypeError):
                 operation(budget)
@@ -336,6 +418,13 @@ class MetadataProviderTests(unittest.TestCase):
         adapter, transport = self.adapter()
         budget = adapter.issue_execution_budget(
             issued.ledger, "operation_1", issued.actor, deadline=1015
+        )
+
+        ledger_state = (issued.ledger.store, issued.ledger.conflict_type)
+        with self.assertRaises(InvalidOperation):
+            issued.ledger.__init__(lookalike.store, conflict_type=RuntimeError)
+        self.assertEqual(
+            (issued.ledger.store, issued.ledger.conflict_type), ledger_state
         )
 
         for name, value in (("store", lookalike.store),
@@ -600,6 +689,13 @@ class MetadataProviderTests(unittest.TestCase):
 
     def test_permit_is_nonserializable_one_use_and_concurrency_safe(self):
         _, adapter, transport, _, permit = self.reserved()
+        permit_state = (permit._owner, permit._budget, permit._lock, permit._consumed)
+        with self.assertRaises(DispatchPermitError):
+            permit.__init__(provider._PERMIT_KEY, owner=object(), budget=object())
+        self.assertEqual(
+            (permit._owner, permit._budget, permit._lock, permit._consumed),
+            permit_state,
+        )
         for operation in (copy.copy, copy.deepcopy, pickle.dumps, json.dumps):
             with self.subTest(operation=operation), self.assertRaises(TypeError):
                 operation(permit)

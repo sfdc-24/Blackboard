@@ -124,6 +124,12 @@ certify it. One immutable `OrgBinding` object is not evidence of a durable,
 bijective registry between opaque IDs and Salesforce orgs; that registry and
 its rebind/rotation controls remain unbuilt.
 
+Sealed bindings, budgets, cancellation views, dispatch permits, ledgers and the
+adapter reject direct initializer re-entry before validating or assigning any
+replacement value. The adapter's issued-plan registry is an immutable value
+replaced only while its internal lock is held, so callers cannot clear it to
+mint a second budget or renew the original deadline.
+
 One sealed, non-copyable, non-serializable `ExecutionBudget` is issued from the
 trusted ledger while an operation is confirmed and before provider preflight.
 It owns one absolute monotonic deadline of at most 20 seconds, the plan expiry,

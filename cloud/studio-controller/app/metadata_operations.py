@@ -294,6 +294,8 @@ class MetadataOperationLedger:
     __slots__ = ("store", "conflict_type", "_sealed")
 
     def __init__(self, store, *, conflict_type):
+        if getattr(self, "_sealed", False):
+            raise InvalidOperation("metadata ledgers cannot be reinitialized")
         # The adapter must implement atomic load/save generation CAS. Do not
         # assume the local FileStore supplies a distributed execution lock.
         if getattr(store, "atomic_generation_cas", None) is not True:

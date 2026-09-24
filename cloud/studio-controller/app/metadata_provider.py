@@ -14,7 +14,7 @@ accepted by the dispatch method.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import json
 import math
 import re
@@ -69,7 +69,7 @@ class DispatchPermitError(MetadataProviderError):
     """A dispatch capability is absent, forged, duplicated, or consumed."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class OrgBinding:
     """Immutable mapping from an opaque ledger binding to one exact org."""
 
@@ -79,24 +79,37 @@ class OrgBinding:
     version: str
     binding_version: int
     environment: str
+    _sealed: bool = dataclass_field(init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if type(self.org_binding_id) is not str or not _OPAQUE_ID.fullmatch(self.org_binding_id):
+    def __init__(self, org_binding_id, org_id, origin, version,
+                 binding_version, environment) -> None:
+        if getattr(self, "_sealed", False):
+            raise MetadataProviderError("organization bindings cannot be reinitialized")
+        # Validate every value before assigning any slot so construction either
+        # produces one complete sealed value or leaves the fresh object empty.
+        if type(org_binding_id) is not str or not _OPAQUE_ID.fullmatch(org_binding_id):
             raise MetadataProviderError("a bounded opaque organization binding ID is required")
-        if self.org_binding_id == self.org_id:
+        if org_binding_id == org_id:
             raise MetadataProviderError("the opaque binding ID must not be the Salesforce organization ID")
-        if type(self.org_id) is not str or not _ORG_ID.fullmatch(self.org_id):
+        if type(org_id) is not str or not _ORG_ID.fullmatch(org_id):
             raise MetadataProviderError("an exact 18-character Salesforce organization ID is required")
-        match = _ORIGIN.fullmatch(self.origin) if type(self.origin) is str else None
+        match = _ORIGIN.fullmatch(origin) if type(origin) is str else None
         if match is None:
             raise MetadataProviderError("a canonical bare HTTPS developer or sandbox origin is required")
         expected_environment = "developer" if match.group(1) == "develop" else "sandbox"
-        if type(self.environment) is not str or self.environment != expected_environment:
+        if type(environment) is not str or environment != expected_environment:
             raise MetadataProviderError("the environment must exactly match the pinned origin")
-        if type(self.version) is not str or not _VERSION.fullmatch(self.version):
+        if type(version) is not str or not _VERSION.fullmatch(version):
             raise MetadataProviderError("a pinned Salesforce API version is required")
-        if type(self.binding_version) is not int or not 1 <= self.binding_version <= 2**31 - 1:
+        if type(binding_version) is not int or not 1 <= binding_version <= 2**31 - 1:
             raise MetadataProviderError("a positive immutable binding version is required")
+        object.__setattr__(self, "org_binding_id", org_binding_id)
+        object.__setattr__(self, "org_id", org_id)
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "binding_version", binding_version)
+        object.__setattr__(self, "environment", environment)
+        object.__setattr__(self, "_sealed", True)
 
     def __repr__(self) -> str:
         # Actual org identity and origin are internal provider-routing data and
@@ -138,6 +151,8 @@ class ExecutionBudget:
 
     def __init__(self, key, *, owner, ledger, binding, snapshot, field, member,
                  deadline, clock, timestamp) -> None:
+        if getattr(self, "_sealed", False):
+            raise MetadataProviderError("execution budgets cannot be reinitialized")
         if key is not _BUDGET_KEY:
             raise MetadataProviderError("execution budgets may only be issued by the adapter")
         mono = _sample_monotonic(clock)
@@ -273,6 +288,8 @@ class _CancellationView:
     __slots__ = ("_budget", "_owner", "_sealed")
 
     def __init__(self, key, budget, owner) -> None:
+        if getattr(self, "_sealed", False):
+            raise MetadataProviderError("cancellation views cannot be reinitialized")
         if key is not _BUDGET_KEY:
             raise MetadataProviderError("cancellation views may only come from an execution budget")
         object.__setattr__(self, "_budget", budget)
@@ -317,6 +334,8 @@ class _DispatchPermit:
     __slots__ = ("_owner", "_budget", "_lock", "_consumed", "_sealed")
 
     def __init__(self, key, *, owner, budget) -> None:
+        if getattr(self, "_sealed", False):
+            raise DispatchPermitError("dispatch permits cannot be reinitialized")
         if key is not _PERMIT_KEY:
             raise DispatchPermitError("dispatch permits may only be minted by the ledger coordinator")
         object.__setattr__(self, "_owner", owner)
@@ -526,6 +545,8 @@ class SalesforceMetadataAdapter:
 
     def __init__(self, binding: OrgBinding, transport, *, clock=time.monotonic,
                  trusted_timestamp) -> None:
+        if getattr(self, "_sealed", False):
+            raise MetadataProviderError("metadata adapters cannot be reinitialized")
         if type(binding) is not OrgBinding:
             raise MetadataProviderError("an immutable closed organization binding is required")
         if not callable(clock) or not callable(trusted_timestamp):
@@ -538,7 +559,7 @@ class SalesforceMetadataAdapter:
         self._trusted_timestamp = trusted_timestamp
         self._owner = object()
         self._budget_lock = threading.Lock()
-        self._budgeted_operations = set()
+        self._budgeted_operations = frozenset()
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, name, value) -> None:
@@ -576,7 +597,10 @@ class SalesforceMetadataAdapter:
                 field=field, member=member, deadline=deadline, clock=self._clock,
                 timestamp=self._trusted_timestamp,
             )
-            self._budgeted_operations.add(identity)
+            object.__setattr__(
+                self, "_budgeted_operations",
+                self._budgeted_operations.union((identity,)),
+            )
         return budget
 
     def cancel_execution(self, budget: ExecutionBudget) -> None:

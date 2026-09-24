@@ -296,6 +296,8 @@ through exact provider preflight, one possible create-method entry and an
 independent verification read. It also seals the in-process ledger dependency
 configuration and pins the exact store object identity used at issuance; a
 look-alike ledger or dependency swap fails before ledger or provider I/O.
+Sealed objects reject initializer re-entry, and the immutable issued-plan
+registry prevents clearing local history to obtain a second execution budget.
 
 The injected transport has only four provider-specific callables and must
 declare no write retries and disabled redirects. The adapter pins their resolved
