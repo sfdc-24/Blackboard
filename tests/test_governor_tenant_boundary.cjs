@@ -341,7 +341,7 @@ test('present malformed budget or cap state fails closed before the provider', (
     JSON.stringify({ day: '20260907', daily: 0,
       sessions: { ['ca_' + 'a'.repeat(32)]: ['1', Date.now() + 60000] } }),
     JSON.stringify({ day: '20260907', daily: 0,
-      sessions: Object.fromEntries(Array.from({ length: 97 }, (_, index) => [
+      sessions: Object.fromEntries(Array.from({ length: createHarness().context.CHAT_MAX_ACTIVE_SESSIONS + 1 }, (_, index) => [
         'ca_' + index.toString(16).padStart(32, '0'), [1, Date.now() + 60000],
       ])) }),
   ];
@@ -372,7 +372,9 @@ test('present malformed budget or cap state fails closed before the provider', (
 test('active-session state is bounded and new spend fails closed without eviction', () => {
   const h = createHarness();
   const admitted = [];
-  for (let i = 0; i < 96; i += 1) {
+  const capacity = h.context.CHAT_MAX_ACTIVE_SESSIONS;
+  assert.ok(capacity >= 96, 'capacity shrank below the v50 floor');
+  for (let i = 0; i < capacity; i += 1) {
     const identity = h.context.conversationIdentity_('', '');
     admitted.push(identity);
     assert.equal(h.context.reserveChatBudget_(identity.key).ok, true);
@@ -381,7 +383,7 @@ test('active-session state is bounded and new spend fails closed without evictio
   const denied = h.context.reserveChatBudget_(overflow.key);
   assert.equal(denied.reason, 'session-capacity');
   const state = JSON.parse(h.values.get('CHAT_BUDGET_V1'));
-  assert.equal(Object.keys(state.sessions).length, 96);
+  assert.equal(Object.keys(state.sessions).length, capacity);
   assert.equal(Object.hasOwn(state.sessions, admitted[0].key), true);
   assert.ok(h.values.get('CHAT_BUDGET_V1').length < 8500);
 });
