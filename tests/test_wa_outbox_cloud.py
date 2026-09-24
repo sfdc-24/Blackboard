@@ -127,5 +127,18 @@ class CloudWrapper(unittest.TestCase):
         self.assertEqual(len(set(self.sent)), 2, "a message was sent twice")
 
 
+class ReceiptMasksTheRecipient(unittest.TestCase):
+    def test_the_number_meta_echoes_back_is_masked(self):
+        echo = '{"contacts":[{"input":"15550001111","wa_id":"15550001111"}],"messages":[{"id":"wamid.X"}]}'
+        with mock.patch.object(wa_notify, "load_env", return_value={
+                "META_TOKEN": "t", "WA_PHONE_NUMBER_ID": "1234567890123456",
+                "WA_TO": "15550001111"}), \
+             mock.patch.object(wa_notify, "send", return_value={"ok": True, "status": 200, "body": echo}):
+            ok, detail = wa_notify.notify("hi", kind="STATUS", tag="x")
+        self.assertTrue(ok)
+        self.assertNotIn("15550001111", detail)
+        self.assertIn("wamid.X", detail)
+
+
 if __name__ == "__main__":
     unittest.main()

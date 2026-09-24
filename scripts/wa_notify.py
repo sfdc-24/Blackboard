@@ -185,7 +185,11 @@ def notify(text: str, kind: str = "BLOCKED", tag: str = "claude-code-cli",
     if dry_run:
         return True, "DRY RUN (%s, %d chars to %s):\n%s" % (which, len(body), recipient, body)
     res = send(body, token, pnid, recipient)
-    return bool(res["ok"]), "HTTP %s %s" % (res["status"], res["body"][:300])
+    # Meta echoes the recipient ("input", "wa_id") in its receipt, and callers
+    # print this string - on 2026-09-24 his number landed in Cloud Logging from
+    # the first cloud send. Mask it here, once, for every caller.
+    detail = res["body"].replace(recipient, "<WA_TO>") if recipient else res["body"]
+    return bool(res["ok"]), "HTTP %s %s" % (res["status"], detail[:300])
 
 
 def main() -> int:
