@@ -67,8 +67,8 @@ is a symlink."* Run it from a real canonical-case directory, not a temp path.
    governor auth and the monitor.
 3. **Never leave `Auth.gs` beside `Auth.js`.** Two copies of one server file in
    one rootDir, and the older can win.
-4. **`gas/` is redundant now** and stays gitignored. These seven files are the
-   tracked copy, and they were already tracked and public before this
+4. **`gas/` is redundant now** and stays gitignored. These tracked project
+   files are the reviewed copy, and they were already tracked and public before this
    reconciliation - what changed is that they are now true.
 
 ## Why the routing change of 2026-09-20 did not need a deploy
@@ -97,7 +97,7 @@ reconciliation, and the procedure below is the one that worked.
 ```
 mkdir C:\Users\salam\Quantum\.gas-pull-20260922      # real path, not a symlink
 # .clasp.json with the scriptId and rootDir "."
-clasp pull                                           # 7 files
+clasp pull                                           # 8 files
 # diff against apps-script/governor-page-api/, edit, node --check
 clasp push --force
 clasp create-version "<what changed>"

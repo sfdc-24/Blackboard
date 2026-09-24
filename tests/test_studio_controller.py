@@ -624,7 +624,9 @@ class ApiTests(unittest.TestCase):
         )
         app = create_app(
             settings=settings(
-                email_sender_url="https://script.google.com/macros/s/test/exec",
+                email_sender_url=(
+                    "https://script.google.com/macros/s/test/exec?action=studio-email"
+                ),
                 email_sender_secret=secret,
             ),
             store=store,
@@ -645,6 +647,10 @@ class ApiTests(unittest.TestCase):
             email_client.close()
 
         self.assertEqual(2, len(observed["requests"]))
+        self.assertEqual("POST", observed["requests"][0].method)
+        self.assertEqual(
+            "studio-email", observed["requests"][0].url.params.get("action")
+        )
         payload = observed["payload"]
         self.assertEqual(
             {"timestamp", "nonce", "email", "code", "signature"}, set(payload)
@@ -657,6 +663,45 @@ class ApiTests(unittest.TestCase):
         ).hexdigest()
         self.assertTrue(hmac.compare_digest(expected, payload["signature"]))
         self.assertNotIn(payload["code"], json.dumps(response.json()))
+
+    def test_email_adapter_rejects_html_false_and_non_object_receipts(self):
+        cases = (
+            (httpx.Response(200, text="<html>not json</html>"), "invalid JSON"),
+            (httpx.Response(200, json={"ok": False}), "refused delivery"),
+            (httpx.Response(200, json=[{"ok": True}]), "refused delivery"),
+        )
+        for sender_response, error in cases:
+            with self.subTest(error=error, body=sender_response.text):
+                email_client = httpx.Client(
+                    transport=httpx.MockTransport(lambda _: sender_response),
+                    follow_redirects=True,
+                    max_redirects=3,
+                )
+                app = create_app(
+                    settings=settings(
+                        email_sender_url=(
+                            "https://script.google.com/macros/s/test/exec"
+                            "?action=studio-email"
+                        ),
+                        email_sender_secret=(
+                            "email-adapter-secret-that-is-at-least-32-bytes"
+                        ),
+                    ),
+                    store=MemoryStore(),
+                    worker=CountingWorker(),
+                    clock=lambda: 1000,
+                    id_factory=IDs(),
+                    voice_client=FakeVoiceClient(),
+                    email_client=email_client,
+                )
+                try:
+                    with TestClient(app):
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            app.state.auth_service.sender(
+                                "operator@example.com", "004219"
+                            )
+                finally:
+                    email_client.close()
 
     def test_signed_token_sse_resume_and_session_binding(self):
         app, configured = self.app()

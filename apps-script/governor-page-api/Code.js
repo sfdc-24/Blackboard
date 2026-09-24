@@ -66,8 +66,26 @@ var TTS_KEY_PROP_PREFIX = 'TTS_KEY_V1_';
 var TTS_BUDGET_STATE    = 'TTS_BUDGET_V1';
 
 // ---------- web entry points ----------
+function studioEmailRouteState_(e) {
+  var single = String((e && e.parameter && e.parameter.action) || '');
+  var all = e && e.parameters && e.parameters.action;
+  if (typeof all !== 'undefined') {
+    var values = Array.isArray(all) ? all : [all];
+    var mentionsStudio = single === 'studio-email' || values.some(function (value) {
+      return String(value) === 'studio-email';
+    });
+    if (!mentionsStudio) return 0;
+    return values.length === 1 && String(values[0]) === 'studio-email' &&
+        single === 'studio-email' ? 1 : -1;
+  }
+  return single === 'studio-email' ? 1 : 0;
+}
+
 function doGet(e) {
   var p = (e && e.parameter) || {};
+  // A GET can prove the route exists without reading a secret, board row,
+  // session or provider.  Repeated/ambiguous action values fail closed too.
+  if (studioEmailRouteState_(e) !== 0) return json_({ ok: false });
   // Public build metadata only: no board read, secret access or provider call.
   // sfdc24BuildIdentity_ is not in this source - scripts/gas_build_identity.py
   // stamps it in at deploy time - so the typeof guard is the whole contract:
@@ -148,6 +166,15 @@ function doGet(e) {
 
 function doPost(e) {
   try {
+    var studioEmailRoute = studioEmailRouteState_(e);
+    if (studioEmailRoute !== 0) {
+      if (studioEmailRoute !== 1 || typeof studioEmailHandlePost_ !== 'function') {
+        return json_({ ok: false });
+      }
+      // Return directly.  A malformed or refused Studio request must never
+      // fall through to GOVERNOR_PASS or appendRow_.
+      return studioEmailHandlePost_(e);
+    }
     var req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     var pass = PropertiesService.getScriptProperties().getProperty('GOVERNOR_PASS');
     if (!pass) return json_({ ok: false, error: 'GOVERNOR_PASS not set in Script Properties' });
