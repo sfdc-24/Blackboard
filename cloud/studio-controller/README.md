@@ -203,8 +203,13 @@ non-external-ID `Text` field on `Lead`. The natural-language grammar is delibera
 narrow: `Plan a new field on Lead for prototype interest` creates the local draft
 `Lead.Prototype_Interest__c`, label `Prototype Interest`, length 80. Unsupported
 recognized metadata requests receive local guidance without invoking the model.
-Other utterances retain the existing worker route. This is not general semantic
-metadata intent detection. A typed `metadata.propose` command uses the existing
+Routing requires that anchored planning grammar or explicit Salesforce phrasing;
+`lead`/`custom field` alone does not turn a website/app form request into an org
+request. UI asks mentioning Salesforce retain the prototype route unless they
+explicitly target Salesforce (for example, a field `in Salesforce` or `on the
+Salesforce Lead object`). Unsupported explicit org operations, including deletion,
+remain local guidance only. Other utterances retain the existing worker route.
+This is not general semantic metadata intent detection. A typed `metadata.propose` command uses the existing
 command envelope plus the closed `field` object:
 
 ```json

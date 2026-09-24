@@ -16,6 +16,10 @@ ORG_RE = re.compile(r"00D[A-Za-z0-9]{15}")
 STEM_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
 HASH_RE = re.compile(r"[a-f0-9]{64}")
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+PLAN_REQUEST_RE = re.compile(
+    r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?",
+    re.IGNORECASE,
+)
 FIELD_KEYS = {"parent", "name", "label", "type", "length", "required", "unique", "external_id"}
 CONFIRM_KEYS = {"plan_id", "plan_revision", "plan_hash", "confirmation_nonce"}
 NOTICE = (
@@ -55,10 +59,7 @@ def parse_request(text: str) -> dict | None:
     Unsupported metadata requests get local guidance rather than model fallback.
     Unrelated prototype requests retain their existing route.
     """
-    match = re.fullmatch(
-        r"(?:please )?plan (?:a )?(?:new )?(?:text )?field on Lead for ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?",
-        text.strip(), flags=re.IGNORECASE,
-    )
+    match = PLAN_REQUEST_RE.fullmatch(text.strip())
     if match:
         label = " ".join(match[1].split()).title()
         return validate_field({"parent": "Lead", "name": label.replace(" ", "_"),
@@ -68,9 +69,31 @@ def parse_request(text: str) -> dict | None:
 
 
 def is_metadata_request(text: str) -> bool:
-    return bool(re.search(r"\b(?:plan|create|add|delete|update|change|deploy)\b", text, re.I)
-                and re.search(r"\b(?:field|object|metadata)\b", text, re.I)
-                and re.search(r"\b(?:Lead|Salesforce|custom|metadata)\b", text, re.I))
+    # "lead" and "custom field" also describe ordinary prototype form inputs.
+    # Only the supported anchored grammar implies Salesforce without naming it.
+    if PLAN_REQUEST_RE.fullmatch(text.strip()):
+        return True
+    if not (re.search(r"\b(?:plan|create|add|delete|update|change|deploy)\b", text, re.I)
+            and re.search(r"\b(?:fields?|objects?|metadata)\b", text, re.I)
+            and re.search(r"\bSalesforce\b(?!-)", text, re.I)):
+        return False
+    # Explicit org-directed operations stay local even if they also mention UI
+    # consequences. Unsupported/deleting operations get guidance, never consent.
+    if re.search(
+        r"\b(?:in|within|from)\s+(?:(?:the|my|our)\s+)?Salesforce\b(?!-)"
+        r"|\b(?:on|to)\s+(?:(?:the|my|our)\s+)?Salesforce\s+"
+        r"(?:(?:Lead|Account|Contact|Opportunity|custom)\s+)?(?:object|org|schema|metadata)\b",
+        text, re.I,
+    ):
+        return True
+    # A Salesforce mention is not itself an org target: a Salesforce-themed
+    # website/app or a lead form populated with Salesforce labels is still UI.
+    if re.search(r"\b(?:website|webpage|web page|page|app|application|prototype|mockup|form|screen)\b", text, re.I):
+        return False
+    return bool(re.search(
+        r"\bSalesforce\s+(?:(?:Lead|Account|Contact|Opportunity|custom|Text)\s+)*"
+        r"(?:fields?|objects?|metadata|schema)\b", text, re.I,
+    ))
 
 
 def validate_confirmation(value: dict) -> None:
