@@ -275,6 +275,7 @@ test('both providers get the first-tier admin reference and the numbers rule', (
     assert.match(prompt, /ADMIN TASK REFERENCE/, who);
     assert.match(prompt, /Salesforce Files[\s\S]*Upload Files/, who);
     assert.match(prompt, /exactly one profile[\s\S]*permission sets/, who);
+    assert.match(prompt, /permission set groups, which are assigned to the user directly[^"]*never added to a profile/, who);
     assert.match(prompt, /Data Export service[\s\S]*Data Loader's Export[\s\S]*Export All/, who);
     assert.match(prompt, /Outlook integration[\s\S]*Gmail integration[\s\S]*Einstein Activity Capture[\s\S]*Email to Salesforce/, who);
     assert.match(prompt, /NUMBERS ARE FACTS TOO/, who);
