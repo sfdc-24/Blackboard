@@ -38,6 +38,30 @@ FIRST_QUESTION = {
 }
 
 
+def _answered_cta_question(state: dict, trigger: dict) -> bool:
+    """Recognize an answered CTA replacement through persisted parent links."""
+    question_id = trigger.get("question_id")
+    questions = {item.get("question_id"): item for item in state.get("questions", [])}
+    question = questions.get(question_id)
+    if not question or question.get("status") != "answered":
+        return False
+    if question.get("selected_option") != trigger.get("option_id"):
+        return False
+
+    seen = set()
+    while question_id not in seen:
+        seen.add(question_id)
+        question = questions.get(question_id)
+        if not question:
+            return False
+        if question_id == FIRST_QUESTION["question_id"]:
+            return not question.get("parent_question_id")
+        question_id = question.get("parent_question_id")
+        if not question_id:
+            return False
+    return False
+
+
 class SyntheticWorker:
     """Changes the same prototype as the shared scripted-session fixture."""
 
@@ -50,7 +74,7 @@ class SyntheticWorker:
         return [deepcopy(FIRST_QUESTION)]
 
     def on_turn(self, state: dict, trigger: dict) -> dict:
-        if trigger.get("kind") == "answer" and trigger.get("question_id") == "q-cta":
+        if trigger.get("kind") == "answer" and _answered_cta_question(state, trigger):
             option = trigger.get("option_id")
             choices = {
                 "describe": ("Describe a problem", "Opens guided intake"),

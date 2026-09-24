@@ -206,6 +206,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(409, caught.exception.status)
         self.assertEqual(1, worker.calls)
 
+    def test_changed_cta_decision_updates_prototype_and_replays_exactly(self):
+        controller, store, worker = make_controller()
+        state, _ = controller.create_session()
+        session_id = state["session_id"]
+        first = controller.execute(session_id, {
+            "command_id": "answer-book", "session_id": session_id,
+            "type": "answer", "expected_version": 1,
+            "question_id": "q-cta", "option_id": "book",
+        })
+        self.assertEqual(2, first["artifact_version"])
+        changed = controller.execute(session_id, {
+            "command_id": "change-cta", "session_id": session_id,
+            "type": "change_decision", "expected_version": 2,
+            "question_id": "q-cta",
+        })
+        replacement = next(event["payload"]["question"] for event in changed["events"]
+                           if event["type"] == "question.asked")
+        self.assertEqual("q-cta", replacement["parent_question_id"])
+        command = {
+            "command_id": "answer-work", "session_id": session_id,
+            "type": "answer", "expected_version": 2,
+            "question_id": replacement["question_id"], "option_id": "work",
+        }
+        answer = controller.execute(session_id, command)
+        self.assertEqual(answer, controller.execute(session_id, command))
+        self.assertEqual(["artifact.patch", "question.answered", "confirm"],
+                         [event["type"] for event in answer["events"]])
+        self.assertEqual(3, answer["artifact_version"])
+        saved = StudioRepository(store).load(session_id).state
+        cta = saved["artifact"]["children"][1]["children"][2]
+        self.assertEqual("See the work", cta["label"])
+        self.assertEqual("Opens case studies", cta["detail"])
+        self.assertEqual("answered", saved["questions"][-1]["status"])
+        self.assertEqual("work", saved["questions"][-1]["selected_option"])
+        self.assertEqual(2, worker.calls)
+
     def test_stale_version_refused_before_worker(self):
         controller, _, worker = make_controller()
         state, _ = controller.create_session()
