@@ -426,7 +426,7 @@ class StudioController:
             candidate["paused"] = False
             candidate["turn_seq"] += 1
             candidate["turn_id"] = "turn-%d" % candidate["turn_seq"]
-            event = self._event(candidate, "session.ended", {"reason": "visitor stopped"})
+            event = self._event(candidate, "session.ended", {"reason": "You ended this session."})
             result = {
                 "command_id": command_id,
                 "session_id": candidate["session_id"],
@@ -615,7 +615,7 @@ class StudioController:
             }))
         elif kind == "stop":
             state["stopped"] = True
-            events.append(self._event(state, "session.ended", {"reason": "visitor stopped"}))
+            events.append(self._event(state, "session.ended", {"reason": "You ended this session."}))
 
         problems = []
         if trigger is not None:

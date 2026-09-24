@@ -338,6 +338,7 @@ class CoreTests(unittest.TestCase):
         controller.execute(state["session_id"], {**base, "command_id": "resume-1", "type": "resume"})
         stop = {**base, "command_id": "stop-1", "type": "stop"}
         first = controller.execute(state["session_id"], stop)
+        self.assertEqual("You ended this session.", first["events"][0]["payload"]["reason"])
         self.assertEqual(first, controller.execute(state["session_id"], stop))
         self.assertEqual(0, worker.calls)
 
@@ -386,6 +387,7 @@ class CoreTests(unittest.TestCase):
             "type": "stop", "expected_version": 0,
         })
         self.assertEqual("session.ended", result["events"][0]["type"])
+        self.assertEqual("You ended this session.", result["events"][0]["payload"]["reason"])
         with self.assertRaisesRegex(CommandError, "stopped"):
             controller.activate_voice(state["session_id"], "voice-1", "rtc_late")
         saved = StudioRepository(store).load(state["session_id"]).state
@@ -875,6 +877,9 @@ class ApiTests(unittest.TestCase):
                 "type": "stop", "expected_version": 0,
             })
             self.assertEqual(200, stopped.status_code, stopped.text)
+            self.assertEqual(
+                "You ended this session.", stopped.json()["events"][0]["payload"]["reason"],
+            )
             self.assertEqual(
                 "https://api.openai.com/v1/realtime/calls/rtc_test_call/hangup",
                 self.voice_client.calls[-1][0],
