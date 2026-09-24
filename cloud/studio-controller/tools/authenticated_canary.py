@@ -39,7 +39,13 @@ _HOST = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\."
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z"
 )
-_LEAD_CANARY_LABEL = re.compile(r"(?:^|-)lead-canary(?:-|$)")
+# The one host this runner may send a sign-in to: the lead-canary TAG of our
+# studio controller. Cloud Run writes a tag url as TAG---SERVICE-HASH-REGION,
+# and HASH is per project. Matching "lead-canary" anywhere in a label also
+# admitted an untagged service merely NAMED lead-canary-..., another service's
+# tag, and the same names in any other project, which would then receive the
+# operator's email and OTP (Gemini's review of #231). So the whole host is fixed.
+LEAD_CANARY_HOST = "lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
 _OPAQUE = re.compile(r"[A-Za-z0-9._:-]{1,512}\Z")
 _OTP = re.compile(r"[0-9]{6}\Z")
 _LEAD_TEXT = re.compile(
@@ -102,12 +108,11 @@ def _configuration(*, live: bool, target: str, origin: str) -> tuple[str, str]:
     origin, _ = _canonical_https_origin(origin)
     if origin != EXPECTED_ORIGIN or not host.endswith(".a.run.app"):
         raise CanaryFailure("configuration")
-    # Only a lead-canary TAG url. The untagged *.a.run.app url is the service's
-    # primary address and serves whatever revision holds public traffic
-    # (claude-code-cli review of #229: an override marker for untagged hosts
-    # accepted exactly that production url), so there is no override.
-    tagged = any(_LEAD_CANARY_LABEL.search(label) for label in host.split("."))
-    if not tagged:
+    # Only the lead-canary TAG url. The untagged *.a.run.app url is the
+    # service's primary address and serves whatever revision holds public
+    # traffic (claude-code-cli review of #229: an override marker for untagged
+    # hosts accepted exactly that production url), so there is no override.
+    if host != LEAD_CANARY_HOST:
         raise CanaryFailure("configuration")
     return target, origin
 

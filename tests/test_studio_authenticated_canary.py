@@ -21,7 +21,7 @@ from app.core import StudioController
 from app.workers.synthetic import SyntheticWorker
 
 
-TARGET = "https://studio-lead-canary-abc-uc.a.run.app"
+TARGET = "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app"
 ORIGIN = "https://www.sfdc24.com"
 EMAIL = "operator@example.com"
 OTP = "123456"
@@ -300,14 +300,14 @@ class ConfigurationTests(unittest.TestCase):
             canary._configuration(live=True, target=TARGET, origin=ORIGIN),
         )
         bad_targets = (
-            "http://studio-lead-canary-abc-uc.a.run.app",
+            "http://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             TARGET + "/",
             TARGET + "/path",
             TARGET + "?x=1",
             TARGET + "#fragment",
-            "https://user@studio-lead-canary-abc-uc.a.run.app",
-            "https://studio-lead-canary-abc-uc.a.run.app:443",
-            "https://STUDIO-lead-canary-abc-uc.a.run.app",
+            "https://user@lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app:443",
+            "https://LEAD-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             "https://localhost",
             "https://127.0.0.1",
         )
@@ -337,6 +337,20 @@ class ConfigurationTests(unittest.TestCase):
             "https://voice-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             "https://leadcanary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
             "https://studio-abc-uc.a.run.app",
+            # Gemini's review of #231: names, not tags, and other projects.
+            # An untagged service named lead-canary or *-lead-canary-*
+            "https://lead-canary-abc-uc.a.run.app",
+            "https://studio-lead-canary-abc-uc.a.run.app",
+            # a prefix before the tag
+            "https://my-lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
+            # the tag on another service in our project
+            "https://lead-canary---other-service-yzet4vuplq-uc.a.run.app",
+            # our service name and tag in someone else's project
+            "https://lead-canary---sfdc24-studio-controller-attacker01-uc.a.run.app",
+            # another region
+            "https://lead-canary---sfdc24-studio-controller-yzet4vuplq-ew.a.run.app",
+            # a subdomain of the real host
+            "https://x.lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app",
         ):
             with self.subTest(target=target), self.assertRaises(canary.CanaryFailure):
                 canary._configuration(live=True, target=target, origin=ORIGIN)
@@ -398,7 +412,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(ORIGIN, request.headers["Origin"])
             self.assertEqual("identity", request.headers["Accept-Encoding"])
             self.assertEqual("https", request.url.scheme)
-            self.assertEqual("studio-lead-canary-abc-uc.a.run.app", request.url.host)
+            self.assertEqual(canary.LEAD_CANARY_HOST, request.url.host)
         self.assertNotIn("Authorization", scenario.calls[0].headers)
         self.assertNotIn("Authorization", scenario.calls[1].headers)
         self.assertEqual("Bearer " + OPERATOR_TOKEN, scenario.calls[2].headers["Authorization"])
@@ -470,7 +484,7 @@ class LifecycleTests(unittest.TestCase):
                     identifier=fixed_identifier, wall_clock=lambda: 1790211840,
                 )
         self.assertEqual(1, len(calls))
-        self.assertEqual("studio-lead-canary-abc-uc.a.run.app", calls[0].url.host)
+        self.assertEqual(canary.LEAD_CANARY_HOST, calls[0].url.host)
 
     def test_identity_body_limit_stops_stream_early_and_closes_it(self):
         half = canary.MAX_RESPONSE_BYTES // 2

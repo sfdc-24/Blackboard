@@ -98,10 +98,10 @@ live. Record the UTC time, release SHA, environment, and resulting receipt.
   request ID.
 
 The source-only authenticated controller canary can exercise the text/API part
-of this case after a dedicated `lead-canary` Cloud Run service exists. Run
-`tools/authenticated_canary.py` only with explicit `--live`, the exact
-`https://www.sfdc24.com` Origin, and the reviewed canonical `.a.run.app` canary
-origin. Enter the email, operator-supplied Lead expectation, and
+of this case against the `lead-canary` tag of this service (0 percent
+traffic). Run `tools/authenticated_canary.py` only with explicit `--live`, the
+exact `https://www.sfdc24.com` Origin, and the one target it accepts,
+`LEAD_CANARY_HOST`. Enter the email, operator-supplied Lead expectation, and
 OTP only through its non-echoing prompts. Its redacted receipt proves the
 baseline snapshot, exact expectation comparison, committed SSE event, stable
 command replay with no new event, replayable Stop, terminal SSE event, and a

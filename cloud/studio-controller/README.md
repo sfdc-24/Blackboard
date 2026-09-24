@@ -143,10 +143,14 @@ the source increment that added it. Hosted CI executes its contract tests throug
 `httpx.MockTransport` with the network namespace removed.
 
 The live CLI requires `--live`, the exact Origin
-`https://www.sfdc24.com`, and a canonical bare HTTPS Cloud Run hostname. The
-hostname must contain a `lead-canary` tag and end in `.a.run.app`. An exact
-`STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1` marker can deliberately admit an
-untagged `.a.run.app` service, but never a public/custom hostname. Redirects,
+`https://www.sfdc24.com`, and exactly one target: the `lead-canary` tag URL of
+this service, `https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app`
+(`LEAD_CANARY_HOST`). Any other host is refused, including the untagged primary
+URL, which serves the public revision, and a service merely named
+`lead-canary`. There is no override. Before a live run, confirm the tag still
+points at a revision with 0 percent traffic
+(`gcloud run services describe sfdc24-studio-controller --region us-central1`),
+because the runner cannot see the traffic table. Redirects,
 proxy environment variables, HTTP retries, browser state, and credential files
 are disabled or unused. The client and its explicit zero-retry transport both
 disable environment trust, send `Accept-Encoding: identity`, refuse compressed
@@ -155,7 +159,7 @@ responses, and enforce the response cap while streaming bounded raw chunks.
 ```powershell
 python cloud/studio-controller/tools/authenticated_canary.py `
   --live `
-  --target https://studio-lead-canary-REVIEWED-uc.a.run.app `
+  --target https://lead-canary---sfdc24-studio-controller-yzet4vuplq-uc.a.run.app `
   --origin https://www.sfdc24.com
 ```
 
