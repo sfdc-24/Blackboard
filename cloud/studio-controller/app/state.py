@@ -142,7 +142,7 @@ class StudioRepository:
             existing = sessions.get(session_id)
             if isinstance(existing, dict):
                 owner = str(existing.get("voice_id") or "")
-                if owner and owner != voice_id:
+                if not owner or owner != voice_id:
                     raise StateConflict("voice index is owned by another call")
             elif existing is not None and not adopt_legacy:
                 raise StateConflict("legacy voice index ownership is unknown")
@@ -160,12 +160,12 @@ class StudioRepository:
 
     def unregister_voice(
             self, session_id: str, voice_id: str | None = None, *,
-            force: bool = False) -> bool:
+            force: bool = False, allow_legacy: bool = False) -> bool:
         """Remove only the index entry owned by the expected voice.
 
-        Legacy entries stored only an integer expiry and are safe to remove.
-        An owned entry is retained on an owner mismatch so late cleanup cannot
-        erase a newer call's sweep coverage.
+        Legacy entries stored only an integer expiry and require an explicit
+        post-reconciliation cleanup mode. An owned entry is retained on an
+        owner mismatch so late cleanup cannot erase a newer call's coverage.
         """
         name = "studio_voice_index"
         for _ in range(self.attempts):
@@ -180,6 +180,8 @@ class StudioRepository:
                     not owner or not voice_id or owner != voice_id
                 ):
                     return False
+            elif not force and not allow_legacy:
+                return False
             sessions.pop(session_id, None)
             candidate = {"sessions": sessions, "updated_at": int(self.clock())}
             try:

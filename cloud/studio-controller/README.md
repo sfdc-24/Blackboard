@@ -14,8 +14,9 @@ instance.
 - strict session, generation, sequence, task-revision, and artifact-version fences;
 - bounded event replay plus a new snapshot-first generation for stale clients;
 - typed artifact nodes and patch operations only—no model HTML or code;
-- a durable UTC-day cap on outbound Realtime call-open attempts, enforced with
-  GCS generation compare-and-swap across instances;
+- a durable authorization cap on Realtime call-open attempts, attributed to
+  the UTC day of their final reservation and enforced with GCS generation
+  compare-and-swap across instances;
 - optional OpenAI Realtime WebRTC SDP relay; the standard API key, SDP, and
   audio never reach durable session state.
 
@@ -89,14 +90,16 @@ Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot
 durably immediately before each provider call-open POST. Invalid requests and
 failures before that reservation consume no slot; after a reservation succeeds,
 the slot is never refunded—even for a provider refusal or ambiguous transport
-outcome—so crashes and retries cannot exceed the UTC-day cap. If midnight UTC
-passes before provider contact, the attempt must also obtain a slot in the new
-day; the prior-day slot remains consumed. Redirects, request timeouts, conflicts,
-and every non-2xx provider response remain `unknown`, non-retryable, and indexed
-because they do not prove that no paid call opened. Each index entry is owned by
-its `voice_id`, so late cleanup cannot erase a newer call. Client code closes its
-peer connection at controller expiry; the service also hangs up on Stop or
-expiry. A scheduler calls
+outcome—so crashes and retries cannot exceed the per-ledger authorization cap.
+If midnight UTC passes before provider contact, the attempt must also obtain a
+slot in the new day; the prior-day slot remains consumed. The accounting day is
+the final authorization reservation, not the external provider's non-atomic
+network receipt timestamp, which can cross midnight. Redirects, request timeouts,
+conflicts, and every non-2xx provider response remain `unknown`, non-retryable,
+and indexed because they do not prove that no paid call opened. Each index entry
+is owned by its `voice_id`, so late cleanup cannot erase a newer call. Client code
+closes its peer connection at controller expiry; the service also hangs up on
+Stop or expiry. A scheduler calls
 `POST /v1/maintenance/voice-sweep` with the maintenance bearer as the idle
 Cloud Run backstop. Audio is never accepted or stored by this service.
 

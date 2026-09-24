@@ -108,7 +108,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return await asyncio.to_thread(repository.unregister_voice, session_id)
         if voice.get("status") in {"ended", "failed"}:
             return await asyncio.to_thread(
-                repository.unregister_voice, session_id, voice.get("voice_id")
+                repository.unregister_voice,
+                session_id,
+                voice.get("voice_id"),
+                allow_legacy=True,
             )
         if voice.get("status") != "active" or not voice.get("call_id"):
             # Opening and ambiguous-provider reservations are deliberately kept
@@ -143,12 +146,18 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             )
         except httpx.HTTPError:
             return False
-        if response.status_code >= 400 and response.status_code not in {404, 409}:
+        if not (
+            200 <= response.status_code < 300
+            or response.status_code in {404, 409}
+        ):
             return False
         try:
             await asyncio.to_thread(controller.finish_voice, session_id, call_id, reason)
             removed = await asyncio.to_thread(
-                repository.unregister_voice, session_id, voice["voice_id"]
+                repository.unregister_voice,
+                session_id,
+                voice["voice_id"],
+                allow_legacy=True,
             )
         except (StateConflict, SessionNotFound):
             return False
@@ -527,7 +536,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(exc.status, str(exc)) from exc
         except StateConflict as exc:
             if began:
-                clean = await release_unopened_voice(session_id, voice_id)
+                # Index registration never completed. Release only this new
+                # session opening; do not touch a conflicting legacy/owned
+                # index entry that this voice never acquired.
+                try:
+                    clean = await asyncio.to_thread(
+                        controller.fail_voice, session_id, voice_id
+                    )
+                except (SessionNotFound, StateConflict):
+                    clean = False
                 if not clean:
                     raise HTTPException(503, "voice index cleanup is pending") from exc
                 raise HTTPException(503, "voice index is unavailable") from exc
@@ -619,7 +636,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     "https://api.openai.com/v1/realtime/calls/%s/hangup" % call_id,
                     headers={"Authorization": "Bearer " + settings.openai_api_key},
                 )
-                reconciled = hangup.status_code < 400 or hangup.status_code in {404, 409}
+                reconciled = (
+                    200 <= hangup.status_code < 300
+                    or hangup.status_code in {404, 409}
+                )
             except httpx.HTTPError:
                 pass
             if reconciled:
