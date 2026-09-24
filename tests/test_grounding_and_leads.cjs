@@ -281,6 +281,9 @@ test('both providers get the first-tier admin reference and the numbers rule', (
     assert.match(prompt, /record-triggered Flow[^"]*only when a record is updated to meet the condition requirements[^"]*sends again/, who);
     assert.match(prompt, /Login IP Ranges: set on the profile only; a permission set cannot carry IP ranges/, who);
     assert.match(prompt, /AND\(NOT\(ISNEW\(\)\), ISPICKVAL\(PRIORVALUE\(StageName\), "Closed Won"\)\)/, who);
+    assert.match(prompt, /On-Demand Email-to-Case; Salesforce does not log in to your mailbox/, who);
+    assert.match(prompt, /On standard objects such as Opportunity, Grant Access Using Hierarchies is always on/, who);
+    assert.match(prompt, /Web-to-Lead[^"]*reCAPTCHA[^"]*Lead Assignment Rule[^"]*not Lead Settings/, who);
     assert.match(prompt, /NUMBERS ARE FACTS TOO/, who);
     assert.ok(prompt.indexOf('ADMIN TASK REFERENCE') < prompt.indexOf('OBJECT REFERENCE -'),
       'the task reference comes before the long object reference');
