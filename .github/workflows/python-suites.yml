@@ -80,6 +80,7 @@ on:
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
       - "tests/test_studio_metadata_contract.py"
+      - "tests/test_studio_metadata_operations.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -158,6 +159,7 @@ on:
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
       - "tests/test_studio_metadata_contract.py"
+      - "tests/test_studio_metadata_operations.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -235,6 +237,7 @@ jobs:
                    tests/test_studio_lead_facts.py \
                    tests/test_studio_lead_deadline.py \
                    tests/test_studio_metadata_contract.py \
+                   tests/test_studio_metadata_operations.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -657,6 +660,14 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      - name: "studio metadata operation ledger: atomic holds and no-retry contracts (no network)"
+        run: |
+          set -euo pipefail
+          test -f cloud/studio-controller/app/metadata_operations.py
+          test -f tests/test_studio_metadata_operations.py
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_metadata_operations
+
       - name: "studio email sender: signed request and replay refusal (no network)"
         run: |
           set -euo pipefail
@@ -724,6 +735,7 @@ jobs:
              && [ ! -f tests/test_studio_lead_facts.py ] \
              && [ ! -f tests/test_studio_lead_deadline.py ] \
              && [ ! -f tests/test_studio_metadata_contract.py ] \
+             && [ ! -f tests/test_studio_metadata_operations.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
