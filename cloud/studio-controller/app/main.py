@@ -97,10 +97,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             await asyncio.to_thread(repository.unregister_voice, session_id)
             return True
         voice = state.get("voice_call") or {}
-        if voice.get("status") != "active" or not voice.get("call_id"):
-            if voice.get("status") in {"ended", "failed"} or not voice:
-                await asyncio.to_thread(repository.unregister_voice, session_id)
+        if voice.get("status") in {"ended", "failed"} or not voice:
+            await asyncio.to_thread(repository.unregister_voice, session_id)
             return True
+        if voice.get("status") != "active" or not voice.get("call_id"):
+            # Opening and ambiguous-provider reservations are deliberately kept
+            # pending. Without a provider call ID, the sweeper cannot prove the
+            # remote call never opened and must not report successful cleanup.
+            return False
         if (
             not force
             and not voice.get("close_requested")
@@ -132,15 +136,35 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return False
         return True
 
-    async def sweep_due_calls() -> None:
+    async def sweep_due_calls() -> dict:
+        summary = {
+            "due": 0,
+            "attempted": 0,
+            "completed": 0,
+            "pending": 0,
+            "index_available": True,
+        }
         if not settings.voice_enabled or not settings.openai_api_key:
-            return
+            return summary
         try:
             due = await asyncio.to_thread(repository.due_voice_sessions, int(clock()))
         except Exception:
-            return
-        for session_id in due[: settings.daily_session_cap]:
-            await end_voice_call(session_id, "expired")
+            summary["index_available"] = False
+            return summary
+        selected = due[: settings.daily_session_cap]
+        summary["due"] = len(due)
+        summary["attempted"] = len(selected)
+        summary["pending"] = len(due) - len(selected)
+        for session_id in selected:
+            try:
+                ended = await end_voice_call(session_id, "expired")
+            except Exception:
+                ended = False
+            if ended:
+                summary["completed"] += 1
+            else:
+                summary["pending"] += 1
+        return summary
 
     async def voice_sweeper() -> None:
         while True:
@@ -239,7 +263,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             )
         # Readiness probes are read-only. Canonical traffic, the background
         # sweeper and authenticated maintenance retain the cleanup backstops.
-        if request.url.path not in {"/health", "/healthz"}:
+        if request.url.path not in {
+            "/health", "/healthz", "/v1/maintenance/voice-sweep",
+        }:
             await sweep_due_calls()
         response = await call_next(request)
         if request.url.path.startswith("/v1/"):
@@ -519,8 +545,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         supplied = auth[7:] if auth.lower().startswith("bearer ") else ""
         if not supplied or not hmac.compare_digest(supplied, settings.maintenance_secret):
             raise HTTPException(401, "maintenance credential is not valid")
-        await sweep_due_calls()
-        return {"ok": True, "checked_at": int(clock())}
+        summary = await sweep_due_calls()
+        result = {
+            "ok": summary["index_available"] and summary["pending"] == 0,
+            "checked_at": int(clock()),
+            **summary,
+        }
+        if not result["ok"]:
+            return JSONResponse(result, status_code=503)
+        return result
 
     return app
 

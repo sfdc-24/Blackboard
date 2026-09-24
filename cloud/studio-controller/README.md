@@ -87,6 +87,17 @@ the service also hangs up on Stop or expiry. A scheduler calls
 `POST /v1/maintenance/voice-sweep` with the maintenance bearer as the idle
 Cloud Run backstop. Audio is never accepted or stored by this service.
 
+The scheduler does not store that bearer. It starts a dedicated Cloud Run Job
+with Google OAuth. The Scheduler caller can only invoke that job; a separate
+job runtime identity can only read `STUDIO_MAINTENANCE_SECRET`. The immutable
+Studio image runs `python -m app.sweep_once`. The job accepts only the exact
+HTTPS maintenance path, never follows redirects, fails closed on a non-200,
+unavailable due-call index, pending cleanup, or malformed success response,
+and logs no response body or credential. Deploy it with one task, parallelism
+one, a 30-second task timeout, and zero task retries; use an every-minute
+Scheduler trigger with a 30-second attempt deadline and zero retries. See
+`ADR-001-VOICE-SWEEP-BACKSTOP.md` for the alternatives and IAM boundary.
+
 ## Incremental release gates
 
 1. `/studio/` synthetic fixture; no controller or provider.
