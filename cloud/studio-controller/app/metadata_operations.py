@@ -314,6 +314,24 @@ class MetadataOperationLedger:
             raise AttributeError("metadata ledger dependencies are immutable")
         object.__delattr__(self, name)
 
+    def __copy__(self):
+        raise TypeError("metadata ledgers cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("metadata ledgers cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __getstate__(self):
+        raise TypeError("metadata ledgers cannot be serialized")
+
+    def __setstate__(self, state):
+        raise TypeError("metadata ledgers cannot be restored")
+
     @staticmethod
     def _name(org_binding_id):
         _id(org_binding_id)

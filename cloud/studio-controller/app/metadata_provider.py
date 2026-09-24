@@ -111,6 +111,24 @@ class OrgBinding:
         object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "_sealed", True)
 
+    def __copy__(self):
+        raise TypeError("organization bindings cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("organization bindings cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("organization bindings cannot be serialized")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("organization bindings cannot be serialized")
+
+    def __getstate__(self):
+        raise TypeError("organization bindings cannot be serialized")
+
+    def __setstate__(self, state):
+        raise TypeError("organization bindings cannot be restored")
+
     def __repr__(self) -> str:
         # Actual org identity and origin are internal provider-routing data and
         # must not appear in generic exception/debug logging.
@@ -220,6 +238,9 @@ class ExecutionBudget:
     def __getstate__(self):
         raise TypeError("execution budgets cannot be serialized")
 
+    def __setstate__(self, state):
+        raise TypeError("execution budgets cannot be restored")
+
     def _assert_owner(self, owner) -> None:
         if owner is not self._owner:
             raise MetadataProviderError("execution budget belongs to another adapter")
@@ -327,6 +348,9 @@ class _CancellationView:
     def __getstate__(self):
         raise TypeError("cancellation views cannot be serialized")
 
+    def __setstate__(self, state):
+        raise TypeError("cancellation views cannot be restored")
+
 
 class _DispatchPermit:
     """Opaque one-use write grant tied to one budget and durable begin."""
@@ -371,6 +395,9 @@ class _DispatchPermit:
 
     def __getstate__(self):
         raise TypeError("dispatch permits cannot be serialized")
+
+    def __setstate__(self, state):
+        raise TypeError("dispatch permits cannot be restored")
 
     def _consume(self, owner) -> ExecutionBudget:
         if owner is not self._owner:
@@ -571,6 +598,24 @@ class SalesforceMetadataAdapter:
         if getattr(self, "_sealed", False):
             raise AttributeError("metadata adapters are immutable issuer capabilities")
         object.__delattr__(self, name)
+
+    def __copy__(self):
+        raise TypeError("metadata adapters cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("metadata adapters cannot be copied")
+
+    def __reduce__(self):
+        raise TypeError("metadata adapters cannot be serialized")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("metadata adapters cannot be serialized")
+
+    def __getstate__(self):
+        raise TypeError("metadata adapters cannot be serialized")
+
+    def __setstate__(self, state):
+        raise TypeError("metadata adapters cannot be restored")
 
     @staticmethod
     def _ledger_snapshot(ledger, operation_id, actor) -> dict:

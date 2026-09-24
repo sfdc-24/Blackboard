@@ -129,6 +129,9 @@ adapter reject direct initializer re-entry before validating or assigning any
 replacement value. The adapter's issued-plan registry is an immutable value
 replaced only while its internal lock is held, so callers cannot clear it to
 mint a second budget or renew the original deadline.
+They also reject state restoration, copying and serialization; `OrgBinding`
+reconstruction uses only its explicit closed `as_mapping()`/`from_mapping()`
+value boundary rather than an automatic object-restoration hook.
 
 One sealed, non-copyable, non-serializable `ExecutionBudget` is issued from the
 trusted ledger while an operation is confirmed and before provider preflight.

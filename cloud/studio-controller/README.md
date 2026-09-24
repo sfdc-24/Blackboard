@@ -298,6 +298,8 @@ configuration and pins the exact store object identity used at issuance; a
 look-alike ledger or dependency swap fails before ledger or provider I/O.
 Sealed objects reject initializer re-entry, and the immutable issued-plan
 registry prevents clearing local history to obtain a second execution budget.
+Automatic state restoration, copying and serialization are rejected; bindings
+cross a reviewed boundary only through their explicit closed mapping shape.
 
 The injected transport has only four provider-specific callables and must
 declare no write retries and disabled redirects. The adapter pins their resolved

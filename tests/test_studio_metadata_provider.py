@@ -268,7 +268,7 @@ class MetadataProviderTests(unittest.TestCase):
                              VERSION, 4, "sandbox")
         self.assertEqual(sandbox.environment, "sandbox")
 
-    def test_org_binding_reinitialization_cannot_retarget_reserved_dispatch(self):
+    def test_org_binding_reinitialization_or_restoration_cannot_retarget_dispatch(self):
         harness, adapter, transport, budget, permit = self.reserved()
         original = adapter.binding.as_mapping()
         with self.assertRaises(MetadataProviderError):
@@ -280,6 +280,27 @@ class MetadataProviderTests(unittest.TestCase):
                 2,
                 "developer",
             )
+        restore_state = [
+            BINDING_ID,
+            "00Dzzzzzzzzzzzzzzz",
+            "https://alternate.develop.my.salesforce.com",
+            "v63.0",
+            2,
+            "developer",
+            True,
+        ]
+        self.assertTrue(hasattr(adapter.binding, "__setstate__"))
+        self.assertEqual(
+            type(adapter.binding).__dict__["__setstate__"].__qualname__,
+            "OrgBinding.__setstate__",
+        )
+        with self.assertRaises(TypeError):
+            adapter.binding.__setstate__(restore_state)
+        with self.assertRaises(TypeError):
+            adapter.binding.__getstate__()
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(operation=operation), self.assertRaises(TypeError):
+                operation(adapter.binding)
         self.assertEqual(adapter.binding.as_mapping(), original)
         self.assertEqual(budget._binding.as_mapping(), original)
 
@@ -321,6 +342,21 @@ class MetadataProviderTests(unittest.TestCase):
                 replacement_binding, Transport(self.mono), clock=lambda: 1,
                 trusted_timestamp=lambda: 1,
             )
+        self.assertEqual(
+            (
+                adapter.binding, adapter._transport, adapter._transport_callables,
+                adapter._clock, adapter._trusted_timestamp, adapter._owner,
+                adapter._budgeted_operations,
+            ),
+            adapter_state,
+        )
+        with self.assertRaises(TypeError):
+            adapter.__setstate__({"binding": replacement_binding, "_sealed": True})
+        with self.assertRaises(TypeError):
+            adapter.__getstate__()
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(adapter_operation=operation), self.assertRaises(TypeError):
+                operation(adapter)
         self.assertEqual(
             (
                 adapter.binding, adapter._transport, adapter._transport_callables,
@@ -386,9 +422,16 @@ class MetadataProviderTests(unittest.TestCase):
             (budget._cancellation._budget, budget._cancellation._owner),
             cancellation_state,
         )
+        with self.assertRaises(TypeError):
+            budget._cancellation.__setstate__({"_budget": object(), "_sealed": True})
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(cancellation_operation=operation), self.assertRaises(TypeError):
+                operation(budget._cancellation)
         for operation in (copy.copy, copy.deepcopy, pickle.dumps, json.dumps):
             with self.subTest(operation=operation), self.assertRaises(TypeError):
                 operation(budget)
+        with self.assertRaises(TypeError):
+            budget.__setstate__({"_deadline": 9999, "_sealed": True})
         with self.assertRaises(AttributeError):
             budget._deadline = 9999
         for name in ("_sealed", "_phase", "_field", "_owner", "_ledger",
@@ -423,6 +466,16 @@ class MetadataProviderTests(unittest.TestCase):
         ledger_state = (issued.ledger.store, issued.ledger.conflict_type)
         with self.assertRaises(InvalidOperation):
             issued.ledger.__init__(lookalike.store, conflict_type=RuntimeError)
+        self.assertEqual(
+            (issued.ledger.store, issued.ledger.conflict_type), ledger_state
+        )
+        with self.assertRaises(TypeError):
+            issued.ledger.__setstate__({"store": lookalike.store, "_sealed": True})
+        with self.assertRaises(TypeError):
+            issued.ledger.__getstate__()
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(ledger_operation=operation), self.assertRaises(TypeError):
+                operation(issued.ledger)
         self.assertEqual(
             (issued.ledger.store, issued.ledger.conflict_type), ledger_state
         )
@@ -696,6 +749,8 @@ class MetadataProviderTests(unittest.TestCase):
             (permit._owner, permit._budget, permit._lock, permit._consumed),
             permit_state,
         )
+        with self.assertRaises(TypeError):
+            permit.__setstate__({"_owner": object(), "_consumed": False})
         for operation in (copy.copy, copy.deepcopy, pickle.dumps, json.dumps):
             with self.subTest(operation=operation), self.assertRaises(TypeError):
                 operation(permit)
