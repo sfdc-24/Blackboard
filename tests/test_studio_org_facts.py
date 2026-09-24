@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -131,6 +132,51 @@ class CodexReReview200OrgFacts(unittest.TestCase):
         self.assertIsNotNone(f._open)
         h = of._NoRedirect()
         self.assertIsNone(h.redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/"))
+
+
+def failing_token(codes, calls):
+    """The fake org, except the first len(codes) token calls fail with those HTTP codes."""
+    base = fake_org(calls)
+    pending = list(codes)
+    def opener(req, timeout=None):
+        if req.full_url.endswith("/services/oauth2/token") and pending:
+            calls.append(req)
+            raise urllib.error.HTTPError(req.full_url, pending.pop(0), "x", {}, io.BytesIO(b""))
+        return base(req, timeout)
+    return opener
+
+
+class TokenRetry(unittest.TestCase):
+    """The first live run after ca30068 hit a one-off token 404 (as org_snapshot did
+    on 2026-09-17); three reruns a minute later all answered."""
+
+    def facts(self, opener):
+        f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener)
+        f._sleep = lambda s: None
+        return f
+
+    def token_calls(self, calls):
+        return sum(1 for c in calls if c.full_url.endswith("/services/oauth2/token"))
+
+    def test_a_transient_404_is_retried_and_the_answer_arrives(self):
+        calls = []
+        a = self.facts(failing_token([404], calls)).lead_counts()
+        self.assertEqual(a["total"], 26)
+        self.assertEqual(self.token_calls(calls), 2)
+
+    def test_bad_credentials_are_never_retried(self):
+        for code in (400, 401, 403):
+            calls = []
+            with self.assertRaises(urllib.error.HTTPError):
+                self.facts(failing_token([code, code, code], calls)).lead_counts()
+            self.assertEqual(self.token_calls(calls), 1, code)
+
+    def test_retries_are_bounded(self):
+        calls = []
+        with self.assertRaises(urllib.error.HTTPError):
+            self.facts(failing_token([404] * 10, calls)).lead_counts()
+        self.assertEqual(self.token_calls(calls), 3)
+        self.assertFalse(any("q=" in c.full_url for c in calls), "no query ran without a token")
 
 
 if __name__ == "__main__":

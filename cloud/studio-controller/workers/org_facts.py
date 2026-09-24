@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,6 +83,7 @@ class OrgFacts:
         self._cid, self._sec = client_id, client_secret
         self._open = opener or urllib.request.build_opener(_NoRedirect).open
         self._token = None
+        self._sleep = time.sleep
         self.host = urllib.parse.urlsplit(self.domain).hostname
 
     @classmethod
@@ -93,14 +95,29 @@ class OrgFacts:
         return cls(os.environ["Headless_domain"], os.environ["Headless_consumer_key"],
                    os.environ["Headless_consumer_secret"], opener)
 
-    def _auth(self):
+    def _auth(self, attempts: int = 3):
+        """The token call, retried on a transient failure. The dev org's token
+        endpoint has answered a one-off 404 between successes (2026-09-17 in
+        org_snapshot.py, again 2026-09-24 on this module's first live run).
+        400/401/403 are answers about the credentials and are never retried."""
         if self._token:
             return self._token
         body = urllib.parse.urlencode({"grant_type": "client_credentials",
                                        "client_id": self._cid, "client_secret": self._sec}).encode()
-        req = urllib.request.Request(self.domain + "/services/oauth2/token", data=body, method="POST")
-        with self._open(req, timeout=30) as r:
-            tok = json.loads(r.read().decode("utf-8", "replace"))
+        tok = None
+        for i in range(1, attempts + 1):
+            req = urllib.request.Request(self.domain + "/services/oauth2/token", data=body, method="POST")
+            try:
+                with self._open(req, timeout=30) as r:
+                    tok = json.loads(r.read().decode("utf-8", "replace"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 401, 403) or i == attempts:
+                    raise
+            except urllib.error.URLError:
+                if i == attempts:
+                    raise
+            self._sleep(1.5 * i)
         # The response names where to send the bearer; it gets the same check
         # as the configured domain before a token goes anywhere.
         self._token = (_approved_origin(tok["instance_url"]), tok["access_token"])
