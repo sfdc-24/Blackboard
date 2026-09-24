@@ -217,6 +217,18 @@ def check(runs_probe: list, runs_shadow: list, hours: int,
         if v:
             verdicts[v] = verdicts.get(v, 0) + 1
     criteria["shadow_verdicts"] = verdicts
+    # WHY each UNKNOWN happened, not only how many. On 2026-09-24 all 4 of 25
+    # were Google's 404 page on the board AND the WhatsApp read at once - a
+    # gateway that flapped, fixed by retrying the read (#232) - and the count
+    # alone could not tell that apart from a read path that is broken.
+    reasons = []
+    for r in runs_shadow:
+        p = r["payload"]
+        if p.get("combined") != "UNKNOWN":
+            continue
+        notes = [str(p[k]) for k in ("board_note", "whatsapp_note") if p.get(k)]
+        reasons.append("%sZ %s" % (r["ts"][5:16], "; ".join(notes) or "no note"))
+    criteria["shadow_unknown_reasons"] = reasons
     if verdicts.get("UNKNOWN") and verdicts["UNKNOWN"] > max(
             1, len(runs_shadow) // 4):
         findings.append("shadow returned UNKNOWN on %d of %d runs - the board "
@@ -277,6 +289,11 @@ def main() -> int:
     print("  shadow runs    : %d" % len(runs_shadow))
     print()
     for k in sorted(criteria):
+        if k == "shadow_unknown_reasons":
+            print("  %-28s %d" % (k, len(criteria[k])))
+            for reason in criteria[k]:
+                print("      - %s" % reason[:160])
+            continue
         print("  %-28s %s" % (k, json.dumps(criteria[k])[:90]))
     print()
     if findings:

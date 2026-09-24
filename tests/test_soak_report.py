@@ -192,6 +192,33 @@ class NotYetIsNotAPass(unittest.TestCase):
             "a 50-hour-old soak should have ~48 hours of runs")
 
 
+class AnUnknownSaysWhy(unittest.TestCase):
+    def setUp(self):
+        self.started = stamp(hours_ago(50))
+        self.probe, self.shadow = clean_window(48, self.started)
+
+    def test_each_unknown_carries_its_time_and_both_notes(self):
+        p = self.shadow[3]["payload"]
+        p["combined"] = "UNKNOWN"
+        p["board_note"] = "board read failed (HTTP 404)"
+        p["whatsapp_note"] = "whatsapp read returned a page, not data (HTTP 404)"
+        _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
+        reasons = criteria["shadow_unknown_reasons"]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn(self.shadow[3]["ts"][5:16], reasons[0])
+        self.assertIn("board read failed (HTTP 404)", reasons[0])
+        self.assertIn("whatsapp read returned a page", reasons[0])
+
+    def test_an_unknown_without_notes_says_so(self):
+        self.shadow[5]["payload"]["combined"] = "UNKNOWN"
+        _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
+        self.assertTrue(criteria["shadow_unknown_reasons"][0].endswith("no note"))
+
+    def test_news_runs_add_no_reasons(self):
+        _, criteria = soak.check(self.probe, self.shadow, 48, 1, self.started)
+        self.assertEqual(criteria["shadow_unknown_reasons"], [])
+
+
 class TheCriteriaAreAllReported(unittest.TestCase):
     def test_every_criterion_appears_even_when_it_passes(self):
         # A report that only lists problems cannot be used to confirm a criterion
@@ -201,7 +228,8 @@ class TheCriteriaAreAllReported(unittest.TestCase):
         _, criteria = soak.check(probe, shadow, 48, 1, started)
         for expected in ("cadence:board-probe", "cadence:waker-shadow",
                          "cursor_monotonic", "board_rows_for_ack_target",
-                         "all_runs_in_cloud", "shadow_verdicts"):
+                         "all_runs_in_cloud", "shadow_verdicts",
+                         "shadow_unknown_reasons"):
             self.assertIn(expected, criteria)
 
 
