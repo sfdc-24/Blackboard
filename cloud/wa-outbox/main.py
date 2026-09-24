@@ -13,9 +13,11 @@ WHAT MAKES THIS SAFE TO SCHEDULE, because every mistake here lands on his phone:
   - IT REFUSES TO RUN WITHOUT ONE. The outbox primes on an empty state, which is
     safe, but a cursor lost between runs would re-prime and then silently skip -
     or worse, a partial one would resend. Seeding is a deliberate act.
-  - BEFORE each send, the outbox writes that row id into the cursor as
-    `inflight` and this wrapper compare-and-swaps the save. Only the run
-    whose write lands may send. The loser is refused and exits non-zero.
+  - BEFORE each send, the outbox writes both identities (Row_ID and BCB id)
+    into the cursor as `inflight` and this wrapper compare-and-swaps the
+    save. Only the run whose write lands may send. The loser is refused
+    and exits non-zero. A legacy claim that stored one string still blocks
+    any row carrying that string on either identity, and is not delivered.
   - A WhatsApp send cannot be read back, and it is not pre-marked
     delivered. The outcome is confirmed (a 2xx that carries a message id),
     not_sent (a 4xx from Graph, or a failure before the request left), or

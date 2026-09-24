@@ -70,6 +70,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import os
@@ -487,13 +488,34 @@ def log(me: str, line: str) -> None:
 
 # -------------------------------------------------------------------- posting
 
+def legacy_reply_row_id(me: str, answers: str) -> str:
+    """Row_ID written before the hash suffix.
+
+    It strips `.` and `_` and keeps 40 characters, so it is not an identity:
+    SYNTHETIC.ASK and SYNTHETIC_ASK become one id, and so do two long ids
+    that share a 40-character prefix. Recovery may FIND an old row by this
+    id. It may accept the row only when answers= is the full source id.
+    """
+    return "%s-WAKE-%s" % (me.upper(), re.sub(r"[^A-Za-z0-9-]", "", str(answers or ""))[:40])
+
+
 def reply_row_id(me: str, answers: str) -> str:
     """Row_ID of the reply post_reply will write for this answers id.
 
-    The cloud waker looks a reply up by this before it will post one again.
-    One function, so the lookup cannot drift from the id that was written.
+    The readable prefix is the source id with the board's id characters
+    kept, so a person can still see which ask it was. A short hash of the
+    FULL source id is appended, because the prefix alone collides: the
+    legacy form strips `.` and `_` and truncates to 40 characters.
+
+    The cloud waker looks a reply up by answers=, not by this string alone.
+    One function, so the id that is written cannot drift from the id a
+    later run computes.
     """
-    return "%s-WAKE-%s" % (me.upper(), re.sub(r"[^A-Za-z0-9-]", "", str(answers or ""))[:40])
+    raw = str(answers or "")
+    prefix = re.sub(r"[^A-Za-z0-9._-]", "", raw)[:40]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    body = "%s-%s" % (prefix, digest) if prefix else digest
+    return "%s-WAKE-%s" % (me.upper(), body)
 
 
 def claim_answer(answers_id: str) -> bool:

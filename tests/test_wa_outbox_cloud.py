@@ -198,6 +198,43 @@ class CloudWrapper(unittest.TestCase):
         self.assertEqual(self.sent, ["GEMINI-WAKE-WRK-9"],
                          "overlapping runs both sent: %r" % (self.sent,))
 
+    def test_a_killed_receipt_quarantines_both_ids_so_the_alias_is_sent_once(self):
+        """ROW-A/EVENT-A is accepted, the receipt save dies, ROW-B/EVENT-A must not send."""
+        row_a = ["ROW-A", "2026-09-24T03:00:00Z", "codex", "wa-outbox", "APPEND",
+                 "BCB|v=1|id=EVENT-A|phase=WA_SEND|from=codex|to=wa-outbox|text=hello"]
+        row_b = ["ROW-B", "2026-09-24T03:00:01Z", "codex", "wa-outbox", "APPEND",
+                 "BCB|v=1|id=EVENT-A|phase=WA_SEND|from=codex|to=wa-outbox|text=hello again"]
+        store = MemStore({"schema": 1, "delivered_row_ids": ["OLD"], "delivered_bcb_ids": []})
+        self.rows = [row_a]
+        self.sent = []
+        real_save = store.save
+
+        def save(name, state, token):
+            delivered = state.get("delivered_row_ids") or []
+            already = (store.state or {}).get("delivered_row_ids") or []
+            if "ROW-A" in delivered and "ROW-A" not in already:
+                raise RuntimeError("killed after send, before the receipt save")
+            return real_save(name, state, token)
+
+        store.save = save
+        with self.assertRaises(RuntimeError):
+            self.run_cloud(store)
+        self.assertEqual(self.sent, ["ROW-A"])
+        claim = store.state.get("inflight") or {}
+        self.assertEqual(claim.get("row_id"), "ROW-A")
+        self.assertEqual(claim.get("bcb_id"), "EVENT-A")
+
+        store.save = real_save
+        self.rows = [row_a, row_b]
+        self.run_cloud(store)
+        self.assertEqual(self.sent, ["ROW-A"],
+                         "the alias was sent after the receipt was killed: %r" % (self.sent,))
+        unknown = store.state.get("unknown_row_ids") or []
+        self.assertIn("ROW-A", unknown)
+        self.assertIn("EVENT-A", unknown)
+        self.assertNotIn("ROW-A", store.state.get("delivered_row_ids") or [])
+        self.assertNotIn("EVENT-A", store.state.get("delivered_bcb_ids") or [])
+
 
 class ReceiptMasksTheRecipient(unittest.TestCase):
     def test_the_number_meta_echoes_back_is_masked(self):

@@ -214,13 +214,23 @@ def save_state(state: dict, path: Path = STATE_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row_ids = list(dict.fromkeys(state.get("delivered_row_ids") or []))[-STATE_CAP:]
     bcb_ids = list(dict.fromkeys(state.get("delivered_bcb_ids") or []))[-STATE_CAP:]
+    inflight = state.get("inflight") or ""
+    if isinstance(inflight, dict):
+        inflight = {
+            "row_id": str(inflight.get("row_id") or ""),
+            "bcb_id": str(inflight.get("bcb_id") or ""),
+        }
+        if not (inflight["row_id"] or inflight["bcb_id"]):
+            inflight = ""
+    else:
+        inflight = str(inflight)
     out = {
         "schema": 1,
         "saved_at": now_iso(),
         "delivered_row_ids": row_ids,
         "delivered_bcb_ids": bcb_ids,
         "unknown_row_ids": list(dict.fromkeys(state.get("unknown_row_ids") or []))[-STATE_CAP:],
-        "inflight": state.get("inflight") or "",
+        "inflight": inflight,
         "primed_at": state.get("primed_at") or "",
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -270,26 +280,55 @@ def prime_state(rows, state: dict) -> dict:
     return state
 
 
+def claim_keys(inflight) -> list[str]:
+    """Identities a pre-send claim covers.
+
+    A current claim is ``{"row_id", "bcb_id"}`` and an uncertain outcome
+    quarantines both, so a later row that reuses either one is not sent.
+    A legacy claim is a single string. That string may be the Row_ID or
+    the BCB id; it blocks a row that carries it on either identity, and
+    it is not treated as delivered.
+    """
+    if isinstance(inflight, dict):
+        keys: list[str] = []
+        for field in ("row_id", "bcb_id"):
+            val = str(inflight.get(field) or "").strip()
+            if val and val not in keys:
+                keys.append(val)
+        return keys
+    text = str(inflight or "").strip()
+    return [text] if text else []
+
+
 def settle_inflight(state: dict, state_path: Path) -> None:
     """A previous run claimed a send and never recorded a receipt.
 
     A WhatsApp send cannot be read back, so this outcome is unknown. Mark
-    the id and do not send it again; a human decides. An id that already
-    has a receipt is just a claim that outlived its save — clear it.
+    every identity on the claim and do not send it again; a human decides.
+    An id that already has a receipt is just a claim that outlived its
+    save — clear it, and do not call it delivered a second time.
     """
-    inflight = str(state.get("inflight") or "").strip()
-    if not inflight:
+    keys = claim_keys(state.get("inflight"))
+    if not keys:
         return
     known = set(state.get("delivered_row_ids") or [])
     known.update(state.get("delivered_bcb_ids") or [])
-    if inflight not in known:
+    recorded = set(known)
+    recorded.update(state.get("unknown_row_ids") or [])
+    uncertain = [key for key in keys if key not in recorded]
+    if uncertain:
+        # The receipt save did not land. Quarantine every identity this
+        # claim still holds, not only the one that used to be stored.
         unknown = list(state.get("unknown_row_ids") or [])
-        if inflight not in unknown:
-            unknown.append(inflight)
+        for key in keys:
+            if key not in known and key not in unknown:
+                unknown.append(key)
         state["unknown_row_ids"] = unknown
-        print("UNKNOWN inflight=%s — no receipt, not resending; a human decides" % inflight)
+        shown = ",".join(keys)
+        print("UNKNOWN inflight=%s — no receipt, not resending; a human decides" % shown)
         append_log({
-            "row_id": inflight,
+            "row_id": keys[0],
+            "bcb_id": keys[1] if len(keys) > 1 else "",
             "unknown": True,
             "ok": None,
             "sent_at": now_iso(),
@@ -482,10 +521,14 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
             continue
         # Own it before the send. The cloud wrapper compare-and-swaps this
         # save, so a second run that loaded the same cursor loses here and
-        # never reaches send_via_notify. A kill after this save and before
-        # the receipt leaves inflight set; the next pass marks it unknown
-        # and does not send it again.
-        state["inflight"] = req["row_id"] or req["bcb_id"]
+        # never reaches send_via_notify. The claim carries BOTH identities:
+        # a kill after this save and before the receipt leaves them set, and
+        # the next pass quarantines both. One string was not enough — a
+        # later row with the same BCB id and a new Row_ID was sent again.
+        state["inflight"] = {
+            "row_id": req.get("row_id") or "",
+            "bcb_id": req.get("bcb_id") or "",
+        }
         save_state(state, state_path)
         outcome, detail = coerce_send(send_via_notify(req))
         entry = {

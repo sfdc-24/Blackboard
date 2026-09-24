@@ -5,9 +5,11 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
+import agent_waker as aw  # noqa: E402
 import state_store  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("gemini_cloud_main", REPO / "cloud" / "agent-waker" / "main.py")
@@ -177,7 +179,7 @@ class NoDuplicateAnswers(unittest.TestCase):
 
         store.save = save
         w = _ClaimingWaker(calls, on_post=lambda me, answers: board.add(
-            "%s-WAKE-%s" % (me.upper(), answers)))
+            aw.reply_row_id(me, answers)))
         w.reply_on_board = lambda rid: rid in board
         with self.assertRaises(RuntimeError):
             main.run(store=store, waker=w)
@@ -337,7 +339,7 @@ class NoDuplicateAnswers(unittest.TestCase):
         store = MemStore(self._posting_cursor())
         calls, posts = [], []
         w = _ClaimingWaker(calls, posts=posts)
-        w.reply_on_board = lambda rid: rid == "GEMINI-WAKE-A"
+        w.reply_on_board = lambda rid: rid == aw.reply_row_id("gemini", "A")
         main.run(store=store, waker=w, now="2026-09-24T06:00:00Z")
         self.assertEqual(calls, [])
         self.assertEqual(posts, [])
@@ -416,6 +418,168 @@ class QuarantineDoesNotStarveNewWork(unittest.TestCase):
         for rid in ("U1", "U2", "U3"):
             self.assertIn(rid, store.state.get("unknown_ids") or [])
             self.assertNotIn(rid, store.state.get("answered_ids") or [])
+
+
+def _legacy_reply(answers_id):
+    """A row in the shape written before reply ids carried a hash."""
+    return [
+        aw.legacy_reply_row_id("gemini", answers_id),
+        "2026-09-24T05:00:00Z",
+        "gemini",
+        "claude-code-cli;ALL",
+        "DONE",
+        "wakerreply=1|answers=%s|evidence=STATED|REPLY: ok" % answers_id,
+    ]
+
+
+class _Probe:
+    """Sees whether recovery already closed the claim, and does not post."""
+
+    def __init__(self, answers_id):
+        self.answers_id = answers_id
+        self.answered_at_start = None
+
+    def post_reply(self, *args, **kwargs):
+        raise AssertionError("recovery posted %s" % (args[4] if len(args) > 4 else args,))
+
+    def main(self, argv):
+        path = os.path.join(os.environ["BLACKBOARD_STATE_DIR"], ".gemini_waker_state.json")
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.answered_at_start = self.answers_id in (state.get("answered_ids") or [])
+        return 0
+
+
+class ReplyIdentity(unittest.TestCase):
+    """A receipt closes the ask it names, not the ask that shares a Row_ID."""
+
+    def _posting(self, answers_id, phase="posting"):
+        return {"watermark": "2026-09-24T02:00:00Z", "answered_ids": [],
+                "inflight": answers_id, "claim_owner": "dead-run",
+                "claim_until": "2026-09-24T05:00:00Z", "claim_phase": phase}
+
+    def _recover(self, inflight, rows, phase="posting"):
+        store = MemStore(self._posting(inflight, phase))
+        probe = _Probe(inflight)
+
+        def read_rows(env, title="Blackboard - Alpha DB", tries=4,
+                      since=None, limit=None, match=None):
+            return {"rows": rows}
+
+        with mock.patch("bus.load_env", return_value={"BUS_URL": "u", "BUS_SECRET": "s"}), \
+             mock.patch("bus.read_rows", side_effect=read_rows):
+            main.run(store=store, waker=probe, now="2026-09-24T06:00:00Z")
+        return store, probe
+
+    def test_a_dotted_receipt_does_not_close_the_underscore_ask(self):
+        first, second = "SYNTHETIC.ASK", "SYNTHETIC_ASK"
+        self.assertEqual(aw.legacy_reply_row_id("gemini", first),
+                         aw.legacy_reply_row_id("gemini", second))
+        store, probe = self._recover(second, [_legacy_reply(first)])
+        self.assertFalse(probe.answered_at_start)
+        self.assertNotIn(second, store.state.get("answered_ids") or [])
+        self.assertIn(second, store.state.get("unknown_ids") or [])
+
+    def test_a_long_prefix_receipt_does_not_close_the_other_long_id(self):
+        first, second = ("L" * 40) + "ONE", ("L" * 40) + "TWO"
+        self.assertEqual(aw.legacy_reply_row_id("gemini", first),
+                         aw.legacy_reply_row_id("gemini", second))
+        store, probe = self._recover(second, [_legacy_reply(first)])
+        self.assertFalse(probe.answered_at_start)
+        self.assertNotIn(second, store.state.get("answered_ids") or [])
+        self.assertIn(second, store.state.get("unknown_ids") or [])
+
+    def test_a_legacy_receipt_with_the_full_answers_field_still_closes(self):
+        """The old Row_ID is how the row is found. answers= is why it counts."""
+        answers_id = "SYNTHETIC_ASK"
+        store, probe = self._recover(answers_id, [_legacy_reply(answers_id)])
+        self.assertTrue(probe.answered_at_start)
+        self.assertIn(answers_id, store.state.get("answered_ids") or [])
+        self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+
+    def _assert_open(self, answers_id, rows, phase):
+        store, probe = self._recover(answers_id, rows, phase)
+        self.assertFalse(probe.answered_at_start)
+        self.assertNotIn(answers_id, store.state.get("answered_ids") or [])
+        if phase == "posting":
+            self.assertIn(answers_id, store.state.get("unknown_ids") or [])
+            self.assertEqual(store.state.get("inflight") or "", "")
+        else:
+            self.assertEqual(store.state.get("inflight"), answers_id)
+            self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+
+    def _assert_closed(self, answers_id, rows, phase):
+        store, probe = self._recover(answers_id, rows, phase)
+        self.assertTrue(probe.answered_at_start)
+        self.assertIn(answers_id, store.state.get("answered_ids") or [])
+        self.assertNotIn(answers_id, store.state.get("unknown_ids") or [])
+        self.assertEqual(store.state.get("inflight") or "", "")
+
+    def test_another_agents_receipt_does_not_complete_this_claim(self):
+        """A claude-api reply to a shared ask is not Gemini's reply."""
+        shared = "SHARED-ASK"
+        rows = [
+            _own_reply(shared, agent="claude-api"),
+            _own_reply(shared, agent="claude-api", legacy=True),
+        ]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_an_ordinary_note_does_not_complete_the_claim(self):
+        """A Codex NOTE that carries answers= is not this waker's reply."""
+        shared = "SHARED-ASK"
+        rows = [_codex_note(shared)]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_the_wrong_row_id_does_not_complete_the_claim(self):
+        """Producer markers are not enough when the Row_ID is not this reply."""
+        shared = "SHARED-ASK"
+        rows = [_own_reply(shared, row_id=aw.reply_row_id("gemini", "OTHER-ASK"))]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_open(shared, rows, phase)
+
+    def test_this_agents_own_reply_still_completes_the_claim(self):
+        shared = "SHARED-ASK"
+        rows = [_own_reply(shared)]
+        for phase in ("claimed", "posting"):
+            with self.subTest(phase=phase):
+                self._assert_closed(shared, rows, phase)
+
+    def test_a_legacy_done_note_from_this_agent_still_completes_the_claim(self):
+        """Rows written before wakerreply=1 are this waker's DONE/NOTE kind."""
+        shared = "SHARED-ASK"
+        rid = aw.legacy_reply_row_id("gemini", shared)
+        payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=gemini|"
+                   "to=claude-code-cli,ALL|answers=%s|evidence=STATED|REPLY: ok"
+                   % (rid, shared))
+        rows = [_own_reply(shared, legacy=True, payload=payload)]
+        self._assert_closed(shared, rows, "posting")
+
+
+def _own_reply(answers_id, *, agent="gemini", legacy=False, source=None,
+               row_id=None, payload=None):
+    """A reply row in the shape fleet_agent writes for this agent."""
+    rid = row_id or (aw.legacy_reply_row_id(agent, answers_id) if legacy
+                     else aw.reply_row_id(agent, answers_id))
+    src = agent if source is None else source
+    if payload is None:
+        payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=%s|"
+                   "to=claude-code-cli,ALL|wakerreply=1|answers=%s|"
+                   "evidence=STATED|REPLY: ok" % (rid, src, answers_id))
+    return [rid, "2026-09-24T05:00:00Z", src, "claude-code-cli;ALL", "DONE", payload]
+
+
+def _codex_note(answers_id):
+    """An ordinary NOTE. Quoting the marker in prose does not make it a reply."""
+    rid = "CODEX-NOTE-%s" % answers_id
+    payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=codex|to=ALL|"
+               "answers=%s|evidence=STATED|REPLY: quoting wakerreply=1 is not a reply"
+               % (rid, answers_id))
+    return [rid, "2026-09-24T05:00:00Z", "codex", "ALL", "DONE", payload]
 
 
 if __name__ == "__main__":

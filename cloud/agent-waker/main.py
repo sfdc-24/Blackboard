@@ -35,11 +35,20 @@ that decides whether a reply is sent twice.
     before the append the owner writes phase `posting` and renews the
     lease to cover the post (400s) plus a margin. A `posting` claim is
     never reclaimed, whatever the lease says: the append may already be
-    on the wire. A later run reads the board. Reply present: mark the row
-    answered. Reply absent: quarantine it and never post it again. It is
-    not marked answered before that reply is seen. Quarantined ids are
-    left out of the per-pass selection window, so they do not crowd out
-    a newer row, and they stay in `unknown_ids` for a person to see.
+    on the wire. A later run reads the board. A reply is present only when
+    the row is THIS waker's own: answers= is the full source id, the
+    source (and from=, when the row carries it) is this agent, the row
+    has wakerreply=1 or this waker's DONE/NOTE kind, and the Row_ID is
+    exactly the current or the legacy id this waker would have written.
+    Another agent's receipt, a NOTE that only carries answers=, or the
+    right markers on the wrong Row_ID are not a reply. The legacy Row_ID
+    strips characters and keeps 40, so it is not an identity by itself;
+    a legacy receipt still counts when the other three hold and answers=
+    is the full source id. Reply present: mark the row answered. Reply
+    absent: quarantine it and never post it again. It is not marked
+    answered before that reply is seen. Quarantined ids are left out of
+    the per-pass selection window, so they do not crowd out a newer row,
+    and they stay in `unknown_ids` for a person to see.
   - The answered id is still recorded when the post is confirmed. Saves are
     compare-and-swap. A second writer with a stale token is refused and this
     run exits non-zero rather than merging.
@@ -86,17 +95,119 @@ POST_TIMEOUT_SECONDS = 400
 POST_LEASE_SECONDS = POST_TIMEOUT_SECONDS + 60
 
 
-def _board_has_row(row_id: str) -> bool:
-    """True when a row with this exact Row_ID is on the board.
+def _field(row, name: str) -> str:
+    """The first name= field on a row, or empty.
 
-    `match` is a substring over the whole row, so a later note that merely
-    quotes the id is not a hit. The Row_ID column has to be that id.
+    First value wins, same as the rest of the board: a later quote of
+    name=<something else> is not a rewrite of the field. A prose mention
+    is not a field either.
+    """
+    if not isinstance(row, (list, tuple)) or len(row) <= 5:
+        return ""
+    want = name.strip().lower()
+    for segment in str(row[5] or "").split("|"):
+        key, sep, val = segment.partition("=")
+        if sep and key.strip().lower() == want:
+            return val.strip()
+    return ""
+
+
+def _answers_of(row) -> str:
+    """The first answers= field on a row, or empty."""
+    return _field(row, "answers")
+
+
+def _producer_is(row, agent: str) -> bool:
+    """True when the row was written as this waker's own agent tag.
+
+    Source_Tag is the column fleet_agent fills with --tag. from= is the
+    same tag copied into the payload. A name that is present and is not
+    this agent is someone else's row. Both absent is not a producer.
+    """
+    expected = (agent or "").strip().lower()
+    if not expected or not isinstance(row, (list, tuple)):
+        return False
+    source = str(row[2] if len(row) > 2 else "").strip().lower()
+    writer = _field(row, "from").strip().lower()
+    if source and source != expected:
+        return False
+    if writer and writer != expected:
+        return False
+    return bool(source or writer)
+
+
+def _is_own_reply(row, answers_id: str, agent: str) -> bool:
+    """True when this row is this waker's reply to this exact source id.
+
+    All four have to hold. answers= alone is how another agent's receipt,
+    a NOTE that merely carries the field, or the right markers on the
+    wrong Row_ID were taken as this waker's reply.
+
+      - answers= is the full source id
+      - the source, and from= when the row has it, is this agent
+      - wakerreply=1, or this waker's own row kind (phase DONE, class NOTE)
+      - Row_ID is exactly the current id or the legacy id for this agent
+        and this source id
+
+    A legacy receipt still counts: its Row_ID is the legacy form, and
+    answers= is the whole id, not the stripped 40-character prefix.
+    """
+    if not answers_id or not agent:
+        return False
+    if _answers_of(row) != answers_id:
+        return False
+    if not _producer_is(row, agent):
+        return False
+    if not isinstance(row, (list, tuple)) or not row:
+        return False
+    rid = str(row[0] or "").strip()
+    import agent_waker
+    expected = (agent_waker.reply_row_id(agent, answers_id),
+                agent_waker.legacy_reply_row_id(agent, answers_id))
+    if rid not in expected:
+        return False
+    if _field(row, "wakerreply") == "1":
+        return True
+    action = str(row[4] if len(row) > 4 else "").strip().upper()
+    phase = (_field(row, "phase") or action).strip().upper()
+    klass = _field(row, "class").strip().upper()
+    return phase == "DONE" and klass == "NOTE"
+
+
+def _rows_answer(rows, answers_id: str, agent: str | None = None) -> bool:
+    """True when some row is this agent's own reply to this exact source id."""
+    who = AGENT if agent is None else agent
+    if not answers_id:
+        return False
+    for row in rows or []:
+        if _is_own_reply(row, answers_id, who):
+            return True
+    return False
+
+
+def _board_has_answer(answers_id: str) -> bool:
+    """True when the board has this waker's own reply to this exact id.
+
+    Search by the answers token, and also by the new and legacy Row_IDs,
+    because `match` is a substring and either form can be how the row is
+    found. A hit still has to be this agent's reply: full answers=, this
+    agent's source, the wakerreply marker or this waker's DONE/NOTE kind,
+    and the exact current or legacy Row_ID. A row whose Row_ID merely
+    collides, or whose answers= matches and nothing else does, does not count.
     """
     import bus
+    import agent_waker
+    if not answers_id:
+        return False
     env = bus.load_env()
-    obj = bus.read_rows(env, match=row_id, limit=20)
-    for row in obj.get("rows") or []:
-        if row and str(row[0]).strip() == row_id:
+    needles = ["answers=%s" % answers_id]
+    for extra in (agent_waker.reply_row_id(AGENT, answers_id),
+                  agent_waker.legacy_reply_row_id(AGENT, answers_id)):
+        if extra and extra not in needles:
+            needles.append(extra)
+    for needle in needles:
+        obj = bus.read_rows(env, match=needle, limit=20)
+        if _rows_answer(obj.get("rows") or [], answers_id):
             return True
     return False
 
@@ -211,14 +322,23 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         clear_claim(s)
 
     def reply_visible(answers_id: str) -> bool:
+        """A reply counts only when it answers this exact source id.
+
+        `reply_rows`, when a test sets it, is the board. Otherwise a test
+        may still plant the Row_ID this run would write (`reply_on_board`
+        / `board_contains`). The live lookup reads answers= off the row.
+        """
         import agent_waker
-        rid = agent_waker.reply_row_id(AGENT, answers_id)
+        rows_of = getattr(waker, "reply_rows", None)
+        if rows_of is not None:
+            rows = rows_of() if callable(rows_of) else rows_of
+            return _rows_answer(rows, answers_id)
         finder = board_contains
         if finder is None:
             finder = getattr(waker, "reply_on_board", None)
-        if finder is None:
-            finder = _board_has_row
-        return bool(finder(rid))
+        if finder is not None:
+            return bool(finder(agent_waker.reply_row_id(AGENT, answers_id)))
+        return _board_has_answer(answers_id)
 
     def resolve_inflight():
         """A previous run owned this answers id and may already have posted.
