@@ -76,6 +76,14 @@ def command(state, command_id="lead-1", item_id="item-lead-1"):
 
 
 class LeadFactsTests(unittest.TestCase):
+    def setUp(self):
+        # These routing tests retain their fake Salesforce opener. The actual
+        # killable process boundary has its own adversarial subprocess suite.
+        patcher = mock.patch("app.workers.lead_facts.fetch_lead_facts", side_effect=lambda org_id, timeout, cancel:
+                             OrgFacts.from_env(expected_org_id=org_id).lead_counts())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_settings_default_off_and_parse_explicit_enable(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(Settings.from_env().lead_facts_enabled)

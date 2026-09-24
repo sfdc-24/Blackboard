@@ -885,7 +885,7 @@ class ApiTests(unittest.TestCase):
             headers = {**self.origin, "X-Forwarded-Proto": "https", "Authorization": "Bearer synthetic-test-token"}
             health = client.get("/health", headers=headers)
             self.assertEqual(200, health.status_code)
-            self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file", "features": {"voice": False}}, health.json())
+            self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file", "features": {"voice": False, "lead_facts": False}}, health.json())
             self.assertEqual(health.json(), client.get("/healthz").json())
             for method, path in (("GET", "/health/"), ("GET", "/healthz/"),
                                  ("POST", "/v1/auth/start/"), ("POST", "/v1/auth/verify/"),

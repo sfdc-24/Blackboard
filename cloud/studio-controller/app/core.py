@@ -442,6 +442,14 @@ class StudioController:
             }
             try:
                 self.repository.save(session_id, candidate, record.token)
+                cancel = getattr(self.worker, "cancel_session", None)
+                if callable(cancel):
+                    # The durable fence must win before local provider work is
+                    # signalled. Cancellation failure cannot undo a saved Stop.
+                    try:
+                        cancel(session_id)
+                    except Exception:
+                        pass
                 return result
             except StateConflict:
                 continue
