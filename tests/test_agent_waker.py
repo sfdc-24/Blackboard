@@ -254,6 +254,20 @@ class TagBoundaries(unittest.TestCase):
 
 
 class GrokLane(unittest.TestCase):
+    def test_the_standby_never_claims_claude_code_cli_is_closed(self):
+        # 2026-09-24: the standby told him "the claude-code-cli lane is not open
+        # right now" while that session was working and replied minutes later.
+        # The standby cannot know whether the session is open, so it must not
+        # say it is closed.
+        # Checked as the exact old claims, not bare words: the new doctrine
+        # has to NAME them to forbid them ("never say it is closed"), and a
+        # substring cannot carry that negation.
+        doctrine = " ".join(aw.AGENTS["claude-api"]["doctrine"].lower().split())
+        self.assertNotIn("the claude-code-cli lane is not open right now", doctrine)
+        self.assertNotIn("addressed claude-code-cli and no session was open", doctrine)
+        self.assertIn("you do not know whether the claude-code-cli session is open", doctrine)
+        self.assertIn("the claude-code-cli session will also see your message", doctrine)
+
     def test_grok_doctrine_separates_the_api_from_the_desktop_app(self):
         """The one confusion that would make a grok reply actively misleading."""
         d = aw.AGENTS["grok"]["doctrine"]
