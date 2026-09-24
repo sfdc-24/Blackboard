@@ -229,6 +229,22 @@ def check(runs_probe: list, runs_shadow: list, hours: int,
         notes = [str(p[k]) for k in ("board_note", "whatsapp_note") if p.get(k)]
         reasons.append("%sZ %s" % (r["ts"][5:16], "; ".join(notes) or "no note"))
     criteria["shadow_unknown_reasons"] = reasons
+    # EVERY FAILED READ, whatever the combined verdict. At 22:45Z on 2026-09-24
+    # the board read failed three times over four minutes, and the run still
+    # said NEWS because the WhatsApp read had news - so the count above, which
+    # keys on the combined verdict, never saw it. The combined verdict is what
+    # decides a wake and stays the finding; this is how reliable the reads are.
+    failed_reads = []
+    for r in runs_shadow:
+        p = r["payload"]
+        which = [lane for lane in ("board", "whatsapp") if p.get(lane) == "UNKNOWN"]
+        if not which:
+            continue
+        notes = [str(p.get(lane + "_note") or "no note") for lane in which]
+        failed_reads.append("%sZ %s failed (combined=%s): %s" % (
+            r["ts"][5:16], "+".join(which), p.get("combined") or "?",
+            "; ".join(notes)))
+    criteria["shadow_failed_reads"] = failed_reads
     if verdicts.get("UNKNOWN") and verdicts["UNKNOWN"] > max(
             1, len(runs_shadow) // 4):
         findings.append("shadow returned UNKNOWN on %d of %d runs - the board "
@@ -289,7 +305,7 @@ def main() -> int:
     print("  shadow runs    : %d" % len(runs_shadow))
     print()
     for k in sorted(criteria):
-        if k == "shadow_unknown_reasons":
+        if k in ("shadow_unknown_reasons", "shadow_failed_reads"):
             print("  %-28s %d" % (k, len(criteria[k])))
             for reason in criteria[k]:
                 print("      - %s" % reason[:160])
