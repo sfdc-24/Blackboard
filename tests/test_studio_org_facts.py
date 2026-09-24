@@ -43,6 +43,27 @@ def fake_org(calls):
 
 
 class OrgFactsTest(unittest.TestCase):
+    def test_token_and_query_responses_are_capped_before_json_decode(self):
+        for stage in ("token", "query"):
+            reads = []
+            class Oversized(Resp):
+                def read(self, size=-1):
+                    reads.append(size)
+                    return super().read(size)
+
+            calls = []
+            base = fake_org(calls)
+            def opener(req, timeout=None):
+                is_token = req.full_url.endswith("/services/oauth2/token")
+                if (stage == "token" and is_token) or (stage == "query" and not is_token):
+                    return Oversized(b"x" * (of.MAX_RESPONSE_BYTES + 100))
+                return base(req, timeout)
+
+            f = of.OrgFacts("a.develop.my.salesforce.com", "id", "secret", opener, expected_org_id=ORG_ID)
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, "payload limit"):
+                f.lead_counts()
+            self.assertEqual([of.MAX_RESPONSE_BYTES + 1], reads)
+
     def facts(self, calls):
         return of.OrgFacts("dbm00000wk2ibeac-dev-ed.develop.my.salesforce.com", "id", "secret", fake_org(calls), expected_org_id=ORG_ID)
 

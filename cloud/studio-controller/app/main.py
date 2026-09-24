@@ -69,7 +69,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     selected_worker = worker or _worker(settings)
     if settings.lead_facts_enabled:
         from .workers.lead_facts import LeadFactsWorker
-        selected_worker = LeadFactsWorker(selected_worker, settings.salesforce_org_id)
+        selected_worker = LeadFactsWorker(selected_worker, settings.salesforce_org_id,
+                                         settings.lead_facts_timeout_seconds)
     controller = StudioController(
         repository, selected_worker, clock=clock, id_factory=id_factory,
         max_seconds=settings.max_session_seconds, daily_cap=settings.daily_session_cap,
@@ -353,7 +354,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "ok": True,
             "worker": settings.worker,
             "state_backend": backend,
-            "features": {"voice": settings.voice_enabled},
+            "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled},
         }
 
     async def json_object(request: Request, label: str) -> dict:

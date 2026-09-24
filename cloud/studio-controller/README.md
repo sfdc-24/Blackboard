@@ -65,11 +65,32 @@ quota ledger. A controller interruption retains the existing unknown/failed-comm
 behavior and is not automatically retried. Query results are snapshots observed
 over separate reads, not an atomic transaction across all aggregates.
 
-The Salesforce client still uses 30-second socket timeouts per request and has
-no end-to-end deadline. Three token attempts, backoff and four queries can exceed
-the current 60-second Cloud Run request timeout (about 214.5 seconds even when
-each request is treated as a 30-second bound; slow reads are not strictly bounded
-by that arithmetic). Resolve this before enabling the feature in that runtime.
+The optional route executes Salesforce I/O in a fixed isolated subprocess, with
+`STUDIO_LEAD_FACTS_TIMEOUT_SECONDS=12` by default and a validated ceiling of 20.
+The parent applies one monotonic deadline across child startup, DNS, token retries,
+backoff, all four queries and response reads. At expiry it kills the child, waits
+for exit and joins its bounded pipe reader before returning unavailable. The
+timeout does not abandon a provider thread. OS kill/reap cleanup adds a small
+margin after deadline detection; the 20-second ceiling leaves 40 seconds within
+the current 60-second Cloud Run request budget for cleanup and controller work.
+This is not a guarantee against an unschedulable or unresponsive operating system.
+
+The child receives only the required Salesforce credentials and basic runtime
+environment; credentials never enter argv or diagnostic output. Provider bodies
+are capped at 64 KiB before JSON decoding. Child output is capped at 4 KiB and
+validated for exact keys, org binding, bounded text/counts, timestamp, and
+`recent site leads <= all site leads <= all leads`. Failed or inconsistent reads
+are unavailable. `/health` exposes only `features.lead_facts` for this capability,
+not configuration, counts or readiness of Salesforce credentials.
+
+After a durable Stop, the local worker is signalled and kills/reaps a child
+promptly. A session-scoped tombstone prevents a subsequent local launch, and the
+existing state CAS prevents late result commits. **Activation hold:** Stop on a
+different Cloud Run instance still fences the result but cannot promptly cancel
+the original instance's provider; that child ends by its own deadline. A durable
+state watcher needs its own bounded I/O supervision: calling the current GCS
+reader synchronously here (60-second socket timeout plus token lookup) would
+break the provider deadline. Do not claim distributed prompt cancellation yet.
 
 This source does not enable the feature in any deployment or implement metadata
 writes. Verify an authenticated served-page count against the same-org query

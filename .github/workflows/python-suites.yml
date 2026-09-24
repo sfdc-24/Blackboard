@@ -78,6 +78,7 @@ on:
       - "tests/test_studio_claude_worker.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
+      - "tests/test_studio_lead_deadline.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -154,6 +155,7 @@ on:
       - "tests/test_studio_claude_worker.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
+      - "tests/test_studio_lead_deadline.py"
       - "cloud/studio-controller/workers/org_facts.py"
       - "cloud/studio-controller/workers/claude_worker.py"
       - "scripts/soak_report.py"
@@ -229,6 +231,7 @@ jobs:
                    tests/test_studio_claude_worker.py \
                    tests/test_studio_org_facts.py \
                    tests/test_studio_lead_facts.py \
+                   tests/test_studio_lead_deadline.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -645,7 +648,7 @@ jobs:
           if [ -f tests/test_studio_controller.py ] && [ -f tests/test_studio_auth.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest \
-              tests.test_studio_auth tests.test_studio_controller tests.test_studio_lead_facts
+              tests.test_studio_auth tests.test_studio_controller tests.test_studio_lead_facts tests.test_studio_lead_deadline
           else
             echo "not on this branch; skipping"
           fi
@@ -715,6 +718,7 @@ jobs:
              && [ ! -f tests/test_studio_claude_worker.py ] \
              && [ ! -f tests/test_studio_org_facts.py ] \
              && [ ! -f tests/test_studio_lead_facts.py ] \
+             && [ ! -f tests/test_studio_lead_deadline.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2

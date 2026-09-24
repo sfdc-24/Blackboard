@@ -1,5 +1,9 @@
 """Optional deterministic facts route; the controller owns auth and idempotency."""
-from workers.org_facts import OrgFacts, describe_lead_counts, is_lead_count_question
+import threading
+import time
+
+from workers.org_facts import describe_lead_counts, is_lead_count_question
+from workers.lead_facts_process import fetch_lead_facts
 
 
 UNAVAILABLE = (
@@ -9,9 +13,25 @@ UNAVAILABLE = (
 
 
 class LeadFactsWorker:
-    def __init__(self, delegate, expected_org_id: str):
+    def __init__(self, delegate, expected_org_id: str, timeout_seconds: float = 12):
         self.delegate = delegate
         self.expected_org_id = expected_org_id
+        self.timeout_seconds = timeout_seconds
+        self._lock = threading.Lock()
+        self._sessions = {}
+
+    def _cancel_event(self, session_id):
+        with self._lock:
+            now = time.monotonic()
+            self._sessions = {key: entry for key, entry in self._sessions.items() if entry[1] > now}
+            if session_id not in self._sessions:
+                # Covers the full 600-second session and the longest provider
+                # deadline. Retain Stop tombstones to close the registration race.
+                self._sessions[session_id] = (threading.Event(), now + 620)
+            return self._sessions[session_id][0]
+
+    def cancel_session(self, session_id):
+        self._cancel_event(session_id).set()
 
     def initial_artifact(self):
         return self.delegate.initial_artifact()
@@ -23,8 +43,9 @@ class LeadFactsWorker:
         if trigger.get("kind") != "utterance" or not is_lead_count_question(trigger.get("text", "")):
             return self.delegate.on_turn(state, trigger)
         try:
-            facts = OrgFacts.from_env(expected_org_id=self.expected_org_id)
-            text = describe_lead_counts(facts.lead_counts())
+            facts = fetch_lead_facts(self.expected_org_id, self.timeout_seconds,
+                                     self._cancel_event(state.get("session_id", "")))
+            text = describe_lead_counts(facts)
         except Exception:
             # Config, auth, wrong-org and malformed/API failures all yield a
             # durable unavailable answer. Never send exception text (which may

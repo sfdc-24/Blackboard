@@ -37,6 +37,14 @@ ALLOWED_HOST_SUFFIXES = (".develop.my.salesforce.com", ".sandbox.my.salesforce.c
 ALLOWED_ORG_TYPES = ("Developer Edition",)
 SITE_SOURCE = "sfdc24.com"
 ORG_ID_RE = re.compile(r"00D[A-Za-z0-9]{15}\Z")
+MAX_RESPONSE_BYTES = 64 * 1024
+
+
+def _json_response(response):
+    raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError("Salesforce response exceeds the aggregate payload limit")
+    return json.loads(raw.decode("utf-8"))
 
 # The whole query surface. Adding a fact means adding a template here, in review.
 QUERIES = {
@@ -115,7 +123,7 @@ class OrgFacts:
             req = urllib.request.Request(self.domain + "/services/oauth2/token", data=body, method="POST")
             try:
                 with self._open(req, timeout=30) as r:
-                    tok = json.loads(r.read().decode("utf-8", "replace"))
+                    tok = _json_response(r)
                 break
             except urllib.error.HTTPError as e:
                 if e.code in (400, 401, 403) or i == attempts:
@@ -135,7 +143,7 @@ class OrgFacts:
         url = "%s/services/data/%s/query?q=%s" % (inst, API, urllib.parse.quote(soql))
         req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
         with self._open(req, timeout=30) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
+            return _json_response(r)
 
     def lead_counts(self) -> dict:
         org = (self._query("org").get("records") or [{}])[0]
