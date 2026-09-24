@@ -30,18 +30,21 @@ from .metadata_operations import (
 
 
 MAX_MONOTONIC_BUDGET_SECONDS = 20.0
-TRANSPORT_METHODS = {
+TRANSPORT_METHOD_ORDER = (
     "open_verified_session",
     "describe_lead_text",
     "create_lead_text_once",
     "close",
-}
-SESSION_KEYS = {"org_id", "origin", "version", "session_handle"}
-DESCRIBE_KEYS = {"org_id", "origin", "version", "member", "complete", "exists", "field"}
-ACK_KEYS = {"org_id", "origin", "version", "member", "field", "created"}
-DISPATCH_KEYS = {"outcome", "definitive_no_change"}
-PREFLIGHT_KEYS = {"org_binding_id", "member", "exists", "observed_at"}
-OBSERVATION_KEYS = {"org_binding_id", "field", "observed_at"}
+)
+TRANSPORT_METHODS = frozenset(TRANSPORT_METHOD_ORDER)
+SESSION_KEYS = frozenset({"org_id", "origin", "version", "session_handle"})
+DESCRIBE_KEYS = frozenset({
+    "org_id", "origin", "version", "member", "complete", "exists", "field",
+})
+ACK_KEYS = frozenset({"org_id", "origin", "version", "member", "field", "created"})
+DISPATCH_KEYS = frozenset({"outcome", "definitive_no_change"})
+PREFLIGHT_KEYS = frozenset({"org_binding_id", "member", "exists", "observed_at"})
+OBSERVATION_KEYS = frozenset({"org_binding_id", "field", "observed_at"})
 
 PREFLIGHT_UNAVAILABLE = "preflight_unavailable"
 VERIFICATION_MISMATCH = "verification_mismatch"
@@ -124,7 +127,8 @@ class ExecutionBudget:
     """Sealed, process-local, non-renewable capability for one operation."""
 
     __slots__ = (
-        "_owner", "_binding", "_operation_id", "_plan_hash", "_field",
+        "_owner", "_ledger", "_ledger_store", "_binding", "_operation_id",
+        "_plan_hash", "_field",
         "_member", "_plan_expires_at", "_deadline", "_clock", "_timestamp",
         "_last_mono", "_last_stamp", "_phase", "_cancelled", "_lock",
         "_preflight_evidence", "_preflight_command", "_begin_command",
@@ -132,7 +136,7 @@ class ExecutionBudget:
         "_verification_command", "_cancellation", "_sealed",
     )
 
-    def __init__(self, key, *, owner, binding, snapshot, field, member,
+    def __init__(self, key, *, owner, ledger, binding, snapshot, field, member,
                  deadline, clock, timestamp) -> None:
         if key is not _BUDGET_KEY:
             raise MetadataProviderError("execution budgets may only be issued by the adapter")
@@ -147,6 +151,8 @@ class ExecutionBudget:
             raise MetadataProviderError("the execution plan is already expired")
 
         object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_ledger", ledger)
+        object.__setattr__(self, "_ledger_store", ledger.store)
         object.__setattr__(self, "_binding", binding)
         object.__setattr__(self, "_operation_id", snapshot["plan"]["operation_id"])
         object.__setattr__(self, "_plan_hash", snapshot["plan_hash"])
@@ -176,6 +182,11 @@ class ExecutionBudget:
             raise AttributeError("execution budgets are immutable capabilities")
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("execution budgets are immutable capabilities")
+        object.__delattr__(self, name)
+
     def __repr__(self) -> str:
         return "<ExecutionBudget sealed>"
 
@@ -197,6 +208,12 @@ class ExecutionBudget:
     def _assert_owner(self, owner) -> None:
         if owner is not self._owner:
             raise MetadataProviderError("execution budget belongs to another adapter")
+
+    def _assert_ledger(self, owner, ledger) -> None:
+        self._assert_owner(owner)
+        if (ledger is not self._ledger
+                or getattr(ledger, "store", None) is not self._ledger_store):
+            raise MetadataProviderError("execution budget belongs to another metadata ledger")
 
     def _sample(self, owner, *, allow_expired=False) -> tuple[bool, int]:
         self._assert_owner(owner)
@@ -267,6 +284,11 @@ class _CancellationView:
             raise AttributeError("cancellation views are immutable")
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("cancellation views are immutable")
+        object.__delattr__(self, name)
+
     def __call__(self) -> bool:
         return self._budget._cancelled_or_expired(self._owner)
 
@@ -307,6 +329,11 @@ class _DispatchPermit:
         if getattr(self, "_sealed", False):
             raise AttributeError("dispatch permits are immutable")
         object.__setattr__(self, name, value)
+
+    def __delattr__(self, name) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("dispatch permits are immutable")
+        object.__delattr__(self, name)
 
     def __repr__(self) -> str:
         return "<DispatchPermit sealed>"
@@ -382,23 +409,41 @@ def _canonical_member(field: dict) -> str:
     return "CustomField:Lead." + field["name"].lower() + "__c"
 
 
-def _validate_transport(transport) -> None:
-    if type(getattr(transport, "zero_retry_writes", None)) is not bool \
-            or transport.zero_retry_writes is not True:
-        raise MetadataProviderError("transport must declare zero-retry writes")
-    if type(getattr(transport, "redirects_disabled", None)) is not bool \
-            or transport.redirects_disabled is not True:
-        raise MetadataProviderError("transport must declare redirects disabled")
-    public_callables = set()
-    for cls in type(transport).__mro__:
-        for name, value in vars(cls).items():
+def _validate_transport(transport) -> tuple:
+    try:
+        if type(getattr(transport, "zero_retry_writes", None)) is not bool \
+                or transport.zero_retry_writes is not True:
+            raise MetadataProviderError("transport must declare zero-retry writes")
+        if type(getattr(transport, "redirects_disabled", None)) is not bool \
+                or transport.redirects_disabled is not True:
+            raise MetadataProviderError("transport must declare redirects disabled")
+        public_callables = set()
+        for cls in type(transport).__mro__:
+            for name, value in vars(cls).items():
+                if not name.startswith("_") and callable(value):
+                    public_callables.add(name)
+        for name, value in getattr(transport, "__dict__", {}).items():
             if not name.startswith("_") and callable(value):
                 public_callables.add(name)
-    for name, value in getattr(transport, "__dict__", {}).items():
-        if not name.startswith("_") and callable(value):
-            public_callables.add(name)
-    if public_callables != TRANSPORT_METHODS:
-        raise MetadataProviderError("transport exposes an unsupported callable surface")
+        if public_callables != TRANSPORT_METHODS:
+            raise MetadataProviderError("transport exposes an unsupported callable surface")
+        resolved = tuple(getattr(transport, name) for name in TRANSPORT_METHOD_ORDER)
+        if not all(callable(value) for value in resolved):
+            raise MetadataProviderError("transport provider callables are unavailable")
+        return resolved
+    except MetadataProviderError:
+        raise
+    except BaseException:
+        raise MetadataProviderError("transport capability declarations are unavailable") from None
+
+
+def _same_callable(current, pinned) -> bool:
+    if current is pinned:
+        return True
+    pinned_function = getattr(pinned, "__func__", None)
+    return (pinned_function is not None
+            and getattr(current, "__self__", None) is getattr(pinned, "__self__", None)
+            and getattr(current, "__func__", None) is pinned_function)
 
 
 def _provider_identity(value: dict, binding: OrgBinding) -> bool:
@@ -474,8 +519,9 @@ class SalesforceMetadataAdapter:
     """Server-internal issuer/coordinator over one exact ledger and transport."""
 
     __slots__ = (
-        "binding", "_transport", "_clock", "_trusted_timestamp", "_owner",
-        "_budget_lock", "_budgeted_operations",
+        "binding", "_transport", "_transport_callables", "_clock",
+        "_trusted_timestamp", "_owner", "_budget_lock",
+        "_budgeted_operations", "_sealed",
     )
 
     def __init__(self, binding: OrgBinding, transport, *, clock=time.monotonic,
@@ -484,14 +530,26 @@ class SalesforceMetadataAdapter:
             raise MetadataProviderError("an immutable closed organization binding is required")
         if not callable(clock) or not callable(trusted_timestamp):
             raise MetadataProviderError("monotonic and trusted timestamp callables are required")
-        _validate_transport(transport)
+        resolved_transport = _validate_transport(transport)
         self.binding = binding
         self._transport = transport
+        self._transport_callables = resolved_transport
         self._clock = clock
         self._trusted_timestamp = trusted_timestamp
         self._owner = object()
         self._budget_lock = threading.Lock()
         self._budgeted_operations = set()
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata adapters are immutable issuer capabilities")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata adapters are immutable issuer capabilities")
+        object.__delattr__(self, name)
 
     @staticmethod
     def _ledger_snapshot(ledger, operation_id, actor) -> dict:
@@ -513,7 +571,8 @@ class SalesforceMetadataAdapter:
             if identity in self._budgeted_operations:
                 raise MetadataProviderError("an execution budget was already issued for this plan")
             budget = ExecutionBudget(
-                _BUDGET_KEY, owner=self._owner, binding=self.binding, snapshot=snapshot,
+                _BUDGET_KEY, owner=self._owner, ledger=ledger, binding=self.binding,
+                snapshot=snapshot,
                 field=field, member=member, deadline=deadline, clock=self._clock,
                 timestamp=self._trusted_timestamp,
             )
@@ -532,6 +591,16 @@ class SalesforceMetadataAdapter:
         if budget._binding != self.binding:
             raise MetadataProviderError("execution budget organization binding mismatch")
 
+    def _assert_budget_ledger(self, budget: ExecutionBudget, ledger) -> None:
+        self._assert_budget(budget)
+        budget._assert_ledger(self._owner, ledger)
+
+    def _assert_transport_unchanged(self) -> None:
+        current = _validate_transport(self._transport)
+        if any(not _same_callable(value, pinned)
+               for value, pinned in zip(current, self._transport_callables)):
+            raise MetadataProviderError("transport provider capabilities changed")
+
     def _matches_budget(self, budget: ExecutionBudget, snapshot: dict) -> tuple[dict, dict, str]:
         self._assert_budget(budget)
         required_state = snapshot.get("state", "") if type(snapshot) is dict else ""
@@ -549,13 +618,13 @@ class SalesforceMetadataAdapter:
         try:
             alive, _ = budget._sample(self._owner)
             if alive:
-                raw_session = self._transport.open_verified_session(
+                raw_session = self._transport_callables[0](
                     self.binding, budget._deadline, budget._cancellation
                 )
                 session = _validate_session(raw_session, self.binding)
                 alive, _ = budget._sample(self._owner)
             if alive and session is not None:
-                raw_description = self._transport.describe_lead_text(
+                raw_description = self._transport_callables[1](
                     copy.deepcopy(session), budget._member, budget._deadline,
                     budget._cancellation,
                 )
@@ -569,7 +638,7 @@ class SalesforceMetadataAdapter:
         finally:
             if session is not None:
                 try:
-                    close_result = self._transport.close(
+                    close_result = self._transport_callables[3](
                         copy.deepcopy(session), budget._deadline, budget._cancellation
                     )
                     alive, _ = budget._sample(self._owner)
@@ -582,6 +651,11 @@ class SalesforceMetadataAdapter:
     def preflight(self, budget: ExecutionBudget):
         self._assert_budget(budget)
         if not budget._begin_phase(self._owner, "created", "preflight_running"):
+            return PREFLIGHT_UNAVAILABLE
+        try:
+            self._assert_transport_unchanged()
+        except BaseException:
+            budget._set_phase(self._owner, "terminal")
             return PREFLIGHT_UNAVAILABLE
         description = self._read_description(budget)
         if description is None:
@@ -604,17 +678,17 @@ class SalesforceMetadataAdapter:
         return evidence
 
     def commit_preflight(self, budget: ExecutionBudget, ledger, actor, *, command_id):
-        self._assert_budget(budget)
-        if budget._phase != "preflighted":
+        self._assert_budget_ledger(budget, ledger)
+        if (budget._phase not in {"preflighted", "terminal"}
+                or (budget._phase == "terminal" and budget._preflight_command is None)):
             raise MetadataProviderError("provider preflight is not ready to commit")
         snapshot = self._ledger_snapshot(ledger, budget._operation_id, actor)
         validated, _, _ = self._matches_budget(budget, snapshot)
         preflight_evidence = _unpack(budget._preflight_evidence)
-        if validated["state"] != "confirmed" or validated["provider_attempts"] != 0:
-            raise MetadataProviderError("durable operation is not awaiting preflight")
-        if validated["preflight"] not in (None, preflight_evidence):
-            raise MetadataProviderError("durable preflight differs from this execution capability")
         if budget._preflight_command is None:
+            if (validated["state"] != "confirmed" or validated["provider_attempts"] != 0
+                    or validated["preflight"] is not None):
+                raise MetadataProviderError("durable operation is not awaiting preflight")
             alive, stamp = budget._sample(self._owner)
             if not alive:
                 budget._set_phase(self._owner, "terminal")
@@ -625,9 +699,29 @@ class SalesforceMetadataAdapter:
                 "payload": {"observation": copy.deepcopy(preflight_evidence)},
             }
             object.__setattr__(budget, "_preflight_command", _pack(command))
-        elif _unpack(budget._preflight_command)["command_id"] != command_id:
+        command = _unpack(budget._preflight_command)
+        if command["command_id"] != command_id:
             raise MetadataProviderError("preflight command identity changed")
-        result = ledger.apply(budget._operation_id, actor, _unpack(budget._preflight_command))
+        if validated["state"] == "confirmed":
+            if (validated["provider_attempts"] != 0
+                    or validated["preflight"] not in (None, preflight_evidence)):
+                raise MetadataProviderError("durable preflight differs from this execution capability")
+        elif validated["state"] == "failed":
+            terminal_replay = (
+                preflight_evidence["exists"] is True
+                and validated["preflight"] == preflight_evidence
+                and validated["reason"] == "preexisting_target"
+                and validated["provider_attempts"] == 0
+                and validated["revision"] == command["expected_revision"] + 1
+                and validated["updated_at"] == command["at"]
+                and validated["audit"][-1]["command_id"] == command_id
+                and command_id in validated["commands"]
+            )
+            if not terminal_replay:
+                raise MetadataProviderError("durable terminal preflight is not an exact replay")
+        else:
+            raise MetadataProviderError("durable operation is not awaiting preflight")
+        result = ledger.apply(budget._operation_id, actor, command)
         budget._set_phase(
             self._owner,
             "preflight_committed" if result["receipt"]["status"] == "confirmed" else "terminal",
@@ -635,7 +729,7 @@ class SalesforceMetadataAdapter:
         return result["receipt"]
 
     def reserve_dispatch(self, budget: ExecutionBudget, ledger, actor, *, command_id):
-        self._assert_budget(budget)
+        self._assert_budget_ledger(budget, ledger)
         if budget._phase != "preflight_committed":
             raise DispatchPermitError("committed absent-target preflight is required")
         snapshot = self._ledger_snapshot(ledger, budget._operation_id, actor)
@@ -687,15 +781,16 @@ class SalesforceMetadataAdapter:
         create_entered = False
         result = _dispatch("rejected")
         try:
+            self._assert_transport_unchanged()
             alive, _ = budget._sample(self._owner)
             if alive:
-                raw_session = self._transport.open_verified_session(
+                raw_session = self._transport_callables[0](
                     self.binding, budget._deadline, budget._cancellation
                 )
                 session = _validate_session(raw_session, self.binding)
                 alive, _ = budget._sample(self._owner)
             if alive and session is not None:
-                raw_description = self._transport.describe_lead_text(
+                raw_description = self._transport_callables[1](
                     copy.deepcopy(session), budget._member, budget._deadline,
                     budget._cancellation,
                 )
@@ -704,7 +799,7 @@ class SalesforceMetadataAdapter:
                 if alive and description["exists"] is False:
                     create_entered = True
                     field = _unpack(budget._field)
-                    raw_ack = self._transport.create_lead_text_once(
+                    raw_ack = self._transport_callables[2](
                         copy.deepcopy(session), copy.deepcopy(field), budget._deadline,
                         budget._cancellation,
                     )
@@ -716,7 +811,7 @@ class SalesforceMetadataAdapter:
         finally:
             if session is not None:
                 try:
-                    close_result = self._transport.close(
+                    close_result = self._transport_callables[3](
                         copy.deepcopy(session), budget._deadline, budget._cancellation
                     )
                     alive, _ = budget._sample(self._owner)
@@ -732,7 +827,7 @@ class SalesforceMetadataAdapter:
         return result
 
     def commit_dispatch_result(self, budget: ExecutionBudget, ledger, actor, *, command_id):
-        self._assert_budget(budget)
+        self._assert_budget_ledger(budget, ledger)
         if budget._phase != "dispatched" or budget._dispatch_result is None:
             raise MetadataProviderError("no adapter dispatch result is ready to commit")
         snapshot = self._ledger_snapshot(ledger, budget._operation_id, actor)
@@ -753,13 +848,14 @@ class SalesforceMetadataAdapter:
         return result["receipt"]
 
     def verify_independent(self, budget: ExecutionBudget, ledger, actor):
-        self._assert_budget(budget)
+        self._assert_budget_ledger(budget, ledger)
         if not budget._begin_phase(self._owner, "dispatch_committed", "verify_running"):
             result = VERIFICATION_UNAVAILABLE
             object.__setattr__(budget, "_verification_result", _pack(result))
             budget._set_phase(self._owner, "verification_ready")
             return result
         try:
+            self._assert_transport_unchanged()
             snapshot = self._ledger_snapshot(ledger, budget._operation_id, actor)
             validated, expected_field, _ = self._matches_budget(budget, snapshot)
         except BaseException:
@@ -805,7 +901,7 @@ class SalesforceMetadataAdapter:
         A retry after an uncertain save reuses the identical ledger command and
         may recover its stored receipt. It never performs another provider read.
         """
-        self._assert_budget(budget)
+        self._assert_budget_ledger(budget, ledger)
         if (budget._verification_result is None
                 or budget._phase not in {"verification_ready", "terminal"}):
             raise MetadataProviderError("no independent verification result is ready to commit")

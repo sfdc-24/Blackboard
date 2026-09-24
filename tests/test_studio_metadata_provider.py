@@ -54,9 +54,12 @@ class Store:
         self.lock = threading.Lock()
         self.fail_after = False
         self.fail_load_once = False
+        self.loads = 0
+        self.saves = 0
 
     def load(self, name):
         with self.lock:
+            self.loads += 1
             if self.fail_load_once:
                 self.fail_load_once = False
                 raise RuntimeError("SECRET_LOAD_FAILURE")
@@ -65,6 +68,7 @@ class Store:
 
     def save(self, name, value, token):
         with self.lock:
+            self.saves += 1
             _, current = self.documents.get(name, ({}, None))
             if current != token:
                 raise Conflict()
@@ -260,7 +264,29 @@ class MetadataProviderTests(unittest.TestCase):
         self.assertEqual(sandbox.environment, "sandbox")
 
     def test_transport_capabilities_and_callable_surface_are_exact(self):
-        self.adapter(Transport(self.mono))
+        for keys in (provider.TRANSPORT_METHODS, provider.SESSION_KEYS,
+                     provider.DESCRIBE_KEYS, provider.ACK_KEYS,
+                     provider.DISPATCH_KEYS, provider.PREFLIGHT_KEYS,
+                     provider.OBSERVATION_KEYS):
+            self.assertIsInstance(keys, frozenset)
+            with self.assertRaises(AttributeError):
+                keys.add("extra")
+        adapter, transport = self.adapter(Transport(self.mono))
+        for name, value in (("binding", object()), ("_transport", object()),
+                            ("_transport_callables", ()),
+                            ("_clock", lambda: 0), ("_trusted_timestamp", lambda: 0),
+                            ("_owner", object()), ("_sealed", False)):
+            with self.subTest(assign=name), self.assertRaises(AttributeError):
+                setattr(adapter, name, value)
+            with self.subTest(delete=name), self.assertRaises(AttributeError):
+                delattr(adapter, name)
+        # Failed tampering must leave the validated transport and clocks usable.
+        harness = LedgerHarness()
+        budget = adapter.issue_execution_budget(
+            harness.ledger, "operation_1", harness.actor, deadline=1015
+        )
+        self.assertIsInstance(budget, ExecutionBudget)
+        self.assertEqual(transport.calls, [])
         for flag in ("zero_retry_writes", "redirects_disabled"):
             transport = Transport(self.mono)
             setattr(transport, flag, False)
@@ -283,18 +309,147 @@ class MetadataProviderTests(unittest.TestCase):
                 operation(budget)
         with self.assertRaises(AttributeError):
             budget._deadline = 9999
+        for name in ("_sealed", "_phase", "_field", "_owner", "_ledger",
+                     "_ledger_store"):
+            with self.subTest(delete=name), self.assertRaises(AttributeError):
+                delattr(budget, name)
         with self.assertRaises(AttributeError):
             budget._cancellation._budget = object()
         with self.assertRaises(AttributeError):
             budget._cancellation._owner = object()
+        for name in ("_sealed", "_budget", "_owner"):
+            with self.subTest(cancel_delete=name), self.assertRaises(AttributeError):
+                delattr(budget._cancellation, name)
         with self.assertRaises(MetadataProviderError):
             adapter.issue_execution_budget(harness.ledger, "operation_1", harness.actor, deadline=1015)
         with self.assertRaises(MetadataProviderError):
-            provider.ExecutionBudget(object(), owner=object(), binding=self.binding,
+            provider.ExecutionBudget(object(), owner=object(), ledger=harness.ledger,
+                                     binding=self.binding,
                                      snapshot=harness.snapshot(), field=FIELD,
                                      member=MEMBER, deadline=1015, clock=self.mono,
                                      timestamp=self.wall)
         self.assertEqual(transport.calls, [])
+
+    def test_budget_and_ledger_reject_dependency_or_lookalike_swap_before_io(self):
+        issued = LedgerHarness()
+        lookalike = LedgerHarness()
+        adapter, transport = self.adapter()
+        budget = adapter.issue_execution_budget(
+            issued.ledger, "operation_1", issued.actor, deadline=1015
+        )
+
+        for name, value in (("store", lookalike.store),
+                            ("conflict_type", RuntimeError), ("_sealed", False)):
+            with self.subTest(assign=name), self.assertRaises(AttributeError):
+                setattr(issued.ledger, name, value)
+            with self.subTest(delete=name), self.assertRaises(AttributeError):
+                delattr(issued.ledger, name)
+
+        adapter.preflight(budget)
+        original_store = issued.ledger.store
+        object.__setattr__(issued.ledger, "store", lookalike.store)
+        lookalike_io = (lookalike.store.loads, lookalike.store.saves)
+        with self.assertRaises(MetadataProviderError):
+            adapter.commit_preflight(
+                budget, issued.ledger, issued.actor, command_id="preflight"
+            )
+        self.assertEqual((lookalike.store.loads, lookalike.store.saves), lookalike_io)
+        object.__setattr__(issued.ledger, "store", original_store)
+
+        lookalike_io = (lookalike.store.loads, lookalike.store.saves)
+        with self.assertRaises(MetadataProviderError):
+            adapter.commit_preflight(
+                budget, lookalike.ledger, lookalike.actor, command_id="preflight"
+            )
+        self.assertEqual((lookalike.store.loads, lookalike.store.saves), lookalike_io)
+
+        adapter.commit_preflight(
+            budget, issued.ledger, issued.actor, command_id="preflight"
+        )
+        lookalike_io = (lookalike.store.loads, lookalike.store.saves)
+        with self.assertRaises(MetadataProviderError):
+            adapter.reserve_dispatch(
+                budget, lookalike.ledger, lookalike.actor, command_id="begin"
+            )
+        self.assertEqual((lookalike.store.loads, lookalike.store.saves), lookalike_io)
+        self.assertEqual(Counter(call[0] for call in transport.calls)["create"], 0)
+        self.assertEqual(issued.snapshot()["provider_attempts"], 0)
+        self.assertEqual(lookalike.snapshot()["provider_attempts"], 0)
+
+    def test_post_reservation_ledger_mismatch_precedes_ledger_and_provider_io(self):
+        issued, adapter, transport, budget, result = self.dispatched()
+        self.assertEqual(result["outcome"], "accepted")
+        lookalike = LedgerHarness()
+
+        def assert_rejected_without_io(call):
+            ledger_io = (lookalike.store.loads, lookalike.store.saves)
+            provider_calls = len(transport.calls)
+            with self.assertRaises(MetadataProviderError):
+                call()
+            self.assertEqual((lookalike.store.loads, lookalike.store.saves), ledger_io)
+            self.assertEqual(len(transport.calls), provider_calls)
+
+        assert_rejected_without_io(lambda: adapter.commit_dispatch_result(
+            budget, lookalike.ledger, lookalike.actor, command_id="dispatch-result"
+        ))
+        adapter.commit_dispatch_result(
+            budget, issued.ledger, issued.actor, command_id="dispatch-result"
+        )
+        assert_rejected_without_io(lambda: adapter.verify_independent(
+            budget, lookalike.ledger, lookalike.actor
+        ))
+
+        transport.exists = True
+        transport.described_field = copy.deepcopy(FIELD)
+        adapter.verify_independent(budget, issued.ledger, issued.actor)
+        assert_rejected_without_io(lambda: adapter.commit_verification(
+            budget, lookalike.ledger, lookalike.actor, command_id="verification"
+        ))
+
+    def test_transport_declaration_or_callable_drift_after_reserve_never_creates(self):
+        modes = ("zero_retry_writes", "redirects_disabled", *provider.TRANSPORT_METHOD_ORDER)
+        for mode in modes:
+            with self.subTest(mode=mode):
+                self.setUp()
+                harness, adapter, transport, budget, permit = self.reserved()
+                if mode in {"zero_retry_writes", "redirects_disabled"}:
+                    setattr(transport, mode, False)
+                else:
+                    setattr(transport, mode, lambda *args, **kwargs: None)
+                result = adapter.dispatch_once(permit)
+                self.assertEqual(
+                    result,
+                    {"outcome": "rejected_no_change", "definitive_no_change": True},
+                )
+                self.assertEqual(Counter(call[0] for call in transport.calls)["create"], 0)
+                receipt = adapter.commit_dispatch_result(
+                    budget, harness.ledger, harness.actor, command_id="dispatch-result"
+                )
+                self.assertEqual(receipt["status"], "failed")
+
+    def test_transport_drift_is_sanitized_at_preflight_and_verification_boundaries(self):
+        harness = LedgerHarness()
+        adapter, transport = self.adapter()
+        budget = adapter.issue_execution_budget(
+            harness.ledger, "operation_1", harness.actor, deadline=1015
+        )
+        transport.redirects_disabled = False
+        self.assertEqual(adapter.preflight(budget), PREFLIGHT_UNAVAILABLE)
+        self.assertEqual(transport.calls, [])
+
+        self.setUp()
+        harness, adapter, transport, budget = self.verify_ready()
+        provider_calls = len(transport.calls)
+        transport.open_verified_session = lambda *args, **kwargs: None
+        self.assertEqual(
+            adapter.verify_independent(budget, harness.ledger, harness.actor),
+            VERIFICATION_UNAVAILABLE,
+        )
+        self.assertEqual(len(transport.calls), provider_calls)
+        receipt = adapter.commit_verification(
+            budget, harness.ledger, harness.actor, command_id="verification"
+        )
+        self.assertEqual(receipt["status"], "outcome_unknown")
 
     def test_invalid_budget_and_plan_expiry_fail_before_provider_io(self):
         for deadline in (1000, 999, 1020.001, True, float("nan"), "1010"):
@@ -418,11 +573,39 @@ class MetadataProviderTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "verify_pending")
         self.assertEqual(len(transport.calls), provider_calls)
 
+    def test_preexisting_preflight_ambiguous_save_replays_terminal_receipt(self):
+        transport = Transport(self.mono)
+        transport.exists = True
+        transport.described_field = copy.deepcopy(FIELD)
+        harness, adapter, transport, budget = self.prepared(transport)
+        evidence = adapter.preflight(budget)
+        self.assertTrue(evidence["exists"])
+        provider_calls = len(transport.calls)
+        harness.store.fail_after = True
+        with self.assertRaises(PersistenceUncertain):
+            adapter.commit_preflight(
+                budget, harness.ledger, harness.actor, command_id="preflight"
+            )
+        self.assertEqual(harness.snapshot()["state"], "failed")
+        receipt = adapter.commit_preflight(
+            budget, harness.ledger, harness.actor, command_id="preflight"
+        )
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(len(transport.calls), provider_calls)
+        replay = adapter.commit_preflight(
+            budget, harness.ledger, harness.actor, command_id="preflight"
+        )
+        self.assertEqual(replay, receipt)
+        self.assertEqual(len(transport.calls), provider_calls)
+
     def test_permit_is_nonserializable_one_use_and_concurrency_safe(self):
         _, adapter, transport, _, permit = self.reserved()
         for operation in (copy.copy, copy.deepcopy, pickle.dumps, json.dumps):
             with self.subTest(operation=operation), self.assertRaises(TypeError):
                 operation(permit)
+        for name in ("_sealed", "_budget", "_consumed", "_owner"):
+            with self.subTest(delete=name), self.assertRaises(AttributeError):
+                delattr(permit, name)
         start = threading.Barrier(3)
         outcomes = []
 

@@ -127,12 +127,15 @@ its rebind/rotation controls remain unbuilt.
 One sealed, non-copyable, non-serializable `ExecutionBudget` is issued from the
 trusted ledger while an operation is confirmed and before provider preflight.
 It owns one absolute monotonic deadline of at most 20 seconds, the plan expiry,
-the exact plan/binding/field, phase state, and one process-local cancellation
-signal. The exact same deadline and cancellation callback are passed to every
-transport call across preflight, dispatch and independent verification; a later
-phase cannot renew the budget. Cancellation is cooperative: this contract lets
-a conforming blocking transport observe it, but cannot forcibly interrupt a
-misbehaving implementation or operating system.
+the exact plan/binding/field, sealed ledger dependency configuration, the exact
+process-local store object identity, phase state, and one process-local
+cancellation signal. Substituting an identically populated ledger or swapping
+ledger dependencies fails before ledger/provider I/O. The exact same deadline
+and cancellation callback are passed to every transport call across preflight,
+dispatch and independent verification; a later phase cannot renew the budget.
+Cancellation is cooperative: this contract lets a conforming blocking transport
+observe it, but cannot forcibly interrupt a misbehaving implementation or
+operating system.
 
 The injected transport must declare `zero_retry_writes = True` and
 `redirects_disabled = True`. Its only public callable surface is:
@@ -141,6 +144,15 @@ The injected transport must declare `zero_retry_writes = True` and
 - `describe_lead_text`
 - `create_lead_text_once`
 - `close`
+
+The adapter pins those four resolved callables during construction and checks
+both declarations and callable identity again at each provider phase boundary.
+Declaration or method drift fails closed before another provider call.
+`open_verified_session` owns any resources it allocates until it returns a
+valid closed session shape. If it raises or returns an invalid response, a
+concrete transport must clean up internally: the adapter cannot safely pass an
+unvalidated response to `close`. Once a session validates, the adapter owns the
+normal `close` call under the original deadline and cancellation signal.
 
 The adapter passes the canonical fixed Lead member to `describe_lead_text`, not
 a URL, query, XML document, generic action, or arbitrary metadata name. Session,
@@ -152,7 +164,9 @@ partial response.
 Provider preflight returns exactly the PR223 evidence shape
 `org_binding_id/member/exists/observed_at`, then the coordinator commits that
 stored evidence through the ledger. Only an absent exact-member result may
-continue. The coordinator—not a caller—invokes the durable `begin`, immediately
+continue. An ambiguously saved preexisting-target preflight may replay its exact
+stored command to recover the already-terminal receipt without provider I/O.
+The coordinator—not a caller—invokes the durable `begin`, immediately
 re-reads the operation, and mints a sealed one-use permit only when the result is
 fresh, non-replayed and matches the single reserved attempt. Old begin-result
 dictionaries, raw booleans, portable snapshots, restarts and ambiguous begin

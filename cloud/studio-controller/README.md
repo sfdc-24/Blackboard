@@ -293,10 +293,15 @@ and pins a developer/sandbox origin, API version, environment and binding
 version. One sealed process-local execution budget carries the same absolute
 maximum-20-second deadline, plan expiry and cooperative cancellation signal
 through exact provider preflight, one possible create-method entry and an
-independent verification read.
+independent verification read. It also seals the in-process ledger dependency
+configuration and pins the exact store object identity used at issuance; a
+look-alike ledger or dependency swap fails before ledger or provider I/O.
 
 The injected transport has only four provider-specific callables and must
-declare no write retries and disabled redirects. Describe results require
+declare no write retries and disabled redirects. The adapter pins their resolved
+identities and rejects declaration/method drift at provider phase boundaries.
+An opening transport owns cleanup until it returns a valid session; invalid open
+responses are not passed to `close`. Describe results require
 explicit `complete:true`; no partial/empty response proves absence. The trusted
 coordinator commits its own preflight evidence, invokes the ledger's durable
 `begin` directly, re-reads the operation and issues a non-serializable one-use

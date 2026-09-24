@@ -291,13 +291,26 @@ def validate_ledger(document):
 
 
 class MetadataOperationLedger:
+    __slots__ = ("store", "conflict_type", "_sealed")
+
     def __init__(self, store, *, conflict_type):
         # The adapter must implement atomic load/save generation CAS. Do not
         # assume the local FileStore supplies a distributed execution lock.
         if getattr(store, "atomic_generation_cas", None) is not True:
             raise InvalidOperation("explicit atomic generation-CAS adapter required")
-        self.store = store
-        self.conflict_type = conflict_type
+        object.__setattr__(self, "store", store)
+        object.__setattr__(self, "conflict_type", conflict_type)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata ledger dependencies are immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("metadata ledger dependencies are immutable")
+        object.__delattr__(self, name)
 
     @staticmethod
     def _name(org_binding_id):
