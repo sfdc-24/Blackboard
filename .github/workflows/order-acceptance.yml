@@ -37,6 +37,7 @@ on:
       - 'tests/test_order_deployment_wrappers.ps1'
       - 'tests/test_order_supervisor.ps1'
       - 'tests/test_order_workspace.ps1'
+      - 'tests/test_order_adapter_denypath.ps1'
       - 'tests/test_azure_vm_supervisor.ps1'
       - 'scripts/board_since.ps1'
       - 'scripts/board_since.lib.ps1'
@@ -169,6 +170,12 @@ jobs:
           }
           if ($suiteExit -ne 0) { exit $suiteExit }
 
+      # Parses ConvertTo-ClaudeEnvDenyPath out of scripts/invoke_order_claude.ps1
+      # and checks the path it refuses. It was in no workflow until 2026-09-24.
+      - name: Test the ORDER adapter's Claude env deny-path
+        shell: pwsh
+        run: ./tests/test_order_adapter_denypath.ps1
+
   windows-powershell-51:
     name: ORDER and Azure contracts on Windows PowerShell 5.1
     runs-on: windows-latest
@@ -201,6 +208,9 @@ jobs:
       - name: Test provider-free ORDER SYSTEM adapter smoke
         shell: powershell
         run: .\tests\test_order_system_adapter_smoke.ps1
+      - name: Test the ORDER adapter's Claude env deny-path
+        shell: powershell
+        run: .\tests\test_order_adapter_denypath.ps1
       - name: Test ORDER Azure job-schedule link validation
         shell: powershell
         run: .\tests\test_order_job_schedule_link_validator.ps1
