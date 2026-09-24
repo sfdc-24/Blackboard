@@ -97,6 +97,18 @@ live. Record the UTC time, release SHA, environment, and resulting receipt.
 - Receipt: org ID hash, org alias, SOQL hash, count, query timestamp, and API
   request ID.
 
+The source-only authenticated controller canary can exercise the text/API part
+of this case after a dedicated `lead-canary` Cloud Run service exists. Run
+`tools/authenticated_canary.py` only with explicit `--live`, the exact
+`https://www.sfdc24.com` Origin, and the reviewed canonical `.a.run.app` canary
+origin. Enter the email, independently captured same-org Lead expectation, and
+OTP only through its non-echoing prompts. Its redacted receipt proves the
+baseline snapshot, exact aggregate comparison, committed SSE event, stable
+command replay with no new event, replayable Stop, terminal SSE event, and a
+fresh post-Stop HTTP 410. Label this `controller_api_canary`; it does not prove
+the served page, browser interaction, email UX, voice, or deployment. The
+offline MockTransport suite is only an `offline pass`, never a live result.
+
 ## 9. Salesforce object or field change
 
 - Ask: `Plan a new field on Lead for prototype interest.`
