@@ -211,8 +211,11 @@ such as `on the Lead object` is recognized without requiring the word Salesforce
 request. UI asks mentioning Salesforce retain the prototype route unless they
 explicitly target Salesforce (for example, a field `in Salesforce` or `on the
 Salesforce Lead object`). Later source/reference clauses such as `using labels
-from Salesforce` do not make a prototype form field an org target. Unsupported
-explicit org operations, including deletion, remain local guidance only. Other
+from Salesforce` do not make a prototype form field an org target.
+`from Salesforce` identifies a data source for UI creation/addition requests;
+deletion/removal of a component `from Salesforce` stays local. Bare destinations
+such as `Add a field to Salesforce` and schema operations are also recognized.
+Unsupported explicit org operations, including deletion, remain local guidance only. Other
 utterances retain the existing worker route. This is not general semantic
 metadata intent detection. A typed `metadata.propose` command uses the existing
 command envelope plus the closed `field` object:

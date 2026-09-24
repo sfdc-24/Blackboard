@@ -21,6 +21,10 @@ PLAN_INTENT_RE = re.compile(PLAN_PREFIX, re.IGNORECASE)
 PLAN_REQUEST_RE = re.compile(PLAN_PREFIX + r" ([A-Za-z][A-Za-z0-9 ]{0,39})[.]?", re.IGNORECASE)
 COMPONENT = r"\b(?:fields?|objects?|metadata|schema)(?:\s+(?:named|called)\s+[A-Za-z][A-Za-z0-9_]*)?"
 STANDARD_OBJECT = r"(?:Lead|Account|Contact|Opportunity|Case|Campaign|Task|Event|User)"
+SALESFORCE_DESTINATION = (
+    r"Salesforce\b(?!-)(?=$|[.,;!?]|\s+(?:org\b|object\b|custom\s+object\b|schema\b|metadata\b|"
+    r"and\b|then\b|now\b|for\b|with\b|named\b|called\b|" + STANDARD_OBJECT + r"\s+object\b))"
+)
 FIELD_KEYS = {"parent", "name", "label", "type", "length", "required", "unique", "external_id"}
 CONFIRM_KEYS = {"plan_id", "plan_revision", "plan_hash", "confirmation_nonce"}
 NOTICE = (
@@ -75,15 +79,25 @@ def is_metadata_request(text: str) -> bool:
     # parse_request's fullmatch can create a proposal; the rest gets guidance.
     if PLAN_INTENT_RE.match(text.strip()):
         return True
-    if not (re.search(r"\b(?:plan|create|add|delete|update|change|deploy)\b", text, re.I)
-            and re.search(r"\b(?:fields?|objects?|metadata)\b", text, re.I)):
+    if not (re.search(r"\b(?:plan|create|add|delete|remove|update|change|deploy)\b", text, re.I)
+            and re.search(r"\b(?:fields?|objects?|metadata|schema)\b", text, re.I)):
         return False
     # A prepositional standard-object target is explicit without the vendor
     # name; "lead form" or "lead field" still does not imply an org operation.
     if re.search(
-        COMPONENT + r"\s+(?:on|to|from|in|within)\s+(?:(?:the|my|our)\s+)?"
+        COMPONENT + r"\s+(?:on|to|in|within)\s+(?:(?:the|my|our)\s+)?"
         + STANDARD_OBJECT + r"\s+object\b",
         text, re.I,
+    ):
+        return True
+    # "from Salesforce" normally identifies an existing UI data source.
+    # Treat it as an org mutation only when delete/remove acts on that noun,
+    # not when a later source clause happens to follow another action.
+    if re.search(
+        r"\b(?:delete|remove)\s+(?:(?:the|a|an|all|existing|custom|Text)\s+)*"
+        r"(?:[A-Za-z][A-Za-z0-9_]*\s+)?" + COMPONENT
+        + r"\s+from\s+(?:(?:the|my|our)\s+)?(?:" + SALESFORCE_DESTINATION + r"|"
+        + STANDARD_OBJECT + r"\s+object\b)", text, re.I,
     ):
         return True
     if not re.search(r"\bSalesforce\b(?!-)", text, re.I):
@@ -93,9 +107,7 @@ def is_metadata_request(text: str) -> bool:
     # stay local even if they also mention UI consequences.
     if re.search(
         COMPONENT + r"(?:\s+on\s+(?:the\s+)?" + STANDARD_OBJECT + r"(?:\s+object)?)?"
-        r"\s+(?:in|within|from)\s+(?:(?:the|my|our)\s+)?Salesforce\b(?!-)"
-        r"|" + COMPONENT + r"\s+(?:on|to)\s+(?:(?:the|my|our)\s+)?Salesforce\s+"
-        r"(?:(?:Lead|Account|Contact|Opportunity|custom)\s+)?(?:object|org|schema|metadata)\b",
+        r"\s+(?:in|within|on|to)\s+(?:(?:the|my|our)\s+)?" + SALESFORCE_DESTINATION,
         text, re.I,
     ):
         return True

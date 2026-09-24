@@ -142,6 +142,12 @@ class MetadataContractTests(unittest.TestCase):
             "Create a search field on the website that imports contacts from Salesforce",
             "Update the field labels on our website to match the labels in Salesforce",
             "Add a phone field to our contact form linked to the Lead object",
+            "Add an existing field from Salesforce to our contact form",
+            "Create a contact form with fields from Salesforce",
+            "Add a phone field from Salesforce to the website contact form",
+            "Add an existing field from the Lead object to our contact form",
+            "Delete a label and add a field from Salesforce to our contact form",
+            "Remove a field from the Salesforce integration settings page",
         )
         for i, text in enumerate(negatives):
             with self.subTest(text=text):
@@ -167,6 +173,15 @@ class MetadataContractTests(unittest.TestCase):
             "Update Salesforce metadata for the Lead object",
             "Add a Text field to the Salesforce Lead object",
             "Delete the field from our Salesforce org",
+            "Remove the field from our Salesforce org",
+            "Remove the Phone field from Salesforce",
+            "Remove the Phone field from the Lead object",
+            "Add a field to Salesforce",
+            "Add a field to Salesforce and show it on the website form",
+            "Add a field on Salesforce",
+            "Add a field to the Salesforce custom object",
+            "Add a field to the Salesforce custom object and show it on the website form",
+            "Update the schema in Salesforce",
             "Create a field in Salesforce and show it on the website form",
             "Create a field on the Account object",
             "Delete a field from the Contact object",
