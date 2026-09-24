@@ -326,23 +326,66 @@ def notify_argv(req: dict, text_file: Path) -> list[str]:
     ]
 
 
-def send_via_notify(req: dict) -> tuple[bool, str]:
+def send_via_notify(req: dict) -> tuple[str, str]:
     """Send through scripts/wa_notify.py. Recipient is not a parameter.
 
-    It used to shell out to powershell.exe and wa_notify.ps1, which a cloud
-    runtime does not have. wa_notify.py is the same contract in stdlib Python:
-    the "[KIND - tag]" prefix, the length cap, one attempt and never a retry.
+    Returns (outcome, detail). outcome is confirmed, not_sent, or unknown.
+    An import error, a missing credential, or any other failure before the
+    request leaves is not_sent: nothing was accepted, so a later pass may
+    retry. Once send() has been called, a lost response is unknown.
     """
     try:
-        from wa_notify import notify
+        from wa_notify import attempt
     except Exception as exc:  # noqa: BLE001
-        return False, f"wa_notify.py unavailable: {exc}"
+        return "not_sent", f"wa_notify.py unavailable: {exc}"
     try:
-        return notify(req["text"], kind=req["kind"], tag=req["tag"])
+        res = attempt(req["text"], kind=req["kind"], tag=req["tag"])
     except SystemExit as exc:
-        return False, str(exc)
+        return "not_sent", str(exc)
     except Exception as exc:  # noqa: BLE001 - report, do not mark delivered
-        return False, f"{type(exc).__name__}: {exc}"
+        return "not_sent", f"{type(exc).__name__}: {exc}"
+    return res["outcome"], res["detail"]
+
+
+def coerce_send(result) -> tuple[str, str]:
+    """Normalise a send result to (outcome, detail).
+
+    attempt() returns the outcome by name. Older callers, and the tests
+    that stand in for them, return (True, ...) or (False, "SEND FAILED") /
+    (False, "HTTP <status> ..."). True is a receipt. False with no HTTP
+    status failed before a request left. An HTTP status is classified the
+    same way as a live Graph response.
+    """
+    if isinstance(result, dict):
+        return str(result.get("outcome") or "unknown"), str(result.get("detail") or "")
+    if isinstance(result, tuple) and len(result) == 2:
+        first, detail = result
+        detail = str(detail or "")
+        if first in ("confirmed", "not_sent", "unknown"):
+            return first, detail
+        if first is True:
+            return "confirmed", detail
+        if first is False:
+            return _legacy_failure(detail), detail
+    return "unknown", str(result)
+
+
+def _legacy_failure(detail: str) -> str:
+    match = re.search(r"\bHTTP\s+(\d+)\b", detail or "")
+    if not match:
+        return "not_sent"
+    from wa_notify import classify_status
+    return classify_status(int(match.group(1)), detail[match.end():])
+
+
+def quarantine(state: dict, req: dict) -> None:
+    """Remember an unknown send under both ids. A later pass must not select it."""
+    unknown = list(state.get("unknown_row_ids") or [])
+    for key in (req.get("row_id"), req.get("bcb_id")):
+        if key and key not in unknown:
+            unknown.append(key)
+    state["unknown_row_ids"] = unknown
+    state["inflight"] = ""
 
 
 def note_payload(req: dict) -> str:
@@ -444,7 +487,7 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
         # and does not send it again.
         state["inflight"] = req["row_id"] or req["bcb_id"]
         save_state(state, state_path)
-        ok, detail = send_via_notify(req)
+        outcome, detail = coerce_send(send_via_notify(req))
         entry = {
             "row_id": req["row_id"],
             "bcb_id": req["bcb_id"],
@@ -452,17 +495,29 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
             "kind": req["kind"],
             "ts": req["ts"],
             "sent_at": now_iso(),
-            "ok": ok,
+            "ok": True if outcome == "confirmed" else (False if outcome == "not_sent" else None),
+            "outcome": outcome,
             "detail": detail[:300],
         }
-        if not ok:
-            # A definite failure is not an unknown send. Release the claim
-            # so a later pass can retry it. Leave it set only when this
-            # process dies without learning the outcome.
+        if outcome == "not_sent":
+            # Proven: Graph refused it (4xx), or the request never left.
+            # Release the claim so a later pass can retry. Do not mark
+            # delivered, and do not quarantine.
             failed += 1
             state["inflight"] = ""
             save_state(state, state_path)
             print("  SEND FAIL", detail[:160].replace("\n", " "))
+            append_log(entry)
+            continue
+        if outcome != "confirmed":
+            # Status 0, a timeout, a 5xx, or a 2xx with no message id.
+            # Meta may already have accepted it. Quarantine; a person
+            # decides. Never an automatic second send, and not delivered.
+            failed += 1
+            quarantine(state, req)
+            save_state(state, state_path)
+            print("  UNKNOWN", detail[:160].replace("\n", " "))
+            entry["unknown"] = True
             append_log(entry)
             continue
         mark_delivered(state, req)

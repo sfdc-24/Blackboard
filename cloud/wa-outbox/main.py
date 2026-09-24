@@ -16,11 +16,13 @@ WHAT MAKES THIS SAFE TO SCHEDULE, because every mistake here lands on his phone:
   - BEFORE each send, the outbox writes that row id into the cursor as
     `inflight` and this wrapper compare-and-swaps the save. Only the run
     whose write lands may send. The loser is refused and exits non-zero.
-  - A WhatsApp send cannot be read back. A later run that finds `inflight`
-    set and no delivered receipt marks the id `unknown` and does not send
-    it again; a human decides. A kill between the send returning and the
-    receipt save is this case. A send that returns a definite failure is
-    not unknown: the claim is cleared and a later run may retry it.
+  - A WhatsApp send cannot be read back, and it is not pre-marked
+    delivered. The outcome is confirmed (a 2xx that carries a message id),
+    not_sent (a 4xx from Graph, or a failure before the request left), or
+    unknown (status 0, a timeout, a 5xx, or a 2xx with no message id).
+    Unknown is quarantined and never resent; only not_sent is released
+    for a later pass. A kill between the send returning and the receipt
+    save is unknown: the next run finds `inflight` with no receipt.
 
 ONE WRITER. From 2026-09-24 this job owns the outbox cursor. The laptop task
 SFDC24-WA-Board-Outbox keeps its own file and must STAY DISABLED: two outboxes
