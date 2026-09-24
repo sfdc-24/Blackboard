@@ -317,9 +317,12 @@ class WhatsAppAcknowledgement(unittest.TestCase):
                     ["id", "2026-9-21T00:01:00Z", "codex", "target", "APPEND", "pending"]):
             responses.append((200, json.dumps({"ok": True, "rows": [row]})))
         for response in responses + [TimeoutError("offline transport failure")]:
+            # A failing read is now asked again after a pause (read_gateway);
+            # the pause is patched so CI never really waits (Cursor on #232).
             with self.subTest(response=response), \
                  mock.patch.object(bw, "load_env", return_value={}), \
                  mock.patch.object(bw, "bus_get") as bus, \
+                 mock.patch.object(bw, "_pause", lambda _seconds: None), \
                  mock.patch.object(bw, "save_state") as save, \
                  mock.patch.object(sys, "argv", ["board_waker.py", "--advance", "--advance-through", "2026-09-21T00:01:29Z"]):
                 if isinstance(response, Exception):

@@ -78,8 +78,10 @@ def reading(rows, total=None, code=200):
 
 @contextlib.contextmanager
 def board(rows, total=None, code=200):
+    # A failing code is now asked again after a pause; offline tests never wait.
     with mock.patch.object(bw, "load_env", return_value={}), \
-         mock.patch.object(bw, "bus_get", side_effect=reading(rows, total, code)):
+         mock.patch.object(bw, "bus_get", side_effect=reading(rows, total, code)), \
+         mock.patch.object(bw, "_pause", lambda _seconds: None):
         yield
 
 
@@ -160,7 +162,8 @@ class UNKNOWNStillMeansTheReadDidNotHappen(unittest.TestCase):
         def fake_get(_env, _params):
             return 200, "<html>proxy interstitial</html>"
         with mock.patch.object(bw, "load_env", return_value={}), \
-             mock.patch.object(bw, "bus_get", side_effect=fake_get):
+             mock.patch.object(bw, "bus_get", side_effect=fake_get), \
+             mock.patch.object(bw, "_pause", lambda _seconds: None):
             status, _, _ = bw.check_board({})
         self.assertEqual(status, "UNKNOWN")
 
@@ -381,6 +384,87 @@ class APayloadCannotKillTheRun(unittest.TestCase):
         with mock.patch.object(sys, "stdout", Stubborn()), \
              mock.patch.object(sys, "stderr", Stubborn()):
             bw._make_output_unkillable()   # must not raise
+
+
+GOOGLE_404 = "<!DOCTYPE html><html><title>Page Not Found</title></html>"
+
+
+class AFlappingGatewayIsAskedAgain(unittest.TestCase):
+    """Cloud soak, 2026-09-24: 4 of 25 shadow runs were UNKNOWN on a single 404
+    page for both reads. A read that comes back as a page is retried; one that
+    never recovers is still UNKNOWN."""
+
+    def run_check(self, check, answers):
+        calls, pauses = [], []
+
+        def fake_get(_env, params):
+            calls.append(params)
+            return answers[min(len(calls), len(answers)) - 1]
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", side_effect=fake_get), \
+             mock.patch.object(bw, "_pause", side_effect=pauses.append):
+            result = check({})
+        return result, calls, pauses
+
+    def good(self, rows):
+        return 200, json.dumps({"rows": rows, "total": len(rows)})
+
+    def test_a_404_page_then_data_is_the_data(self):
+        (status, _, fresh), calls, pauses = self.run_check(
+            bw.check_board, [(404, GOOGLE_404), self.good([row("R-1", GOOD_TS)])])
+        self.assertEqual(status, "NEWS")
+        self.assertEqual(len(fresh), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(pauses, [3.0])
+
+    def test_a_gateway_that_never_recovers_is_still_UNKNOWN(self):
+        (status, note, fresh), calls, pauses = self.run_check(
+            bw.check_board, [(404, GOOGLE_404)])
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("HTTP 404", note)
+        self.assertEqual(fresh, [])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(pauses, [3.0, 8.0], "no pause after the last attempt")
+
+    def test_a_200_page_that_is_not_json_is_retried_too(self):
+        (status, _, _), calls, _ = self.run_check(
+            bw.check_board, [(200, GOOGLE_404), self.good([])])
+        self.assertEqual(status, "QUIET")
+        self.assertEqual(len(calls), 2)
+
+    def test_the_first_good_answer_is_not_asked_twice(self):
+        (status, _, _), calls, pauses = self.run_check(
+            bw.check_board, [self.good([row("R-1", GOOD_TS)])])
+        self.assertEqual(status, "NEWS")
+        self.assertEqual((len(calls), pauses), (1, []))
+
+    def test_whatsapp_is_asked_again_as_well(self):
+        wa = ["WA-1", GOOD_TS, "whatsapp", "", "OPEN", "Claude-code-cli are you there"]
+        (status, _, fresh), calls, pauses = self.run_check(
+            bw.check_whatsapp, [(404, GOOGLE_404), self.good([wa])])
+        self.assertEqual(status, "NEWS")
+        self.assertEqual(len(fresh), 1)
+        self.assertEqual((len(calls), pauses), (2, [3.0]))
+
+    def test_whatsapp_that_never_recovers_is_still_UNKNOWN(self):
+        (status, note, _), calls, _ = self.run_check(
+            bw.check_whatsapp, [(404, GOOGLE_404)])
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("HTTP 404", note)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_transport_exception_is_not_retried(self):
+        calls = []
+
+        def boom(_env, _params):
+            calls.append(1)
+            raise TimeoutError("read timed out")
+        with mock.patch.object(bw, "load_env", return_value={}), \
+             mock.patch.object(bw, "bus_get", side_effect=boom), \
+             mock.patch.object(bw, "_pause", side_effect=AssertionError("no pause")):
+            status, _, _ = bw.check_board({})
+        self.assertEqual(status, "UNKNOWN")
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

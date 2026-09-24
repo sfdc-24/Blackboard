@@ -45,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -57,6 +58,28 @@ sys.path.insert(0, str(SCRIPTS))
 from board_say import load_env, bus_get, BOARD  # noqa: E402
 
 ME = "claude-code-cli"
+
+# THE GATEWAY ANSWERS WITH A PAGE NOW AND THEN. Measured in the cloud soak on
+# 2026-09-24: 4 of 25 waker-shadow runs read UNKNOWN because the board read AND
+# the WhatsApp read both got Google's HTTP 404 page at the same moment, and each
+# was attempted exactly once. A read is idempotent, so one that comes back as
+# anything but a JSON body is asked again after a pause. After the last attempt
+# the caller sees exactly what that attempt saw, so UNKNOWN still means the read
+# did not happen. A transport exception is NOT retried: bus_get waits up to 180s
+# per attempt, and tripling that is not a fix for a 404.
+READ_TRIES = 3
+READ_PAUSES = (3.0, 8.0)
+_pause = time.sleep
+
+
+def read_gateway(env: dict, params: dict) -> tuple:
+    code, body = bus_get(env, params)
+    for pause in READ_PAUSES[:READ_TRIES - 1]:
+        if code == 200 and body.lstrip().startswith("{"):
+            break
+        _pause(pause)
+        code, body = bus_get(env, params)
+    return code, body
 
 # Credential files are machine state, never source. Local installations may
 # point BLACKBOARD_ENV at a gitignored file. Cloud runtimes inject BUS_URL and
@@ -146,7 +169,7 @@ def check_board(state: dict, strict: bool = False) -> tuple:
         params["since"] = since
     try:
         env = load_env()
-        code, body = bus_get(env, params)
+        code, body = read_gateway(env, params)
         if code != 200:
             return "UNKNOWN", "board read failed (HTTP %s)" % code, []
         data = json.loads(body)
@@ -247,7 +270,7 @@ def check_whatsapp(state: dict) -> tuple:
     # may inherit the general board boundary.
     since = state["wa_watermark"] if "wa_watermark" in state else state.get("watermark") or ""
     params = {"action": "read", "title": BOARD, "match": "whatsapp", "limit": 30}
-    code, body = bus_get(env, params)
+    code, body = read_gateway(env, params)
     if not body.lstrip().startswith("{"):
         return "UNKNOWN", "whatsapp read returned a page, not data (HTTP %s)" % code, []
     data = json.loads(body)
