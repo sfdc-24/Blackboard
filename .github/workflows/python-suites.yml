@@ -64,6 +64,8 @@ on:
       - "scripts/board_say.py"
       - "tests/test_waker_peek_verdict.py"
       - "tests/test_board_probe_readonly.py"
+      - "tests/test_board_probe_read_retry.py"
+      - "tests/test_read_since_retry.py"
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
@@ -143,6 +145,8 @@ on:
       - "scripts/board_say.py"
       - "tests/test_waker_peek_verdict.py"
       - "tests/test_board_probe_readonly.py"
+      - "tests/test_board_probe_read_retry.py"
+      - "tests/test_read_since_retry.py"
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
@@ -223,6 +227,8 @@ jobs:
                    tests/test_cloud_runtime_contract.py \
                    tests/test_waker_peek_verdict.py \
                    tests/test_board_probe_readonly.py \
+                   tests/test_board_probe_read_retry.py \
+                   tests/test_read_since_retry.py \
                    tests/test_state_store.py \
                    tests/test_waker_shadow.py \
                    tests/test_board_watcher.py \
@@ -514,6 +520,26 @@ jobs:
           if [ -f tests/test_board_probe_readonly.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_board_probe_readonly.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: a slow board read is a failed attempt, not a crash - probe (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_board_probe_read_retry.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_board_probe_read_retry.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: a slow board read is a failed attempt, not a crash - read_since (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_read_since_retry.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_read_since_retry.py
           else
             echo "not on this branch; skipping"
           fi

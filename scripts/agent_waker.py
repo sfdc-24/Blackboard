@@ -265,7 +265,13 @@ def read_since(env: dict, since_iso: str, tries: int = 3) -> dict:
     payload = {"action": "read", "secret": env["BUS_SECRET"],
                "title": BOARD_TITLE, "since": since_iso}
     for attempt in range(tries):
-        body = _fetch(env["BUS_URL"], payload)
+        # A timeout or a dropped connection is a failed attempt, the same as
+        # a health ping or a non-JSON body - not a crash. The cloud board-probe
+        # lost its 07Z run on 2026-09-24 to exactly this (#224).
+        try:
+            body = _fetch(env["BUS_URL"], payload)
+        except (TimeoutError, OSError):  # URLError is an OSError
+            continue
         try:
             obj = json.loads(body)
         except json.JSONDecodeError:
