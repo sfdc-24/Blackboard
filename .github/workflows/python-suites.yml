@@ -64,6 +64,8 @@ on:
       - "scripts/board_say.py"
       - "tests/test_waker_peek_verdict.py"
       - "tests/test_board_probe_readonly.py"
+      - "tests/test_governor_live_check.py"
+      - "scripts/governor_live_check.py"
       - "tests/test_board_probe_read_retry.py"
       - "tests/test_read_since_retry.py"
       - "tests/test_state_store.py"
@@ -148,6 +150,8 @@ on:
       - "scripts/board_say.py"
       - "tests/test_waker_peek_verdict.py"
       - "tests/test_board_probe_readonly.py"
+      - "tests/test_governor_live_check.py"
+      - "scripts/governor_live_check.py"
       - "tests/test_board_probe_read_retry.py"
       - "tests/test_read_since_retry.py"
       - "tests/test_state_store.py"
@@ -233,6 +237,7 @@ jobs:
                    tests/test_cloud_runtime_contract.py \
                    tests/test_waker_peek_verdict.py \
                    tests/test_board_probe_readonly.py \
+                   tests/test_governor_live_check.py \
                    tests/test_board_probe_read_retry.py \
                    tests/test_read_since_retry.py \
                    tests/test_state_store.py \
@@ -548,6 +553,16 @@ jobs:
           if [ -f tests/test_read_since_retry.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_read_since_retry.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: governor live check compares every file on a pinned main (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_governor_live_check.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" tests/test_governor_live_check.py
           else
             echo "not on this branch; skipping"
           fi
