@@ -134,6 +134,73 @@ reconnect with the last received ID using bounded backoff. A persistent failure
 is then a preflight HTTP refusal. An EOF alone is not evidence of a successful
 session or a new durable event. No token belongs in a URL.
 
+## Authenticated Lead controller canary (source-only)
+
+`tools/authenticated_canary.py` is an explicit API/controller acceptance runner;
+it is not imported by the application and is not evidence about the served page,
+browser UI, email delivery UX, voice, or a deployment. No live canary was run by
+the source increment that added it. Hosted CI executes its contract tests through
+`httpx.MockTransport` with the network namespace removed.
+
+The live CLI requires `--live`, the exact Origin
+`https://www.sfdc24.com`, and a canonical bare HTTPS Cloud Run hostname. The
+hostname must contain a `lead-canary` tag and end in `.a.run.app`. An exact
+`STUDIO_AUTHENTICATED_CANARY_READ_ONLY_V1` marker can deliberately admit an
+untagged `.a.run.app` service, but never a public/custom hostname. Redirects,
+proxy environment variables, HTTP retries, browser state, and credential files
+are disabled or unused. The client and its explicit zero-retry transport both
+disable environment trust, send `Accept-Encoding: identity`, refuse compressed
+responses, and enforce the response cap while streaming bounded raw chunks.
+
+```powershell
+python cloud/studio-controller/tools/authenticated_canary.py `
+  --live `
+  --target https://studio-lead-canary-REVIEWED-uc.a.run.app `
+  --origin https://www.sfdc24.com
+```
+
+The console reads the operator email and OTP with non-echoing `getpass`; a
+`GetPassWarning` is a closed failure rather than permission to echo. It also
+reads a non-echoing closed operator expectation containing `org_label`,
+`org_type`, `total`, `site_total`, and `site_recent`. Nothing is read from argv
+or environment for those values. Email and expectation prompt time precedes the
+elapsed-budget network sequence; after `auth/start`, OTP waiting is deliberately charged
+to the elapsed whole-run budget. Each request receives HTTPX pool/connect/write/read
+inactivity limits no larger than the remaining request and whole-run budgets. The
+runner checks elapsed time immediately after response headers, between one-byte
+raw response chunks, after EOF, and between requests. Synchronous HTTPX does not
+pre-empt an active header phase at an elapsed-time boundary. Header negotiation can
+span multiple successful reads, including informational responses, and can continue
+past both elapsed budgets while each read remains below its inactivity timeout. The
+runner closes and fails without a follow-on request once control reaches the next
+checkpoint, but it does not guarantee a finite total runtime for an active blocking
+phase. Run a live invocation under an external wall-clock process supervisor and
+interrupt or terminate it if that limit expires. These are cooperative checkpoints
+and inactivity limits, not hard wall-clock cancellation. No request is automatically
+retried:
+
+1. start and verify email authentication;
+2. create one operator-authenticated session;
+3. read the baseline SSE snapshot and pin its generation, root, artifact version,
+   and cursor;
+4. send only `How many leads do we have?`, parse the complete known Lead formatter,
+   compare the org label/type and all three aggregates to the operator expectation,
+   and require a fresh UTC observation;
+5. read exactly that committed Lead event after the baseline cursor;
+6. replay the identical stable command receipt and prove the SSE cursor stays quiet;
+7. commit and replay Stop, read exactly its terminal event, then prove one fresh
+   well-formed non-Stop command receives the exact terminal HTTP 410 refusal.
+
+Standard output is one closed redacted JSON receipt. It contains only the
+evidence label, safe aggregate counts/UTC observation, generation/sequence
+numbers, and boolean expectation/replay/SSE/terminal checks. The expectation
+match proves only equality with operator-supplied values; it does not bind or
+independently prove an immutable Salesforce org identity. The receipt never
+contains the email, OTP, Bearer tokens, session/command identifiers, org label/type, or
+remote error/body details. A failed check emits only its allowlisted stage.
+This canary reads Lead aggregates through the already deployed controller path;
+it cannot create or modify Salesforce metadata.
+
 ## Cloud Run contract
 
 Required secrets/environment:

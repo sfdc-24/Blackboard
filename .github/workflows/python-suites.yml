@@ -81,6 +81,8 @@ on:
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
+      - "tests/test_studio_authenticated_canary.py"
+      - "cloud/studio-controller/tools/authenticated_canary.py"
       - "tests/test_studio_metadata_contract.py"
       - "tests/test_studio_metadata_operations.py"
       - "tests/test_studio_metadata_provider.py"
@@ -163,6 +165,8 @@ on:
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
+      - "tests/test_studio_authenticated_canary.py"
+      - "cloud/studio-controller/tools/authenticated_canary.py"
       - "tests/test_studio_metadata_contract.py"
       - "tests/test_studio_metadata_operations.py"
       - "tests/test_studio_metadata_provider.py"
@@ -244,6 +248,7 @@ jobs:
                    tests/test_studio_org_facts.py \
                    tests/test_studio_lead_facts.py \
                    tests/test_studio_lead_deadline.py \
+                   tests/test_studio_authenticated_canary.py \
                    tests/test_studio_metadata_contract.py \
                    tests/test_studio_metadata_operations.py \
                    tests/test_studio_metadata_provider.py \
@@ -672,7 +677,7 @@ jobs:
       # the suite itself still runs with no network and all provider clients
       # are fakes.
       - name: Install pinned Studio controller test dependencies
-        if: ${{ hashFiles('tests/test_studio_controller.py') != '' || hashFiles('tests/test_studio_auth.py') != '' }}
+        if: ${{ hashFiles('tests/test_studio_controller.py') != '' || hashFiles('tests/test_studio_auth.py') != '' || hashFiles('tests/test_studio_authenticated_canary.py') != '' }}
         # The controller's own pins, so CI tests what the image installs -
         # including the anthropic SDK that STUDIO_WORKER=claude imports.
         run: python3 -m pip install -r cloud/studio-controller/requirements.txt
@@ -688,6 +693,19 @@ jobs:
           else
             echo "not on this branch; skipping"
           fi
+
+      # The live CLI is inert unless an operator supplies --live, an exact
+      # canary Cloud Run target, hidden email/OTP, and an independent same-org
+      # Lead receipt. CI uses MockTransport with the network namespace removed;
+      # it proves request cardinality, redaction, replay, SSE and Stop contracts
+      # without sending mail, authenticating, querying Salesforce, or writing.
+      - name: "studio authenticated Lead API canary contract (no network)"
+        run: |
+          set -euo pipefail
+          test -f cloud/studio-controller/tools/authenticated_canary.py
+          test -f tests/test_studio_authenticated_canary.py
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_authenticated_canary
 
       - name: "studio metadata operation ledger: atomic holds and no-retry contracts (no network)"
         run: |
@@ -776,6 +794,7 @@ jobs:
              && [ ! -f tests/test_studio_org_facts.py ] \
              && [ ! -f tests/test_studio_lead_facts.py ] \
              && [ ! -f tests/test_studio_lead_deadline.py ] \
+             && [ ! -f tests/test_studio_authenticated_canary.py ] \
              && [ ! -f tests/test_studio_metadata_contract.py ] \
              && [ ! -f tests/test_studio_metadata_operations.py ] \
              && [ ! -f tests/test_studio_metadata_provider.py ] \
