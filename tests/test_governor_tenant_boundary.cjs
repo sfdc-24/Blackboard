@@ -369,23 +369,43 @@ test('present malformed budget or cap state fails closed before the provider', (
   assert.equal(legacy.providerCalls, 0);
 });
 
-test('active-session state is bounded and new spend fails closed without eviction', () => {
+// CHANGED ON PURPOSE 2026-09-24 (v59). This test used to assert that a full
+// table REFUSES the next visitor. That behaviour locked the live site twice in
+// one night - test probes filled every slot and no new visitor got an answer
+// for hours - so anyone opening enough conversations could do the same. Spend
+// is bounded by the whole-site daily cap; the table now evicts the conversation
+// idle longest. What stays pinned: the state is bounded, fits one property,
+// a conversation in use is not the one evicted, and the daily cap still holds.
+test('a full table evicts the longest-idle conversation instead of locking visitors out', () => {
   const h = createHarness();
   const admitted = [];
   const capacity = h.context.CHAT_MAX_ACTIVE_SESSIONS;
   assert.ok(capacity >= 96, 'capacity shrank below the v50 floor');
-  for (let i = 0; i < capacity; i += 1) {
-    const identity = h.context.conversationIdentity_('', '');
-    admitted.push(identity);
-    assert.equal(h.context.reserveChatBudget_(identity.key).ok, true);
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+    for (let i = 0; i < capacity; i += 1) {
+      clock += 1000;
+      const identity = h.context.conversationIdentity_('', '');
+      admitted.push(identity);
+      assert.equal(h.context.reserveChatBudget_(identity.key).ok, true);
+    }
+    // The first conversation comes back: it is now the most recently active.
+    clock += 1000;
+    assert.equal(h.context.reserveChatBudget_(admitted[0].key).ok, true);
+    clock += 1000;
+    const newcomer = h.context.conversationIdentity_('', '');
+    assert.equal(h.context.reserveChatBudget_(newcomer.key).ok, true, 'a new visitor is answered');
+    const state = JSON.parse(h.values.get('CHAT_BUDGET_V1'));
+    assert.equal(Object.keys(state.sessions).length, capacity, 'still bounded');
+    assert.equal(Object.hasOwn(state.sessions, admitted[0].key), true, 'the active one kept its place');
+    assert.equal(state.sessions[admitted[0].key][0], 2, 'and its count');
+    assert.equal(Object.hasOwn(state.sessions, admitted[1].key), false, 'the longest idle was evicted');
+    assert.ok(h.values.get('CHAT_BUDGET_V1').length < 8500);
+  } finally {
+    Date.now = realNow;
   }
-  const overflow = h.context.conversationIdentity_('', '');
-  const denied = h.context.reserveChatBudget_(overflow.key);
-  assert.equal(denied.reason, 'session-capacity');
-  const state = JSON.parse(h.values.get('CHAT_BUDGET_V1'));
-  assert.equal(Object.keys(state.sessions).length, capacity);
-  assert.equal(Object.hasOwn(state.sessions, admitted[0].key), true);
-  assert.ok(h.values.get('CHAT_BUDGET_V1').length < 8500);
 });
 
 test('identified reception keeps provenance untrusted and leaks no Governor data upstream', () => {

@@ -20,18 +20,28 @@ const { gasRead } = require('./gas_source.cjs');
 
 const CODE = gasRead('governor-page-api', 'Code');
 
-function load(props = {}) {
+function load(props = {}, { status = 200 } = {}) {
   const posts = [];
   const cache = new Map();
+  const store = Object.assign({}, props);
   const ctx = {
     console,
-    PropertiesService: { getScriptProperties: () => ({ getProperty: k => (k in props ? props[k] : null) }) },
+    PropertiesService: { getScriptProperties: () => ({
+      getProperty: k => (k in store ? store[k] : null),
+      setProperty: (k, v) => { store[k] = String(v); },
+    }) },
     CacheService: { getScriptCache: () => ({
       get: k => (cache.has(k) ? cache.get(k) : null), put: (k, v) => cache.set(k, String(v)),
+      remove: k => cache.delete(k),
     }) },
     LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
-    UrlFetchApp: { fetch: (url, opts) => { posts.push({ url, opts }); return { getResponseCode: () => 200 }; } },
-    ContentService: {}, HtmlService: {}, Utilities: {}, SpreadsheetApp: {}, Session: {},
+    UrlFetchApp: { fetch: (url, opts) => {
+      posts.push({ url, opts });
+      const code = typeof status === 'function' ? status(posts.length) : status;
+      return { getResponseCode: () => code };
+    } },
+    ContentService: {}, HtmlService: {}, SpreadsheetApp: {}, Session: {},
+    Utilities: { formatDate: () => '20260924' },
   };
   vm.createContext(ctx);
   vm.runInContext(CODE, ctx);
@@ -138,4 +148,41 @@ test('capture runs before the spend gates, so a capped chat still records the le
   assert.ok(capture > 0);
   assert.ok(capture < body.indexOf("=== 'off'"), 'capture after the CHAT_ENABLED switch');
   assert.ok(capture < body.indexOf('reserveChatBudget_('), 'capture after the budget gate');
+});
+
+// Codex review of PR 195, P1: conversations are free to mint, so a per-
+// conversation guard alone let 150 synthetic identities make 150 Lead posts.
+test('150 fresh conversations cannot make more Leads than the daily cap', () => {
+  const { ctx, posts } = load();
+  const props = ctx.PropertiesService.getScriptProperties();
+  for (let i = 0; i < 150; i += 1) ctx.captureChatLead_('ca_' + i, 'x' + i + '@y.co', [], props);
+  assert.equal(posts.length, 25);
+});
+
+test('the daily cap is a Script Property', () => {
+  const { ctx, posts } = load({ CHAT_LEADS_DAILY_CAP: '3' });
+  const props = ctx.PropertiesService.getScriptProperties();
+  for (let i = 0; i < 10; i += 1) ctx.captureChatLead_('ca_' + i, 'x' + i + '@y.co', [], props);
+  assert.equal(posts.length, 3);
+});
+
+// P3: the conversation was marked before the post and never released, so a
+// failed post could not be retried.
+test('a failed post is released so the next email retries; a sent one is not resent', () => {
+  const { ctx, posts } = load({}, { status: (n) => (n === 1 ? 503 : 200) });
+  const props = ctx.PropertiesService.getScriptProperties();
+  assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
+  assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), true);
+  assert.equal(ctx.captureChatLead_('ca_1', 'a@b.co', [], props), false);
+  assert.equal(posts.length, 2);
+});
+
+// P2: the reference omits system and audit fields on purpose, so the prompt
+// must not call its list complete for those.
+test('the grounding rule never lets an omitted system field read as absent', () => {
+  const { ctx } = load();
+  const prompt = ctx.SYSTEM_PROMPT_('claude');
+  assert.match(prompt, /OwnerId/);
+  assert.match(prompt, /never deny one/i);
+  assert.doesNotMatch(prompt, /its list of standard fields is complete/);
 });
