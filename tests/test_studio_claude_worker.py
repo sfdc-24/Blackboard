@@ -326,6 +326,15 @@ class CodexReview206(unittest.TestCase):
         self.assertEqual({"question_id": "q-cta", "option_id": "book"}, out["resolves"])
 
 
+class BuildsFromAnEmptyScreen(unittest.TestCase):
+    def test_the_prompt_says_to_build_a_whole_first_version_from_an_empty_screen(self):
+        self.assertIn("BUILDING FROM AN EMPTY SCREEN", cw.SYSTEM)
+        self.assertIn("Build a complete, usable first version", cw.SYSTEM)
+        self.assertIn("insert the parent", cw.SYSTEM)
+        self.assertIn("ONE AREA AT A TIME. After the first version", cw.SYSTEM)
+        self.assertIn("set_label the root screen to a short name", cw.SYSTEM)
+
+
 class TalkLaneModule(unittest.TestCase):
     """workers/talk.py without any provider: routing, refusal, history, summary."""
 

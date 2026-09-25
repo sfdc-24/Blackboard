@@ -428,8 +428,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_origin(request)
         operator = require_operator(request)
         body = await json_object(request, "session")
-        if set(body) - {"title", "creation_id"}:
+        if set(body) - {"title", "creation_id", "start"}:
             raise HTTPException(400, "session body has unknown fields")
+        start = body.get("start") or "template"
+        if start not in ("template", "blank"):
+            raise HTTPException(400, "start must be template or blank")
         creation_id = body.get("creation_id")
         if not isinstance(creation_id, str) or not creation_id:
             raise HTTPException(400, "session requires creation_id")
@@ -438,7 +441,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, "title must be a string")
         try:
             state, admitted = await asyncio.to_thread(
-                controller.create_session, title[:600], operator["sid"], creation_id
+                controller.create_session, title[:600], operator["sid"], creation_id, start
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
