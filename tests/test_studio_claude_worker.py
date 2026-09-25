@@ -336,6 +336,11 @@ class BuildsFromAnEmptyScreen(unittest.TestCase):
 
 
 class TalkLaneModule(unittest.TestCase):
+    def test_the_talk_voice_acknowledges_and_leaves_questions_to_the_analyst(self):
+        from workers import talk
+        self.assertIn("Do not ask questions", talk.SYSTEM)
+        self.assertNotIn("ask one short question", talk.SYSTEM)
+
     """workers/talk.py without any provider: routing, refusal, history, summary."""
 
     def load(self):
