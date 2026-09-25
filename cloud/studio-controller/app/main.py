@@ -684,13 +684,6 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             advise_busy.discard(session_id)
         if advice is None:
             return advisor_done(session_id, started, "none")
-        try:
-            latest = await asyncio.to_thread(live_state, session_id)
-        except HTTPException:
-            return advisor_done(session_id, started, "fenced")
-        if (advisor_snapshot_marker(latest) != snapshot_marker
-                or advice_fenced(advice, int(latest.get("artifact_version") or 0))):
-            return advisor_done(session_id, started, "fenced")
         # The advisor's own words are moderated before the page sees them. The
         # lane is optional, so it fails CLOSED: flagged, or moderation not
         # available, and the advice is withheld (not counted against the visitor).
@@ -699,6 +692,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return advisor_done(session_id, started, "withheld",
                                 reason="flagged" if verdict.flagged else "moderation_unavailable",
                                 categories=list(verdict.categories))
+        # The #266 fence is the LAST step: state read after every await, and no
+        # await between the check and the return (Cursor NO-GO on 6ec1c7e).
+        try:
+            latest = await asyncio.to_thread(live_state, session_id)
+        except HTTPException:
+            return advisor_done(session_id, started, "fenced")
+        if (advisor_snapshot_marker(latest) != snapshot_marker
+                or advice_fenced(advice, int(latest.get("artifact_version") or 0))):
+            return advisor_done(session_id, started, "fenced")
         advisor_done(session_id, started, "advice")
         return {"advice": advice}
 

@@ -325,6 +325,35 @@ class Moderated(Route):
         self.assertNotIn("Say where", json.dumps(calls))
         self.assertNotIn("website", json.dumps(calls))
 
+    def test_a_commit_during_moderation_is_fenced(self):
+        # Cursor NO-GO on 6ec1c7e: moderation must not open a window after the fence.
+        import tests.test_studio_governance as gov
+        holder = {}
+
+        class MovingModeration(gov.FakeModeration):
+            async def post(self, url, **kwargs):
+                repo = holder["app"].state.controller.repository
+                record = repo.load(holder["sid"])
+                moved = dict(record.state)
+                moved["artifact_version"] = int(moved["artifact_version"]) + 1
+                repo.save(holder["sid"], moved, record.token)
+                return await super().post(url, **kwargs)
+
+        self.store = base.MemoryStore()
+        self.email_sender = base.EmailSender()
+        self.moderation = MovingModeration()
+        app = create_app(settings=base.settings(moderation_enabled=True, openai_api_key="sk-moderation-test"),
+                         store=self.store, worker=base.CountingWorker(), clock=lambda: 1000, id_factory=base.IDs(),
+                         email_sender=self.email_sender, talk_client=base.FakeTalk(), advisor=FakeAdvisor(),
+                         moderation_client=self.moderation)
+        holder["app"] = app
+        with TestClient(app) as client:
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        self.assertEqual(1, len(self.moderation.calls))
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
     def test_the_advisor_cannot_be_switched_on_without_moderation(self):
         with self.assertRaises(RuntimeError):
             base.settings(advisor_enabled=True, moderation_enabled=False).validate()
