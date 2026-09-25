@@ -1,13 +1,21 @@
 # Domain Portfolio, ROI and 30/60/90 Go-to-Market Roadmap
 
-**Version:** 1.0  
-**Decision date:** 2026-09-25  
-**Launch clock starts:** Monday, 2026-09-28  
-**Executive sponsor:** Salam  
-**Strategy owner:** Codex  
-**Independent reviews:** Claude Sonnet 5, Gemini 3.8 Flash, and a separate domain/brand screen  
-**Salesforce control Case:** 00001028 (`500fj00002YiZS5AAN`)  
-**Parent business Case:** 00001027 (`500fj00002YiMjNAAV`)  
+**Version:** 1.0
+
+**Decision date:** 2026-09-25
+
+**Launch clock starts:** Monday, 2026-09-28
+
+**Executive sponsor:** Salam
+
+**Strategy owner:** Codex
+
+**Independent reviews:** Claude Sonnet 5, Gemini 3.8 Flash, and a separate domain/brand screen
+
+**Salesforce control Case:** 00001028 (`500fj00002YiZS5AAN`)
+
+**Parent business Case:** 00001027 (`500fj00002YiMjNAAV`)
+
 **Status:** DECISION READY; no domain has been purchased and no advertising spend has been released
 
 ## Executive decision
