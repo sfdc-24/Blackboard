@@ -1,8 +1,8 @@
 """The analyst lane: a second agent beside the builder on the same session.
 
 What is under test is the gate and the lane, never a provider: the analyst's
-output is data checked before it reaches the page, its commit never waits on
-(or blocks) a build, it asks at most one question at a time, and once it is
+output is data checked before it reaches the page, its model call runs
+beside a build and its commit waits for the build rather than disrupting it, it asks at most one question at a time, and once it is
 active the builder stops asking so the two agents never talk over each other.
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ from tests.test_studio_controller import (  # noqa: E402  (sets sys.path for app
     CountingWorker, EmailSender, FakeTalk, FakeVoiceClient, IDs, MemoryStore, make_controller, settings,
 )
 from app.core import CommandError  # noqa: E402
+from app.state import StateConflict  # noqa: E402
 from app.main import create_app  # noqa: E402
 from workers import analyst as an  # noqa: E402
 
@@ -182,6 +183,48 @@ class Commit(unittest.TestCase):
         state = controller.repository.load(sid).state
         self.assertEqual("Built meanwhile", state["artifact"]["label"])            # the build survived
         self.assertEqual(model, state["model"])                                     # and so did the analysis
+
+    def test_a_build_in_flight_is_never_disrupted_the_analysis_lands_after_it(self):
+        controller, _, sid = self.open()
+        model, question, _ = an.validate(copy.deepcopy(MODEL_RAW))
+        # A build reserves the lock, exactly as execute() does before calling the builder.
+        record = controller.repository.load(sid)
+        state = record.state
+        state["active_command"] = "cmd-build"
+        reserved = controller.repository.save(sid, state, record.token)
+        slept = []
+
+        def finish_the_build_while_waiting(seconds):
+            slept.append(seconds)
+            if len(slept) == 3:                              # the build completes and saves with its token
+                working = controller.repository.load(sid).state
+                working["artifact"]["label"] = "Built"
+                controller._event(working, "artifact.patch", {"ops": []})
+                working["active_command"] = None
+                controller.repository.save(sid, working, reserved)   # must not conflict
+
+        controller.sleep = finish_the_build_while_waiting
+        events = controller.commit_analysis(sid, model, question)
+        after = controller.repository.load(sid).state
+        self.assertEqual(3, len(slept))
+        self.assertEqual("Built", after["artifact"]["label"])
+        self.assertEqual(model, after["model"])
+        seqs = [e["seq"] for e in after["events"]]
+        self.assertEqual(sorted(set(seqs)), seqs)                              # one monotonic sequence
+        self.assertGreater(events[0]["seq"], max(e["seq"] for e in after["events"] if e["type"] == "artifact.patch"))
+
+    def test_a_build_that_never_finishes_does_not_hang_the_analyst(self):
+        controller, _, sid = self.open()
+        record = controller.repository.load(sid)
+        state = record.state
+        state["active_command"] = "cmd-stuck"
+        controller.repository.save(sid, state, record.token)
+        controller.sleep = lambda seconds: None
+        controller.analysis_wait_polls = 5
+        model, question, _ = an.validate(copy.deepcopy(MODEL_RAW))
+        with self.assertRaises(StateConflict):
+            controller.commit_analysis(sid, model, question)
+        self.assertNotIn("model", controller.repository.load(sid).state)
 
     def test_a_stopped_session_refuses(self):
         controller, _, sid = self.open()

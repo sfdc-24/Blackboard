@@ -134,6 +134,11 @@ class StudioController:
                  metadata_org_id: str = ""):
         self.repository = repository
         self.worker = worker
+        # The analyst commit polls while a build holds the command lock (at most
+        # 180 x 0.5 s); tests replace sleep so no real time passes.
+        self.sleep = time.sleep
+        self.analysis_poll_seconds = 0.5
+        self.analysis_wait_polls = 180
         self.clock = clock
         self.id_factory = id_factory or (lambda prefix: prefix + "-" + uuid.uuid4().hex)
         self.max_seconds = max_seconds
@@ -434,17 +439,29 @@ class StudioController:
     def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
         """Record the analyst's data model, and at most one question, beside the builder.
 
-        The analyst never edits the artifact, so it does not take the command
-        lock: the builder and the analyst run at the same time on the same
-        session. This commit re-reads the latest state and retries on a
-        compare-and-set conflict instead of queueing behind a build. A question
-        is added only when none is open and it was not asked before; the
-        builder can then resolve it from what the visitor says, as with its own.
+        The analyst's model call - the slow part - runs at the same time as a
+        build and never takes the command lock. Only this commit, which takes
+        milliseconds, waits while a build is in flight: a build saves with the
+        token it reserved, so a write landing in between would make that save
+        fail and the build be lost, and both lanes would number events from the
+        same last_seq (Gemini's challenge of the parallel lanes). Waiting keeps
+        one writer at a time and one monotonic event sequence. Conflicts from
+        anything else are retried on fresh state. A question is added only when
+        none is open and it was not asked before; the builder can then resolve
+        it from what the visitor says, as with its own.
         """
-        for _ in range(self.repository.attempts):
+        conflicts = 0
+        waits = 0
+        while True:
             record = self.repository.load(session_id)
             state = record.state
             self._assert_live(state)
+            if state.get("active_command"):
+                waits += 1
+                if waits > self.analysis_wait_polls:
+                    raise StateConflict("analysis could not be recorded; a build is still running")
+                self.sleep(self.analysis_poll_seconds)
+                continue
             events = []
             state["analyst"] = True
             state["model"] = copy.deepcopy(model)
@@ -466,8 +483,9 @@ class StudioController:
                 self.repository.save(session_id, state, record.token)
                 return copy.deepcopy(events)
             except StateConflict:
-                continue
-        raise StateConflict("analysis could not be recorded; the session kept changing")
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("analysis could not be recorded; the session kept changing")
 
     def stop_session(self, session_id: str, command: dict) -> dict:
         """Fail-safe stop that fences any late worker commit with CAS.
