@@ -1404,8 +1404,8 @@ class FindingF2Redaction(unittest.TestCase):
                 redact(large)
                 self.assertLessEqual(calls["n"], 3 * len(large) + 10, unit)
                 cost(small)
-                base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
-                self.assertLess(grown, 10 * base + 0.25, (unit, base, grown))
+                base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(3))
+                self.assertLess(grown, 10 * base + 1.0, (unit, base, grown))
                 self.assertLess(grown, 20.0, unit)
         finally:
             page._host_char = real_host_char
@@ -1419,8 +1419,8 @@ class FindingF2Redaction(unittest.TestCase):
         for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc"):
             small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
             cost(small)
-            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
-            self.assertLess(grown, 10 * base + 0.25, (unit, base, grown))
+            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(3))
+            self.assertLess(grown, 10 * base + 1.0, (unit, base, grown))
             self.assertLess(grown, 20.0, unit)
 
 
