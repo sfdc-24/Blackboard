@@ -767,7 +767,9 @@ jobs:
               tests.test_studio_routing \
               tests.test_studio_advisor \
               tests.test_studio_advisor_route \
-              tests.test_studio_charter \n              tests.test_studio_clients \n              tests.test_studio_workspace_revisions
+              tests.test_studio_charter \
+              tests.test_studio_clients \
+              tests.test_studio_workspace_revisions
           else
             echo "not on this branch; skipping"
           fi
