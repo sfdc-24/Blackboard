@@ -89,9 +89,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None) -> FastAPI:
+               advisor=None, charter=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
+    from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
+    from .pricing import parse_price_table
+    price_table = parse_price_table(settings.price_table, _TOPICS,
+                                    lambda t: [line[0] for line in _quote_lines(t)])
     store = store or open_store(settings.state_uri)
     repository = StudioRepository(store, clock=clock)
     selected_worker = worker or _worker(settings)
@@ -470,7 +474,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "governance": True,
                          "voices": voices_available(),
                          "rating": True, "summary_email": settings.summary_email_enabled,
-                         "routing": True, "advisor": advisor_lane.ready()},
+                         "routing": True, "advisor": advisor_lane.ready(),
+                         "charter": charter_ready()},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -674,6 +679,96 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 or advice_fenced(advice, int(latest.get("artifact_version") or 0))):
             return {"advice": None, "fenced": True}
         return {"advice": advice}
+
+    # THE CHARTER LANE (workers/charter.py): a project charter and workplan in
+    # disguise - how well each part of the topic's frame is covered, and the one
+    # question worth asking next. It reads the committed moment and commits the
+    # charter onto the session (for the build plan PDF), never while a build is
+    # in flight, and only if the moment it read is still the committed one.
+    from workers.charter import Charter, charter_texts
+    charter_lane = charter if charter is not None else Charter(enabled=settings.charter_enabled)
+    charter_busy: set = set()
+
+    def charter_ready() -> bool:
+        return bool(charter_lane.ready()) and (charter is not None or settings.worker == "claude")
+
+    def charter_done(session_id: str, started: float, outcome: str, **extra) -> None:
+        """One content-free telemetry line per call: the outcome and the time, never words."""
+        governance.log_event("studio.charter_call", session_id=session_id, outcome=outcome,
+                             latency_ms=int((time.monotonic() - started) * 1000),
+                             severity="WARNING" if outcome == "withheld" else "INFO", **extra)
+
+    @app.post("/v1/session/{session_id}/charter")
+    async def charter_route(request: Request, session_id: str):
+        require_origin(request)
+        require_session(request, session_id)
+        if not charter_ready():
+            raise HTTPException(503, "the charter is not available")
+        body = await json_object(request, "charter")
+        if set(body) - {"revision"}:
+            raise HTTPException(400, "charter body has unknown fields")
+        revision = body.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise HTTPException(400, "charter needs the canvas revision")
+        from workers.talk import canvas_summary
+        from workers.topics import topic_line
+        state = await asyncio.to_thread(live_state, session_id)
+        if int(state.get("artifact_version") or 0) != revision:
+            raise HTTPException(409, "the canvas has moved on")
+        if state.get("active_command"):
+            raise HTTPException(409, "a build is running; ask again when it lands")
+        snapshot_marker = advisor_snapshot_marker(state)
+        if session_id in charter_busy:
+            raise HTTPException(409, "the charter is already being prepared for this session")
+        said = [str(t.get("text") or "") for t in state.get("transcript") or []
+                if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-12:]
+        snapshot = {"revision": revision, "topic": state.get("topic") or "", "topic_line": topic_line(state),
+                    "canvas": canvas_summary(state.get("artifact")), "said": said,
+                    "charter": state.get("charter") or {}}
+        charter_busy.add(session_id)
+        started = time.monotonic()
+        try:
+            result = await asyncio.to_thread(charter_lane.chart, snapshot)
+        finally:
+            charter_busy.discard(session_id)
+        if not result:
+            charter_done(session_id, started, "none")
+            return {"charter": None}
+        # Its own words are moderated before the page sees them: flagged, or
+        # moderation not available, and the charter is withheld (fail closed).
+        verdict = await moderator.check(charter_texts(result))
+        if verdict.flagged or not verdict.available:
+            charter_done(session_id, started, "withheld",
+                         reason="flagged" if verdict.flagged else "moderation_unavailable",
+                         categories=list(verdict.categories))
+            return {"charter": None, "withheld": True}
+        public = {"revision": revision, "topic": result["topic"],
+                  "dimensions": [dict(d) for d in result["dimensions"]], "next": result["next"]}
+        committed: dict = {}
+
+        # The #266 fence, as the LAST step: the fresh read, the fence and the
+        # write are one compare-and-set, with nothing awaited between the check
+        # and the save. No write while a build is in flight (its reserved save
+        # token is never invalidated under it).
+        def record(current):
+            if (current.get("stopped") or int(current.get("expires_at") or 0) <= int(clock())
+                    or current.get("active_command")
+                    or advisor_snapshot_marker(current) != snapshot_marker
+                    or int(current.get("artifact_version") or 0) != revision):
+                return None
+            current["charter"] = dict(public, updated_at=int(clock()))
+            committed["charter"] = public
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, record)
+        except (SessionNotFound, StateConflict):
+            committed.clear()
+        if not committed:
+            charter_done(session_id, started, "fenced")
+            return {"charter": None, "fenced": True}
+        charter_done(session_id, started, "charter")
+        return {"charter": public}
 
     muse_counts: dict = {}
     MUSE_STYLE = ("A curious, imaginative creative director: bright, playful and thought-provoking, "
@@ -1270,11 +1365,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         email = await asyncio.to_thread(email_for_subject, subject)
         if not email:
             raise HTTPException(409, "no verified email is on record for this session")
+        masked = mask_email(email)
         try:
-            pdf = await asyncio.to_thread(build_summary_pdf, state, design_png=design)
+            pdf = await asyncio.to_thread(build_summary_pdf, state, design_png=design,
+                                          price_table=price_table, prepared_for=masked)
         except DesignImageError as exc:
             raise HTTPException(400, str(exc)) from exc
-        masked = mask_email(email)
         now = int(clock())
         reservation = secrets.token_hex(8)
         outcome: dict = {}

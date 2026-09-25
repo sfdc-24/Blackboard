@@ -91,8 +91,12 @@ def _decided(state: dict) -> list:
     return rows
 
 
-def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
-    """One PDF of the working session. Raises DesignImageError for an unreadable PNG."""
+def build_summary_pdf(state: dict, *, design_png: bytes | None = None, price_table: dict | None = None,
+                      prepared_for: str | None = None) -> bytes:
+    """One PDF of the working session - the build plan and quote when the session
+    has a charter. Raises DesignImageError for an unreadable PNG."""
+    if _charter(state) is not None:
+        return build_quote_pdf(state, design_png=design_png, price_table=price_table, prepared_for=prepared_for)
     from fpdf import FPDF
 
     pdf = FPDF(format="A4")
@@ -205,11 +209,341 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
     return bytes(pdf.output())
 
 
+# --- the build plan and quote (a session with a charter) -----------------------
+# Owner, 2026-09-25, on the emailed plan from his run: "it needs a lot more work
+# to make it look like a quote rather than summary of discussion". A quote: the
+# header (quote number, date, validity, who it is for), the project and its
+# scope of work (the charter), priced line items, the payment terms, the support
+# plan options and the next step; the discussion moves to an appendix.
+PLAN_TERMS = (
+    "50% to start build and test.",
+    "50% on delivery and handover.",
+    "Support plan, chosen at handover: subscription or on demand.",
+)
+PRICED_AFTER_REVIEW = "Priced after review"
+TO_CONFIRM = "To confirm at kickoff"
+NEXT_STEP = "Reply to this email to accept, or book a kickoff at sfdc24.com."
+WATERMARK = "sfdc24.com"
+VALID_DAYS = 30
+SUPPORT_OPTIONS = (
+    ("subscription", "Subscription", "Monthly support: updates, fixes and questions", "/ month"),
+    ("on_demand", "On demand", "Hourly support, when you need it", "/ hour"),
+)
+LEVEL_WORDS = {0: TO_CONFIRM, 1: TO_CONFIRM, 2: "Clear", 3: "Confirmed"}
+
+NAVY = (11, 31, 58)
+INK = (30, 30, 30)
+MUTE = (110, 116, 128)
+RULE = (214, 220, 229)
+FILL = (244, 246, 250)
+MARK = (236, 240, 246)
+
+
+def _charter(state: dict) -> dict | None:
+    charter = state.get("charter")
+    if not isinstance(charter, dict) or not isinstance(charter.get("dimensions"), list) or not charter["dimensions"]:
+        return None
+    return charter
+
+
+def quote_number(state: dict) -> str:
+    """Q-YYYYMMDD-XXXXXX: the session's day and six hex digits of a hash of it.
+    Short, stable for a session, and it never shows the session id."""
+    import hashlib
+    created = int(state.get("created_at") or 0)
+    day = datetime.fromtimestamp(created, timezone.utc).strftime("%Y%m%d") if created else "00000000"
+    seed = "sfdc24-quote:%s:%d" % (state.get("session_id") or "", created)
+    return "Q-%s-%s" % (day, hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6].upper())
+
+
+def _goal(state: dict) -> str:
+    said = [str(t.get("text") or "").strip() for t in state.get("transcript") or []
+            if isinstance(t, dict) and t.get("role", "visitor") == "visitor" and str(t.get("text") or "").strip()]
+    first = next((s for s in said if len(s.split()) >= 3), said[0] if said else "")
+    return clean(first, 240) if first else TO_CONFIRM
+
+
+def _line_description(line, dims: dict, artifact: dict) -> str:
+    _, _, default, source = line
+    if source == "canvas":
+        parts = [clean(c.get("label"), 30) for c in (artifact.get("children") or [])
+                 if isinstance(c, dict) and clean(c.get("label"), 30).strip()][:6]
+        return ("Covers: " + ", ".join(parts)) if parts else default
+    if source and source in dims and dims[source].get("level", 0) >= 2 and dims[source].get("captured"):
+        return clean(dims[source]["captured"], 140)
+    return default
+
+
+def build_quote_pdf(state: dict, *, design_png: bytes | None = None, price_table: dict | None = None,
+                    prepared_for: str | None = None) -> bytes:
+    """The build plan and quote for a session with a charter."""
+    from fpdf import FPDF
+    try:
+        from workers.topics import charter_frame, quote_lines, session_type, TOPICS
+    except ImportError:  # pragma: no cover - the app always has the workers package
+        raise
+    from .pricing import money
+
+    charter = _charter(state)
+    topic = charter.get("topic") if charter.get("topic") in TOPICS else ""
+    number = quote_number(state)
+    created = int(state.get("created_at") or 0)
+    issued = datetime.fromtimestamp(created, timezone.utc) if created else datetime.now(timezone.utc)
+    from datetime import timedelta
+    until = issued + timedelta(days=VALID_DAYS)
+    artifact = state.get("artifact") or {}
+    table = price_table or {}
+    currency = table.get("currency", "")
+    line_prices = (table.get("lines") or {}).get(topic or "other") or {}
+    support_prices = table.get("support") or {}
+
+    class Quote(FPDF):
+        def header(self):
+            # the watermark, under the content, on every page
+            self.set_font("Helvetica", "B", 66)
+            self.set_text_color(*MARK)
+            wide = self.get_string_width(WATERMARK)
+            with self.rotation(35, self.w / 2, self.h / 2):
+                self.text(self.w / 2 - wide / 2, self.h / 2 + 8, WATERMARK)
+            if self.page_no() > 1:
+                self.set_xy(self.l_margin, 10)
+                self.set_font("Helvetica", "B", 8.5)
+                self.set_text_color(*NAVY)
+                self.cell(40, 5, WATERMARK)
+                self.set_font("Helvetica", "", 8.5)
+                self.set_text_color(*MUTE)
+                self.cell(self.w - self.l_margin - self.r_margin - 40, 5,
+                          "Build plan and quote  " + number, align="R")
+                self.set_draw_color(*RULE)
+                self.set_line_width(0.2)
+                self.line(self.l_margin, 16.5, self.w - self.r_margin, 16.5)
+                self.set_y(22)
+            self.set_text_color(*INK)
+
+        def footer(self):
+            self.set_y(-14)
+            self.set_draw_color(*RULE)
+            self.set_line_width(0.2)
+            self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 8)
+            self.set_text_color(*MUTE)
+            half = (self.w - self.l_margin - self.r_margin) / 2
+            self.cell(half, 5, "Quote " + number)
+            self.cell(half, 5, "Page %d of {nb}" % self.page_no(), align="R")
+
+    pdf = Quote(format="A4")
+    pdf.set_margins(20, 18, 20)
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_title("SFDC24 build plan and quote " + number)
+    pdf.set_author("SFDC24")
+    pdf.add_page()
+    width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    def section(text, gap=6, need=22):
+        # a heading never sits alone at the foot of a page: it keeps room for its first rows
+        if pdf.get_y() + gap + need > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.ln(gap)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(width, 7, clean(text, 80), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(*RULE)
+        pdf.set_line_width(0.3)
+        pdf.line(pdf.l_margin, pdf.get_y() + 0.6, pdf.l_margin + width, pdf.get_y() + 0.6)
+        pdf.ln(3.2)
+        pdf.set_text_color(*INK)
+
+    def pair(label, value, label_w=34, size=10.5):
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(*MUTE)
+        y = pdf.get_y()
+        pdf.cell(label_w, 5.6, clean(label, 40))
+        pdf.set_font("Helvetica", "", size)
+        pdf.set_text_color(*INK)
+        pdf.set_xy(pdf.l_margin + label_w, y)
+        pdf.multi_cell(width - label_w, 5.6, clean(value, 400), new_x="LMARGIN", new_y="NEXT")
+
+    def grid(cells, widths, styles, *, aligns=None, colors=None, fill=None, rule=RULE, rule_w=0.2,
+             pad=2.2, line_h=5.0, repeat=None):
+        """One row of a ruled table; wraps each cell and keeps the row on one page."""
+        aligns = aligns or ["L"] * len(cells)
+        colors = colors or [INK] * len(cells)
+        rows_needed = []
+        for (style, size), text, w in zip(styles, cells, widths):
+            pdf.set_font("Helvetica", style, size)
+            rows_needed.append(max(1, len(pdf.multi_cell(w - 2 * pad, line_h, text, dry_run=True, output="LINES"))))
+        h = max(rows_needed) * line_h + 2 * pad
+        if pdf.get_y() + h > pdf.page_break_trigger:
+            pdf.add_page()
+            if repeat:
+                repeat()
+        x0, y0 = pdf.l_margin, pdf.get_y()
+        if fill:
+            pdf.set_fill_color(*fill)
+            pdf.rect(x0, y0, sum(widths), h, "F")
+        x = x0
+        for (style, size), text, w, align, color in zip(styles, cells, widths, aligns, colors):
+            pdf.set_font("Helvetica", style, size)
+            pdf.set_text_color(*color)
+            pdf.set_xy(x + pad, y0 + pad)
+            pdf.multi_cell(w - 2 * pad, line_h, text, align=align, new_x="LMARGIN", new_y="NEXT")
+            x += w
+        if rule:
+            pdf.set_draw_color(*rule)
+            pdf.set_line_width(rule_w)
+            pdf.line(x0, y0 + h, x0 + sum(widths), y0 + h)
+        pdf.set_xy(x0, y0 + h)
+        pdf.set_text_color(*INK)
+
+    # --- header ---
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(*NAVY)
+    pdf.set_char_spacing(0.6)
+    pdf.cell(width, 7, WATERMARK, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_char_spacing(0)
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "B", 24)
+    pdf.cell(width, 11, "Build plan and quote", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    pair("Quote", number)
+    pair("Date", issued.strftime("%B %d, %Y"))
+    pair("Validity", "Valid for %d days, until %s" % (VALID_DAYS, until.strftime("%B %d, %Y")))
+    if prepared_for:
+        pair("Prepared for", prepared_for)
+
+    # --- the project and its scope of work ---
+    section("Project")
+    pair("Goal", _goal(state))
+    pair("Session type", session_type(topic))
+
+    section("Scope of work")
+    frame = charter_frame(topic)
+    labels = {d[0]: d[1] for d in frame}
+    dims = {}
+    for d in charter["dimensions"]:
+        if isinstance(d, dict) and d.get("id") in labels:
+            level = d.get("level") if type(d.get("level")) is int and d.get("level") in LEVEL_WORDS else 0
+            dims[d["id"]] = {"level": level, "captured": clean(d.get("captured"), 140)}
+    scope_w = (44, width - 44 - 38, 38)
+    for did, label, covers in frame:
+        entry = dims.get(did, {"level": 0, "captured": ""})
+        if entry["level"] >= 2 and entry["captured"]:
+            body = entry["captured"]
+        elif entry["captured"]:
+            body = "Noted so far: " + entry["captured"]
+        else:
+            body = covers[:1].upper() + covers[1:]
+        grid((clean(label, 40), body, LEVEL_WORDS[entry["level"]]), scope_w,
+             (("B", 10), ("", 10), ("", 8.5)), aligns=("L", "L", "R"),
+             colors=(INK, INK if entry["level"] >= 1 else MUTE, MUTE), pad=1.8, line_h=4.8)
+    if charter.get("next"):
+        pdf.set_font("Helvetica", "I", 9.5)
+        pdf.set_text_color(*MUTE)
+        pdf.multi_cell(width, 5, "Next to settle: " + clean(charter.get("next"), 160), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(*INK)
+
+    # --- line items ---
+    section("Line items", need=34)
+    widths = (48, width - 48 - 44, 44)
+
+    def table_head():
+        grid(("Item", "Description", "Price"), widths, (("B", 9), ("B", 9), ("B", 9)),
+             aligns=("L", "L", "R"), colors=(MUTE, MUTE, MUTE), fill=FILL, rule=NAVY, rule_w=0.35)
+
+    def row(cells, *, bold=False, rule=RULE, rule_w=0.2):
+        grid(cells, widths, (("B", 10), ("B" if bold else "", 10), ("B" if bold else "", 10)),
+             aligns=("L", "L", "R"), rule=rule, rule_w=rule_w, repeat=table_head)
+
+    table_head()
+    lines = quote_lines(topic)
+    total, priced = 0.0, True
+    for line in lines:
+        amount = line_prices.get(line[0])
+        if amount is None:
+            priced = False
+        else:
+            total += amount
+        row((line[1], _line_description(line, dims, artifact),
+             money(amount, currency) if amount is not None else PRICED_AFTER_REVIEW))
+    total = round(total, 2)
+    if priced and lines:
+        row(("Total", "", money(total, currency)), bold=True, rule=NAVY, rule_w=0.35)
+
+    # --- payment terms ---
+    section("Payment terms", need=24)
+    half = round(total / 2, 2)
+    for i, term in enumerate(PLAN_TERMS[:2]):
+        amount = (money(half if i == 0 else round(total - half, 2), currency) if priced and lines else "")
+        grid((term, amount), (width - 44, 44), (("", 10.5), ("", 10.5)), aligns=("L", "R"),
+             rule=None, pad=1.2, line_h=5.4)
+
+    # --- support plan ---
+    section("Support plan options", need=36)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(width, 5.4, PLAN_TERMS[2], new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1.5)
+    for key, name, what, per in SUPPORT_OPTIONS:
+        amount = support_prices.get(key)
+        row((name, what, (money(amount, currency) + " " + per) if amount is not None else PRICED_AFTER_REVIEW))
+
+    # --- next step ---
+    section("Next step", need=14)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*NAVY)
+    pdf.multi_cell(width, 6, NEXT_STEP, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*INK)
+
+    # --- appendix: session notes ---
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(width, 9, "Session notes", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(*MUTE)
+    pdf.multi_cell(width, 5, "A short record of the conversation behind this plan.", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*INK)
+
+    def notes(title, items):
+        if not items:
+            return
+        section(title, gap=4)
+        pdf.set_font("Helvetica", "", 9.5)
+        for item in items:
+            pdf.multi_cell(width, 5, "- " + item, new_x="LMARGIN", new_y="NEXT")
+
+    recap = (state.get("recap") or {}).get("text")
+    if recap:
+        section("Recap", gap=4)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.multi_cell(width, 5, clean(recap, 1200), new_x="LMARGIN", new_y="NEXT")
+    said = [t.get("text", "") for t in state.get("transcript") or [] if t.get("role", "visitor") == "visitor"]
+    notes("What you asked for", [clean(s, 300) for s in said[-8:]])
+    built = [(e.get("payload") or {}).get("text", "") for e in state.get("events") or [] if e.get("type") == "confirm"]
+    notes("What the architect built", [clean(c, 200) for c in built if c][-8:])
+    notes("Decisions", _decided(state)[-8:])
+    if design_png is not None:
+        section("Design snapshot", gap=4)
+        try:
+            pdf.image(io.BytesIO(design_png), w=min(width, 140))
+        except Exception as exc:  # a PNG that passed the header checks but will not decode
+            raise DesignImageError("design_png is not a readable PNG") from exc
+    else:
+        outline = _outline(artifact)[:30]
+        if outline:
+            section("The canvas", gap=4)
+            pdf.set_font("Courier", "", 8.5)
+            for line in outline:
+                pdf.multi_cell(width, 4.4, line, new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
+
+
 def mask_email(email: str) -> str:
     """j***@example.com: enough to recognise, never the whole address."""
     local, _, domain = str(email).partition("@")
     return (local[:1] or "*") + "***@" + domain
 
 
-__all__ = ["DesignImageError", "build_summary_pdf", "clean", "decode_design_png", "mask_email",
-           "PNG_MAX_BYTES", "PNG_MAX_SIDE"]
+__all__ = ["DesignImageError", "build_summary_pdf", "build_quote_pdf", "clean", "decode_design_png", "mask_email",
+           "quote_number", "PNG_MAX_BYTES", "PNG_MAX_SIDE", "PLAN_TERMS", "PRICED_AFTER_REVIEW", "TO_CONFIRM",
+           "NEXT_STEP", "WATERMARK"]
