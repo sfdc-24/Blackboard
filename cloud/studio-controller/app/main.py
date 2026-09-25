@@ -88,7 +88,8 @@ ARCHITECT_VOICE_STYLE = (
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
-               analyst=None, moderation_client=None, muse=None, summary_sender=None) -> FastAPI:
+               analyst=None, moderation_client=None, muse=None, summary_sender=None,
+               advisor=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -469,7 +470,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "governance": True,
                          "voices": voices_available(),
                          "rating": True, "summary_email": settings.summary_email_enabled,
-                         "routing": True},
+                         "routing": True, "advisor": advisor_lane.ready()},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -593,6 +594,52 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # three directions to choose from. Its directions need Anthropic (the same
     # readiness as the builder); its voice needs OpenAI TTS like the architect's,
     # so /health lists "muse" among the voices only when both are there.
+    # The Gemini advisor (workers/advisor.py, plan R3): a second perspective on
+    # the committed canvas. It advises, never builds: its answer is bound to the
+    # revision it read and dropped if the canvas moves during the call. Nothing
+    # of it is committed; a tapped suggestion goes to the builder like speech.
+    from workers.advisor import Advisor, fenced as advice_fenced
+    advisor_lane = advisor if advisor is not None else Advisor(enabled=settings.advisor_enabled)
+    advise_busy: set = set()
+
+    @app.post("/v1/session/{session_id}/advise")
+    async def advise(request: Request, session_id: str):
+        require_origin(request)
+        require_session(request, session_id)
+        if not advisor_lane.ready():
+            raise HTTPException(503, "the advisor is not available")
+        body = await json_object(request, "advise")
+        if set(body) - {"revision"}:
+            raise HTTPException(400, "advise body has unknown fields")
+        revision = body.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise HTTPException(400, "advise needs the canvas revision")
+        from workers.talk import canvas_summary
+        from workers.topics import topic_line
+        state = await asyncio.to_thread(live_state, session_id)
+        if int(state.get("artifact_version") or 0) != revision:
+            raise HTTPException(409, "the canvas has moved on")
+        if session_id in advise_busy:
+            raise HTTPException(409, "advice is already being prepared for this session")
+        said = [str(t.get("text") or "") for t in state.get("transcript") or []
+                if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-4:]
+        snapshot = {"revision": revision, "topic_line": topic_line(state),
+                    "canvas": canvas_summary(state.get("artifact")), "said": said}
+        advise_busy.add(session_id)
+        try:
+            advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
+        finally:
+            advise_busy.discard(session_id)
+        if advice is None:
+            return {"advice": None}
+        try:
+            latest = await asyncio.to_thread(live_state, session_id)
+        except HTTPException:
+            return {"advice": None, "fenced": True}
+        if advice_fenced(advice, int(latest.get("artifact_version") or 0)):
+            return {"advice": None, "fenced": True}
+        return {"advice": advice}
+
     muse_counts: dict = {}
     MUSE_STYLE = ("A curious, imaginative creative director: bright, playful and thought-provoking, "
                   "with wonder in the voice and a lively pace.")

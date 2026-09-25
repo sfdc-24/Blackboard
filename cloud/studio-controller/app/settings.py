@@ -71,6 +71,8 @@ class Settings:
     muse_voice: str = "coral"
     muse_cap: int = 6
     summary_email_enabled: bool = False
+    # The Gemini advisor (workers/advisor.py, plan R3): off unless switched on.
+    advisor_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -123,6 +125,7 @@ class Settings:
             muse_voice=os.environ.get("STUDIO_MUSE_VOICE", "coral"),
             muse_cap=int(os.environ.get("STUDIO_MUSE_CAP", "6")),
             summary_email_enabled=_enabled(os.environ.get("STUDIO_ENABLE_SUMMARY_EMAIL", "false")),
+            advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
         )
 
     @property
