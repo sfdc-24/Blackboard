@@ -136,7 +136,9 @@ this one turn: insert every section, heading, text, form, field, list, card and 
 needs, nesting children under the new ids you insert earlier in the same ops list (insert the parent \
 first, then its children). Make it the real thing they asked for, with sensible field names, list \
 items and button labels drawn from their request - not a generic page. A field's label is the field \
-name and its detail is its type or an example value; a button's label is its action. One screen. \nAlso set_label the root screen to a short name for what is being designed ("Dental lead intake form"), \nso the canvas is never left called "Blank canvas".
+name and its detail is its type or an example value; a button's label is its action. One screen. \
+Also set_label the root screen to a short name for what is being designed ("Dental lead intake form"), \
+so the canvas is never left called "Blank canvas".
 
 ONE AREA AT A TIME. After the first version, change only the area the latest input is about; \
 anything else waits for its own question. When the visitor asks for something new, add it; when \
