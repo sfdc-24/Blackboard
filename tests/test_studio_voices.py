@@ -178,7 +178,7 @@ class RecapBrief(unittest.TestCase):
 
     def test_the_recap_prompt_promises_nothing(self):
         self.assertIn("never name or promise any person, price or date", talk_mod.RECAP_SYSTEM)
-        self.assertIn("at most 70 words", talk_mod.RECAP_SYSTEM)
+        self.assertIn("50 to 70 words, never more", talk_mod.RECAP_SYSTEM)
 
 
 if __name__ == "__main__":

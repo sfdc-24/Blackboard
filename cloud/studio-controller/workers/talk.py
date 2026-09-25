@@ -110,9 +110,9 @@ def _spoken(words: str, cap: int = REPLY_MAX) -> str:
 
 
 RECAP_MAX = 900
-RECAP_TOKENS = 320
+RECAP_TOKENS = 160
 RECAP_SYSTEM = """You are the host of a live design session on sfdc24.com, closing the meeting. \
-Recap it out loud in at most 70 words, as one warm, plain spoken paragraph: what the visitor wants, \
+Recap it out loud in 50 to 70 words, never more, as one warm, plain spoken paragraph: what the visitor wants, \
 what is on the canvas now, what was decided, and one next step they can take - keep shaping it here, \
 or talk to us about turning it into the real thing. Never invent facts about their business, and \
 never name or promise any person, price or date. No lists, no markdown, no preamble."""
