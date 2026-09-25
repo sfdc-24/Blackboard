@@ -638,12 +638,24 @@ def _option_text(o):
     return "%s = %s -> %s%s" % (o["option_id"], o.get("label", ""), o.get("consequence", ""), rec)
 
 
+try:  # the app and the image import this module as part of the workers package
+    from workers.topics import topic_line as _topic_line
+except ImportError:  # loaded from its file (tests): read the sibling topics.py the same way
+    import importlib.util as _topics_util
+    _topics_spec = _topics_util.spec_from_file_location(
+        "studio_topics", os.path.join(os.path.dirname(os.path.abspath(__file__)), "topics.py"))
+    _topics = _topics_util.module_from_spec(_topics_spec)
+    _topics_spec.loader.exec_module(_topics)
+    _topic_line = _topics.topic_line
+
+
 def _describe(state: dict, trigger: dict) -> str:
     """Everything the model needs to act on a choice: each question's options WITH
     their meaning, and the chosen option spelled out - an opaque id like "a" is
     not an answer the model can enact (Codex review of PR 200, P1)."""
     nodes = _flatten(state["artifact"], {})
-    lines = ["CURRENT PROTOTYPE (id | kind | label | detail | parent):"]
+    lines = [_topic_line(state).strip()] if _topic_line(state) else []
+    lines.append("CURRENT PROTOTYPE (id | kind | label | detail | parent):")
     for nid, n in nodes.items():
         lines.append("%s | %s | %s | %s | %s" % (nid, n["kind"], n["label"], n["detail"], n["parent"] or "-"))
     by_id = {}
