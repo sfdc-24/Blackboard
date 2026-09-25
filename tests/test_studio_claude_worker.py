@@ -144,6 +144,141 @@ OPEN_Q = dict(q(), status="open")
 NOTHING = {"ops": [], "confirm": "", "questions": [], "batch_title": ""}
 
 
+SCENE_ROOT = {"id": "screen-home", "kind": "screen", "label": "Logo", "children": [
+    {"id": "logo", "kind": "scene", "label": "Logo", "detail": "400x400 bg=#FFFFFF", "children": [
+        {"id": "mark", "kind": "entity", "label": "Wheat mark", "detail": "circle cx=200 cy=160 r=90 fill=#E8B04B"}]}]}
+
+
+def run_on(root, draft):
+    draft = dict(draft, resolves={"question_id": "", "option_id": "", "freeform_answer": ""})
+    client = FakeClient(draft)
+    state = {"artifact": root, "questions": [], "transcript": [], "session_id": "s1", "turn_seq": 1}
+    return cw.ClaudeWorker(client=client).on_turn(state, {"kind": "utterance", "text": "a logo"})
+
+
+def insert(parent, node_id, kind, label, detail):
+    return {"op": "insert_child", "node_id": parent, "value": "",
+            "new_node": {"id": node_id, "kind": kind, "label": label, "detail": detail}}
+
+
+class LiveScenes(unittest.TestCase):
+    """Scenes run as a live engine on the page, built from a closed grammar - never markup or code."""
+
+    def test_a_live_banner_with_motion_physics_particles_and_pointer(self):
+        out = run_on(ROOT, {"ops": [
+            insert("screen-home", "banner", "scene", "Autumn banner", "1200x400 bg=#0B3D2E gravity=900"),
+            insert("banner", "band", "entity", "Band", "rect x=0 y=300 width=1200 height=100 fill=#E8B04B"),
+            insert("banner", "headline", "entity", "Fresh bread daily",
+                   "text x=600 y=190 size=72 weight=700 anchor=middle font=display fill=#FFFFFF float=6 period=3"),
+            insert("banner", "wave", "entity", "Wave", "path d=M0,300C300,250,900,350,1200,300Z fill=#14553F"),
+            insert("banner", "star", "entity", "Star", "polygon points=10,0;20,20;0,20 fill=#FFF spin=40"),
+            insert("banner", "ball", "entity", "Ball",
+                   "circle cx=100 cy=50 r=24 fill=#F25C54 body=1 bounce=1 drag=1 tap=jump vx=120"),
+            insert("banner", "snow", "entity", "Flour dust",
+                   "particles x=600 y=0 rate=30 size=3 speed=40 angle=90 spread=160 life=6 shape=circle fill=#FFFFFF"),
+            insert("banner", "moon", "entity", "Moon", "circle cx=0 cy=0 r=20 fill=#FFF orbit=600,200,150,30 glow=#FFE9A8"),
+            insert("banner", "counter", "entity", "Counter", "rect x=0 y=330 width=1200 height=70 fill=#3A2417 solid=1"),
+            insert("banner", "slash", "entity", "Crust mark", "line x1=90 y1=45 x2=110 y2=30 stroke=#8A5A2B attach=ball"),
+        ], "confirm": "Built the live banner.", "questions": [], "batch_title": ""})
+        self.assertEqual([], out["problems"])
+        ops = out["events"][0]["payload"]["ops"]
+        self.assertEqual(["scene"] + ["entity"] * 9, [o["node"]["kind"] for o in ops])
+
+    def test_markup_or_script_can_never_be_an_entity(self):
+        for detail in ("<svg onload=alert(1)>", "rect x=0 y=0 width=10 height=10 fill=url(#x)",
+                       "rect x=0 onclick=alert(1)", "image href=https://evil.example/x.png",
+                       "path d=M0,0L10,10javascript:1", "text x=1 y=1 font=Comic",
+                       "rect x=0 x=1", "circle cx=1 cy=1 r=1 opacity=2", "rect x=10px",
+                       "circle cx=1 cy=1 r=1 tap=eval", "circle cx=1 cy=1 r=1 body=yes",
+                       "circle orbit=1,2,3", "particles shape=script", "rect solid=yes",
+                       "line attach=../../x", "line attach=a;b"):
+            out = run_on(SCENE_ROOT, {"ops": [insert("logo", "bad", "entity", "Bad", detail)],
+                                      "confirm": "Drew it.", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], detail)
+            self.assertTrue(out["problems"], detail)
+
+    def test_a_scene_needs_a_size_and_holds_only_entities(self):
+        for detail in ("", "big", "4000x400", "1200x400 bg=red", "1200 x 400", "1200x400 gravity=9.8",
+                       "1200x400 bg=#000 bg=#fff"):
+            out = run_on(ROOT, {"ops": [insert("screen-home", "g", "scene", "Banner", detail)],
+                                "confirm": "", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], detail)
+        out = run_on(SCENE_ROOT, {"ops": [insert("logo", "t", "text", "Loose words", "")],
+                                  "confirm": "", "questions": [], "batch_title": ""})
+        self.assertIn("only entities", " ".join(out["problems"]))
+
+    def test_a_statement_must_carry_its_geometry_and_sizes_are_never_negative(self):
+        for detail in ("circle", "polygon", "path d=M", "text fill=#fff", "rect solid=1", "rect x=0 y=0 width=10",
+                       "circle cx=1 cy=1 r=-5", "rect x=0 y=0 width=-10 height=5", "ellipse cx=1 cy=1 rx=2",
+                       "particles x=1 y=1 rate=-3", " circle cx=1 cy=1 r=1", "circle cx=1 cy=1 r=1 ",
+                       "circle  cx=1 cy=1 r=1", "circle\u00a0cx=1 cy=1 r=1", "text x=1 y=1 weight=450"):
+            out = run_on(SCENE_ROOT, {"ops": [insert("logo", "bad", "entity", "Bad", detail)],
+                                      "confirm": "Drew it.", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], repr(detail))
+        for detail in (" 400x400", "400x400 ", "400x400  bg=#fff"):
+            out = run_on(ROOT, {"ops": [insert("screen-home", "g", "scene", "S", detail)],
+                                "confirm": "", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], repr(detail))
+        ok = run_on(ROOT, {"ops": [insert("screen-home", "g", "scene", "S", "400x400 bg=none")],
+                           "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], ok["problems"])
+
+    def test_an_entity_holds_nothing(self):
+        out = run_on(SCENE_ROOT, {"ops": [insert("mark", "inner", "scene", "Inner", "100x100")],
+                                  "confirm": "", "questions": [], "batch_title": ""})
+        self.assertIn("holds nothing", " ".join(out["problems"]))
+
+    def test_attach_names_one_real_sibling_one_level_deep(self):
+        def attach(detail, node_id="part"):
+            return run_on(SCENE_ROOT, {"ops": [insert("logo", node_id, "entity", "Part", detail)],
+                                       "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], attach("circle cx=1 cy=1 r=1 attach=mark")["problems"])
+        for bad in ("circle cx=1 cy=1 r=1 attach=part", "circle cx=1 cy=1 r=1 attach=ghost",
+                    "circle cx=1 cy=1 r=1 attach=logo", "circle cx=1 cy=1 r=1 attach=screen-home"):
+            self.assertTrue(attach(bad)["problems"], bad)
+        chain = run_on(SCENE_ROOT, {"ops": [
+            insert("logo", "a", "entity", "A", "circle cx=1 cy=1 r=1 attach=mark"),
+            insert("logo", "b", "entity", "B", "circle cx=1 cy=1 r=1 attach=a")],
+            "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], chain["events"])
+        cycle = run_on(SCENE_ROOT, {"ops": [
+            insert("logo", "a", "entity", "A", "circle cx=1 cy=1 r=1 attach=mark"),
+            {"op": "set_detail", "node_id": "mark", "new_node": BLANK,
+             "value": "circle cx=200 cy=160 r=90 fill=#E8B04B attach=a"}],
+            "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], cycle["events"])
+
+    def test_an_entity_outside_a_scene_is_refused(self):
+        out = run_on(ROOT, {"ops": [insert("hero", "dot", "entity", "Dot", "circle cx=1 cy=1 r=1")],
+                            "confirm": "", "questions": [], "batch_title": ""})
+        self.assertIn("inside a scene", " ".join(out["problems"]))
+
+    def test_changing_an_entity_goes_through_the_same_grammar(self):
+        ok = run_on(SCENE_ROOT, {"ops": [{"op": "set_detail", "node_id": "mark", "new_node": BLANK,
+                                          "value": "circle cx=200 cy=160 r=90 fill=#1B4D3E spin=20"}],
+                                 "confirm": "Made the mark green and spinning.", "questions": [], "batch_title": ""})
+        self.assertEqual([], ok["problems"])
+        bad = run_on(SCENE_ROOT, {"ops": [{"op": "set_detail", "node_id": "mark", "new_node": BLANK,
+                                           "value": "circle fill=javascript:x"}],
+                                  "confirm": "Changed it.", "questions": [], "batch_title": ""})
+        self.assertEqual([], bad["events"])
+        resize = run_on(SCENE_ROOT, {"ops": [{"op": "set_detail", "node_id": "logo", "new_node": BLANK,
+                                              "value": "600x600 gravity=400"}],
+                                     "confirm": "Made it bigger.", "questions": [], "batch_title": ""})
+        self.assertEqual([], resize["problems"])
+
+    def test_the_prompt_teaches_the_grammar_the_gate_enforces(self):
+        for word in ('"scene"', '"entity"', "polygon points=", "path d=", "anchor=start|middle|end",
+                     "font=sans|serif|mono|display", "tap=pulse|spin|burst|jump|hide", "weight=400|500|600|700|800|900", "orbit=cx,cy,radius,deg/s",
+                     "shape=circle|square|star", "body=1", "drag=1", "solid=1", "attach=<entity id>", "[Tagline]"):
+            self.assertIn(word, cw.SYSTEM)
+        self.assertEqual(set(cw.SHAPES), {"rect", "circle", "ellipse", "line", "polygon", "path", "text",
+                                          "particles"})
+        for shape, keys in cw.SHAPES.items():
+            for key, kind in keys.items():
+                self.assertIn(kind, cw._VALUES, (shape, key))
+
+
 class Resolves(unittest.TestCase):
     """A spoken answer: the worker names which open question it resolves; the
     controller owns the record and emits question.answered."""
