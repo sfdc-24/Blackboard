@@ -338,6 +338,11 @@ class BuildsFromAnEmptyScreen(unittest.TestCase):
 class TalkLaneModule(unittest.TestCase):
     """workers/talk.py without any provider: routing, refusal, history, summary."""
 
+    def test_the_talk_voice_acknowledges_and_leaves_questions_to_the_analyst(self):
+        talk = self.load()
+        self.assertIn("Do not ask questions", talk.SYSTEM)
+        self.assertNotIn("ask one short question", talk.SYSTEM)
+
     def load(self):
         import importlib.util as iu
         spec2 = iu.spec_from_file_location(

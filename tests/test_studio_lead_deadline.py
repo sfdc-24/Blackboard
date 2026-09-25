@@ -217,7 +217,8 @@ class DeadlineTests(unittest.TestCase):
                              store=MemoryStore(), worker=CountingWorker(), clock=lambda: 1000, id_factory=IDs())
             with TestClient(app) as client, mock.patch.dict(os.environ, {}, clear=True):
                 health = client.get("/health").json()
-            self.assertEqual({"voice": False, "lead_facts": enabled, "talk": False, "agents": []},
+            self.assertEqual({"voice": False, "lead_facts": enabled, "talk": False, "agents": [],
+                              "analyst": False},
                              health["features"])
             self.assertEqual({"ok", "worker", "state_backend", "features"}, set(health))
             self.assertNotIn(ORG_ID, json.dumps(health))
