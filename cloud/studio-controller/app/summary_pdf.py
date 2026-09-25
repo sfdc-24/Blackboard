@@ -91,13 +91,46 @@ def _decided(state: dict) -> list:
     return rows
 
 
-def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
-    """One PDF of the working session. Raises DesignImageError for an unreadable PNG."""
+# The build plan's terms (owner, 2026-09-25): "50% to move ahead with build and
+# test and 50% upon complete delivery and handover with support plan
+# (subscription based or on demand)". Printed exactly; never reworded by a model.
+PLAN_TERMS = (
+    "50% to start build and test.",
+    "50% on delivery and handover.",
+    "Support plan, chosen at handover: subscription or on demand.",
+)
+PRICED_AFTER_REVIEW = "Priced after review."
+WATERMARK = "sfdc24.com"
+LEVEL_WORDS = {0: "To confirm", 1: "To confirm", 2: "Clear", 3: "Confirmed"}
+
+
+def _charter(state: dict) -> dict | None:
+    charter = state.get("charter")
+    if not isinstance(charter, dict) or not isinstance(charter.get("dimensions"), list) or not charter["dimensions"]:
+        return None
+    return charter
+
+
+def build_summary_pdf(state: dict, *, design_png: bytes | None = None, price_table: dict | None = None) -> bytes:
+    """One PDF of the working session - the build plan when the session has a
+    charter. Raises DesignImageError for an unreadable PNG."""
     from fpdf import FPDF
 
-    pdf = FPDF(format="A4")
+    charter = _charter(state)
+
+    class Plan(FPDF):
+        def header(self):  # the watermark, under the content, on every page
+            if charter is None:
+                return
+            self.set_font("Helvetica", "B", 64)
+            self.set_text_color(236, 240, 246)
+            with self.rotation(35, self.w / 2, self.h / 2):
+                self.text(self.w / 2 - 72, self.h / 2 + 8, WATERMARK)
+            self.set_text_color(30, 30, 30)
+
+    pdf = Plan(format="A4") if charter is not None else FPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.set_title("SFDC24 working session")
+    pdf.set_title("SFDC24 build plan" if charter is not None else "SFDC24 working session")
     pdf.set_author("SFDC24")
     pdf.add_page()
     width = pdf.w - pdf.l_margin - pdf.r_margin
@@ -124,7 +157,8 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
 
     pdf.set_font("Helvetica", "B", 20)
     pdf.set_text_color(11, 31, 58)
-    pdf.multi_cell(width, 10, "Your SFDC24 working session", new_x="LMARGIN", new_y="NEXT")
+    pdf.multi_cell(width, 10, "Your build plan" if charter is not None else "Your SFDC24 working session",
+                   new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 11)
     pdf.set_text_color(90, 90, 90)
     subtitle = clean(artifact.get("label"), 200)
@@ -135,6 +169,24 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
     if recap:
         heading("Recap")
         para(recap)
+
+    if charter is not None:
+        heading("Your project charter")
+        from workers.topics import charter_frame
+        labels = {d[0]: d[1] for d in charter_frame(charter.get("topic") or "")}
+        for d in charter["dimensions"]:
+            if not isinstance(d, dict):
+                continue
+            level = d.get("level") if type(d.get("level")) is int and d.get("level") in LEVEL_WORDS else 0
+            captured = clean(d.get("captured"), 140)
+            pdf.set_font("Helvetica", "B", 10.5)
+            pdf.multi_cell(width, 5.5, "%s - %s" % (clean(labels.get(d.get("id"), d.get("id")), 40),
+                                                    LEVEL_WORDS[level]), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10.5)
+            if captured:
+                pdf.multi_cell(width, 5.5, "    " + captured, new_x="LMARGIN", new_y="NEXT")
+        if charter.get("next"):
+            para("Next to settle: " + clean(charter.get("next"), 160))
 
     said = [t.get("text", "") for t in state.get("transcript") or [] if t.get("role", "visitor") == "visitor"]
     if said:
@@ -192,6 +244,22 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
             pdf.set_font("Helvetica", "", 10.5)
             bullets([clean(f, 300) for f in findings])
 
+    if charter is not None:
+        heading("To move ahead")
+        topic = charter.get("topic") or ""
+        price = ((price_table or {}).get("prices") or {}).get(topic)
+        if price:
+            from .pricing import money
+            currency = price_table["currency"]
+            half = round(price["amount"] / 2, 2)
+            para("%s: %s" % (clean(price["label"], 80), money(price["amount"], currency)))
+            bullets(["%s (%s)" % (PLAN_TERMS[0], money(half, currency)),
+                     "%s (%s)" % (PLAN_TERMS[1], money(round(price["amount"] - half, 2), currency)),
+                     PLAN_TERMS[2]])
+        else:
+            para(PRICED_AFTER_REVIEW)
+            bullets(list(PLAN_TERMS))
+
     rating = state.get("rating") or {}
     if rating.get("score"):
         heading("How happy you were")
@@ -212,4 +280,4 @@ def mask_email(email: str) -> str:
 
 
 __all__ = ["DesignImageError", "build_summary_pdf", "clean", "decode_design_png", "mask_email",
-           "PNG_MAX_BYTES", "PNG_MAX_SIDE"]
+           "PNG_MAX_BYTES", "PNG_MAX_SIDE", "PLAN_TERMS", "PRICED_AFTER_REVIEW", "WATERMARK"]

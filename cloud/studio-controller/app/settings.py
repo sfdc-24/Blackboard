@@ -73,6 +73,10 @@ class Settings:
     summary_email_enabled: bool = False
     # The Gemini advisor (workers/advisor.py, plan R3): off unless switched on.
     advisor_enabled: bool = False
+    # The charter lane (workers/charter.py): off unless switched on.
+    charter_enabled: bool = False
+    # The build plan's prices (app/pricing.py): the owner's numbers or nothing.
+    price_table: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,6 +130,8 @@ class Settings:
             muse_cap=int(os.environ.get("STUDIO_MUSE_CAP", "6")),
             summary_email_enabled=_enabled(os.environ.get("STUDIO_ENABLE_SUMMARY_EMAIL", "false")),
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
+            charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
+            price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
         )
 
     @property
@@ -133,6 +139,18 @@ class Settings:
         return bool(os.environ.get("K_SERVICE"))
 
     def validate(self) -> None:
+        if self.charter_enabled and not self.moderation_enabled:
+            # The charter's lines reach the page; they are moderated first.
+            raise RuntimeError("STUDIO_ENABLE_CHARTER requires STUDIO_ENABLE_MODERATION")
+        from .pricing import parse_price_table
+        try:
+            from workers.topics import TOPICS
+        except ImportError:  # the settings module loaded without the workers package
+            TOPICS = ("logo", "website", "app", "salesforce_admin", "salesforce_data", "other")
+        try:
+            parse_price_table(self.price_table, TOPICS)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         if self.lead_facts_enabled and (
             type(self.lead_facts_timeout_seconds) not in (int, float)
             or not math.isfinite(self.lead_facts_timeout_seconds)
