@@ -253,6 +253,42 @@ provisioning-plus-execution durations and reduces the risk of queued executions
 accumulating. It does not guarantee non-overlap. See
 `ADR-001-VOICE-SWEEP-BACKSTOP.md` for the alternatives and IAM boundary.
 
+## The end card: rating and the session PDF
+
+After a conversation the homepage asks how happy the visitor is and offers the
+working session as a PDF by email.
+
+- `POST /v1/session/{id}/rating` with `{"score": 1-5, "comment": "..."}`
+  (comment optional, at most 300 characters) returns `{"ok": true}`. The last
+  rating wins and is stored on the session record. Always available.
+- `POST /v1/session/{id}/summary` with `{"design_png": "data:image/png;base64,..."}`
+  (optional; at most 1.5 MB and 4096x4096) builds a PDF of the session: the
+  host's recap (kept when `/recap` runs), what the visitor asked for, what the
+  architect built, the decisions, the final design image and outline, the
+  analyst's data model and the rating. It is emailed once to the owner's
+  verified address and returns `{"sent": true, "to": "j***@example.com"}`; a
+  replay answers from the record and sends nothing. Behind
+  `STUDIO_ENABLE_SUMMARY_EMAIL` (default off; 503 while off). The body is
+  capped at 2.1 MB from `Content-Length` before it is read (413).
+
+One email per session, ever: a missing email is better than a duplicate. A
+send that certainly did not leave (no connection to the sender, or its explicit
+`{"ok": false}`, which it answers before mailing) is `failed` and may be asked
+again (502, "the summary email could not be sent; try again"). Anything that
+may have been delivered (a timeout after the request left, a lost redirect, a
+5xx, a body that is not the receipt) is `unconfirmed` and is never sent again:
+502 on that call, then 409 "the summary may already have been sent; check your
+inbox". A reservation still `sending` after 120 seconds becomes `unconfirmed`
+the same way.
+
+Both take the session token and stay open for 30 minutes after the session
+ends (stopped or timed out); no other endpoint gains that grace. The address is
+never taken from the request: it is the contact recorded at sign-in (only while
+the summary is on, and only used if it hashes to the session's subject) or the
+operator allowlist. It is never returned to a page or logged; the session keeps
+only the masked form. Delivery is the same signed Apps Script sender as the
+sign-in code, kind `summary` (see `apps-script/studio-email-sender/README.md`).
+
 ## Incremental release gates
 
 1. `/studio/` synthetic fixture; no controller or provider.

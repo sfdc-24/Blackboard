@@ -19,3 +19,22 @@ joined by newlines with HMAC-SHA256. A successful send returns `{"ok":true}`;
 all other outcomes return `{"ok":false}` without request details. Apps Script
 web apps return HTTP 200 for these JSON responses, so the controller must
 inspect `ok` if it needs to distinguish delivery success from refusal.
+
+## The working-session summary (kind `summary`)
+
+At the end of a homepage conversation the visitor can have the session sent to
+them as a PDF. The controller posts exactly `kind` (`"summary"`), `timestamp`,
+`nonce`, `email`, `pdf` (standard base64), `pdf_sha256` (hex) and `signature`,
+all strings. The signature is HMAC-SHA256 over `summary`, the timestamp, the
+nonce, the email and the PDF digest joined by newlines, so it can never be
+replayed as a sign-in code or the other way round. The script recomputes the
+digest of the decoded attachment, requires `%PDF`, shares the nonce ledger with
+the sign-in path, and sends one email with the PDF attached.
+
+Recipients follow the same allowlist unless the Script Property
+`STUDIO_SUMMARY_ANY_RECIPIENT` is exactly `true`, which lets a summary (never a
+sign-in code) reach a public visitor's verified address. The controller only
+asks for a summary to an address it verified at sign-in.
+
+The new kind needs no new OAuth scope: `script.send_mail` covers attachments.
+Deploy it as a new version of the same web app deployment so the URL is kept.

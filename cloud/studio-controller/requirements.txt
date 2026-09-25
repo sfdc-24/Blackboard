@@ -2,3 +2,5 @@ fastapi==0.115.6
 uvicorn==0.34.0
 httpx==0.28.1
 anthropic==1.8.0
+fpdf2==2.8.8
+pillow==12.3.0

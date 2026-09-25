@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { createHmac } = require('node:crypto');
+const { createHash, createHmac } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -13,13 +13,16 @@ const secret = 'studio-test-secret-at-least-thirty-two-bytes';
 const email = 'operator@example.com';
 const code = '004219';
 
-function harness({ nowMs = Date.now() } = {}) {
+const signed = (bytes) => Array.from(bytes).map((b) => (b > 127 ? b - 256 : b));
+
+function harness({ nowMs = Date.now(), extraProperties = [] } = {}) {
   const sent = [];
   const logs = [];
   const cache = new Map();
   const properties = new Map([
     ['STUDIO_EMAIL_SENDER_SECRET', secret],
     ['STUDIO_OPERATOR_EMAILS', email + ',other@example.com'],
+    ...extraProperties,
   ]);
   let locked = false;
   let nextLockDelayMs = 0;
@@ -36,6 +39,14 @@ function harness({ nowMs = Date.now() } = {}) {
       Charset: { UTF_8: 'UTF-8' },
       computeHmacSha256Signature: (message, key) =>
         Array.from(createHmac('sha256', key).update(message, 'utf8').digest()),
+      // Apps Script byte arrays are signed Java bytes.
+      base64Decode: (text) => signed(Buffer.from(text, 'base64')),
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: (algorithm, bytes) => {
+        assert.equal(algorithm, 'SHA_256');
+        return signed(createHash('sha256').update(Buffer.from(bytes.map((b) => b & 255))).digest());
+      },
+      newBlob: (bytes, type, name) => ({ bytes, type, name }),
     },
     LockService: {
       getScriptLock: () => ({
@@ -86,6 +97,7 @@ function harness({ nowMs = Date.now() } = {}) {
     post: (body) => JSON.parse(context.doPost({ postData: {
       contents: JSON.stringify(body),
     } }).body),
+    postRaw: (contents) => JSON.parse(context.doPost({ postData: { contents } }).body),
   };
 }
 
@@ -165,4 +177,85 @@ test('shape and type checks reject extra fields, numeric codes, and unsafe nonce
   assert.deepEqual(app.post({ ...signedRequest(), code: 4219 }), { ok: false });
   assert.deepEqual(app.post(signedRequest({ nonce: '../unsafe' })), { ok: false });
   assert.equal(app.sent.length, 0);
+});
+
+const pdf = Buffer.from('%PDF-1.4\nSFDC24 working session\n%%EOF\n', 'latin1');
+
+function signedSummary(overrides = {}, bytes = pdf) {
+  const body = {
+    kind: 'summary',
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    nonce: 'fedcba9876543210fedcba9876543210',
+    email,
+    pdf: bytes.toString('base64'),
+    pdf_sha256: createHash('sha256').update(bytes).digest('hex'),
+    ...overrides,
+  };
+  body.signature = createHmac('sha256', secret)
+    .update(['summary', body.timestamp, body.nonce, body.email, body.pdf_sha256].join('\n'))
+    .digest('hex');
+  return body;
+}
+
+test('a signed summary sends the exact PDF once, as an attachment, and a replay is refused', () => {
+  const app = harness();
+  const request = signedSummary();
+  assert.deepEqual(app.post(request), { ok: true });
+  assert.equal(app.sent.length, 1);
+  const [to, subject, text, options] = app.sent[0];
+  assert.equal(to, email);
+  assert.match(subject, /working session/);
+  assert.equal(text.includes(request.pdf), false);
+  assert.equal(options.attachments.length, 1);
+  const blob = options.attachments[0];
+  assert.equal(blob.type, 'application/pdf');
+  assert.deepEqual(Buffer.from(blob.bytes.map((b) => b & 255)), pdf);
+  assert.deepEqual(app.post(request), { ok: false });
+  assert.equal(app.sent.length, 1);
+  const captured = JSON.stringify(app.logs);
+  assert.equal(captured.includes(email), false);
+});
+
+test('a summary whose PDF does not match its signed digest never sends', () => {
+  const app = harness();
+  const request = signedSummary();
+  request.pdf = Buffer.from('%PDF-1.4\nsomething else\n', 'latin1').toString('base64');
+  assert.deepEqual(app.post(request), { ok: false });
+  const notPdf = Buffer.from('<html>not a pdf</html>', 'latin1');
+  assert.deepEqual(app.post(signedSummary({ nonce: '1'.repeat(32) }, notPdf)), { ok: false });
+  assert.equal(app.sent.length, 0);
+});
+
+test('a summary signature cannot be replayed as a sign-in code and the other way round', () => {
+  const app = harness();
+  const code = signedRequest();
+  assert.deepEqual(app.post({ ...signedSummary(), signature: code.signature }), { ok: false });
+  const summary = signedSummary();
+  assert.deepEqual(app.post({ ...code, signature: summary.signature }), { ok: false });
+  assert.equal(app.sent.length, 0);
+});
+
+test('a summary to an address off the allowlist needs the owner to open it', () => {
+  const closed = harness();
+  assert.deepEqual(closed.post(signedSummary({ email: 'visitor@bakery.example' })), { ok: false });
+  assert.equal(closed.sent.length, 0);
+  const open = harness({ extraProperties: [['STUDIO_SUMMARY_ANY_RECIPIENT', 'true']] });
+  assert.deepEqual(open.post(signedSummary({ email: 'visitor@bakery.example' })), { ok: true });
+  assert.equal(open.sent.length, 1);
+  // Opening summaries never opens the sign-in code to outsiders.
+  assert.deepEqual(open.post(signedRequest({ email: 'visitor@bakery.example' })), { ok: false });
+  assert.equal(open.sent.length, 1);
+});
+
+test('summary shape checks: extra fields, bad base64, oversized sign-in bodies', () => {
+  const app = harness();
+  assert.deepEqual(app.post({ ...signedSummary(), extra: 'x' }), { ok: false });
+  assert.deepEqual(app.post(signedSummary({ pdf: 'not base64!' })), { ok: false });
+  assert.deepEqual(app.post({ ...signedRequest(), filler: 'x'.repeat(3000) }), { ok: false });
+  // A valid sign-in request padded past 2048 characters is still refused: the
+  // larger limit belongs to summaries only.
+  const padded = JSON.stringify(signedRequest()) + ' '.repeat(3000);
+  assert.deepEqual(app.postRaw(padded), { ok: false });
+  assert.equal(app.sent.length, 0);
+  assert.deepEqual(app.postRaw(JSON.stringify(signedRequest({ nonce: 'a'.repeat(32) }))), { ok: true });
 });

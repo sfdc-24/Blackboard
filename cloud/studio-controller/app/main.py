@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -18,9 +20,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 try:
-    from scripts.state_store import open_store
+    from scripts.state_store import Conflict, open_store
 except ImportError:
-    from state_store import open_store
+    from state_store import Conflict, open_store
 
 from . import governance
 from .core import CommandError, StudioController
@@ -33,11 +35,16 @@ from .state import (
     StudioRepository,
     VoiceCapacityExceeded,
 )
+from .summary_pdf import DesignImageError, build_summary_pdf, decode_design_png, mask_email
 from .tokens import InvalidToken, mint_token, verify_token
 from .workers.synthetic import SyntheticWorker
 
 
 CALL_ID_RE = re.compile(r"^rtc_[A-Za-z0-9_-]{1,120}$")
+
+
+class SummaryNotSent(RuntimeError):
+    """The summary email certainly did not leave: safe to try again."""
 
 
 def _worker(settings: Settings):
@@ -81,7 +88,7 @@ ARCHITECT_VOICE_STYLE = (
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
-               analyst=None, moderation_client=None, muse=None) -> FastAPI:
+               analyst=None, moderation_client=None, muse=None, summary_sender=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -264,6 +271,58 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not isinstance(receipt, dict) or receipt.get("ok") is not True:
             raise RuntimeError("email sender refused delivery")
 
+    SUMMARY_EMAIL_TIMEOUT_SECONDS = 45
+
+    def send_summary_email(email: str, pdf: bytes) -> None:
+        """The working-session PDF to a verified address, through the same signed
+        Apps Script sender as the sign-in code (kind "summary"). The signature
+        covers the PDF's SHA-256, so the sender refuses any other attachment.
+
+        Raises SummaryNotSent only when the email certainly did not go: the
+        connection to the sender never opened, or the script answered an
+        explicit {"ok": false} (it refuses before MailApp). Every other failure
+        - a timeout after the request left, a lost redirect, a 5xx, a body that
+        is not the receipt - may follow a delivered email and raises something
+        else, which the caller records as unconfirmed and never resends."""
+        if summary_sender is not None:
+            summary_sender(email, pdf)
+            return
+        if (not settings.email_sender_url or not settings.email_sender_secret
+                or getattr(app.state, "email_client", None) is None):
+            raise SummaryNotSent("email sender is not configured")
+        timestamp = str(int(clock()))
+        nonce = secrets.token_hex(16)
+        digest = hashlib.sha256(pdf).hexdigest()
+        canonical = "\n".join(("summary", timestamp, nonce, email, digest)).encode("utf-8")
+        signature = hmac.new(
+            settings.email_sender_secret.encode("utf-8"), canonical, hashlib.sha256
+        ).hexdigest()
+        client = app.state.email_client
+        try:
+            # Redirects are followed by hand below, so a connection failure here
+            # is always the POST itself, before the script could have run.
+            response = client.post(settings.email_sender_url, json={
+                "kind": "summary",
+                "timestamp": timestamp,
+                "nonce": nonce,
+                "email": email,
+                "pdf": base64.b64encode(pdf).decode("ascii"),
+                "pdf_sha256": digest,
+                "signature": signature,
+            }, timeout=SUMMARY_EMAIL_TIMEOUT_SECONDS, follow_redirects=False)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise SummaryNotSent("the email sender could not be reached") from exc
+        # The script has run from here on. Apps Script answers with a redirect
+        # to its receipt; losing that hop says nothing about the email.
+        if response.is_redirect and response.headers.get("location"):
+            response = client.get(response.headers["location"], timeout=SUMMARY_EMAIL_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        receipt = response.json()
+        if isinstance(receipt, dict) and receipt.get("ok") is False:
+            raise SummaryNotSent("the email sender refused delivery")
+        if not isinstance(receipt, dict) or receipt.get("ok") is not True:
+            raise RuntimeError("the email sender gave no receipt")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if voice_client is None:
@@ -408,7 +467,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "analyst": analyst_ready(), "muse": muse_ready(),
                          "public_visitors": settings.public_visitors,
                          "governance": True,
-                         "voices": voices_available()},
+                         "voices": voices_available(),
+                         "rating": True, "summary_email": settings.summary_email_enabled},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -563,6 +623,109 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, label + " body must be an object")
         return body
 
+    # THE END CARD. After a conversation the visitor says how happy they are
+    # and can have the working session sent to them as a PDF. Both endpoints
+    # accept the session token for END_CARD_GRACE_SECONDS after the session
+    # expired (a time-limit end must still count); no other endpoint does.
+    END_CARD_GRACE_SECONDS = 30 * 60
+    SUMMARY_BODY_MAX = 2_100_000
+    SUMMARY_STALE_SECONDS = 120
+    SUMMARY_MARK_ATTEMPTS = 3
+    SUMMARY_UNCONFIRMED = "the summary may already have been sent; check your inbox"
+    RATING_COMMENT_MAX = 300
+
+    async def capped_body(request: Request, cap: int) -> bytes:
+        """The request body, refused with 413 as soon as it is known to exceed
+        `cap`: from Content-Length before anything is read, else while it
+        streams in."""
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                length = int(declared)
+            except ValueError as exc:
+                raise HTTPException(400, "Content-Length must be an integer") from exc
+            if length > cap:
+                raise HTTPException(413, "request body is too large")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > cap:
+                raise HTTPException(413, "request body is too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def require_recent_session(request: Request, session_id: str) -> dict:
+        auth = request.headers.get("authorization") or ""
+        token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        try:
+            claims = verify_token(token, settings.session_secret,
+                                  now=clock() - END_CARD_GRACE_SECONDS, scope="session")
+        except InvalidToken as exc:
+            raise HTTPException(401, str(exc)) from exc
+        if claims["sid"] != session_id:
+            raise HTTPException(403, "token does not belong to this session")
+        return claims
+
+    def within_grace(state: dict) -> None:
+        if int(state.get("expires_at") or 0) + END_CARD_GRACE_SECONDS <= int(clock()):
+            raise HTTPException(410, "this session closed more than 30 minutes ago")
+
+    def recent_state(session_id: str) -> dict:
+        try:
+            state = repository.load(session_id).state
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        within_grace(state)
+        return state
+
+    def update_state(session_id: str, change) -> dict:
+        """Compare-and-set one change to the session record. `change` gets a
+        copy and returns the new state, or None to write nothing."""
+        for _ in range(repository.attempts):
+            record = repository.load(session_id)
+            candidate = change(copy.deepcopy(record.state))
+            if candidate is None:
+                return record.state
+            try:
+                repository.save(session_id, candidate, record.token)
+                return candidate
+            except StateConflict:
+                continue
+        raise StateConflict("session is busy; try again")
+
+    def contact_name(subject: str) -> str:
+        return "studio_contact_" + subject
+
+    def record_contact(subject: str, email: str) -> None:
+        """The verified address behind a sign-in subject, kept server-side only
+        for the summary email. Never returned to a page, never logged."""
+        name = contact_name(subject)
+        for _ in range(4):
+            current, token = store.load(name)
+            if isinstance(current, dict) and current.get("email") == email:
+                return
+            try:
+                store.save(name, {"version": 1, "email": email, "verified_at": int(clock())}, token)
+                return
+            except Conflict:
+                continue
+
+    def email_for_subject(subject: str) -> str:
+        """The session owner's verified address, from server records only: the
+        contact written at sign-in (checked against the subject it claims), or
+        the operator allowlist. Never from the request."""
+        if not subject:
+            return ""
+        record, _ = store.load(contact_name(subject))
+        email = record.get("email") if isinstance(record, dict) else ""
+        if isinstance(email, str) and email and hmac.compare_digest(
+                auth_service._subject_hash(email), subject):
+            return email
+        for candidate in settings.operator_emails:
+            if hmac.compare_digest(auth_service._subject_hash(candidate), subject):
+                return candidate
+        return ""
+
     @app.post("/v1/auth/start")
     async def auth_start(request: Request):
         require_origin(request)
@@ -587,11 +750,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         )
         if not verified.get("verified"):
             raise HTTPException(401, "verification code was not accepted")
-        if verified.get("role") == "visitor":
-            # Switched off after the code was sent: the code proves the mailbox,
-            # but public visitors are no longer admitted.
-            if not settings.public_visitors:
-                raise HTTPException(401, "verification code was not accepted")
+        visitor = verified.get("role") == "visitor"
+        # Switched off after the code was sent: the code proves the mailbox,
+        # but public visitors are no longer admitted.
+        if visitor and not settings.public_visitors:
+            raise HTTPException(401, "verification code was not accepted")
+        if settings.summary_email_enabled:
+            try:
+                await asyncio.to_thread(record_contact, verified["subject_hash"], body["email"])
+            except Exception:
+                pass  # sign-in never fails on this; the summary falls back to the allowlist
+        if visitor:
             expires_at = int(clock()) + settings.visitor_token_seconds
             token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="visitor")
             await asyncio.to_thread(lead_book.record_verified, verified["subject_hash"], body.get("email"))
@@ -920,6 +1089,16 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if state.get("visitor_subject"):
             # The recap is what the visitor was told they would get back: keep it with their lead.
             await asyncio.to_thread(lead_book.record_recap, state["visitor_subject"], session_id, text)
+        kept_at = int(clock())
+
+        def keep(current):
+            current["recap"] = {"text": text[:1200], "at": kept_at, "speaker": agent}
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, keep)
+        except (StateConflict, SessionNotFound):
+            pass  # the recap is still spoken; only the summary PDF goes without it
         return {"recap": text, "speaker": agent}
 
     @app.get("/v1/leads")
@@ -928,6 +1107,154 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_origin(request)
         require_operator(request)
         return {"leads": await asyncio.to_thread(lead_book.list, 50)}
+
+    @app.post("/v1/session/{session_id}/rating")
+    async def rating(request: Request, session_id: str):
+        """How happy the visitor is with the outcome: 1 to 5, and a few words."""
+        require_origin(request)
+        require_recent_session(request, session_id)
+        body = await json_object(request, "rating")
+        if set(body) - {"score", "comment"}:
+            raise HTTPException(400, "rating body has unknown fields")
+        score = body.get("score")
+        if type(score) is not int or not 1 <= score <= 5:
+            raise HTTPException(400, "score must be a whole number from 1 to 5")
+        comment = body.get("comment")
+        if comment is None:
+            comment = ""
+        if not isinstance(comment, str) or len(comment) > RATING_COMMENT_MAX:
+            raise HTTPException(400, "comment must be text of at most %d characters" % RATING_COMMENT_MAX)
+        now = int(clock())
+
+        def rate(current):
+            within_grace(current)
+            current["rating"] = {"score": score, "comment": comment.strip(), "at": now}
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, rate)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/v1/session/{session_id}/summary")
+    async def summary(request: Request, session_id: str):
+        """Email the working session as a PDF to the owner's verified address.
+        Once per session: a replay answers from the record and sends nothing."""
+        require_origin(request)
+        require_recent_session(request, session_id)
+        if not settings.summary_email_enabled:
+            raise HTTPException(503, "the summary email is not enabled in this release")
+        raw = await capped_body(request, SUMMARY_BODY_MAX)
+        try:
+            body = json.loads(raw or b"{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "summary body must be JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(400, "summary body must be an object")
+        if set(body) - {"design_png"}:
+            raise HTTPException(400, "summary body has unknown fields")
+        try:
+            design = decode_design_png(body.get("design_png"))
+        except DesignImageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        state = await asyncio.to_thread(recent_state, session_id)
+        done = state.get("summary") or {}
+        if done.get("status") == "sent":
+            return {"sent": True, "to": done.get("to", "")}
+        subject = state.get("operator_subject") or state.get("visitor_subject") or ""
+        email = await asyncio.to_thread(email_for_subject, subject)
+        if not email:
+            raise HTTPException(409, "no verified email is on record for this session")
+        try:
+            pdf = await asyncio.to_thread(build_summary_pdf, state, design_png=design)
+        except DesignImageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        masked = mask_email(email)
+        now = int(clock())
+        reservation = secrets.token_hex(8)
+        outcome: dict = {}
+
+        # ONE EMAIL PER SESSION, EVER. A duplicate is worse than a missing
+        # email: anything that may have been delivered is "unconfirmed" and is
+        # never sent again, including a reservation whose request outlived
+        # SUMMARY_STALE_SECONDS. Only a failure that certainly sent nothing
+        # ("failed") may be retried.
+        def reserve(current):
+            within_grace(current)
+            prior = current.get("summary") or {}
+            status = prior.get("status")
+            if status == "sent":
+                outcome["replay"] = prior
+                return None
+            if status == "unconfirmed":
+                outcome["unconfirmed"] = True
+                return None
+            if status == "sending":
+                if now - int(prior.get("at") or 0) < SUMMARY_STALE_SECONDS:
+                    outcome["busy"] = True
+                    return None
+                current["summary"] = {"status": "unconfirmed", "at": now, "why": "stale"}
+                outcome["unconfirmed"] = True
+                return current
+            current["summary"] = {"status": "sending", "at": now, "reservation": reservation}
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, reserve)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if outcome.get("replay"):
+            return {"sent": True, "to": outcome["replay"].get("to", "")}
+        if outcome.get("unconfirmed"):
+            raise HTTPException(409, SUMMARY_UNCONFIRMED)
+        if outcome.get("busy"):
+            raise HTTPException(409, "the summary is already on its way")
+
+        async def settle(change) -> None:
+            """Record the outcome, retrying the compare-and-set; a record that
+            still says "sending" later turns unconfirmed, never resendable."""
+            for _ in range(SUMMARY_MARK_ATTEMPTS):
+                try:
+                    await asyncio.to_thread(update_state, session_id, change)
+                    return
+                except StateConflict:
+                    continue
+                except SessionNotFound:
+                    return
+
+        try:
+            await asyncio.to_thread(send_summary_email, email, pdf)
+        except SummaryNotSent as exc:
+            def failed(current):
+                prior = current.get("summary") or {}
+                if prior.get("status") != "sending" or prior.get("reservation") != reservation:
+                    return None
+                current["summary"] = {"status": "failed", "at": int(clock())}
+                return current
+
+            await settle(failed)
+            raise HTTPException(502, "the summary email could not be sent; try again") from exc
+        except Exception as exc:
+            def unconfirmed(current):
+                if (current.get("summary") or {}).get("status") == "sent":
+                    return None
+                current["summary"] = {"status": "unconfirmed", "at": int(clock())}
+                return current
+
+            await settle(unconfirmed)
+            raise HTTPException(502, SUMMARY_UNCONFIRMED) from exc
+
+        def sent(current):
+            current["summary"] = {"status": "sent", "at": int(clock()), "to": masked}
+            return current
+
+        await settle(sent)
+        return {"sent": True, "to": masked}
 
     @app.post("/v1/session/{session_id}/analyze")
     async def analyze(request: Request, session_id: str):
