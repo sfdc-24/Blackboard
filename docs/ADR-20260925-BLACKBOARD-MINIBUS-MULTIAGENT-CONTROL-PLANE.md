@@ -482,8 +482,8 @@ flowchart TB
       COORD -->|consented speech, present, share, teardown intent| MEETING
       MEETING -->|bounded command and receipt| ZOOM
       WORK -->|Claude build proposal| WRITER
-      WORK -->|Gemini analysis| WRITER
-      WORK -->|creative directions| WRITER
+      WORK -->|Gemini analysis| COORD
+      WORK -->|creative directions| COORD
       WRITER --> LEDGER
       LEDGER -->|SSE, snapshots, receipts| WEB
       COORD -->|approved host text| WEB
@@ -597,7 +597,7 @@ All targets require real production telemetry before being promoted to SLOs.
 
 ## Incremental release plan
 
-### R1 - Accept the deployed Gemini website-talk path
+### G1 - Accept the deployed Gemini website-talk path
 
 No code change:
 
@@ -610,14 +610,14 @@ No code change:
    uninterrupted minutes;
 7. capture redacted provider, latency, event, artifact, and rollback receipts.
 
-### R2 - Provider reliability
+### G2 - Provider reliability
 
 - Add definite-error fallback, provider circuit state, stale-turn fences, hard
   deadlines, bounded response bodies, and provider/model/latency/outcome receipts.
 - Test timeout, quota, auth, malformed, refusal, empty, and recap-failure cases.
 - Keep fallback visible in telemetry; do not mislabel the responding provider.
 
-### R3 - Close the PR260 client-isolation gate
+### G3 - Close the PR260 client-isolation gate
 
 - Remediate PR260 tenant/project/subject binding, revocation enforcement,
   pre-admission fetch controls, parser deadline, bounded workers, and audit
@@ -626,7 +626,7 @@ No code change:
 - Deploy disabled and at zero traffic; run cross-tenant and revocation negative
   controls.
 
-### R4 - Close the PR261 durable-publication gate
+### G4 - Close the PR261 durable-publication gate
 
 - Begin only after PR260 has been accepted on its exact rebased head.
 - Rebase PR261 onto the accepted PR260/main state.
@@ -636,7 +636,7 @@ No code change:
   persistence; prove one publication and one receipt after recovery.
 - Obtain a separate exact-head review and deploy disabled at zero traffic.
 
-### R5 - Harden and accept Gemini Analyst as a dark advisory lane
+### G5 - Harden and accept Gemini Analyst as a dark advisory lane
 
 - Treat the disabled server-side, stateless, no-tools contribution contract as
   landed in source; keep production on R5 while the quarantined R6 code is
@@ -649,7 +649,7 @@ No code change:
 - Then run Gemini in parallel with Claude builder using the existing closed
   Analyst schema and display `Analyst · Gemini` provenance.
 
-### R6 - Salesforce read-only customer facts
+### G6 - Salesforce read-only customer facts
 
 - Bind the intended org by immutable Organization ID and environment type.
 - Enable only fixed read-only tools such as Lead count and schema describe.
@@ -657,14 +657,14 @@ No code change:
 - Compare the website result with a separate authoritative query.
 - Keep mutations disabled.
 
-### R7 - Durable effects and Salesforce mutations
+### G7 - Durable effects and Salesforce mutations
 
 - Land the operation ledger, explicit visual confirmation, dispatch-once outbox,
   independent destination read-back, and unknown-outcome reconciliation.
 - Start in a sandbox with a narrow reversible metadata operation.
 - Prove crash/restart, replay, duplicate suppression, revocation, and rollback.
 
-### R8 - WhatsApp and Zoom channel expansion
+### G8 - WhatsApp and Zoom channel expansion
 
 - Harden WhatsApp inbound/outbound deduplication and read back actual delivery
   status, while retaining it as the status and blocker channel.
@@ -672,12 +672,12 @@ No code change:
   on-demand presenter start, live listen/speak/share, reconnect, and teardown.
 - Route both through the same session and effect authority.
 
-### R9 - Converspan and client minibuses
+### G9 - Converspan and client minibuses
 
 - The non-waivable foundation gate is: accepted SFDC24 continuous-audio and
-  live-prototype evidence from R1; provider fallback/deadline/circuit/telemetry
-  controls from R2; exact-head PR260 tenant-isolation acceptance from R3;
-  PR261 durable publication, restart, and replay acceptance from R4; immutable
+  live-prototype evidence from G1; provider fallback/deadline/circuit/telemetry
+  controls from G2; exact-head PR260 tenant-isolation acceptance from G3;
+  PR261 durable publication, restart, and replay acceptance from G4; immutable
   source-to-runtime receipts; and a tested rollback on production `main`.
 - Strategy, documentation, and non-production design may continue before that
   gate. Converspan production implementation, deployment, and client onboarding
@@ -800,7 +800,7 @@ stopping safe, non-conflicting work on another path.
 
 ## Required follow-up records
 
-- Exact owner-path R1 acceptance receipt.
+- Exact owner-path G1 acceptance receipt.
 - Fresh exact-head PR260 security ruling after remediation and rebase.
 - Fresh PR261 durability/replay ruling after PR260.
 - Gemini advisor contract review and dark-probe receipt.
