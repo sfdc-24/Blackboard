@@ -90,6 +90,32 @@ class Route(unittest.TestCase):
             out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
         self.assertEqual({"advice": None, "fenced": True}, out.json())
 
+    def test_advice_is_fenced_when_a_new_turn_changes_only_the_transcript(self):
+        holder = {}
+
+        def speak_meanwhile():
+            repo = holder["app"].state.controller.repository
+            sid = holder["sid"]
+            record = repo.load(sid)
+            moved = dict(record.state)
+            moved["transcript"] = list(moved.get("transcript") or []) + [
+                {"role": "visitor", "text": "Make it warmer"}
+            ]
+            moved["turn_seq"] = int(moved.get("turn_seq") or 0) + 1
+            moved["turn_id"] = "turn-%d" % moved["turn_seq"]
+            # The reproduced bug matters precisely because the canvas did not
+            # move while the words the advisor read became stale.
+            self.assertEqual(1, moved["artifact_version"])
+            repo.save(sid, moved, record.token)
+
+        advisor = FakeAdvisor(during=speak_meanwhile)
+        with TestClient(self.make(advisor)) as client:
+            holder["app"] = self.app
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
     def test_off_means_503_and_health_says_so(self):
         with TestClient(self.make(FakeAdvisor(ready=False))) as client:
             sid, headers = self.session(client)

@@ -602,6 +602,25 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     advisor_lane = advisor if advisor is not None else Advisor(enabled=settings.advisor_enabled)
     advise_busy: set = set()
 
+    def advisor_snapshot_marker(state: dict) -> tuple:
+        """Fence advice to the complete committed moment, not only its canvas.
+
+        A visitor turn may change the transcript without changing the artifact
+        version.  Binding only to artifact_version would then allow advice for
+        the previous words to be returned as current.  These controller-owned
+        monotonic fields conservatively invalidate advice after any committed
+        turn/event or lifecycle change while the provider call is in flight.
+        """
+        return (
+            int(state.get("generation") or 0),
+            int(state.get("task_revision") or 0),
+            int(state.get("artifact_version") or 0),
+            int(state.get("turn_seq") or 0),
+            int(state.get("last_seq") or 0),
+            bool(state.get("paused")),
+            bool(state.get("stopped")),
+        )
+
     @app.post("/v1/session/{session_id}/advise")
     async def advise(request: Request, session_id: str):
         require_origin(request)
@@ -619,6 +638,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = await asyncio.to_thread(live_state, session_id)
         if int(state.get("artifact_version") or 0) != revision:
             raise HTTPException(409, "the canvas has moved on")
+        snapshot_marker = advisor_snapshot_marker(state)
         if session_id in advise_busy:
             raise HTTPException(409, "advice is already being prepared for this session")
         said = [str(t.get("text") or "") for t in state.get("transcript") or []
@@ -636,7 +656,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             latest = await asyncio.to_thread(live_state, session_id)
         except HTTPException:
             return {"advice": None, "fenced": True}
-        if advice_fenced(advice, int(latest.get("artifact_version") or 0)):
+        if (advisor_snapshot_marker(latest) != snapshot_marker
+                or advice_fenced(advice, int(latest.get("artifact_version") or 0))):
             return {"advice": None, "fenced": True}
         return {"advice": advice}
 
