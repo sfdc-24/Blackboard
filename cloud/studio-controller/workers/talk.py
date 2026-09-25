@@ -111,11 +111,26 @@ def _spoken(words: str, cap: int = REPLY_MAX) -> str:
 
 RECAP_MAX = 900
 RECAP_TOKENS = 160
+RECAP_WORDS = 70  # enforced below, on a sentence boundary; the prompt alone does not hold it
 RECAP_SYSTEM = """You are the host of a live design session on sfdc24.com, closing the meeting. \
-Recap it out loud in 50 to 70 words, never more, as one warm, plain spoken paragraph: what the visitor wants, \
+Recap it out loud in about 60 words (70 at most), as one warm, plain spoken paragraph: what the visitor wants, \
 what is on the canvas now, what was decided, and one next step they can take - keep shaping it here, \
 or talk to us about turning it into the real thing. Never invent facts about their business, and \
 never name or promise any person, price or date. No lists, no markdown, no preamble."""
+
+
+def fit_words(text: str, limit: int) -> str:
+    """At most `limit` words, cut back to the last full sentence inside the limit
+    so a spoken recap never stops mid-thought; with no sentence end inside the
+    limit, the words up to it and a full stop."""
+    words = (text or "").split()
+    if len(words) <= limit:
+        return " ".join(words)
+    head = words[:limit]
+    for i in range(len(head) - 1, -1, -1):
+        if head[i].endswith((".", "!", "?")):
+            return " ".join(head[:i + 1])
+    return " ".join(head).rstrip(",;:-") + "."
 
 
 def recap_brief(state: dict, canvas: str) -> str:
@@ -173,8 +188,8 @@ class TalkClient:
             raise LookupError("agent %r is not configured" % agent)
         messages = [{"role": "user", "content": brief}]
         if agent == "claude":
-            return self._claude(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX)
-        return self._openai(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX)
+            return fit_words(self._claude(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX), RECAP_WORDS)
+        return fit_words(self._openai(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX), RECAP_WORDS)
 
     def _claude(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
         if self._anthropic is None:

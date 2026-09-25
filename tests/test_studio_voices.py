@@ -176,9 +176,38 @@ class RecapBrief(unittest.TestCase):
         self.assertNotIn("Colours?", brief)
         self.assertIn("DATA MODEL (Bookings): Contact, Booking", brief)
 
+    def test_a_long_recap_is_cut_to_seventy_words_on_a_sentence_end(self):
+        eighty_one = ("So you came in wanting a playful animated logo for Crumb and Co that really captures your "
+                      "artisan bakery with a bouncy crusty loaf that has personality. We built out that scene with "
+                      "warm colours that felt right to you, so we locked those in. Now you have seven elements "
+                      "working together on the canvas. From here you can keep refining the bounce and feel of that "
+                      "loaf, or if you are ready, let us talk about making it real.")
+        self.assertGreater(len(eighty_one.split()), 70)
+        cut = talk_mod.fit_words(eighty_one, 70)
+        self.assertLessEqual(len(cut.split()), 70)
+        self.assertTrue(cut.endswith("canvas."), cut[-40:])
+        self.assertEqual("One two three.", talk_mod.fit_words("One two three four five", 3))
+        self.assertEqual("Short and done.", talk_mod.fit_words("Short and  done.", 70))
+
+    def test_the_client_returns_at_most_seventy_words(self):
+        class Anthropic:
+            def __init__(self):
+                self.messages = self
+
+            def create(self, **kw):
+                from types import SimpleNamespace
+                long = " ".join(["This is a sentence of eight words."] * 12)
+                return SimpleNamespace(content=[SimpleNamespace(type="text", text=long)])
+
+        client = talk_mod.TalkClient(anthropic_client=Anthropic(), anthropic_ready=True, openai_key="")
+        text = client.recap("claude", "brief")
+        self.assertLessEqual(len(text.split()), talk_mod.RECAP_WORDS)
+        self.assertTrue(text.endswith("."))
+        self.assertEqual(160, talk_mod.RECAP_TOKENS)
+
     def test_the_recap_prompt_promises_nothing(self):
         self.assertIn("never name or promise any person, price or date", talk_mod.RECAP_SYSTEM)
-        self.assertIn("50 to 70 words, never more", talk_mod.RECAP_SYSTEM)
+        self.assertIn("about 60 words (70 at most)", talk_mod.RECAP_SYSTEM)
 
 
 if __name__ == "__main__":
