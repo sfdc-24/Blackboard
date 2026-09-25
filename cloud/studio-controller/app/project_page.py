@@ -239,16 +239,27 @@ _VOID = {"img", "input", "br", "hr", "meta", "link", "source", "area", "base", "
 _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
 # No address from the page reaches a label, even as visible text: links,
 # bare domains, IP addresses and email addresses become a neutral placeholder.
+# Conservative on purpose (Codex Gate 1 NO-GO on a2d98fc): ANY plausible host
+# is an address - any label.label... ending in 2-63 letters of any script
+# (secret.photography, bücher.de) or a punycode label (xn--...), with ASCII or
+# IDNA full-width dots - and so is any local@host, whatever its script. Words
+# like "e.g." and "Inc." stay; a product name written like a host ("Node.js")
+# is redacted too, which is the price of never leaking an address.
 LINK = "[link]"
 EMAIL = "[email]"
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}")
+_DOT = "[.\u3002\uff0e\uff61]"
+_NOT_ADDR = "\\s@<>()\\[\\]{}\"',;:"
+# An address starts only after a separator, so a long run without "@" is scanned once, not once per character.
+_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^" + _NOT_ADDR + "]+@[^" + _NOT_ADDR + "]+(?:" + _DOT + "[^" + _NOT_ADDR
+                       + ".\u3002\uff0e\uff61]+)+")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
 _IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
 _IPV6_RE = re.compile(r"(?i)(?<![\w:])\[?([0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7})(?:%\w+)?\]?(?::\d{1,5})?(?![\w:])")
-_TLD = (r"(?:com|net|org|info|biz|io|co|ai|app|dev|site|online|shop|store|tech|xyz|me|tv|gov|edu|mil|int"
-        r"|cloud|page|link|live|pro|blog|news|agency|design|studio|solutions|services|[a-z]{2})")
-_DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+" + _TLD + r"\b(?::\d{1,5})?(?:/\S*)?")
+_LABEL = r"[^\W_](?:[\w-]{0,61}[^\W_])?"
+_TLD = r"(?:xn--[a-z0-9-]{1,59}|[^\W\d_]{2,63})"
+_DOMAIN_RE = re.compile(r"(?i)(?<![\w@.\u3002\uff0e\uff61-])(?:" + _LABEL + _DOT + r")+" + _TLD
+                        + r"(?![\w-])(?::\d{1,5})?(?:[/?#]\S*)?")
 
 
 def _ipv6_link(match) -> str:

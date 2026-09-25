@@ -284,7 +284,7 @@ class Auth(unittest.TestCase):
 
 # -- the API ---------------------------------------------------------------------------------
 class Api(unittest.TestCase):
-    def make(self, fetcher=None, registry=None, worker=None, talk=None, **overrides):
+    def make(self, fetcher=None, registry=None, worker=None, talk=None, advisor=None, **overrides):
         values = dict(client_workspaces=True)
         values.update(overrides)
         self.store = MemoryStore()
@@ -295,7 +295,7 @@ class Api(unittest.TestCase):
         self.talk = talk or FakeTalk()
         self.app = create_app(settings=settings(**values), store=self.store, worker=self.worker,
                               id_factory=IDs(), email_sender=self.email_sender, project_fetcher=self.fetcher,
-                              talk_client=self.talk)
+                              talk_client=self.talk, advisor=advisor)
         return self.app
 
     def sign_in(self, client, email=CLIENT_EMAIL):
@@ -1287,6 +1287,50 @@ class FindingF2Redaction(unittest.TestCase):
         for never in ("steel.example.com", "203.0.113.9", "sales@"):
             self.assertNotIn(never, labels)
 
+    def test_codex_blocker_1_any_plausible_host_or_unicode_address_is_redacted(self):
+        # Codex Gate 1 NO-GO on a2d98fc: these all survived the old allowlist.
+        cases = {
+            "Our studio secret.photography opens": "Our studio [link] opens",
+            "Read example.consulting/path now": "Read [link] now",
+            "Books at bücher.de today": "Books at [link] today",
+            "Punycode xn--bcher-kva.de too": "Punycode [link] too",
+            "Mixed shop.xn--p1ai here": "Mixed [link] here",
+            "Full-width bücher\u3002de and bücher\uff0ede": "Full-width [link] and [link]",
+            "Mail josé@bücher.de please": "Mail [email] please",
+            "Write 用户@例子.广告 now": "Write [email] now",
+            "Ping jürgen.müller@firma.example today": "Ping [email] today",
+            "Server 2001:db8:85a3::8a2e:370:7334 is": "Server [link] is",
+            "Long tld site.international end": "Long tld [link] end",
+            "Port and query steel.works:8443/a?b=c#d end": "Port and query [link] end",
+            "Sentence ends at steelworkson.ca.": "Sentence ends at [link].",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text)
+
+    def test_ordinary_words_and_numbers_survive(self):
+        for text in ("Steel Works Inc. builds frames, e.g. stairs and rails.",
+                     "Open 9am-5pm, 10:30 to 3.14 km, i.e. most weekends.",
+                     "No. 5 plate, 2.5 mm, $1,200.00 per ton.",
+                     "Call us: we reply fast; email is below.",
+                     "Meet @ 5pm, or ask @steelworks on social."):
+            self.assertEqual(text, " ".join(redact(text).split()), text)
+
+    def test_codex_blocker_1_on_the_page_labels_that_reach_state(self):
+        page = ("<h1>Visit secret.photography</h1><p>Book at example.consulting/path or bücher.de</p>"
+                "<p>Write josé@bücher.de or 2001:db8::7334</p><button>xn--bcher-kva.de</button>"
+                "<input placeholder='you@例子.广告'><img alt='photo from studio.gallery'>")
+        labels = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for never in ("secret.photography", "example.consulting", "bücher", "josé", "2001:db8", "xn--",
+                      "例子", "studio.gallery"):
+            self.assertNotIn(never, labels)
+
+    def test_the_redaction_is_linear_on_hostile_input(self):
+        import time as _time
+        for hostile in ("a." * 30000, "a" * 60000, "a-" * 30000 + "!", ("x@" * 20000) + "y", "1." * 30000):
+            started = _time.monotonic()
+            redact(hostile)
+            self.assertLess(_time.monotonic() - started, 2.0, hostile[:12])
+
 
 class GeminiAttacks(unittest.TestCase):
     def test_attack_1_mapped_answers_are_refused_and_a_swap_never_re_resolves(self):
@@ -1314,3 +1358,115 @@ class GeminiAttacks(unittest.TestCase):
         self.assertIn("welcome", text)
         self.assertIn("after it all", text)
 
+
+class ProviderTalk(FakeTalk):
+    """Every agent configured, every call counted - a talk or a recap."""
+
+    def __init__(self):
+        super().__init__(agents=("claude", "openai", "gemini", "meta"))
+        self.recaps = []
+
+    def recap(self, agent, brief):
+        self.recaps.append(agent)
+        return "Here is where we got to."
+
+
+class CountingAdvisor:
+    def __init__(self):
+        self.calls = 0
+
+    def ready(self):
+        return True
+
+    def advise(self, session_id, snapshot):
+        self.calls += 1
+        return {"agent": "gemini", "revision": snapshot["revision"], "perspective": "p", "questions": [], "risks": []}
+
+
+class CodexBlocker2ProviderIsolation(Api):
+    """Codex Gate 1 NO-GO on a2d98fc, blocker_2: a client session reaches only
+    the approved providers, refused or re-routed before any provider call."""
+
+    def client_session(self, client, topic=None):
+        token = self.sign_in(client).json()["token"]
+        body = {"creation_id": "prov-1", "start": "project", "project": "steelworks"}
+        if topic:
+            body["topic"] = topic
+        live = client.post("/v1/session", headers=self.auth(token), json=body)
+        self.assertEqual(200, live.status_code, live.text)
+        return live.json()
+
+    def say(self, client, live, **extra):
+        return client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                           json=dict({"text": "make the heading bigger"}, **extra))
+
+    def test_an_explicit_unapproved_agent_is_refused_with_zero_provider_calls(self):
+        talk = ProviderTalk()
+        with TestClient(self.make(talk=talk)) as client:
+            live = self.client_session(client)
+            refused = [self.say(client, live, agent=a) for a in ("gemini", "meta")]
+            recaps = [client.post("/v1/session/%s/recap" % live["session_id"], headers=self.auth(live["token"]),
+                                  json={"agent": a}) for a in ("gemini", "meta")]
+        self.assertEqual([403, 403, 403, 403], [r.status_code for r in refused + recaps])
+        self.assertEqual({"that assistant is not available in this workspace"},
+                         {r.json()["detail"] for r in refused + recaps})
+        self.assertEqual(([], []), (talk.calls, talk.recaps))
+
+    def test_topic_routing_skips_unapproved_providers(self):
+        for topic, expected in (("website", "claude"), ("app", "claude"), ("logo", "openai"), ("salesforce_admin", "claude")):
+            talk = ProviderTalk()
+            with TestClient(self.make(talk=talk)) as client:
+                live = self.client_session(client, topic=topic)
+                said = self.say(client, live)
+                recap = client.post("/v1/session/%s/recap" % live["session_id"], headers=self.auth(live["token"]), json={})
+            self.assertEqual((200, 200), (said.status_code, recap.status_code), (topic, said.text, recap.text))
+            self.assertEqual((expected, expected), (said.json()["speaker"], recap.json()["speaker"]), topic)
+            self.assertEqual(([expected], [expected]), ([c["agent"] for c in talk.calls], talk.recaps), topic)
+
+    def test_the_advisor_is_refused_for_a_client_with_zero_calls(self):
+        advisor = CountingAdvisor()
+        with TestClient(self.make(advisor=advisor)) as client:
+            live = self.client_session(client)
+            out = client.post("/v1/session/%s/advise" % live["session_id"], headers=self.auth(live["token"]),
+                              json={"revision": live["artifact_version"]})
+        self.assertEqual((403, 0), (out.status_code, advisor.calls))
+
+    def test_operator_sessions_keep_every_agent_and_the_advisor(self):
+        talk, advisor = ProviderTalk(), CountingAdvisor()
+        with TestClient(self.make(talk=talk, advisor=advisor)) as client:
+            token = self.sign_in(client, OPERATOR).json()["token"]
+            live = client.post("/v1/session", headers=self.auth(token), json={
+                "creation_id": "op-prov", "start": "blank", "topic": "website"}).json()
+            routed = self.say(client, live)
+            advice = client.post("/v1/session/%s/advise" % live["session_id"], headers=self.auth(live["token"]),
+                                 json={"revision": live["artifact_version"]})
+        self.assertEqual((200, "gemini"), (routed.status_code, routed.json()["speaker"]))
+        self.assertEqual((200, 1), (advice.status_code, advisor.calls))
+
+    def test_a_listed_provider_is_allowed_and_a_bad_setting_stops_the_service(self):
+        talk = ProviderTalk()
+        with TestClient(self.make(talk=talk, client_providers=("claude", "openai", "gemini"))) as client:
+            live = self.client_session(client, topic="website")
+            said = self.say(client, live)
+        self.assertEqual((200, "gemini"), (said.status_code, said.json()["speaker"]))
+        for bad in ((), ("claude", "claude"), ("claude", "grok"), ("Claude",), ("claude", "")):
+            with self.assertRaises(RuntimeError, msg=bad):
+                settings(client_providers=bad).validate()
+
+    def test_the_env_parse_is_exact(self):
+        import os
+        from app.settings import Settings
+        old = os.environ.get("STUDIO_CLIENT_PROVIDERS")
+        try:
+            os.environ.pop("STUDIO_CLIENT_PROVIDERS", None)
+            self.assertEqual(("claude", "openai"), Settings.from_env().client_providers)
+            os.environ["STUDIO_CLIENT_PROVIDERS"] = " claude , openai,gemini "
+            self.assertEqual(("claude", "openai", "gemini"), Settings.from_env().client_providers)
+            os.environ["STUDIO_CLIENT_PROVIDERS"] = "claude,,openai"
+            with self.assertRaises(RuntimeError):
+                Settings.from_env().validate()
+        finally:
+            if old is None:
+                os.environ.pop("STUDIO_CLIENT_PROVIDERS", None)
+            else:
+                os.environ["STUDIO_CLIENT_PROVIDERS"] = old

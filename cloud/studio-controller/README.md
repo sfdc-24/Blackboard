@@ -395,6 +395,19 @@ tenant exists and still lists an address that hashes to the token's subject.
   labels, and 2 s of parsing.
 - Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
   `[email]`. The registry's project name is kept as written.
+- The redaction is conservative: any `label.label...` ending in 2-63 letters of any script, or in
+  a punycode `xn--` label, counts as a host, with ASCII or IDNA full-width dots. So does any
+  `local@host` in any script. "e.g." and "Inc." stay; a product name written like a host ("Node.js")
+  is redacted too. Codex Gate 1 NO-GO on a2d98fc.
+
+**Providers.** A client session reaches only `STUDIO_CLIENT_PROVIDERS`, which defaults to
+`claude,openai`. Distinct names from claude, openai, gemini and meta are accepted; anything else
+stops the service at start.
+- Talk and recap with an explicitly unlisted agent: `403`, before any provider call.
+- Topic routing picks only from the listed agents.
+- `/advise` (Gemini): `403` for a client session unless `gemini` is listed.
+- Operator and visitor sessions are unchanged. The builder (Claude) and the voice, speech and
+  moderation calls (OpenAI) are the base of every session.
 
 **Audit.** Every accepted command in a client session appends exactly one entry to `state["audit"]`,
 keeping the last 200.

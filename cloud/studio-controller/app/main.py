@@ -585,6 +585,20 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     def talk_agents() -> list:
         return list(talk_lane().agents())
 
+    # A client (workspace) session reaches only the providers approved for
+    # client data (settings.client_providers; Codex Gate 1 NO-GO on a2d98fc):
+    # an explicit choice of any other is refused, topic routing skips it, and
+    # the Gemini advisor is refused unless listed - all before any provider
+    # call. Operator and visitor sessions keep every configured agent.
+    CLIENT_PROVIDER_DENIED = "that assistant is not available in this workspace"
+    client_providers = frozenset(settings.client_providers)
+
+    def is_client_session(state: dict) -> bool:
+        return bool(state.get("client_subject") or state.get("client_tenant"))
+
+    def session_agents(state: dict, agents: list) -> list:
+        return [a for a in agents if a in client_providers] if is_client_session(state) else list(agents)
+
     # Two voices (owner direction): the host is the realtime call; the architect
     # speaks the builder's and analyst's lines in its own OpenAI TTS voice.
     speak_counts: dict = {}
@@ -740,6 +754,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         from workers.talk import canvas_summary
         from workers.topics import topic_line
         state = await asyncio.to_thread(live_state, session_id)
+        if is_client_session(state) and "gemini" not in client_providers:
+            raise HTTPException(403, CLIENT_PROVIDER_DENIED)
         if int(state.get("artifact_version") or 0) != revision:
             raise HTTPException(409, "the canvas has moved on")
         snapshot_marker = advisor_snapshot_marker(state)
@@ -1289,9 +1305,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = record.state
         if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
             raise HTTPException(410, "session has ended")
+        allowed = session_agents(state, agents)
+        if agent is not None and agent not in allowed:
+            raise HTTPException(403, CLIENT_PROVIDER_DENIED)
+        if not allowed:
+            raise HTTPException(503, "talk is not available")
         if agent is None:
             from workers.topics import route_agent
-            agent = route_agent(state.get("topic"), agents)
+            agent = route_agent(state.get("topic"), allowed)
         used = talk_counts.get(session_id, 0)
         if used >= settings.talk_cap:
             raise HTTPException(429, "talk limit reached for this session")
@@ -1459,9 +1480,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if agent is not None and agent not in agents:
             raise HTTPException(400, "agent %r is not configured; available: %s" % (str(agent)[:20], ", ".join(agents)))
         state = await asyncio.to_thread(live_state, session_id)
+        allowed = session_agents(state, agents)
+        if agent is not None and agent not in allowed:
+            raise HTTPException(403, CLIENT_PROVIDER_DENIED)
+        if not allowed:
+            raise HTTPException(503, "the host is not available")
         if agent is None:
             from workers.topics import route_agent
-            agent = route_agent(state.get("topic"), agents)
+            agent = route_agent(state.get("topic"), allowed)
         spend(recap_counts, session_id, settings.recap_cap, "recap")
         from workers.talk import canvas_summary, recap_brief
         from workers.topics import with_topic

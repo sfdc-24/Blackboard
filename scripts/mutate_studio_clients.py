@@ -59,7 +59,38 @@ MUTANTS = [
     # -- the tree -----------------------------------------------------------------------------
     ("tree: redaction off", [(PAGE, "    if redacted:\n        text = redact(text)\n", "")]),
     ("tree: emails kept", [(PAGE, "    text = _EMAIL_RE.sub(EMAIL, text)\n", "")]),
+    # -- which providers a client session reaches (Codex Gate 1 blocker_2) -------------------------
+    ("providers: client sessions keep every agent", [(MAIN,
+        "        return [a for a in agents if a in client_providers] if is_client_session(state) else list(agents)",
+        "        return list(agents)")]),
+    ("providers: explicit talk choice not checked", [(MAIN,
+        "        allowed = session_agents(state, agents)\n        if agent is not None and agent not in allowed:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n        if not allowed:\n"
+        "            raise HTTPException(503, \"talk is not available\")",
+        "        allowed = session_agents(state, agents)\n        if not allowed:\n"
+        "            raise HTTPException(503, \"talk is not available\")")]),
+    ("providers: talk routes over every agent", [(MAIN,
+        "            agent = route_agent(state.get(\"topic\"), allowed)\n        used = talk_counts",
+        "            agent = route_agent(state.get(\"topic\"), agents)\n        used = talk_counts")]),
+    ("providers: recap routes over every agent", [(MAIN,
+        "            agent = route_agent(state.get(\"topic\"), allowed)\n        spend(recap_counts",
+        "            agent = route_agent(state.get(\"topic\"), agents)\n        spend(recap_counts")]),
+    ("providers: advisor open to clients", [(MAIN,
+        "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n", "")]),
+    ("tree: email scan not anchored (quadratic)", [(PAGE, '_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^"',
+                                                    '_EMAIL_RE = re.compile("[^"')]),
+    ("providers: any setting accepted", [("cloud/studio-controller/app/settings.py",
+        "            raise RuntimeError(\"STUDIO_CLIENT_PROVIDERS must be distinct names from: \" + \", \".join(KNOWN_PROVIDERS))",
+        "            pass")]),
     ("tree: bare domains kept", [(PAGE, "    return _DOMAIN_RE.sub(LINK, text)", "    return text")]),
+    ("tree: only ASCII hosts", [(PAGE, '_LABEL = r"[^\\W_](?:[\\w-]{0,61}[^\\W_])?"',
+                                 '_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"')]),
+    ("tree: only short TLDs", [(PAGE, "|[^\\W\\d_]{2,63})", "|[a-z]{2,6})")]),
+    ("tree: punycode TLD kept", [(PAGE, '_TLD = r"(?:xn--[a-z0-9-]{1,59}|', '_TLD = r"(?:')]),
+    ("tree: full-width dots kept", [(PAGE, '_DOT = "[.\\u3002\\uff0e\\uff61]"', '_DOT = "[.]"')]),
+    ("tree: host paths kept", [(PAGE, r"(?:[/?#]\S*)?", r"(?:)?")]),
+    ("tree: ASCII-only emails", [(PAGE, '_NOT_ADDR + "]+@[^"', '_NOT_ADDR + "]+@[^\\x80-\\U0010ffff"')]),
     ("tree: IPv4 kept", [(PAGE, "    text = _IPV4_RE.sub(LINK, text)\n", "")]),
     ("tree: IPv6 kept", [(PAGE, "    text = _IPV6_RE.sub(_ipv6_link, text)\n", "")]),
     ("tree: no depth cap", [(PAGE, "MAX_DEPTH = 4 ", "MAX_DEPTH = 99 ")]),
