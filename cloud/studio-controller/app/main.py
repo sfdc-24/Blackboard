@@ -43,6 +43,10 @@ from .workers.synthetic import SyntheticWorker
 CALL_ID_RE = re.compile(r"^rtc_[A-Za-z0-9_-]{1,120}$")
 
 
+class SummaryNotSent(RuntimeError):
+    """The summary email certainly did not leave: safe to try again."""
+
+
 def _worker(settings: Settings):
     if settings.worker == "synthetic":
         return SyntheticWorker()
@@ -272,13 +276,20 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     def send_summary_email(email: str, pdf: bytes) -> None:
         """The working-session PDF to a verified address, through the same signed
         Apps Script sender as the sign-in code (kind "summary"). The signature
-        covers the PDF's SHA-256, so the sender refuses any other attachment."""
+        covers the PDF's SHA-256, so the sender refuses any other attachment.
+
+        Raises SummaryNotSent only when the email certainly did not go: the
+        connection to the sender never opened, or the script answered an
+        explicit {"ok": false} (it refuses before MailApp). Every other failure
+        - a timeout after the request left, a lost redirect, a 5xx, a body that
+        is not the receipt - may follow a delivered email and raises something
+        else, which the caller records as unconfirmed and never resends."""
         if summary_sender is not None:
             summary_sender(email, pdf)
             return
         if (not settings.email_sender_url or not settings.email_sender_secret
                 or getattr(app.state, "email_client", None) is None):
-            raise RuntimeError("email sender is not configured")
+            raise SummaryNotSent("email sender is not configured")
         timestamp = str(int(clock()))
         nonce = secrets.token_hex(16)
         digest = hashlib.sha256(pdf).hexdigest()
@@ -286,22 +297,31 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         signature = hmac.new(
             settings.email_sender_secret.encode("utf-8"), canonical, hashlib.sha256
         ).hexdigest()
-        response = app.state.email_client.post(settings.email_sender_url, json={
-            "kind": "summary",
-            "timestamp": timestamp,
-            "nonce": nonce,
-            "email": email,
-            "pdf": base64.b64encode(pdf).decode("ascii"),
-            "pdf_sha256": digest,
-            "signature": signature,
-        }, timeout=SUMMARY_EMAIL_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        client = app.state.email_client
         try:
-            receipt = response.json()
-        except ValueError as exc:
-            raise RuntimeError("email sender returned invalid JSON") from exc
+            # Redirects are followed by hand below, so a connection failure here
+            # is always the POST itself, before the script could have run.
+            response = client.post(settings.email_sender_url, json={
+                "kind": "summary",
+                "timestamp": timestamp,
+                "nonce": nonce,
+                "email": email,
+                "pdf": base64.b64encode(pdf).decode("ascii"),
+                "pdf_sha256": digest,
+                "signature": signature,
+            }, timeout=SUMMARY_EMAIL_TIMEOUT_SECONDS, follow_redirects=False)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise SummaryNotSent("the email sender could not be reached") from exc
+        # The script has run from here on. Apps Script answers with a redirect
+        # to its receipt; losing that hop says nothing about the email.
+        if response.is_redirect and response.headers.get("location"):
+            response = client.get(response.headers["location"], timeout=SUMMARY_EMAIL_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        receipt = response.json()
+        if isinstance(receipt, dict) and receipt.get("ok") is False:
+            raise SummaryNotSent("the email sender refused delivery")
         if not isinstance(receipt, dict) or receipt.get("ok") is not True:
-            raise RuntimeError("email sender refused delivery")
+            raise RuntimeError("the email sender gave no receipt")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -610,7 +630,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     END_CARD_GRACE_SECONDS = 30 * 60
     SUMMARY_BODY_MAX = 2_100_000
     SUMMARY_STALE_SECONDS = 120
+    SUMMARY_MARK_ATTEMPTS = 3
+    SUMMARY_UNCONFIRMED = "the summary may already have been sent; check your inbox"
     RATING_COMMENT_MAX = 300
+
+    async def capped_body(request: Request, cap: int) -> bytes:
+        """The request body, refused with 413 as soon as it is known to exceed
+        `cap`: from Content-Length before anything is read, else while it
+        streams in."""
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                length = int(declared)
+            except ValueError as exc:
+                raise HTTPException(400, "Content-Length must be an integer") from exc
+            if length > cap:
+                raise HTTPException(413, "request body is too large")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > cap:
+                raise HTTPException(413, "request body is too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def require_recent_session(request: Request, session_id: str) -> dict:
         auth = request.headers.get("authorization") or ""
@@ -1105,9 +1147,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_recent_session(request, session_id)
         if not settings.summary_email_enabled:
             raise HTTPException(503, "the summary email is not enabled in this release")
-        raw = await request.body()
-        if len(raw) > SUMMARY_BODY_MAX:
-            raise HTTPException(413, "summary body is too large")
+        raw = await capped_body(request, SUMMARY_BODY_MAX)
         try:
             body = json.loads(raw or b"{}")
         except (ValueError, UnicodeDecodeError) as exc:
@@ -1134,17 +1174,32 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, str(exc)) from exc
         masked = mask_email(email)
         now = int(clock())
-        replay: dict = {}
+        reservation = secrets.token_hex(8)
+        outcome: dict = {}
 
+        # ONE EMAIL PER SESSION, EVER. A duplicate is worse than a missing
+        # email: anything that may have been delivered is "unconfirmed" and is
+        # never sent again, including a reservation whose request outlived
+        # SUMMARY_STALE_SECONDS. Only a failure that certainly sent nothing
+        # ("failed") may be retried.
         def reserve(current):
             within_grace(current)
             prior = current.get("summary") or {}
-            if prior.get("status") == "sent":
-                replay.update(prior)
+            status = prior.get("status")
+            if status == "sent":
+                outcome["replay"] = prior
                 return None
-            if prior.get("status") == "sending" and now - int(prior.get("at") or 0) < SUMMARY_STALE_SECONDS:
-                raise HTTPException(409, "the summary is already on its way")
-            current["summary"] = {"status": "sending", "at": now}
+            if status == "unconfirmed":
+                outcome["unconfirmed"] = True
+                return None
+            if status == "sending":
+                if now - int(prior.get("at") or 0) < SUMMARY_STALE_SECONDS:
+                    outcome["busy"] = True
+                    return None
+                current["summary"] = {"status": "unconfirmed", "at": now, "why": "stale"}
+                outcome["unconfirmed"] = True
+                return current
+            current["summary"] = {"status": "sending", "at": now, "reservation": reservation}
             return current
 
         try:
@@ -1153,31 +1208,52 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(404, "session not found") from exc
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
-        if replay:
-            return {"sent": True, "to": replay.get("to", "")}
+        if outcome.get("replay"):
+            return {"sent": True, "to": outcome["replay"].get("to", "")}
+        if outcome.get("unconfirmed"):
+            raise HTTPException(409, SUMMARY_UNCONFIRMED)
+        if outcome.get("busy"):
+            raise HTTPException(409, "the summary is already on its way")
+
+        async def settle(change) -> None:
+            """Record the outcome, retrying the compare-and-set; a record that
+            still says "sending" later turns unconfirmed, never resendable."""
+            for _ in range(SUMMARY_MARK_ATTEMPTS):
+                try:
+                    await asyncio.to_thread(update_state, session_id, change)
+                    return
+                except StateConflict:
+                    continue
+                except SessionNotFound:
+                    return
+
         try:
             await asyncio.to_thread(send_summary_email, email, pdf)
-        except Exception as exc:
-            def release(current):
-                if (current.get("summary") or {}).get("status") != "sending":
+        except SummaryNotSent as exc:
+            def failed(current):
+                prior = current.get("summary") or {}
+                if prior.get("status") != "sending" or prior.get("reservation") != reservation:
                     return None
                 current["summary"] = {"status": "failed", "at": int(clock())}
                 return current
 
-            try:
-                await asyncio.to_thread(update_state, session_id, release)
-            except (StateConflict, SessionNotFound):
-                pass
-            raise HTTPException(502, "the summary email could not be sent") from exc
+            await settle(failed)
+            raise HTTPException(502, "the summary email could not be sent; try again") from exc
+        except Exception as exc:
+            def unconfirmed(current):
+                if (current.get("summary") or {}).get("status") == "sent":
+                    return None
+                current["summary"] = {"status": "unconfirmed", "at": int(clock())}
+                return current
 
-        def mark(current):
+            await settle(unconfirmed)
+            raise HTTPException(502, SUMMARY_UNCONFIRMED) from exc
+
+        def sent(current):
             current["summary"] = {"status": "sent", "at": int(clock()), "to": masked}
             return current
 
-        try:
-            await asyncio.to_thread(update_state, session_id, mark)
-        except (StateConflict, SessionNotFound):
-            pass
+        await settle(sent)
         return {"sent": True, "to": masked}
 
     @app.post("/v1/session/{session_id}/analyze")

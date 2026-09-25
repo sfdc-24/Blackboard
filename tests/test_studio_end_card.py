@@ -27,7 +27,7 @@ from tests.test_studio_controller import (  # noqa: E402  (sets sys.path for app
     CountingWorker, EmailSender, IDs, MemoryStore, settings,
 )
 from tests.test_studio_voices import RecapTalk  # noqa: E402
-from app.main import create_app  # noqa: E402
+from app.main import SummaryNotSent, create_app  # noqa: E402
 from app.summary_pdf import PNG_MAX_BYTES, clean, mask_email  # noqa: E402
 
 ORIGIN = {"Origin": "https://www.sfdc24.com"}
@@ -36,6 +36,7 @@ CLIENT = "browser-instance-1234567890"
 START = 1000
 EXPIRES = START + 600
 GRACE = 30 * 60
+UNCONFIRMED = "the summary may already have been sent; check your inbox"
 
 
 def _chunk(kind, data):
@@ -69,14 +70,19 @@ def pdf_text(pdf: bytes) -> str:
 
 
 class SummarySender:
-    def __init__(self, fail=False):
+    """fail=None sends; fail="not sent" raises SummaryNotSent (certainly not
+    delivered); fail="ambiguous" raises anything else (may have been)."""
+
+    def __init__(self, fail=None):
         self.calls = []
         self.fail = fail
 
     def __call__(self, email, pdf):
         self.calls.append((email, pdf))
-        if self.fail:
-            raise RuntimeError("sender down")
+        if self.fail == "not sent":
+            raise SummaryNotSent("sender refused")
+        if self.fail == "ambiguous":
+            raise TimeoutError("read timed out after the request left")
 
 
 class EndCard(unittest.TestCase):
@@ -321,29 +327,116 @@ class Summary(EndCard):
         self.assertEqual({"sent": True, "to": "o***@example.com"}, r.json())
         self.assertEqual([], self.sender.calls)
 
-    def test_one_in_flight_send_blocks_a_second_until_it_is_stale(self):
+    def test_a_reservation_blocks_a_second_send_and_a_stale_one_is_never_resent(self):
         with TestClient(self.make()) as client:
             sid, headers = self.session(client)
-            self.state(sid)["summary"] = {"status": "sending", "at": START}
+            self.state(sid)["summary"] = {"status": "sending", "at": START, "reservation": "other"}
             self.now[0] = START + 119
             busy = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual("sending", self.state(sid)["summary"]["status"])
             self.now[0] = START + 120
             stale = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
-        self.assertEqual(409, busy.status_code)
-        self.assertEqual(200, stale.status_code, stale.text)
-        self.assertEqual(1, len(self.sender.calls))
+            self.assertEqual("unconfirmed", self.state(sid)["summary"]["status"])
+            again = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual((409, "the summary is already on its way"), (busy.status_code, busy.json()["detail"]))
+        self.assertEqual((409, UNCONFIRMED), (stale.status_code, stale.json()["detail"]))
+        self.assertEqual((409, UNCONFIRMED), (again.status_code, again.json()["detail"]))
+        self.assertEqual([], self.sender.calls)
 
-    def test_a_failed_send_is_reported_and_can_be_retried(self):
-        sender = SummarySender(fail=True)
+    def test_a_send_that_certainly_failed_can_be_retried(self):
+        sender = SummarySender(fail="not sent")
         with TestClient(self.make(sender=sender)) as client:
             sid, headers = self.session(client)
             failed = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
             self.assertEqual("failed", self.state(sid)["summary"]["status"])
-            sender.fail = False
+            sender.fail = None
             retried = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
-        self.assertEqual(502, failed.status_code)
+        self.assertEqual((502, "the summary email could not be sent; try again"),
+                         (failed.status_code, failed.json()["detail"]))
         self.assertEqual(200, retried.status_code)
         self.assertEqual(2, len(sender.calls))
+
+    def test_a_send_that_may_have_gone_is_never_sent_again(self):
+        sender = SummarySender(fail="ambiguous")
+        with TestClient(self.make(sender=sender)) as client:
+            sid, headers = self.session(client)
+            first = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual("unconfirmed", self.state(sid)["summary"]["status"])
+            sender.fail = None
+            second = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.now[0] = EXPIRES + GRACE - 1                      # long after, still inside the window
+            later = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual((502, UNCONFIRMED), (first.status_code, first.json()["detail"]))
+        self.assertEqual((409, UNCONFIRMED), (second.status_code, second.json()["detail"]))
+        self.assertEqual((409, UNCONFIRMED), (later.status_code, later.json()["detail"]))
+        self.assertEqual(1, len(sender.calls))
+
+    def test_a_certain_failure_never_overwrites_someone_elses_record(self):
+        # While this send was in flight its reservation went stale and another
+        # request marked it unconfirmed. A late "not sent" must not reopen it.
+        def sender(email, pdf):
+            self.state(self.sid)["summary"] = {"status": "unconfirmed", "at": START, "why": "stale"}
+            raise SummaryNotSent("refused")
+
+        with TestClient(self.make(sender=sender)) as client:
+            self.sid, headers = self.session(client)
+            client.post("/v1/session/%s/summary" % self.sid, headers=headers, json={})
+        self.assertEqual("unconfirmed", self.state(self.sid)["summary"]["status"])
+
+    def test_the_sent_mark_is_retried_past_a_run_of_conflicts(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            self.refuse_sent_marks(sid, 10)                    # more than one update_state's 8 CAS attempts
+            r = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual(200, r.status_code, r.text)
+        self.assertEqual("sent", self.state(sid)["summary"]["status"])
+
+    def test_a_sent_mark_that_never_lands_still_never_sends_twice(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            self.refuse_sent_marks(sid, 10_000)
+            first = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual("sending", self.state(sid)["summary"]["status"])
+            soon = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.now[0] = START + 120
+            later = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual({"sent": True, "to": "o***@example.com"}, first.json())    # it did go
+        self.assertEqual(409, soon.status_code)
+        self.assertEqual((409, UNCONFIRMED), (later.status_code, later.json()["detail"]))
+        self.assertEqual(1, len(self.sender.calls))
+
+    def refuse_sent_marks(self, sid, times):
+        from scripts.state_store import Conflict
+        name = "studio_session_" + sid
+        real_save = self.store.save
+        left = {"n": times}
+
+        def save(key, state, token):
+            if key == name and (state.get("summary") or {}).get("status") == "sent" and left["n"]:
+                left["n"] -= 1
+                raise Conflict("refused for the test")
+            return real_save(key, state, token)
+
+        self.store.save = save
+
+    def test_an_oversized_body_is_refused_before_it_is_read(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            declared = client.post("/v1/session/%s/summary" % sid, content=b"{}",
+                                   headers={**headers, "Content-Type": "application/json",
+                                            "Content-Length": "2100001"})
+
+            def chunks():
+                for _ in range(22):
+                    yield b" " * 100_000
+
+            streamed = client.post("/v1/session/%s/summary" % sid, content=chunks(),
+                                   headers={**headers, "Content-Type": "application/json"})
+            fits = client.post("/v1/session/%s/summary" % sid, content=b"{}",
+                               headers={**headers, "Content-Type": "application/json"})
+        self.assertEqual(413, declared.status_code)             # 2 bytes arrived; the header decided
+        self.assertEqual(413, streamed.status_code)             # no Content-Length: counted as it streamed
+        self.assertEqual(200, fits.status_code, fits.text)
 
     def test_switched_off_it_is_503_and_nothing_is_sent(self):
         with TestClient(self.make(summary_email_enabled=False)) as client:
@@ -390,6 +483,124 @@ class Summary(EndCard):
         text = pdf_text(self.sender.calls[0][1])
         self.assertIn("/JavaScript \\(app.alert\\(1\\)\\)", text)     # escaped: still just text
         self.assertNotIn("/JavaScript (app", text)
+
+
+class Delivery(unittest.TestCase):
+    """The real HTTP path to the Apps Script sender, and how each way it can
+    fail is classified: "failed" only when the email certainly did not leave."""
+
+    URL = "https://script.google.com/macros/s/test/exec"
+    ECHO = "https://script.googleusercontent.com/macros/echo?receipt=1"
+
+    def run_summary(self, behave, retry_with=None):
+        """Sign in and ask for the summary through an httpx client whose summary
+        POSTs follow `behave(request)`; optionally ask again with `retry_with`."""
+        self.posts = []
+        current = {"behave": behave}
+
+        def route(request):
+            if request.method == "POST":
+                body = json.loads(request.content)
+                if body.get("kind") != "summary":
+                    self.code = body["code"]
+                    return httpx.Response(200, json={"ok": True})
+                self.posts.append(body)
+            return current["behave"](request)
+
+        email_client = httpx.Client(transport=httpx.MockTransport(route), follow_redirects=True, max_redirects=3)
+        self.store = MemoryStore()
+        app = create_app(settings=settings(summary_email_enabled=True, email_sender_url=self.URL,
+                                           email_sender_secret="summary-sender-secret-at-least-32-bytes"),
+                         store=self.store, worker=CountingWorker(), clock=lambda: START, id_factory=IDs(),
+                         email_client=email_client, talk_client=RecapTalk())
+        try:
+            with TestClient(app) as client:
+                started = client.post("/v1/auth/start", headers=ORIGIN, json={"email": OPERATOR, "client_key": CLIENT})
+                operator = client.post("/v1/auth/verify", headers=ORIGIN, json={
+                    "challenge_id": started.json()["challenge_id"], "email": OPERATOR,
+                    "code": self.code, "client_key": CLIENT}).json()["token"]
+                created = client.post("/v1/session", headers={**ORIGIN, "Authorization": "Bearer " + operator},
+                                      json={"creation_id": "delivery-1", "start": "blank"}).json()
+                self.sid = created["session_id"]
+                headers = {**ORIGIN, "Authorization": "Bearer " + created["token"]}
+                first = client.post("/v1/session/%s/summary" % self.sid, headers=headers, json={})
+                second = None
+                if retry_with is not None:
+                    current["behave"] = retry_with
+                    second = client.post("/v1/session/%s/summary" % self.sid, headers=headers, json={})
+        finally:
+            email_client.close()
+        return first, second
+
+    def status(self):
+        return self.store.data["studio_session_" + self.sid]["summary"]["status"]
+
+    @staticmethod
+    def ok(request):
+        return httpx.Response(200, json={"ok": True})
+
+    @classmethod
+    def redirect_then(cls, final):
+        def behave(request):
+            if request.method == "POST":
+                return httpx.Response(302, headers={"Location": cls.ECHO})
+            return final(request)
+        return behave
+
+    def assert_not_sent_then_retried(self, behave):
+        first, second = self.run_summary(behave, retry_with=self.ok)
+        self.assertEqual((502, "the summary email could not be sent; try again"),
+                         (first.status_code, first.json()["detail"]))
+        self.assertEqual(200, second.status_code, second.text)
+        self.assertEqual(("sent", 2), (self.status(), len(self.posts)))
+
+    def assert_unconfirmed_and_never_resent(self, behave):
+        first, second = self.run_summary(behave, retry_with=self.ok)
+        self.assertEqual((502, UNCONFIRMED), (first.status_code, first.json()["detail"]))
+        self.assertEqual((409, UNCONFIRMED), (second.status_code, second.json()["detail"]))
+        self.assertEqual(("unconfirmed", 1), (self.status(), len(self.posts)))
+
+    # -- certainly not sent: retryable
+    def test_no_connection_to_the_sender_is_retryable(self):
+        def refuse(request):
+            raise httpx.ConnectError("connection refused", request=request)
+        self.assert_not_sent_then_retried(refuse)
+
+    def test_a_connect_timeout_is_retryable(self):
+        def slow(request):
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        self.assert_not_sent_then_retried(slow)
+
+    def test_an_explicit_refusal_from_the_script_is_retryable(self):
+        self.assert_not_sent_then_retried(lambda request: httpx.Response(200, json={"ok": False}))
+
+    def test_an_explicit_refusal_behind_the_redirect_is_retryable(self):
+        self.assert_not_sent_then_retried(self.redirect_then(lambda request: httpx.Response(200, json={"ok": False})))
+
+    # -- may have been sent: never again
+    def test_a_read_timeout_after_the_request_left_is_unconfirmed(self):
+        def late(request):
+            raise httpx.ReadTimeout("read timed out", request=request)
+        self.assert_unconfirmed_and_never_resent(late)
+
+    def test_a_lost_redirect_is_unconfirmed(self):
+        def lost(request):
+            raise httpx.ConnectError("receipt host unreachable", request=request)
+        self.assert_unconfirmed_and_never_resent(self.redirect_then(lost))
+
+    def test_a_server_error_is_unconfirmed_even_with_a_refusal_body(self):
+        self.assert_unconfirmed_and_never_resent(lambda request: httpx.Response(500, json={"ok": False}))
+
+    def test_a_body_that_is_not_json_is_unconfirmed(self):
+        self.assert_unconfirmed_and_never_resent(lambda request: httpx.Response(200, text="<html>sign in</html>"))
+
+    def test_a_receipt_without_a_clear_answer_is_unconfirmed(self):
+        self.assert_unconfirmed_and_never_resent(lambda request: httpx.Response(200, json={"ok": "yes"}))
+
+    def test_the_receipt_behind_the_redirect_confirms_the_send(self):
+        first, _ = self.run_summary(self.redirect_then(self.ok))
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual(("sent", 1), (self.status(), len(self.posts)))
 
 
 class SignedDelivery(unittest.TestCase):
