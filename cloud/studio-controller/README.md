@@ -320,6 +320,38 @@ Until the use-policy module lands (PR #255), the Muse carries the policy in
 one sentence of its own prompt; after it lands, it takes `USE_POLICY` and the
 moderation gate like the other lanes.
 
+## Client workspaces (STUDIO_CLIENT_WORKSPACES, off by default)
+
+A named client signs in on the homepage and sees their own projects.
+
+- **Registry.** One state-store object, `studio_clients`: `{"version": 1, "clients": [{"name", "emails",
+  "projects": [{"id", "name", "url"}]}]}`. An operator script writes it; the controller only reads it,
+  with a 30-second cache. Addresses are exact lowercase. A malformed client entry is skipped as a
+  whole, and an address listed for two clients admits neither. Project URLs must be https on a
+  named host: no IP, no port, no credentials.
+- **Sign-in.** A registry address gets the email code like an operator. Verify returns
+  `{"token", "expires_at", "scope": "client"}`, with the operator token lifetime. A client token
+  opens nothing operator-only: `/v1/leads` refuses it, and client sessions carry `client_subject`
+  with an empty `operator_subject`, so metadata proposals refuse it too. Clients share the daily
+  session and voice ledgers below the operator's reserve, like visitors. The Apps Script sender
+  must list the same addresses in its `STUDIO_CLIENT_EMAILS` Script Property.
+- **`GET /v1/workspace`** (client token and Origin) returns `{"name", "projects": [{"id", "name",
+  "url"}]}` and never an address. Other scopes get 403, and 503 while the switch is off.
+- **`POST /v1/session` with `start: "project", "project": "<id>"`** is for a client whose entry lists
+  that id; anyone else gets 403.
+  - The controller fetches that project's exact registered URL with `app/project_page.py`: https
+    only, at most 3 redirects and only within the same site, 8 s, 1.5 MB, HTML only.
+  - It turns the page into a text-only tree: screen, section, nav, heading, text, button,
+    image-placeholder, list, form and field; at most 60 nodes and 200-character labels. Scripts,
+    styles, frames and SVG are dropped, and no URL is kept.
+  - Only then is the session admitted and created, with the page as its snapshot at version 1,
+    `state["project"]` set and the analyst flag on as for a blank start.
+  - A page that does not load answers 502 "the project page could not be loaded", with no
+    session and no admission. A replayed creation id returns the same session without fetching
+    again.
+- **Summary email.** The end-card PDF reaches a client through the sign-in contact, or else through
+  the registry.
+
 ## Metadata proposal contract (offline-only increment)
 
 `STUDIO_ENABLE_METADATA_PROPOSALS` defaults to `false`. Enabling it requires an

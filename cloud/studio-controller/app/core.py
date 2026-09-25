@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 
-from .state import StateConflict, StudioRepository
+from .state import SessionNotFound, StateConflict, StudioRepository
 from .artifacts import apply_ops
 from . import metadata_contract as metadata
 
@@ -132,7 +132,7 @@ def reduce_event(state: dict, event: dict) -> bool:
     return True
 
 
-START_MODES = ("template", "blank")
+START_MODES = ("template", "blank", "project")
 
 
 class StudioController:
@@ -183,21 +183,40 @@ class StudioController:
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
                        visitor: bool = False, admit_limit: int | None = None,
-                       analyst: bool = False, topic: str = "") -> tuple[dict, int]:
+                       analyst: bool = False, topic: str = "", client: bool = False,
+                       artifact: dict | None = None, project: str = "") -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
-            raise CommandError("start must be template or blank")
+            raise CommandError("start must be template, blank or project")
+        if visitor and client:
+            raise CommandError("a session has one kind of owner")
+        if start == "project" and not (client and project and creation_id):
+            raise CommandError("a project session belongs to a client and a creation id", 403)
         now = int(self.clock())
         if creation_id:
             stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
             session_id = "s-" + stable
         else:
             session_id = self.id_factory("s")
+        if start == "project" and artifact is None:
+            # Only the replay of a project session that already exists may omit
+            # its page: nothing is admitted or created for a page never loaded.
+            try:
+                existing = self.repository.load(session_id).state
+            except SessionNotFound as exc:
+                raise CommandError("the project page could not be loaded", 502) from exc
+            self._same_owner(existing, subject, visitor, client)
+            return copy.deepcopy(existing), self.repository.admit(admit_limit or self.daily_cap, session_id)
         # A visitor is admitted against the same daily ledger, but only up to a
         # lower limit, so the operator keeps headroom.
         admitted = self.repository.admit(admit_limit or self.daily_cap, session_id)
-        if start == "blank":
+        if start == "project":
+            # A client's existing page, as fetched and converted by the caller
+            # (app/project_page.py): the builder edits it from the first turn.
+            artifact = copy.deepcopy(artifact)
+            questions = []
+        elif start == "blank":
             # BUILT FROM WHAT THE VISITOR ASKS FOR. The template start always
             # opened on our own homepage with a question about its button, so a
             # live session could only ever edit that page. A blank start is one
@@ -237,12 +256,15 @@ class StudioController:
             "stopped": False,
             # A public visitor is never an operator: operator-only paths
             # (metadata proposals) check operator_subject, which stays empty.
-            "operator_subject": "" if visitor else subject,
+            "operator_subject": "" if (visitor or client) else subject,
             "visitor_subject": subject if visitor else "",
+            # A client (app/clients.py) is not an operator either.
+            "client_subject": subject if client else "",
+            "project": project if start == "project" else "",
             "voice_item_ids": [],
             "voice_epoch": 0,
         }
-        if analyst and start == "blank":
+        if analyst and start in ("blank", "project"):
             # A homepage (blank) session with the analyst lane: the analyst owns
             # the questions from the first turn, so the builder never opens one
             # of its own. A builder question left open made every later spoken
@@ -276,10 +298,27 @@ class StudioController:
             if not creation_id:
                 raise
             existing = self.repository.load(session_id).state
-            owner = existing.get("operator_subject") or existing.get("visitor_subject") or ""
-            if owner != subject or bool(existing.get("visitor_subject")) != bool(visitor):
-                raise StateConflict("creation_id belongs to another operator")
+            self._same_owner(existing, subject, visitor, client)
             return copy.deepcopy(existing), admitted
+
+    def created_session_exists(self, subject: str, creation_id: str) -> bool:
+        """Whether this owner's creation id already made a session (a replay)."""
+        if not creation_id or not ID_RE.fullmatch(creation_id):
+            return False
+        stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
+        try:
+            self.repository.load("s-" + stable)
+            return True
+        except SessionNotFound:
+            return False
+
+    @staticmethod
+    def _same_owner(existing: dict, subject: str, visitor: bool, client: bool) -> None:
+        owner = (existing.get("operator_subject") or existing.get("visitor_subject")
+                 or existing.get("client_subject") or "")
+        if (owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
+                or bool(existing.get("client_subject")) != bool(client)):
+            raise StateConflict("creation_id belongs to another operator")
 
     def _assert_live(self, state: dict) -> None:
         if int(state.get("expires_at") or 0) <= int(self.clock()):

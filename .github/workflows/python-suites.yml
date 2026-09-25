@@ -92,6 +92,7 @@ on:
       - "tests/test_studio_advisor.py"
       - "tests/test_studio_advisor_route.py"
       - "tests/test_studio_charter.py"
+      - "tests/test_studio_clients.py"
       - "tests/test_acceptance_current_state.py"
       - "tests/mutate_bus_filters.py"
       - "scripts/bus.py"
@@ -201,6 +202,7 @@ on:
       - "tests/test_studio_advisor.py"
       - "tests/test_studio_advisor_route.py"
       - "tests/test_studio_charter.py"
+      - "tests/test_studio_clients.py"
       - "tests/test_acceptance_current_state.py"
       - "tests/mutate_bus_filters.py"
       - "scripts/bus.py"
@@ -763,7 +765,8 @@ jobs:
               tests.test_studio_routing \
               tests.test_studio_advisor \
               tests.test_studio_advisor_route \
-              tests.test_studio_charter
+              tests.test_studio_charter \
+              tests.test_studio_clients
           else
             echo "not on this branch; skipping"
           fi

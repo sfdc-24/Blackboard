@@ -259,3 +259,24 @@ test('summary shape checks: extra fields, bad base64, oversized sign-in bodies',
   assert.equal(app.sent.length, 0);
   assert.deepEqual(app.postRaw(JSON.stringify(signedRequest({ nonce: 'a'.repeat(32) }))), { ok: true });
 });
+
+test('client workspace addresses get the sign-in code and their summary; nobody else does', () => {
+  const clients = [['STUDIO_CLIENT_EMAILS', 'client@example.com, second.client@example.com']];
+  const app = harness({ extraProperties: clients });
+  assert.deepEqual(app.post(signedRequest({ email: 'client@example.com' })), { ok: true });
+  assert.deepEqual(app.post(signedSummary({ email: 'second.client@example.com',
+    nonce: 'fedcba9876543210fedcba9876543210' })), { ok: true });
+  assert.deepEqual(app.post(signedRequest({ email: 'outsider@example.com',
+    nonce: '11111111111111111111111111111111' })), { ok: false });
+  assert.equal(app.sent.length, 2);
+  // Without the property, the same client address is refused.
+  const closed = harness();
+  assert.deepEqual(closed.post(signedRequest({ email: 'client@example.com' })), { ok: false });
+  assert.equal(closed.sent.length, 0);
+});
+
+test('one malformed client address refuses every request, like the operator list', () => {
+  const app = harness({ extraProperties: [['STUDIO_CLIENT_EMAILS', 'client@example.com,Not An Email']] });
+  assert.deepEqual(app.post(signedRequest()), { ok: false });
+  assert.equal(app.sent.length, 0);
+});

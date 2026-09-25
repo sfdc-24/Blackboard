@@ -27,7 +27,9 @@ except ImportError:
 from . import governance
 from .core import CommandError, StudioController
 from .auth import AuthService
+from .clients import ClientRegistry, public_view
 from .leads import LeadBook, LeadCapExceeded
+from .project_page import PageFetchError, fetch_page, page_to_tree
 from .settings import Settings
 from .state import (
     SessionNotFound,
@@ -89,7 +91,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None, charter=None) -> FastAPI:
+               advisor=None, charter=None, project_fetcher=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
@@ -368,9 +370,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                   lifespan=lifespan, redirect_slashes=False)
     app.state.settings = settings
     app.state.controller = controller
+    # Client workspaces (app/clients.py): registered clients sign in with a code
+    # and see their own projects. The registry is read, never written, here.
+    clients = ClientRegistry(store)
+    app.state.clients = clients
+    fetch_project = project_fetcher or fetch_page
     auth_service = AuthService(
         store, settings.operator_emails, settings.session_secret, send_auth_email, clock=clock,
         public_visitors=settings.public_visitors, visitor_daily_cap=settings.visitor_codes_daily_cap,
+        client_emails=clients.emails if settings.client_workspaces else None,
     )
     app.state.auth_service = auth_service
     lead_book = LeadBook(store, clock=clock)
@@ -436,18 +444,34 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return ""
 
     def require_signed_in(request: Request) -> tuple[dict, str]:
-        """An operator, or - only while public visitors are on - a verified visitor."""
+        """An operator; while public visitors are on, a verified visitor; while
+        client workspaces are on, a registered client."""
+        auth = request.headers.get("authorization") or ""
+        token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        scopes = ["operator"] + (["visitor"] if settings.public_visitors else []) \
+            + (["client"] if settings.client_workspaces else [])
+        error = None
+        for scope in scopes:
+            try:
+                return verify_token(token, settings.session_secret, now=clock(), scope=scope), scope
+            except InvalidToken as exc:
+                error = exc
+        raise HTTPException(401, str(error)) from error
+
+    def require_client(request: Request) -> tuple[dict, dict]:
+        """A client token, and that client's current registry entry."""
+        if not settings.client_workspaces:
+            raise HTTPException(503, "client workspaces are not enabled in this release")
         auth = request.headers.get("authorization") or ""
         token = auth[7:] if auth.lower().startswith("bearer ") else ""
         try:
-            return verify_token(token, settings.session_secret, now=clock(), scope="operator"), "operator"
-        except InvalidToken as operator_error:
-            if not settings.public_visitors:
-                raise HTTPException(401, str(operator_error)) from operator_error
-        try:
-            return verify_token(token, settings.session_secret, now=clock(), scope="visitor"), "visitor"
+            claims = verify_token(token, settings.session_secret, now=clock(), scope="client")
         except InvalidToken as exc:
-            raise HTTPException(401, str(exc)) from exc
+            raise HTTPException(403 if token else 401, "a client sign-in is required") from exc
+        client = clients.for_subject(claims["sid"], auth_service._subject_hash)
+        if client is None:
+            raise HTTPException(403, "this workspace is no longer open")
+        return claims, client
 
     def require_operator(request: Request) -> dict:
         auth = request.headers.get("authorization") or ""
@@ -471,6 +495,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
                          "analyst": analyst_ready(), "muse": muse_ready(), "topics": True,
                          "public_visitors": settings.public_visitors,
+                         "workspaces": settings.client_workspaces,
                          "governance": True,
                          "voices": voices_available(),
                          "rating": True, "summary_email": settings.summary_email_enabled,
@@ -902,6 +927,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         for candidate in settings.operator_emails:
             if hmac.compare_digest(auth_service._subject_hash(candidate), subject):
                 return candidate
+        if settings.client_workspaces:
+            for candidate in sorted(clients.emails()):
+                if hmac.compare_digest(auth_service._subject_hash(candidate), subject):
+                    return candidate
         return ""
 
     @app.post("/v1/auth/start")
@@ -929,9 +958,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not verified.get("verified"):
             raise HTTPException(401, "verification code was not accepted")
         visitor = verified.get("role") == "visitor"
+        client = verified.get("role") == "client"
         # Switched off after the code was sent: the code proves the mailbox,
         # but public visitors are no longer admitted.
         if visitor and not settings.public_visitors:
+            raise HTTPException(401, "verification code was not accepted")
+        # The same for a client switched off, or taken out of the registry.
+        if client and (not settings.client_workspaces or await asyncio.to_thread(
+                clients.for_subject, verified["subject_hash"], auth_service._subject_hash) is None):
             raise HTTPException(401, "verification code was not accepted")
         if settings.summary_email_enabled:
             try:
@@ -943,18 +977,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="visitor")
             await asyncio.to_thread(lead_book.record_verified, verified["subject_hash"], body.get("email"))
             return {"token": token, "expires_at": expires_at, "scope": "visitor"}
+        if client:
+            expires_at = int(clock()) + settings.operator_token_seconds
+            token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="client")
+            return {"token": token, "expires_at": expires_at, "scope": "client"}
         expires_at = int(clock()) + settings.operator_token_seconds
         token = mint_token(
             verified["subject_hash"], expires_at, settings.session_secret, scope="operator"
         )
         return {"token": token, "expires_at": expires_at, "scope": "operator"}
 
+    @app.get("/v1/workspace")
+    async def workspace(request: Request):
+        """The signed-in client's name and projects. Never an address."""
+        require_origin(request)
+        _, client = await asyncio.to_thread(require_client, request)
+        return public_view(client)
+
     @app.post("/v1/session")
     async def create_session(request: Request):
         require_origin(request)
         operator, role = require_signed_in(request)
         body = await json_object(request, "session")
-        if set(body) - {"title", "creation_id", "start", "topic"}:
+        if set(body) - {"title", "creation_id", "start", "topic", "project"}:
             raise HTTPException(400, "session body has unknown fields")
         from workers.topics import TOPICS
         topic = body.get("topic")
@@ -964,8 +1009,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not isinstance(topic, str) or (topic and topic not in TOPICS):
             raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(TOPICS)))
         start = body.get("start") or "template"
-        if start not in ("template", "blank"):
-            raise HTTPException(400, "start must be template or blank")
+        if start not in ("template", "blank", "project"):
+            raise HTTPException(400, "start must be template, blank or project")
         creation_id = body.get("creation_id")
         if not isinstance(creation_id, str) or not creation_id:
             raise HTTPException(400, "session requires creation_id")
@@ -973,15 +1018,39 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not isinstance(title, str):
             raise HTTPException(400, "title must be a string")
         visitor = role == "visitor"
+        client = role == "client"
+        project_id, artifact = "", None
+        if "project" in body and start != "project":
+            raise HTTPException(400, "project is only for start project")
+        if start == "project":
+            # A client's own registered page, fetched here from its exact URL -
+            # before any admission, so a page that does not load costs nothing.
+            if not client:
+                raise HTTPException(403, "a project session is for a signed-in client")
+            owner = await asyncio.to_thread(clients.for_subject, operator["sid"], auth_service._subject_hash)
+            project = clients.project(owner, body.get("project"))
+            if project is None:
+                raise HTTPException(403, "that project is not in this workspace")
+            project_id, title = project["id"], project["name"]
+            replay = await asyncio.to_thread(controller.created_session_exists, operator["sid"], creation_id)
+            if not replay:
+                try:
+                    html = await asyncio.to_thread(fetch_project, project["url"])
+                    artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
+                except PageFetchError as exc:
+                    raise HTTPException(502, "the project page could not be loaded") from exc
+                except Exception as exc:
+                    raise HTTPException(502, "the project page could not be loaded") from exc
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
         try:
             state, admitted = await asyncio.to_thread(
                 controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
-                settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
-                start == "blank" and analyst_ready(),
-                topic,
+                (settings.daily_session_cap - settings.operator_reserved_sessions
+                 if (visitor or client) else None),
+                start in ("blank", "project") and analyst_ready(),
+                topic, client, artifact, project_id,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
@@ -1361,7 +1430,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         done = state.get("summary") or {}
         if done.get("status") == "sent":
             return {"sent": True, "to": done.get("to", "")}
-        subject = state.get("operator_subject") or state.get("visitor_subject") or ""
+        subject = (state.get("operator_subject") or state.get("visitor_subject")
+                   or state.get("client_subject") or "")
         email = await asyncio.to_thread(email_for_subject, subject)
         if not email:
             raise HTTPException(409, "no verified email is on record for this session")
@@ -1611,9 +1681,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if state["expires_at"] <= now or state.get("stopped"):
             await release_unopened_voice(session_id, voice_id)
             raise HTTPException(410, "session is no longer active")
-        # A visitor session stops below the daily voice cap; the operator keeps headroom.
+        # A visitor or client session stops below the daily voice cap; the
+        # operator keeps headroom.
         voice_limit = (settings.voice_mint_cap - settings.operator_reserved_voice
-                       if state.get("visitor_subject") else settings.voice_mint_cap)
+                       if state.get("visitor_subject") or state.get("client_subject")
+                       else settings.voice_mint_cap)
         try:
             reservation = await asyncio.to_thread(
                 repository.reserve_voice_open, voice_limit, voice_id
@@ -1655,7 +1727,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except Exception as exc:
             await release_unopened_voice(session_id, voice_id)
             raise HTTPException(503, "voice admission is unavailable") from exc
-        subject = latest.get("operator_subject") or latest.get("visitor_subject") or session_id
+        subject = (latest.get("operator_subject") or latest.get("visitor_subject")
+                   or latest.get("client_subject") or session_id)
         safety_id = hashlib.sha256(("studio:" + subject).encode()).hexdigest()[:32]
         try:
             response = await request.app.state.voice_client.post(

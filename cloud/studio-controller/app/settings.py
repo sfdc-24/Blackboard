@@ -77,6 +77,9 @@ class Settings:
     charter_enabled: bool = False
     # The build plan's prices (app/pricing.py): the owner's numbers or nothing.
     price_table: str = ""
+    # Client workspaces (app/clients.py): a registered client signs in and
+    # sees their own projects. Off unless STUDIO_CLIENT_WORKSPACES=true.
+    client_workspaces: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -132,6 +135,7 @@ class Settings:
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
             charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
+            client_workspaces=_enabled(os.environ.get("STUDIO_CLIENT_WORKSPACES", "false")),
         )
 
     @property
@@ -183,6 +187,14 @@ class Settings:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave visitors at least one daily session")
         if self.public_visitors and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave visitors at least one daily voice call")
+        if self.client_workspaces and not 1 <= self.operator_reserved_sessions < self.daily_session_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave clients at least one daily session")
+        if self.client_workspaces and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave clients at least one daily voice call")
+        if self.client_workspaces and self.lead_facts_enabled:
+            # Lead facts read the Salesforce org for any session; a client must
+            # never reach that path either.
+            raise RuntimeError("STUDIO_CLIENT_WORKSPACES cannot be on while STUDIO_ENABLE_LEAD_FACTS is on")
         if self.public_visitors and self.lead_facts_enabled:
             # Lead facts read the Salesforce org for any session; a public
             # visitor must never reach that path.
