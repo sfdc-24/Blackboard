@@ -807,10 +807,19 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                            if isinstance(d, dict) and d.get("id") == direction), None)
             if stored is None:
                 raise HTTPException(400, "there is no direction %r to speak" % direction)
-            headline = str(stored["read"]["headline"]).strip()
+            from workers.muse import plain_text
+            try:
+                headline = stored["read"]["headline"].strip()
+                line, tone = stored["read"]["line"].strip(), stored["hear"]["tone"].strip()
+            except (KeyError, TypeError, AttributeError) as exc:
+                raise HTTPException(400, "there is no direction %r to speak" % direction) from exc
+            # Checked again here, not only when the set was stored: nothing that
+            # is not one line of plain text reaches the voice provider.
+            if not all(plain_text(v) and v for v in (headline, line, tone)):
+                raise HTTPException(400, "there is no direction %r to speak" % direction)
             joiner = " " if headline.endswith((".", "!", "?")) else ". "
-            text = headline + joiner + str(stored["read"]["line"]).strip()
-            instructions = MUSE_STYLE + " Deliver this line in this tone: " + str(stored["hear"]["tone"]).strip()
+            text = headline + joiner + line
+            instructions = MUSE_STYLE + " Deliver this line in this tone: " + tone
         else:
             text = body.get("text")
             if not isinstance(text, str) or not text.strip() or len(text) > SPEAK_MAX:
@@ -857,9 +866,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         turn = body.get("turn", 0)
         if type(turn) is not int or not 0 <= turn <= 1_000_000:
             raise HTTPException(400, "turn must be a non-negative integer")
-        text = body.get("text")
-        if text is not None and (not isinstance(text, str) or len(text) > TEXT_MAX):
-            raise HTTPException(400, "inspire text must be at most %d characters" % TEXT_MAX)
+        text = body.get("text", "")
+        if not isinstance(text, str) or len(text) > TEXT_MAX:
+            raise HTTPException(400, "inspire text must be a string of at most %d characters" % TEXT_MAX)
         state = await asyncio.to_thread(live_state, session_id)
         spend(muse_counts, session_id, settings.muse_cap, "inspiration")
         try:

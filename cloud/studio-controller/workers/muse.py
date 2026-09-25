@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 
 MODEL = (os.environ.get("STUDIO_MUSE_MODEL") or os.environ.get("STUDIO_WORKER_MODEL")
          or "claude-sonnet-5")
@@ -115,9 +116,24 @@ class MuseUnavailable(RuntimeError):
     """The Muse gave no valid set, even after one repair attempt."""
 
 
+# Every control, format, separator, private-use and surrogate code point: C0
+# and C1 controls (U+0085 NEXT LINE is a line break), zero-width and bidi
+# formatting, and U+2028/U+2029. One line of plain text only (Cursor NO-GO on
+# 666a51f: a C1 control or a line separator passed the ASCII-only pattern and
+# split the TTS instructions).
+UNSAFE_CATEGORIES = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
+
+
+def plain_text(value) -> bool:
+    """True for one line of plain text: no markup brackets, no invisible or
+    line-breaking code points."""
+    return (isinstance(value, str) and not BAD_CHARS_RE.search(value)
+            and not any(unicodedata.category(ch) in UNSAFE_CATEGORIES for ch in value))
+
+
 def _plain(value, cap: int) -> bool:
     return (isinstance(value, str) and value.strip() != "" and len(value.strip()) <= cap
-            and not BAD_CHARS_RE.search(value))
+            and plain_text(value))
 
 
 def validate(raw) -> tuple[dict | None, list]:
