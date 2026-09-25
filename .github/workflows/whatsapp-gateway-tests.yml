@@ -7,6 +7,13 @@ on:
       - 'tests/test_whatsapp_gateway.cjs'
       - 'tests/helpers/pipedream_loader.cjs'
       - '.github/workflows/whatsapp-gateway-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/pipedream_wa_*.js'
+      - 'tests/test_whatsapp_gateway.cjs'
+      - 'tests/helpers/pipedream_loader.cjs'
+      - '.github/workflows/whatsapp-gateway-tests.yml'
 
 permissions:
   contents: read
