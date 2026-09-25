@@ -38,6 +38,13 @@ class Settings:
     worker: str = "synthetic"
     operator_emails: tuple[str, ...] = ()
     operator_token_seconds: int = 8 * 60 * 60
+    # Public visitors (off unless STUDIO_PUBLIC_VISITORS=true): any email can
+    # get a sign-in code, capped per UTC day across all visitors; a verified
+    # visitor gets a short visitor token and a few sessions a day.
+    public_visitors: bool = False
+    visitor_codes_daily_cap: int = 100
+    visitor_sessions_per_day: int = 2
+    visitor_token_seconds: int = 2 * 60 * 60
     email_sender_url: str = ""
     email_sender_secret: str = ""
     voice_enabled: bool = False
@@ -79,6 +86,10 @@ class Settings:
             worker=os.environ.get("STUDIO_WORKER", "synthetic").strip().lower(),
             operator_emails=_emails(os.environ.get("STUDIO_OPERATOR_EMAILS", "")),
             operator_token_seconds=int(os.environ.get("STUDIO_OPERATOR_TOKEN_SECONDS", "28800")),
+            public_visitors=_enabled(os.environ.get("STUDIO_PUBLIC_VISITORS", "false")),
+            visitor_codes_daily_cap=int(os.environ.get("STUDIO_VISITOR_CODES_DAILY_CAP", "100")),
+            visitor_sessions_per_day=int(os.environ.get("STUDIO_VISITOR_SESSIONS_PER_DAY", "2")),
+            visitor_token_seconds=int(os.environ.get("STUDIO_VISITOR_TOKEN_SECONDS", "7200")),
             email_sender_url=os.environ.get("STUDIO_EMAIL_SENDER_URL", "").strip(),
             email_sender_secret=os.environ.get("STUDIO_EMAIL_SENDER_SECRET", ""),
             voice_enabled=_enabled(os.environ.get("STUDIO_ENABLE_VOICE", "false")),
@@ -128,6 +139,16 @@ class Settings:
             raise RuntimeError("STUDIO_MAX_COMMANDS must be between 10 and 500")
         if self.operator_token_seconds < 600 or self.operator_token_seconds > 86400:
             raise RuntimeError("STUDIO_OPERATOR_TOKEN_SECONDS must be between 600 and 86400")
+        if not 1 <= self.visitor_codes_daily_cap <= 1000:
+            raise RuntimeError("STUDIO_VISITOR_CODES_DAILY_CAP must be between 1 and 1000")
+        if not 1 <= self.visitor_sessions_per_day <= 20:
+            raise RuntimeError("STUDIO_VISITOR_SESSIONS_PER_DAY must be between 1 and 20")
+        if not 600 <= self.visitor_token_seconds <= 86400:
+            raise RuntimeError("STUDIO_VISITOR_TOKEN_SECONDS must be between 600 and 86400")
+        if self.public_visitors and self.lead_facts_enabled:
+            # Lead facts read the Salesforce org for any session; a public
+            # visitor must never reach that path.
+            raise RuntimeError("STUDIO_PUBLIC_VISITORS cannot be on while STUDIO_ENABLE_LEAD_FACTS is on")
         if any(email != email.lower() or email != email.strip() for email in self.operator_emails):
             raise RuntimeError("STUDIO_OPERATOR_EMAILS must contain exact lowercase addresses")
         if self.production and self.session_secret == "local-development-only-change-me":

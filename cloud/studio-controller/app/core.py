@@ -172,7 +172,8 @@ class StudioController:
         return event
 
     def create_session(self, title: str = "Live prototype", subject: str = "",
-                       creation_id: str = "", start: str = "template") -> tuple[dict, int]:
+                       creation_id: str = "", start: str = "template",
+                       visitor: bool = False) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -219,7 +220,10 @@ class StudioController:
             "active_command": None,
             "paused": False,
             "stopped": False,
-            "operator_subject": subject,
+            # A public visitor is never an operator: operator-only paths
+            # (metadata proposals) check operator_subject, which stays empty.
+            "operator_subject": "" if visitor else subject,
+            "visitor_subject": subject if visitor else "",
             "voice_item_ids": [],
         }
         self._event(state, "session.started", {"title": title[:600]})
@@ -248,7 +252,8 @@ class StudioController:
             if not creation_id:
                 raise
             existing = self.repository.load(session_id).state
-            if existing.get("operator_subject") != subject:
+            owner = existing.get("operator_subject") or existing.get("visitor_subject") or ""
+            if owner != subject or bool(existing.get("visitor_subject")) != bool(visitor):
                 raise StateConflict("creation_id belongs to another operator")
             return copy.deepcopy(existing), admitted
 

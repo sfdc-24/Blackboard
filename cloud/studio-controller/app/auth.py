@@ -57,6 +57,10 @@ def _wait_until(deadline: float) -> None:
         threading.Event().wait(remaining)
 
 _OTP_RE = re.compile(r"^[0-9]{6}$")
+# A deliberately plain shape check for a public visitor address; delivery is the
+# real proof, and the code only reaches whoever owns the mailbox.
+_VISITOR_EMAIL_RE = re.compile(r"^[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}$")
+VISITOR_WINDOW_NAME = "studio_auth_visitor_day_"
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 
 
@@ -93,6 +97,8 @@ class AuthService:
         dispatch: Callable[[Callable[[], None]], None] = _dispatch_start,
         monotonic: Callable[[], float] = time.monotonic,
         wait_until: Callable[[float], None] = _wait_until,
+        public_visitors: bool = False,
+        visitor_daily_cap: int = 100,
     ):
         allowed = frozenset(allowed_emails)
         for email in allowed:
@@ -124,6 +130,8 @@ class AuthService:
         self.dispatch = dispatch
         self.monotonic = monotonic
         self.wait_until = wait_until
+        self.public_visitors = bool(public_visitors)
+        self.visitor_daily_cap = int(visitor_daily_cap)
 
     def _digest(self, purpose: str, value: str) -> str:
         message = purpose.encode("ascii") + b"\x00" + value.encode("utf-8")
@@ -187,6 +195,22 @@ class AuthService:
                 continue
         return False
 
+    def _reserve_visitor_day(self, now: int) -> bool:
+        """One more visitor code today, across every visitor, under CAS."""
+        day = time.strftime("%Y%m%d", time.gmtime(now))
+        name = VISITOR_WINDOW_NAME + day
+        for _ in range(self.cas_attempts):
+            state, token = self.store.load(name)
+            sent = int(state.get("sent", 0)) if isinstance(state, dict) else 0
+            if sent >= self.visitor_daily_cap:
+                return False
+            try:
+                self.store.save(name, {"version": 1, "day": day, "sent": sent + 1, "updated_at": now}, token)
+                return True
+            except Conflict:
+                continue
+        return False
+
     def start(self, email: str, client_key: str) -> dict:
         """Start an OTP challenge without revealing allowlist or rate status.
 
@@ -218,19 +242,19 @@ class AuthService:
 
     def _issue_challenge(self, challenge_id: str, code: str, email: str,
                          client_key: str) -> None:
-        eligible_email = (
-            isinstance(email, str)
-            and len(email) <= 320
-            and email == email.lower()
-            and email in self.allowed_emails
-        )
+        clean = isinstance(email, str) and len(email) <= 320 and email == email.lower()
+        operator = clean and email in self.allowed_emails
+        visitor = (clean and not operator and self.public_visitors
+                   and len(email) <= 254 and bool(_VISITOR_EMAIL_RE.fullmatch(email)))
         eligible_client = isinstance(client_key, str) and 0 < len(client_key) <= 512
-        if not eligible_email or not eligible_client:
+        if not (operator or visitor) or not eligible_client:
             return
 
         now = int(self.clock())
         subject_hash = self._subject_hash(email)
         if not self._reserve_send(subject_hash, now):
+            return
+        if visitor and not self._reserve_visitor_day(now):
             return
 
         client_hash = self._client_hash(client_key)
@@ -243,6 +267,7 @@ class AuthService:
             "expires_at": now + OTP_TTL_SECONDS,
             "attempts": 0,
             "used_at": None,
+            "role": "operator" if operator else "visitor",
         }
         try:
             self.store.save(self._challenge_name(challenge_id), record, None)
@@ -300,7 +325,9 @@ class AuthService:
             except Conflict:
                 continue
             if matches:
-                return {"verified": True, "subject_hash": stored_subject}
+                # A challenge written before roles existed was an operator's.
+                role = state.get("role") if state.get("role") in ("operator", "visitor") else "operator"
+                return {"verified": True, "subject_hash": stored_subject, "role": role}
             return failure
         return failure
 
