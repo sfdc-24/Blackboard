@@ -1,9 +1,9 @@
 # ADR: Blackboard-governed SFDC24 and client minibus architecture
 
-**Status:** Accepted architecture direction; staged implementation and acceptance pending  
-**Decision date:** 2026-09-25  
-**Decision owner:** Mr. Salam  
-**Technical coordination:** Blackboard, Claude, Codex, Gemini, and Grok review lanes  
+**Status:** Accepted architecture direction; staged implementation and acceptance pending<br>
+**Decision date:** 2026-09-25<br>
+**Decision owner:** Mr. Salam<br>
+**Technical coordination:** Blackboard, Claude, Codex, Gemini, and Grok review lanes<br>
 **Applies to:** SFDC24, future Converspan service, and later client minibuses
 
 ## PDF semantic contract
