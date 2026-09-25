@@ -23,6 +23,16 @@ import os
 import urllib.error
 import urllib.request
 
+try:  # the app and the image import this module as part of the workers package
+    from workers.policy import USE_POLICY
+except ImportError:  # loaded from its file (tests): read the sibling policy.py the same way
+    import importlib.util as _util
+    _spec = _util.spec_from_file_location(
+        "studio_use_policy", os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.py"))
+    _policy = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(_policy)
+    USE_POLICY = _policy.USE_POLICY
+
 CLAUDE_MODEL = os.environ.get("STUDIO_TALK_MODEL") or "claude-haiku-4-5-20251001"
 OPENAI_MODEL = os.environ.get("STUDIO_TALK_OPENAI_MODEL") or "gpt-4.1-mini"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -46,7 +56,9 @@ lists, no markdown, no emoji, no preamble.
 
 Never say something was built, changed or removed unless the canvas summary already shows it; \
 for a new request say it is being built now. Never invent facts about the visitor's business, \
-never name or promise any person, and never describe how this system works."""
+never name or promise any person, and never describe how this system works.
+
+""" + USE_POLICY
 
 
 def canvas_summary(artifact: dict | None) -> str:
@@ -116,7 +128,10 @@ RECAP_SYSTEM = """You are the host of a live design session on sfdc24.com, closi
 Recap it out loud in about 60 words (70 at most), as one warm, plain spoken paragraph: what the visitor wants, \
 what is on the canvas now, what was decided, and one next step they can take - keep shaping it here, \
 or talk to us about turning it into the real thing. Never invent facts about their business, and \
-never name or promise any person, price or date. No lists, no markdown, no preamble."""
+never name or promise any person, price or date. No lists, no markdown, no preamble. Never repeat \
+or summarise a request that was declined under the use policy below.
+
+""" + USE_POLICY
 
 
 def fit_words(text: str, limit: int) -> str:

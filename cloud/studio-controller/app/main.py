@@ -22,6 +22,7 @@ try:
 except ImportError:
     from state_store import open_store
 
+from . import governance
 from .core import CommandError, StudioController
 from .auth import AuthService
 from .leads import LeadBook, LeadCapExceeded
@@ -64,7 +65,7 @@ def _sse(event: dict, name: str | None = None) -> str:
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
-               analyst=None) -> FastAPI:
+               analyst=None, moderation_client=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -393,6 +394,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
                          "analyst": analyst_ready(),
                          "public_visitors": settings.public_visitors,
+                         "governance": True,
                          "voices": ["host", "architect"] if (settings.voice_enabled and settings.openai_api_key) else []},
         }
 
@@ -461,6 +463,59 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             from workers.analyst import Analyst
             analyst = Analyst()
         return analyst
+
+    # THE USE-POLICY GATE (app/governance.py). Visitor text is checked before
+    # any lane runs; a flagged line runs none of them. Flags live in their own
+    # store object, never in the session record, so counting one can never make
+    # an in-flight build's compare-and-set save fail.
+    moderator = governance.Moderator(
+        lambda: moderation_client or app.state.voice_client, settings.openai_api_key,
+        enabled=settings.moderation_enabled, clock=clock)
+    policy_book = governance.PolicyBook(store, clock=clock)
+    app.state.moderator = moderator
+    app.state.policy_book = policy_book
+
+    async def end_for_policy(session_id: str) -> None:
+        stop = {"command_id": "policy-stop-" + secrets.token_hex(6), "session_id": session_id,
+                "type": "stop", "expected_version": 0}
+        try:
+            await asyncio.to_thread(controller.stop_session, session_id, stop,
+                                    reason=governance.POLICY_END_REASON)
+        except CommandError:
+            pass                                   # already stopped
+        except (StateConflict, SessionNotFound) as exc:
+            governance.log_event("studio.policy_stop_failed", session_id=session_id,
+                                 reason=type(exc).__name__)
+            return
+        await end_voice_call(session_id, "use policy", force=True)
+
+    async def policy_gate(session_id: str, lane: str, texts: list, *, count: bool = True) -> str:
+        """"" when the words may go on; "refused"; or "ended" once this flag stopped the session."""
+        verdict = await moderator.check(texts)
+        if not verdict.available:
+            # Fail open: the lanes' own use policy and the providers' safeguards
+            # still apply to this turn; the outage is counted and logged.
+            governance.log_event("studio.moderation_unavailable", session_id=session_id, lane=lane,
+                                 reason=verdict.reason)
+            return ""
+        if not verdict.flagged:
+            return ""
+        if not count:
+            governance.log_event("studio.policy_refused", session_id=session_id, lane=lane,
+                                 categories=list(verdict.categories))
+            return "refused"
+        try:
+            total = await asyncio.to_thread(policy_book.record, session_id, lane, verdict.categories)
+        except Exception as exc:                   # the refusal stands without the count
+            governance.log_event("studio.policy_count_failed", session_id=session_id, lane=lane,
+                                 reason=type(exc).__name__)
+            return "refused"
+        governance.log_event("studio.policy_flag", session_id=session_id, lane=lane,
+                             categories=list(verdict.categories), count=total)
+        if total < governance.FLAG_LIMIT:
+            return "refused"
+        await end_for_policy(session_id)
+        return "ended"
 
     async def json_object(request: Request, label: str) -> dict:
         raw = await request.body()
@@ -667,6 +722,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             for stale in list(talk_counts)[:250]:
                 talk_counts.pop(stale, None)
                 talk_last.pop(stale, None)
+        outcome = await policy_gate(session_id, "talk", [text] + governance.history_texts(history))
+        if outcome:
+            refused = {"reply": governance.POLICY_END_LINE if outcome == "ended" else governance.POLICY_LINE,
+                       "speaker": agent, "turn": turn, "refused": True}
+            if outcome == "ended":
+                refused["ended"] = True
+            return refused
         try:
             reply = await asyncio.to_thread(
                 talk_lane().reply, agent, text.strip(), history, canvas_summary(state.get("artifact")))
@@ -694,6 +756,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, "speak needs text of 1 to %d characters" % SPEAK_MAX)
         await asyncio.to_thread(live_state, session_id)
         spend(speak_counts, session_id, settings.speak_cap, "speech")
+        if await policy_gate(session_id, "speak", [text], count=False):
+            raise HTTPException(422, governance.POLICY_PROBLEM)
         try:
             response = await request.app.state.voice_client.post(
                 TTS_URL,
@@ -789,6 +853,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             for stale in list(analyze_counts)[:250]:
                 analyze_counts.pop(stale, None)
                 analyze_last.pop(stale, None)
+        outcome = await policy_gate(session_id, "analyze", [text])
+        if outcome == "ended":
+            raise HTTPException(410, "session has ended")
+        if outcome:
+            return {"turn": turn, "model": None, "events": [], "problems": [governance.POLICY_PROBLEM],
+                    "searched": 0, "refused": True}
         analyze_busy.add(session_id)
         try:
             try:
@@ -818,6 +888,18 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_session(request, session_id)
         try:
             command = await json_object(request, "command")
+            texts = governance.command_texts(command)
+            # Stop is the visitor's emergency brake: it is never gated.
+            if texts and moderator.enabled and command.get("type") != "stop":
+                state = (await asyncio.to_thread(controller.repository.load, session_id)).state
+                if not state.get("stopped") and int(state.get("expires_at") or 0) > int(clock()):
+                    outcome = await policy_gate(session_id, "commands", texts)
+                    if outcome == "ended":
+                        raise HTTPException(410, "session has ended")
+                    if outcome:
+                        return {"command_id": str(command.get("command_id") or ""), "session_id": session_id,
+                                "artifact_version": state.get("artifact_version"), "events": [],
+                                "problems": [governance.POLICY_PROBLEM], "refused": True}
             result = await asyncio.to_thread(controller.execute, session_id, command)
         except SessionNotFound as exc:
             raise HTTPException(404, "session not found") from exc

@@ -27,6 +27,16 @@ import json
 import os
 import re
 
+try:  # the app and the image import this module as part of the workers package
+    from workers.policy import USE_POLICY
+except ImportError:  # loaded from its file (tests): read the sibling policy.py the same way
+    import importlib.util as _util
+    _spec = _util.spec_from_file_location(
+        "studio_use_policy", os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.py"))
+    _policy = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(_policy)
+    USE_POLICY = _policy.USE_POLICY
+
 MODEL = os.environ.get("STUDIO_ANALYST_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_ANALYST_EFFORT") or "low"
 RESEARCH = (os.environ.get("STUDIO_ANALYST_RESEARCH") or "1") == "1"
@@ -113,7 +123,10 @@ they did not give you; say "usually" or "often" for general knowledge.
 the build, with 2 or 3 concrete options and the consequence of each. Never repeat a question \
 already asked. If nothing material is open, use an empty prompt, an empty reason and no options.
 
-Plain words, no jargon beyond object and field names. Finish by calling record_analysis once."""
+Plain words, no jargon beyond object and field names. Finish by calling record_analysis once - \
+unless the request falls outside the use policy below; then do not call it and do not research it.
+
+""" + USE_POLICY
 
 
 def _txt(s, cap=TEXT_MAX):

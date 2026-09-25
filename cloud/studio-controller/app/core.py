@@ -494,7 +494,8 @@ class StudioController:
                 if conflicts >= self.repository.attempts:
                     raise StateConflict("analysis could not be recorded; the session kept changing")
 
-    def stop_session(self, session_id: str, command: dict) -> dict:
+    def stop_session(self, session_id: str, command: dict,
+                     reason: str = "You ended this session.") -> dict:
         """Fail-safe stop that fences any late worker commit with CAS.
 
         Stop is deliberately not blocked by an in-flight command, receipt cap,
@@ -532,7 +533,7 @@ class StudioController:
             candidate["paused"] = False
             candidate["turn_seq"] += 1
             candidate["turn_id"] = "turn-%d" % candidate["turn_seq"]
-            event = self._event(candidate, "session.ended", {"reason": "You ended this session."})
+            event = self._event(candidate, "session.ended", {"reason": reason})
             result = {
                 "command_id": command_id,
                 "session_id": candidate["session_id"],

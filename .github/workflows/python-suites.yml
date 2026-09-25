@@ -80,6 +80,7 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_governance.py"
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_studio_public_visitors.py"
@@ -180,6 +181,7 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_governance.py"
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_studio_public_visitors.py"
@@ -793,6 +795,19 @@ jobs:
           if [ -f tests/test_studio_claude_worker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The use policy: a moderation gate in front of every lane, flags counted per
+      # session, fail-open on an outage, and the one policy text in every prompt.
+      # A fake moderation client answers; no network, no key.
+      - name: "studio use policy: gate, flag count and prompts (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_studio_governance.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_governance
           else
             echo "not on this branch; skipping"
           fi

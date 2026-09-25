@@ -396,3 +396,62 @@ immutable binding object does not prove a durable bijective org-binding registry
 See
 [METADATA-OPERATIONS.md](METADATA-OPERATIONS.md) for the exact shapes, recovery
 rules, test command and remaining activation holds.
+
+## Use policy
+
+The homepage studio builds legitimate, professional business work only. Three
+layers enforce that, and each one stands on its own:
+
+1. **The gate** (`app/governance.py`). Before any lane runs, every piece of
+   visitor text goes through OpenAI's moderation endpoint
+   (`omni-moderation-latest`): talk text and its history, an utterance or typed
+   answer sent to the builder, analyst text, and a line sent to the architect's
+   voice. A flagged line runs no lane:
+   - talk replies with the policy line (`"refused": true`), which the page speaks;
+   - a command returns no events and the problem `declined by the SFDC24 use policy`;
+   - analyze returns no model and no events;
+   - speak returns 422, and that refusal is not counted, because its text
+     normally comes from our own agents.
+
+   A stop command is never gated.
+2. **The policy text** (`workers/policy.py`, `USE_POLICY`). It is appended to
+   the system prompt of every lane: talk, recap, builder and analyst. It covers
+   impersonation (look-alike logins, fake records, phishing, capturing
+   credentials or payments), deception and harassment, sexual, hateful, violent
+   or extremist content, illegal activity and rights violations, and
+   unprofessional content. Moderation cannot tell that a bank login lookalike
+   is a phishing kit, but the agents can, and they decline in one sentence.
+   Visitor words, the canvas, the history and research all arrive as user
+   content, so none of them sits where it could rewrite the policy.
+3. **The providers' own usage policies** (Anthropic, OpenAI) apply underneath
+   every call.
+
+**Counting.** Flags are counted per session in their own store object,
+`studio_policy_<session id>`, never in the session record. That way a flag
+can't make an in-flight build's compare-and-set save fail. One spoken line
+reaches talk, the builder and the analyst, so each lane keeps its own count
+and the session's count is the highest of them. At 3 the session is stopped
+with the reason "This session was ended because requests went against the
+SFDC24 use policy", and its voice call is hung up.
+
+**Outage.** No key, a timeout (3 s), an HTTP error or a malformed answer means
+the gate fails **open**. The turn goes on under layers 2 and 3, the outage is
+counted (`app.state.moderator.stats["unavailable"]`), and it is logged as
+`studio.moderation_unavailable`.
+
+**What is kept.** Never the visitor's words. A flag record holds the lane, the
+moderation categories and a timestamp. A log line (`studio.policy_flag`,
+`studio.policy_refused`) adds the session id and the count. The in-memory cache
+of recent verdicts is keyed by SHA-256.
+
+**Switch.** `STUDIO_ENABLE_MODERATION` defaults to `true` from the environment.
+`/health` reports `features.governance`.
+
+A code guard on artifacts that name well-known brands in a login or payment
+context was considered and left out:
+- a closed list of brands is never complete;
+- legitimate work names brands in exactly that context ("Sign in with
+  Google", "Pay with Visa", a Salesforce login for a Salesforce consultancy);
+- a canvas prototype cannot collect anything.
+
+The prompt layer and moderation carry it.

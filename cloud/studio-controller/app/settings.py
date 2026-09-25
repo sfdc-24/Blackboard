@@ -65,6 +65,9 @@ class Settings:
     recap_cap: int = 6
     architect_voice: str = "cedar"
     analyze_cap: int = 30
+    # The use-policy gate (app/governance.py). Off unless constructed on; the
+    # environment turns it ON by default, so a deploy never ships without it.
+    moderation_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -113,6 +116,7 @@ class Settings:
             recap_cap=int(os.environ.get("STUDIO_RECAP_CAP", "6")),
             architect_voice=os.environ.get("STUDIO_ARCHITECT_VOICE", "cedar"),
             analyze_cap=int(os.environ.get("STUDIO_ANALYZE_CAP", "30")),
+            moderation_enabled=_enabled(os.environ.get("STUDIO_ENABLE_MODERATION", "true")),
         )
 
     @property
