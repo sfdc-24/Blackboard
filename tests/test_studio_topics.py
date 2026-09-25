@@ -50,9 +50,16 @@ class TopicTests(unittest.TestCase):
 
     def test_a_topic_outside_the_set_is_refused(self):
         with TestClient(self.make()) as client:
-            for bad in ("hacking", "Logo", 7, ["logo"], "logo\n"):
+            for bad in ("hacking", "Logo", 7, ["logo"], "logo\n", False, 0, [], {}, True):
                 created = self.create(client, {"creation_id": "topic-bad", "start": "blank", "topic": bad})
                 self.assertEqual(400, created.status_code, (bad, created.text))
+
+    def test_a_replayed_creation_keeps_its_first_topic(self):
+        with TestClient(self.make()) as client:
+            first = self.create(client, {"creation_id": "topic-r", "start": "blank", "topic": "logo"}).json()
+            self.create(client, {"creation_id": "topic-r", "start": "template", "topic": "website", "title": "x"})
+            self.create(client, {"creation_id": "topic-r", "start": "blank"})
+        self.assertEqual("logo", StudioRepository(self.store).load(first["session_id"]).state["topic"])
 
     def test_the_talk_lane_hears_the_topic(self):
         with TestClient(self.make()) as client:
@@ -61,6 +68,26 @@ class TopicTests(unittest.TestCase):
             client.post("/v1/session/%s/talk" % created["session_id"], headers=headers, json={"text": "hello"})
         self.assertTrue(self.talk.calls[0]["canvas"].startswith(
             "The visitor picked this topic before starting: Design a logo"), self.talk.calls[0]["canvas"])
+
+
+class TheMuseHearsTheTopic(unittest.TestCase):
+    def test_inspire_gets_the_topic_line_first(self):
+        import tests.test_studio_muse as muse_tests   # module alias: its cases are not re-run here
+        case = muse_tests.Endpoints()
+        with TestClient(case.make()) as client:
+            started = client.post("/v1/auth/start", headers=case.origin, json={
+                "email": "operator@example.com", "client_key": "browser-instance-1234567890"})
+            code = case.email_sender.calls[-1][1]
+            operator = client.post("/v1/auth/verify", headers=case.origin, json={
+                "challenge_id": started.json()["challenge_id"], "email": "operator@example.com",
+                "code": code, "client_key": "browser-instance-1234567890"}).json()["token"]
+            created = client.post("/v1/session", headers={**case.origin, "Authorization": "Bearer " + operator},
+                                  json={"creation_id": "muse-topic", "start": "blank", "topic": "app"}).json()
+            headers = {**case.origin, "Authorization": "Bearer " + created["token"]}
+            out = client.post("/v1/session/%s/inspire" % created["session_id"], headers=headers, json={"text": "an app"})
+        self.assertEqual(200, out.status_code, out.text)
+        self.assertTrue(case.muse.calls[0]["canvas"].startswith(
+            "The visitor picked this topic before starting: Develop an app"), case.muse.calls[0]["canvas"][:120])
 
 
 class TopicLine(unittest.TestCase):

@@ -779,7 +779,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if set(body) - {"title", "creation_id", "start", "topic"}:
             raise HTTPException(400, "session body has unknown fields")
         from workers.topics import TOPICS
-        topic = body.get("topic") or ""
+        topic = body.get("topic")
+        if topic is None:                          # omitted or null: no topic
+            topic = ""
+        # false, 0, [] and {} are not "no topic": every non-string is a 400.
         if not isinstance(topic, str) or (topic and topic not in TOPICS):
             raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(TOPICS)))
         start = body.get("start") or "template"
@@ -1036,6 +1039,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not muse_ready():
             raise HTTPException(503, "the muse is not available")
         from workers.talk import TEXT_MAX, canvas_summary
+        from workers.topics import with_topic
         body = await json_object(request, "inspire")
         if set(body) - {"text", "turn"}:
             raise HTTPException(400, "inspire body has unknown fields")
@@ -1055,7 +1059,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         spend(muse_counts, session_id, settings.muse_cap, "inspiration")
         try:
             result = await asyncio.to_thread(
-                muse_lane().inspire, state, (text or "").strip(), canvas_summary(state.get("artifact")))
+                muse_lane().inspire, state, (text or "").strip(), with_topic(state, canvas_summary(state.get("artifact"))))
         except Exception as exc:  # the builder, the host and the analyst carry on without it
             raise HTTPException(503, "the muse could not answer") from exc
         try:
