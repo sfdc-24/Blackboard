@@ -595,6 +595,132 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([2], [event["seq"] for event in events])
 
 
+class FakeTalk:
+    """Stands in for workers.talk.TalkClient: records calls, never touches a provider."""
+
+    def __init__(self, agents=("claude", "openai"), reply="Building that now.", fail=False):
+        self._agents = list(agents)
+        self.text = reply
+        self.fail = fail
+        self.calls = []
+
+    def agents(self):
+        return list(self._agents)
+
+    def reply(self, agent, text, history, canvas):
+        self.calls.append({"agent": agent, "text": text, "history": history, "canvas": canvas})
+        if self.fail:
+            raise RuntimeError("provider down")
+        return self.text
+
+
+class TalkLaneTests(unittest.TestCase):
+    origin = {"Origin": "https://www.sfdc24.com"}
+
+    def make(self, talk=None, **overrides):
+        self.store = MemoryStore()
+        self.email_sender = EmailSender()
+        self.talk = talk if talk is not None else FakeTalk()
+        app = create_app(
+            settings=settings(**overrides), store=self.store, worker=CountingWorker(),
+            clock=lambda: 1000, id_factory=IDs(), voice_client=FakeVoiceClient(),
+            email_sender=self.email_sender, talk_client=self.talk,
+        )
+        return app
+
+    def session(self, client):
+        started = client.post("/v1/auth/start", headers=self.origin, json={
+            "email": "operator@example.com", "client_key": "browser-instance-1234567890"})
+        code = self.email_sender.calls[-1][1]
+        operator = client.post("/v1/auth/verify", headers=self.origin, json={
+            "challenge_id": started.json()["challenge_id"], "email": "operator@example.com",
+            "code": code, "client_key": "browser-instance-1234567890"}).json()["token"]
+        created = client.post("/v1/session", headers={**self.origin, "Authorization": "Bearer " + operator},
+                              json={"creation_id": "talk-1"}).json()
+        return created["session_id"], {**self.origin, "Authorization": "Bearer " + created["token"]}
+
+    def test_health_lists_the_configured_agents(self):
+        with TestClient(self.make()) as client:
+            features = client.get("/health").json()["features"]
+        self.assertEqual(True, features["talk"])
+        self.assertEqual(["claude", "openai"], features["agents"])
+
+    def test_a_turn_gets_the_selected_agents_reply_grounded_in_the_canvas(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            response = client.post("/v1/session/%s/talk" % sid, headers=headers, json={
+                "text": "Make a logo for my cafe", "agent": "openai",
+                "history": [{"who": "you", "text": "hello"}, {"who": "openai", "text": "Hi there."}]})
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual({"reply": "Building that now.", "speaker": "openai"}, response.json())
+        call = self.talk.calls[0]
+        self.assertEqual("openai", call["agent"])
+        self.assertEqual("Make a logo for my cafe", call["text"])
+        self.assertEqual(2, len(call["history"]))
+        self.assertIn("parts", call["canvas"])
+
+    def test_the_agent_defaults_to_the_first_configured_one(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            response = client.post("/v1/session/%s/talk" % sid, headers=headers, json={"text": "hi"})
+        self.assertEqual("claude", response.json()["speaker"])
+
+    def test_an_unconfigured_agent_is_refused_not_simulated(self):
+        with TestClient(self.make(FakeTalk(agents=("claude",)))) as client:
+            sid, headers = self.session(client)
+            response = client.post("/v1/session/%s/talk" % sid, headers=headers, json={
+                "text": "hi", "agent": "openai"})
+        self.assertEqual(400, response.status_code)
+        self.assertIn("not configured", response.text)
+        self.assertEqual([], self.talk.calls)
+
+    def test_bad_bodies_are_refused(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/talk" % sid
+            for body in ({"text": ""}, {"text": "   "}, {"text": "x" * 601}, {"text": "hi", "extra": 1},
+                         {"text": "hi", "history": [{"who": "robot", "text": "x"}]},
+                         {"text": "hi", "history": [{"who": "you", "text": "x"}] * 9}):
+                with self.subTest(body=str(body)[:60]):
+                    self.assertEqual(400, client.post(url, headers=headers, json=body).status_code)
+        self.assertEqual([], self.talk.calls)
+
+    def test_it_needs_the_sessions_own_token_and_an_allowed_origin(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/talk" % sid
+            self.assertEqual(401, client.post(url, headers=self.origin, json={"text": "hi"}).status_code)
+            self.assertEqual(403, client.post(url, headers={**headers, "Origin": "https://evil.example"},
+                                              json={"text": "hi"}).status_code)
+            self.assertEqual(403, client.post("/v1/session/other/talk", headers=headers,
+                                              json={"text": "hi"}).status_code)
+        self.assertEqual([], self.talk.calls)
+
+    def test_the_per_session_cap_returns_429(self):
+        with TestClient(self.make(talk_cap=2)) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/talk" % sid
+            codes = [client.post(url, headers=headers, json={"text": "hi"}).status_code for _ in range(3)]
+        self.assertEqual([200, 200, 429], codes)
+
+    def test_a_provider_failure_is_a_503_and_the_session_lives_on(self):
+        with TestClient(self.make(FakeTalk(fail=True))) as client:
+            sid, headers = self.session(client)
+            failed = client.post("/v1/session/%s/talk" % sid, headers=headers, json={"text": "hi"})
+            events = client.get("/v1/session/%s/events?once=1" % sid, headers=headers)
+        self.assertEqual(503, failed.status_code)
+        self.assertEqual(200, events.status_code)
+
+    def test_a_stopped_session_does_not_talk(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            client.post("/v1/session/%s/commands" % sid, headers=headers, json={
+                "command_id": "cmd-stop", "session_id": sid, "type": "stop", "expected_version": 1})
+            response = client.post("/v1/session/%s/talk" % sid, headers=headers, json={"text": "hi"})
+        self.assertEqual(410, response.status_code)
+        self.assertEqual([], self.talk.calls)
+
+
 class ApiTests(unittest.TestCase):
     origin = {"Origin": "https://www.sfdc24.com"}
 
@@ -885,7 +1011,9 @@ class ApiTests(unittest.TestCase):
             headers = {**self.origin, "X-Forwarded-Proto": "https", "Authorization": "Bearer synthetic-test-token"}
             health = client.get("/health", headers=headers)
             self.assertEqual(200, health.status_code)
-            self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file", "features": {"voice": False, "lead_facts": False}}, health.json())
+            self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file",
+                          "features": {"voice": False, "lead_facts": False, "talk": False, "agents": []}},
+                         health.json())
             self.assertEqual(health.json(), client.get("/healthz").json())
             for method, path in (("GET", "/health/"), ("GET", "/healthz/"),
                                  ("POST", "/v1/auth/start/"), ("POST", "/v1/auth/verify/"),
