@@ -42,10 +42,16 @@ HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 BAD_CHARS_RE = re.compile(r"[<>\x00-\x1f\x7f]")
 CAPS = {"line": 200, "title": 40, "motif": 60, "headline": 60, "read_line": 140, "tone": 80, "work": 120}
 
-# Until the use-policy module (workers/policy.py, PR #255) lands, the Muse
-# carries the policy in one sentence of its own prompt.
-POLICY = ("Offer only professional, ethical directions for legitimate business work: never imitate a real "
-          "brand, person or organisation, and never produce deceptive, sexual, hateful, violent or unlawful content.")
+# The same use policy every lane carries (workers/policy.py, PR #255).
+try:  # the app and the image import this module as part of the workers package
+    from workers.policy import USE_POLICY as POLICY
+except ImportError:  # loaded from its file (tests): read the sibling policy.py the same way
+    import importlib.util as _util
+    _spec = _util.spec_from_file_location(
+        "studio_use_policy", os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.py"))
+    _policy = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(_policy)
+    POLICY = _policy.USE_POLICY
 
 OFFER_TOOL = {
     "name": "offer_directions",

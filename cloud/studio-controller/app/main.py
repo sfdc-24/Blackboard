@@ -870,6 +870,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not isinstance(text, str) or len(text) > TEXT_MAX:
             raise HTTPException(400, "inspire text must be a string of at most %d characters" % TEXT_MAX)
         state = await asyncio.to_thread(live_state, session_id)
+        if text.strip():
+            # The same use-policy gate as talk, commands and analyze: a flagged
+            # line wakes no Muse and spends no inspiration.
+            outcome = await policy_gate(session_id, "muse", [text])
+            if outcome:
+                return {"turn": turn, "muse": None, "refused": True, "ended": outcome == "ended"}
         spend(muse_counts, session_id, settings.muse_cap, "inspiration")
         try:
             result = await asyncio.to_thread(

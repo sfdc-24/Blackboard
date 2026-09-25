@@ -138,7 +138,7 @@ class Lane(unittest.TestCase):
         call = client.calls[0]
         self.assertEqual({"type": "tool", "name": "offer_directions"}, call["tool_choice"])
         self.assertEqual(mu.MODEL, call["model"])
-        self.assertIn("never imitate a real brand", call["system"])
+        self.assertIn("SFDC24 USE POLICY", call["system"])
         self.assertIn("a bakery logo", call["messages"][0]["content"])
 
     def test_a_refused_set_gets_one_repair_then_passes(self):
@@ -180,10 +180,31 @@ class FakeMuse:
         return {"muse": muse, "attempts": 1}
 
 
+class UnderTheUsePolicy(unittest.TestCase):
+    def test_the_muse_prompt_carries_the_shared_use_policy(self):
+        from workers.policy import USE_POLICY
+        self.assertIn(USE_POLICY, mu.SYSTEM)
+
+    def test_a_flagged_line_wakes_no_muse_and_spends_nothing(self):
+        from tests.test_studio_governance import FakeModeration
+        case = Endpoints()
+        moderation = FakeModeration()
+        with TestClient(case.make(moderation=moderation, moderation_enabled=True)) as client:
+            sid, headers = case.session(client)
+            out = client.post("/v1/session/%s/inspire" % sid, headers=headers, json={"text": "FLAG this", "turn": 1})
+            clean = [client.post("/v1/session/%s/inspire" % sid, headers=headers, json={"text": "a bakery"}).status_code
+                     for _ in range(6)]
+        self.assertEqual(200, out.status_code, out.text)
+        self.assertEqual({"turn": 1, "muse": None, "refused": True, "ended": False}, out.json())
+        self.assertEqual([200] * 6, clean)                 # the refused call spent none of the six
+        self.assertEqual(6, len(case.muse.calls))
+        self.assertIn(["FLAG this"], moderation.inputs())
+
+
 class Endpoints(unittest.TestCase):
     origin = {"Origin": "https://www.sfdc24.com"}
 
-    def make(self, muse="fake", openai=None, **overrides):
+    def make(self, muse="fake", openai=None, moderation=None, **overrides):
         values = dict(voice_enabled=True, openai_api_key="sk-test", maintenance_secret="m" * 40)
         values.update(overrides)
         self.store = MemoryStore()
@@ -192,7 +213,8 @@ class Endpoints(unittest.TestCase):
         self.muse = FakeMuse() if muse == "fake" else muse
         return create_app(settings=settings(**values), store=self.store, worker=CountingWorker(),
                           clock=lambda: 1000, id_factory=IDs(), voice_client=self.openai,
-                          email_sender=self.email_sender, talk_client=FakeTalk(), muse=self.muse)
+                          email_sender=self.email_sender, talk_client=FakeTalk(), muse=self.muse,
+                          moderation_client=moderation)
 
     def session(self, client):
         started = client.post("/v1/auth/start", headers=self.origin, json={
@@ -373,7 +395,8 @@ class Endpoints(unittest.TestCase):
             self.assertEqual({"model", "voice", "input", "instructions", "response_format"}, set(kwargs["json"]))
             self.assertEqual(("gpt-4o-mini-tts", "cedar", "mp3"),
                              (kwargs["json"]["model"], kwargs["json"]["voice"], kwargs["json"]["response_format"]))
-            self.assertTrue(kwargs["json"]["instructions"].startswith("A calm, confident solution architect"))
+            from app.main import ARCHITECT_VOICE_STYLE
+        self.assertEqual(ARCHITECT_VOICE_STYLE, kwargs["json"]["instructions"])   # #256 style, untouched by the Muse
         self.assertEqual("Built the landing page.", self.openai.calls[0][1]["json"]["input"])
 
     def test_the_muse_voice_shares_the_speech_cap_and_needs_the_muse(self):
