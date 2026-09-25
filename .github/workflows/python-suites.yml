@@ -87,6 +87,7 @@ on:
       - "tests/test_studio_muse.py"
       - "tests/test_studio_end_card.py"
       - "tests/test_studio_topics.py"
+      - "tests/test_studio_talk_prompts.py"
       - "tests/test_studio_routing.py"
       - "tests/test_studio_advisor.py"
       - "tests/test_studio_advisor_route.py"
@@ -194,6 +195,7 @@ on:
       - "tests/test_studio_muse.py"
       - "tests/test_studio_end_card.py"
       - "tests/test_studio_topics.py"
+      - "tests/test_studio_talk_prompts.py"
       - "tests/test_studio_routing.py"
       - "tests/test_studio_advisor.py"
       - "tests/test_studio_advisor_route.py"
@@ -755,6 +757,7 @@ jobs:
               tests.test_studio_muse \
               tests.test_studio_end_card \
               tests.test_studio_topics \
+              tests.test_studio_talk_prompts \
               tests.test_studio_routing \
               tests.test_studio_advisor \
               tests.test_studio_advisor_route
