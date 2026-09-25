@@ -17,6 +17,30 @@ TOPICS = {
 }
 
 
+# Which model talks, by what the visitor wants to do (owner, 2026-09-25: "design
+# logo would be openAI and may be salesforce is claude ... also get Gemini and
+# Meta to participate"). The visitor never picks a model.
+TOPIC_AGENT = {
+    "logo": "openai",
+    "website": "gemini",
+    "app": "meta",
+    "salesforce_admin": "claude",
+    "salesforce_data": "claude",
+    "other": "claude",
+}
+FALLBACK = ("claude", "openai", "gemini", "meta")
+
+
+def route_agent(topic, available) -> str:
+    """The topic's agent when it is available, else the first available in
+    FALLBACK order; "" when none is."""
+    available = list(available or [])
+    wanted = TOPIC_AGENT.get(topic if isinstance(topic, str) else "", "claude")
+    if wanted in available:
+        return wanted
+    return next((a for a in FALLBACK if a in available), "")
+
+
 def topic_line(state: dict | None) -> str:
     """One line naming the topic, or "" when the visitor did not pick one."""
     topic = (state or {}).get("topic") or ""
@@ -29,4 +53,4 @@ def with_topic(state: dict | None, canvas: str) -> str:
     return topic_line(state) + (canvas or "")
 
 
-__all__ = ["TOPICS", "topic_line", "with_topic"]
+__all__ = ["TOPICS", "TOPIC_AGENT", "FALLBACK", "route_agent", "topic_line", "with_topic"]

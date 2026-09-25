@@ -14,12 +14,23 @@ talk model must acknowledge intent, not narrate a canvas mutation before the
 builder commits it). The canvas summary it is given is read-only.
 
 Measured on 2026-09-25 with the production keys: Claude (claude-haiku-4-5)
-0.9-1.0 s warm; OpenAI (gpt-4.1-mini) 0.9-1.1 s.
+0.9-1.0 s warm; OpenAI (gpt-4.1-mini) 0.9-1.1 s; Gemini (gemini-3.5-flash-lite,
+thinking minimal) about 0.6 s.
+
+FOUR AGENTS, CHOSEN BY WHAT THE VISITOR WANTS TO DO (owner, 2026-09-25: "I dont
+want users to select between claude and openai; it should be selected based on
+what they want to do ... also get Gemini and Meta to participate ... Models
+should add value; perspective; color and speed"). The controller picks the
+agent from the session's topic (workers/topics.py TOPIC_AGENT); each agent
+brings its own angle (PERSPECTIVES). Meta's Llama runs on Vertex AI (GCP only):
+Groq, the other place it ran, no longer lists a Llama chat model, and the
+Vertex model must be enabled for the project before "meta" is offered.
 """
 from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -36,15 +47,34 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
 CLAUDE_MODEL = os.environ.get("STUDIO_TALK_MODEL") or "claude-haiku-4-5-20251001"
 OPENAI_MODEL = os.environ.get("STUDIO_TALK_OPENAI_MODEL") or "gpt-4.1-mini"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+# Gemini: the fastest current model answering a 30-word spoken reply (0.6 s);
+# thinking "minimal" keeps it from spending the reply budget on thoughts.
+GEMINI_MODEL = os.environ.get("STUDIO_TALK_GEMINI_MODEL") or "gemini-3.5-flash-lite"
+_thinking = os.environ.get("STUDIO_TALK_GEMINI_THINKING")
+GEMINI_THINKING = "minimal" if _thinking is None else _thinking
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+# Meta: Llama on Vertex AI MaaS, through its OpenAI-compatible endpoint, with
+# the service account's token. Offered only when a project is configured.
+META_MODEL = os.environ.get("STUDIO_TALK_META_MODEL") or "meta/llama-4-maverick-17b-128e-instruct-maas"
+META_REGION = os.environ.get("STUDIO_TALK_META_REGION") or "us-east5"
+META_URL = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/endpoints/openapi/chat/completions"
 TIMEOUT_SECONDS = 8.0
 MAX_TOKENS = 160
 REPLY_MAX = 400
 HISTORY_MAX = 8
 TEXT_MAX = 600
-AGENTS = ("claude", "openai")
-NAMES = {"claude": "Claude", "openai": "the SFDC24 studio assistant"}
+AGENTS = ("claude", "openai", "gemini", "meta")
+NAMES = {"claude": "Claude", "openai": "the SFDC24 studio assistant",
+         "gemini": "the SFDC24 studio assistant", "meta": "the SFDC24 studio assistant"}
+# What each model adds to the conversation - its angle, in one line.
+PERSPECTIVES = {
+    "claude": "you bring structure: what it has to do, for whom, and why, in plain words.",
+    "openai": "you bring a designer's eye: color, type, mood and how it will feel.",
+    "gemini": "you keep it quick and concrete: the very next thing they will see change.",
+    "meta": "you bring energy and plain-spoken ideas, like a friend who builds things.",
+}
 
-SYSTEM = """You are {name}, talking out loud with a visitor during a live design session on \
+_SYSTEM_BODY = """You are {name}, talking out loud with a visitor during a live design session on \
 sfdc24.com. While you talk, a separate builder is drawing the prototype on the visitor's screen \
 from the same words. You speak; the builder builds. You can design anything the builder can draw - \
 a website section, an app screen, a form, a logo or banner, a process or a data model.
@@ -58,7 +88,14 @@ Never say something was built, changed or removed unless the canvas summary alre
 for a new request say it is being built now. Never invent facts about the visitor's business, \
 never name or promise any person, and never describe how this system works.
 
-""" + USE_POLICY
+"""
+SYSTEM = _SYSTEM_BODY + USE_POLICY
+PERSPECTIVE_LINE = "Your angle in this conversation: {perspective}\n\n"
+
+
+def talk_system(agent: str) -> str:
+    """The talk prompt for one agent: who it is, its angle, then the use policy, always last."""
+    return (_SYSTEM_BODY + PERSPECTIVE_LINE).format(name=NAMES[agent], perspective=PERSPECTIVES[agent]) + USE_POLICY
 
 
 def canvas_summary(artifact: dict | None) -> str:
@@ -173,38 +210,47 @@ class TalkClient:
     credential are offered; an unavailable one is refused, never simulated."""
 
     def __init__(self, *, anthropic_client=None, anthropic_ready: bool | None = None,
-                 openai_key: str | None = None, opener=None):
+                 openai_key: str | None = None, opener=None, gemini_key: str | None = None,
+                 meta_project: str | None = None, meta_token=None):
         self._anthropic = anthropic_client
         self._anthropic_ready = (anthropic_client is not None or bool(os.environ.get("ANTHROPIC_API_KEY"))) \
             if anthropic_ready is None else anthropic_ready
         self._openai_key = os.environ.get("OPENAI_API_KEY", "") if openai_key is None else openai_key
+        self._gemini_key = os.environ.get("GEMINI_API_KEY", "") if gemini_key is None else gemini_key
+        self._meta_project = os.environ.get("STUDIO_TALK_META_PROJECT", "") if meta_project is None else meta_project
+        self._meta_token = meta_token          # () -> (token, expires_in); the metadata server by default
+        self._meta_cached = ("", 0.0)
         self._open = opener or urllib.request.urlopen
 
     def agents(self) -> list:
+        """Only agents with a credential; order is the fallback order."""
         ready = []
         if self._anthropic_ready:
             ready.append("claude")
         if self._openai_key:
             ready.append("openai")
+        if self._gemini_key:
+            ready.append("gemini")
+        if self._meta_project:
+            ready.append("meta")
         return ready
+
+    def _call(self, agent: str, system: str, messages: list, max_tokens: int, cap: int) -> str:
+        call = {"claude": self._claude, "openai": self._openai, "gemini": self._gemini, "meta": self._meta}[agent]
+        return call(system, messages, max_tokens, cap)
 
     def reply(self, agent: str, text: str, history: list, canvas: str) -> str:
         if agent not in self.agents():
             raise LookupError("agent %r is not configured" % agent)
-        system = SYSTEM.format(name=NAMES[agent])
-        messages = _messages(text, history, canvas)
-        if agent == "claude":
-            return self._claude(system, messages)
-        return self._openai(system, messages)
+        system = talk_system(agent)
+        return self._call(agent, system, _messages(text, history, canvas), MAX_TOKENS, REPLY_MAX)
 
     def recap(self, agent: str, brief: str) -> str:
         """The host closing the meeting: a short spoken recap from the session record."""
         if agent not in self.agents():
             raise LookupError("agent %r is not configured" % agent)
         messages = [{"role": "user", "content": brief}]
-        if agent == "claude":
-            return fit_words(self._claude(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX), RECAP_WORDS)
-        return fit_words(self._openai(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX), RECAP_WORDS)
+        return fit_words(self._call(agent, RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX), RECAP_WORDS)
 
     def _claude(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
         if self._anthropic is None:
@@ -224,6 +270,58 @@ class TalkClient:
         }).encode("utf-8")
         request = urllib.request.Request(OPENAI_URL, data=body, method="POST", headers={
             "Authorization": "Bearer " + self._openai_key,
+            "Content-Type": "application/json",
+        })
+        with self._open(request, timeout=TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        choices = payload.get("choices") or []
+        return _spoken(((choices[0] or {}).get("message") or {}).get("content", "") if choices else "", cap)
+
+    def _gemini(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
+        """Google Generative Language API. The key goes in a header, never the URL."""
+        config = {"maxOutputTokens": max_tokens}
+        if GEMINI_THINKING:
+            config["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING}
+        body = json.dumps({
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                         for m in messages],
+            "generationConfig": config,
+        }).encode("utf-8")
+        request = urllib.request.Request(GEMINI_URL % GEMINI_MODEL, data=body, method="POST", headers={
+            "x-goog-api-key": self._gemini_key,
+            "Content-Type": "application/json",
+        })
+        with self._open(request, timeout=TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        candidates = payload.get("candidates") or []
+        parts = ((candidates[0] or {}).get("content") or {}).get("parts") or [] if candidates else []
+        return _spoken("".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought")), cap)
+
+    def _meta_bearer(self) -> str:
+        token, until = self._meta_cached
+        if token and until - 60 > time.time():
+            return token
+        provider = self._meta_token
+        if provider is None:
+            try:
+                from scripts.state_store import metadata_token as provider
+            except ImportError:  # Docker copies the shared module beside the app.
+                from state_store import metadata_token as provider
+        token, expires_in = provider()
+        self._meta_cached = (token, time.time() + int(expires_in or 0))
+        return token
+
+    def _meta(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
+        """Meta's Llama on Vertex AI MaaS (OpenAI-compatible), with the service account's token."""
+        body = json.dumps({
+            "model": META_MODEL,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system}] + messages,
+        }).encode("utf-8")
+        url = META_URL % (META_REGION, self._meta_project, META_REGION)
+        request = urllib.request.Request(url, data=body, method="POST", headers={
+            "Authorization": "Bearer " + self._meta_bearer(),
             "Content-Type": "application/json",
         })
         with self._open(request, timeout=TIMEOUT_SECONDS) as response:
