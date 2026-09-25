@@ -58,8 +58,8 @@ def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def validate_contract(contract: dict, adr_text: str) -> None:
-    """Validate types, accepted state, and required prose anchors."""
+def validate_contract(contract: dict, adr_prose: str) -> None:
+    """Validate types, accepted state, and anchors outside the JSON contract."""
     if not isinstance(contract, dict) or set(contract) != CONTRACT_KEYS:
         raise RuntimeError("architecture PDF contract keys do not match the closed schema")
     if type(contract["schema_version"]) is not int or contract["schema_version"] != 1:
@@ -85,9 +85,8 @@ def validate_contract(contract: dict, adr_text: str) -> None:
         if len(set(phrases)) != len(phrases):
             raise RuntimeError(f"duplicate architecture PDF contract phrase: {key}")
     missing = [phrase for phrase in contract["required_adr_phrases"]
-               if adr_text.count(phrase) < 2]
+               if phrase not in adr_prose]
     if missing:
-        # Each anchor occurs once in the contract and must also occur in ADR prose.
         raise RuntimeError("ADR semantic drift; missing prose anchors: " + repr(missing))
 
 
@@ -96,14 +95,17 @@ def load_contract() -> tuple[dict, str]:
     adr_text = ADR.read_text(encoding="utf-8")
     if adr_text.count(CONTRACT_START) != 1 or adr_text.count(CONTRACT_END) != 1:
         raise RuntimeError("ADR must contain exactly one architecture PDF contract")
-    raw = adr_text.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
+    before_contract, remainder = adr_text.split(CONTRACT_START, 1)
+    raw, after_contract = remainder.split(CONTRACT_END, 1)
+    raw = raw.strip()
     if not raw.startswith("```json") or not raw.endswith("```"):
         raise RuntimeError("architecture PDF contract must be a fenced JSON object")
     contract = json.loads(
         raw[len("```json"): -len("```")].strip(),
         object_pairs_hook=reject_duplicate_json_keys,
     )
-    validate_contract(contract, adr_text)
+    # Contract-contained strings cannot satisfy an ADR prose anchor.
+    validate_contract(contract, before_contract + after_contract)
     canonical = json.dumps(contract, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return contract, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

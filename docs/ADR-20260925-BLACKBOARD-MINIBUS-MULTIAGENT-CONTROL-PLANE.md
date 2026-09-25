@@ -357,7 +357,10 @@ as `Builder · Claude` and `Analyst · Gemini`; the host voice remains singular.
 
 ### 7. Minibuses use leases, not inherited omnipotent credentials
 
-A minibus enrollment produces a signed, expiring capability/configuration lease:
+A minibus enrollment produces a signed, expiring capability/configuration
+lease. The JSON below is the protected claims payload, not a complete bearer
+credential. It is carried in an allowlisted JWS or equivalent signed envelope;
+the signature is outside the claims and is verified before any claim is trusted:
 
 ```json
 {

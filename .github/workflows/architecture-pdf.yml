@@ -65,6 +65,12 @@ jobs:
               pass
           else:
               raise SystemExit("boolean architecture PDF schema version was accepted")
+          try:
+              namespace["validate_contract"](namespace["CONTRACT"], "")
+          except RuntimeError:
+              pass
+          else:
+              raise SystemExit("contract-contained phrases satisfied ADR prose anchors")
           PY
       - name: Validate the ADR contract and rebuild the artifact twice, byte for byte
         shell: bash
