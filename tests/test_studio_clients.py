@@ -22,6 +22,7 @@ import ipaddress
 import json
 import logging
 import os
+import threading
 import time
 import unittest
 from unittest import mock
@@ -30,15 +31,15 @@ import httpx
 from fastapi.testclient import TestClient
 
 from tests.test_studio_controller import (  # noqa: E402  (sets sys.path for app.*)
-    CountingWorker, EmailSender, IDs, MemoryStore, settings,
+    CountingWorker, EmailSender, FakeTalk, IDs, MemoryStore, settings,
 )
 from app.auth import AuthService  # noqa: E402
 from app.clients import ClientRegistry, REGISTRY, project_url_ok  # noqa: E402
-from app.main import WORKSPACE_DENIED, create_app  # noqa: E402
+from app.main import FETCH_ATTEMPTS_PER_HOUR, SERVER_ERROR, WORKSPACE_DENIED, create_app  # noqa: E402
 import app.project_page as project_page  # noqa: E402
 from app.project_page import (  # noqa: E402
-    MAX_DEPTH, MAX_IMAGES, MAX_NODES, PageFetchError, address_ok, fetch_page, page_to_tree, tree_depth,
-    tree_nodes,
+    MAX_DEPTH, MAX_IMAGES, MAX_NODES, FetchBusy, PageFetchError, address_ok, fetch_page, page_to_tree, redact,
+    tree_depth, tree_nodes,
 )
 from app.tokens import (  # noqa: E402
     CLIENT_AUDIENCE, InvalidToken, _b64e, _client_signature, mint_client_token, mint_token,
@@ -283,15 +284,18 @@ class Auth(unittest.TestCase):
 
 # -- the API ---------------------------------------------------------------------------------
 class Api(unittest.TestCase):
-    def make(self, fetcher=None, registry=None, worker=None, **overrides):
+    def make(self, fetcher=None, registry=None, worker=None, talk=None, **overrides):
         values = dict(client_workspaces=True)
         values.update(overrides)
         self.store = MemoryStore()
         self.store.save(REGISTRY, registry or registry_record(), None)
         self.email_sender = EmailSender()
         self.fetcher = fetcher or FakeFetcher()
-        self.app = create_app(settings=settings(**values), store=self.store, worker=worker or CountingWorker(),
-                              id_factory=IDs(), email_sender=self.email_sender, project_fetcher=self.fetcher)
+        self.worker = worker or CountingWorker()
+        self.talk = talk or FakeTalk()
+        self.app = create_app(settings=settings(**values), store=self.store, worker=self.worker,
+                              id_factory=IDs(), email_sender=self.email_sender, project_fetcher=self.fetcher,
+                              talk_client=self.talk)
         return self.app
 
     def sign_in(self, client, email=CLIENT_EMAIL):
@@ -567,14 +571,14 @@ class Audit(Api):
         first, second = audit
         self.assertEqual({"actor", "token_type", "tenant", "project", "command_id", "command_type", "prior_revision",
                           "revision", "op_ids", "at", "outcome"}, set(first))
-        patch_op = [e["op_id"] for e in applied.json()["events"] if e["type"] == "artifact.patch"]
+        patch_op = [e["op_id"] for e in applied.json()["events"]]
         self.assertEqual(("client:" + self.subject()[:16], "session", "nav", "steelworks", "cmd-1", "utterance",
                           1, 2, patch_op, "applied"),
                          (first["actor"], first["token_type"], first["tenant"], first["project"], first["command_id"],
                           first["command_type"], first["prior_revision"], first["revision"], first["op_ids"],
                           first["outcome"]))
-        self.assertEqual((2, 2, [], "refused"), (second["prior_revision"], second["revision"], second["op_ids"],
-                                                  second["outcome"]))
+        self.assertEqual((2, 2, [e["op_id"] for e in refused.json()["events"]], "refused"),
+                         (second["prior_revision"], second["revision"], second["op_ids"], second["outcome"]))
         dumped = json.dumps(audit)
         for never in ("Steel Works", "bigger", "refuse this", CLIENT_EMAIL):
             self.assertNotIn(never, dumped)
@@ -600,6 +604,17 @@ class CoreGuard(unittest.TestCase):
                 controller.create_session(*args)
             self.assertEqual(403, caught.exception.status)
         state, _ = controller.create_session("x", "subject", "c-2", "project", False, None, True, "", True, tree, "p", "nav")
+        # A replay whose stored record says another tenant or project is refused, not returned.
+        from app.state import StateConflict
+        for field, value in (("client_tenant", "other"), ("project", "q")):
+            blank, _ = controller.create_session("x", "subject", "r-" + field, "blank", False, None, False, "", True,
+                                                 None, "", "nav")
+            record = controller.repository.load(blank["session_id"])
+            tampered = dict(record.state, **{field: value})
+            controller.repository.save(blank["session_id"], tampered, record.token)
+            with self.assertRaises(StateConflict, msg=field):
+                controller.create_session("x", "subject", "r-" + field, "blank", False, None, False, "", True,
+                                          None, "", "nav")
         self.assertEqual(("", "subject", "nav", "p", True), (state["operator_subject"], state["client_subject"],
                                                               state["client_tenant"], state["project"], state["analyst"]))
 
@@ -959,3 +974,343 @@ class NoLeaks(Api):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =====================================================================================================
+# Codex NO-GO on cf8f5ac (row CODEX-PR260-GATE1-NOGO-CF8F5AC-20260925T111206Z), and Gemini's attacks.
+# =====================================================================================================
+SESSION_ROUTES = (
+    ("GET", "events?once=true", None), ("POST", "talk", {"text": "hello"}),
+    ("POST", "speak", {"text": "hello", "voice": "architect"}), ("POST", "inspire", {}),
+    ("POST", "recap", {}), ("POST", "analyze", {"text": "hello"}),
+    ("POST", "commands", "UTTERANCE"), ("POST", "voice", {"sdp": "v=0"}),
+    ("POST", "rating", {"score": 5}), ("POST", "summary", {}),
+)
+
+
+class Blocker1TenantAndProjectBinding(Api):
+    def call(self, client, method, route, body, sid, token):
+        url = "/v1/session/%s/%s" % (sid, route)
+        if body == "UTTERANCE":
+            body = {"command_id": "cmd-x", "session_id": sid, "type": "utterance", "expected_version": 1,
+                    "transcript": "make it bigger", "item_id": "item-x"}
+        return client.get(url, headers=self.auth(token)) if method == "GET" else \
+            client.post(url, headers=self.auth(token), json=body)
+
+    def test_an_address_moved_to_another_tenant_never_reaches_its_old_sessions(self):
+        # Codex repro: the same verified address moved from tenant nav to tenant
+        # other; the same blank creation id returned the old nav session.
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            old = {start: client.post("/v1/session", headers=self.auth(token),
+                                      json={"creation_id": "same-" + start, "start": start}).json()
+                   for start in ("blank", "template")}
+            self.set_registry(registry_record(client_entry(emails=("someone@example.com",)),
+                                              client_entry("other", emails=(CLIENT_EMAIL,))))
+            moved = self.sign_in(client).json()["token"]
+            self.assertEqual("other", verify_client_token(moved, SECRET)["tnt"])
+            new = {start: client.post("/v1/session", headers=self.auth(moved),
+                                      json={"creation_id": "same-" + start, "start": start}).json()
+                   for start in ("blank", "template")}
+            for start in ("blank", "template"):
+                self.assertNotEqual(old[start]["session_id"], new[start]["session_id"], start)
+                stale = client.get("/v1/session/%s/events?once=true" % old[start]["session_id"],
+                                   headers=self.auth(old[start]["token"]))
+                fresh = client.get("/v1/session/%s/events?once=true" % new[start]["session_id"],
+                                   headers=self.auth(new[start]["token"]))
+                self.assertEqual((403, WORKSPACE_DENIED), (stale.status_code, stale.json()["detail"]), start)
+                self.assertEqual(200, fresh.status_code, start)
+                self.assertEqual("other", self.state(new[start]["session_id"])["client_tenant"])
+
+    def test_the_session_token_is_bound_to_subject_tenant_and_project(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            got = verify_token(live["token"], SECRET, scope="session")
+        self.assertEqual(("nav", self.subject(), "steelworks"), (got["tnt"], got["csub"], got["prj"]))
+
+    def test_gemini_attack_2_every_disagreement_of_state_token_and_registry_is_one_denial_before_side_effects(self):
+        # (i) stored = token = nav, but the registry now lists the project under
+        # acme; (ii) the token says acme; (iii) the stored tenant says acme.
+        acme = client_entry("acme", emails=(OTHER_EMAIL,), projects=[project()])
+        for case in ("registry", "token", "state"):
+            with TestClient(self.make(registry=registry_record(client_entry(), client_entry("acme", emails=(OTHER_EMAIL,), projects=[])))) as client:
+                token = self.sign_in(client).json()["token"]
+                live = self.project_session(client, token).json()
+                sid, session_token = live["session_id"], live["token"]
+                if case == "registry":
+                    self.set_registry(registry_record(client_entry(projects=[]), acme))
+                elif case == "token":
+                    session_token = mint_token(sid, 10 ** 11, SECRET,
+                                               binding={"tnt": "acme", "csub": self.subject(), "prj": "steelworks"})
+                else:
+                    record, stamp = self.store.load("studio_session_" + sid)
+                    record["client_tenant"] = "acme"
+                    self.store.save("studio_session_" + sid, record, stamp)
+                before = json.dumps(self.state(sid), sort_keys=True)
+                calls = (self.worker.calls, len(self.talk.calls))
+                for method, route, body in SESSION_ROUTES:
+                    out = self.call(client, method, route, body, sid, session_token)
+                    self.assertEqual((403, WORKSPACE_DENIED), (out.status_code, out.json()["detail"]), (case, route))
+                self.assertEqual(before, json.dumps(self.state(sid), sort_keys=True), case)
+                self.assertEqual(calls, (self.worker.calls, len(self.talk.calls)), case)
+
+    def test_a_token_never_crosses_between_client_and_other_sessions(self):
+        with TestClient(self.make()) as client:
+            client_token = self.sign_in(client).json()["token"]
+            mine = self.project_session(client, client_token).json()
+            operator = self.sign_in(client, OPERATOR).json()["token"]
+            theirs = client.post("/v1/session", headers=self.auth(operator), json={"creation_id": "op-1", "start": "blank"}).json()
+            unbound = mint_token(mine["session_id"], 10 ** 11, SECRET)            # a client session without binding
+            bound_to_operator = mint_token(theirs["session_id"], 10 ** 11, SECRET,
+                                           binding={"tnt": "nav", "csub": self.subject(), "prj": ""})
+            wrong_project = mint_token(mine["session_id"], 10 ** 11, SECRET,
+                                       binding={"tnt": "nav", "csub": self.subject(), "prj": ""})
+            answers = [client.get("/v1/session/%s/events?once=true" % sid, headers=self.auth(t))
+                       for sid, t in ((mine["session_id"], unbound), (theirs["session_id"], bound_to_operator),
+                                      (mine["session_id"], wrong_project))]
+            operator_ok = client.get("/v1/session/%s/events?once=true" % theirs["session_id"],
+                                     headers=self.auth(theirs["token"]))
+        for out in answers:
+            self.assertEqual((403, WORKSPACE_DENIED), (out.status_code, out.json()["detail"]))
+        self.assertEqual(200, operator_ok.status_code)
+
+
+class Blocker2ProjectRevocation(Blocker1TenantAndProjectBinding):
+    def test_removing_the_project_shuts_every_session_route_before_any_side_effect(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            blank = client.post("/v1/session", headers=self.auth(token), json={"creation_id": "b-1", "start": "blank"}).json()
+            self.set_registry(registry_record(client_entry(projects=[])))    # tenant and address stay
+            sid = live["session_id"]
+            before = json.dumps(self.state(sid), sort_keys=True)
+            calls = (self.worker.calls, len(self.talk.calls))
+            for method, route, body in SESSION_ROUTES:
+                out = self.call(client, method, route, body, sid, live["token"])
+                self.assertEqual((403, WORKSPACE_DENIED), (out.status_code, out.json()["detail"]), route)
+            # A blank session of the same client needs only the tenant and address.
+            still = client.get("/v1/session/%s/events?once=true" % blank["session_id"], headers=self.auth(blank["token"]))
+        self.assertEqual(before, json.dumps(self.state(sid), sort_keys=True))
+        self.assertEqual(calls, (self.worker.calls, len(self.talk.calls)))
+        self.assertEqual(200, still.status_code)
+
+
+class Blocker3ParseAndFetchBudgets(Api):
+    def test_a_giant_tag_and_a_giant_text_node_stop_quickly_on_the_real_clock(self):
+        for name, html, kept in (
+                ("giant tag", "<p>kept before</p><a title='" + "x" * 1_990_000, "kept before"),
+                ("unclosed script", "<p>kept before</p><script>" + "x" * 1_990_000, "kept before"),
+                ("giant text", "<p>" + "word " * 399_000 + "</p>", "word word"),
+                ("deep nesting", "<p>kept before</p>" + "<div><span>" * 180_000, "kept before"),
+                ("many attributes", "<p>kept before</p><p " + " ".join("a%d=1" % n for n in range(150_000)) + ">", "kept before")):
+            started = time.monotonic()
+            tree = page_to_tree(html, "T")
+            self.assertLess(time.monotonic() - started, 2.5, name)
+            self.assertIn(kept, json.dumps(tree), name)
+            self.assertLessEqual(max(len(label) for label in Tree.labels(Tree(), tree).split(" | ")), 204, name)
+
+    def test_the_unparsed_remainder_and_the_event_count_are_hard_stops(self):
+        with mock.patch.object(project_page, "MAX_PENDING", 1_000):
+            # The tag spans feed chunks, so the parser holds it unparsed: past the cap, stop.
+            tree = page_to_tree("<p>first</p><a title='" + "x" * 40_000 + "'>late</a><p>after the tag</p>", "T")
+        self.assertIn("first", json.dumps(tree))
+        self.assertNotIn("after the tag", json.dumps(tree))
+        with mock.patch.object(project_page, "MAX_EVENTS", 10):
+            tree = page_to_tree("".join("<p>para %d here</p>" % n for n in range(50)), "T")
+        self.assertLess(tree_nodes(tree), 8)
+        # With the clock frozen, only the event cap stops 120,000 empty tags.
+        tree = page_to_tree("<b></b>" * 60_000 + "<p>tail text</p>", "T", clock=lambda: 0.0)
+        self.assertNotIn("tail text", json.dumps(tree))
+
+    def test_page_loads_per_tenant_are_budgeted_before_any_fetch_and_a_failure_admits_nothing(self):
+        with TestClient(self.make(fetcher=FakeFetcher(fail=True))) as client:
+            token = self.sign_in(client).json()["token"]
+            answers = [self.project_session(client, token, "fail-%d" % n).status_code
+                       for n in range(FETCH_ATTEMPTS_PER_HOUR + 3)]
+            blank = client.post("/v1/session", headers=self.auth(token),
+                                json={"creation_id": "after-1", "start": "blank"}).json()
+        self.assertEqual([502] * FETCH_ATTEMPTS_PER_HOUR + [429] * 3, answers)
+        self.assertEqual(FETCH_ATTEMPTS_PER_HOUR, len(self.fetcher.calls))
+        self.assertEqual(1, blank["daily_admission_number"])
+        attempts = self.store.data["studio_client_fetch_nav"]["attempts"]
+        self.assertEqual({"at", "project"}, set(attempts[0]))                 # no URL, no page content
+
+    def test_one_page_load_per_tenant_at_a_time(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            self.app.state.fetches_in_flight.add("nav")
+            busy = self.project_session(client, token)
+            self.app.state.fetches_in_flight.discard("nav")
+            ok = self.project_session(client, token, "after-busy")
+        self.assertEqual(429, busy.status_code)
+        self.assertEqual(200, ok.status_code)
+        self.assertEqual([PAGE], self.fetcher.calls)
+
+    def test_no_free_load_slot_is_a_503_that_admits_nothing(self):
+        class Busy(FakeFetcher):
+            def __call__(self, url):
+                self.calls.append(url)
+                raise FetchBusy("every page-load slot is taken")
+        with TestClient(self.make(fetcher=Busy())) as client:
+            token = self.sign_in(client).json()["token"]
+            out = self.project_session(client, token)
+            blank = client.post("/v1/session", headers=self.auth(token), json={"creation_id": "b-1", "start": "blank"}).json()
+        self.assertEqual(503, out.status_code)
+        self.assertEqual(1, blank["daily_admission_number"])
+
+
+class Blocker4BoundedBlockedDns(unittest.TestCase):
+    def test_blocked_resolvers_hold_at_most_the_slot_count_of_threads_and_the_rest_fail_fast(self):
+        gate = threading.Event()
+
+        def stuck(host):
+            gate.wait(10)
+            return [PUBLIC_IP]
+
+        def alive():
+            return [t for t in threading.enumerate() if t.name == "studio-project-fetch" and t.is_alive()]
+        slots = threading.BoundedSemaphore(4)
+        outcomes = []
+        with mock.patch.object(project_page, "_SLOTS", slots), mock.patch.object(project_page, "TOTAL_SECONDS", 0.2):
+            for _ in range(30):
+                started = time.monotonic()
+                try:
+                    fetch_page(PAGE, resolver=stuck, transport=page_transport())
+                except FetchBusy:
+                    outcomes.append(("busy", time.monotonic() - started))
+                except PageFetchError:
+                    outcomes.append(("timeout", time.monotonic() - started))
+            self.assertEqual(4, len(alive()))                       # 30 calls, 4 threads
+            self.assertEqual(["timeout"] * 4 + ["busy"] * 26, [kind for kind, _ in outcomes])
+            self.assertTrue(all(took < 0.1 for kind, took in outcomes if kind == "busy"))
+            gate.set()                                            # the resolvers return ...
+            deadline = time.monotonic() + 5
+            while alive() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual([], alive())                         # ... the threads drain, the slots free
+            self.assertEqual("<h1>ok</h1>", fetch_page(PAGE, resolver=Resolver([PUBLIC_IP]),
+                                                       transport=page_transport()))
+
+
+class Blocker5AuditAndRedaction(Api):
+    def command(self, client, live, command_id, kind, **extra):
+        body = {"command_id": command_id, "session_id": live["session_id"], "type": kind,
+                "expected_version": self.state(live["session_id"])["artifact_version"]}
+        body.update(extra)
+        self.last_body = body
+        return client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]), json=body)
+
+    def replay(self, client, live):
+        return client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                           json=self.last_body)
+
+    def test_every_accepted_command_is_audited_exactly_once_with_its_op_ids(self):
+        with TestClient(self.make(worker=PatchWorker())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            first = self.command(client, live, "c-1", "utterance", transcript="bigger please", item_id="i-1")
+            again = self.replay(client, live)
+            paused = self.command(client, live, "c-2", "pause")
+            resumed = self.command(client, live, "c-3", "resume")
+            stopped = self.command(client, live, "c-4", "stop")
+            stopped_again = self.replay(client, live)
+        self.assertEqual(first.json(), again.json())
+        self.assertEqual(stopped.json(), stopped_again.json())
+        audit = self.state(live["session_id"])["audit"]
+        self.assertEqual(["c-1", "c-2", "c-3", "c-4"], [a["command_id"] for a in audit])     # replays add nothing
+        for entry, response, kind in ((audit[0], first, "utterance"), (audit[1], paused, "pause"),
+                                      (audit[2], resumed, "resume"), (audit[3], stopped, "stop")):
+            self.assertEqual((kind, "applied", [e["op_id"] for e in response.json()["events"]]),
+                             (entry["command_type"], entry["outcome"], entry["op_ids"]))
+            self.assertTrue(entry["op_ids"], kind)
+
+    def test_a_worker_failure_answers_and_logs_no_words_and_is_audited(self):
+        class Exploding(PatchWorker):
+            def on_turn(self, state, trigger):
+                raise RuntimeError("SECRETWORDS the client said: " + trigger.get("text", ""))
+        captured = io.StringIO()
+        handler = logging.StreamHandler(captured)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                with TestClient(self.make(worker=Exploding()), raise_server_exceptions=False) as client:
+                    token = self.sign_in(client).json()["token"]
+                    live = self.project_session(client, token).json()
+                    out = self.command(client, live, "c-1", "utterance", transcript="PRIVATEPLAN for my shop", item_id="i-1")
+        finally:
+            root.removeHandler(handler)
+        self.assertEqual((500, {"detail": SERVER_ERROR}), (out.status_code, out.json()))
+        for marker in ("SECRETWORDS", "PRIVATEPLAN"):
+            self.assertNotIn(marker, out.text)
+            self.assertNotIn(marker, captured.getvalue())
+        self.assertIn("RuntimeError", captured.getvalue())               # the type is logged, nothing else
+        audit = self.state(live["session_id"])["audit"]
+        self.assertEqual([("c-1", "failed", [])], [(a["command_id"], a["outcome"], a["op_ids"]) for a in audit])
+
+    def test_any_unexpected_failure_is_a_static_answer(self):
+        with TestClient(self.make(), raise_server_exceptions=False) as client:
+            token = self.sign_in(client).json()["token"]
+            with mock.patch.object(self.app.state.clients, "member", side_effect=RuntimeError("SECRETWORDS")):
+                out = client.get("/v1/workspace", headers=self.auth(token))
+        self.assertEqual((500, {"detail": SERVER_ERROR}), (out.status_code, out.json()))
+
+
+class FindingF1WorkspaceSnapshot(Api):
+    def test_an_old_token_sees_only_the_projects_it_was_issued_for(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            self.set_registry(registry_record(client_entry(projects=[project(), project("second", "https://www.second.example.com/")])))
+            old = client.get("/v1/workspace", headers=self.auth(token)).json()
+            fresh = client.get("/v1/workspace", headers=self.auth(self.sign_in(client).json()["token"])).json()
+        self.assertEqual(["steelworks"], [p["id"] for p in old["projects"]])
+        self.assertEqual(["steelworks", "second"], [p["id"] for p in fresh["projects"]])
+
+
+class FindingF2Redaction(unittest.TestCase):
+    def test_links_domains_addresses_and_emails_become_placeholders(self):
+        cases = {
+            "Visit steelworkson.ca today": "Visit [link] today",
+            "Mail info@steel-works.ca now": "Mail [email] now",
+            "Admin at 10.0.0.1/admin here": "Admin at [link] here",
+            "Also 2001:db8::1 and [fe80::1]:8080": "Also [link] and [link]",
+            "See https://x.example/a or www.example.org": "See [link] or [link]",
+            "Open 9am-5pm, 10:30 to 3.14 km, e.g. weekends": "Open 9am-5pm, 10:30 to 3.14 km, e.g. weekends",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text)
+        tree = page_to_tree("<h1>steel.example.com</h1><p>Call 203.0.113.9 or write sales@steel.example.com</p>",
+                            "steel.example.com")
+        self.assertEqual("steel.example.com", tree["label"])                 # the registry's name, as written
+        labels = json.dumps(tree["children"])
+        for never in ("steel.example.com", "203.0.113.9", "sales@"):
+            self.assertNotIn(never, labels)
+
+
+class GeminiAttacks(unittest.TestCase):
+    def test_attack_1_mapped_answers_are_refused_and_a_swap_never_re_resolves(self):
+        for answers in (["::ffff:127.0.0.1"], ["::ffff:169.254.169.254"], [PUBLIC_IP, "::ffff:10.0.0.1"]):
+            seen = []
+            with self.assertRaises(PageFetchError, msg=answers):
+                fetch_page(PAGE, resolver=Resolver(answers), transport=page_transport(seen=seen))
+            self.assertEqual([], seen)
+        swap, seen = Resolver([PUBLIC_IP], ["::ffff:127.0.0.1"]), []
+        fetch_page(PAGE, resolver=swap, transport=page_transport(seen=seen))
+        self.assertEqual((1, [PUBLIC_IP]), (len(swap.calls), [r.url.host for r in seen]))
+
+    def test_attack_3_foreign_namespaces_templates_and_noscript_leave_only_inert_labels(self):
+        page = ("<body><h1>Welcome</h1>"
+                "<svg><foreignObject><div><p>svg html payload</p><script>alert('svg')</script></div></foreignObject></svg>"
+                "<math><annotation-xml encoding='text/html'><p>math html payload</p><script>alert('math')</script>"
+                "</annotation-xml></math>"
+                "<template><p>template payload</p><script>alert('tpl')</script></template>"
+                "<noscript><img src=x onerror=alert('ns')><p>noscript payload</p></noscript>"
+                "<p>After it all</p></body>")
+        tree = page_to_tree(page, "T")
+        text = json.dumps(tree).lower()
+        for never in ("payload", "alert", "script", "onerror", "svg", "math", "template", "noscript", "http"):
+            self.assertNotIn(never, text)
+        self.assertIn("welcome", text)
+        self.assertIn("after it all", text)
+

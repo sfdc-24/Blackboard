@@ -51,6 +51,11 @@ CHARSETS = {"utf-8": "utf-8", "utf8": "utf-8", "iso-8859-1": "latin-1", "latin-1
             "windows-1252": "cp1252", "cp1252": "cp1252", "us-ascii": "ascii", "ascii": "ascii"}
 
 MAX_HTML_CHARS = 2_000_000
+FEED_CHUNK = 16_384           # the parser is fed this much at a time ...
+MAX_PENDING = 65_536          # ... and may never hold more than this unparsed (one giant tag)
+MAX_EVENTS = 50_000           # tags and text runs handled, in all
+MAX_CALLBACK_CHARS = 4_096    # the most of one text run or attribute ever looked at
+MAX_OUTSTANDING_FETCHES = 4   # page loads (and their threads) alive at once, timed out or not
 MAX_NODES = 60
 MAX_DEPTH = 4                 # screen > section > list/form > item
 MAX_IMAGES = 12
@@ -62,6 +67,16 @@ USER_AGENT = "SFDC24-Studio/1.0 (+https://www.sfdc24.com)"
 
 class PageFetchError(RuntimeError):
     """The project page could not be loaded (never carries the page, its URL or address)."""
+
+
+class FetchBusy(PageFetchError):
+    """Every page-load slot is taken: nothing was started."""
+
+
+# A page load keeps its slot until its thread has actually finished - a caller
+# that stopped waiting at the deadline does not free it. So however many
+# resolvers or connections hang, at most MAX_OUTSTANDING_FETCHES threads exist.
+_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_FETCHES)
 
 
 # -- which addresses may be reached ---------------------------------------------------
@@ -120,6 +135,9 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
     per-chunk deadline, and its result is discarded.)"""
     if not project_url_ok(url):
         raise PageFetchError("not a registered https page")
+    slots = _SLOTS
+    if not slots.acquire(blocking=False):
+        raise FetchBusy("every page-load slot is taken")
     outcome: dict = {}
 
     def work():
@@ -129,9 +147,15 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
             outcome["error"] = exc
         except BaseException as exc:         # never the message: it can carry the URL
             outcome["error"] = PageFetchError(type(exc).__name__)
+        finally:
+            slots.release()                  # only once the work has really stopped
 
     worker = threading.Thread(target=work, name="studio-project-fetch", daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        slots.release()
+        raise
     worker.join(TOTAL_SECONDS)
     if worker.is_alive():
         raise PageFetchError("the page was too slow")
@@ -213,14 +237,45 @@ _TEXT_BLOCKS = {"p", "blockquote", "figcaption", "dt", "dd", "td", "th", "addres
 _VOID = {"img", "input", "br", "hr", "meta", "link", "source", "area", "base", "col", "embed", "param",
          "track", "wbr", "keygen"}
 _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
-# No address from the page reaches a label, even as visible text.
+# No address from the page reaches a label, even as visible text: links,
+# bare domains, IP addresses and email addresses become a neutral placeholder.
+LINK = "[link]"
+EMAIL = "[email]"
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
+_IPV6_RE = re.compile(r"(?i)(?<![\w:])\[?([0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7})(?:%\w+)?\]?(?::\d{1,5})?(?![\w:])")
+_TLD = (r"(?:com|net|org|info|biz|io|co|ai|app|dev|site|online|shop|store|tech|xyz|me|tv|gov|edu|mil|int"
+        r"|cloud|page|link|live|pro|blog|news|agency|design|studio|solutions|services|[a-z]{2})")
+_DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+" + _TLD + r"\b(?::\d{1,5})?(?:/\S*)?")
 
 
-def clean_text(value: str, cap: int = LABEL_MAX) -> str:
-    """Visible words as one plain line: no addresses, no control, format or
-    separator code points, no angle brackets, single spaces, at most ``cap``."""
+def _ipv6_link(match) -> str:
+    text = match.group(1)
+    if "::" not in text and not re.search(r"(?i)[a-f]", text):
+        return match.group(0)                # a time or a score, not an address
+    try:
+        ipaddress.IPv6Address(text)
+        return LINK
+    except ValueError:
+        return match.group(0)
+
+
+def redact(text: str) -> str:
+    """Replace every link-, domain-, IP- and email-shaped token with a placeholder."""
+    text = _EMAIL_RE.sub(EMAIL, text)
+    text = _URL_RE.sub(LINK, text)
+    text = _IPV4_RE.sub(LINK, text)
+    text = _IPV6_RE.sub(_ipv6_link, text)
+    return _DOMAIN_RE.sub(LINK, text)
+
+
+def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> str:
+    """Visible words as one plain line: no addresses (``redacted``), no
+    control, format or separator code points, no angle brackets, single
+    spaces, at most ``cap``. Only the first MAX_CALLBACK_CHARS are looked at."""
+    value = (value or "")[:MAX_CALLBACK_CHARS]
     kept = []
     for ch in value or "":
         if ch in "<>":
@@ -229,11 +284,17 @@ def clean_text(value: str, cap: int = LABEL_MAX) -> str:
             kept.append(" ")
         elif unicodedata.category(ch) not in _UNSAFE:
             kept.append(ch)
-    text = _URL_RE.sub(" ", "".join(kept))
+    text = "".join(kept)
+    if redacted:
+        text = redact(text)
     text = re.sub(r" +", " ", text).strip()
     if len(text) > cap:
         text = text[:cap].rsplit(" ", 1)[0].rstrip(" ,.;:-") or text[:cap]
     return text
+
+
+class _ParseStop(Exception):
+    """The parse budget is spent: stop now, keep what was built."""
 
 
 class _Builder(HTMLParser):
@@ -241,10 +302,12 @@ class _Builder(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.clock = clock
         self.deadline = clock() + PARSE_SECONDS
+        self.events = 0
         self.count = 1                       # the screen
         self.images = 0
         self.full = False
-        self.screen = {"id": "screen", "kind": "screen", "label": clean_text(title, 80) or "Project",
+        # The project's name from the registry is not page text: kept as written.
+        self.screen = {"id": "screen", "kind": "screen", "label": clean_text(title, 80, redacted=False) or "Project",
                        "children": []}
         self.section = None
         self.nav = None
@@ -256,8 +319,12 @@ class _Builder(HTMLParser):
         self.last_text = None
 
     def _over_time(self) -> bool:
-        if not self.full and self.clock() > self.deadline:
+        """Every callback starts here: past the time or event budget, the whole
+        parse stops at once (the exception unwinds out of HTMLParser.feed)."""
+        self.events += 1
+        if self.events > MAX_EVENTS or self.clock() > self.deadline:
             self.full = True
+            raise _ParseStop()
         return self.full
 
     # -- nodes ---------------------------------------------------------------------
@@ -440,6 +507,7 @@ class _Builder(HTMLParser):
     def handle_data(self, data):
         if self._over_time() or self.skip:
             return
+        data = data[:MAX_CALLBACK_CHARS]     # never scan more of one text run than this
         if self.buffers:
             words = self.buffers[-1][2]
             if sum(len(w) for w in words) < LABEL_MAX * 4:
@@ -467,10 +535,18 @@ class _Builder(HTMLParser):
 def page_to_tree(html: str, title: str, *, clock=time.monotonic) -> dict:
     """The builder's artifact tree for a page: plain text in known kinds only."""
     builder = _Builder(title, clock=clock)
+    text = (html or "")[:MAX_HTML_CHARS]
     try:
-        builder.feed((html or "")[:MAX_HTML_CHARS])
+        # Fed in chunks, with a hard stop between them on time, on the node cap,
+        # and on the unparsed remainder: a tag or a script that never closes is
+        # held by the parser, and re-scanning it chunk after chunk is the cost
+        # this bounds.
+        for start in range(0, len(text), FEED_CHUNK):
+            builder.feed(text[start:start + FEED_CHUNK])
+            if builder.full or clock() > builder.deadline or len(builder.rawdata) > MAX_PENDING:
+                raise _ParseStop()
         builder.close()
-    except Exception:                        # a broken page still yields what was read
+    except Exception:                        # a stopped or broken page still yields what was read
         pass
     return builder.finish()
 

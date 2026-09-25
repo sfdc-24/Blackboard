@@ -198,7 +198,8 @@ class StudioController:
             raise CommandError("a client session needs its subject and tenant", 403)
         now = int(self.clock())
         if creation_id:
-            session_id = self._session_key(subject, creation_id, tenant, project if start == "project" else "")
+            session_id = self._session_key(subject, creation_id, tenant if client else "",
+                                           project if start == "project" else "")
         else:
             session_id = self.id_factory("s")
         if start == "project" and artifact is None:
@@ -208,7 +209,7 @@ class StudioController:
                 existing = self.repository.load(session_id).state
             except SessionNotFound as exc:
                 raise CommandError("the project page could not be loaded", 502) from exc
-            self._same_owner(existing, subject, visitor, client)
+            self._same_owner(existing, subject, visitor, client, tenant, project)
             return copy.deepcopy(existing), self.repository.admit(admit_limit or self.daily_cap, session_id)
         # A visitor is admitted against the same daily ledger, but only up to a
         # lower limit, so the operator keeps headroom.
@@ -302,14 +303,17 @@ class StudioController:
             if not creation_id:
                 raise
             existing = self.repository.load(session_id).state
-            self._same_owner(existing, subject, visitor, client)
+            self._same_owner(existing, subject, visitor, client, tenant if client else "",
+                             project if start == "project" else "")
             return copy.deepcopy(existing), admitted
 
     @staticmethod
     def _session_key(subject: str, creation_id: str, tenant: str = "", project: str = "") -> str:
-        """A workspace session is keyed by {tenant, project} as well as its owner
-        and creation id; other sessions keep the key they always had."""
-        parts = [subject, creation_id] + ([tenant, project] if project else [])
+        """Every client session is keyed by {tenant, project} as well as its
+        owner and creation id (project "" for blank and template), so the same
+        address moved to another tenant never reaches its old sessions. Other
+        sessions keep the key they always had."""
+        parts = [subject, creation_id] + ([tenant, project] if tenant else [])
         return "s-" + hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:32]
 
     def created_session_exists(self, subject: str, creation_id: str, tenant: str = "",
@@ -324,11 +328,14 @@ class StudioController:
             return False
 
     @staticmethod
-    def _same_owner(existing: dict, subject: str, visitor: bool, client: bool) -> None:
+    def _same_owner(existing: dict, subject: str, visitor: bool, client: bool,
+                    tenant: str = "", project: str = "") -> None:
         owner = (existing.get("operator_subject") or existing.get("visitor_subject")
                  or existing.get("client_subject") or "")
         if (not owner or owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
-                or bool(existing.get("client_subject")) != bool(client)):
+                or bool(existing.get("client_subject")) != bool(client)
+                or (existing.get("client_tenant") or "") != tenant
+                or (existing.get("project") or "") != project):
             raise StateConflict("creation_id belongs to another operator")
 
     def _assert_live(self, state: dict) -> None:
@@ -504,6 +511,8 @@ class StudioController:
             }
             state["active_command"] = None
             _advance_epoch(state, "command_epoch")
+            if state.get("client_tenant"):
+                self._audit(state, command, state["artifact_version"], {}, outcome="failed")
             try:
                 self.repository.save(session_id, state, reserved_token)
             except StateConflict:
@@ -657,6 +666,8 @@ class StudioController:
                 "result": copy.deepcopy(result),
             }
             _advance_epoch(candidate, "command_epoch")
+            if candidate.get("client_tenant"):
+                self._audit(candidate, command, candidate["artifact_version"], result, outcome="applied")
             try:
                 self.repository.save(session_id, candidate, record.token)
                 cancel = getattr(self.worker, "cancel_session", None)
@@ -828,17 +839,24 @@ class StudioController:
 
     AUDIT_MAX = 200
 
-    def _audit(self, state: dict, command: dict, prior_revision: int, result: dict) -> None:
-        """One entry per command in a client (workspace) session: who, which
-        {tenant, project}, the revision before and after, the patch op ids,
-        when, and the outcome. Never the page, the words said, or any label."""
-        patch_ops = [e["op_id"] for e in result.get("events") or [] if e.get("type") == "artifact.patch"]
-        if patch_ops:
-            outcome = "applied"
-        elif result.get("problems"):
-            outcome = "refused"
-        else:
-            outcome = "no_change"
+    def _audit(self, state: dict, command: dict, prior_revision: int, result: dict,
+               outcome: str | None = None) -> None:
+        """One entry per command in a client (workspace) session - stop and a
+        failure included, a replayed command_id never again: who, which
+        {tenant, project}, the revision before and after, the op id of every
+        event the command emitted, when, and the outcome. Never the page, the
+        words said, or any label."""
+        events = result.get("events") or []
+        op_ids = [e["op_id"] for e in events if e.get("op_id")]
+        if outcome is None:
+            if any(e.get("type") == "artifact.patch" for e in events):
+                outcome = "applied"
+            elif result.get("problems"):
+                outcome = "refused"
+            elif events:
+                outcome = "applied"
+            else:
+                outcome = "no_change"
         entry = {
             "actor": "client:" + str(state.get("client_subject") or "")[:16],
             "token_type": "session",
@@ -848,7 +866,7 @@ class StudioController:
             "command_type": str(command.get("type") or ""),
             "prior_revision": prior_revision,
             "revision": state["artifact_version"],
-            "op_ids": patch_ops,
+            "op_ids": op_ids,
             "at": int(self.clock()),
             "outcome": outcome,
         }

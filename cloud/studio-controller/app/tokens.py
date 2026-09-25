@@ -24,12 +24,15 @@ def _b64d(value: str) -> bytes:
 
 def mint_token(session_id: str, expires_at: int, secret: str, scope: str = "session",
                binding: dict | None = None) -> str:
-    """A v1 token. ``binding`` (a client session's tenant and subject) is signed
-    in so a session-scope request can be re-authorised against the registry."""
+    """A v1 token. ``binding`` - a client session's tenant, subject and project
+    ("" for a blank or template session) - is signed in, so every session-scope
+    request is compared with the stored session and re-authorised against the
+    registry."""
     claims = {"sid": session_id, "exp": int(expires_at), "scope": scope, "v": 1}
     if binding:
-        if set(binding) != {"tnt", "csub"} or not all(isinstance(v, str) and v for v in binding.values()):
-            raise ValueError("a session binding is exactly a tenant and a client subject")
+        if (set(binding) != {"tnt", "csub", "prj"} or not all(isinstance(v, str) for v in binding.values())
+                or not binding["tnt"] or not binding["csub"]):
+            raise ValueError("a session binding is exactly a tenant, a client subject and a project")
         claims.update(binding)
     payload = _b64e(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
     signature = _b64e(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest())

@@ -10,6 +10,7 @@ import ipaddress
 import json
 import re
 import secrets
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,7 +30,7 @@ from .core import CommandError, StudioController
 from .auth import AuthService
 from .clients import ClientRegistry, public_view
 from .leads import LeadBook, LeadCapExceeded
-from .project_page import PageFetchError, fetch_page, page_to_tree
+from .project_page import FetchBusy, PageFetchError, fetch_page, page_to_tree
 from .settings import Settings
 from .state import (
     SessionNotFound,
@@ -47,6 +48,13 @@ CALL_ID_RE = re.compile(r"^rtc_[A-Za-z0-9_-]{1,120}$")
 # tenant's project, a project that does not exist, a token of the wrong kind -
 # so a denial never tells which of those it was.
 WORKSPACE_DENIED = "this workspace is not available"
+# What an unexpected failure says: never its exception text, which can hold
+# what a visitor said or a page held.
+SERVER_ERROR = "the request could not be completed"
+# Page loads a tenant may start, whatever their outcome: bounded before any
+# fetch or parse, so failed creation ids cannot drive repeated work.
+FETCH_ATTEMPTS_PER_HOUR = 10
+FETCH_ATTEMPTS_PER_DAY = 40
 
 
 class SummaryNotSent(RuntimeError):
@@ -412,7 +420,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "/health", "/healthz", "/v1/maintenance/voice-sweep",
         }:
             await sweep_due_calls()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            # A static answer and a log line with the error type only.
+            governance.log_event("studio.request_failed", path_kind=request.url.path.split("/")[2]
+                                 if request.url.path.startswith("/v1/") else "other", error=type(exc).__name__)
+            response = JSONResponse({"detail": SERVER_ERROR}, status_code=500)
         if request.url.path.startswith("/v1/"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -432,16 +446,36 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(401, str(exc)) from exc
         if claims["sid"] != session_id:
             raise HTTPException(403, "token does not belong to this session")
-        require_bound_client(claims)
+        require_bound_client(claims, session_id)
         return claims
 
-    def require_bound_client(claims: dict) -> None:
-        """A client session's token carries its tenant and subject: while it is
-        used, that client must still be in the registry (read fresh)."""
-        if "tnt" not in claims and "csub" not in claims:
-            return
-        if not settings.client_workspaces or clients.member(
-                claims.get("tnt", ""), claims.get("csub", ""), auth_service._subject_hash) is None:
+    def require_bound_client(claims: dict, session_id: str) -> None:
+        """Before any read, write or provider call on a session: a client
+        session is reached only with a token bound to its exact subject, tenant
+        and project, and only while the registry (read fresh) still lists that
+        subject under that tenant - and, for a project session, that project.
+        A client-bound token never reaches any other session. Every refusal is
+        the same."""
+        bound = any(key in claims for key in ("tnt", "csub", "prj"))
+        try:
+            state = repository.load(session_id).state
+        except SessionNotFound:
+            if bound:
+                raise HTTPException(403, WORKSPACE_DENIED) from None
+            return                               # the handler answers 404
+        owner = state.get("client_subject") or ""
+        if not bound and not owner:
+            return                               # an operator or visitor session
+        tenant, subject, project = (str(claims.get("tnt") or ""), str(claims.get("csub") or ""),
+                                    str(claims.get("prj") or ""))
+        same = (bound and owner and settings.client_workspaces
+                and hmac.compare_digest(subject, owner)
+                and hmac.compare_digest(tenant, state.get("client_tenant") or "")
+                and hmac.compare_digest(project, state.get("project") or ""))
+        if not same:
+            raise HTTPException(403, WORKSPACE_DENIED)
+        client = clients.member(tenant, subject, auth_service._subject_hash)
+        if client is None or (project and clients.project(client, project) is None):
             raise HTTPException(403, WORKSPACE_DENIED)
 
     def caller_address(request: Request) -> str:
@@ -893,7 +927,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(401, str(exc)) from exc
         if claims["sid"] != session_id:
             raise HTTPException(403, "token does not belong to this session")
-        require_bound_client(claims)
+        require_bound_client(claims, session_id)
         return claims
 
     def within_grace(state: dict) -> None:
@@ -1021,12 +1055,47 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         )
         return {"token": token, "expires_at": expires_at, "scope": "operator"}
 
+    fetch_lock = threading.Lock()
+    fetches_in_flight: set = set()
+    app.state.fetches_in_flight = fetches_in_flight
+
+    def claim_fetch_slot(tenant: str) -> bool:
+        with fetch_lock:
+            if tenant in fetches_in_flight:
+                return False
+            fetches_in_flight.add(tenant)
+            return True
+
+    def release_fetch_slot(tenant: str) -> None:
+        with fetch_lock:
+            fetches_in_flight.discard(tenant)
+
+    def reserve_fetch_attempt(tenant: str, project_id: str) -> bool:
+        """Spend one of the tenant's page-load attempts, by compare-and-set,
+        before the fetch. The record is the audit of attempts: when, which
+        project - never a URL or any page content."""
+        name = "studio_client_fetch_" + tenant
+        now = int(clock())
+        for _ in range(8):
+            current, token = store.load(name)
+            attempts = [a for a in (current.get("attempts") or []) if isinstance(a, dict)
+                        and int(a.get("at") or 0) > now - 86400] if isinstance(current, dict) else []
+            if (len(attempts) >= FETCH_ATTEMPTS_PER_DAY
+                    or sum(1 for a in attempts if int(a["at"]) > now - 3600) >= FETCH_ATTEMPTS_PER_HOUR):
+                return False
+            try:
+                store.save(name, {"version": 1, "attempts": attempts + [{"at": now, "project": project_id}]}, token)
+                return True
+            except Conflict:
+                continue
+        return False
+
     @app.get("/v1/workspace")
     async def workspace(request: Request):
         """The signed-in client's name and projects. Never an address."""
         require_origin(request)
-        _, client = await asyncio.to_thread(require_client, request)
-        return public_view(client)
+        claims, client = await asyncio.to_thread(require_client, request)
+        return public_view(client, allowed=claims["prj"])
 
     @app.post("/v1/session")
     async def create_session(request: Request):
@@ -1070,13 +1139,25 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             replay = await asyncio.to_thread(controller.created_session_exists, operator["sid"], creation_id,
                                              tenant, project_id)
             if not replay:
+                # Before any fetch or parse: one page load per tenant at a time,
+                # and a small per-tenant budget of attempts that a failure
+                # spends too - but no session admission.
+                if not claim_fetch_slot(tenant):
+                    raise HTTPException(429, "a page for this workspace is already loading")
                 try:
-                    html = await asyncio.to_thread(fetch_project, project["url"])
-                    artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
-                except PageFetchError as exc:
-                    raise HTTPException(502, "the project page could not be loaded") from exc
-                except Exception as exc:
-                    raise HTTPException(502, "the project page could not be loaded") from exc
+                    if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
+                        raise HTTPException(429, "too many page loads for this workspace; try again later")
+                    try:
+                        html = await asyncio.to_thread(fetch_project, project["url"])
+                        artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
+                    except FetchBusy as exc:
+                        raise HTTPException(503, "page loading is busy; try again shortly") from exc
+                    except PageFetchError as exc:
+                        raise HTTPException(502, "the project page could not be loaded") from exc
+                    except Exception as exc:
+                        raise HTTPException(502, "the project page could not be loaded") from exc
+                finally:
+                    release_fetch_slot(tenant)
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
@@ -1101,7 +1182,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 raise HTTPException(429, "the conversations for today are used up") from exc
         # A client session's token is bound to its tenant and subject, so each
         # request on it is re-authorised against the registry.
-        binding = {"tnt": tenant, "csub": operator["sid"]} if client else None
+        binding = {"tnt": tenant, "csub": operator["sid"], "prj": state.get("project") or ""} if client else None
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret, binding=binding)
         return {
             "session_id": state["session_id"],
@@ -1663,6 +1744,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(exc.status, str(exc)) from exc
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # A worker failure is recorded on the command (and in a client
+            # session's audit); the answer and the log carry no words.
+            governance.log_event("studio.command_failed", session_id=session_id, error=type(exc).__name__)
+            raise HTTPException(500, SERVER_ERROR) from None
         if command.get("type") == "stop":
             ended = await end_voice_call(session_id, "visitor stopped", force=True)
             if not ended:

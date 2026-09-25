@@ -176,10 +176,13 @@ class ClientRegistry:
         return None
 
 
-def public_view(client: dict) -> dict:
-    """What the page may see of a client: the name and the projects - never an address."""
+def public_view(client: dict, allowed=None) -> dict:
+    """What the page may see of a client: the name and the projects - never an
+    address. ``allowed`` (a client token's project ids) keeps the view to the
+    projects the token was issued for, even if more were added since."""
     return {"name": client["name"],
-            "projects": [{"id": p["id"], "name": p["name"], "url": p["url"]} for p in client["projects"]]}
+            "projects": [{"id": p["id"], "name": p["name"], "url": p["url"]} for p in client["projects"]
+                         if allowed is None or p["id"] in allowed]}
 
 
 __all__ = ["ClientRegistry", "REGISTRY", "TENANT_RE", "PROJECT_ID_RE", "project_url_ok", "public_view"]

@@ -343,17 +343,31 @@ and verified only by `verify_client_token`.
 - v1 operator, visitor and session tokens and client tokens never pass for each other.
 - `/v1/auth/verify` returns `{"token", "expires_at", "scope": "client"}` for a registry address.
 
-**Revocation.** Every client-scope request re-checks, fresh from the registry, that the tenant exists and
-still lists an address that hashes to the token's subject.
+**Revocation and binding.** Every client-scope request re-checks, fresh from the registry, that the
+tenant exists and still lists an address that hashes to the token's subject.
 - This covers `/v1/workspace`, `POST /v1/session`, and every session-scope request on a client
-  session, whose session token carries `tnt` and `csub`.
+  session. That check happens before any read, write or provider call, in `require_session` and
+  `require_recent_session`.
+- A client session's token binds `tnt`, `csub` and `prj` (`""` for blank and template). All three
+  must equal the stored session. For a project session, the registry must still list that project
+  under that tenant.
+- An unbound token never reaches a client session, and a bound token never reaches any other.
+- Every client session is keyed by `{subject, creation id, tenant, project}`. Replay ownership
+  compares all of them, so an address moved to another tenant never reaches its old sessions.
+- `/v1/workspace` shows only the projects in the token's `prj` snapshot.
 - A removed client, another tenant's project, a project that does not exist, a project added after
   sign-in, and a token of the wrong kind all get the same `403 "this workspace is not available"`.
 - Client tokens reach nothing operator-only, and client sessions have an empty `operator_subject`.
   An empty subject never passes.
 
 **Project sessions.** `POST /v1/session` with `start: "project", "project": "<id>"`.
-- The page is fetched by `app/project_page.py` before any admission.
+- The page is fetched by `app/project_page.py` before any admission, and only after two checks:
+  - a per-tenant budget of page-load attempts is reserved (10 an hour, 40 a day; a failure spends
+    one). It's recorded in `studio_client_fetch_<tenant>` as `{at, project}` only.
+  - no other load for that tenant is in flight (429 if one is).
+- At most 4 loads are outstanding process-wide. A load that timed out keeps its slot until its
+  thread has really finished, so blocked resolvers can't pile up threads. With no free slot, the
+  answer is 503 at once and nothing starts.
 - A page that fails to load gets 502 `"the project page could not be loaded"`: no session, no
   admission.
 - Sessions are keyed by owner, creation id, tenant and project. A replay fetches nothing.
@@ -375,13 +389,23 @@ still lists an address that hashes to the token's subject.
   form and field.
 - Dropped: scripts, styles, frames, objects, SVG, MathML, templates, comments, and every attribute
   except a few read as label text. No URL survives, even as visible text.
-- Caps: 2M input characters, 60 nodes, depth 4, 12 images, 200-character labels, and 2 s of
-  parsing.
+- Caps: 2M input characters, fed in 16 KB chunks, with a hard stop between chunks on time, node
+  count and an unparsed remainder over 64 KB (one giant tag or an unclosed script). Also 50,000
+  events, 4 KB looked at per text run or attribute, 60 nodes, depth 4, 12 images, 200-character
+  labels, and 2 s of parsing.
+- Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
+  `[email]`. The registry's project name is kept as written.
 
-**Audit.** Each command in a client session appends
-`{actor, token_type, tenant, project, command_id, command_type, prior_revision, revision, op_ids, at,
-outcome}` to `state["audit"]`, keeping the last 200 entries. The audit never holds page text,
-transcripts or addresses.
+**Audit.** Every accepted command in a client session appends exactly one entry to `state["audit"]`,
+keeping the last 200.
+- Entry fields: `{actor, token_type, tenant, project, command_id, command_type, prior_revision,
+  revision, op_ids, at, outcome}`.
+- Stop and worker failures are included (outcome `failed`). A replayed `command_id` adds nothing.
+- `op_ids` lists every event the command emitted.
+- The audit never holds page text, transcripts or addresses.
+
+**Failures.** An unexpected failure is answered `500 "the request could not be completed"` and logged
+with its error type only, both by the commands route and by a catch-all in the middleware.
 
 **Logs.** No token, address, project URL, pinned IP or page text appears in logs or error bodies.
 httpx and httpcore request logging is held at WARNING.
