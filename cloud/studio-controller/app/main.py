@@ -610,10 +610,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         the previous words to be returned as current.  These controller-owned
         monotonic fields conservatively invalidate advice after any committed
         turn/event or lifecycle change while the provider call is in flight.
-        The active-command reservation is included because a new command can be
-        claimed before any of those monotonic counters advance. The canonical
-        voice-call marker does the same for opening, activation, close request,
-        ambiguous outcome, and completion transitions.
+        The command and voice epochs advance on every durable lifecycle write,
+        closing reserve-then-clear and open-then-remove ABA windows. The current
+        active-command and canonical voice-call values remain defense in depth
+        for legacy records and independently catch one-way state changes.
         """
         voice_marker = json.dumps(
             state.get("voice_call") or {},
@@ -627,6 +627,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             int(state.get("artifact_version") or 0),
             int(state.get("turn_seq") or 0),
             int(state.get("last_seq") or 0),
+            int(state.get("command_epoch") or 0),
+            int(state.get("voice_epoch") or 0),
             str(state.get("active_command") or ""),
             voice_marker,
             bool(state.get("paused")),

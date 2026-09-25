@@ -167,6 +167,71 @@ class Route(unittest.TestCase):
             out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
         self.assertEqual({"advice": None, "fenced": True}, out.json())
 
+    def test_advice_is_fenced_when_failed_command_reservation_returns_to_idle(self):
+        holder = {}
+
+        def fail_command_meanwhile():
+            controller = holder["app"].state.controller
+            sid = holder["sid"]
+            before = controller.repository.load(sid).state
+            controller.worker.fail = True
+            try:
+                with self.assertRaisesRegex(RuntimeError, "synthetic worker failed"):
+                    controller.execute(sid, {
+                        "command_id": "cmd-aba",
+                        "session_id": sid,
+                        "type": "utterance",
+                        "expected_version": 1,
+                        "item_id": "typed-aba",
+                        "transcript": "Try a change that fails",
+                    })
+            finally:
+                controller.worker.fail = False
+            after = controller.repository.load(sid).state
+            self.assertIsNone(after.get("active_command"))
+            self.assertEqual("failed", after["commands"]["cmd-aba"]["status"])
+            self.assertEqual(before.get("last_seq"), after.get("last_seq"))
+            self.assertEqual(before.get("turn_seq"), after.get("turn_seq"))
+            self.assertEqual(before.get("artifact_version"), after.get("artifact_version"))
+            self.assertEqual(int(before.get("command_epoch") or 0) + 2,
+                             after["command_epoch"])
+
+        advisor = FakeAdvisor(during=fail_command_meanwhile)
+        with TestClient(self.make(advisor)) as client:
+            holder["app"] = self.app
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers,
+                              json={"revision": 1})
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
+    def test_advice_is_fenced_when_failed_voice_open_returns_to_absent(self):
+        holder = {}
+
+        def fail_voice_meanwhile():
+            controller = holder["app"].state.controller
+            sid = holder["sid"]
+            before = controller.repository.load(sid).state
+            controller.begin_voice(sid, "voice-aba", 1600)
+            self.assertTrue(controller.fail_voice(sid, "voice-aba"))
+            after = controller.repository.load(sid).state
+            self.assertNotIn("voice_call", before)
+            self.assertNotIn("voice_call", after)
+            self.assertEqual(before.get("last_seq"), after.get("last_seq"))
+            self.assertEqual(before.get("turn_seq"), after.get("turn_seq"))
+            self.assertEqual(before.get("artifact_version"), after.get("artifact_version"))
+            self.assertEqual(int(before.get("voice_epoch") or 0) + 2,
+                             after["voice_epoch"])
+
+        advisor = FakeAdvisor(during=fail_voice_meanwhile)
+        with TestClient(self.make(advisor)) as client:
+            holder["app"] = self.app
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers,
+                              json={"revision": 1})
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
     def test_off_means_503_and_health_says_so(self):
         with TestClient(self.make(FakeAdvisor(ready=False))) as client:
             sid, headers = self.session(client)
