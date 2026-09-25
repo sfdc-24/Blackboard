@@ -70,6 +70,7 @@ class Settings:
     moderation_enabled: bool = False
     muse_voice: str = "coral"
     muse_cap: int = 6
+    summary_email_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -121,6 +122,7 @@ class Settings:
             moderation_enabled=_enabled(os.environ.get("STUDIO_ENABLE_MODERATION", "true")),
             muse_voice=os.environ.get("STUDIO_MUSE_VOICE", "coral"),
             muse_cap=int(os.environ.get("STUDIO_MUSE_CAP", "6")),
+            summary_email_enabled=_enabled(os.environ.get("STUDIO_ENABLE_SUMMARY_EMAIL", "false")),
         )
 
     @property

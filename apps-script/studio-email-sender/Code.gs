@@ -1,13 +1,29 @@
-/** Server-to-server OTP sender for the SFDC24 Studio controller. */
+/**
+ * Server-to-server sender for the SFDC24 Studio controller: the sign-in code,
+ * and (kind "summary") the working-session PDF a visitor asked for at the end
+ * of a conversation. Both are HMAC-signed by the controller; the summary
+ * signature covers the SHA-256 of the exact PDF attached.
+ */
+var STUDIO_EMAIL_CODE_MAX_CHARS = 2048;
+var STUDIO_EMAIL_SUMMARY_MAX_CHARS = 4000000;
+var STUDIO_EMAIL_PDF_MAX_CHARS = 3900000;
+
 function doPost(e) {
   try {
     if (!e || !e.postData || typeof e.postData.contents !== 'string' ||
-        e.postData.contents.length > 2048) {
+        e.postData.contents.length > STUDIO_EMAIL_SUMMARY_MAX_CHARS) {
       return studioEmailResponse_(false);
     }
 
     var request = JSON.parse(e.postData.contents);
-    if (!studioEmailValidRequest_(request)) return studioEmailResponse_(false);
+    var summary = !!request && typeof request === 'object' && !Array.isArray(request) &&
+        request.kind === 'summary';
+    if (!summary && e.postData.contents.length > STUDIO_EMAIL_CODE_MAX_CHARS) {
+      return studioEmailResponse_(false);
+    }
+    if (summary ? !studioEmailValidSummary_(request) : !studioEmailValidRequest_(request)) {
+      return studioEmailResponse_(false);
+    }
 
     var properties = PropertiesService.getScriptProperties();
     var secret = properties.getProperty('STUDIO_EMAIL_SENDER_SECRET');
@@ -20,17 +36,38 @@ function doPost(e) {
     if (!allowed.every(function (entry) {
       return entry && entry === entry.toLowerCase() &&
           /^[^\s@]+@[^\s@]+$/.test(entry);
-    }) || allowed.indexOf(request.email) === -1) {
+    })) {
+      return studioEmailResponse_(false);
+    }
+    // A summary may go to a public visitor only when the owner opens that on
+    // purpose; the sign-in code always requires the allowlist.
+    var anyRecipient = summary &&
+        properties.getProperty('STUDIO_SUMMARY_ANY_RECIPIENT') === 'true';
+    if (!anyRecipient && allowed.indexOf(request.email) === -1) {
       return studioEmailResponse_(false);
     }
 
-    var canonical = [request.timestamp, request.nonce, request.email, request.code].join('\n');
+    var canonical = summary
+        ? ['summary', request.timestamp, request.nonce, request.email, request.pdf_sha256].join('\n')
+        : [request.timestamp, request.nonce, request.email, request.code].join('\n');
     var signedBytes = Utilities.computeHmacSha256Signature(
       canonical, secret, Utilities.Charset.UTF_8);
-    var expected = signedBytes.map(function (byte) {
-      return ('0' + (byte & 255).toString(16)).slice(-2);
-    }).join('');
-    if (!studioEmailEqual_(expected, request.signature)) return studioEmailResponse_(false);
+    if (!studioEmailEqual_(studioEmailHex_(signedBytes), request.signature)) {
+      return studioEmailResponse_(false);
+    }
+    var pdfBytes = null;
+    if (summary) {
+      // The attachment must be exactly the PDF the controller signed.
+      pdfBytes = Utilities.base64Decode(request.pdf);
+      var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, pdfBytes);
+      if (!studioEmailEqual_(studioEmailHex_(digest), request.pdf_sha256)) {
+        return studioEmailResponse_(false);
+      }
+      if (pdfBytes.length < 5 || pdfBytes[0] !== 37 || pdfBytes[1] !== 80 ||
+          pdfBytes[2] !== 68 || pdfBytes[3] !== 70) {
+        return studioEmailResponse_(false);  // not %PDF
+      }
+    }
 
     // CacheService can evict entries before their TTL. Keep a small durable
     // nonce ledger as well, so early eviction does not permit a replay.
@@ -67,6 +104,17 @@ function doPost(e) {
       lock.releaseLock();
     }
 
+    if (summary) {
+      MailApp.sendEmail(
+        request.email,
+        'Your SFDC24 working session',
+        'Attached is your working session from sfdc24.com: what you asked for, ' +
+            'what was built, and the final design.',
+        { name: 'SFDC24', attachments: [
+          Utilities.newBlob(pdfBytes, 'application/pdf', 'SFDC24-working-session.pdf')] }
+      );
+      return studioEmailResponse_(true);
+    }
     MailApp.sendEmail(
       request.email,
       'Your SFDC24 Studio verification code',
@@ -92,6 +140,27 @@ function studioEmailValidRequest_(request) {
       !/^[^\s@]+@[^\s@]+$/.test(request.email)) return false;
   if (!/^[0-9]{6}$/.test(request.code)) return false;
   return /^[0-9a-f]{64}$/.test(request.signature);
+}
+
+function studioEmailValidSummary_(request) {
+  var keys = Object.keys(request).sort();
+  if (keys.join(',') !== 'email,kind,nonce,pdf,pdf_sha256,signature,timestamp') return false;
+  if (!keys.every(function (key) { return typeof request[key] === 'string'; })) return false;
+  if (!/^[1-9][0-9]{9}$/.test(request.timestamp)) return false;
+  if (!studioEmailFresh_(request.timestamp, Date.now() / 1000)) return false;
+  if (!/^[0-9a-f]{32}$/.test(request.nonce)) return false;
+  if (request.email.length > 320 || request.email !== request.email.toLowerCase() ||
+      !/^[^\s@]+@[^\s@]+$/.test(request.email)) return false;
+  if (!/^[0-9a-f]{64}$/.test(request.pdf_sha256)) return false;
+  if (request.pdf.length === 0 || request.pdf.length > STUDIO_EMAIL_PDF_MAX_CHARS ||
+      request.pdf.length % 4 !== 0 || !/^[A-Za-z0-9+\/]+={0,2}$/.test(request.pdf)) return false;
+  return /^[0-9a-f]{64}$/.test(request.signature);
+}
+
+function studioEmailHex_(bytes) {
+  return bytes.map(function (byte) {
+    return ('0' + (byte & 255).toString(16)).slice(-2);
+  }).join('');
 }
 
 function studioEmailFresh_(timestamp, now) {
