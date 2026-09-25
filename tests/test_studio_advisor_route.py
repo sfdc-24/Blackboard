@@ -116,6 +116,30 @@ class Route(unittest.TestCase):
             out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
         self.assertEqual({"advice": None, "fenced": True}, out.json())
 
+    def test_advice_is_fenced_when_a_new_command_is_only_reserved(self):
+        holder = {}
+
+        def reserve_meanwhile():
+            repo = holder["app"].state.controller.repository
+            sid = holder["sid"]
+            record = repo.load(sid)
+            moved = dict(record.state)
+            moved["active_command"] = "cmd-new"
+            # Reservation happens before command completion advances sequence
+            # or artifact counters, so this field must independently fence.
+            self.assertEqual(record.state.get("last_seq"), moved.get("last_seq"))
+            self.assertEqual(record.state.get("turn_seq"), moved.get("turn_seq"))
+            self.assertEqual(record.state.get("artifact_version"), moved.get("artifact_version"))
+            repo.save(sid, moved, record.token)
+
+        advisor = FakeAdvisor(during=reserve_meanwhile)
+        with TestClient(self.make(advisor)) as client:
+            holder["app"] = self.app
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
     def test_off_means_503_and_health_says_so(self):
         with TestClient(self.make(FakeAdvisor(ready=False))) as client:
             sid, headers = self.session(client)

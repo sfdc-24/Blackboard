@@ -610,6 +610,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         the previous words to be returned as current.  These controller-owned
         monotonic fields conservatively invalidate advice after any committed
         turn/event or lifecycle change while the provider call is in flight.
+        The active-command reservation is included because a new command can be
+        claimed before any of those monotonic counters advance.
         """
         return (
             int(state.get("generation") or 0),
@@ -617,6 +619,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             int(state.get("artifact_version") or 0),
             int(state.get("turn_seq") or 0),
             int(state.get("last_seq") or 0),
+            str(state.get("active_command") or ""),
             bool(state.get("paused")),
             bool(state.get("stopped")),
         )
