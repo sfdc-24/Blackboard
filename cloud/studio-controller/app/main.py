@@ -61,7 +61,8 @@ def _sse(event: dict, name: str | None = None) -> str:
 
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
-               email_sender=None, email_client=None, talk_client=None) -> FastAPI:
+               email_sender=None, email_client=None, talk_client=None,
+               analyst=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -357,7 +358,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "worker": settings.worker,
             "state_backend": backend,
             "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
-                         "talk": bool(talk_agents()), "agents": talk_agents()},
+                         "talk": bool(talk_agents()), "agents": talk_agents(),
+                         "analyst": analyst_ready()},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -381,6 +383,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     def talk_agents() -> list:
         return list(talk_lane().agents())
+
+    # The analyst lane: a second agent beside the builder (workers/analyst.py).
+    analyze_counts: dict = {}
+    analyze_last: dict = {}
+    analyze_busy: set = set()
+    ANALYZE_SPACING_SECONDS = 3.0
+
+    def analyst_ready() -> bool:
+        return analyst is not None or settings.worker == "claude"
+
+    def analyst_lane():
+        nonlocal analyst
+        if analyst is None:
+            from workers.analyst import Analyst
+            analyst = Analyst()
+        return analyst
 
     async def json_object(request: Request, label: str) -> dict:
         raw = await request.body()
@@ -574,6 +592,74 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not reply:
             raise HTTPException(503, "talk returned nothing")
         return {"reply": reply, "speaker": agent, "turn": turn}
+
+    @app.post("/v1/session/{session_id}/analyze")
+    async def analyze(request: Request, session_id: str):
+        """Run the analyst on what the visitor just said, beside the builder.
+
+        Read the session, let the analyst research and map the data model and
+        the next question, then record them with a compare-and-set commit that
+        never waits for (or blocks) a build. Events reach the page over the
+        session stream and in this response.
+        """
+        require_origin(request)
+        require_session(request, session_id)
+        if not analyst_ready():
+            raise HTTPException(503, "the analyst is not available")
+        from workers.talk import TEXT_MAX, canvas_summary
+        body = await json_object(request, "analyze")
+        if set(body) - {"text", "turn"}:
+            raise HTTPException(400, "analyze body has unknown fields")
+        turn = body.get("turn", 0)
+        if type(turn) is not int or not 0 <= turn <= 1_000_000:
+            raise HTTPException(400, "turn must be a non-negative integer")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > TEXT_MAX:
+            raise HTTPException(400, "analyze needs text of 1 to %d characters" % TEXT_MAX)
+        try:
+            record = await asyncio.to_thread(controller.repository.load, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        state = record.state
+        if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
+            raise HTTPException(410, "session has ended")
+        if session_id in analyze_busy:
+            raise HTTPException(409, "an analysis is already running for this session")
+        used = analyze_counts.get(session_id, 0)
+        if used >= settings.analyze_cap:
+            raise HTTPException(429, "analysis limit reached for this session")
+        now = clock()
+        last = analyze_last.get(session_id)
+        if last is not None and now - last < ANALYZE_SPACING_SECONDS:
+            raise HTTPException(429, "analysis is limited to one every %.0f seconds" % ANALYZE_SPACING_SECONDS)
+        analyze_counts[session_id] = used + 1
+        analyze_last[session_id] = now
+        if len(analyze_counts) > 500:
+            for stale in list(analyze_counts)[:250]:
+                analyze_counts.pop(stale, None)
+                analyze_last.pop(stale, None)
+        analyze_busy.add(session_id)
+        try:
+            try:
+                result = await asyncio.to_thread(
+                    analyst_lane().analyze, state, text.strip(), canvas_summary(state.get("artifact")))
+            except Exception as exc:  # the builder and the talk lane carry on without it
+                raise HTTPException(503, "the analyst is unavailable right now") from exc
+            if not result.get("model"):
+                raise HTTPException(503, "; ".join(result.get("problems") or ["no analysis"])[:300])
+            try:
+                events = await asyncio.to_thread(
+                    controller.commit_analysis, session_id, result["model"], result.get("question"))
+            except SessionNotFound as exc:
+                raise HTTPException(404, "session not found") from exc
+            except CommandError as exc:
+                raise HTTPException(exc.status, str(exc)) from exc
+            except StateConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+        finally:
+            analyze_busy.discard(session_id)
+        return {"turn": turn, "model": result["model"], "events": events,
+                "problems": result.get("problems") or [], "searched": result.get("searched", 0)}
 
     @app.post("/v1/session/{session_id}/commands")
     async def commands(request: Request, session_id: str):

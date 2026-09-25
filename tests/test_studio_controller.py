@@ -1099,7 +1099,8 @@ class ApiTests(unittest.TestCase):
             health = client.get("/health", headers=headers)
             self.assertEqual(200, health.status_code)
             self.assertEqual({"ok": True, "worker": "synthetic", "state_backend": "file",
-                          "features": {"voice": False, "lead_facts": False, "talk": False, "agents": []}},
+                          "features": {"voice": False, "lead_facts": False, "talk": False, "agents": [],
+                               "analyst": False}},
                          health.json())
             self.assertEqual(health.json(), client.get("/healthz").json())
             for method, path in (("GET", "/health/"), ("GET", "/healthz/"),

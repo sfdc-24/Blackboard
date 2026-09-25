@@ -50,6 +50,7 @@ class Settings:
     realtime_model: str = "gpt-realtime-2.1"
     realtime_voice: str = "marin"
     talk_cap: int = 60
+    analyze_cap: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +89,7 @@ class Settings:
             realtime_model=os.environ.get("STUDIO_REALTIME_MODEL", "gpt-realtime-2.1"),
             realtime_voice=os.environ.get("STUDIO_REALTIME_VOICE", "marin"),
             talk_cap=int(os.environ.get("STUDIO_TALK_CAP", "60")),
+            analyze_cap=int(os.environ.get("STUDIO_ANALYZE_CAP", "30")),
         )
 
     @property

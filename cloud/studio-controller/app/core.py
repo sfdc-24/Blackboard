@@ -431,6 +431,44 @@ class StudioController:
         self.repository.save(session_id, working, reserved_token)
         return result
 
+    def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
+        """Record the analyst's data model, and at most one question, beside the builder.
+
+        The analyst never edits the artifact, so it does not take the command
+        lock: the builder and the analyst run at the same time on the same
+        session. This commit re-reads the latest state and retries on a
+        compare-and-set conflict instead of queueing behind a build. A question
+        is added only when none is open and it was not asked before; the
+        builder can then resolve it from what the visitor says, as with its own.
+        """
+        for _ in range(self.repository.attempts):
+            record = self.repository.load(session_id)
+            state = record.state
+            self._assert_live(state)
+            events = []
+            state["analyst"] = True
+            state["model"] = copy.deepcopy(model)
+            events.append(self._event(state, "model.updated", {"model": copy.deepcopy(model)}))
+            questions = state.setdefault("questions", [])
+            asked = {(q.get("prompt") or "").strip().lower() for q in questions}
+            open_now = any(q.get("status") == "open" for q in questions)
+            if question and not open_now and question["prompt"].strip().lower() not in asked:
+                qid = "qa-%d" % (sum(1 for q in questions if str(q.get("question_id", "")).startswith("qa-")) + 1)
+                recorded = {
+                    "question_id": qid, "group": "Data", "scope_path": "Data model",
+                    "reason": question["reason"], "prompt": question["prompt"],
+                    "options": copy.deepcopy(question["options"]), "status": "open",
+                    "affected_artifact_ids": [state["artifact"]["id"]],
+                }
+                questions.append(copy.deepcopy(recorded))
+                events.append(self._event(state, "question.asked", {"question": recorded}))
+            try:
+                self.repository.save(session_id, state, record.token)
+                return copy.deepcopy(events)
+            except StateConflict:
+                continue
+        raise StateConflict("analysis could not be recorded; the session kept changing")
+
     def stop_session(self, session_id: str, command: dict) -> dict:
         """Fail-safe stop that fences any late worker commit with CAS.
 
