@@ -286,7 +286,7 @@ class Auth(unittest.TestCase):
 # -- the API ---------------------------------------------------------------------------------
 class Api(unittest.TestCase):
     def make(self, fetcher=None, registry=None, worker=None, talk=None, advisor=None, clock=None, **overrides):
-        values = dict(client_workspaces=True, single_instance=True)
+        values = dict(client_workspaces=True)
         values.update(overrides)
         self.store = MemoryStore()
         self.store.save(REGISTRY, registry or registry_record(), None)
@@ -537,7 +537,7 @@ class ProjectSessions(Api):
         self.store = MemoryStore()
         self.store.save(REGISTRY, registry_record(), None)
         self.email_sender = EmailSender()
-        self.app = create_app(settings=settings(client_workspaces=True, single_instance=True, summary_email_enabled=True), store=self.store,
+        self.app = create_app(settings=settings(client_workspaces=True, summary_email_enabled=True), store=self.store,
                               worker=CountingWorker(), id_factory=IDs(), email_sender=self.email_sender,
                               project_fetcher=FakeFetcher(), summary_sender=lambda email, pdf: sent.append(email))
         with TestClient(self.app) as client:
@@ -1140,9 +1140,9 @@ class Blocker3ParseAndFetchBudgets(Api):
     def test_one_page_load_per_tenant_at_a_time(self):
         with TestClient(self.make()) as client:
             token = self.sign_in(client).json()["token"]
-            self.app.state.fetches_in_flight.add("nav")
+            held = self.app.state.guards.acquire(tenant_record("nav"), "fetch", "holder", 60, 1)
             busy = self.project_session(client, token)
-            self.app.state.fetches_in_flight.discard("nav")
+            self.app.state.guards.release(tenant_record("nav"), "fetch", "holder", held)
             ok = self.project_session(client, token, "after-busy")
         self.assertEqual(429, busy.status_code)
         self.assertEqual(200, ok.status_code)
@@ -1377,12 +1377,51 @@ class FindingF2Redaction(unittest.TestCase):
             self.assertNotIn(never, labels)
 
     def test_the_redaction_is_linear_on_hostile_input(self):
+        # Work counted where Python does it: the host scan tests each character
+        # a bounded number of times. The regex engine's steps cannot be counted
+        # from Python, so those passes are held to relative growth - four times
+        # the text well under sixteen times the time - which load slows
+        # proportionally. No absolute wall-clock limit but a 20 s backstop.
         import time as _time
-        for hostile in ("a." * 30000, "a" * 60000, "a-" * 30000 + "!", ("x@" * 20000) + "y", "1." * 30000,
-                        "-" * 60000, "\u3002" * 60000, "a" * 30000 + ".bc" * 10000, "ab." * 20000, "1\u3002" * 30000):
-            started = _time.monotonic()
-            redact(hostile)
-            self.assertLess(_time.monotonic() - started, 2.0, hostile[:12])
+        from app import project_page as page
+        real_host_char, calls = page._host_char, {"n": 0}
+
+        def counting(ch):
+            calls["n"] += 1
+            return real_host_char(ch)
+
+        def cost(text):
+            started = _time.perf_counter()
+            redact(text)
+            return _time.perf_counter() - started
+
+        stop = chr(0x3002)
+        page._host_char = counting
+        try:
+            for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc"):
+                small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
+                calls["n"] = 0
+                redact(large)
+                self.assertLessEqual(calls["n"], 3 * len(large) + 10, unit)
+                cost(small)
+                base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
+                self.assertLess(grown, 10 * base + 0.25, (unit, base, grown))
+                self.assertLess(grown, 20.0, unit)
+        finally:
+            page._host_char = real_host_char
+
+        def cost(text):
+            started = _time.perf_counter()
+            redact(text)
+            return _time.perf_counter() - started
+
+        stop = chr(0x3002)
+        for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc"):
+            small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
+            cost(small)
+            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
+            self.assertLess(grown, 10 * base + 0.25, (unit, base, grown))
+            self.assertLess(grown, 20.0, unit)
 
 
 class GeminiAttacks(unittest.TestCase):
@@ -1977,35 +2016,6 @@ class CodexCc56feaB2OpenStreams(Api):
         self.assertEqual(1, reads)                                        # no read after the refusal
 
 
-class CodexCc56feaB3B4Topology(unittest.TestCase):
-    """B3/B4: the per-process guards hold only on one instance, so client
-    workspaces refuse to start without the single-instance declaration."""
-
-    def test_client_workspaces_require_the_single_instance_declaration(self):
-        with self.assertRaisesRegex(RuntimeError, "STUDIO_SINGLE_INSTANCE"):
-            settings(client_workspaces=True, single_instance=False).validate()
-        with self.assertRaises(RuntimeError):
-            create_app(settings=settings(client_workspaces=True, single_instance=False), store=MemoryStore(),
-                       worker=CountingWorker(), id_factory=IDs(), email_sender=EmailSender())
-        settings(client_workspaces=True, single_instance=True).validate()
-        settings(client_workspaces=False, single_instance=False).validate()
-
-    def test_the_env_reads_it(self):
-        import os
-        from app.settings import Settings
-        old = os.environ.get("STUDIO_SINGLE_INSTANCE")
-        try:
-            os.environ.pop("STUDIO_SINGLE_INSTANCE", None)
-            self.assertFalse(Settings.from_env().single_instance)
-            os.environ["STUDIO_SINGLE_INSTANCE"] = "true"
-            self.assertTrue(Settings.from_env().single_instance)
-        finally:
-            if old is None:
-                os.environ.pop("STUDIO_SINGLE_INSTANCE", None)
-            else:
-                os.environ["STUDIO_SINGLE_INSTANCE"] = old
-
-
 class CodexCc56feaB5WholeAddresses(unittest.TestCase):
     def test_local_and_literal_host_addresses_go_whole(self):
         cases = {
@@ -2126,3 +2136,481 @@ class CodexR7CompatibilityForms(Api):
                 self.assertNotIn(never, text, (surface, never))
         self.assertIn("[link]", persisted)
         self.assertIn("[email]", persisted)
+
+
+# -- Codex Gate 1 NO-GO on 38bc713 (20:25Z row): round 8 ----------------------------------------
+import asyncio as _asyncio  # noqa: E402
+from unittest import mock as _mock  # noqa: E402
+
+from tests.test_studio_controller import Conflict  # noqa: E402
+from app.core import CommandError  # noqa: E402
+from app.guards import CEILING_RECORD, DurableGuards, GuardUnavailable, session_record, tenant_record  # noqa: E402
+from app import project_page as _project_page  # noqa: E402
+
+
+class CountingGateWorker(GateWorker):
+    def __init__(self, fail=False):
+        super().__init__()
+        self.fail, self.turns = fail, 0
+
+    def on_turn(self, state, trigger):
+        self.turns += 1
+        self.entered.set()
+        self.release.wait(10)
+        if self.fail:
+            raise RuntimeError("provider failed")
+        return PatchWorker.on_turn(self, state, trigger)
+
+
+class CodexR8B1FinaliserExhaustion(Api):
+    """B1: when the fresh-state finish loses every compare-and-set, the command
+    still ends terminal - durably, without waiting for a client command."""
+
+    def inject(self, budget):
+        original, left = self.store.save, {"n": budget}
+
+        def save(name, state, token):
+            if name.startswith("studio_session_") and left["n"] > 0:
+                left["n"] -= 1
+                raise Conflict("injected")
+            return original(name, state, token)
+        self.store.save = save
+        return left
+
+    def exhaust(self, client, worker, extra, recovery_attempts, poll=0.01):
+        token = self.sign_in(client).json()["token"]
+        live = self.project_session(client, token).json()
+        controller = self.app.state.controller
+        controller.recovery_poll_seconds = poll
+        controller.recovery_attempts = recovery_attempts
+        sid = live["session_id"]
+        out = {}
+
+        def build():
+            try:
+                out["result"] = controller.execute(sid, {
+                    "command_id": "build-exhaust", "session_id": sid, "type": "utterance",
+                    "expected_version": live["artifact_version"], "transcript": "bigger", "item_id": "item-x"})
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = exc
+
+        thread = threading.Thread(target=build)
+        thread.start()
+        self.assertTrue(worker.entered.wait(10))
+        cas_write(controller, sid, lambda s: s.update(rating={"score": 4, "comment": "", "at": 1}))  # a real writer
+        left = self.inject(1 + 8 + extra)       # the reserved save, all eight fresh saves, then `extra`
+        worker.release.set()
+        thread.join(10)
+        return live, controller, sid, out, left
+
+    def assert_terminal(self, sid, fail, out):
+        state = self.state(sid)
+        receipt = state["commands"]["build-exhaust"]
+        self.assertEqual("failed", receipt["status"], receipt)
+        self.assertIsNone(state["active_command"])
+        self.assertEqual([("build-exhaust", "failed")],
+                         [(a["command_id"], a["outcome"]) for a in state["audit"] if a["command_id"] == "build-exhaust"])
+        self.assertEqual(4, state["rating"]["score"])                             # orthogonal state kept
+        if fail:
+            self.assertIsInstance(out.get("error"), RuntimeError)
+        else:
+            self.assertEqual(409, getattr(out.get("error"), "status", None), out)
+        return state
+
+    def next_and_replay(self, controller, sid, worker):
+        after = controller.execute(sid, {"command_id": "pause-next", "session_id": sid, "type": "pause",
+                                         "expected_version": self.state(sid)["artifact_version"]})
+        self.assertEqual("pause-next", after["command_id"])                       # accepted at once
+        with self.assertRaises(CommandError) as replay:
+            controller.execute(sid, {"command_id": "build-exhaust", "session_id": sid, "type": "utterance",
+                                     "expected_version": self.state(sid)["artifact_version"],
+                                     "transcript": "bigger", "item_id": "item-x"})
+        self.assertEqual(409, replay.exception.status)
+        self.assertEqual(1, worker.turns)                                         # replay is inert
+        self.assertEqual(["build-exhaust", "pause-next"], [a["command_id"] for a in self.state(sid)["audit"]])
+
+    def test_exhausted_success_and_failure_end_terminal_at_once(self):
+        for fail in (False, True):
+            worker = CountingGateWorker(fail)
+            with TestClient(self.make(worker=worker)) as client:
+                live, controller, sid, out, left = self.exhaust(client, worker, extra=0, recovery_attempts=40)
+                self.assert_terminal(sid, fail, out)
+                self.next_and_replay(controller, sid, worker)
+
+    def test_a_scheduled_recovery_finishes_it_without_any_client_command(self):
+        worker = CountingGateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            live, controller, sid, out, left = self.exhaust(client, worker, extra=3 + 2, recovery_attempts=40, poll=0.2)
+            self.assertEqual("build-exhaust", self.state(sid)["active_command"])  # the inline tries all lost
+            for thread in controller.recoveries:
+                thread.join(10)
+            self.assertEqual(0, left["n"])
+            self.assert_terminal(sid, False, out)
+            self.next_and_replay(controller, sid, worker)
+
+    def test_the_next_command_applies_the_durable_outcome_at_once(self):
+        for fail in (False, True):
+            worker = CountingGateWorker(fail)
+            with TestClient(self.make(worker=worker)) as client:
+                live, controller, sid, out, left = self.exhaust(client, worker, extra=10 ** 6, recovery_attempts=0)
+                self.assertEqual("build-exhaust", self.state(sid)["active_command"])
+                left["n"] = 0                                                     # the store is calm again
+                self.next_and_replay(controller, sid, worker)
+                self.assert_terminal(sid, fail, out)
+
+    def test_a_late_recovery_after_stop_writes_nothing(self):
+        worker = CountingGateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            live, controller, sid, out, left = self.exhaust(client, worker, extra=10 ** 6, recovery_attempts=0)
+            left["n"] = 0
+            controller.execute(sid, {"command_id": "stop-1", "session_id": sid, "type": "stop", "expected_version": 0})
+            before = copy.deepcopy(self.state(sid))
+            outcome = controller._load_outcome(sid, "build-exhaust")
+            self.assertIsNotNone(outcome)
+            self.assertTrue(controller._apply_outcome(sid, outcome, tries=1))     # not owned: nothing to do
+            self.assertEqual(before, self.state(sid))
+            self.assertEqual([("build-exhaust", "failed"), ("stop-1", "applied")],
+                             [(a["command_id"], a["outcome"]) for a in self.state(sid)["audit"]])
+
+
+class CodexR8B2StreamSendBoundary(Api):
+    """B2: drive the events route through ASGI so a change can land between
+    the chunks a client actually receives."""
+
+    def asgi_stream(self, live, on_chunk):
+        chunks = []
+        headers = [(b"origin", ORIGIN["Origin"].encode()), (b"authorization", ("Bearer " + live["token"]).encode()),
+                   (b"host", b"testserver")]
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+                 "scheme": "http", "path": "/v1/session/%s/events" % live["session_id"], "raw_path": b"",
+                 "query_string": b"", "root_path": "", "headers": headers, "client": ("test", 1),
+                 "server": ("testserver", 80)}
+        state = {"requested": False}
+
+        async def receive():
+            if not state["requested"]:
+                state["requested"] = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await _asyncio.sleep(3600)
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                chunks.append(message["body"].decode("utf-8"))
+                on_chunk(len(chunks))
+
+        _asyncio.run(self.app(scope, receive, send))
+        return chunks
+
+    def event_chunks(self, chunks):
+        return [c for c in chunks if re.search(r"^id: ", c, re.M)]
+
+    def open(self, client, extra_events=2):
+        token = self.sign_in(client).json()["token"]
+        live = self.project_session(client, token).json()
+        controller = self.app.state.controller
+        for n in range(extra_events):
+            commit_event(controller, live["session_id"], "earlier %d" % n)
+        return live, controller
+
+    def test_control_a_later_event_arrives_and_a_batch_is_one_chunk(self):
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+            live, controller = self.open(client)
+            first = self.state(live["session_id"])["last_seq"]
+            chunks = self.asgi_stream(live, lambda n: n == 1 and commit_event(controller, live["session_id"]))
+        events = self.event_chunks(chunks)
+        self.assertGreaterEqual(len(re.findall(r"^id: ", events[0], re.M)), 3)     # the whole first batch, once
+        self.assertIn("id: %d" % (first + 1), "".join(events[1:]))
+
+    def test_revocation_between_chunks_sends_nothing_more(self):
+        for revoked in (registry_record(client_entry(projects=[])), {"version": 1, "clients": []}):
+            with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+                live, controller = self.open(client)
+
+                def revoke(n, record=revoked):
+                    if n == 1:
+                        self.set_registry(record)
+                        commit_event(controller, live["session_id"])
+                chunks = self.asgi_stream(live, revoke)
+            self.assertEqual(1, len(self.event_chunks(chunks)), chunks)
+
+    def test_expiry_between_chunks_sends_nothing_more(self):
+        offset = [0]
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1,
+                                  clock=lambda: time.time() + offset[0])) as client:
+            live, controller = self.open(client)
+
+            def expire(n):
+                if n == 1:
+                    offset[0] = 700
+                    commit_event(controller, live["session_id"])
+            chunks = self.asgi_stream(live, expire)
+        self.assertEqual(1, len(self.event_chunks(chunks)), chunks)
+
+    def test_expiry_inside_the_gate_sends_nothing_more(self):
+        offset = [0]
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1,
+                                  clock=lambda: time.time() + offset[0])) as client:
+            live, controller = self.open(client)
+            original_load, after_first = self.store.load, {"on": False, "reads": 0}
+
+            def load(name):
+                if name == REGISTRY and after_first["on"]:
+                    after_first["reads"] += 1
+                    if after_first["reads"] == 2:              # the gate right before the next batch leaves
+                        offset[0] = 700                        # the registry read was slow: the token expired in it
+                return original_load(name)
+
+            def first(n):
+                if n == 1:
+                    commit_event(controller, live["session_id"])
+                    after_first["on"] = True
+            self.store.load = load
+            try:
+                chunks = self.asgi_stream(live, first)
+            finally:
+                self.store.load = original_load
+        self.assertEqual(1, len(self.event_chunks(chunks)), chunks)
+
+
+class CodexR8B3GuardUnits(unittest.TestCase):
+    """B3: the durable guards, two instances on one store."""
+
+    def pair(self):
+        store, now = MemoryStore(), [1000.0]
+        return (DurableGuards(store, Conflict, clock=lambda: now[0]),
+                DurableGuards(store, Conflict, clock=lambda: now[0]), now, store)
+
+    def test_cap_and_spacing_hold_across_instances(self):
+        a, b, now, _ = self.pair()
+        name = session_record("s-1")
+        self.assertEqual("", a.take(name, "talk", 3, 1.5))
+        self.assertEqual("spacing", b.take(name, "talk", 3, 1.5))             # the other instance sees it
+        now[0] += 2
+        self.assertEqual("", b.take(name, "talk", 3, 1.5))
+        now[0] += 2
+        self.assertEqual("", a.take(name, "talk", 3, 1.5))
+        now[0] += 2
+        self.assertEqual("cap", b.take(name, "talk", 3, 1.5))
+
+    def test_a_lease_is_exclusive_expires_and_is_fenced(self):
+        a, b, now, _ = self.pair()
+        name = session_record("s-1")
+        first = a.acquire(name, "analyze", "owner-a", 60)
+        self.assertIsNotNone(first)
+        self.assertIsNone(b.acquire(name, "analyze", "owner-b", 60))           # held on the other instance
+        now[0] += 61                                                           # expired: not counted
+        second = b.acquire(name, "analyze", "owner-b", 60)
+        self.assertGreater(second, first)
+        a.release(name, "analyze", "owner-a", first)                           # the stale holder releases nothing
+        self.assertIsNone(a.acquire(name, "analyze", "owner-c", 60))
+        b.release(name, "analyze", "owner-b", first)                           # the wrong fence releases nothing
+        self.assertIsNone(a.acquire(name, "analyze", "owner-c", 60))
+        b.release(name, "analyze", "owner-b", second)
+        self.assertIsNotNone(a.acquire(name, "analyze", "owner-c", 60))
+
+    def test_the_ceiling_counts_live_leases_across_instances(self):
+        a, b, now, _ = self.pair()
+        got = [a.acquire(CEILING_RECORD, "fetch", "o1", 60, 2), b.acquire(CEILING_RECORD, "fetch", "o2", 60, 2),
+               a.acquire(CEILING_RECORD, "fetch", "o3", 60, 2)]
+        self.assertEqual([True, True, False], [g is not None for g in got])
+
+    def test_a_store_failure_fails_closed(self):
+        a, _, _, store = self.pair()
+
+        def broken(*args, **kwargs):
+            raise OSError("down")
+        store.load = broken
+        for call in (lambda: a.take("x", "talk", 3), lambda: a.acquire("x", "analyze", "o", 60)):
+            with self.assertRaises(GuardUnavailable):
+                call()
+
+
+class HoldingFetcher(FakeFetcher):
+    def __init__(self):
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def __call__(self, url):
+        self.entered.set()
+        self.release.wait(10)
+        return super().__call__(url)
+
+
+class CodexR8B3TwoInstances(Api):
+    """B3: two app objects on one store hold the client's limits between them."""
+
+    def second_app(self, clock=None, fetcher=None, talk=None, **overrides):
+        values = dict(client_workspaces=True)
+        values.update(overrides)
+        return create_app(settings=settings(**values), store=self.store, worker=CountingWorker(), id_factory=IDs(),
+                          email_sender=self.email_sender, project_fetcher=fetcher or FakeFetcher(),
+                          talk_client=talk or ProviderTalk(), **({"clock": clock} if clock else {}))
+
+    def test_talk_cap_and_spacing_hold_across_two_instances(self):
+        offset = [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        with TestClient(self.make(talk=ProviderTalk(), clock=clock, talk_cap=3)) as a, \
+                TestClient(self.second_app(clock=clock, talk_cap=3)) as b:
+            token = self.sign_in(a).json()["token"]
+            live = self.project_session(a, token).json()
+            say = lambda c: c.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),  # noqa: E731
+                                   json={"text": "make it bigger"})
+            first = say(a)
+            spaced = say(b)                                                    # at once, on the other instance
+            codes = []
+            for c in (b, a, b, a):
+                offset[0] += 10
+                codes.append(say(c).status_code)
+        self.assertEqual((200, 429), (first.status_code, spaced.status_code))
+        self.assertIn("one turn every", spaced.json()["detail"])
+        self.assertEqual([200, 200, 429, 429], codes)
+
+    def test_recap_cap_holds_across_two_instances(self):
+        with TestClient(self.make(talk=ProviderTalk(), recap_cap=1)) as a, \
+                TestClient(self.second_app(recap_cap=1)) as b:
+            token = self.sign_in(a).json()["token"]
+            live = self.project_session(a, token).json()
+            codes = [c.post("/v1/session/%s/recap" % live["session_id"], headers=self.auth(live["token"]),
+                            json={}).status_code for c in (a, b)]
+        self.assertEqual([200, 429], codes)
+
+    def test_one_page_load_per_tenant_across_two_instances(self):
+        holding = HoldingFetcher()
+        with TestClient(self.make(fetcher=holding)) as a, TestClient(self.second_app()) as b:
+            token = self.sign_in(a).json()["token"]
+            out = {}
+            thread = threading.Thread(target=lambda: out.update(a=self.project_session(a, token, "load-a")))
+            thread.start()
+            self.assertTrue(holding.entered.wait(10))
+            busy = self.project_session(b, token, "load-b")
+            holding.release.set()
+            thread.join(10)
+            after = self.project_session(b, token, "load-b2")
+        self.assertEqual((200, 429, 200), (out["a"].status_code, busy.status_code, after.status_code))
+
+    def test_the_page_load_ceiling_holds_across_two_instances(self):
+        acme = client_entry(tenant="acme", emails=("acme@example.com",), name="Acme",
+                            projects=[project("acme-site", "https://www.acme.example.com/", "acme.example.com")])
+        holding = HoldingFetcher()
+        with _mock.patch.object(_project_page, "MAX_OUTSTANDING_FETCHES", 1):
+            with TestClient(self.make(fetcher=holding, registry=registry_record(client_entry(), acme))) as a, \
+                    TestClient(self.second_app()) as b:
+                nav_token = self.sign_in(a).json()["token"]
+                acme_token = self.sign_in(b, "acme@example.com").json()["token"]
+                out = {}
+                thread = threading.Thread(target=lambda: out.update(a=self.project_session(a, nav_token, "load-a")))
+                thread.start()
+                self.assertTrue(holding.entered.wait(10))
+                busy = self.project_session(b, acme_token, "acme-1", project_id="acme-site")
+                holding.release.set()
+                thread.join(10)
+                after = self.project_session(b, acme_token, "acme-2", project_id="acme-site")
+        self.assertEqual((200, 503, 200), (out["a"].status_code, busy.status_code, after.status_code))
+
+    def test_guard_state_that_cannot_be_read_refuses(self):
+        with TestClient(self.make(talk=ProviderTalk())) as a:
+            token = self.sign_in(a).json()["token"]
+            live = self.project_session(a, token).json()
+            original = self.store.load
+
+            def load(name):
+                if name.startswith("studio_guard_"):
+                    raise OSError("down")
+                return original(name)
+            self.store.load = load
+            try:
+                out = a.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                             json={"text": "make it bigger"})
+            finally:
+                self.store.load = original
+        self.assertEqual(503, out.status_code)
+
+
+APOSTROPHE_CASES = {
+    "Write johnsmith'alias@example.com today": "Write [email] today",
+    "Or o'neil+tag@sub.example.co.uk now": "Or [email] now",
+    "Local d'arcy@localhost here": "Local [email] here",
+    "Literal o'hara@[10.0.0.1] here": "Literal [email] here",
+    "Paren (jo'e@example.com) end": "Paren [email]) end",
+    "Profile https://user@host.example/path here": "Profile [link] here",
+    "Wide johnsmith\uff07alias@example.com today": "Wide [email] today",      # a full-width apostrophe
+}
+APOSTROPHE_NEVER = ("johnsmith", "alias", "\uff07", "o'neil", "d'arcy", "o'hara", "jo'e", "user@", "/path")
+
+
+class CodexR8B4ApostropheMailbox(Api):
+    def test_the_whole_mailbox_goes_and_near_addresses_stay(self):
+        for text, expected in APOSTROPHE_CASES.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text)
+        for keep in ("O'Brien's shop", "rock 'n' roll", "it's @ noon", "Meet @ 5pm", "ask @steelworks",
+                     "a @b and c@ d", "email: none", "(see below)", "Tom's 'quoted' words."):
+            self.assertEqual(keep, redact(keep), keep)
+
+    def test_no_surface_carries_it(self):
+        texts = list(APOSTROPHE_CASES)
+        page = ("<h1>%s</h1>" % texts[0] + "".join("<p>%s</p>" % t for t in texts[1:])
+                + "<img alt=\"%s\"><input placeholder=\"%s\">" % (texts[0], texts[1]))
+        talk, worker = FakeTalk(), SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-a", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-a"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        state = self.state(live["session_id"])
+        surfaces = (("tree", json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)),
+                    ("state", json.dumps(state, ensure_ascii=False)),
+                    ("audit", json.dumps(state.get("audit"), ensure_ascii=False)),
+                    ("provider", json.dumps([talk.calls, worker.seen], ensure_ascii=False)), ("events", events))
+        for surface, text in surfaces:
+            for never in APOSTROPHE_NEVER:
+                self.assertNotIn(never, text, (surface, never))
+        self.assertIn("[email]", surfaces[1][1])
+
+
+REPEATED_DOTS = {"Leader secret\u2025com end": "Leader [link] end",           # two-dot leader
+                 "Ellipsis secret\u2026com end": "Ellipsis [link] end",
+                 "Vertical secret\ufe19com end": "Vertical [link] end",
+                 "Vertical two secret\ufe30com end": "Vertical two [link] end"}
+
+
+class CodexR8RepeatedDotForms(unittest.TestCase):
+    def test_repeated_dot_forms_read_as_one_dot(self):
+        for text, expected in REPEATED_DOTS.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), repr(text))
+        for keep in ("Wait\u2026 what", "and then\u2026", "Hmm\u2026 ok.", "Well... okay", "\u2025 two"):
+            self.assertEqual(keep, " ".join(redact(keep).split()), repr(keep))
+        labels = json.dumps(page_to_tree("".join("<p>%s</p>" % t for t in REPEATED_DOTS), "T")["children"])
+        self.assertNotIn("secret", labels)
+
+
+class CodexR8OperatorStreamExpiry(Api):
+    """An operator's token has no registry to read: its expiry is checked
+    before a batch leaves too."""
+
+    asgi_stream = CodexR8B2StreamSendBoundary.asgi_stream
+    event_chunks = CodexR8B2StreamSendBoundary.event_chunks
+
+    def test_an_operator_stream_crossing_expiry_sends_nothing_more(self):
+        offset = [0]
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1,
+                                  clock=lambda: time.time() + offset[0])) as client:
+            token = self.sign_in(client, OPERATOR).json()["token"]
+            live = client.post("/v1/session", headers=self.auth(token),
+                               json={"creation_id": "op-stream", "start": "blank"}).json()
+            controller = self.app.state.controller
+
+            def expire(n):
+                if n == 1:
+                    offset[0] = 700
+                    commit_event(controller, live["session_id"])
+            chunks = self.asgi_stream(live, expire)
+        self.assertEqual(1, len(self.event_chunks(chunks)), chunks)

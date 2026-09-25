@@ -396,7 +396,9 @@ tenant exists and still lists an address that hashes to the token's subject.
 - Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
   `[email]`. The registry's project name is kept as written. An email is replaced whole, local
   part included, whether its host is dotted, dotless (`admin@localhost`) or a bracketed literal
-  (`user@[2001:db8::1]`).
+  (`user@[2001:db8::1]`). The local part is whatever the registry accepts: anything but whitespace, `@` and angle
+  brackets. So `johnsmith'alias@example.com` goes whole. Links are read first, so a link's
+  `user@host` goes with it.
 - Detection reads a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
   name. Circled, full-width, squared and mathematical forms of letters, digits, dots, colons and
   `@` are read as what they stand for (`secret.ⓒⓞⓜ` is `secret.com`). An offset map leads each
@@ -446,22 +448,39 @@ cc56fea.
   other write stands.
 - A failing worker finishes the same way.
 - There is always one terminal receipt and one audit entry, and the session is never wedged.
+- If even that finish loses every compare-and-set, the command's failed outcome is written once,
+  create-only, to its own small record, outside the contended session. It is then applied under
+  the same ownership fence by whichever comes first:
+  - at once;
+  - a scheduled background recovery, which needs no client command;
+  - the next reader of the session, before its own command.
+
+  So there is still one terminal receipt and one audit entry, and the next command is accepted at
+  once (Codex Gate 1 B1 on 38bc713).
 - A snapshot repair waits for a running build. The analyst, the Muse and the charter already did.
 
 **Open streams.** The event stream is re-authorised before every state read and before each batch
 leaves: the token's expiry and, for a client-bound token, the session binding and the registry,
 read fresh. When that fails the stream closes and nothing more is sent. Codex Gate 1 B2 on cc56fea.
+Each batch leaves as a single chunk, right after that check, and the expiry is checked again after
+the registry read. Nothing can change between the check and the batch, and no event goes out after
+a revocation or an expiry. Codex Gate 1 B2 on 38bc713.
 
-**One instance.** The talk, recap and muse counters, talk spacing, the busy guards, the per-tenant
-fetch single-flight and attempt budget, and the fetch semaphore are all per process.
-`STUDIO_CLIENT_WORKSPACES=true` therefore refuses to start unless `STUDIO_SINGLE_INSTANCE=true`
-declares a one-instance service. The deploy recipe must keep `--max-instances=1` (production:
-min 1, max 1, concurrency 8). Codex Gate 1 B3/B4 on cc56fea.
-- **Residual risk.** During a revision rollout, the old and new revisions can serve at the same
-  time for a short window. Each has its own counters, so a client could get up to twice the
-  per-session caps. Fetch concurrency could also reach twice its bound for that window.
-- This is accepted for the rollout window only, pending a ruling. Durable CAS leases are the
-  alternative.
+**Durable guards.** For client sessions, every guard below lives in compare-and-set state
+(`app/guards.py`), so it holds across instances, revisions, a rollout and a rollback: two app
+objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
+- The talk, recap, speech, inspiration, analysis and advice counters.
+- Talk and analysis spacing.
+- The analysis, charter and advice single-flight leases.
+- One page load per tenant, and the service-wide page-load ceiling (`MAX_OUTSTANDING_FETCHES`).
+- A lease has an owner, an expiry and a growing fence. Only its owner, with its fence, releases it.
+  A lease that has expired is no longer counted.
+- A page load that timed out but may still be running keeps its leases until they expire. The
+  expiry (60 s) outlives any load.
+- Guard state that cannot be read or written refuses the call (503). It never lets the call
+  through.
+- Operator and visitor sessions keep the in-process guards. Admission, voice, commands and the
+  summary were already durable.
 
 ## Metadata proposal contract (offline-only increment)
 

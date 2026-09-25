@@ -109,8 +109,6 @@ MUTANTS = [
         "                try:\n                    require_bound_client(claims, session_id)\n"
         "                except HTTPException:\n                    return False\n", "")]),
     # -- one instance (Codex Gate 1 B3/B4 on cc56fea) ----------------------------------------------
-    ("topology: client workspaces without the one-instance declaration", [("cloud/studio-controller/app/settings.py",
-        "        if self.client_workspaces and not self.single_instance:", "        if False:")]),
     # -- which providers a client session reaches (Codex Gate 1 blocker_2) -------------------------
     ("providers: client sessions keep every agent", [(MAIN,
         "        return [a for a in agents if a in client_providers] if is_client_session(state) else list(agents)",
@@ -122,8 +120,8 @@ MUTANTS = [
         "        allowed = session_agents(state, agents)\n        if not allowed:\n"
         "            raise HTTPException(503, \"talk is not available\")")]),
     ("providers: talk routes over every agent", [(MAIN,
-        "            agent = route_agent(state.get(\"topic\"), allowed)\n        used = talk_counts",
-        "            agent = route_agent(state.get(\"topic\"), agents)\n        used = talk_counts")]),
+        "            agent = route_agent(state.get(\"topic\"), allowed)\n        # Gemini's review of the talk lane",
+        "            agent = route_agent(state.get(\"topic\"), agents)\n        # Gemini's review of the talk lane")]),
     ("providers: recap routes over every agent", [(MAIN,
         "            agent = route_agent(state.get(\"topic\"), allowed)\n        spend(recap_counts",
         "            agent = route_agent(state.get(\"topic\"), agents)\n        spend(recap_counts")]),
@@ -144,7 +142,7 @@ MUTANTS = [
         "            raise HTTPException(400, \"advise needs the canvas revision\")\n"
         "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
         "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n")]),
-    ("tree: email scan not anchored (quadratic)", [(PAGE, '_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^"',
+    ("tree: email scan not anchored (quadratic)", [(PAGE, '_EMAIL_RE = re.compile("(?<![^" + _NOT_LOCAL + "])[^"',
                                                     '_EMAIL_RE = re.compile("[^"')]),
     ("providers: any setting accepted", [("cloud/studio-controller/app/settings.py",
         "            raise RuntimeError(\"STUDIO_CLIENT_PROVIDERS must be distinct names from: \" + \", \".join(KNOWN_PROVIDERS))",
@@ -259,7 +257,54 @@ MUTANTS = [
     # -- budgets before the fetch ---------------------------------------------------------------
     ("budget: no per-tenant page-load budget", [(MAIN,
         "if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):", "if False:")]),
-    ("budget: no single flight per tenant", [(MAIN, "if not claim_fetch_slot(tenant):", "if False:")]),
+    ("budget: no single flight per tenant", [(MAIN,
+        "tenant_fence = guards.acquire(tenant_record(tenant), \"fetch\", owner, FETCH_LEASE_SECONDS, 1)",
+        "tenant_fence = guards.acquire(tenant_record(tenant), \"fetch\", owner, FETCH_LEASE_SECONDS, 10 ** 6)")]),
+    # -- round 8 (Codex Gate 1 NO-GO on 38bc713, 20:25Z) -----------------------------------------
+    ("exhaust: the outcome is not made durable", [(CORE,
+        "            self.repository.store.save(self._outcome_name(session_id, command_id), outcome, None)\n",
+        "            pass\n")]),
+    ("exhaust: no scheduled recovery", [(CORE,
+        "        if not self._apply_outcome(session_id, outcome, tries=3):\n            self._schedule_recovery(session_id, outcome)\n",
+        "        if not self._apply_outcome(session_id, outcome, tries=3):\n            pass\n")]),
+    ("exhaust: the next reader does not apply the outcome", [(CORE,
+        "            recorded = self._load_outcome(session_id, active)\n", "            recorded = None\n")]),
+    ("exhaust: an outcome applied without owning the command", [(CORE,
+        "            if not self._owns(state, outcome):\n                return True\n", "")]),
+    ("sse: a batch leaves one event at a time", [(MAIN,
+        "                    yield \"\".join(_sse(event) for event in batch)\n                    after = int(batch[-1][\"seq\"])\n",
+        "                    for event in batch:\n                        yield _sse(event)\n"
+        "                        after = int(event[\"seq\"])\n")]),
+    ("sse: expiry not rechecked after the registry", [(MAIN,
+        "                if int(clock()) >= int(claims.get(\"exp\") or 0):   # after the registry read, which can be slow\n"
+        "                    return False\n", "")]),
+    ("guards: client talk counted per process", [(MAIN,
+        "        if is_client_session(state):\n            refused = await asyncio.to_thread(guard_take, session_id, \"talk\"",
+        "        if False:\n            refused = await asyncio.to_thread(guard_take, session_id, \"talk\"")]),
+    ("guards: client spend counted per process", [(MAIN,
+        "        if is_client_session(state):\n            if guard_take(session_id, \"spend:\" + what, cap) == \"cap\":",
+        "        if False:\n            if guard_take(session_id, \"spend:\" + what, cap) == \"cap\":")]),
+    ("guards: no service-wide page-load ceiling", [(MAIN,
+        "                                       project_page_module.MAX_OUTSTANDING_FETCHES)",
+        "                                       10 ** 6)")]),
+    ("guards: an expired lease still counted", [("cloud/studio-controller/app/guards.py",
+        "if isinstance(l, dict) and float(l.get(\"until\") or 0) > now}", "if isinstance(l, dict)}")]),
+    ("guards: release without the fence", [("cloud/studio-controller/app/guards.py",
+        "            if not isinstance(held, dict) or int(held.get(\"fence\") or 0) != int(fence or 0):",
+        "            if not isinstance(held, dict):")]),
+    ("guards: unreadable state lets the call through", [(MAIN,
+        "            return guards.take(session_record(session_id), lane, cap, spacing)\n        except GuardUnavailable as exc:\n"
+        "            raise HTTPException(503, GUARDS_DOWN) from exc",
+        "            return guards.take(session_record(session_id), lane, cap, spacing)\n        except GuardUnavailable as exc:\n"
+        "            return \"\"")]),
+    ("tree: repeated-dot forms read as several dots", [(PAGE,
+        "        if len(mapped) > 1 and all(c in _DOT_CHARS for c in mapped):\n", "        if False:\n")]),
+    ("tree: apostrophes end a mailbox", [(PAGE, '_NOT_LOCAL = "\\\\s@<>"', '_NOT_LOCAL = "\\\\s@<>\'"')]),
+    ("tree: emails read before links", [(PAGE,
+        "    text = _replace_found(text, _regex_found(_URL_RE, LINK))      # first: a link's user@host goes with it\n"
+        "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n",
+        "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n"
+        "    text = _replace_found(text, _regex_found(_URL_RE, LINK))\n")]),
     # -- audit and redacted failures --------------------------------------------------------------
     ("audit: none at all", [(CORE,
         "        if state.get(\"client_tenant\"):\n            self._audit(state, command, prior_revision, result)\n", "")]),

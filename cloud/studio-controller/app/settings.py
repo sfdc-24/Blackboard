@@ -94,10 +94,6 @@ class Settings:
     # STUDIO_CLIENT_PROVIDERS names others. The builder (Claude) and the voice,
     # speech and moderation calls (OpenAI) are the base of every session.
     client_providers: tuple[str, ...] = ("claude", "openai")
-    # The spend, spacing, busy and fetch guards are per process (Codex Gate 1
-    # B3/B4 on cc56fea): client workspaces run only on a service declared to
-    # be one instance (deploy with --max-instances=1).
-    single_instance: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -155,7 +151,6 @@ class Settings:
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
             client_workspaces=_enabled(os.environ.get("STUDIO_CLIENT_WORKSPACES", "false")),
             client_providers=_providers(os.environ.get("STUDIO_CLIENT_PROVIDERS", "claude,openai")),
-            single_instance=_enabled(os.environ.get("STUDIO_SINGLE_INSTANCE", "false")),
         )
 
     @property
@@ -216,10 +211,6 @@ class Settings:
                 or any(p not in KNOWN_PROVIDERS for p in providers)):
             # Fail closed: a typo must stop the service, never widen or silently narrow it.
             raise RuntimeError("STUDIO_CLIENT_PROVIDERS must be distinct names from: " + ", ".join(KNOWN_PROVIDERS))
-        if self.client_workspaces and not self.single_instance:
-            raise RuntimeError("STUDIO_CLIENT_WORKSPACES requires STUDIO_SINGLE_INSTANCE=true: its spend, spacing, "
-                               "busy and fetch guards are per process, so the service must run as one instance "
-                               "(--max-instances=1)")
         if self.client_workspaces and self.lead_facts_enabled:
             # Lead facts read the Salesforce org for any session; a client must
             # never reach that path either.

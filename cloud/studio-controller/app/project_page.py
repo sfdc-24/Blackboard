@@ -73,6 +73,10 @@ class FetchBusy(PageFetchError):
     """Every page-load slot is taken: nothing was started."""
 
 
+class FetchTimeout(PageFetchError):
+    """The caller stopped waiting; the load's thread may still be running."""
+
+
 # A page load keeps its slot until its thread has actually finished - a caller
 # that stopped waiting at the deadline does not free it. So however many
 # resolvers or connections hang, at most MAX_OUTSTANDING_FETCHES threads exist.
@@ -158,7 +162,7 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
         raise
     worker.join(TOTAL_SECONDS)
     if worker.is_alive():
-        raise PageFetchError("the page was too slow")
+        raise FetchTimeout("the page was too slow")
     if "error" in outcome:
         raise outcome["error"]
     return outcome["html"]
@@ -263,7 +267,12 @@ _NOT_ADDR = "\\s@<>()\\[\\]{}\"',;:"
 # (user@[2001:db8::1]); the whole address goes, local part included (Codex
 # Gate 1 B5 on cc56fea).
 _HOST_SEG = "[^" + _NOT_ADDR + ".\u3002\uff0e\uff61]+"
-_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^" + _NOT_ADDR + "]+@(?:\\[[^\\]\\s]{1,100}\\]|"
+# A mailbox's local part is anything the registry accepts there - only not
+# whitespace, "@" or angle brackets, so apostrophes, quotes, brackets and
+# commas included - and the whole mailbox goes (Codex Gate 1 on 38bc713:
+# johnsmith'alias@example.com left johnsmith' behind).
+_NOT_LOCAL = "\\s@<>"
+_EMAIL_RE = re.compile("(?<![^" + _NOT_LOCAL + "])[^" + _NOT_LOCAL + "]+@(?:\\[[^\\]\\s]{1,100}\\]|"
                        + _HOST_SEG + "(?:" + _DOT + _HOST_SEG + ")*)")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
@@ -355,6 +364,11 @@ def _compat_view(text: str) -> tuple[str, list | None]:
     chunks, origin, changed = [], [], False
     for i, ch in enumerate(text):
         mapped = unicodedata.normalize("NFKC", ch) if ord(ch) > 0x7F else ch
+        if len(mapped) > 1 and all(c in _DOT_CHARS for c in mapped):
+            # A repeated-dot form UTS46 disallows (two-dot leader, ellipsis,
+            # their vertical forms) reads as one dot, conservatively: secret‥com
+            # is taken for secret.com (Codex, 21:19Z on 132a544).
+            mapped = "."
         if not mapped:
             mapped = ch
         changed = changed or mapped != ch
@@ -386,8 +400,8 @@ def _replace_found(text: str, finder) -> str:
 def redact(text: str) -> str:
     """Replace every link-, domain-, IP- and email-shaped token with a
     placeholder, each found on the compatibility view (above)."""
+    text = _replace_found(text, _regex_found(_URL_RE, LINK))      # first: a link's user@host goes with it
     text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))
-    text = _replace_found(text, _regex_found(_URL_RE, LINK))
     text = _replace_found(text, _regex_found(_IPV4_RE, LINK))
     text = _replace_found(text, _ipv6_found)
     return _replace_found(text, _host_spans)
@@ -681,5 +695,5 @@ def tree_depth(tree: dict) -> int:
     return 1 + max((tree_depth(c) for c in tree.get("children") or []), default=0)
 
 
-__all__ = ["PageFetchError", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
+__all__ = ["PageFetchError", "FetchBusy", "FetchTimeout", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
            "system_resolver", "tree_nodes", "tree_depth", "MAX_NODES", "MAX_DEPTH", "MAX_IMAGES", "LABEL_MAX"]

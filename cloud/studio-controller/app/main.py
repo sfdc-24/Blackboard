@@ -30,7 +30,9 @@ from .core import CommandError, StudioController
 from .auth import AuthService
 from .clients import ClientRegistry, public_view
 from .leads import LeadBook, LeadCapExceeded
-from .project_page import FetchBusy, PageFetchError, fetch_page, page_to_tree
+from . import project_page as project_page_module
+from .guards import CEILING_RECORD, DurableGuards, GuardUnavailable, session_record, tenant_record
+from .project_page import FetchBusy, FetchTimeout, PageFetchError, fetch_page, page_to_tree
 from .settings import Settings
 from .state import (
     SessionNotFound,
@@ -617,7 +619,41 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(410, "session has ended")
         return state
 
-    def spend(counts: dict, session_id: str, cap: int, what: str) -> None:
+    # Client (workspace) sessions keep their paid-lane counters, spacing and
+    # single-flight leases, and the page-load leases with their ceiling, in
+    # durable compare-and-set state (app/guards.py; Codex Gate 1 B3/B4 on
+    # 38bc713), so they hold across instances, revisions and a rollout.
+    # Operator and visitor sessions keep the in-process guards.
+    guards = DurableGuards(store, Conflict, clock=clock)
+    app.state.guards = guards
+    LEASE_SECONDS = 120.0            # longer than any provider call is allowed to run
+    GUARDS_DOWN = "this session's limits could not be checked; try again"
+
+    def guard_take(session_id: str, lane: str, cap: int, spacing: float = 0.0) -> str:
+        try:
+            return guards.take(session_record(session_id), lane, cap, spacing)
+        except GuardUnavailable as exc:
+            raise HTTPException(503, GUARDS_DOWN) from exc
+
+    def guard_lease(session_id: str, lane: str, owner: str):
+        try:
+            return guards.acquire(session_record(session_id), lane, owner, LEASE_SECONDS, 1)
+        except GuardUnavailable as exc:
+            raise HTTPException(503, GUARDS_DOWN) from exc
+
+    def guard_release(session_id: str, lane: str, owner: str, fence) -> None:
+        guards.release(session_record(session_id), lane, owner, fence)
+
+    def spend(counts: dict, session_id: str, cap: int, what: str, state: dict | None = None) -> None:
+        if state is None:
+            try:
+                state = repository.load(session_id).state
+            except SessionNotFound as exc:
+                raise HTTPException(404, "session not found") from exc
+        if is_client_session(state):
+            if guard_take(session_id, "spend:" + what, cap) == "cap":
+                raise HTTPException(429, "%s limit reached for this session" % what)
+            return
         used = counts.get(session_id, 0)
         if used >= cap:
             raise HTTPException(429, "%s limit reached for this session" % what)
@@ -763,17 +799,31 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if int(state.get("artifact_version") or 0) != revision:
             raise HTTPException(409, "the canvas has moved on")
         snapshot_marker = advisor_snapshot_marker(state)
-        if session_id in advise_busy:
+        client = is_client_session(state)
+        advise_owner, advise_fence = secrets.token_hex(8), None
+        if client:
+            advise_fence = await asyncio.to_thread(guard_lease, session_id, "advise", advise_owner)
+            if advise_fence is None:
+                raise HTTPException(409, "advice is already being prepared for this session")
+            if await asyncio.to_thread(guard_take, session_id, "advise",
+                                       int(getattr(advisor_lane, "call_cap", 12))) == "cap":
+                await asyncio.to_thread(guard_release, session_id, "advise", advise_owner, advise_fence)
+                raise HTTPException(429, "advice limit reached for this session")
+        elif session_id in advise_busy:
             raise HTTPException(409, "advice is already being prepared for this session")
         said = [str(t.get("text") or "") for t in state.get("transcript") or []
                 if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-4:]
         snapshot = {"revision": revision, "topic_line": topic_line(state),
                     "canvas": canvas_summary(state.get("artifact")), "said": said}
-        advise_busy.add(session_id)
+        if not client:
+            advise_busy.add(session_id)
         try:
             advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
         finally:
-            advise_busy.discard(session_id)
+            if client:
+                await asyncio.to_thread(guard_release, session_id, "advise", advise_owner, advise_fence)
+            else:
+                advise_busy.discard(session_id)
         if advice is None:
             return {"advice": None}
         try:
@@ -823,19 +873,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if state.get("active_command"):
             raise HTTPException(409, "a build is running; ask again when it lands")
         snapshot_marker = advisor_snapshot_marker(state)
-        if session_id in charter_busy:
+        client = is_client_session(state)
+        charter_owner, charter_fence = secrets.token_hex(8), None
+        if client:
+            charter_fence = await asyncio.to_thread(guard_lease, session_id, "charter", charter_owner)
+            if charter_fence is None:
+                raise HTTPException(409, "the charter is already being prepared for this session")
+        elif session_id in charter_busy:
             raise HTTPException(409, "the charter is already being prepared for this session")
         said = [str(t.get("text") or "") for t in state.get("transcript") or []
                 if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-12:]
         snapshot = {"revision": revision, "topic": state.get("topic") or "", "topic_line": topic_line(state),
                     "canvas": canvas_summary(state.get("artifact")), "said": said,
                     "charter": state.get("charter") or {}}
-        charter_busy.add(session_id)
+        if not client:
+            charter_busy.add(session_id)
         started = time.monotonic()
         try:
             result = await asyncio.to_thread(charter_lane.chart, snapshot)
         finally:
-            charter_busy.discard(session_id)
+            if client:
+                await asyncio.to_thread(guard_release, session_id, "charter", charter_owner, charter_fence)
+            else:
+                charter_busy.discard(session_id)
         if not result:
             charter_done(session_id, started, "none")
             return {"charter": None}
@@ -1075,20 +1135,31 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         )
         return {"token": token, "expires_at": expires_at, "scope": "operator"}
 
-    fetch_lock = threading.Lock()
-    fetches_in_flight: set = set()
-    app.state.fetches_in_flight = fetches_in_flight
+    # One page load per tenant, and a service-wide ceiling on page loads, as
+    # durable leases (Codex Gate 1 B3/B4 on 38bc713): they hold across
+    # instances. A lease outlives any load and its thread (project_page bounds
+    # connect, first byte, idle and per-chunk time), so a load that timed out
+    # but is still running keeps its leases until they expire.
+    FETCH_LEASE_SECONDS = 60.0
 
-    def claim_fetch_slot(tenant: str) -> bool:
-        with fetch_lock:
-            if tenant in fetches_in_flight:
-                return False
-            fetches_in_flight.add(tenant)
-            return True
+    def claim_fetch(tenant: str):
+        """(owner, tenant fence, ceiling fence), or "tenant" while the tenant
+        is loading, or "ceiling" while every service-wide slot is taken."""
+        owner = secrets.token_hex(8)
+        tenant_fence = guards.acquire(tenant_record(tenant), "fetch", owner, FETCH_LEASE_SECONDS, 1)
+        if tenant_fence is None:
+            return "tenant"
+        ceiling_fence = guards.acquire(CEILING_RECORD, "fetch", owner, FETCH_LEASE_SECONDS,
+                                       project_page_module.MAX_OUTSTANDING_FETCHES)
+        if ceiling_fence is None:
+            guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
+            return "ceiling"
+        return owner, tenant_fence, ceiling_fence
 
-    def release_fetch_slot(tenant: str) -> None:
-        with fetch_lock:
-            fetches_in_flight.discard(tenant)
+    def release_fetch(tenant: str, claim) -> None:
+        owner, tenant_fence, ceiling_fence = claim
+        guards.release(CEILING_RECORD, "fetch", owner, ceiling_fence)
+        guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
 
     def reserve_fetch_attempt(tenant: str, project_id: str) -> bool:
         """Spend one of the tenant's page-load attempts, by compare-and-set,
@@ -1162,8 +1233,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 # Before any fetch or parse: one page load per tenant at a time,
                 # and a small per-tenant budget of attempts that a failure
                 # spends too - but no session admission.
-                if not claim_fetch_slot(tenant):
+                try:
+                    claim = await asyncio.to_thread(claim_fetch, tenant)
+                except GuardUnavailable as exc:
+                    raise HTTPException(503, "page loading is busy; try again shortly") from exc
+                if claim == "tenant":
                     raise HTTPException(429, "a page for this workspace is already loading")
+                if claim == "ceiling":
+                    raise HTTPException(503, "page loading is busy; try again shortly")
+                timed_out = False
                 try:
                     if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
                         raise HTTPException(429, "too many page loads for this workspace; try again later")
@@ -1172,12 +1250,16 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                         artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
                     except FetchBusy as exc:
                         raise HTTPException(503, "page loading is busy; try again shortly") from exc
+                    except FetchTimeout as exc:
+                        timed_out = True
+                        raise HTTPException(502, "the project page could not be loaded") from exc
                     except PageFetchError as exc:
                         raise HTTPException(502, "the project page could not be loaded") from exc
                     except Exception as exc:
                         raise HTTPException(502, "the project page could not be loaded") from exc
                 finally:
-                    release_fetch_slot(tenant)
+                    if not timed_out:                # a load still running keeps its leases until they expire
+                        await asyncio.to_thread(release_fetch, tenant, claim)
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
@@ -1251,6 +1333,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     require_bound_client(claims, session_id)
                 except HTTPException:
                     return False
+                if int(clock()) >= int(claims.get("exp") or 0):   # after the registry read, which can be slow
+                    return False
             return True
 
         async def stream():
@@ -1262,9 +1346,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     return
                 if repaired:
                     after = 0
-                for event in batch:
-                    yield _sse(event)
-                    after = int(event["seq"])
+                if batch:
+                    # One chunk, authorised once, just above: nothing between
+                    # the check and the whole batch leaving (Codex Gate 1 B2).
+                    yield "".join(_sse(event) for event in batch)
+                    after = int(batch[-1]["seq"])
                 if once or clock() >= deadline or state.get("stopped"):
                     break
                 if await request.is_disconnected():
@@ -1337,21 +1423,28 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if agent is None:
             from workers.topics import route_agent
             agent = route_agent(state.get("topic"), allowed)
-        used = talk_counts.get(session_id, 0)
-        if used >= settings.talk_cap:
-            raise HTTPException(429, "talk limit reached for this session")
         # Gemini's review of the talk lane: a hard total per session and a
         # minimum spacing, both on the server, so no client can run up spend.
-        now = clock()
-        last = talk_last.get(session_id)
-        if last is not None and now - last < TALK_SPACING_SECONDS:
-            raise HTTPException(429, "talk is limited to one turn every %.1f seconds" % TALK_SPACING_SECONDS)
-        talk_counts[session_id] = used + 1
-        talk_last[session_id] = now
-        if len(talk_counts) > 500:
-            for stale in list(talk_counts)[:250]:
-                talk_counts.pop(stale, None)
-                talk_last.pop(stale, None)
+        if is_client_session(state):
+            refused = await asyncio.to_thread(guard_take, session_id, "talk", settings.talk_cap, TALK_SPACING_SECONDS)
+            if refused == "cap":
+                raise HTTPException(429, "talk limit reached for this session")
+            if refused == "spacing":
+                raise HTTPException(429, "talk is limited to one turn every %.1f seconds" % TALK_SPACING_SECONDS)
+        else:
+            used = talk_counts.get(session_id, 0)
+            if used >= settings.talk_cap:
+                raise HTTPException(429, "talk limit reached for this session")
+            now = clock()
+            last = talk_last.get(session_id)
+            if last is not None and now - last < TALK_SPACING_SECONDS:
+                raise HTTPException(429, "talk is limited to one turn every %.1f seconds" % TALK_SPACING_SECONDS)
+            talk_counts[session_id] = used + 1
+            talk_last[session_id] = now
+            if len(talk_counts) > 500:
+                for stale in list(talk_counts)[:250]:
+                    talk_counts.pop(stale, None)
+                    talk_last.pop(stale, None)
         outcome = await policy_gate(session_id, "talk", [text] + governance.history_texts(history))
         if outcome:
             refused = {"reply": governance.POLICY_END_LINE if outcome == "ended" else governance.POLICY_LINE,
@@ -1422,7 +1515,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 raise HTTPException(400, "speak needs text of 1 to %d characters" % SPEAK_MAX)
             await asyncio.to_thread(live_state, session_id)
             instructions = MUSE_STYLE if who == "muse" else ARCHITECT_STYLE
-        spend(speak_counts, session_id, settings.speak_cap, "speech")
+        await asyncio.to_thread(spend, speak_counts, session_id, settings.speak_cap, "speech")
         if await policy_gate(session_id, "speak", [text], count=False):
             raise HTTPException(422, governance.POLICY_PROBLEM)
         voice_name = settings.muse_voice if who == "muse" else settings.architect_voice
@@ -1473,7 +1566,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             outcome = await policy_gate(session_id, "muse", [text])
             if outcome:
                 return {"turn": turn, "muse": None, "refused": True, "ended": outcome == "ended"}
-        spend(muse_counts, session_id, settings.muse_cap, "inspiration")
+        await asyncio.to_thread(spend, muse_counts, session_id, settings.muse_cap, "inspiration", state)
         try:
             result = await asyncio.to_thread(
                 muse_lane().inspire, state, (text or "").strip(), with_topic(state, canvas_summary(state.get("artifact"))))
@@ -1512,7 +1605,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if agent is None:
             from workers.topics import route_agent
             agent = route_agent(state.get("topic"), allowed)
-        spend(recap_counts, session_id, settings.recap_cap, "recap")
+        await asyncio.to_thread(spend, recap_counts, session_id, settings.recap_cap, "recap", state)
         from workers.talk import canvas_summary, recap_brief
         from workers.topics import with_topic
         try:
@@ -1725,28 +1818,43 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = record.state
         if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
             raise HTTPException(410, "session has ended")
-        if session_id in analyze_busy:
-            raise HTTPException(409, "an analysis is already running for this session")
-        used = analyze_counts.get(session_id, 0)
-        if used >= settings.analyze_cap:
-            raise HTTPException(429, "analysis limit reached for this session")
-        now = clock()
-        last = analyze_last.get(session_id)
-        if last is not None and now - last < ANALYZE_SPACING_SECONDS:
-            raise HTTPException(429, "analysis is limited to one every %.0f seconds" % ANALYZE_SPACING_SECONDS)
-        analyze_counts[session_id] = used + 1
-        analyze_last[session_id] = now
-        if len(analyze_counts) > 500:
-            for stale in list(analyze_counts)[:250]:
-                analyze_counts.pop(stale, None)
-                analyze_last.pop(stale, None)
+        client = is_client_session(state)
+        if client:
+            refused = await asyncio.to_thread(guard_take, session_id, "analyze", settings.analyze_cap,
+                                              ANALYZE_SPACING_SECONDS)
+            if refused == "cap":
+                raise HTTPException(429, "analysis limit reached for this session")
+            if refused == "spacing":
+                raise HTTPException(429, "analysis is limited to one every %.0f seconds" % ANALYZE_SPACING_SECONDS)
+        else:
+            if session_id in analyze_busy:
+                raise HTTPException(409, "an analysis is already running for this session")
+            used = analyze_counts.get(session_id, 0)
+            if used >= settings.analyze_cap:
+                raise HTTPException(429, "analysis limit reached for this session")
+            now = clock()
+            last = analyze_last.get(session_id)
+            if last is not None and now - last < ANALYZE_SPACING_SECONDS:
+                raise HTTPException(429, "analysis is limited to one every %.0f seconds" % ANALYZE_SPACING_SECONDS)
+            analyze_counts[session_id] = used + 1
+            analyze_last[session_id] = now
+            if len(analyze_counts) > 500:
+                for stale in list(analyze_counts)[:250]:
+                    analyze_counts.pop(stale, None)
+                    analyze_last.pop(stale, None)
         outcome = await policy_gate(session_id, "analyze", [text])
         if outcome == "ended":
             raise HTTPException(410, "session has ended")
         if outcome:
             return {"turn": turn, "model": None, "events": [], "problems": [governance.POLICY_PROBLEM],
                     "searched": 0, "refused": True}
-        analyze_busy.add(session_id)
+        analyze_owner, analyze_fence = secrets.token_hex(8), None
+        if client:
+            analyze_fence = await asyncio.to_thread(guard_lease, session_id, "analyze", analyze_owner)
+            if analyze_fence is None:
+                raise HTTPException(409, "an analysis is already running for this session")
+        else:
+            analyze_busy.add(session_id)
         try:
             try:
                 result = await asyncio.to_thread(
@@ -1765,7 +1873,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             except StateConflict as exc:
                 raise HTTPException(409, str(exc)) from exc
         finally:
-            analyze_busy.discard(session_id)
+            if client:
+                await asyncio.to_thread(guard_release, session_id, "analyze", analyze_owner, analyze_fence)
+            else:
+                analyze_busy.discard(session_id)
         return {"turn": turn, "model": result["model"], "events": events,
                 "problems": result.get("problems") or [], "searched": result.get("searched", 0)}
 

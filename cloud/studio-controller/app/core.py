@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 import time
 import uuid
 
@@ -175,6 +176,11 @@ class StudioController:
         self.max_events = max_events
         self.max_commands = max_commands
         self.inflight_lease_seconds = inflight_lease_seconds
+        # A finish that lost every compare-and-set is recovered in the
+        # background (Codex Gate 1 B1): these pace it; tests shorten them.
+        self.recovery_poll_seconds = 0.05
+        self.recovery_attempts = 40
+        self.recoveries: list = []
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
 
@@ -463,6 +469,14 @@ class StudioController:
         if not active:
             return state, token
         receipt = state.get("commands", {}).get(active) or {}
+        if receipt.get("status") == "inflight":
+            # A finish that lost every compare-and-set left its outcome durable
+            # (_finish_exhausted): applied here at once, never after the lease.
+            recorded = self._load_outcome(session_id, active)
+            if recorded and self._owns(state, recorded):
+                self._terminalise(state, recorded)
+                token = self.repository.save(session_id, state, token)
+                return state, token
         started_at = int(receipt.get("started_at") or 0)
         if receipt.get("status") != "inflight" or int(self.clock()) - started_at < self.inflight_lease_seconds:
             return state, token
@@ -596,7 +610,94 @@ class StudioController:
             if ours is not None and not landed:
                 raise CommandError("another change landed while this was being built; say it again", 409)
             return
-        raise StateConflict("session is busy; the command will be recovered")
+        self._finish_exhausted(session_id, base, command, fingerprint, dict(failure or {
+            "status": "failed", "error": "the session was too busy to save this command's result",
+            "finished_at": int(self.clock()), "fingerprint": fingerprint}))
+        if ours is not None:
+            raise CommandError("the session was too busy to save this change; say it again", 409)
+
+    # -- a finish that lost every compare-and-set (Codex Gate 1 B1 on 38bc713) --------------------
+    # The command's terminal outcome is written once, create-only, to its own
+    # small record - outside the contended session record, so no session writer
+    # can take that write from it - and then applied to the session under the
+    # same ownership fence: at once, by a scheduled recovery that needs no
+    # client command, and by the next reader of the session
+    # (_recover_stale_inflight), whichever lands first. Applying it is one
+    # compare-and-set that fails the receipt, clears the command and writes its
+    # one audit entry; once it has landed, nothing owns the command any more.
+    def _outcome_name(self, session_id: str, command_id: str) -> str:
+        return "studio_outcome_%s_%s" % (session_id, hashlib.sha256(str(command_id).encode()).hexdigest()[:32])
+
+    def _load_outcome(self, session_id: str, command_id: str) -> dict | None:
+        try:
+            raw, _ = self.repository.store.load(self._outcome_name(session_id, command_id))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) and raw.get("command_id") == command_id else None
+
+    @staticmethod
+    def _owns(state: dict, outcome: dict) -> bool:
+        command_id = outcome.get("command_id")
+        receipt = (state.get("commands") or {}).get(command_id) or {}
+        return (state.get("active_command") == command_id and receipt.get("status") == "inflight"
+                and receipt.get("fingerprint") == outcome.get("fingerprint")
+                and state.get("command_epoch") == outcome.get("command_epoch"))
+
+    def _terminalise(self, state: dict, outcome: dict) -> None:
+        command_id = outcome["command_id"]
+        inflight = dict(state["commands"][command_id])
+        state["commands"][command_id] = dict(outcome["receipt"])
+        state["active_command"] = None
+        _advance_epoch(state, "command_epoch")
+        self._audit_fenced(state, command_id, inflight)     # one entry, in this same transition
+
+    def _apply_outcome(self, session_id: str, outcome: dict, tries: int = 3) -> bool:
+        """True once the outcome is in the session, or nothing owns the command
+        any more (Stop, recovery or an earlier apply finished it)."""
+        for _ in range(max(1, int(tries))):
+            try:
+                record = self.repository.load(session_id)
+            except SessionNotFound:
+                return True
+            state = record.state
+            if not self._owns(state, outcome):
+                return True
+            self._terminalise(state, outcome)
+            try:
+                self.repository.save(session_id, state, record.token)
+                return True
+            except StateConflict:
+                continue
+        return False
+
+    def _schedule_recovery(self, session_id: str, outcome: dict) -> None:
+        def run():
+            delay = self.recovery_poll_seconds
+            for _ in range(self.recovery_attempts):
+                self.sleep(delay)
+                try:
+                    if self._apply_outcome(session_id, outcome, tries=1):
+                        return
+                except Exception:
+                    pass
+                delay = min(delay * 2, 2.0)
+
+        thread = threading.Thread(target=run, name="studio-command-recovery", daemon=True)
+        self.recoveries.append(thread)
+        self.recoveries[:] = [t for t in self.recoveries if t.is_alive() or t is thread][-50:]
+        thread.start()
+
+    def _finish_exhausted(self, session_id: str, base: dict, command: dict, fingerprint: str,
+                          receipt: dict) -> None:
+        command_id = str(command["command_id"])
+        outcome = {"version": 1, "session_id": session_id, "command_id": command_id, "fingerprint": fingerprint,
+                   "command_epoch": base.get("command_epoch"), "receipt": dict(receipt)}
+        try:
+            self.repository.store.save(self._outcome_name(session_id, command_id), outcome, None)
+        except Exception:
+            pass                          # the in-process recovery below, and the lease, still finish it
+        if not self._apply_outcome(session_id, outcome, tries=3):
+            self._schedule_recovery(session_id, outcome)
 
     def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
         """Record the analyst's data model, and at most one question, beside the builder.
