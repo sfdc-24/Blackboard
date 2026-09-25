@@ -46,11 +46,29 @@ always the job name: `gemini-waker` and `claude-api-waker` both build from
 
 `sfdc24-studio-controller` is a Cloud Run **service**, not a job.
 
-| revision | traffic | tag |
-|---|---|---|
-| `sfdc24-studio-controller-p3-claude-6fd0dc4` | **100%** | `claude-text` |
-| `sfdc24-studio-controller-lead-test-bb68838-r3` | 0% | `lead-canary` |
-| `sfdc24-studio-controller-voice-cap-b04762d` | 0% | `voice-canary` |
+As of 2026-09-25 04:25Z (three homepage releases that night; each earlier
+revision is the rollback for the one after it):
+
+| revision | traffic | tag | what it is |
+|---|---|---|---|
+| `sfdc24-studio-controller-r3-d961048` | **100%** | `r3-live` | main d961048: talk lane, analyst, scene grammar, two voices (`/speak`, `/recap`) |
+| `sfdc24-studio-controller-r2-44ed5d7` | 0% | `r2-live` | main 44ed5d7: talk lane, analyst, scene grammar |
+| `sfdc24-studio-controller-talk-293d248` | 0% | `talk-live` | main 293d248: talk lane, blank start |
+| `sfdc24-studio-controller-p3-claude-6fd0dc4` | 0% | `claude-text` | before voice was on |
+| `sfdc24-studio-controller-lead-test-bb68838-r3` | 0% | `lead-canary` | Salesforce lead facts canary |
+| `sfdc24-studio-controller-voice-cap-b04762d` | 0% | `voice-canary` | old voice canary; `studio-voice-sweep` still calls this tag URL (shared GCS state, so it works) |
+
+Production env on r3: `STUDIO_ENABLE_VOICE=true`, `STUDIO_ENABLE_LEAD_FACTS=false`
+(and no `Headless_*` / org-id secrets), `STUDIO_VOICE_MINT_CAP=10`,
+`STUDIO_WORKER_MODEL=claude-sonnet-5` (the blueprint builder; the analyst stays on
+claude-opus-5). The service template carried the lead-canary settings once;
+every release sets these explicitly.
+
+A release: build from a merged main SHA in a detached worktree, deploy with
+`--no-traffic --tag <name>`, read `/health` on the tag URL (voice, talk,
+analyst, voices), then `gcloud run services update-traffic ... --to-revisions=<rev>=100`
+as a command of its own. `python scripts/acceptance_current_state.py --only studio_controller`
+confirms production afterwards.
 
 The traffic column decides what the untagged `*.a.run.app` URL serves: that
 URL is production. A tag URL always reaches its own revision, whatever the
