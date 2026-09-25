@@ -59,6 +59,22 @@ def _sse(event: dict, name: str | None = None) -> str:
     )
 
 
+# How the two voices sound (owner, 2026-09-25: "a more powerful voice for the
+# AI Agents, may be with a bit more fire/character"). The host is the realtime
+# call and still says only the exact line it is given; the architect is TTS.
+HOST_INSTRUCTIONS = (
+    "You are the host of a live SFDC24 build session. Speak only the exact text you are given, word for word, "
+    "and nothing else. Deliver it with real energy and warmth, like a host who is delighted the visitor is "
+    "here: bright, expressive, a smile in the voice, a lively natural pace, never flat or monotone. "
+    "Never state facts about Salesforce or the visitor's business. Ask one question at a time."
+)
+ARCHITECT_VOICE_STYLE = (
+    "An energetic, confident solution architect who loves building things with people: punchy and upbeat, "
+    "a little playful, with real conviction in every line. Brisk pace, crisp delivery, a smile in the voice. "
+    "Never flat or monotone."
+)
+
+
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
@@ -84,10 +100,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         return {
             "type": "realtime",
             "model": settings.realtime_model,
-            "instructions": (
-                "Speak only the exact controller event text you are given, briefly and warmly. "
-                "Never state facts about Salesforce or the visitor's business. Ask one question at a time."
-            ),
+            "instructions": HOST_INSTRUCTIONS,
             "audio": {
                 "input": {
                     "transcription": {"model": "gpt-transcribe"},
@@ -391,8 +404,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     recap_counts: dict = {}
     TTS_URL = "https://api.openai.com/v1/audio/speech"
     TTS_MODEL = "gpt-4o-mini-tts"
-    ARCHITECT_STYLE = ("A calm, confident solution architect in a client meeting: warm, clear and "
-                       "unhurried, with a short pause between ideas.")
+    ARCHITECT_STYLE = ARCHITECT_VOICE_STYLE
     SPEAK_MAX = 400
 
     def live_state(session_id: str) -> dict:

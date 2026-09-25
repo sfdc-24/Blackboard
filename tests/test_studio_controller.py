@@ -1178,6 +1178,8 @@ class ApiTests(unittest.TestCase):
             self.assertEqual("realtime", session_config["type"])
             self.assertEqual("gpt-transcribe", session_config["audio"]["input"]["transcription"]["model"])
             self.assertFalse(session_config["audio"]["input"]["turn_detection"]["create_response"])
+            from app.main import HOST_INSTRUCTIONS
+            self.assertEqual(HOST_INSTRUCTIONS, session_config["instructions"])
             self.assertNotIn(configured.openai_api_key, json.dumps(self.store.data))
             saved = StudioRepository(self.store).load(created["session_id"]).state
             self.assertEqual("rtc_test_call", saved["voice_call"]["call_id"])
