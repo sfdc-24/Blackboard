@@ -657,12 +657,22 @@ class TalkLaneTests(unittest.TestCase):
                 "text": "Make a logo for my cafe", "agent": "openai",
                 "history": [{"who": "you", "text": "hello"}, {"who": "openai", "text": "Hi there."}]})
         self.assertEqual(200, response.status_code, response.text)
-        self.assertEqual({"reply": "Building that now.", "speaker": "openai"}, response.json())
+        self.assertEqual({"reply": "Building that now.", "speaker": "openai", "turn": 0}, response.json())
         call = self.talk.calls[0]
         self.assertEqual("openai", call["agent"])
         self.assertEqual("Make a logo for my cafe", call["text"])
         self.assertEqual(2, len(call["history"]))
         self.assertIn("parts", call["canvas"])
+
+    def test_the_turn_number_is_echoed_and_validated(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/talk" % sid
+            ok = self.post_spaced(client, url, headers, {"text": "hi", "turn": 7})
+            bad = [self.post_spaced(client, url, headers, {"text": "hi", "turn": value}).status_code
+                   for value in (-1, "7", 1.5, True, 10 ** 7)]
+        self.assertEqual(7, ok.json()["turn"])
+        self.assertEqual([400, 400, 400, 400, 400], bad)
 
     def test_the_agent_defaults_to_the_first_configured_one(self):
         with TestClient(self.make()) as client:

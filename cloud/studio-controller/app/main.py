@@ -521,8 +521,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(503, "talk is not available")
         from workers.talk import TEXT_MAX, canvas_summary, clean_history
         body = await json_object(request, "talk")
-        if set(body) - {"text", "history", "agent"}:
+        if set(body) - {"text", "history", "agent", "turn"}:
             raise HTTPException(400, "talk body has unknown fields")
+        # The page's own turn counter, echoed back, so a reply that resolves
+        # after the visitor has already started a newer turn can be dropped
+        # before it is spoken (Gemini's review of the talk contract).
+        turn = body.get("turn", 0)
+        if type(turn) is not int or not 0 <= turn <= 1_000_000:
+            raise HTTPException(400, "turn must be a non-negative integer")
         agent = body.get("agent") or agents[0]
         if agent not in agents:
             # An unconfigured provider is reported precisely, never simulated.
@@ -564,7 +570,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(503, "talk is unavailable right now") from exc
         if not reply:
             raise HTTPException(503, "talk returned nothing")
-        return {"reply": reply, "speaker": agent}
+        return {"reply": reply, "speaker": agent, "turn": turn}
 
     @app.post("/v1/session/{session_id}/commands")
     async def commands(request: Request, session_id: str):
