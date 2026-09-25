@@ -2025,3 +2025,82 @@ class CodexCc56feaB5WholeAddresses(unittest.TestCase):
             self.assertNotIn(never, labels)
         for keep in ("Meet @ 5pm", "ask @steelworks", "a @ b"):
             self.assertEqual(keep, redact(keep))
+
+
+# -- Codex Gate 1 NO-GO on 5c2957d / 38bc713: compatibility forms ---------------------------------
+COMPAT_CASES = {
+    "Visit secret.ⓒⓞⓜ today": "Visit [link] today",                       # the TLD circled
+    "Visit ⓈⒺⒸⓇⒺⓉ.com today": "Visit [link] today",          # the label circled
+    "Visit secret.ⓓⓔ now": "Visit [link] now",
+    "Leader secret․com end": "Leader [link] end",                                       # one dot leader
+    "Small stop secret﹒de end": "Small stop [link] end",
+    "Squared secret.㏄ end": "Squared [link] end",                                       # one code point, two letters
+    "Path ⓢⓔⓒⓡⓔⓣ.ⓒⓞⓜ/a?b=1 end": "Path [link] end",
+    "Math \U0001d42c\U0001d41e\U0001d41c\U0001d42b\U0001d41e\U0001d42d.\U0001d41c\U0001d428\U0001d426 end":
+        "Math [link] end",
+    "Mail user＠secret.com now": "Mail [email] now",                                     # a full-width @
+    "Mail user﹫secret now": "Mail [email] now",
+    "Mail ⓤⓢⓔⓡ@ⓢⓔⓒⓡⓔⓣ now": "Mail [email] now",
+    "IP １０。０。０。１ here": "IP [link] here",
+    "Web ｈｔｔｐｓ：／／x end": "Web [link] end",
+}
+COMPAT_NEVER = ("ⓢⓔⓒ", "ⓈⒺⒸ", "ⓒⓞⓜ", "ⓓⓔ", "secret", "㏄",
+                "＠", "﹫", "․com", "﹒de", "\U0001d42c", "ｈｔ", "ⓤⓢ")
+
+
+class CodexR7CompatibilityForms(Api):
+    def test_compatibility_forms_in_the_label_and_the_tld_are_redacted_whole(self):
+        for text, expected in COMPAT_CASES.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), repr(text))
+
+    def test_ordinary_compatibility_characters_keep_their_own_form(self):
+        for keep in ("Ⓐ grade and ① first", "™ brand, ﬁne work", "Café № 5 today.",
+                     "Part Ⅳ and ⒈ point", "①. ②. ③.", "Full-width ＡＢＣ words"):
+            self.assertEqual(keep, " ".join(redact(keep).split()), keep)
+
+    def test_the_view_is_linear_on_hostile_compatibility_input(self):
+        # Growth, not a wall clock: four times the text must cost well under
+        # sixteen times the time (what a quadratic scan would), and never long.
+        def cost(text):
+            started = time.perf_counter()
+            redact(text)
+            return time.perf_counter() - started
+
+        circled_a, fullwidth_at, square_cc, leader, one_stop = (chr(0x24D0), chr(0xFF20), chr(0x33C4),
+                                                               chr(0x2024), chr(0x2488))
+        for unit in (circled_a + ".", circled_a, fullwidth_at, square_cc + ".", leader, circled_a + fullwidth_at,
+                     one_stop):
+            small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
+            cost(small)                                                # warm up
+            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
+            self.assertLess(grown, 10 * base + 0.25, (hex(ord(unit[0])), base, grown))
+            self.assertLess(grown, 10.0, hex(ord(unit[0])))
+
+    def test_no_surface_carries_them(self):
+        texts = list(COMPAT_CASES)
+        page = ("<h1>%s</h1>" % texts[0] + "".join("<p>%s</p>" % t for t in texts[1:])
+                + "<img alt='%s'><input placeholder='%s'><nav aria-label='%s'><a href='/'>Home</a></nav>"
+                % (texts[1], texts[8], texts[5]))
+        talk, worker = FakeTalk(), SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-c", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-c"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        persisted = json.dumps(self.state(live["session_id"]), ensure_ascii=False)
+        provider = json.dumps([talk.calls, worker.seen], ensure_ascii=False)
+        tree = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for surface, text in (("tree", tree), ("state", persisted), ("provider", provider), ("events", events)):
+            for never in COMPAT_NEVER:
+                self.assertNotIn(never, text, (surface, never))
+        self.assertIn("[link]", persisted)
+        self.assertIn("[email]", persisted)

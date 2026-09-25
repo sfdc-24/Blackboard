@@ -397,6 +397,11 @@ tenant exists and still lists an address that hashes to the token's subject.
   `[email]`. The registry's project name is kept as written. An email is replaced whole, local
   part included, whether its host is dotted, dotless (`admin@localhost`) or a bracketed literal
   (`user@[2001:db8::1]`).
+- Detection reads a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
+  name. Circled, full-width, squared and mathematical forms of letters, digits, dots, colons and
+  `@` are read as what they stand for (`secret.ⓒⓞⓜ` is `secret.com`). An offset map leads each
+  match back to the page, and the complete original characters are replaced. One code point maps
+  to at most 18, so the scan stays linear. Codex Gate 1 NO-GO on 5c2957d and 38bc713.
 - The redaction is conservative: any `label.label...` ending in 2-63 letters of any script, or in
   a punycode `xn--` label, counts as a host, with ASCII or IDNA full-width dots. So does any
   `local@host` in any script. "e.g." and "Inc." stay; a product name written like a host ("Node.js")

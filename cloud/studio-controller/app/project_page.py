@@ -253,6 +253,7 @@ _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
 # "i.e." and "Inc." stay; a product name written like a host ("Node.js") is
 # redacted too, which is the price of never leaking an address. Every scan is
 # linear in the text.
+# Every one of them reads the compatibility view (_compat_view, below).
 LINK = "[link]"
 EMAIL = "[email]"
 _DOT = "[.\u3002\uff0e\uff61]"
@@ -296,10 +297,10 @@ def _hostlike(run: str) -> bool:
     return any(parts[i - 1] and _tld_like(parts[i]) for i in range(1, len(parts)))
 
 
-def _redact_hosts(text: str) -> str:
+def _host_spans(text: str):
     """One pass over the text: each maximal run of host characters is looked
     at once, so the scan is linear however the text is shaped."""
-    out, last, i, n = [], 0, 0, len(text)
+    i, n = 0, len(text)
     while i < n:
         if not _host_char(text[i]):
             i += 1
@@ -310,13 +311,10 @@ def _redact_hosts(text: str) -> str:
         host = text[i:j].rstrip(_DOT_CHARS)          # a sentence's full stop is not the host's
         if _hostlike(host):
             end = _HOST_TAIL_RE.match(text, i + len(host)).end()
-            out.append(text[last:i])
-            out.append(LINK)
-            last = i = end
+            yield i, end, LINK
+            i = end
         else:
             i = j
-    out.append(text[last:])
-    return "".join(out)
 
 
 def _ipv6_link(match) -> str:
@@ -330,13 +328,69 @@ def _ipv6_link(match) -> str:
         return match.group(0)
 
 
+def _ipv6_found(view: str):
+    for match in _IPV6_RE.finditer(view):
+        if _ipv6_link(match) == LINK:
+            yield match.start(), match.end(), LINK
+
+
+def _regex_found(pattern, placeholder: str):
+    return lambda view: ((m.start(), m.end(), placeholder) for m in pattern.finditer(view))
+
+
+# Every detection reads a compatibility view of the text (Codex Gate 1 NO-GO on
+# 5c2957d and 38bc713). Each code point becomes its NFKC mapping, the way UTS46
+# maps a host name, so circled, full-width, squared, mathematical and other
+# compatibility letters, digits, dots, colons and "@" read as what they stand
+# for (secret.ⓒⓞⓜ is secret.com). One code point maps to at most 18, so the
+# view is bounded and stays linear in the text, and only code points outside
+# ASCII are normalized, one at a time - never the payload as a whole. An offset
+# map leads every match back to the original, and the COMPLETE original
+# characters it covers are replaced; everything else keeps its own characters.
+def _compat_view(text: str) -> tuple[str, list | None]:
+    """(the view, the original index of each view character), or (text, None)
+    when nothing maps to anything else."""
+    if text.isascii():
+        return text, None
+    chunks, origin, changed = [], [], False
+    for i, ch in enumerate(text):
+        mapped = unicodedata.normalize("NFKC", ch) if ord(ch) > 0x7F else ch
+        if not mapped:
+            mapped = ch
+        changed = changed or mapped != ch
+        chunks.append(mapped)
+        origin.extend([i] * len(mapped))
+    if not changed:
+        return text, None
+    return "".join(chunks), origin
+
+
+def _replace_found(text: str, finder) -> str:
+    """One detection pass on the compatibility view; each match replaces the
+    complete original characters it covers."""
+    view, origin = _compat_view(text)
+    out, last = [], 0
+    for start, end, placeholder in finder(view):
+        if origin is not None:
+            start, end = origin[start], origin[end - 1] + 1
+        if start < last:                     # inside the last replacement's characters: widen it
+            last = max(last, end)
+            continue
+        out.append(text[last:start])
+        out.append(placeholder)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def redact(text: str) -> str:
-    """Replace every link-, domain-, IP- and email-shaped token with a placeholder."""
-    text = _EMAIL_RE.sub(EMAIL, text)
-    text = _URL_RE.sub(LINK, text)
-    text = _IPV4_RE.sub(LINK, text)
-    text = _IPV6_RE.sub(_ipv6_link, text)
-    return _redact_hosts(text)
+    """Replace every link-, domain-, IP- and email-shaped token with a
+    placeholder, each found on the compatibility view (above)."""
+    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))
+    text = _replace_found(text, _regex_found(_URL_RE, LINK))
+    text = _replace_found(text, _regex_found(_IPV4_RE, LINK))
+    text = _replace_found(text, _ipv6_found)
+    return _replace_found(text, _host_spans)
 
 
 def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> str:
