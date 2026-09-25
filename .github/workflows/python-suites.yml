@@ -83,6 +83,7 @@ on:
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_acceptance_current_state.py"
+      - "tests/mutate_bus_filters.py"
       - "scripts/acceptance_current_state.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
@@ -179,6 +180,7 @@ on:
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_acceptance_current_state.py"
+      - "tests/mutate_bus_filters.py"
       - "scripts/acceptance_current_state.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
@@ -784,6 +786,18 @@ jobs:
           if [ -f tests/test_studio_claude_worker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Each board-read guard is deleted on purpose and the suite must break the
+      # way predicted in advance; a surviving mutant is an untested claim.
+      - name: "board read guards are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_bus_filters.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
           else
             echo "not on this branch; skipping"
           fi
