@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -343,6 +344,19 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(403, "token does not belong to this session")
         return claims
 
+    def caller_address(request: Request) -> str:
+        """The address Google's front end observed: the LAST X-Forwarded-For hop.
+        Earlier hops are whatever the client sent and are never trusted. Only a
+        valid IP counts; anything else becomes "" and shares one fail-closed
+        bucket. Only visitors are limited by it, and only its keyed hash is stored."""
+        values = request.headers.getlist("x-forwarded-for") if hasattr(request.headers, "getlist") else []
+        hops = [hop.strip() for value in values for hop in value.split(",") if hop.strip()]
+        candidate = hops[-1] if hops else (request.client.host if request.client else "")
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return ""
+
     def require_signed_in(request: Request) -> tuple[dict, str]:
         """An operator, or - only while public visitors are on - a verified visitor."""
         auth = request.headers.get("authorization") or ""
@@ -466,10 +480,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         body = await json_object(request, "authentication")
         if set(body) != {"email", "client_key"}:
             raise HTTPException(400, "authentication body requires email and client_key")
-        # Cloud Run puts the caller first in X-Forwarded-For; only visitors are
-        # limited by it, and only its keyed hash is stored.
-        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-        client_ip = forwarded or (request.client.host if request.client else "")
+        client_ip = caller_address(request)
         return await asyncio.to_thread(
             auth_service.start, body.get("email"), body.get("client_key"), client_ip
         )

@@ -63,6 +63,11 @@ _VISITOR_EMAIL_RE = re.compile(r"^[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*
 VISITOR_WINDOW_NAME = "studio_auth_visitor_day_"
 VISITOR_IP_WINDOW_SECONDS = 60 * 60
 VISITOR_IP_MAX_PER_WINDOW = 10
+VISITOR_IP_DAY_SECONDS = 24 * 60 * 60
+VISITOR_IP_MAX_PER_DAY = 20
+# Every request without a usable address shares this one bucket, so a missing
+# or forged value is limited together instead of skipping the limit.
+UNKNOWN_ADDRESS = "unknown"
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 
 
@@ -214,18 +219,20 @@ class AuthService:
         return False
 
     def _reserve_visitor_ip(self, client_ip: str, now: int) -> bool:
-        """At most VISITOR_IP_MAX_PER_WINDOW visitor codes per network address per hour."""
-        if not client_ip:
-            return True
-        name = "studio_auth_visitor_ip_" + self._digest("studio-auth-ip-v1", client_ip)
-        cutoff = now - VISITOR_IP_WINDOW_SECONDS
+        """At most VISITOR_IP_MAX_PER_WINDOW visitor codes per network address per
+        hour and VISITOR_IP_MAX_PER_DAY per day; no address shares one bucket."""
+        name = "studio_auth_visitor_ip_" + self._digest("studio-auth-ip-v1", client_ip or UNKNOWN_ADDRESS)
+        day_cutoff = now - VISITOR_IP_DAY_SECONDS
+        hour_cutoff = now - VISITOR_IP_WINDOW_SECONDS
         for _ in range(self.cas_attempts):
             state, token = self.store.load(name)
             try:
-                sent = [int(t) for t in (state.get("sent_at") or []) if int(t) > cutoff]
+                sent = [int(t) for t in (state.get("sent_at") or []) if int(t) > day_cutoff]
             except (TypeError, ValueError, AttributeError):
                 return False
-            if len(sent) >= VISITOR_IP_MAX_PER_WINDOW:
+            if len(sent) >= VISITOR_IP_MAX_PER_DAY:
+                return False
+            if sum(1 for t in sent if t > hour_cutoff) >= VISITOR_IP_MAX_PER_WINDOW:
                 return False
             try:
                 self.store.save(name, {"version": 1, "sent_at": sent + [now], "updated_at": now}, token)

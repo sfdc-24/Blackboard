@@ -80,6 +80,21 @@ class Auth(unittest.TestCase):
         self.assertIn(OPERATOR, emails)
         self.assertIn("other@bakery.example", emails)
 
+    def test_one_address_gets_twenty_visitor_codes_a_day_even_spread_over_hours(self):
+        now = [1_700_000_000]
+        auth, sent = service(cap=1000, clock=lambda: now[0])
+        for hour in range(12):
+            for n in range(10):
+                auth.start("h%dn%d@bakery.example" % (hour, n), CLIENT, "203.0.113.7")
+            now[0] += 3600
+        self.assertEqual(20, len(sent))
+
+    def test_no_usable_address_shares_one_limited_bucket(self):
+        auth, sent = service(cap=1000)
+        for n in range(15):
+            auth.start("u%d@bakery.example" % n, CLIENT, "")
+        self.assertEqual(10, len(sent))
+
     def test_the_per_address_limit_still_applies_to_visitors(self):
         auth, sent = service()
         for _ in range(5):
@@ -244,6 +259,28 @@ class Lane(unittest.TestCase):
                                            headers={**ORIGIN, "Authorization": "Bearer " + created["token"]},
                                            json={"sdp": "v=0 offer"}).status_code)
         self.assertEqual([200, 429], results)
+
+    def test_a_forged_first_forwarded_hop_does_not_escape_the_limit(self):
+        with TestClient(self.make(visitor_codes_daily_cap=1000)) as client:
+            for n in range(15):
+                client.post("/v1/auth/start", json={"email": "f%d@bakery.example" % n, "client_key": CLIENT},
+                            headers={**ORIGIN, "X-Forwarded-For": "10.0.0.%d, 203.0.113.7" % n})
+            for n in range(15):
+                client.post("/v1/auth/start", json={"email": "g%d@bakery.example" % n, "client_key": CLIENT},
+                            headers={**ORIGIN, "X-Forwarded-For": "not-an-ip-%d" % n})
+        sent = [e for e, _ in self.email_sender.calls]
+        self.assertEqual(10, sum(1 for e in sent if e.startswith("f")))     # the real last hop is one address
+        self.assertEqual(10, sum(1 for e in sent if e.startswith("g")))     # garbage shares one bucket
+
+    def test_the_lead_counts_every_session_not_only_the_kept_ones(self):
+        now = [1_700_000_000]
+        book = LeadBook(MemoryStore(), clock=lambda: now[0])
+        book.record_verified("subj", VISITOR)
+        for n in range(24):
+            book.admit_session("subj", "s-%d" % n, "t", 2)
+            if n % 2:
+                now[0] += 24 * 3600
+        self.assertEqual(24, book.list()[0]["sessions"])
 
     def test_the_operator_path_is_unchanged(self):
         with TestClient(self.make()) as client:

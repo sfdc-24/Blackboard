@@ -96,6 +96,7 @@ class LeadBook:
                 raise LeadCapExceeded("visitor sessions for today are used up")
             sessions.append({"session_id": session_id, "day": day, "at": now, "title": title[:120]})
             lead["sessions"] = sessions[-SESSIONS_MAX:]
+            lead["session_total"] = int(lead.get("session_total") or len(sessions) - 1) + 1
             lead["last_seen"] = now
             admitted["n"] = today + 1
             return lead
@@ -135,7 +136,7 @@ class LeadBook:
                 "email": lead.get("email", ""),
                 "first_seen": lead.get("first_seen"),
                 "last_seen": lead.get("last_seen"),
-                "sessions": len(lead.get("sessions") or []),
+                "sessions": int(lead.get("session_total") or len(lead.get("sessions") or [])),
                 "last_recap": recaps[-1]["recap"] if recaps else "",
             })
         leads.sort(key=lambda lead: lead.get("last_seen") or 0, reverse=True)
