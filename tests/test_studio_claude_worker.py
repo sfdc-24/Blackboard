@@ -332,6 +332,7 @@ class BuildsFromAnEmptyScreen(unittest.TestCase):
         self.assertIn("Build a complete, usable first version", cw.SYSTEM)
         self.assertIn("insert the parent", cw.SYSTEM)
         self.assertIn("ONE AREA AT A TIME. After the first version", cw.SYSTEM)
+        self.assertIn("set_label the root screen to a short name", cw.SYSTEM)
 
 
 if __name__ == "__main__":
