@@ -671,7 +671,11 @@ def draw_future(c: canvas.Canvas) -> None:
 
 def build() -> Path:
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    c = canvas.Canvas(str(OUT), pagesize=(PAGE_W, PAGE_H), pageCompression=1)
+    # invariant=1 fixes ReportLab timestamps and document IDs so the committed
+    # artifact has one reproducible digest across clean-checkout rebuilds.
+    c = canvas.Canvas(
+        str(OUT), pagesize=(PAGE_W, PAGE_H), pageCompression=1, invariant=1
+    )
     c.setTitle("SFDC24 and Blackboard current and future architecture")
     c.setAuthor("Codex with Claude, Gemini and Grok review input")
     c.setSubject("Two-page evidence-bound architecture for realtime audio, live prototyping, Salesforce, WhatsApp, Zoom and governed client minibuses")
