@@ -140,6 +140,33 @@ class Route(unittest.TestCase):
             out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
         self.assertEqual({"advice": None, "fenced": True}, out.json())
 
+    def test_advice_is_fenced_when_voice_lifecycle_changes_only(self):
+        holder = {}
+
+        def reserve_voice_meanwhile():
+            repo = holder["app"].state.controller.repository
+            sid = holder["sid"]
+            record = repo.load(sid)
+            moved = dict(record.state)
+            moved["voice_call"] = {
+                "voice_id": "voice-new",
+                "status": "opening",
+                "started_at": 1000,
+                "ends_at": 1600,
+            }
+            self.assertEqual(record.state.get("last_seq"), moved.get("last_seq"))
+            self.assertEqual(record.state.get("turn_seq"), moved.get("turn_seq"))
+            self.assertEqual(record.state.get("artifact_version"), moved.get("artifact_version"))
+            repo.save(sid, moved, record.token)
+
+        advisor = FakeAdvisor(during=reserve_voice_meanwhile)
+        with TestClient(self.make(advisor)) as client:
+            holder["app"] = self.app
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
     def test_off_means_503_and_health_says_so(self):
         with TestClient(self.make(FakeAdvisor(ready=False))) as client:
             sid, headers = self.session(client)

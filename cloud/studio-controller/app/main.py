@@ -611,8 +611,16 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         monotonic fields conservatively invalidate advice after any committed
         turn/event or lifecycle change while the provider call is in flight.
         The active-command reservation is included because a new command can be
-        claimed before any of those monotonic counters advance.
+        claimed before any of those monotonic counters advance. The canonical
+        voice-call marker does the same for opening, activation, close request,
+        ambiguous outcome, and completion transitions.
         """
+        voice_marker = json.dumps(
+            state.get("voice_call") or {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         return (
             int(state.get("generation") or 0),
             int(state.get("task_revision") or 0),
@@ -620,6 +628,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             int(state.get("turn_seq") or 0),
             int(state.get("last_seq") or 0),
             str(state.get("active_command") or ""),
+            voice_marker,
             bool(state.get("paused")),
             bool(state.get("stopped")),
         )
