@@ -66,6 +66,13 @@ class WorkspaceStore:
         record = self.load(tenant, project)
         if not record:
             return {"saved": False, "revision": 0}
+        # The save this command made, if the history still holds it: reported
+        # exactly as the command's first response reported it, so a replay
+        # returns the same answer (Codex Gate 1: replays are identical).
+        for entry in reversed(record.get("history") or []):
+            if (isinstance(entry, dict) and entry.get("session_id") == session_id
+                    and entry.get("session_artifact_version") == int(artifact_version) and entry.get("digest")):
+                return {"saved": True, "revision": int(entry["revision"]), "digest": entry["digest"]}
         covered = (record.get("session_id") == session_id
                    and int(record.get("session_artifact_version") or 0) >= int(artifact_version))
         out = {"saved": bool(covered), "revision": int(record.get("revision") or 0)}
@@ -103,7 +110,8 @@ class WorkspaceStore:
             now = int(self.clock())
             history = list((state or {}).get("history") or []) if isinstance(state, dict) else []
             history.append({"revision": revision, "session_id": session_id, "at": now,
-                            "op_ids": [str(o) for o in op_ids][:20]})
+                            "op_ids": [str(o) for o in op_ids][:20],
+                            "session_artifact_version": int(artifact_version), "digest": digest(artifact)})
             record = {"version": 1, "tenant": tenant, "project": project, "revision": revision,
                       "artifact": copy.deepcopy(artifact), "digest": digest(artifact), "updated_at": now,
                       "session_id": session_id, "session_artifact_version": int(artifact_version),

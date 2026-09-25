@@ -142,7 +142,17 @@ class Revisions(base.Api):
             first = self.utter(client, live, 1, "make the heading bigger", version=1).json()
             replay = self.utter(client, live, 1, "make the heading bigger", version=1).json()
         self.assertEqual({"saved": True, "revision": 1}, {k: first["workspace"][k] for k in ("saved", "revision")})
-        self.assertEqual({"saved": True, "revision": 1}, replay["workspace"])
+        self.assertEqual(first, replay)                      # Codex Gate 1: a replay is the first response
+
+    def test_a_replay_after_later_saves_still_reports_its_own_save(self):
+        with TestClient(self.make(worker=base.PatchWorker())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            first = self.utter(client, live, 1, "make the heading bigger", version=1).json()
+            later = self.utter(client, live, 2, "and bolder", version=first["artifact_version"]).json()
+            replay = self.utter(client, live, 1, "make the heading bigger", version=1).json()
+        self.assertEqual(2, later["workspace"]["revision"])
+        self.assertEqual(first, replay)
 
     def test_fresh_starts_again_from_the_live_page_and_saves_on_top(self):
         with TestClient(self.make(worker=base.PatchWorker())) as client:
