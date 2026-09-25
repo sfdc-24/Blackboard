@@ -233,8 +233,10 @@ MUTANTS = [
     ("binding: an unbound token reaches a client session", [(MAIN,
         "        if not bound and not owner:\n            return", "        if not bound:\n            return")]),
     ("binding: the session state is not read", [(MAIN,
-        "        bound = any(key in claims for key in (\"tnt\", \"csub\", \"prj\"))\n",
-        "        bound = any(key in claims for key in (\"tnt\", \"csub\", \"prj\"))\n        return\n")]),
+        "        bound = any(key in claims for key in (\"tnt\", \"csub\", \"prj\"))\n"
+        "        try:\n            state = repository.load(session_id).state\n",
+        "        bound = any(key in claims for key in (\"tnt\", \"csub\", \"prj\"))\n        return\n"
+        "        try:\n            state = repository.load(session_id).state\n")]),
     ("keys: a blank session key without the tenant", [(CORE,
         "        parts = [subject, creation_id] + ([tenant, project] if tenant else [])",
         "        parts = [subject, creation_id] + ([tenant, project] if project else [])")]),
