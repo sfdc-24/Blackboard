@@ -101,6 +101,7 @@ def validate(raw, revision: int) -> tuple[dict | None, list]:
         if not isinstance(q, dict) or set(q) != {"prompt", "why", "options", "recommended"}:
             problems.append("question %d has the wrong fields" % i)
             continue
+        before = len(problems)
         if not plain(q["prompt"], CAPS["prompt"]) or not plain(q["why"], CAPS["why"]):
             problems.append("question %d text" % i)
         options = q["options"]
@@ -109,18 +110,19 @@ def validate(raw, revision: int) -> tuple[dict | None, list]:
             continue
         ids = []
         for o in options:
-            if (not isinstance(o, dict) or set(o) != {"id", "label"} or o["id"] not in OPTION_IDS
-                    or not plain(o["label"], CAPS["label"])):
+            if (not isinstance(o, dict) or set(o) != {"id", "label"} or not isinstance(o["id"], str)
+                    or o["id"] not in OPTION_IDS or not plain(o["label"], CAPS["label"])):
                 problems.append("question %d has a bad option" % i)
                 break
             ids.append(o["id"])
         if len(set(ids)) != len(ids):
             problems.append("question %d repeats an option id" % i)
-        if q["recommended"] not in ids:
+        if not isinstance(q["recommended"], str) or q["recommended"] not in ids:
             problems.append("question %d recommends an option it does not offer" % i)
+        if len(problems) > before:        # a broken question is never cleaned: every field below is a checked str
+            continue
         clean_questions.append({"id": "q%d" % (i + 1), "prompt": q["prompt"].strip(), "why": q["why"].strip(),
-                                "options": [{"id": o["id"], "label": o["label"].strip()} for o in options
-                                            if isinstance(o, dict) and "label" in o],
+                                "options": [{"id": o["id"], "label": o["label"].strip()} for o in options],
                                 "recommended": q["recommended"]})
     risks = raw["risks"]
     if not isinstance(risks, list) or len(risks) > MAX_RISKS or not all(plain(r, CAPS["risk"]) for r in risks):
@@ -172,12 +174,13 @@ class Advisor:
         if used >= self.call_cap:
             return None
         self._calls[session_id] = used + 1
-        revision = int(snapshot.get("revision") or 0)
         try:
-            raw = self._ask(snapshot_text(snapshot))
+            revision = snapshot.get("revision")
+            if type(revision) is not int or revision < 0:
+                return None
+            advice, problems = validate(self._ask(snapshot_text(snapshot)), revision)
         except Exception:                  # a failed advisor blocks nothing; nothing of it is logged
             return None
-        advice, problems = validate(raw, revision)
         return advice if not problems else None
 
     def _ask(self, text: str) -> dict:

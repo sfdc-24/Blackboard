@@ -96,6 +96,31 @@ class Contract(unittest.TestCase):
                        Opener(payload={"candidates": []}), Opener(payload=gemini_payload("not json {"))):
             self.assertIsNone(adv.Advisor(key=KEY, enabled=True, opener=opener).advise("s-1", snapshot()))
 
+    def test_wrong_types_anywhere_return_none_and_never_raise(self):
+        # Cursor NO-GO on 7675620: a non-string prompt, a null label, a why object, a bad revision
+        breaks = [
+            lambda r: r["questions"][0].update(prompt=7),
+            lambda r: r["questions"][0].update(why={"x": 1}),
+            lambda r: r["questions"][0]["options"][0].update(label=None),
+            lambda r: r["questions"][0]["options"][0].update(id=["a"]),
+            lambda r: r["questions"][0].update(recommended=["a"]),
+            lambda r: r["questions"][0].update(options=None),
+            lambda r: r.update(risks=[None]),
+            lambda r: r.update(perspective=None),
+            lambda r: r.update(questions=[None]),
+        ]
+        for i, change in enumerate(breaks):
+            raw = copy.deepcopy(GOOD)
+            change(raw)
+            self.assertEqual((None, True), (lambda a: (a[0], bool(a[1])))(adv.validate(raw, 1)), i)
+            advisor = adv.Advisor(key=KEY, enabled=True, opener=Opener(payload=gemini_payload(raw)))
+            self.assertIsNone(advisor.advise("s-1", snapshot()), i)
+        for revision in ("three", None, -1, 2.5, True):
+            opener = Opener()
+            snap = dict(snapshot(), revision=revision)
+            self.assertIsNone(adv.Advisor(key=KEY, enabled=True, opener=opener).advise("s-1", snap), revision)
+            self.assertEqual([], opener.requests, revision)
+
     def test_the_call_cap_per_session(self):
         opener = Opener()
         advisor = adv.Advisor(key=KEY, enabled=True, opener=opener, call_cap=2)
