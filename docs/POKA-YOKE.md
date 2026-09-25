@@ -200,6 +200,34 @@ was said on WhatsApp.
 
 ---
 
+## L-99 — Arm the merge before the base can outrun the release
+
+**Incident.** SFDC24 site PR #212 had fourteen green hosted checks and an
+independent exact-head GO at `55f55fc2`. The final merge was still refused
+because `main` advanced to `4787229` while those checks were running. Waiting
+for CI and then beginning the merge as a separate manual step created another
+full review/check cycle and made healthy delivery look stuck. After one clean
+reconciliation, protected auto-merge was armed at `4775821c`; GitHub merged it
+as `846539aa`. Public acceptance then sampled the real homepage twice and saw
+the release timer move from `00:25:53` to `00:25:50`.
+
+**Naive rule.** "Check `main` again and merge faster."
+
+**Mechanism — PARTIALLY IN FORCE.** The protected current-base gate is real: it
+physically rejected the stale merge. Once a release slice has its exact-head
+review, reconcile the base once and arm protected auto-merge *before* the final
+checks finish; do not leave a second manual race between green CI and merge.
+Delivery still ends only after public served-byte and browser-state read-back,
+not at a PR, green checks, a merge SHA, or an updated countdown target.
+
+The stale-base rejection is an enforced mechanism. Arming auto-merge and
+performing the public two-sample check are still operator actions today. They
+become a complete poka-yoke only when a checked-in release helper performs both
+and refuses to report success otherwise. Until then, score the enforced part as
+in force and the rest as an explicit automation gap.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
@@ -259,14 +287,17 @@ for what 2026-09-08/09 added, and for the *distinction* between a rule and a
 mechanism. If an entry below ever becomes enforceable in CI or a rule engine,
 move it up into the mechanism form and say so.
 
-**Scoreboard, so this file does not flatter itself.** Of eight entries,
-**none is a mechanism in force today.** Two are proposed and land only if
-Blackboard PR #40 (L-91) and sfdc24-site PR #13 (L-94) merge. Six are rules
+**Scoreboard, so this file does not flatter itself.** Of nine entries,
+**one contains a mechanism in force today:** L-99's protected current-base gate
+rejected a stale merge. Its auto-merge and public-read-back steps are not yet
+automatic, so L-99 is only partial. Two older mechanisms are proposed and land
+only if Blackboard PR #40 (L-91) and sfdc24-site PR #13 (L-94) merge. Six are rules
 with no enforcement at all (L-92, L-93, L-95, L-96, L-97, L-98) and are the
 honest input for a scoring engine.
 
-Zero of eight. That is the most useful sentence in the document: a night that
-produced eight learnings produced **no controls that are actually in force**, and
+One enforced gate across nine entries is still a thin result: a night that
+produced eight earlier learnings produced **no controls that were actually in
+force**, and
 every previous version of this scoreboard overstated it — six mechanisms, then
 two, then three proposals of which one was not a mechanism at all. Three
 corrections, three different reviewers, none of them the author. The count has
