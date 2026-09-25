@@ -394,7 +394,9 @@ tenant exists and still lists an address that hashes to the token's subject.
   events, 4 KB looked at per text run or attribute, 60 nodes, depth 4, 12 images, 200-character
   labels, and 2 s of parsing.
 - Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
-  `[email]`. The registry's project name is kept as written.
+  `[email]`. The registry's project name is kept as written. An email is replaced whole, local
+  part included, whether its host is dotted, dotless (`admin@localhost`) or a bracketed literal
+  (`user@[2001:db8::1]`).
 - The redaction is conservative: any `label.label...` ending in 2-63 letters of any script, or in
   a punycode `xn--` label, counts as a host, with ASCII or IDNA full-width dots. So does any
   `local@host` in any script. "e.g." and "Inc." stay; a product name written like a host ("Node.js")
@@ -428,6 +430,33 @@ httpx and httpcore request logging is held at WARNING.
 
 **Other.** The end-card summary reaches a client through the sign-in contact or the registry. The
 Apps Script sender must list the same addresses in `STUDIO_CLIENT_EMAILS`.
+
+**Concurrent writers.** A command holds its reservation while the worker runs. Codex Gate 1 B1 on
+cc56fea.
+- If another writer lands in that time (rating, recap, summary, voice, or anything else), the
+  reserved save loses its compare-and-set. The command then finishes from fresh state, but only
+  while it still owns the reservation: same active command, inflight receipt, same command epoch.
+- Keys the other writer changed are kept beside the command's. If both changed the same key, the
+  result cannot land: the command ends `failed` (409 to the caller), with its audit entry, and the
+  other write stands.
+- A failing worker finishes the same way.
+- There is always one terminal receipt and one audit entry, and the session is never wedged.
+- A snapshot repair waits for a running build. The analyst, the Muse and the charter already did.
+
+**Open streams.** The event stream is re-authorised before every state read and before each batch
+leaves: the token's expiry and, for a client-bound token, the session binding and the registry,
+read fresh. When that fails the stream closes and nothing more is sent. Codex Gate 1 B2 on cc56fea.
+
+**One instance.** The talk, recap and muse counters, talk spacing, the busy guards, the per-tenant
+fetch single-flight and attempt budget, and the fetch semaphore are all per process.
+`STUDIO_CLIENT_WORKSPACES=true` therefore refuses to start unless `STUDIO_SINGLE_INSTANCE=true`
+declares a one-instance service. The deploy recipe must keep `--max-instances=1` (production:
+min 1, max 1, concurrency 8). Codex Gate 1 B3/B4 on cc56fea.
+- **Residual risk.** During a revision rollout, the old and new revisions can serve at the same
+  time for a short window. Each has its own counters, so a client could get up to twice the
+  per-session caps. Fetch concurrency could also reach twice its bound for that window.
+- This is accepted for the rollout window only, pending a ruling. Durable CAS leases are the
+  alternative.
 
 ## Metadata proposal contract (offline-only increment)
 

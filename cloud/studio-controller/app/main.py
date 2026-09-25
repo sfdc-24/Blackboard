@@ -743,6 +743,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     async def advise(request: Request, session_id: str):
         require_origin(request)
         require_session(request, session_id)
+        # A client session's provider allowlist decides first - before the
+        # advisor's readiness and before the body (Cursor NO-GO on cc56fea):
+        # a default client gets 403 whatever else is true, and no call.
+        state = await asyncio.to_thread(live_state, session_id)
+        if is_client_session(state) and "gemini" not in client_providers:
+            raise HTTPException(403, CLIENT_PROVIDER_DENIED)
         if not advisor_lane.ready():
             raise HTTPException(503, "the advisor is not available")
         body = await json_object(request, "advise")
@@ -753,9 +759,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, "advise needs the canvas revision")
         from workers.talk import canvas_summary
         from workers.topics import topic_line
-        state = await asyncio.to_thread(live_state, session_id)
-        if is_client_session(state) and "gemini" not in client_providers:
-            raise HTTPException(403, CLIENT_PROVIDER_DENIED)
+        state = await asyncio.to_thread(live_state, session_id)          # fresh, for the revision
         if int(state.get("artifact_version") or 0) != revision:
             raise HTTPException(409, "the canvas has moved on")
         snapshot_marker = advisor_snapshot_marker(state)
@@ -1216,7 +1220,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                      once: bool = Query(False),
                      last_event_id: str | None = Header(None, alias="Last-Event-ID")):
         require_origin(request)
-        require_session(request, session_id)
+        claims = require_session(request, session_id)
         try:
             after = int(last_event_id or 0)
         except ValueError as exc:
@@ -1233,11 +1237,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
 
+        # An open stream is re-authorised before every state read and before
+        # each batch leaves (Codex Gate 1 B2 on cc56fea): the token's expiry and,
+        # for a client-bound token, the session binding and the registry, read
+        # fresh. Refused means closed, with nothing more sent.
+        bound = any(key in claims for key in ("tnt", "csub", "prj"))
+
+        def still_allowed() -> bool:
+            if int(clock()) >= int(claims.get("exp") or 0):
+                return False
+            if bound:
+                try:
+                    require_bound_client(claims, session_id)
+                except HTTPException:
+                    return False
+            return True
+
         async def stream():
             nonlocal after
             deadline = clock() + (0 if once else settings.sse_wait_seconds)
             batch, repaired, state = initial
             while True:
+                if not await asyncio.to_thread(still_allowed):      # before a batch leaves
+                    return
                 if repaired:
                     after = 0
                 for event in batch:
@@ -1250,6 +1272,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 if not batch:
                     yield ": keep-alive\n\n"
                 await asyncio.sleep(settings.sse_poll_seconds)
+                if not await asyncio.to_thread(still_allowed):      # before the next state read
+                    return
                 try:
                     batch, repaired, state = await asyncio.to_thread(
                         controller.events_after, session_id, after

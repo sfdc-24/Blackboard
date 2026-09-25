@@ -258,8 +258,12 @@ EMAIL = "[email]"
 _DOT = "[.\u3002\uff0e\uff61]"
 _NOT_ADDR = "\\s@<>()\\[\\]{}\"',;:"
 # An address starts only after a separator, so a long run without "@" is scanned once, not once per character.
-_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^" + _NOT_ADDR + "]+@[^" + _NOT_ADDR + "]+(?:" + _DOT + "[^" + _NOT_ADDR
-                       + ".\u3002\uff0e\uff61]+)+")
+# The host is dotted or not (admin@localhost), or a bracketed literal
+# (user@[2001:db8::1]); the whole address goes, local part included (Codex
+# Gate 1 B5 on cc56fea).
+_HOST_SEG = "[^" + _NOT_ADDR + ".\u3002\uff0e\uff61]+"
+_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^" + _NOT_ADDR + "]+@(?:\\[[^\\]\\s]{1,100}\\]|"
+                       + _HOST_SEG + "(?:" + _DOT + _HOST_SEG + ")*)")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
 _IPV4_RE = re.compile(r"\b\d{1,3}(?:" + _DOT + r"\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
@@ -276,12 +280,14 @@ def _host_char(ch: str) -> bool:
 
 
 def _tld_like(label: str) -> bool:
-    """2-63 letters of any script (with their combining marks), or a punycode label."""
-    if not 2 <= len(label) <= 63:
-        return False
-    if label[:4].lower() == "xn--":
-        return len(label) >= 5 and all(c.isascii() and (c.isalnum() or c == "-") for c in label)
-    return label[0].isalpha() and all(c.isalpha() or unicodedata.category(c)[0] == "M" for c in label)
+    """2-63 letters of any script, or a punycode label - measured on the base
+    letters only: combining marks anywhere (first included) and "-" or "_" at
+    either edge never hide a TLD, and marks never push it past 63 (Cursor
+    NO-GO on cc56fea)."""
+    base = "".join(c for c in label if unicodedata.category(c)[0] != "M").strip("-_")
+    if base[:4].lower() == "xn--":
+        return 5 <= len(base) <= 63 and all(c.isascii() and (c.isalnum() or c == "-") for c in base)
+    return 2 <= len(base) <= 63 and all(c.isalpha() for c in base)
 
 
 def _hostlike(run: str) -> bool:

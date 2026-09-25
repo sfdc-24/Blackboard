@@ -34,6 +34,26 @@ def _command_fingerprint(command: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_ABSENT = object()
+
+
+def _merge_three(base: dict, ours: dict, theirs: dict) -> dict | None:
+    """A top-level three-way merge of one session record: each key takes the
+    side that changed it; None when both changed the same key differently."""
+    merged = {}
+    for key in set(base) | set(ours) | set(theirs):
+        b, o, t = base.get(key, _ABSENT), ours.get(key, _ABSENT), theirs.get(key, _ABSENT)
+        if o == t or t == b:
+            value = o
+        elif o == b:
+            value = t
+        else:
+            return None
+        if value is not _ABSENT:
+            merged[key] = value
+    return merged
+
+
 def _advance_epoch(state: dict, key: str) -> None:
     """Persist one monotonic lifecycle transition, including on old sessions."""
     state[key] = int(state.get(key) or 0) + 1
@@ -501,16 +521,18 @@ class StudioController:
         _advance_epoch(state, "command_epoch")
         reserved_token = self.repository.save(session_id, state, current_token)
 
+        base = copy.deepcopy(state)           # the reserved record: what a lost save finishes from
         working = copy.deepcopy(state)
         try:
             result = self._run_reserved(working, command)
         except Exception as exc:
             # Persist a terminal failure without replaying the worker. The same
             # command_id returns this failure; recovery requires a new command.
-            state["commands"][command_id] = {
+            failure = {
                 "status": "failed", "error": "worker failure: " + type(exc).__name__,
                 "finished_at": int(self.clock()), "fingerprint": fingerprint,
             }
+            state["commands"][command_id] = dict(failure)
             state["active_command"] = None
             _advance_epoch(state, "command_epoch")
             if state.get("client_tenant"):
@@ -518,7 +540,10 @@ class StudioController:
             try:
                 self.repository.save(session_id, state, reserved_token)
             except StateConflict:
-                pass
+                try:
+                    self._finish_after_race(session_id, base, None, command, fingerprint, failure)
+                except StateConflict:
+                    pass                      # Stop or recovery owns it and has already finished it
             raise
 
         working["commands"][command_id] = {
@@ -527,8 +552,51 @@ class StudioController:
         }
         working["active_command"] = None
         _advance_epoch(working, "command_epoch")
-        self.repository.save(session_id, working, reserved_token)
+        try:
+            self.repository.save(session_id, working, reserved_token)
+        except StateConflict:
+            self._finish_after_race(session_id, base, working, command, fingerprint, None)
         return result
+
+    def _finish_after_race(self, session_id: str, base: dict, ours: dict | None, command: dict,
+                           fingerprint: str, failure: dict | None) -> None:
+        """Another writer committed while the worker ran, so the reserved token
+        is spent (Codex Gate 1 B1 on cc56fea). Finish from fresh state - only
+        while this command still owns its reservation: the same active command,
+        its inflight receipt, the same command epoch. Keys the other writer
+        changed are kept beside ours; if both changed one key, this result
+        cannot land and the command ends failed. Either way one terminal
+        receipt, one audit entry, and no wedge. Raises StateConflict when Stop
+        or recovery owns the command now (they finished it), and CommandError
+        409 when a successful result could not land."""
+        command_id = str(command["command_id"])
+        for _ in range(self.repository.attempts):
+            record = self.repository.load(session_id)
+            fresh = record.state
+            receipt = (fresh.get("commands") or {}).get(command_id) or {}
+            if (fresh.get("active_command") != command_id or receipt.get("status") != "inflight"
+                    or receipt.get("fingerprint") != fingerprint
+                    or fresh.get("command_epoch") != base.get("command_epoch")):
+                raise StateConflict("the command was fenced before it could finish")
+            merged = _merge_three(base, ours, fresh) if ours is not None else None
+            landed = merged is not None
+            if not landed:
+                merged = copy.deepcopy(fresh)
+                merged["commands"][command_id] = dict(failure or {
+                    "status": "failed", "error": "another change landed while this command ran",
+                    "finished_at": int(self.clock()), "fingerprint": fingerprint})
+                merged["active_command"] = None
+                _advance_epoch(merged, "command_epoch")
+                if merged.get("client_tenant"):
+                    self._audit(merged, command, merged["artifact_version"], {}, outcome="failed")
+            try:
+                self.repository.save(session_id, merged, record.token)
+            except StateConflict:
+                continue
+            if ours is not None and not landed:
+                raise CommandError("another change landed while this was being built; say it again", 409)
+            return
+        raise StateConflict("session is busy; the command will be recovered")
 
     def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
         """Record the analyst's data model, and at most one question, beside the builder.
@@ -1121,7 +1189,8 @@ class StudioController:
         artifact.snapshot shape at seq 1. Open decisions are re-announced only
         after that snapshot so the browser can rebuild its conversation UI.
         """
-        for _ in range(self.repository.attempts):
+        conflicts = waits = 0
+        while True:
             record = self.repository.load(session_id)
             state = record.state
             events = state.get("events") or []
@@ -1134,6 +1203,14 @@ class StudioController:
                     state,
                 )
 
+            if state.get("active_command"):
+                # A build holds the record (Codex Gate 1 B1 on cc56fea): the repair
+                # waits for it rather than spending the build's reserved save.
+                waits += 1
+                if waits > self.analysis_wait_polls:
+                    raise StateConflict("snapshot repair is waiting for a build; reconnect")
+                self.sleep(self.analysis_poll_seconds)
+                continue
             candidate = copy.deepcopy(state)
             candidate["generation"] = int(candidate.get("generation") or 1) + 1
             candidate["last_seq"] = 0
@@ -1151,5 +1228,6 @@ class StudioController:
                 self.repository.save(session_id, candidate, record.token)
                 return copy.deepcopy(candidate["events"]), True, candidate
             except StateConflict:
-                continue
-        raise StateConflict("snapshot repair is busy; reconnect")
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("snapshot repair is busy; reconnect") from None

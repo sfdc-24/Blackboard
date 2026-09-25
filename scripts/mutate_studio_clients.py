@@ -69,6 +69,36 @@ MUTANTS = [
         "        prior = receipt")]),
     ("audit: the fenced command's type is not kept", [(CORE,
         "            \"command_type\": str(command[\"type\"]),       # for the audit if Stop or recovery fails it\n", "")]),
+    # -- a write that lands during a build (Codex Gate 1 B1 on cc56fea) ---------------------------
+    ("race: a lost save is not finished", [(CORE,
+        "        except StateConflict:\n            self._finish_after_race(session_id, base, working, command, fingerprint, None)\n",
+        "        except StateConflict:\n            raise\n")]),
+    ("race: a failing worker's lost save is not finished", [(CORE,
+        "                    self._finish_after_race(session_id, base, None, command, fingerprint, failure)\n",
+        "                    pass\n")]),
+    ("race: ownership of the reservation not proven", [(CORE,
+        "                raise StateConflict(\"the command was fenced before it could finish\")\n", "                pass\n")]),
+    ("race: a clashing key is overwritten", [(CORE,
+        "        else:\n            return None\n        if value is not _ABSENT:",
+        "        else:\n            value = o\n        if value is not _ABSENT:")]),
+    ("race: a repair does not wait for a build", [(CORE,
+        "            if state.get(\"active_command\"):\n                # A build holds the record (Codex Gate 1 B1 on cc56fea): the repair",
+        "            if False:\n                # A build holds the record (Codex Gate 1 B1 on cc56fea): the repair")]),
+    # -- an open event stream (Codex Gate 1 B2 on cc56fea) -----------------------------------------
+    ("sse: no recheck before a batch leaves", [(MAIN,
+        "                if not await asyncio.to_thread(still_allowed):      # before a batch leaves\n"
+        "                    return\n", "")]),
+    ("sse: no recheck before a state read", [(MAIN,
+        "                if not await asyncio.to_thread(still_allowed):      # before the next state read\n"
+        "                    return\n", "")]),
+    ("sse: token expiry not rechecked", [(MAIN,
+        "            if int(clock()) >= int(claims.get(\"exp\") or 0):\n                return False\n", "")]),
+    ("sse: registry not rechecked", [(MAIN,
+        "                try:\n                    require_bound_client(claims, session_id)\n"
+        "                except HTTPException:\n                    return False\n", "")]),
+    # -- one instance (Codex Gate 1 B3/B4 on cc56fea) ----------------------------------------------
+    ("topology: client workspaces without the one-instance declaration", [("cloud/studio-controller/app/settings.py",
+        "        if self.client_workspaces and not self.single_instance:", "        if False:")]),
     # -- which providers a client session reaches (Codex Gate 1 blocker_2) -------------------------
     ("providers: client sessions keep every agent", [(MAIN,
         "        return [a for a in agents if a in client_providers] if is_client_session(state) else list(agents)",
@@ -88,6 +118,20 @@ MUTANTS = [
     ("providers: advisor open to clients", [(MAIN,
         "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
         "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n", "")]),
+    ("providers: advisor readiness before the client gate", [(MAIN,
+        "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n", ""), (MAIN,
+        "            raise HTTPException(503, \"the advisor is not available\")\n",
+        "            raise HTTPException(503, \"the advisor is not available\")\n"
+        "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n")]),
+    ("providers: advise body before the client gate", [(MAIN,
+        "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n", ""), (MAIN,
+        "            raise HTTPException(400, \"advise needs the canvas revision\")\n",
+        "            raise HTTPException(400, \"advise needs the canvas revision\")\n"
+        "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
+        "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n")]),
     ("tree: email scan not anchored (quadratic)", [(PAGE, '_EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^"',
                                                     '_EMAIL_RE = re.compile("[^"')]),
     ("providers: any setting accepted", [("cloud/studio-controller/app/settings.py",
@@ -106,8 +150,13 @@ MUTANTS = [
         '    return ch.isalnum() or ch in "-_" or ch in _DOT_CHARS or unicodedata.category(ch)[0] == "M"',
         '    return ch.isalnum() or ch in "-_" or ch in _DOT_CHARS')]),
     ("tree: TLD without combining marks", [(PAGE,
-        '    return label[0].isalpha() and all(c.isalpha() or unicodedata.category(c)[0] == "M" for c in label)',
-        '    return label[0].isalpha() and all(c.isalpha() for c in label)')]),
+        '    base = "".join(c for c in label if unicodedata.category(c)[0] != "M").strip("-_")',
+        '    base = label.strip("-_")')]),
+    ("tree: marks counted in the TLD length", [(PAGE,
+        "    return 2 <= len(base) <= 63 and all(c.isalpha() for c in base)",
+        "    return 2 <= len(label) <= 63 and all(c.isalpha() for c in base)")]),
+    ("tree: an edge - or _ hides the TLD", [(PAGE, '!= "M").strip("-_")', '!= "M")')]),
+    ("tree: a trailing - or _ hides the TLD", [(PAGE, '!= "M").strip("-_")', '!= "M").lstrip("-_")')]),
     ("tree: all-numeric IPv6 skipped", [(PAGE,
         'if "::" not in text and not re.search(r"(?i)[a-f]", text) and text.count(":") != 7:',
         'if "::" not in text and not re.search(r"(?i)[a-f]", text):')]),
@@ -117,13 +166,15 @@ MUTANTS = [
                                                       'return ch.isalnum() or ch in "" or')]),
     ("tree: only ASCII hosts", [(PAGE, "    return ch.isalnum() or ch in",
                                  "    return (ch.isascii() and ch.isalnum()) or ch in")]),
-    ("tree: only short TLDs", [(PAGE, "    if not 2 <= len(label) <= 63:", "    if not 2 <= len(label) <= 6:")]),
-    ("tree: punycode TLD kept", [(PAGE, '    if label[:4].lower() == "xn--":',
+    ("tree: only short TLDs", [(PAGE, "    return 2 <= len(base) <= 63 and", "    return 2 <= len(base) <= 6 and")]),
+    ("tree: punycode TLD kept", [(PAGE, '    if base[:4].lower() == "xn--":',
                                   '    if False:')]),
     ("tree: full-width dots kept", [(PAGE, '_DOT = "[.\\u3002\\uff0e\\uff61]"', '_DOT = "[.]"')]),
     ("tree: host paths kept", [(PAGE, '_HOST_TAIL_RE = re.compile(r"(?::\\d{1,5})?(?:[/?#]\\S*)?")',
                                 '_HOST_TAIL_RE = re.compile(r"")')]),
-    ("tree: ASCII-only emails", [(PAGE, '_NOT_ADDR + "]+@[^"', '_NOT_ADDR + "]+@[^\\x80-\\U0010ffff"')]),
+    ("tree: ASCII-only emails", [(PAGE, '_HOST_SEG = "[^" + _NOT_ADDR', '_HOST_SEG = "[^\\x80-\\U0010ffff" + _NOT_ADDR')]),
+    ("tree: dotless email hosts kept", [(PAGE, '_HOST_SEG + ")*)")', '_HOST_SEG + ")+)")')]),
+    ("tree: bracketed email literals kept", [(PAGE, "{1,100}", "{0}")]),
     ("tree: IPv4 kept", [(PAGE, "    text = _IPV4_RE.sub(LINK, text)\n", "")]),
     ("tree: IPv6 kept", [(PAGE, "    text = _IPV6_RE.sub(_ipv6_link, text)\n", "")]),
     ("tree: no depth cap", [(PAGE, "MAX_DEPTH = 4 ", "MAX_DEPTH = 99 ")]),

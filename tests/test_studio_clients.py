@@ -20,6 +20,7 @@ import hmac
 import io
 import ipaddress
 import json
+import re
 import logging
 import os
 import threading
@@ -284,8 +285,8 @@ class Auth(unittest.TestCase):
 
 # -- the API ---------------------------------------------------------------------------------
 class Api(unittest.TestCase):
-    def make(self, fetcher=None, registry=None, worker=None, talk=None, advisor=None, **overrides):
-        values = dict(client_workspaces=True)
+    def make(self, fetcher=None, registry=None, worker=None, talk=None, advisor=None, clock=None, **overrides):
+        values = dict(client_workspaces=True, single_instance=True)
         values.update(overrides)
         self.store = MemoryStore()
         self.store.save(REGISTRY, registry or registry_record(), None)
@@ -295,7 +296,7 @@ class Api(unittest.TestCase):
         self.talk = talk or FakeTalk()
         self.app = create_app(settings=settings(**values), store=self.store, worker=self.worker,
                               id_factory=IDs(), email_sender=self.email_sender, project_fetcher=self.fetcher,
-                              talk_client=self.talk, advisor=advisor)
+                              talk_client=self.talk, advisor=advisor, **({"clock": clock} if clock else {}))
         return self.app
 
     def sign_in(self, client, email=CLIENT_EMAIL):
@@ -536,7 +537,7 @@ class ProjectSessions(Api):
         self.store = MemoryStore()
         self.store.save(REGISTRY, registry_record(), None)
         self.email_sender = EmailSender()
-        self.app = create_app(settings=settings(client_workspaces=True, summary_email_enabled=True), store=self.store,
+        self.app = create_app(settings=settings(client_workspaces=True, single_instance=True, summary_email_enabled=True), store=self.store,
                               worker=CountingWorker(), id_factory=IDs(), email_sender=self.email_sender,
                               project_fetcher=FakeFetcher(), summary_sender=lambda email, pdf: sent.append(email))
         with TestClient(self.app) as client:
@@ -1327,6 +1328,28 @@ class FindingF2Redaction(unittest.TestCase):
         for never in ("steelworkson", "secret", "photography", "bücher", "10\u30020", "10\uff0e0", "foo_"):
             self.assertNotIn(never, labels)
 
+    def test_cursor_nogo_cc56fea_marks_and_edges_never_hide_the_tld(self):
+        mark = "\u0308"
+        cases = {
+            "Visit secret." + mark + "photography today": "Visit [link] today",
+            "Mail us at steelworkson." + mark + "ca": "Mail us at [link]",
+            "b\u00fccher." + mark + "de": "[link]",
+            "secret.-photography": "[link]",
+            "secret._photography": "[link]",
+            "secret.photography" + mark * 53: "[link]",
+            "Ends secret.photography- and secret.photography_ here": "Ends [link] and [link] here",
+            "Mixed secret.-" + mark + "_photography here": "Mixed [link] here",
+            "Punycode shop.-xn--p1ai here": "Punycode [link] here",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), repr(text[:40]))
+        page = "".join("<p>%s</p>" % text for text in cases) + "<img alt='secret.%sphotography'>" % mark
+        labels = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for never in ("secret", "steelworkson", "cher", "photography", "xn--", "shop"):
+            self.assertNotIn(never, labels)
+        for keep in ("U.S.A. and Ph.D.", "i.e. a mark\u0308 here", "Score 3.14 - 2.5", "e.g._ then"):
+            self.assertEqual(keep, " ".join(redact(keep).split()), keep)
+
     def test_the_canvas_title_is_the_registry_name_shown_on_purpose(self):
         # The root label is the operator-registered project name, never page text:
         # shown as written, on purpose. Page text with the same host is redacted.
@@ -1413,6 +1436,11 @@ class CountingAdvisor:
         return {"agent": "gemini", "revision": snapshot["revision"], "perspective": "p", "questions": [], "risks": []}
 
 
+class OffAdvisor(CountingAdvisor):
+    def ready(self):
+        return False
+
+
 class CodexBlocker2ProviderIsolation(Api):
     """Codex Gate 1 NO-GO on a2d98fc, blocker_2: a client session reaches only
     the approved providers, refused or re-routed before any provider call."""
@@ -1460,6 +1488,24 @@ class CodexBlocker2ProviderIsolation(Api):
             out = client.post("/v1/session/%s/advise" % live["session_id"], headers=self.auth(live["token"]),
                               json={"revision": live["artifact_version"]})
         self.assertEqual((403, 0), (out.status_code, advisor.calls))
+
+    def test_a_client_gets_403_before_readiness_or_the_body_with_zero_calls(self):
+        # Cursor NO-GO on cc56fea: the allowlist decides before 503 and 400.
+        cases = [(OffAdvisor(), {"revision": 1}), (OffAdvisor(), {"nope": 1}), (CountingAdvisor(), {"nope": 1}),
+                 (CountingAdvisor(), {}), (CountingAdvisor(), {"revision": "one"}), (CountingAdvisor(), {"revision": 99}),
+                 (None, {"revision": 1}), (CountingAdvisor(), b"not json")]
+        for advisor, body in cases:
+            with TestClient(self.make(advisor=advisor)) as client:
+                live = self.client_session(client)
+                url = "/v1/session/%s/advise" % live["session_id"]
+                if isinstance(body, bytes):
+                    out = client.post(url, headers={**self.auth(live["token"]), "Content-Type": "application/json"},
+                                      content=body)
+                else:
+                    out = client.post(url, headers=self.auth(live["token"]), json=body)
+            self.assertEqual((403, "that assistant is not available in this workspace"),
+                             (out.status_code, out.json().get("detail")), (type(advisor).__name__, body))
+            self.assertEqual(0, advisor.calls if advisor is not None else 0)
 
     def test_operator_sessions_keep_every_agent_and_the_advisor(self):
         talk, advisor = ProviderTalk(), CountingAdvisor()
@@ -1678,3 +1724,304 @@ class CodexDfbcc11AuditAddendum(Api):
             controller.repository.save(sid, record.state, record.token)
             controller.execute(sid, {"command_id": "stop-1", "session_id": sid, "type": "stop", "expected_version": 0})
         self.assertNotIn("audit", self.state(sid))
+
+
+# -- Codex Gate 1 on cc56fea ----------------------------------------------------------------------
+class FailingGateWorker(GateWorker):
+    """Held in the provider call, then fails."""
+
+    def on_turn(self, state, trigger):
+        self.entered.set()
+        self.release.wait(10)
+        raise RuntimeError("provider failed")
+
+
+def cas_write(controller, sid, change):
+    """One compare-and-set write to the session record, as update_state does."""
+    repo = controller.repository
+    for _ in range(8):
+        record = repo.load(sid)
+        state = copy.deepcopy(record.state)
+        change(state)
+        try:
+            repo.save(sid, state, record.token)
+            return
+        except Exception:  # noqa: BLE001 - lost the CAS: read again
+            continue
+    raise AssertionError("could not write")
+
+
+def commit_event(controller, sid, text="a later change"):
+    cas_write(controller, sid, lambda s: controller._event(s, "confirm", {"text": text, "artifact_ids": []}))
+
+
+class CodexCc56feaB1Races(Api):
+    """B1: a session writer that commits while a build is in the provider call
+    never wedges it - one terminal receipt, one audit entry, the other write
+    kept - on success and on failure."""
+
+    def race(self, writer, fail=False):
+        worker = FailingGateWorker() if fail else GateWorker()
+        with TestClient(self.make(worker=worker, talk=ProviderTalk())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            controller = self.app.state.controller
+            controller.analysis_poll_seconds = 0.02
+            sid = live["session_id"]
+            out = {}
+
+            def build():
+                try:
+                    out["result"] = controller.execute(sid, {
+                        "command_id": "build-race", "session_id": sid, "type": "utterance",
+                        "expected_version": live["artifact_version"], "transcript": "bigger", "item_id": "item-r"})
+                except Exception as exc:  # noqa: BLE001
+                    out["error"] = exc
+
+            thread = threading.Thread(target=build)
+            thread.start()
+            self.assertTrue(worker.entered.wait(10))
+            written = writer(client, live, controller)
+            worker.release.set()
+            thread.join(10)
+            if callable(written):
+                written = written()
+            after = controller.execute(sid, {"command_id": "pause-after", "session_id": sid, "type": "pause",
+                                             "expected_version": self.state(sid)["artifact_version"]})
+        state = self.state(sid)
+        self.assertIsNone(state["active_command"])
+        receipt = state["commands"]["build-race"]
+        self.assertEqual("failed" if fail else "completed", receipt["status"], (receipt, out))
+        self.assertEqual([("build-race", "failed" if fail else "applied")],
+                         [(a["command_id"], a["outcome"]) for a in state["audit"] if a["command_id"] == "build-race"])
+        self.assertEqual(["build-race", "pause-after"], [a["command_id"] for a in state["audit"]])
+        self.assertEqual("pause-after", after["command_id"])                       # no wedge
+        if fail:
+            self.assertIsInstance(out.get("error"), RuntimeError)
+        else:
+            self.assertNotIn("error", out)
+        return state, written
+
+    def rating(self, client, live, controller):
+        out = client.post("/v1/session/%s/rating" % live["session_id"], headers=self.auth(live["token"]),
+                          json={"score": 5, "comment": "fast"})
+        self.assertEqual(200, out.status_code, out.text)
+        return out
+
+    def recap(self, client, live, controller):
+        out = client.post("/v1/session/%s/recap" % live["session_id"], headers=self.auth(live["token"]), json={})
+        self.assertEqual(200, out.status_code, out.text)
+        return out
+
+    def summary(self, client, live, controller):
+        cas_write(controller, live["session_id"], lambda s: s.update(summary={"status": "sending", "at": 1}))
+
+    def repair(self, client, live, controller):
+        got = {}
+        thread = threading.Thread(target=lambda: got.update(
+            events=controller.events_after(live["session_id"], 10 ** 6)))
+        thread.start()
+        time.sleep(0.3)
+        self.assertTrue(thread.is_alive(), "the repair must wait for the build")
+        self.assertNotIn("events", got)
+
+        def finish():
+            thread.join(10)
+            return got
+        return finish
+
+    def test_rating_during_a_build(self):
+        for fail in (False, True):
+            state, _ = self.race(self.rating, fail)
+            self.assertEqual(5, state["rating"]["score"], fail)
+
+    def test_recap_during_a_build(self):
+        for fail in (False, True):
+            state, _ = self.race(self.recap, fail)
+            self.assertIn("text", state["recap"], fail)
+
+    def test_the_summary_record_during_a_build(self):
+        for fail in (False, True):
+            state, _ = self.race(self.summary, fail)
+            self.assertEqual("sending", state["summary"]["status"], fail)
+
+    def test_a_repair_waits_for_the_build(self):
+        for fail in (False, True):
+            state, got = self.race(self.repair, fail)
+            events, repaired, _ = got["events"]
+            self.assertTrue(repaired)
+            self.assertEqual("artifact.snapshot", events[0]["type"])
+            label = json.dumps(events[0]["payload"])
+            self.assertEqual(not fail, "Steel Works, bigger" in label, fail)
+
+    def test_a_clashing_write_ends_the_build_failed_not_wedged(self):
+        worker = GateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            controller = self.app.state.controller
+            sid = live["session_id"]
+            out = {}
+
+            def build():
+                try:
+                    out["result"] = controller.execute(sid, {
+                        "command_id": "build-race", "session_id": sid, "type": "utterance",
+                        "expected_version": live["artifact_version"], "transcript": "bigger", "item_id": "item-r"})
+                except Exception as exc:  # noqa: BLE001
+                    out["error"] = exc
+
+            thread = threading.Thread(target=build)
+            thread.start()
+            self.assertTrue(worker.entered.wait(10))
+            commit_event(controller, sid)                  # a writer on the same key as the build
+            worker.release.set()
+            thread.join(10)
+            after = controller.execute(sid, {"command_id": "pause-after", "session_id": sid, "type": "pause",
+                                             "expected_version": self.state(sid)["artifact_version"]})
+        state = self.state(sid)
+        self.assertEqual(409, getattr(out.get("error"), "status", None), out)
+        self.assertEqual("failed", state["commands"]["build-race"]["status"])
+        self.assertIsNone(state["active_command"])
+        self.assertEqual([("build-race", "failed"), ("pause-after", "applied")],
+                         [(a["command_id"], a["outcome"]) for a in state["audit"]])
+        self.assertIn("a later change", json.dumps(state["events"]))
+        self.assertNotIn("Steel Works, bigger", json.dumps(state["artifact"]))
+        self.assertEqual("pause-after", after["command_id"])
+
+
+class CodexCc56feaB2OpenStreams(Api):
+    """B2: an open event stream is re-authorised before every state read and
+    before each batch leaves; refused means closed, nothing more sent."""
+
+    def open_stream(self, client, live, on_read=None, at_read=2, registry_from=None):
+        controller = self.app.state.controller
+        original = controller.events_after
+        reads = {"n": 0}
+
+        def wrapped(sid, after):
+            reads["n"] += 1
+            if on_read and reads["n"] == at_read:
+                on_read(sid)
+            return original(sid, after)
+
+        original_load = self.store.load
+        registry_reads = {"n": 0}
+
+        def load(name):
+            if name == REGISTRY and registry_from is not None:
+                registry_reads["n"] += 1
+                if registry_reads["n"] >= registry_from:
+                    return registry_record(client_entry(projects=[])), "revoked"
+            return original_load(name)
+
+        controller.events_after = wrapped
+        self.store.load = load
+        try:
+            body = client.get("/v1/session/%s/events" % live["session_id"], headers=self.auth(live["token"])).text
+        finally:
+            controller.events_after = original
+            self.store.load = original_load
+        return [int(x) for x in re.findall(r"^id: (\d+)$", body, re.M)], reads["n"]
+
+    def session(self, client):
+        token = self.sign_in(client).json()["token"]
+        live = self.project_session(client, token).json()
+        return live, self.app.state.controller
+
+    def test_control_a_later_event_arrives(self):
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+            live, controller = self.session(client)
+            before = self.state(live["session_id"])["last_seq"]
+            ids, _ = self.open_stream(client, live, on_read=lambda sid: commit_event(controller, sid))
+        self.assertIn(before + 1, ids)
+
+    def test_a_revoked_project_or_client_gets_no_later_event(self):
+        for revoked in (registry_record(client_entry(projects=[])), {"version": 1, "clients": []}):
+            with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+                live, controller = self.session(client)
+                before = self.state(live["session_id"])["last_seq"]
+
+                def revoke_then_commit(sid, record=revoked):
+                    self.set_registry(record)
+                    commit_event(controller, sid)
+                ids, _ = self.open_stream(client, live, on_read=revoke_then_commit)
+            self.assertTrue(ids)                                          # the stream did open
+            self.assertTrue(all(i <= before for i in ids), (ids, before))
+
+    def test_crossing_the_token_expiry_gets_no_later_event(self):
+        offset = [0]
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1,
+                                  clock=lambda: time.time() + offset[0])) as client:
+            live, controller = self.session(client)
+            before = self.state(live["session_id"])["last_seq"]
+
+            def expire_then_commit(sid):
+                offset[0] = 700                                           # past the 600 s session token
+                commit_event(controller, sid)
+            ids, _ = self.open_stream(client, live, on_read=expire_then_commit)
+        self.assertTrue(ids)
+        self.assertTrue(all(i <= before for i in ids), (ids, before))
+
+    def test_refused_before_the_first_batch_leaves(self):
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+            live, _ = self.session(client)
+            ids, reads = self.open_stream(client, live, registry_from=2)  # the open is #1
+        self.assertEqual(([], 1), (ids, reads))
+
+    def test_refused_before_the_next_state_read(self):
+        with TestClient(self.make(sse_poll_seconds=0.01, sse_wait_seconds=1)) as client:
+            live, _ = self.session(client)
+            ids, reads = self.open_stream(client, live, registry_from=3)  # the open, then the first batch
+        self.assertTrue(ids)
+        self.assertEqual(1, reads)                                        # no read after the refusal
+
+
+class CodexCc56feaB3B4Topology(unittest.TestCase):
+    """B3/B4: the per-process guards hold only on one instance, so client
+    workspaces refuse to start without the single-instance declaration."""
+
+    def test_client_workspaces_require_the_single_instance_declaration(self):
+        with self.assertRaisesRegex(RuntimeError, "STUDIO_SINGLE_INSTANCE"):
+            settings(client_workspaces=True, single_instance=False).validate()
+        with self.assertRaises(RuntimeError):
+            create_app(settings=settings(client_workspaces=True, single_instance=False), store=MemoryStore(),
+                       worker=CountingWorker(), id_factory=IDs(), email_sender=EmailSender())
+        settings(client_workspaces=True, single_instance=True).validate()
+        settings(client_workspaces=False, single_instance=False).validate()
+
+    def test_the_env_reads_it(self):
+        import os
+        from app.settings import Settings
+        old = os.environ.get("STUDIO_SINGLE_INSTANCE")
+        try:
+            os.environ.pop("STUDIO_SINGLE_INSTANCE", None)
+            self.assertFalse(Settings.from_env().single_instance)
+            os.environ["STUDIO_SINGLE_INSTANCE"] = "true"
+            self.assertTrue(Settings.from_env().single_instance)
+        finally:
+            if old is None:
+                os.environ.pop("STUDIO_SINGLE_INSTANCE", None)
+            else:
+                os.environ["STUDIO_SINGLE_INSTANCE"] = old
+
+
+class CodexCc56feaB5WholeAddresses(unittest.TestCase):
+    def test_local_and_literal_host_addresses_go_whole(self):
+        cases = {
+            "Write admin@localhost now": "Write [email] now",
+            "Root at root@intranet.": "Root at [email].",
+            "Ops ops@[2001:db8::1] here": "Ops [email] here",
+            "Box user@[10.0.0.1] here": "Box [email] here",
+            "Tagged user@[IPv6:2001:db8::1] end": "Tagged [email] end",
+            "Unicode jürgen@server here": "Unicode [email] here",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text)
+        page = ("<p>Write admin@localhost or ops@[2001:db8::1]</p><img alt='user@[10.0.0.1]'>"
+                "<input placeholder='root@intranet'>")
+        labels = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for never in ("admin", "localhost", "ops@", "2001", "user@", "10.0.0.1", "root@", "intranet"):
+            self.assertNotIn(never, labels)
+        for keep in ("Meet @ 5pm", "ask @steelworks", "a @ b"):
+            self.assertEqual(keep, redact(keep))
