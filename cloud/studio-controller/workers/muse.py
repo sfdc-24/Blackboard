@@ -40,7 +40,12 @@ TYPES = ("serif", "sans", "mono", "display", "script")
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 # One line of plain text: no markup characters, no control characters.
 BAD_CHARS_RE = re.compile(r"[<>\x00-\x1f\x7f]")
-CAPS = {"line": 200, "title": 40, "motif": 60, "headline": 60, "read_line": 140, "tone": 80, "work": 120}
+# ASKED is what the prompt asks the model for; CAPS is what the gate accepts.
+# The model overshoots a stated length now and then (live-like input on
+# 2026-09-25: every motif ran past 60 and the whole set was refused, twice), so
+# the gate allows headroom; the page and the PDF lay out the longer text fine.
+ASKED = {"line": 200, "title": 40, "motif": 60, "headline": 60, "read_line": 140, "tone": 80, "work": 120}
+CAPS = {"line": 260, "title": 60, "motif": 100, "headline": 80, "read_line": 200, "tone": 120, "work": 180}
 
 # The same use policy every lane carries (workers/policy.py, PR #255).
 try:  # the app and the image import this module as part of the workers package

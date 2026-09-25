@@ -81,14 +81,14 @@ class Gate(unittest.TestCase):
     def test_every_field_is_checked(self):
         cases = {
             "line empty": lambda r: r.update(line=" "),
-            "line too long": lambda r: r.update(line="x" * 201),
-            "title too long": lambda r: r["directions"][0].update(title="x" * 41),
-            "motif too long": lambda r: r["directions"][0]["see"].update(motif="x" * 61),
+            "line too long": lambda r: r.update(line="x" * 261),
+            "title too long": lambda r: r["directions"][0].update(title="x" * 61),
+            "motif too long": lambda r: r["directions"][0]["see"].update(motif="x" * 101),
             "type not in enum": lambda r: r["directions"][0]["see"].update(type="comic"),
-            "headline too long": lambda r: r["directions"][0]["read"].update(headline="x" * 61),
-            "read line too long": lambda r: r["directions"][0]["read"].update(line="x" * 141),
-            "tone too long": lambda r: r["directions"][0]["hear"].update(tone="x" * 81),
-            "work too long": lambda r: r["directions"][0].update(work="x" * 121),
+            "headline too long": lambda r: r["directions"][0]["read"].update(headline="x" * 81),
+            "read line too long": lambda r: r["directions"][0]["read"].update(line="x" * 201),
+            "tone too long": lambda r: r["directions"][0]["hear"].update(tone="x" * 121),
+            "work too long": lambda r: r["directions"][0].update(work="x" * 181),
             "work missing": lambda r: r["directions"][0].pop("work"),
             "extra field": lambda r: r["directions"][0].update(css="body{}"),
             "extra top field": lambda r: r.update(note="x"),
@@ -124,6 +124,20 @@ class Gate(unittest.TestCase):
         # A fourth direction is refused for being a fourth, not only for reusing an id.
         muse, problems = mu.validate(broken(cases["a fourth direction"]))
         self.assertEqual(["exactly three directions are required"], problems)
+
+    def test_a_model_that_runs_a_little_long_is_not_refused(self):
+        # Live-like input, 2026-09-25: motifs of 70-90 characters sank every set.
+        raw = copy.deepcopy(SET)
+        raw["directions"][0]["see"]["motif"] = "hand-drawn wheat stalks framing a rounded loaf, soft flour speckle texture"
+        raw["directions"][1]["hear"]["tone"] = "bubbly and quick, like the bell over a busy shop door on a Saturday morning"
+        muse, problems = mu.validate(raw)
+        self.assertEqual([], problems)
+        self.assertEqual(raw["directions"][0]["see"]["motif"], muse["directions"][0]["see"]["motif"])
+
+    def test_the_model_is_still_asked_for_the_short_length(self):
+        self.assertIn("at most 60 characters", mu.SYSTEM)
+        for field, asked in mu.ASKED.items():
+            self.assertLess(asked, mu.CAPS[field], field)
 
     def test_not_an_object_is_refused(self):
         for raw in (None, [], "text", {"line": "x"}):
