@@ -184,19 +184,21 @@ class StudioController:
                        creation_id: str = "", start: str = "template",
                        visitor: bool = False, admit_limit: int | None = None,
                        analyst: bool = False, topic: str = "", client: bool = False,
-                       artifact: dict | None = None, project: str = "") -> tuple[dict, int]:
+                       artifact: dict | None = None, project: str = "",
+                       tenant: str = "") -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
             raise CommandError("start must be template, blank or project")
         if visitor and client:
             raise CommandError("a session has one kind of owner")
-        if start == "project" and not (client and project and creation_id):
+        if start == "project" and not (client and project and creation_id and tenant):
             raise CommandError("a project session belongs to a client and a creation id", 403)
+        if client and not (subject and tenant):
+            raise CommandError("a client session needs its subject and tenant", 403)
         now = int(self.clock())
         if creation_id:
-            stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
-            session_id = "s-" + stable
+            session_id = self._session_key(subject, creation_id, tenant, project if start == "project" else "")
         else:
             session_id = self.id_factory("s")
         if start == "project" and artifact is None:
@@ -258,8 +260,10 @@ class StudioController:
             # (metadata proposals) check operator_subject, which stays empty.
             "operator_subject": "" if (visitor or client) else subject,
             "visitor_subject": subject if visitor else "",
-            # A client (app/clients.py) is not an operator either.
+            # A client (app/clients.py) is not an operator either; its session
+            # belongs to one {tenant, project} workspace.
             "client_subject": subject if client else "",
+            "client_tenant": tenant if client else "",
             "project": project if start == "project" else "",
             "voice_item_ids": [],
             "voice_epoch": 0,
@@ -301,13 +305,20 @@ class StudioController:
             self._same_owner(existing, subject, visitor, client)
             return copy.deepcopy(existing), admitted
 
-    def created_session_exists(self, subject: str, creation_id: str) -> bool:
-        """Whether this owner's creation id already made a session (a replay)."""
+    @staticmethod
+    def _session_key(subject: str, creation_id: str, tenant: str = "", project: str = "") -> str:
+        """A workspace session is keyed by {tenant, project} as well as its owner
+        and creation id; other sessions keep the key they always had."""
+        parts = [subject, creation_id] + ([tenant, project] if project else [])
+        return "s-" + hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    def created_session_exists(self, subject: str, creation_id: str, tenant: str = "",
+                               project: str = "") -> bool:
+        """Whether this owner's creation id already made this session (a replay)."""
         if not creation_id or not ID_RE.fullmatch(creation_id):
             return False
-        stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
         try:
-            self.repository.load("s-" + stable)
+            self.repository.load(self._session_key(subject, creation_id, tenant, project))
             return True
         except SessionNotFound:
             return False
@@ -316,7 +327,7 @@ class StudioController:
     def _same_owner(existing: dict, subject: str, visitor: bool, client: bool) -> None:
         owner = (existing.get("operator_subject") or existing.get("visitor_subject")
                  or existing.get("client_subject") or "")
-        if (owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
+        if (not owner or owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
                 or bool(existing.get("client_subject")) != bool(client)):
             raise StateConflict("creation_id belongs to another operator")
 
@@ -809,6 +820,41 @@ class StudioController:
         })
 
     def _run_reserved(self, state: dict, command: dict) -> dict:
+        prior_revision = state["artifact_version"]
+        result = self._run_turn(state, command)
+        if state.get("client_tenant"):
+            self._audit(state, command, prior_revision, result)
+        return result
+
+    AUDIT_MAX = 200
+
+    def _audit(self, state: dict, command: dict, prior_revision: int, result: dict) -> None:
+        """One entry per command in a client (workspace) session: who, which
+        {tenant, project}, the revision before and after, the patch op ids,
+        when, and the outcome. Never the page, the words said, or any label."""
+        patch_ops = [e["op_id"] for e in result.get("events") or [] if e.get("type") == "artifact.patch"]
+        if patch_ops:
+            outcome = "applied"
+        elif result.get("problems"):
+            outcome = "refused"
+        else:
+            outcome = "no_change"
+        entry = {
+            "actor": "client:" + str(state.get("client_subject") or "")[:16],
+            "token_type": "session",
+            "tenant": state.get("client_tenant", ""),
+            "project": state.get("project", ""),
+            "command_id": str(command.get("command_id") or ""),
+            "command_type": str(command.get("type") or ""),
+            "prior_revision": prior_revision,
+            "revision": state["artifact_version"],
+            "op_ids": patch_ops,
+            "at": int(self.clock()),
+            "outcome": outcome,
+        }
+        state["audit"] = (state.get("audit") or [])[-(self.AUDIT_MAX - 1):] + [entry]
+
+    def _run_turn(self, state: dict, command: dict) -> dict:
         kind = command["type"]
         state["turn_seq"] += 1
         state["turn_id"] = "turn-%d" % state["turn_seq"]

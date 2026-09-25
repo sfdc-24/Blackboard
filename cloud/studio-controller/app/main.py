@@ -38,11 +38,15 @@ from .state import (
     VoiceCapacityExceeded,
 )
 from .summary_pdf import DesignImageError, build_summary_pdf, decode_design_png, mask_email
-from .tokens import InvalidToken, mint_token, verify_token
+from .tokens import InvalidToken, mint_client_token, mint_token, verify_client_token, verify_token
 from .workers.synthetic import SyntheticWorker
 
 
 CALL_ID_RE = re.compile(r"^rtc_[A-Za-z0-9_-]{1,120}$")
+# One answer for every refused client-scope request - a removed client, another
+# tenant's project, a project that does not exist, a token of the wrong kind -
+# so a denial never tells which of those it was.
+WORKSPACE_DENIED = "this workspace is not available"
 
 
 class SummaryNotSent(RuntimeError):
@@ -428,7 +432,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(401, str(exc)) from exc
         if claims["sid"] != session_id:
             raise HTTPException(403, "token does not belong to this session")
+        require_bound_client(claims)
         return claims
+
+    def require_bound_client(claims: dict) -> None:
+        """A client session's token carries its tenant and subject: while it is
+        used, that client must still be in the registry (read fresh)."""
+        if "tnt" not in claims and "csub" not in claims:
+            return
+        if not settings.client_workspaces or clients.member(
+                claims.get("tnt", ""), claims.get("csub", ""), auth_service._subject_hash) is None:
+            raise HTTPException(403, WORKSPACE_DENIED)
 
     def caller_address(request: Request) -> str:
         """The address Google's front end observed: the LAST X-Forwarded-For hop.
@@ -445,32 +459,44 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     def require_signed_in(request: Request) -> tuple[dict, str]:
         """An operator; while public visitors are on, a verified visitor; while
-        client workspaces are on, a registered client."""
+        client workspaces are on, a registered client. Each kind has its own
+        verification path, and an empty subject never passes."""
         auth = request.headers.get("authorization") or ""
         token = auth[7:] if auth.lower().startswith("bearer ") else ""
-        scopes = ["operator"] + (["visitor"] if settings.public_visitors else []) \
-            + (["client"] if settings.client_workspaces else [])
+        if token.startswith("c2."):
+            if not settings.client_workspaces:
+                raise HTTPException(401, "client sign-in is not enabled")
+            claims, client = require_client(request)
+            return {"sid": claims["sub"], "tnt": claims["tnt"], "prj": claims["prj"], "client": client}, "client"
+        scopes = ["operator"] + (["visitor"] if settings.public_visitors else [])
         error = None
         for scope in scopes:
             try:
-                return verify_token(token, settings.session_secret, now=clock(), scope=scope), scope
+                claims = verify_token(token, settings.session_secret, now=clock(), scope=scope)
             except InvalidToken as exc:
                 error = exc
+                continue
+            if not claims["sid"]:
+                raise HTTPException(401, "token has no subject")
+            return claims, scope
         raise HTTPException(401, str(error)) from error
 
     def require_client(request: Request) -> tuple[dict, dict]:
-        """A client token, and that client's current registry entry."""
+        """A client token, verified on the client path, AND its tenant and
+        subject still in the registry (read fresh). The token alone grants nothing."""
         if not settings.client_workspaces:
             raise HTTPException(503, "client workspaces are not enabled in this release")
         auth = request.headers.get("authorization") or ""
         token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        if not token:
+            raise HTTPException(401, "a client sign-in is required")
         try:
-            claims = verify_token(token, settings.session_secret, now=clock(), scope="client")
+            claims = verify_client_token(token, settings.session_secret, now=clock())
         except InvalidToken as exc:
-            raise HTTPException(403 if token else 401, "a client sign-in is required") from exc
-        client = clients.for_subject(claims["sid"], auth_service._subject_hash)
+            raise HTTPException(403, WORKSPACE_DENIED) from exc
+        client = clients.member(claims["tnt"], claims["sub"], auth_service._subject_hash)
         if client is None:
-            raise HTTPException(403, "this workspace is no longer open")
+            raise HTTPException(403, WORKSPACE_DENIED)
         return claims, client
 
     def require_operator(request: Request) -> dict:
@@ -867,6 +893,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(401, str(exc)) from exc
         if claims["sid"] != session_id:
             raise HTTPException(403, "token does not belong to this session")
+        require_bound_client(claims)
         return claims
 
     def within_grace(state: dict) -> None:
@@ -964,9 +991,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if visitor and not settings.public_visitors:
             raise HTTPException(401, "verification code was not accepted")
         # The same for a client switched off, or taken out of the registry.
-        if client and (not settings.client_workspaces or await asyncio.to_thread(
-                clients.for_subject, verified["subject_hash"], auth_service._subject_hash) is None):
-            raise HTTPException(401, "verification code was not accepted")
+        registered = None
+        if client:
+            registered = await asyncio.to_thread(
+                clients.for_subject, verified["subject_hash"], auth_service._subject_hash
+            ) if settings.client_workspaces else None
+            if registered is None:
+                raise HTTPException(401, "verification code was not accepted")
         if settings.summary_email_enabled:
             try:
                 await asyncio.to_thread(record_contact, verified["subject_hash"], body["email"])
@@ -978,8 +1009,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             await asyncio.to_thread(lead_book.record_verified, verified["subject_hash"], body.get("email"))
             return {"token": token, "expires_at": expires_at, "scope": "visitor"}
         if client:
-            expires_at = int(clock()) + settings.operator_token_seconds
-            token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="client")
+            issued_at = int(clock())
+            expires_at = issued_at + settings.operator_token_seconds
+            token = mint_client_token(verified["subject_hash"], registered["id"],
+                                      [p["id"] for p in registered["projects"]],
+                                      issued_at, expires_at, settings.session_secret)
             return {"token": token, "expires_at": expires_at, "scope": "client"}
         expires_at = int(clock()) + settings.operator_token_seconds
         token = mint_token(
@@ -1019,20 +1053,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(400, "title must be a string")
         visitor = role == "visitor"
         client = role == "client"
+        tenant = operator.get("tnt", "") if client else ""
         project_id, artifact = "", None
         if "project" in body and start != "project":
             raise HTTPException(400, "project is only for start project")
         if start == "project":
             # A client's own registered page, fetched here from its exact URL -
             # before any admission, so a page that does not load costs nothing.
-            if not client:
-                raise HTTPException(403, "a project session is for a signed-in client")
-            owner = await asyncio.to_thread(clients.for_subject, operator["sid"], auth_service._subject_hash)
-            project = clients.project(owner, body.get("project"))
-            if project is None:
-                raise HTTPException(403, "that project is not in this workspace")
+            # The project must be the tenant's now (registry, read fresh) AND
+            # have been when the token was issued; every refusal reads the same.
+            requested = body.get("project")
+            project = clients.project(operator.get("client"), requested) if client else None
+            if project is None or requested not in operator.get("prj", []):
+                raise HTTPException(403, WORKSPACE_DENIED)
             project_id, title = project["id"], project["name"]
-            replay = await asyncio.to_thread(controller.created_session_exists, operator["sid"], creation_id)
+            replay = await asyncio.to_thread(controller.created_session_exists, operator["sid"], creation_id,
+                                             tenant, project_id)
             if not replay:
                 try:
                     html = await asyncio.to_thread(fetch_project, project["url"])
@@ -1050,7 +1086,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 (settings.daily_session_cap - settings.operator_reserved_sessions
                  if (visitor or client) else None),
                 start in ("blank", "project") and analyst_ready(),
-                topic, client, artifact, project_id,
+                topic, client, artifact, project_id, tenant,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
@@ -1063,7 +1099,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                                         title, settings.visitor_sessions_per_day)
             except LeadCapExceeded as exc:
                 raise HTTPException(429, "the conversations for today are used up") from exc
-        token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
+        # A client session's token is bound to its tenant and subject, so each
+        # request on it is re-authorised against the registry.
+        binding = {"tnt": tenant, "csub": operator["sid"]} if client else None
+        token = mint_token(state["session_id"], state["expires_at"], settings.session_secret, binding=binding)
         return {
             "session_id": state["session_id"],
             "generation": state["generation"],

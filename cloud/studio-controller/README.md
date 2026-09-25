@@ -322,35 +322,72 @@ moderation gate like the other lanes.
 
 ## Client workspaces (STUDIO_CLIENT_WORKSPACES, off by default)
 
-A named client signs in on the homepage and sees their own projects.
+A named client signs in on the homepage and sees their own projects. This is held to the Gate 1
+security contract in `docs/SFDC24-CODEX-STRATEGY-EXECUTION-PLAN-20260925.md`, and
+`tests/test_studio_clients.py` covers it item by item.
 
-- **Registry.** One state-store object, `studio_clients`: `{"version": 1, "clients": [{"name", "emails",
-  "projects": [{"id", "name", "url"}]}]}`. An operator script writes it; the controller only reads it,
-  with a 30-second cache. Addresses are exact lowercase. A malformed client entry is skipped as a
-  whole, and an address listed for two clients admits neither. Project URLs must be https on a
-  named host: no IP, no port, no credentials.
-- **Sign-in.** A registry address gets the email code like an operator. Verify returns
-  `{"token", "expires_at", "scope": "client"}`, with the operator token lifetime. A client token
-  opens nothing operator-only: `/v1/leads` refuses it, and client sessions carry `client_subject`
-  with an empty `operator_subject`, so metadata proposals refuse it too. Clients share the daily
-  session and voice ledgers below the operator's reserve, like visitors. The Apps Script sender
-  must list the same addresses in its `STUDIO_CLIENT_EMAILS` Script Property.
-- **`GET /v1/workspace`** (client token and Origin) returns `{"name", "projects": [{"id", "name",
-  "url"}]}` and never an address. Other scopes get 403, and 503 while the switch is off.
-- **`POST /v1/session` with `start: "project", "project": "<id>"`** is for a client whose entry lists
-  that id; anyone else gets 403.
-  - The controller fetches that project's exact registered URL with `app/project_page.py`: https
-    only, at most 3 redirects and only within the same site, 8 s, 1.5 MB, HTML only.
-  - It turns the page into a text-only tree: screen, section, nav, heading, text, button,
-    image-placeholder, list, form and field; at most 60 nodes and 200-character labels. Scripts,
-    styles, frames and SVG are dropped, and no URL is kept.
-  - Only then is the session admitted and created, with the page as its snapshot at version 1,
-    `state["project"]` set and the analyst flag on as for a blank start.
-  - A page that does not load answers 502 "the project page could not be loaded", with no
-    session and no admission. A replayed creation id returns the same session without fetching
-    again.
-- **Summary email.** The end-card PDF reaches a client through the sign-in contact, or else through
-  the registry.
+**Registry (`app/clients.py`).** One state-store object, `studio_clients`: `{"version": 1, "clients":
+[{"id", "name", "emails", "projects": [{"id", "name", "url"}]}]}`.
+- `id` is the tenant, and a workspace is always `{tenant, project}`.
+- Operators write the registry; the controller only reads it. Every authorisation reads it fresh,
+  and only the sign-in address list is cached, for 30 seconds.
+- A malformed entry is skipped whole. An address or tenant id that appears twice admits neither.
+- A project URL is a reviewed canonical https page: a named host with a letter TLD; no IP literal,
+  port, userinfo, query, fragment, percent-encoding or backslash; and no `.internal`, `.local`,
+  `.localdomain`, `.localhost` or similar private name.
+
+**Client token (`app/tokens.py`).** Its own format, `c2.`, signed with a key derived for this purpose
+and verified only by `verify_client_token`.
+- Its claims are exactly `v, typ, sub, tnt, prj, iat, exp, aud, jti`, and each is checked.
+- It lives at most 24 hours; an `iat` in the future is refused.
+- v1 operator, visitor and session tokens and client tokens never pass for each other.
+- `/v1/auth/verify` returns `{"token", "expires_at", "scope": "client"}` for a registry address.
+
+**Revocation.** Every client-scope request re-checks, fresh from the registry, that the tenant exists and
+still lists an address that hashes to the token's subject.
+- This covers `/v1/workspace`, `POST /v1/session`, and every session-scope request on a client
+  session, whose session token carries `tnt` and `csub`.
+- A removed client, another tenant's project, a project that does not exist, a project added after
+  sign-in, and a token of the wrong kind all get the same `403 "this workspace is not available"`.
+- Client tokens reach nothing operator-only, and client sessions have an empty `operator_subject`.
+  An empty subject never passes.
+
+**Project sessions.** `POST /v1/session` with `start: "project", "project": "<id>"`.
+- The page is fetched by `app/project_page.py` before any admission.
+- A page that fails to load gets 502 `"the project page could not be loaded"`: no session, no
+  admission.
+- Sessions are keyed by owner, creation id, tenant and project. A replay fetches nothing.
+
+**Fetch (SSRF).** Only the registry URL is fetched.
+- The name is resolved in the worker, and every answer must be a public unicast address: no
+  loopback, RFC1918, CGNAT, link-local, multicast, documentation, benchmarking, reserved, ULA, or
+  mapped/6to4/Teredo form.
+- The connection goes to that validated address, with the registered name kept for SNI, the
+  certificate check and Host. This rules out DNS rebinding.
+- Redirects fail closed. Environment proxies are never used. Only `text/html` is accepted, with
+  identity or gzip encoding.
+- Size caps: 1.5 MB compressed, 3 MB decompressed.
+- Time caps: connect 3 s; first byte 5 s; idle 4 s; one wall-clock total of 8 s across
+  resolve, connect, first byte and body.
+
+**Tree.** The page becomes inert text in known kinds.
+- Kept: screen, section, nav, heading, text, button, image-placeholder (never fetched), list,
+  form and field.
+- Dropped: scripts, styles, frames, objects, SVG, MathML, templates, comments, and every attribute
+  except a few read as label text. No URL survives, even as visible text.
+- Caps: 2M input characters, 60 nodes, depth 4, 12 images, 200-character labels, and 2 s of
+  parsing.
+
+**Audit.** Each command in a client session appends
+`{actor, token_type, tenant, project, command_id, command_type, prior_revision, revision, op_ids, at,
+outcome}` to `state["audit"]`, keeping the last 200 entries. The audit never holds page text,
+transcripts or addresses.
+
+**Logs.** No token, address, project URL, pinned IP or page text appears in logs or error bodies.
+httpx and httpcore request logging is held at WARNING.
+
+**Other.** The end-card summary reaches a client through the sign-in contact or the registry. The
+Apps Script sender must list the same addresses in `STUDIO_CLIENT_EMAILS`.
 
 ## Metadata proposal contract (offline-only increment)
 
