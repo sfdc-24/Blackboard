@@ -5,8 +5,8 @@ evidence for how it got here is in `docs/CLOUD-CREDENTIAL-CONTRACT.md` and
 `docs/OPENAI-CLOUD-MIGRATION.md`; this page is the current state and the
 procedure.
 
-**Read live, then trust this page.** The job and scheduler tables were read
-from GCP on 2026-09-24 between 22:00 and 22:30 UTC; the studio controller table on
+**Read live, then trust this page.** The job table was read from GCP on
+2026-09-24 between 22:00 and 22:30 UTC; the studio controller table on
 2026-09-25 at 04:25 UTC. Images move with every rollout, so run the three commands
 in *Read the live state* before acting on a row here.
 
@@ -73,9 +73,16 @@ A release: build from a merged main SHA in a detached worktree, deploy with
 `--no-traffic --tag <name>`, read `/health` on the tag URL (voice, talk,
 analyst, voices), then `gcloud run services update-traffic ... --to-revisions=<rev>=100`
 as a command of its own. `python scripts/acceptance_current_state.py --only studio_controller`
-confirms production afterwards: it requires voice, talk, analyst and both voices, so it
-passes on r3 and reports `voices` missing after a rollback to r2 or earlier - expected,
-not a new fault.
+confirms production afterwards. It requires voice, talk, analyst and both voices,
+so only r3 passes (`ok; voice/talk/analyst on; voices ['host', 'architect']`). After
+a rollback its FAIL line names exactly what that revision lacks - expected, not a
+new fault:
+
+| rolled back to | expected `studio_controller` line |
+|---|---|
+| `r2-44ed5d7` | `ok=True, off: voice:host, voice:architect` |
+| `talk-293d248` | `ok=True, off: analyst, voice:host, voice:architect` |
+| `p3-claude-6fd0dc4` (voice off) | `ok=True, off: voice, talk, analyst, voice:host, voice:architect` |
 
 The traffic column decides what the untagged `*.a.run.app` URL serves: that
 URL is production. A tag URL always reaches its own revision, whatever the
