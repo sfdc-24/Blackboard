@@ -92,9 +92,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                advisor=None, charter=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
-    from workers.topics import TOPICS as _TOPICS
+    from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
     from .pricing import parse_price_table
-    price_table = parse_price_table(settings.price_table, _TOPICS)
+    price_table = parse_price_table(settings.price_table, _TOPICS,
+                                    lambda t: [line[0] for line in _quote_lines(t)])
     store = store or open_store(settings.state_uri)
     repository = StudioRepository(store, clock=clock)
     selected_worker = worker or _worker(settings)
@@ -1364,12 +1365,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         email = await asyncio.to_thread(email_for_subject, subject)
         if not email:
             raise HTTPException(409, "no verified email is on record for this session")
+        masked = mask_email(email)
         try:
             pdf = await asyncio.to_thread(build_summary_pdf, state, design_png=design,
-                                          price_table=price_table)
+                                          price_table=price_table, prepared_for=masked)
         except DesignImageError as exc:
             raise HTTPException(400, str(exc)) from exc
-        masked = mask_email(email)
         now = int(clock())
         reservation = secrets.token_hex(8)
         outcome: dict = {}

@@ -23,10 +23,11 @@ import tests.test_studio_governance as gov  # noqa: E402
 from tests.test_studio_end_card import EndCard, pdf_text  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.pricing import parse_price_table  # noqa: E402
-from app.summary_pdf import PLAN_TERMS, PRICED_AFTER_REVIEW, build_summary_pdf  # noqa: E402
+from app.summary_pdf import (NEXT_STEP, PLAN_TERMS, PRICED_AFTER_REVIEW, TO_CONFIRM,  # noqa: E402
+                             build_summary_pdf, quote_number)
 from workers import charter as ch  # noqa: E402
 from workers.policy import USE_POLICY  # noqa: E402
-from workers.topics import CHARTER_FRAMES, DEFAULT_CHARTER_FRAME, TOPICS, charter_frame  # noqa: E402
+from workers.topics import CHARTER_FRAMES, DEFAULT_CHARTER_FRAME, TOPICS, charter_frame, quote_lines  # noqa: E402
 
 WEBSITE = [d[0] for d in CHARTER_FRAMES["website"]]
 
@@ -351,100 +352,185 @@ class Route(unittest.TestCase):
         base.settings(charter_enabled=True, moderation_enabled=True).validate()
 
 
-# --- the build plan PDF ----------------------------------------------------------
-def plan_state(topic="website", said=3):
-    return {"created_at": 1790000000,
-            "artifact": {"id": "screen", "kind": "screen", "label": "Crumb and Co.", "children": []},
+# --- the build plan and quote PDF ------------------------------------------------
+QUOTE_RE = re.compile(r"Q-\d{8}-[0-9A-F]{6}")
+LINE_IDS = lambda t: [line[0] for line in quote_lines(t)]  # noqa: E731
+
+
+def plan_state(topic="website", said=3, levels=None):
+    frame = [d[0] for d in charter_frame(topic)]
+    levels = levels if levels is not None else {frame[0]: 3, frame[1]: 1}
+    dims = [{"id": i, "level": levels.get(i, 0),
+             "captured": ("About " + i) if levels.get(i, 0) else ""} for i in frame]
+    return {"session_id": "s-0123456789abcdef0123456789abcdef", "created_at": 1790340000, "topic": topic,
+            "artifact": {"id": "screen", "kind": "screen", "label": "Crumb and Co.", "children": [
+                {"id": "h", "kind": "section", "label": "Hero"}, {"id": "m", "kind": "section", "label": "Menu"}]},
             "transcript": [{"role": "visitor", "text": "we bake sourdough every morning, line %d" % i}
                            for i in range(said)],
-            "charter": {"revision": 3, "topic": topic, "next": "Who should visit first?", "updated_at": 1790000100,
-                        "dimensions": [{"id": "type", "level": 3, "captured": "A company page"},
-                                       {"id": "audience", "level": 1, "captured": "Locals"},
-                                       {"id": "business", "level": 0, "captured": ""}]}}
+            "recap": {"text": "A warm company site where locals order ahead."},
+            "charter": {"revision": 3, "topic": topic, "next": "Who should visit first?", "updated_at": 1790340100,
+                        "dimensions": dims}}
+
+
+def text_of(pdf: bytes) -> str:
+    """The page text, with PDF string escapes undone."""
+    return pdf_text(pdf).replace("\\(", "(").replace("\\)", ")")
 
 
 def pages(pdf: bytes) -> int:
     return len(re.findall(rb"/Type /Page\b", pdf))
 
 
-class BuildPlan(unittest.TestCase):
-    def test_the_plan_carries_the_watermark_the_charter_and_the_exact_terms(self):
-        pdf = build_summary_pdf(plan_state())
-        text = pdf_text(pdf)
-        self.assertIn("Your build plan", text)
-        self.assertIn("Your project charter", text)
-        self.assertIn("Site type - Confirmed", text)
-        self.assertIn("Audience - To confirm", text)
-        self.assertIn("The business - To confirm", text)
-        self.assertIn("A company page", text)
+def table(lines=None, support=None, currency="CAD"):
+    raw = {"currency": currency}
+    if lines is not None:
+        raw["lines"] = lines
+    if support is not None:
+        raw["support"] = support
+    return parse_price_table(json.dumps(raw), TOPICS, LINE_IDS)
+
+
+FULL_WEBSITE = {"discovery": 800, "design": 1200, "build": 2400, "test": 600, "handover": 400.5}
+
+
+class Quote(unittest.TestCase):
+    def test_the_header_names_a_quote_with_a_number_a_date_validity_and_who_it_is_for(self):
+        pdf = build_summary_pdf(plan_state(), prepared_for="o***@example.com")
+        text = text_of(pdf)
+        self.assertIn("Build plan and quote", text)
+        numbers = set(QUOTE_RE.findall(text))
+        self.assertEqual(1, len(numbers))
+        self.assertTrue(next(iter(numbers)).startswith("Q-20260925-"))
+        self.assertIn("September 25, 2026", text)
+        self.assertIn("Valid for 30 days, until October 25, 2026", text)
+        self.assertIn("o***@example.com", text)
+        self.assertNotIn("0123456789abcdef", text)                        # never the session id
+        self.assertEqual(quote_number(plan_state()), next(iter(numbers)))
+        other = plan_state()
+        other["session_id"] = "s-ffffffffffffffffffffffffffffffff"
+        self.assertNotEqual(quote_number(other), quote_number(plan_state()))
+
+    def test_the_project_and_the_scope_of_work_from_the_charter(self):
+        text = text_of(build_summary_pdf(plan_state()))
+        self.assertIn("we bake sourdough every morning, line 0", text)     # the goal: the first line
+        self.assertIn("Build a website", text)                             # the session type
+        self.assertIn("Scope of work", text)
+        self.assertIn("About type", text)                                  # level 3: what was said
+        self.assertIn("Noted so far: About audience", text)                # level 1
+        self.assertIn(TO_CONFIRM, text)                                    # level 0-1
         self.assertIn("Next to settle: Who should visit first?", text)
-        for term in PLAN_TERMS:
-            self.assertIn(term, text)
-        self.assertIn(PRICED_AFTER_REVIEW, text)
-        self.assertNotIn("$", text)
-        self.assertNotIn("CAD ", text)
+
+    def test_line_items_come_from_the_frame_and_the_canvas_priced_after_review_without_a_table(self):
+        text = text_of(build_summary_pdf(plan_state()))
+        for item in ("Discovery and plan", "Design", "Build", "Test and launch", "Handover"):
+            self.assertIn(item, text)
+        self.assertIn("Covers: Hero, Menu", text)                          # the build line reads the canvas
+        self.assertEqual(len(quote_lines("website")) + 2, text.count(PRICED_AFTER_REVIEW))  # + two support options
+        self.assertNotIn("Total", text)
+        self.assertNotIn("CAD", text)
+        admin = text_of(build_summary_pdf(plan_state("salesforce_admin")))
+        for item in ("Discovery", "Configuration", "Automation", "Data", "Testing", "Training and handover"):
+            self.assertIn(item, admin)
+        self.assertIn("Salesforce admin", admin)
+
+    def test_a_total_only_when_every_line_is_priced_and_the_terms_split_it(self):
+        full = text_of(build_summary_pdf(plan_state(), price_table=table({"website": FULL_WEBSITE})))
+        self.assertIn("Total", full)
+        self.assertIn("CAD 5,400.50", full)
+        self.assertIn("CAD 2,700.25", full)                                # 50% to start
+        self.assertIn("CAD 2,700.25", full.split("50% on delivery and handover.")[1])
+        partial = dict(FULL_WEBSITE)
+        partial.pop("handover")
+        some = text_of(build_summary_pdf(plan_state(), price_table=table({"website": partial})))
+        self.assertIn("CAD 2,400.00", some)
+        self.assertIn(PRICED_AFTER_REVIEW, some)
+        self.assertNotIn("Total", some)
+        self.assertNotIn("CAD 5,", some)
+        other_topic = text_of(build_summary_pdf(plan_state(), price_table=table({"logo": {"discovery": 300}})))
+        self.assertNotIn("Total", other_topic)
+        self.assertNotIn("CAD 300", other_topic)
+
+    def test_the_payment_terms_support_options_and_next_step_are_exact(self):
+        text = text_of(build_summary_pdf(plan_state()))
+        self.assertIn("50% to start build and test.", text)
+        self.assertIn("50% on delivery and handover.", text)
+        self.assertIn(PLAN_TERMS[2], text)
+        self.assertIn("Subscription", text)
+        self.assertIn("On demand", text)
+        self.assertIn(NEXT_STEP, text)
+        self.assertEqual("Reply to this email to accept, or book a kickoff at sfdc24.com.", NEXT_STEP)
+        priced = text_of(build_summary_pdf(plan_state(), price_table=table(support={"subscription": 150, "on_demand": 120})))
+        self.assertIn("CAD 150.00 / month", priced)
+        self.assertIn("CAD 120.00 / hour", priced)
+
+    def test_the_discussion_is_a_short_appendix_at_the_end(self):
+        text = text_of(build_summary_pdf(plan_state(said=20)))
+        self.assertIn("Session notes", text)
+        self.assertGreater(text.index("Session notes"), text.index(NEXT_STEP))
+        self.assertIn("A warm company site where locals order ahead.", text)
+        self.assertIn("line 19", text)
+        self.assertNotIn("line 11,", text + ",")                           # the last eight lines only
 
     def test_the_watermark_is_on_every_page(self):
         pdf = build_summary_pdf(plan_state(said=40))
         n = pages(pdf)
         self.assertGreaterEqual(n, 2)
-        self.assertGreaterEqual(pdf_text(pdf).count("sfdc24.com"), n + 1)   # one per page, plus the footer
+        rotated = re.findall(r"0\.8192 0\.5736 -0\.5736 0\.8192 [-\d.]+ [-\d.]+ cm", pdf_text(pdf))
+        self.assertEqual(n, len(rotated))
 
     def test_without_a_charter_the_summary_is_as_before(self):
         state = plan_state()
         state.pop("charter")
-        text = pdf_text(build_summary_pdf(state))
+        text = text_of(build_summary_pdf(state, prepared_for="o***@example.com",
+                                         price_table=table({"website": FULL_WEBSITE})))
         self.assertIn("Your SFDC24 working session", text)
-        self.assertNotIn("Your build plan", text)
+        self.assertNotIn("Build plan and quote", text)
         self.assertNotIn(PLAN_TERMS[0], text)
+        self.assertIsNone(QUOTE_RE.search(text))
         self.assertEqual(1, text.count("sfdc24.com"))                        # the footer only
-
-    def test_the_owners_prices_only_and_the_halves(self):
-        table = parse_price_table(json.dumps({"currency": "CAD", "prices": {
-            "website": {"label": "Company website build", "amount": 4801}}}), TOPICS)
-        text = pdf_text(build_summary_pdf(plan_state(), price_table=table)).replace("\(", "(").replace("\)", ")")
-        self.assertIn("Company website build: CAD 4,801.00", text)
-        self.assertIn("50% to start build and test. (CAD 2,400.50)", text)
-        self.assertIn("50% on delivery and handover. (CAD 2,400.50)", text)
-        self.assertNotIn(PRICED_AFTER_REVIEW, text)
-        other = parse_price_table(json.dumps({"currency": "USD", "prices": {
-            "salesforce_admin": {"label": "Admin fix", "amount": 900}}}), TOPICS)
-        self.assertIn(PRICED_AFTER_REVIEW, pdf_text(build_summary_pdf(plan_state(), price_table=other)))
 
 
 class PriceTable(unittest.TestCase):
     def test_empty_is_none_and_a_good_table_parses(self):
-        self.assertIsNone(parse_price_table("", TOPICS))
-        self.assertIsNone(parse_price_table("   ", TOPICS))
-        good = parse_price_table('{"currency": "USD", "prices": {"salesforce_data": {"label": "Data model", "amount": 1250.5}}}', TOPICS)
-        self.assertEqual({"currency": "USD", "prices": {"salesforce_data": {"label": "Data model", "amount": 1250.5}}}, good)
+        self.assertIsNone(parse_price_table("", TOPICS, LINE_IDS))
+        self.assertIsNone(parse_price_table("   ", TOPICS, LINE_IDS))
+        good = table({"salesforce_data": {"model": 1250.5}}, {"on_demand": 140}, currency="USD")
+        self.assertEqual({"currency": "USD", "lines": {"salesforce_data": {"model": 1250.5}},
+                          "support": {"on_demand": 140.0}}, good)
+        self.assertEqual({}, table(support={"subscription": 99})["lines"])
 
     def test_anything_odd_refuses_the_whole_table(self):
         bad = [
-            "not json", "[]", '{"currency": "CAD"}', '{"currency": "EUR", "prices": {"website": {"label": "x", "amount": 1}}}',
-            '{"currency": "CAD", "prices": {}}',
-            '{"currency": "CAD", "prices": {"websites": {"label": "x", "amount": 1}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": 0}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": 1000001}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": 1.234}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": true}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": "100"}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "<b>x</b>", "amount": 1}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "", "amount": 1}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": 1, "note": 1}}}',
-            '{"currency": "CAD", "prices": {"website": {"label": "x", "amount": 1}}, "extra": 1}',
+            "not json", "[]", '{"currency": "CAD"}',
+            '{"currency": "EUR", "support": {"subscription": 1}}',
+            '{"lines": {"website": {"build": 1}}}',
+            '{"currency": "CAD", "lines": {}}',
+            '{"currency": "CAD", "lines": {"websites": {"build": 1}}}',
+            '{"currency": "CAD", "lines": {"website": {"automation": 1}}}',
+            '{"currency": "CAD", "lines": {"website": {}}}',
+            '{"currency": "CAD", "lines": {"website": {"build": 0}}}',
+            '{"currency": "CAD", "lines": {"website": {"build": 1000001}}}',
+            '{"currency": "CAD", "lines": {"website": {"build": 1.234}}}',
+            '{"currency": "CAD", "lines": {"website": {"build": true}}}',
+            '{"currency": "CAD", "lines": {"website": {"build": "100"}}}',
+            '{"currency": "CAD", "support": {}}',
+            '{"currency": "CAD", "support": {"weekly": 10}}',
+            '{"currency": "CAD", "support": {"subscription": -5}}',
+            '{"currency": "CAD", "support": {"subscription": 5}, "extra": 1}',
         ]
         for raw in bad:
             with self.assertRaises(ValueError, msg=raw):
-                parse_price_table(raw, TOPICS)
+                parse_price_table(raw, TOPICS, LINE_IDS)
         with self.assertRaises(RuntimeError):
             base.settings(price_table="not json").validate()
+        base.settings(price_table=json.dumps({"currency": "CAD", "lines": {"website": FULL_WEBSITE}})).validate()
 
 
-class SummaryUsesThePlan(EndCard):
-    def test_the_summary_email_is_the_build_plan_with_the_owners_price(self):
-        table = json.dumps({"currency": "CAD", "prices": {"logo": {"label": "Logo package", "amount": 1200}}})
-        with TestClient(self.make(price_table=table)) as client:
+class SummaryUsesTheQuote(EndCard):
+    def test_the_summary_email_is_the_quote_prepared_for_the_masked_address(self):
+        prices = json.dumps({"currency": "CAD", "lines": {"logo": {"discovery": 300, "design": 900, "build": 600,
+                                                                   "test": 100, "handover": 100}}})
+        with TestClient(self.make(price_table=prices)) as client:
             sid, headers = self.session(client)
             repo = client.app.state.controller.repository
             record = repo.load(sid)
@@ -454,9 +540,14 @@ class SummaryUsesThePlan(EndCard):
             repo.save(sid, state, record.token)
             r = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
         self.assertEqual(200, r.status_code, r.text)
-        text = pdf_text(self.sender.calls[0][1])
-        self.assertIn("Your build plan", text)
-        self.assertIn("Logo package: CAD 1,200.00", text)
+        text = text_of(self.sender.calls[0][1])
+        self.assertIn("Build plan and quote", text)
+        self.assertIn("Prepared for", text)
+        self.assertIn("o***@example.com", text)
+        self.assertNotIn("operator@example.com", text)
+        self.assertNotIn(sid, text)
+        self.assertIsNotNone(QUOTE_RE.search(text))
+        self.assertIn("CAD 2,000.00", text)                                  # the total, fully priced
         self.assertIn("A mark for a bakery", text)
 
 

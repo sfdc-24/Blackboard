@@ -143,12 +143,9 @@ class Settings:
             # The charter's lines reach the page; they are moderated first.
             raise RuntimeError("STUDIO_ENABLE_CHARTER requires STUDIO_ENABLE_MODERATION")
         from .pricing import parse_price_table
+        from workers.topics import TOPICS, quote_lines
         try:
-            from workers.topics import TOPICS
-        except ImportError:  # the settings module loaded without the workers package
-            TOPICS = ("logo", "website", "app", "salesforce_admin", "salesforce_data", "other")
-        try:
-            parse_price_table(self.price_table, TOPICS)
+            parse_price_table(self.price_table, TOPICS, lambda t: [line[0] for line in quote_lines(t)])
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         if self.lead_facts_enabled and (
