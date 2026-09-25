@@ -1,14 +1,17 @@
 """Build the two-page SFDC24 / Blackboard architecture brief.
 
 The PDF is deliberately evidence-aware: LIVE, PARTIAL, HELD, and TARGET are
-not interchangeable.  It is generated from the accepted 2026-09-25 ADR and is
-small enough to use as the Drive architecture directive.
+not interchangeable. It reads and validates the machine-readable semantic
+contract in the accepted 2026-09-25 ADR, then binds that contract's digest into
+the PDF. The result is small enough to use as the Drive architecture directive.
 
 Clean-checkout dependency install:
     python -m pip install -r tools/requirements-architecture-pdf.txt
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from pathlib import Path
 
@@ -22,8 +25,74 @@ from reportlab.platypus import Paragraph
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ADR = ROOT / "docs" / "ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
 OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
 PAGE_W, PAGE_H = landscape(TABLOID)
+
+CONTRACT_START = "<!-- architecture-pdf-contract:start -->"
+CONTRACT_END = "<!-- architecture-pdf-contract:end -->"
+CONTRACT_KEYS = {
+    "schema_version",
+    "facts_refreshed_label",
+    "facts_refreshed_iso",
+    "production_controller_revision",
+    "production_controller_label",
+    "production_traffic_percent",
+    "site_commit",
+    "site_commit_label",
+    "advisor_enabled",
+    "converspan_production",
+    "required_adr_phrases",
+    "required_pdf_phrases",
+}
+RENDERED_TEXT: list[str] = []
+
+
+def load_contract() -> tuple[dict, str]:
+    """Read the closed semantic contract from the ADR and verify its anchors."""
+    adr_text = ADR.read_text(encoding="utf-8")
+    if adr_text.count(CONTRACT_START) != 1 or adr_text.count(CONTRACT_END) != 1:
+        raise RuntimeError("ADR must contain exactly one architecture PDF contract")
+    raw = adr_text.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
+    if not raw.startswith("```json") or not raw.endswith("```"):
+        raise RuntimeError("architecture PDF contract must be a fenced JSON object")
+    contract = json.loads(raw[len("```json"): -len("```")].strip())
+    if not isinstance(contract, dict) or set(contract) != CONTRACT_KEYS:
+        raise RuntimeError("architecture PDF contract keys do not match the closed schema")
+    if contract["schema_version"] != 1:
+        raise RuntimeError("unsupported architecture PDF contract schema")
+    if type(contract["production_traffic_percent"]) is not int or not (
+            0 <= contract["production_traffic_percent"] <= 100):
+        raise RuntimeError("production traffic percent must be an integer from 0 to 100")
+    if contract["advisor_enabled"] is not False:
+        raise RuntimeError("this accepted snapshot requires the advisor to remain disabled")
+    if contract["converspan_production"] != "HELD":
+        raise RuntimeError("this accepted snapshot requires Converspan production to remain held")
+    for key in ("facts_refreshed_label", "facts_refreshed_iso",
+                "production_controller_revision", "production_controller_label",
+                "site_commit", "site_commit_label"):
+        if not isinstance(contract[key], str) or not contract[key].strip() or len(contract[key]) > 120:
+            raise RuntimeError(f"invalid architecture PDF contract value: {key}")
+    for key in ("required_adr_phrases", "required_pdf_phrases"):
+        phrases = contract[key]
+        if (not isinstance(phrases, list) or not phrases
+                or any(not isinstance(item, str) or not item or len(item) > 300
+                       for item in phrases)):
+            raise RuntimeError(f"invalid architecture PDF contract phrase list: {key}")
+    missing = [phrase for phrase in contract["required_adr_phrases"]
+               if adr_text.count(phrase) < 2]
+    if missing:
+        # Each anchor occurs once in the contract and must also occur in ADR prose.
+        raise RuntimeError("ADR semantic drift; missing prose anchors: " + repr(missing))
+    canonical = json.dumps(contract, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return contract, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+CONTRACT, CONTRACT_SHA256 = load_contract()
+
+
+def track(text: str) -> None:
+    RENDERED_TEXT.append(str(text))
 
 INK = colors.HexColor("#10243E")
 MUTED = colors.HexColor("#526177")
@@ -56,6 +125,7 @@ def paragraph(c: canvas.Canvas, text: str, x: float, top: float, width: float,
               font_size: float = 8.0, leading: float | None = None,
               color=INK, bold: bool = False, align=TA_LEFT,
               max_height: float = 1000) -> float:
+    track(text)
     style = ParagraphStyle(
         name="architecture",
         fontName="Helvetica-Bold" if bold else "Helvetica",
@@ -76,6 +146,7 @@ def paragraph(c: canvas.Canvas, text: str, x: float, top: float, width: float,
 
 def pill(c: canvas.Canvas, x: float, y: float, label: str, fill=None,
          text_color=INK, font_size: float = 6.5) -> float:
+    track(label)
     fill = fill or STATUS_FILL.get(label, GRAY_SOFT)
     width = stringWidth(label, "Helvetica-Bold", font_size) + 11
     c.setFillColor(fill)
@@ -108,6 +179,7 @@ def box(c: canvas.Canvas, x: float, y: float, w: float, h: float,
 
 def section_label(c: canvas.Canvas, x: float, y: float, label: str,
                   width: float) -> None:
+    track(label)
     c.setFillColor(colors.HexColor("#E7ECF2"))
     c.roundRect(x, y, width, 17, 8.5, stroke=0, fill=1)
     c.setFillColor(MUTED)
@@ -137,6 +209,7 @@ def arrow(c: canvas.Canvas, x1: float, y1: float, x2: float, y2: float,
     c.drawPath(path, stroke=0, fill=1)
     c.restoreState()
     if label:
+        track(label)
         lx, ly = label_at or ((x1 + x2) / 2, (y1 + y2) / 2)
         label_width = stringWidth(label, "Helvetica-Bold", 6.5) + 9
         c.setFillColor(colors.white)
@@ -176,6 +249,7 @@ def ortho_arrow(c: canvas.Canvas, points: list[tuple[float, float]], color=BLUE,
     c.drawPath(tip, stroke=0, fill=1)
     c.restoreState()
     if label:
+        track(label)
         lx, ly = label_at or points[len(points) // 2]
         label_width = stringWidth(label, "Helvetica-Bold", 6.5) + 9
         c.setFillColor(colors.white)
@@ -189,6 +263,7 @@ def ortho_arrow(c: canvas.Canvas, points: list[tuple[float, float]], color=BLUE,
 def connector_label(c: canvas.Canvas, x: float, y: float, label: str,
                     color=BLUE) -> None:
     """Draw a connector label after nodes so no node can obscure the chip."""
+    track(label)
     label_width = stringWidth(label, "Helvetica-Bold", 6.5) + 10
     c.setFillColor(colors.white)
     c.setStrokeColor(BORDER)
@@ -201,6 +276,9 @@ def connector_label(c: canvas.Canvas, x: float, y: float, label: str,
 
 
 def header(c: canvas.Canvas, title: str, subtitle: str, page_label: str) -> None:
+    track(title)
+    track(subtitle)
+    track(page_label)
     c.setFillColor(LIGHT)
     c.rect(0, 0, PAGE_W, PAGE_H, stroke=0, fill=1)
     c.setFillColor(INK)
@@ -222,6 +300,8 @@ def principle_strip(c: canvas.Canvas, entries: list[tuple[str, str, object, obje
     y = PAGE_H - 91
     width = (PAGE_W - 56 - gap * (len(entries) - 1)) / len(entries)
     for title, body, fill, accent in entries:
+        track(title)
+        track(body)
         c.setFillColor(fill)
         c.roundRect(x, y, width, 27, 7, stroke=0, fill=1)
         c.setFillColor(accent)
@@ -264,6 +344,9 @@ def tech_panel_header(c: canvas.Canvas, x: float, y: float, w: float, h: float,
 
 
 def footer(c: canvas.Canvas, page_no: int, left: str, right: str) -> None:
+    track(left)
+    track(right)
+    track(f"{page_no} / 2")
     c.setFillColor(MUTED)
     c.setFont("Helvetica", 6.5)
     c.drawString(28, 34, left)
@@ -276,11 +359,11 @@ def draw_current(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - current operating architecture",
-        "Evidence-bound snapshot through 25 Sep 2026 12:56 UTC: what is live, what was rehearsed, and what is still held",
+        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what was rehearsed, and what is still held",
         "CURRENT STATE",
     )
     principle_strip(c, [
-        ("PRODUCTION CONTAINED", "R5 serves 100%; advisor tag removed; next template is advisor-off", GREEN_SOFT, GREEN),
+        ("PRODUCTION CONTAINED", f"R5 serves {CONTRACT['production_traffic_percent']}%; advisor tag removed; next template is advisor-off", GREEN_SOFT, GREEN),
         ("ONE AUDIO ARBITER", "Realtime host plus queued TTS; one serialized audible turn", BLUE_SOFT, BLUE),
         ("ONE ARTIFACT WRITER", "Parallel lanes propose; the controller validates and commits", PURPLE_SOFT, PURPLE),
         ("EVIDENCE LEVELS STAY SEPARATE", "Source, served bytes, provider success and E2E are distinct", ORANGE_SOFT, ORANGE),
@@ -358,7 +441,7 @@ def draw_current(c: canvas.Canvas) -> None:
         "Owns one playback queue, captions, mute/listening state and audible-turn ordering.",
         BLUE_SOFT, BLUE, "CURRENT", 8.15, 6.0)
     box(c, 410, 475, 278, 73,
-        "Studio Controller - production R5 0895605",
+        f"Studio Controller - production {CONTRACT['production_controller_label']}",
         "FastAPI session authority: auth, topic route, questions, deadlines, revision fencing, typed events, command dedupe and provider coordination.",
         BLUE_SOFT, BLUE, "LIVE", 8.65, 6.15)
     box(c, 708, 475, 127, 73,
@@ -399,7 +482,7 @@ def draw_current(c: canvas.Canvas) -> None:
         BLUE_SOFT, BLUE, "CURRENT", 8.25, 5.9)
     box(c, 670, 228, 165, 78,
         "GitHub + public site",
-        "Site main 3d9b4a1 exactly matches served homepage bytes; CI and rollback remain versioned.",
+        f"Site main {CONTRACT['site_commit_label']} exactly matches served homepage bytes; CI and rollback remain versioned.",
         PURPLE_SOFT, PURPLE, "LIVE", 8.15, 5.85)
 
     # Evidence band.
@@ -455,7 +538,7 @@ def draw_current(c: canvas.Canvas) -> None:
 
     footer(
         c, 1,
-        "Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed 25 Sep 2026 12:56 UTC",
+        f"Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed {CONTRACT['facts_refreshed_label']}",
         "Transport proof is not human-heard end-to-end acceptance.",
     )
     c.showPage()
@@ -602,7 +685,7 @@ def draw_future(c: canvas.Canvas) -> None:
     box(c, 50, 91, 190, 100,
         "Converspan minibus",
         "Web/logo/app design on the governed core. Production stays frozen until SFDC24 foundation gates pass.",
-        PURPLE_SOFT, PURPLE, "HELD", 8.45, 6.0)
+        PURPLE_SOFT, PURPLE, CONTRACT["converspan_production"], 8.45, 6.0)
     box(c, 255, 91, 210, 100,
         "Nav / steelworkson.ca minibus",
         "Nav signs in directly for sites/redesigns. Separate tenant identity, state, keys, limits and audit.",
@@ -671,6 +754,7 @@ def draw_future(c: canvas.Canvas) -> None:
 
 def build() -> Path:
     OUT.parent.mkdir(parents=True, exist_ok=True)
+    RENDERED_TEXT.clear()
     # invariant=1 fixes ReportLab timestamps and document IDs so the committed
     # artifact has one reproducible digest across clean-checkout rebuilds.
     c = canvas.Canvas(
@@ -678,10 +762,14 @@ def build() -> Path:
     )
     c.setTitle("SFDC24 and Blackboard current and future architecture")
     c.setAuthor("Codex with Claude, Gemini and Grok review input")
-    c.setSubject("Two-page evidence-bound architecture for realtime audio, live prototyping, Salesforce, WhatsApp, Zoom and governed client minibuses")
-    c.setKeywords("SFDC24, Blackboard, Converspan, minibus, OpenAI Realtime, Claude, Gemini, Salesforce, WhatsApp, Zoom")
+    c.setSubject("Two-page evidence-bound architecture for realtime audio, live prototyping, Salesforce, WhatsApp, Zoom and governed client minibuses; ADR contract sha256:" + CONTRACT_SHA256)
+    c.setKeywords("SFDC24, Blackboard, Converspan, minibus, OpenAI Realtime, Claude, Gemini, Salesforce, WhatsApp, Zoom, ADR-contract-" + CONTRACT_SHA256)
     draw_current(c)
     draw_future(c)
+    rendered = "\n".join(RENDERED_TEXT)
+    missing = [phrase for phrase in CONTRACT["required_pdf_phrases"] if phrase not in rendered]
+    if missing:
+        raise RuntimeError("PDF semantic drift; required rendered facts missing: " + repr(missing))
     c.save()
     return OUT
 

@@ -6,6 +6,58 @@
 **Technical coordination:** Blackboard, Claude, Codex, Gemini, and Grok review lanes  
 **Applies to:** SFDC24, future Converspan service, and later client minibuses
 
+## PDF semantic contract
+
+The fenced JSON below is the canonical revision and required-fact contract read
+by `tools/build_sfdc24_architecture_pdf.py`. The generator refuses an ADR that
+no longer contains a required fact, verifies that every required PDF fact was
+actually sent to the renderer, and embeds the canonical contract digest in the
+PDF metadata. CI then rebuilds and byte-compares the PDF. Edit this block with
+any material architecture or snapshot change; prose-only edits that preserve
+the contract do not churn the published artifact.
+
+<!-- architecture-pdf-contract:start -->
+```json
+{
+  "schema_version": 1,
+  "facts_refreshed_label": "25 Sep 2026 12:56 UTC",
+  "facts_refreshed_iso": "2026-09-25T12:56Z",
+  "production_controller_revision": "sfdc24-studio-controller-r5-0895605-g",
+  "production_controller_label": "R5 0895605",
+  "production_traffic_percent": 100,
+  "site_commit": "3d9b4a1b8ed1cdb34a794fc134a19820cc810d04",
+  "site_commit_label": "3d9b4a1",
+  "advisor_enabled": false,
+  "converspan_production": "HELD",
+  "required_adr_phrases": [
+    "Blackboard is the motherboard and durable control plane.",
+    "sfdc24-studio-controller-r5-0895605-g",
+    "Ready at 100% traffic",
+    "3d9b4a1b8ed1cdb34a794fc134a19820cc810d04",
+    "OpenAI Realtime is the live conversational host over direct browser WebRTC.",
+    "The Studio Controller is the session coordinator",
+    "Salesforce is the commercial and customer-success system of record.",
+    "Foundry removed",
+    "Converspan production implementation, deployment, and client onboarding"
+  ],
+  "required_pdf_phrases": [
+    "R5 serves 100%",
+    "OpenAI Realtime",
+    "OpenAI TTS",
+    "Studio Controller - production R5 0895605",
+    "Claude builder",
+    "Gemini advisor",
+    "Blackboard motherboard",
+    "Converspan minibus",
+    "Salesforce commercial engine",
+    "WhatsApp",
+    "Zoom RTMS + Ubuntu presenter",
+    "Foundry excluded"
+  ]
+}
+```
+<!-- architecture-pdf-contract:end -->
+
 ## Decision summary
 
 Blackboard is the motherboard and durable control plane. SFDC24 is the first
