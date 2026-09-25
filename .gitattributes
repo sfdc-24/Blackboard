@@ -48,3 +48,7 @@ packaging/env.example            text eol=lf
 # a silently untested guard looks identical to a tested one. Every sibling .py here
 # is already pinned; this file was the one unpinned text file in the tool.
 *.clp                            text eol=lf
+
+# Generated architecture artifacts are binary. Never run line-ending filters
+# over compressed PDF streams or render them through a text diff driver.
+*.pdf                            binary

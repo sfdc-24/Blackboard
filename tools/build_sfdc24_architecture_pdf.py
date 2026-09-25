@@ -3,6 +3,9 @@
 The PDF is deliberately evidence-aware: LIVE, PARTIAL, HELD, and TARGET are
 not interchangeable.  It is generated from the accepted 2026-09-25 ADR and is
 small enough to use as the Drive architecture directive.
+
+Clean-checkout dependency install:
+    python -m pip install -r tools/requirements-architecture-pdf.txt
 """
 from __future__ import annotations
 
@@ -452,7 +455,7 @@ def draw_current(c: canvas.Canvas) -> None:
 
     footer(
         c, 1,
-        "Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed 25 Sep 2026 13:18 UTC",
+        "Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed 25 Sep 2026 12:56 UTC",
         "Transport proof is not human-heard end-to-end acceptance.",
     )
     c.showPage()
