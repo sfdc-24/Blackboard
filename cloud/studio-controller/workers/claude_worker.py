@@ -49,40 +49,49 @@ KINDS = ["screen", "section", "heading", "text", "button", "image-placeholder",
 # data, so the page builds and animates each entity without parsing markup
 # or running code. The page applies this same grammar again before drawing
 # (sfdc24-site assets/prototype-canvas.js); keep the two in step.
-SCENE_RE = re.compile(r"^(\d{2,4})x(\d{2,4})((?: (?:bg=(?:#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{3})|gravity=-?\d{1,4}))*)$")
+SCENE_RE = re.compile(r"^(\d{2,4})x(\d{2,4})((?: (?:bg=(?:#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{3}|none)|gravity=-?\d{1,4}))*)$")
+# One statement is printable ASCII tokens separated by single spaces: what the
+# gate checks is exactly the string stored and drawn, never a trimmed copy.
+STATEMENT_RE = re.compile(r"^[!-~]+(?: [!-~]+)*$")
 _N = r"-?\d{1,5}(?:\.\d{1,3})?"
 NUM_RE = re.compile("^" + _N + "$")
 COLOUR_RE = re.compile(r"^(?:#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{3}|none)$")
 POINTS_RE = re.compile("^%s,%s(?:;%s,%s){1,39}$" % (_N, _N, _N, _N))
 ORBIT_RE = re.compile("^%s,%s,%s,%s$" % (_N, _N, _N, _N))
 PATH_RE = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz][MmLlHhVvCcSsQqTtAaZz0-9.,\-]{0,499}$")
-_PAINT = {"fill": "colour", "stroke": "colour", "stroke-width": "num", "opacity": "unit", "rotate": "num",
+_PAINT = {"fill": "colour", "stroke": "colour", "stroke-width": "pos", "opacity": "unit", "rotate": "num",
           "glow": "colour"}
-_MOTION = {"vx": "num", "vy": "num", "spin": "num", "pulse": "unit", "period": "num", "float": "num",
+_MOTION = {"vx": "num", "vy": "num", "spin": "num", "pulse": "unit", "period": "pos", "float": "num",
            "orbit": "orbit", "body": "bit", "bounce": "bit", "wrap": "bit", "drag": "bit", "tap": "tap",
            "delay": "num", "solid": "bit", "attach": "ref"}
 _BASE = dict(_PAINT, **_MOTION)
 SHAPES = {
-    "rect": dict(_BASE, x="num", y="num", width="num", height="num", rx="num"),
-    "circle": dict(_BASE, cx="num", cy="num", r="num"),
-    "ellipse": dict(_BASE, cx="num", cy="num", rx="num", ry="num"),
+    "rect": dict(_BASE, x="num", y="num", width="pos", height="pos", rx="pos"),
+    "circle": dict(_BASE, cx="num", cy="num", r="pos"),
+    "ellipse": dict(_BASE, cx="num", cy="num", rx="pos", ry="pos"),
     "line": dict(_BASE, x1="num", y1="num", x2="num", y2="num"),
     "polygon": dict(_BASE, points="points"),
     "path": dict(_BASE, d="path"),
-    "text": dict(_BASE, x="num", y="num", size="num", weight="weight", anchor="anchor", font="font",
+    "text": dict(_BASE, x="num", y="num", size="pos", weight="weight", anchor="anchor", font="font",
                  spacing="num"),
-    "particles": dict(_BASE, x="num", y="num", rate="num", size="num", speed="num", angle="num",
-                      spread="num", life="num", shape="dot"),
+    "particles": dict(_BASE, x="num", y="num", rate="pos", size="pos", speed="pos", angle="num",
+                      spread="pos", life="pos", shape="dot"),
 }
+# The geometry each type cannot be drawn without.
+REQUIRED = {"rect": ("x", "y", "width", "height"), "circle": ("cx", "cy", "r"),
+            "ellipse": ("cx", "cy", "rx", "ry"), "line": ("x1", "y1", "x2", "y2"),
+            "polygon": ("points",), "path": ("d",), "text": ("x", "y"), "particles": ("x", "y")}
 _VALUES = {
     "num": NUM_RE.match,
+    "pos": lambda v: NUM_RE.match(v) and float(v) >= 0,
     "colour": COLOUR_RE.match,
     "unit": lambda v: NUM_RE.match(v) and 0 <= float(v) <= 1,
     "bit": lambda v: v in ("0", "1"),
     "ref": ID_RE.match,
     "points": POINTS_RE.match,
     "orbit": ORBIT_RE.match,
-    "path": PATH_RE.match,
+    # A path starts with a moveto and carries at least one coordinate pair.
+    "path": lambda v: bool(PATH_RE.match(v)) and v[0] in "Mm" and len(re.findall(r"[0-9]+(?:[.][0-9]+)?", v)) >= 2,
     "weight": lambda v: v in ("400", "500", "600", "700", "800", "900"),
     "anchor": lambda v: v in ("start", "middle", "end"),
     "font": lambda v: v in ("sans", "serif", "mono", "display"),
@@ -93,7 +102,9 @@ _VALUES = {
 
 def visual_problem(kind: str, detail: str, parent_kind: str | None) -> str | None:
     """Why a scene or entity node cannot be run, or None when it can."""
-    detail = (detail or "").strip()
+    detail = detail or ""
+    if kind in ("scene", "entity") and not STATEMENT_RE.match(detail):
+        return "%s detail must be printable words separated by single spaces" % kind
     if kind == "scene":
         m = SCENE_RE.match(detail)
         if not m or not (16 <= int(m.group(1)) <= 2400 and 16 <= int(m.group(2)) <= 2400):
@@ -115,6 +126,28 @@ def visual_problem(kind: str, detail: str, parent_kind: str | None) -> str | Non
         if not eq or key not in allowed or key in seen or not _VALUES[allowed[key]](value):
             return "entity %s has a bad setting %r" % (parts[0], pair[:40])
         seen.add(key)
+    missing = [key for key in REQUIRED[parts[0]] if key not in seen]
+    if missing:
+        return "entity %s is missing %s" % (parts[0], ", ".join(missing))
+    return None
+
+
+def attach_problem(node_id: str, detail: str, index: dict, parents: dict) -> str | None:
+    """attach=<id> names a sibling entity in the same scene that is not itself a part,
+    and the entity being attached has no parts of its own: one level, no self-link, no cycle."""
+    target = next((p.split("=", 1)[1] for p in (detail or "").split(" ") if p.startswith("attach=")), None)
+    here = parents.get(node_id)
+    siblings = (here or {}).get("children") or []
+    if any(c.get("id") != node_id and ("attach=" + node_id) in (c.get("detail") or "").split(" ") for c in siblings):
+        if target is not None:
+            return "%r has parts attached to it, so it cannot be a part itself" % node_id
+    if target is None:
+        return None
+    other = index.get(target)
+    if target == node_id or other is None or other.get("kind") != "entity" or parents.get(target) is not here:
+        return "attach=%s must name another entity in the same scene" % target[:40]
+    if any(p.startswith("attach=") for p in (other.get("detail") or "").split(" ")):
+        return "attach=%s names an entity that is itself a part" % target[:40]
     return None
 
 
@@ -236,7 +269,7 @@ IS the words drawn - and its detail is one statement: a type, then settings.
 Types and geometry:
   rect x= y= width= height= rx=        circle cx= cy= r=        ellipse cx= cy= rx= ry=
   line x1= y1= x2= y2=                 polygon points=x,y;x,y;x,y      path d=M10,10L90,10L50,80Z
-  text x= y= size= weight=400-900 anchor=start|middle|end font=sans|serif|mono|display spacing=
+  text x= y= size= weight=400|500|600|700|800|900 anchor=start|middle|end font=sans|serif|mono|display spacing=
   particles x= y= rate=(per second) size= speed= angle=(degrees, 0 = right, 90 = down) spread= \
 life=(seconds) shape=circle|square|star     - a continuous emitter: snow, sparks, confetti, bubbles
 Paint (any type): fill=#hex stroke=#hex stroke-width= opacity=0-1 rotate=(degrees) glow=#hex
@@ -247,6 +280,7 @@ scene edges)  wrap=1 (leaves one edge, enters the opposite)  delay=(s before it 
 part of that entity: moves, spins and scales with it, and is dragged with it - the crust marks on a \
 loaf, the eyes on a character; insert the parts after the entity they attach to)
 Pointer: drag=1 (the visitor can pick it up and throw it)  tap=pulse|spin|burst|jump|hide
+Every geometry setting listed for a type is required; sizes are never negative. \
 Numbers are plain (no units), colours are #hex or none, no spaces inside a value (path data uses \
 commas: "M10,10C20,0,40,0,50,10"). Later entities draw on top.
 Make it alive: give things motion that suits them - a logo mark that slowly spins or pulses, a \
@@ -394,6 +428,9 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 why = visual_problem(index[nid].get("kind"), op["value"], parent.get("kind") if parent else None)
             else:
                 index[nid]["label" if kind == "set_label" else "detail"] = op["value"]
+                if kind == "set_detail" and index[nid].get("kind") == "entity" and attach_problem(
+                        nid, op["value"], index, parents):
+                    why = attach_problem(nid, op["value"], index, parents)
                 ops_out.append({"op": kind, "node_id": nid, "value": op["value"]})
         elif kind == "insert_child":
             nn = op.get("new_node") or {}
@@ -406,6 +443,8 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 why = visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind"))
             elif index[nid].get("kind") == "scene" and nn["kind"] != "entity":
                 why = "a scene holds only entities"
+            elif index[nid].get("kind") == "entity":
+                why = "an entity holds nothing"
             elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
                 why = "%r already has %d children" % (nid, MAX_CHILDREN)
             else:
@@ -415,6 +454,8 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 index[nid].setdefault("children", []).append(dict(new))
                 index[new["id"]] = index[nid]["children"][-1]
                 parents[new["id"]] = index[nid]
+                if new["kind"] == "entity" and attach_problem(new["id"], new.get("detail", ""), index, parents):
+                    why = attach_problem(new["id"], new.get("detail", ""), index, parents)
                 if allowed is not None:
                     allowed.add(new["id"])
                 ops_out.append({"op": "insert_child", "node_id": nid, "node": new})

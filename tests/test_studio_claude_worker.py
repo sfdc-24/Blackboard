@@ -207,6 +207,47 @@ class LiveScenes(unittest.TestCase):
                                   "confirm": "", "questions": [], "batch_title": ""})
         self.assertIn("only entities", " ".join(out["problems"]))
 
+    def test_a_statement_must_carry_its_geometry_and_sizes_are_never_negative(self):
+        for detail in ("circle", "polygon", "path d=M", "text fill=#fff", "rect solid=1", "rect x=0 y=0 width=10",
+                       "circle cx=1 cy=1 r=-5", "rect x=0 y=0 width=-10 height=5", "ellipse cx=1 cy=1 rx=2",
+                       "particles x=1 y=1 rate=-3", " circle cx=1 cy=1 r=1", "circle cx=1 cy=1 r=1 ",
+                       "circle  cx=1 cy=1 r=1", "circle\u00a0cx=1 cy=1 r=1", "text x=1 y=1 weight=450"):
+            out = run_on(SCENE_ROOT, {"ops": [insert("logo", "bad", "entity", "Bad", detail)],
+                                      "confirm": "Drew it.", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], repr(detail))
+        for detail in (" 400x400", "400x400 ", "400x400  bg=#fff"):
+            out = run_on(ROOT, {"ops": [insert("screen-home", "g", "scene", "S", detail)],
+                                "confirm": "", "questions": [], "batch_title": ""})
+            self.assertEqual([], out["events"], repr(detail))
+        ok = run_on(ROOT, {"ops": [insert("screen-home", "g", "scene", "S", "400x400 bg=none")],
+                           "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], ok["problems"])
+
+    def test_an_entity_holds_nothing(self):
+        out = run_on(SCENE_ROOT, {"ops": [insert("mark", "inner", "scene", "Inner", "100x100")],
+                                  "confirm": "", "questions": [], "batch_title": ""})
+        self.assertIn("holds nothing", " ".join(out["problems"]))
+
+    def test_attach_names_one_real_sibling_one_level_deep(self):
+        def attach(detail, node_id="part"):
+            return run_on(SCENE_ROOT, {"ops": [insert("logo", node_id, "entity", "Part", detail)],
+                                       "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], attach("circle cx=1 cy=1 r=1 attach=mark")["problems"])
+        for bad in ("circle cx=1 cy=1 r=1 attach=part", "circle cx=1 cy=1 r=1 attach=ghost",
+                    "circle cx=1 cy=1 r=1 attach=logo", "circle cx=1 cy=1 r=1 attach=screen-home"):
+            self.assertTrue(attach(bad)["problems"], bad)
+        chain = run_on(SCENE_ROOT, {"ops": [
+            insert("logo", "a", "entity", "A", "circle cx=1 cy=1 r=1 attach=mark"),
+            insert("logo", "b", "entity", "B", "circle cx=1 cy=1 r=1 attach=a")],
+            "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], chain["events"])
+        cycle = run_on(SCENE_ROOT, {"ops": [
+            insert("logo", "a", "entity", "A", "circle cx=1 cy=1 r=1 attach=mark"),
+            {"op": "set_detail", "node_id": "mark", "new_node": BLANK,
+             "value": "circle cx=200 cy=160 r=90 fill=#E8B04B attach=a"}],
+            "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual([], cycle["events"])
+
     def test_an_entity_outside_a_scene_is_refused(self):
         out = run_on(ROOT, {"ops": [insert("hero", "dot", "entity", "Dot", "circle cx=1 cy=1 r=1")],
                             "confirm": "", "questions": [], "batch_title": ""})
@@ -228,7 +269,7 @@ class LiveScenes(unittest.TestCase):
 
     def test_the_prompt_teaches_the_grammar_the_gate_enforces(self):
         for word in ('"scene"', '"entity"', "polygon points=", "path d=", "anchor=start|middle|end",
-                     "font=sans|serif|mono|display", "tap=pulse|spin|burst|jump|hide", "orbit=cx,cy,radius,deg/s",
+                     "font=sans|serif|mono|display", "tap=pulse|spin|burst|jump|hide", "weight=400|500|600|700|800|900", "orbit=cx,cy,radius,deg/s",
                      "shape=circle|square|star", "body=1", "drag=1", "solid=1", "attach=<entity id>", "[Tagline]"):
             self.assertIn(word, cw.SYSTEM)
         self.assertEqual(set(cw.SHAPES), {"rect", "circle", "ellipse", "line", "polygon", "path", "text",
