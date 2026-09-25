@@ -1307,12 +1307,41 @@ class FindingF2Redaction(unittest.TestCase):
         for text, expected in cases.items():
             self.assertEqual(expected, " ".join(redact(text).split()), text)
 
+    def test_cursor_nogo_dfbcc11_hosts_after_any_character_and_any_label_length(self):
+        # Cursor NO-GO on dfbcc11: each of these survived page_to_tree unchanged.
+        cases = {
+            "Email us @steelworkson.ca today": "Email us @[link] today",
+            "Visit -secret.photography and .bücher.de": "Visit [link] and [link]",
+            "a" * 64 + ".secret.photography": "[link]",
+            "IP 10\u30020\u30020\u30021": "IP [link]",
+            "IP 10\uff0e0\uff0e0\uff0e1 and 10\uff610\uff610\uff611/admin": "IP [link] and [link]",
+            "\u3002secret.photography": "[link]",
+            "secret-.photography": "[link]",
+            "foo_.photography": "[link]",
+            "short." + "b" * 80 + ".photography": "[link]",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text[:40])
+        page = "".join("<p>%s</p>" % text for text in cases)
+        labels = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for never in ("steelworkson", "secret", "photography", "bücher", "10\u30020", "10\uff0e0", "foo_"):
+            self.assertNotIn(never, labels)
+
+    def test_the_canvas_title_is_the_registry_name_shown_on_purpose(self):
+        # The root label is the operator-registered project name, never page text:
+        # shown as written, on purpose. Page text with the same host is redacted.
+        tree = page_to_tree("<h1>steelworkson.ca</h1><p>Visit steelworkson.ca</p>", "steelworkson.ca")
+        self.assertEqual("steelworkson.ca", tree["label"])
+        self.assertNotIn("steelworkson", json.dumps(tree["children"]))
+
     def test_ordinary_words_and_numbers_survive(self):
         for text in ("Steel Works Inc. builds frames, e.g. stairs and rails.",
                      "Open 9am-5pm, 10:30 to 3.14 km, i.e. most weekends.",
                      "No. 5 plate, 2.5 mm, $1,200.00 per ton.",
                      "Call us: we reply fast; email is below.",
-                     "Meet @ 5pm, or ask @steelworks on social."):
+                     "Meet @ 5pm, or ask @steelworks on social.",
+                     "U.S.A. and Ph.D. and A.I. and 1.2.3 and v2.0",
+                     "Open 9am-5pm, $1,200.00; 10:30; 3.14; i.e. now; e.g. then; Inc. too."):
             self.assertEqual(text, " ".join(redact(text).split()), text)
 
     def test_codex_blocker_1_on_the_page_labels_that_reach_state(self):
@@ -1326,7 +1355,8 @@ class FindingF2Redaction(unittest.TestCase):
 
     def test_the_redaction_is_linear_on_hostile_input(self):
         import time as _time
-        for hostile in ("a." * 30000, "a" * 60000, "a-" * 30000 + "!", ("x@" * 20000) + "y", "1." * 30000):
+        for hostile in ("a." * 30000, "a" * 60000, "a-" * 30000 + "!", ("x@" * 20000) + "y", "1." * 30000,
+                        "-" * 60000, "\u3002" * 60000, "a" * 30000 + ".bc" * 10000, "ab." * 20000, "1\u3002" * 30000):
             started = _time.monotonic()
             redact(hostile)
             self.assertLess(_time.monotonic() - started, 2.0, hostile[:12])
@@ -1470,3 +1500,181 @@ class CodexBlocker2ProviderIsolation(Api):
                 os.environ.pop("STUDIO_CLIENT_PROVIDERS", None)
             else:
                 os.environ["STUDIO_CLIENT_PROVIDERS"] = old
+
+
+# -- Codex Gate 1 on dfbcc11: combining marks, all-numeric IPv6, every surface ------------------
+import unicodedata as _ud  # noqa: E402
+import copy  # noqa: E402
+
+DEVANAGARI = "\u0909\u0926\u093e\u0939\u0930\u0923.\u092d\u093e\u0930\u0924"       # उदाहरण.भारत
+NFD_HOST = _ud.normalize("NFD", "b\u00fccher.de")                                       # bücher.de, decomposed
+NFD_EMAIL = _ud.normalize("NFD", "jos\u00e9@b\u00fccher.de")
+IPV6_EXPANDED = ("0:0:0:0:0:0:0:1", "2001:4860:4860:0:0:0:0:8888")
+LEAKS = (DEVANAGARI, NFD_HOST, NFD_EMAIL) + IPV6_EXPANDED
+# What must never be seen anywhere once the page is read: each host's name
+# and each address's distinctive part, in both normal forms.
+NEVER = ("\u0909\u0926\u093e", "\u092d\u093e\u0930", "cher", "jos", "4860", "0:0:0:0:0:0:0:1", "8888")
+
+
+def surfaces_page():
+    text = " / ".join(LEAKS)
+    return ("<h1>Visit %s</h1><p>%s</p><p>Bracketed [%s] and [%s]:8443</p>"
+            "<img alt='%s'><input placeholder='%s'><nav aria-label='%s'><a href='/'>Home</a></nav>"
+            "<form><input type='submit' value='%s'></form>"
+            % (DEVANAGARI, text, IPV6_EXPANDED[0], IPV6_EXPANDED[1], NFD_HOST, NFD_EMAIL, DEVANAGARI,
+               IPV6_EXPANDED[1]))
+
+
+class CodexDfbcc11Redaction(Api):
+    def test_combining_marks_and_decomposed_hosts_are_redacted_whole(self):
+        for text in (DEVANAGARI, "Visit " + DEVANAGARI + " now", NFD_HOST, "Mail " + NFD_EMAIL,
+                     _ud.normalize("NFC", NFD_HOST), _ud.normalize("NFD", DEVANAGARI)):
+            out = redact(text)
+            for never in NEVER:
+                self.assertNotIn(never, out, (text, out))
+        self.assertEqual("Visit [link] now", " ".join(redact("Visit " + DEVANAGARI + " now").split()))
+        self.assertEqual("Mail [email]", " ".join(redact("Mail " + NFD_EMAIL).split()))
+
+    def test_every_eight_group_ipv6_is_parsed_bracketed_or_not(self):
+        cases = {
+            "Loopback 0:0:0:0:0:0:0:1 here": "Loopback [link] here",
+            "DNS 2001:4860:4860:0:0:0:0:8888 here": "DNS [link] here",
+            "In brackets [0:0:0:0:0:0:0:1] and [2001:4860:4860:0:0:0:0:8888]:8443 too":
+                "In brackets [link] and [link] too",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), text)
+        for keep in ("10:30", "1:2:3", "Score 3:1:2", "Open 9:00-17:00"):
+            self.assertEqual(keep, redact(keep))
+
+    def test_no_surface_carries_them_text_attributes_state_or_provider_context(self):
+        talk = FakeTalk()
+        worker = SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(surfaces_page()), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-s", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-s"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        persisted = json.dumps(self.state(live["session_id"]), ensure_ascii=False)
+        provider = json.dumps([talk.calls, worker.seen], ensure_ascii=False)
+        for surface, text in (("state", persisted), ("provider", provider), ("events", events)):
+            for never in NEVER:
+                self.assertNotIn(never, text, surface)
+        self.assertIn("[link]", persisted)
+
+
+class SeeingWorker(PatchWorker):
+    """The builder's view of the session - what reaches the Claude provider."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def on_turn(self, state, trigger):
+        self.seen.append(copy.deepcopy(state.get("artifact")))
+        return super().on_turn(state, trigger)
+
+
+class GateWorker(PatchWorker):
+    """Holds the builder inside the provider call until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def on_turn(self, state, trigger):
+        self.entered.set()
+        self.release.wait(10)
+        return super().on_turn(state, trigger)
+
+
+class CodexDfbcc11AuditAddendum(Api):
+    """An accepted client command never drops out of the audit: Stop fencing
+    and stale-inflight recovery audit it in the same transition."""
+
+    def open(self, client):
+        token = self.sign_in(client).json()["token"]
+        live = self.project_session(client, token).json()
+        return live, self.app.state.controller
+
+    def test_a_build_fenced_by_stop_is_audited_once_ahead_of_the_stop(self):
+        worker = GateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            live, controller = self.open(client)
+            sid = live["session_id"]
+            outcome = {}
+
+            def build():
+                try:
+                    outcome["result"] = controller.execute(sid, {
+                        "command_id": "build-1", "session_id": sid, "type": "utterance",
+                        "expected_version": live["artifact_version"], "transcript": "bigger", "item_id": "item-b"})
+                except Exception as exc:  # noqa: BLE001 - the fenced build's save must lose
+                    outcome["error"] = type(exc).__name__
+
+            thread = threading.Thread(target=build)
+            thread.start()
+            self.assertTrue(worker.entered.wait(10))
+            stopped = controller.execute(sid, {"command_id": "stop-1", "session_id": sid, "type": "stop",
+                                               "expected_version": 0})
+            worker.release.set()
+            thread.join(10)
+        state = self.state(sid)
+        self.assertEqual("StateConflict", outcome.get("error"), outcome)
+        self.assertEqual(("failed", "completed"), (state["commands"]["build-1"]["status"],
+                                                   state["commands"]["stop-1"]["status"]))
+        audit = state["audit"]
+        self.assertEqual([("build-1", "utterance", "failed"), ("stop-1", "stop", "applied")],
+                         [(a["command_id"], a["command_type"], a["outcome"]) for a in audit])
+        self.assertEqual(stopped["events"][0]["op_id"], audit[1]["op_ids"][0])
+        self.assertEqual([], audit[0]["op_ids"])
+
+    def test_a_command_stranded_by_a_restart_is_audited_when_recovery_fails_it(self):
+        for receipt_type, expected_type in (("utterance", "utterance"), (None, "")):
+            with TestClient(self.make()) as client:
+                live, controller = self.open(client)
+                sid = live["session_id"]
+                repo = controller.repository
+                record = repo.load(sid)
+                receipt = {"status": "inflight", "started_at": 0, "expected_version": live["artifact_version"],
+                           "fingerprint": "x"}
+                if receipt_type:
+                    receipt["command_type"] = receipt_type        # an old receipt has no type
+                record.state["commands"]["lost-1"] = receipt
+                record.state["active_command"] = "lost-1"
+                repo.save(sid, record.state, record.token)
+                controller.execute(sid, {"command_id": "pause-1", "session_id": sid, "type": "pause",
+                                         "expected_version": live["artifact_version"]})
+                again = client.post("/v1/session/%s/commands" % sid, headers=self.auth(live["token"]), json={
+                    "command_id": "lost-1", "session_id": sid, "type": "utterance",
+                    "expected_version": live["artifact_version"], "transcript": "x", "item_id": "item-x"})
+            state = self.state(sid)
+            self.assertTrue(state["commands"]["lost-1"]["outcome_unknown"])
+            self.assertEqual([("lost-1", expected_type, "failed"), ("pause-1", "pause", "applied")],
+                             [(a["command_id"], a["command_type"], a["outcome"]) for a in state["audit"]])
+            self.assertEqual(409, again.status_code)                  # a replay of the lost command adds nothing
+            self.assertEqual(2, len(state["audit"]))
+
+    def test_operator_sessions_get_no_audit_from_fencing(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client, OPERATOR).json()["token"]
+            live = client.post("/v1/session", headers=self.auth(token), json={"creation_id": "op-f", "start": "blank"}).json()
+            controller = self.app.state.controller
+            sid = live["session_id"]
+            record = controller.repository.load(sid)
+            record.state["commands"]["lost-1"] = {"status": "inflight", "started_at": 0, "expected_version": 1,
+                                                  "fingerprint": "x", "command_type": "utterance"}
+            record.state["active_command"] = "lost-1"
+            controller.repository.save(sid, record.state, record.token)
+            controller.execute(sid, {"command_id": "stop-1", "session_id": sid, "type": "stop", "expected_version": 0})
+        self.assertNotIn("audit", self.state(sid))

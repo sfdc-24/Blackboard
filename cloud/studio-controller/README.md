@@ -414,6 +414,9 @@ keeping the last 200.
 - Entry fields: `{actor, token_type, tenant, project, command_id, command_type, prior_revision,
   revision, op_ids, at, outcome}`.
 - Stop and worker failures are included (outcome `failed`). A replayed `command_id` adds nothing.
+- A command that Stop fences, or that recovery finds stranded after an interruption, is audited as
+  `failed` in the same compare-and-set transition that marks its receipt failed, ahead of Stop's own
+  entry. Its own late save can never land after that. Codex Gate 1 addendum on dfbcc11.
 - `op_ids` lists every event the command emitted.
 - The audit never holds page text, transcripts or addresses.
 

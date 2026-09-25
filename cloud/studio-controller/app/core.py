@@ -454,6 +454,7 @@ class StudioController:
         })
         state["active_command"] = None
         _advance_epoch(state, "command_epoch")
+        self._audit_fenced(state, active, receipt)      # in the same transition that fails it
         token = self.repository.save(session_id, state, token)
         return state, token
 
@@ -494,6 +495,7 @@ class StudioController:
             "status": "inflight", "started_at": int(self.clock()),
             "expected_version": command["expected_version"],
             "fingerprint": fingerprint,
+            "command_type": str(command["type"]),       # for the audit if Stop or recovery fails it
         }
         state["active_command"] = command_id
         _advance_epoch(state, "command_epoch")
@@ -647,6 +649,7 @@ class StudioController:
                     "outcome_unknown": True,
                 })
                 candidate["active_command"] = None
+                self._audit_fenced(candidate, active, receipt)   # before Stop's own entry, same CAS
             candidate["stopped"] = True
             candidate["paused"] = False
             candidate["turn_seq"] += 1
@@ -838,6 +841,17 @@ class StudioController:
         return result
 
     AUDIT_MAX = 200
+
+    def _audit_fenced(self, state: dict, command_id: str, receipt: dict) -> None:
+        """An accepted command that Stop fenced, or that recovery found stranded,
+        is audited as failed in the same state that marks its receipt failed
+        (Codex Gate 1 addendum on dfbcc11): its own save can never land now, so
+        this is its one entry."""
+        if not state.get("client_tenant"):
+            return
+        prior = receipt.get("expected_version")
+        self._audit(state, {"command_id": command_id, "type": receipt.get("command_type") or ""},
+                    int(prior) if isinstance(prior, int) else int(state["artifact_version"]), {}, outcome="failed")
 
     def _audit(self, state: dict, command: dict, prior_revision: int, result: dict,
                outcome: str | None = None) -> None:

@@ -239,12 +239,20 @@ _VOID = {"img", "input", "br", "hr", "meta", "link", "source", "area", "base", "
 _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
 # No address from the page reaches a label, even as visible text: links,
 # bare domains, IP addresses and email addresses become a neutral placeholder.
-# Conservative on purpose (Codex Gate 1 NO-GO on a2d98fc): ANY plausible host
-# is an address - any label.label... ending in 2-63 letters of any script
-# (secret.photography, bücher.de) or a punycode label (xn--...), with ASCII or
-# IDNA full-width dots - and so is any local@host, whatever its script. Words
-# like "e.g." and "Inc." stay; a product name written like a host ("Node.js")
-# is redacted too, which is the price of never leaking an address.
+# Conservative on purpose (Codex Gate 1 NO-GO on a2d98fc; Cursor NO-GO on
+# dfbcc11): ANY plausible host is an address. A host is found inside any run of
+# word characters, hyphens and dots (ASCII or IDNA full-width), wherever the
+# run starts - after "@", "-", ".", "_" or a full-width dot too - and whatever
+# its label lengths: the run is an address when some dot has anything before
+# it and a TLD-shaped label after it (2-63 letters of any script, or xn--...).
+# The whole run goes, with its :port and /?# tail. Combining marks belong to
+# the run and to the TLD (Codex, dfbcc11), so Indic hosts (उदाहरण.भारत) and
+# decomposed (NFD) ones are taken whole. Any local@host in any script is an
+# address too; IPv4 counts with full-width dots; every eight-group IPv6
+# candidate is decided by parsing it. Words like "e.g.",
+# "i.e." and "Inc." stay; a product name written like a host ("Node.js") is
+# redacted too, which is the price of never leaking an address. Every scan is
+# linear in the text.
 LINK = "[link]"
 EMAIL = "[email]"
 _DOT = "[.\u3002\uff0e\uff61]"
@@ -254,18 +262,61 @@ _EMAIL_RE = re.compile("(?<![^" + _NOT_ADDR + "])[^" + _NOT_ADDR + "]+@[^" + _NO
                        + ".\u3002\uff0e\uff61]+)+")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
-_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:" + _DOT + r"\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
 _IPV6_RE = re.compile(r"(?i)(?<![\w:])\[?([0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7})(?:%\w+)?\]?(?::\d{1,5})?(?![\w:])")
-_LABEL = r"[^\W_](?:[\w-]{0,61}[^\W_])?"
-_TLD = r"(?:xn--[a-z0-9-]{1,59}|[^\W\d_]{2,63})"
-_DOMAIN_RE = re.compile(r"(?i)(?<![\w@.\u3002\uff0e\uff61-])(?:" + _LABEL + _DOT + r")+" + _TLD
-                        + r"(?![\w-])(?::\d{1,5})?(?:[/?#]\S*)?")
+_DOT_CHARS = ".\u3002\uff0e\uff61"
+_HOST_SPLIT_RE = re.compile(_DOT)
+_HOST_TAIL_RE = re.compile(r"(?::\d{1,5})?(?:[/?#]\S*)?")
+
+
+def _host_char(ch: str) -> bool:
+    """What a host run holds: letters and digits of any script, combining
+    marks, "-", "_" and the dots."""
+    return ch.isalnum() or ch in "-_" or ch in _DOT_CHARS or unicodedata.category(ch)[0] == "M"
+
+
+def _tld_like(label: str) -> bool:
+    """2-63 letters of any script (with their combining marks), or a punycode label."""
+    if not 2 <= len(label) <= 63:
+        return False
+    if label[:4].lower() == "xn--":
+        return len(label) >= 5 and all(c.isascii() and (c.isalnum() or c == "-") for c in label)
+    return label[0].isalpha() and all(c.isalpha() or unicodedata.category(c)[0] == "M" for c in label)
+
+
+def _hostlike(run: str) -> bool:
+    """A dot with anything before it and a TLD-shaped label after it."""
+    parts = _HOST_SPLIT_RE.split(run)
+    return any(parts[i - 1] and _tld_like(parts[i]) for i in range(1, len(parts)))
+
+
+def _redact_hosts(text: str) -> str:
+    """One pass over the text: each maximal run of host characters is looked
+    at once, so the scan is linear however the text is shaped."""
+    out, last, i, n = [], 0, 0, len(text)
+    while i < n:
+        if not _host_char(text[i]):
+            i += 1
+            continue
+        j = i
+        while j < n and _host_char(text[j]):
+            j += 1
+        host = text[i:j].rstrip(_DOT_CHARS)          # a sentence's full stop is not the host's
+        if _hostlike(host):
+            end = _HOST_TAIL_RE.match(text, i + len(host)).end()
+            out.append(text[last:i])
+            out.append(LINK)
+            last = i = end
+        else:
+            i = j
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _ipv6_link(match) -> str:
     text = match.group(1)
-    if "::" not in text and not re.search(r"(?i)[a-f]", text):
-        return match.group(0)                # a time or a score, not an address
+    if "::" not in text and not re.search(r"(?i)[a-f]", text) and text.count(":") != 7:
+        return match.group(0)                # a time or a score, not an address; eight groups are always parsed
     try:
         ipaddress.IPv6Address(text)
         return LINK
@@ -279,7 +330,7 @@ def redact(text: str) -> str:
     text = _URL_RE.sub(LINK, text)
     text = _IPV4_RE.sub(LINK, text)
     text = _IPV6_RE.sub(_ipv6_link, text)
-    return _DOMAIN_RE.sub(LINK, text)
+    return _redact_hosts(text)
 
 
 def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> str:
