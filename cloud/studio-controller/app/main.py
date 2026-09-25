@@ -468,7 +468,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "public_visitors": settings.public_visitors,
                          "governance": True,
                          "voices": voices_available(),
-                         "rating": True, "summary_email": settings.summary_email_enabled},
+                         "rating": True, "summary_email": settings.summary_email_enabled,
+                         "routing": True},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -901,8 +902,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         turn = body.get("turn", 0)
         if type(turn) is not int or not 0 <= turn <= 1_000_000:
             raise HTTPException(400, "turn must be a non-negative integer")
-        agent = body.get("agent") or agents[0]
-        if agent not in agents:
+        # Without an agent, the session's topic picks it (workers/topics.py);
+        # an explicit one from an older page is still honoured and validated.
+        agent = body.get("agent")
+        if agent is not None and agent not in agents:
             # An unconfigured provider is reported precisely, never simulated.
             raise HTTPException(400, "agent %r is not configured; available: %s"
                                 % (str(agent)[:20], ", ".join(agents)))
@@ -920,6 +923,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = record.state
         if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
             raise HTTPException(410, "session has ended")
+        if agent is None:
+            from workers.topics import route_agent
+            agent = route_agent(state.get("topic"), agents)
         used = talk_counts.get(session_id, 0)
         if used >= settings.talk_cap:
             raise HTTPException(429, "talk limit reached for this session")
@@ -1083,10 +1089,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         body = await json_object(request, "recap")
         if set(body) - {"agent"}:
             raise HTTPException(400, "recap body has unknown fields")
-        agent = body.get("agent") or agents[0]
-        if agent not in agents:
+        agent = body.get("agent")
+        if agent is not None and agent not in agents:
             raise HTTPException(400, "agent %r is not configured; available: %s" % (str(agent)[:20], ", ".join(agents)))
         state = await asyncio.to_thread(live_state, session_id)
+        if agent is None:
+            from workers.topics import route_agent
+            agent = route_agent(state.get("topic"), agents)
         spend(recap_counts, session_id, settings.recap_cap, "recap")
         from workers.talk import canvas_summary, recap_brief
         from workers.topics import with_topic
