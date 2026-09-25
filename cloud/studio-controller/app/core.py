@@ -13,6 +13,10 @@ from .state import StateConflict, StudioRepository
 from .artifacts import apply_ops
 from . import metadata_contract as metadata
 
+# Said when the builder refused every op of a spoken change.
+REFUSED_CHANGE_TEXT = "That change did not go through. Say it once more, a little differently, " \
+                      "and I will build it."
+
 
 class CommandError(ValueError):
     def __init__(self, message: str, status: int = 400):
@@ -173,7 +177,8 @@ class StudioController:
 
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
-                       visitor: bool = False, admit_limit: int | None = None) -> tuple[dict, int]:
+                       visitor: bool = False, admit_limit: int | None = None,
+                       analyst: bool = False) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -228,6 +233,14 @@ class StudioController:
             "visitor_subject": subject if visitor else "",
             "voice_item_ids": [],
         }
+        if analyst and start == "blank":
+            # A homepage (blank) session with the analyst lane: the analyst owns
+            # the questions from the first turn, so the builder never opens one
+            # of its own. A builder question left open made every later spoken
+            # change read as its answer and be refused by its scope (live
+            # session, 2026-09-25). Set here, in the one write that creates the
+            # session, so a replayed creation never gains or loses it.
+            state["analyst"] = True
         self._event(state, "session.started", {"title": title[:600]})
         state["artifact_version"] = 1
         self._event(state, "artifact.snapshot", {"root": artifact}, artifact_version=1)
@@ -938,6 +951,15 @@ class StudioController:
                         "status": "open",
                         "question_ids": [question["question_id"] for question in questions],
                     }
+            if (trigger["kind"] == "utterance" and problems and not worker_result.get("events")
+                    and not answered_questions):
+                # The builder refused the whole change. Say so: on the homepage
+                # silence after "on it" reads as the canvas ignoring you (live
+                # session 2026-09-25, four logo changes, no word back).
+                emit_answers()
+                events.append(self._event(state, "confirm", {
+                    "text": REFUSED_CHANGE_TEXT, "artifact_ids": [state["artifact"]["id"]],
+                }))
             emit_answers()
 
         result = {

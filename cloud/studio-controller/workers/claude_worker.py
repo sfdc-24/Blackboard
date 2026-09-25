@@ -417,80 +417,108 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     claimed_but_invalid = bool(rqid) and resolves is None
 
     # -- the patch, as one transaction on a candidate tree
-    tree = json.loads(json.dumps(artifact_root))
-    index, parents = _index(tree)
-    scope = set() if claimed_but_invalid else _scope_ids(state_questions, trigger, resolves)
-    allowed = None
-    if scope is not None:
+    def scope_of(ids, index, parents):
+        # A question about part of a scene (the mark of a logo) is about the
+        # scene: its answer may restyle, add or remove anything in that stage.
         allowed = set()
-        for a in scope:
-            if a in index:
+        for a in ids:
+            if a not in index:
+                continue
+            holder = parents.get(a)
+            if index[a].get("kind") == "entity" and holder is not None and holder.get("kind") == "scene":
+                allowed |= _subtree_ids(holder)
+            else:
                 allowed |= _subtree_ids(index[a])
-    ops_out, txn_ok = [], True
-    for i, op in enumerate(draft.get("ops") or []):
-        kind, nid = op.get("op"), op.get("node_id", "")
-        why = None
-        if nid not in index:
-            why = "targets unknown node %r" % nid
-        elif allowed is not None and nid not in allowed:
-            why = "changes %r, outside the answered question's scope" % nid
-        elif kind in ("set_label", "set_detail"):
-            parent = parents[nid]
-            if not _txt(op.get("value")):
-                why = "value too long"
-            elif kind == "set_detail" and visual_problem(
-                    index[nid].get("kind"), op["value"], parent.get("kind") if parent else None):
-                why = visual_problem(index[nid].get("kind"), op["value"], parent.get("kind") if parent else None)
+        return allowed
+
+    def transaction(scope):
+        tree = json.loads(json.dumps(artifact_root))
+        index, parents = _index(tree)
+        allowed = None if scope is None else scope_of(scope, index, parents)
+        breach = False
+        loop_problems = []
+        ops_out, txn_ok = [], True
+        for i, op in enumerate(draft.get("ops") or []):
+            kind, nid = op.get("op"), op.get("node_id", "")
+            why = None
+            if nid not in index:
+                why = "targets unknown node %r" % nid
+            elif allowed is not None and nid not in allowed:
+                why = "changes %r, outside the answered question's scope" % nid
+                breach = True
+            elif kind in ("set_label", "set_detail"):
+                parent = parents[nid]
+                if not _txt(op.get("value")):
+                    why = "value too long"
+                elif kind == "set_detail" and visual_problem(
+                        index[nid].get("kind"), op["value"], parent.get("kind") if parent else None):
+                    why = visual_problem(index[nid].get("kind"), op["value"], parent.get("kind") if parent else None)
+                else:
+                    index[nid]["label" if kind == "set_label" else "detail"] = op["value"]
+                    if kind == "set_detail" and index[nid].get("kind") == "entity" and attach_problem(
+                            nid, op["value"], index, parents):
+                        why = attach_problem(nid, op["value"], index, parents)
+                    ops_out.append({"op": kind, "node_id": nid, "value": op["value"]})
+            elif kind == "insert_child":
+                nn = op.get("new_node") or {}
+                if not ID_RE.match(nn.get("id", "")) or nn["id"] in index:
+                    why = "new id %r missing, malformed or taken" % nn.get("id")
+                elif nn.get("kind") not in KINDS or not _txt(nn.get("label")) or not (nn.get("label") or "").strip() \
+                        or not _txt(nn.get("detail", "")):
+                    why = "new node invalid"
+                elif visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind")):
+                    why = visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind"))
+                elif index[nid].get("kind") == "scene" and nn["kind"] != "entity":
+                    why = "a scene holds only entities"
+                elif index[nid].get("kind") == "entity":
+                    why = "an entity holds nothing"
+                elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
+                    why = "%r already has %d children" % (nid, MAX_CHILDREN)
+                else:
+                    new = {"id": nn["id"], "kind": nn["kind"], "label": nn["label"]}
+                    if nn.get("detail"):
+                        new["detail"] = nn["detail"]
+                    index[nid].setdefault("children", []).append(dict(new))
+                    index[new["id"]] = index[nid]["children"][-1]
+                    parents[new["id"]] = index[nid]
+                    if new["kind"] == "entity" and attach_problem(new["id"], new.get("detail", ""), index, parents):
+                        why = attach_problem(new["id"], new.get("detail", ""), index, parents)
+                    if allowed is not None:
+                        allowed.add(new["id"])
+                    ops_out.append({"op": "insert_child", "node_id": nid, "node": new})
+            elif kind == "remove":
+                if parents[nid] is None:
+                    why = "would remove the root"
+                else:
+                    gone = _subtree_ids(index[nid])
+                    p = parents[nid]
+                    p["children"] = [c for c in p["children"] if c["id"] != nid]
+                    for g in gone:
+                        index.pop(g, None)
+                        parents.pop(g, None)
+                    ops_out.append({"op": "remove", "node_id": nid})
             else:
-                index[nid]["label" if kind == "set_label" else "detail"] = op["value"]
-                if kind == "set_detail" and index[nid].get("kind") == "entity" and attach_problem(
-                        nid, op["value"], index, parents):
-                    why = attach_problem(nid, op["value"], index, parents)
-                ops_out.append({"op": kind, "node_id": nid, "value": op["value"]})
-        elif kind == "insert_child":
-            nn = op.get("new_node") or {}
-            if not ID_RE.match(nn.get("id", "")) or nn["id"] in index:
-                why = "new id %r missing, malformed or taken" % nn.get("id")
-            elif nn.get("kind") not in KINDS or not _txt(nn.get("label")) or not (nn.get("label") or "").strip() \
-                    or not _txt(nn.get("detail", "")):
-                why = "new node invalid"
-            elif visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind")):
-                why = visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind"))
-            elif index[nid].get("kind") == "scene" and nn["kind"] != "entity":
-                why = "a scene holds only entities"
-            elif index[nid].get("kind") == "entity":
-                why = "an entity holds nothing"
-            elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
-                why = "%r already has %d children" % (nid, MAX_CHILDREN)
-            else:
-                new = {"id": nn["id"], "kind": nn["kind"], "label": nn["label"]}
-                if nn.get("detail"):
-                    new["detail"] = nn["detail"]
-                index[nid].setdefault("children", []).append(dict(new))
-                index[new["id"]] = index[nid]["children"][-1]
-                parents[new["id"]] = index[nid]
-                if new["kind"] == "entity" and attach_problem(new["id"], new.get("detail", ""), index, parents):
-                    why = attach_problem(new["id"], new.get("detail", ""), index, parents)
-                if allowed is not None:
-                    allowed.add(new["id"])
-                ops_out.append({"op": "insert_child", "node_id": nid, "node": new})
-        elif kind == "remove":
-            if parents[nid] is None:
-                why = "would remove the root"
-            else:
-                gone = _subtree_ids(index[nid])
-                p = parents[nid]
-                p["children"] = [c for c in p["children"] if c["id"] != nid]
-                for g in gone:
-                    index.pop(g, None)
-                    parents.pop(g, None)
-                ops_out.append({"op": "remove", "node_id": nid})
-        else:
-            why = "unknown op %r" % kind
-        if why:
-            problems.append("op %d %s; the whole patch is dropped" % (i, why))
-            txn_ok = False
-            break
+                why = "unknown op %r" % kind
+            if why:
+                loop_problems.append("op %d %s; the whole patch is dropped" % (i, why))
+                txn_ok = False
+                break
+
+        return ops_out, txn_ok, tree, index, parents, breach, loop_problems
+
+    scope = set() if claimed_but_invalid else _scope_ids(state_questions, trigger, resolves)
+    ops_out, txn_ok, tree, index, parents, breach, loop_problems = transaction(scope)
+    if not txn_ok and breach and resolves and trigger.get("kind") == "utterance":
+        # Words that change more than the question they seemed to answer are
+        # a new request, not that answer: apply the change, record no answer.
+        # A tap keeps the strict scope. (Live session 2026-09-25: four spoken
+        # logo changes were each dropped because the model read them as the
+        # answer to an open question about the mark.)
+        problems.append("resolution of %r not recorded: the change reached beyond that question, "
+                        "so it applies as a new request" % resolves["question_id"])
+        resolves = None
+        ops_out, txn_ok, tree, index, parents, breach, loop_problems = transaction(None)
+    problems.extend(loop_problems)
 
     confirm = draft.get("confirm") or ""
     if not txn_ok:

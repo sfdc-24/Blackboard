@@ -2057,6 +2057,56 @@ def _find(state, qid):
     return next(q for q in state["questions"] if q["question_id"] == qid)
 
 
+class _Refuser(SyntheticWorker):
+    """The builder dropped the whole patch, as the live logo turns did."""
+    def on_turn(self, state, trigger):
+        return {"events": [], "problems": ["op 2 changes 'logo_scene'; the whole patch is dropped"],
+                "resolves": {}}
+
+
+class _AnswerNoChange(_Resolver):
+    """A spoken answer the controller accepts, with no change and a dropped question."""
+    def on_turn(self, state, trigger):
+        return {"events": [], "problems": ["question dropped: its option ids repeat"],
+                "resolves": {"question_id": "q-cta", "option_id": "book"}}
+
+
+class ARefusedSpokenChangeIsSaid(unittest.TestCase):
+    def test_only_a_new_blank_session_carries_the_analyst_flag(self):
+        controller, _, _ = make_controller()
+        template, _ = controller.create_session(start="template", analyst=True)
+        blank, _ = controller.create_session(start="blank", analyst=True)
+        plain, _ = controller.create_session(start="blank")
+        self.assertEqual((None, True, None), (template.get("analyst"), blank.get("analyst"), plain.get("analyst")))
+
+    def test_a_recorded_answer_is_not_contradicted(self):
+        # Cursor NO-GO on e22eb9e: question.answered and "did not go through"
+        # in the same turn. An answer was recorded, so nothing was refused.
+        controller, _, _ = make_controller(worker=_AnswerNoChange(None))
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual(["question.answered"], [e["type"] for e in result["events"]])
+
+    def test_the_visitor_hears_that_it_did_not_go_through(self):
+        from app.core import REFUSED_CHANGE_TEXT
+        controller, store, _ = make_controller(worker=_Refuser())
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], _say(state, 1, "make the logo blue", 1))
+        self.assertEqual(["confirm"], [e["type"] for e in result["events"]])
+        confirm = result["events"][0]
+        self.assertEqual(REFUSED_CHANGE_TEXT, confirm["payload"]["text"])
+        self.assertEqual(1, confirm["artifact_version"])       # the page shows a confirm at its own version
+        self.assertEqual(1, StudioRepository(store).load(state["session_id"]).state["artifact_version"])
+
+    def test_a_tap_is_not_answered_with_it(self):
+        controller, _, _ = make_controller(worker=_Refuser())
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], {
+            "command_id": "tap-1", "session_id": state["session_id"], "type": "answer",
+            "expected_version": 1, "question_id": "q-cta", "option_id": "book"})
+        self.assertNotIn("confirm", [e["type"] for e in result["events"]])
+
+
 
 class _SequenceResolver(_Resolver):
     """Starts with the two-question form BatchWorker opens, and names a

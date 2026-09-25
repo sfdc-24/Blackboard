@@ -626,6 +626,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             state, admitted = await asyncio.to_thread(
                 controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
                 settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
+                start == "blank" and analyst_ready(),
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
