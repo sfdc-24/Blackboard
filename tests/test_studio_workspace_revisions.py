@@ -112,6 +112,30 @@ class Revisions(base.Api):
         self.assertEqual(200, after.status_code, after.text)
         self.assertEqual((True, 1), (after.json()["workspace"]["saved"], after.json()["workspace"]["revision"]))
 
+    def test_a_change_that_lands_beside_another_write_publishes_its_revision(self):
+        # Codex Gate 1 B1 on #260: a disjoint write during the build (a rating)
+        # no longer costs the change; it lands beside it and is published.
+        # (The test above clashes on voice_item_ids, so that change ends failed.)
+        test = self
+
+        class DisjointWriter(base.PatchWorker):
+            def on_turn(self, state, trigger):
+                out = base.PatchWorker.on_turn(self, state, trigger)
+                base.cas_write(test.app.state.controller, state["session_id"],
+                               lambda s: s.update(rating={"score": 5, "comment": "", "at": 1}))
+                return out
+
+        with TestClient(self.make(worker=DisjointWriter())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            landed = self.utter(client, live, 1, "first")
+            back = client.get("/v1/workspace/steelworks", headers=self.auth(token)).json()
+        self.assertEqual(200, landed.status_code, landed.text)
+        self.assertEqual((True, 1), (landed.json()["workspace"]["saved"], landed.json()["workspace"]["revision"]))
+        self.assertEqual(1, back["revision"])
+        state = self.state(live["session_id"])
+        self.assertEqual((5, "completed"), (state["rating"]["score"], state["commands"]["cmd-1"]["status"]))
+
     def test_a_sessions_own_saves_never_count_against_it(self):
         store = WorkspaceStore(base.MemoryStore(), clock=lambda: 1000)
         tree = {"id": "screen", "kind": "screen", "label": "x", "children": []}
