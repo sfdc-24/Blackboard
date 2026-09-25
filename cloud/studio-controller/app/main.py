@@ -366,6 +366,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # builder's one in-flight command. Per-session count is in memory: the
     # session is operator-only and lasts at most max_session_seconds.
     talk_counts: dict = {}
+    talk_last: dict = {}
+    TALK_SPACING_SECONDS = 1.5
 
     def talk_lane():
         nonlocal talk_client
@@ -543,10 +545,18 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         used = talk_counts.get(session_id, 0)
         if used >= settings.talk_cap:
             raise HTTPException(429, "talk limit reached for this session")
+        # Gemini's review of the talk lane: a hard total per session and a
+        # minimum spacing, both on the server, so no client can run up spend.
+        now = clock()
+        last = talk_last.get(session_id)
+        if last is not None and now - last < TALK_SPACING_SECONDS:
+            raise HTTPException(429, "talk is limited to one turn every %.1f seconds" % TALK_SPACING_SECONDS)
         talk_counts[session_id] = used + 1
+        talk_last[session_id] = now
         if len(talk_counts) > 500:
             for stale in list(talk_counts)[:250]:
                 talk_counts.pop(stale, None)
+                talk_last.pop(stale, None)
         try:
             reply = await asyncio.to_thread(
                 talk_lane().reply, agent, text.strip(), history, canvas_summary(state.get("artifact")))

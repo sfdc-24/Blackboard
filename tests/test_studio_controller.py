@@ -621,12 +621,17 @@ class TalkLaneTests(unittest.TestCase):
         self.store = MemoryStore()
         self.email_sender = EmailSender()
         self.talk = talk if talk is not None else FakeTalk()
+        self.now = [1000.0]
         app = create_app(
             settings=settings(**overrides), store=self.store, worker=CountingWorker(),
-            clock=lambda: 1000, id_factory=IDs(), voice_client=FakeVoiceClient(),
+            clock=lambda: self.now[0], id_factory=IDs(), voice_client=FakeVoiceClient(),
             email_sender=self.email_sender, talk_client=self.talk,
         )
         return app
+
+    def post_spaced(self, client, url, headers, body):
+        self.now[0] += 2.0
+        return client.post(url, headers=headers, json=body)
 
     def session(self, client):
         started = client.post("/v1/auth/start", headers=self.origin, json={
@@ -700,8 +705,23 @@ class TalkLaneTests(unittest.TestCase):
         with TestClient(self.make(talk_cap=2)) as client:
             sid, headers = self.session(client)
             url = "/v1/session/%s/talk" % sid
-            codes = [client.post(url, headers=headers, json={"text": "hi"}).status_code for _ in range(3)]
+            codes = [self.post_spaced(client, url, headers, {"text": "hi"}).status_code for _ in range(3)]
         self.assertEqual([200, 200, 429], codes)
+
+    def test_turns_closer_than_the_spacing_are_refused(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/talk" % sid
+            first = client.post(url, headers=headers, json={"text": "hi"}).status_code
+            self.now[0] += 0.5
+            too_soon = client.post(url, headers=headers, json={"text": "again"})
+            self.now[0] += 1.5
+            later = client.post(url, headers=headers, json={"text": "again"}).status_code
+        self.assertEqual(200, first)
+        self.assertEqual(429, too_soon.status_code)
+        self.assertIn("one turn every", too_soon.text)
+        self.assertEqual(200, later)
+        self.assertEqual(2, len(self.talk.calls))
 
     def test_a_provider_failure_is_a_503_and_the_session_lives_on(self):
         with TestClient(self.make(FakeTalk(fail=True))) as client:
