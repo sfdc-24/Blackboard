@@ -48,6 +48,16 @@ CONTRACT_KEYS = {
 RENDERED_TEXT: list[str] = []
 
 
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict:
+    """Keep the ADR contract closed: duplicate keys are ambiguous, not last-wins."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate architecture PDF contract key: " + key)
+        result[key] = value
+    return result
+
+
 def load_contract() -> tuple[dict, str]:
     """Read the closed semantic contract from the ADR and verify its anchors."""
     adr_text = ADR.read_text(encoding="utf-8")
@@ -56,7 +66,10 @@ def load_contract() -> tuple[dict, str]:
     raw = adr_text.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
     if not raw.startswith("```json") or not raw.endswith("```"):
         raise RuntimeError("architecture PDF contract must be a fenced JSON object")
-    contract = json.loads(raw[len("```json"): -len("```")].strip())
+    contract = json.loads(
+        raw[len("```json"): -len("```")].strip(),
+        object_pairs_hook=reject_duplicate_json_keys,
+    )
     if not isinstance(contract, dict) or set(contract) != CONTRACT_KEYS:
         raise RuntimeError("architecture PDF contract keys do not match the closed schema")
     if contract["schema_version"] != 1:
@@ -79,6 +92,8 @@ def load_contract() -> tuple[dict, str]:
                 or any(not isinstance(item, str) or not item or len(item) > 300
                        for item in phrases)):
             raise RuntimeError(f"invalid architecture PDF contract phrase list: {key}")
+        if len(set(phrases)) != len(phrases):
+            raise RuntimeError(f"duplicate architecture PDF contract phrase: {key}")
     missing = [phrase for phrase in contract["required_adr_phrases"]
                if adr_text.count(phrase) < 2]
     if missing:
