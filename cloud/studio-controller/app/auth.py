@@ -61,6 +61,8 @@ _OTP_RE = re.compile(r"^[0-9]{6}$")
 # real proof, and the code only reaches whoever owns the mailbox.
 _VISITOR_EMAIL_RE = re.compile(r"^[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}$")
 VISITOR_WINDOW_NAME = "studio_auth_visitor_day_"
+VISITOR_IP_WINDOW_SECONDS = 60 * 60
+VISITOR_IP_MAX_PER_WINDOW = 10
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
 
 
@@ -211,7 +213,28 @@ class AuthService:
                 continue
         return False
 
-    def start(self, email: str, client_key: str) -> dict:
+    def _reserve_visitor_ip(self, client_ip: str, now: int) -> bool:
+        """At most VISITOR_IP_MAX_PER_WINDOW visitor codes per network address per hour."""
+        if not client_ip:
+            return True
+        name = "studio_auth_visitor_ip_" + self._digest("studio-auth-ip-v1", client_ip)
+        cutoff = now - VISITOR_IP_WINDOW_SECONDS
+        for _ in range(self.cas_attempts):
+            state, token = self.store.load(name)
+            try:
+                sent = [int(t) for t in (state.get("sent_at") or []) if int(t) > cutoff]
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if len(sent) >= VISITOR_IP_MAX_PER_WINDOW:
+                return False
+            try:
+                self.store.save(name, {"version": 1, "sent_at": sent + [now], "updated_at": now}, token)
+                return True
+            except Conflict:
+                continue
+        return False
+
+    def start(self, email: str, client_key: str, client_ip: str = "") -> dict:
         """Start an OTP challenge without revealing allowlist or rate status.
 
         Acceptance has a fixed deadline independent of delivery, storage,
@@ -229,7 +252,7 @@ class AuthService:
 
         def issue():
             try:
-                self._issue_challenge(challenge_id, code, email, client_key)
+                self._issue_challenge(challenge_id, code, email, client_key, client_ip)
             except Exception:  # No storage/delivery failure reveals membership.
                 pass
 
@@ -241,7 +264,7 @@ class AuthService:
         return public
 
     def _issue_challenge(self, challenge_id: str, code: str, email: str,
-                         client_key: str) -> None:
+                         client_key: str, client_ip: str = "") -> None:
         clean = isinstance(email, str) and len(email) <= 320 and email == email.lower()
         operator = clean and email in self.allowed_emails
         visitor = (clean and not operator and self.public_visitors
@@ -253,6 +276,8 @@ class AuthService:
         now = int(self.clock())
         subject_hash = self._subject_hash(email)
         if not self._reserve_send(subject_hash, now):
+            return
+        if visitor and not self._reserve_visitor_ip(client_ip, now):
             return
         if visitor and not self._reserve_visitor_day(now):
             return

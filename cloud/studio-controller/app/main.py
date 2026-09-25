@@ -466,8 +466,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         body = await json_object(request, "authentication")
         if set(body) != {"email", "client_key"}:
             raise HTTPException(400, "authentication body requires email and client_key")
+        # Cloud Run puts the caller first in X-Forwarded-For; only visitors are
+        # limited by it, and only its keyed hash is stored.
+        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        client_ip = forwarded or (request.client.host if request.client else "")
         return await asyncio.to_thread(
-            auth_service.start, body.get("email"), body.get("client_key")
+            auth_service.start, body.get("email"), body.get("client_key"), client_ip
         )
 
     @app.post("/v1/auth/verify")
@@ -520,7 +524,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(429, "the conversations for today are used up")
         try:
             state, admitted = await asyncio.to_thread(
-                controller.create_session, title[:600], operator["sid"], creation_id, start, visitor
+                controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
+                settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
@@ -866,9 +871,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if state["expires_at"] <= now or state.get("stopped"):
             await release_unopened_voice(session_id, voice_id)
             raise HTTPException(410, "session is no longer active")
+        # A visitor session stops below the daily voice cap; the operator keeps headroom.
+        voice_limit = (settings.voice_mint_cap - settings.operator_reserved_voice
+                       if state.get("visitor_subject") else settings.voice_mint_cap)
         try:
             reservation = await asyncio.to_thread(
-                repository.reserve_voice_open, settings.voice_mint_cap, voice_id
+                repository.reserve_voice_open, voice_limit, voice_id
             )
             for _ in range(3):
                 latest = (await asyncio.to_thread(repository.load, session_id)).state
@@ -888,7 +896,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 # again in the current UTC-day ledger before provider contact.
                 reservation = await asyncio.to_thread(
                     repository.reserve_voice_open,
-                    settings.voice_mint_cap,
+                    voice_limit,
                     voice_id,
                 )
             else:

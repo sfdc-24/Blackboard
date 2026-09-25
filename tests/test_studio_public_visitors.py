@@ -69,6 +69,17 @@ class Auth(unittest.TestCase):
         auth.start(OPERATOR, CLIENT)
         self.assertEqual(["visitor0@bakery.example", "visitor1@bakery.example", OPERATOR], [e for e, _ in sent])
 
+    def test_one_network_address_gets_ten_visitor_codes_an_hour_and_the_operator_is_never_limited(self):
+        auth, sent = service(cap=1000)
+        for n in range(12):
+            auth.start("v%d@bakery.example" % n, CLIENT, "203.0.113.7")
+        auth.start(OPERATOR, CLIENT, "203.0.113.7")
+        auth.start("other@bakery.example", CLIENT, "198.51.100.1")
+        emails = [e for e, _ in sent]
+        self.assertEqual(10, sum(1 for e in emails if e.startswith("v")))
+        self.assertIn(OPERATOR, emails)
+        self.assertIn("other@bakery.example", emails)
+
     def test_the_per_address_limit_still_applies_to_visitors(self):
         auth, sent = service()
         for _ in range(5):
@@ -123,6 +134,9 @@ class Settings_(unittest.TestCase):
                            ("visitor_token_seconds", 60)):
             with self.subTest(field=field), self.assertRaises(RuntimeError):
                 settings(**{field: bad}).validate()
+        for field, bad in (("operator_reserved_sessions", 20), ("operator_reserved_voice", 3)):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                settings(public_visitors=True, **{field: bad}).validate()
 
 
 class Lane(unittest.TestCase):
@@ -208,6 +222,28 @@ class Lane(unittest.TestCase):
             leads = client.get("/v1/leads", headers=operator_headers).json()["leads"]
         self.assertEqual(200, recap.status_code, recap.text)
         self.assertIn("pre-order page", leads[0]["last_recap"])
+
+    def test_visitors_stop_below_the_daily_session_cap_and_the_operator_keeps_headroom(self):
+        with TestClient(self.make(daily_session_cap=4, operator_reserved_sessions=2)) as client:
+            codes = []
+            for n in range(3):
+                _, headers = self.sign_in(client, "v%d@bakery.example" % n)
+                codes.append(self.session(client, headers, n).status_code)
+            _, operator_headers = self.sign_in(client, OPERATOR)
+            operator_codes = [self.session(client, operator_headers, 10 + n).status_code for n in range(3)]
+        self.assertEqual([200, 200, 429], codes)                  # visitors stop at 4 - 2
+        self.assertEqual([200, 200, 429], operator_codes)         # the operator still gets the reserved 2
+
+    def test_a_visitor_voice_call_stops_below_the_daily_voice_cap(self):
+        with TestClient(self.make(voice_mint_cap=3, operator_reserved_voice=2)) as client:
+            results = []
+            for n in range(2):
+                _, headers = self.sign_in(client, "v%d@bakery.example" % n)
+                created = self.session(client, headers, n).json()
+                results.append(client.post("/v1/session/%s/voice" % created["session_id"],
+                                           headers={**ORIGIN, "Authorization": "Bearer " + created["token"]},
+                                           json={"sdp": "v=0 offer"}).status_code)
+        self.assertEqual([200, 429], results)
 
     def test_the_operator_path_is_unchanged(self):
         with TestClient(self.make()) as client:

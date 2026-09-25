@@ -173,7 +173,7 @@ class StudioController:
 
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
-                       visitor: bool = False) -> tuple[dict, int]:
+                       visitor: bool = False, admit_limit: int | None = None) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -184,7 +184,9 @@ class StudioController:
             session_id = "s-" + stable
         else:
             session_id = self.id_factory("s")
-        admitted = self.repository.admit(self.daily_cap, session_id)
+        # A visitor is admitted against the same daily ledger, but only up to a
+        # lower limit, so the operator keeps headroom.
+        admitted = self.repository.admit(admit_limit or self.daily_cap, session_id)
         if start == "blank":
             # BUILT FROM WHAT THE VISITOR ASKS FOR. The template start always
             # opened on our own homepage with a question about its button, so a

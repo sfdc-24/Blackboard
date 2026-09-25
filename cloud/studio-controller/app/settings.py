@@ -45,6 +45,10 @@ class Settings:
     visitor_codes_daily_cap: int = 100
     visitor_sessions_per_day: int = 2
     visitor_token_seconds: int = 2 * 60 * 60
+    # Visitors share the daily session and voice ledgers with the operator but
+    # stop this far below each cap, so the operator is never locked out.
+    operator_reserved_sessions: int = 5
+    operator_reserved_voice: int = 1
     email_sender_url: str = ""
     email_sender_secret: str = ""
     voice_enabled: bool = False
@@ -90,6 +94,8 @@ class Settings:
             visitor_codes_daily_cap=int(os.environ.get("STUDIO_VISITOR_CODES_DAILY_CAP", "100")),
             visitor_sessions_per_day=int(os.environ.get("STUDIO_VISITOR_SESSIONS_PER_DAY", "2")),
             visitor_token_seconds=int(os.environ.get("STUDIO_VISITOR_TOKEN_SECONDS", "7200")),
+            operator_reserved_sessions=int(os.environ.get("STUDIO_OPERATOR_RESERVED_SESSIONS", "5")),
+            operator_reserved_voice=int(os.environ.get("STUDIO_OPERATOR_RESERVED_VOICE", "1")),
             email_sender_url=os.environ.get("STUDIO_EMAIL_SENDER_URL", "").strip(),
             email_sender_secret=os.environ.get("STUDIO_EMAIL_SENDER_SECRET", ""),
             voice_enabled=_enabled(os.environ.get("STUDIO_ENABLE_VOICE", "false")),
@@ -145,6 +151,10 @@ class Settings:
             raise RuntimeError("STUDIO_VISITOR_SESSIONS_PER_DAY must be between 1 and 20")
         if not 600 <= self.visitor_token_seconds <= 86400:
             raise RuntimeError("STUDIO_VISITOR_TOKEN_SECONDS must be between 600 and 86400")
+        if self.public_visitors and not 1 <= self.operator_reserved_sessions < self.daily_session_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave visitors at least one daily session")
+        if self.public_visitors and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave visitors at least one daily voice call")
         if self.public_visitors and self.lead_facts_enabled:
             # Lead facts read the Salesforce org for any session; a public
             # visitor must never reach that path.
