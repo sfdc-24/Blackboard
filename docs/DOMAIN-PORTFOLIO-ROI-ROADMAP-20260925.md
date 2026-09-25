@@ -1,6 +1,6 @@
 # Domain Portfolio, ROI and 30/60/90 Go-to-Market Roadmap
 
-**Version:** 1.1
+**Version:** 1.2
 
 **Decision date:** 2026-09-25
 
@@ -50,8 +50,8 @@ before checkout completes.
 | Decision | Exact domain | Role | Current evidence | Activation rule |
 |---|---|---|---|---|
 | **REGISTER NOW** | `converspan.com` | Sole public parent, accounts, checkout, and cross-vertical trust layer | No authoritative RDAP record; enabled NameSilo result at **US$17.29**, renewal **US$17.29** | Use as the canonical public origin after legal seller/footer/checkout identity is consistent |
-| **REGISTER NOW — defensive** | `converspan.ca` | Canada defensive redirect to `.com` | No authoritative RDAP record; enabled NameSilo result at **US$9.99**, renewal **US$9.99** | 301 redirect only; no separate content or analytics identity |
-| **DO NOT BUY NOW** | `converspan.org` | Optional collision protection only; no current customer or market function | No authoritative RDAP record; enabled NameSilo result at **US$14.99**, renewal **US$14.99** | Reconsider only if impersonation/confusion emerges; `.org` can wrongly imply a nonprofit |
+| **HOLD, DO NOT BUY NOW** | `converspan.ca` | Possible future Canadian local/defensive route | No authoritative RDAP record; enabled NameSilo result at **US$9.99**, renewal **US$9.99** | Buy only if Canadian localization, search, or trust evidence gives it a distinct job |
+| **REGISTER NOW — mission layer** | `converspan.org` | Public-interest mission, responsible-AI charter, community learning, accessibility, and open resources | No authoritative RDAP record; enabled NameSilo result at **US$14.99**, renewal **US$14.99** | No commercial checkout; clearly state actual legal status and never imply registered nonprofit status unless that entity exists |
 | **KEEP / RISK-REDUCE** | `sfdc24.com` | Existing Salesforce content and inbound lead capture | Already registered and live | Add clear independence language; move checkout and legal seller identity to Converspan; no new paid brand investment |
 | **HOLD, DO NOT BUY** | `pageandmark.com` | Possible future website and identity studio | No RDAP record; enabled NameSilo result at **US$17.29**, renewal **US$17.29**; matching `.ca` and `.org` also showed no registry record | Buy only after three paid web-sprint deliveries, at least CAD 400 measured contribution per standard delivery, and a distinct repeatable channel |
 | **HOLD, DO NOT BUY** | `stepandship.com` | Applied-AI work-skills education | `.com`, `.ca`, and `.org` showed no RDAP record | Buy only after two paid team engagements and at least 60% reusable curriculum |
@@ -64,10 +64,10 @@ before checkout completes.
 The proposed first order contains only:
 
 - `converspan.com` — US$17.29;
-- `converspan.ca` — US$9.99.
+- `converspan.org` — US$14.99.
 
-**Displayed first-year total: US$27.28 before applicable tax and card foreign
-exchange. Displayed annual renewal total: US$27.28 at the time checked.** The
+**Displayed first-year total: US$32.28 before applicable tax and card foreign
+exchange. Displayed annual renewal total: US$32.28 at the time checked.** The
 order must be re-read at checkout because registry and registrar prices can
 change. No cart addition or financial transaction is authorized by this
 document; the exact checkout total requires action-time approval.
@@ -112,7 +112,8 @@ sfdc24.com                            existing specialist acquisition surface
   -> qualified CTA to converspan.com/salesforce
   -> neutral legal seller / checkout / receipt identity
 
-converspan.ca                          permanent redirect to converspan.com
+converspan.org                         public-interest charter, learning, and open resources
+                                       no paid checkout; truthful legal-status language
 ```
 
 Every route uses one verified legal seller on the checkout, receipt, statement
@@ -194,7 +195,9 @@ acquisition: owner prospecting and sales time are logged.
 ### Day 0-3 — September 25-28, 2026
 
 - Obtain action-time approval and register the two-domain Converspan set.
-- Configure `.ca` as a permanent redirect to `.com`.
+- Publish a small `.org` mission page with the responsible-use charter,
+  community-learning purpose, and accurate legal-status language; do not put
+  commercial checkout on `.org`.
 - Publish one minimal Converspan storefront with `/salesforce`, `/web-sprint`,
   `/ai-clinic`, and `/account`; do not create separate vertical sites.
 - Make the verified legal seller consistent across footer, terms, privacy,
@@ -348,7 +351,7 @@ measure both commercial return and customer success.
 ## Immediate next decision
 
 At the financial confirmation gate, present the live checkout for exactly
-`converspan.com` and `converspan.ca`, including term, tax,
+`converspan.com` and `converspan.org`, including term, tax,
 foreign exchange treatment if shown, first-year total, and renewal total. Do
 not add hosting, email, SSL, privacy upsells, or another domain. After approval,
 register, read back the domain list, configure redirects, and execute the Day
