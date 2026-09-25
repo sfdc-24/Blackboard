@@ -61,7 +61,8 @@ def _sse(event: dict, name: str | None = None) -> str:
 
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
-               email_sender=None, email_client=None) -> FastAPI:
+               email_sender=None, email_client=None, talk_client=None,
+               analyst=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -356,8 +357,48 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "ok": True,
             "worker": settings.worker,
             "state_backend": backend,
-            "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled},
+            "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
+                         "talk": bool(talk_agents()), "agents": talk_agents(),
+                         "analyst": analyst_ready()},
         }
+
+    # THE TALK LANE. A spoken reply to what the visitor just said, in about a
+    # second, while the same words go to the builder as an utterance command.
+    # It reads the session (never writes it), so it cannot contend with the
+    # builder's one in-flight command. Per-session count is in memory: the
+    # session is operator-only and lasts at most max_session_seconds.
+    talk_counts: dict = {}
+    talk_last: dict = {}
+    TALK_SPACING_SECONDS = 1.5
+
+    def talk_lane():
+        nonlocal talk_client
+        if talk_client is None:
+            from workers.talk import TalkClient
+            talk_client = TalkClient(
+                anthropic_ready=settings.worker == "claude",
+                openai_key=settings.openai_api_key,
+            )
+        return talk_client
+
+    def talk_agents() -> list:
+        return list(talk_lane().agents())
+
+    # The analyst lane: a second agent beside the builder (workers/analyst.py).
+    analyze_counts: dict = {}
+    analyze_last: dict = {}
+    analyze_busy: set = set()
+    ANALYZE_SPACING_SECONDS = 3.0
+
+    def analyst_ready() -> bool:
+        return analyst is not None or settings.worker == "claude"
+
+    def analyst_lane():
+        nonlocal analyst
+        if analyst is None:
+            from workers.analyst import Analyst
+            analyst = Analyst()
+        return analyst
 
     async def json_object(request: Request, label: str) -> dict:
         raw = await request.body()
@@ -491,6 +532,134 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "Cache-Control": "no-store", "X-Accel-Buffering": "no",
             "X-Studio-Generation": str(initial[2]["generation"]),
         })
+
+    @app.post("/v1/session/{session_id}/talk")
+    async def talk(request: Request, session_id: str):
+        require_origin(request)
+        require_session(request, session_id)
+        agents = talk_agents()
+        if not agents:
+            raise HTTPException(503, "talk is not available")
+        from workers.talk import TEXT_MAX, canvas_summary, clean_history
+        body = await json_object(request, "talk")
+        if set(body) - {"text", "history", "agent", "turn"}:
+            raise HTTPException(400, "talk body has unknown fields")
+        # The page's own turn counter, echoed back, so a reply that resolves
+        # after the visitor has already started a newer turn can be dropped
+        # before it is spoken (Gemini's review of the talk contract).
+        turn = body.get("turn", 0)
+        if type(turn) is not int or not 0 <= turn <= 1_000_000:
+            raise HTTPException(400, "turn must be a non-negative integer")
+        agent = body.get("agent") or agents[0]
+        if agent not in agents:
+            # An unconfigured provider is reported precisely, never simulated.
+            raise HTTPException(400, "agent %r is not configured; available: %s"
+                                % (str(agent)[:20], ", ".join(agents)))
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > TEXT_MAX:
+            raise HTTPException(400, "talk needs text of 1 to %d characters" % TEXT_MAX)
+        try:
+            history = clean_history(body.get("history"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            record = await asyncio.to_thread(controller.repository.load, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        state = record.state
+        if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
+            raise HTTPException(410, "session has ended")
+        used = talk_counts.get(session_id, 0)
+        if used >= settings.talk_cap:
+            raise HTTPException(429, "talk limit reached for this session")
+        # Gemini's review of the talk lane: a hard total per session and a
+        # minimum spacing, both on the server, so no client can run up spend.
+        now = clock()
+        last = talk_last.get(session_id)
+        if last is not None and now - last < TALK_SPACING_SECONDS:
+            raise HTTPException(429, "talk is limited to one turn every %.1f seconds" % TALK_SPACING_SECONDS)
+        talk_counts[session_id] = used + 1
+        talk_last[session_id] = now
+        if len(talk_counts) > 500:
+            for stale in list(talk_counts)[:250]:
+                talk_counts.pop(stale, None)
+                talk_last.pop(stale, None)
+        try:
+            reply = await asyncio.to_thread(
+                talk_lane().reply, agent, text.strip(), history, canvas_summary(state.get("artifact")))
+        except Exception as exc:  # the builder still has the words; talking is best-effort
+            raise HTTPException(503, "talk is unavailable right now") from exc
+        if not reply:
+            raise HTTPException(503, "talk returned nothing")
+        return {"reply": reply, "speaker": agent, "turn": turn}
+
+    @app.post("/v1/session/{session_id}/analyze")
+    async def analyze(request: Request, session_id: str):
+        """Run the analyst on what the visitor just said, beside the builder.
+
+        Read the session, let the analyst research and map the data model and
+        the next question, then record them with a compare-and-set commit that
+        never waits for (or blocks) a build. Events reach the page over the
+        session stream and in this response.
+        """
+        require_origin(request)
+        require_session(request, session_id)
+        if not analyst_ready():
+            raise HTTPException(503, "the analyst is not available")
+        from workers.talk import TEXT_MAX, canvas_summary
+        body = await json_object(request, "analyze")
+        if set(body) - {"text", "turn"}:
+            raise HTTPException(400, "analyze body has unknown fields")
+        turn = body.get("turn", 0)
+        if type(turn) is not int or not 0 <= turn <= 1_000_000:
+            raise HTTPException(400, "turn must be a non-negative integer")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > TEXT_MAX:
+            raise HTTPException(400, "analyze needs text of 1 to %d characters" % TEXT_MAX)
+        try:
+            record = await asyncio.to_thread(controller.repository.load, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        state = record.state
+        if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
+            raise HTTPException(410, "session has ended")
+        if session_id in analyze_busy:
+            raise HTTPException(409, "an analysis is already running for this session")
+        used = analyze_counts.get(session_id, 0)
+        if used >= settings.analyze_cap:
+            raise HTTPException(429, "analysis limit reached for this session")
+        now = clock()
+        last = analyze_last.get(session_id)
+        if last is not None and now - last < ANALYZE_SPACING_SECONDS:
+            raise HTTPException(429, "analysis is limited to one every %.0f seconds" % ANALYZE_SPACING_SECONDS)
+        analyze_counts[session_id] = used + 1
+        analyze_last[session_id] = now
+        if len(analyze_counts) > 500:
+            for stale in list(analyze_counts)[:250]:
+                analyze_counts.pop(stale, None)
+                analyze_last.pop(stale, None)
+        analyze_busy.add(session_id)
+        try:
+            try:
+                result = await asyncio.to_thread(
+                    analyst_lane().analyze, state, text.strip(), canvas_summary(state.get("artifact")))
+            except Exception as exc:  # the builder and the talk lane carry on without it
+                raise HTTPException(503, "the analyst is unavailable right now") from exc
+            if not result.get("model"):
+                raise HTTPException(503, "; ".join(result.get("problems") or ["no analysis"])[:300])
+            try:
+                events = await asyncio.to_thread(
+                    controller.commit_analysis, session_id, result["model"], result.get("question"))
+            except SessionNotFound as exc:
+                raise HTTPException(404, "session not found") from exc
+            except CommandError as exc:
+                raise HTTPException(exc.status, str(exc)) from exc
+            except StateConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+        finally:
+            analyze_busy.discard(session_id)
+        return {"turn": turn, "model": result["model"], "events": events,
+                "problems": result.get("problems") or [], "searched": result.get("searched", 0)}
 
     @app.post("/v1/session/{session_id}/commands")
     async def commands(request: Request, session_id: str):

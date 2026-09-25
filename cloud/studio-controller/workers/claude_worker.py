@@ -636,6 +636,11 @@ class ClaudeWorker:
         except ValueError:
             return {"events": [], "problems": ["model output was not JSON"]}
         clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger)
+        if state.get("analyst"):
+            # The analyst lane asks the questions in this session (it maps the
+            # data model in parallel); the builder builds and confirms. Two
+            # agents asking at once would talk over each other.
+            clean["questions"] = []
         # Fresh per turn, never derived from a counter that can repeat.
         batch_id = "b-%s-%s" % (state.get("session_id", "s"), uuid.uuid4().hex[:10])
         # `resolves` is for the controller: it owns the question record, so it
