@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import unicodedata
 import urllib.request
@@ -34,10 +35,13 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
     _spec.loader.exec_module(_policy)
     USE_POLICY = _policy.USE_POLICY
 
-MODEL = os.environ.get("STUDIO_ADVISOR_MODEL") or "gemini-3.5-flash-lite"
+# A release must be reproducible from source.  Changing the provider model is a
+# reviewed code change, not an unreported mutable environment override.
+MODEL = "gemini-3.5-flash-lite"
 URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 TIMEOUT_SECONDS = 6.0
 MAX_TOKENS = 700
+MAX_RESPONSE_BYTES = 32 * 1024
 CALL_CAP = 12                      # advice calls per session
 CAPS = {"perspective": 240, "prompt": 160, "why": 160, "label": 60, "risk": 120}
 MAX_QUESTIONS = 2
@@ -162,6 +166,8 @@ class Advisor:
         self.clock = clock
         self.call_cap = call_cap
         self._calls: dict = {}
+        self._busy: set = set()
+        self._lock = threading.Lock()
 
     def ready(self) -> bool:
         return self.enabled and bool(self.key)
@@ -170,17 +176,27 @@ class Advisor:
         """Advice bound to snapshot["revision"], or None - never an exception."""
         if not self.ready():
             return None
-        used = self._calls.get(session_id, 0)
-        if used >= self.call_cap:
+        if not isinstance(session_id, str) or not session_id:
             return None
-        self._calls[session_id] = used + 1
+        with self._lock:
+            used = self._calls.get(session_id, 0)
+            if used >= self.call_cap or session_id in self._busy:
+                return None
+            self._calls[session_id] = used + 1
+            self._busy.add(session_id)
+        deadline = self.clock() + TIMEOUT_SECONDS
         try:
             revision = snapshot.get("revision")
             if type(revision) is not int or revision < 0:
                 return None
             advice, problems = validate(self._ask(snapshot_text(snapshot)), revision)
+            if self.clock() >= deadline:
+                return None
         except Exception:                  # a failed advisor blocks nothing; nothing of it is logged
             return None
+        finally:
+            with self._lock:
+                self._busy.discard(session_id)
         return advice if not problems else None
 
     def _ask(self, text: str) -> dict:
@@ -195,11 +211,21 @@ class Advisor:
             "Content-Type": "application/json",
         })
         with self._open(request, timeout=TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            headers = getattr(response, "headers", None)
+            declared = headers.get("Content-Length") if headers is not None else None
+            if declared not in (None, ""):
+                declared_size = int(declared)
+                if declared_size < 0 or declared_size > MAX_RESPONSE_BYTES:
+                    raise ValueError("advisor response is outside the byte limit")
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ValueError("advisor response is outside the byte limit")
+            payload = json.loads(raw.decode("utf-8"))
         candidates = payload.get("candidates") or []
         parts = ((candidates[0] or {}).get("content") or {}).get("parts") or [] if candidates else []
         text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
         return json.loads(text)
 
 
-__all__ = ["Advisor", "validate", "fenced", "snapshot_text", "SYSTEM", "CAPS"]
+__all__ = ["Advisor", "validate", "fenced", "snapshot_text", "SYSTEM", "CAPS",
+           "MODEL", "MAX_RESPONSE_BYTES"]

@@ -9,6 +9,7 @@ import json
 import logging
 import pathlib
 import sys
+import threading
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -30,11 +31,15 @@ KEY = "AIza-test-key-not-real"
 
 
 class Response:
-    def __init__(self, payload):
+    def __init__(self, payload=None, *, raw=None, headers=None):
         self.payload = payload
+        self.raw = raw if raw is not None else json.dumps(payload).encode("utf-8")
+        self.headers = headers or {}
+        self.read_sizes = []
 
-    def read(self):
-        return json.dumps(self.payload).encode("utf-8")
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return self.raw if size is None or size < 0 else self.raw[:size]
 
     def __enter__(self):
         return self
@@ -52,16 +57,28 @@ def gemini_payload(obj, thought=False):
 
 
 class Opener:
-    def __init__(self, payload=None, fail=None):
+    def __init__(self, payload=None, fail=None, response=None, after=None):
         self.payload = payload if payload is not None else gemini_payload(GOOD)
         self.fail = fail
+        self.response = response
+        self.after = after
         self.requests = []
 
     def __call__(self, request, timeout=None):
         self.requests.append((request, timeout))
+        if self.after:
+            self.after()
         if self.fail:
             raise self.fail
-        return Response(self.payload)
+        return self.response or Response(self.payload)
+
+
+class Clock:
+    def __init__(self, value=100.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
 
 
 def snapshot(revision=3):
@@ -141,6 +158,53 @@ class Contract(unittest.TestCase):
         self.assertEqual("application/json", body["generationConfig"]["responseMimeType"])
         self.assertIn("SFDC24 USE POLICY", body["systemInstruction"]["parts"][0]["text"])
         self.assertIn("revision 3", body["contents"][0]["parts"][0]["text"])
+
+    def test_the_release_uses_one_source_pinned_model(self):
+        self.assertEqual("gemini-3.5-flash-lite", adv.MODEL)
+
+    def test_the_provider_body_is_bounded_before_json_decode(self):
+        oversized = Response(raw=b"x" * (adv.MAX_RESPONSE_BYTES + 1))
+        opener = Opener(response=oversized)
+        result = adv.Advisor(key=KEY, enabled=True, opener=opener).advise("s-1", snapshot())
+        self.assertIsNone(result)
+        self.assertEqual([adv.MAX_RESPONSE_BYTES + 1], oversized.read_sizes)
+
+        declared = Response(raw=b"{}", headers={"Content-Length": str(adv.MAX_RESPONSE_BYTES + 1)})
+        opener = Opener(response=declared)
+        result = adv.Advisor(key=KEY, enabled=True, opener=opener).advise("s-2", snapshot())
+        self.assertIsNone(result)
+        self.assertEqual([], declared.read_sizes)
+
+    def test_a_late_provider_result_is_discarded(self):
+        clock = Clock()
+        opener = Opener(after=lambda: setattr(clock, "value", clock.value + adv.TIMEOUT_SECONDS))
+        result = adv.Advisor(key=KEY, enabled=True, opener=opener, clock=clock).advise("s-1", snapshot())
+        self.assertIsNone(result)
+
+    def test_same_session_single_flight_is_nonblocking_and_releases(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block_first():
+            entered.set()
+            self.assertTrue(release.wait(2.0))
+
+        opener = Opener(after=block_first)
+        advisor = adv.Advisor(key=KEY, enabled=True, opener=opener)
+        first = []
+        thread = threading.Thread(target=lambda: first.append(advisor.advise("s-1", snapshot())))
+        thread.start()
+        self.assertTrue(entered.wait(1.0))
+        self.assertIsNone(advisor.advise("s-1", snapshot()))
+        self.assertEqual(1, len(opener.requests))
+        release.set()
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertIsNotNone(first[0])
+
+        opener.after = None
+        self.assertIsNotNone(advisor.advise("s-1", snapshot()))
+        self.assertEqual(2, len(opener.requests))
 
     def test_nothing_about_a_failure_is_logged(self):
         stream = io.StringIO()

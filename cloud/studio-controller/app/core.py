@@ -34,6 +34,11 @@ def _command_fingerprint(command: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _advance_epoch(state: dict, key: str) -> None:
+    """Persist one monotonic lifecycle transition, including on old sessions."""
+    state[key] = int(state.get(key) or 0) + 1
+
+
 def _find_question(state: dict, question_id: str) -> dict:
     for question in state.get("questions", []):
         if question.get("question_id") == question_id:
@@ -227,6 +232,7 @@ class StudioController:
             "seen_ops": [],
             "commands": {},
             "active_command": None,
+            "command_epoch": 0,
             "paused": False,
             "stopped": False,
             # A public visitor is never an operator: operator-only paths
@@ -234,6 +240,7 @@ class StudioController:
             "operator_subject": "" if visitor else subject,
             "visitor_subject": subject if visitor else "",
             "voice_item_ids": [],
+            "voice_epoch": 0,
         }
         if analyst and start == "blank":
             # A homepage (blank) session with the analyst lane: the analyst owns
@@ -389,6 +396,7 @@ class StudioController:
             "outcome_unknown": True,
         })
         state["active_command"] = None
+        _advance_epoch(state, "command_epoch")
         token = self.repository.save(session_id, state, token)
         return state, token
 
@@ -431,6 +439,7 @@ class StudioController:
             "fingerprint": fingerprint,
         }
         state["active_command"] = command_id
+        _advance_epoch(state, "command_epoch")
         reserved_token = self.repository.save(session_id, state, current_token)
 
         working = copy.deepcopy(state)
@@ -444,6 +453,7 @@ class StudioController:
                 "finished_at": int(self.clock()), "fingerprint": fingerprint,
             }
             state["active_command"] = None
+            _advance_epoch(state, "command_epoch")
             try:
                 self.repository.save(session_id, state, reserved_token)
             except StateConflict:
@@ -455,6 +465,7 @@ class StudioController:
             "fingerprint": fingerprint, "result": copy.deepcopy(result)
         }
         working["active_command"] = None
+        _advance_epoch(working, "command_epoch")
         self.repository.save(session_id, working, reserved_token)
         return result
 
@@ -595,6 +606,7 @@ class StudioController:
                 "fingerprint": fingerprint,
                 "result": copy.deepcopy(result),
             }
+            _advance_epoch(candidate, "command_epoch")
             try:
                 self.repository.save(session_id, candidate, record.token)
                 cancel = getattr(self.worker, "cancel_session", None)
@@ -626,6 +638,7 @@ class StudioController:
             "started_at": int(self.clock()),
             "ends_at": int(ends_at),
         }
+        _advance_epoch(state, "voice_epoch")
         self.repository.save(session_id, state, record.token)
         return copy.deepcopy(state)
 
@@ -639,6 +652,7 @@ class StudioController:
         voice["call_id"] = call_id
         voice["status"] = "active"
         voice["activated_at"] = int(self.clock())
+        _advance_epoch(state, "voice_epoch")
         self.repository.save(session_id, state, record.token)
         return copy.deepcopy(state)
 
@@ -654,6 +668,7 @@ class StudioController:
             "failed_at": int(self.clock()),
             "failure": "provider request outcome unknown",
         })
+        _advance_epoch(state, "voice_epoch")
         self.repository.save(session_id, state, record.token)
 
     def reconcile_voice_hangup(
@@ -684,6 +699,7 @@ class StudioController:
                 "ended_at": int(self.clock()),
                 "end_reason": reason,
             })
+            _advance_epoch(state, "voice_epoch")
             try:
                 self.repository.save(session_id, state, record.token)
                 return True
@@ -702,6 +718,7 @@ class StudioController:
             "close_reason": reason,
             "retry_at": int(self.clock()),
         })
+        _advance_epoch(state, "voice_epoch")
         self.repository.save(session_id, state, record.token)
 
     def fail_voice(self, session_id: str, voice_id: str) -> bool:
@@ -715,6 +732,7 @@ class StudioController:
             if voice.get("voice_id") != voice_id or voice.get("status") != "opening":
                 return False
             state.pop("voice_call", None)
+            _advance_epoch(state, "voice_epoch")
             try:
                 self.repository.save(session_id, state, record.token)
                 return True
@@ -729,6 +747,7 @@ class StudioController:
         if voice.get("call_id") != call_id or voice.get("status") != "active":
             return
         voice.update({"status": "ended", "ended_at": int(self.clock()), "end_reason": reason})
+        _advance_epoch(state, "voice_epoch")
         self.repository.save(session_id, state, record.token)
 
     def _metadata_proposal_event(self, state: dict, field: dict) -> dict:
