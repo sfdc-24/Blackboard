@@ -262,6 +262,28 @@ accumulating. It does not guarantee non-overlap. See
 4. Claude worker and external connectors are enabled independently; none is a
    prerequisite for an earlier safe release.
 
+## The Muse (third homepage agent)
+
+`POST /v1/session/{id}/inspire` with `{"text"?: str <= 600, "turn": int}` returns
+`{"turn", "muse": {"line", "directions": [a, b, c]}}`: one spark plus three
+different directions, each with what to see (palette, motif, type family), read
+(headline, line), hear (tone) and work with. `workers/muse.py` checks the whole set
+(exact ids a/b/c, hex colours, closed type enum, caps, no `<`/`>` or control
+characters, distinct titles, types and palettes) with one repair attempt, then
+503. The set is stored as `state["muse"]` by the same wait-for-the-build commit
+as the analyst. At most `STUDIO_MUSE_CAP` (6) calls per session.
+
+`/speak` accepts `{"voice": "muse", "text"}` in the Muse's voice
+(`STUDIO_MUSE_VOICE`, default `coral`), or `{"voice": "muse", "direction": "a"}`,
+which speaks the STORED direction's headline and line in its stored tone. The
+page never supplies TTS instructions; the architect path is unchanged. `/health`
+reports `features.muse` (Anthropic ready) and lists `muse` in `features.voices`
+only when voice and the Muse are both available.
+
+Until the use-policy module lands (PR #255), the Muse carries the policy in
+one sentence of its own prompt; after it lands, it takes `USE_POLICY` and the
+moderation gate like the other lanes.
+
 ## Metadata proposal contract (offline-only increment)
 
 `STUDIO_ENABLE_METADATA_PROPOSALS` defaults to `false`. Enabling it requires an

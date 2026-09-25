@@ -494,6 +494,39 @@ class StudioController:
                 if conflicts >= self.repository.attempts:
                     raise StateConflict("analysis could not be recorded; the session kept changing")
 
+    def commit_muse(self, session_id: str, muse: dict) -> dict:
+        """Record the Muse's last set of directions beside the builder.
+
+        Same discipline as commit_analysis: the model call ran outside any
+        lock; only this millisecond write waits while a build is in flight, so
+        a build's reserved save token is never invalidated under it. No event
+        is emitted - the page has the set in the /inspire response - and the
+        stored copy is what a spoken direction preview reads, so the page can
+        never supply the text or the tone that gets spoken.
+        """
+        conflicts = 0
+        waits = 0
+        while True:
+            record = self.repository.load(session_id)
+            state = record.state
+            self._assert_live(state)
+            if state.get("active_command"):
+                waits += 1
+                if waits > self.analysis_wait_polls:
+                    raise StateConflict("inspiration could not be recorded; a build is still running")
+                self.sleep(self.analysis_poll_seconds)
+                continue
+            stored = {"directions": copy.deepcopy(muse["directions"]), "line": muse["line"],
+                      "at": int(self.clock())}
+            state["muse"] = stored
+            try:
+                self.repository.save(session_id, state, record.token)
+                return copy.deepcopy(stored)
+            except StateConflict:
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("inspiration could not be recorded; the session kept changing")
+
     def stop_session(self, session_id: str, command: dict,
                      reason: str = "You ended this session.") -> dict:
         """Fail-safe stop that fences any late worker commit with CAS.
