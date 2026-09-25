@@ -38,9 +38,11 @@ on:
       - 'tests/test_build_health.cjs'
       - 'apps-script/governor-page-api/Code.js'
       - 'apps-script/governor-page-api/Monitor.js'
+      - 'apps-script/governor-page-api/StudioEmail.js'
       - 'apps-script/governor-page-api/appsscript.json'
       - 'tests/test_governor_v30.cjs'
       - 'tests/test_governor_v31.cjs'
+      - 'tests/test_studio_email_sender.cjs'
       - 'apps-script/glasses-intake-uploader/Code.gs'
       - 'scripts/gas_staging_targets.json'
       - 'tests/test_staging_target.py'
@@ -128,8 +130,8 @@ jobs:
           npm ci --prefix tooling/clasp --ignore-scripts --no-audit --no-fund
           test "$(tooling/clasp/node_modules/.bin/clasp --version)" = '3.4.1'
           node --test tests/test_clasp_json_contract.cjs
-      - name: Test Google callback claims with mocked token exchange
-        run: node --test tests/test_governor_auth.cjs tests/test_governor_tenant_boundary.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs
+      - name: Test Google callback claims and Governor email routing with mocked providers
+        run: node --test tests/test_governor_auth.cjs tests/test_governor_tenant_boundary.cjs tests/test_governor_v30.cjs tests/test_governor_v31.cjs tests/test_studio_email_sender.cjs
 
       # tests/test_reception_popblock.cjs arrived with this PR and NO workflow
       # referenced it, so all three of the PR's green checks passed without ever

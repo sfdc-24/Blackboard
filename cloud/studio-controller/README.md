@@ -212,8 +212,10 @@ Required secrets/environment:
 - `BLACKBOARD_STATE_URI=gs://sfdc24-fleet-state/studio`
 - `STUDIO_SESSION_SECRET` from Secret Manager (at least 32 random bytes)
 - `STUDIO_OPERATOR_EMAILS` as an exact lowercase allowlist
-- `STUDIO_EMAIL_SENDER_URL` for the HTTPS Apps Script/Pipedream mail adapter
-- `STUDIO_EMAIL_SENDER_SECRET` for request HMAC signing
+- `STUDIO_EMAIL_SENDER_URL` for the HTTPS Apps Script/Pipedream mail adapter;
+  the reviewed Governor adapter uses its `/exec?action=studio-email` URL
+- `STUDIO_EMAIL_SENDER_SECRET` for request HMAC signing; the Governor adapter
+  uses a dedicated key, distinct from `GOVERNOR_PASS` and any standalone sender
 - `STUDIO_WORKER=synthetic` for the provider-free release; `claude` plus
   `ANTHROPIC_API_KEY` for the model-backed one
 - `STUDIO_ENABLE_VOICE=false` for the authentication/text release
