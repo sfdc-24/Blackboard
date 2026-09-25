@@ -81,14 +81,14 @@ class Gate(unittest.TestCase):
     def test_every_field_is_checked(self):
         cases = {
             "line empty": lambda r: r.update(line=" "),
-            "line too long": lambda r: r.update(line="x" * 261),
-            "title too long": lambda r: r["directions"][0].update(title="x" * 61),
-            "motif too long": lambda r: r["directions"][0]["see"].update(motif="x" * 101),
+            "line too long": lambda r: r.update(line="x" * 241),
+            "title too long": lambda r: r["directions"][0].update(title="x" * 51),
+            "motif too long": lambda r: r["directions"][0]["see"].update(motif="x" * 91),
             "type not in enum": lambda r: r["directions"][0]["see"].update(type="comic"),
-            "headline too long": lambda r: r["directions"][0]["read"].update(headline="x" * 81),
-            "read line too long": lambda r: r["directions"][0]["read"].update(line="x" * 201),
-            "tone too long": lambda r: r["directions"][0]["hear"].update(tone="x" * 121),
-            "work too long": lambda r: r["directions"][0].update(work="x" * 181),
+            "headline too long": lambda r: r["directions"][0]["read"].update(headline="x" * 71),
+            "read line too long": lambda r: r["directions"][0]["read"].update(line="x" * 171),
+            "tone too long": lambda r: r["directions"][0]["hear"].update(tone="x" * 101),
+            "work too long": lambda r: r["directions"][0].update(work="x" * 151),
             "work missing": lambda r: r["directions"][0].pop("work"),
             "extra field": lambda r: r["directions"][0].update(css="body{}"),
             "extra top field": lambda r: r.update(note="x"),
@@ -133,6 +133,13 @@ class Gate(unittest.TestCase):
         muse, problems = mu.validate(raw)
         self.assertEqual([], problems)
         self.assertEqual(raw["directions"][0]["see"]["motif"], muse["directions"][0]["see"]["motif"])
+
+    def test_two_picks_at_the_caps_fit_the_homepage_brief(self):
+        # The page's brief per pick: "Title" (#AAAAAA #BBBBBB #CCCCCC, display type, "Headline"; tone: ...)
+        one = (mu.CAPS["title"] + 3 * 7 + 2 + len("display") + mu.CAPS["headline"] + mu.CAPS["tone"]
+               + mu.BRIEF_OVERHEAD)
+        two = len("Blend these directions: ") + 2 * one + len(" and ") + 1
+        self.assertLessEqual(two, 600, (one, two))
 
     def test_the_model_is_still_asked_for_the_short_length(self):
         self.assertIn("at most 60 characters", mu.SYSTEM)

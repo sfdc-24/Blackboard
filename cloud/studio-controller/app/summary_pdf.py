@@ -139,7 +139,7 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None) -> bytes:
     said = [t.get("text", "") for t in state.get("transcript") or [] if t.get("role", "visitor") == "visitor"]
     if said:
         heading("What you asked for")
-        bullets([clean(s, 300) for s in said[-40:]])
+        bullets([clean(s, 600) for s in said[-40:]])     # a whole spoken line: the utterance cap
 
     confirmed = [(e.get("payload") or {}).get("text", "") for e in state.get("events") or []
                  if e.get("type") == "confirm"]

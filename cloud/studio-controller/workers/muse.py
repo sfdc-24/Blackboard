@@ -43,9 +43,16 @@ BAD_CHARS_RE = re.compile(r"[<>\x00-\x1f\x7f]")
 # ASKED is what the prompt asks the model for; CAPS is what the gate accepts.
 # The model overshoots a stated length now and then (live-like input on
 # 2026-09-25: every motif ran past 60 and the whole set was refused, twice), so
-# the gate allows headroom; the page and the PDF lay out the longer text fine.
+# the gate allows modest headroom - sized so the homepage's brief for up to two
+# picked directions (title, three colours, type, headline, tone) stays inside
+# the 600-character utterance, and the summary PDF keeps a whole spoken line.
 ASKED = {"line": 200, "title": 40, "motif": 60, "headline": 60, "read_line": 140, "tone": 80, "work": 120}
-CAPS = {"line": 260, "title": 60, "motif": 100, "headline": 80, "read_line": 200, "tone": 120, "work": 180}
+CAPS = {"line": 240, "title": 50, "motif": 90, "headline": 70, "read_line": 170, "tone": 100, "work": 150}
+# The homepage's brief for one picked direction, at the caps: the quoted title,
+# three colours, the type family, the quoted headline and the tone, with the
+# page's punctuation. Two of them plus "Blend these directions: " and " and "
+# must fit the 600-character utterance (tests pin this).
+BRIEF_OVERHEAD = 26
 
 # The same use policy every lane carries (workers/policy.py, PR #255).
 try:  # the app and the image import this module as part of the workers package
