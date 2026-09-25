@@ -37,7 +37,7 @@ the contract do not churn the published artifact.
     "OpenAI Realtime is the live conversational host over direct browser WebRTC.",
     "The Studio Controller is the session coordinator",
     "Salesforce is the commercial and customer-success system of record.",
-    "Foundry removed",
+    "Foundry is excluded from this architecture.",
     "Converspan production implementation, deployment, and client onboarding"
   ],
   "required_pdf_phrases": [
@@ -63,6 +63,9 @@ the contract do not churn the published artifact.
 Blackboard is the motherboard and durable control plane. SFDC24 is the first
 service minibus. Converspan and later client minibuses are governed descendants,
 not independent copies with unrestricted credentials or authority.
+
+Foundry is excluded from this architecture. Meta inference remains optional
+and off until it has separate access, policy, cost, and acceptance evidence.
 
 The Studio Controller is the session coordinator and sole artifact commit
 authority. It may ask several model providers to work concurrently, but provider

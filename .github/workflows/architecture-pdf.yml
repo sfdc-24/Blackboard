@@ -37,7 +37,7 @@ jobs:
           cache-dependency-path: tools/requirements-architecture-pdf.txt
       - name: Install the pinned architecture-PDF dependency
         run: python -m pip install --disable-pip-version-check -r tools/requirements-architecture-pdf.txt
-      - name: Reject ambiguous duplicate contract keys
+      - name: Reject ambiguous contract encodings
         shell: bash
         run: |
           python - <<'PY'
@@ -52,6 +52,17 @@ jobs:
               pass
           else:
               raise SystemExit("duplicate architecture PDF contract key was accepted")
+          invalid = dict(namespace["CONTRACT"])
+          invalid["schema_version"] = True
+          try:
+              namespace["validate_contract"](
+                  invalid,
+                  namespace["ADR"].read_text(encoding="utf-8"),
+              )
+          except RuntimeError:
+              pass
+          else:
+              raise SystemExit("boolean architecture PDF schema version was accepted")
           PY
       - name: Validate the ADR contract and rebuild the artifact twice, byte for byte
         shell: bash
