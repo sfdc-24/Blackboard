@@ -80,6 +80,10 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_analyst.py"
+      - "tests/test_studio_voices.py"
+      - "tests/test_acceptance_current_state.py"
+      - "scripts/acceptance_current_state.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
@@ -172,6 +176,10 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/test_studio_analyst.py"
+      - "tests/test_studio_voices.py"
+      - "tests/test_acceptance_current_state.py"
+      - "scripts/acceptance_current_state.py"
       - "tests/test_studio_org_facts.py"
       - "tests/test_studio_lead_facts.py"
       - "tests/test_studio_lead_deadline.py"
@@ -720,7 +728,7 @@ jobs:
             sudo unshare -n -- "$python_bin" -m unittest \
               tests.test_studio_auth tests.test_studio_controller tests.test_studio_lead_facts \
               tests.test_studio_lead_deadline tests.test_studio_metadata_contract \
-              tests.test_studio_voice_sweep_job
+              tests.test_studio_voice_sweep_job tests.test_studio_analyst tests.test_studio_voices
           else
             echo "not on this branch; skipping"
           fi
@@ -776,6 +784,18 @@ jobs:
           if [ -f tests/test_studio_claude_worker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The current-state acceptance runner: every reader faked, so this proves
+      # only how it judges (PASS / FAIL / UNKNOWN), never the live fleet.
+      - name: "current-state acceptance runner judges correctly (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_acceptance_current_state.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_acceptance_current_state
           else
             echo "not on this branch; skipping"
           fi
