@@ -464,7 +464,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "state_backend": backend,
             "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
-                         "analyst": analyst_ready(), "muse": muse_ready(),
+                         "analyst": analyst_ready(), "muse": muse_ready(), "topics": True,
                          "public_visitors": settings.public_visitors,
                          "governance": True,
                          "voices": voices_available(),
@@ -776,8 +776,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         require_origin(request)
         operator, role = require_signed_in(request)
         body = await json_object(request, "session")
-        if set(body) - {"title", "creation_id", "start"}:
+        if set(body) - {"title", "creation_id", "start", "topic"}:
             raise HTTPException(400, "session body has unknown fields")
+        from workers.topics import TOPICS
+        topic = body.get("topic") or ""
+        if not isinstance(topic, str) or (topic and topic not in TOPICS):
+            raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(TOPICS)))
         start = body.get("start") or "template"
         if start not in ("template", "blank"):
             raise HTTPException(400, "start must be template or blank")
@@ -796,6 +800,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
                 settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
                 start == "blank" and analyst_ready(),
+                topic,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
@@ -883,6 +888,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not agents:
             raise HTTPException(503, "talk is not available")
         from workers.talk import TEXT_MAX, canvas_summary, clean_history
+        from workers.topics import with_topic
         body = await json_object(request, "talk")
         if set(body) - {"text", "history", "agent", "turn"}:
             raise HTTPException(400, "talk body has unknown fields")
@@ -935,7 +941,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return refused
         try:
             reply = await asyncio.to_thread(
-                talk_lane().reply, agent, text.strip(), history, canvas_summary(state.get("artifact")))
+                talk_lane().reply, agent, text.strip(), history, with_topic(state, canvas_summary(state.get("artifact"))))
         except Exception as exc:  # the builder still has the words; talking is best-effort
             raise HTTPException(503, "talk is unavailable right now") from exc
         if not reply:
@@ -1079,9 +1085,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = await asyncio.to_thread(live_state, session_id)
         spend(recap_counts, session_id, settings.recap_cap, "recap")
         from workers.talk import canvas_summary, recap_brief
+        from workers.topics import with_topic
         try:
             text = await asyncio.to_thread(
-                talk_lane().recap, agent, recap_brief(state, canvas_summary(state.get("artifact"))))
+                talk_lane().recap, agent, recap_brief(state, with_topic(state, canvas_summary(state.get("artifact")))))
         except Exception as exc:
             raise HTTPException(503, "the recap is unavailable right now") from exc
         if not text:
@@ -1270,6 +1277,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not analyst_ready():
             raise HTTPException(503, "the analyst is not available")
         from workers.talk import TEXT_MAX, canvas_summary
+        from workers.topics import with_topic
         body = await json_object(request, "analyze")
         if set(body) - {"text", "turn"}:
             raise HTTPException(400, "analyze body has unknown fields")
@@ -1311,7 +1319,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         try:
             try:
                 result = await asyncio.to_thread(
-                    analyst_lane().analyze, state, text.strip(), canvas_summary(state.get("artifact")))
+                    analyst_lane().analyze, state, text.strip(), with_topic(state, canvas_summary(state.get("artifact"))))
             except Exception as exc:  # the builder and the talk lane carry on without it
                 raise HTTPException(503, "the analyst is unavailable right now") from exc
             if not result.get("model"):

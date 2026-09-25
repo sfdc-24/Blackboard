@@ -178,7 +178,7 @@ class StudioController:
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
                        visitor: bool = False, admit_limit: int | None = None,
-                       analyst: bool = False) -> tuple[dict, int]:
+                       analyst: bool = False, topic: str = "") -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -218,6 +218,8 @@ class StudioController:
             "turn_id": "turn-0",
             "turn_seq": 0,
             "artifact": copy.deepcopy(artifact),
+            # What the visitor picked before Start (workers/topics.py); "" when none.
+            "topic": topic,
             "questions": copy.deepcopy(questions),
             "batches": {},
             "transcript": [],
