@@ -84,6 +84,7 @@ on:
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_studio_public_visitors.py"
+      - "tests/test_studio_muse.py"
       - "tests/test_acceptance_current_state.py"
       - "tests/mutate_bus_filters.py"
       - "scripts/bus.py"
@@ -185,6 +186,7 @@ on:
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
       - "tests/test_studio_public_visitors.py"
+      - "tests/test_studio_muse.py"
       - "tests/test_acceptance_current_state.py"
       - "tests/mutate_bus_filters.py"
       - "scripts/bus.py"
@@ -740,6 +742,7 @@ jobs:
               tests.test_studio_lead_deadline tests.test_studio_metadata_contract \
               tests.test_studio_voice_sweep_job tests.test_studio_analyst tests.test_studio_voices \
               tests.test_studio_public_visitors
+              tests.test_studio_muse
           else
             echo "not on this branch; skipping"
           fi

@@ -81,7 +81,7 @@ ARCHITECT_VOICE_STYLE = (
 def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
-               analyst=None, moderation_client=None) -> FastAPI:
+               analyst=None, moderation_client=None, muse=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     store = store or open_store(settings.state_uri)
@@ -405,10 +405,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "state_backend": backend,
             "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
-                         "analyst": analyst_ready(),
+                         "analyst": analyst_ready(), "muse": muse_ready(),
                          "public_visitors": settings.public_visitors,
                          "governance": True,
-                         "voices": ["host", "architect"] if (settings.voice_enabled and settings.openai_api_key) else []},
+                         "voices": voices_available()},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -528,6 +528,28 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return "refused"
         await end_for_policy(session_id)
         return "ended"
+    # The Muse (workers/muse.py): a third agent that sparks ideas and offers
+    # three directions to choose from. Its directions need Anthropic (the same
+    # readiness as the builder); its voice needs OpenAI TTS like the architect's,
+    # so /health lists "muse" among the voices only when both are there.
+    muse_counts: dict = {}
+    MUSE_STYLE = ("A curious, imaginative creative director: bright, playful and thought-provoking, "
+                  "with wonder in the voice and a lively pace.")
+
+    def muse_ready() -> bool:
+        return muse is not None or settings.worker == "claude"
+
+    def muse_lane():
+        nonlocal muse
+        if muse is None:
+            from workers.muse import Muse
+            muse = Muse()
+        return muse
+
+    def voices_available() -> list:
+        if not (settings.voice_enabled and settings.openai_api_key):
+            return []
+        return ["host", "architect"] + (["muse"] if muse_ready() else [])
 
     async def json_object(request: Request, label: str) -> dict:
         raw = await request.body()
@@ -752,37 +774,108 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     @app.post("/v1/session/{session_id}/speak")
     async def speak(request: Request, session_id: str):
-        """One line in the architect's voice, as audio. The text is what the page
-        was sent by the builder or the analyst; nothing is generated here."""
+        """One line as audio, in the architect's voice or the Muse's.
+
+        The architect speaks text the page was sent by the builder or the
+        analyst. The Muse speaks either such text, or - with "direction" and
+        no text - the headline and line of one of its STORED directions, in
+        that direction's stored tone: the "hear" preview. The page never
+        supplies the instructions the voice is given; nothing is generated here.
+        """
         require_origin(request)
         require_session(request, session_id)
         if not (settings.voice_enabled and settings.openai_api_key):
             raise HTTPException(503, "voice is not enabled in this release")
         body = await json_object(request, "speak")
-        if set(body) - {"text", "voice"}:
+        if set(body) - {"text", "voice", "direction"}:
             raise HTTPException(400, "speak body has unknown fields")
-        if body.get("voice", "architect") != "architect":
-            raise HTTPException(400, "voice must be architect")
-        text = body.get("text")
-        if not isinstance(text, str) or not text.strip() or len(text) > SPEAK_MAX:
-            raise HTTPException(400, "speak needs text of 1 to %d characters" % SPEAK_MAX)
-        await asyncio.to_thread(live_state, session_id)
+        who = body.get("voice", "architect")
+        if who not in ("architect", "muse"):
+            raise HTTPException(400, "voice must be architect or muse")
+        if who == "muse" and not muse_ready():
+            raise HTTPException(503, "the muse is not available")
+        if "direction" in body:
+            if who != "muse":
+                raise HTTPException(400, "a direction is spoken only by the muse")
+            if "text" in body:
+                raise HTTPException(400, "send a direction or text, not both")
+            direction = body.get("direction")
+            if direction not in ("a", "b", "c"):
+                raise HTTPException(400, "direction must be a, b or c")
+            state = await asyncio.to_thread(live_state, session_id)
+            stored = next((d for d in ((state.get("muse") or {}).get("directions") or [])
+                           if isinstance(d, dict) and d.get("id") == direction), None)
+            if stored is None:
+                raise HTTPException(400, "there is no direction %r to speak" % direction)
+            headline = str(stored["read"]["headline"]).strip()
+            joiner = " " if headline.endswith((".", "!", "?")) else ". "
+            text = headline + joiner + str(stored["read"]["line"]).strip()
+            instructions = MUSE_STYLE + " Deliver this line in this tone: " + str(stored["hear"]["tone"]).strip()
+        else:
+            text = body.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text) > SPEAK_MAX:
+                raise HTTPException(400, "speak needs text of 1 to %d characters" % SPEAK_MAX)
+            await asyncio.to_thread(live_state, session_id)
+            instructions = MUSE_STYLE if who == "muse" else ARCHITECT_STYLE
         spend(speak_counts, session_id, settings.speak_cap, "speech")
         if await policy_gate(session_id, "speak", [text], count=False):
             raise HTTPException(422, governance.POLICY_PROBLEM)
+        voice_name = settings.muse_voice if who == "muse" else settings.architect_voice
+        unavailable = "the muse voice is unavailable right now" if who == "muse" \
+            else "the architect voice is unavailable right now"
         try:
             response = await request.app.state.voice_client.post(
                 TTS_URL,
                 headers={"Authorization": "Bearer " + settings.openai_api_key},
-                json={"model": TTS_MODEL, "voice": settings.architect_voice, "input": " ".join(text.split()),
-                      "instructions": ARCHITECT_STYLE, "response_format": "mp3"},
+                json={"model": TTS_MODEL, "voice": voice_name, "input": " ".join(text.split()),
+                      "instructions": instructions, "response_format": "mp3"},
             )
         except httpx.HTTPError as exc:
-            raise HTTPException(503, "the architect voice is unavailable right now") from exc
+            raise HTTPException(503, unavailable) from exc
         if response.status_code != 200 or not getattr(response, "content", b""):
-            raise HTTPException(503, "the architect voice is unavailable right now")
+            raise HTTPException(503, unavailable)
         return Response(content=response.content, media_type="audio/mpeg",
                         headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/{session_id}/inspire")
+    async def inspire(request: Request, session_id: str):
+        """The Muse: one spark and three directions to choose from.
+
+        The text is what the visitor last said; without it the Muse inspires
+        from what is on the canvas. The set is checked in workers/muse.py (one
+        repair attempt), then stored on the session by compare-and-set without
+        disturbing a build, so a spoken preview can only ever read it back.
+        """
+        require_origin(request)
+        require_session(request, session_id)
+        if not muse_ready():
+            raise HTTPException(503, "the muse is not available")
+        from workers.talk import TEXT_MAX, canvas_summary
+        body = await json_object(request, "inspire")
+        if set(body) - {"text", "turn"}:
+            raise HTTPException(400, "inspire body has unknown fields")
+        turn = body.get("turn", 0)
+        if type(turn) is not int or not 0 <= turn <= 1_000_000:
+            raise HTTPException(400, "turn must be a non-negative integer")
+        text = body.get("text")
+        if text is not None and (not isinstance(text, str) or len(text) > TEXT_MAX):
+            raise HTTPException(400, "inspire text must be at most %d characters" % TEXT_MAX)
+        state = await asyncio.to_thread(live_state, session_id)
+        spend(muse_counts, session_id, settings.muse_cap, "inspiration")
+        try:
+            result = await asyncio.to_thread(
+                muse_lane().inspire, state, (text or "").strip(), canvas_summary(state.get("artifact")))
+        except Exception as exc:  # the builder, the host and the analyst carry on without it
+            raise HTTPException(503, "the muse could not answer") from exc
+        try:
+            await asyncio.to_thread(controller.commit_muse, session_id, result["muse"])
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        except CommandError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"turn": turn, "muse": result["muse"]}
 
     @app.post("/v1/session/{session_id}/recap")
     async def recap(request: Request, session_id: str):
