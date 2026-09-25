@@ -291,6 +291,12 @@ class Lane(unittest.TestCase):
         self.now[0] += 4.0
         return client.post(url, headers=headers, json=body)
 
+    def test_a_homepage_session_starts_with_the_analyst_owning_the_questions(self):
+        with TestClient(self.make()) as client:
+            sid, headers = self.session(client)
+        state = next(v for v in self.store.data.values() if isinstance(v, dict) and v.get("session_id") == sid)
+        self.assertTrue(state["analyst"])
+
     def test_health_says_the_analyst_is_there(self):
         with TestClient(self.make()) as client:
             self.assertTrue(client.get("/health").json()["features"]["analyst"])

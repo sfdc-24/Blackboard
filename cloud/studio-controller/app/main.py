@@ -616,6 +616,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                                         title, settings.visitor_sessions_per_day)
             except LeadCapExceeded as exc:
                 raise HTTPException(429, "the conversations for today are used up") from exc
+        if start == "blank" and analyst_ready() and not state.get("analyst"):
+            await asyncio.to_thread(controller.enable_analyst, state["session_id"])
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],

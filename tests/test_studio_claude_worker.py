@@ -461,6 +461,66 @@ class CodexReview206(unittest.TestCase):
         self.assertEqual({"question_id": "q-cta", "option_id": "book"}, out["resolves"])
 
 
+class SpokenChangesAreNeverLostToAScope(unittest.TestCase):
+    """Live session 2026-09-25: a logo was built with an open question about its
+    mark; four spoken changes ("make it...") were each read as that answer and
+    dropped because they touched the scene around the mark. Nothing changed."""
+
+    LOGO = {"id": "screen", "kind": "screen", "label": "SFDC24 logo", "children": [
+        {"id": "logo_scene", "kind": "scene", "label": "Logo", "detail": "800x400 bg=#0B1F3A", "children": [
+            {"id": "mark_circle", "kind": "entity", "label": "Ring", "detail": "circle cx=200 cy=200 r=80 stroke=#00A1E0"},
+            {"id": "mark_core", "kind": "entity", "label": "Core", "detail": "circle cx=200 cy=200 r=40 fill=#00A1E0"},
+            {"id": "word", "kind": "entity", "label": "SFDC24", "detail": "text x=320 y=220 size=64"}]},
+        {"id": "footer", "kind": "section", "label": "Footer"}]}
+    MARK_Q = {"question_id": "q_logo_style", "status": "open", "group": "Content", "scope_path": "Logo > Mark",
+              "reason": "r", "prompt": "What kind of mark?", "affected_artifact_ids": ["mark_circle", "mark_core"],
+              "options": [{"option_id": "monogram", "label": "Monogram", "consequence": "c"},
+                          {"option_id": "abstract", "label": "Abstract", "consequence": "c"}]}
+
+    def turn(self, ops, resolves, trigger=None):
+        draft = {"ops": ops, "confirm": "Changed the logo.", "questions": [], "batch_title": "",
+                 "resolves": resolves}
+        state = {"artifact": self.LOGO, "questions": [dict(self.MARK_Q)], "transcript": [], "session_id": "s1"}
+        return cw.ClaudeWorker(client=FakeClient(draft)).on_turn(
+            state, trigger or {"kind": "utterance", "text": "add a sigma symbol and make the background lighter"})
+
+    SCENE_OPS = [{"op": "set_detail", "node_id": "logo_scene", "value": "800x400 bg=#F4F7FB", "new_node": BLANK},
+                 {"op": "insert_child", "node_id": "logo_scene", "value": "", "new_node": {
+                     "id": "sigma", "kind": "entity", "label": "Sigma", "detail": "text x=200 y=220 size=72 fill=#0B1F3A"}}]
+
+    def test_the_live_case_restyling_the_scene_around_the_mark_now_applies(self):
+        out = self.turn(self.SCENE_OPS, {"question_id": "q_logo_style", "option_id": "monogram", "freeform_answer": ""})
+        self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+        self.assertEqual({"question_id": "q_logo_style", "option_id": "monogram"}, out["resolves"])
+        self.assertEqual([], out["problems"])
+
+    def test_a_spoken_change_beyond_the_question_applies_as_a_new_request(self):
+        ops = self.SCENE_OPS + [{"op": "set_label", "node_id": "footer", "value": "Contact us", "new_node": BLANK}]
+        out = self.turn(ops, {"question_id": "q_logo_style", "option_id": "monogram", "freeform_answer": ""})
+        self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+        self.assertEqual(3, len(out["events"][0]["payload"]["ops"]))
+        self.assertIsNone(out["resolves"])                                      # not recorded as the answer
+        self.assertTrue(any("applies as a new request" in p for p in out["problems"]))
+
+    def test_a_question_about_part_of_a_scene_covers_the_whole_scene(self):
+        ops = [{"op": "set_detail", "node_id": "word", "value": "text x=320 y=220 size=64 fill=#00A1E0", "new_node": BLANK}]
+        out = self.turn(ops, {"question_id": "q_logo_style", "option_id": "monogram", "freeform_answer": ""})
+        self.assertEqual({"question_id": "q_logo_style", "option_id": "monogram"}, out["resolves"])
+        self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+
+    def test_a_tap_keeps_the_strict_scope(self):
+        ops = [{"op": "set_label", "node_id": "footer", "value": "Contact", "new_node": BLANK}]
+        out = self.turn(ops, {"question_id": "", "option_id": "", "freeform_answer": ""},
+                        trigger={"kind": "answer", "question_id": "q_logo_style", "option_id": "monogram"})
+        self.assertEqual([], out["events"])
+
+    def test_an_invalid_op_is_still_dropped_even_as_a_new_request(self):
+        ops = [{"op": "set_detail", "node_id": "logo_scene", "value": "800x400 bg=#F4F7FB", "new_node": BLANK},
+               {"op": "set_label", "node_id": "ghost", "value": "x", "new_node": BLANK}]
+        out = self.turn(ops, {"question_id": "q_logo_style", "option_id": "monogram", "freeform_answer": ""})
+        self.assertEqual([], out["events"])
+
+
 class BuildsFromAnEmptyScreen(unittest.TestCase):
     def test_the_prompt_says_to_build_a_whole_first_version_from_an_empty_screen(self):
         self.assertIn("BUILDING FROM AN EMPTY SCREEN", cw.SYSTEM)
