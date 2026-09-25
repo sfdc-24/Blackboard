@@ -186,6 +186,41 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(1, state["artifact_version"])
         self.assertEqual("q-cta", state["questions"][0]["question_id"])
 
+    def test_a_blank_start_is_one_empty_screen_named_by_the_request(self):
+        controller, _, _ = make_controller()
+        state, _ = controller.create_session(
+            "A lead intake form for a dental clinic", start="blank")
+        self.assertEqual(["session.started", "artifact.snapshot"],
+                         [event["type"] for event in state["events"]])
+        root = state["events"][1]["payload"]["root"]
+        self.assertEqual({"id": "screen", "kind": "screen",
+                          "label": "A lead intake form for a dental clinic",
+                          "children": []}, root)
+        self.assertEqual([], state["questions"])
+        self.assertEqual(1, state["artifact_version"])
+
+    def test_the_template_start_is_unchanged(self):
+        controller, _, _ = make_controller()
+        state, _ = controller.create_session("Homepage", start="template")
+        self.assertEqual("q-cta", state["questions"][0]["question_id"])
+        self.assertEqual("screen-home", state["artifact"]["id"])
+
+    def test_an_unknown_start_is_refused_before_admission(self):
+        controller, store, _ = make_controller()
+        with self.assertRaises(CommandError):
+            controller.create_session("x", start="anything")
+        self.assertFalse(any(name.startswith("studio_admission_") for name in store.data))
+
+    def test_a_blank_session_takes_an_utterance_as_its_first_command(self):
+        controller, _, worker = make_controller()
+        state, _ = controller.create_session("A booking page", start="blank")
+        controller.execute(state["session_id"], {
+            "command_id": "cmd-1", "session_id": state["session_id"],
+            "type": "utterance", "expected_version": 1,
+            "item_id": "typed-1", "transcript": "A booking page for a yoga studio",
+        })
+        self.assertEqual(1, worker.calls)
+
     def test_command_is_durable_and_idempotent(self):
         controller, store, worker = make_controller()
         state, _ = controller.create_session()
@@ -642,6 +677,28 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(200, response.status_code, response.text)
         return response.json()
+
+    def test_the_session_route_takes_a_blank_start_and_refuses_others(self):
+        app, _ = self.app()
+        with TestClient(app) as client:
+            operator = self.authenticate(client)
+            headers = {**self.origin, "Authorization": "Bearer " + operator}
+            ok = client.post("/v1/session", headers=headers, json={
+                "creation_id": "blank-1", "title": "A quote request form", "start": "blank"})
+            self.assertEqual(200, ok.status_code, ok.text)
+            sid = ok.json()["session_id"]
+            stored = [v for v in self.store.data.values()
+                      if isinstance(v, dict) and v.get("session_id") == sid]
+            self.assertEqual(1, len(stored))
+            self.assertEqual([], stored[0]["artifact"]["children"])
+            self.assertEqual("A quote request form", stored[0]["artifact"]["label"])
+            self.assertEqual([], stored[0]["questions"])
+            bad = client.post("/v1/session", headers=headers, json={
+                "creation_id": "blank-2", "start": "freeform"})
+            self.assertEqual(400, bad.status_code)
+            unknown = client.post("/v1/session", headers=headers, json={
+                "creation_id": "blank-3", "brief": "x"})
+            self.assertEqual(400, unknown.status_code)
 
     def test_origin_is_fail_closed_and_daily_cap_returns_429(self):
         app, _ = self.app(daily_session_cap=1)
