@@ -2059,22 +2059,44 @@ class CodexR7CompatibilityForms(Api):
             self.assertEqual(keep, " ".join(redact(keep).split()), keep)
 
     def test_the_view_is_linear_on_hostile_compatibility_input(self):
-        # Growth, not a wall clock: four times the text must cost well under
-        # sixteen times the time (what a quadratic scan would), and never long.
-        def cost(text):
-            started = time.perf_counter()
-            redact(text)
-            return time.perf_counter() - started
+        # Work counted, not timed (a timing test flakes under load and would
+        # fake kills in the mutation harness): each character is normalized at
+        # most once per pass, one code point at a time, and the host scan tests
+        # each character at most twice. The clock is only a generous backstop.
+        from app import project_page as page
+        real_unicodedata, real_host_char = page.unicodedata, page._host_char
+        calls = {"normalize": 0, "host_char": 0, "longest": 0}
+
+        class CountingUnicodedata:
+            def normalize(self, form, text):
+                calls["normalize"] += 1
+                calls["longest"] = max(calls["longest"], len(text))
+                return real_unicodedata.normalize(form, text)
+
+            def __getattr__(self, name):
+                return getattr(real_unicodedata, name)
+
+        def counting_host_char(ch):
+            calls["host_char"] += 1
+            return real_host_char(ch)
 
         circled_a, fullwidth_at, square_cc, leader, one_stop = (chr(0x24D0), chr(0xFF20), chr(0x33C4),
                                                                chr(0x2024), chr(0x2488))
-        for unit in (circled_a + ".", circled_a, fullwidth_at, square_cc + ".", leader, circled_a + fullwidth_at,
-                     one_stop):
-            small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
-            cost(small)                                                # warm up
-            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(2))
-            self.assertLess(grown, 10 * base + 0.25, (hex(ord(unit[0])), base, grown))
-            self.assertLess(grown, 10.0, hex(ord(unit[0])))
+        page.unicodedata, page._host_char = CountingUnicodedata(), counting_host_char
+        try:
+            for unit in (circled_a + ".", circled_a, fullwidth_at, square_cc + ".", leader,
+                         circled_a + fullwidth_at, one_stop, "a" + circled_a * 3 + "." + chr(0x24D2) * 2):
+                text = unit * (60000 // len(unit))
+                calls.update(normalize=0, host_char=0, longest=0)
+                started = time.perf_counter()
+                redact(text)
+                elapsed = time.perf_counter() - started
+                self.assertLessEqual(calls["normalize"], 5 * len(text), hex(ord(unit[0])))
+                self.assertEqual(1, calls["longest"], hex(ord(unit[0])))          # one code point at a time
+                self.assertLessEqual(calls["host_char"], 2 * 18 * len(text) + 10, hex(ord(unit[0])))
+                self.assertLess(elapsed, 20.0, hex(ord(unit[0])))
+        finally:
+            page.unicodedata, page._host_char = real_unicodedata, real_host_char
 
     def test_no_surface_carries_them(self):
         texts = list(COMPAT_CASES)

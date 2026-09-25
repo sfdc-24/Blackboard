@@ -61,6 +61,10 @@ MUTANTS = [
     ("tree: emails kept", [(PAGE, "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n", "")]),
     ("tree: no compatibility view", [(PAGE, "    if text.isascii():\n        return text, None\n    chunks",
                                       "    if True:\n        return text, None\n    chunks")]),
+    ("tree: the view normalizes slices, not one code point", [(PAGE,
+        'mapped = unicodedata.normalize("NFKC", ch) if ord(ch) > 0x7F else ch',
+        'mapped = (unicodedata.normalize("NFKC", text[i:i + 64]) and unicodedata.normalize("NFKC", ch)) '
+        'if ord(ch) > 0x7F else ch')]),
     ("tree: part of an original character kept", [(PAGE, "start, end = origin[start], origin[end - 1] + 1",
                                                    "start, end = origin[start], origin[end - 1]")]),
     ("tree: emails read without the compatibility view", [(PAGE,
