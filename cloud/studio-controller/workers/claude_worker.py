@@ -32,6 +32,16 @@ import os
 import re
 import uuid
 
+try:  # the app and the image import this module as part of the workers package
+    from workers.policy import USE_POLICY
+except ImportError:  # loaded from its file (tests): read the sibling policy.py the same way
+    import importlib.util as _util
+    _spec = _util.spec_from_file_location(
+        "studio_use_policy", os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.py"))
+    _policy = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(_policy)
+    USE_POLICY = _policy.USE_POLICY
+
 MODEL = os.environ.get("STUDIO_WORKER_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_WORKER_EFFORT") or "low"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
@@ -290,7 +300,12 @@ coherent palette with strong contrast between text and its background. The visit
 name goes in text; never invent a slogan they did not give you - use "[Tagline]" instead. To \
 change an entity later, set_detail it with its full new statement: the page animates the change \
 (position, size and colour glide to the new values), so small precise edits read as live \
-motion."""
+motion.
+
+DECLINING. When the latest input falls outside the use policy below, return no ops, no questions \
+and an empty confirm; the spoken agent tells the visitor why. Never build part of it.
+
+""" + USE_POLICY
 
 
 def _flatten(node, out, parent=None):
