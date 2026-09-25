@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -23,6 +24,7 @@ except ImportError:
 
 from .core import CommandError, StudioController
 from .auth import AuthService
+from .leads import LeadBook, LeadCapExceeded
 from .settings import Settings
 from .state import (
     SessionNotFound,
@@ -289,9 +291,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     app.state.settings = settings
     app.state.controller = controller
     auth_service = AuthService(
-        store, settings.operator_emails, settings.session_secret, send_auth_email, clock=clock
+        store, settings.operator_emails, settings.session_secret, send_auth_email, clock=clock,
+        public_visitors=settings.public_visitors, visitor_daily_cap=settings.visitor_codes_daily_cap,
     )
     app.state.auth_service = auth_service
+    lead_book = LeadBook(store, clock=clock)
+    app.state.lead_book = lead_book
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),
@@ -339,6 +344,33 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(403, "token does not belong to this session")
         return claims
 
+    def caller_address(request: Request) -> str:
+        """The address Google's front end observed: the LAST X-Forwarded-For hop.
+        Earlier hops are whatever the client sent and are never trusted. Only a
+        valid IP counts; anything else becomes "" and shares one fail-closed
+        bucket. Only visitors are limited by it, and only its keyed hash is stored."""
+        values = request.headers.getlist("x-forwarded-for") if hasattr(request.headers, "getlist") else []
+        hops = [hop.strip() for value in values for hop in value.split(",") if hop.strip()]
+        candidate = hops[-1] if hops else (request.client.host if request.client else "")
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return ""
+
+    def require_signed_in(request: Request) -> tuple[dict, str]:
+        """An operator, or - only while public visitors are on - a verified visitor."""
+        auth = request.headers.get("authorization") or ""
+        token = auth[7:] if auth.lower().startswith("bearer ") else ""
+        try:
+            return verify_token(token, settings.session_secret, now=clock(), scope="operator"), "operator"
+        except InvalidToken as operator_error:
+            if not settings.public_visitors:
+                raise HTTPException(401, str(operator_error)) from operator_error
+        try:
+            return verify_token(token, settings.session_secret, now=clock(), scope="visitor"), "visitor"
+        except InvalidToken as exc:
+            raise HTTPException(401, str(exc)) from exc
+
     def require_operator(request: Request) -> dict:
         auth = request.headers.get("authorization") or ""
         token = auth[7:] if auth.lower().startswith("bearer ") else ""
@@ -360,6 +392,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
                          "analyst": analyst_ready(),
+                         "public_visitors": settings.public_visitors,
                          "voices": ["host", "architect"] if (settings.voice_enabled and settings.openai_api_key) else []},
         }
 
@@ -447,8 +480,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         body = await json_object(request, "authentication")
         if set(body) != {"email", "client_key"}:
             raise HTTPException(400, "authentication body requires email and client_key")
+        client_ip = caller_address(request)
         return await asyncio.to_thread(
-            auth_service.start, body.get("email"), body.get("client_key")
+            auth_service.start, body.get("email"), body.get("client_key"), client_ip
         )
 
     @app.post("/v1/auth/verify")
@@ -464,6 +498,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         )
         if not verified.get("verified"):
             raise HTTPException(401, "verification code was not accepted")
+        if verified.get("role") == "visitor":
+            # Switched off after the code was sent: the code proves the mailbox,
+            # but public visitors are no longer admitted.
+            if not settings.public_visitors:
+                raise HTTPException(401, "verification code was not accepted")
+            expires_at = int(clock()) + settings.visitor_token_seconds
+            token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="visitor")
+            await asyncio.to_thread(lead_book.record_verified, verified["subject_hash"], body.get("email"))
+            return {"token": token, "expires_at": expires_at, "scope": "visitor"}
         expires_at = int(clock()) + settings.operator_token_seconds
         token = mint_token(
             verified["subject_hash"], expires_at, settings.session_secret, scope="operator"
@@ -473,7 +516,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     @app.post("/v1/session")
     async def create_session(request: Request):
         require_origin(request)
-        operator = require_operator(request)
+        operator, role = require_signed_in(request)
         body = await json_object(request, "session")
         if set(body) - {"title", "creation_id", "start"}:
             raise HTTPException(400, "session body has unknown fields")
@@ -486,15 +529,26 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         title = body.get("title") or "Live prototype"
         if not isinstance(title, str):
             raise HTTPException(400, "title must be a string")
+        visitor = role == "visitor"
+        if visitor and await asyncio.to_thread(
+                lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
+            raise HTTPException(429, "the conversations for today are used up")
         try:
             state, admitted = await asyncio.to_thread(
-                controller.create_session, title[:600], operator["sid"], creation_id, start
+                controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
+                settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
         except StateConflict as exc:
             status = 429 if "capacity" in str(exc) else 503
             raise HTTPException(status, str(exc)) from exc
+        if visitor:
+            try:
+                await asyncio.to_thread(lead_book.admit_session, operator["sid"], state["session_id"],
+                                        title, settings.visitor_sessions_per_day)
+            except LeadCapExceeded as exc:
+                raise HTTPException(429, "the conversations for today are used up") from exc
         token = mint_token(state["session_id"], state["expires_at"], settings.session_secret)
         return {
             "session_id": state["session_id"],
@@ -678,7 +732,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(503, "the recap is unavailable right now") from exc
         if not text:
             raise HTTPException(503, "the recap came back empty")
+        if state.get("visitor_subject"):
+            # The recap is what the visitor was told they would get back: keep it with their lead.
+            await asyncio.to_thread(lead_book.record_recap, state["visitor_subject"], session_id, text)
         return {"recap": text, "speaker": agent}
+
+    @app.get("/v1/leads")
+    async def leads(request: Request):
+        """Verified public visitors, newest first. Operators only."""
+        require_origin(request)
+        require_operator(request)
+        return {"leads": await asyncio.to_thread(lead_book.list, 50)}
 
     @app.post("/v1/session/{session_id}/analyze")
     async def analyze(request: Request, session_id: str):
@@ -818,9 +882,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if state["expires_at"] <= now or state.get("stopped"):
             await release_unopened_voice(session_id, voice_id)
             raise HTTPException(410, "session is no longer active")
+        # A visitor session stops below the daily voice cap; the operator keeps headroom.
+        voice_limit = (settings.voice_mint_cap - settings.operator_reserved_voice
+                       if state.get("visitor_subject") else settings.voice_mint_cap)
         try:
             reservation = await asyncio.to_thread(
-                repository.reserve_voice_open, settings.voice_mint_cap, voice_id
+                repository.reserve_voice_open, voice_limit, voice_id
             )
             for _ in range(3):
                 latest = (await asyncio.to_thread(repository.load, session_id)).state
@@ -840,7 +907,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 # again in the current UTC-day ledger before provider contact.
                 reservation = await asyncio.to_thread(
                     repository.reserve_voice_open,
-                    settings.voice_mint_cap,
+                    voice_limit,
                     voice_id,
                 )
             else:
@@ -859,7 +926,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except Exception as exc:
             await release_unopened_voice(session_id, voice_id)
             raise HTTPException(503, "voice admission is unavailable") from exc
-        subject = latest.get("operator_subject") or session_id
+        subject = latest.get("operator_subject") or latest.get("visitor_subject") or session_id
         safety_id = hashlib.sha256(("studio:" + subject).encode()).hexdigest()[:32]
         try:
             response = await request.app.state.voice_client.post(
