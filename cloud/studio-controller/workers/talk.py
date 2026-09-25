@@ -105,8 +105,37 @@ def _messages(text: str, history: list, canvas: str) -> list:
     return messages
 
 
-def _spoken(words: str) -> str:
-    return " ".join((words or "").split())[:REPLY_MAX]
+def _spoken(words: str, cap: int = REPLY_MAX) -> str:
+    return " ".join((words or "").split())[:cap]
+
+
+RECAP_MAX = 900
+RECAP_TOKENS = 320
+RECAP_SYSTEM = """You are the host of a live design session on sfdc24.com, closing the meeting. \
+Recap it out loud in at most 70 words, as one warm, plain spoken paragraph: what the visitor wants, \
+what is on the canvas now, what was decided, and one next step they can take - keep shaping it here, \
+or talk to us about turning it into the real thing. Never invent facts about their business, and \
+never name or promise any person, price or date. No lists, no markdown, no preamble."""
+
+
+def recap_brief(state: dict, canvas: str) -> str:
+    """What the host recaps from: the session record only."""
+    said = [t.get("text", "") for t in (state.get("transcript") or []) if t.get("role", "visitor") == "visitor"]
+    decided = []
+    for q in state.get("questions") or []:
+        if q.get("status") != "answered":
+            continue
+        chosen = next((o.get("label", "") for o in q.get("options") or []
+                       if o.get("option_id") == q.get("selected_option")), "") or q.get("freeform_answer", "")
+        decided.append("%s -> %s" % (q.get("prompt", ""), chosen))
+    model = state.get("model") or {}
+    objects = ", ".join(o.get("name", "") for o in model.get("objects") or [])
+    lines = ["THE VISITOR SAID (oldest first):"] + ["- " + text for text in said[-20:]]
+    lines += ["", "ON THE CANVAS: " + canvas]
+    lines += ["DECIDED: " + ("; ".join(decided) if decided else "nothing yet")]
+    if objects:
+        lines += ["DATA MODEL (%s): %s" % (model.get("domain", ""), objects)]
+    return "\n".join(lines)[:6000]
 
 
 class TalkClient:
@@ -138,20 +167,29 @@ class TalkClient:
             return self._claude(system, messages)
         return self._openai(system, messages)
 
-    def _claude(self, system: str, messages: list) -> str:
+    def recap(self, agent: str, brief: str) -> str:
+        """The host closing the meeting: a short spoken recap from the session record."""
+        if agent not in self.agents():
+            raise LookupError("agent %r is not configured" % agent)
+        messages = [{"role": "user", "content": brief}]
+        if agent == "claude":
+            return self._claude(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX)
+        return self._openai(RECAP_SYSTEM, messages, RECAP_TOKENS, RECAP_MAX)
+
+    def _claude(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
         if self._anthropic is None:
             import anthropic
             self._anthropic = anthropic.Anthropic(timeout=TIMEOUT_SECONDS, max_retries=0)
         response = self._anthropic.messages.create(
-            model=CLAUDE_MODEL, max_tokens=MAX_TOKENS, system=system, messages=messages,
+            model=CLAUDE_MODEL, max_tokens=max_tokens, system=system, messages=messages,
         )
         return _spoken("".join(getattr(block, "text", "") for block in response.content
-                               if getattr(block, "type", "") == "text"))
+                               if getattr(block, "type", "") == "text"), cap)
 
-    def _openai(self, system: str, messages: list) -> str:
+    def _openai(self, system: str, messages: list, max_tokens: int = MAX_TOKENS, cap: int = REPLY_MAX) -> str:
         body = json.dumps({
             "model": OPENAI_MODEL,
-            "max_completion_tokens": MAX_TOKENS,
+            "max_completion_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}] + messages,
         }).encode("utf-8")
         request = urllib.request.Request(OPENAI_URL, data=body, method="POST", headers={
@@ -161,4 +199,4 @@ class TalkClient:
         with self._open(request, timeout=TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
         choices = payload.get("choices") or []
-        return _spoken(((choices[0] or {}).get("message") or {}).get("content", "") if choices else "")
+        return _spoken(((choices[0] or {}).get("message") or {}).get("content", "") if choices else "", cap)

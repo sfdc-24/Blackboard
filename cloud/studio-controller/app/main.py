@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 try:
     from scripts.state_store import open_store
@@ -359,7 +359,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "state_backend": backend,
             "features": {"voice": settings.voice_enabled, "lead_facts": settings.lead_facts_enabled,
                          "talk": bool(talk_agents()), "agents": talk_agents(),
-                         "analyst": analyst_ready()},
+                         "analyst": analyst_ready(),
+                         "voices": ["host", "architect"] if (settings.voice_enabled and settings.openai_api_key) else []},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -383,6 +384,34 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     def talk_agents() -> list:
         return list(talk_lane().agents())
+
+    # Two voices (owner direction): the host is the realtime call; the architect
+    # speaks the builder's and analyst's lines in its own OpenAI TTS voice.
+    speak_counts: dict = {}
+    recap_counts: dict = {}
+    TTS_URL = "https://api.openai.com/v1/audio/speech"
+    TTS_MODEL = "gpt-4o-mini-tts"
+    ARCHITECT_STYLE = ("A calm, confident solution architect in a client meeting: warm, clear and "
+                       "unhurried, with a short pause between ideas.")
+    SPEAK_MAX = 400
+
+    def live_state(session_id: str) -> dict:
+        try:
+            state = controller.repository.load(session_id).state
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
+            raise HTTPException(410, "session has ended")
+        return state
+
+    def spend(counts: dict, session_id: str, cap: int, what: str) -> None:
+        used = counts.get(session_id, 0)
+        if used >= cap:
+            raise HTTPException(429, "%s limit reached for this session" % what)
+        counts[session_id] = used + 1
+        if len(counts) > 500:
+            for stale in list(counts)[:250]:
+                counts.pop(stale, None)
 
     # The analyst lane: a second agent beside the builder (workers/analyst.py).
     analyze_counts: dict = {}
@@ -592,6 +621,64 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if not reply:
             raise HTTPException(503, "talk returned nothing")
         return {"reply": reply, "speaker": agent, "turn": turn}
+
+    @app.post("/v1/session/{session_id}/speak")
+    async def speak(request: Request, session_id: str):
+        """One line in the architect's voice, as audio. The text is what the page
+        was sent by the builder or the analyst; nothing is generated here."""
+        require_origin(request)
+        require_session(request, session_id)
+        if not (settings.voice_enabled and settings.openai_api_key):
+            raise HTTPException(503, "voice is not enabled in this release")
+        body = await json_object(request, "speak")
+        if set(body) - {"text", "voice"}:
+            raise HTTPException(400, "speak body has unknown fields")
+        if body.get("voice", "architect") != "architect":
+            raise HTTPException(400, "voice must be architect")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > SPEAK_MAX:
+            raise HTTPException(400, "speak needs text of 1 to %d characters" % SPEAK_MAX)
+        await asyncio.to_thread(live_state, session_id)
+        spend(speak_counts, session_id, settings.speak_cap, "speech")
+        try:
+            response = await request.app.state.voice_client.post(
+                TTS_URL,
+                headers={"Authorization": "Bearer " + settings.openai_api_key},
+                json={"model": TTS_MODEL, "voice": settings.architect_voice, "input": " ".join(text.split()),
+                      "instructions": ARCHITECT_STYLE, "response_format": "mp3"},
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(503, "the architect voice is unavailable right now") from exc
+        if response.status_code != 200 or not getattr(response, "content", b""):
+            raise HTTPException(503, "the architect voice is unavailable right now")
+        return Response(content=response.content, media_type="audio/mpeg",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/{session_id}/recap")
+    async def recap(request: Request, session_id: str):
+        """The host closes the meeting: a short recap from the session record."""
+        require_origin(request)
+        require_session(request, session_id)
+        agents = talk_agents()
+        if not agents:
+            raise HTTPException(503, "the host is not available")
+        body = await json_object(request, "recap")
+        if set(body) - {"agent"}:
+            raise HTTPException(400, "recap body has unknown fields")
+        agent = body.get("agent") or agents[0]
+        if agent not in agents:
+            raise HTTPException(400, "agent %r is not configured; available: %s" % (str(agent)[:20], ", ".join(agents)))
+        state = await asyncio.to_thread(live_state, session_id)
+        spend(recap_counts, session_id, settings.recap_cap, "recap")
+        from workers.talk import canvas_summary, recap_brief
+        try:
+            text = await asyncio.to_thread(
+                talk_lane().recap, agent, recap_brief(state, canvas_summary(state.get("artifact"))))
+        except Exception as exc:
+            raise HTTPException(503, "the recap is unavailable right now") from exc
+        if not text:
+            raise HTTPException(503, "the recap came back empty")
+        return {"recap": text, "speaker": agent}
 
     @app.post("/v1/session/{session_id}/analyze")
     async def analyze(request: Request, session_id: str):

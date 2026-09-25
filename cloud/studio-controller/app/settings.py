@@ -50,6 +50,9 @@ class Settings:
     realtime_model: str = "gpt-realtime-2.1"
     realtime_voice: str = "marin"
     talk_cap: int = 60
+    speak_cap: int = 150
+    recap_cap: int = 6
+    architect_voice: str = "cedar"
     analyze_cap: int = 30
 
     @classmethod
@@ -89,6 +92,9 @@ class Settings:
             realtime_model=os.environ.get("STUDIO_REALTIME_MODEL", "gpt-realtime-2.1"),
             realtime_voice=os.environ.get("STUDIO_REALTIME_VOICE", "marin"),
             talk_cap=int(os.environ.get("STUDIO_TALK_CAP", "60")),
+            speak_cap=int(os.environ.get("STUDIO_SPEAK_CAP", "150")),
+            recap_cap=int(os.environ.get("STUDIO_RECAP_CAP", "6")),
+            architect_voice=os.environ.get("STUDIO_ARCHITECT_VOICE", "cedar"),
             analyze_cap=int(os.environ.get("STUDIO_ANALYZE_CAP", "30")),
         )
 
