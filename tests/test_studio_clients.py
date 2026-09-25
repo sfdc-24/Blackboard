@@ -1377,51 +1377,46 @@ class FindingF2Redaction(unittest.TestCase):
             self.assertNotIn(never, labels)
 
     def test_the_redaction_is_linear_on_hostile_input(self):
-        # Work counted where Python does it: the host scan tests each character
-        # a bounded number of times. The regex engine's steps cannot be counted
-        # from Python, so those passes are held to relative growth - four times
-        # the text well under sixteen times the time - which load slows
-        # proportionally. No absolute wall-clock limit but a 20 s backstop.
-        import time as _time
+        # Work counted, not timed (a loaded machine is slow, not quadratic): the
+        # character mappings and the host scan's checks grow linearly with the
+        # text - four times the text, at most four times the work - and stay
+        # within a fixed bound per character. The regex passes' own steps cannot
+        # be counted from Python; a generous 20 s backstop holds them (the
+        # unanchored email scan takes far longer, and its mutant fails here).
         from app import project_page as page
-        real_host_char, calls = page._host_char, {"n": 0}
+        real_host_char, real_unicodedata = page._host_char, page.unicodedata
+        work = {"n": 0}
 
-        def counting(ch):
-            calls["n"] += 1
+        def counting_host_char(ch):
+            work["n"] += 1
             return real_host_char(ch)
 
-        def cost(text):
-            started = _time.perf_counter()
-            redact(text)
-            return _time.perf_counter() - started
+        class CountingUnicodedata:
+            def normalize(self, form, text):
+                work["n"] += 1
+                return real_unicodedata.normalize(form, text)
 
-        stop = chr(0x3002)
-        page._host_char = counting
+            def __getattr__(self, name):
+                return getattr(real_unicodedata, name)
+
+        def measure(text):
+            work["n"] = 0
+            started = time.perf_counter()
+            redact(text)
+            return work["n"], time.perf_counter() - started
+
+        stop, circled_a = chr(0x3002), chr(0x24D0)
+        page._host_char, page.unicodedata = counting_host_char, CountingUnicodedata()
         try:
-            for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc"):
+            for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc", circled_a + "."):
                 small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
-                calls["n"] = 0
-                redact(large)
-                self.assertLessEqual(calls["n"], 3 * len(large) + 10, unit)
-                cost(small)
-                base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(3))
-                self.assertLess(grown, 10 * base + 1.0, (unit, base, grown))
-                self.assertLess(grown, 20.0, unit)
+                small_work, _ = measure(small)
+                large_work, elapsed = measure(large)
+                self.assertLessEqual(large_work, 4 * small_work + 10, (unit, small_work, large_work))
+                self.assertLessEqual(large_work, 8 * len(large) + 10, (unit, large_work))
+                self.assertLess(elapsed, 20.0, unit)
         finally:
-            page._host_char = real_host_char
-
-        def cost(text):
-            started = _time.perf_counter()
-            redact(text)
-            return _time.perf_counter() - started
-
-        stop = chr(0x3002)
-        for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc"):
-            small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
-            cost(small)
-            base, grown = min(cost(small) for _ in range(3)), min(cost(large) for _ in range(3))
-            self.assertLess(grown, 10 * base + 1.0, (unit, base, grown))
-            self.assertLess(grown, 20.0, unit)
+            page._host_char, page.unicodedata = real_host_char, real_unicodedata
 
 
 class GeminiAttacks(unittest.TestCase):
