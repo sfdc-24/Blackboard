@@ -226,6 +226,17 @@ class Commit(unittest.TestCase):
             controller.commit_analysis(sid, model, question)
         self.assertNotIn("model", controller.repository.load(sid).state)
 
+    def test_a_reconnect_after_the_window_rolls_still_gets_the_model(self):
+        controller, _, sid = self.open()
+        model, question, _ = an.validate(copy.deepcopy(MODEL_RAW))
+        controller.commit_analysis(sid, model, question)
+        last = controller.repository.load(sid).state["last_seq"]
+        events, repaired, _ = controller.events_after(sid, last + 50)       # a cursor the server cannot replay
+        self.assertTrue(repaired)
+        self.assertEqual(["artifact.snapshot", "model.updated", "question.asked"], [e["type"] for e in events])
+        self.assertEqual(model, events[1]["payload"]["model"])
+        self.assertEqual([1, 2, 3], [e["seq"] for e in events])
+
     def test_a_stopped_session_refuses(self):
         controller, _, sid = self.open()
         state = controller.repository.load(sid).state

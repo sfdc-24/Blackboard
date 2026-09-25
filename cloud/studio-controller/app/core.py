@@ -938,6 +938,11 @@ class StudioController:
             candidate["last_seq"] = 0
             candidate["events"] = []
             self._event(candidate, "artifact.snapshot", {"root": copy.deepcopy(candidate["artifact"])})
+            # The analyst lane state is re-announced too, or a page that
+            # reconnects after model.updated rolled off never sees the model
+            # (Cursor NO-GO on #247 8e0b992).
+            if candidate.get("model"):
+                self._event(candidate, "model.updated", {"model": copy.deepcopy(candidate["model"])})
             for question in candidate.get("questions") or []:
                 if question.get("status") == "open":
                     self._event(candidate, "question.asked", {"question": copy.deepcopy(question)})
