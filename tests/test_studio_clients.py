@@ -571,8 +571,7 @@ class Audit(Api):
         self.assertEqual(2, len(audit))
         first, second = audit
         self.assertEqual({"actor", "token_type", "tenant", "project", "command_id", "command_type", "prior_revision",
-                          "revision", "workspace_revision", "op_ids", "at", "outcome"}, set(first))
-        self.assertEqual((1, 1), (first["workspace_revision"], second["workspace_revision"]))
+                          "revision", "op_ids", "at", "outcome"}, set(first))
         patch_op = [e["op_id"] for e in applied.json()["events"]]
         self.assertEqual(("client:" + self.subject()[:16], "session", "nav", "steelworks", "cmd-1", "utterance",
                           1, 2, patch_op, "applied"),

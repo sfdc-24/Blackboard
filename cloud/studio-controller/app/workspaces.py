@@ -68,12 +68,16 @@ class WorkspaceStore:
 
     def save(self, tenant: str, project: str, artifact: dict, session_id: str, base_revision: int,
              op_ids=()) -> int:
-        """Write base_revision + 1, only if the stored revision is still base_revision."""
+        """Write the next revision - only if nobody else has saved since this
+        session opened on base_revision, or the last save was this session's own.
+        (A session's own saves never count against it, even when its session
+        record could not note them: Cursor NO-GO on 5db3d90.)"""
         name = self.name(tenant, project)
         for _ in range(self.attempts):
             state, token = self.store.load(name)
             stored = int(state.get("revision") or 0) if isinstance(state, dict) and state else 0
-            if stored != int(base_revision):
+            last_writer = str(state.get("session_id") or "") if isinstance(state, dict) and state else ""
+            if stored != int(base_revision) and last_writer != session_id:
                 raise WorkspaceConflict(stored)
             revision = stored + 1
             now = int(self.clock())

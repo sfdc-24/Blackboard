@@ -67,6 +67,62 @@ class Revisions(base.Api):
         self.assertEqual({"saved": False, "revision": 1, "reason": "the project changed elsewhere"}, stale["workspace"])
         self.assertEqual(digest(self.state(two["session_id"])["artifact"]), back["digest"])
 
+    def test_a_command_fenced_by_stop_publishes_no_revision(self):
+        test = self
+
+        class StopDuringBuild(base.PatchWorker):
+            def on_turn(self, state, trigger):
+                out = base.PatchWorker.on_turn(self, state, trigger)
+                test.app.state.controller.stop_session(state["session_id"], {
+                    "command_id": "stop-mid", "session_id": state["session_id"], "type": "stop",
+                    "expected_version": state["artifact_version"]})
+                return out
+
+        with TestClient(self.make(worker=StopDuringBuild())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            out = self.utter(client, live, 1, "make the heading bigger")
+            back = client.get("/v1/workspace/steelworks", headers=self.auth(token)).json()
+        self.assertEqual(409, out.status_code, out.text)
+        self.assertEqual(0, back["revision"])                        # nothing published
+        self.assertFalse([k for k in self.store.data if k.startswith("studio_ws_")])
+
+    def test_a_lost_session_commit_publishes_no_revision_and_the_next_change_still_saves(self):
+        test = self
+
+        class OtherWriter(base.PatchWorker):
+            def on_turn(self, state, trigger):
+                out = base.PatchWorker.on_turn(self, state, trigger)
+                if trigger.get("text") == "first":
+                    repo = test.app.state.controller.repository
+                    record = repo.load(state["session_id"])
+                    touched = dict(record.state)
+                    touched["voice_item_ids"] = list(touched.get("voice_item_ids") or []) + ["other-writer"]
+                    repo.save(state["session_id"], touched, record.token)   # another writer wins the session
+                return out
+
+        with TestClient(self.make(worker=OtherWriter())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            lost = self.utter(client, live, 1, "first")
+            back = client.get("/v1/workspace/steelworks", headers=self.auth(token)).json()
+            self.assertEqual((409, 0), (lost.status_code, back["revision"]))
+            self.app.state.controller.inflight_lease_seconds = -1             # recovery clears the lost command
+            after = self.utter(client, live, 2, "second")
+        self.assertEqual(200, after.status_code, after.text)
+        self.assertEqual((True, 1), (after.json()["workspace"]["saved"], after.json()["workspace"]["revision"]))
+
+    def test_a_sessions_own_saves_never_count_against_it(self):
+        store = WorkspaceStore(base.MemoryStore(), clock=lambda: 1000)
+        tree = {"id": "screen", "kind": "screen", "label": "x", "children": []}
+        self.assertEqual(1, store.save("nav", "p1", tree, "s-1", 0))
+        self.assertEqual(2, store.save("nav", "p1", tree, "s-1", 0))   # its own chain, same opening base
+        with self.assertRaises(WorkspaceConflict):
+            store.save("nav", "p1", tree, "s-2", 0)                   # opened on 0, s-1 has written since
+        self.assertEqual(3, store.save("nav", "p1", tree, "s-3", 2))   # opened on 2: nobody else since
+        with self.assertRaises(WorkspaceConflict):
+            store.save("nav", "p1", tree, "s-1", 0)                   # s-1 is stale once s-3 has written
+
     def test_fresh_starts_again_from_the_live_page_and_saves_on_top(self):
         with TestClient(self.make(worker=base.PatchWorker())) as client:
             token = self.sign_in(client).json()["token"]

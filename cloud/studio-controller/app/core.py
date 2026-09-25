@@ -590,6 +590,12 @@ class StudioController:
             self.repository.save(session_id, working, reserved_token)
         except StateConflict:
             self._finish_after_race(session_id, base, working, command, fingerprint, None)
+        # Only a change the session has committed becomes the project's next
+        # revision: a command fenced by Stop, or one whose session commit lost,
+        # never publishes one (Cursor NO-GO on 5db3d90). A result that landed
+        # beside another writer's change (Codex Gate 1 B1) has committed too.
+        if working.get("client_tenant") and working.get("project"):
+            self._save_workspace(working, result)
         return result
 
     def _finish_after_race(self, session_id: str, base: dict, ours: dict | None, command: dict,
@@ -1055,8 +1061,6 @@ class StudioController:
     def _run_reserved(self, state: dict, command: dict) -> dict:
         prior_revision = state["artifact_version"]
         result = self._run_turn(state, command)
-        if state.get("client_tenant") and state.get("project"):
-            self._save_workspace(state, result)
         if state.get("client_tenant"):
             self._audit(state, command, prior_revision, result)
         return result
@@ -1069,6 +1073,8 @@ class StudioController:
             return
         from .workspaces import WorkspaceConflict, digest
         try:
+            # The base is the revision the session opened on; its own later
+            # saves are recognised by the store, so no second session write.
             revision = self.workspace_store.save(state["client_tenant"], state["project"], state["artifact"],
                                                  state["session_id"], state.get("workspace_revision", 0), patch_ops)
         except WorkspaceConflict as exc:
@@ -1079,7 +1085,6 @@ class StudioController:
             result["workspace"] = {"saved": False, "revision": state.get("workspace_revision", 0),
                                    "reason": "the project could not be saved"}
             return
-        state["workspace_revision"] = revision
         result["workspace"] = {"saved": True, "revision": revision, "digest": digest(state["artifact"])}
 
     AUDIT_MAX = 200
@@ -1122,7 +1127,6 @@ class StudioController:
             "command_type": str(command.get("type") or ""),
             "prior_revision": prior_revision,
             "revision": state["artifact_version"],
-            "workspace_revision": state.get("workspace_revision", 0),
             "op_ids": op_ids,
             "at": int(self.clock()),
             "outcome": outcome,
