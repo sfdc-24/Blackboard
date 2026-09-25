@@ -123,6 +123,9 @@ def reduce_event(state: dict, event: dict) -> bool:
     return True
 
 
+START_MODES = ("template", "blank")
+
+
 class StudioController:
     def __init__(self, repository: StudioRepository, worker, *, clock=time.time,
                  id_factory=None, max_seconds: int = 600, daily_cap: int = 20,
@@ -164,9 +167,11 @@ class StudioController:
         return event
 
     def create_session(self, title: str = "Live prototype", subject: str = "",
-                       creation_id: str = "") -> tuple[dict, int]:
+                       creation_id: str = "", start: str = "template") -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
+        if start not in START_MODES:
+            raise CommandError("start must be template or blank")
         now = int(self.clock())
         if creation_id:
             stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
@@ -174,8 +179,19 @@ class StudioController:
         else:
             session_id = self.id_factory("s")
         admitted = self.repository.admit(self.daily_cap, session_id)
-        artifact = self.worker.initial_artifact()
-        questions = self.worker.initial_questions()
+        if start == "blank":
+            # BUILT FROM WHAT THE VISITOR ASKS FOR. The template start always
+            # opened on our own homepage with a question about its button, so a
+            # live session could only ever edit that page. A blank start is one
+            # empty screen named by the visitor's request and no question; the
+            # page sends the request as the first utterance and the worker
+            # builds the first version from it.
+            artifact = {"id": "screen", "kind": "screen",
+                        "label": (title or "Live prototype")[:600], "children": []}
+            questions = []
+        else:
+            artifact = self.worker.initial_artifact()
+            questions = self.worker.initial_questions()
         state = {
             "schema_version": 1,
             "session_id": session_id,
