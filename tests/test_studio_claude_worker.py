@@ -335,5 +335,75 @@ class BuildsFromAnEmptyScreen(unittest.TestCase):
         self.assertIn("set_label the root screen to a short name", cw.SYSTEM)
 
 
+class TalkLaneModule(unittest.TestCase):
+    """workers/talk.py without any provider: routing, refusal, history, summary."""
+
+    def load(self):
+        import importlib.util as iu
+        spec2 = iu.spec_from_file_location(
+            "talk_mod", Path(__file__).resolve().parents[1] / "cloud" / "studio-controller" / "workers" / "talk.py")
+        mod = iu.module_from_spec(spec2)
+        spec2.loader.exec_module(mod)
+        return mod
+
+    def test_only_configured_agents_are_offered_and_others_refused(self):
+        talk = self.load()
+        client = talk.TalkClient(anthropic_ready=False, openai_key="")
+        self.assertEqual([], client.agents())
+        with self.assertRaises(LookupError):
+            client.reply("claude", "hi", [], "empty")
+
+    def test_the_openai_agent_sends_the_system_prompt_and_speaks_one_line(self):
+        talk = self.load()
+        seen = {}
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(self.body).encode("utf-8")
+
+        def opener(request, timeout):
+            seen["url"] = request.full_url
+            seen["timeout"] = timeout
+            seen["body"] = json.loads(request.data.decode("utf-8"))
+            seen["auth"] = request.get_header("Authorization")
+            return Resp({"choices": [{"message": {"content": "  Building the logo now.\n Warm or bold?  "}}]})
+
+        client = talk.TalkClient(anthropic_ready=False, openai_key="sk-test", opener=opener)
+        self.assertEqual(["openai"], client.agents())
+        out = client.reply("openai", "A logo please", [{"who": "you", "text": "hi"}], "The canvas is empty.")
+        self.assertEqual("Building the logo now. Warm or bold?", out)
+        self.assertEqual(talk.OPENAI_URL, seen["url"])
+        self.assertEqual(talk.TIMEOUT_SECONDS, seen["timeout"])
+        self.assertEqual("Bearer sk-test", seen["auth"])
+        self.assertEqual("system", seen["body"]["messages"][0]["role"])
+        self.assertIn("Never say something was built", seen["body"]["messages"][0]["content"])
+        self.assertIn("[Canvas now: The canvas is empty.]", seen["body"]["messages"][-1]["content"])
+
+    def test_history_is_validated(self):
+        talk = self.load()
+        self.assertEqual([], talk.clean_history(None))
+        for bad in ([{"who": "x", "text": "a"}], [{"who": "you", "text": ""}],
+                    [{"who": "you", "text": "a", "k": 1}], "nope", [{"who": "you", "text": "a"}] * 9):
+            with self.subTest(bad=str(bad)[:40]), self.assertRaises(ValueError):
+                talk.clean_history(bad)
+
+    def test_the_canvas_summary_says_empty_or_names_the_parts(self):
+        talk = self.load()
+        self.assertIn("empty", talk.canvas_summary({"id": "screen", "kind": "screen", "label": "x", "children": []}))
+        summary = talk.canvas_summary({"id": "s", "kind": "screen", "label": "Cafe logo", "children": [
+            {"id": "h", "kind": "heading", "label": "Bean There"}]})
+        self.assertIn("Cafe logo", summary)
+        self.assertIn("heading Bean There", summary)
+
+
 if __name__ == "__main__":
     unittest.main()
