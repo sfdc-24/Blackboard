@@ -12,9 +12,11 @@ The fenced JSON below is the canonical revision and required-fact contract read
 by `tools/build_sfdc24_architecture_pdf.py`. The generator refuses an ADR that
 no longer contains a required fact, verifies that every required PDF fact was
 actually sent to the renderer, and embeds the canonical contract digest in the
-PDF metadata. CI then rebuilds and byte-compares the PDF. Edit this block with
-any material architecture or snapshot change; prose-only edits that preserve
-the contract do not churn the published artifact.
+PDF metadata. The reviewed artifact SHA-256 is pinned in the adjacent
+`.pdf.sha256` attestation. CI verifies that attestation before and after two
+byte-identical rebuilds. Edit this block with any material architecture or
+snapshot change; prose-only edits that preserve the contract do not churn the
+published artifact.
 
 <!-- architecture-pdf-contract:start -->
 ```json
