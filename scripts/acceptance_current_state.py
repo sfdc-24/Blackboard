@@ -11,7 +11,8 @@ board and never sends a message.
     python scripts/acceptance_current_state.py --json     # one JSON object
 
 Exit 0 when nothing FAILed, 1 when anything did. UNKNOWN never passes for
-PASS: it means the check could not see, and says why.
+PASS: it means the check could not see, and says why. With --strict, UNKNOWN
+also exits 1 - an alarm must not stay green because it could not look.
 
 What each check calls PASS is written next to it. Components that are not
 deployed anywhere yet (the Zoom agent) are UNKNOWN with the reason, never
@@ -40,9 +41,14 @@ SITE_PATHS = ("/", "/assets/voice-conversation.js", "/assets/prototype-canvas.js
 VMS = {"blackboard-bus": ("RUNNING",), "zoom-presenter-tmp": ("TERMINATED", "RUNNING")}
 JOBS = ("board-watcher", "board-probe", "gemini-waker", "claude-api-waker", "wa-outbox", "waker-shadow",
         "studio-voice-sweep")
+# The fleet schedulers (docs/CLOUD-FLEET-RUNBOOK.md): each must exist, not just
+# whatever the list happens to return.
+SCHEDULERS = ("board-watcher-2min", "board-probe-hourly", "waker-shadow-hourly",
+              "studio-voice-sweep-every-minute")
 # A scheduler that has not attempted within this many of its own intervals is stale.
 SCHEDULE_SLACK = 3
 CONTROLLER_FEATURES = ("voice", "talk", "analyst")
+CONTROLLER_VOICES = ("host", "architect")
 
 PASS, FAIL, UNKNOWN = "PASS", "FAIL", "UNKNOWN"
 
@@ -99,7 +105,7 @@ def check_site_paths(get=http_get, **_):
 
 
 def check_controller(get=http_get, **_):
-    """PASS: the studio controller answers /health ok with voice, talk and analyst on."""
+    """PASS: the studio controller answers /health ok with voice, talk and analyst on and both voices."""
     status, body = get(CONTROLLER + "/health")
     if status != 200:
         return FAIL, "/health answered %s" % status
@@ -109,6 +115,8 @@ def check_controller(get=http_get, **_):
         return FAIL, "/health is not JSON"
     features = health.get("features") or {}
     off = [name for name in CONTROLLER_FEATURES if not features.get(name)]
+    voices = features.get("voices") or []
+    off += ["voice:" + v for v in CONTROLLER_VOICES if v not in voices]
     if not health.get("ok") or off:
         return FAIL, "ok=%s, off: %s" % (health.get("ok"), ", ".join(off) or "-")
     return PASS, "ok; %s on; voices %s" % ("/".join(CONTROLLER_FEATURES), features.get("voices") or [])
@@ -144,7 +152,10 @@ def check_jobs(run=gcloud, **_):
         try:
             runs = run(["run", "jobs", "executions", "list", "--job", job, "--region", REGION, "--limit", "5"])
         except Exception as exc:  # noqa: BLE001
-            unknown.append("%s (%s)" % (job, str(exc)[:60]))
+            if "not found" in str(exc).lower() or "not_found" in str(exc).lower():
+                failed.append("%s (missing)" % job)      # a job that does not exist is not "could not see"
+            else:
+                unknown.append("%s (%s)" % (job, str(exc)[:60]))
             continue
         # The newest FINISHED execution decides; a job that runs every minute is
         # usually mid-run when looked at.
@@ -188,6 +199,8 @@ def check_schedulers(run=gcloud, now=None, **_):
     except Exception as exc:  # noqa: BLE001
         return UNKNOWN, str(exc)
     problems, count = [], 0
+    present = {(job.get("name") or "").rsplit("/", 1)[-1] for job in jobs or []}
+    problems += ["%s missing" % name for name in SCHEDULERS if name not in present]
     for job in jobs or []:
         name = (job.get("name") or "").rsplit("/", 1)[-1]
         count += 1
@@ -268,10 +281,18 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--only", help="comma-separated component names")
+    parser.add_argument("--strict", action="store_true", help="UNKNOWN also exits 1 (for alarms)")
     args = parser.parse_args(argv)
     checks = CHECKS
     if args.only:
-        wanted = set(args.only.split(","))
+        wanted = [name.strip() for name in args.only.split(",") if name.strip()]
+        known = {name for name, _ in CHECKS}
+        unknown_names = [name for name in wanted if name not in known]
+        if not wanted or unknown_names:
+            # A typo must never become a clean run of nothing.
+            print("unknown component(s): %s; known: %s" % (", ".join(unknown_names) or "(none given)",
+                                                           ", ".join(sorted(known))), file=sys.stderr)
+            return 2
         checks = tuple(c for c in CHECKS if c[0] in wanted)
     results = run_all(checks)
     if args.json:
@@ -279,7 +300,8 @@ def main(argv=None) -> int:
     else:
         for r in results:
             print("%-8s %-18s %s" % (r["status"], r["component"], r["evidence"]))
-    return 1 if any(r["status"] == FAIL for r in results) else 0
+    bad = (FAIL, UNKNOWN) if args.strict else (FAIL,)
+    return 1 if any(r["status"] in bad for r in results) else 0
 
 
 if __name__ == "__main__":

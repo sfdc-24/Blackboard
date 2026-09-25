@@ -44,6 +44,11 @@ class Controller(unittest.TestCase):
         body = json.dumps({"ok": True, "features": features}).encode()
         return lambda url: (200, body)
 
+    def test_no_usable_voices_fails(self):
+        status, evidence = acc.check_controller(get=self.health(voice=True, talk=True, analyst=True, voices=[]))
+        self.assertEqual(acc.FAIL, status)
+        self.assertIn("voice:host", evidence)
+
     def test_all_lanes_on_pass(self):
         status, evidence = acc.check_controller(get=self.health(voice=True, talk=True, analyst=True,
                                                                 voices=["host", "architect"]))
@@ -97,6 +102,15 @@ class Jobs(unittest.TestCase):
         self.assertEqual(acc.FAIL, status)
         self.assertIn("wa-outbox", evidence)
 
+    def test_a_missing_job_fails_but_a_network_error_is_unknown(self):
+        def run(args, why):
+            if args[args.index("--job") + 1] == "wa-outbox":
+                raise RuntimeError(why)
+            return [execution("True")]
+        status, evidence = acc.check_jobs(run=lambda a: run(a, "ERROR: (gcloud.run.jobs.executions.list) NOT_FOUND: wa-outbox"))
+        self.assertEqual((acc.FAIL, True), (status, "wa-outbox (missing)" in evidence))
+        self.assertEqual(acc.UNKNOWN, acc.check_jobs(run=lambda a: run(a, "connection reset"))[0])
+
     def test_nothing_finished_is_unknown_not_pass(self):
         self.assertEqual(acc.UNKNOWN, acc.check_jobs(run=lambda args: [execution("Unknown")])[0])
 
@@ -107,17 +121,31 @@ class Schedulers(unittest.TestCase):
         return {"name": "projects/p/locations/l/jobs/" + name, "schedule": schedule, "state": state,
                 "lastAttemptTime": datetime.fromtimestamp(last, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 
+    def fleet(self, **overrides):
+        jobs = {"board-watcher-2min": ("* * * * *", 1), "board-probe-hourly": ("15 * * * *", 50),
+                "waker-shadow-hourly": ("45 * * * *", 20), "studio-voice-sweep-every-minute": ("*/5 * * * *", 6)}
+        jobs.update(overrides)
+        return [self.job(name, sched, ago) for name, (sched, ago) in jobs.items() if sched]
+
     def test_on_time_passes(self):
-        jobs = [self.job("watcher", "* * * * *", 1), self.job("probe", "15 * * * *", 50),
-                self.job("sweep", "*/5 * * * *", 6)]
-        self.assertEqual(acc.PASS, acc.check_schedulers(run=lambda args: jobs, now=NOW)[0])
+        self.assertEqual(acc.PASS, acc.check_schedulers(run=lambda args: self.fleet(), now=NOW)[0])
+
+    def test_a_missing_fleet_scheduler_fails_even_beside_a_healthy_one(self):
+        status, evidence = acc.check_schedulers(run=lambda args: [self.job("unrelated", "* * * * *", 1)], now=NOW)
+        self.assertEqual(acc.FAIL, status)
+        self.assertIn("board-watcher-2min missing", evidence)
+        status, evidence = acc.check_schedulers(run=lambda args: self.fleet(**{"waker-shadow-hourly": (None, 0)}),
+                                                now=NOW)
+        self.assertEqual((acc.FAIL, True), (status, "waker-shadow-hourly missing" in evidence))
 
     def test_stale_paused_or_never_attempted_fails(self):
-        for job in (self.job("watcher", "* * * * *", 10), self.job("probe", "15 * * * *", 200),
-                    self.job("probe", "15 * * * *", 1, state="PAUSED")):
-            self.assertEqual(acc.FAIL, acc.check_schedulers(run=lambda args, j=job: [j], now=NOW)[0], job)
-        never = {"name": "x/jobs/new", "schedule": "* * * * *", "state": "ENABLED"}
-        self.assertEqual(acc.FAIL, acc.check_schedulers(run=lambda args: [never], now=NOW)[0])
+        for bad in (self.job("board-watcher-2min", "* * * * *", 10), self.job("board-probe-hourly", "15 * * * *", 200),
+                    self.job("board-probe-hourly", "15 * * * *", 1, state="PAUSED")):
+            jobs = [j for j in self.fleet() if not j["name"].endswith("/" + bad["name"].rsplit("/", 1)[-1])] + [bad]
+            self.assertEqual(acc.FAIL, acc.check_schedulers(run=lambda args, js=jobs: js, now=NOW)[0], bad)
+        never = {"name": "x/jobs/board-watcher-2min", "schedule": "* * * * *", "state": "ENABLED"}
+        jobs = [j for j in self.fleet() if "board-watcher" not in j["name"]] + [never]
+        self.assertEqual(acc.FAIL, acc.check_schedulers(run=lambda args: jobs, now=NOW)[0])
 
     def test_intervals(self):
         self.assertEqual((1, 5, 60, 1440), (acc._interval_minutes("* * * * *"), acc._interval_minutes("*/5 * * * *"),
@@ -133,6 +161,20 @@ class Runner(unittest.TestCase):
 
     def test_the_zoom_agent_is_never_pass_by_absence(self):
         self.assertEqual(acc.UNKNOWN, acc.check_zoom_agent()[0])
+
+    def test_a_typo_in_only_is_refused_not_a_clean_run(self):
+        self.assertEqual(2, acc.main(["--only", "board-read"]))
+        self.assertEqual(2, acc.main(["--only", "zoom_agent,board-read"]))
+        self.assertEqual(2, acc.main(["--only", ","]))
+
+    def test_strict_fails_on_unknown(self):
+        original = acc.CHECKS
+        try:
+            acc.CHECKS = (("x", lambda **_: (acc.UNKNOWN, "could not see")),)
+            self.assertEqual(0, acc.main([]))
+            self.assertEqual(1, acc.main(["--strict"]))
+        finally:
+            acc.CHECKS = original
 
     def test_exit_code_is_one_only_on_a_fail(self):
         original = acc.CHECKS
