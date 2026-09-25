@@ -528,7 +528,18 @@ class StudioController:
             if not hmac.compare_digest(str(prior.get("fingerprint") or ""), fingerprint):
                 raise CommandError("command_id is already bound to a different payload", 409)
             if prior.get("status") == "completed":
-                return copy.deepcopy(prior["result"])
+                replay = copy.deepcopy(prior["result"])
+                if (self.workspace_store is not None and state.get("client_tenant") and state.get("project")
+                        and any(e.get("type") == "artifact.patch" for e in replay.get("events") or [])):
+                    # The stored result was copied before the project save; a
+                    # replay reports the save as the store has it now.
+                    try:
+                        replay["workspace"] = self.workspace_store.receipt(
+                            state["client_tenant"], state["project"], state["session_id"],
+                            int(replay.get("artifact_version") or 0))
+                    except Exception:
+                        replay["workspace"] = {"saved": False, "reason": "the project could not be read"}
+                return replay
             if prior.get("status") == "failed":
                 raise CommandError("command has already failed; use a new command_id", 409)
             raise CommandError("command is already in progress", 409)
@@ -1076,7 +1087,8 @@ class StudioController:
             # The base is the revision the session opened on; its own later
             # saves are recognised by the store, so no second session write.
             revision = self.workspace_store.save(state["client_tenant"], state["project"], state["artifact"],
-                                                 state["session_id"], state.get("workspace_revision", 0), patch_ops)
+                                                 state["session_id"], state.get("workspace_revision", 0), patch_ops,
+                                                 state["artifact_version"])
         except WorkspaceConflict as exc:
             result["workspace"] = {"saved": False, "revision": exc.stored_revision,
                                    "reason": "the project changed elsewhere"}

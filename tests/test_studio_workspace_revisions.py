@@ -115,13 +115,34 @@ class Revisions(base.Api):
     def test_a_sessions_own_saves_never_count_against_it(self):
         store = WorkspaceStore(base.MemoryStore(), clock=lambda: 1000)
         tree = {"id": "screen", "kind": "screen", "label": "x", "children": []}
-        self.assertEqual(1, store.save("nav", "p1", tree, "s-1", 0))
-        self.assertEqual(2, store.save("nav", "p1", tree, "s-1", 0))   # its own chain, same opening base
+        self.assertEqual(1, store.save("nav", "p1", tree, "s-1", 0, artifact_version=2))
+        self.assertEqual(2, store.save("nav", "p1", tree, "s-1", 0, artifact_version=3))   # its own chain
         with self.assertRaises(WorkspaceConflict):
             store.save("nav", "p1", tree, "s-2", 0)                   # opened on 0, s-1 has written since
-        self.assertEqual(3, store.save("nav", "p1", tree, "s-3", 2))   # opened on 2: nobody else since
+        self.assertEqual(3, store.save("nav", "p1", tree, "s-3", 2, artifact_version=2))   # opened on 2
         with self.assertRaises(WorkspaceConflict):
-            store.save("nav", "p1", tree, "s-1", 0)                   # s-1 is stale once s-3 has written
+            store.save("nav", "p1", tree, "s-1", 0, artifact_version=4)   # s-1 is stale once s-3 wrote
+
+    def test_a_sessions_older_tree_arriving_late_never_overwrites_its_newer_one(self):
+        # Cursor's interleaving on 3ff39b9: command 1 committed, command 2 saved
+        # first, then command 1's save ran. The older tree must not win.
+        store = WorkspaceStore(base.MemoryStore(), clock=lambda: 1000)
+        first = {"id": "screen", "kind": "screen", "label": "FIRST-TREE", "children": []}
+        second = {"id": "screen", "kind": "screen", "label": "SECOND-TREE", "children": []}
+        self.assertEqual(1, store.save("nav", "p1", second, "s-1", 0, artifact_version=3))
+        self.assertEqual(1, store.save("nav", "p1", first, "s-1", 0, artifact_version=2))   # late and older
+        record = store.load("nav", "p1")
+        self.assertEqual((1, "SECOND-TREE"), (record["revision"], record["artifact"]["label"]))
+        self.assertEqual(2, store.save("nav", "p1", first, "s-1", 0, artifact_version=4))   # newer: saved
+
+    def test_a_replayed_command_still_carries_its_receipt(self):
+        with TestClient(self.make(worker=base.PatchWorker())) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token).json()
+            first = self.utter(client, live, 1, "make the heading bigger", version=1).json()
+            replay = self.utter(client, live, 1, "make the heading bigger", version=1).json()
+        self.assertEqual({"saved": True, "revision": 1}, {k: first["workspace"][k] for k in ("saved", "revision")})
+        self.assertEqual({"saved": True, "revision": 1}, replay["workspace"])
 
     def test_fresh_starts_again_from_the_live_page_and_saves_on_top(self):
         with TestClient(self.make(worker=base.PatchWorker())) as client:
@@ -168,11 +189,11 @@ class Store(unittest.TestCase):
     def test_compare_and_set_on_the_revision(self):
         store = WorkspaceStore(base.MemoryStore(), clock=lambda: 1000)
         tree = {"id": "screen", "kind": "screen", "label": "x", "children": []}
-        self.assertEqual(1, store.save("nav", "p1", tree, "s-1", 0, ["op-1"]))
+        self.assertEqual(1, store.save("nav", "p1", tree, "s-1", 0, ["op-1"], artifact_version=2))
         with self.assertRaises(WorkspaceConflict) as caught:
             store.save("nav", "p1", tree, "s-2", 0)
         self.assertEqual(1, caught.exception.stored_revision)
-        self.assertEqual(2, store.save("nav", "p1", tree, "s-1", 1))
+        self.assertEqual(2, store.save("nav", "p1", tree, "s-1", 1, artifact_version=3))
         self.assertEqual(2, store.load("nav", "p1")["revision"])
         self.assertIsNone(store.load("nav", "p2"))
         self.assertIsNone(store.load("other", "p1"))

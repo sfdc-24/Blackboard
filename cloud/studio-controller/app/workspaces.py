@@ -60,6 +60,19 @@ class WorkspaceStore:
             return None
         return copy.deepcopy(state)
 
+    def receipt(self, tenant: str, project: str, session_id: str, artifact_version: int) -> dict:
+        """What a replayed command reports: whether this session's change at this
+        artifact version is inside the saved project, and at which revision."""
+        record = self.load(tenant, project)
+        if not record:
+            return {"saved": False, "revision": 0}
+        covered = (record.get("session_id") == session_id
+                   and int(record.get("session_artifact_version") or 0) >= int(artifact_version))
+        out = {"saved": bool(covered), "revision": int(record.get("revision") or 0)}
+        if not covered:
+            out["reason"] = "the project changed elsewhere"
+        return out
+
     def summary(self, tenant: str, project: str) -> dict:
         record = self.load(tenant, project)
         if not record:
@@ -67,7 +80,7 @@ class WorkspaceStore:
         return {"revision": int(record.get("revision") or 0), "updated_at": record.get("updated_at")}
 
     def save(self, tenant: str, project: str, artifact: dict, session_id: str, base_revision: int,
-             op_ids=()) -> int:
+             op_ids=(), artifact_version: int = 0) -> int:
         """Write the next revision - only if nobody else has saved since this
         session opened on base_revision, or the last save was this session's own.
         (A session's own saves never count against it, even when its session
@@ -77,7 +90,14 @@ class WorkspaceStore:
             state, token = self.store.load(name)
             stored = int(state.get("revision") or 0) if isinstance(state, dict) and state else 0
             last_writer = str(state.get("session_id") or "") if isinstance(state, dict) and state else ""
-            if stored != int(base_revision) and last_writer != session_id:
+            last_version = int(state.get("session_artifact_version") or 0) if isinstance(state, dict) and state else 0
+            if last_writer == session_id:
+                # This session's own saves are ordered by its artifact version:
+                # an older tree arriving late is already inside the newer saved
+                # one and is never written over it (Cursor NO-GO on 3ff39b9).
+                if int(artifact_version) <= last_version:
+                    return stored
+            elif stored != int(base_revision):
                 raise WorkspaceConflict(stored)
             revision = stored + 1
             now = int(self.clock())
@@ -86,7 +106,8 @@ class WorkspaceStore:
                             "op_ids": [str(o) for o in op_ids][:20]})
             record = {"version": 1, "tenant": tenant, "project": project, "revision": revision,
                       "artifact": copy.deepcopy(artifact), "digest": digest(artifact), "updated_at": now,
-                      "session_id": session_id, "history": history[-HISTORY_MAX:]}
+                      "session_id": session_id, "session_artifact_version": int(artifact_version),
+                      "history": history[-HISTORY_MAX:]}
             try:
                 self.store.save(name, record, token)
                 return revision
