@@ -261,19 +261,6 @@ _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
 LINK = "[link]"
 EMAIL = "[email]"
 _DOT = "[.\u3002\uff0e\uff61]"
-_NOT_ADDR = "\\s@<>()\\[\\]{}\"',;:"
-# An address starts only after a separator, so a long run without "@" is scanned once, not once per character.
-# The host is dotted or not (admin@localhost), or a bracketed literal
-# (user@[2001:db8::1]); the whole address goes, local part included (Codex
-# Gate 1 B5 on cc56fea).
-_HOST_SEG = "[^" + _NOT_ADDR + ".\u3002\uff0e\uff61]+"
-# A mailbox's local part is anything the registry accepts there - only not
-# whitespace, "@" or angle brackets, so apostrophes, quotes, brackets and
-# commas included - and the whole mailbox goes (Codex Gate 1 on 38bc713:
-# johnsmith'alias@example.com left johnsmith' behind).
-_NOT_LOCAL = "\\s@<>"
-_EMAIL_RE = re.compile("(?<![^" + _NOT_LOCAL + "])[^" + _NOT_LOCAL + "]+@(?:\\[[^\\]\\s]{1,100}\\]|"
-                       + _HOST_SEG + "(?:" + _DOT + _HOST_SEG + ")*)")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftps?|javascript|vbscript|data|file|blob|wss?|mailto|tel|sms):\S+"
                      r"|(?:^|(?<=\s))//\S+|\bwww\.\S+")
 _IPV4_RE = re.compile(r"\b\d{1,3}(?:" + _DOT + r"\d{1,3}){3}(?::\d{1,5})?(?:/\S*)?")
@@ -397,11 +384,68 @@ def _replace_found(text: str, finder) -> str:
     return "".join(out)
 
 
+# Mailboxes, found around each "@" within bounded windows (Cursor and Codex
+# on 6081563: an unanchored regex scan could go quadratic). The local part
+# runs back from the "@" to a separator - whitespace, "@" or an angle bracket;
+# apostrophes, quotes, brackets and commas are part of it, as the registry
+# accepts - never past the previous mailbox, and at most LOCAL_MAX characters.
+# The domain runs forward: dotted or not (admin@localhost), or a bracketed
+# literal (user@[2001:db8::1]), at most DOMAIN_MAX characters. Every character
+# is tested a bounded number of times, so the scan is linear by construction;
+# the whole mailbox goes, local part included.
+LOCAL_MAX = 64            # the registry's own limits (app/clients.py)
+DOMAIN_MAX = 255
+_NOT_ADDR_CHARS = "@<>()[]{}\"',;:"
+
+
+def _local_char(ch: str) -> bool:
+    return not (ch.isspace() or ch in "@<>")
+
+
+def _domain_char(ch: str) -> bool:
+    return not (ch.isspace() or ch in _NOT_ADDR_CHARS or ch in _DOT_CHARS)
+
+
+def _domain_end(text: str, start: int) -> int:
+    """Where the domain that starts at `start` ends; `start` when there is none."""
+    n = len(text)
+    if start < n and text[start] == "[":                 # a bracketed literal, 1 to 100 characters
+        close, limit = start + 1, min(n, start + 102)
+        while close < limit and text[close] != "]" and not text[close].isspace():
+            close += 1
+        return close + 1 if close < limit and text[close] == "]" and close > start + 1 else start
+    k, limit = start, min(n, start + DOMAIN_MAX)
+    while k < limit and _domain_char(text[k]):
+        k += 1
+    if k == start:
+        return start
+    while k + 1 < limit and text[k] in _DOT_CHARS and _domain_char(text[k + 1]):   # further labels
+        k += 1
+        while k < limit and _domain_char(text[k]):
+            k += 1
+    return k
+
+
+def _email_spans(text: str):
+    last, at = 0, text.find("@")
+    while at != -1:
+        start, floor = at, max(last, at - LOCAL_MAX)
+        while start > floor and _local_char(text[start - 1]):
+            start -= 1
+        end = _domain_end(text, at + 1) if start < at else at + 1
+        if start < at and end > at + 1:
+            yield start, end, EMAIL
+            last = end
+            at = text.find("@", end)
+        else:
+            at = text.find("@", at + 1)
+
+
 def redact(text: str) -> str:
     """Replace every link-, domain-, IP- and email-shaped token with a
     placeholder, each found on the compatibility view (above)."""
     text = _replace_found(text, _regex_found(_URL_RE, LINK))      # first: a link's user@host goes with it
-    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))
+    text = _replace_found(text, _email_spans)
     text = _replace_found(text, _regex_found(_IPV4_RE, LINK))
     text = _replace_found(text, _ipv6_found)
     return _replace_found(text, _host_spans)

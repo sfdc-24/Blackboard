@@ -58,7 +58,7 @@ MUTANTS = [
         '    if host.endswith(_PRIVATE_SUFFIXES) or host.split(".")[0] in ("localhost", "metadata"):', '    if False:')]),
     # -- the tree -----------------------------------------------------------------------------
     ("tree: redaction off", [(PAGE, "    if redacted:\n        text = redact(text)\n", "")]),
-    ("tree: emails kept", [(PAGE, "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n", "")]),
+    ("tree: emails kept", [(PAGE, "    text = _replace_found(text, _email_spans)\n", "")]),
     ("tree: no compatibility view", [(PAGE, "    if text.isascii():\n        return text, None\n    chunks",
                                       "    if True:\n        return text, None\n    chunks")]),
     ("tree: the view normalizes slices, not one code point", [(PAGE,
@@ -68,7 +68,8 @@ MUTANTS = [
     ("tree: part of an original character kept", [(PAGE, "start, end = origin[start], origin[end - 1] + 1",
                                                    "start, end = origin[start], origin[end - 1]")]),
     ("tree: emails read without the compatibility view", [(PAGE,
-        "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n", "    text = _EMAIL_RE.sub(EMAIL, text)\n")]),
+        "    text = _replace_found(text, _email_spans)\n",
+        "    text = _replace_found(text, lambda view, raw=text: _email_spans(raw))\n")]),
     ("tree: links read without the compatibility view", [(PAGE,
         "    text = _replace_found(text, _regex_found(_URL_RE, LINK))\n", "    text = _URL_RE.sub(LINK, text)\n")]),
     # -- a fenced or stranded command is audited (Codex Gate 1 addendum on dfbcc11) ----------------
@@ -142,8 +143,9 @@ MUTANTS = [
         "            raise HTTPException(400, \"advise needs the canvas revision\")\n"
         "        if is_client_session(state) and \"gemini\" not in client_providers:\n"
         "            raise HTTPException(403, CLIENT_PROVIDER_DENIED)\n")]),
-    ("tree: email scan not anchored (quadratic)", [(PAGE, '_EMAIL_RE = re.compile("(?<![^" + _NOT_LOCAL + "])[^"',
-                                                    '_EMAIL_RE = re.compile("[^"')]),
+    ("tree: the mailbox scan walks past separators and its window (quadratic)", [(PAGE,
+        "        while start > floor and _local_char(text[start - 1]):\n",
+        "        while start > 0 and (_local_char(text[start - 1]) or True):\n")]),
     ("providers: any setting accepted", [("cloud/studio-controller/app/settings.py",
         "            raise RuntimeError(\"STUDIO_CLIENT_PROVIDERS must be distinct names from: \" + \", \".join(KNOWN_PROVIDERS))",
         "            pass")]),
@@ -182,9 +184,12 @@ MUTANTS = [
     ("tree: full-width dots kept", [(PAGE, '_DOT = "[.\\u3002\\uff0e\\uff61]"', '_DOT = "[.]"')]),
     ("tree: host paths kept", [(PAGE, '_HOST_TAIL_RE = re.compile(r"(?::\\d{1,5})?(?:[/?#]\\S*)?")',
                                 '_HOST_TAIL_RE = re.compile(r"")')]),
-    ("tree: ASCII-only emails", [(PAGE, '_HOST_SEG = "[^" + _NOT_ADDR', '_HOST_SEG = "[^\\x80-\\U0010ffff" + _NOT_ADDR')]),
-    ("tree: dotless email hosts kept", [(PAGE, '_HOST_SEG + ")*)")', '_HOST_SEG + ")+)")')]),
-    ("tree: bracketed email literals kept", [(PAGE, "{1,100}", "{0}")]),
+    ("tree: ASCII-only emails", [(PAGE, "    return not (ch.isspace() or ch in _NOT_ADDR_CHARS or ch in _DOT_CHARS)",
+                                  "    return ch.isascii() and not (ch.isspace() or ch in _NOT_ADDR_CHARS or ch in _DOT_CHARS)")]),
+    ("tree: dotless email hosts kept", [(PAGE, "    if k == start:\n        return start\n",
+                                         "    if k == start or k >= len(text) or text[k] not in _DOT_CHARS:\n        return start\n")]),
+    ("tree: bracketed email literals kept", [(PAGE, '    if start < n and text[start] == "[":', "    if False:")]),
+    ("tree: the local window is unbounded", [(PAGE, "floor = at, max(last, at - LOCAL_MAX)", "floor = at, last")]),
     ("tree: IPv4 kept", [(PAGE, "    text = _replace_found(text, _regex_found(_IPV4_RE, LINK))\n", "")]),
     ("tree: IPv6 kept", [(PAGE, "    text = _replace_found(text, _ipv6_found)\n", "")]),
     ("tree: no depth cap", [(PAGE, "MAX_DEPTH = 4 ", "MAX_DEPTH = 99 ")]),
@@ -299,11 +304,12 @@ MUTANTS = [
         "            return \"\"")]),
     ("tree: repeated-dot forms read as several dots", [(PAGE,
         "        if len(mapped) > 1 and all(c in _DOT_CHARS for c in mapped):\n", "        if False:\n")]),
-    ("tree: apostrophes end a mailbox", [(PAGE, '_NOT_LOCAL = "\\\\s@<>"', '_NOT_LOCAL = "\\\\s@<>\'"')]),
+    ("tree: apostrophes end a mailbox", [(PAGE, "    return not (ch.isspace() or ch in \"@<>\")",
+                                          "    return not (ch.isspace() or ch in \"@<>'\")")]),
     ("tree: emails read before links", [(PAGE,
         "    text = _replace_found(text, _regex_found(_URL_RE, LINK))      # first: a link's user@host goes with it\n"
-        "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n",
-        "    text = _replace_found(text, _regex_found(_EMAIL_RE, EMAIL))\n"
+        "    text = _replace_found(text, _email_spans)\n",
+        "    text = _replace_found(text, _email_spans)\n"
         "    text = _replace_found(text, _regex_found(_URL_RE, LINK))\n")]),
     # -- audit and redacted failures --------------------------------------------------------------
     ("audit: none at all", [(CORE,

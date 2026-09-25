@@ -1377,19 +1377,24 @@ class FindingF2Redaction(unittest.TestCase):
             self.assertNotIn(never, labels)
 
     def test_the_redaction_is_linear_on_hostile_input(self):
-        # Work counted, not timed (a loaded machine is slow, not quadratic): the
-        # character mappings and the host scan's checks grow linearly with the
-        # text - four times the text, at most four times the work - and stay
-        # within a fixed bound per character. The regex passes' own steps cannot
-        # be counted from Python; a generous 20 s backstop holds them (the
-        # unanchored email scan takes far longer, and its mutant fails here).
+        # Work counted, not timed (a loaded machine is slow, not quadratic):
+        # every character test the scans make - the compatibility mappings,
+        # the host scan's, and the mailbox scan's local and domain windows -
+        # is counted. Four times the text must cost at most four times the
+        # work, and never more than a fixed amount per character. A mailbox
+        # scan that walks past separators and its window (the unanchored
+        # mutant) does quadratic work on "x@" runs and fails the count here.
+        # The regexes still in use (links, IPv4, IPv6) have fixed-width anchors;
+        # a generous backstop is the only clock.
         from app import project_page as page
-        real_host_char, real_unicodedata = page._host_char, page.unicodedata
-        work = {"n": 0}
+        real = {name: getattr(page, name) for name in ("_host_char", "_local_char", "_domain_char")}
+        real_unicodedata, work = page.unicodedata, {"n": 0}
 
-        def counting_host_char(ch):
-            work["n"] += 1
-            return real_host_char(ch)
+        def counted(fn):
+            def call(ch):
+                work["n"] += 1
+                return fn(ch)
+            return call
 
         class CountingUnicodedata:
             def normalize(self, form, text):
@@ -1406,18 +1411,31 @@ class FindingF2Redaction(unittest.TestCase):
             return work["n"], time.perf_counter() - started
 
         stop, circled_a = chr(0x3002), chr(0x24D0)
-        page._host_char, page.unicodedata = counting_host_char, CountingUnicodedata()
+        for name, fn in real.items():
+            setattr(page, name, counted(fn))
+        page.unicodedata = CountingUnicodedata()
         try:
-            for unit in ("a.", "a", "a-", "x@", "1.", "-", stop, "ab.", "1" + stop, "a.bc", circled_a + "."):
-                small, large = unit * (15000 // len(unit)), unit * (60000 // len(unit))
+            for unit in ("a.", "a", "a-", "x@", "a@b", "@", "a@", "1.", "-", stop, "ab.", "1" + stop, "a.bc",
+                         circled_a + ".", "x" * 70 + "@", "a@[", "a@b.c."):
+                small, large = unit * (12000 // len(unit)), unit * (48000 // len(unit))
                 small_work, _ = measure(small)
                 large_work, elapsed = measure(large)
-                self.assertLessEqual(large_work, 4 * small_work + 10, (unit, small_work, large_work))
-                self.assertLessEqual(large_work, 8 * len(large) + 10, (unit, large_work))
-                self.assertLess(elapsed, 20.0, unit)
+                self.assertLessEqual(large_work, 4 * small_work + 64, (unit[:8], small_work, large_work))
+                self.assertLessEqual(large_work, 12 * len(large) + 64, (unit[:8], large_work))
+                self.assertLess(elapsed, 60.0, unit[:8])
         finally:
-            page._host_char, page.unicodedata = real_host_char, real_unicodedata
+            for name, fn in real.items():
+                setattr(page, name, fn)
+            page.unicodedata = real_unicodedata
 
+    def test_the_mailbox_windows_are_bounded(self):
+        # The local part stops at LOCAL_MAX characters and the domain at
+        # DOMAIN_MAX, the registry's own limits.
+        from app import project_page as page
+        self.assertEqual("b" * 36 + "[email]", redact("b" * 100 + "@example.com"))
+        self.assertEqual("[email]", redact("b" * page.LOCAL_MAX + "@example.com"))
+        spans = list(page._email_spans("x@" + "a" * 400))
+        self.assertEqual([(0, 2 + page.DOMAIN_MAX, "[email]")], spans)
 
 class GeminiAttacks(unittest.TestCase):
     def test_attack_1_mapped_answers_are_refused_and_a_swap_never_re_resolves(self):
@@ -2067,7 +2085,8 @@ class CodexR7CompatibilityForms(Api):
         # Work counted, not timed (a timing test flakes under load and would
         # fake kills in the mutation harness): each character is normalized at
         # most once per pass, one code point at a time, and the host scan tests
-        # each character at most twice. The clock is only a generous backstop.
+        # each character a bounded number of times. The clock is only a
+        # generous backstop (60 s), never the assertion.
         from app import project_page as page
         real_unicodedata, real_host_char = page.unicodedata, page._host_char
         calls = {"normalize": 0, "host_char": 0, "longest": 0}
@@ -2099,7 +2118,7 @@ class CodexR7CompatibilityForms(Api):
                 self.assertLessEqual(calls["normalize"], 5 * len(text), hex(ord(unit[0])))
                 self.assertEqual(1, calls["longest"], hex(ord(unit[0])))          # one code point at a time
                 self.assertLessEqual(calls["host_char"], 2 * 18 * len(text) + 10, hex(ord(unit[0])))
-                self.assertLess(elapsed, 20.0, hex(ord(unit[0])))
+                self.assertLess(elapsed, 60.0, hex(ord(unit[0])))
         finally:
             page.unicodedata, page._host_char = real_unicodedata, real_host_char
 
