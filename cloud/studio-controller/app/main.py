@@ -396,6 +396,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # and see their own projects. The registry is read, never written, here.
     clients = ClientRegistry(store)
     app.state.clients = clients
+    from .workspaces import WorkspaceStore, digest as workspace_digest
+    workspaces = WorkspaceStore(store, clock=clock)
+    app.state.workspaces = workspaces
+    controller.workspace_store = workspaces if settings.client_workspaces else None
     fetch_project = project_fetcher or fetch_page
     auth_service = AuthService(
         store, settings.operator_emails, settings.session_secret, send_auth_email, clock=clock,
@@ -1251,14 +1255,32 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         """The signed-in client's name and projects. Never an address."""
         require_origin(request)
         claims, client = await asyncio.to_thread(require_client, request)
-        return public_view(client, allowed=claims["prj"])
+        view = public_view(client, allowed=claims["prj"])
+        for p in view["projects"]:                 # how far the saved design has come
+            p.update(await asyncio.to_thread(workspaces.summary, client["id"], p["id"]))
+        return view
+
+    @app.get("/v1/workspace/{project_id}")
+    async def workspace_revision(request: Request, project_id: str):
+        """Read-back of a project's saved revision: its number, when, and the
+        design's digest - never the page itself."""
+        require_origin(request)
+        claims, client = await asyncio.to_thread(require_client, request)
+        project = clients.project(client, project_id)
+        if project is None or project_id not in claims.get("prj", []):
+            raise HTTPException(403, WORKSPACE_DENIED)
+        record = await asyncio.to_thread(workspaces.load, client["id"], project["id"])
+        if not record:
+            return {"project": project["id"], "revision": 0, "updated_at": None, "digest": None}
+        return {"project": project["id"], "revision": record["revision"], "updated_at": record["updated_at"],
+                "digest": record["digest"]}
 
     @app.post("/v1/session")
     async def create_session(request: Request):
         require_origin(request)
         operator, role = require_signed_in(request)
         body = await json_object(request, "session")
-        if set(body) - {"title", "creation_id", "start", "topic", "project"}:
+        if set(body) - {"title", "creation_id", "start", "topic", "project", "fresh"}:
             raise HTTPException(400, "session body has unknown fields")
         from workers.topics import TOPICS
         topic = body.get("topic")
@@ -1279,9 +1301,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         visitor = role == "visitor"
         client = role == "client"
         tenant = operator.get("tnt", "") if client else ""
-        project_id, artifact = "", None
-        if "project" in body and start != "project":
+        project_id, artifact, workspace_revision = "", None, 0
+        if ("project" in body or "fresh" in body) and start != "project":
             raise HTTPException(400, "project is only for start project")
+        fresh = body.get("fresh", False)
+        if not isinstance(fresh, bool):
+            raise HTTPException(400, "fresh must be true or false")
         if start == "project":
             # A client's own registered page, fetched here from its exact URL -
             # before any admission, so a page that does not load costs nothing.
@@ -1295,40 +1320,50 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             replay = await asyncio.to_thread(controller.created_session_exists, operator["sid"], creation_id,
                                              tenant, project_id)
             if not replay:
-                # Before any fetch or parse: one page load per tenant at a time,
-                # and a small per-tenant budget of attempts that a failure
-                # spends too - but no session admission.
-                try:
-                    claim = await asyncio.to_thread(claim_fetch, tenant)
-                except GuardUnavailable as exc:
-                    raise HTTPException(503, "page loading is busy; try again shortly") from exc
-                if claim == "tenant":
-                    raise HTTPException(429, "a page for this workspace is already loading")
-                if claim == "ceiling":
-                    raise HTTPException(503, "page loading is busy; try again shortly")
-                timed_out, still_running, stop_it = False, None, None
-                try:
-                    if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
-                        raise HTTPException(429, "too many page loads for this workspace; try again later")
+                # The saved design continues where it was left (app/workspaces.py);
+                # the live page is fetched only the first time, or when the client
+                # asks to start again from it (fresh). Either way the session
+                # builds on the stored revision, so its saves never overwrite a
+                # newer one.
+                saved = await asyncio.to_thread(workspaces.load, tenant, project_id)
+                workspace_revision = int(saved["revision"]) if saved else 0
+                if saved and not fresh:
+                    artifact = saved["artifact"]
+                else:
+                    # Before any fetch or parse: one page load per tenant at a time,
+                    # and a small per-tenant budget of attempts that a failure
+                    # spends too - but no session admission.
                     try:
-                        html = await asyncio.to_thread(fetch_project, project["url"])
-                        artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
-                    except FetchBusy as exc:
+                        claim = await asyncio.to_thread(claim_fetch, tenant)
+                    except GuardUnavailable as exc:
                         raise HTTPException(503, "page loading is busy; try again shortly") from exc
-                    except FetchTimeout as exc:
-                        timed_out, still_running = True, getattr(exc, "done", None)
-                        stop_it = getattr(exc, "cancel", None)
-                        raise HTTPException(502, "the project page could not be loaded") from exc
-                    except PageFetchError as exc:
-                        raise HTTPException(502, "the project page could not be loaded") from exc
-                    except Exception as exc:
-                        raise HTTPException(502, "the project page could not be loaded") from exc
-                finally:
-                    if not timed_out:
-                        await asyncio.to_thread(release_fetch, tenant, claim)
-                    elif still_running is not None:  # held, and renewed, until its worker stops
-                        keep_fetch_leases(tenant, claim, still_running, stop_it)
-                    # (a timeout without a liveness signal keeps its leases until they expire)
+                    if claim == "tenant":
+                        raise HTTPException(429, "a page for this workspace is already loading")
+                    if claim == "ceiling":
+                        raise HTTPException(503, "page loading is busy; try again shortly")
+                    timed_out, still_running, stop_it = False, None, None
+                    try:
+                        if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
+                            raise HTTPException(429, "too many page loads for this workspace; try again later")
+                        try:
+                            html = await asyncio.to_thread(fetch_project, project["url"])
+                            artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
+                        except FetchBusy as exc:
+                            raise HTTPException(503, "page loading is busy; try again shortly") from exc
+                        except FetchTimeout as exc:
+                            timed_out, still_running = True, getattr(exc, "done", None)
+                            stop_it = getattr(exc, "cancel", None)
+                            raise HTTPException(502, "the project page could not be loaded") from exc
+                        except PageFetchError as exc:
+                            raise HTTPException(502, "the project page could not be loaded") from exc
+                        except Exception as exc:
+                            raise HTTPException(502, "the project page could not be loaded") from exc
+                    finally:
+                        if not timed_out:
+                            await asyncio.to_thread(release_fetch, tenant, claim)
+                        elif still_running is not None:  # held, and renewed, until its worker stops
+                            keep_fetch_leases(tenant, claim, still_running, stop_it)
+                        # (a timeout without a liveness signal keeps its leases until they expire)
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
@@ -1338,7 +1373,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 (settings.daily_session_cap - settings.operator_reserved_sessions
                  if (visitor or client) else None),
                 start in ("blank", "project") and analyst_ready(),
-                topic, client, artifact, project_id, tenant,
+                topic, client, artifact, project_id, tenant, workspace_revision,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc

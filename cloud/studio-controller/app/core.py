@@ -184,6 +184,9 @@ class StudioController:
         self.outcome_write_attempts = 4
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
+        # Set by the app when client workspaces are on: saves each applied change
+        # of a project session as the project's next revision (app/workspaces.py).
+        self.workspace_store = None
 
     def _event(self, state: dict, event_type: str, payload: dict, *,
                turn_id: str | None = None, task_revision: int | None = None,
@@ -212,7 +215,7 @@ class StudioController:
                        visitor: bool = False, admit_limit: int | None = None,
                        analyst: bool = False, topic: str = "", client: bool = False,
                        artifact: dict | None = None, project: str = "",
-                       tenant: str = "") -> tuple[dict, int]:
+                       tenant: str = "", workspace_revision: int = 0) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -293,6 +296,8 @@ class StudioController:
             "client_subject": subject if client else "",
             "client_tenant": tenant if client else "",
             "project": project if start == "project" else "",
+            # The saved workspace revision this session builds on (app/workspaces.py).
+            "workspace_revision": int(workspace_revision) if start == "project" else 0,
             "voice_item_ids": [],
             "voice_epoch": 0,
         }
@@ -1050,9 +1055,32 @@ class StudioController:
     def _run_reserved(self, state: dict, command: dict) -> dict:
         prior_revision = state["artifact_version"]
         result = self._run_turn(state, command)
+        if state.get("client_tenant") and state.get("project"):
+            self._save_workspace(state, result)
         if state.get("client_tenant"):
             self._audit(state, command, prior_revision, result)
         return result
+
+    def _save_workspace(self, state: dict, result: dict) -> None:
+        """An applied change in a project session becomes the project's next
+        revision - never over a newer one. The result carries the receipt."""
+        patch_ops = [e["op_id"] for e in result.get("events") or [] if e.get("type") == "artifact.patch"]
+        if not patch_ops or self.workspace_store is None:
+            return
+        from .workspaces import WorkspaceConflict, digest
+        try:
+            revision = self.workspace_store.save(state["client_tenant"], state["project"], state["artifact"],
+                                                 state["session_id"], state.get("workspace_revision", 0), patch_ops)
+        except WorkspaceConflict as exc:
+            result["workspace"] = {"saved": False, "revision": exc.stored_revision,
+                                   "reason": "the project changed elsewhere"}
+            return
+        except Exception:                           # the change stands in the session; only the save failed
+            result["workspace"] = {"saved": False, "revision": state.get("workspace_revision", 0),
+                                   "reason": "the project could not be saved"}
+            return
+        state["workspace_revision"] = revision
+        result["workspace"] = {"saved": True, "revision": revision, "digest": digest(state["artifact"])}
 
     AUDIT_MAX = 200
 
@@ -1094,6 +1122,7 @@ class StudioController:
             "command_type": str(command.get("type") or ""),
             "prior_revision": prior_revision,
             "revision": state["artifact_version"],
+            "workspace_revision": state.get("workspace_revision", 0),
             "op_ids": op_ids,
             "at": int(self.clock()),
             "outcome": outcome,
