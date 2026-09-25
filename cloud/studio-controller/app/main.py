@@ -635,6 +635,23 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             bool(state.get("stopped")),
         )
 
+    def advice_texts(advice: dict) -> list:
+        """Every string the page would show: what the moderation gate reads."""
+        texts = [advice.get("perspective") or ""]
+        for q in advice.get("questions") or []:
+            texts += [q.get("prompt") or "", q.get("why") or ""]
+            texts += [o.get("label") or "" for o in q.get("options") or []]
+        texts += list(advice.get("risks") or [])
+        return [t for t in texts if isinstance(t, str) and t]
+
+    def advisor_done(session_id: str, started: float, outcome: str, **extra) -> dict:
+        """One content-free telemetry line per call (Codex #266: usage and
+        circuit telemetry): the outcome and how long it took, never words."""
+        governance.log_event("studio.advisor_call", session_id=session_id, outcome=outcome,
+                             latency_ms=int((time.monotonic() - started) * 1000),
+                             severity="WARNING" if outcome == "withheld" else "INFO", **extra)
+        return {"advice": None, outcome: True} if outcome in ("fenced", "withheld") else {"advice": None}
+
     @app.post("/v1/session/{session_id}/advise")
     async def advise(request: Request, session_id: str):
         require_origin(request)
@@ -660,19 +677,29 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         snapshot = {"revision": revision, "topic_line": topic_line(state),
                     "canvas": canvas_summary(state.get("artifact")), "said": said}
         advise_busy.add(session_id)
+        started = time.monotonic()
         try:
             advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
         finally:
             advise_busy.discard(session_id)
         if advice is None:
-            return {"advice": None}
+            return advisor_done(session_id, started, "none")
         try:
             latest = await asyncio.to_thread(live_state, session_id)
         except HTTPException:
-            return {"advice": None, "fenced": True}
+            return advisor_done(session_id, started, "fenced")
         if (advisor_snapshot_marker(latest) != snapshot_marker
                 or advice_fenced(advice, int(latest.get("artifact_version") or 0))):
-            return {"advice": None, "fenced": True}
+            return advisor_done(session_id, started, "fenced")
+        # The advisor's own words are moderated before the page sees them. The
+        # lane is optional, so it fails CLOSED: flagged, or moderation not
+        # available, and the advice is withheld (not counted against the visitor).
+        verdict = await moderator.check(advice_texts(advice))
+        if verdict.flagged or not verdict.available:
+            return advisor_done(session_id, started, "withheld",
+                                reason="flagged" if verdict.flagged else "moderation_unavailable",
+                                categories=list(verdict.categories))
+        advisor_done(session_id, started, "advice")
         return {"advice": advice}
 
     muse_counts: dict = {}

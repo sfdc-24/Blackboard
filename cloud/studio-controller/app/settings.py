@@ -144,6 +144,10 @@ class Settings:
             or not re.fullmatch(r"00D[A-Za-z0-9]{15}", self.salesforce_org_id)
         ):
             raise RuntimeError("STUDIO_SALESFORCE_ORG_ID must be an exact 18-character 00D Organization ID")
+        if self.advisor_enabled and not self.moderation_enabled:
+            # The advisor's words reach the page; they are moderated first, so
+            # the advisor never runs without the moderation gate (Codex #266).
+            raise RuntimeError("STUDIO_ENABLE_ADVISOR requires STUDIO_ENABLE_MODERATION")
         if not self.allowed_origins:
             raise RuntimeError("STUDIO_ALLOWED_ORIGINS must contain at least one exact origin")
         if self.max_session_seconds < 60 or self.max_session_seconds > 600:
