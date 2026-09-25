@@ -177,10 +177,12 @@ class LiveScenes(unittest.TestCase):
             insert("banner", "snow", "entity", "Flour dust",
                    "particles x=600 y=0 rate=30 size=3 speed=40 angle=90 spread=160 life=6 shape=circle fill=#FFFFFF"),
             insert("banner", "moon", "entity", "Moon", "circle cx=0 cy=0 r=20 fill=#FFF orbit=600,200,150,30 glow=#FFE9A8"),
+            insert("banner", "counter", "entity", "Counter", "rect x=0 y=330 width=1200 height=70 fill=#3A2417 solid=1"),
+            insert("banner", "slash", "entity", "Crust mark", "line x1=90 y1=45 x2=110 y2=30 stroke=#8A5A2B attach=ball"),
         ], "confirm": "Built the live banner.", "questions": [], "batch_title": ""})
         self.assertEqual([], out["problems"])
         ops = out["events"][0]["payload"]["ops"]
-        self.assertEqual(["scene"] + ["entity"] * 7, [o["node"]["kind"] for o in ops])
+        self.assertEqual(["scene"] + ["entity"] * 9, [o["node"]["kind"] for o in ops])
 
     def test_markup_or_script_can_never_be_an_entity(self):
         for detail in ("<svg onload=alert(1)>", "rect x=0 y=0 width=10 height=10 fill=url(#x)",
@@ -188,7 +190,8 @@ class LiveScenes(unittest.TestCase):
                        "path d=M0,0L10,10javascript:1", "text x=1 y=1 font=Comic",
                        "rect x=0 x=1", "circle cx=1 cy=1 r=1 opacity=2", "rect x=10px",
                        "circle cx=1 cy=1 r=1 tap=eval", "circle cx=1 cy=1 r=1 body=yes",
-                       "circle orbit=1,2,3", "particles shape=script"):
+                       "circle orbit=1,2,3", "particles shape=script", "rect solid=yes",
+                       "line attach=../../x", "line attach=a;b"):
             out = run_on(SCENE_ROOT, {"ops": [insert("logo", "bad", "entity", "Bad", detail)],
                                       "confirm": "Drew it.", "questions": [], "batch_title": ""})
             self.assertEqual([], out["events"], detail)
@@ -226,7 +229,7 @@ class LiveScenes(unittest.TestCase):
     def test_the_prompt_teaches_the_grammar_the_gate_enforces(self):
         for word in ('"scene"', '"entity"', "polygon points=", "path d=", "anchor=start|middle|end",
                      "font=sans|serif|mono|display", "tap=pulse|spin|burst|jump|hide", "orbit=cx,cy,radius,deg/s",
-                     "shape=circle|square|star", "body=1", "drag=1", "[Tagline]"):
+                     "shape=circle|square|star", "body=1", "drag=1", "solid=1", "attach=<entity id>", "[Tagline]"):
             self.assertIn(word, cw.SYSTEM)
         self.assertEqual(set(cw.SHAPES), {"rect", "circle", "ellipse", "line", "polygon", "path", "text",
                                           "particles"})

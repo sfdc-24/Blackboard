@@ -60,7 +60,7 @@ _PAINT = {"fill": "colour", "stroke": "colour", "stroke-width": "num", "opacity"
           "glow": "colour"}
 _MOTION = {"vx": "num", "vy": "num", "spin": "num", "pulse": "unit", "period": "num", "float": "num",
            "orbit": "orbit", "body": "bit", "bounce": "bit", "wrap": "bit", "drag": "bit", "tap": "tap",
-           "delay": "num"}
+           "delay": "num", "solid": "bit", "attach": "ref"}
 _BASE = dict(_PAINT, **_MOTION)
 SHAPES = {
     "rect": dict(_BASE, x="num", y="num", width="num", height="num", rx="num"),
@@ -79,6 +79,7 @@ _VALUES = {
     "colour": COLOUR_RE.match,
     "unit": lambda v: NUM_RE.match(v) and 0 <= float(v) <= 1,
     "bit": lambda v: v in ("0", "1"),
+    "ref": ID_RE.match,
     "points": POINTS_RE.match,
     "orbit": ORBIT_RE.match,
     "path": PATH_RE.match,
@@ -241,7 +242,10 @@ life=(seconds) shape=circle|square|star     - a continuous emitter: snow, sparks
 Paint (any type): fill=#hex stroke=#hex stroke-width= opacity=0-1 rotate=(degrees) glow=#hex
 Motion and physics (any type): vx= vy= (px/s) spin=(deg/s) pulse=0-1 period=(s) float=(px bob) \
 orbit=cx,cy,radius,deg/s  body=1 (falls under the scene's gravity)  bounce=1 (rebounds off the \
-scene edges)  wrap=1 (leaves one edge, enters the opposite)  delay=(s before it appears)
+scene edges)  wrap=1 (leaves one edge, enters the opposite)  delay=(s before it appears)  solid=1 \
+(bodies land on it and bounce off it - floors, counters, platforms, walls)  attach=<entity id> (a \
+part of that entity: moves, spins and scales with it, and is dragged with it - the crust marks on a \
+loaf, the eyes on a character; insert the parts after the entity they attach to)
 Pointer: drag=1 (the visitor can pick it up and throw it)  tap=pulse|spin|burst|jump|hide
 Numbers are plain (no units), colours are #hex or none, no spaces inside a value (path data uses \
 commas: "M10,10C20,0,40,0,50,10"). Later entities draw on top.
