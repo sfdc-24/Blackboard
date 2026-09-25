@@ -3,8 +3,9 @@ name: live-health
 # Every 30 minutes: does www.sfdc24.com serve main, do the homepage's voice and
 # canvas assets answer, and is the studio controller healthy with voice, talk
 # and analyst on? Public reads only - no secrets, nothing written. A red run is
-# the alarm. A merge can leave Pages a minute behind main, so a mismatch is
-# re-checked once after two minutes before the run fails.
+# the alarm, and so is a check that could not see (--strict). A merge can
+# leave Pages a minute behind main, so a failure is re-checked once after
+# two minutes before the run fails.
 
 on:
   schedule:
@@ -29,8 +30,10 @@ jobs:
       - name: Public acceptance checks (www serves main, assets, controller lanes)
         run: |
           set -uo pipefail
+          # --strict: UNKNOWN (nothing answered, a timeout, DNS) fails too. The
+          # outage this alarm exists for is the one where nothing can be seen.
           checks=pages_serves_main,site_paths,studio_controller
-          if python3 scripts/acceptance_current_state.py --only "$checks"; then exit 0; fi
+          if python3 scripts/acceptance_current_state.py --strict --only "$checks"; then exit 0; fi
           echo "re-checking once in 120 s (Pages can trail a merge)"
           sleep 120
-          python3 scripts/acceptance_current_state.py --only "$checks"
+          python3 scripts/acceptance_current_state.py --strict --only "$checks"
