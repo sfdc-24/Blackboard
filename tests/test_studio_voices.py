@@ -20,6 +20,24 @@ from workers import talk as talk_mod  # noqa: E402
 MP3 = b"ID3\x04\x00fake-mp3-bytes"
 
 
+class TheVoicesHaveCharacter(unittest.TestCase):
+    """Owner, 2026-09-25: more fire and character, without the host ever
+    saying anything but the exact line it is given."""
+
+    def test_the_host_keeps_to_the_exact_line_and_brings_energy(self):
+        from app.main import HOST_INSTRUCTIONS
+        self.assertIn("exact text you are given, word for word", HOST_INSTRUCTIONS)
+        self.assertIn("Never state facts about Salesforce", HOST_INSTRUCTIONS)
+        self.assertRegex(HOST_INSTRUCTIONS, r"energy")
+        self.assertNotIn("briefly", HOST_INSTRUCTIONS)
+
+    def test_the_architect_is_energetic_not_calm(self):
+        from app.main import ARCHITECT_VOICE_STYLE
+        self.assertRegex(ARCHITECT_VOICE_STYLE, r"energetic")
+        self.assertNotIn("calm", ARCHITECT_VOICE_STYLE)
+        self.assertNotIn("unhurried", ARCHITECT_VOICE_STYLE)
+
+
 class TtsResponse:
     def __init__(self, status_code=200, content=MP3):
         self.status_code = status_code
@@ -96,6 +114,8 @@ class Lanes(unittest.TestCase):
         self.assertEqual(("gpt-4o-mini-tts", "cedar", "Built the landing page.", "mp3"),
                          (kwargs["json"]["model"], kwargs["json"]["voice"], kwargs["json"]["input"],
                           kwargs["json"]["response_format"]))
+        from app.main import ARCHITECT_VOICE_STYLE
+        self.assertEqual(ARCHITECT_VOICE_STYLE, kwargs["json"]["instructions"])   # the style that ships is the one sent
 
     def test_speak_refuses_bad_bodies_other_voices_and_strangers(self):
         with TestClient(self.make()) as client:
