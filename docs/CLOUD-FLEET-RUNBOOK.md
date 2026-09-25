@@ -32,7 +32,7 @@ run the three commands in *Read the live state* before acting on a row here.
 | `claude-api-waker` | answers rows addressed to `claude-api`, and stands by for WhatsApp messages addressed to `claude-code-cli` (`agent_waker.addressed_to`) | board-watcher | `agent-waker:697e190` | `agent-waker:e6f9e5a` | 840s |
 | `wa-outbox` | sends WhatsApp requests found on the board | board-watcher | `wa-outbox:2f73072125bc` | - | 300s |
 | `board-probe` | hourly health read of the board; its cursor must only move forward | `board-probe-hourly` (`15 * * * *`) | `board-probe:e6f9e5a` | `board-probe:v4` | 1800s |
-| `waker-shadow` | runs the laptop waker's decision logic read-only, to prove the cloud can replace it | `waker-shadow-hourly` (`45 * * * *`) | `waker-shadow:675f6fe166a9` | `waker-shadow:v2` | 1800s |
+| `waker-shadow` | runs the laptop waker's decision logic read-only, to prove the cloud can replace it | `waker-shadow-hourly` (`45 * * * *`) | `waker-shadow:9fa38c1c9499` (#242, rolled 2026-09-24 ~23:25Z) | `waker-shadow:675f6fe166a9` | 1800s |
 | `studio-voice-sweep` | backstop that hangs up any studio voice call the controller missed, so none keeps billing (`cloud/studio-controller/ADR-001-VOICE-SWEEP-BACKSTOP.md`) | `studio-voice-sweep-every-minute` (`*/5 * * * *`, every five minutes despite the name) | `studio-controller@sha256:1736bc4f…` (the reviewed studio image, pinned by digest) | the previous digest | 30s |
 
 Images are in `us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/`,
