@@ -177,7 +177,8 @@ class StudioController:
 
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
-                       visitor: bool = False, admit_limit: int | None = None) -> tuple[dict, int]:
+                       visitor: bool = False, admit_limit: int | None = None,
+                       analyst: bool = False) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -232,6 +233,14 @@ class StudioController:
             "visitor_subject": subject if visitor else "",
             "voice_item_ids": [],
         }
+        if analyst and start == "blank":
+            # A homepage (blank) session with the analyst lane: the analyst owns
+            # the questions from the first turn, so the builder never opens one
+            # of its own. A builder question left open made every later spoken
+            # change read as its answer and be refused by its scope (live
+            # session, 2026-09-25). Set here, in the one write that creates the
+            # session, so a replayed creation never gains or loses it.
+            state["analyst"] = True
         self._event(state, "session.started", {"title": title[:600]})
         state["artifact_version"] = 1
         self._event(state, "artifact.snapshot", {"root": artifact}, artifact_version=1)
@@ -262,27 +271,6 @@ class StudioController:
             if owner != subject or bool(existing.get("visitor_subject")) != bool(visitor):
                 raise StateConflict("creation_id belongs to another operator")
             return copy.deepcopy(existing), admitted
-
-    def enable_analyst(self, session_id: str) -> None:
-        """Mark the session as one whose questions come from the analyst lane.
-
-        Set when a homepage (blank-start) session is created with the analyst
-        available, so the builder never opens a question of its own there. A
-        builder question left open on the first turn made every later spoken
-        change read as its answer and be refused by its scope (live session,
-        2026-09-25)."""
-        for _ in range(self.repository.attempts):
-            record = self.repository.load(session_id)
-            if record.state.get("analyst"):
-                return
-            state = dict(record.state)
-            state["analyst"] = True
-            try:
-                self.repository.save(session_id, state, record.token)
-                return
-            except StateConflict:
-                continue
-        raise StateConflict("could not mark the analyst lane")
 
     def _assert_live(self, state: dict) -> None:
         if int(state.get("expires_at") or 0) <= int(self.clock()):
@@ -930,7 +918,8 @@ class StudioController:
                         "status": "open",
                         "question_ids": [question["question_id"] for question in questions],
                     }
-            if trigger["kind"] == "utterance" and problems and not worker_result.get("events"):
+            if (trigger["kind"] == "utterance" and problems and not worker_result.get("events")
+                    and not answered_questions):
                 # The builder refused the whole change. Say so: on the homepage
                 # silence after "on it" reads as the canvas ignoring you (live
                 # session 2026-09-25, four logo changes, no word back).

@@ -297,6 +297,25 @@ class Lane(unittest.TestCase):
         state = next(v for v in self.store.data.values() if isinstance(v, dict) and v.get("session_id") == sid)
         self.assertTrue(state["analyst"])
 
+    def test_the_analyst_flag_is_part_of_creation_and_a_replay_never_changes_it(self):
+        # Cursor NO-GO on e22eb9e: a second write after admission could 500 and
+        # could mark a replayed TEMPLATE session. Now it is set in the creating write.
+        with TestClient(self.make()) as client:
+            started = client.post("/v1/auth/start", headers=self.origin, json={
+                "email": "operator@example.com", "client_key": "browser-instance-1234567890"})
+            code = self.email_sender.calls[-1][1]
+            operator = client.post("/v1/auth/verify", headers=self.origin, json={
+                "challenge_id": started.json()["challenge_id"], "email": "operator@example.com",
+                "code": code, "client_key": "browser-instance-1234567890"}).json()["token"]
+            auth = {**self.origin, "Authorization": "Bearer " + operator}
+            first = client.post("/v1/session", headers=auth, json={"creation_id": "tpl-1", "start": "template"}).json()
+            again = client.post("/v1/session", headers=auth, json={"creation_id": "tpl-1", "start": "blank"})
+        self.assertEqual(first["session_id"], again.json()["session_id"])
+        state = next(v for v in self.store.data.values()
+                     if isinstance(v, dict) and v.get("session_id") == first["session_id"])
+        self.assertNotIn("analyst", state)
+        self.assertTrue(state["questions"])                 # still the template, questions and all
+
     def test_health_says_the_analyst_is_there(self):
         with TestClient(self.make()) as client:
             self.assertTrue(client.get("/health").json()["features"]["analyst"])

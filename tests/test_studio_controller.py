@@ -2064,7 +2064,29 @@ class _Refuser(SyntheticWorker):
                 "resolves": {}}
 
 
+class _AnswerNoChange(_Resolver):
+    """A spoken answer the controller accepts, with no change and a dropped question."""
+    def on_turn(self, state, trigger):
+        return {"events": [], "problems": ["question dropped: its option ids repeat"],
+                "resolves": {"question_id": "q-cta", "option_id": "book"}}
+
+
 class ARefusedSpokenChangeIsSaid(unittest.TestCase):
+    def test_only_a_new_blank_session_carries_the_analyst_flag(self):
+        controller, _, _ = make_controller()
+        template, _ = controller.create_session(start="template", analyst=True)
+        blank, _ = controller.create_session(start="blank", analyst=True)
+        plain, _ = controller.create_session(start="blank")
+        self.assertEqual((None, True, None), (template.get("analyst"), blank.get("analyst"), plain.get("analyst")))
+
+    def test_a_recorded_answer_is_not_contradicted(self):
+        # Cursor NO-GO on e22eb9e: question.answered and "did not go through"
+        # in the same turn. An answer was recorded, so nothing was refused.
+        controller, _, _ = make_controller(worker=_AnswerNoChange(None))
+        state, _ = controller.create_session()
+        result = controller.execute(state["session_id"], _say(state, 1, "book a call", 1))
+        self.assertEqual(["question.answered"], [e["type"] for e in result["events"]])
+
     def test_the_visitor_hears_that_it_did_not_go_through(self):
         from app.core import REFUSED_CHANGE_TEXT
         controller, store, _ = make_controller(worker=_Refuser())
