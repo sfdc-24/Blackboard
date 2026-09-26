@@ -158,7 +158,9 @@ try {
         -Executable $env:ComSpec -Arguments @('/d', '/c', 'exit 0') `
         -LaneLockPath $cleanupLock -LaneStateRoot $stateRoot `
         -MetadataRemover { param($Root) throw 'TEST_CLEANUP_FAILURE' } 3>&1 6>&1)
-    $cleanupCode = [int] $cleanupObservations[-1]
+    $cleanupCodes = @($cleanupObservations | Where-Object { $_ -is [int] })
+    Assert-Equal 'metadata cleanup emits exactly one child verdict' 1 $cleanupCodes.Count
+    $cleanupCode = [int] $cleanupCodes[0]
     Assert-Equal 'metadata cleanup failure preserves the child verdict' 0 $cleanupCode
     Assert-True 'metadata cleanup failure is observable' `
         (@($cleanupObservations | Where-Object {
@@ -179,7 +181,9 @@ try {
         -LaneLockPath (Join-Path $stateRoot 'priority.lock') `
         -LaneStateRoot $stateRoot `
         -PriorityApplier { param($Process, $Target) return $false } 3>&1 6>&1)
-    $priorityCode = [int] $priorityObservations[-1]
+    $priorityCodes = @($priorityObservations | Where-Object { $_ -is [int] })
+    Assert-Equal 'priority refusal emits exactly one child verdict' 1 $priorityCodes.Count
+    $priorityCode = [int] $priorityCodes[0]
     Assert-Equal 'priority refusal does not discard successful work' 0 $priorityCode
     Assert-True 'priority refusal is reported in the STARTED receipt' `
         (@($priorityObservations | Where-Object {
