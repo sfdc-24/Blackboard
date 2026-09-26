@@ -712,11 +712,19 @@ def draw_current(c: canvas.Canvas) -> None:
         "Owner live run 26 Sep 01:00:53-01:10:11Z",
         CLAIM("p1.run"),
         GREEN_SOFT, GREEN, "PARTIAL", 8.5, 6.0)
+    verdict_keys = ("r.pr272", "r.pr272b", "r.r5d", "r.site223", "r.site224",
+                    "r.site224b", "r.site222a", "r.site222b")
     box(c, 272, 76, 303, 144,
-        "Exact-head verdicts on open work",
-        " ".join(REVIEW(k) for k in ("r.pr272", "r.pr272b", "r.r5d", "r.site223", "r.site224",
-                                     "r.site224b", "r.site222a", "r.site222b")),
-        REVIEW_SOFT, ORANGE, "NO-GO", 8.5, 5.95)
+        "Codex verdicts at the evidence cutoff",
+        " ".join(REVIEW(k) for k in verdict_keys),
+        REVIEW_SOFT, ORANGE, None, 8.5, 5.95)
+    # The badge is the content: one pill per verdict, with its count.
+    x = 272 + 9
+    for verdict in ("NO-GO", "GO", "PENDING"):
+        n = sum(1 for k in verdict_keys if REVIEWS[k]["verdict"] == verdict)
+        if n:
+            x += pill(c, x, 76 + 4, "%d %s" % (n, VERDICT_SHORT[verdict]),
+                      STATUS_FILL[{"NO-GO": "HELD", "GO": "LIVE", "PENDING": "PARTIAL"}[verdict]]) + 5
     box(c, 590, 76, 245, 144,
         "Held, and dark source",
         " ".join([REVIEW("r.pr260"), REVIEW("r.pr260b")]

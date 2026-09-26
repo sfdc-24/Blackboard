@@ -110,8 +110,9 @@ def load_reviews(adr_text: str) -> list[dict]:
         repo = "sfdc24-site" if "Site #" in ref or "Site #" in subject else "Blackboard"
         reviews.append({"key": m.group(1), "ref": ref, "subject": subject, "head": head,
                         "verdict": verdict, "row": row, "note": note, "source": source,
-                        # r5d is the release path for Blackboard #272 (its subject says so)
-                        "repo": repo, "pr": pr_number(ref.split("#")[-1]) if "#" in ref else pr_number(subject.split("#")[-1].split()[0]),
+                        # the PR number follows '#' in the reference, else in the subject
+                        # (r5d is the release path for Blackboard #272, and its subject says so)
+                        "repo": repo, "pr": (re.search(r"#(\d+)", ref) or re.search(r"#(\d+)", subject)).group(1),
                         "line": line})
     return reviews
 
