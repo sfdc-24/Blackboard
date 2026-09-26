@@ -3,6 +3,9 @@ switch, on the committed canvas, bound to its revision, fenced when the canvas
 moves during the call, never committed."""
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import unittest
 
 from fastapi.testclient import TestClient
@@ -258,6 +261,103 @@ class Route(unittest.TestCase):
             stranger = client.post("/v1/session/%s/advise" % sid, headers=self.origin, json={"revision": 1})
         self.assertEqual([400, 400, 400, 400], codes)
         self.assertEqual(401, stranger.status_code)
+
+
+class Moderated(Route):
+    """Codex #266 prerequisites: the advisor's words are moderated before the
+    page sees them (fail-closed), every call leaves one content-free telemetry
+    line, and the advisor cannot be switched on without moderation."""
+
+    def make_moderated(self, advisor, mode="ok", key="sk-moderation-test"):
+        import tests.test_studio_governance as gov
+        self.store = base.MemoryStore()
+        self.email_sender = base.EmailSender()
+        self.moderation = gov.FakeModeration(mode)
+        self.app = create_app(settings=base.settings(moderation_enabled=True, openai_api_key=key),
+                              store=self.store, worker=base.CountingWorker(), clock=lambda: 1000,
+                              id_factory=base.IDs(), email_sender=self.email_sender, talk_client=base.FakeTalk(),
+                              advisor=advisor, moderation_client=self.moderation)
+        return self.app
+
+    def advise_logged(self, advisor, **kw):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with TestClient(self.make_moderated(advisor, **kw)) as client:
+                sid, headers = self.session(client)
+                reply = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        lines = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+        return reply, [line for line in lines if line.get("event") == "studio.advisor_call"]
+
+    def test_clean_advice_passes_and_the_gate_read_every_shown_string(self):
+        advisor = FakeAdvisor()
+        advisor_answer = dict(ADVICE, perspective="Say where the shop is.", risks=["No hours yet."],
+                              questions=[{"id": "q1", "prompt": "Which first?", "why": "Order.",
+                                          "options": [{"id": "a", "label": "Menu"}, {"id": "b", "label": "Map"}],
+                                          "recommended": "a"}])
+        advisor.advise = lambda sid, snap: dict(advisor_answer, revision=snap["revision"])
+        reply, calls = self.advise_logged(advisor)
+        self.assertEqual(200, reply.status_code, reply.text)
+        self.assertEqual("Say where the shop is.", reply.json()["advice"]["perspective"])
+        read = [t for batch in self.moderation.inputs() for t in batch]
+        for shown in ("Say where the shop is.", "Which first?", "Order.", "Menu", "Map", "No hours yet."):
+            self.assertIn(shown, read)
+        self.assertEqual(["advice"], [c["outcome"] for c in calls])
+
+    def test_flagged_advice_is_withheld_and_never_reaches_the_page(self):
+        advisor = FakeAdvisor()
+        advisor.advise = lambda sid, snap: dict(ADVICE, perspective="FLAG this", revision=snap["revision"])
+        reply, calls = self.advise_logged(advisor)
+        self.assertEqual({"advice": None, "withheld": True}, reply.json())
+        self.assertEqual([("withheld", "flagged", ["harassment"])],
+                         [(c["outcome"], c["reason"], c["categories"]) for c in calls])
+
+    def test_moderation_unavailable_withholds_the_advice(self):
+        for mode, key in (("raise", "sk-moderation-test"), ("http500", "sk-moderation-test"), ("ok", "")):
+            reply, calls = self.advise_logged(FakeAdvisor(), mode=mode, key=key)
+            self.assertEqual({"advice": None, "withheld": True}, reply.json(), mode)
+            self.assertEqual(["moderation_unavailable"], [c["reason"] for c in calls], mode)
+
+    def test_every_call_leaves_one_line_with_no_words(self):
+        reply, calls = self.advise_logged(FakeAdvisor(answer=False))
+        self.assertEqual({"advice": None}, reply.json())
+        self.assertEqual(1, len(calls))
+        self.assertEqual({"event", "severity", "session_id", "outcome", "latency_ms"}, set(calls[0]))
+        self.assertNotIn("Say where", json.dumps(calls))
+        self.assertNotIn("website", json.dumps(calls))
+
+    def test_a_commit_during_moderation_is_fenced(self):
+        # Cursor NO-GO on 6ec1c7e: moderation must not open a window after the fence.
+        import tests.test_studio_governance as gov
+        holder = {}
+
+        class MovingModeration(gov.FakeModeration):
+            async def post(self, url, **kwargs):
+                repo = holder["app"].state.controller.repository
+                record = repo.load(holder["sid"])
+                moved = dict(record.state)
+                moved["artifact_version"] = int(moved["artifact_version"]) + 1
+                repo.save(holder["sid"], moved, record.token)
+                return await super().post(url, **kwargs)
+
+        self.store = base.MemoryStore()
+        self.email_sender = base.EmailSender()
+        self.moderation = MovingModeration()
+        app = create_app(settings=base.settings(moderation_enabled=True, openai_api_key="sk-moderation-test"),
+                         store=self.store, worker=base.CountingWorker(), clock=lambda: 1000, id_factory=base.IDs(),
+                         email_sender=self.email_sender, talk_client=base.FakeTalk(), advisor=FakeAdvisor(),
+                         moderation_client=self.moderation)
+        holder["app"] = app
+        with TestClient(app) as client:
+            sid, headers = self.session(client)
+            holder["sid"] = sid
+            out = client.post("/v1/session/%s/advise" % sid, headers=headers, json={"revision": 1})
+        self.assertEqual(1, len(self.moderation.calls))
+        self.assertEqual({"advice": None, "fenced": True}, out.json())
+
+    def test_the_advisor_cannot_be_switched_on_without_moderation(self):
+        with self.assertRaises(RuntimeError):
+            base.settings(advisor_enabled=True, moderation_enabled=False).validate()
+        base.settings(advisor_enabled=True, moderation_enabled=True).validate()
 
 
 if __name__ == "__main__":
