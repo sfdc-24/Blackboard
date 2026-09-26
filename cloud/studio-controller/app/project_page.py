@@ -68,6 +68,7 @@ MAX_IMAGES = 12
 LABEL_MAX = 200
 PARSE_SECONDS = 2.0
 MAX_OPEN_TAGS = 256
+MAX_RUN_CHARS = 2_000         # one unbroken visible run held across tags; longer is dropped whole
 USER_AGENT = "SFDC24-Studio/1.0 (+https://www.sfdc24.com)"
 
 
@@ -851,6 +852,25 @@ class _Builder(HTMLParser):
         # at the next tag or at the end (Codex Gate 1 on ecee267).
         self.pending, self.pending_len = [], 0
         self.stopped = False                 # the parse ended early: the last run may be cut
+        # ONE UNRESOLVED VISIBLE RUN (Codex Gate 1 B1 on cfdebac). A word that
+        # meets a tag with no whitespace between may continue on the far side
+        # of it - any tag: ordinary, skipped or custom - so zqalice<a>@x</a>yz
+        # reads as one word. Its pieces are held here, with where each would
+        # have gone, and nothing the page says reaches a node until the word
+        # ends: then the whole word is redacted as one. While a word is held,
+        # every other change to the tree waits in ``queue`` too, so the page
+        # keeps its order. A parse that stops while a word is held drops it,
+        # and so does a word longer than MAX_RUN_CHARS or one running into
+        # text past MAX_CALLBACK_CHARS: its later pieces go too (``dropping``)
+        # until whitespace or a line break ends it. Nothing held or dropped
+        # was ever materialised.
+        self.run = []                        # [(text, the entry it goes to)]
+        self.run_len = 0
+        self.queue = []                      # (function, args): tree changes waiting behind the held word
+        self.placed = []                     # what each held piece became, while the queue drains
+        self.run_done = []
+        self.dropping = False
+        self.unplaced = []                   # sections made, joining the screen with their first child
 
     def _over_time(self) -> bool:
         """Every callback starts here: past the time or event budget, the whole
@@ -872,56 +892,84 @@ class _Builder(HTMLParser):
             node["detail"] = detail
         return node
 
-    def _section(self, label: str = "Page") -> dict | None:
+    def _section(self, label: str = "Page") -> dict:
         if self.section is None:
-            self.section = self._new("section", label)
-            if self.section is None:
-                return None
-            self.section["children"] = []
-            self.screen["children"].append(self.section)
+            self.section = {"kind": "section", "label": label, "children": []}
+            self.unplaced.append(self.section)
         return self.section
 
+    def _join(self, node) -> bool:
+        """A section joins the screen once - at its first child, or where the
+        page opens its own <section> - and only then is it counted and named,
+        as it was made at that moment before B1. False: the node cap is full."""
+        for i, pending in enumerate(self.unplaced):
+            if pending is node:
+                made = self._new("section", node["label"])
+                if made is None:
+                    return False
+                del self.unplaced[i]
+                kids = node["children"]
+                node.clear()
+                node.update(made)
+                node["children"] = kids
+                self.screen["children"].append(node)
+                return True
+        return True
+
+    def _append(self, parent, node) -> None:
+        if self._join(parent):
+            parent["children"].append(node)
+
+    def _slot(self, kind: str):
+        """Where a node of ``kind`` goes, decided at the moment the page put it there."""
+        if self.nav is not None:
+            return ("nav", self.nav) if kind in ("text", "button") else None
+        if self.form is not None and kind in ("button", "field", "text"):
+            return ("form", self.form)
+        if self.list is not None and kind == "text":
+            return ("list", self.list)
+        return ("section", self._section())
+
+    def _later(self, fn, *args) -> None:
+        """A change to the tree: now, or - behind a held word - in page order
+        once the word is resolved."""
+        if self.run:
+            self.queue.append((fn, args))
+        else:
+            fn(*args)
+
     def _add(self, kind: str, label: str, detail: str = "") -> None:
+        self._later(self._emit, kind, label, detail, self._slot(kind))
+
+    def _emit(self, kind: str, label: str, detail: str, slot) -> None:
         label = clean_text(label)
         if not label or (kind == "text" and len(label) < 2):
             return
         if kind in ("text", "heading") and self.last_text == (kind, label):
             return                           # the same words twice in a row
-        if self.nav is not None:
-            if kind in ("text", "button"):
-                node = self._new("text", label)
-                if node:
-                    self.nav["children"].append(node)
+        if slot is None:
             return
-        if self.form is not None and kind in ("button", "field", "text"):
-            node = self._new(kind, label, detail)
-            if node:
-                self.form["children"].append(node)
+        where, parent = slot
+        if not self._join(parent):
             return
-        if self.list is not None and kind == "text":
-            node = self._new("text", label)
-            if node:
-                self.list["children"].append(node)
-            return
-        parent = self._section()
-        if parent is None:
-            return
-        node = self._new(kind, label, detail)
+        node = self._new("text" if where in ("nav", "list") else kind, label,
+                         detail if where in ("form", "section") else "")
         if node:
             parent["children"].append(node)
-            self.last_text = (kind, label)
+            if where == "section":
+                self.last_text = (kind, label)
 
     def _container(self, kind: str, label: str) -> dict | None:
         if self.nav is not None:
             return None
         parent = self._section()
-        if parent is None:
-            return None
+        if not self.run and not self._join(parent):
+            return None                      # (behind a held word, it joins in page order below)
         node = self._new(kind, clean_text(label) or kind.capitalize())
         if node is None:
             return None
         node["children"] = []
-        parent["children"].append(node)
+        self._later(self._append, parent, node)
         return node
 
     # -- parser events ---------------------------------------------------------------
@@ -963,12 +1011,12 @@ class _Builder(HTMLParser):
             node = self._new("nav", clean_text(a.get("aria-label", "")) or "Navigation")
             if node is not None:
                 node["children"] = []
-                self.screen["children"].append(node)
+                self._later(self.screen["children"].append, node)
                 self.nav = node
             return
         if tag in _SECTIONS and self.nav is None:
             self.section = None
-            self._section(clean_text(a.get("aria-label", "")) or tag.capitalize())
+            self._later(self._join, self._section(clean_text(a.get("aria-label", "")) or tag.capitalize()))
             return
         if tag in ("ul", "ol") and self.list is None and self.form is None:
             self.list = self._container("list", a.get("aria-label", "") or "List")
@@ -1002,8 +1050,11 @@ class _Builder(HTMLParser):
                 self._flush_open()           # a block inside a block starts a new line
             kind = "button" if buttonish else "heading" if tag in _HEADINGS else "text"
             self.buffers.append([tag, kind, [], False])
-        if tag == "br" and self.buffers:
-            self.buffers[-1][2].append(" ")
+        if tag == "br":
+            self._resolve()                  # a line break ends any word
+            self.dropping = False
+            if self.buffers:
+                self.buffers[-1][2].append(" ")
 
     @staticmethod
     def _words(entry) -> str:
@@ -1011,9 +1062,21 @@ class _Builder(HTMLParser):
         return _drop_tail(text) if entry[3] else text     # its last token may run on past the limit
 
     def _flush_open(self):
-        for entry in self.buffers:
-            if entry[2] and entry[1] == "text":
+        entries = [entry for entry in self.buffers if entry[1] == "text"]
+        if self.run:
+            # Held pieces may still land in these elements: their words are
+            # read in page order, once the word resolves.
+            self.queue.append((self._flush_entries, (entries, self._slot("text"))))
+            return
+        for entry in entries:
+            if entry[2]:
                 self._add("text", self._words(entry))
+                entry[2], entry[3] = [], False
+
+    def _flush_entries(self, entries, slot) -> None:
+        for entry in entries:
+            if entry[2]:
+                self._emit("text", self._words(entry), "", slot)
                 entry[2], entry[3] = [], False
 
     def handle_endtag(self, tag):
@@ -1036,9 +1099,14 @@ class _Builder(HTMLParser):
     def _close(self, tag):
         if self.buffers and self.buffers[-1][0] == tag:
             entry = self.buffers.pop()
-            text = self._words(entry)
-            if text.strip():
-                self._add(entry[1], text)
+            if self.run:
+                # A held piece may still belong to this element: its words
+                # are read when the word resolves, in page order.
+                self.queue.append((self._emit_entry, (entry, self._slot(entry[1]))))
+            else:
+                text = self._words(entry)
+                if text.strip():
+                    self._add(entry[1], text)
         if tag == "nav" and self.nav is not None:
             self.nav = None
         elif tag in ("ul", "ol") and self.list is not None:
@@ -1063,20 +1131,107 @@ class _Builder(HTMLParser):
             return
         data = "".join(self.pending)
         self.pending, self.pending_len = [], 0
-        data, cut = _cut(data, MAX_CALLBACK_CHARS)
-        if cut_short:
-            data, cut = _drop_tail(data), True
-        if self.buffers:
-            entry = self.buffers[-1]
-            budget = LABEL_MAX * 4 - sum(len(w) for w in entry[2])
-            if budget <= 0:
-                entry[3] = entry[3] or bool(data)
-                return
-            piece, over = _cut(data, budget)
-            entry[2].append(piece)
-            entry[3] = entry[3] or cut or over
-        elif data.strip():
-            self._add("text", data)
+        data, lost = _cut(data, MAX_CALLBACK_CHARS)
+        if cut_short or lost:
+            data = _drop_tail(data)          # a limit or a stop cut the last word: it goes whole
+        # Text in no element collects in an entry of its own: one node, as the
+        # page wrote it, placed once its last piece is.
+        target = self.buffers[-1] if self.buffers else [None, "text", [], False]
+        if not data:
+            if lost:                         # one token past the limit: the word before it runs into it
+                self._drop_run()
+                self.dropping = True
+            return
+        lead = re.match(r"\S*", data).group(0)
+        if lead and (self.run or self.dropping):
+            if not self.dropping:
+                self._hold(lead, target)     # the held word goes on past the tag
+            data = data[len(lead):]          # (a dropped one goes on being dropped)
+            if not data:
+                self.dropping = self.dropping or lost
+                self._loose(target)
+                return                       # still unbroken
+        self._resolve()                      # whitespace: the word before it has ended
+        tail = "" if data[-1].isspace() else re.search(r"\S+$", data).group(0)
+        body = data[:len(data) - len(tail)]
+        if body:
+            self._put(body, target)
+        if tail:
+            self._hold(tail, target)
+        self.dropping = lost                 # a cut text's last word may go on past the next tag
+        self._loose(target)
+
+    def _loose(self, entry) -> None:
+        if entry[0] is None:                 # text in no element: one node, once its last piece is placed
+            self._later(self._emit_entry, entry, self._slot("text"))
+
+    def _put(self, text: str, entry) -> None:
+        """Words the page has finished, to the element they are in."""
+        budget = LABEL_MAX * 4 - sum(len(w) for w in entry[2])
+        if budget <= 0:
+            entry[3] = entry[3] or bool(text)
+            return
+        piece, over = _cut(text, budget)
+        entry[2].append(piece)
+        entry[3] = entry[3] or over
+
+    def _hold(self, text: str, entry) -> None:
+        self.run.append((text, entry))
+        self.queue.append((self._place, (len(self.run) - 1,)))
+        self.run_len += len(text)
+        if self.run_len > MAX_RUN_CHARS:
+            self._drop_run()                 # an unbroken run this long says nothing worth keeping
+            self.dropping = True             # nor does the rest of it
+
+    def _place(self, index: int) -> None:
+        if self.placed[index]:
+            self._put(self.placed[index], self.run_done[index][1])
+
+    def _emit_entry(self, entry, slot) -> None:
+        text = self._words(entry)
+        if text.strip():
+            self._emit(entry[1], text, "", slot)
+
+    def _drop_run(self) -> None:
+        self._settle([""] * len(self.run))
+
+    def _resolve(self) -> None:
+        """The held word has ended: it is redacted as ONE word. Only what the
+        redaction changed moves: the characters before and after it stay with
+        their own pieces, and its placeholder goes to the piece where the
+        change begins. Joined, the pieces read exactly as the redacted word."""
+        if not self.run:
+            return
+        run = self.run
+        joined = "".join(text for text, _ in run)
+        whole = redact(joined)
+        texts = [text for text, _ in run]
+        if len(run) > 1 and whole != joined:
+            n = min(len(joined), len(whole))
+            head = 0
+            while head < n and joined[head] == whole[head]:
+                head += 1
+            tail = 0
+            while tail < n - head and joined[-1 - tail] == whole[-1 - tail]:
+                tail += 1
+            end, middle = len(joined) - tail, whole[head:len(whole) - tail]
+            owner = min(head, len(joined) - 1)
+            texts, at = [], 0
+            for text, _ in run:
+                start, at = at, at + len(text)
+                texts.append(text[:max(0, head - start)] + (middle if start <= owner < at else "")
+                             + text[max(0, end - start):])
+        self._settle(texts)
+
+    def _settle(self, texts) -> None:
+        """The held word is resolved (or dropped): each piece becomes its text
+        in ``texts``, and every change that waited behind it runs, in order."""
+        self.run_done, self.placed = self.run, texts
+        self.run, self.run_len = [], 0
+        queue, self.queue = self.queue, []
+        for fn, args in queue:
+            fn(*args)
+        self.run_done, self.placed = [], []
 
     def finish(self) -> dict:
         # A parse that stopped early may have stopped inside a word: the last
@@ -1084,8 +1239,11 @@ class _Builder(HTMLParser):
         # on ecee267) rather than kept as part of an address.
         self._flush_data(cut_short=self.stopped)
         if self.stopped:
+            self._drop_run()                 # a word the stop may have cut is never materialised
             for entry in self.buffers:
                 entry[3] = True
+        else:
+            self._resolve()
         while self.stack and not self.full:
             self._close(self.stack.pop())
 

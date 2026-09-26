@@ -1099,23 +1099,30 @@ class Blocker2ProjectRevocation(Blocker1TenantAndProjectBinding):
 
 class Blocker3ParseAndFetchBudgets(Api):
     def test_a_giant_tag_and_a_giant_text_node_stop_quickly_on_the_real_clock(self):
-        for name, html, kept in (
-                ("giant tag", "<p>kept before</p><a title='" + "x" * 1_990_000, "kept before"),
-                ("unclosed script", "<p>kept before</p><script>" + "x" * 1_990_000, "kept before"),
-                ("giant text", "<p>" + "word " * 399_000 + "</p>", "word word"),
-                ("deep nesting", "<p>kept before</p>" + "<div><span>" * 180_000, "kept before"),
-                ("many attributes", "<p>kept before</p><p " + " ".join("a%d=1" % n for n in range(150_000)) + ">", "kept before")):
+        # "before" touches the construct the parse stops in, with no whitespace
+        # between: it may go on past it, so it is dropped with the stop (Codex
+        # Gate 1 B1 on cfdebac, CodexR13B1OneVisibleRun). "kept" stays.
+        for name, html, kept, dropped in (
+                ("giant tag", "<p>kept before</p><a title='" + "x" * 1_990_000, "kept", "before"),
+                ("unclosed script", "<p>kept before</p><script>" + "x" * 1_990_000, "kept", "before"),
+                ("giant text", "<p>" + "word " * 399_000 + "</p>", "word word", None),
+                ("deep nesting", "<p>kept before</p>" + "<div><span>" * 180_000, "kept", "before"),
+                ("many attributes", "<p>kept before</p><p " + " ".join("a%d=1" % n for n in range(150_000)) + ">",
+                 "kept", "before")):
             started = time.monotonic()
             tree = page_to_tree(html, "T")
             self.assertLess(time.monotonic() - started, 2.5, name)
             self.assertIn(kept, json.dumps(tree), name)
+            if dropped:
+                self.assertNotIn(dropped, json.dumps(tree), name)
             self.assertLessEqual(max(len(label) for label in Tree.labels(Tree(), tree).split(" | ")), 204, name)
 
     def test_the_unparsed_remainder_and_the_event_count_are_hard_stops(self):
         with mock.patch.object(project_page, "MAX_PENDING", 1_000):
             # The tag spans feed chunks, so the parser holds it unparsed: past the cap, stop.
-            tree = page_to_tree("<p>first</p><a title='" + "x" * 40_000 + "'>late</a><p>after the tag</p>", "T")
+            tree = page_to_tree("<p>first words</p><a title='" + "x" * 40_000 + "'>late</a><p>after the tag</p>", "T")
         self.assertIn("first", json.dumps(tree))
+        self.assertNotIn("words", json.dumps(tree))       # it touches the stop: dropped with it (B1, round 13)
         self.assertNotIn("after the tag", json.dumps(tree))
         with mock.patch.object(project_page, "MAX_EVENTS", 10):
             tree = page_to_tree("".join("<p>para %d here</p>" % n for n in range(50)), "T")
@@ -3265,7 +3272,11 @@ class CodexR12B1RedactBeforeLoss(Api):
             rows.append("<img alt=\"%s\">" % _straddle(400, local, "zqattrdom.com", where))
         for where, local in (("after-at", "zqwordsa"), ("local", "zqwordsb"), ("domain", "zqwordsc")):
             rows.append("<p>%s</p>" % _straddle(800, local, "zqwordsdom.com", where))
-        rows.append("<section><h2>Loose</h2></section>%s<section><h2>After</h2></section>"
+        # ("After" touches a text cut unseen past 4096, so it may be the end of
+        # that text's last word and goes with it - B1, round 13; "Later",
+        # with whitespace on both sides, reads.)
+        rows.append("<section><h2>Loose</h2></section>%s<section><h2>After</h2></section>\n"
+                    "<section><h2>Later</h2></section>\n"
                     % _straddle(4096, "zqloosea", "zqloosedom.com", "after-at"))
         # a split by inline tags
         rows.append("<section>zqinline<b>@zqinlinedom.com</b> and more</section>")
@@ -3299,7 +3310,7 @@ class CodexR12B1RedactBeforeLoss(Api):
             for never in self.NEVER:
                 self.assertNotIn(never, text, (surface, never))
         self.assertIn("[email]", state)
-        self.assertIn("After", state)                                         # the page after them still reads
+        self.assertIn("Later", state)                                         # the page after them still reads
 
     def test_a_run_split_by_a_feed_chunk_is_read_whole(self):
         for inside in (False, True):
@@ -4081,3 +4092,199 @@ class CodexR13B3NetworkSteps(unittest.TestCase):
             raise httpx.ReadError("the interrupter closed the socket")    # ... and the socket dies
         with self.assertRaises(FetchCancelled):
             project_page._fetch(PAGE, Resolver([PUBLIC_IP]), httpx.MockTransport(handler), time.monotonic, cancel)
+
+
+# -- round 13, B1: one unresolved visible run across any markup ---------------------------------
+class _SeeingAdvisor(CountingAdvisor):
+    def __init__(self):
+        super().__init__()
+        self.snapshots = []
+
+    def advise(self, session_id, snapshot):
+        self.snapshots.append(copy.deepcopy(snapshot))
+        return super().advise(session_id, snapshot)
+
+
+def _r13_labels(node):
+    return [node["label"]] + [label for child in node.get("children") or [] for label in _r13_labels(child)]
+
+
+class CodexR13B1OneVisibleRun(Api):
+    """B1 on cfdebac: an address split by any tag - one the parser flushes at,
+    one it skips, one it has never heard of - is read as the one word it
+    shows, and redacted whole; a parse that stops inside such a word drops it,
+    and so does a word too long to hold or one running out of cut text. The
+    marker is then absent, independently, from the tree, the saved state, the
+    logs, the live events, and the talk, advisor and builder contexts. The
+    page keeps its order and its words; only a line break ends a word early."""
+
+    SPLITS = {
+        "flushed-at": "<p>zqalice<a>@x</a>yz</p>",
+        "flushed-at, e2e": "<div>zqcarol<a>@zqsecret.example</a></div>",
+        "skipped script": "<p>zqskip<script>var a = 1;</script>@zqskipdom.com</p>",
+        "skipped style": "<p>zqstyle<style>.a {}</style>@zqstyledom.com</p>",
+        "skipped template": "<p>zqtpl<template>x</template>@zqtpldom.com</p>",
+        "custom": "<section>zqcustom<x-card>@zqcustomdom</x-card>.com</section>",
+        "across blocks": "<p>zqblock</p><p>@zqblockdom.com</p>",
+        "button": "<p>zqbtn<a class=\"btn\">@zqbtndom.com</a></p>",
+    }
+    NEVER = ("zqalice", "zqcarol", "zqsecret", "zqskip", "zqstyle", "zqtpl", "zqcustom", "zqblock", "zqbtn")
+
+    def page(self):
+        # Whitespace between the blocks, as a page written by hand has it: each
+        # split is a word of its own. A page with none is the test after next.
+        return ("<html><body>\n<h1>Steel Works</h1>\n" + "\n".join(self.SPLITS.values())
+                + "\n<ul><li>Home</li><li>Shop</li><li>About us</li></ul>\n<p>Call <b>us</b> today</p>\n"
+                + "</body></html>")
+
+    def test_each_split_is_one_word_redacted_whole(self):
+        for name, html in self.SPLITS.items():
+            tree = json.dumps(page_to_tree("<html><body>%s</body></html>" % html, "T")["children"],
+                              ensure_ascii=False)
+            for never in self.NEVER:
+                self.assertNotIn(never, tree, (name, never))
+            self.assertIn("[email]", tree, name)
+
+    def test_ordinary_markup_keeps_its_words_where_they_were(self):
+        tree = page_to_tree("<html><body><ul><li>Home</li><li>Shop</li><li>About us</li></ul>"
+                            "<p>Welcome</p><p>Order now</p><p>Call <b>us</b> today</p></body></html>", "T")
+
+        def labels(node):
+            return [node["label"]] + [label for child in node.get("children") or [] for label in labels(child)]
+        self.assertEqual(["T", "Page", "List", "Home", "Shop", "About us", "Welcome", "Order now", "Call us today"],
+                         labels(tree))
+
+    def test_minified_markup_keeps_the_page_order_and_its_words(self):
+        # Holding a word must not move anything: a heading held behind its last
+        # word still comes before the list that follows it (a first cut of B1
+        # put it after), and text in no element is still one node.
+        cases = {
+            "<h1>Steel Works</h1><ul><li>Home</li><li>Shop</li></ul><p>Welcome</p>":
+                ["Page", "Steel Works", "List", "Home", "Shop", "Welcome"],
+            "<div>Say Hello<p>world</p></div>": ["Page", "Say Hello", "world"],
+            "Welcome to our site<ul><li>Home</li></ul>": ["Page", "Welcome to our site", "List", "Home"],
+            "<h1>Steel Works</h1><form><input type=submit value=Go></form>": ["Page", "Steel Works", "Form", "Go"],
+            "Hello<a>World</a>there friend": ["Page", "Hello", "World", "there friend"],
+            "<a class=skip>Skip to the chat</a><nav><a>Home</a><a>Shop</a></nav>":
+                ["Page", "Skip to the chat", "Navigation", "Home", "Shop"],
+            # Nothing is given a place before it shows: whitespace in wrappers,
+            # a held word of one letter, a repeated heading - the page's first
+            # words, after the menu, still open its section after the menu.
+            "<div>\n  <div>\n  <nav><a>Home</a></nav><p>Hello there</p></div></div>":
+                ["Navigation", "Home", "Page", "Hello there"],
+            "<div>x<div><nav><a>Home</a></nav></div></div><p>Hello there</p>":
+                ["Navigation", "Home", "Page", "Hello there"],
+            "<section><h2>A</h2></section><h2>A</h2><nav><a>Home</a></nav><p>Hello there</p>":
+                ["Section", "A", "Navigation", "Home", "Page", "Hello there"],
+        }
+        for html, expected in cases.items():
+            self.assertEqual(["T"] + expected, _r13_labels(page_to_tree("<html><body>%s</body></html>" % html, "T")),
+                             html)
+
+    def test_an_address_glued_to_its_neighbours_takes_them_with_it(self):
+        # Minified markup puts no whitespace between blocks, and a stylesheet
+        # (never read here) can show them as one line: then the run IS one word,
+        # and it goes whole - the price the mailbox grammar already pays. Words
+        # with whitespace before them, and the page's order, stay.
+        tree = page_to_tree("<html><body><h1>Steel Works</h1><p>zqalice<a>@x</a>yz</p>"
+                            "<ul><li>Home</li><li>Shop</li><li>About us</li></ul></body></html>", "T")
+        self.assertEqual(["T", "Page", "Steel [email]", "List", "us"], _r13_labels(tree))
+
+    def test_a_line_break_ends_a_word(self):
+        tree = page_to_tree("<html><body><p>Steel Works Inc.<br>123 Main St<br>zqinfo@zqsteel.example<br>"
+                            "555-1234</p></body></html>", "T")
+        self.assertEqual(["T", "Page", "Steel Works Inc. 123 Main St [email] 555-1234"], _r13_labels(tree))
+
+    def test_the_placeholder_goes_where_the_change_begins(self):
+        # "(zqhost.example)" is one word across three blocks: the brackets are
+        # not part of the address, so each stays in its own block.
+        tree = page_to_tree("<html><body><p>Visit (</p><p>zqhost.example</p><p>) today</p></body></html>", "T")
+        self.assertEqual(["T", "Page", "Visit (", "[link]", ") today"], _r13_labels(tree))
+
+    def test_a_word_past_the_run_limit_is_dropped_to_its_end(self):
+        # Past MAX_RUN_CHARS the held word goes, and every later piece of it:
+        # "@zqhost" alone is no address, but it is the end of one.
+        page = ("<html><body><p>w " + "x" * (project_page.MAX_RUN_CHARS - 4)
+                + "<a>zq</a><a>alice</a><a>@zqhost</a> after</p></body></html>")
+        self.assertEqual(["T", "Page", "w after"], _r13_labels(page_to_tree(page, "T")))
+
+    def test_a_word_running_out_of_cut_text_is_dropped_past_the_tag(self):
+        # A text past MAX_CALLBACK_CHARS loses its end unseen, and that end may
+        # be the first half of the word the next tag continues.
+        words = "word " * (project_page.MAX_CALLBACK_CHARS // 5 + 10)
+        page = "<html><body><p>" + words + "zqlost</p><a>@zqcut</a> <p>after</p></body></html>"
+        tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+        self.assertNotIn("zqlost", tree)
+        self.assertNotIn("zqcut", tree)
+        self.assertIn('"after"', tree)                                     # whitespace ended it
+
+    def test_a_parse_stopped_inside_a_split_word_drops_it(self):
+        page = "<html><body><p>w w zqint<a>@zqintdom.com</a> end</p></body></html>"
+        cut = page.index("@zqintdom") + 4                                   # stopped inside the far piece
+        with mock.patch.object(project_page, "MAX_HTML_CHARS", cut):
+            tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+        self.assertNotIn("zqint", tree)
+        self.assertNotIn("zqi", tree)
+        self.assertIn("w w", tree)                                          # what came before still reads
+        # A stop the page's length does not explain (the event or time budget),
+        # at every point of the page, with the held piece's own element already
+        # closed or in no element at all: no open element's cut mark drops it
+        # there, only the stop's own drop does.
+        for page, marker in (("<html><body><p>w w zqblk</p><p>@zqblkdom.com</p> end</body></html>", "zqblk"),
+                             ("<html><body>w w zqloose<a>@zqloosedom.com</a> end</body></html>", "zqloose")):
+            seen = set()
+            for cap in range(1, 16):
+                with mock.patch.object(project_page, "MAX_EVENTS", cap):
+                    tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+                self.assertNotIn(marker[:3], tree, (marker, cap))
+                seen.add("w w" in tree)
+            self.assertEqual({False, True}, seen, marker)                  # stopped before and after it
+
+    def test_no_surface_carries_a_split_address(self):
+        page = self.page()
+        talk, worker, advisor = FakeTalk(), SeeingWorker(), _SeeingAdvisor()
+        captured = io.StringIO()
+        handler = logging.StreamHandler(captured)
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                app = self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker, advisor=advisor,
+                                client_providers=("claude", "openai", "gemini"))
+                with TestClient(app) as client:
+                    token = self.sign_in(client).json()["token"]
+                    live = self.project_session(client, token)
+                    self.assertEqual(200, live.status_code, live.text)
+                    live = live.json()
+                    headers = self.auth(live["token"])
+                    said = client.post("/v1/session/%s/talk" % live["session_id"], headers=headers,
+                                       json={"text": "make the heading bigger"})
+                    built = client.post("/v1/session/%s/commands" % live["session_id"], headers=headers,
+                                        json={"command_id": "cmd-r13", "session_id": live["session_id"],
+                                              "type": "utterance", "expected_version": live["artifact_version"],
+                                              "transcript": "bigger", "item_id": "item-r13"})
+                    version = self.state(live["session_id"])["artifact_version"]
+                    advised = client.post("/v1/session/%s/advise" % live["session_id"], headers=headers,
+                                          json={"revision": version})
+                    events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                        headers=headers).text
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        self.assertEqual((200, 200, 200), (said.status_code, built.status_code, advised.status_code),
+                         (said.text, built.text, advised.text))
+        state = json.dumps(self.state(live["session_id"]), ensure_ascii=False)
+        surfaces = {"tree": json.dumps(page_to_tree(page, "T"), ensure_ascii=False), "state": state,
+                    "logs": captured.getvalue(), "events": events,
+                    "talk": json.dumps(talk.calls, ensure_ascii=False),
+                    "advisor": json.dumps(advisor.snapshots, ensure_ascii=False),
+                    "builder": json.dumps(worker.seen, ensure_ascii=False)}
+        self.assertTrue(advisor.snapshots and worker.seen and talk.calls)
+        for surface, text in surfaces.items():
+            for never in self.NEVER:
+                self.assertNotIn(never, text, (surface, never))
+        self.assertIn("[email]", state)
+        self.assertIn("About us", state)                                     # the rest of the page still reads
+        self.assertIn("Steel Works", state)
