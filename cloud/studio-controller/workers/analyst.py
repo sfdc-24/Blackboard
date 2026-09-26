@@ -39,6 +39,7 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
 
 MODEL = os.environ.get("STUDIO_ANALYST_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_ANALYST_EFFORT") or "low"
+TIMEOUT_SECONDS = 40.0
 RESEARCH = (os.environ.get("STUDIO_ANALYST_RESEARCH") or "1") == "1"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 TEXT_MAX = 300
@@ -201,7 +202,9 @@ class Analyst:
     def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT, research: bool = RESEARCH):
         if client is None:
             import anthropic  # the official SDK; ANTHROPIC_API_KEY from Secret Manager
-            client = anthropic.Anthropic(timeout=60.0, max_retries=0)
+            # 60 s was Cloud Run's own request timeout: the owner's run lost an
+            # analysis to a 504 at exactly 60.0 s. Give up inside the request.
+            client = anthropic.Anthropic(timeout=TIMEOUT_SECONDS, max_retries=0)
         self.client, self.model, self.effort, self.research = client, model, effort, research
 
     def analyze(self, state: dict, text: str, canvas: str) -> dict:

@@ -16,6 +16,9 @@ from . import metadata_contract as metadata
 # Said when the builder refused every op of a spoken change.
 REFUSED_CHANGE_TEXT = "That change did not go through. Say it once more, a little differently, " \
                       "and I will build it."
+# The builder gave up at its deadline or the provider failed (workers/claude_worker.py).
+SLOW_BUILD_PROBLEM = "the architect could not finish that build"
+SLOW_BUILD_TEXT = "That build took too long, so nothing changed yet. Say it again and I will build it."
 
 
 class CommandError(ValueError):
@@ -978,8 +981,10 @@ class StudioController:
                 # silence after "on it" reads as the canvas ignoring you (live
                 # session 2026-09-25, four logo changes, no word back).
                 emit_answers()
+                slow = any(str(p).startswith(SLOW_BUILD_PROBLEM) for p in problems)
                 events.append(self._event(state, "confirm", {
-                    "text": REFUSED_CHANGE_TEXT, "artifact_ids": [state["artifact"]["id"]],
+                    "text": SLOW_BUILD_TEXT if slow else REFUSED_CHANGE_TEXT,
+                    "artifact_ids": [state["artifact"]["id"]],
                 }))
             emit_answers()
 

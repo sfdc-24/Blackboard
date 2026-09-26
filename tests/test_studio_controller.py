@@ -2175,5 +2175,45 @@ class CodexReview206ControllerTests(unittest.TestCase):
                                                                [{"question_id": "q-tone", "option_id": "calm"}]))
 
 
+class _TimeoutThenBuild:
+    """The provider times out once, then answers: the owner's 01:04Z turn."""
+    def __init__(self, *drafts):
+        from types import SimpleNamespace
+        self.drafts, self.calls = list(drafts), 0
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        from types import SimpleNamespace
+        import anthropic
+        self.calls += 1
+        if self.calls == 1:
+            raise anthropic.APITimeoutError(request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+        return SimpleNamespace(stop_reason="end_turn",
+                               content=[SimpleNamespace(type="text", text=json.dumps(self.drafts[0]))])
+
+
+class ASlowBuildNeverHoldsTheSlot(unittest.TestCase):
+    def test_a_build_that_times_out_completes_and_the_next_is_accepted_at_once(self):
+        from app.core import SLOW_BUILD_TEXT
+        from workers.claude_worker import ClaudeWorker
+        worker = ClaudeWorker(client=_TimeoutThenBuild(_BOOK_BY_VOICE))
+        seed = SyntheticWorker()
+        worker.initial_artifact, worker.initial_questions = seed.initial_artifact, seed.initial_questions
+        controller, store, _ = make_controller(worker=worker)
+        state, _ = controller.create_session()
+        sid = state["session_id"]
+        first = controller.execute(sid, _say(state, 1, "make the main action booking", 1))
+        self.assertEqual(["confirm"], [e["type"] for e in first["events"]])
+        self.assertEqual(SLOW_BUILD_TEXT, first["events"][0]["payload"]["text"])
+        saved = StudioRepository(store).load(sid).state
+        self.assertIsNone(saved["active_command"], "no inflight slot is left behind")
+        self.assertEqual("completed", saved["commands"]["spoken-1"]["status"])
+        self.assertNotIn("inflight", [c.get("status") for c in saved["commands"].values()])
+        # The very next command is accepted - no 409 - and builds.
+        second = controller.execute(sid, _say(state, 2, "book a call, then", 1))
+        self.assertIn("artifact.patch", [e["type"] for e in second["events"]])
+        self.assertEqual(2, second["artifact_version"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,15 @@ as a tap.
 Provider workers return event drafts; the controller alone assigns envelopes
 and versions.
 
+Every model lane gives up inside Cloud Run's 60-second request timeout. The
+builder has a 40-second client deadline with no retries and a 4000-token cap;
+the analyst has 40 seconds; the muse 25, the charter 20, talk 8. A builder
+timeout or provider error completes the command with the problem "the
+architect could not finish that build", and the visitor hears that nothing
+changed yet - so the command slot is free for the next build at once. Before
+this, one turn in the owner's run of 2026-09-26 wrote to a 16000-token cap,
+died at 60 s with a 504, and held the slot while five builds got 409.
+
 ## Optional live Lead counts
 
 `STUDIO_ENABLE_LEAD_FACTS=false` is the default. When explicitly enabled, a
