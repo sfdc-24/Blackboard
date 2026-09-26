@@ -408,6 +408,14 @@ tenant exists and still lists an address that hashes to the token's subject.
   behind, and punctuation the registry accepts (`secret＜alias@example.com`,
   `user@secret：part`) does not stop it. This is over-redaction by design, and linear: one
   character test per character. Codex Gate 1 NO-GO on 59ed871.
+- Nothing can take part of an address away before it is read (Codex Gate 1 on ecee267).
+  - Addresses are found on the original code points before angle brackets and invisible
+    characters are stripped (`alice@<` and `bob@` plus a zero-width space go whole), and again
+    after, so stripping can neither hide an address nor assemble one.
+  - A limit (an attribute's 400 characters, a run's 4096, the 800-character words budget, the
+    page's 2 MB) never keeps part of a token: the token it cuts is dropped whole.
+  - A run of text is read whole: pieces split by a feed chunk, a comment or an inline tag
+    (`<b>`, `<span>`...) are joined first. A parse that stops early drops its last token.
 - Links, IP addresses and hosts are detected on a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
   name. Circled, full-width, squared and mathematical forms of letters, digits, dots, colons and
   `@` are read as what they stand for (`secret.ⓒⓞⓜ` is `secret.com`). An offset map leads each
@@ -494,8 +502,9 @@ objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
 - A page load that timed out while its worker is still alive keeps both leases for as long as the
   worker lives.
   - A keeper renews them, owned and fenced, every 15 s, and gives them back once the worker stops.
-  - A renewal only extends an entry still in the record. A successful acquire rewrites the lane
-    with the live leases alone, so a renewal can never admit past the ceiling.
+  - A renewal only extends a lease that is still in the record AND has not expired: an expired
+    lease is renewed by nobody, so its owner can never come back beside the holder that replaced
+    it (Codex Gate 1 on ecee267).
   - A process that dies renews nothing, so its leases still expire after 60 s.
   - Codex Gate 1 on 59ed871.
 - The work never outlives its lease (Codex Gate 1 on 80dfc8f).
@@ -504,10 +513,20 @@ objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
     before giving anything back.
   - The name lookup runs in a child process that is killed at 3 s or on that stop. Every later
     step checks the stop and is bounded by its connect or idle timeout.
+  - The work also keeps its OWN deadline: 10 s before its last confirmed lease could lapse. Only
+    a written renewal moves it. The work reads it before every step (the lookup child, the
+    request, every chunk), so a keeper that is paused or starved cannot keep the work alive past
+    its lease (Codex Gate 1 on ecee267).
+  - The stop and the deadline are also checked inside the transport, right before anything is
+    connected or written: a stop that lands after the last check still sends nothing.
   - So when a lease lapses and another instance takes the place, the old work is already gone.
     The tenant's single flight and the ceiling hold through an outage of any length.
 - If the tenant lease is taken but the ceiling cannot be read or written, the tenant lease goes
   back at once. A retry is then not refused as "already loading".
+- The advice lease and its use are taken in one write, so a store that fails part way leaves
+  neither behind (Codex Gate 1 on ecee267).
+- A release that cannot be written is owed: it is written before anything new is taken on that
+  record, and retried in the background. A retry after an outage never meets a ghost lease.
 - Guard state that cannot be read or written refuses the call (503). It never lets the call
   through.
 - Operator and visitor sessions keep the in-process guards. Admission, voice, commands and the

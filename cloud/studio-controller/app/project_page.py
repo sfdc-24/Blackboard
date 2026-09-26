@@ -97,6 +97,30 @@ class FetchCancelled(PageFetchError):
     """The load was stopped on purpose (its leases could not be kept)."""
 
 
+class WorkDeadline:
+    """When a load's work must have stopped: the end of its last CONFIRMED
+    durable lease, less a margin longer than any one blocking step (Codex Gate
+    1 on ecee267). The keeper moves it only after a renewal is written; the
+    work reads it itself before every step - the lookup, the request, every
+    chunk - on the same clock the leases use. So a keeper that is paused, or
+    starved, cannot keep the work alive past its lease: the work stops on its
+    own, before any other instance can take the place."""
+
+    def __init__(self, clock, until: float):
+        self.clock = clock
+        self._until = float(until)
+        self._lock = threading.Lock()
+
+    def extend(self, until: float) -> None:
+        with self._lock:
+            self._until = max(self._until, float(until))
+
+    def passed(self) -> bool:
+        with self._lock:
+            until = self._until
+        return float(self.clock()) >= until
+
+
 # A page load keeps its slot until its thread has actually finished - a caller
 # that stopped waiting at the deadline does not free it. So however many
 # resolvers or connections hang, at most MAX_OUTSTANDING_FETCHES threads exist.
@@ -138,14 +162,16 @@ _RESOLVE_CHILD = ("import json, socket, sys\n"
 _RESOLVE_OUTPUT = 65536
 
 
-def system_resolver(host: str, cancel: "threading.Event | None" = None, seconds: float | None = None) -> list:
+def system_resolver(host: str, cancel: "threading.Event | None" = None, seconds: float | None = None,
+                    deadline: "WorkDeadline | None" = None) -> list:
     limit = RESOLVE_SECONDS if seconds is None else float(seconds)
     child = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RESOLVE_CHILD, str(host)],
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + limit
+    limit_at = time.monotonic() + limit
     try:
         while child.poll() is None:
-            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+            if (cancel is not None and cancel.is_set()) or time.monotonic() >= limit_at \
+                    or (deadline is not None and deadline.passed()):
                 raise OSError("the name did not resolve in time")
             time.sleep(0.02)
         out = child.stdout.read(_RESOLVE_OUTPUT + 1)
@@ -182,7 +208,8 @@ def resolve_pinned(host: str, resolver) -> "ipaddress.IPv4Address | ipaddress.IP
     return chosen
 
 
-def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic) -> str:
+def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic,
+               deadline: "WorkDeadline | None" = None) -> str:
     """The registered page's HTML, or PageFetchError - within TOTAL_SECONDS of
     wall-clock time, whatever the resolver, the connection or the body do: the
     whole fetch runs in a worker the caller stops waiting for at the deadline.
@@ -198,7 +225,7 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
 
     def work():
         try:
-            outcome["html"] = _fetch(url, resolver, transport, clock, cancel)
+            outcome["html"] = _fetch(url, resolver, transport, clock, cancel, deadline)
         except PageFetchError as exc:
             outcome["error"] = exc
         except BaseException as exc:         # never the message: it can carry the URL
@@ -221,21 +248,45 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
     return outcome["html"]
 
 
-def _stopped(cancel) -> None:
+def _stopped(cancel, deadline=None) -> None:
     if cancel is not None and cancel.is_set():
         raise FetchCancelled("the load was stopped")
+    if deadline is not None and deadline.passed():
+        raise FetchCancelled("the load's lease ran out")
 
 
-def _fetch(url: str, resolver, transport, clock, cancel=None) -> str:
+def _gated(transport, stop):
+    """The transport behind a gate checked inside it, immediately before a
+    request is connected or written (Codex Gate 1 on ecee267): a cancel or a
+    lapsed deadline that lands after the caller's last check and before the
+    send still wins - nothing reaches the network."""
+    import httpx
+
+    class Gated(httpx.BaseTransport):
+        def __init__(self, inner):
+            self.inner = inner
+
+        def handle_request(self, request):
+            stop()
+            return self.inner.handle_request(request)
+
+        def close(self):
+            self.inner.close()
+    return Gated(transport if transport is not None else httpx.HTTPTransport(trust_env=False))
+
+
+def _fetch(url: str, resolver, transport, clock, cancel=None, deadline=None) -> str:
     import httpx
     parts = urlsplit(url)
     host = parts.hostname
-    ip = resolve_pinned(host, resolver or (lambda name: system_resolver(name, cancel)))
-    _stopped(cancel)                         # every step checks: a stopped load goes no further
+    _stopped(cancel, deadline)
+    ip = resolve_pinned(host, resolver or (lambda name: system_resolver(name, cancel, deadline=deadline)))
+    _stopped(cancel, deadline)               # every step checks: a stopped load goes no further
     pinned = urlunsplit(("https", "[%s]" % ip if ip.version == 6 else str(ip), parts.path or "/", "", ""))
     timeout = httpx.Timeout(connect=CONNECT_SECONDS, read=IDLE_SECONDS, write=CONNECT_SECONDS,
                             pool=CONNECT_SECONDS)
-    client = httpx.Client(transport=transport, timeout=timeout, follow_redirects=False, trust_env=False)
+    client = httpx.Client(transport=_gated(transport, lambda: _stopped(cancel, deadline)), timeout=timeout,
+                          follow_redirects=False, trust_env=False)
     started = clock()
     try:
         request = client.build_request(
@@ -245,10 +296,10 @@ def _fetch(url: str, resolver, transport, clock, cancel=None) -> str:
             # TLS is to the registered name, not the address: SNI and the
             # certificate check both use it.
             extensions={"sni_hostname": host})
-        _stopped(cancel)
+        _stopped(cancel, deadline)
         response = client.send(request, stream=True, follow_redirects=False)
         try:
-            _stopped(cancel)
+            _stopped(cancel, deadline)
             if clock() - started > FIRST_BYTE_SECONDS:
                 raise PageFetchError("the page was too slow to answer")
             if 300 <= response.status_code < 400:
@@ -264,7 +315,7 @@ def _fetch(url: str, resolver, transport, clock, cancel=None) -> str:
             inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if coding == "gzip" else None
             raw_total, body = 0, bytearray()
             for chunk in response.iter_raw():
-                _stopped(cancel)
+                _stopped(cancel, deadline)
                 raw_total += len(chunk)
                 if raw_total > MAX_COMPRESSED_BYTES:
                     raise PageFetchError("the page is too large")
@@ -288,6 +339,8 @@ def _fetch(url: str, resolver, transport, clock, cancel=None) -> str:
             return bytes(body).decode(CHARSETS.get(charset, "utf-8"), errors="replace")
         finally:
             response.close()
+    except FetchCancelled:
+        raise
     except (httpx.HTTPError, httpx.StreamError, httpx.InvalidURL, zlib.error, UnicodeError, LookupError) as exc:
         raise PageFetchError(type(exc).__name__) from None
     finally:
@@ -303,6 +356,11 @@ _TEXT_BLOCKS = {"p", "blockquote", "figcaption", "dt", "dd", "td", "th", "addres
 _VOID = {"img", "input", "br", "hr", "meta", "link", "source", "area", "base", "col", "embed", "param",
          "track", "wbr", "keygen"}
 _UNSAFE = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn")
+# Inline tags do not end a run of words: "alice<b>@example.com</b>" reads as
+# one address, as a browser shows it (Codex Gate 1 on ecee267: a split run
+# left part of an address behind).
+_INLINE = {"b", "strong", "i", "em", "span", "small", "u", "s", "sub", "sup", "code", "kbd", "mark", "abbr",
+           "cite", "q", "time", "font", "var", "samp", "dfn", "bdi", "bdo", "data", "wbr", "del", "ins", "tt"}
 # No address from the page reaches a label, even as visible text: links,
 # bare domains, IP addresses and email addresses become a neutral placeholder.
 # Conservative on purpose (Codex Gate 1 NO-GO on a2d98fc; Cursor NO-GO on
@@ -524,11 +582,41 @@ def redact(text: str) -> str:
     return _replace_found(text, _host_spans)
 
 
+def _cut(text: str, n: int) -> tuple[str, bool]:
+    """At most n characters, and whether anything was cut. A token the cut
+    goes through is dropped WHOLE (Codex Gate 1 on ecee267): a cap must never
+    leave part of an address - a local part, an "@", a piece of a domain."""
+    if len(text) <= n:
+        return text, False
+    head = text[:n]
+    if not text[n].isspace():
+        i = len(head)
+        while i > 0 and not head[i - 1].isspace():
+            i -= 1
+        head = head[:i]
+    return head, True
+
+
+def _drop_tail(text: str) -> str:
+    """Without its last token, unless it already ends between words: for text
+    whose end was cut by something that could not see the rest."""
+    i = len(text)
+    while i > 0 and not text[i - 1].isspace():
+        i -= 1
+    return text[:i]
+
+
 def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> str:
     """Visible words as one plain line: no addresses (``redacted``), no
     control, format or separator code points, no angle brackets, single
-    spaces, at most ``cap``. Only the first MAX_CALLBACK_CHARS are looked at."""
-    value = (value or "")[:MAX_CALLBACK_CHARS]
+    spaces, at most ``cap``. Only the first MAX_CALLBACK_CHARS are looked at,
+    and a token that limit cuts is dropped whole. Addresses are found on the
+    ORIGINAL code points before anything is stripped (Codex Gate 1 on
+    ecee267: "alice@<" lost its "<" and kept "alice@"), and again after, so
+    stripping can neither hide an address nor assemble one."""
+    value, _ = _cut(value or "", MAX_CALLBACK_CHARS)
+    if redacted:
+        value = redact(value)
     kept = []
     for ch in value or "":
         if ch in "<>":
@@ -568,8 +656,13 @@ class _Builder(HTMLParser):
         self.form = None
         self.skip, self.skip_tag = 0, ""
         self.stack = []                      # open tags
-        self.buffers = []                    # [tag, kind, words] of open text-collecting elements
+        self.buffers = []                    # [tag, kind, words, cut] of open text-collecting elements
         self.last_text = None
+        # One text run can reach handle_data in pieces (a feed chunk boundary, a
+        # comment in the middle): the pieces are joined, and read as one run
+        # at the next tag or at the end (Codex Gate 1 on ecee267).
+        self.pending, self.pending_len = [], 0
+        self.stopped = False                 # the parse ended early: the last run may be cut
 
     def _over_time(self) -> bool:
         """Every callback starts here: past the time or event budget, the whole
@@ -650,12 +743,15 @@ class _Builder(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if self._over_time():
             return
+        if tag not in _INLINE:
+            self._flush_data()
         if self.skip:
             if tag == self.skip_tag:
                 self.skip += 1
             return
-        # Only these attributes are ever read, and only as label text.
-        a = {k: (v or "")[:400] for k, v in attrs[:64]
+        # Only these attributes are ever read, and only as label text; a token
+        # the 400-character limit cuts is dropped whole.
+        a = {k: _cut(v or "", 400)[0] for k, v in attrs[:64]
              if k in ("alt", "aria-label", "placeholder", "value", "name", "type", "class", "role",
                       "width", "height")}
         if tag == "select":
@@ -709,7 +805,7 @@ class _Builder(HTMLParser):
                 self._add("field", label, clean_text(a.get("placeholder", ""), 80))
             return
         if tag == "a" and self.nav is not None:
-            self.buffers.append([tag, "text", []])   # a menu link's words, never its address
+            self.buffers.append([tag, "text", [], False])   # a menu link's words, never its address
             return
         buttonish = tag == "button" or (tag == "a" and (a.get("role") == "button"
                                                         or re.search(r"\b(btn|button|cta)\b", a.get("class", ""))))
@@ -717,19 +813,26 @@ class _Builder(HTMLParser):
             if tag in _TEXT_BLOCKS or tag == "li":
                 self._flush_open()           # a block inside a block starts a new line
             kind = "button" if buttonish else "heading" if tag in _HEADINGS else "text"
-            self.buffers.append([tag, kind, []])
+            self.buffers.append([tag, kind, [], False])
         if tag == "br" and self.buffers:
             self.buffers[-1][2].append(" ")
+
+    @staticmethod
+    def _words(entry) -> str:
+        text = "".join(entry[2])
+        return _drop_tail(text) if entry[3] else text     # its last token may run on past the limit
 
     def _flush_open(self):
         for entry in self.buffers:
             if entry[2] and entry[1] == "text":
-                self._add("text", "".join(entry[2]))
-                entry[2] = []
+                self._add("text", self._words(entry))
+                entry[2], entry[3] = [], False
 
     def handle_endtag(self, tag):
         if self._over_time():
             return
+        if tag not in _INLINE:
+            self._flush_data()
         if self.skip:
             if tag == self.skip_tag:
                 self.skip -= 1
@@ -744,10 +847,10 @@ class _Builder(HTMLParser):
 
     def _close(self, tag):
         if self.buffers and self.buffers[-1][0] == tag:
-            _, kind, words = self.buffers.pop()
-            text = "".join(words)
+            entry = self.buffers.pop()
+            text = self._words(entry)
             if text.strip():
-                self._add(kind, text)
+                self._add(entry[1], text)
         if tag == "nav" and self.nav is not None:
             self.nav = None
         elif tag in ("ul", "ol") and self.list is not None:
@@ -760,15 +863,41 @@ class _Builder(HTMLParser):
     def handle_data(self, data):
         if self._over_time() or self.skip:
             return
-        data = data[:MAX_CALLBACK_CHARS]     # never scan more of one text run than this
+        room = MAX_CALLBACK_CHARS + 1 - self.pending_len   # one more than is read: shows a cut
+        if room > 0:
+            self.pending.append(data[:room])
+            self.pending_len += min(len(data), room)
+
+    def _flush_data(self, cut_short: bool = False):
+        """Read the joined run: never more of it than MAX_CALLBACK_CHARS, and a
+        token a limit cuts goes whole."""
+        if not self.pending:
+            return
+        data = "".join(self.pending)
+        self.pending, self.pending_len = [], 0
+        data, cut = _cut(data, MAX_CALLBACK_CHARS)
+        if cut_short:
+            data, cut = _drop_tail(data), True
         if self.buffers:
-            words = self.buffers[-1][2]
-            if sum(len(w) for w in words) < LABEL_MAX * 4:
-                words.append(data[:LABEL_MAX * 4])
+            entry = self.buffers[-1]
+            budget = LABEL_MAX * 4 - sum(len(w) for w in entry[2])
+            if budget <= 0:
+                entry[3] = entry[3] or bool(data)
+                return
+            piece, over = _cut(data, budget)
+            entry[2].append(piece)
+            entry[3] = entry[3] or cut or over
         elif data.strip():
             self._add("text", data)
 
     def finish(self) -> dict:
+        # A parse that stopped early may have stopped inside a word: the last
+        # run, and every open element's last token, are dropped (Codex Gate 1
+        # on ecee267) rather than kept as part of an address.
+        self._flush_data(cut_short=self.stopped)
+        if self.stopped:
+            for entry in self.buffers:
+                entry[3] = True
         while self.stack and not self.full:
             self._close(self.stack.pop())
 
@@ -788,7 +917,7 @@ class _Builder(HTMLParser):
 def page_to_tree(html: str, title: str, *, clock=time.monotonic) -> dict:
     """The builder's artifact tree for a page: plain text in known kinds only."""
     builder = _Builder(title, clock=clock)
-    text = (html or "")[:MAX_HTML_CHARS]
+    text, builder.stopped = _cut(html or "", MAX_HTML_CHARS)
     try:
         # Fed in chunks, with a hard stop between them on time, on the node cap,
         # and on the unparsed remainder: a tag or a script that never closes is
@@ -800,7 +929,7 @@ def page_to_tree(html: str, title: str, *, clock=time.monotonic) -> dict:
                 raise _ParseStop()
         builder.close()
     except Exception:                        # a stopped or broken page still yields what was read
-        pass
+        builder.stopped = True
     return builder.finish()
 
 
@@ -812,5 +941,5 @@ def tree_depth(tree: dict) -> int:
     return 1 + max((tree_depth(c) for c in tree.get("children") or []), default=0)
 
 
-__all__ = ["PageFetchError", "FetchBusy", "FetchTimeout", "FetchCancelled", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
+__all__ = ["PageFetchError", "FetchBusy", "FetchTimeout", "FetchCancelled", "WorkDeadline", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
            "system_resolver", "tree_nodes", "tree_depth", "MAX_NODES", "MAX_DEPTH", "MAX_IMAGES", "LABEL_MAX"]

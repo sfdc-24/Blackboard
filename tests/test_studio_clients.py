@@ -93,7 +93,7 @@ class FakeFetcher:
     def __init__(self, html=FIXTURE, fail=False):
         self.html, self.fail, self.calls = html, fail, []
 
-    def __call__(self, url):
+    def __call__(self, url, deadline=None):
         self.calls.append(url)
         if self.fail:
             raise PageFetchError("down")
@@ -932,8 +932,8 @@ class NoLeaks(Api):
                 return page_transport(body=("<p>" + self.PAGE_TEXT + "</p>").encode(), status=500)
             return page_transport(body=("<h1>" + self.PAGE_TEXT + "</h1>").encode())
 
-        def fetcher(url):
-            return fetch_page(url, resolver=Resolver([PUBLIC_IP]), transport=transport_for(url))
+        def fetcher(url, deadline=None):
+            return fetch_page(url, resolver=Resolver([PUBLIC_IP]), transport=transport_for(url), deadline=deadline)
         captured = io.StringIO()
         handler = logging.StreamHandler(captured)
         root = logging.getLogger()
@@ -1150,7 +1150,7 @@ class Blocker3ParseAndFetchBudgets(Api):
 
     def test_no_free_load_slot_is_a_503_that_admits_nothing(self):
         class Busy(FakeFetcher):
-            def __call__(self, url):
+            def __call__(self, url, deadline=None):
                 self.calls.append(url)
                 raise FetchBusy("every page-load slot is taken")
         with TestClient(self.make(fetcher=Busy())) as client:
@@ -2451,7 +2451,7 @@ class HoldingFetcher(FakeFetcher):
         super().__init__()
         self.entered, self.release = threading.Event(), threading.Event()
 
-    def __call__(self, url):
+    def __call__(self, url, deadline=None):
         self.entered.set()
         self.release.wait(10)
         return super().__call__(url)
@@ -2793,7 +2793,7 @@ class TimedOutFetcher(FakeFetcher):
         super().__init__()
         self.done = threading.Event()
 
-    def __call__(self, url):
+    def __call__(self, url, deadline=None):
         self.calls.append(url)
         raise FetchTimeout("the page was too slow", self.done)
 
@@ -3012,7 +3012,7 @@ class StoppableTimedOutFetcher(FakeFetcher):
         super().__init__()
         self.live, self.stop_delay, self.on_stop, self.loads = live, stop_delay, on_stop, []
 
-    def __call__(self, url):
+    def __call__(self, url, deadline=None):
         self.calls.append(url)
         done, cancel, token = threading.Event(), threading.Event(), object()
         self.live.add(token)
@@ -3036,7 +3036,7 @@ class CountingLiveFetcher(FakeFetcher):
         super().__init__()
         self.live, self.seen_live = live, []
 
-    def __call__(self, url):
+    def __call__(self, url, deadline=None):
         self.seen_live.append(len(self.live))
         return super().__call__(url)
 
@@ -3163,7 +3163,9 @@ class CodexR11FetchOutage(Api):
 
 
 class CodexR11AdviseLease(Api):
-    """Finding 4: everything after the advise lease is under its cleanup."""
+    """Finding 4: a guard that fails part way leaves no lease behind. Since
+    round 12 the lease and its use are ONE write, so the first guard operation
+    on the record is the whole acquisition and the second is the release."""
 
     def test_a_half_failed_advise_guard_leaves_no_lease(self):
         for how in ("read", "write"):
@@ -3177,14 +3179,14 @@ class CodexR11AdviseLease(Api):
                 def load(name, how=how):
                     if name == record:
                         seen["load"] += 1
-                        if how == "read" and seen["load"] == 2:              # the cap's read, after the lease
+                        if how == "read" and seen["load"] == 1:              # the acquisition's read
                             raise OSError("down")
                     return original_load(name)
 
                 def save(name, state, token_, how=how):
                     if name == record:
                         seen["save"] += 1
-                        if how == "write" and seen["save"] == 2:             # the cap's write, after the lease
+                        if how == "write" and seen["save"] == 1:             # the acquisition's write
                             raise OSError("down")
                     return original_save(name, state, token_)
                 self.store.load, self.store.save = load, save
@@ -3192,7 +3194,463 @@ class CodexR11AdviseLease(Api):
                 first = client.post(url, headers=self.auth(live["token"]), json={"revision": live["artifact_version"]})
                 calls_after_first = advisor.calls
                 leases = ((self.store.data.get(record) or {}).get("leases") or {}).get("advise") or {}
+                used = ((self.store.data.get(record) or {}).get("counts") or {}).get("advise", 0)
                 self.store.load, self.store.save = original_load, original_save
                 retry = client.post(url, headers=self.auth(live["token"]), json={"revision": live["artifact_version"]})
-            self.assertEqual((503, 0, {}), (first.status_code, calls_after_first, leases), (how, first.text))
+            self.assertEqual((503, 0, {}, 0), (first.status_code, calls_after_first, leases, used), (how, first.text))
             self.assertEqual((200, 1), (retry.status_code, advisor.calls), (how, retry.text))
+
+
+# =====================================================================================================
+# Codex Gate 1 NO-GO on ecee267 (row CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z): four windows.
+# =====================================================================================================
+from app.project_page import WorkDeadline, _cut, clean_text  # noqa: E402
+
+R12_STRIPPED = ("zqalice@<", "zqbob@" + chr(0x200B), "zqcarol@>", "zqdave@" + chr(0x2060), "zqerin@" + chr(0x7F))
+
+
+def _straddle(prefix_len: int, local: str, domain: str, where: str) -> str:
+    """Filler words, then local@domain placed so that position prefix_len (the
+    cap) falls right after the "@", inside the local part, or inside the domain."""
+    address = local + "@" + domain
+    at = {"after-at": len(local) + 1, "local": 3, "domain": len(local) + 4}[where]
+    lead = prefix_len - at
+    return " " * lead + address + " tail"                 # spaces collapse: the cut token would lead the label
+
+
+class CodexR12B1RedactBeforeLoss(Api):
+    """B1: an address is found on the original code points, before any strip
+    or cap can take part of it away; a token a cap cuts goes whole."""
+
+    def test_stripped_domains_go_whole(self):
+        from app.clients import _EMAIL_RE
+        for address in R12_STRIPPED:
+            self.assertTrue(_EMAIL_RE.fullmatch(address), repr(address))          # registry-valid
+            for text in (address, "mail " + address + " now"):
+                out = clean_text(text)
+                self.assertIn("[email]", out, repr(text))
+                self.assertNotIn("@", out, repr(text))
+                self.assertNotIn(address.split("@")[0], out, repr(text))
+
+    def test_a_cut_token_goes_whole(self):
+        self.assertEqual(("ab ", True), _cut("ab cdef", 5))
+        self.assertEqual(("ab ", True), _cut("ab cd", 3))                   # the cut is between words
+        self.assertEqual(("ab cd", True), _cut("ab cd ef", 5))               # the cut falls on a space: kept
+        self.assertEqual(("abc", False), _cut("abc", 3))
+        self.assertEqual(("", True), _cut("abcdef", 3))
+        for where in ("after-at", "local", "domain"):
+            text = _straddle(4096, "zqcapx", "zqcapdomain.com", where)
+            out = clean_text(text)
+            for never in ("zqc", "zqcapdomain", "@"):
+                self.assertNotIn(never, out, (where, never))
+
+    def page(self):
+        rows = []
+        # the stripped-domain forms, as text, in attributes and in a menu label
+        rows.append("<p>Write to %s today</p>" % R12_STRIPPED[0].replace("<", "&lt;"))
+        rows.append("<p>Or %s here</p>" % R12_STRIPPED[1])
+        rows.append("<img alt=\"%s\">" % R12_STRIPPED[2].replace(">", "&gt;"))
+        rows.append("<input placeholder=\"%s\">" % R12_STRIPPED[3])
+        rows.append("<nav aria-label=\"%s\"><a href='/'>Home</a></nav>" % R12_STRIPPED[4])
+        # cross-cap: the attribute limit (400), the words budget (800), a loose run (4096)
+        for where, local in (("after-at", "zqattra"), ("local", "zqattrb"), ("domain", "zqattrc")):
+            rows.append("<img alt=\"%s\">" % _straddle(400, local, "zqattrdom.com", where))
+        for where, local in (("after-at", "zqwordsa"), ("local", "zqwordsb"), ("domain", "zqwordsc")):
+            rows.append("<p>%s</p>" % _straddle(800, local, "zqwordsdom.com", where))
+        rows.append("<section><h2>Loose</h2></section>%s<section><h2>After</h2></section>"
+                    % _straddle(4096, "zqloosea", "zqloosedom.com", "after-at"))
+        # a split by inline tags
+        rows.append("<section>zqinline<b>@zqinlinedom.com</b> and more</section>")
+        return "<html><body>" + "".join(rows) + "</body></html>"
+
+    NEVER = ("zqalice", "zqbob", "zqcarol", "zqdave", "zqerin", "zqattr", "zqwords", "zqloose", "zqinline")
+
+    def test_no_surface_carries_them(self):
+        page = self.page()
+        tree = json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)
+        for never in self.NEVER:
+            self.assertNotIn(never, tree, never)
+        talk, worker = FakeTalk(), SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-r12", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-r12"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        state = json.dumps(self.state(live["session_id"]), ensure_ascii=False)
+        provider = json.dumps([talk.calls, worker.seen], ensure_ascii=False)
+        for surface, text in (("state", state), ("talk and builder", provider), ("events", events)):
+            for never in self.NEVER:
+                self.assertNotIn(never, text, (surface, never))
+        self.assertIn("[email]", state)
+        self.assertIn("After", state)                                         # the page after them still reads
+
+    def test_a_run_split_by_a_feed_chunk_is_read_whole(self):
+        for inside in (False, True):
+            # Block tags up to just before the boundary, so the run that crosses
+            # it starts close enough to be read (a run is read to MAX_CALLBACK_CHARS).
+            head = "<html><body>"
+            opener = "<p>" if inside else ""
+            k = (project_page.FEED_CHUNK - 5 - len(head) - len(opener) - 10) // 4
+            before = head + "<hr>" * k + opener
+            before += " " * (project_page.FEED_CHUNK - 5 - len(before))
+            page = before + "zqsplit@zqsplitdom.com end" + ("</p>" if inside else "") + "</body></html>"
+            self.assertEqual("zqspl", page[project_page.FEED_CHUNK - 5:project_page.FEED_CHUNK])
+            tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+            self.assertNotIn("zqs", tree, inside)
+            self.assertIn("[email]", tree, inside)
+
+    def test_a_page_cut_short_drops_its_last_token(self):
+        for opener, closer in (("<p>", "</p>"), ("<section><h2>Loose</h2></section>", "")):
+            page = "<html><body>" + opener + "w " * 60 + "zqshort@zqshortdom.com and on" + closer + "</body></html>"
+            cut = page.index("zqshort") + 8                                      # right after its "@"
+            with mock.patch.object(project_page, "MAX_HTML_CHARS", cut):
+                tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+            self.assertNotIn("zqsho", tree, opener)
+            self.assertIn("w w", tree, opener)                                   # what came before still reads
+
+    def test_a_parse_stopped_inside_a_run_drops_its_last_token(self):
+        # A feed chunk ends inside an address; the event budget runs out on the
+        # very next piece of text, so the parse stops with half of it read.
+        head = "<html><body>"
+        k = (project_page.FEED_CHUNK - 5 - len(head) - 10) // 4
+        before = head + "<hr>" * k
+        before += " " * (project_page.FEED_CHUNK - 5 - len(before))
+        page = before + "zqstop@zqstopdom.com end" + "</body></html>"
+        self.assertEqual("zqsto", page[project_page.FEED_CHUNK - 5:project_page.FEED_CHUNK])
+        with mock.patch.object(project_page, "MAX_EVENTS", 2 + k + 1):
+            tree = json.dumps(page_to_tree(page, "T"), ensure_ascii=False)
+        self.assertNotIn("zqs", tree)
+
+
+class KeeperPausingGuards:
+    """Stands in for one instance's guards, pausing its keeper inside renew."""
+
+    def __init__(self, guards):
+        self.guards, self.gate, self.entered = guards, threading.Event(), threading.Event()
+        self.real_renew = guards.renew
+
+    def renew(self, *args, **kwargs):
+        self.entered.set()
+        self.gate.wait(30)                              # the keeper is paused (scheduler, GC, a stalled host)
+        return self.real_renew(*args, **kwargs)
+
+
+class DeadlineHonouringFetcher(FakeFetcher):
+    """A timed-out load whose work runs on until it is cancelled or its own
+    deadline passes - as fetch_page's work does at every step."""
+
+    def __init__(self, live):
+        super().__init__()
+        self.live, self.loads = live, []
+
+    def __call__(self, url, deadline=None):
+        self.calls.append(url)
+        done, cancel, token = threading.Event(), threading.Event(), object()
+        self.live.add(token)
+
+        def work():
+            while not cancel.is_set() and not (deadline is not None and deadline.passed()):
+                time.sleep(0.005)
+            self.live.discard(token)
+            done.set()
+        threading.Thread(target=work, daemon=True).start()
+        self.loads.append((done, cancel, deadline))
+        raise FetchTimeout("the page was too slow", done, cancel)
+
+
+class CodexR12B2WorkDeadline(Api):
+    """B2: the work stops on its own deadline, from its last confirmed lease,
+    whatever its keeper is doing; an expired lease is never renewed."""
+
+    second_app = CodexR8B3TwoInstances.second_app
+    guard_outage = CodexR11FetchOutage.guard_outage
+
+    def test_an_expired_lease_is_never_renewed(self):
+        now = [1000.0]
+        self.store = MemoryStore()
+        guards = DurableGuards(self.store, Conflict, clock=lambda: now[0])
+        fence = guards.acquire("studio_guard_x", "fetch", "a", 60, 1)
+        now[0] = 1059.0
+        self.assertTrue(guards.renew("studio_guard_x", "fetch", "a", fence, 60))       # live: renewed to 1119
+        now[0] = 1119.0
+        self.assertFalse(guards.renew("studio_guard_x", "fetch", "a", fence, 60))      # at its expiry: gone
+        now[0] = 1120.0
+        self.assertFalse(guards.renew("studio_guard_x", "fetch", "a", fence, 60))
+        self.assertEqual(1119.0, self.store.data["studio_guard_x"]["leases"]["fetch"]["a"]["until"])
+
+    def keeper_paused_then_second_load(self, other_tenant):
+        acme = client_entry(tenant="acme", emails=("acme@example.com",), name="Acme",
+                            projects=[project("acme-site", "https://www.acme.example.com/", "acme.example.com")])
+        live = set()
+        stuck, fresh, offset = DeadlineHonouringFetcher(live), CountingLiveFetcher(live), [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        with _mock.patch.object(_project_page, "MAX_OUTSTANDING_FETCHES", 1), \
+                _mock.patch.object(_main, "FETCH_RENEW_SECONDS", 0.02):
+            with TestClient(self.make(fetcher=stuck, clock=clock, registry=registry_record(client_entry(), acme))) as a, \
+                    TestClient(self.second_app(clock=clock, fetcher=fresh)) as b:
+                pause = KeeperPausingGuards(self.app.state.guards)
+                self.app.state.guards.renew = pause.renew                          # this instance's keeper only
+                nav_token = self.sign_in(a).json()["token"]
+                acme_token = self.sign_in(b, "acme@example.com").json()["token"]
+                first = self.project_session(a, nav_token, "load-a")              # timed out; its work runs on
+                self.assertTrue(pause.entered.wait(5))                             # its keeper is stuck in renew
+                for _ in range(8):                                                # 80 s: past the 60 s lease
+                    offset[0] += 10
+                    time.sleep(0.1)
+                if other_tenant:
+                    second = self.project_session(b, acme_token, "acme-1", project_id="acme-site")
+                else:
+                    second = self.project_session(b, nav_token, "load-b")
+                stopped, cancelled = stuck.loads[0][0].is_set(), stuck.loads[0][1].is_set()
+                pause.gate.set()                                                   # the keeper wakes up late ...
+                for keeper in list(self.app.state.fetch_keepers):
+                    keeper.join(5)
+                now = clock()
+        self.assertEqual((502, 200), (first.status_code, second.status_code), second.text)
+        self.assertEqual([0], fresh.seen_live)                   # admitted only once the old work had stopped
+        self.assertEqual((True, False), (stopped, cancelled))      # stopped on its own deadline; nobody cancelled it
+        for record in (CEILING_RECORD, tenant_record("nav")):     # the late keeper renewed nothing back to life
+            leases = ((self.store.data.get(record) or {}).get("leases") or {}).get("fetch") or {}
+            live_owners = [o for o, l in leases.items() if float(l.get("until") or 0) > now]
+            self.assertEqual([], live_owners, record)
+
+    def test_a_paused_keeper_cannot_keep_the_work_past_its_lease_the_global_ceiling(self):
+        self.keeper_paused_then_second_load(other_tenant=True)
+
+    def test_a_paused_keeper_cannot_keep_the_work_past_its_lease_the_tenant_single_flight(self):
+        self.keeper_paused_then_second_load(other_tenant=False)
+
+    def test_an_unconfirmed_renewal_does_not_move_the_deadline(self):
+        live = set()
+        stuck, offset = DeadlineHonouringFetcher(live), [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        with _mock.patch.object(_main, "FETCH_RENEW_SECONDS", 0.02), \
+                _mock.patch.object(_main, "FETCH_STOP_MARGIN_SECONDS", 0.0):   # the keeper never stops it itself
+            with TestClient(self.make(fetcher=stuck, clock=clock)) as a:
+                token = self.sign_in(a).json()["token"]
+                first = self.project_session(a, token, "load-a")
+                down = self.guard_outage()                                      # every renewal: unknown
+                deadline = stuck.loads[0][2]
+                start = clock()
+                for step in (10, 10, 10, 10, 10, 5):                            # 55 s: past the deadline, inside the lease
+                    offset[0] += step
+                    time.sleep(0.1)
+                stopped_by = stuck.loads[0][0].is_set()
+                down["on"] = False
+                for keeper in list(self.app.state.fetch_keepers):
+                    keeper.join(5)
+        self.assertEqual(502, first.status_code)
+        self.assertTrue(stopped_by)                                              # stopped on the deadline set at the start
+        self.assertLessEqual(deadline._until, start + 60)
+
+    def test_a_confirmed_renewal_moves_the_deadline(self):
+        deadline = WorkDeadline(lambda: 0.0, 50.0)
+        deadline.extend(40.0)
+        self.assertEqual(50.0, deadline._until)                                  # never earlier
+        deadline.extend(110.0)
+        self.assertEqual(110.0, deadline._until)
+
+
+class CodexR12B3CancelAtSend(unittest.TestCase):
+    """B3: a cancel (or a lapsed deadline) that lands after the last check and
+    before the send still wins: the transport is never invoked."""
+
+    def test_a_cancel_at_send_sends_nothing(self):
+        seen, cancel = [], threading.Event()
+        real_send = httpx.Client.send
+
+        def send(client, request, **kwargs):
+            cancel.set()
+            return real_send(client, request, **kwargs)
+        with mock.patch.object(httpx.Client, "send", send):
+            with self.assertRaises(FetchCancelled):
+                project_page._fetch(PAGE, Resolver([PUBLIC_IP]), page_transport(seen=seen), time.monotonic, cancel)
+        self.assertEqual([], seen)
+
+    def test_a_deadline_passing_at_send_sends_nothing(self):
+        seen, now = [], [0.0]
+        deadline = WorkDeadline(lambda: now[0], 10.0)
+        real_send = httpx.Client.send
+
+        def send(client, request, **kwargs):
+            now[0] = 11.0
+            return real_send(client, request, **kwargs)
+        with mock.patch.object(httpx.Client, "send", send):
+            with self.assertRaises(FetchCancelled):
+                project_page._fetch(PAGE, Resolver([PUBLIC_IP]), page_transport(seen=seen), time.monotonic,
+                                    None, deadline)
+        self.assertEqual([], seen)
+
+    def test_an_uncancelled_load_still_sends_once(self):
+        seen = []
+        html = project_page._fetch(PAGE, Resolver([PUBLIC_IP]), page_transport(seen=seen), time.monotonic,
+                                   threading.Event(), WorkDeadline(time.monotonic, time.monotonic() + 60))
+        self.assertEqual(1, len(seen))
+        self.assertIn("ok", html)
+
+
+class CodexR12B4AdviseAtomic(Api):
+    """B4: the advise lease and its use are one write; a release the store
+    refuses is owed, so a persistent outage leaves no ghost and the retry
+    after it is not a 409."""
+
+    def advise(self, client, live):
+        return client.post("/v1/session/%s/advise" % live["session_id"], headers=self.auth(live["token"]),
+                           json={"revision": live["artifact_version"]})
+
+    def outage_from(self, record, how, first_failing):
+        original_load, original_save, seen, down = self.store.load, self.store.save, {"n": 0}, {"on": True}
+
+        def load(name):
+            if down["on"] and name == record and how == "read":
+                seen["n"] += 1
+                if seen["n"] >= first_failing:
+                    raise OSError("down")
+            return original_load(name)
+
+        def save(name, state, token_):
+            if down["on"] and name == record and how == "write":
+                seen["n"] += 1
+                if seen["n"] >= first_failing:
+                    raise OSError("down")
+            return original_save(name, state, token_)
+        self.store.load, self.store.save = load, save
+
+        def restore():
+            down["on"] = False
+            self.store.load, self.store.save = original_load, original_save
+        return restore
+
+    def leases(self, record):
+        now = time.time()
+        held = ((self.store.data.get(record) or {}).get("leases") or {}).get("advise") or {}
+        return {o: l for o, l in held.items() if float(l.get("until") or 0) > now}
+
+    def test_the_lease_and_its_use_are_one_write(self):
+        advisor = CountingAdvisor()
+        with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+            live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+            record = session_record(live["session_id"])
+            original_save, saves = self.store.save, []
+
+            def save(name, state, token_):
+                if name == record:
+                    saves.append(copy.deepcopy(state))
+                return original_save(name, state, token_)
+            self.store.save = save
+            answered = self.advise(client, live)
+            self.store.save = original_save
+        self.assertEqual(200, answered.status_code, answered.text)
+        self.assertEqual(2, len(saves))                                         # take both, then give the lease back
+        taken = saves[0]
+        self.assertEqual(1, (taken.get("counts") or {}).get("advise"))           # the use ...
+        self.assertEqual(1, len(((taken.get("leases") or {}).get("advise") or {})))   # ... and the lease, together
+
+    def test_an_abandoned_advise_lease_expires(self):
+        offset = [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        advisor = CountingAdvisor()
+        with TestClient(self.make(advisor=advisor, clock=clock,
+                                  client_providers=("claude", "openai", "gemini"))) as client:
+            live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+            record = session_record(live["session_id"])
+            fence, refused = self.app.state.guards.lease_and_spend(record, "advise", "crashed-instance", 120, 12)
+            busy = self.advise(client, live)                         # its holder died without giving it back
+            offset[0] += 121
+            later = self.advise(client, live)                        # ... so it lapses on its own
+        self.assertEqual((1, ""), (fence, refused))
+        self.assertEqual((409, 200, 1), (busy.status_code, later.status_code, advisor.calls), later.text)
+
+    def test_an_outage_from_the_start_takes_nothing_and_calls_nobody(self):
+        for how in ("read", "write"):
+            advisor = CountingAdvisor()
+            with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+                live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+                record = session_record(live["session_id"])
+                restore = self.outage_from(record, how, 1)
+                first = self.advise(client, live)
+                calls_first, ghost = advisor.calls, self.leases(record)
+                restore()
+                retry = self.advise(client, live)
+            self.assertEqual((503, 0, {}), (first.status_code, calls_first, ghost), how)
+            self.assertEqual((200, 1), (retry.status_code, advisor.calls), how)
+
+    def test_a_persistent_outage_after_the_lease_leaves_no_ghost_and_the_retry_is_not_409(self):
+        for how in ("read", "write"):
+            advisor = CountingAdvisor()
+            with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+                live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+                record = session_record(live["session_id"])
+                restore = self.outage_from(record, how, 2)           # the lease and its use are written; then down
+                first = self.advise(client, live)
+                calls_first, owed = advisor.calls, self.app.state.guards.owed()
+                restore()                                            # the store is back
+                retry = self.advise(client, live)                    # at once: the owed release is settled first
+                ghost = self.leases(record)
+                owed_after = self.app.state.guards.owed()
+            self.assertEqual((200, 1, 1), (first.status_code, calls_first, owed), how)
+            self.assertEqual((200, 2), (retry.status_code, advisor.calls), (how, retry.text))
+            self.assertEqual(({}, 0), (ghost, owed_after), how)
+
+    def test_an_owed_release_is_settled_in_the_background(self):
+        advisor = CountingAdvisor()
+        with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+            self.app.state.guards.retry_seconds = 0.05
+            live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+            record = session_record(live["session_id"])
+            restore = self.outage_from(record, "write", 2)
+            self.assertEqual(200, self.advise(client, live).status_code)
+            self.assertEqual(1, self.app.state.guards.owed())
+            restore()
+            for _ in range(100):                                     # nobody retries the request ...
+                if not self.app.state.guards.owed():
+                    break
+                time.sleep(0.02)
+            self.assertEqual((0, {}), (self.app.state.guards.owed(), self.leases(record)))   # ... it is given back anyway
+
+    def test_a_cancelled_request_gives_its_lease_back(self):
+        entered, gate = threading.Event(), threading.Event()
+
+        class SlowAdvisor(CountingAdvisor):
+            def advise(self, session_id, snapshot):
+                entered.set()
+                gate.wait(10)
+                return super().advise(session_id, snapshot)
+        advisor = SlowAdvisor()
+        with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+            live = self.project_session(client, self.sign_in(client).json()["token"]).json()
+            record = session_record(live["session_id"])
+            app = self.app
+
+            async def run():
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+                    task = _asyncio.ensure_future(ac.post(
+                        "/v1/session/%s/advise" % live["session_id"],
+                        headers={**self.auth(live["token"]), **ORIGIN}, json={"revision": live["artifact_version"]}))
+                    while not entered.is_set():
+                        await _asyncio.sleep(0.01)
+                    task.cancel()                                    # the caller goes away mid-advice
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    gate.set()
+                    for _ in range(200):
+                        if not self.leases(record):
+                            return True
+                        await _asyncio.sleep(0.02)
+                    return False
+            released = _asyncio.run(run())
+            retry = self.advise(client, live)
+        self.assertTrue(released)
+        self.assertEqual(200, retry.status_code, retry.text)

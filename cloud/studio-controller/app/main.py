@@ -32,7 +32,7 @@ from .clients import ClientRegistry, public_view
 from .leads import LeadBook, LeadCapExceeded
 from . import project_page as project_page_module
 from .guards import CEILING_RECORD, DurableGuards, GuardUnavailable, session_record, tenant_record
-from .project_page import FetchBusy, FetchTimeout, PageFetchError, fetch_page, page_to_tree
+from .project_page import FetchBusy, FetchTimeout, PageFetchError, WorkDeadline, fetch_page, page_to_tree
 from .settings import Settings
 from .state import (
     SessionNotFound,
@@ -65,6 +65,12 @@ FETCH_RENEW_SECONDS = 15.0
 # stop (the lookup child is killed at once; each network step is bounded by
 # its connect or idle timeout, a few seconds), with room to spare.
 FETCH_STOP_MARGIN_SECONDS = 25.0
+# The load's own deadline (Codex Gate 1 on ecee267): it stops by itself this
+# long before its last CONFIRMED lease could lapse, whatever its keeper is
+# doing. Longer than any one blocking step of a load (the lookup child is
+# killed at 3 s; connect 3 s; each read waits at most 4 s), so a load that
+# sees its deadline mid-step has still stopped before the lease lapses.
+FETCH_WORK_MARGIN_SECONDS = 10.0
 
 
 class SummaryNotSent(RuntimeError):
@@ -810,20 +816,24 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         client = is_client_session(state)
         advise_owner, advise_fence = secrets.token_hex(8), None
         if client:
-            advise_fence = await asyncio.to_thread(guard_lease, session_id, "advise", advise_owner)
-            if advise_fence is None:
+            # The lease and its use in ONE write (Codex Gate 1 on ecee267): a
+            # store that fails part way leaves neither behind, never a lease
+            # to 409 the retry.
+            try:
+                advise_fence, refused = await asyncio.to_thread(
+                    guards.lease_and_spend, session_record(session_id), "advise", advise_owner,
+                    LEASE_SECONDS, int(getattr(advisor_lane, "call_cap", 12)))
+            except GuardUnavailable as exc:
+                raise HTTPException(503, GUARDS_DOWN) from exc
+            if refused == "busy":
                 raise HTTPException(409, "advice is already being prepared for this session")
+            if refused == "cap":
+                raise HTTPException(429, "advice limit reached for this session")
         elif session_id in advise_busy:
             raise HTTPException(409, "advice is already being prepared for this session")
         else:
             advise_busy.add(session_id)
-        # Everything after the lease - the cap included - is inside the owned,
-        # fenced cleanup: a guard that fails half way (503) leaves no lease
-        # behind to 409 the retry (Codex Gate 1 on 80dfc8f).
         try:
-            if client and await asyncio.to_thread(guard_take, session_id, "advise",
-                                                  int(getattr(advisor_lane, "call_cap", 12))) == "cap":
-                raise HTTPException(429, "advice limit reached for this session")
             said = [str(t.get("text") or "") for t in state.get("transcript") or []
                     if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-4:]
             snapshot = {"revision": revision, "topic_line": topic_line(state),
@@ -831,7 +841,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
         finally:
             if client:
-                await asyncio.to_thread(guard_release, session_id, "advise", advise_owner, advise_fence)
+                # Shielded: a cancelled request still gives its lease back, and a
+                # release the store refuses is owed and retried (app/guards.py).
+                await asyncio.shield(asyncio.to_thread(guard_release, session_id, "advise", advise_owner,
+                                                       advise_fence))
             else:
                 advise_busy.discard(session_id)
         if advice is None:
@@ -1186,12 +1199,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return "ceiling"
         return owner, tenant_fence, ceiling_fence, held_until
 
+    def work_deadline(claim) -> WorkDeadline:
+        """The load's own deadline, from the lease just taken; the keeper moves
+        it only after a renewal is written."""
+        return WorkDeadline(guards.clock, claim[3] - FETCH_WORK_MARGIN_SECONDS)
+
     def release_fetch(tenant: str, claim) -> None:
         owner, tenant_fence, ceiling_fence, _ = claim
         guards.release(CEILING_RECORD, "fetch", owner, ceiling_fence)
         guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
 
-    def keep_fetch_leases(tenant: str, claim, done, cancel=None) -> None:
+    def keep_fetch_leases(tenant: str, claim, done, cancel=None, deadline=None) -> None:
         """Renew a timed-out load's leases while its worker lives; give them
         back once it has stopped. A renewal that cannot be written is tried
         again at the next beat; if the lease is gone, or cannot be confirmed
@@ -1209,11 +1227,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 try:
                     for name, fence in ((CEILING_RECORD, ceiling_fence), (tenant_record(tenant), tenant_fence)):
                         if not guards.renew(name, "fetch", owner, fence, FETCH_LEASE_SECONDS):
-                            kept = False                  # replaced: this load holds no place any more
+                            kept = False                  # replaced or lapsed: this load holds no place
+                            break
                 except GuardUnavailable:
                     kept = None                           # unknown: the lease keeps its last expiry
                 if kept:
                     until = started + FETCH_LEASE_SECONDS
+                    if deadline is not None:              # only a written renewal moves the work's deadline
+                        deadline.extend(until - FETCH_WORK_MARGIN_SECONDS)
                     continue
                 if kept is False or until - float(guards.clock()) <= FETCH_STOP_MARGIN_SECONDS:
                     if cancel is not None:
@@ -1307,11 +1328,12 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 if claim == "ceiling":
                     raise HTTPException(503, "page loading is busy; try again shortly")
                 timed_out, still_running, stop_it = False, None, None
+                deadline = work_deadline(claim)
                 try:
                     if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
                         raise HTTPException(429, "too many page loads for this workspace; try again later")
                     try:
-                        html = await asyncio.to_thread(fetch_project, project["url"])
+                        html = await asyncio.to_thread(fetch_project, project["url"], deadline=deadline)
                         artifact = await asyncio.to_thread(page_to_tree, html, project["name"])
                     except FetchBusy as exc:
                         raise HTTPException(503, "page loading is busy; try again shortly") from exc
@@ -1327,7 +1349,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     if not timed_out:
                         await asyncio.to_thread(release_fetch, tenant, claim)
                     elif still_running is not None:  # held, and renewed, until its worker stops
-                        keep_fetch_leases(tenant, claim, still_running, stop_it)
+                        keep_fetch_leases(tenant, claim, still_running, stop_it, deadline)
                     # (a timeout without a liveness signal keeps its leases until they expire)
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
