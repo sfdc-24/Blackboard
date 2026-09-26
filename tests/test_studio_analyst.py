@@ -395,8 +395,149 @@ class AnalystDeadline(unittest.TestCase):
             else:
                 sys.modules.pop("anthropic", None)
         self.assertEqual(0, seen.get("max_retries"))
-        self.assertEqual(an.TIMEOUT_SECONDS, seen.get("timeout"))
-        self.assertLessEqual(seen.get("timeout"), 45)
+        self.assertEqual(an.BUDGET_SECONDS, seen.get("timeout"))
+        self.assertLessEqual(an.BUDGET_SECONDS, 35)
+
+
+# --- Codex NO-GO on #272 at 8a9349e: analyze settles inside a total budget ---
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from tests.studio_slow_provider import SlowProvider, tool_message  # noqa: E402
+
+RECORDED = tool_message("record_analysis", MODEL_RAW)
+STATE = {"session_id": "s1", "artifact": {"id": "screen", "kind": "screen", "label": "x", "children": []}}
+
+
+class AnalystThroughTheRealSdk(unittest.TestCase):
+    def provider(self, *replies):
+        prov = SlowProvider(*replies)
+        self.addCleanup(prov.close)
+        return prov
+
+    def test_a_trickling_analysis_is_abandoned_at_the_budget_and_its_socket_shut(self):
+        prov = self.provider(("slow", RECORDED, 0.01))
+        analyst = an.Analyst(client=prov.client(), research=False, budget_seconds=0.6)
+        started = time.monotonic()
+        out = analyst.analyze(STATE, "An ordering app for my bakery", "The canvas is empty.")
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsNone(out["model"])
+        self.assertEqual("transient", out["fault"])
+        self.assertTrue(out["problems"][0].startswith(an.SLOW_PROBLEM), out["problems"])
+        record = prov.wait_settled(0)
+        self.assertIn("dropped", record)
+        self.assertNotIn("complete", record)
+
+    def test_permanent_and_transient_statuses(self):
+        for code, kind, fault in ((400, "invalid_request_error", "permanent"), (401, "authentication_error", "permanent"),
+                                  (403, "permission_error", "permanent"), (429, "rate_limit_error", "transient"),
+                                  (500, "api_error", "transient")):
+            with self.subTest(status=code):
+                prov = self.provider(("status", code, kind))
+                out = an.Analyst(client=prov.client(), research=False, budget_seconds=5).analyze(STATE, "x", "y")
+                self.assertEqual(fault, out["fault"])
+                self.assertIsNone(out["model"])
+                self.assertEqual(1, len(prov.served), "no retry")
+
+    def test_an_answer_in_time_is_an_analysis(self):
+        prov = self.provider(("fast", RECORDED))
+        out = an.Analyst(client=prov.client(), research=False, budget_seconds=5).analyze(STATE, "x", "y")
+        self.assertEqual(["account", "order"], [o["id"] for o in out["model"]["objects"]])
+        self.assertNotIn("fault", out)
+
+
+class _HangingAnalyst(FakeAnalyst):
+    def __init__(self):
+        super().__init__()
+        self.release, self.finished = threading.Event(), threading.Event()
+
+    def analyze(self, state, text, canvas):
+        if not self.calls:
+            self.calls.append({"text": text})
+            self.release.wait(10)
+            out = super().analyze(state, text, canvas)
+            self.finished.set()
+            return out
+        return super().analyze(state, text, canvas)
+
+
+class AnalyzeSettlesInsideItsBudget(Lane):
+    def model_of(self, sid):
+        state = next(v for v in self.store.data.values() if isinstance(v, dict) and v.get("session_id") == sid)
+        return state.get("model")
+
+    def test_a_trickling_provider_is_a_503_in_time_and_the_next_analysis_lands(self):
+        prov = SlowProvider(("slow", RECORDED, 0.01), ("fast", RECORDED))
+        self.addCleanup(prov.close)
+        analyst = an.Analyst(client=prov.client(), research=False, budget_seconds=0.6)
+        with TestClient(self.make(analyst=analyst)) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/analyze" % sid
+            started = time.monotonic()
+            first = client.post(url, headers=headers, json={"text": "An ordering app for my bakery"})
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertIsNone(self.model_of(sid))
+            second = self.spaced(client, url, headers, {"text": "An ordering app for my bakery"})
+        self.assertEqual(503, first.status_code)
+        self.assertTrue(first.json()["detail"].startswith(an.SLOW_PROBLEM), first.text)
+        self.assertNotIn("not available", first.json()["detail"], "a slow turn does not switch the analyst off")
+        self.assertEqual(200, second.status_code, second.text)
+        self.assertIsNotNone(self.model_of(sid))
+
+    def test_a_permanent_fault_says_not_available(self):
+        prov = SlowProvider(("status", 401, "authentication_error"))
+        self.addCleanup(prov.close)
+        analyst = an.Analyst(client=prov.client(), research=False, budget_seconds=5)
+        with TestClient(self.make(analyst=analyst)) as client:
+            sid, headers = self.session(client)
+            out = client.post("/v1/session/%s/analyze" % sid, headers=headers, json={"text": "x"})
+        self.assertEqual(503, out.status_code)
+        self.assertIn("not available", out.json()["detail"])
+        self.assertEqual(1, len(prov.served))
+
+    def test_a_hanging_analyst_is_abandoned_by_the_route_and_its_late_model_never_lands(self):
+        analyst = _HangingAnalyst()
+        with TestClient(self.make(analyst=analyst, analyze_deadline_seconds=0.4)) as client:
+            sid, headers = self.session(client)
+            url = "/v1/session/%s/analyze" % sid
+            started = time.monotonic()
+            first = client.post(url, headers=headers, json={"text": "x"})
+            self.assertLess(time.monotonic() - started, 1.5)
+            analyst.release.set()
+            self.assertTrue(analyst.finished.wait(5))
+            time.sleep(0.2)
+            self.assertIsNone(self.model_of(sid), "the late model is never committed")
+            second = self.spaced(client, url, headers, {"text": "x"})
+        self.assertEqual(503, first.status_code)
+        self.assertEqual("the analyst could not finish in time", first.json()["detail"])
+        self.assertEqual(200, second.status_code, second.text)
+
+    def test_the_route_deadline_stays_under_cloud_run(self):
+        for bad in (0, 60, 75.0, "40"):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                settings(analyze_deadline_seconds=bad).validate()
+        settings(analyze_deadline_seconds=40.0).validate()
+
+
+class AnalystAborts(unittest.TestCase):
+    def test_the_analyst_passes_its_abort_as_the_cancel(self):
+        aborted = []
+        real = an.bounded.abortable
+
+        def spying(client):
+            call = real(client)
+            inner = call.abort
+            call.abort = lambda: (aborted.append(1), inner())
+            return call
+        prov = SlowProvider(("slow", RECORDED, 0.01))
+        self.addCleanup(prov.close)
+        an.bounded.abortable = spying
+        try:
+            out = an.Analyst(client=prov.client(), research=False, budget_seconds=0.4).analyze(STATE, "x", "y")
+        finally:
+            an.bounded.abortable = real
+        self.assertEqual([1], aborted)
+        self.assertEqual("transient", out["fault"])
 
 
 if __name__ == "__main__":

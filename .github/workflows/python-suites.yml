@@ -80,6 +80,7 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/studio_slow_provider.py"
       - "tests/test_studio_governance.py"
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
@@ -185,6 +186,7 @@ on:
       - "apps-script/studio-email-sender/**"
       - "cloud/studio-controller/**"
       - "tests/test_studio_claude_worker.py"
+      - "tests/studio_slow_provider.py"
       - "tests/test_studio_governance.py"
       - "tests/test_studio_analyst.py"
       - "tests/test_studio_voices.py"
@@ -738,12 +740,15 @@ jobs:
         # including the anthropic SDK that STUDIO_WORKER=claude imports.
         run: python3 -m pip install -r cloud/studio-controller/requirements.txt
 
+      # Loopback only: the deadline tests serve the real SDK a trickling body on
+      # 127.0.0.1 (tests/studio_slow_provider.py). A new namespace starts with lo
+      # down and no other interface, so nothing can route out.
       - name: "studio controller: CAS, idempotency, replay and auth (no network)"
         run: |
           set -euo pipefail
           if [ -f tests/test_studio_controller.py ] && [ -f tests/test_studio_auth.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest \
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$@"' sh "$python_bin" -m unittest \
               tests.test_studio_auth tests.test_studio_controller tests.test_studio_lead_facts \
               tests.test_studio_lead_deadline tests.test_studio_metadata_contract \
               tests.test_studio_voice_sweep_job tests.test_studio_analyst tests.test_studio_voices \
@@ -800,13 +805,15 @@ jobs:
           fi
 
       # The studio's Claude worker: model output is data, checked before it can
-      # reach a visitor. A fake client drives it; no network, no key, no SDK import.
+      # reach a visitor. Fake clients drive the gate; the deadline tests drive the
+      # real SDK against a loopback provider (lo only - no route out, no key).
       - name: "studio Claude worker: model output gated before the page (no network)"
         run: |
           set -euo pipefail
           if [ -f tests/test_studio_claude_worker.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
+            sudo unshare -n -- sh -c 'ip link set lo up && exec "$@"' sh \
+              "$python_bin" -m unittest tests.test_studio_claude_worker tests.test_studio_org_facts
           else
             echo "not on this branch; skipping"
           fi

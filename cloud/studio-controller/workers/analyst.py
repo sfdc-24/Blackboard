@@ -37,9 +37,22 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
     _spec.loader.exec_module(_policy)
     USE_POLICY = _policy.USE_POLICY
 
+try:  # the app and the image import this module as part of the workers package
+    from workers import bounded
+except ImportError:  # loaded from its file (tests): read the sibling bounded.py the same way
+    import importlib.util as _bounded_util
+    _bounded_spec = _bounded_util.spec_from_file_location(
+        "studio_bounded", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bounded.py"))
+    bounded = _bounded_util.module_from_spec(_bounded_spec)
+    _bounded_spec.loader.exec_module(bounded)
+
 MODEL = os.environ.get("STUDIO_ANALYST_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_ANALYST_EFFORT") or "low"
-TIMEOUT_SECONDS = 40.0
+# A total budget by the monotonic clock, not the SDK's per-read timeout
+# (workers/bounded.py): the owner's run lost an analysis to a 504 at 60.0 s.
+BUDGET_SECONDS = 35.0
+SLOW_PROBLEM = "the analyst could not finish in time"
+BLOCKED_PROBLEM = "the analyst cannot answer this request"
 RESEARCH = (os.environ.get("STUDIO_ANALYST_RESEARCH") or "1") == "1"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 TEXT_MAX = 300
@@ -199,27 +212,40 @@ def validate(raw: dict) -> tuple[dict, dict | None, list]:
 
 
 class Analyst:
-    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT, research: bool = RESEARCH):
+    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT, research: bool = RESEARCH,
+                 budget_seconds: float = BUDGET_SECONDS):
         if client is None:
             import anthropic  # the official SDK; ANTHROPIC_API_KEY from Secret Manager
-            # 60 s was Cloud Run's own request timeout: the owner's run lost an
-            # analysis to a 504 at exactly 60.0 s. Give up inside the request.
-            client = anthropic.Anthropic(timeout=TIMEOUT_SECONDS, max_retries=0)
+            client = anthropic.Anthropic(timeout=budget_seconds, max_retries=0)
         self.client, self.model, self.effort, self.research = client, model, effort, research
+        self.budget_seconds = budget_seconds
 
     def analyze(self, state: dict, text: str, canvas: str) -> dict:
         tools = [RECORD_TOOL]
         if self.research:
             tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 2}, RECORD_TOOL]
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            system=SYSTEM,
-            output_config={"effort": self.effort},
-            tools=tools,
-            tool_choice={"type": "auto"},
-            messages=[{"role": "user", "content": _describe(state, text, canvas)}],
-        )
+        prompt = _describe(state, text, canvas)
+        call = bounded.abortable(self.client)
+        try:
+            resp = bounded.run_within(self.budget_seconds, lambda: call.client.messages.create(
+                model=self.model,
+                max_tokens=8000,
+                system=SYSTEM,
+                output_config={"effort": self.effort},
+                tools=tools,
+                tool_choice={"type": "auto"},
+                messages=[{"role": "user", "content": prompt}],
+            ), cancel=call.abort)
+        except Exception as exc:
+            fault = bounded.classify(exc)
+            if fault is None:
+                raise
+            said = BLOCKED_PROBLEM if fault == "permanent" else SLOW_PROBLEM
+            code = getattr(exc, "status_code", None)
+            cause = "%s %s" % (type(exc).__name__, code) if code else type(exc).__name__
+            return {"model": None, "question": None, "problems": ["%s (%s)" % (said, cause)], "fault": fault}
+        finally:
+            call.close()
         call = next((b for b in resp.content if getattr(b, "type", "") == "tool_use"
                      and getattr(b, "name", "") == "record_analysis"), None)
         if call is None:

@@ -674,8 +674,8 @@ class BoundedAndFilled(unittest.TestCase):
             else:
                 sys.modules.pop("anthropic", None)
         self.assertEqual(0, seen.get("max_retries"))
-        self.assertLessEqual(seen.get("timeout"), 45)
-        self.assertEqual(cw.BUILD_TIMEOUT_SECONDS, seen.get("timeout"))
+        self.assertEqual(cw.BUILD_BUDGET_SECONDS, seen.get("timeout"))
+        self.assertLessEqual(cw.BUILD_BUDGET_SECONDS, 35)
 
     def test_a_turn_asks_for_no_more_than_fits_the_deadline(self):
         _, client = run({"ops": [], "confirm": "", "questions": [], "batch_title": ""})
@@ -772,6 +772,193 @@ class BoundedAndFilled(unittest.TestCase):
         out, _ = run(draft)
         self.assertEqual(["section 'sec-empty' was added with nothing in it"], out["problems"])
         self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+
+
+# --- Codex NO-GO on #272 at 8a9349e: a total budget, a real cancel, honest faults ---
+import time  # noqa: E402
+
+_slow_spec = importlib.util.spec_from_file_location("studio_slow_provider", REPO / "tests" / "studio_slow_provider.py")
+slow = importlib.util.module_from_spec(_slow_spec)
+_slow_spec.loader.exec_module(slow)
+bounded = cw.bounded
+LATE = {"ops": [{"op": "set_label", "node_id": "hero-cta", "value": "LATE LABEL", "new_node": BLANK}],
+        "confirm": "Changed the action.", "questions": [], "batch_title": "",
+        "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""}}
+STATE = {"artifact": ROOT, "questions": [], "transcript": [], "session_id": "s1", "turn_seq": 3}
+SAY = {"kind": "utterance", "text": "make the main action booking"}
+
+
+class RunWithin(unittest.TestCase):
+    def test_an_answer_inside_the_budget_is_returned(self):
+        self.assertEqual(7, bounded.run_within(1.0, lambda: 7))
+
+    def test_a_failure_inside_the_budget_is_raised_as_itself(self):
+        with self.assertRaises(KeyError):
+            bounded.run_within(1.0, lambda: {}["x"])
+
+    def test_at_the_budget_the_caller_is_free_the_call_is_cancelled_and_its_result_never_read(self):
+        release, finished, cancels = __import__("threading").Event(), __import__("threading").Event(), []
+
+        def late():
+            release.wait(5)
+            finished.set()
+            return "late"
+        started = time.monotonic()
+        with self.assertRaises(bounded.DeadlineExceeded):
+            bounded.run_within(0.3, late, cancel=lambda: cancels.append(1))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual([1], cancels)
+        release.set()
+        self.assertTrue(finished.wait(5))            # it did finish - and nothing read it
+
+    def test_faults_are_sorted_into_transient_permanent_and_bugs(self):
+        self.assertEqual("transient", bounded.classify(bounded.DeadlineExceeded()))
+        self.assertEqual("transient", bounded.classify(TimeoutError()))
+        self.assertEqual("transient", bounded.classify(ConnectionResetError()))
+        self.assertIsNone(bounded.classify(KeyError("bug")))
+        self.assertIsNone(bounded.classify(ValueError("bug")))
+
+
+class ThroughTheRealSdk(unittest.TestCase):
+    """The installed SDK against a loopback provider, as Codex probed it."""
+
+    def provider(self, *replies):
+        prov = slow.SlowProvider(*replies)
+        self.addCleanup(prov.close)
+        return prov
+
+    def test_a_trickling_body_is_abandoned_at_the_budget_and_its_socket_shut(self):
+        prov = self.provider(("slow", slow.message(json.dumps(LATE)), 0.01))
+        worker = cw.ClaudeWorker(client=prov.client(), budget_seconds=0.6)
+        started = time.monotonic()
+        out = worker.on_turn(STATE, SAY)
+        self.assertLess(time.monotonic() - started, 1.5, "the turn ends at its budget, not at the body's end")
+        self.assertEqual([], out["events"])
+        self.assertTrue(out["problems"][0].startswith(cw.SLOW_BUILD_PROBLEM), out["problems"])
+        record = prov.wait_settled(0)
+        self.assertIn("dropped", record, "the provider's connection was shut, not left to run")
+        self.assertNotIn("complete", record)
+        self.assertLess(record["dropped"], 3.0)
+        self.assertEqual(1, len(prov.served), "no retry")
+
+    def test_the_same_answer_in_time_builds(self):
+        prov = self.provider(("fast", slow.message(json.dumps(LATE))))
+        out = cw.ClaudeWorker(client=prov.client(), budget_seconds=5).on_turn(STATE, SAY)
+        self.assertEqual([], out["problems"])
+        self.assertEqual("LATE LABEL", out["events"][0]["payload"]["ops"][0]["value"])
+
+    def test_each_provider_status_is_transient_or_permanent_and_never_retried(self):
+        cases = [(400, "invalid_request_error", cw.BLOCKED_BUILD_PROBLEM),
+                 (401, "authentication_error", cw.BLOCKED_BUILD_PROBLEM),
+                 (403, "permission_error", cw.BLOCKED_BUILD_PROBLEM),
+                 (404, "not_found_error", cw.BLOCKED_BUILD_PROBLEM),
+                 (408, "timeout_error", cw.SLOW_BUILD_PROBLEM),
+                 (429, "rate_limit_error", cw.SLOW_BUILD_PROBLEM),
+                 (500, "api_error", cw.SLOW_BUILD_PROBLEM),
+                 (529, "overloaded_error", cw.SLOW_BUILD_PROBLEM)]
+        for code, kind, said in cases:
+            with self.subTest(status=code):
+                prov = self.provider(("status", code, kind))
+                out = cw.ClaudeWorker(client=prov.client(), budget_seconds=5).on_turn(STATE, SAY)
+                self.assertEqual([], out["events"])
+                self.assertEqual(1, len(out["problems"]))
+                self.assertTrue(out["problems"][0].startswith(said + " ("), out["problems"])
+                self.assertIn(str(code), out["problems"][0])
+                self.assertEqual(1, len(prov.served), "no retry")
+
+    def test_a_refusal_is_permanent(self):
+        out, _ = run({"ops": [], "confirm": "", "questions": [], "batch_title": ""}, stop="refusal")
+        self.assertEqual([], out["events"])
+        self.assertTrue(out["problems"][0].startswith(cw.BLOCKED_BUILD_PROBLEM), out["problems"])
+
+
+class EmptyContainersThatAreGone(unittest.TestCase):
+    def test_a_section_inserted_then_removed_is_not_reported_empty(self):
+        draft = {"ops": [{"op": "insert_child", "node_id": "screen-home", "value": "",
+                          "new_node": {"id": "sec-tmp", "kind": "section", "label": "Draft", "detail": ""}},
+                         {"op": "remove", "node_id": "sec-tmp", "value": "", "new_node": BLANK}],
+                 "confirm": "Tried a section and took it out.", "questions": [], "batch_title": ""}
+        out, _ = run(draft)
+        self.assertEqual([], out["problems"])
+
+
+class TheAbortItself(unittest.TestCase):
+    """abort() alone - before any close - ends a read another thread is blocked in."""
+
+    def test_abort_shuts_the_providers_connection_without_a_close(self):
+        prov = slow.SlowProvider(("slow", slow.message(json.dumps(LATE)), 0.01))
+        self.addCleanup(prov.close)
+        call = bounded.abortable(prov.client())
+        with self.assertRaises(bounded.DeadlineExceeded):
+            bounded.run_within(0.4, lambda: call.client.messages.create(
+                model="m", max_tokens=5, messages=[{"role": "user", "content": "x"}]), cancel=call.abort)
+        record = prov.wait_settled(0, seconds=3.0)
+        call.close()
+        self.assertIn("dropped", record, "abort, not close, ended the read")
+
+    def _pair(self):
+        import socket
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        b.settimeout(2.0)
+        return a, b
+
+    def test_the_upgraded_stream_is_the_one_shut(self):
+        raw_near, raw_far = self._pair()
+        tls_near, tls_far = self._pair()
+
+        class Stream:
+            def __init__(self, sock, upgraded=None):
+                self.sock, self.upgraded = sock, upgraded
+
+            def get_extra_info(self, info):
+                return self.sock if info == "socket" else None
+
+            def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+                return self.upgraded
+
+        backend = bounded._Backend()
+        backend._inner = SimpleNamespace(connect_tcp=lambda *a: Stream(raw_near, Stream(tls_near)))
+        stream = backend.connect_tcp("api.example", 443)
+        stream.start_tls(None, "api.example")
+        backend.abort()
+        self.assertEqual(b"", tls_far.recv(1), "the TLS stream's socket is shut down")
+        self.assertEqual(b"", raw_far.recv(1))
+
+    def test_a_connection_opened_after_the_abort_is_shut_at_once(self):
+        near, far = self._pair()
+        backend = bounded._Backend()
+        backend._inner = SimpleNamespace(connect_tcp=lambda *a: SimpleNamespace(
+            get_extra_info=lambda info: near if info == "socket" else None))
+        backend.abort()
+        backend.connect_tcp("api.example", 443)
+        self.assertEqual(b"", far.recv(1))
+
+    def test_a_provider_that_cannot_be_reached_is_transient(self):
+        prov = slow.SlowProvider(("fast", slow.message("{}")))
+        client = prov.client()
+        prov.close()                                   # nothing listens there now
+        out = cw.ClaudeWorker(client=client, budget_seconds=5).on_turn(STATE, SAY)
+        self.assertTrue(out["problems"][0].startswith(cw.SLOW_BUILD_PROBLEM), out["problems"])
+
+    def test_the_builder_passes_its_abort_as_the_cancel(self):
+        aborted = []
+        real = bounded.abortable
+
+        def spying(client):
+            call = real(client)
+            inner = call.abort
+            call.abort = lambda: (aborted.append(1), inner())
+            return call
+        prov = slow.SlowProvider(("slow", slow.message(json.dumps(LATE)), 0.01))
+        self.addCleanup(prov.close)
+        bounded.abortable = spying
+        try:
+            cw.ClaudeWorker(client=prov.client(), budget_seconds=0.4).on_turn(STATE, SAY)
+        finally:
+            bounded.abortable = real
+        self.assertEqual([1], aborted)
 
 
 if __name__ == "__main__":

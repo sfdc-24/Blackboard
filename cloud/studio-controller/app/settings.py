@@ -65,6 +65,9 @@ class Settings:
     recap_cap: int = 6
     architect_voice: str = "cedar"
     analyze_cap: int = 30
+    # /analyze gives up here whatever the analyst is doing: under Cloud Run's
+    # 60 s request timeout, above the analyst's own 35 s budget.
+    analyze_deadline_seconds: float = 40.0
     # The use-policy gate (app/governance.py). Off unless constructed on; the
     # environment turns it ON by default, so a deploy never ships without it.
     moderation_enabled: bool = False
@@ -130,6 +133,9 @@ class Settings:
         return bool(os.environ.get("K_SERVICE"))
 
     def validate(self) -> None:
+        if type(self.analyze_deadline_seconds) not in (int, float) \
+                or not 0 < self.analyze_deadline_seconds < 60:
+            raise RuntimeError("analyze_deadline_seconds must be above 0 and under Cloud Run's 60")
         if self.lead_facts_enabled and (
             type(self.lead_facts_timeout_seconds) not in (int, float)
             or not math.isfinite(self.lead_facts_timeout_seconds)

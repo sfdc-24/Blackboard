@@ -26,9 +26,13 @@ Model: claude-opus-5 at low effort - this runs inside a spoken conversation,
 so latency matters more than depth. Server-side refusal fallback is on.
 
 BOUNDED. A turn finishes, or gives up, well inside Cloud Run's 60 s request
-timeout: a 40 s client deadline with no retries and a 4000-token cap. A
-timeout or provider error is a turn that built nothing and says so, never a
-crash - so the command completes and the next one is accepted at once.
+timeout: a 35 s total budget by the monotonic clock (workers/bounded.py - the
+SDK's own timeout is per read, and a trickling body never trips it), no
+retries and a 4000-token cap. At the budget the provider's socket is shut
+down and anything it returns later is never read. A transient fault (the
+deadline, a dropped connection, 429, 5xx) and a permanent one (400, 401, 403,
+a refusal) are each a turn that built nothing and says which, never a crash -
+so the command completes and the next one is accepted at once.
 """
 from __future__ import annotations
 
@@ -47,6 +51,15 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
     _spec.loader.exec_module(_policy)
     USE_POLICY = _policy.USE_POLICY
 
+try:  # the app and the image import this module as part of the workers package
+    from workers import bounded
+except ImportError:  # loaded from its file (tests): read the sibling bounded.py the same way
+    import importlib.util as _bounded_util
+    _bounded_spec = _bounded_util.spec_from_file_location(
+        "studio_bounded", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bounded.py"))
+    bounded = _bounded_util.module_from_spec(_bounded_spec)
+    _bounded_spec.loader.exec_module(bounded)
+
 MODEL = os.environ.get("STUDIO_WORKER_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_WORKER_EFFORT") or "low"
 # The owner's live run (2026-09-26 01:04Z): one turn wrote to the old
@@ -54,9 +67,11 @@ EFFORT = os.environ.get("STUDIO_WORKER_EFFORT") or "low"
 # kept its command slot, and the next five builds were refused for over a
 # minute while the architect said nothing. The largest real turn so far (a
 # 26-node first version) is about 1500 tokens.
-BUILD_TIMEOUT_SECONDS = 40.0
+BUILD_BUDGET_SECONDS = 35.0
 MAX_TOKENS = 4000
+# The controller words these for the visitor (app/core.py); keep them in step.
 SLOW_BUILD_PROBLEM = "the architect could not finish that build"
+BLOCKED_BUILD_PROBLEM = "the architect cannot build that request"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 TEXT_MAX = 600
 MAX_CHILDREN = 60
@@ -560,7 +575,7 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     for op in ops_out:
         node = op.get("node") or {}
         if op["op"] == "insert_child" and node.get("kind") in ("section", "list", "form") \
-                and not (index.get(node["id"]) or {}).get("children"):
+                and node["id"] in index and not index[node["id"]].get("children"):
             problems.append("%s %r was added with nothing in it" % (node["kind"], node["id"]))
 
     # -- questions, fenced and capped, against the tree as it will be
@@ -726,15 +741,9 @@ def _describe(state: dict, trigger: dict) -> str:
     return "\n".join(lines)
 
 
-def _provider_failure(exc) -> bool:
-    """A timeout, a dropped connection or a provider error status."""
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-    try:
-        import anthropic
-    except ImportError:
-        return False
-    return isinstance(exc, anthropic.APIError)
+def _cause(exc) -> str:
+    code = getattr(exc, "status_code", None)
+    return "%s %s" % (type(exc).__name__, code) if code else type(exc).__name__
 
 
 class ClaudeWorker:
@@ -749,15 +758,19 @@ class ClaudeWorker:
               answered an open question; the controller then emits question.answered.
     """
 
-    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT):
+    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT,
+                 budget_seconds: float = BUILD_BUDGET_SECONDS):
         if client is None:
             import anthropic  # the official SDK; ANTHROPIC_API_KEY from Secret Manager
-            client = anthropic.Anthropic(timeout=BUILD_TIMEOUT_SECONDS, max_retries=0)
+            client = anthropic.Anthropic(timeout=budget_seconds, max_retries=0)
         self.client, self.model, self.effort = client, model, effort
+        self.budget_seconds = budget_seconds
 
     def on_turn(self, state: dict, trigger: dict) -> dict:
+        prompt = _describe(state, trigger)
+        call = bounded.abortable(self.client)
         try:
-            resp = self.client.beta.messages.create(
+            resp = bounded.run_within(self.budget_seconds, lambda: call.client.beta.messages.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
                 betas=["server-side-fallback-2026-07-01"],
@@ -765,15 +778,19 @@ class ClaudeWorker:
                 system=SYSTEM,
                 output_config={"effort": self.effort,
                                "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-                messages=[{"role": "user", "content": _describe(state, trigger)}],
-            )
+                messages=[{"role": "user", "content": prompt}],
+            ), cancel=call.abort)
         except Exception as exc:
-            if not _provider_failure(exc):
+            fault = bounded.classify(exc)
+            if fault is None:
                 raise
-            # Nothing was built; the command completes and says so (core.py).
-            return {"events": [], "problems": ["%s (%s)" % (SLOW_BUILD_PROBLEM, type(exc).__name__)]}
+            # Nothing was built; the command completes and says which (core.py).
+            said = BLOCKED_BUILD_PROBLEM if fault == "permanent" else SLOW_BUILD_PROBLEM
+            return {"events": [], "problems": ["%s (%s)" % (said, _cause(exc))]}
+        finally:
+            call.close()
         if resp.stop_reason == "refusal":
-            return {"events": [], "problems": ["model refused this turn"]}
+            return {"events": [], "problems": ["%s (the model declined it)" % BLOCKED_BUILD_PROBLEM]}
         if resp.stop_reason == "max_tokens":
             return {"events": [], "problems": ["model output truncated"]}
         text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
