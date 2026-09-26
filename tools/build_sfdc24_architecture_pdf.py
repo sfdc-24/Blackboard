@@ -38,7 +38,7 @@ from reportlab.platypus import Paragraph
 
 ROOT = Path(__file__).resolve().parents[1]
 ADR = ROOT / "docs" / "ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
-OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260926-2.pdf"
 PAGE_W, PAGE_H = landscape(TABLOID)
 
 CONTRACT_START = "<!-- architecture-pdf-contract:start -->"
@@ -267,7 +267,8 @@ def REVIEW(key: str) -> str:
         raise RuntimeError("PDF renders a review the ADR does not list: " + key)
     USED["reviews"].add(key)
     r = REVIEWS[key]
-    return "%s at %s: %s. %s" % (r["subject"], r["head"], VERDICT_WORDS[r["verdict"]], r["note"])
+    text = "%s at %s: %s." % (r["subject"], r["head"], VERDICT_WORDS[r["verdict"]])
+    return text if r["note"] == "-" else text + " " + r["note"]
 
 
 def REVIEW_SHORT(key: str) -> str:
@@ -580,7 +581,7 @@ def draw_current(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - current operating architecture",
-        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what was run, and what is still held",
+        f"Evidence cutoff {CONTRACT['facts_refreshed_iso']}: facts and verdicts as of that instant; later verdicts are not reflected",
         "CURRENT STATE",
     )
     principle_strip(c, [
@@ -714,7 +715,7 @@ def draw_current(c: canvas.Canvas) -> None:
     box(c, 272, 76, 303, 144,
         "Exact-head verdicts on open work",
         " ".join(REVIEW(k) for k in ("r.pr272", "r.pr272b", "r.r5d", "r.site223", "r.site224",
-                                     "r.site222a", "r.site222b")),
+                                     "r.site224b", "r.site222a", "r.site222b")),
         REVIEW_SOFT, ORANGE, "NO-GO", 8.5, 5.95)
     box(c, 590, 76, 245, 144,
         "Held, and dark source",
@@ -762,7 +763,7 @@ def draw_current(c: canvas.Canvas) -> None:
 
     footer(
         c, 1,
-        f"Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited | Facts refreshed {CONTRACT['facts_refreshed_label']}",
+        f"Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited | Evidence cutoff {CONTRACT['facts_refreshed_iso']}",
         "Transport proof is not human-heard end-to-end acceptance.",
     )
     c.showPage()
@@ -772,7 +773,7 @@ def draw_future(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - future governed minibus architecture",
-        f"Evidence-bound through {CONTRACT['facts_refreshed_label']}: each component's status now, the ADR pass condition that promotes it, and its gate",
+        f"Evidence cutoff {CONTRACT['facts_refreshed_iso']}: each component's status then, the ADR pass condition that promotes it, and its gate",
         "FUTURE STATE",
     )
     principle_strip(c, [
@@ -840,9 +841,9 @@ def draw_future(c: canvas.Canvas) -> None:
     c.setStrokeColor(ORANGE)
     c.setLineWidth(1.0)
     for x in (285, 460):
-        c.line(x, 210, x, 204)
+        c.line(x, 214, x, 209)
     c.restoreState()
-    ortho_arrow(c, [(115, 210), (115, 204), (770, 204), (770, 210)],
+    ortho_arrow(c, [(115, 214), (115, 209), (770, 209), (770, 214)],
                 ORANGE, 1.0)
 
     # Blackboard motherboard.
@@ -875,20 +876,20 @@ def draw_future(c: canvas.Canvas) -> None:
     comp_box("c.outbox", 520, 325, 316, 62, ORANGE_SOFT, ORANGE, 8.2)
 
     # Sibling minibuses and the commercial plane.
-    comp_box("c.converspan", 50, 210, 150, 66, PURPLE_SOFT, PURPLE)
-    comp_box("c.nav", 210, 210, 175, 66, GREEN_SOFT, GREEN)
-    comp_box("c.clients", 395, 210, 150, 66, BLUE_SOFT, BLUE)
-    comp_box("c.charter", 555, 210, 135, 66, GRAY_SOFT, INK)
-    comp_box("c.sf", 700, 210, 140, 66, ORANGE_SOFT, ORANGE)
+    comp_box("c.converspan", 50, 214, 150, 62, PURPLE_SOFT, PURPLE)
+    comp_box("c.nav", 210, 214, 175, 62, GREEN_SOFT, GREEN)
+    comp_box("c.clients", 395, 214, 150, 62, BLUE_SOFT, BLUE)
+    comp_box("c.charter", 555, 214, 135, 62, GRAY_SOFT, INK)
+    comp_box("c.sf", 700, 214, 140, 62, ORANGE_SOFT, ORANGE)
 
     # Proof and sequence band, in page 1's style.
     proven = (CLAIM("p2.proven_main") + " " + REVIEW_SHORT("r.site216") + "; "
               + REVIEW_SHORT("r.site221") + ". " + CLAIM("p2.proven_rest"))
-    box(c, 50, 76, 200, 122, "Proven toward the future", proven,
+    box(c, 50, 74, 150, 129, "Proven toward the future", proven,
         GREEN_SOFT, GREEN, "PARTIAL", 8.5, 5.95)
-    box(c, 262, 76, 250, 122, "Next promotions, in order", CLAIM("p2.order"),
+    box(c, 210, 74, 200, 129, "Next promotions, in order", CLAIM("p2.order"),
         BLUE_SOFT, BLUE, "TARGET", 8.5, 5.95)
-    box(c, 524, 76, 316, 122, "Converspan launch gate", CLAIM("p2.gate"),
+    box(c, 420, 74, 420, 129, "Converspan launch gate", CLAIM("p2.gate"),
         RED_SOFT, RED, "HELD", 8.5, 5.9)
 
     connector_label(c, 445, 583, "SFDC24 lease + config", BLUE)
@@ -905,7 +906,7 @@ def draw_future(c: canvas.Canvas) -> None:
     connector_label(c, 790, 482, "speak / share / teardown", PURPLE)
     connector_label(c, 650, 494, "send + receipt", GREEN)
     connector_label(c, 770, 306, "SFDC24 authorized facts", ORANGE)
-    connector_label(c, 455, 204, "client facts + entitlements", ORANGE)
+    connector_label(c, 455, 209, "client facts + entitlements", ORANGE)
 
     # Promotion ledger: every component, the ADR pass condition that promotes
     # it, and its gate.
@@ -932,7 +933,7 @@ def draw_future(c: canvas.Canvas) -> None:
 
     footer(
         c, 2,
-        "Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited",
+        f"Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited | Evidence cutoff {CONTRACT['facts_refreshed_iso']}",
         "TARGET is selected architecture, not a deployment or acceptance claim.",
     )
     c.showPage()
