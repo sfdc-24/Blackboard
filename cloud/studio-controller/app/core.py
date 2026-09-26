@@ -12,11 +12,25 @@ import uuid
 
 from .state import SessionNotFound, StateConflict, StudioRepository
 from .artifacts import apply_ops
+from workers.bounded import DeadlineExceeded, run_within
 from . import metadata_contract as metadata
 
 # Said when the builder refused every op of a spoken change.
 REFUSED_CHANGE_TEXT = "That change did not go through. Say it once more, a little differently, " \
                       "and I will build it."
+# What the builder reports when the provider did not build (workers/claude_worker.py),
+# and what the visitor hears. Transient - the deadline, a dropped connection,
+# 429, 5xx - may work in a moment. Permanent - 400, 401, 403, a refusal - will
+# not work by asking again, so the visitor is not asked to.
+SLOW_BUILD_PROBLEM = "the architect could not finish that build"
+BLOCKED_BUILD_PROBLEM = "the architect cannot build that request"
+SLOW_BUILD_TEXT = "The architect could not finish that build, so nothing changed yet. " \
+                  "Say it again in a moment and I will build it."
+BLOCKED_BUILD_TEXT = "The architect could not build that, and saying it again will not change it. " \
+                     "Nothing changed; the host is still listening."
+# Any worker, however it hangs, is abandoned here - under Cloud Run's 60 s and
+# above the builder's own 35 s budget, which normally fires first.
+WORKER_BUDGET_SECONDS = 40.0
 
 
 class CommandError(ValueError):
@@ -161,6 +175,7 @@ class StudioController:
                  id_factory=None, max_seconds: int = 600, daily_cap: int = 20,
                  max_events: int = 200, max_commands: int = 100,
                  inflight_lease_seconds: int = 90, metadata_proposals_enabled: bool = False,
+                 worker_budget_seconds: float = WORKER_BUDGET_SECONDS,
                  metadata_org_id: str = ""):
         self.repository = repository
         self.worker = worker
@@ -182,6 +197,7 @@ class StudioController:
         self.recovery_attempts = 40
         self.recoveries: list = []
         self.outcome_write_attempts = 4
+        self.worker_budget_seconds = worker_budget_seconds
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
 
@@ -1243,7 +1259,15 @@ class StudioController:
 
         problems = []
         if trigger is not None:
-            worker_result = self.worker.on_turn(copy.deepcopy(state), trigger)
+            snapshot = copy.deepcopy(state)
+            try:
+                # The worker runs where it can be abandoned: at the budget the
+                # command settles as a turn that built nothing, and whatever the
+                # worker returns later is never read (Codex NO-GO on #272).
+                worker_result = run_within(self.worker_budget_seconds,
+                                           lambda: self.worker.on_turn(snapshot, trigger))
+            except DeadlineExceeded:
+                worker_result = {"events": [], "problems": [SLOW_BUILD_PROBLEM + " (controller deadline)"]}
             problems = list(worker_result.get("problems") or [])
             # A spoken turn can answer the open question ("book a call, then").
             # The worker only NAMES the answer; the controller owns the record,
@@ -1309,8 +1333,14 @@ class StudioController:
                 # silence after "on it" reads as the canvas ignoring you (live
                 # session 2026-09-25, four logo changes, no word back).
                 emit_answers()
+                said = REFUSED_CHANGE_TEXT
+                if any(str(p).startswith(BLOCKED_BUILD_PROBLEM) for p in problems):
+                    said = BLOCKED_BUILD_TEXT
+                elif any(str(p).startswith(SLOW_BUILD_PROBLEM) for p in problems):
+                    said = SLOW_BUILD_TEXT
                 events.append(self._event(state, "confirm", {
-                    "text": REFUSED_CHANGE_TEXT, "artifact_ids": [state["artifact"]["id"]],
+                    "text": said,
+                    "artifact_ids": [state["artifact"]["id"]],
                 }))
             emit_answers()
 

@@ -681,6 +681,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     analyze_last: dict = {}
     analyze_busy: set = set()
     ANALYZE_SPACING_SECONDS = 3.0
+    # The route's own backstop: under Cloud Run's 60 s and above the analyst's
+    # 35 s budget (workers/analyst.py), which normally fires first. A result
+    # after it is never committed (Codex NO-GO on #272).
+    ANALYZE_DEADLINE_SECONDS = settings.analyze_deadline_seconds
 
     def analyst_ready() -> bool:
         return analyst is not None or settings.worker == "claude"
@@ -1948,10 +1952,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             analyze_busy.add(session_id)
         try:
             try:
-                result = await asyncio.to_thread(
-                    analyst_lane().analyze, state, text.strip(), with_topic(state, canvas_summary(state.get("artifact"))))
+                result = await asyncio.wait_for(asyncio.to_thread(
+                    analyst_lane().analyze, state, text.strip(), with_topic(state, canvas_summary(state.get("artifact")))),
+                    ANALYZE_DEADLINE_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(503, "the analyst could not finish in time") from exc
             except Exception as exc:  # the builder and the talk lane carry on without it
                 raise HTTPException(503, "the analyst is unavailable right now") from exc
+            if result.get("fault") == "permanent":
+                # Asking again will not help: "not available" tells the page to
+                # stop calling the analyst for this session.
+                raise HTTPException(503, ("the analyst is not available: " + "; ".join(result.get("problems") or []))[:300])
             if not result.get("model"):
                 raise HTTPException(503, "; ".join(result.get("problems") or ["no analysis"])[:300])
             try:

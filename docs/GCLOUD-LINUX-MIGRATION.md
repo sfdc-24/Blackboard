@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it replicates the Azure VM, which was dropped on 2026-09-24; line 61 also carries a wrong BUS_URL. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # GCloud Linux Migration Playbook — Blackboard Development Environment
 
 **Prepared for:** Claude (claude-code-cli) leading autonomous setup  

@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: Foundry is excluded from the architecture (ADR, 2026-09-25). Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # Microsoft Foundry worker contract
 
 Status: governed seam version 1; the model-deployment path was live-canary

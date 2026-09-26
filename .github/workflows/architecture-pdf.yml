@@ -8,6 +8,8 @@ on:
       - "docs/ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
   push:
@@ -18,6 +20,8 @@ on:
       - "docs/ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
 
@@ -72,12 +76,48 @@ jobs:
           else:
               raise SystemExit("contract-contained phrases satisfied ADR prose anchors")
           PY
-      - name: Validate the ADR contract and rebuild the artifact twice, byte for byte
+      - name: Reject contradictory architecture records
+        shell: bash
+        run: |
+          python - <<'PY'
+          import copy
+          import runpy
+
+          ns = runpy.run_path("tools/build_sfdc24_architecture_pdf.py")
+          reviews, components = ns["REVIEWS"], ns["COMPONENTS"]
+          validate, load = ns["validate_records"], ns["load_records"]
+          adr = ns["ADR"].read_text(encoding="utf-8")
+
+          def must_fail(label, fn):
+              try:
+                  fn()
+              except RuntimeError:
+                  return
+              raise SystemExit("accepted a contradictory architecture record: " + label)
+
+          live = copy.deepcopy(components)
+          live["c.web"]["status"] = "LIVE"          # depends on a NO-GO review
+          must_fail("LIVE over a NO-GO review", lambda: validate(reviews, live))
+          unknown = copy.deepcopy(components)
+          unknown["c.web"]["depends"].append("c.nowhere")
+          must_fail("unknown dependency", lambda: validate(reviews, unknown))
+          cycle = copy.deepcopy(components)
+          cycle["c.controller"]["depends"].append("c.charter")
+          must_fail("dependency cycle", lambda: validate(reviews, cycle))
+          twice = copy.deepcopy(reviews)
+          twice["r.dup"] = dict(twice["r.pr272"], verdict="PENDING")
+          must_fail("two verdicts for one head", lambda: validate(twice, components))
+          must_fail("verdict stated in free text",
+                    lambda: load(adr.replace("- `p1.prod` R5b serves 100%", "- `p1.prod` #272 pending; R5b serves 100%", 1)))
+          PY
+      - name: The 2026-09-25 edition stays pinned as a historical artifact
+        run: sha256sum --check docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256
+      - name: Validate the ADR contract and rebuild the current edition twice, byte for byte
         shell: bash
         run: |
           set -euo pipefail
-          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
-          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
           sha256sum --check "$attestation"
           cp "$artifact" /tmp/committed.pdf
           python tools/build_sfdc24_architecture_pdf.py

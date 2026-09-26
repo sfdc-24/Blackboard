@@ -1,9 +1,20 @@
 """Build the two-page SFDC24 / Blackboard architecture brief.
 
-The PDF is deliberately evidence-aware: LIVE, PARTIAL, HELD, and TARGET are
-not interchangeable. It reads and validates the machine-readable semantic
-contract in the accepted 2026-09-25 ADR, then binds that contract's digest into
+The PDF is deliberately evidence-aware: LIVE, CURRENT, PARTIAL, REVIEW, DARK,
+HELD, and TARGET are not interchangeable. It reads and validates the
+machine-readable semantic contract in the accepted 2026-09-25 ADR (snapshot
+refreshed by its 2026-09-26 addendum), then binds that contract's digest into
 the PDF. The result is small enough to use as the Drive architecture directive.
+The 2026-09-25 edition stays committed as a historical artifact; this script
+builds the current edition only.
+
+Every evidence claim on the page comes from the ADR's claims block, where each
+line cites its source (the recorded fact list, a repository path, or a
+Blackboard row). Review records carry every Codex verdict; component records
+carry each page-2 component's single status, evidence, promotion test, gate
+and dependencies, and draw both its box and its ledger row. The build fails on
+an unrendered record, a verdict stated in free text, an unknown or cyclic
+dependency, or a LIVE/CURRENT component that depends on anything blocked.
 
 Clean-checkout dependency install:
     python -m pip install -r tools/requirements-architecture-pdf.txt
@@ -13,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -26,7 +38,7 @@ from reportlab.platypus import Paragraph
 
 ROOT = Path(__file__).resolve().parents[1]
 ADR = ROOT / "docs" / "ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
-OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
+OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
 PAGE_W, PAGE_H = landscape(TABLOID)
 
 CONTRACT_START = "<!-- architecture-pdf-contract:start -->"
@@ -112,6 +124,189 @@ def load_contract() -> tuple[dict, str]:
 
 CONTRACT, CONTRACT_SHA256 = load_contract()
 
+CLAIMS_START = "<!-- architecture-pdf-claims:start -->"
+CLAIMS_END = "<!-- architecture-pdf-claims:end -->"
+CLAIM_SOURCE = " | Source: "
+FIELD = " || "
+FORBIDDEN_IN_CLAIM = "<>&"   # ReportLab paragraph markup
+COMPONENT_STATUSES = ("LIVE", "CURRENT", "PARTIAL", "NO-GO", "DARK", "HELD", "TARGET")
+VERDICTS = ("GO", "NO-GO", "PENDING")
+GATES = tuple("G%d" % n for n in range(1, 10))
+BLOCKED_STATUSES = ("NO-GO", "HELD", "DARK", "TARGET")
+VERDICT_WORDS = {"GO": "Codex GO", "NO-GO": "Codex NO-GO", "PENDING": "Codex verdict pending"}
+VERDICT_SHORT = {"GO": "GO", "NO-GO": "NO-GO", "PENDING": "verdict pending"}
+# A Codex verdict is stated only by a review record, never in free text or a
+# note, so the two pages cannot carry "pending" beside "NO-GO" for one head.
+# "requires Codex GO" states a requirement, not a verdict, and is allowed.
+VERDICT_IN_TEXT = re.compile(r"\bNO-GO\b|\bpending\b|(?<!requires )\bCodex GO\b|\bGO at\b",
+                             re.IGNORECASE)
+VERDICT_TEXT_EXEMPT = {"p1.legend"}   # the legend defines the words
+
+
+def _check_text(key: str, text: str) -> None:
+    if not text:
+        raise RuntimeError("architecture PDF record has an empty field: " + key)
+    if any(ch in text for ch in FORBIDDEN_IN_CLAIM):
+        raise RuntimeError("architecture PDF record contains paragraph markup: " + key)
+
+
+def load_records(adr_text: str) -> tuple[dict, dict, dict]:
+    """Read the ADR claims block into (claims, reviews, components)."""
+    if adr_text.count(CLAIMS_START) != 1 or adr_text.count(CLAIMS_END) != 1:
+        raise RuntimeError("ADR must contain exactly one architecture PDF claims block")
+    block = adr_text.split(CLAIMS_START, 1)[1].split(CLAIMS_END, 1)[0]
+    claims: dict[str, str] = {}
+    reviews: dict[str, dict] = {}
+    components: dict[str, dict] = {}
+    for line in block.strip().splitlines():
+        if not line.startswith("- `") or line.count("`") < 2 or CLAIM_SOURCE not in line:
+            raise RuntimeError("malformed architecture PDF record line: " + line[:80])
+        key, rest = line[3:].split("`", 1)
+        body, source = rest.strip().split(CLAIM_SOURCE, 1)
+        body = body.strip()
+        if not key or key in claims or key in reviews or key in components:
+            raise RuntimeError("missing or duplicate architecture PDF record key: " + key)
+        if not source.strip():
+            raise RuntimeError("architecture PDF record needs a source: " + key)
+        if key.startswith("r."):
+            fields = [f.strip() for f in body.split(FIELD)]
+            if len(fields) != 6:
+                raise RuntimeError("review record needs 6 fields: " + key)
+            ref, subject, head, verdict, row, note = fields
+            for text in (ref, subject, head, row, note):
+                _check_text(key, text)
+            if verdict not in VERDICTS:
+                raise RuntimeError("review verdict must be one of %s: %s" % (VERDICTS, key))
+            if VERDICT_IN_TEXT.search(note):
+                raise RuntimeError("a review note may not state a Codex verdict: " + key)
+            reviews[key] = {"ref": ref, "subject": subject, "head": head,
+                            "verdict": verdict, "row": row, "note": note}
+        elif key.startswith("c."):
+            fields = [f.strip() for f in body.split(FIELD)]
+            if len(fields) != 7:
+                raise RuntimeError("component record needs 7 fields: " + key)
+            status, title, head, now, promote, gate, depends = fields
+            for text in (title, head, now, promote, gate, depends):
+                _check_text(key, text)
+            if status not in COMPONENT_STATUSES:
+                raise RuntimeError("component status must be one of %s: %s" % (COMPONENT_STATUSES, key))
+            for text in (now, promote):
+                if VERDICT_IN_TEXT.search(text):
+                    raise RuntimeError("component text may not state a Codex verdict: " + key)
+            components[key] = {"status": status, "title": title, "head": head, "now": now,
+                               "promote": promote, "gate": gate,
+                               "depends": [d.strip() for d in depends.split(",") if d.strip()]}
+        elif key.startswith(("p1.", "p2.")):
+            _check_text(key, body)
+            if key not in VERDICT_TEXT_EXEMPT and VERDICT_IN_TEXT.search(body):
+                raise RuntimeError("free text may not state a Codex verdict: " + key)
+            claims[key] = body
+        else:
+            raise RuntimeError("unknown architecture PDF record kind: " + key)
+    validate_records(reviews, components)
+    return claims, reviews, components
+
+
+def validate_records(reviews: dict, components: dict) -> None:
+    """One status per component, closed dependencies and no contradictions."""
+    seen: dict[tuple[str, str], str] = {}
+    for key, review in reviews.items():
+        ident = (review["ref"], review["head"])
+        if ident in seen:
+            raise RuntimeError("two review records for one head: %s and %s" % (seen[ident], key))
+        seen[ident] = key
+    for key, comp in components.items():
+        for dep in comp["depends"]:
+            if dep not in GATES and dep not in reviews and dep not in components:
+                raise RuntimeError("component %s depends on unknown %s" % (key, dep))
+        review_deps = [reviews[d] for d in comp["depends"] if d in reviews]
+        comp_deps = [components[d] for d in comp["depends"] if d in components]
+        if comp["status"] in ("LIVE", "CURRENT"):
+            if any(r["verdict"] != "GO" for r in review_deps):
+                raise RuntimeError("%s is %s but depends on a review that is not GO" % (key, comp["status"]))
+            if any(c["status"] in BLOCKED_STATUSES for c in comp_deps):
+                raise RuntimeError("%s is %s but depends on a blocked component" % (key, comp["status"]))
+        if comp["status"] == "NO-GO" and not any(r["verdict"] == "NO-GO" for r in review_deps):
+            raise RuntimeError("%s is NO-GO without a NO-GO review" % key)
+    # No dependency cycles among components.
+    state: dict[str, int] = {}
+
+    def visit(key: str) -> None:
+        if state.get(key) == 1:
+            raise RuntimeError("component dependency cycle through " + key)
+        if state.get(key) == 2:
+            return
+        state[key] = 1
+        for dep in components[key]["depends"]:
+            if dep in components:
+                visit(dep)
+        state[key] = 2
+
+    for key in components:
+        visit(key)
+
+
+CLAIMS, REVIEWS, COMPONENTS = load_records(ADR.read_text(encoding="utf-8"))
+RECORDS_SHA256 = hashlib.sha256(json.dumps(
+    {"claims": CLAIMS, "reviews": REVIEWS, "components": COMPONENTS},
+    ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+USED: dict[str, set] = {"claims": set(), "reviews": set(), "boxes": set(), "rows": set()}
+
+
+def CLAIM(key: str) -> str:
+    """The ADR's free-text claim for key, recorded as rendered."""
+    if key not in CLAIMS:
+        raise RuntimeError("PDF renders a claim the ADR does not list: " + key)
+    USED["claims"].add(key)
+    return CLAIMS[key]
+
+
+def REVIEW(key: str) -> str:
+    """A review record in full: subject, head, verdict and note."""
+    if key not in REVIEWS:
+        raise RuntimeError("PDF renders a review the ADR does not list: " + key)
+    USED["reviews"].add(key)
+    r = REVIEWS[key]
+    return "%s at %s: %s. %s" % (r["subject"], r["head"], VERDICT_WORDS[r["verdict"]], r["note"])
+
+
+def REVIEW_SHORT(key: str) -> str:
+    if key not in REVIEWS:
+        raise RuntimeError("PDF renders a review the ADR does not list: " + key)
+    USED["reviews"].add(key)
+    r = REVIEWS[key]
+    return "%s at %s: %s" % (r["ref"], r["head"], VERDICT_SHORT[r["verdict"]])
+
+
+def COMPONENT_BOX(key: str) -> tuple[str, str, str]:
+    """(title, body, status) for a page-2 box, with dependency verdicts."""
+    comp = COMPONENTS[key]
+    USED["boxes"].add(key)
+    body = comp["now"]
+    verdicts = [REVIEW_SHORT(d) for d in comp["depends"] if d in REVIEWS]
+    if verdicts:
+        body += " " + "; ".join(verdicts) + "."
+    return comp["title"], body, comp["status"]
+
+
+def COMPONENT_ROW(key: str) -> tuple[str, str, str]:
+    """(title, promotion test and gate, status) for the promotion ledger."""
+    comp = COMPONENTS[key]
+    USED["rows"].add(key)
+    return comp["title"], "%s Gate: %s." % (comp["promote"], comp["gate"]), comp["status"]
+
+
+def check_all_rendered() -> None:
+    missing = {
+        "claims": sorted(set(CLAIMS) - USED["claims"]),
+        "reviews": sorted(set(REVIEWS) - USED["reviews"]),
+        "component boxes": sorted(set(COMPONENTS) - USED["boxes"]),
+        "ledger rows": sorted(set(COMPONENTS) - USED["rows"]),
+    }
+    missing = {k: v for k, v in missing.items() if v}
+    if missing:
+        raise RuntimeError("ADR records not rendered in the PDF: " + repr(missing))
+
 
 def track(text: str) -> None:
     RENDERED_TEXT.append(str(text))
@@ -132,6 +327,8 @@ PURPLE_SOFT = colors.HexColor("#F1ECF8")
 RED = colors.HexColor("#A64141")
 RED_SOFT = colors.HexColor("#FBECEC")
 GRAY_SOFT = colors.HexColor("#EDF1F5")
+REVIEW_SOFT = colors.HexColor("#FFF6D8")
+DARK_SOFT = colors.HexColor("#DFE4EA")
 
 STATUS_FILL = {
     "LIVE": GREEN_SOFT,
@@ -140,6 +337,8 @@ STATUS_FILL = {
     "HELD": RED_SOFT,
     "TARGET": BLUE_SOFT,
     "OPTIONAL": PURPLE_SOFT,
+    "REVIEW": REVIEW_SOFT,   # an open PR with an exact-head review pending
+    "DARK": DARK_SOFT,       # merged to main and switched off
 }
 
 
@@ -348,21 +547,21 @@ def panel_shell(c: canvas.Canvas) -> tuple[tuple[float, float, float, float],
 
 def tech_row(c: canvas.Canvas, x: float, top: float, w: float,
              title: str, why: str, status: str, accent=BLUE,
-             row_h: float = 41) -> float:
+             row_h: float = 41, body_offset: float = 16) -> float:
     c.setStrokeColor(BORDER)
     c.setLineWidth(0.45)
     c.line(x, top - row_h, x + w, top - row_h)
     pill(c, x, top - 16, status)
     paragraph(c, title, x + 58, top - 3, w - 58, 7.5, 8.2, INK, True)
-    paragraph(c, why, x + 58, top - 16, w - 58, 7.0, 7.9, MUTED)
+    paragraph(c, why, x + 58, top - body_offset, w - 58, 7.0, 7.9, MUTED)
     return top - row_h
 
 
 def tech_panel_header(c: canvas.Canvas, x: float, y: float, w: float, h: float,
-                      title: str, body: str) -> float:
+                      title: str, body: str, rows_offset: float = 70) -> float:
     paragraph(c, title, x + 15, y + h - 17, w - 30, 11.5, 13, INK, True)
     paragraph(c, body, x + 15, y + h - 38, w - 30, 7.0, 8.1, MUTED)
-    return y + h - 70
+    return y + h - rows_offset
 
 
 def footer(c: canvas.Canvas, page_no: int, left: str, right: str) -> None:
@@ -381,11 +580,11 @@ def draw_current(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - current operating architecture",
-        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what was rehearsed, and what is still held",
+        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what was run, and what is still held",
         "CURRENT STATE",
     )
     principle_strip(c, [
-        ("PRODUCTION CONTAINED", f"R5 serves {CONTRACT['production_traffic_percent']}%; advisor tag removed; next template is advisor-off", GREEN_SOFT, GREEN),
+        ("PRODUCTION CONTAINED", CLAIM("p1.prod"), GREEN_SOFT, GREEN),
         ("ONE AUDIO ARBITER", "Realtime host plus queued TTS; one serialized audible turn", BLUE_SOFT, BLUE),
         ("ONE ARTIFACT WRITER", "Parallel lanes propose; the controller validates and commits", PURPLE_SOFT, PURPLE),
         ("EVIDENCE LEVELS STAY SEPARATE", "Source, served bytes, provider success and E2E are distinct", ORANGE_SOFT, ORANGE),
@@ -429,13 +628,13 @@ def draw_current(c: canvas.Canvas) -> None:
     ortho_arrow(c, [(160, 306), (160, 340), (400, 340), (400, 475)],
                 ORANGE, 1.15, True)
     ortho_arrow(c, [(382, 588), (382, 306)], GREEN, 1.0, True)
-    arrow(c, 290, 270, 270, 270, GREEN, 1.0, True)
+    arrow(c, 285, 270, 270, 270, GREEN, 1.0, True)
     ortho_arrow(c, [(557, 588), (557, 320), (220, 320), (220, 306)],
                 PURPLE, 1.0, True)
     ortho_arrow(c, [(748, 588), (748, 560), (650, 560), (650, 548)],
                 ORANGE, 1.0, True)
 
-    # Surface layer.
+    # Surface layer (descriptions unchanged from the 2026-09-25 edition).
     box(c, 50, 588, 245, 64,
         "sfdc24.com authenticated owner",
         "Authenticated owner session with voice/text input, dialogue cards, design choices and live website/app prototype.",
@@ -456,15 +655,15 @@ def draw_current(c: canvas.Canvas) -> None:
     # Browser media and controller layer.
     box(c, 50, 475, 165, 73,
         "OpenAI Realtime",
-        "Direct browser WebRTC host for microphone, transcript, approved host speech and interruption.",
+        CLAIM("p1.realtime"),
         GREEN_SOFT, GREEN, "PARTIAL", 8.25, 6.0)
     box(c, 230, 475, 160, 73,
         "Browser audio arbiter",
-        "Owns one playback queue, captions, mute/listening state and audible-turn ordering.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.15, 6.0)
+        REVIEW("r.site221"),
+        BLUE_SOFT, BLUE, "LIVE", 8.15, 6.0)
     box(c, 410, 475, 278, 73,
         f"Studio Controller - production {CONTRACT['production_controller_label']}",
-        "FastAPI session authority: auth, topic route, questions, deadlines, revision fencing, typed events, command dedupe and provider coordination.",
+        "FastAPI session authority: auth, topic route, deadlines, revision fencing, typed events and command dedupe. " + CLAIM("p1.controller"),
         BLUE_SOFT, BLUE, "LIVE", 8.65, 6.15)
     box(c, 708, 475, 127, 73,
         "OpenAI TTS",
@@ -479,11 +678,11 @@ def draw_current(c: canvas.Canvas) -> None:
     box(c, 267, 352, 178, 76,
         "Claude builder",
         "Authoritative builder produces the only committable typed artifact proposal.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.3, 6.05)
+        BLUE_SOFT, BLUE, "PARTIAL", 8.3, 6.05)
     box(c, 460, 352, 176, 76,
         "Analyst + Muse",
         "Bounded analysis and creative directions support the build; they do not commit artifacts.",
-        GREEN_SOFT, GREEN, "CURRENT", 8.3, 5.95)
+        GREEN_SOFT, GREEN, "PARTIAL", 8.3, 5.95)
     box(c, 661, 352, 174, 76,
         "Ordered artifact + event ledger",
         "The controller alone validates and commits; this ledger records versions, events, snapshots and receipts.",
@@ -492,33 +691,35 @@ def draw_current(c: canvas.Canvas) -> None:
     # Durable plane.
     box(c, 50, 228, 220, 78,
         "Blackboard + Apps Script",
-        "Motherboard handoff, claims, review, audit, release evidence and exact row read-back. Not in the media hot path.",
+        "Handoff, claims, review, audit and exact row read-back. " + CLAIM("p1.incident"),
         ORANGE_SOFT, ORANGE, "CURRENT", 8.45, 6.05)
-    box(c, 290, 228, 165, 78,
+    box(c, 285, 228, 150, 78,
         "Pipedream + outbox",
         "Existing channel bridge. Deployed signing/dedupe and destination delivery remain unverified.",
         GREEN_SOFT, GREEN, "PARTIAL", 8.25, 5.9)
-    box(c, 475, 228, 175, 78,
+    box(c, 450, 228, 160, 78,
         "GCS CAS session state",
         "Durable state, optimistic concurrency, replayable events and snapshot repair outside containers.",
         BLUE_SOFT, BLUE, "CURRENT", 8.25, 5.9)
-    box(c, 670, 228, 165, 78,
+    box(c, 625, 228, 210, 78,
         "GitHub + public site",
-        f"Site main {CONTRACT['site_commit_label']} exactly matches served homepage bytes; CI and rollback remain versioned.",
+        CLAIM("p1.repo") + " " + CLAIM("p1.served"),
         PURPLE_SOFT, PURPLE, "LIVE", 8.15, 5.85)
 
     # Evidence band.
-    box(c, 50, 91, 245, 111,
-        "Authenticated R5 rehearsal - proven",
-        "Session 200; /voice 200; eight TTS blobs reached the browser; /commands, /analyze and /inspire completed concurrently; landing page, demo form and Clean Signal direction became visible; session ended cleanly.",
+    box(c, 50, 76, 210, 144,
+        "Owner live run 26 Sep 01:00:53-01:10:11Z",
+        CLAIM("p1.run"),
         GREEN_SOFT, GREEN, "PARTIAL", 8.5, 6.0)
-    box(c, 310, 91, 245, 111,
-        "Gemini advisor containment - proven",
-        "Unaccepted R6 was returned to zero traffic; adv tag removed; former URL 404; R5 restored to 100%; zero-traffic service template normalized to advisor=false. No /advise call was observed in R6 logs.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.5, 5.95)
-    box(c, 570, 91, 265, 111,
-        "Release held pending acceptance",
-        "Microphone transcription, physical-speaker/human-heard audio, real Gemini TALK, five turns, two barge-ins, ten uninterrupted minutes, replay, Salesforce website facts/effects, delivered WhatsApp receipt, and live Zoom listen/speak/share.",
+    box(c, 272, 76, 303, 144,
+        "Exact-head verdicts on open work",
+        " ".join(REVIEW(k) for k in ("r.pr272", "r.pr272b", "r.r5d", "r.site223", "r.site224",
+                                     "r.site222a", "r.site222b")),
+        REVIEW_SOFT, ORANGE, "NO-GO", 8.5, 5.95)
+    box(c, 590, 76, 245, 144,
+        "Held, and dark source",
+        " ".join([REVIEW("r.pr260"), REVIEW("r.pr260b")]
+                 + [CLAIM(k) for k in ("p1.r261", "p1.dark", "p1.unchanged")]),
         RED_SOFT, RED, "HELD", 8.5, 5.9)
 
     # Connector label chips are last so no box can cover or reframe them.
@@ -535,20 +736,21 @@ def draw_current(c: canvas.Canvas) -> None:
     connector_label(c, 700, 560, "disabled canary", ORANGE)
     connector_label(c, 600, 570, "ordered SSE + snapshots", BLUE)
 
-    # Current stack panel.
+    # Current stack panel (row text unchanged from the 2026-09-25 edition
+    # except the OpenAI TTS row, which is a listed claim).
     top = tech_panel_header(
         c, rx, ry, rw, rh,
         "Current technologies and why",
-        "LIVE serving; CURRENT present; PARTIAL bounded proof; HELD disabled/frozen; TARGET future. Foundry excluded; Meta optional/off.",
+        CLAIM("p1.legend"),
     )
     rows = [
         ("GitHub Pages + typed browser UI", "Fast versioned delivery of dialogue, prototype and release surfaces.", "LIVE", PURPLE),
         ("Cloud Run + Python/FastAPI", "Managed controller runtime, TLS, bounded API surface and rollback revisions.", "LIVE", BLUE),
         ("OpenAI Realtime WebRTC", "Lowest-hop browser conversation path; full microphone/audio acceptance remains open.", "PARTIAL", GREEN),
-        ("OpenAI TTS", "Female-capable natural speech for non-host lines through the browser queue.", "PARTIAL", ORANGE),
-        ("Claude builder", "Single authoritative artifact proposal keeps revisions deterministic and reversible.", "CURRENT", BLUE),
+        ("OpenAI TTS", CLAIM("p1.tts_row"), "PARTIAL", ORANGE),
+        ("Claude builder", "Single authoritative artifact proposal keeps revisions deterministic and reversible.", "PARTIAL", BLUE),
         ("Gemini topic route", "Fast alternative TALK/RECAP provider behind the same controller policy.", "PARTIAL", GREEN),
-        ("Gemini advisor", "Merged source is quarantined; hardening, exact-head review and a real dark probe are required.", "HELD", RED),
+        ("Gemini advisor", "Merged source is quarantined; hardening, exact-head review and a real dark probe are required.", "DARK", RED),
         ("GCS CAS + event ledger", "Persistent session state, revision fencing, replay and reconnect repair.", "CURRENT", BLUE),
         ("Blackboard + Apps Script", "Durable multi-agent command, evidence, handoff and audit plane.", "CURRENT", ORANGE),
         ("Pipedream + WhatsApp API", "Existing mobile bridge; delivery/read receipts require separate proof.", "PARTIAL", GREEN),
@@ -560,7 +762,7 @@ def draw_current(c: canvas.Canvas) -> None:
 
     footer(
         c, 1,
-        f"Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed {CONTRACT['facts_refreshed_label']}",
+        f"Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited | Facts refreshed {CONTRACT['facts_refreshed_label']}",
         "Transport proof is not human-heard end-to-end acceptance.",
     )
     c.showPage()
@@ -570,7 +772,7 @@ def draw_future(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - future governed minibus architecture",
-        "Blackboard stays the motherboard; SFDC24, Converspan and client minibuses inherit bounded capabilities and remain revocable",
+        f"Evidence-bound through {CONTRACT['facts_refreshed_label']}: each component's status now, the ADR pass condition that promotes it, and its gate",
         "FUTURE STATE",
     )
     principle_strip(c, [
@@ -582,193 +784,155 @@ def draw_future(c: canvas.Canvas) -> None:
     (_, _, _, _), (rx, ry, rw, rh) = panel_shell(c)
 
     section_label(c, 43, 655, "Blackboard control and audit plane", 218)
-    section_label(c, 43, 542, "SFDC24 service minibus", 150)
-    section_label(c, 43, 201, "Sibling client minibuses and commercial plane", 270)
+    section_label(c, 43, 575, "SFDC24 service minibus", 150)
+    section_label(c, 43, 300, "Sibling client minibuses and commercial plane", 270)
 
-    # Outer minibus boundary.
+    # Outer SFDC24 minibus boundary.
     c.setFillColor(colors.HexColor("#FAFCFF"))
     c.setStrokeColor(BLUE)
     c.setLineWidth(1.1)
-    c.roundRect(45, 225, 802, 310, 11, stroke=1, fill=1)
+    c.roundRect(45, 318, 802, 253, 11, stroke=1, fill=1)
 
     # Blackboard governs SFDC24 and each client minibus as siblings. The client
     # trunk stays outside the SFDC24 boundary so leases never appear to transit it.
-    arrow(c, 445, 580, 445, 535, BLUE, 1.5)
-    ortho_arrow(c, [(807, 535), (807, 560), (680, 560), (680, 580)],
+    arrow(c, 445, 594, 445, 571, BLUE, 1.5)
+    ortho_arrow(c, [(807, 571), (807, 585), (680, 585), (680, 594)],
                 GREEN, 1.0, True)
-    ortho_arrow(c, [(840, 610), (856, 610), (856, 197)],
+    # Leases go down to each sibling minibus; bounded returns come back up to
+    # Blackboard on their own trunk, also outside the SFDC24 boundary.
+    ortho_arrow(c, [(840, 622), (856, 622), (856, 294), (115, 294), (115, 276)],
                 BLUE, 1.0, True)
-    for x in (145, 360, 568):
-        ortho_arrow(c, [(856, 197), (x, 197), (x, 191)],
-                    BLUE, 0.9, True)
-        ortho_arrow(c, [(x + 5, 191), (x + 5, 194), (852, 194), (856, 197)],
-                    GREEN, 0.75, True)
-    ortho_arrow(c, [(856, 197), (870, 197), (870, 625), (840, 625)],
-                GREEN, 0.9, True)
+    for x in (285, 460):
+        ortho_arrow(c, [(x, 294), (x, 276)], BLUE, 0.9, True)
+    for x in (165, 345, 515):
+        ortho_arrow(c, [(x, 276), (x, 287), (866, 287), (866, 606), (840, 606)],
+                    GREEN, 0.9, True)
 
-    # Browser media and channel ingress. Realtime is duplex; TTS always returns
-    # through the sole audio arbiter.
-    arrow(c, 135, 452, 160, 413, BLUE, 1.1)
-    arrow(c, 255, 413, 275, 452, GREEN, 1.25)
-    arrow(c, 275, 452, 255, 413, GREEN, 1.25)
-    arrow(c, 430, 413, 405, 452, ORANGE, 1.1)
-    arrow(c, 375, 452, 255, 413, ORANGE, 1.1)
-    arrow(c, 200, 375, 330, 375, BLUE, 1.25)
-    arrow(c, 135, 452, 400, 413, BLUE, 0.9)
-    arrow(c, 530, 452, 500, 413, GREEN, 1.0)
-    arrow(c, 710, 452, 555, 413, PURPLE, 1.0)
+    # Channel row <-> coordinator row. Realtime is duplex; TTS returns only
+    # through the sole audio arbiter; web commands and ordered SSE meet the
+    # controller.
+    arrow(c, 115, 503, 115, 476, GREEN, 1.25)
+    arrow(c, 130, 476, 130, 503, GREEN, 1.25)
+    arrow(c, 257, 503, 257, 476, ORANGE, 1.15)
+    arrow(c, 340, 476, 300, 503, ORANGE, 1.0)
+    arrow(c, 380, 503, 380, 476, BLUE, 1.25)
+    arrow(c, 395, 476, 395, 503, BLUE, 1.25)
+    arrow(c, 540, 503, 520, 476, GREEN, 1.0)
+    arrow(c, 300, 445, 315, 445, BLUE, 1.2)
+    arrow(c, 587, 445, 602, 445, BLUE, 1.2)
 
-    # Multi-agent work returns through the coordinator or the single writer.
-    arrow(c, 420, 337, 195, 304, PURPLE, 1.05)
-    arrow(c, 280, 304, 505, 337, GREEN, 1.0)
-    ortho_arrow(c, [(300, 304), (300, 323), (420, 323), (420, 304)],
-                BLUE, 1.35)
-    ortho_arrow(c, [(500, 270), (600, 270), (600, 320), (720, 320), (720, 337)],
-                BLUE, 1.25)
-    arrow(c, 550, 337, 670, 304, ORANGE, 1.15)
-    ortho_arrow(c, [(827, 375), (840, 375), (840, 526), (135, 526), (135, 514)],
-                BLUE, 1.0)
+    # Coordinator row <-> work row: bounded work goes out, advice returns to
+    # the controller, and only the committer writes one fenced revision.
+    arrow(c, 334, 414, 334, 387, PURPLE, 1.1)
+    arrow(c, 321, 387, 321, 414, GREEN, 1.0)
+    arrow(c, 340, 356, 355, 356, BLUE, 1.25)
+    arrow(c, 495, 387, 620, 414, BLUE, 1.25)
 
-    # Durable external effects return receipts through capability gateways.
-    ortho_arrow(c, [(590, 304), (590, 440), (560, 440), (560, 452)],
-                GREEN, 1.0)
-    ortho_arrow(c, [(760, 304), (835, 304), (835, 430), (710, 430), (710, 452)],
+    # Durable effects return receipts through the capability gateways.
+    ortho_arrow(c, [(836, 350), (842, 350), (842, 488), (726, 488), (726, 503)],
                 PURPLE, 1.0)
-
-    # SFDC24 and client minibuses exchange only governed commercial facts with
-    # Salesforce; no model receives direct CRM authority.
-    ortho_arrow(c, [(760, 240), (840, 240), (840, 220), (755, 220), (755, 191)],
-                ORANGE, 1.1)
-    ortho_arrow(c, [(780, 191), (780, 215), (830, 215), (830, 247), (790, 247), (790, 240)],
+    ortho_arrow(c, [(836, 370), (846, 370), (846, 494), (545, 494), (545, 503)],
                 GREEN, 1.0)
-    for x in (145, 360, 568):
-        arrow(c, x, 91, x, 82, ORANGE, 0.9)
-        arrow(c, x, 77, x, 91, GREEN, 0.9)
-    ortho_arrow(c, [(145, 82), (755, 82), (755, 91)], ORANGE, 1.0)
-    ortho_arrow(c, [(775, 91), (775, 77), (145, 77)], GREEN, 1.0)
+
+    # Governed commercial facts only; no model receives CRM authority.
+    arrow(c, 770, 318, 770, 276, ORANGE, 1.1)
+    c.saveState()
+    c.setStrokeColor(ORANGE)
+    c.setLineWidth(1.0)
+    for x in (285, 460):
+        c.line(x, 210, x, 204)
+    c.restoreState()
+    ortho_arrow(c, [(115, 210), (115, 204), (770, 204), (770, 210)],
+                ORANGE, 1.0)
 
     # Blackboard motherboard.
-    box(c, 50, 580, 790, 70,
+    box(c, 50, 594, 790, 58,
         "Blackboard motherboard - control, policy, audit and lifecycle authority",
-        "Registry | signed capability/config leases | routing | budgets | release receipts | health/usage evidence | pause, quarantine, credential epoch, kill, retirement and reconciliation. Customer content stays in each tenant.",
-        BLUE_SOFT, BLUE, "TARGET", 9.1, 6.35)
+        "Registry | signed capability/config leases | routing | budgets | release receipts | health/usage evidence | pause, quarantine, credential epoch, kill, retirement and reconciliation. " + COMPONENT_BOX("c.mother")[1] + " " + CLAIM("p2.return"),
+        BLUE_SOFT, BLUE, None, 9.1, 6.35)
+    # Three body lines fill this wide box, so its status sits on the title line.
+    pill(c, 50 + 790 - 62, 594 + 58 - 25, COMPONENTS["c.mother"]["status"])
 
-    # Channel and explicit media-provider row inside SFDC24.
-    box(c, 65, 452, 135, 62,
-        "Web / mobile",
-        "Scoped sign-in, dialogue, captions and live prototype.",
-        BLUE_SOFT, BLUE, "TARGET", 8.1)
-    box(c, 210, 452, 130, 62,
-        "OpenAI Realtime",
-        "Direct duplex WebRTC: mic, host speech and barge-in.",
-        GREEN_SOFT, GREEN, "TARGET", 8.0)
-    box(c, 350, 452, 110, 62,
-        "OpenAI TTS",
-        "Approved secondary-voice blobs only.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.0)
-    box(c, 470, 452, 120, 62,
-        "WhatsApp",
-        "Signed/deduped async intake, status and approvals.",
-        GREEN_SOFT, GREEN, "TARGET", 8.0)
-    box(c, 600, 452, 227, 62,
-        "Zoom RTMS + Ubuntu presenter",
-        "Consented events; on-demand speak, present, share and teardown with receipts.",
-        PURPLE_SOFT, PURPLE, "TARGET", 8.1)
+    def comp_box(key, x, y, w, h, fill, accent, title_size=8.0):
+        title, body, status = COMPONENT_BOX(key)
+        box(c, x, y, w, h, title, body, fill, accent, status, title_size)
+
+    # Channel row inside SFDC24.
+    comp_box("c.realtime", 60, 503, 130, 62, GREEN_SOFT, GREEN)
+    comp_box("c.tts", 202, 503, 110, 62, ORANGE_SOFT, ORANGE)
+    comp_box("c.web", 324, 503, 150, 62, BLUE_SOFT, BLUE)
+    comp_box("c.wa", 486, 503, 118, 62, GREEN_SOFT, GREEN)
+    comp_box("c.zoom", 616, 503, 220, 62, PURPLE_SOFT, PURPLE, 8.1)
 
     # Coordinator row.
-    box(c, 65, 337, 225, 76,
-        "One browser audio arbiter",
-        "One owner controls playback, TTS queue, interrupt, cancel, captions and consent state.",
-        GREEN_SOFT, GREEN, "TARGET", 8.4, 5.95)
-    box(c, 330, 337, 255, 76,
-        "Studio Controller turn and task arbiter",
-        "Trusted identity/reference, immutable snapshot, deadlines, cancellation, fallbacks, revision fencing and event order.",
-        BLUE_SOFT, BLUE, "TARGET", 8.55, 6.0)
-    box(c, 615, 337, 212, 76,
-        "Session, event + CAS ledger",
-        "Durable commands, fenced revisions, replay receipts, unknown-outcome holds and snapshot repair.",
-        GRAY_SOFT, INK, "TARGET", 8.3, 5.9)
+    comp_box("c.arbiter", 60, 414, 240, 62, GREEN_SOFT, GREEN, 8.3)
+    comp_box("c.controller", 315, 414, 272, 62, BLUE_SOFT, BLUE, 8.4)
+    comp_box("c.ledger", 602, 414, 234, 62, GRAY_SOFT, INK, 8.2)
 
     # Work/effect row.
-    box(c, 65, 240, 260, 64,
-        "Concurrent bounded work",
-        "Claude build goes to the writer; Gemini/creative advice returns to the controller.",
-        PURPLE_SOFT, PURPLE, "TARGET", 8.35, 5.85)
-    box(c, 340, 240, 160, 64,
-        "Single artifact committer",
-        "Validates one proposal; writes one fenced revision.",
-        BLUE_SOFT, BLUE, "TARGET", 8.15, 5.8)
-    box(c, 515, 240, 312, 64,
-        "Durable outbox + capability gateways",
-        "Authorized, idempotent, read-back and reconciled WhatsApp, Zoom, Git, payment and Salesforce effects.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.25, 5.75)
+    comp_box("c.work", 60, 325, 280, 62, PURPLE_SOFT, PURPLE, 8.3)
+    comp_box("c.commit", 355, 325, 150, 62, BLUE_SOFT, BLUE, 8.1)
+    comp_box("c.outbox", 520, 325, 316, 62, ORANGE_SOFT, ORANGE, 8.2)
 
-    # Client seeds and commercial engine.
-    box(c, 50, 91, 190, 100,
-        "Converspan minibus",
-        "Web/logo/app design on the governed core. Production stays frozen until SFDC24 foundation gates pass.",
-        PURPLE_SOFT, PURPLE, CONTRACT["converspan_production"], 8.45, 6.0)
-    box(c, 255, 91, 210, 100,
-        "Nav / steelworkson.ca minibus",
-        "Nav signs in directly for sites/redesigns. Separate tenant identity, state, keys, limits and audit.",
-        GREEN_SOFT, GREEN, "TARGET", 8.45, 5.95)
-    box(c, 480, 91, 175, 100,
-        "Additional client minibuses",
-        "Same seed; reconfigurable, throttled, paused, upgraded or retired by Blackboard.",
-        BLUE_SOFT, BLUE, "TARGET", 8.35, 5.9)
-    box(c, 670, 91, 170, 100,
-        "Salesforce commercial engine",
-        "Campaign, lead, opportunity, tokenized payment reference, entitlement, case, success and renewal.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.3, 5.85)
+    # Sibling minibuses and the commercial plane.
+    comp_box("c.converspan", 50, 210, 150, 66, PURPLE_SOFT, PURPLE)
+    comp_box("c.nav", 210, 210, 175, 66, GREEN_SOFT, GREEN)
+    comp_box("c.clients", 395, 210, 150, 66, BLUE_SOFT, BLUE)
+    comp_box("c.charter", 555, 210, 135, 66, GRAY_SOFT, INK)
+    comp_box("c.sf", 700, 210, 140, 66, ORANGE_SOFT, ORANGE)
 
-    connector_label(c, 445, 558, "SFDC24 lease + config", BLUE)
-    connector_label(c, 746, 560, "health / usage / evidence - no content", GREEN)
-    connector_label(c, 260, 433, "duplex WebRTC", GREEN)
-    connector_label(c, 390, 433, "approved TTS request + blob", ORANGE)
-    connector_label(c, 510, 526, "ordered SSE + snapshots + receipts", BLUE)
-    connector_label(c, 340, 326, "Claude proposal to writer", BLUE)
-    connector_label(c, 500, 315, "advice returns to controller", GREEN)
-    connector_label(c, 670, 326, "one fenced revision", BLUE)
-    connector_label(c, 545, 440, "send + receipt", GREEN)
-    connector_label(c, 735, 430, "speak / share / teardown", PURPLE)
-    connector_label(c, 765, 220, "SFDC24 events / authorized facts", ORANGE)
-    connector_label(c, 455, 82, "client events / authorized facts + entitlements", ORANGE)
-    connector_label(c, 690, 197, "independent leases; evidence returns", BLUE)
+    # Proof and sequence band, in page 1's style.
+    proven = (CLAIM("p2.proven_main") + " " + REVIEW_SHORT("r.site216") + "; "
+              + REVIEW_SHORT("r.site221") + ". " + CLAIM("p2.proven_rest"))
+    box(c, 50, 76, 200, 122, "Proven toward the future", proven,
+        GREEN_SOFT, GREEN, "PARTIAL", 8.5, 5.95)
+    box(c, 262, 76, 250, 122, "Next promotions, in order", CLAIM("p2.order"),
+        BLUE_SOFT, BLUE, "TARGET", 8.5, 5.95)
+    box(c, 524, 76, 316, 122, "Converspan launch gate", CLAIM("p2.gate"),
+        RED_SOFT, RED, "HELD", 8.5, 5.9)
 
-    # Future stack panel.
+    connector_label(c, 445, 583, "SFDC24 lease + config", BLUE)
+    connector_label(c, 746, 585, "health / usage / evidence - no content", GREEN)
+    connector_label(c, 620, 294, "independent leases", BLUE)
+    connector_label(c, 400, 287, "bounded returns, no content", GREEN)
+    connector_label(c, 123, 489, "duplex WebRTC", GREEN)
+    connector_label(c, 257, 489, "TTS blob", ORANGE)
+    connector_label(c, 322, 489, "TTS request", ORANGE)
+    connector_label(c, 440, 489, "commands / SSE", BLUE)
+    connector_label(c, 270, 400, "bounded work", PURPLE)
+    connector_label(c, 392, 400, "advice returns", GREEN)
+    connector_label(c, 560, 400, "one fenced revision", BLUE)
+    connector_label(c, 790, 482, "speak / share / teardown", PURPLE)
+    connector_label(c, 650, 494, "send + receipt", GREEN)
+    connector_label(c, 770, 306, "SFDC24 authorized facts", ORANGE)
+    connector_label(c, 455, 204, "client facts + entitlements", ORANGE)
+
+    # Promotion ledger: every component, the ADR pass condition that promotes
+    # it, and its gate.
     top = tech_panel_header(
         c, rx, ry, rw, rh,
-        "Selected future stack and why",
-        "TARGET means selected future architecture, not deployed or accepted. Choices favor speed, safe autonomy and reversibility.",
+        "Promotion ledger",
+        "Status now, the ADR pass condition that promotes each component, and its gate (ADR acceptance matrix, G1-G9). TARGET is selected design, not a deployment claim.",
+        60,
     )
-    rows = [
-        ("Email OTP + scoped session tokens", "Target passwordless entry; OIDC-compatible boundary when external identity is selected.", "TARGET", GREEN),
-        ("WebRTC + OpenAI Realtime", "Direct low-hop host audio, captions and barge-in; short-lived server-minted access.", "TARGET", GREEN),
-        ("OpenAI TTS + one audio queue", "Welcoming secondary voices without competing playback authorities.", "TARGET", ORANGE),
-        ("Cloud Run + FastAPI controller", "Managed TLS/scaling with deterministic session and commit authority.", "TARGET", BLUE),
-        ("Typed JSON + DOM/SVG", "Fast, crisp and accessible live prototypes; no model HTML, script or eval.", "TARGET", PURPLE),
-        ("Claude builder + Gemini analyst", "Parallel specialized value while only one validated proposal can commit.", "TARGET", PURPLE),
-        ("GCS CAS + durable outbox", "Durable replay, revision control, effects, restart recovery and reconciliation.", "TARGET", BLUE),
-        ("Blackboard signed leases", "Central capability ceiling, budgets, rewiring, revocation and sub-60s connected kill target.", "TARGET", BLUE),
-        ("WhatsApp + Pipedream", "Low-friction mobile status/intake outside the continuous-audio path.", "TARGET", GREEN),
-        ("Zoom RTMS + Ubuntu presenter", "Backend observer plus on-demand participant for speech, presentation and screen share.", "TARGET", PURPLE),
-        ("Salesforce as CRM/success", "One attribution and customer-success spine across domains and client minibuses.", "TARGET", ORANGE),
-        ("Payment-provider boundary (TBD)", "Provider owns checkout/card data; Salesforce stores tokenized commercial references only.", "TARGET", ORANGE),
-    ]
+    ledger_keys = ("c.mother", "c.realtime", "c.tts", "c.web", "c.wa", "c.zoom",
+                   "c.arbiter", "c.controller", "c.ledger", "c.work", "c.commit",
+                   "c.outbox", "c.charter", "c.converspan", "c.nav", "c.clients", "c.sf")
+    accents = {"c.mother": BLUE, "c.realtime": GREEN, "c.tts": ORANGE, "c.web": BLUE,
+               "c.wa": GREEN, "c.zoom": PURPLE, "c.arbiter": GREEN, "c.controller": BLUE,
+               "c.ledger": INK, "c.work": PURPLE, "c.commit": BLUE, "c.outbox": ORANGE,
+               "c.charter": INK, "c.converspan": PURPLE, "c.nav": GREEN,
+               "c.clients": BLUE, "c.sf": ORANGE}
+    rows = []
+    for key in ledger_keys:
+        title, test, status = COMPONENT_ROW(key)
+        rows.append((title, test, status, accents[key]))
     for row in rows:
-        top = tech_row(c, rx + 15, top, rw - 30, *row, row_h=38)
-
-    c.setFillColor(RED_SOFT)
-    c.roundRect(rx + 15, ry + 10, rw - 30, 65, 8, stroke=0, fill=1)
-    paragraph(c, "Non-waivable launch gate", rx + 27, ry + 62, rw - 54,
-              7.4, 8.4, RED, True)
-    paragraph(c,
-              "No Converspan production onboarding until SFDC24 proves continuous audio, artifact replay, tenant isolation, durable effects, source-to-runtime identity and rollback.",
-              rx + 27, ry + 45, rw - 54, 7.0, 8.0, INK)
+        top = tech_row(c, rx + 15, top, rw - 30, *row, row_h=32, body_offset=12.5)
 
     footer(
         c, 2,
-        "Tabloid digital brief | Source: ADR-20260925 on PR265 | Review inputs: Claude, Gemini, Codex and Grok",
+        "Tabloid digital brief | Source: ADR-20260925 and its 2026-09-26 addendum, where each claim is cited",
         "TARGET is selected architecture, not a deployment or acceptance claim.",
     )
     c.showPage()
@@ -777,21 +941,24 @@ def draw_future(c: canvas.Canvas) -> None:
 def build() -> Path:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     RENDERED_TEXT.clear()
+    for used in USED.values():
+        used.clear()
     # invariant=1 fixes ReportLab timestamps and document IDs so the committed
     # artifact has one reproducible digest across clean-checkout rebuilds.
     c = canvas.Canvas(
         str(OUT), pagesize=(PAGE_W, PAGE_H), pageCompression=1, invariant=1
     )
     c.setTitle("SFDC24 and Blackboard current and future architecture")
-    c.setAuthor("Codex with Claude, Gemini and Grok review input")
+    c.setAuthor("Claude Code (2026-09-26 edition); 2026-09-25 edition by Codex")
     c.setSubject("Two-page evidence-bound architecture for realtime audio, live prototyping, Salesforce, WhatsApp, Zoom and governed client minibuses; ADR contract sha256:" + CONTRACT_SHA256)
-    c.setKeywords("SFDC24, Blackboard, Converspan, minibus, OpenAI Realtime, Claude, Gemini, Salesforce, WhatsApp, Zoom, ADR-contract-" + CONTRACT_SHA256)
+    c.setKeywords("SFDC24, Blackboard, Converspan, minibus, OpenAI Realtime, Claude, Gemini, Salesforce, WhatsApp, Zoom, ADR-contract-" + CONTRACT_SHA256 + ", ADR-records-" + RECORDS_SHA256)
     draw_current(c)
     draw_future(c)
     rendered = "\n".join(RENDERED_TEXT)
     missing = [phrase for phrase in CONTRACT["required_pdf_phrases"] if phrase not in rendered]
     if missing:
         raise RuntimeError("PDF semantic drift; required rendered facts missing: " + repr(missing))
+    check_all_rendered()
     c.save()
     return OUT
 

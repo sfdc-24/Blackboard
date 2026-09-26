@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it installs the self-hosted bus, which is not the live board. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # blackboard-bus — Deploying to an Ubuntu VM on Google Cloud
 
 The package carries the Blackboard bus architecture on a VM you control:

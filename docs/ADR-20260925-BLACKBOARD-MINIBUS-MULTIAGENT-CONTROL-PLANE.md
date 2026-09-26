@@ -22,13 +22,13 @@ published artifact.
 ```json
 {
   "schema_version": 1,
-  "facts_refreshed_label": "25 Sep 2026 12:56 UTC",
-  "facts_refreshed_iso": "2026-09-25T12:56Z",
-  "production_controller_revision": "sfdc24-studio-controller-r5-0895605-g",
-  "production_controller_label": "R5 0895605",
+  "facts_refreshed_label": "26 Sep 2026 03:23 UTC",
+  "facts_refreshed_iso": "2026-09-26T03:23Z",
+  "production_controller_revision": "sfdc24-studio-controller-r5b-0895605",
+  "production_controller_label": "R5b 0895605",
   "production_traffic_percent": 100,
-  "site_commit": "3d9b4a1b8ed1cdb34a794fc134a19820cc810d04",
-  "site_commit_label": "3d9b4a1",
+  "site_commit": "e538ecfd763f91c0b1608f233f70bd2ecbd5dc65",
+  "site_commit_label": "e538ecf",
   "advisor_enabled": false,
   "converspan_production": "HELD",
   "required_adr_phrases": [
@@ -40,13 +40,17 @@ published artifact.
     "The Studio Controller is the session coordinator",
     "Salesforce is the commercial and customer-success system of record.",
     "Foundry is excluded from this architecture.",
-    "Converspan production implementation, deployment, and client onboarding"
+    "Converspan production implementation, deployment, and client onboarding",
+    "Addendum 2026-09-26",
+    "sfdc24-studio-controller-r5b-0895605",
+    "Every future component carries a present status, its evidence, the test that promotes it, and its gate.",
+    "e538ecfd763f91c0b1608f233f70bd2ecbd5dc65"
   ],
   "required_pdf_phrases": [
-    "R5 serves 100%",
+    "R5b serves 100%",
     "OpenAI Realtime",
     "OpenAI TTS",
-    "Studio Controller - production R5 0895605",
+    "Studio Controller - production R5b 0895605",
     "Claude builder",
     "Gemini advisor",
     "Blackboard motherboard",
@@ -54,7 +58,12 @@ published artifact.
     "Salesforce commercial engine",
     "WhatsApp",
     "Zoom RTMS + Ubuntu presenter",
-    "Foundry excluded"
+    "Foundry excluded",
+    "Repository main e538ecf",
+    "Proven toward the future",
+    "Next promotions, in order",
+    "Converspan launch gate",
+    "Promotion ledger"
   ]
 }
 ```
@@ -869,3 +878,102 @@ stopping safe, non-conflicting work on another path.
   and current versus proposed capabilities labelled accurately.
 - Google Drive publication and destination read-back for the revised PDF.
 - Blackboard row linking each release receipt and final artifact digest.
+
+## Addendum 2026-09-26 - evidence refresh and future-state promotion map
+
+Facts verified at 2026-09-26T03:23Z, at publication of this edition. The
+decisions above are unchanged. This addendum refreshes the snapshot contract
+and produces `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf`; the 2026-09-25
+PDF stays committed as a historical artifact. Snapshot identities (FL): production
+controller revision `sfdc24-studio-controller-r5b-0895605`; sfdc24-site repository
+main `e538ecfd763f91c0b1608f233f70bd2ecbd5dc65`.
+
+Every future component carries a present status, its evidence, the test that promotes it, and its gate.
+
+**Source rule.** Each line below cites (a) the fact list recorded as Blackboard
+row `CCC-ARCH-0926-FACT-LIST-20260926T0305Z` (cited as FL), (b) a repository
+path, or (c) a named Blackboard row. The generator reads this block, renders it
+unchanged, and fails the build (and so CI) if a line is not rendered or the
+page asks for a line that is not here. Descriptive box and table text not
+listed here is taken, sometimes shortened, from
+`docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` or from this ADR.
+
+The block has three kinds of line, fields separated by ` || `:
+
+- `r.` **review records** - reference, subject, exact head, Codex verdict (GO,
+  NO-GO or PENDING), verdict row, note. Every Codex verdict on either page is
+  rendered from one of these; free text and notes may not state a Codex verdict.
+- `c.` **component records** - status, title, serving head, present evidence,
+  promotion test, gate, dependencies. The generator draws both the page-2 box
+  and the promotion-ledger row from the one record, and appends the verdict of
+  each review the component depends on.
+- `p1.` and `p2.` **free-text claims**.
+
+The generator enforces: one status per component from LIVE, CURRENT, PARTIAL,
+NO-GO, DARK, HELD, TARGET; every dependency exists (`c.`, `r.` or G1-G9) with
+no cycles; a LIVE or CURRENT component depends on no review other than GO and
+on no NO-GO, HELD, DARK or TARGET component; a NO-GO component depends on at
+least one NO-GO review; and one verdict per (reference, head).
+
+<!-- architecture-pdf-claims:start -->
+- `r.site216` Site #216 || Site #216 (host nudge) || e5a9ae3 || GO || CODEX-SITE216-E5A9AE3-GO-20260926T0100Z || Merged 01:01Z. | Source: FL; row CODEX-SITE216-E5A9AE3-GO-20260926T0100Z
+- `r.site221` Site #221 || Site #221 || 7a2685a || GO || CODEX-SITE221-7A2685A-GO-20260926T0153Z || A cleared nudge retracts its question; 20 s talk deadline; response-id ownership. | Source: FL; row CODEX-SITE221-7A2685A-GO-20260926T0153Z
+- `r.site223` Site #223 || Site #223 (builder hears the answered question) || 89e3abc || NO-GO || CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z || An approval at 02:36Z was withdrawn at 02:41Z, after the 02:38:20Z merge; the audible-lifecycle and question-span fix-forward is site #224. | Source: FL; rows CODEX-SITE223-89E3ABC-GO-20260926T0236Z, CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z, CODEX-SITE223-89E3ABC-NOGO-ADDENDUM-20260926T024635Z
+- `r.site222a` Site #222 || Site #222 (step descriptions and image captions) || 9f965e6 || NO-GO || CODEX-SITE222-9F965E6-NOGO-20260926T021638Z || Caption contrast. | Source: row CODEX-SITE222-9F965E6-NOGO-20260926T021638Z
+- `r.site222b` Site #222 || Site #222 || ee80098 || PENDING || CCC-SITE222-EE80098-REVIEW-REQUEST-20260926T0312Z || Contrast repair; review requested. | Source: row CCC-SITE222-EE80098-REVIEW-REQUEST-20260926T0312Z
+- `r.site224` Site #224 || Site #224 (#223 fix-forward) || a66b536 || PENDING || CCC-SITE224-A66B536-REVIEW-REQUEST-20260926T0314Z || Review requested. | Source: row CCC-SITE224-A66B536-REVIEW-REQUEST-20260926T0314Z
+- `r.pr272` #272 || Blackboard #272 || 8a9349e || NO-GO || CODEX-PR272-8A9349E-NOGO-20260926T020927Z || Its provider timeout is per operation, not a total wall-clock deadline, and it classes permanent 400, 401 and 403 errors as timeouts. | Source: row CODEX-PR272-8A9349E-NOGO-20260926T020927Z
+- `r.pr272b` #272 || Blackboard #272 || 29f0add || PENDING || CCC-PR272-29F0ADD-REVIEW-REQUEST-20260926T0320Z || Repair; review requested. | Source: row CCC-PR272-29F0ADD-REVIEW-REQUEST-20260926T0320Z
+- `r.r5d` r5d || The r5d path (0895605 plus #272 only) || 8a9349e || NO-GO || CODEX-R5D-8A9349E-NOGO-20260926T0231Z || Its validation image is do not promote; r5b stays at 100%. | Source: rows CODEX-R5D-8A9349E-NOGO-20260926T0231Z, CCC-R5D-NOGO-ACK-20260926T0238Z, CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z
+- `r.pr260` #260 || #260 client workspaces (Nav / steelworkson.ca), Gate 1 || ecee267 || NO-GO || CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z || Four reproduced boundary failures. The outcome durability and terminalisation finding passed. | Source: FL; row CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z
+- `r.pr260b` #260 || #260 client workspaces, Gate 1 || cfdebac || PENDING || CCC-GATE1-REVIEW-REQUEST-PR260-CFDEBAC-20260926T0318Z || Round-12 repair head; review requested. | Source: row CCC-GATE1-REVIEW-REQUEST-PR260-CFDEBAC-20260926T0318Z
+- `p1.prod` R5b serves 100%; rollback r5-0895605-g; r5c at 0% | Source: FL
+- `p1.realtime` Direct browser WebRTC host; the response.metadata echo on created and done was probed on gpt-realtime-2.1. | Source: FL
+- `p1.controller` Cloud Run request timeout 60 s, concurrency 8, 1 CPU / 512Mi; worker model claude-sonnet-5. | Source: FL
+- `p1.incident` Codex got 401 from its upstream credential 25 Sep 22:38-23:30Z; an app restart fixed it; the production OpenAI key was unaffected. | Source: FL; rows CCC-OPENAI-CODEX-401-DIAG-20260925T2332Z, CODEX-ALIVE-20260926T000934Z
+- `p1.repo` Repository main e538ecf: the #223 merge, 26 Sep 02:38:20Z. | Source: FL; row CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z
+- `p1.served` Last observed served bytes, 02:42Z: two cache-busted reads of voice-conversation.js matched #223's reviewed head. | Source: row CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z
+- `p1.run` Worked: session, voice, TTS, concurrent analyze, inspire and commands, recap, rating, and the summary-PDF handoff to the mail sender (HTTP 200; delivery not verified). Defect 1: one builder POST hit 504 at 60.0 s, then a 90 s inflight lease returned 409 to five builds, about 3 minutes of architect silence. Defect 2: /analyze also hit 504 at 60 s. Defect 3: the canvas was sparse after the first build; the builder held changes back to ask questions that the analyst lane discards. | Source: FL
+- `p1.r261` #261 is stacked on #260; STUDIO_CLIENT_WORKSPACES is off and the registry is not seeded. | Source: FL
+- `p1.dark` Dark source in main: #269 charter lane and quote PDF (STUDIO_ENABLE_CHARTER false, empty price table) and the Gemini advisor (off). #270 talk prompts: merged source, not in the serving image. | Source: FL; row CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z
+- `p1.unchanged` Unchanged: Zoom RTMS and Ubuntu presenter held; Salesforce writes paused (BLK-059); Converspan held. | Source: FL
+- `p1.legend` LIVE serving; CURRENT present; PARTIAL bounded proof; NO-GO rejected exact head; DARK merged source, switch off; HELD gated; TARGET future. Foundry excluded; Meta optional/off. | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` legend; NO-GO and DARK defined by this addendum
+- `p1.tts_row` Controller-generated Architect and Muse speech through the browser queue. | Source: this ADR, Decision summary
+- `p2.return` Minibus returns carry health, usage, policy and release versions and redacted acceptance and outcome evidence; never customer content, transcripts, canvases, personal data, credentials or provider bodies. | Source: row CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z (finding 4); this ADR, Future-state architecture
+- `p2.proven_main` Repository main e538ecf carries #209, #216 and #221. | Source: FL
+- `p2.proven_rest` Realtime's response.metadata echo was probed on gpt-realtime-2.1. Analyze, inspire and commands ran concurrently in the 26 Sep owner run. Exact-head reviews held #272 and the r5d path before any deploy. | Source: FL; rows CODEX-R5D-8A9349E-NOGO-20260926T0231Z, CCC-R5D-NOGO-ACK-20260926T0238Z
+- `p2.order` 1 #272 repaired on a fresh exact head, independent acceptance, then a newly verified image; each requires Codex GO. 2 Deploy, traffic and the owner rehearsal (targeted G1 close) are gated separately. 3 Complete G2 and the #260 gate, then #261. 4 Repair and review #269; CX1 charter-only operator canary with PDF and price effects off; CX2 unpriced and fully priced quote canaries after the owner's commercial gates. Traffic is a separate GO. Then ADR G5-G9. | Source: row CODEX-R7-PLAN-AMEND-20260925T1854Z (sequence); rows CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z (finding 1), CODEX-PR274-31DBBBB-NOGO-20260926T030702Z (accept 2 and 3); this ADR, Incremental release plan
+- `p2.gate` ADR G9 in full: G1 continuous-audio and live-prototype evidence; G2 provider reliability; exact-head #260 (G3) and #261 (G4) acceptance; immutable source-to-runtime receipts; a tested rollback on production main. Soak: minimum sessions, turns and concurrency, the candidate revision and config, a reset-on-failure rule, and 24 h versus 48 h exit criteria, to be set by Codex/owner. Rollback: RTO to be set by Codex/owner, with traffic, image, config, state and log read-back. Each minibus: its own tenant and subject binding, runtime identity, secret, signed lease and revocation, budget, provider egress, privacy, microphone, retention, restore and deletion decisions, isolation and denial tests, release receipt, kill switch, canary and rollback. No minibus inherits Converspan's soak. | Source: this ADR, G9; rows CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z (finding 3), CODEX-PR274-31DBBBB-NOGO-20260926T030702Z (finding 4 and accept 4)
+- `c.mother` PARTIAL || Blackboard motherboard || - || Now: current handoff and audit; signed leases and the kill switch are future. || Kill switch reaches connected nodes within the 60 s design target. || G9 enrollment || G9 | Source: this ADR, Current logical architecture, decision 7 and G9
+- `c.realtime` PARTIAL || OpenAI Realtime || - || Now: live WebRTC host; audio not yet accepted. || Ten minutes, five turns, two barge-ins, no reconnect or transcript-only substitution. || G1 || G1 | Source: FL; this ADR, Acceptance matrix (Continuous audio) and G1
+- `c.tts` PARTIAL || OpenAI TTS || - || Now: Architect and Muse speech as audio blobs. || Spoken once through the browser audio arbiter in that session. || G1 || G1 | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 1; this ADR, Acceptance matrix (Gemini website TALK/RECAP) and G1
+- `c.web` PARTIAL || Web / mobile || e538ecf || Now: authenticated owner session. || No cross-tenant read or reuse; revocation enforced at every boundary. || G3 || G3, r.site223 | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 1; this ADR, Acceptance matrix (Tenant isolation) and G3
+- `c.wa` PARTIAL || WhatsApp || - || Now: outbound accepted (HTTP 200); delivery unverified. || One inbound message, one authorized work item, one delivered status with destination receipt. || G8 || G8 | Source: FL; row CODEX-WA-SFDC24-PR221-STATUS-20260926T022002Z; this ADR, Acceptance matrix (WhatsApp) and G8
+- `c.zoom` HELD || Zoom RTMS + Ubuntu presenter || - || Now: source only; the Ubuntu presenter VM is stopped; no live meeting acceptance. || A consented real meeting: media, speak, present, reconnect, tear down. || G8 || G8 | Source: this ADR, Context and current-state snapshot (Zoom presenter), Acceptance matrix (Zoom) and G8
+- `c.arbiter` PARTIAL || One browser audio arbiter || e538ecf || Now: one queue, with response-id ownership and a 20 s talk deadline. || Two barge-ins inside the ten-minute continuous-audio session. || G1 || G1, r.site221 | Source: FL; this ADR, Acceptance matrix (Continuous audio) and G1
+- `c.controller` PARTIAL || Studio Controller turn and task arbiter || r5b-0895605 || Now: r5b at 100%; the builder and /analyze hit Cloud Run's 60 s limit on 26 Sep; #272 in repair. || G2: end-to-end deadlines, cancellation, fallback, circuit state, stale-turn fences, bounded bodies, receipts, fault tests. || G2 || G2, r.pr272, r.pr272b | Source: FL; row CODEX-PR272-8A9349E-NOGO-20260926T020927Z; this ADR, G2
+- `c.ledger` PARTIAL || Session, event + CAS ledger || r5b-0895605 || Now: GCS CAS state, fenced revisions and replay; #260's outcome durability finding passed. || Final artifact reproduced from the event ledger (G1); one publication and one receipt after a crash (G4). || G1, G4 || G1, G4, r.pr260 | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 1; row CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z; this ADR, Acceptance matrix, G1 and G4
+- `c.work` PARTIAL || Concurrent bounded work || r5b-0895605 || Now: analyze, inspire and commands ran concurrently in the 26 Sep run; Gemini advisor dark. || A stale, late, malformed or over-budget Gemini result cannot change the artifact. || G5 || G5 | Source: FL; this ADR, Acceptance matrix (Gemini Analyst) and G5
+- `c.commit` PARTIAL || Single artifact committer || r5b-0895605 || Now: the controller alone validates and commits. || At least three visible typed revisions in one session. || G1 || G1 | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 1; this ADR, Acceptance matrix (Live prototype) and G1
+- `c.outbox` TARGET || Durable outbox + capability gateways || - || Now: a channel outbox exists; the dispatch-once effect outbox is G7. || A confirmed sandbox operation dispatches once, is read back, survives restart, has a tested rollback. || G7 || G7 | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 1 (Pipedream + outbox); this ADR, Acceptance matrix (Salesforce mutation) and G7
+- `c.charter` DARK || Charter + quote PDF (#269) || - || Now: in main, switched off; empty price table. || Repair and review #269; CX1 with PDF and price effects off; CX2 after the owner's commercial gates. || CX1, CX2 || c.controller | Source: FL; row CODEX-R7-PLAN-AMEND-20260925T1854Z
+- `c.converspan` HELD || Converspan minibus || - || Now: production frozen until SFDC24 foundation gates pass. || ADR G9 in full, including G2 and its own enrollment (launch gate box). || G9, non-waivable || G9, c.controller, c.web, c.ledger | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 2; this ADR, G9
+- `c.nav` HELD || Nav / steelworkson.ca minibus || - || Now: workspaces off. || #260 exact-head acceptance (G3), #261 (G4), then its own G9 enrollment. || G3, G4, G9 || G3, G4, G9, r.pr260, r.pr260b | Source: FL; row CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z; this ADR, G3, G4 and G9
+- `c.clients` TARGET || Additional client minibuses || - || Now: selected design only. || Each its own G9 enrollment; Converspan's soak is evidence, not approval. || G9 || G9, c.converspan | Source: `docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf` page 2 (TARGET); this ADR, G9; row CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z (finding 3)
+- `c.sf` HELD || Salesforce commercial engine || - || Now: writes paused (BLK-059). || Lead count matches a separate org read with org binding (G6); then sandbox mutations (G7). || G6, G7 || G6, G7 | Source: FL; this ADR, Acceptance matrix (Salesforce Lead count, Salesforce mutation), G6 and G7
+<!-- architecture-pdf-claims:end -->
+
+**Status changes from the 2026-09-25 edition** (shown only as status pills):
+
+- Page 1: browser audio arbiter CURRENT to LIVE (#221 in repository main,
+  review `r.site221`); Claude builder and Analyst + Muse CURRENT to PARTIAL
+  (owner-run defects 1 and 2; FL); Gemini advisor HELD to DARK (FL); controller
+  revision R5 to R5b (FL).
+- Page 2: each component's status comes from its `c.` record above.
+
+**Out of scope for this artifact.** PR #273 is review work, not an accepted
+gate (row `CODEX-PR274-31DBBBB-ARCH-NOGO-20260926T0306Z`, finding 3); nothing
+here cites it. The soak, SLO, reset-on-failure and rollback-time numbers asked
+for in row `CODEX-PR274-31DBBBB-NOGO-20260926T030702Z` (finding 4) are not set
+by any source; the launch-gate box says "to be set by Codex/owner" instead of
+inventing them.

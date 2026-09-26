@@ -161,14 +161,14 @@ def settings(**overrides):
 
 
 def make_controller(*, store=None, worker=None, cap=20, max_events=200,
-                    max_commands=100, now=1000):
+                    max_commands=100, now=1000, **extra):
     store = store or MemoryStore()
     worker = worker or CountingWorker()
     clock = lambda: now
     controller = StudioController(
         StudioRepository(store, clock=clock), worker, clock=clock, id_factory=IDs(),
         max_seconds=600, daily_cap=cap, max_events=max_events,
-        max_commands=max_commands,
+        max_commands=max_commands, **extra,
     )
     return controller, store, worker
 
@@ -2173,6 +2173,156 @@ class CodexReview206ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandError, "open decision batch"):
             controller.execute(state["session_id"], _batch_cmd(state, "b-late", batch_id,
                                                                [{"question_id": "q-tone", "option_id": "calm"}]))
+
+
+class _TimeoutThenBuild:
+    """The provider times out once, then answers: the owner's 01:04Z turn."""
+    def __init__(self, *drafts):
+        from types import SimpleNamespace
+        self.drafts, self.calls = list(drafts), 0
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        from types import SimpleNamespace
+        import anthropic
+        self.calls += 1
+        if self.calls == 1:
+            raise anthropic.APITimeoutError(request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+        return SimpleNamespace(stop_reason="end_turn",
+                               content=[SimpleNamespace(type="text", text=json.dumps(self.drafts[0]))])
+
+
+class ASlowBuildNeverHoldsTheSlot(unittest.TestCase):
+    def test_a_build_that_times_out_completes_and_the_next_is_accepted_at_once(self):
+        from app.core import SLOW_BUILD_TEXT
+        from workers.claude_worker import ClaudeWorker
+        worker = ClaudeWorker(client=_TimeoutThenBuild(_BOOK_BY_VOICE))
+        seed = SyntheticWorker()
+        worker.initial_artifact, worker.initial_questions = seed.initial_artifact, seed.initial_questions
+        controller, store, _ = make_controller(worker=worker)
+        state, _ = controller.create_session()
+        sid = state["session_id"]
+        first = controller.execute(sid, _say(state, 1, "make the main action booking", 1))
+        self.assertEqual(["confirm"], [e["type"] for e in first["events"]])
+        self.assertEqual(SLOW_BUILD_TEXT, first["events"][0]["payload"]["text"])
+        saved = StudioRepository(store).load(sid).state
+        self.assertIsNone(saved["active_command"], "no inflight slot is left behind")
+        self.assertEqual("completed", saved["commands"]["spoken-1"]["status"])
+        self.assertNotIn("inflight", [c.get("status") for c in saved["commands"].values()])
+        # The very next command is accepted - no 409 - and builds.
+        second = controller.execute(sid, _say(state, 2, "book a call, then", 1))
+        self.assertIn("artifact.patch", [e["type"] for e in second["events"]])
+        self.assertEqual(2, second["artifact_version"])
+
+
+# --- Codex NO-GO on #272 at 8a9349e: the command settles inside a total budget ---
+from tests.studio_slow_provider import SlowProvider, message as _message  # noqa: E402
+
+_LATE_DRAFT = {"ops": [{"op": "set_label", "node_id": "hero-cta", "value": "LATE LABEL", "new_node": _NO_NODE}],
+               "confirm": "Changed the action.", "questions": [], "batch_title": "",
+               "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""}}
+
+
+class _HangsThenAnswers(SyntheticWorker):
+    """The first turn hangs (not in a provider), then answers with a change; later turns are quick."""
+    def __init__(self):
+        self.release, self.finished, self.calls = threading.Event(), threading.Event(), 0
+
+    def on_turn(self, state, trigger):
+        self.calls += 1
+        if self.calls == 1:
+            self.release.wait(10)
+            self.finished.set()
+            return {"events": [{"type": "artifact.patch", "payload": {"ops": [
+                {"op": "set_label", "node_id": "hero-cta", "value": "LATE LABEL"}]}}], "problems": []}
+        return super().on_turn(state, trigger)
+
+
+def _loopback_claude(prov, budget):
+    from workers.claude_worker import ClaudeWorker
+    worker = ClaudeWorker(client=prov.client(), budget_seconds=budget)
+    seed = SyntheticWorker()
+    worker.initial_artifact, worker.initial_questions = seed.initial_artifact, seed.initial_questions
+    return worker
+
+
+class ACommandSettlesInsideItsBudget(unittest.TestCase):
+    def settled(self, store, sid):
+        saved = StudioRepository(store).load(sid).state
+        self.assertIsNone(saved["active_command"], "no slot is left held")
+        self.assertNotIn("inflight", [c.get("status") for c in saved["commands"].values()])
+        return saved
+
+    def test_the_problem_wording_is_the_workers(self):
+        import app.core as core
+        from workers import claude_worker as cw
+        self.assertEqual(cw.SLOW_BUILD_PROBLEM, core.SLOW_BUILD_PROBLEM)
+        self.assertEqual(cw.BLOCKED_BUILD_PROBLEM, core.BLOCKED_BUILD_PROBLEM)
+        self.assertLess(core.WORKER_BUDGET_SECONDS, 60)
+        self.assertGreater(core.WORKER_BUDGET_SECONDS, cw.BUILD_BUDGET_SECONDS)
+
+    def test_a_worker_that_hangs_is_abandoned_and_its_late_answer_never_lands(self):
+        from app.core import SLOW_BUILD_TEXT
+        worker = _HangsThenAnswers()
+        controller, store, _ = make_controller(worker=worker, worker_budget_seconds=0.4)
+        state, _ = controller.create_session()
+        sid = state["session_id"]
+        started = time.monotonic()
+        first = controller.execute(sid, _say(state, 1, "make the main action booking", 1))
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual([SLOW_BUILD_TEXT], [e["payload"]["text"] for e in first["events"] if e["type"] == "confirm"])
+        self.assertTrue(any("controller deadline" in p for p in first["problems"]), first["problems"])
+        self.assertEqual("completed", self.settled(store, sid)["commands"]["spoken-1"]["status"])
+        second = controller.execute(sid, _say(state, 2, "and a phone number field", 1))   # no 409
+        self.assertEqual(second["command_id"], "spoken-2")
+        worker.release.set()
+        self.assertTrue(worker.finished.wait(5))
+        time.sleep(0.2)
+        saved = self.settled(store, sid)
+        self.assertNotIn("LATE LABEL", json.dumps(saved["artifact"]), "the late answer never commits")
+        self.assertEqual(second["artifact_version"], saved["artifact_version"])
+
+    def test_a_trickling_provider_settles_the_command_and_the_next_one_builds(self):
+        from app.core import SLOW_BUILD_TEXT
+        prov = SlowProvider(("slow", _message(json.dumps(_LATE_DRAFT)), 0.01),
+                            ("fast", _message(json.dumps(_BOOK_BY_VOICE))))
+        self.addCleanup(prov.close)
+        controller, store, _ = make_controller(worker=_loopback_claude(prov, 0.6))
+        state, _ = controller.create_session()
+        sid = state["session_id"]
+        started = time.monotonic()
+        first = controller.execute(sid, _say(state, 1, "make the main action booking", 1))
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(["confirm"], [e["type"] for e in first["events"]])
+        self.assertEqual(SLOW_BUILD_TEXT, first["events"][0]["payload"]["text"])
+        self.settled(store, sid)
+        self.assertIn("dropped", prov.wait_settled(0))
+        second = controller.execute(sid, _say(state, 2, "book a call, then", 1))
+        self.assertIn("artifact.patch", [e["type"] for e in second["events"]])
+        saved = self.settled(store, sid)
+        self.assertEqual(2, saved["artifact_version"])
+        self.assertNotIn("LATE LABEL", json.dumps(saved["artifact"]))
+        self.assertEqual(2, len(prov.served), "one call per command, no retry")
+
+    def test_a_permanent_fault_is_said_as_one_and_a_transient_one_as_a_moment(self):
+        from app.core import BLOCKED_BUILD_TEXT, SLOW_BUILD_TEXT
+        for code, kind, said in ((400, "invalid_request_error", BLOCKED_BUILD_TEXT),
+                                 (401, "authentication_error", BLOCKED_BUILD_TEXT),
+                                 (403, "permission_error", BLOCKED_BUILD_TEXT),
+                                 (429, "rate_limit_error", SLOW_BUILD_TEXT),
+                                 (529, "overloaded_error", SLOW_BUILD_TEXT)):
+            with self.subTest(status=code):
+                prov = SlowProvider(("status", code, kind), ("fast", _message(json.dumps(_BOOK_BY_VOICE))))
+                self.addCleanup(prov.close)
+                controller, store, _ = make_controller(worker=_loopback_claude(prov, 5))
+                state, _ = controller.create_session()
+                sid = state["session_id"]
+                first = controller.execute(sid, _say(state, 1, "make the main action booking", 1))
+                self.assertEqual([said], [e["payload"]["text"] for e in first["events"]])
+                self.settled(store, sid)
+                second = controller.execute(sid, _say(state, 2, "book a call, then", 1))
+                self.assertIn("artifact.patch", [e["type"] for e in second["events"]])
+                self.assertEqual(2, len(prov.served), "no retry")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: its list of current Drive docs and its wake order are stale. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # Drive Markdown Mind-Map (SFDC24 / Blackboard)
 **As of:** 2026-09-18 (America/Toronto) · **Author:** grok-bot
 **Full inventory JSON:** [`docs/_md_inventory.json`](./_md_inventory.json) · **Doc train / pokayoke search:** [`docs/_search_doctrain_pokayoke.json`](./_search_doctrain_pokayoke.json)
