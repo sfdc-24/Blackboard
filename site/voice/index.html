@@ -445,6 +445,7 @@ body{overflow:hidden}
   // ---- state --------------------------------------------------------------
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   var mode = "off", rec = null, finalText = "", lastError = "";
+  var replyPending = false;
 
   var WORDS = { off:"ready", listening:"listening", thinking:"thinking", speaking:"speaking" };
   var HINTS = {
@@ -462,6 +463,8 @@ body{overflow:hidden}
     hint.textContent = HINTS[m] || "";
     bars.hidden = (m !== "speaking");
     mic.setAttribute("aria-label", m === "off" ? "Start talking" : m === "speaking" ? "Interrupt" : "Stop");
+    mic.disabled = replyPending;
+    syncSend();
   }
 
   // ---- listening ----------------------------------------------------------
@@ -529,9 +532,12 @@ body{overflow:hidden}
 
   // ---- one exchange -------------------------------------------------------
   function handle(text){
+    if (replyPending) return;
+    replyPending = true;
     turn("me", "you", text);
     setMode("thinking");
     jsonp({ action:"say", ct:CONVERSATION, q:text, s:TOKEN }, function(res){
+      replyPending = false;
       if (res && res.ct) {
         CONVERSATION = res.ct;
         try { localStorage.setItem("sfdc_conv", CONVERSATION) } catch(e){}
@@ -606,6 +612,7 @@ body{overflow:hidden}
 
   // ---- the tap ------------------------------------------------------------
   mic.addEventListener("click", function(){
+    if (replyPending) return;
     unlock();                          // must happen inside the gesture
     if (mode !== "off") { stopAll(); return }
     if (!SR) {
@@ -619,13 +626,16 @@ body{overflow:hidden}
   });
 
   // ---- typed --------------------------------------------------------------
-  function syncSend(){ send.disabled = !box.value.trim() || mode === "thinking" }
+  function syncSend(){ send.disabled = !box.value.trim() || replyPending }
   box.addEventListener("input", syncSend);
   box.addEventListener("keydown", function(e){
     if (e.key === "Enter" && box.value.trim()) { e.preventDefault(); submitTyped() }
   });
   send.addEventListener("click", submitTyped);
   function submitTyped(){
+    // Enter must obey the same pending-reply guard as the disabled send button.
+    // Keep the draft until the first response establishes conversation identity.
+    if (replyPending) return;
     var t = box.value.trim(); if (!t) return;
     unlock();
     box.value = ""; syncSend();
