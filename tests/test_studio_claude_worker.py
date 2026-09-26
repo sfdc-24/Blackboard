@@ -605,5 +605,174 @@ class TalkLaneModule(unittest.TestCase):
         self.assertIn("heading Bean There", summary)
 
 
+# --- The owner's live run, 2026-09-26 01:00-01:10Z: bounded and filled ---
+class _RaisingClient:
+    def __init__(self, exc):
+        self.exc, self.calls = exc, []
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        self.calls.append(kw)
+        raise self.exc
+
+
+def _request():
+    import httpx
+    return httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+BAKERY = "I run a small bakery in Hamilton. Customers order cakes online and pay by card or e-transfer, " \
+         "then pick up Tuesday to Saturday. I want a page for the cakes and a way to order."
+FILLED_BUILD = {
+    "ops": [
+        {"op": "set_label", "node_id": "screen-home", "value": "Bakery cake ordering site", "new_node": BLANK},
+        {"op": "insert_child", "node_id": "screen-home", "value": "",
+         "new_node": {"id": "sec-cakes", "kind": "section", "label": "Cakes", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-cakes", "value": "",
+         "new_node": {"id": "cakes-h", "kind": "heading", "label": "Cakes to order", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-cakes", "value": "",
+         "new_node": {"id": "cakes-list", "kind": "list", "label": "Cakes", "detail": ""}},
+        {"op": "insert_child", "node_id": "cakes-list", "value": "",
+         "new_node": {"id": "cake-1", "kind": "card", "label": "[Cake name]", "detail": "[Price] - order online"}},
+        {"op": "insert_child", "node_id": "screen-home", "value": "",
+         "new_node": {"id": "sec-pay", "kind": "section", "label": "Paying", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-pay", "value": "",
+         "new_node": {"id": "pay-h", "kind": "heading", "label": "How to pay", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-pay", "value": "",
+         "new_node": {"id": "pay-list", "kind": "list", "label": "Payment methods", "detail": ""}},
+        {"op": "insert_child", "node_id": "pay-list", "value": "",
+         "new_node": {"id": "pay-card", "kind": "text", "label": "Card, when you order online", "detail": ""}},
+        {"op": "insert_child", "node_id": "pay-list", "value": "",
+         "new_node": {"id": "pay-etransfer", "kind": "text", "label": "E-transfer", "detail": ""}},
+        {"op": "insert_child", "node_id": "screen-home", "value": "",
+         "new_node": {"id": "sec-pickup", "kind": "section", "label": "Pickup", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-pickup", "value": "",
+         "new_node": {"id": "pickup-h", "kind": "heading", "label": "Pick up in Hamilton", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-pickup", "value": "",
+         "new_node": {"id": "pickup-t", "kind": "text", "label": "Tuesday to Saturday", "detail": ""}},
+        {"op": "insert_child", "node_id": "sec-pickup", "value": "",
+         "new_node": {"id": "pickup-cta", "kind": "button", "label": "Order a cake", "detail": ""}},
+    ],
+    "confirm": "Built the cake page with ordering, card or e-transfer, and Tuesday to Saturday pickup.",
+    "questions": [], "batch_title": "",
+    "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""},
+}
+
+
+class BoundedAndFilled(unittest.TestCase):
+    def test_the_builder_client_gives_up_inside_cloud_runs_60_seconds(self):
+        import sys
+        seen = {}
+        stub = SimpleNamespace(Anthropic=lambda **kw: seen.update(kw) or SimpleNamespace())
+        real = sys.modules.get("anthropic")
+        sys.modules["anthropic"] = stub
+        try:
+            cw.ClaudeWorker()
+        finally:
+            if real is not None:
+                sys.modules["anthropic"] = real
+            else:
+                sys.modules.pop("anthropic", None)
+        self.assertEqual(0, seen.get("max_retries"))
+        self.assertLessEqual(seen.get("timeout"), 45)
+        self.assertEqual(cw.BUILD_TIMEOUT_SECONDS, seen.get("timeout"))
+
+    def test_a_turn_asks_for_no_more_than_fits_the_deadline(self):
+        _, client = run({"ops": [], "confirm": "", "questions": [], "batch_title": ""})
+        self.assertEqual(cw.MAX_TOKENS, client.calls[0]["max_tokens"])
+        self.assertLessEqual(cw.MAX_TOKENS, 4000)
+        # The largest real turn (a filled first version) fits with room to spare.
+        self.assertLess(len(json.dumps(FILLED_BUILD)) / 3, cw.MAX_TOKENS / 2)
+
+    def _turn_with(self, exc):
+        w = cw.ClaudeWorker(client=_RaisingClient(exc))
+        state = {"artifact": ROOT, "questions": [], "transcript": [], "session_id": "s1", "turn_seq": 3}
+        return w.on_turn(state, {"kind": "utterance", "text": BAKERY})
+
+    def test_a_timeout_is_a_turn_that_built_nothing_and_says_so(self):
+        import anthropic
+        out = self._turn_with(anthropic.APITimeoutError(request=_request()))
+        self.assertEqual([], out["events"])
+        self.assertEqual(1, len(out["problems"]))
+        self.assertTrue(out["problems"][0].startswith(cw.SLOW_BUILD_PROBLEM), out["problems"])
+
+    def test_a_provider_error_status_is_the_same(self):
+        import anthropic
+        import httpx
+        overloaded = anthropic.InternalServerError(
+            "overloaded", response=httpx.Response(529, request=_request()), body=None)
+        out = self._turn_with(overloaded)
+        self.assertEqual([], out["events"])
+        self.assertTrue(out["problems"][0].startswith(cw.SLOW_BUILD_PROBLEM))
+
+    def test_a_bug_is_still_a_crash_not_a_quiet_nothing(self):
+        with self.assertRaises(KeyError):
+            self._turn_with(KeyError("a programming error"))
+
+    def test_with_the_analyst_asking_the_builder_is_told_to_build_now(self):
+        client = FakeClient({"ops": [], "confirm": "", "questions": [], "batch_title": "",
+                             "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""}})
+        w = cw.ClaudeWorker(client=client)
+        base = {"artifact": ROOT, "questions": [], "transcript": [], "session_id": "s1", "turn_seq": 3}
+        w.on_turn(dict(base, analyst=True), {"kind": "utterance", "text": BAKERY})
+        w.on_turn(dict(base), {"kind": "utterance", "text": BAKERY})
+        with_analyst, without = (c["messages"][0]["content"] for c in client.calls)
+        self.assertIn("THE ANALYST ASKS THE QUESTIONS", with_analyst)
+        self.assertIn("never hold it back for a question", with_analyst)
+        self.assertNotIn("THE ANALYST ASKS THE QUESTIONS", without)
+
+    def test_with_the_analyst_asking_a_dropped_question_is_not_a_failed_change(self):
+        # The owner's run: two turns returned no change and a question that
+        # reused a recorded id; the visitor heard "did not go through".
+        draft = {"ops": [], "confirm": "", "questions": [q("q-cta")], "batch_title": "",
+                 "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""}}
+        w = cw.ClaudeWorker(client=FakeClient(draft))
+        state = {"artifact": ROOT, "questions": [dict(q("q-cta"), status="answered")], "transcript": [],
+                 "session_id": "s1", "turn_seq": 3, "analyst": True}
+        out = w.on_turn(state, {"kind": "utterance", "text": "sounds good"})
+        self.assertEqual([], out["events"])
+        self.assertEqual([], out["problems"])
+        # Without the analyst the same dropped question is still reported.
+        state.pop("analyst")
+        out = cw.ClaudeWorker(client=FakeClient(draft)).on_turn(state, {"kind": "utterance", "text": "sounds good"})
+        self.assertTrue(any(p.startswith("question 'q-cta' dropped") for p in out["problems"]), out["problems"])
+
+    def test_the_prompt_says_to_fill_what_is_added(self):
+        self.assertIn("FILL WHAT YOU ADD. A section is never just a heading.", cw.SYSTEM)
+        self.assertIn("payment methods", cw.SYSTEM)
+
+    def test_a_realistic_website_turn_arrives_filled(self):
+        w = cw.ClaudeWorker(client=FakeClient(FILLED_BUILD))
+        state = {"artifact": ROOT, "questions": [], "transcript": [{"role": "visitor", "text": BAKERY}],
+                 "session_id": "s1", "turn_seq": 1, "topic": "website", "analyst": True}
+        out = w.on_turn(state, {"kind": "utterance", "text": BAKERY})
+        self.assertEqual([], out["problems"])
+        patch = out["events"][0]["payload"]["ops"]
+        self.assertEqual(len(FILLED_BUILD["ops"]), len(patch), "the gate kept every op")
+        tree = cw.apply_ops(ROOT, patch)
+        sections = [c for c in tree["children"] if c["kind"] == "section" and c["id"].startswith("sec-")]
+        self.assertEqual(["sec-cakes", "sec-pay", "sec-pickup"], [s["id"] for s in sections])
+        for sec in sections:
+            with self.subTest(section=sec["id"]):
+                kinds = [c["kind"] for c in sec.get("children") or []]
+                self.assertIn("heading", kinds)
+                self.assertTrue(set(kinds) - {"heading"}, "a section carries content, not just a heading")
+        labels = json.dumps(tree)
+        for said in ("E-transfer", "Tuesday to Saturday", "Hamilton", "Order a cake"):
+            self.assertIn(said, labels)
+
+    def test_a_section_added_empty_is_reported_and_the_change_stands(self):
+        draft = {"ops": [{"op": "insert_child", "node_id": "screen-home", "value": "",
+                          "new_node": {"id": "sec-empty", "kind": "section", "label": "Payments", "detail": ""}},
+                         {"op": "insert_child", "node_id": "screen-home", "value": "",
+                          "new_node": {"id": "sec-ok", "kind": "section", "label": "Hours", "detail": ""}},
+                         {"op": "insert_child", "node_id": "sec-ok", "value": "",
+                          "new_node": {"id": "ok-t", "kind": "text", "label": "Tuesday to Saturday", "detail": ""}}],
+                 "confirm": "Added payments and hours.", "questions": [], "batch_title": ""}
+        out, _ = run(draft)
+        self.assertEqual(["section 'sec-empty' was added with nothing in it"], out["problems"])
+        self.assertEqual(["artifact.patch", "confirm"], [e["type"] for e in out["events"]])
+
+
 if __name__ == "__main__":
     unittest.main()

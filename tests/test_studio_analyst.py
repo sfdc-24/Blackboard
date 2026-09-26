@@ -378,5 +378,26 @@ class Lane(unittest.TestCase):
         self.assertEqual([], self.analyst.calls)
 
 
+class AnalystDeadline(unittest.TestCase):
+    def test_the_analyst_gives_up_inside_cloud_runs_60_seconds(self):
+        # The owner's run (2026-09-26 01:04Z): /analyze died with a 504 at
+        # exactly 60.0 s, which was both the client timeout and Cloud Run's.
+        import sys
+        seen = {}
+        stub = SimpleNamespace(Anthropic=lambda **kw: seen.update(kw) or SimpleNamespace())
+        real = sys.modules.get("anthropic")
+        sys.modules["anthropic"] = stub
+        try:
+            an.Analyst()
+        finally:
+            if real is not None:
+                sys.modules["anthropic"] = real
+            else:
+                sys.modules.pop("anthropic", None)
+        self.assertEqual(0, seen.get("max_retries"))
+        self.assertEqual(an.TIMEOUT_SECONDS, seen.get("timeout"))
+        self.assertLessEqual(seen.get("timeout"), 45)
+
+
 if __name__ == "__main__":
     unittest.main()
