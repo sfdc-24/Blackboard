@@ -402,7 +402,9 @@ tenant exists and still lists an address that hashes to the token's subject.
   is three letters. The whole run of non-whitespace characters around an `@`, or its full-width
   and small forms, goes, whatever its length: the local part and the domain together, dotted,
   dotless (`admin@localhost`) or a bracketed literal (`user@[2001:db8::1]`). Only trailing
-  sentence punctuation (`.,;:!?`) stays. No window can leave a registry-valid prefix or suffix
+  sentence punctuation (`.,;:!?`) stays, and not even that when it is all that follows the `@`:
+  the registry accepts `client@?!` and `a@.` too, so the whole run goes (Codex Gate 1 on
+  80dfc8f). No window can leave a registry-valid prefix or suffix
   behind, and punctuation the registry accepts (`secret＜alias@example.com`,
   `user@secret：part`) does not stop it. This is over-redaction by design, and linear: one
   character test per character. Codex Gate 1 NO-GO on 59ed871.
@@ -463,7 +465,9 @@ cc56fea.
     fingerprint and command epoch. It is never overwritten.
   - The outcome is then applied under the same ownership fence by whichever comes first:
     - at once;
-    - a scheduled background recovery, which needs no client command;
+    - a scheduled background recovery, which needs no client command. It also writes the
+      record again until it is durable if the finish could not, and a finish whose apply fails
+      to load or write the session still schedules it (Codex Gate 1 on 80dfc8f);
     - any reader of the session, on any instance: a new command, or the event stream's read. So a
       restarted controller finishes it with no client command at all (Codex Gate 1 on 59ed871).
 
@@ -488,12 +492,20 @@ objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
 - A lease has an owner, an expiry and a growing fence. Only its owner, with its fence, releases it.
   A lease that has expired is no longer counted.
 - A page load that timed out while its worker is still alive keeps both leases for as long as the
-  worker lives. A resolver can block without bound.
+  worker lives.
   - A keeper renews them, owned and fenced, every 15 s, and gives them back once the worker stops.
   - A renewal only extends an entry still in the record. A successful acquire rewrites the lane
     with the live leases alone, so a renewal can never admit past the ceiling.
   - A process that dies renews nothing, so its leases still expire after 60 s.
   - Codex Gate 1 on 59ed871.
+- The work never outlives its lease (Codex Gate 1 on 80dfc8f).
+  - If a renewal is refused, or cannot be confirmed within 25 s of the lease lapsing (the guard
+    store is down, or the keeper was paused), the keeper stops the load and waits for it to stop
+    before giving anything back.
+  - The name lookup runs in a child process that is killed at 3 s or on that stop. Every later
+    step checks the stop and is bounded by its connect or idle timeout.
+  - So when a lease lapses and another instance takes the place, the old work is already gone.
+    The tenant's single flight and the ceiling hold through an outage of any length.
 - If the tenant lease is taken but the ceiling cannot be read or written, the tenant lease goes
   back at once. A retry is then not refused as "already loading".
 - Guard state that cannot be read or written refuses the call (503). It never lets the call

@@ -685,11 +685,20 @@ class StudioController:
                 continue
         return False
 
-    def _schedule_recovery(self, session_id: str, outcome: dict) -> None:
+    def _schedule_recovery(self, session_id: str, outcome: dict, durable: bool = True) -> None:
+        """Keep at it without any client command: record the outcome until it
+        is durable (Codex Gate 1 on 80dfc8f: a record that could not be made
+        at the finish is part of terminalising, not optional), and apply it
+        until it lands or nothing owns the command any more."""
         def run():
-            delay = self.recovery_poll_seconds
+            delay, recorded = self.recovery_poll_seconds, durable
             for _ in range(self.recovery_attempts):
                 self.sleep(delay)
+                if not recorded:
+                    try:
+                        recorded = self._record_outcome(session_id, outcome)
+                    except Exception:
+                        recorded = False
                 try:
                     if self._apply_outcome(session_id, outcome, tries=1):
                         return
@@ -727,9 +736,13 @@ class StudioController:
         command_id = str(command["command_id"])
         outcome = {"version": 1, "session_id": session_id, "command_id": command_id, "fingerprint": fingerprint,
                    "command_epoch": base.get("command_epoch"), "receipt": dict(receipt)}
-        self._record_outcome(session_id, outcome)   # if even that fails: the recovery below, then the lease
-        if not self._apply_outcome(session_id, outcome, tries=3):
-            self._schedule_recovery(session_id, outcome)
+        durable = self._record_outcome(session_id, outcome)
+        try:
+            applied = self._apply_outcome(session_id, outcome, tries=3)
+        except Exception:
+            applied = False               # a load or write that failed never bypasses the recovery
+        if not applied:
+            self._schedule_recovery(session_id, outcome, durable)
 
     def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
         """Record the analyst's data model, and at most one question, beside the builder.

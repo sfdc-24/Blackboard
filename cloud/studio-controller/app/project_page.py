@@ -23,9 +23,12 @@ Input characters, nodes, depth, label length, images and parse time are capped.
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -41,6 +44,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 CONNECT_SECONDS = 3.0
+RESOLVE_SECONDS = 3.0         # the name lookup, in a child process killed at this deadline
 IDLE_SECONDS = 4.0            # longest wait for the next bytes (httpx read timeout)
 FIRST_BYTE_SECONDS = 5.0      # from the request to the response headers
 TOTAL_SECONDS = 8.0
@@ -76,11 +80,21 @@ class FetchBusy(PageFetchError):
 class FetchTimeout(PageFetchError):
     """The caller stopped waiting; the load's thread may still be running.
     ``done`` is set once that thread has really stopped, so a caller can keep
-    the load's durable leases alive until then (Codex Gate 1 on 59ed871)."""
+    the load's durable leases alive until then (Codex Gate 1 on 59ed871).
+    ``cancel`` stops it: set, the load makes no further step - the name lookup
+    child is killed, no connection is opened, no more bytes are read - so a
+    caller that can no longer hold its leases stops the work before they can
+    lapse (Codex Gate 1 on 80dfc8f)."""
 
-    def __init__(self, message: str, done: "threading.Event | None" = None):
+    def __init__(self, message: str, done: "threading.Event | None" = None,
+                 cancel: "threading.Event | None" = None):
         super().__init__(message)
         self.done = done
+        self.cancel = cancel
+
+
+class FetchCancelled(PageFetchError):
+    """The load was stopped on purpose (its leases could not be kept)."""
 
 
 # A page load keeps its slot until its thread has actually finished - a caller
@@ -113,8 +127,39 @@ def address_ok(ip) -> bool:
                                        or ip.is_reserved or ip.is_unspecified)
 
 
-def system_resolver(host: str) -> list:
-    return [info[4][0] for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)]
+# The system lookup can block without bound and a thread cannot be stopped,
+# so it runs in a child process that is killed at RESOLVE_SECONDS or the
+# moment the load is cancelled: no lookup outlives its load's leases (Codex
+# Gate 1 on 80dfc8f). The host is argv, never a shell; -I -S keep the child
+# free of the environment and site packages; it prints one JSON list.
+_RESOLVE_CHILD = ("import json, socket, sys\n"
+                  "print(json.dumps([i[4][0] for i in socket.getaddrinfo(sys.argv[1], 443, "
+                  "type=socket.SOCK_STREAM)]))")
+_RESOLVE_OUTPUT = 65536
+
+
+def system_resolver(host: str, cancel: "threading.Event | None" = None, seconds: float | None = None) -> list:
+    limit = RESOLVE_SECONDS if seconds is None else float(seconds)
+    child = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RESOLVE_CHILD, str(host)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + limit
+    try:
+        while child.poll() is None:
+            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+                raise OSError("the name did not resolve in time")
+            time.sleep(0.02)
+        out = child.stdout.read(_RESOLVE_OUTPUT + 1)
+        if child.returncode != 0 or len(out) > _RESOLVE_OUTPUT:
+            raise OSError("the name did not resolve")
+        answers = json.loads(out.decode("utf-8"))
+        if not isinstance(answers, list) or not all(isinstance(a, str) for a in answers):
+            raise ValueError("not a list of addresses")
+        return answers
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        child.stdout.close()
 
 
 def resolve_pinned(host: str, resolver) -> "ipaddress.IPv4Address | ipaddress.IPv6Address":
@@ -149,11 +194,11 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
     if not slots.acquire(blocking=False):
         raise FetchBusy("every page-load slot is taken")
     outcome: dict = {}
-    finished = threading.Event()
+    finished, cancel = threading.Event(), threading.Event()
 
     def work():
         try:
-            outcome["html"] = _fetch(url, resolver, transport, clock)
+            outcome["html"] = _fetch(url, resolver, transport, clock, cancel)
         except PageFetchError as exc:
             outcome["error"] = exc
         except BaseException as exc:         # never the message: it can carry the URL
@@ -170,17 +215,23 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
         raise
     worker.join(TOTAL_SECONDS)
     if worker.is_alive():
-        raise FetchTimeout("the page was too slow", finished)
+        raise FetchTimeout("the page was too slow", finished, cancel)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["html"]
 
 
-def _fetch(url: str, resolver, transport, clock) -> str:
+def _stopped(cancel) -> None:
+    if cancel is not None and cancel.is_set():
+        raise FetchCancelled("the load was stopped")
+
+
+def _fetch(url: str, resolver, transport, clock, cancel=None) -> str:
     import httpx
     parts = urlsplit(url)
     host = parts.hostname
-    ip = resolve_pinned(host, resolver or system_resolver)
+    ip = resolve_pinned(host, resolver or (lambda name: system_resolver(name, cancel)))
+    _stopped(cancel)                         # every step checks: a stopped load goes no further
     pinned = urlunsplit(("https", "[%s]" % ip if ip.version == 6 else str(ip), parts.path or "/", "", ""))
     timeout = httpx.Timeout(connect=CONNECT_SECONDS, read=IDLE_SECONDS, write=CONNECT_SECONDS,
                             pool=CONNECT_SECONDS)
@@ -194,8 +245,10 @@ def _fetch(url: str, resolver, transport, clock) -> str:
             # TLS is to the registered name, not the address: SNI and the
             # certificate check both use it.
             extensions={"sni_hostname": host})
+        _stopped(cancel)
         response = client.send(request, stream=True, follow_redirects=False)
         try:
+            _stopped(cancel)
             if clock() - started > FIRST_BYTE_SECONDS:
                 raise PageFetchError("the page was too slow to answer")
             if 300 <= response.status_code < 400:
@@ -211,6 +264,7 @@ def _fetch(url: str, resolver, transport, clock) -> str:
             inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if coding == "gzip" else None
             raw_total, body = 0, bytearray()
             for chunk in response.iter_raw():
+                _stopped(cancel)
                 raw_total += len(chunk)
                 if raw_total > MAX_COMPRESSED_BYTES:
                     raise PageFetchError("the page is too large")
@@ -403,7 +457,10 @@ def _replace_found(text: str, finder) -> str:
 # literal or not - so no window can leave a registry-valid prefix or suffix
 # behind: not U+FB03 x30 before the "@", not a literal of 51 squared units,
 # not "secret" + a full-width "<" or ":". That is over-redaction by design.
-# Only trailing sentence punctuation (.,;:!?) stays outside it. One pass, one
+# Only trailing sentence punctuation (.,;:!?) stays outside it - unless the
+# part after the "@" is nothing but that punctuation ("zqclient@?!", "a@."),
+# which the registry accepts as a mailbox too: then the whole run goes,
+# punctuation and all (Codex Gate 1 on 80dfc8f). One pass, one
 # character test per character (_email_class, counted by the linear-work
 # test): linear by construction.
 _AT_FORMS = frozenset("@\ufe6b\uff20")     # every code point whose NFKC holds "@" (checked by a test)
@@ -422,7 +479,8 @@ def _email_class(ch: str) -> int:
 def _email_spans(text: str):
     """(start, end, EMAIL) for each run of non-whitespace characters that
     holds an "@" with something before and after it, in original coordinates;
-    trailing sentence punctuation is left outside the span."""
+    trailing sentence punctuation is left outside the span, except when it is
+    all that follows the "@" - then the whole run goes."""
     i, n = 0, len(text)
     while i < n:
         kind = _email_class(text[i])
@@ -440,8 +498,8 @@ def _email_spans(text: str):
             if kind != _TRAILING:
                 core = i
             i += 1
-        if at > start and core > at:
-            yield start, core + 1, EMAIL
+        if at > start and i > at + 1:                 # the registry's grammar: 1+ before, 1+ after
+            yield start, (core + 1 if core > at else i), EMAIL
 
 
 def _replace_raw(text: str, finder) -> str:
@@ -754,5 +812,5 @@ def tree_depth(tree: dict) -> int:
     return 1 + max((tree_depth(c) for c in tree.get("children") or []), default=0)
 
 
-__all__ = ["PageFetchError", "FetchBusy", "FetchTimeout", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
+__all__ = ["PageFetchError", "FetchBusy", "FetchTimeout", "FetchCancelled", "address_ok", "fetch_page", "page_to_tree", "clean_text", "resolve_pinned",
            "system_resolver", "tree_nodes", "tree_depth", "MAX_NODES", "MAX_DEPTH", "MAX_IMAGES", "LABEL_MAX"]

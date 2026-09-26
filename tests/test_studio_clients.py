@@ -2873,3 +2873,326 @@ class CodexR10FetchLeases(Api):
                 finally:
                     self.store.load, self.store.save = original_load, original_save
             self.assertEqual((503, 200), (first.status_code, retry.status_code), (how, retry.text))
+
+
+# -- Codex Gate 1 NO-GO on 80dfc8f (01:26Z row): round 11 ----------------------------------------
+from app.project_page import FetchCancelled  # noqa: E402
+
+R11_CASES = {
+    "Q zqclient@?! end": "Q [email] end",                   # a domain of nothing but punctuation: all of it goes
+    "Bang zqbang@! end": "Bang [email] end",
+    "Dot zqdot@. end": "Dot [email] end",
+    "Mix zqmix@.,;:!? end": "Mix [email] end",
+    "Tail zqtail@x. end": "Tail [email]. end",              # a real domain keeps a sentence's full stop outside
+}
+R11_NEVER = ("zqclient", "zqbang", "zqdot", "zqmix", "zqtail")
+
+
+class CodexR11AllTrailDomain(Api):
+    """Finding 1: the registry accepts a domain that is nothing but sentence punctuation."""
+
+    def test_all_trail_domains_go_whole(self):
+        for text, expected in R11_CASES.items():
+            self.assertEqual(expected, redact(text), repr(text))
+
+    def test_registry_conformance(self):
+        # Every registry-valid mailbox, whatever its parts are made of, goes: no
+        # "@" and none of its local part survives, in a sentence or alone.
+        from app.clients import _EMAIL_RE
+        locals_ = ("zqa", "zq!", "zq?!", "zq.x", "zq" + chr(0xFB03), "zq'e", "zq[")
+        domains = ("?", "!", ".", ".,;:!?", "b", "b.", "b.c", "[1]", "x" * 255, "?b", "b?", chr(0x33C4))
+        checked = 0
+        for local in locals_:
+            for domain in domains:
+                address = local + "@" + domain
+                if not _EMAIL_RE.fullmatch(address):
+                    continue
+                checked += 1
+                for text in (address, "see " + address + " now", "(" + address + ")"):
+                    out = redact(text)
+                    self.assertIn("[email]", out, repr(text))
+                    self.assertNotIn("@", out, repr(text))
+                    self.assertNotIn(local, out, repr(text))
+        self.assertGreater(checked, 70)
+
+    def test_the_registry_accepts_them(self):
+        from app.clients import _EMAIL_RE
+        for text in R11_CASES:
+            self.assertTrue(_EMAIL_RE.fullmatch(text.split(" ")[1]), text)
+
+    def test_no_surface_carries_them(self):
+        texts = list(R11_CASES)
+        page = ("<h1>%s</h1>" % texts[0] + "".join("<p>%s</p>" % t for t in texts[4:])
+                + "<img alt=\"%s\"><input placeholder=\"%s\"><nav aria-label=\"%s\"><a href='/'>Home</a></nav>"
+                % (texts[1], texts[2], texts[3]))
+        talk, worker = FakeTalk(), SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-r11", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-r11"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        state = self.state(live["session_id"])
+        surfaces = (("tree", json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)),
+                    ("state", json.dumps(state, ensure_ascii=False)),
+                    ("provider", json.dumps([talk.calls, worker.seen], ensure_ascii=False)), ("events", events))
+        for surface, text in surfaces:
+            for never in R11_NEVER:
+                self.assertNotIn(never, text, (surface, never))
+        self.assertIn("[email]", surfaces[1][1])
+
+
+class CodexR11OutcomeTerminalisation(Api):
+    """Finding 2: recording the outcome is part of terminalising it."""
+
+    inject = CodexR8B1FinaliserExhaustion.inject
+    exhaust = CodexR8B1FinaliserExhaustion.exhaust
+    assert_terminal = CodexR8B1FinaliserExhaustion.assert_terminal
+    fresh_app = CodexR10OutcomeDurability.fresh_app
+    fail_outcome_writes = CodexR10OutcomeDurability.fail_outcome_writes
+    read_events = CodexR10OutcomeDurability.read_events
+
+    def test_four_outcome_write_failures_then_a_restart_still_finish(self):
+        for fail in (False, True):
+            worker = CountingGateWorker(fail)
+            with TestClient(self.make(worker=worker)) as client:
+                outcome_left = self.fail_outcome_writes(4)                # every write at the finish fails
+                # ... and every session write loses: the finish, the fresh finishes, every apply
+                live, controller, sid, out, left = self.exhaust(client, worker, extra=10 ** 6,
+                                                                recovery_attempts=6)
+                for thread in controller.recoveries:
+                    thread.join(10)
+                self.assertEqual(0, outcome_left["n"])
+                self.assertEqual("build-exhaust", self.state(sid)["active_command"])
+                self.assertIsNotNone(controller._load_outcome(sid, "build-exhaust"))   # the recovery recorded it
+                left["n"] = 0                                                    # then the process restarts
+                events = self.read_events(sid, live)                              # no client command at all
+            self.assertEqual(200, events.status_code, events.text)
+            self.assert_terminal(sid, fail, out)
+            self.assertEqual(1, worker.turns)
+
+    def test_an_apply_whose_session_load_fails_still_schedules_its_recovery(self):
+        worker = CountingGateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            original_save, original_load, armed = self.store.save, self.store.load, {"load": False, "hit": 0}
+
+            def save(name, state, token):
+                result = original_save(name, state, token)
+                if name.startswith("studio_outcome_"):
+                    armed["load"] = True                  # durable now: the next session read fails once
+                return result
+
+            def load(name):
+                if armed["load"] and name.startswith("studio_session_"):
+                    armed["load"], armed["hit"] = False, armed["hit"] + 1
+                    raise OSError("transient")
+                return original_load(name)
+            self.store.save, self.store.load = save, load
+            live, controller, sid, out, left = self.exhaust(client, worker, extra=0, recovery_attempts=40)
+            self.assertEqual(1, armed["hit"])
+            self.assertEqual(1, len(controller.recoveries))                   # scheduled, not bypassed
+            for thread in controller.recoveries:
+                thread.join(10)
+            self.assert_terminal(sid, False, out)                                # with no reader at all
+
+
+class StoppableTimedOutFetcher(FakeFetcher):
+    """A timed-out load that stops when it is cancelled, as fetch_page's does;
+    `live` is shared between instances: every load still running."""
+
+    def __init__(self, live, stop_delay=0.0, on_stop=None):
+        super().__init__()
+        self.live, self.stop_delay, self.on_stop, self.loads = live, stop_delay, on_stop, []
+
+    def __call__(self, url):
+        self.calls.append(url)
+        done, cancel, token = threading.Event(), threading.Event(), object()
+        self.live.add(token)
+
+        def work():
+            cancel.wait(30)                            # blocked, like a lookup that never returns - until stopped
+            time.sleep(self.stop_delay)
+            if self.on_stop:
+                self.on_stop()
+            self.live.discard(token)
+            done.set()
+        threading.Thread(target=work, daemon=True).start()
+        self.loads.append((done, cancel))
+        raise FetchTimeout("the page was too slow", done, cancel)
+
+
+class CountingLiveFetcher(FakeFetcher):
+    """Notes how many loads are still running when this one is admitted."""
+
+    def __init__(self, live):
+        super().__init__()
+        self.live, self.seen_live = live, []
+
+    def __call__(self, url):
+        self.seen_live.append(len(self.live))
+        return super().__call__(url)
+
+
+class CodexR11FetchOutage(Api):
+    """Finding 3: a load never outlives its lease - through a guard outage
+    longer than the lease, the old work stops before anyone takes its place."""
+
+    second_app = CodexR8B3TwoInstances.second_app
+
+    def guard_outage(self):
+        original_load, original_save, down = self.store.load, self.store.save, {"on": True}
+
+        def load(name):
+            if down["on"] and name.startswith("studio_guard_"):
+                raise OSError("guard store down")
+            return original_load(name)
+
+        def save(name, state, token):
+            if down["on"] and name.startswith("studio_guard_"):
+                raise OSError("guard store down")
+            return original_save(name, state, token)
+        self.store.load, self.store.save = load, save
+        return down
+
+    def outage_then_second_load(self, other_tenant):
+        acme = client_entry(tenant="acme", emails=("acme@example.com",), name="Acme",
+                            projects=[project("acme-site", "https://www.acme.example.com/", "acme.example.com")])
+        live = set()
+        stuck, fresh, offset = StoppableTimedOutFetcher(live), CountingLiveFetcher(live), [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        with _mock.patch.object(_project_page, "MAX_OUTSTANDING_FETCHES", 1), \
+                _mock.patch.object(_main, "FETCH_RENEW_SECONDS", 0.02):
+            with TestClient(self.make(fetcher=stuck, clock=clock, registry=registry_record(client_entry(), acme))) as a, \
+                    TestClient(self.second_app(clock=clock, fetcher=fresh)) as b:
+                nav_token = self.sign_in(a).json()["token"]
+                acme_token = self.sign_in(b, "acme@example.com").json()["token"]
+                first = self.project_session(a, nav_token, "load-a")              # timed out; its work runs on
+                down = self.guard_outage()                                        # the guard store goes away ...
+                for _ in range(8):                                                # ... for 80 s: past the 60 s lease
+                    offset[0] += 10
+                    time.sleep(0.1)
+                down["on"] = False                                                # it is back
+                if other_tenant:
+                    second = self.project_session(b, acme_token, "acme-1", project_id="acme-site")
+                else:
+                    second = self.project_session(b, nav_token, "load-b")
+                for keeper in list(self.app.state.fetch_keepers):
+                    keeper.join(5)
+        self.assertEqual((502, 200), (first.status_code, second.status_code), second.text)
+        self.assertEqual([0], fresh.seen_live)                   # admitted only once the old load had stopped
+        self.assertTrue(stuck.loads[0][1].is_set())               # stopped on purpose, before its lease lapsed
+
+    def test_an_outage_past_the_lease_stops_the_load_first_the_global_ceiling(self):
+        self.outage_then_second_load(other_tenant=True)
+
+    def test_an_outage_past_the_lease_stops_the_load_first_the_tenant_single_flight(self):
+        self.outage_then_second_load(other_tenant=False)
+
+    def test_a_refused_renewal_stops_the_load_at_once_and_gives_nothing_back_before_it_stops(self):
+        live, held_at_stop = set(), []
+
+        def tenant_still_held():
+            leases = ((self.store.data.get(tenant_record("nav")) or {}).get("leases") or {}).get("fetch") or {}
+            held_at_stop.append(bool(leases))
+        stuck = StoppableTimedOutFetcher(live, stop_delay=0.3, on_stop=tenant_still_held)
+        with _mock.patch.object(_main, "FETCH_RENEW_SECONDS", 0.02):
+            with TestClient(self.make(fetcher=stuck)) as a:
+                token = self.sign_in(a).json()["token"]
+                first = self.project_session(a, token, "load-a")
+                with self.store.lock:                                         # another writer replaced it
+                    self.store.data[CEILING_RECORD]["leases"]["fetch"] = {}
+                done, cancel = stuck.loads[0]
+                self.assertTrue(cancel.wait(5))                               # stopped at the next beat
+                self.assertTrue(done.wait(5))
+                for keeper in list(self.app.state.fetch_keepers):
+                    keeper.join(5)
+                retry = self.project_session(a, token, "load-b")              # the tenant lease went back after
+        self.assertEqual(502, first.status_code)
+        self.assertEqual([True], held_at_stop)                                 # ... and only after it stopped
+        self.assertEqual(502, retry.status_code)                               # a fresh load was admitted (and timed out)
+
+    def test_a_cancelled_load_goes_no_further(self):
+        gate, seen = threading.Event(), []
+
+        def stuck(host):
+            gate.wait(10)
+            return [PUBLIC_IP]
+        with mock.patch.object(project_page, "TOTAL_SECONDS", 0.2):
+            with self.assertRaises(FetchTimeout) as timed_out:
+                fetch_page(PAGE, resolver=stuck, transport=page_transport(seen=seen))
+        exc = timed_out.exception
+        exc.cancel.set()
+        gate.set()                                                             # the lookup returns ...
+        self.assertTrue(exc.done.wait(5))
+        self.assertEqual([], seen)                                             # ... and nothing is ever sent
+
+    def test_the_lookup_child_is_killed_on_cancel_and_at_its_deadline(self):
+        children = []
+        real_popen = project_page.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+        with mock.patch.object(project_page.subprocess, "Popen", popen), \
+                mock.patch.object(project_page, "_RESOLVE_CHILD", "import time; time.sleep(30)"):
+            cancel = threading.Event()
+            timer = threading.Timer(0.3, cancel.set)
+            timer.start()
+            started = time.monotonic()
+            with self.assertRaises(OSError):
+                project_page.system_resolver("steel.example.com", cancel, seconds=20)
+            self.assertLess(time.monotonic() - started, 5)                     # cancelled: killed at once
+            started = time.monotonic()
+            with self.assertRaises(OSError):
+                project_page.system_resolver("steel.example.com", None, seconds=0.5)
+            self.assertLess(time.monotonic() - started, 5)                     # its deadline: killed
+        with mock.patch.object(project_page.subprocess, "Popen", popen), \
+                mock.patch.object(project_page, "_RESOLVE_CHILD", "print('[\"93.184.216.34\"]')"):
+            self.assertEqual([PUBLIC_IP], project_page.system_resolver("steel.example.com"))
+        self.assertEqual(3, len(children))
+        self.assertTrue(all(child.returncode is not None for child in children))   # every child reaped
+
+
+class CodexR11AdviseLease(Api):
+    """Finding 4: everything after the advise lease is under its cleanup."""
+
+    def test_a_half_failed_advise_guard_leaves_no_lease(self):
+        for how in ("read", "write"):
+            advisor = CountingAdvisor()
+            with TestClient(self.make(advisor=advisor, client_providers=("claude", "openai", "gemini"))) as client:
+                token = self.sign_in(client).json()["token"]
+                live = self.project_session(client, token).json()
+                sid, record = live["session_id"], session_record(live["session_id"])
+                original_load, original_save, seen = self.store.load, self.store.save, {"load": 0, "save": 0}
+
+                def load(name, how=how):
+                    if name == record:
+                        seen["load"] += 1
+                        if how == "read" and seen["load"] == 2:              # the cap's read, after the lease
+                            raise OSError("down")
+                    return original_load(name)
+
+                def save(name, state, token_, how=how):
+                    if name == record:
+                        seen["save"] += 1
+                        if how == "write" and seen["save"] == 2:             # the cap's write, after the lease
+                            raise OSError("down")
+                    return original_save(name, state, token_)
+                self.store.load, self.store.save = load, save
+                url = "/v1/session/%s/advise" % sid
+                first = client.post(url, headers=self.auth(live["token"]), json={"revision": live["artifact_version"]})
+                calls_after_first = advisor.calls
+                leases = ((self.store.data.get(record) or {}).get("leases") or {}).get("advise") or {}
+                self.store.load, self.store.save = original_load, original_save
+                retry = client.post(url, headers=self.auth(live["token"]), json={"revision": live["artifact_version"]})
+            self.assertEqual((503, 0, {}), (first.status_code, calls_after_first, leases), (how, first.text))
+            self.assertEqual((200, 1), (retry.status_code, advisor.calls), (how, retry.text))
