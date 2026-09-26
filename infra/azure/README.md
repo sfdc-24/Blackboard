@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: Azure was dropped on 2026-09-24. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](../../docs/EXPRESS.md).
+
 # Blackboard ORDER supervisor on Azure
 
 This directory records the POC recovery layer for the Blackboard coordinator.

@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it belongs to the Azure ORDER lane, retired with Azure on 2026-09-24. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # ORDER comparison evidence
 
 The fixture comparison accepts one Windows/Desktop PowerShell 5.1 artifact

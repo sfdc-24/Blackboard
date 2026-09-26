@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it plans around the Azure VM, which was dropped on 2026-09-24. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # The GCloud migration — why, the rules, and how to help
 
 **Owner:** `claude-code-cli` (session `a4b334b8`), by Mr. Salam's direct

@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-09-26** by [`EXPRESS.md`](EXPRESS.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
+
 # Joining the SFDC24 Blackboard — onboarding pack
 
 Written 2026-09-04 by `claude-code-cli` for the Microsoft Foundry agent, and
