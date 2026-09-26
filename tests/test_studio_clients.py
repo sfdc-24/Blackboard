@@ -2853,7 +2853,11 @@ class CodexR10FetchLeases(Api):
         for how in ("read", "write"):
             with TestClient(self.make()) as a:
                 token = self.sign_in(a).json()["token"]
-                original_load, original_save, left = self.store.load, self.store.save, {"n": 1}
+                # Round 13 retries a transient guard READ a few times before
+                # refusing, so a read failure outlasts those tries to still
+                # refuse; a failed write is read back once, not retried.
+                tries = a.app.state.guards.transient_tries if how == "read" else 1
+                original_load, original_save, left = self.store.load, self.store.save, {"n": tries}
 
                 def load(name, how=how):
                     if how == "read" and name == CEILING_RECORD and left["n"] > 0:
@@ -3176,10 +3180,12 @@ class CodexR11AdviseLease(Api):
                 sid, record = live["session_id"], session_record(live["session_id"])
                 original_load, original_save, seen = self.store.load, self.store.save, {"load": 0, "save": 0}
 
+                tries = client.app.state.guards.transient_tries    # round 13 retries a transient read
+
                 def load(name, how=how):
                     if name == record:
                         seen["load"] += 1
-                        if how == "read" and seen["load"] == 1:              # the acquisition's read
+                        if how == "read" and seen["load"] <= tries:          # the acquisition's reads
                             raise OSError("down")
                     return original_load(name)
 
@@ -3654,3 +3660,275 @@ class CodexR12B4AdviseAtomic(Api):
             retry = self.advise(client, live)
         self.assertTrue(released)
         self.assertEqual(200, retry.status_code, retry.text)
+
+
+# -- Codex Gate 1 NO-GO on cfdebac (04:41Z row): round 13, B4 ------------------------------------
+from fastapi import HTTPException as _HTTPException  # noqa: E402
+
+R13_PROVIDERS = ("claude", "openai", "gemini")
+
+
+class _FlakyView:
+    """One instance's view of the shared store: the same data, but this
+    instance's reads or writes of one record can be failed on demand."""
+
+    def __init__(self, store):
+        self.store, self.record, self.down_reads, self.down_writes = store, None, 0, 0
+
+    def describe(self):
+        return self.store.describe()
+
+    def load(self, name):
+        if name == self.record and self.down_reads:
+            self.down_reads -= 1
+            raise OSError("this instance cannot read")
+        return self.store.load(name)
+
+    def save(self, name, state, token):
+        if name == self.record and self.down_writes:
+            self.down_writes -= 1
+            raise OSError("this instance cannot write")
+        return self.store.save(name, state, token)
+
+
+class CodexR13B4ProviderLease(Api):
+    """B4 on cfdebac: an ambiguous acquisition is read back by operation id; a
+    provider lease is short and renewed while the provider thread lives, so a
+    release one instance loses lapses for every instance; and cancelling the
+    request never strands a lease or lets a second call in beside a live one.
+    Two-app tests share one store, as two Cloud Run instances do."""
+
+    def live(self, client):
+        token = self.sign_in(client).json()["token"]
+        return self.project_session(client, token).json()
+
+    def advise(self, client, live):
+        return client.post("/v1/session/%s/advise" % live["session_id"], headers=self.auth(live["token"]),
+                           json={"revision": live["artifact_version"]})
+
+    def leases(self, record):
+        return ((self.store.data.get(record) or {}).get("leases") or {}).get("advise") or {}
+
+    def used(self, record):
+        return ((self.store.data.get(record) or {}).get("counts") or {}).get("advise", 0)
+
+    def drain(self, app, seconds=5.0):
+        end = time.monotonic() + seconds
+        while app.state.lease_tails and time.monotonic() < end:
+            time.sleep(0.02)
+        return not app.state.lease_tails
+
+    def second(self, store, advisor, clock=None):
+        """Another instance on the SAME store."""
+        return create_app(settings=settings(client_workspaces=True, client_providers=R13_PROVIDERS),
+                          store=store, worker=self.worker, id_factory=IDs(), email_sender=self.email_sender,
+                          project_fetcher=self.fetcher, talk_client=self.talk, advisor=advisor,
+                          **({"clock": clock} if clock else {}))
+
+    def test_an_acquisition_that_landed_but_lost_its_reply_goes_ahead(self):
+        advisor = CountingAdvisor()
+        with TestClient(self.make(advisor=advisor, client_providers=R13_PROVIDERS)) as client:
+            live = self.live(client)
+            record = session_record(live["session_id"])
+            original_save, lost = self.store.save, {"done": False}
+
+            def save(name, state, token_):
+                out = original_save(name, state, token_)
+                if name == record and not lost["done"]:
+                    lost["done"] = True
+                    raise OSError("the write landed; its reply was lost")
+                return out
+            self.store.save = save
+            try:
+                one = self.advise(client, live)
+            finally:
+                self.store.save = original_save
+            again = self.advise(client, live)
+        self.assertEqual((200, 200, 2), (one.status_code, again.status_code, advisor.calls), one.text)
+        self.assertEqual(({}, 2), (self.leases(record), self.used(record)))
+
+    def test_an_ambiguous_acquisition_refuses_then_gives_its_lease_back(self):
+        advisor = CountingAdvisor()
+        app = self.make(advisor=advisor, client_providers=R13_PROVIDERS)
+        with TestClient(app) as client:
+            live = self.live(client)
+            record = session_record(live["session_id"])
+            tries = app.state.guards.transient_tries
+            original_load, original_save, state = self.store.load, self.store.save, {"lost": False, "reads": 0}
+
+            def save(name, state_, token_):
+                out = original_save(name, state_, token_)
+                if name == record and not state["lost"]:
+                    state["lost"] = True
+                    raise OSError("the write landed; its reply was lost")
+                return out
+
+            def load(name):
+                if name == record and state["lost"] and state["reads"] < tries:
+                    state["reads"] += 1
+                    raise OSError("and the read-back failed too")
+                return original_load(name)
+            self.store.save, self.store.load = save, load
+            try:
+                one = self.advise(client, live)
+            finally:
+                self.store.save, self.store.load = original_save, original_load
+            calls_after_one = advisor.calls
+            self.assertTrue(self.drain(app))
+            leases_after = dict(self.leases(record))
+            again = self.advise(client, live)
+        self.assertEqual((503, 0), (one.status_code, calls_after_one), one.text)
+        self.assertEqual({}, leases_after)
+        self.assertEqual(200, again.status_code, again.text)
+        self.assertEqual(1, advisor.calls)
+
+    def test_one_transient_read_error_is_absorbed_not_refused(self):
+        store, calls = MemoryStore(), {"n": 0}
+        original = store.load
+
+        def load(name):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("a blip")
+            return original(name)
+        store.load = load
+        guards = DurableGuards(store, Conflict, sleep=lambda s: None)
+        self.assertEqual("", guards.take("studio_guard_x", "talk", 5))
+        self.assertEqual(1, store.data["studio_guard_x"]["counts"]["talk"])
+
+    def test_a_release_one_instance_lost_lapses_for_every_instance(self):
+        now = [time.time()]
+        clock = lambda: now[0]  # noqa: E731
+        advisor_a, advisor_b = CountingAdvisor(), CountingAdvisor()
+        app_a = self.make(advisor=advisor_a, client_providers=R13_PROVIDERS, clock=clock)
+        shared = self.store
+        view = _FlakyView(shared)
+        # Instance A sees the same data through a view whose reads of the
+        # session's guard record fail from the moment its provider returns.
+        app_a.state.guards.store = view
+        app_b = self.second(shared, advisor_b, clock)
+        with TestClient(app_a) as a, TestClient(app_b) as b:
+            live = self.live(a)
+            record = session_record(live["session_id"])
+            view.record = record
+            original = advisor_a.advise
+
+            def advise_then_lose_the_store(session_id, snapshot):
+                out = original(session_id, snapshot)
+                view.down_reads = 10 ** 6          # A never reads that record again: as good as restarted
+                return out
+            advisor_a.advise = advise_then_lose_the_store
+            first = self.advise(a, live)
+            self.assertTrue(self.drain(app_a))
+            at_once = self.advise(b, live)                  # B, immediately: A's lease is still live
+            now[0] += 21.0                                  # no heartbeat renews it: it lapses
+            later = self.advise(b, live)
+        self.assertEqual((200, 409, 200), (first.status_code, at_once.status_code, later.status_code), later.text)
+        self.assertEqual("20", at_once.headers.get("retry-after"))
+        self.assertEqual((1, 1), (advisor_a.calls, advisor_b.calls))
+        self.assertEqual({}, self.leases(record))
+
+    def test_the_lease_is_renewed_for_as_long_as_the_provider_runs(self):
+        now = [time.time()]
+        clock = lambda: now[0]  # noqa: E731
+        app = self.make(advisor=CountingAdvisor(), client_providers=R13_PROVIDERS, clock=clock)
+        with TestClient(app) as client:
+            live = self.live(client)
+        sid, record = live["session_id"], session_record(live["session_id"])
+        app.state.provider_renew_seconds = 0.02
+        started, finish = threading.Event(), threading.Event()
+
+        def slow_provider():
+            started.set()
+            finish.wait(10)
+            return "done"
+
+        async def scenario():
+            first = _asyncio.ensure_future(app.state.leased_call(sid, "advise", slow_provider, cap=12,
+                                                                  busy_detail="busy"))
+            await _asyncio.to_thread(started.wait, 5)
+            for _ in range(4):                           # 40 s on the clock, far past one 20 s lease
+                now[0] += 10.0
+                await _asyncio.sleep(0.1)                # a few beats renew it
+            with self.assertRaises(_HTTPException) as busy:
+                await app.state.leased_call(sid, "advise", lambda: "second", cap=12, busy_detail="busy")
+            finish.set()
+            return busy.exception.status_code, await first
+        code, result = _asyncio.run(scenario())
+        self.assertTrue(self.drain(app))
+        self.assertEqual((409, "done"), (code, result))
+        self.assertEqual({}, self.leases(record))
+
+    def test_cancelling_while_the_acquisition_lands_gives_the_lease_back(self):
+        app = self.make(advisor=CountingAdvisor(), client_providers=R13_PROVIDERS)
+        with TestClient(app) as client:
+            live = self.live(client)
+        sid, record = live["session_id"], session_record(live["session_id"])
+        committed, reply = threading.Event(), threading.Event()
+        original = app.state.guards.lease_and_spend
+        calls = []
+
+        def slow_reply(*args, **kwargs):
+            out = original(*args, **kwargs)              # the lease and its use are written ...
+            committed.set()
+            reply.wait(5)                                # ... and the answer is slow to come back
+            return out
+        app.state.guards.lease_and_spend = slow_reply
+
+        async def scenario():
+            task = _asyncio.ensure_future(app.state.leased_call(sid, "advise", lambda: calls.append(1), cap=12,
+                                                                 busy_detail="busy"))
+            await _asyncio.to_thread(committed.wait, 5)
+            task.cancel()
+            reply.set()
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+            while app.state.lease_tails:
+                await _asyncio.sleep(0.02)
+        _asyncio.run(scenario())
+        self.assertEqual(([], {}, 1), (calls, self.leases(record), self.used(record)))
+
+    def test_cancelling_while_the_provider_runs_keeps_the_lease_until_it_stops(self):
+        app = self.make(advisor=CountingAdvisor(), client_providers=R13_PROVIDERS)
+        with TestClient(app) as client:
+            live = self.live(client)
+        sid, record = live["session_id"], session_record(live["session_id"])
+        started, finish, lock = threading.Event(), threading.Event(), threading.Lock()
+        running, peak = [0], [0]
+
+        def provider():
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            started.set()
+            finish.wait(5)
+            with lock:
+                running[0] -= 1
+            return "ok"
+
+        async def scenario():
+            first = _asyncio.ensure_future(app.state.leased_call(sid, "advise", provider, cap=12,
+                                                                  busy_detail="busy"))
+            await _asyncio.to_thread(started.wait, 5)
+            first.cancel()
+            try:
+                await first
+            except _asyncio.CancelledError:
+                pass
+            for _ in range(25):                          # give any give-back time to run, if it would
+                if not app.state.lease_tails:
+                    break
+                await _asyncio.sleep(0.02)
+            held = dict(self.leases(record))             # the thread still runs: the lease is still held
+            with self.assertRaises(_HTTPException) as busy:
+                await app.state.leased_call(sid, "advise", provider, cap=12, busy_detail="busy")
+            finish.set()
+            while app.state.lease_tails:
+                await _asyncio.sleep(0.02)
+            after = await app.state.leased_call(sid, "advise", lambda: "next", cap=12, busy_detail="busy")
+            return held, busy.exception.status_code, after
+        held, code, after = _asyncio.run(scenario())
+        self.assertEqual((1, 409, "next", 1), (len(held), code, after, peak[0]))
+        self.assertEqual({}, self.leases(record))

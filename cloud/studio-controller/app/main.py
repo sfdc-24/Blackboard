@@ -31,7 +31,8 @@ from .auth import AuthService
 from .clients import ClientRegistry, public_view
 from .leads import LeadBook, LeadCapExceeded
 from . import project_page as project_page_module
-from .guards import CEILING_RECORD, DurableGuards, GuardUnavailable, session_record, tenant_record
+from .guards import (CEILING_RECORD, DurableGuards, GuardAmbiguous, GuardUnavailable, session_record,
+                     tenant_record)
 from .project_page import FetchBusy, FetchTimeout, PageFetchError, WorkDeadline, fetch_page, page_to_tree
 from .settings import Settings
 from .state import (
@@ -640,7 +641,6 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     # Operator and visitor sessions keep the in-process guards.
     guards = DurableGuards(store, Conflict, clock=clock)
     app.state.guards = guards
-    LEASE_SECONDS = 120.0            # longer than any provider call is allowed to run
     GUARDS_DOWN = "this session's limits could not be checked; try again"
 
     def guard_take(session_id: str, lane: str, cap: int, spacing: float = 0.0) -> str:
@@ -649,14 +649,107 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except GuardUnavailable as exc:
             raise HTTPException(503, GUARDS_DOWN) from exc
 
-    def guard_lease(session_id: str, lane: str, owner: str):
-        try:
-            return guards.acquire(session_record(session_id), lane, owner, LEASE_SECONDS, 1)
-        except GuardUnavailable as exc:
-            raise HTTPException(503, GUARDS_DOWN) from exc
-
     def guard_release(session_id: str, lane: str, owner: str, fence) -> None:
         guards.release(session_record(session_id), lane, owner, fence)
+
+    # A PROVIDER CALL UNDER A DURABLE LEASE (Codex Gate 1 B4 on cfdebac). The
+    # lease is short and renewed while the provider's thread is alive, so it is
+    # held for exactly as long as the work runs, whichever instance runs it: a
+    # holder that crashes, restarts or cannot write its release lets it lapse
+    # within PROVIDER_LEASE_SECONDS, instead of refusing every retry for
+    # minutes. Cancelling the request never cancels the bookkeeping: an
+    # acquisition in flight is waited for and given back, and a provider
+    # thread still running keeps its lease until it has actually stopped.
+    PROVIDER_LEASE_SECONDS = 20.0
+    app.state.provider_renew_seconds = 5.0
+    app.state.lease_tails = set()
+
+    def lease_tail(coro):
+        """Run bookkeeping to its end even if the request that started it is gone."""
+        task = asyncio.ensure_future(coro)
+        app.state.lease_tails.add(task)
+        task.add_done_callback(app.state.lease_tails.discard)
+        return task
+
+    async def give_back(record: str, lane: str, owner: str, fence) -> None:
+        if fence is not None:
+            await asyncio.to_thread(guards.release, record, lane, owner, fence)
+
+    async def leased_call(session_id: str, lane: str, work_fn, *, cap=None, busy_detail: str,
+                          cap_detail: str = ""):
+        record, owner, attempt = session_record(session_id), secrets.token_hex(8), {}
+
+        def take():
+            if cap is None:
+                fence = guards.acquire(record, lane, owner, PROVIDER_LEASE_SECONDS, 1, attempt=attempt)
+                return fence, ("" if fence is not None else "busy")
+            return guards.lease_and_spend(record, lane, owner, PROVIDER_LEASE_SECONDS, int(cap),
+                                          attempt=attempt)
+
+        acquiring = asyncio.ensure_future(asyncio.to_thread(take))
+
+        async def settle_acquisition():
+            # The request stopped waiting; the write may still land. Give back
+            # whatever it took, or might have taken.
+            try:
+                got, _ = await acquiring
+            except GuardAmbiguous:
+                got = attempt.get("fence")
+            except Exception:
+                return
+            await give_back(record, lane, owner, got)
+
+        try:
+            fence, refused = await asyncio.shield(acquiring)
+        except asyncio.CancelledError:
+            lease_tail(settle_acquisition())
+            raise
+        except GuardAmbiguous as exc:
+            lease_tail(give_back(record, lane, owner, attempt.get("fence")))
+            raise HTTPException(503, GUARDS_DOWN) from exc
+        except GuardUnavailable as exc:
+            raise HTTPException(503, GUARDS_DOWN) from exc
+        if refused == "busy":
+            raise HTTPException(409, busy_detail, headers={"Retry-After": str(int(PROVIDER_LEASE_SECONDS))})
+        if refused == "cap":
+            raise HTTPException(429, cap_detail)
+
+        stopped = asyncio.Event()
+
+        async def keep():
+            while True:
+                try:
+                    await asyncio.wait_for(stopped.wait(), app.state.provider_renew_seconds)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    await asyncio.to_thread(guards.renew, record, lane, owner, fence, PROVIDER_LEASE_SECONDS)
+                except GuardUnavailable:
+                    pass                 # the next beat tries again; with none landing, the lease lapses
+
+        keeper = asyncio.ensure_future(keep())
+        working = asyncio.ensure_future(asyncio.to_thread(work_fn))
+
+        async def finish():
+            try:
+                await asyncio.wait({working})       # the provider thread has really stopped
+            finally:
+                stopped.set()
+                await keeper
+                await give_back(record, lane, owner, fence)
+
+        try:
+            result = await asyncio.shield(working)
+        except asyncio.CancelledError:
+            lease_tail(finish())
+            raise
+        except BaseException:
+            await asyncio.shield(lease_tail(finish()))
+            raise
+        await asyncio.shield(lease_tail(finish()))
+        return result
+    app.state.leased_call = leased_call
 
     def spend(counts: dict, session_id: str, cap: int, what: str, state: dict | None = None) -> None:
         if state is None:
@@ -818,38 +911,26 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(409, "the canvas has moved on")
         snapshot_marker = advisor_snapshot_marker(state)
         client = is_client_session(state)
-        advise_owner, advise_fence = secrets.token_hex(8), None
+        said = [str(t.get("text") or "") for t in state.get("transcript") or []
+                if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-4:]
+        snapshot = {"revision": revision, "topic_line": topic_line(state),
+                    "canvas": canvas_summary(state.get("artifact")), "said": said}
         if client:
-            # The lease and its use in ONE write (Codex Gate 1 on ecee267): a
-            # store that fails part way leaves neither behind, never a lease
-            # to 409 the retry.
-            try:
-                advise_fence, refused = await asyncio.to_thread(
-                    guards.lease_and_spend, session_record(session_id), "advise", advise_owner,
-                    LEASE_SECONDS, int(getattr(advisor_lane, "call_cap", 12)))
-            except GuardUnavailable as exc:
-                raise HTTPException(503, GUARDS_DOWN) from exc
-            if refused == "busy":
-                raise HTTPException(409, "advice is already being prepared for this session")
-            if refused == "cap":
-                raise HTTPException(429, "advice limit reached for this session")
-        elif session_id in advise_busy:
-            raise HTTPException(409, "advice is already being prepared for this session")
+            # The lease and its use in ONE write (Codex Gate 1 on ecee267), held
+            # while the provider runs and given back after it stops, whatever
+            # happens to the request (leased_call; Codex Gate 1 B4 on cfdebac).
+            advice = await leased_call(
+                session_id, "advise", lambda: advisor_lane.advise(session_id, snapshot),
+                cap=int(getattr(advisor_lane, "call_cap", 12)),
+                busy_detail="advice is already being prepared for this session",
+                cap_detail="advice limit reached for this session")
         else:
+            if session_id in advise_busy:
+                raise HTTPException(409, "advice is already being prepared for this session")
             advise_busy.add(session_id)
-        try:
-            said = [str(t.get("text") or "") for t in state.get("transcript") or []
-                    if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-4:]
-            snapshot = {"revision": revision, "topic_line": topic_line(state),
-                        "canvas": canvas_summary(state.get("artifact")), "said": said}
-            advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
-        finally:
-            if client:
-                # Shielded: a cancelled request still gives its lease back, and a
-                # release the store refuses is owed and retried (app/guards.py).
-                await asyncio.shield(asyncio.to_thread(guard_release, session_id, "advise", advise_owner,
-                                                       advise_fence))
-            else:
+            try:
+                advice = await asyncio.to_thread(advisor_lane.advise, session_id, snapshot)
+            finally:
                 advise_busy.discard(session_id)
         if advice is None:
             return {"advice": None}
@@ -901,27 +982,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(409, "a build is running; ask again when it lands")
         snapshot_marker = advisor_snapshot_marker(state)
         client = is_client_session(state)
-        charter_owner, charter_fence = secrets.token_hex(8), None
-        if client:
-            charter_fence = await asyncio.to_thread(guard_lease, session_id, "charter", charter_owner)
-            if charter_fence is None:
-                raise HTTPException(409, "the charter is already being prepared for this session")
-        elif session_id in charter_busy:
-            raise HTTPException(409, "the charter is already being prepared for this session")
         said = [str(t.get("text") or "") for t in state.get("transcript") or []
                 if isinstance(t, dict) and t.get("role") == "visitor" and t.get("text")][-12:]
         snapshot = {"revision": revision, "topic": state.get("topic") or "", "topic_line": topic_line(state),
                     "canvas": canvas_summary(state.get("artifact")), "said": said,
                     "charter": state.get("charter") or {}}
-        if not client:
-            charter_busy.add(session_id)
         started = time.monotonic()
-        try:
-            result = await asyncio.to_thread(charter_lane.chart, snapshot)
-        finally:
-            if client:
-                await asyncio.to_thread(guard_release, session_id, "charter", charter_owner, charter_fence)
-            else:
+        if client:
+            result = await leased_call(session_id, "charter", lambda: charter_lane.chart(snapshot),
+                                       busy_detail="the charter is already being prepared for this session")
+        else:
+            if session_id in charter_busy:
+                raise HTTPException(409, "the charter is already being prepared for this session")
+            charter_busy.add(session_id)
+            try:
+                result = await asyncio.to_thread(charter_lane.chart, snapshot)
+            finally:
                 charter_busy.discard(session_id)
         if not result:
             charter_done(session_id, started, "none")

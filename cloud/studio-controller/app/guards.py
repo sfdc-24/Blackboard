@@ -13,6 +13,13 @@ A release that cannot be written is owed, not forgotten (Codex Gate 1 on
 ecee267): it is settled before anything new is taken on that record - so a
 retry after the store comes back never meets a ghost lease - and by a
 background retry for a caller that never comes back.
+
+Every write carries an operation id (Codex Gate 1 B4a on cfdebac). A save that
+raises may still have landed, so the record is read back: an id present means
+the write happened and its result stands; an id absent means it did not; a
+read-back that fails too is ambiguous, and says so (GuardAmbiguous), so the
+caller can give back what it may hold. A transient read or write error is
+retried a few times, briefly, before the caller is refused.
 """
 from __future__ import annotations
 
@@ -20,10 +27,18 @@ import copy
 import hashlib
 import threading
 import time
+import uuid
 
 
 class GuardUnavailable(RuntimeError):
     """The guard state could not be read or written: refuse, never let through."""
+
+
+class GuardAmbiguous(GuardUnavailable):
+    """A write raised and its read-back failed too: it may or may not have landed."""
+
+
+OPS_KEPT = 64                        # recent operation ids a record keeps, for read-back
 
 
 CEILING_RECORD = "studio_guard_fetch_ceiling"
@@ -38,34 +53,68 @@ def tenant_record(tenant: str) -> str:
 
 
 class DurableGuards:
-    def __init__(self, store, conflict, clock=time.time, attempts: int = 8, retry_seconds: float = 1.0):
+    def __init__(self, store, conflict, clock=time.time, attempts: int = 8, retry_seconds: float = 1.0,
+                 transient_tries: int = 3, transient_pause: float = 0.05, sleep=time.sleep):
         self.store = store
         self.conflict = conflict
         self.clock = clock
         self.attempts = attempts
         self.retry_seconds = retry_seconds
+        self.transient_tries = max(1, int(transient_tries))
+        self.transient_pause = float(transient_pause)
+        self.sleep = sleep
         self._owed: dict = {}                # (record, lane, owner) -> fence: releases not written yet
         self._owed_lock = threading.Lock()
         self._retrying = False
 
-    def _change(self, name: str, change):
-        """Read, decide, and write back only if nothing changed in between."""
-        for _ in range(self.attempts):
+    def _load(self, name: str):
+        """The record, trying a transient read error a few times before refusing."""
+        for attempt in range(self.transient_tries):
             try:
-                raw, token = self.store.load(name)
+                return self.store.load(name)
             except Exception as exc:
-                raise GuardUnavailable("guard state could not be read") from exc
+                if attempt + 1 >= self.transient_tries:
+                    raise GuardUnavailable("guard state could not be read") from exc
+                self.sleep(self.transient_pause * (attempt + 1))
+
+    def _landed(self, name: str, op: str):
+        """After a save raised: True if the record carries ``op``, False if it
+        does not, None if the record could not be read back."""
+        for attempt in range(self.transient_tries):
+            try:
+                raw, _ = self.store.load(name)
+            except Exception:
+                if attempt + 1 >= self.transient_tries:
+                    return None
+                self.sleep(self.transient_pause * (attempt + 1))
+                continue
+            return isinstance(raw, dict) and op in (raw.get("ops") or [])
+        return None
+
+    def _change(self, name: str, change):
+        """Read, decide, and write back only if nothing changed in between.
+        Each write carries an operation id; a save that raises is read back
+        by that id before anything is decided (Codex Gate 1 B4a on cfdebac)."""
+        for _ in range(self.attempts):
+            raw, token = self._load(name)
             state = copy.deepcopy(raw) if isinstance(raw, dict) else {}
             state.setdefault("version", 1)
             result, write = change(state, float(self.clock()))
             if not write:
                 return result
+            op = uuid.uuid4().hex
+            state["ops"] = ([o for o in (state.get("ops") or []) if isinstance(o, str)] + [op])[-OPS_KEPT:]
             try:
                 self.store.save(name, state, token)
                 return result
             except self.conflict:
                 continue
             except Exception as exc:
+                landed = self._landed(name, op)
+                if landed is True:
+                    return result                # it was written: the result stands
+                if landed is None:
+                    raise GuardAmbiguous("guard state may or may not have been written") from exc
                 raise GuardUnavailable("guard state could not be written") from exc
         raise GuardUnavailable("guard state is busy")
 
@@ -84,8 +133,11 @@ class DurableGuards:
             return "", True
         return self._change(name, change)
 
-    def acquire(self, name: str, lane: str, owner: str, ttl: float, ceiling: int = 1):
-        """A lease on the lane: its fence, or None when `ceiling` live leases are held."""
+    def acquire(self, name: str, lane: str, owner: str, ttl: float, ceiling: int = 1,
+                attempt: dict | None = None):
+        """A lease on the lane: its fence, or None when `ceiling` live leases are
+        held. ``attempt`` receives the fence being written, so a caller told the
+        write is ambiguous can still give that lease back."""
         self._settle(name)
 
         def change(state, now):
@@ -95,12 +147,15 @@ class DurableGuards:
                 return None, False
             fence = int(state.get("fence") or 0) + 1
             state["fence"] = fence
+            if attempt is not None:
+                attempt["fence"] = fence
             leases[owner] = {"until": now + float(ttl), "fence": fence}
             state.setdefault("leases", {})[lane] = leases
             return fence, True
         return self._change(name, change)
 
-    def lease_and_spend(self, name: str, lane: str, owner: str, ttl: float, cap: int):
+    def lease_and_spend(self, name: str, lane: str, owner: str, ttl: float, cap: int,
+                        attempt: dict | None = None):
         """A single-flight lease on the lane AND one of its `cap` uses, in ONE
         compare-and-set (Codex Gate 1 on ecee267): (fence, "") when both were
         taken, (None, "busy") while another lease is live, (None, "cap") when
@@ -120,6 +175,8 @@ class DurableGuards:
                 return (None, "cap"), False
             fence = int(state.get("fence") or 0) + 1
             state["fence"] = fence
+            if attempt is not None:
+                attempt["fence"] = fence
             leases[owner] = {"until": now + float(ttl), "fence": fence}
             state.setdefault("leases", {})[lane] = leases
             counts[lane] = used + 1
@@ -211,4 +268,5 @@ class DurableGuards:
                     return
 
 
-__all__ = ["DurableGuards", "GuardUnavailable", "CEILING_RECORD", "session_record", "tenant_record"]
+__all__ = ["DurableGuards", "GuardAmbiguous", "GuardUnavailable", "CEILING_RECORD", "session_record",
+           "tenant_record"]
