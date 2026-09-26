@@ -139,7 +139,7 @@ There are four levels. No lower level is ever reported as a higher one:
 - **The homepage only.** Voice and canvas work goes on sfdc24.com's homepage: no new pages, no `/studio/`.
 - **Before and after snapshots** of every visible release, phone and desktop.
 - **The release rail** (`data/next-release.json` in sfdc24-site) never sits expired. Move it to the next real thing.
-- **An honesty-check failure does not block a release.** Log it to the backlog. The copy must still be true. That relaxation covers copy findings only. The homepage voice and canvas specs run in the same `honesty-dom-test` job, which is not a required check on sfdc24-site (ruleset 23679990 requires exactly `prototype-publisher-test / test`, `site-positioning-test / test`, `homepage-recovery-test / test`, `intake-contract / intake` and `xray-page-test / test`), so read that job before merging voice or canvas work.
+- **The honesty guard is retired** (his order; sfdc24-site #229, 2026-09-26). The capability-claim checks are deleted: do not re-add them. The copy must still be true. The homepage voice, canvas, header and page-icon specs run in `homepage-browser-tests` (renamed from `honesty-dom-test` in #233). It is not a required check (ruleset 23679990 requires exactly `prototype-publisher-test / test`, `site-positioning-test / test`, `homepage-recovery-test / test`, `intake-contract / intake` and `xray-page-test / test`), so read that job before merging voice or canvas work. A red run there is a functional regression.
 - **Stacked PRs:** retarget the child to `main` *before* merging the parent with `--delete-branch`.
 - **Before any write,** check `git rev-parse --show-toplevel` and the branch.
 - **Python on Windows:** write files with `newline=""`.
@@ -179,7 +179,7 @@ New lessons go only to `docs/POKA-YOKE.md`, from L-100 up.
 | Who holds which gate today? | The newest Codex verdict row for that PR or revision (every sender tag) |
 | What is the architecture, and what gates remain? | `docs/ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md` and its dated PDF edition |
 | What is Converspan allowed to do yet? | `docs/CONVERSPAN-READINESS-20260926.md`: design and contracts only until G9 |
-| What may the site say? | sfdc24-site `tests/capabilities.json` and `tests/site_positioning.cjs` |
+| What may the site say? | sfdc24-site `tests/site_positioning.cjs` (the `capabilities.json` claim registry was retired in #229) |
 | What happened before 2026-09-19? | Drive `Blackboard - Alpha DB - ARCHIVE to 2026-09-18`, same row numbers and Row_IDs. The live board keeps about the last seven days |
 | What does he still need to decide? | The Blockers page |
 

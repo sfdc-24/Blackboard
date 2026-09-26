@@ -62,14 +62,16 @@ carries a status banner is shifted down by two lines.
 - Changes go through a PR; `required_approving_review_count` is 0, and unattributed changes need an extra approval.
 - Five strict required checks: `prototype-publisher-test / test`, `site-positioning-test / test`, `homepage-recovery-test / test`, `intake-contract / intake`, `xray-page-test / test`.
 - No bypass, and Copilot reviews every push.
-- `honesty-dom-test` is **not** required. The site's `copilot-instructions.md` (lines 159–162) lists it as required, and `site-doctrine.md` (line 9) says "six required checks".
+- `homepage-browser-tests` (named `honesty-dom-test` until #233) is **not** required. The site's `copilot-instructions.md` now says so (#229, #233). `site-doctrine.md` (line 10) still says "six required checks".
+- **The honesty guard is retired** (his order; #229, 2026-09-26). `tests/capabilities.json`, `tests/honesty.spec.cjs` and the negative control are deleted; do not re-add them.
 
 | Document | Status | Notes |
 |---|---|---|
-| tests/capabilities.json, tests/site_positioning.cjs, tests/honesty.spec.cjs, tests/test_triage_no_names.py | CANON | What the site may claim, how it speaks, and no names. capabilities.json content is dated 09-09: 21 of its 26 homepage entries no longer appear on the page. |
+| tests/site_positioning.cjs, tests/test_triage_no_names.py | CANON | What the site may claim, how it speaks, and no names. |
+| tests/capabilities.json, tests/honesty.spec.cjs, tests/honesty_negative_control.cjs | RETIRED (deleted in #229) | The honesty guard, retired by his order on 2026-09-26. Do not re-add. |
 | docs/PROTOTYPE-PUBLISHER.md | CANON | `/p/<uuid>/` prototypes and the exact-SHA Pages read-back. |
 | studio/contract/README.md (+ events.schema.json) | CANON (the controller contract), STALE | Renderer rules 1–10 hold. Its `/studio/` framing is outdated, and the API table lacks `/talk`. |
-| .github/copilot-instructions.md | CANON for Copilot, STALE | Stale: honesty-dom is not required (159–162); canvas #24 is not "no go" (203–204); P0s #1, #2 and #12 are closed (198–199). |
+| .github/copilot-instructions.md | CANON for Copilot, STALE | The required-checks and honesty lines are current (#229, #233). Stale: canvas #24 is not "no go" (line 206); P0s #1, #2 and #12 are closed (line 201). |
 | docs/site-doctrine.md | STALE | The visitor-copy rules hold. Stale: "six required checks" (L9), Foundry (L7), SPEED unowned and Grok reserved (L106), "no weekday date" (L5, L31), "no sitemap" (L17), and the IP rule contradicting itself (L66 vs L110). |
 | docs/STT-STREAM.md, docs/python-offload.md, tests/fixtures/README.md, data/next-release.json, data/site-manifest.json | REFERENCE | STT-STREAM lines 87–93 are stale: relayUrl is now set. The release rail must never sit expired. |
 | docs/lessons-log.md | STALE (dormant) | The ETA logging stopped on 09-19. |
