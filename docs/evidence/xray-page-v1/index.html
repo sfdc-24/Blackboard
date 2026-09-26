@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="SFDC24 X-Ray — a Black Belt readout of your Salesforce org: sigma scores, belt grades, and a prioritized fix backlog.">
+<title>SFDC24 X-Ray Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=Caveat:wght@500;600&display=swap">
+<style>
+  /* ============ tokens — dark-first: the blackboard is home ============ */
+  :root{
+    color-scheme: dark;
+    --board:#17201c; --slate:#202b25; --slate-2:#243029; --line:#33413a;
+    --chalk:#e8e4d8; --chalk-dim:#a9b3a9; --chalk-faint:#6e7a70;
+    --accent:#e8c558;
+    --sec:#3987e5; --ops:#d95926; --wst:#199e70; --red2:#c98500;
+    --good:#4fae6d; --warn:#d99a2b; --crit:#d96459;
+    --chip-ink:#17201c;
+    --heat-0:#243029; --heat-1:#2c4a41; --heat-2:#2f6b58; --heat-3:#3a9070; --heat-4:#52b98a;
+    --shadow:0 1px 0 rgba(0,0,0,.35);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      color-scheme: light;
+      --board:#f4f2ec; --slate:#fdfcf8; --slate-2:#efece2; --line:#d9d4c5;
+      --chalk:#232a26; --chalk-dim:#5b6259; --chalk-faint:#8b9188;
+      --accent:#a67c1b;
+      --sec:#2a78d6; --ops:#eb6834; --wst:#1baf7a; --red2:#eda100;
+      --good:#1e7f43; --warn:#a66b0f; --crit:#bf4438;
+      --chip-ink:#fdfcf8;
+      --heat-0:#efece2; --heat-1:#d7e6dc; --heat-2:#a9d1b8; --heat-3:#6fb58e; --heat-4:#358a5d;
+      --shadow:0 1px 2px rgba(60,55,40,.12);
+    }
+  }
+  :root[data-theme="light"]{
+    color-scheme: light;
+    --board:#f4f2ec; --slate:#fdfcf8; --slate-2:#efece2; --line:#d9d4c5;
+    --chalk:#232a26; --chalk-dim:#5b6259; --chalk-faint:#8b9188;
+    --accent:#a67c1b;
+    --sec:#2a78d6; --ops:#eb6834; --wst:#1baf7a; --red2:#eda100;
+    --good:#1e7f43; --warn:#a66b0f; --crit:#bf4438;
+    --chip-ink:#fdfcf8;
+    --heat-0:#efece2; --heat-1:#d7e6dc; --heat-2:#a9d1b8; --heat-3:#6fb58e; --heat-4:#358a5d;
+    --shadow:0 1px 2px rgba(60,55,40,.12);
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --board:#17201c; --slate:#202b25; --slate-2:#243029; --line:#33413a;
+    --chalk:#e8e4d8; --chalk-dim:#a9b3a9; --chalk-faint:#6e7a70;
+    --accent:#e8c558;
+    --sec:#3987e5; --ops:#d95926; --wst:#199e70; --red2:#c98500;
+    --good:#4fae6d; --warn:#d99a2b; --crit:#d96459;
+    --chip-ink:#17201c;
+    --heat-0:#243029; --heat-1:#2c4a41; --heat-2:#2f6b58; --heat-3:#3a9070; --heat-4:#52b98a;
+    --shadow:0 1px 0 rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--board); color:var(--chalk);
+    font:400 15px/1.55 "IBM Plex Sans",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:20px 22px 64px}
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
+  .num{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  .chalkhand{font-family:"Caveat","IBM Plex Sans",cursive; color:var(--accent)}
+  button{font:inherit; color:inherit; background:none; border:none; cursor:pointer}
+  button:focus-visible,[tabindex]:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  @media (prefers-reduced-motion: reduce){ *{transition:none !important; animation:none !important} }
+
+  /* ============ header ============ */
+  header.top{display:flex; align-items:center; gap:14px; padding:6px 0 18px; border-bottom:1px solid var(--line); flex-wrap:wrap}
+  .brand{font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:17px; letter-spacing:.06em}
+  .brand b{color:var(--accent); font-weight:600}
+  .brand-sub{font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--chalk-dim)}
+  .org-line{margin-left:auto; text-align:right; font-size:12.5px; color:var(--chalk-dim); line-height:1.45}
+  .org-line .mono{color:var(--chalk)}
+  .theme-btn{border:1px solid var(--line); border-radius:6px; padding:5px 11px; font-size:12.5px; color:var(--chalk-dim)}
+  .theme-btn:hover{color:var(--chalk); border-color:var(--chalk-faint)}
+
+  /* cost meter — the fuel gauge */
+  .meter{display:flex; align-items:center; gap:9px; border:1px solid var(--line); border-radius:8px; padding:6px 11px}
+  .meter .mlab{font-size:10px; letter-spacing:.13em; text-transform:uppercase; color:var(--chalk-faint); line-height:1.3}
+  .meter .mval{font-family:"IBM Plex Mono",monospace; font-size:14px; font-weight:600; color:var(--chalk); line-height:1.2}
+  .meter .mval small{font-size:10.5px; color:var(--chalk-faint); font-weight:400}
+  .meter .mbar{width:74px; height:6px; background:var(--slate-2); border-radius:3px; overflow:hidden}
+  .meter .mbar>i{display:block; height:100%; background:var(--good); border-radius:3px; transition:width .4s}
+  .meter button{font-size:10.5px; color:var(--chalk-faint); border:1px solid var(--line); border-radius:5px; padding:2px 7px}
+  .meter button:hover{color:var(--chalk)}
+
+  /* ============ hero ============ */
+  .hero{display:flex; align-items:center; gap:30px; padding:26px 4px 22px; flex-wrap:wrap}
+  .dial{position:relative; width:158px; height:158px; flex:none}
+  .dial svg{display:block}
+  .dial .sigma-big{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0}
+  .sigma-big .v{font-family:"IBM Plex Mono",monospace; font-size:40px; font-weight:600; color:var(--accent); line-height:1}
+  .sigma-big .u{font-size:12px; letter-spacing:.14em; color:var(--chalk-dim); margin-top:4px}
+  .hero-meta h1{margin:0 0 4px; font-size:23px; font-weight:600; letter-spacing:-.01em; text-wrap:balance}
+  .hero-stats{display:flex; gap:26px; margin-top:12px; flex-wrap:wrap}
+  .hstat .k{font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:var(--chalk-faint)}
+  .hstat .v{font-family:"IBM Plex Mono",monospace; font-size:21px; font-weight:500; margin-top:2px}
+  .belt-chip{display:inline-flex; align-items:center; gap:7px; border-radius:999px; padding:3px 12px 3px 6px; font-size:13px; font-weight:600; vertical-align:2px}
+  .belt-swatch{width:26px; height:8px; border-radius:4px; display:inline-block; border:1px solid rgba(0,0,0,.25)}
+  .hero-note{max-width:300px; margin-left:auto; font-size:19px; line-height:1.3; transform:rotate(-1.2deg)}
+
+  /* ============ grid ============ */
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:8px}
+  @media (max-width:940px){ .grid{grid-template-columns:repeat(2,1fr)} }
+  @media (max-width:640px){ .grid{grid-template-columns:1fr} .hero-note{margin-left:0} }
+  .tile{background:var(--slate); border:1px solid var(--line); border-radius:10px; padding:16px 16px 14px; box-shadow:var(--shadow); display:flex; flex-direction:column; min-height:190px}
+  .tile h2{margin:0 0 2px; font-size:11.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--chalk-dim)}
+  .tile .sub{font-size:12px; color:var(--chalk-faint); margin-bottom:10px}
+  .tile .body{flex:1; display:flex; flex-direction:column; justify-content:center}
+
+  /* pillar scorecard */
+  .prow{display:grid; grid-template-columns:96px 1fr 104px; align-items:center; gap:10px; padding:7px 4px; border-radius:7px; cursor:pointer}
+  .prow:hover{background:var(--slate-2)}
+  .prow.active{background:var(--slate-2); outline:1px solid var(--line)}
+  .prow .pname{font-size:12.5px; font-weight:600; letter-spacing:.04em; display:flex; align-items:center; gap:7px}
+  .pdot{width:9px; height:9px; border-radius:3px; flex:none}
+  .pbar{height:10px; background:var(--slate-2); border-radius:5px; position:relative; overflow:hidden}
+  .pbar>i{position:absolute; inset:0 auto 0 0; border-radius:5px 3px 3px 5px}
+  .pval{font-size:12px; text-align:right; color:var(--chalk-dim); white-space:nowrap}
+  .pval b{color:var(--chalk); font-weight:500}
+
+  /* sigma ladder */
+  .ladder{width:100%}
+  .ladder text{font-family:"IBM Plex Mono",monospace; font-size:10.5px; fill:var(--chalk-dim)}
+  .ladder .lab-strong{fill:var(--chalk); font-weight:600}
+  .ladder .rail{stroke:var(--line); stroke-width:2}
+  .ladder .tick{stroke:var(--chalk-faint); stroke-width:1.5}
+  .ladder .zone{fill:var(--accent); opacity:.13}
+  .ladder .you{fill:var(--accent)}
+  .ladder .youline{stroke:var(--accent); stroke-width:2}
+  .ladder .anno{fill:var(--chalk-faint); font-size:10px}
+
+  /* heat matrix */
+  .heat{display:grid; grid-template-columns:auto repeat(5,1fr); gap:2px; font-size:11px}
+  .heat .hcell{aspect-ratio:1.5; border-radius:4px; display:flex; align-items:center; justify-content:center; font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--chalk)}
+  .heat .hlab{display:flex; align-items:center; justify-content:flex-end; padding-right:7px; color:var(--chalk-dim); font-weight:600; font-size:10.5px; letter-spacing:.04em}
+  .heat .hcol{display:flex; align-items:center; justify-content:center; color:var(--chalk-faint); font-family:"IBM Plex Mono",monospace}
+
+  /* hero-number tiles */
+  .bignum{font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:33px; line-height:1.05; letter-spacing:-.01em}
+  .bignum small{font-size:15px; font-weight:500; color:var(--chalk-dim); letter-spacing:0}
+  .big-sub{font-size:12.5px; color:var(--chalk-dim); margin-top:6px; line-height:1.5}
+  .big-sub b{color:var(--chalk); font-weight:500}
+  .kv{display:grid; grid-template-columns:1fr auto; gap:3px 14px; font-size:12.5px; margin-top:10px}
+  .kv .k{color:var(--chalk-dim)}
+  .kv .v{font-family:"IBM Plex Mono",monospace; text-align:right}
+  .kv .v.bad{color:var(--crit)}
+  .kv .v.ok{color:var(--good)}
+
+  /* risk register + confusion list */
+  .rlist{display:flex; flex-direction:column; gap:8px; font-size:12.5px}
+  .ritem{display:flex; gap:9px; align-items:baseline}
+  .sev{flex:none; font-family:"IBM Plex Mono",monospace; font-size:10.5px; font-weight:600; padding:1px 7px; border-radius:4px; color:var(--chip-ink)}
+  .sev.s5{background:var(--crit)} .sev.s4{background:var(--warn)} .sev.s3{background:var(--chalk-faint)}
+  .tag{font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--chalk-faint)}
+
+  /* live sample */
+  .live-dot{display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--good); margin-right:6px; vertical-align:1px}
+
+  /* ============ backlog ============ */
+  .backlog{margin-top:30px}
+  .backlog-head{display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; margin-bottom:12px}
+  .backlog-head h2{margin:0; font-size:17px; font-weight:600}
+  .filters{display:flex; gap:6px; flex-wrap:wrap}
+  .fchip{border:1px solid var(--line); border-radius:999px; padding:3px 12px; font-size:12px; color:var(--chalk-dim); display:inline-flex; align-items:center; gap:6px}
+  .fchip:hover{color:var(--chalk)}
+  .fchip.on{background:var(--slate-2); color:var(--chalk); border-color:var(--chalk-faint)}
+  .fnote{margin-left:auto; font-size:12px; color:var(--chalk-faint)}
+  details.frow{border:1px solid var(--line); border-radius:9px; background:var(--slate); margin-bottom:8px; overflow:hidden}
+  details.frow summary{list-style:none; display:grid; grid-template-columns:8px 60px 1fr auto auto auto; gap:12px; align-items:center; padding:11px 14px; cursor:pointer}
+  details.frow summary::-webkit-details-marker{display:none}
+  @media (max-width:560px){ details.frow summary{grid-template-columns:8px 1fr auto auto} .fid,.fmetric{display:none} }
+  details.frow summary:hover{background:var(--slate-2)}
+  .fstripe{width:4px; height:26px; border-radius:2px}
+  .fid{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--chalk-faint)}
+  .ftitle{font-size:13.5px; font-weight:500}
+  .fmetric{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--chalk-dim); text-align:right; white-space:nowrap}
+  .feffort{font-family:"IBM Plex Mono",monospace; font-size:10.5px; border:1px solid var(--line); border-radius:4px; padding:1px 7px; color:var(--chalk-dim)}
+  .fbody{padding:4px 16px 14px 34px; font-size:13px; border-top:1px dashed var(--line)}
+  .fbody .frame{color:var(--chalk-dim); font-style:italic; margin:9px 0 7px}
+  .fbody .rec{margin:0 0 7px}
+  .fbody .rec b{color:var(--accent); font-weight:600}
+  .fbody .math{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--chalk-faint)}
+  .wo-btn{border:1px solid var(--line); border-radius:6px; padding:4px 11px; font-size:11.5px; font-family:"IBM Plex Mono",monospace; color:var(--chalk-dim); margin-top:2px}
+  .wo-btn:hover{color:var(--chalk); background:var(--slate-2)}
+  .wo-btn.done{color:var(--good); border-color:var(--good)}
+  .toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--slate-2); border:1px solid var(--line); color:var(--chalk); border-radius:8px; padding:8px 16px; font-size:12.5px; box-shadow:var(--shadow); opacity:0; pointer-events:none; transition:opacity .25s}
+  .toast.show{opacity:1}
+
+  /* ============ loader / footer ============ */
+  .loader{margin-top:26px; border:1px dashed var(--line); border-radius:10px; padding:14px 16px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; font-size:13px; color:var(--chalk-dim)}
+  .loader input{display:none}
+  .loader label{border:1px solid var(--line); border-radius:6px; padding:5px 12px; cursor:pointer; color:var(--chalk); font-size:12.5px}
+  .loader label:hover{background:var(--slate-2)}
+  .src-badge{font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--accent)}
+  footer.method{margin-top:22px; font-size:12px; color:var(--chalk-faint); line-height:1.7}
+  footer.method code{font-size:11px}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="brand">SFDC<b>24</b> · X-Ray</div>
+      <div class="brand-sub">Black Belt org assessment</div>
+    </div>
+    <div class="org-line">
+      <div><span class="mono" id="org-name">Seasoned Org — sample data</span></div>
+      <div id="org-sub">scored by xray-score-v1 · <span class="mono">2026-09-07</span></div>
+    </div>
+    <div class="meter" title="Live cost meter — every action priced in pennies against your prepaid scan budget">
+      <div>
+        <div class="mlab">Cost meter</div>
+        <div class="mval num"><span id="meter-spent">$0.000</span> <small>of <span id="meter-budget">$25.00</span></small></div>
+      </div>
+      <div class="mbar"><i id="meter-bar" style="width:0%"></i></div>
+      <button id="meter-pause" aria-label="Pause the meter">pause</button>
+    </div>
+    <button class="theme-btn" id="theme-btn" aria-label="Switch theme">Chalk / Paper</button>
+  </header>
+
+  <section class="hero">
+    <div class="dial" aria-label="Overall sigma dial">
+      <svg viewBox="0 0 158 158" width="158" height="158" id="dial-svg" role="img" aria-label="Sigma gauge"></svg>
+      <div class="sigma-big"><span class="v num" id="sigma-v">–</span><span class="u">SIGMA (σ)</span></div>
+    </div>
+    <div class="hero-meta">
+      <h1>Org capability readout</h1>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span id="belt-chip"></span>
+        <span id="belt-next" style="font-size:12.5px;color:var(--chalk-dim)"></span>
+      </div>
+      <div class="hero-stats">
+        <div class="hstat"><div class="k">Score</div><div class="v" id="score-v">–</div></div>
+        <div class="hstat"><div class="k">DPMO</div><div class="v" id="dpmo-v">–</div></div>
+        <div class="hstat"><div class="k">Findings</div><div class="v" id="fcount-v">–</div></div>
+        <div class="hstat"><div class="k">Defects observed</div><div class="v" id="defects-v">–</div></div>
+      </div>
+    </div>
+    <div class="hero-note chalkhand" id="hero-note">most orgs live at 2–3σ — the distance to six is the roadmap, priced fix by fix</div>
+  </section>
+
+  <section class="grid" id="grid"><!-- tiles rendered by JS --></section>
+
+  <section class="backlog">
+    <div class="backlog-head">
+      <h2>Prioritized backlog</h2>
+      <div class="filters" id="filters"></div>
+      <div class="fnote">priority = severity × defect rate · click a row for evidence</div>
+    </div>
+    <div id="backlog-rows"></div>
+  </section>
+
+  <div class="loader">
+    <span><b style="color:var(--chalk)">Point it at a real org:</b> run <code>xray_extract.sh</code> then <code>xray_score.py</code>, and load the result —</span>
+    <label for="scores-file">Load scores.json</label>
+    <input type="file" id="scores-file" accept=".json,application/json">
+    <span class="src-badge" id="src-badge">showing: sample org (demo)</span>
+  </div>
+
+  <footer class="method">
+    Method (checkable): <code>DPMO = defects ÷ opportunities × 10⁶</code> · <code>σ = Φ⁻¹(1 − DPMO/10⁶) + 1.5</code> (standard shift) ·
+    pillar score = <code>100 × (1 − Σ sev·rate ÷ Σ sev)</code> · belts: White &lt;40 · Yellow 40 · Green 55 · Blue 70 · Brown 80 · Black 90+.<br>
+    Live-sample tile measured today via Salesforce Headless 360 (read-only aggregate queries — no row-level data). Sample-org figures are demo data modeled on a seasoned org; they are not client figures.
+  </footer>
+</div>
+
+<script>
+/* ================= data ================= */
+const DEMO = {"version":"xray-score-v1","overall":{"score":73.5,"belt":"Blue","sigma":2.95,"dpmo":73625},
+"pillars":{"SECURITY":{"score":70.3,"belt":"Blue","sigma":2.17,"dpmo":250639,"defects":98,"opportunities":391},
+"OPERABILITY":{"score":89.0,"belt":"Brown","sigma":3.19,"dpmo":45580,"defects":3450,"opportunities":75691},
+"WASTE":{"score":60.7,"belt":"Green","sigma":1.71,"dpmo":415185,"defects":2242,"opportunities":5400},
+"REDUNDANCY":{"score":67.7,"belt":"Green","sigma":2.17,"dpmo":252785,"defects":295,"opportunities":1167}},
+"findings":[
+{"id":"RED-01","pillar":"REDUNDANCY","severity":5,"title":"Objects with multiple active triggers","opportunities":6,"defects":3,"dpmo":500000,"sigma":1.5,"effort":"M","priority":2.5,
+ "frame":"Two triggers on one object = two cooks, no recipe: execution order is undefined — pure special-cause variation.","rec":"One trigger per object routing to handler classes (trigger framework)."},
+{"id":"RED-02","pillar":"REDUNDANCY","severity":4,"title":"Objects running both workflow rules AND flows","opportunities":6,"defects":3,"dpmo":500000,"sigma":1.5,"effort":"M","priority":2.0,
+ "frame":"Overlapping automation layers are overprocessing; Workflow Rules are also end-of-life.","rec":"Migrate workflow rules into the object's record-triggered flow."},
+{"id":"SEC-01","pillar":"SECURITY","severity":5,"title":"Salesforce Health Check score below 80","opportunities":100,"defects":39,"dpmo":390000,"sigma":1.78,"effort":"M","priority":1.95,
+ "frame":"Health Check is Salesforce's own control chart for security posture; every point below 80 is a defect against the baseline.","rec":"Remediate high-risk Health Check items first (session settings, password policies, certificate expiry)."},
+{"id":"SEC-04","pillar":"SECURITY","severity":3,"title":"Connected apps never reviewed","opportunities":19,"defects":11,"dpmo":578947,"sigma":1.3,"effort":"M","priority":1.737,
+ "frame":"Unreviewed integrations are unmeasured inputs to the process — invisible to any control plan.","rec":"Inventory connected apps; retire unused, scope the rest with IP restrictions."},
+{"id":"WST-05","pillar":"WASTE","severity":3,"title":"Apex classes on API versions >5 years old","opportunities":266,"defects":135,"dpmo":507519,"sigma":1.48,"effort":"M","priority":1.523,
+ "frame":"Old API versions are deferred maintenance — technical debt accruing interest at every release.","rec":"Batch-upgrade API versions with test runs per wave."},
+{"id":"WST-04","pillar":"WASTE","severity":2,"title":"Reports not run in 12+ months","opportunities":1240,"defects":861,"dpmo":694355,"sigma":0.99,"effort":"S","priority":1.389,
+ "frame":"Stale reports are overproduction — built once, consumed never.","rec":"Bulk-move to an Archive folder; delete after 90 days unclaimed."},
+{"id":"WST-02","pillar":"WASTE","severity":3,"title":"Inactive flows left in the org","opportunities":200,"defects":83,"dpmo":415000,"sigma":1.71,"effort":"S","priority":1.245,
+ "frame":"Dead automation is motion waste for every admin who must read past it.","rec":"Archive metadata to the repo, then delete inactive flow versions."},
+{"id":"WST-01","pillar":"WASTE","severity":3,"title":"Custom fields never populated / unused","opportunities":3480,"defects":1122,"dpmo":322414,"sigma":1.96,"effort":"M","priority":0.967,
+ "frame":"Unused fields are Lean inventory: paid for, stored, never consumed — and every page load carries them.","rec":"Field-usage scan, then deprecate in waves (hide → read-only → delete after backup)."},
+{"id":"OPS-04","pillar":"OPERABILITY","severity":3,"title":"Deployments failing (30d)","opportunities":20,"defects":6,"dpmo":300000,"sigma":2.02,"effort":"L","priority":0.9,
+ "frame":"Rolled-back deploys measure release process capability directly.","rec":"Stand up CI with delta deploys + automated tests before every promote."},
+{"id":"RED-04","pillar":"REDUNDANCY","severity":3,"title":"Duplicate/overlapping price book entries","opportunities":1110,"defects":287,"dpmo":258559,"sigma":2.15,"effort":"M","priority":0.776,
+ "frame":"The same product priced in N books is N chances to quote the wrong number.","rec":"Consolidate to one book per market; retire technician sub-books into filters."},
+{"id":"SEC-02","pillar":"SECURITY","severity":4,"title":"Active users with no login in 90+ days","opportunities":214,"defects":41,"dpmo":191589,"sigma":2.37,"effort":"S","priority":0.766,
+ "frame":"Every dormant active user is an open door and a paid seat — a defect in access control AND license spend.","rec":"Freeze then deactivate stale users; reclaim licenses on renewal."},
+{"id":"WST-03","pillar":"WASTE","severity":4,"title":"Paid licenses on stale users (annualized CAD)","opportunities":214,"defects":41,"dpmo":191589,"sigma":2.37,"effort":"S","priority":0.766,"annual_waste_cad":112028,
+ "frame":"License waste is the dollar figure that makes the room lean forward: stale seats × US$165/user/month (Sales Cloud EE list).","rec":"Reharvest seats; right-size license mix at renewal."},
+{"id":"OPS-03","pillar":"OPERABILITY","severity":4,"title":"Apex org-wide test coverage below 85%","opportunities":100,"defects":17,"dpmo":170000,"sigma":2.45,"effort":"L","priority":0.68,
+ "frame":"Coverage below 85% means changes ship without a control plan; 75% is the floor, not the target.","rec":"Raise coverage on the classes that change most often first (Pareto)."},
+{"id":"SEC-03","pillar":"SECURITY","severity":5,"title":"Permission sets granting Modify All Data","opportunities":58,"defects":7,"dpmo":120690,"sigma":2.67,"effort":"M","priority":0.603,
+ "frame":"Modify-All-Data is special-cause variation waiting to happen: one click can rewrite the dataset.","rec":"Replace broad grants with object-scoped permission sets; audit quarterly."},
+{"id":"RED-03","pillar":"REDUNDANCY","severity":5,"title":"Naming collisions with standard objects (confusion index)","opportunities":45,"defects":2,"dpmo":44444,"sigma":3.2,"effort":"S","priority":0.222,
+ "frame":"A custom object named 'Account' is a poka-yoke violation: the org invites the mistake instead of preventing it.","rec":"Rename with a clear prefix; add naming standards to the release checklist."},
+{"id":"OPS-05","pillar":"OPERABILITY","severity":3,"title":"Open cases older than 30 days","opportunities":18240,"defects":1276,"dpmo":69956,"sigma":2.98,"effort":"M","priority":0.21,
+ "frame":"Aged open cases are WIP inventory past takt time — the process is not flowing.","rec":"Add case age SLAs + escalation flows; review the 14 intake paths for consolidation."},
+{"id":"OPS-01","pillar":"OPERABILITY","severity":5,"title":"Flow runs ending in error (30d)","opportunities":48211,"defects":1937,"dpmo":40178,"sigma":3.25,"effort":"M","priority":0.201,
+ "frame":"Errored flow interviews ARE the DPMO of your automation: each one is a unit of work the process failed to complete.","rec":"Add fault paths + platform-event alerting; fix the top three failing flows first."},
+{"id":"OPS-02","pillar":"OPERABILITY","severity":4,"title":"Async Apex jobs failing (7d)","opportunities":9120,"defects":214,"dpmo":23465,"sigma":3.49,"effort":"M","priority":0.094,
+ "frame":"Failed batch/queueable jobs are silent line stoppages — work queued and never done.","rec":"Route failures to a monitored error object; retry with backoff."}
+]};
+
+/* measured live today — read-only aggregates via Headless 360 Playground */
+const LIVE = { org:"abdus.omnistudio@sfdc24.com", date:"2026-09-07",
+  activeUsers:10, staleUsers90:9, apexClasses:32, apexTriggers:0,
+  permissionSets:38, profiles:46, activePricebooks:1 };
+
+const PILLARS = ["SECURITY","OPERABILITY","WASTE","REDUNDANCY"];
+const PCOLOR = {SECURITY:"var(--sec)", OPERABILITY:"var(--ops)", WASTE:"var(--wst)", REDUNDANCY:"var(--red2)"};
+const PSHORT = {SECURITY:"Security", OPERABILITY:"Operability", WASTE:"Waste", REDUNDANCY:"Redundancy"};
+const BELT_BG = {White:"#e8e4d8", Yellow:"#e8c558", Green:"#3a9070", Blue:"#3987e5", Brown:"#8a5a3c", Black:"#141414"};
+const BELT_INK = {White:"#232a26", Yellow:"#232a26", Green:"#fff", Blue:"#fff", Brown:"#fff", Black:"#e8e4d8"};
+const fmt = n => n==null ? "–" : n.toLocaleString("en-CA");
+
+let DATA = DEMO, activePillar = null;
+
+/* ================= helpers ================= */
+const el = (h) => { const t=document.createElement("template"); t.innerHTML=h.trim(); return t.content.firstChild; };
+const esc = s => String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function beltChip(belt, big){
+  if(!belt) return "";
+  return `<span class="belt-chip" style="background:${BELT_BG[belt]};color:${BELT_INK[belt]};${big?'font-size:14px':''}">
+    <span class="belt-swatch" style="background:${BELT_BG[belt]}"></span>${esc(belt)} Belt</span>`;
+}
+
+/* ================= hero ================= */
+function renderHero(){
+  const o = DATA.overall;
+  document.getElementById("sigma-v").textContent = o.sigma?.toFixed ? o.sigma.toFixed(2) : o.sigma;
+  document.getElementById("score-v").textContent = o.score ?? "–";
+  document.getElementById("dpmo-v").textContent = fmt(o.dpmo);
+  document.getElementById("fcount-v").textContent = DATA.findings.length;
+  document.getElementById("defects-v").textContent = fmt(DATA.findings.reduce((a,f)=>a+(f.defects||0),0));
+  document.getElementById("belt-chip").innerHTML = beltChip(o.belt, true);
+  // next-belt journey
+  const LADDER=[["White",0],["Yellow",40],["Green",55],["Blue",70],["Brown",80],["Black",90]];
+  const nxt = LADDER.find(([b,t])=>t>(o.score||0));
+  document.getElementById("belt-next").textContent = nxt
+    ? `next: ${nxt[0]} at ${nxt[1]} — ${(nxt[1]-o.score).toFixed(1)} points away`
+    : "Black Belt — ambassador tier: your org passes the test";
+  // dial: arc from 0..6 sigma
+  const svg = document.getElementById("dial-svg");
+  const frac = Math.max(0, Math.min(1, (o.sigma||0)/6));
+  const R=66, C=79, start=-215, sweep=250;
+  const arc=(a0,a1,color,w)=>{ const p0=[C+R*Math.cos(a0*Math.PI/180),C+R*Math.sin(a0*Math.PI/180)],
+    p1=[C+R*Math.cos(a1*Math.PI/180),C+R*Math.sin(a1*Math.PI/180)], large=(a1-a0)>180?1:0;
+    return `<path d="M${p0[0].toFixed(1)} ${p0[1].toFixed(1)} A${R} ${R} 0 ${large} 1 ${p1[0].toFixed(1)} ${p1[1].toFixed(1)}" fill="none" stroke="${color}" stroke-width="${w}" stroke-linecap="round"/>`; };
+  let ticks="";
+  for(let s=0;s<=6;s++){ const a=(start+sweep*s/6)*Math.PI/180;
+    ticks+=`<line x1="${(C+(R-9)*Math.cos(a)).toFixed(1)}" y1="${(C+(R-9)*Math.sin(a)).toFixed(1)}" x2="${(C+(R+1)*Math.cos(a)).toFixed(1)}" y2="${(C+(R+1)*Math.sin(a)).toFixed(1)}" stroke="var(--line)" stroke-width="2"/>`;
+    if(s>0&&s<6) ticks+=`<text x="${(C+(R-19)*Math.cos(a)).toFixed(1)}" y="${(C+(R-19)*Math.sin(a)+3).toFixed(1)}" text-anchor="middle" font-size="9" font-family="IBM Plex Mono,monospace" fill="var(--chalk-faint)">${s}</text>`; }
+  svg.innerHTML = arc(start,start+sweep,"var(--slate-2)",7) + (frac>0?arc(start,start+sweep*frac,"var(--accent)",7):"") + ticks;
+}
+
+/* ================= tiles ================= */
+function tile(title, sub, bodyHTML, extraClass){
+  return `<div class="tile ${extraClass||""}"><h2>${title}</h2><div class="sub">${sub}</div><div class="body">${bodyHTML}</div></div>`;
+}
+
+function renderGrid(){
+  const g = document.getElementById("grid");
+  const P = DATA.pillars, F = DATA.findings;
+
+  /* 1 · pillar scorecard */
+  const rows = PILLARS.filter(p=>P[p]&&P[p].score!=null).map(p=>{
+    const v=P[p];
+    return `<div class="prow ${activePillar===p?'active':''}" data-pillar="${p}" role="button" tabindex="0" aria-label="Filter backlog to ${PSHORT[p]}">
+      <span class="pname"><span class="pdot" style="background:${PCOLOR[p]}"></span>${PSHORT[p]}</span>
+      <span class="pbar"><i style="width:${v.score}%;background:${PCOLOR[p]}"></i></span>
+      <span class="pval num"><b>${v.score}</b> · ${v.sigma}σ</span>
+    </div>`;
+  }).join("");
+  const beltRow = PILLARS.filter(p=>P[p]&&P[p].belt).map(p=>`<span style="font-size:11px;color:var(--chalk-faint)">${PSHORT[p]}: <b style="color:var(--chalk);font-weight:500">${P[p].belt}</b></span>`).join(" · ");
+
+  /* 2 · sigma ladder */
+  const marks=[[1,"691,462"],[2,"308,538"],[3,"66,807"],[4,"6,210"],[5,"233"],[6,"3.4"]];
+  const sx = s => 34 + (s-0.5)/5.7*252;
+  const you = DATA.overall.sigma||0;
+  const ladder = `<svg class="ladder" viewBox="0 0 300 118" role="img" aria-label="Sigma ladder, org at ${you} sigma">
+    <rect class="zone" x="${sx(2)}" y="34" width="${sx(3)-sx(2)}" height="30" rx="3"/>
+    <line class="rail" x1="24" y1="49" x2="292" y2="49"/>
+    ${marks.map(([s,d])=>`<line class="tick" x1="${sx(s)}" y1="42" x2="${sx(s)}" y2="56"/>
+      <text x="${sx(s)}" y="76" text-anchor="middle" class="${s===6?'lab-strong':''}">${s}σ</text>
+      <text x="${sx(s)}" y="90" text-anchor="middle" class="anno">${d}</text>`).join("")}
+    <text x="158" y="106" text-anchor="middle" class="anno">defects per million opportunities</text>
+    <line class="youline" x1="${sx(you)}" y1="30" x2="${sx(you)}" y2="60"/>
+    <circle class="you" cx="${sx(you)}" cy="49" r="5.5"/>
+    <text x="${sx(you)}" y="22" text-anchor="middle" class="lab-strong">you · ${you}σ</text>
+    <text x="${(sx(2)+sx(3))/2}" y="42" text-anchor="middle" class="anno" font-size="8.5">industry band</text>
+  </svg>`;
+
+  /* 3 · findings heat (pillar × severity) */
+  const sevs=[5,4,3,2,1];
+  const counts={}; let maxC=0;
+  F.forEach(f=>{ const k=f.pillar+f.severity; counts[k]=(counts[k]||0)+1; maxC=Math.max(maxC,counts[k]); });
+  const heatCell = c => { const lv = c===0?0 : Math.ceil(c/Math.max(1,maxC)*4); return `var(--heat-${lv})`; };
+  const heat = `<div class="heat" role="table" aria-label="Findings by pillar and severity">
+    <div></div>${sevs.map(s=>`<div class="hcol">S${s}</div>`).join("")}
+    ${PILLARS.map(p=>`<div class="hlab">${PSHORT[p].slice(0,3).toUpperCase()}</div>${sevs.map(s=>{
+      const c=counts[p+s]||0;
+      return `<div class="hcell" style="background:${heatCell(c)}" title="${PSHORT[p]} severity ${s}: ${c}">${c||""}</div>`; }).join("")}`).join("")}
+  </div><div class="big-sub" style="margin-top:8px">severity 5 = business-stopping · counts of findings</div>`;
+
+  /* 4 · license waste */
+  const lw = F.find(f=>f.id==="WST-03");
+  const waste = `<div class="bignum" style="color:var(--crit)">CA$${fmt(lw?.annual_waste_cad||0)}<small> / yr</small></div>
+    <div class="big-sub"><b>${lw?fmt(lw.defects):0} stale seats</b> still licensed — no login in 90+ days.<br>US$165/user/mo (Sales Cloud EE list) × 12 × 1.38 CAD.</div>`;
+
+  /* 5 · automation health */
+  const fl = F.find(f=>f.id==="OPS-01"), aj = F.find(f=>f.id==="OPS-02");
+  const auto = `<div class="bignum">${fl?fmt(fl.dpmo):"–"}<small> DPMO</small></div>
+    <div class="big-sub">flow runs ending in error (30d) — <b>${fl?fl.sigma:"–"}σ</b> process</div>
+    <div class="kv">
+      <span class="k">Errored flow runs</span><span class="v bad">${fl?fmt(fl.defects):"–"} / ${fl?fmt(fl.opportunities):"–"}</span>
+      <span class="k">Failed async jobs (7d)</span><span class="v bad">${aj?fmt(aj.defects):"–"} / ${aj?fmt(aj.opportunities):"–"}</span>
+    </div>`;
+
+  /* 6 · confusion index */
+  const ci = F.find(f=>f.id==="RED-03");
+  const conf = `<div class="bignum">${ci?ci.defects:0}<small> collisions</small></div>
+    <div class="big-sub">custom objects shadowing standard names — the org invites the mistake</div>
+    <div class="rlist" style="margin-top:10px">
+      <div class="ritem"><span class="tag mono">Account__c</span><span style="color:var(--chalk-dim)">collides with standard Account</span></div>
+      <div class="ritem"><span class="tag mono">Task__c</span><span style="color:var(--chalk-dim)">collides with standard Task</span></div>
+    </div>`;
+
+  /* 7 · risk register */
+  const risks = F.filter(f=>f.severity>=4).slice(0,4).map(f=>
+    `<div class="ritem"><span class="sev s${f.severity}">S${f.severity}</span><span>${esc(f.title)}</span></div>`).join("");
+  const risk = `<div class="rlist">${risks}</div><div class="big-sub" style="margin-top:10px">${DATA.findings.filter(f=>f.severity>=4).length} findings at severity 4+ — full list in the backlog below</div>`;
+
+  /* 8 · live sample */
+  const stale = LIVE.staleUsers90, act = LIVE.activeUsers;
+  const liveDpmo = Math.round(stale/act*1e6);
+  const live = `<div class="kv" style="margin-top:0">
+      <span class="k">Active users</span><span class="v">${act}</span>
+      <span class="k">— stale 90+ days</span><span class="v bad">${stale} (${Math.round(stale/act*100)}%)</span>
+      <span class="k">Apex classes</span><span class="v">${LIVE.apexClasses}</span>
+      <span class="k">Active triggers</span><span class="v ok">${LIVE.apexTriggers}</span>
+      <span class="k">Profiles</span><span class="v">${LIVE.profiles}</span>
+      <span class="k">Custom permission sets</span><span class="v">${LIVE.permissionSets}</span>
+    </div>
+    <div class="big-sub" style="margin-top:10px">stale-user check alone: <b class="mono">${fmt(liveDpmo)} DPMO</b> — same math, real org, one query away</div>`;
+
+  /* 9 · what happens next */
+  const next = `<div class="rlist" style="gap:10px">
+      <div class="ritem"><span class="sev s5">1</span><span><b>See it</b> — this console: one screen over the whole org, free first scan</span></div>
+      <div class="ritem"><span class="sev s4">2</span><span><b>Choose</b> — every finding is priced by value ÷ effort; you spend where it pays</span></div>
+      <div class="ritem"><span class="sev s3">3</span><span><b>Fix it</b> — each backlog row becomes a work order a service agent executes in your org, with your approval, costs on the meter</span></div>
+    </div>
+    <div class="big-sub" style="margin-top:10px">SFDC24.com as the front end of Salesforce: dashboards you read, workers that act</div>`;
+
+  g.innerHTML =
+    tile("Belt scorecard","severity-weighted score per pillar · click to filter", rows + `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:9px">${beltRow}</div>`) +
+    tile("Sigma ladder","where this org sits — and what six sigma means", ladder) +
+    tile("Findings heat","where the pain concentrates", heat) +
+    tile("License waste","the number that makes the room lean forward", waste) +
+    tile("Automation health","is the machinery finishing its work?", auto) +
+    tile("Confusion index","poka-yoke violations — naming that invites mistakes", conf) +
+    tile("Risk register","severity 4+ · needs an owner and a date", risk) +
+    tile(`<span class="live-dot"></span>Live org sample`, `measured ${LIVE.date} · ${LIVE.org} · Headless 360`, live) +
+    tile("From reading to fixing","how the console becomes remediation", next);
+
+  g.querySelectorAll(".prow").forEach(r=>{
+    const go=()=>{ activePillar = activePillar===r.dataset.pillar ? null : r.dataset.pillar; renderGrid(); renderBacklog(); };
+    r.addEventListener("click",go);
+    r.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){e.preventDefault();go();} });
+  });
+}
+
+/* ================= backlog ================= */
+function renderBacklog(){
+  const wrap=document.getElementById("backlog-rows");
+  const fs=document.getElementById("filters");
+  fs.innerHTML = `<button class="fchip ${!activePillar?'on':''}" data-p="">All</button>` +
+    PILLARS.map(p=>`<button class="fchip ${activePillar===p?'on':''}" data-p="${p}">
+      <span class="pdot" style="background:${PCOLOR[p]};width:8px;height:8px;border-radius:2px;display:inline-block"></span>${PSHORT[p]}</button>`).join("");
+  fs.querySelectorAll(".fchip").forEach(b=>b.addEventListener("click",()=>{ activePillar=b.dataset.p||null; renderGrid(); renderBacklog(); }));
+
+  const list = DATA.findings.filter(f=>!activePillar||f.pillar===activePillar);
+  wrap.innerHTML = list.map(f=>`<details class="frow">
+    <summary>
+      <span class="fstripe" style="background:${PCOLOR[f.pillar]}"></span>
+      <span class="fid">${esc(f.id)}</span>
+      <span class="ftitle">${esc(f.title)}${f.annual_waste_cad?` — <b class="num" style="color:var(--crit)">CA$${fmt(f.annual_waste_cad)}/yr</b>`:""}</span>
+      <span class="fmetric">${fmt(f.dpmo)} DPMO · ${f.sigma}σ</span>
+      <span class="sev s${f.severity}">S${f.severity}</span>
+      <span class="feffort">${esc(f.effort||"?")}</span>
+    </summary>
+    <div class="fbody">
+      <div class="math">evidence: ${fmt(f.defects)} defects in ${fmt(f.opportunities)} opportunities → ${fmt(f.dpmo)} DPMO → ${f.sigma}σ · priority ${f.priority}</div>
+      <p class="frame">${esc(f.six_sigma_frame||f.frame||"")}</p>
+      <p class="rec"><b>Fix:</b> ${esc(f.recommendation||f.rec||"")} <span class="feffort" style="margin-left:6px">effort ${esc(f.effort||"?")}</span></p>
+      <button class="wo-btn" data-wo="${esc(f.id)}">⧉ Copy work order</button>
+    </div>
+  </details>`).join("") || `<div style="color:var(--chalk-faint);padding:20px 4px">No findings in this pillar — clean bill.</div>`;
+  wrap.querySelectorAll(".wo-btn").forEach(b=>b.addEventListener("click",()=>copyWorkOrder(b)));
+}
+
+/* ================= loader & theme ================= */
+document.getElementById("scores-file").addEventListener("change", e=>{
+  const file=e.target.files[0]; if(!file) return;
+  const r=new FileReader();
+  r.onload=()=>{ try{
+      const d=JSON.parse(r.result);
+      if(!d.overall||!d.pillars||!d.findings) throw new Error("not a scores.json (need overall, pillars, findings)");
+      DATA=d; activePillar=null;
+      document.getElementById("org-name").textContent = file.name.replace(/\.json$/,"");
+      document.getElementById("org-sub").textContent = "scored by "+(d.version||"xray-score");
+      document.getElementById("src-badge").textContent = "showing: "+file.name;
+      renderHero(); renderGrid(); renderBacklog();
+    }catch(err){ document.getElementById("src-badge").textContent = "could not load: "+err.message; } };
+  r.readAsText(file);
+});
+
+/* ---- work orders: a finding becomes a dispatchable job ---- */
+function copyWorkOrder(btn){
+  const f = DATA.findings.find(x=>x.id===btn.dataset.wo); if(!f) return;
+  const ts = new Date().toISOString().replace(/[-:]|\.\d+/g,"").slice(0,15)+"Z";
+  const clean = s => String(s||"").replace(/,/g," ·").replace(/\|/g,"/");
+  const wo = `BCB|v=1|id=WO-${f.id}-${ts}|phase=DISPATCH|class=FIX|from=xray-console|to=vm-order-worker|cc=ALL|wf=blackbelt-xray|finding=${f.id}|sev=${f.severity}|dpmo=${f.dpmo}|effort=${f.effort}|title=${clean(f.title)}|fix=${clean(f.recommendation||f.rec)}|guardrail=read-only-until-approved · client approves before any org write`;
+  (navigator.clipboard?navigator.clipboard.writeText(wo):Promise.reject()).then(()=>{
+    btn.textContent="✓ Work order copied"; btn.classList.add("done"); meterTick(0.004);
+    toast("Work order on your clipboard — paste it on the Blackboard to dispatch");
+    setTimeout(()=>{btn.textContent="⧉ Copy work order"; btn.classList.remove("done");},2600);
+  }).catch(()=>{ toast(wo.slice(0,80)+"… (clipboard unavailable — select from console)"); console.log(wo); });
+}
+function toast(msg){
+  let t=document.querySelector(".toast");
+  if(!t){ t=el('<div class="toast" role="status"></div>'); document.body.appendChild(t); }
+  t.textContent=msg; t.classList.add("show");
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),2800);
+}
+
+/* ---- cost meter: transparency as a feature ---- */
+const METER={spent:0, budget:25, paused:false};
+function meterTick(cost){
+  if(METER.paused) return;
+  METER.spent=Math.min(METER.budget, METER.spent+cost);
+  document.getElementById("meter-spent").textContent="$"+METER.spent.toFixed(3);
+  document.getElementById("meter-bar").style.width=(METER.spent/METER.budget*100)+"%";
+  const bar=document.getElementById("meter-bar");
+  bar.style.background = METER.spent/METER.budget>0.8 ? "var(--warn)" : "var(--good)";
+}
+document.getElementById("meter-pause").addEventListener("click",e=>{
+  METER.paused=!METER.paused;
+  e.target.textContent=METER.paused?"resume":"pause";
+  toast(METER.paused?"Meter paused — nothing accrues while you read":"Meter running");
+});
+document.addEventListener("click",e=>{ if(e.target.closest(".prow,.fchip,details.frow summary")) meterTick(0.002); });
+meterTick(0.011); /* the scan itself */
+
+document.getElementById("theme-btn").addEventListener("click", ()=>{
+  const r=document.documentElement;
+  const cur = r.dataset.theme || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  r.dataset.theme = cur==="dark" ? "light" : "dark";
+});
+
+renderHero(); renderGrid(); renderBacklog();
+</script>
+
+</body>
+</html>
