@@ -263,6 +263,11 @@ ACCEPT_LINE = "To accept this quote, sign below or reply to the email it came wi
 DRAFT_LINE = ("This is a draft build plan for review. It becomes a quote you can accept once every "
               "line has its price.")
 QUOTE_MAX_PAGES = 6
+LINE_FACT_MAX = 110
+NBSP = " "
+SITE_MAP_MAX = 30
+SITE_MAP_DEPTH = 3
+SITE_MAP_KINDS = ("screen", "section", "form", "list", "card", "nav")
 APPENDIX_ROOM = 70
 FIGURE_MAX_SIDE = 1600
 
@@ -291,14 +296,40 @@ def _goal(state: dict) -> str:
     return clean(first, 240) if first else TO_CONFIRM
 
 
+def _project_name(artifact: dict) -> str:
+    """The project's name from the canvas title ("Crumb & Co. - order ahead" ->
+    "Crumb & Co."), or ""."""
+    label = clean((artifact or {}).get("label"), 80).strip()
+    return label.split(" - ")[0].strip()[:40]
+
+
+def _as_clause(text: str, keep: str = "") -> str:
+    """A captured sentence as the tail of another: its first letter lowered,
+    unless it starts a proper name (the project's own name)."""
+    text = text.strip()
+    first = text.split(" ")[0] if text else ""
+    if text and first[:1].isupper() and first[1:2].islower() and not (keep and keep.startswith(first)):
+        return text[:1].lower() + text[1:]
+    return text
+
+
 def _line_description(line, dims: dict, artifact: dict) -> str:
-    _, _, default, source = line
+    """What the line's work is, tailored with what the session settled. The line
+    describes the work; a session fact only sharpens it (owner review, 2026-09-26:
+    a description that was just the business's own sentence read as unpolished)."""
+    line_id, _, default, source = line
     if source == "canvas":
         parts = [clean(c.get("label"), 30) for c in (artifact.get("children") or [])
                  if isinstance(c, dict) and clean(c.get("label"), 30).strip()][:6]
         return ("Covers: " + ", ".join(parts)) if parts else default
+    name = _project_name(artifact)
+    if line_id == "discovery":
+        return "%s for %s" % (default, name.replace(" ", NBSP)) if name else default   # the name never splits
     if source and source in dims and dims[source].get("level", 0) >= 2 and dims[source].get("captured"):
-        return clean(dims[source]["captured"], 140)
+        fact = dims[source]["captured"].strip().rstrip(".")
+        if len(fact) > LINE_FACT_MAX:
+            fact = fact[:LINE_FACT_MAX].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+        return "%s: %s" % (default, _as_clause(fact, name))
     return default
 
 
@@ -586,7 +617,7 @@ def build_quote_pdf(state: dict, *, design_png: bytes | None = None, price_table
 
     # --- line items ---
     section("Line items", need=40)
-    widths = (10, 44, width - 10 - 44 - 40, 40)
+    widths = (9, 42, width - 9 - 42 - 34, 34)     # the description gets the room: it is what the client reads
 
     def table_head():
         grid(("#", "Item", "Description", "Price"), widths, (("B", 8.5),) * 4, aligns=("L", "L", "L", "R"),
@@ -756,15 +787,48 @@ def build_quote_pdf(state: dict, *, design_png: bytes | None = None, price_table
     built = [(e.get("payload") or {}).get("text", "") for e in state.get("events") or [] if e.get("type") == "confirm"]
     notes("What the architect built", [clean(c, 200) for c in built if c][-8:])
     notes("Decisions", _decided(state)[-8:])
-    outline = _outline(artifact)[:30]
-    if outline:
-        section("The canvas", gap=4)
-        pdf.set_font("Courier", "", 8.5)
-        for line in outline:
-            pdf.multi_cell(width, 4.4, line, new_x="LMARGIN", new_y="NEXT")
+    entries = _site_map(artifact)
+    if entries:
+        section("Site map", gap=4, need=min(len(entries) * 6.4 + 10, 130))   # heading and rows as one block: no orphan row
+        for i, (depth, label) in enumerate(entries):
+            indent = 4 + 7 * depth
+            pdf.set_font("Helvetica", "B" if depth == 0 else "", 10 if depth == 0 else 9.5)
+            h = 6.4
+            if pdf.get_y() + h > pdf.page_break_trigger:
+                pdf.add_page()
+            y = pdf.get_y()
+            if i % 2 == 1:
+                pdf.set_fill_color(*BAND)
+                pdf.rect(pdf.l_margin, y, width, h, "F")
+            pdf.set_fill_color(*(NAVY if depth == 0 else ACCENT if depth == 1 else MUTE))
+            pdf.circle(pdf.l_margin + indent - 1.6, y + h / 2, 0.9 if depth else 1.2, "F")
+            pdf.set_xy(pdf.l_margin + indent + 1, y + 0.8)
+            pdf.set_text_color(*(NAVY if depth == 0 else INK))
+            pdf.cell(width - indent - 2, h - 1.6, _fit(pdf, label, width - indent - 2))
+            pdf.set_xy(pdf.l_margin, y + h)
+        pdf.set_text_color(*INK)
     if pdf.pages_count > QUOTE_MAX_PAGES:     # bounded: every list above is capped; this is the backstop
         raise ValueError("the quote ran to %d pages" % pdf.pages_count)
     return bytes(pdf.output())
+
+
+def _site_map(artifact: dict) -> list:
+    """(depth, name) for the prototype's pages and sections, in order: structural
+    parts only, no node kinds, at most SITE_MAP_DEPTH deep and SITE_MAP_MAX long."""
+    out = []
+
+    def walk(node, depth):
+        if not isinstance(node, dict) or len(out) >= SITE_MAP_MAX or depth > SITE_MAP_DEPTH:
+            return
+        label = clean(node.get("label"), 80).strip()
+        shown = node.get("kind") in SITE_MAP_KINDS and bool(label)
+        if shown:
+            out.append((depth, label))
+        for child in node.get("children") or []:
+            walk(child, depth + 1 if shown else depth)
+
+    walk(artifact or {}, 0)
+    return out
 
 
 def _fit(pdf, text: str, w: float) -> str:

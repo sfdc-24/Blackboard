@@ -597,6 +597,92 @@ class QuoteDesign(unittest.TestCase):
         self.assertEqual("Short", sp._fit(pdf, "Short", 49))
 
 
+def flow(text: str) -> str:
+    """The shown strings in order, joined: wrapped lines read as one sentence."""
+    return " ".join(re.findall(r"\(((?:[^()\\]|\\.)*)\) Tj", text))
+
+
+class QuoteWording(unittest.TestCase):
+    """Coordinator review of the sample, 2026-09-26: a line's description must
+    describe its work, and the canvas appendix must read as a site map."""
+
+    def lines_text(self, state, prices=None):
+        return text_of(build_summary_pdf(state, price_table=table({"website": prices or FULL_WEBSITE})))
+
+    def test_each_line_describes_its_work_tailored_with_the_session(self):
+        state = plan_state(levels={"business": 3, "design": 2})
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "business":
+                d["captured"] = "Crumb and Co., a two-person sourdough bakery."
+            if d["id"] == "design":
+                d["captured"] = "Warm browns and cream, real photography."
+        text = self.lines_text(state)
+        raw = text.split("Line items")[1].split("Total")[0]
+        lines = flow(raw)
+        self.assertIn("Goals, audience and a page-by-page plan for Crumb and Co.", lines)
+        self.assertIn("(Crumb and Co.)", raw)                               # the name wraps as one piece
+        self.assertNotRegex(raw, r"\((and )?Co\.\)")
+        self.assertIn("Style, palette and type: warm browns and cream, real photography", lines)
+        self.assertNotIn("a two-person sourdough bakery", lines)             # not the business's own sentence
+        self.assertIn("Covers: Hero, Menu", lines)                         # build keeps its list
+        self.assertIn("Testing on phones and desktops, launch and go-live checks", lines)
+        self.assertIn("Walkthrough, admin access and documentation", lines)
+
+    def test_an_unsettled_dimension_or_no_name_leaves_the_plain_work(self):
+        state = plan_state(levels={"design": 1})
+        state["artifact"]["label"] = ""
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "design":
+                d["captured"] = "Maybe blue."
+        text = flow(self.lines_text(state))
+        self.assertIn("Goals, audience and a page-by-page plan", text)
+        self.assertNotIn("page-by-page plan for", text)
+        self.assertIn("Style, palette and type", text)
+        self.assertNotIn("Style, palette and type: maybe blue", text)
+
+    def test_a_long_fact_is_cut_at_a_word_and_a_proper_name_keeps_its_capital(self):
+        state = plan_state(levels={"design": 3})
+        state["artifact"]["label"] = "Crumb - shop"
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "design":
+                d["captured"] = "Crumb brown and cream with " + "hand drawn loaves " * 8
+        text = flow(self.lines_text(state))
+        tail = text.split("Style, palette and type: ")[1]
+        self.assertTrue(tail.startswith("Crumb brown"))                    # the project's name keeps its capital
+        self.assertIn("...", tail.split("CAD")[0])
+
+    def test_the_canvas_is_a_site_map_not_a_node_tree(self):
+        state = plan_state()
+        state["artifact"]["children"][0]["children"] = [
+            {"id": "hh", "kind": "heading", "label": "Fresh bread every morning"},
+            {"id": "sub", "kind": "section", "label": "Opening hours"}]
+        pdf = build_summary_pdf(state)
+        text = text_of(pdf)
+        self.assertIn("Site map", text)
+        self.assertNotIn("The canvas", text)
+        for kind in ("screen:", "section:", "heading:"):
+            self.assertNotIn(kind, text)
+        self.assertNotIn(b"/BaseFont /Courier", pdf)
+        notes = text.split("Site map")[1]
+        for name in ("Crumb and Co.", "Hero", "Opening hours", "Menu"):
+            self.assertIn(name, notes)
+        self.assertNotIn("Fresh bread every morning", notes)              # content, not structure
+        self.assertEqual([(0, "Crumb and Co."), (1, "Hero"), (2, "Opening hours"), (1, "Menu")],
+                         sp._site_map(state["artifact"]))
+
+    def test_the_site_map_is_bounded(self):
+        deep = {"id": "d", "kind": "section", "label": "L0", "children": []}
+        node = deep
+        for i in range(1, 8):
+            child = {"id": "d%d" % i, "kind": "section", "label": "L%d" % i, "children": []}
+            node["children"].append(child)
+            node = child
+        self.assertEqual(sp.SITE_MAP_DEPTH, max(d for d, _ in sp._site_map(deep)))
+        wide = {"id": "w", "kind": "screen", "label": "Wide", "children": [
+            {"id": "c%d" % i, "kind": "section", "label": "Part %d" % i} for i in range(80)]}
+        self.assertEqual(sp.SITE_MAP_MAX, len(sp._site_map(wide)))
+
+
 class PriceTable(unittest.TestCase):
     def test_empty_is_none_and_a_good_table_parses(self):
         self.assertIsNone(parse_price_table("", TOPICS, LINE_IDS))
