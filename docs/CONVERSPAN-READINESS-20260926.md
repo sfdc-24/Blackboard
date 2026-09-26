@@ -75,19 +75,35 @@ G9 also requires, after the gate:
 
 **G2: provider controls (OPEN)**
 - Evidence: Blackboard #272 (builder bounded) has Cursor GO at `8a9349e` and a Codex NO-GO (`board` CODEX-PR272-8A9349E-NOGO-20260926T020927Z, CODEX-R5D-8A9349E-NOGO-20260926T0231Z): no total wall-clock deadline, and permanent 4xx errors classed as timeouts.
-- What closes it: the complete ADR G2 controls, not #272 alone: definite-error fallback, provider circuit state, stale-turn fences, hard deadlines, bounded response bodies, and provider/model/latency/outcome receipts. Each needs failure-case evidence (timeout, quota, auth, malformed, refusal, empty, recap failure) and a Codex GO.
+- What closes it: ADR G2 in full (`repo`, quoted), with failure-case evidence and a Codex GO:
+
+> - Add definite-error fallback, provider circuit state, stale-turn fences, hard
+>   deadlines, bounded response bodies, and provider/model/latency/outcome receipts.
+> - Test timeout, quota, auth, malformed, refusal, empty, and recap-failure cases.
+> - Keep fallback visible in telemetry; do not mislabel the responding provider.
 
 **G3: tenant isolation (OPEN)**
 - Evidence: Blackboard #260 is open at `ecee267`. Cursor GO 02:05Z; Codex Gate 1 NO-GO (`board` CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z).
-- What closes it: Codex exact-head GO, a disabled zero-traffic deploy, and cross-tenant and revocation negative controls.
+- What closes it: ADR G3 in full (`repo`, quoted):
+
+> - Remediate PR260 tenant/project/subject binding, revocation enforcement,
+>   pre-admission fetch controls, parser deadline, bounded workers, and audit
+>   redaction.
+> - Rebase it onto current `main` and obtain a fresh exact-head independent review.
+> - Deploy disabled and at zero traffic; run cross-tenant and revocation negative
+>   controls.
 
 **G4: durable publication (OPEN)**
 - Evidence: Blackboard #261 is open, stacked on #260. Starting #261 is not closure.
-- What closes it (ADR G4):
-  - rebase onto the accepted #260/main base;
-  - crash-after-commit recovery with exactly one publication and a durable replay receipt;
-  - a separate exact-head review;
-  - an accepted disabled zero-traffic deploy.
+- What closes it: ADR G4 in full (`repo`, quoted):
+
+> - Begin only after PR260 has been accepted on its exact rebased head.
+> - Rebase PR261 onto the accepted PR260/main state.
+> - Persist publication intent durably with command completion, reconcile pending
+>   publication after restart, and return the same final receipt on replay.
+> - Inject a crash immediately after command/session commit and before workspace
+>   persistence; prove one publication and one receipt after recovery.
+> - Obtain a separate exact-head review and deploy disabled at zero traffic.
 
 **Immutable source-to-runtime receipts (PARTIAL)**
 - Evidence:
