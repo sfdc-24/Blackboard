@@ -342,6 +342,218 @@ Until the use-policy module lands (PR #255), the Muse carries the policy in
 one sentence of its own prompt; after it lands, it takes `USE_POLICY` and the
 moderation gate like the other lanes.
 
+## Client workspaces (STUDIO_CLIENT_WORKSPACES, off by default)
+
+A named client signs in on the homepage and sees their own projects. This is held to the Gate 1
+security contract in `docs/SFDC24-CODEX-STRATEGY-EXECUTION-PLAN-20260925.md`, and
+`tests/test_studio_clients.py` covers it item by item.
+
+**Registry (`app/clients.py`).** One state-store object, `studio_clients`: `{"version": 1, "clients":
+[{"id", "name", "emails", "projects": [{"id", "name", "url"}]}]}`.
+- `id` is the tenant, and a workspace is always `{tenant, project}`.
+- Operators write the registry; the controller only reads it. Every authorisation reads it fresh,
+  and only the sign-in address list is cached, for 30 seconds.
+- A malformed entry is skipped whole. An address or tenant id that appears twice admits neither.
+- A project URL is a reviewed canonical https page: a named host with a letter TLD; no IP literal,
+  port, userinfo, query, fragment, percent-encoding or backslash; and no `.internal`, `.local`,
+  `.localdomain`, `.localhost` or similar private name.
+
+**Client token (`app/tokens.py`).** Its own format, `c2.`, signed with a key derived for this purpose
+and verified only by `verify_client_token`.
+- Its claims are exactly `v, typ, sub, tnt, prj, iat, exp, aud, jti`, and each is checked.
+- It lives at most 24 hours; an `iat` in the future is refused.
+- v1 operator, visitor and session tokens and client tokens never pass for each other.
+- `/v1/auth/verify` returns `{"token", "expires_at", "scope": "client"}` for a registry address.
+
+**Revocation and binding.** Every client-scope request re-checks, fresh from the registry, that the
+tenant exists and still lists an address that hashes to the token's subject.
+- This covers `/v1/workspace`, `POST /v1/session`, and every session-scope request on a client
+  session. That check happens before any read, write or provider call, in `require_session` and
+  `require_recent_session`.
+- A client session's token binds `tnt`, `csub` and `prj` (`""` for blank and template). All three
+  must equal the stored session. For a project session, the registry must still list that project
+  under that tenant.
+- An unbound token never reaches a client session, and a bound token never reaches any other.
+- Every client session is keyed by `{subject, creation id, tenant, project}`. Replay ownership
+  compares all of them, so an address moved to another tenant never reaches its old sessions.
+- `/v1/workspace` shows only the projects in the token's `prj` snapshot.
+- A removed client, another tenant's project, a project that does not exist, a project added after
+  sign-in, and a token of the wrong kind all get the same `403 "this workspace is not available"`.
+- Client tokens reach nothing operator-only, and client sessions have an empty `operator_subject`.
+  An empty subject never passes.
+
+**Project sessions.** `POST /v1/session` with `start: "project", "project": "<id>"`.
+- The page is fetched by `app/project_page.py` before any admission, and only after two checks:
+  - a per-tenant budget of page-load attempts is reserved (10 an hour, 40 a day; a failure spends
+    one). It's recorded in `studio_client_fetch_<tenant>` as `{at, project}` only.
+  - no other load for that tenant is in flight (429 if one is).
+- At most 4 loads are outstanding process-wide. A load that timed out keeps its slot until its
+  thread has really finished, so blocked resolvers can't pile up threads. With no free slot, the
+  answer is 503 at once and nothing starts.
+- A page that fails to load gets 502 `"the project page could not be loaded"`: no session, no
+  admission.
+- Sessions are keyed by owner, creation id, tenant and project. A replay fetches nothing.
+
+**Fetch (SSRF).** Only the registry URL is fetched.
+- The name is resolved in the worker, and every answer must be a public unicast address: no
+  loopback, RFC1918, CGNAT, link-local, multicast, documentation, benchmarking, reserved, ULA, or
+  mapped/6to4/Teredo form.
+- The connection goes to that validated address, with the registered name kept for SNI, the
+  certificate check and Host. This rules out DNS rebinding.
+- Redirects fail closed. Environment proxies are never used. Only `text/html` is accepted, with
+  identity or gzip encoding.
+- Size caps: 1.5 MB compressed, 3 MB decompressed.
+- Time caps: connect 3 s; first byte 5 s; idle 4 s; one wall-clock total of 8 s across
+  resolve, connect, first byte and body.
+
+**Tree.** The page becomes inert text in known kinds.
+- Kept: screen, section, nav, heading, text, button, image-placeholder (never fetched), list,
+  form and field.
+- Dropped: scripts, styles, frames, objects, SVG, MathML, templates, comments, and every attribute
+  except a few read as label text. No URL survives, even as visible text.
+- Caps: 2M input characters, fed in 16 KB chunks, with a hard stop between chunks on time, node
+  count and an unparsed remainder over 64 KB (one giant tag or an unclosed script). Also 50,000
+  events, 4 KB looked at per text run or attribute, 60 nodes, depth 4, 12 images, 200-character
+  labels, and 2 s of parsing.
+- Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
+  `[email]`. The registry's project name is kept as written. Links are read first, so a link's
+  `user@host` goes with it.
+- A mailbox is found in the registry's own grammar and coordinates. The registry accepts 1-64
+  code points that are neither whitespace nor `@`, an `@`, and 1-255 more, counted in original
+  code points. So the scan reads the original text, not a compatibility view where one ligature
+  is three letters. The whole run of non-whitespace characters around an `@`, or its full-width
+  and small forms, goes, whatever its length: the local part and the domain together, dotted,
+  dotless (`admin@localhost`) or a bracketed literal (`user@[2001:db8::1]`). Only trailing
+  sentence punctuation (`.,;:!?`) stays, and not even that when it is all that follows the `@`:
+  the registry accepts `client@?!` and `a@.` too, so the whole run goes (Codex Gate 1 on
+  80dfc8f). No window can leave a registry-valid prefix or suffix
+  behind, and punctuation the registry accepts (`secret＜alias@example.com`,
+  `user@secret：part`) does not stop it. This is over-redaction by design, and linear: one
+  character test per character. Codex Gate 1 NO-GO on 59ed871.
+- Nothing can take part of an address away before it is read (Codex Gate 1 on ecee267).
+  - Addresses are found on the original code points before angle brackets and invisible
+    characters are stripped (`alice@<` and `bob@` plus a zero-width space go whole), and again
+    after, so stripping can neither hide an address nor assemble one.
+  - A limit (an attribute's 400 characters, a run's 4096, the 800-character words budget, the
+    page's 2 MB) never keeps part of a token: the token it cuts is dropped whole.
+  - A run of text is read whole: pieces split by a feed chunk, a comment or an inline tag
+    (`<b>`, `<span>`...) are joined first. A parse that stops early drops its last token.
+- Links, IP addresses and hosts are detected on a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
+  name. Circled, full-width, squared and mathematical forms of letters, digits, dots, colons and
+  `@` are read as what they stand for (`secret.ⓒⓞⓜ` is `secret.com`). An offset map leads each
+  match back to the page, and the complete original characters are replaced. One code point maps
+  to at most 18, so the scan stays linear. Codex Gate 1 NO-GO on 5c2957d and 38bc713.
+- The redaction is conservative: any `label.label...` ending in 2-63 letters of any script, or in
+  a punycode `xn--` label, counts as a host, with ASCII or IDNA full-width dots. So does any
+  `local@host` in any script. "e.g." and "Inc." stay; a product name written like a host ("Node.js")
+  is redacted too. Codex Gate 1 NO-GO on a2d98fc.
+
+**Providers.** A client session reaches only `STUDIO_CLIENT_PROVIDERS`, which defaults to
+`claude,openai`. Distinct names from claude, openai, gemini and meta are accepted; anything else
+stops the service at start.
+- Talk and recap with an explicitly unlisted agent: `403`, before any provider call.
+- Topic routing picks only from the listed agents.
+- `/advise` (Gemini): `403` for a client session unless `gemini` is listed.
+- Operator and visitor sessions are unchanged. The builder (Claude) and the voice, speech and
+  moderation calls (OpenAI) are the base of every session.
+
+**Audit.** Every accepted command in a client session appends exactly one entry to `state["audit"]`,
+keeping the last 200.
+- Entry fields: `{actor, token_type, tenant, project, command_id, command_type, prior_revision,
+  revision, op_ids, at, outcome}`.
+- Stop and worker failures are included (outcome `failed`). A replayed `command_id` adds nothing.
+- A command that Stop fences, or that recovery finds stranded after an interruption, is audited as
+  `failed` in the same compare-and-set transition that marks its receipt failed, ahead of Stop's own
+  entry. Its own late save can never land after that. Codex Gate 1 addendum on dfbcc11.
+- `op_ids` lists every event the command emitted.
+- The audit never holds page text, transcripts or addresses.
+
+**Failures.** An unexpected failure is answered `500 "the request could not be completed"` and logged
+with its error type only, both by the commands route and by a catch-all in the middleware.
+
+**Logs.** No token, address, project URL, pinned IP or page text appears in logs or error bodies.
+httpx and httpcore request logging is held at WARNING.
+
+**Other.** The end-card summary reaches a client through the sign-in contact or the registry. The
+Apps Script sender must list the same addresses in `STUDIO_CLIENT_EMAILS`.
+
+**Concurrent writers.** A command holds its reservation while the worker runs. Codex Gate 1 B1 on
+cc56fea.
+- If another writer lands in that time (rating, recap, summary, voice, or anything else), the
+  reserved save loses its compare-and-set. The command then finishes from fresh state, but only
+  while it still owns the reservation: same active command, inflight receipt, same command epoch.
+- Keys the other writer changed are kept beside the command's. If both changed the same key, the
+  result cannot land: the command ends `failed` (409 to the caller), with its audit entry, and the
+  other write stands.
+- A failing worker finishes the same way.
+- There is always one terminal receipt and one audit entry, and the session is never wedged.
+- If even that finish loses every compare-and-set, the command's failed outcome is written once,
+  create-only, to its own small record, outside the contended session.
+  - The write is made sure of. A write that failed, or whose answer was lost, is tried again and
+    read back.
+  - A record already there counts only when it is this command's: the same session, command,
+    fingerprint and command epoch. It is never overwritten.
+  - The outcome is then applied under the same ownership fence by whichever comes first:
+    - at once;
+    - a scheduled background recovery, which needs no client command. It also writes the
+      record again until it is durable if the finish could not, and a finish whose apply fails
+      to load or write the session still schedules it (Codex Gate 1 on 80dfc8f);
+    - any reader of the session, on any instance: a new command, or the event stream's read. So a
+      restarted controller finishes it with no client command at all (Codex Gate 1 on 59ed871).
+
+  So there is still one terminal receipt and one audit entry, and the next command is accepted at
+  once (Codex Gate 1 B1 on 38bc713).
+- A snapshot repair waits for a running build. The analyst, the Muse and the charter already did.
+
+**Open streams.** The event stream is re-authorised before every state read and before each batch
+leaves: the token's expiry and, for a client-bound token, the session binding and the registry,
+read fresh. When that fails the stream closes and nothing more is sent. Codex Gate 1 B2 on cc56fea.
+Each batch leaves as a single chunk, right after that check, and the expiry is checked again after
+the registry read. Nothing can change between the check and the batch, and no event goes out after
+a revocation or an expiry. Codex Gate 1 B2 on 38bc713.
+
+**Durable guards.** For client sessions, every guard below lives in compare-and-set state
+(`app/guards.py`), so it holds across instances, revisions, a rollout and a rollback: two app
+objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
+- The talk, recap, speech, inspiration, analysis and advice counters.
+- Talk and analysis spacing.
+- The analysis, charter and advice single-flight leases.
+- One page load per tenant, and the service-wide page-load ceiling (`MAX_OUTSTANDING_FETCHES`).
+- A lease has an owner, an expiry and a growing fence. Only its owner, with its fence, releases it.
+  A lease that has expired is no longer counted.
+- A page load that timed out while its worker is still alive keeps both leases for as long as the
+  worker lives.
+  - A keeper renews them, owned and fenced, every 15 s, and gives them back once the worker stops.
+  - A renewal only extends a lease that is still in the record AND has not expired: an expired
+    lease is renewed by nobody, so its owner can never come back beside the holder that replaced
+    it (Codex Gate 1 on ecee267).
+  - A process that dies renews nothing, so its leases still expire after 60 s.
+  - Codex Gate 1 on 59ed871.
+- The work never outlives its lease (Codex Gate 1 on 80dfc8f).
+  - If a renewal is refused, or cannot be confirmed within 25 s of the lease lapsing (the guard
+    store is down, or the keeper was paused), the keeper stops the load and waits for it to stop
+    before giving anything back.
+  - The name lookup runs in a child process that is killed at 3 s or on that stop. Every later
+    step checks the stop and is bounded by its connect or idle timeout.
+  - The work also keeps its OWN deadline: 10 s before its last confirmed lease could lapse. Only
+    a written renewal moves it. The work reads it before every step (the lookup child, the
+    request, every chunk), so a keeper that is paused or starved cannot keep the work alive past
+    its lease (Codex Gate 1 on ecee267).
+  - The stop and the deadline are also checked inside the transport, right before anything is
+    connected or written: a stop that lands after the last check still sends nothing.
+  - So when a lease lapses and another instance takes the place, the old work is already gone.
+    The tenant's single flight and the ceiling hold through an outage of any length.
+- If the tenant lease is taken but the ceiling cannot be read or written, the tenant lease goes
+  back at once. A retry is then not refused as "already loading".
+- The advice lease and its use are taken in one write, so a store that fails part way leaves
+  neither behind (Codex Gate 1 on ecee267).
+- A release that cannot be written is owed: it is written before anything new is taken on that
+  record, and retried in the background. A retry after an outage never meets a ghost lease.
+- Guard state that cannot be read or written refuses the call (503). It never lets the call
+  through.
+- Operator and visitor sessions keep the in-process guards. Admission, voice, commands and the
+  summary were already durable.
+
 ## Metadata proposal contract (offline-only increment)
 
 `STUDIO_ENABLE_METADATA_PROPOSALS` defaults to `false`. Enabling it requires an
