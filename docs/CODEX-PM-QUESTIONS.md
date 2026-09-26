@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: its BUS_URL (line 260) is wrong and lines 280-284 tell readers to edit the sheet by hand. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # Codex PM Decisions — Three Questions Blocking Integration
 
 **To dispatch via Blackboard bus:** Use `bus.ps1 -SheetRowJson` with the payloads below.
