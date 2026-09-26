@@ -1,4 +1,4 @@
-> **SUPERSEDED 2026-09-26** by [`EXPRESS.md`](EXPRESS.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
+> **SUPERSEDED 2026-09-26** by [`CLOUD-FLEET-RUNBOOK.md`](CLOUD-FLEET-RUNBOOK.md) and [`CLOUD-CREDENTIAL-CONTRACT.md`](CLOUD-CREDENTIAL-CONTRACT.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
 
 # Running SFDC24 off the Claude console instead of the laptop
 

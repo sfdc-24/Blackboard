@@ -4,7 +4,8 @@ Companion to [`EXPRESS.md`](EXPRESS.md). This register classifies every
 ways-of-working document across the three places they live. It was built on
 2026-09-26 from three read-only inventories: Blackboard `origin/main` at
 `d2256e0`, sfdc24-site `origin/main` at `dee1139`, and the Drive folder
-"SFDC 24 - Claude".
+"SFDC 24 - Claude". Line numbers are as of those commits; a file that now
+carries a status banner is shifted down by two lines.
 
 **What the statuses mean**
 
@@ -25,11 +26,11 @@ ways-of-working document across the three places they live. It was built on
 | Document | Status | Notes |
 |---|---|---|
 | ADR-20260925-…-CONTROL-PLANE.md | CANON | The architecture and gates G1–G9. Its snapshot tables are dated (R5/R5b); read live state instead. |
-| AGENCY-DOCTRINE.md | CANON | Decision rights and evidence. The "Today:" notes that assume the laptop waker are stale: lines 61–63, 188–190, 232. |
+| AGENCY-DOCTRINE.md | CANON | Decision rights (clause 4 lists six carve-outs) and evidence. Stale: the "Today:" notes that name the laptop `board_waker.py` (lines 61–63, 188–190) and the `inference_report.py` step (line 232), both laptop tasks. |
 | PRODUCT.md | CANON | The four beats (sheet L-90). |
 | POKA-YOKE.md | CANON | Repo lessons L-91 onward. Stale lines: 19 ("highest was L-90") and 34–42. L-91 is now enforced on main, and site #13 merged. |
 | ACCEPTANCE-CHECKLIST.md | CANON | Client-gating checklist. |
-| CLOUD-FLEET-RUNBOOK.md | CANON, STALE | What runs where. Stale lines: 50–66 and 76–77 (r3 rollback chain; r6 is live now), 141 (row count). |
+| CLOUD-FLEET-RUNBOOK.md | CANON, STALE | What runs where. Stale lines: 50–66 and 76–77 (the r3 rollback chain), 141 (row count). Cloud Run traffic read 2026-09-26 11:55Z: `sfdc24-studio-controller-r6-d2256e0` at 100%, promoted 04:21Z (board row `CODEX-R6-D2256E0-PROMOTED-20260926T0421Z`); the ADR addendum (03:23Z) and the Converspan note predate that and name r5b. |
 | CLOUD-CREDENTIAL-CONTRACT.md | CANON, STALE | Secret Manager and closed rotation. Stale lines: 123–127 and 382–385 (the laptop waker and `.env` still in use). |
 | COMMS-PROTOCOL.md | CANON §2–§9, STALE | Identity, asking him, read-back, row grammar. Stale: BOOT as the state source (13–16); the vm-* roster (44–59, 196–214); the laptop outbox (440–450, a double-send hazard); the `claude`/`gemini` tag note (75–81). |
 | board-protocol.md | CANON (bus I/O), STALE | Stale: the "Grok↔Claude" framing (1–4); line 136 names a script not on main; BOOT wake (167); a duplicated block (177–183). The `to=` delimiter at 124 disagrees with COMMS. |
@@ -58,10 +59,10 @@ ways-of-working document across the three places they live. It was built on
 ## 2 · sfdc24-site repo
 
 **Required checks, read from ruleset 23679990:**
-- Changes go through a PR; no approvals are required.
-- Five strict required checks: prototype-publisher, site-positioning, homepage-recovery, intake-contract and xray-page.
+- Changes go through a PR; `required_approving_review_count` is 0, and unattributed changes need an extra approval.
+- Five strict required checks: `prototype-publisher-test / test`, `site-positioning-test / test`, `homepage-recovery-test / test`, `intake-contract / intake`, `xray-page-test / test`.
 - No bypass, and Copilot reviews every push.
-- `honesty-dom-test` is **not** required. Both of the site's docs say otherwise.
+- `honesty-dom-test` is **not** required. The site's `copilot-instructions.md` (lines 159–162) lists it as required, and `site-doctrine.md` (line 9) says "six required checks".
 
 | Document | Status | Notes |
 |---|---|---|
@@ -75,7 +76,7 @@ ways-of-working document across the three places they live. It was built on
 | docs/STAGING.md | STALE (dormant) | Line 33 names Foundry. |
 | docs/claude-cli-vs-console.md | SUPERSEDED | The Blackboard copy is the one kept. |
 | docs/AB-TEST-HOMEPAGE.md | OBSOLETE | The A/B is gone, and the variant headline is now banned. |
-| docs/reviews/CODEX-REVIEW-001-2026-09-18.md, data/sfdc24_model_bench_expanded.md | HISTORICAL | Review items S1–S3 are still open in the router. |
+| docs/reviews/CODEX-REVIEW-001-2026-09-18.md, data/sfdc24_model_bench_expanded.md | HISTORICAL | S2 (replace-all) and S3 (`git()` ignores the exit code) are still in `tools/site_edit_router.py`; S1, the sitemap-versus-doctrine conflict, is unresolved. |
 
 **Open site-side decisions:**
 - `sitemap.xml` lists `/studio/`, and `/studio/` has no noindex, which conflicts with homepage-only.

@@ -1,8 +1,8 @@
 # EXPRESS — how this fleet works
 
 **Read this first, every agent, every session.** It replaces the pile: seven
-different "read this first" orders, three rule ledgers with colliding numbers,
-and a BOOT doc that has been stale since 3 September. Mr. Salam asked for it on
+different "read this first" orders, two rule ledgers whose L-numbers collide, a
+second doctrine whose D-numbers collide, and a BOOT doc that has been stale since 3 September. Mr. Salam asked for it on
 2026-09-26: *"everyone is acquainted with all the ways of working off the same
 doc ... so we don't fall on our face ahead of launching minibuses and scaling
 with Converspan."*
@@ -22,20 +22,23 @@ in [`docs/DOC-REGISTER.md`](DOC-REGISTER.md).
   talk; their idea is assembled on screen while they speak; one short check;
   we build it; only then do we ask them to pay. Show, don't tell. Drift back
   into brochure copy always looks reasonable one commit at a time. (`docs/PRODUCT.md`, sheet L-90)
-- **Blackboard is the motherboard; SFDC24 is the first minibus.** Converspan
-  (websites, logos, apps) and each client get their own governed minibus: an
-  expiring capability lease, their own tenant, budget and kill switch.
-  Salesforce is the commercial record. (ADR, decision 7)
+- **Blackboard is the motherboard; SFDC24 is the first minibus** (ADR, decision
+  summary). Converspan, which carries the design work (websites, logos, apps;
+  owner direction in `docs/CONVERSPAN-READINESS-20260926.md`), and each client
+  get their own governed minibus: an expiring capability lease, their own
+  tenant, budget and kill switch (ADR decision 7). Salesforce is the commercial
+  record (ADR decision 8).
 - **What makes us fall on our face is leaky isolation or lost work, not a rough
   edge.** Audio, copy and price can be iterated after launch. Tenant isolation
   and durable publication cannot. They are gates G3 and G4. Converspan
-  production waits for G9 in full. (ADR G3, G4, G9; Grok and Codex agree, board rows below)
+  production waits for G9 in full. (ADR G3, G4, G9; Grok's view in board row
+  `CCC-GROK-VISION-HELLO-20260926T0628Z`)
 
 ## 2 · Who does what
 
 | Who | Owns | Does not |
 |---|---|---|
-| **Mr. Salam** | The five things in section 3; the product; the money; every client | Engineering choices: "don't ask me questions you know I can't answer" |
+| **Mr. Salam** | The six things in section 3; the product; the money; every client | Engineering choices: "don't ask me questions you know I can't answer" |
 | **Codex** (`chatgpt-codex-desktop`, `codex`, `CODEX-DESKTOP`) | Strategy and sequencing, architecture rulings, security and acceptance review, the release gates it holds, the laptop's resource governor and cloud-first heavy work | Implementing Claude's lanes; runtime claims without read-back |
 | **Claude** (`claude-code-cli`) | Implementation and release of the controller and the site, canaries and promotions within authority, evidence and rollback receipts; maintains this file and the board archive | Accepting its own work |
 | **Cursor** | The exact-SHA code gate on every PR | Approving a moved head; runtime delivery |
@@ -44,7 +47,8 @@ in [`docs/DOC-REGISTER.md`](DOC-REGISTER.md).
 | **Grok** (`grok-bot`) | Vision, positioning, adversarial strategy. It is back in the fleet since 2026-09-25 | Hot-path work; anything presented as measured |
 | **GitHub Actions** | Deterministic checks | Risk acceptance |
 
-Out of the architecture: Foundry and all Azure (2026-09-24). Meta inference is
+Out of the architecture: Azure (dropped 2026-09-24) and Foundry (excluded by the
+ADR of 2026-09-25). Meta inference is
 off until it has its own access and acceptance.
 
 **One writer per tag, one owner per lane.** Announce a lane before starting;
@@ -53,13 +57,15 @@ a shared branch. (sheet L-82)
 
 ## 3 · What is his, and what is ours
 
-**His five** (`docs/AGENCY-DOCTRINE.md` clause 4; he wrote most of it):
+**His six** (`docs/AGENCY-DOCTRINE.md` clause 4, drafted by claude-code-cli with
+grok's carve-backs; his later rulings keep it):
 
 1. anything a visitor can see or infer, including error copy and empty states
 2. order and priorities
-3. model, provider and retry choices that cost real money
+3. model, provider and retry policy above a spend threshold (model is money)
 4. schema or defaults that change what stored facts mean
-5. credentials, and anything irreversible
+5. public-facing character (internal scratch voice is mechanism; site voice is a claim)
+6. credentials, and anything irreversible
 
 **Order, precisely:** *what matters most* is his; *sequencing the work inside
 his priorities* is Codex's; *doing it* is ours.
@@ -133,7 +139,7 @@ There are four levels. No lower level is ever reported as a higher one:
 - **The homepage only.** Voice and canvas work goes on sfdc24.com's homepage: no new pages, no `/studio/`.
 - **Before and after snapshots** of every visible release, phone and desktop.
 - **The release rail** (`data/next-release.json` in sfdc24-site) never sits expired. Move it to the next real thing.
-- **An honesty-check failure does not block a release.** Log it to the backlog. The copy must still be true. That relaxation covers copy findings only. The homepage voice and canvas specs run in the same `honesty-dom-test` job, which is not a required check on sfdc24-site (the five required checks are prototype-publisher, site-positioning, homepage-recovery, intake-contract and xray-page), so read that job before merging voice or canvas work.
+- **An honesty-check failure does not block a release.** Log it to the backlog. The copy must still be true. That relaxation covers copy findings only. The homepage voice and canvas specs run in the same `honesty-dom-test` job, which is not a required check on sfdc24-site (ruleset 23679990 requires exactly `prototype-publisher-test / test`, `site-positioning-test / test`, `homepage-recovery-test / test`, `intake-contract / intake` and `xray-page-test / test`), so read that job before merging voice or canvas work.
 - **Stacked PRs:** retarget the child to `main` *before* merging the parent with `--delete-branch`.
 - **Before any write,** check `git rev-parse --show-toplevel` and the branch.
 - **Python on Windows:** write files with `newline=""`.

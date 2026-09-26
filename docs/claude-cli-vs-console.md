@@ -1,4 +1,4 @@
-> **SUPERSEDED 2026-09-26** by [`EXPRESS.md`](EXPRESS.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
+> **SUPERSEDED 2026-09-26** by [`CLOUD-FLEET-RUNBOOK.md`](CLOUD-FLEET-RUNBOOK.md) and [`CLOUD-CREDENTIAL-CONTRACT.md`](CLOUD-CREDENTIAL-CONTRACT.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
 
 > **Inherited from grok, 2026-09-23.** grok ran out of usage allowance, and this
 > analysis was open as draft PR #142 carrying a 27-line summary plus a machine
