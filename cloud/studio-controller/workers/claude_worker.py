@@ -24,6 +24,15 @@ WHAT IS CHECKED BEFORE ANYTHING LEAVES HERE - the schema alone cannot say these:
 
 Model: claude-opus-5 at low effort - this runs inside a spoken conversation,
 so latency matters more than depth. Server-side refusal fallback is on.
+
+BOUNDED. A turn finishes, or gives up, well inside Cloud Run's 60 s request
+timeout: a 35 s total budget by the monotonic clock (workers/bounded.py - the
+SDK's own timeout is per read, and a trickling body never trips it), no
+retries and a 4000-token cap. At the budget the provider's socket is shut
+down and anything it returns later is never read. A transient fault (the
+deadline, a dropped connection, 429, 5xx) and a permanent one (400, 401, 403,
+a refusal) are each a turn that built nothing and says which, never a crash -
+so the command completes and the next one is accepted at once.
 """
 from __future__ import annotations
 
@@ -42,8 +51,27 @@ except ImportError:  # loaded from its file (tests): read the sibling policy.py 
     _spec.loader.exec_module(_policy)
     USE_POLICY = _policy.USE_POLICY
 
+try:  # the app and the image import this module as part of the workers package
+    from workers import bounded
+except ImportError:  # loaded from its file (tests): read the sibling bounded.py the same way
+    import importlib.util as _bounded_util
+    _bounded_spec = _bounded_util.spec_from_file_location(
+        "studio_bounded", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bounded.py"))
+    bounded = _bounded_util.module_from_spec(_bounded_spec)
+    _bounded_spec.loader.exec_module(bounded)
+
 MODEL = os.environ.get("STUDIO_WORKER_MODEL") or "claude-opus-5"
 EFFORT = os.environ.get("STUDIO_WORKER_EFFORT") or "low"
+# The owner's live run (2026-09-26 01:04Z): one turn wrote to the old
+# 16000-token cap, the request died at Cloud Run's 60 s with a 504, the build
+# kept its command slot, and the next five builds were refused for over a
+# minute while the architect said nothing. The largest real turn so far (a
+# 26-node first version) is about 1500 tokens.
+BUILD_BUDGET_SECONDS = 35.0
+MAX_TOKENS = 4000
+# The controller words these for the visitor (app/core.py); keep them in step.
+SLOW_BUILD_PROBLEM = "the architect could not finish that build"
+BLOCKED_BUILD_PROBLEM = "the architect cannot build that request"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 TEXT_MAX = 600
 MAX_CHILDREN = 60
@@ -265,6 +293,13 @@ so the canvas is never left called "Blank canvas".
 ONE AREA AT A TIME. After the first version, change only the area the latest input is about; \
 anything else waits for its own question. When the visitor asks for something new, add it; when \
 they ask to remove or rename something, do exactly that.
+
+FILL WHAT YOU ADD. A section is never just a heading. Every section you insert carries its content \
+in the same turn - the text, list items, cards, fields and buttons that make it real - written from \
+what the visitor has said so far: their offer, audience, options, prices, payment methods, hours, \
+places and calls to action go into the labels and details, in their words. When they describe or \
+decide something (how customers pay, a design they picked, what a page should say), build it now, in \
+full, where it belongs.
 
 NEVER INVENT FACTS ABOUT THE VISITOR'S BUSINESS. No testimonials, client names, quotes, numbers, \
 prices, awards or results they did not give you. Where the design needs one, use a visible \
@@ -535,6 +570,13 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     if not _txt(confirm):
         problems.append("confirm too long")
         confirm = ""
+    # A section, list or form added with nothing in it is the empty canvas the
+    # owner saw: said here, so the log shows it (the change itself stands).
+    for op in ops_out:
+        node = op.get("node") or {}
+        if op["op"] == "insert_child" and node.get("kind") in ("section", "list", "form") \
+                and node["id"] in index and not index[node["id"]].get("children"):
+            problems.append("%s %r was added with nothing in it" % (node["kind"], node["id"]))
 
     # -- questions, fenced and capped, against the tree as it will be
     questions, seen = [], set(recorded)
@@ -690,7 +732,18 @@ def _describe(state: dict, trigger: dict) -> str:
     else:
         latest = "the visitor said: %s" % (trigger.get("text") or "")
     lines.append("\nLATEST INPUT: " + latest)
+    if state.get("analyst"):
+        # The analyst lane asks this session's questions and the builder's are
+        # discarded, so a change held back for "its own question" never came
+        # (the owner's run: two turns built nothing and said it had failed).
+        lines.append("\nIN THIS SESSION THE ANALYST ASKS THE QUESTIONS: return no questions. Build what the "
+                     "latest input decides or describes now, in full - never hold it back for a question.")
     return "\n".join(lines)
+
+
+def _cause(exc) -> str:
+    code = getattr(exc, "status_code", None)
+    return "%s %s" % (type(exc).__name__, code) if code else type(exc).__name__
 
 
 class ClaudeWorker:
@@ -705,25 +758,39 @@ class ClaudeWorker:
               answered an open question; the controller then emits question.answered.
     """
 
-    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT):
+    def __init__(self, client=None, model: str = MODEL, effort: str = EFFORT,
+                 budget_seconds: float = BUILD_BUDGET_SECONDS):
         if client is None:
             import anthropic  # the official SDK; ANTHROPIC_API_KEY from Secret Manager
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(timeout=budget_seconds, max_retries=0)
         self.client, self.model, self.effort = client, model, effort
+        self.budget_seconds = budget_seconds
 
     def on_turn(self, state: dict, trigger: dict) -> dict:
-        resp = self.client.beta.messages.create(
-            model=self.model,
-            max_tokens=16000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            system=SYSTEM,
-            output_config={"effort": self.effort,
-                           "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-            messages=[{"role": "user", "content": _describe(state, trigger)}],
-        )
+        prompt = _describe(state, trigger)
+        call = bounded.abortable(self.client)
+        try:
+            resp = bounded.run_within(self.budget_seconds, lambda: call.client.beta.messages.create(
+                model=self.model,
+                max_tokens=MAX_TOKENS,
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                system=SYSTEM,
+                output_config={"effort": self.effort,
+                               "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+                messages=[{"role": "user", "content": prompt}],
+            ), cancel=call.abort)
+        except Exception as exc:
+            fault = bounded.classify(exc)
+            if fault is None:
+                raise
+            # Nothing was built; the command completes and says which (core.py).
+            said = BLOCKED_BUILD_PROBLEM if fault == "permanent" else SLOW_BUILD_PROBLEM
+            return {"events": [], "problems": ["%s (%s)" % (said, _cause(exc))]}
+        finally:
+            call.close()
         if resp.stop_reason == "refusal":
-            return {"events": [], "problems": ["model refused this turn"]}
+            return {"events": [], "problems": ["%s (the model declined it)" % BLOCKED_BUILD_PROBLEM]}
         if resp.stop_reason == "max_tokens":
             return {"events": [], "problems": ["model output truncated"]}
         text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
@@ -735,8 +802,10 @@ class ClaudeWorker:
         if state.get("analyst"):
             # The analyst lane asks the questions in this session (it maps the
             # data model in parallel); the builder builds and confirms. Two
-            # agents asking at once would talk over each other.
+            # agents asking at once would talk over each other. A question it
+            # dropped is no failure of the change: it is not reported as one.
             clean["questions"] = []
+            problems = [p for p in problems if not p.startswith("question ")]
         # Fresh per turn, never derived from a counter that can repeat.
         batch_id = "b-%s-%s" % (state.get("session_id", "s"), uuid.uuid4().hex[:10])
         # `resolves` is for the controller: it owns the question record, so it
