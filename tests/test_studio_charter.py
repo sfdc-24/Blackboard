@@ -23,8 +23,9 @@ import tests.test_studio_governance as gov  # noqa: E402
 from tests.test_studio_end_card import EndCard, pdf_text  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.pricing import parse_price_table  # noqa: E402
-from app.summary_pdf import (NEXT_STEP, PLAN_TERMS, PRICED_AFTER_REVIEW, TO_CONFIRM,  # noqa: E402
-                             build_summary_pdf, quote_number)
+from app import summary_pdf as sp  # noqa: E402
+from app.summary_pdf import (DRAFT_NEXT_STEP, NEXT_STEP, PLAN_TERMS, PRICED_AFTER_REVIEW, TO_CONFIRM,  # noqa: E402
+                             DesignImageError, build_summary_pdf, quote_number)
 from workers import charter as ch  # noqa: E402
 from workers.policy import USE_POLICY  # noqa: E402
 from workers.topics import CHARTER_FRAMES, DEFAULT_CHARTER_FRAME, TOPICS, charter_frame, quote_lines  # noqa: E402
@@ -457,16 +458,21 @@ class Quote(unittest.TestCase):
         self.assertIn(PLAN_TERMS[2], text)
         self.assertIn("Subscription", text)
         self.assertIn("On demand", text)
-        self.assertIn(NEXT_STEP, text)
+        self.assertIn(DRAFT_NEXT_STEP, text)                                 # a draft has nothing to accept yet
+        self.assertNotIn(NEXT_STEP, text)
         self.assertEqual("Reply to this email to accept, or book a kickoff at sfdc24.com.", NEXT_STEP)
+        self.assertEqual("Reply to this email with questions, or book a kickoff at sfdc24.com.", DRAFT_NEXT_STEP)
         priced = text_of(build_summary_pdf(plan_state(), price_table=table(support={"subscription": 150, "on_demand": 120})))
         self.assertIn("CAD 150.00 / month", priced)
         self.assertIn("CAD 120.00 / hour", priced)
+        full = text_of(build_summary_pdf(plan_state(), price_table=table({"website": FULL_WEBSITE})))
+        self.assertIn(NEXT_STEP, full)
+        self.assertNotIn(DRAFT_NEXT_STEP, full)
 
     def test_the_discussion_is_a_short_appendix_at_the_end(self):
         text = text_of(build_summary_pdf(plan_state(said=20)))
         self.assertIn("Session notes", text)
-        self.assertGreater(text.index("Session notes"), text.index(NEXT_STEP))
+        self.assertGreater(text.index("Session notes"), text.index(DRAFT_NEXT_STEP))
         self.assertIn("A warm company site where locals order ahead.", text)
         self.assertIn("line 19", text)
         self.assertNotIn("line 11,", text + ",")                           # the last eight lines only
@@ -488,6 +494,107 @@ class Quote(unittest.TestCase):
         self.assertNotIn(PLAN_TERMS[0], text)
         self.assertIsNone(QUOTE_RE.search(text))
         self.assertEqual(1, text.count("sfdc24.com"))                        # the footer only
+
+
+def png_bytes(w, h, color=(200, 160, 110)):
+    import io as _io
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def image_widths(pdf: bytes) -> list:
+    return [int(w) for w in re.findall(rb"/Subtype /Image.*?/Width (\d+)", pdf, re.S)]
+
+
+class QuoteDesign(unittest.TestCase):
+    """Owner, 2026-09-26: "a nice looking quote PDF that has images, design
+    elements and a professional format"."""
+
+    def test_page_one_shows_the_brand_the_status_the_facts_and_what_you_get(self):
+        full = text_of(build_summary_pdf(plan_state(), price_table=table({"website": FULL_WEBSITE})))
+        draft = text_of(build_summary_pdf(plan_state()))
+        for text in (full, draft):
+            self.assertIn("SFDC24", text)                                  # the wordmark in the band
+            self.assertIn("What you get", text)
+            for line in quote_lines("website"):
+                self.assertIn(line[1], text)
+        self.assertIn(sp.STATUS_READY, full)
+        self.assertNotIn(sp.STATUS_DRAFT, full)
+        self.assertIn(sp.STATUS_DRAFT, draft)
+        self.assertNotIn(sp.STATUS_READY, draft)
+
+    def test_only_a_fully_priced_quote_can_be_accepted(self):
+        full = text_of(build_summary_pdf(plan_state(), price_table=table({"website": FULL_WEBSITE})))
+        self.assertIn("Acceptance", full)
+        self.assertIn(sp.ACCEPT_LINE, full)
+        self.assertIn("Signature", full)
+        self.assertNotIn(sp.DRAFT_LINE, full)
+        partial = dict(FULL_WEBSITE)
+        partial.pop("test")
+        for text in (text_of(build_summary_pdf(plan_state())),
+                     text_of(build_summary_pdf(plan_state(), price_table=table({"website": partial})))):
+            self.assertNotIn("Acceptance", text)
+            self.assertNotIn("Signature", text)
+            self.assertIn(sp.DRAFT_LINE, text)
+
+    def test_the_milestones_keep_their_exact_words_and_say_half_when_unpriced(self):
+        draft = text_of(build_summary_pdf(plan_state()))
+        self.assertIn(PLAN_TERMS[0], draft)
+        self.assertIn(PLAN_TERMS[1], draft)
+        self.assertIn(sp.MILESTONE_UNPRICED[0], draft)
+        self.assertIn(sp.MILESTONE_UNPRICED[1], draft)
+        self.assertLess(draft.index(PLAN_TERMS[0]), draft.index(PLAN_TERMS[1]))
+
+    def test_the_snapshot_is_framed_scaled_and_captioned(self):
+        big = png_bytes(3200, 2000)
+        pdf = build_summary_pdf(plan_state(), design_png=big)
+        widths = image_widths(pdf)
+        self.assertEqual([sp.FIGURE_MAX_SIDE], widths)                     # scaled once, on page one
+        self.assertIn(sp.FIGURE_CAPTION, text_of(pdf))
+        small = build_summary_pdf(plan_state(), design_png=png_bytes(400, 300))
+        self.assertEqual([400], image_widths(small))                       # small ones are left alone
+        none = text_of(build_summary_pdf(plan_state()))
+        self.assertIn(sp.WIREFRAME_CAPTION, none)                          # no snapshot: the canvas as a wireframe
+        self.assertIn("Hero", none)
+        self.assertIn("Menu", none)
+        broken = big[:40] + b"\x00" * 200
+        with self.assertRaises(DesignImageError):
+            build_summary_pdf(plan_state(), design_png=broken)
+
+    def test_the_pages_are_bounded_and_the_backstop_refuses_more(self):
+        state = plan_state(said=400, levels={d[0]: 3 for d in charter_frame("website")})
+        for d in state["charter"]["dimensions"]:
+            d["captured"] = "x " * 200
+        state["recap"] = {"text": "long recap " * 400}
+        state["events"] = [{"type": "confirm", "payload": {"text": "built " * 80}} for _ in range(60)]
+        pdf = build_summary_pdf(state, design_png=png_bytes(1600, 4000), price_table=table({"website": FULL_WEBSITE}))
+        self.assertLessEqual(pages(pdf), sp.QUOTE_MAX_PAGES)
+        keep = sp.QUOTE_MAX_PAGES
+        try:
+            sp.QUOTE_MAX_PAGES = 1
+            with self.assertRaises(ValueError):
+                build_summary_pdf(plan_state())
+        finally:
+            sp.QUOTE_MAX_PAGES = keep
+
+    def test_the_same_session_renders_the_same_bytes_dated_by_the_session(self):
+        one = build_summary_pdf(plan_state(), design_png=png_bytes(300, 200))
+        two = build_summary_pdf(plan_state(), design_png=png_bytes(300, 200))
+        self.assertEqual(one, two)
+        self.assertIn(b"/CreationDate (D:20260925", one)
+
+    def test_text_that_would_overflow_its_column_is_shortened(self):
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "", 8)
+        long = "Testing on phones and desktops, launch and go-live checks, and a lot more besides"
+        fitted = sp._fit(pdf, long, 49)
+        self.assertTrue(fitted.endswith("..."))
+        self.assertLessEqual(pdf.get_string_width(fitted), 49)
+        self.assertEqual("Short", sp._fit(pdf, "Short", 49))
 
 
 class PriceTable(unittest.TestCase):
