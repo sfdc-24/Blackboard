@@ -184,6 +184,9 @@ class StudioController:
         self.outcome_write_attempts = 4
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
+        # Set by the app when client workspaces are on: saves each applied change
+        # of a project session as the project's next revision (app/workspaces.py).
+        self.workspace_store = None
 
     def _event(self, state: dict, event_type: str, payload: dict, *,
                turn_id: str | None = None, task_revision: int | None = None,
@@ -212,7 +215,7 @@ class StudioController:
                        visitor: bool = False, admit_limit: int | None = None,
                        analyst: bool = False, topic: str = "", client: bool = False,
                        artifact: dict | None = None, project: str = "",
-                       tenant: str = "") -> tuple[dict, int]:
+                       tenant: str = "", workspace_revision: int = 0) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -293,6 +296,8 @@ class StudioController:
             "client_subject": subject if client else "",
             "client_tenant": tenant if client else "",
             "project": project if start == "project" else "",
+            # The saved workspace revision this session builds on (app/workspaces.py).
+            "workspace_revision": int(workspace_revision) if start == "project" else 0,
             "voice_item_ids": [],
             "voice_epoch": 0,
         }
@@ -523,7 +528,18 @@ class StudioController:
             if not hmac.compare_digest(str(prior.get("fingerprint") or ""), fingerprint):
                 raise CommandError("command_id is already bound to a different payload", 409)
             if prior.get("status") == "completed":
-                return copy.deepcopy(prior["result"])
+                replay = copy.deepcopy(prior["result"])
+                if (self.workspace_store is not None and state.get("client_tenant") and state.get("project")
+                        and any(e.get("type") == "artifact.patch" for e in replay.get("events") or [])):
+                    # The stored result was copied before the project save; a
+                    # replay reports the save as the store has it now.
+                    try:
+                        replay["workspace"] = self.workspace_store.receipt(
+                            state["client_tenant"], state["project"], state["session_id"],
+                            int(replay.get("artifact_version") or 0))
+                    except Exception:
+                        replay["workspace"] = {"saved": False, "reason": "the project could not be read"}
+                return replay
             if prior.get("status") == "failed":
                 raise CommandError("command has already failed; use a new command_id", 409)
             raise CommandError("command is already in progress", 409)
@@ -585,6 +601,12 @@ class StudioController:
             self.repository.save(session_id, working, reserved_token)
         except StateConflict:
             self._finish_after_race(session_id, base, working, command, fingerprint, None)
+        # Only a change the session has committed becomes the project's next
+        # revision: a command fenced by Stop, or one whose session commit lost,
+        # never publishes one (Cursor NO-GO on 5db3d90). A result that landed
+        # beside another writer's change (Codex Gate 1 B1) has committed too.
+        if working.get("client_tenant") and working.get("project"):
+            self._save_workspace(working, result)
         return result
 
     def _finish_after_race(self, session_id: str, base: dict, ours: dict | None, command: dict,
@@ -1053,6 +1075,29 @@ class StudioController:
         if state.get("client_tenant"):
             self._audit(state, command, prior_revision, result)
         return result
+
+    def _save_workspace(self, state: dict, result: dict) -> None:
+        """An applied change in a project session becomes the project's next
+        revision - never over a newer one. The result carries the receipt."""
+        patch_ops = [e["op_id"] for e in result.get("events") or [] if e.get("type") == "artifact.patch"]
+        if not patch_ops or self.workspace_store is None:
+            return
+        from .workspaces import WorkspaceConflict, digest
+        try:
+            # The base is the revision the session opened on; its own later
+            # saves are recognised by the store, so no second session write.
+            revision = self.workspace_store.save(state["client_tenant"], state["project"], state["artifact"],
+                                                 state["session_id"], state.get("workspace_revision", 0), patch_ops,
+                                                 state["artifact_version"])
+        except WorkspaceConflict as exc:
+            result["workspace"] = {"saved": False, "revision": exc.stored_revision,
+                                   "reason": "the project changed elsewhere"}
+            return
+        except Exception:                           # the change stands in the session; only the save failed
+            result["workspace"] = {"saved": False, "revision": state.get("workspace_revision", 0),
+                                   "reason": "the project could not be saved"}
+            return
+        result["workspace"] = {"saved": True, "revision": revision, "digest": digest(state["artifact"])}
 
     AUDIT_MAX = 200
 

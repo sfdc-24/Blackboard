@@ -372,7 +372,7 @@ class Denials(Api):
             token = self.sign_in(client).json()["token"]
             mine = client.get("/v1/workspace", headers=self.auth(token))
         self.assertEqual(200, mine.status_code, mine.text)
-        self.assertEqual({"name": "Nav", "projects": [project()]}, mine.json())
+        self.assertEqual({"name": "Nav", "projects": [dict(project(), revision=0, updated_at=None)]}, mine.json())
         self.assertNotIn(CLIENT_EMAIL, mine.text)
 
     def test_every_refusal_reads_the_same(self):
