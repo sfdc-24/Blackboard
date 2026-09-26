@@ -1,0 +1,12 @@
+{
+  "currency": "CAD",
+  "lines": {
+    "website": {"discovery": 600, "design": 1200, "build": 2400, "test": 500, "handover": 300},
+    "logo": {"discovery": 300, "design": 900, "build": 450, "test": 150, "handover": 200},
+    "app": {"discovery": 1200, "design": 2400, "build": 4800, "test": 900, "handover": 500},
+    "salesforce_admin": {"discovery": 1200, "configuration": 2400, "automation": 3000, "data": 1500, "testing": 900, "handover": 900},
+    "salesforce_data": {"discovery": 1200, "model": 1800, "quality": 3000, "reports": 2100, "testing": 900, "handover": 900},
+    "other": {"discovery": 500, "design": 800, "build": 1600, "test": 400, "handover": 300}
+  },
+  "support": {"subscription": 250, "on_demand": 150}
+}
