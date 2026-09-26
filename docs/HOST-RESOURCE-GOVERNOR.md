@@ -72,11 +72,14 @@ through the existing environment or provider vault, exactly as for an
 unwrapped command. In-process callers may use the typed `-ArgumentList` array
 or `-ArgumentListJson`. Supply only one of the three argument forms.
 
-`.cmd` and `.bat` targets are refused with exit `24`. They invoke `cmd.exe` and
-parse the command line a second time, which can turn argument characters such
-as `&`, `|`, `<`, `>`, `^` and `%` into commands. Invoke the underlying
-executable instead—for example, `node.exe` plus the JavaScript entry point,
-not `npx.cmd` or `npm.cmd`.
+Only a name or path that resolves to an existing `.exe` is accepted; everything
+else is refused with exit `24`. This is deliberately an allow-list. Windows
+normalizes trailing spaces and periods before process creation, so checking only
+the raw extension would let spellings such as `tool.cmd.` reach `cmd.exe` and
+parse the command line a second time. Invoke the underlying executable
+explicitly—for example, `node.exe` plus the JavaScript entry point, not
+`npx.cmd` or `npm.cmd`. An explicit shell executable is still possible, but
+then the caller owns that deliberate shell boundary.
 
 Exit codes are contractual: `20` pressure refusal, `21` lane busy, `22` child
 launch failure, `23` unavailable metrics, and `24` invalid run request. A

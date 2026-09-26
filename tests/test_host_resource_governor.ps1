@@ -100,12 +100,25 @@ Assert-Throws 'argument JSON rejects an object' {
 Assert-Throws 'argument JSON rejects non-string values' {
     ConvertFrom-Sfdc24ArgumentJson -Json '["ok",7]'
 } 'HOST_GOVERNOR_ARGUMENT_JSON_NON_STRING'
-Assert-True 'cmd targets are rejected case-insensitively' `
-    (Test-Sfdc24BatchTarget -Executable 'npx.CMD')
-Assert-True 'bat targets are rejected case-insensitively' `
-    (Test-Sfdc24BatchTarget -Executable 'runner.Bat')
-Assert-True 'explicit executables remain allowed' `
-    (-not (Test-Sfdc24BatchTarget -Executable 'node.exe'))
+Assert-Throws 'cmd targets are rejected case-insensitively' {
+    Resolve-Sfdc24Executable -Executable 'npx.CMD'
+} 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+Assert-Throws 'bat targets are rejected case-insensitively' {
+    Resolve-Sfdc24Executable -Executable 'runner.Bat'
+} 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+Assert-Throws 'trailing-dot target spellings are rejected before Windows normalizes them' {
+    Resolve-Sfdc24Executable -Executable 'runner.cmd.'
+} 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+Assert-Throws 'trailing-space target spellings are rejected before Windows normalizes them' {
+    Resolve-Sfdc24Executable -Executable 'runner.cmd '
+} 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+Assert-Throws 'wildcard executable names do not select an arbitrary application' {
+    Resolve-Sfdc24Executable -Executable '*.exe'
+} 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+$resolvedPowerShell = Resolve-Sfdc24Executable -Executable 'powershell.exe'
+Assert-True 'an explicit application resolves to an existing exe' `
+    ((Test-Path -LiteralPath $resolvedPowerShell -PathType Leaf) -and
+     [IO.Path]::GetExtension($resolvedPowerShell) -ieq '.exe')
 Assert-Throws 'a lock path cannot escape the private state root' {
     Resolve-Sfdc24StateChildPath -Root 'C:\safe-root' -Candidate 'C:\other\lane.lock'
 } 'HOST_GOVERNOR_STATE_PATH_INVALID'
@@ -170,13 +183,23 @@ try {
         "@echo off`r`n@echo %*`r`n",
         (New-Object Text.UTF8Encoding($false))
     )
-    $batchCode = Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 8.0 5) `
-        -LaneOwner codex -Executable $batchTarget `
-        -Arguments @('plain', "x&echo injected>$batchMarker", 'a|findstr b') `
-        -LaneLockPath (Join-Path $stateRoot 'batch.lock') -LaneStateRoot $stateRoot
-    Assert-Equal 'batch targets are refused with the invalid-request code' 24 $batchCode
-    Assert-True 'batch metacharacters never execute' `
-        (-not (Test-Path -LiteralPath $batchMarker))
+    $batchSpellings = @(
+        [pscustomobject]@{ Label = 'exact'; Value = $batchTarget },
+        [pscustomobject]@{ Label = 'trailing dot'; Value = $batchTarget + '.' },
+        [pscustomobject]@{ Label = 'trailing space'; Value = $batchTarget + ' ' },
+        [pscustomobject]@{ Label = 'trailing dot and space'; Value = $batchTarget + '. ' }
+    )
+    foreach ($spelling in $batchSpellings) {
+        $batchCode = Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 8.0 5) `
+            -LaneOwner codex -Executable $spelling.Value `
+            -Arguments @('plain', "x&echo injected>$batchMarker", 'a|findstr b') `
+            -LaneLockPath (Join-Path $stateRoot ('batch-' + $spelling.Label.Replace(' ', '-') + '.lock')) `
+            -LaneStateRoot $stateRoot
+        Assert-Equal ("{0} batch target is refused with the invalid-request code" -f $spelling.Label) `
+            24 $batchCode
+        Assert-True ("{0} batch metacharacters never execute" -f $spelling.Label) `
+            (-not (Test-Path -LiteralPath $batchMarker))
+    }
 
     $overlapObservations = @(Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 8.0 5) `
         -LaneOwner codex -Executable $env:ComSpec `

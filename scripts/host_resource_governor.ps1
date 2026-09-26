@@ -144,12 +144,43 @@ function Enter-Sfdc24HeavyLane {
     }
 }
 
-function Test-Sfdc24BatchTarget {
+function Resolve-Sfdc24Executable {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Executable)
 
-    $extension = [IO.Path]::GetExtension($Executable)
-    return $extension -ieq '.cmd' -or $extension -ieq '.bat'
+    # CreateProcess normalizes trailing ASCII spaces and periods before it
+    # decides what the target is. Inspecting the raw extension therefore lets
+    # ``tool.cmd.`` and ``tool.cmd `` evade a deny-list and reach cmd.exe. Use
+    # an allow-list instead: reject ambiguous spelling, resolve to a real file,
+    # and accept only the resolved .exe. Shells remain possible only when the
+    # caller names their executable explicitly (for example powershell.exe).
+    if ([string]::IsNullOrWhiteSpace($Executable) -or $Executable -match '[ .]+$') {
+        throw 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+    }
+    if ([IO.Path]::GetExtension($Executable) -ine '.exe') {
+        throw 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+    }
+
+    try {
+        $hasSeparator = $Executable.IndexOf([IO.Path]::DirectorySeparatorChar) -ge 0 `
+            -or $Executable.IndexOf([IO.Path]::AltDirectorySeparatorChar) -ge 0
+        if ([IO.Path]::IsPathRooted($Executable) -or $hasSeparator) {
+            $item = Get-Item -LiteralPath $Executable -Force -ErrorAction Stop
+        } else {
+            $applications = @(Get-Command -Name $Executable -CommandType Application -ErrorAction Stop)
+            $application = @($applications | Where-Object { $_.Name -ieq $Executable } | Select-Object -First 1)
+            if ($application.Count -ne 1) {
+                throw 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+            }
+            $item = Get-Item -LiteralPath ([string] $application[0].Source) -Force -ErrorAction Stop
+        }
+        if ($item.PSIsContainer -or [IO.Path]::GetExtension($item.FullName) -ine '.exe') {
+            throw 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+        }
+        return [IO.Path]::GetFullPath($item.FullName)
+    } catch {
+        throw 'HOST_GOVERNOR_EXECUTABLE_NOT_ALLOWED'
+    }
 }
 
 function Exit-Sfdc24HeavyLane {
@@ -359,12 +390,13 @@ function Invoke-Sfdc24HeavyRun {
         [scriptblock] $MetadataRemover
     )
 
-    # ProcessStartInfo protects the executable launch from shell expansion, but
-    # .cmd and .bat targets invoke cmd.exe internally and parse the command line
-    # a second time. Refuse that BatBadBut class instead of maintaining brittle
-    # caret escaping. Call node.exe, python.exe or powershell.exe explicitly.
-    if (Test-Sfdc24BatchTarget -Executable $Executable) {
-        Write-Host 'REFUSED state=INVALID reason=batch_target_not_supported'
+    # Resolve once to an existing .exe before metrics, locking or Process.Start.
+    # This is an allow-list, so Windows trailing-dot/space normalization cannot
+    # turn a refused .cmd/.bat spelling into an implicit cmd.exe invocation.
+    try {
+        $Executable = Resolve-Sfdc24Executable -Executable $Executable
+    } catch {
+        Write-Host 'REFUSED state=INVALID reason=executable_must_resolve_to_exe'
         return 24
     }
 
@@ -472,8 +504,10 @@ function Invoke-Sfdc24HostResourceGovernor {
             Write-Host 'REFUSED state=INVALID reason=FilePath_required_for_Run'
             return [pscustomobject]@{ ExitCode = 24; Output = $null }
         }
-        if (Test-Sfdc24BatchTarget -Executable $FilePath) {
-            Write-Host 'REFUSED state=INVALID reason=batch_target_not_supported'
+        try {
+            $FilePath = Resolve-Sfdc24Executable -Executable $FilePath
+        } catch {
+            Write-Host 'REFUSED state=INVALID reason=executable_must_resolve_to_exe'
             return [pscustomobject]@{ ExitCode = 24; Output = $null }
         }
 
