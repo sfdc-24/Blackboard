@@ -1,6 +1,6 @@
 # Converspan readiness - 2026-09-26
 
-**Snapshot:** 2026-09-26 02:40 UTC. Prepared overnight on the owner's instruction "get ready to start on Converspan".
+**Snapshot:** 2026-09-26 02:40 UTC, with a 03:00 UTC delta for the site row. Facts are dated observations, not acceptances. Prepared overnight on the owner's instruction "get ready to start on Converspan".
 
 **Status:** strategy and documentation only. ADR G9 permits this before its gate. Nothing here builds, deploys, points
 DNS or spends.
@@ -26,7 +26,7 @@ PR numbers carry their repository.
 
 G9 also requires, after the gate:
 - a distinct tenant/minibus with an expiring capability lease, separate budgets, a separate data boundary and a Blackboard kill switch;
-- a zero/low-traffic canary, a rollback drill, and a 24/48-hour soak before broader onboarding.
+- a zero/low-traffic canary, a rollback drill, and a 24/48-hour soak before broader client onboarding.
 
 ## What Converspan is, and what is still undecided
 
@@ -45,9 +45,9 @@ G9 also requires, after the gate:
 
 | Asset | State | Source |
 |---|---|---|
-| `converspan.com`, `.org`, `.ca` | Registered with NameSilo DNS (`ns1`/`ns2`/`ns3.dnsowl.com`). A records vary by resolver (172.232.24.161, 172.232.24.235, 172.234.25.42). HTTP and HTTPS returned no response within 10 s at 02:38 UTC. No site is pointed | `session` DNS/HTTP checks via 8.8.8.8 and 1.1.1.1 |
+| `converspan.com`, `.org`, `.ca` | Registered with NameSilo DNS (`ns1`/`ns2`/`ns3.dnsowl.com`), A records 172.232.24.161, 172.232.24.235 and 172.234.25.42. No site is served: HTTP returns `502 Bad Gateway` (Pingora) and HTTPS fails with a TLS alert, as reported by the Cursor review on this PR; from the owner's laptop the connection is refused at once (02:48 UTC) | `session` DNS checks via 8.8.8.8 and 1.1.1.1; Cursor review comment on this PR |
 | `sfdc-24/converspan` | An OpenAI Sites (vinext) starter the owner created on 2026-09-25. One commit, `a1953af`. The local checkout also has uncommitted starter files, left untouched. The repository is private and not visible to review bots | `session` (local checkout) |
-| SFDC24 homepage voice and live canvas | LIVE: sfdc24-site main `88b2419` (sfdc24-site #209 guided meeting, #216 host nudge, #221 nudge lifecycle) | sfdc24-site repo; served-byte checks in `board` CCC-SITE216-MERGED-OVER-OPEN-NOGO-FIX-FORWARD-20260926T0112Z and `session` |
+| SFDC24 homepage voice and live canvas | LIVE at 03:00 UTC: sfdc24-site main `e538ecf` (sfdc24-site #209 guided meeting, #216 host nudge, #221 nudge lifecycle, #223 builder question context). After merging #223, Codex withdrew its GO, finding an unheard-question lifecycle race and a question-span cut. A fix-forward is in progress | sfdc24-site repo; `board` CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z and ...-NOGO-ADDENDUM-20260926T024635Z; served-byte checks in `session` |
 | Studio controller | Serving `r5b-0895605` at 100% since 2026-09-25 18:37Z: the same image as `r5-0895605-g`, with one added operator. The ADR contract's "r5-0895605-g at 100%" line is stale | `session` (Cloud Run traffic); `board` CCC-SITE209-MOVED-HEAD-454B60E-20260925T2030Z |
 | Build plan and quote PDF | Merged dark (Blackboard #269). `STUDIO_ENABLE_CHARTER` defaults false and `STUDIO_PRICE_TABLE` defaults empty. Payment terms: 50% to start build and test, 50% on delivery and handover | `repo` (`app/summary_pdf.py`, #269) |
 
@@ -75,15 +75,19 @@ G9 also requires, after the gate:
 
 **G2: provider controls (OPEN)**
 - Evidence: Blackboard #272 (builder bounded) has Cursor GO at `8a9349e` and a Codex NO-GO (`board` CODEX-PR272-8A9349E-NOGO-20260926T020927Z, CODEX-R5D-8A9349E-NOGO-20260926T0231Z): no total wall-clock deadline, and permanent 4xx errors classed as timeouts.
-- What closes it: a fresh #272 head with a monotonic budget, cancellation, a late-result fence and error classes, then a Codex GO.
+- What closes it: the complete ADR G2 controls, not #272 alone: definite-error fallback, provider circuit state, stale-turn fences, hard deadlines, bounded response bodies, and provider/model/latency/outcome receipts. Each needs failure-case evidence (timeout, quota, auth, malformed, refusal, empty, recap failure) and a Codex GO.
 
 **G3: tenant isolation (OPEN)**
 - Evidence: Blackboard #260 is open at `ecee267`. Cursor GO 02:05Z; Codex Gate 1 NO-GO (`board` CODEX-PR260-ECEE267-GATE1-NOGO-20260926T021501Z).
 - What closes it: Codex exact-head GO, a disabled zero-traffic deploy, and cross-tenant and revocation negative controls.
 
 **G4: durable publication (OPEN)**
-- Evidence: Blackboard #261 is open, stacked on #260.
-- What closes it: it starts only after #260 is accepted (ADR G4).
+- Evidence: Blackboard #261 is open, stacked on #260. Starting #261 is not closure.
+- What closes it (ADR G4):
+  - rebase onto the accepted #260/main base;
+  - crash-after-commit recovery with exactly one publication and a durable replay receipt;
+  - a separate exact-head review;
+  - an accepted disabled zero-traffic deploy.
 
 **Immutable source-to-runtime receipts (PARTIAL)**
 - Evidence:
@@ -102,16 +106,19 @@ G9 also requires, after the gate:
   - What: the Converspan landing and conversation design as a design artifact.
   - Where: in the owner's Sites repo on a branch, or as a Blackboard design doc.
   - Constraints: not published, not pointed at a domain, and no voice or controller connection.
-- **D2: the minibus contract drafts:**
-  - the Converspan tenant manifest, capability lease, budgets and kill switch (G9's enrollment requirements);
-  - aligned with Blackboard #268's creator minibus contract.
+- **D2: the minibus contract drafts.** Aligned with Blackboard #268, they must define:
+  - **Enrollment:** the Converspan tenant manifest, an expiring capability lease, budgets, and a scoped kill switch (G9).
+  - **Authorization:** server-enforced subject and tenant binding. CORS is origin control, not authorization.
+  - **Microphone:** affirmative activation and guaranteed teardown.
+  - **Data:** retention and deletion for raw audio and transcripts, and provider egress permissions per provider.
+  - **The return path to the motherboard:** schema-limited, carrying only health, usage, policy and release versions, plus redacted acceptance evidence. It never automatically returns transcripts, canvases, personal data, credentials, provider bodies or unapproved learnings.
 - **Not before G9 passes:** any Converspan deployment, holding page on a live domain, controller origin change, onboarding, checkout, or paid acquisition.
 
 ## Decisions that are the owner's
 
 1. **Hosting for the public Converspan site, once G9 passes.**
-   - Recommendation: the OpenAI Sites repo the owner created as the public shell, calling the existing studio controller for voice and canvas behind its origin allowlist.
-   - Consequence: one controller and one set of gates serve both brands, and there is no second runtime to harden.
+   - Recommendation: the OpenAI Sites repo the owner created as the public shell. Voice and canvas come from the same controller *implementation* as SFDC24, deployed as Converspan's own instance.
+   - Consequence: the code and its tests are shared, but the runtimes are not. Converspan needs its own enrollment, server-side auth and tenant negative controls, provider permissions, budget limits, release receipt, canary, rollback and scoped kill switch. It is not an extra origin on SFDC24's controller.
 2. **DNS** for `converspan.com`, once G9 passes. DNS is outside standing permission.
 3. **The commercial model.**
    - The options: the domain roadmap (Converspan is the seller) or Blackboard #268 (SFDC24 invoices the creator).
