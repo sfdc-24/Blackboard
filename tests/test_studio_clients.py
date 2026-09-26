@@ -4201,6 +4201,33 @@ class CodexR13B1OneVisibleRun(Api):
         tree = page_to_tree("<html><body><p>Visit (</p><p>zqhost.example</p><p>) today</p></body></html>", "T")
         self.assertEqual(["T", "Page", "Visit (", "[link]", ") today"], _r13_labels(tree))
 
+    def test_a_character_stripped_at_a_tag_boundary_assembles_nothing(self):
+        # Cursor NO-GO on 3fef998: a label drops "<>" and control or format
+        # code points and then looks for addresses again. The held word gets
+        # the same three stages over the whole word, or the strip would join
+        # pieces that were already placed apart.
+        splits = ["<p>zqsecret</p><p>&lt;.example</p>",
+                  "<section>zqsecret<x-card>&#8203;.example</x-card></section>",
+                  "<p>zqsecret<img alt=\"logo\">&#8203;.example</p>",
+                  "<p>zqalice@</p><p>&lt;</p>"]                          # found only BEFORE the strip
+        splits += ["<p>zqsecret</p><p>%s.example</p>" % stripped
+                   for stripped in ("&#8203;", "&#8288;", "&#173;", "&#65279;", chr(0))]
+        for html in splits:
+            tree = json.dumps(page_to_tree("<html><body>%s</body></html>" % html, "T"), ensure_ascii=False)
+            self.assertNotIn("zq", tree, html)
+            self.assertTrue("[link]" in tree or "[email]" in tree, html)
+        tree = json.dumps(page_to_tree("<html><body><p>10.0.0</p><p>&#8203;.1</p></body></html>", "T"))
+        self.assertNotIn("10.0", tree)
+        self.assertIn("[link]", tree)
+        self.assertIn("logo", json.dumps(page_to_tree("<html><body>%s</body></html>" % splits[2], "T")))
+
+    def test_a_stripped_character_with_no_address_moves_no_letters(self):
+        # The strip is per character: without an address, each element keeps
+        # its own letters, as it did before B1.
+        tree = page_to_tree("<html><body><p>Hel&#8203;lo</p><p>Wor&#8203;ld</p>"
+                            "<h1>Steel&#173;Works</h1></body></html>", "T")
+        self.assertEqual(["T", "Page", "Hello", "World", "SteelWorks"], _r13_labels(tree))
+
     def test_a_word_past_the_run_limit_is_dropped_to_its_end(self):
         # Past MAX_RUN_CHARS the held word goes, and every later piece of it:
         # "@zqhost" alone is no address, but it is the end of one.

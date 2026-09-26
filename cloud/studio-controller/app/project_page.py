@@ -806,6 +806,18 @@ def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> st
     value, _ = _cut(value or "", MAX_CALLBACK_CHARS)
     if redacted:
         value = redact(value)
+    text = _strip_unsafe(value)
+    if redacted:
+        text = redact(text)
+    text = re.sub(r" +", " ", text).strip()
+    if len(text) > cap:
+        text = text[:cap].rsplit(" ", 1)[0].rstrip(" ,.;:-") or text[:cap]
+    return text
+
+
+def _strip_unsafe(value: str) -> str:
+    """No angle brackets, no control, format or separator code points, and
+    every whitespace a plain space."""
     kept = []
     for ch in value or "":
         if ch in "<>":
@@ -814,13 +826,32 @@ def clean_text(value: str, cap: int = LABEL_MAX, *, redacted: bool = True) -> st
             kept.append(" ")
         elif unicodedata.category(ch) not in _UNSAFE:
             kept.append(ch)
-    text = "".join(kept)
-    if redacted:
-        text = redact(text)
-    text = re.sub(r" +", " ", text).strip()
-    if len(text) > cap:
-        text = text[:cap].rsplit(" ", 1)[0].rstrip(" ,.;:-") or text[:cap]
-    return text
+    return "".join(kept)
+
+
+def _spread(pieces: list, whole: str) -> list:
+    """``whole`` is the pieces joined, with one span rewritten. Only that span
+    moves: the characters before and after it stay in their own pieces, and
+    its new text goes to the piece where the change begins. Joined, the
+    result is exactly ``whole``."""
+    joined = "".join(pieces)
+    if whole == joined:
+        return list(pieces)
+    n = min(len(joined), len(whole))
+    head = 0
+    while head < n and joined[head] == whole[head]:
+        head += 1
+    tail = 0
+    while tail < n - head and joined[-1 - tail] == whole[-1 - tail]:
+        tail += 1
+    end, middle = len(joined) - tail, whole[head:len(whole) - tail]
+    owner = min(head, len(joined) - 1)
+    out, at = [], 0
+    for text in pieces:
+        start, at = at, at + len(text)
+        out.append(text[:max(0, head - start)] + (middle if start <= owner < at else "")
+                   + text[max(0, end - start):])
+    return out
 
 
 class _ParseStop(Exception):
@@ -1196,31 +1227,20 @@ class _Builder(HTMLParser):
         self._settle([""] * len(self.run))
 
     def _resolve(self) -> None:
-        """The held word has ended: it is redacted as ONE word. Only what the
-        redaction changed moves: the characters before and after it stay with
-        their own pieces, and its placeholder goes to the piece where the
-        change begins. Joined, the pieces read exactly as the redacted word."""
+        """The held word has ended: it is read as ONE word, the way clean_text
+        reads a label - addresses on the original code points, then again once
+        "<>" and control or format code points are gone - so a character
+        stripped at a tag boundary cannot assemble an address that no piece
+        shows whole (Cursor NO-GO on 3fef998). Each stage runs over the whole
+        word, and moves only what it changed (_spread); the strip itself is
+        per character, so it moves nothing."""
         if not self.run:
             return
-        run = self.run
-        joined = "".join(text for text, _ in run)
-        whole = redact(joined)
-        texts = [text for text, _ in run]
-        if len(run) > 1 and whole != joined:
-            n = min(len(joined), len(whole))
-            head = 0
-            while head < n and joined[head] == whole[head]:
-                head += 1
-            tail = 0
-            while tail < n - head and joined[-1 - tail] == whole[-1 - tail]:
-                tail += 1
-            end, middle = len(joined) - tail, whole[head:len(whole) - tail]
-            owner = min(head, len(joined) - 1)
-            texts, at = [], 0
-            for text, _ in run:
-                start, at = at, at + len(text)
-                texts.append(text[:max(0, head - start)] + (middle if start <= owner < at else "")
-                             + text[max(0, end - start):])
+        texts = [text for text, _ in self.run]
+        if len(texts) > 1:
+            texts = _spread(texts, redact("".join(texts)))
+            texts = [_strip_unsafe(text) for text in texts]
+            texts = _spread(texts, redact("".join(texts)))
         self._settle(texts)
 
     def _settle(self, texts) -> None:
