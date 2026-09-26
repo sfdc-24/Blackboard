@@ -100,6 +100,12 @@ Assert-Throws 'argument JSON rejects an object' {
 Assert-Throws 'argument JSON rejects non-string values' {
     ConvertFrom-Sfdc24ArgumentJson -Json '["ok",7]'
 } 'HOST_GOVERNOR_ARGUMENT_JSON_NON_STRING'
+Assert-True 'cmd targets are rejected case-insensitively' `
+    (Test-Sfdc24BatchTarget -Executable 'npx.CMD')
+Assert-True 'bat targets are rejected case-insensitively' `
+    (Test-Sfdc24BatchTarget -Executable 'runner.Bat')
+Assert-True 'explicit executables remain allowed' `
+    (-not (Test-Sfdc24BatchTarget -Executable 'node.exe'))
 Assert-Throws 'a lock path cannot escape the private state root' {
     Resolve-Sfdc24StateChildPath -Root 'C:\safe-root' -Candidate 'C:\other\lane.lock'
 } 'HOST_GOVERNOR_STATE_PATH_INVALID'
@@ -120,6 +126,11 @@ try {
 } finally {
     Exit-Sfdc24HeavyLane -Handle $third
 }
+$directoryLock = Join-Path $stateRoot 'directory-cannot-be-a-lock'
+[IO.Directory]::CreateDirectory($directoryLock) | Out-Null
+$unauthorized = Enter-Sfdc24HeavyLane -Path $directoryLock
+Assert-True 'an unauthorized lock target fails closed without escaping the contract' `
+    ($null -eq $unauthorized)
 
 try {
     $blocked = Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 2.0 5) `
@@ -151,6 +162,34 @@ try {
     Assert-Equal 'an accepted run returns the child exit code' 7 $childCode
     Assert-True 'metadata is removed after the child exits' `
         (-not (Test-Path -LiteralPath (Join-Path $stateRoot 'heavy-lane.json')))
+
+    $batchTarget = Join-Path $stateRoot 'echoargs.cmd'
+    $batchMarker = Join-Path $stateRoot 'batch-injected.txt'
+    [IO.File]::WriteAllText(
+        $batchTarget,
+        "@echo off`r`n@echo %*`r`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $batchCode = Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 8.0 5) `
+        -LaneOwner codex -Executable $batchTarget `
+        -Arguments @('plain', "x&echo injected>$batchMarker", 'a|findstr b') `
+        -LaneLockPath (Join-Path $stateRoot 'batch.lock') -LaneStateRoot $stateRoot
+    Assert-Equal 'batch targets are refused with the invalid-request code' 24 $batchCode
+    Assert-True 'batch metacharacters never execute' `
+        (-not (Test-Path -LiteralPath $batchMarker))
+
+    $overlapObservations = @(Invoke-Sfdc24HeavyRun -Metrics (New-Metrics 8.0 5) `
+        -LaneOwner codex -Executable $env:ComSpec `
+        -Arguments @('/d', '/c', 'exit 21') `
+        -LaneLockPath (Join-Path $stateRoot 'overlap.lock') `
+        -LaneStateRoot $stateRoot 6>&1)
+    $overlapCodes = @($overlapObservations | Where-Object { $_ -is [int] })
+    Assert-Equal 'a child may legitimately use a governor-numbered exit code' 21 `
+        ([int] $overlapCodes[0])
+    Assert-True 'STARTED disambiguates a child exit 21 from lane busy' `
+        (@($overlapObservations | Where-Object {
+            $_.ToString() -match '^STARTED owner=codex '
+        }).Count -eq 1)
 
     $cleanupLock = Join-Path $stateRoot 'cleanup-failure.lock'
     $cleanupObservations = @(Invoke-Sfdc24HeavyRun `
@@ -192,6 +231,31 @@ try {
     Assert-True 'priority refusal emits one warning' `
         (@($priorityObservations | Where-Object {
             $_.ToString() -match 'CHILD_PRIORITY_NOT_APPLIED'
+        }).Count -eq 1)
+
+    $argumentFile = Join-Path $stateRoot 'cli-arguments.json'
+    [IO.File]::WriteAllText(
+        $argumentFile,
+        '["-NoProfile","-Command","exit 7"]',
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $fileArguments = @(Read-Sfdc24ArgumentFile -Path $argumentFile)
+    Assert-Equal 'argument file preserves array width' 3 $fileArguments.Count
+    Assert-Equal 'argument file preserves a spaced command' 'exit 7' $fileArguments[2]
+
+    $cliRoot = Join-Path $stateRoot 'documented-cli'
+    $cliLock = Join-Path $cliRoot 'heavy-lane.lock'
+    $cliOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File ([IO.Path]::GetFullPath($sut)) -Action Run -Owner contract `
+        -FilePath powershell.exe -ArgumentListFile $argumentFile `
+        -StateRoot $cliRoot -LockPath $cliLock `
+        -GreenFreeGB 0.6 -RedFreeGB 0.5 `
+        -AmberCpuPercent 99 -RedCpuPercent 100 2>&1)
+    $cliCode = $LASTEXITCODE
+    Assert-Equal 'documented powershell File invocation returns the child verdict' 7 $cliCode
+    Assert-True 'documented powershell File invocation emits a STARTED receipt' `
+        (@($cliOutput | Where-Object {
+            $_.ToString() -match '^STARTED owner=contract .*priority_target='
         }).Count -eq 1)
 } finally {
     if (Test-Path -LiteralPath $stateRoot -PathType Container) {

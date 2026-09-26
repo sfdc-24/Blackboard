@@ -27,6 +27,7 @@ param(
     [string] $FilePath,
     [string[]] $ArgumentList = @(),
     [string] $ArgumentListJson,
+    [string] $ArgumentListFile,
 
     [ValidateRange(0.5, 64.0)]
     [double] $GreenFreeGB = 4.0,
@@ -138,7 +139,17 @@ function Enter-Sfdc24HeavyLane {
         )
     } catch [IO.IOException] {
         return $null
+    } catch [UnauthorizedAccessException] {
+        return $null
     }
+}
+
+function Test-Sfdc24BatchTarget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Executable)
+
+    $extension = [IO.Path]::GetExtension($Executable)
+    return $extension -ieq '.cmd' -or $extension -ieq '.bat'
 }
 
 function Exit-Sfdc24HeavyLane {
@@ -307,6 +318,29 @@ function ConvertFrom-Sfdc24ArgumentJson {
     return $values
 }
 
+function Read-Sfdc24ArgumentFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'HOST_GOVERNOR_ARGUMENT_FILE_NOT_FOUND'
+    }
+    try {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        $item = Get-Item -LiteralPath $resolved
+        if ($item.Length -gt 65536) {
+            throw 'HOST_GOVERNOR_ARGUMENT_FILE_TOO_LARGE'
+        }
+        $json = [IO.File]::ReadAllText($resolved, [Text.Encoding]::UTF8)
+    } catch {
+        if ($_.Exception.Message -eq 'HOST_GOVERNOR_ARGUMENT_FILE_TOO_LARGE') {
+            throw
+        }
+        throw 'HOST_GOVERNOR_ARGUMENT_FILE_UNREADABLE'
+    }
+    return @(ConvertFrom-Sfdc24ArgumentJson -Json $json)
+}
+
 function Invoke-Sfdc24HeavyRun {
     [CmdletBinding()]
     param(
@@ -324,6 +358,15 @@ function Invoke-Sfdc24HeavyRun {
         [scriptblock] $PriorityApplier,
         [scriptblock] $MetadataRemover
     )
+
+    # ProcessStartInfo protects the executable launch from shell expansion, but
+    # .cmd and .bat targets invoke cmd.exe internally and parse the command line
+    # a second time. Refuse that BatBadBut class instead of maintaining brittle
+    # caret escaping. Call node.exe, python.exe or powershell.exe explicitly.
+    if (Test-Sfdc24BatchTarget -Executable $Executable) {
+        Write-Host 'REFUSED state=INVALID reason=batch_target_not_supported'
+        return 24
+    }
 
     $state = Get-Sfdc24ResourceState -Metrics $Metrics `
         -GreenAtFreeGB $GreenAtFreeGB -RedBelowFreeGB $RedBelowFreeGB `
@@ -423,6 +466,45 @@ function Invoke-Sfdc24HostResourceGovernor {
         return [pscustomobject]@{ ExitCode = 0; Output = $json }
     }
 
+    $runArguments = @()
+    if ($Action -eq 'Run') {
+        if ([string]::IsNullOrWhiteSpace($FilePath)) {
+            Write-Host 'REFUSED state=INVALID reason=FilePath_required_for_Run'
+            return [pscustomobject]@{ ExitCode = 24; Output = $null }
+        }
+        if (Test-Sfdc24BatchTarget -Executable $FilePath) {
+            Write-Host 'REFUSED state=INVALID reason=batch_target_not_supported'
+            return [pscustomobject]@{ ExitCode = 24; Output = $null }
+        }
+
+        $hasTypedArguments = @($ArgumentList).Count -gt 0
+        $hasJsonArguments = -not [string]::IsNullOrWhiteSpace($ArgumentListJson)
+        $hasArgumentFile = -not [string]::IsNullOrWhiteSpace($ArgumentListFile)
+        $argumentSourceCount = @(
+            $hasTypedArguments,
+            $hasJsonArguments,
+            $hasArgumentFile
+        ).Where({ $_ }).Count
+        if ($argumentSourceCount -gt 1) {
+            Write-Host 'REFUSED state=INVALID reason=choose_one_argument_source'
+            return [pscustomobject]@{ ExitCode = 24; Output = $null }
+        }
+
+        if ($hasJsonArguments) {
+            try { $runArguments = @(ConvertFrom-Sfdc24ArgumentJson -Json $ArgumentListJson) } catch {
+                Write-Host ("REFUSED state=INVALID reason={0}" -f $_.Exception.Message)
+                return [pscustomobject]@{ ExitCode = 24; Output = $null }
+            }
+        } elseif ($hasArgumentFile) {
+            try { $runArguments = @(Read-Sfdc24ArgumentFile -Path $ArgumentListFile) } catch {
+                Write-Host ("REFUSED state=INVALID reason={0}" -f $_.Exception.Message)
+                return [pscustomobject]@{ ExitCode = 24; Output = $null }
+            }
+        } else {
+            $runArguments = @($ArgumentList)
+        }
+    }
+
     $metrics = $null
     try { $metrics = Get-Sfdc24HostMetrics } catch {
         if ($Action -eq 'Run') {
@@ -456,21 +538,6 @@ function Invoke-Sfdc24HostResourceGovernor {
         return [pscustomobject]@{ ExitCode = 0; Output = $json }
     }
 
-    if ([string]::IsNullOrWhiteSpace($FilePath)) {
-        Write-Host 'REFUSED state=INVALID reason=FilePath_required_for_Run'
-        return [pscustomobject]@{ ExitCode = 24; Output = $null }
-    }
-    $runArguments = @($ArgumentList)
-    if (-not [string]::IsNullOrWhiteSpace($ArgumentListJson)) {
-        if ($runArguments.Count -gt 0) {
-            Write-Host 'REFUSED state=INVALID reason=choose_ArgumentList_or_ArgumentListJson'
-            return [pscustomobject]@{ ExitCode = 24; Output = $null }
-        }
-        try { $runArguments = @(ConvertFrom-Sfdc24ArgumentJson -Json $ArgumentListJson) } catch {
-            Write-Host ("REFUSED state=INVALID reason={0}" -f $_.Exception.Message)
-            return [pscustomobject]@{ ExitCode = 24; Output = $null }
-        }
-    }
     $code = Invoke-Sfdc24HeavyRun -Metrics $metrics -LaneOwner $Owner `
         -Executable $FilePath -Arguments $runArguments -LaneLockPath $safeLockPath `
         -LaneStateRoot $StateRoot -GreenAtFreeGB $GreenFreeGB `

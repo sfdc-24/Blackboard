@@ -22,7 +22,7 @@ this machine.
 |---|---|---|
 | GREEN | at least 4 GB free and CPU below 75% | one owner may enter the lane |
 | AMBER | 2.5-4 GB free or CPU at least 75% | refuse; use hosted CI/cloud |
-| RED | less than 2.5 GB free or CPU at least 90% | refuse; current owner checkpoints at the next safe boundary |
+| RED | less than 2.5 GB free or CPU at least 90% | refuse new work; by operating rule, the current owner checkpoints at the next safe boundary |
 | UNKNOWN | metrics cannot be read or thresholds are invalid | fail closed |
 
 The script does not kill a process, suspend an interactive agent, set a global
@@ -36,32 +36,57 @@ observable optimization. The operating system still decides memory allocation.
 
 ## Use
 
-Read the current state without changing anything:
+Read the current state without starting a workload. The probe may create the
+empty lock path and briefly holds its exclusive handle while checking it:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\host_resource_governor.ps1 -Action Status
 ```
 
-Run one focused heavy command under the shared lane:
+Run one focused heavy command under the shared lane. Windows PowerShell 5.1
+does not preserve embedded JSON quotes reliably when a literal JSON value is
+passed through another `powershell.exe -File` command line, so use a UTF-8
+argument file for this cross-process form:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File scripts\host_resource_governor.ps1 `
-  -Action Run -Owner claude `
-  -FilePath python.exe `
-  -ArgumentListJson '["-m","unittest","tests.test_studio_auth"]'
+$argumentFile = Join-Path $env:TEMP 'sfdc24-host-governor-args.json'
+[IO.File]::WriteAllText(
+  $argumentFile,
+  '["-m","unittest","tests.test_studio_auth"]',
+  (New-Object Text.UTF8Encoding($false))
+)
+try {
+  powershell -NoProfile -ExecutionPolicy Bypass `
+    -File scripts\host_resource_governor.ps1 `
+    -Action Run -Owner claude `
+    -FilePath python.exe `
+    -ArgumentListFile $argumentFile
+} finally {
+  Remove-Item -LiteralPath $argumentFile -Force -ErrorAction SilentlyContinue
+}
 ```
 
-`ArgumentListJson` is a JSON array of strings so Windows PowerShell 5.1 does
-not silently collapse or rebind a multi-value `-File` argument. Do not put a
-credential in that JSON; supply secrets through the existing environment or
-provider vault, exactly as for an unwrapped command. Direct callers may use the
-typed `-ArgumentList` array, but must not provide both forms.
+`ArgumentListFile` contains a JSON array of strings and is capped at 64 KiB.
+Delete it after the run. Do not put a credential in that file; supply secrets
+through the existing environment or provider vault, exactly as for an
+unwrapped command. In-process callers may use the typed `-ArgumentList` array
+or `-ArgumentListJson`. Supply only one of the three argument forms.
+
+`.cmd` and `.bat` targets are refused with exit `24`. They invoke `cmd.exe` and
+parse the command line a second time, which can turn argument characters such
+as `&`, `|`, `<`, `>`, `^` and `%` into commands. Invoke the underlying
+executable instead—for example, `node.exe` plus the JavaScript entry point,
+not `npx.cmd` or `npm.cmd`.
 
 Exit codes are contractual: `20` pressure refusal, `21` lane busy, `22` child
 launch failure, `23` unavailable metrics, and `24` invalid run request. A
 refusal is routing information, not a test failure: send the work to hosted CI
 or the relevant cloud environment instead of retrying locally.
+
+After a `STARTED` receipt, the governor passes the child's exit code through
+unchanged. A child can itself exit `20`–`24`, so automation must interpret
+those numbers as governor refusals only when no `STARTED` receipt was emitted.
+The receipt disambiguates the source of the verdict.
 
 The cross-process authority is an exclusively opened local file,
 `%LOCALAPPDATA%\SFDC24\host-resource-governor\heavy-lane.lock`. A stale empty
@@ -82,6 +107,11 @@ releases the lane in a nested `finally` block so the host cannot deadlock.
   provider call or user experience succeeded. Use the normal destination
   read-back and acceptance evidence.
 - The exclusive lock is host-local. Hosted CI and cloud workloads do not consume it.
+- `Status` briefly tests the lane by opening the same exclusive lock. A Run
+  racing that probe can receive a conservative false `BUSY` and route to the
+  cloud; it cannot start a second local workload.
+- RED checkpointing for an already-running owner is an operating rule, not a
+  kill, suspend or mid-process monitoring mechanism in this script.
 - If an agent bypasses the wrapper, the governance mechanism cannot serialize
   that work. The compact ways-of-working document should make the wrapper the
   only approved local entry point for a heavy command.
