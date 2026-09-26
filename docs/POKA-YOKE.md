@@ -228,6 +228,109 @@ in force and the rest as an explicit automation gap.
 
 ---
 
+## L-100 — Rebuild a stacked PR's conflict from the parent's exact text
+
+**Incident.** Blackboard #261 is stacked on #260. Between 2026-09-25 and
+2026-09-26, #260 went through eleven review rounds, and every round that
+touched the project-start code conflicted with #261's saved-revision branch.
+
+On the round-11 restack (onto `ecee267`), resolving the conflict hunk by hunk
+kept the lines git considered common between the two hunks. Those lines came
+from #261's side. The resolved block replaced the page fetch and parse with a
+second lease claim. It parsed and would have broken every first page load.
+
+An earlier restack had resolved the CI unittest list through a shell string
+and left a literal `\n` in `python-suites.yml`.
+
+Both were caught before a commit, only because the result was read by eye.
+
+**Naive rule.** "Resolve stacked conflicts carefully."
+
+**Mechanism: PROPOSED, used by hand on 2026-09-26.**
+- Never resolve a stacked conflict hunk by hunk. Take the parent's block
+  byte-for-byte from git (`git show <parent-head>:<file>`), place it under the
+  child's new branch, then `diff` that region against the parent's block.
+  Commit only when the diff is indentation alone.
+- It becomes a mechanism when a checked-in helper does the take-and-diff and
+  refuses to stage otherwise.
+- The CI list half is an easy full mechanism: a test that parses
+  `python-suites.yml` and fails on a literal `\n` or a missing line
+  continuation. That is not yet written.
+
+---
+
+## L-101 — A kill must come from the test that claims it
+
+**Incident.** In #260's mutation harness, "email scan not anchored
+(quadratic)" reported KILLED. The test written for it was a counted-work test
+that could not see regex backtracking. The kill actually came from a different
+test hitting its wall-clock cap (24.6 s) on a laptop running at 100% CPU.
+Cursor caught it at `6081563`.
+
+The same night, two linearity tests with 2.0 s and ratio limits failed on
+correct code under the same load. Both a false kill and a false failure came
+from timing an assertion.
+
+**Naive rule.** "Don't rely on timing in tests."
+
+**Mechanism: PARTLY IN FORCE.**
+- In force on #260: linearity is asserted by counting work (every character
+  test and every normalization call), and the scan was redesigned so its work
+  is countable (a bounded window around each `@`). A clock remains only as a
+  generous backstop, never the assertion.
+- Proposed: a harness option that applies one mutant and runs only the test
+  that claims it (done by hand with a scratch script; the quadratic mutant then
+  failed that test by count, 576,048,008 > 144,048,096). Until the harness
+  itself does this, a KILLED verdict says only that some test failed.
+
+---
+
+## L-102 — Describe the commit, not the intention
+
+**Incident.** On #260, a review request described a test change "on
+`a702180`". The change was not in that commit. The edit, commit, push and
+comment had been chained with `&&` and ended with `&`. An earlier assertion in
+the chain failed, and the comment still went out through a separate path.
+Cursor reviewed the stated SHA, found the old test byte-identical, and issued a
+NO-GO. That cost a full review round and a correction comment.
+
+**Naive rule.** "Check the commit before describing it."
+
+**Mechanism: PROPOSED, used by hand since.**
+- Post a review request only after two checks pass: the remote head equals the
+  local HEAD, and `git show <sha>:<file>` proves the described change is there
+  (for example, a grep count of the removed construct is 0).
+- Never background a chain that ends in an outward-facing message.
+- It becomes a mechanism when the fleet's review-request helper runs both
+  checks and refuses to post otherwise.
+
+---
+
+## L-103 — A mutation run must heal a mutant it left behind
+
+**Incident.** The #260 harness rewrites product files in place and restores
+them in a `finally`. On 2026-09-25, Claude Code stopped a full run on memory
+pressure after 12 of about 104 mutants. The kill skipped the `finally`, and
+the worktree was left with a live mutant (`if False:` in place of the
+page-load time cap). Nothing on the machine was going to undo it.
+
+It was found only because `git status` ran before the next step. Committing
+from that tree would have shipped the mutant. The same night, two superseded
+full runs were stopped by hand for the same reason, and each needed its tree
+restored by hand.
+
+**Naive rule.** "Run `git status` after a harness run."
+
+**Mechanism: PROPOSED.**
+- Before mutating, the harness writes the original bytes to a sidecar file.
+- On every start it restores any sidecar it finds, then deletes it. That makes
+  a killed run self-healing.
+- A pre-commit guard refuses a commit while a sidecar exists.
+- Until then, run `git status` before any commit from a tree a harness has
+  touched, and restore by `git checkout -- <file>` against the known head.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
