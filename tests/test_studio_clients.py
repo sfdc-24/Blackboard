@@ -1379,33 +1379,39 @@ class FindingF2Redaction(unittest.TestCase):
     def test_the_redaction_is_linear_on_hostile_input(self):
         # Work counted, not timed (a loaded machine is slow, not quadratic):
         # every character test the scans make - the compatibility mappings,
-        # the host scan's, and the mailbox scan's local and domain windows -
-        # is counted. Four times the text must cost at most four times the
-        # work, and never more than a fixed amount per character. A mailbox
-        # scan that walks past separators and its window (the unanchored
-        # mutant) does quadratic work on "x@" runs and fails the count here.
+        # the host scan's, and the mailbox scan's (its only one, _email_class:
+        # it reads no character any other way and never calls str.find) - is
+        # counted. Four times the text must cost at most four times the work,
+        # and never more than a fixed amount per character. A mailbox scan that
+        # restarts a run from its next character (the quadratic mutant) fails
+        # the count here.
         # The regexes still in use (links, IPv4, IPv6) have fixed-width anchors;
         # a generous backstop is the only clock.
         from app import project_page as page
-        real = {name: getattr(page, name) for name in ("_host_char", "_local_char", "_domain_char")}
-        real_unicodedata, work = page.unicodedata, {"n": 0}
+        real = {name: getattr(page, name) for name in ("_host_char", "_email_class")}
+        real_unicodedata, work = page.unicodedata, {"n": 0, "budget": 0}
+
+        def spend():
+            work["n"] += 1
+            if work["n"] > work["budget"]:          # past the linear budget: fail now, not minutes later
+                raise AssertionError("more than %d character tests" % work["budget"])
 
         def counted(fn):
             def call(ch):
-                work["n"] += 1
+                spend()
                 return fn(ch)
             return call
 
         class CountingUnicodedata:
             def normalize(self, form, text):
-                work["n"] += 1
+                spend()
                 return real_unicodedata.normalize(form, text)
 
             def __getattr__(self, name):
                 return getattr(real_unicodedata, name)
 
         def measure(text):
-            work["n"] = 0
+            work["n"], work["budget"] = 0, 12 * len(text) + 64
             started = time.perf_counter()
             redact(text)
             return work["n"], time.perf_counter() - started
@@ -1416,7 +1422,8 @@ class FindingF2Redaction(unittest.TestCase):
         page.unicodedata = CountingUnicodedata()
         try:
             for unit in ("a.", "a", "a-", "x@", "a@b", "@", "a@", "1.", "-", stop, "ab.", "1" + stop, "a.bc",
-                         circled_a + ".", "x" * 70 + "@", "a@[", "a@b.c."):
+                         circled_a + ".", "x" * 70 + "@", "a@[", "a@b.c.", chr(0xFB03) + "@",
+                         "a@[" + chr(0x33C4), chr(0xFF20), "zq" + chr(0xFF1C), "a" + chr(0xFF1A) + "@", "a.,"):
                 small, large = unit * (12000 // len(unit)), unit * (48000 // len(unit))
                 small_work, _ = measure(small)
                 large_work, elapsed = measure(large)
@@ -1428,14 +1435,14 @@ class FindingF2Redaction(unittest.TestCase):
                 setattr(page, name, fn)
             page.unicodedata = real_unicodedata
 
-    def test_the_mailbox_windows_are_bounded(self):
-        # The local part stops at LOCAL_MAX characters and the domain at
-        # DOMAIN_MAX, the registry's own limits.
+    def test_the_whole_mailbox_run_goes_whatever_its_length(self):
+        # No window (Codex on 59ed871: windows in view characters left
+        # registry-valid residue): the whole non-whitespace run goes.
         from app import project_page as page
-        self.assertEqual("b" * 36 + "[email]", redact("b" * 100 + "@example.com"))
-        self.assertEqual("[email]", redact("b" * page.LOCAL_MAX + "@example.com"))
-        spans = list(page._email_spans("x@" + "a" * 400))
-        self.assertEqual([(0, 2 + page.DOMAIN_MAX, "[email]")], spans)
+        self.assertEqual("[email]", redact("b" * 100 + "@example.com"))
+        self.assertEqual("[email]", redact("b" * 64 + "@example.com"))
+        self.assertEqual([(0, 402, "[email]")], list(page._email_spans("x@" + "a" * 400)))
+        self.assertEqual([(2, 11, "[email]")], list(page._email_spans("A b@example?! c")))  # trailing punctuation out
 
 class GeminiAttacks(unittest.TestCase):
     def test_attack_1_mapped_answers_are_refused_and_a_swap_never_re_resolves(self):
@@ -2545,7 +2552,7 @@ APOSTROPHE_CASES = {
     "Or o'neil+tag@sub.example.co.uk now": "Or [email] now",
     "Local d'arcy@localhost here": "Local [email] here",
     "Literal o'hara@[10.0.0.1] here": "Literal [email] here",
-    "Paren (jo'e@example.com) end": "Paren [email]) end",
+    "Paren (jo'e@example.com) end": "Paren [email] end",           # the whole run, brackets too
     "Profile https://user@host.example/path here": "Profile [link] here",
     "Wide johnsmith\uff07alias@example.com today": "Wide [email] today",      # a full-width apostrophe
 }
@@ -2628,3 +2635,241 @@ class CodexR8OperatorStreamExpiry(Api):
                     commit_event(controller, live["session_id"])
             chunks = self.asgi_stream(live, expire)
         self.assertEqual(1, len(self.event_chunks(chunks)), chunks)
+
+
+# -- Codex Gate 1 NO-GO on 59ed871 (00:28Z row): round 10 ----------------------------------------
+import app.main as _main  # noqa: E402
+from app.project_page import FetchTimeout  # noqa: E402
+
+LIG, SQCC, FW_LT, FW_COLON = chr(0xFB03), chr(0x33C4), chr(0xFF1C), chr(0xFF1A)
+R10_CASES = {
+    "Lig " + LIG * 30 + "@example.com now": "Lig [email] now",           # 30 code points, 90 in the view
+    "Edge " + LIG * 64 + "@example.com x": "Edge [email] x",             # the registry's 64, exactly
+    "Over " + LIG * 65 + "@example.com x": "Over [email] x",
+    "Dom a@" + LIG * 100 + " now": "Dom [email] now",                    # 100 code points, 300 in the view
+    "Lit a@[" + SQCC * 51 + "] end": "Lit [email] end",                  # 51 code points, 102 in the view
+    "Angle zqsecret" + FW_LT + "zqalias@example.com end": "Angle [email] end",
+    "Colon zquser@zqsecret" + FW_COLON + "zqpart end": "Colon [email] end",
+    "B99 a@[" + "7" * 99 + "] e": "B99 [email] e",                       # bracketed literals at 99, 100, 101
+    "B100 a@[" + "7" * 100 + "] e": "B100 [email] e",
+    "B101 a@[" + "7" * 101 + "] e": "B101 [email] e",
+    "Wide a@[" + SQCC * 100 + "] e": "Wide [email] e",
+}
+R10_NEVER = (LIG, SQCC, FW_LT, FW_COLON, "zqsecret", "zqalias", "zquser", "zqpart", "7" * 20)
+
+
+class CodexR10MailboxGrammar(Api):
+    """Finding 1: mailboxes in the registry's grammar and its coordinates."""
+
+    def test_registry_valid_mailboxes_go_whole(self):
+        for text, expected in R10_CASES.items():
+            self.assertEqual(expected, " ".join(redact(text).split()), repr(text[:24]))
+        for keep in ("Meet @ 5pm", "ask @steelworks", "a @b and c@ d", "it's @ noon", "5 @ $3 each",
+                     "email: none", "rock 'n' roll", "Full-width \uff21\uff22\uff23 words"):
+            self.assertEqual(keep, redact(keep), keep)
+
+    def test_the_registry_accepts_what_the_scan_redacts(self):
+        # The cases are registry-valid (app/clients.py) - the residue they left
+        # was a registry mailbox's own characters.
+        from app.clients import _EMAIL_RE
+        for text in R10_CASES:
+            if text.startswith("Over "):
+                continue                                                      # 65: past the registry, redacted anyway
+            address = text.split(" ")[1]
+            self.assertTrue(_EMAIL_RE.fullmatch(address.lower()), repr(address[:24]))
+
+    def test_every_compatibility_at_is_an_at(self):
+        import unicodedata
+        from app import project_page as page
+        found = {chr(c) for c in range(0x80, 0x110000) if not 0xD800 <= c <= 0xDFFF
+                 and "@" in unicodedata.normalize("NFKC", chr(c))}
+        self.assertEqual(found | {"@"}, set(page._AT_FORMS))
+
+    def test_no_surface_carries_them(self):
+        texts = list(R10_CASES)
+        page = ("<h1>%s</h1>" % texts[0] + "".join("<p>%s</p>" % t for t in texts[1:])
+                + "<img alt=\"%s\"><input placeholder=\"%s\"><nav aria-label=\"%s\"><a href='/'>Home</a></nav>"
+                % (texts[4], texts[5], texts[6]))
+        talk, worker = FakeTalk(), SeeingWorker()
+        with TestClient(self.make(fetcher=FakeFetcher(page), talk=talk, worker=worker)) as client:
+            token = self.sign_in(client).json()["token"]
+            live = self.project_session(client, token)
+            self.assertEqual(200, live.status_code, live.text)
+            live = live.json()
+            said = client.post("/v1/session/%s/talk" % live["session_id"], headers=self.auth(live["token"]),
+                               json={"text": "make the heading bigger"})
+            built = client.post("/v1/session/%s/commands" % live["session_id"], headers=self.auth(live["token"]),
+                                json={"command_id": "cmd-r10", "session_id": live["session_id"], "type": "utterance",
+                                      "expected_version": live["artifact_version"], "transcript": "bigger",
+                                      "item_id": "item-r10"})
+            events = client.get("/v1/session/%s/events?once=true" % live["session_id"],
+                                headers=self.auth(live["token"])).text
+        self.assertEqual((200, 200), (said.status_code, built.status_code), (said.text, built.text))
+        state = self.state(live["session_id"])
+        surfaces = (("tree", json.dumps(page_to_tree(page, "T")["children"], ensure_ascii=False)),
+                    ("state", json.dumps(state, ensure_ascii=False)),
+                    ("provider", json.dumps([talk.calls, worker.seen], ensure_ascii=False)), ("events", events))
+        for surface, text in surfaces:
+            for never in R10_NEVER:
+                self.assertNotIn(never, text, (surface, repr(never)))
+        self.assertIn("[email]", surfaces[1][1])
+
+
+class CodexR10OutcomeDurability(Api):
+    """Finding 2: the create-only outcome write is made sure of, and any reader
+    - a restarted controller's events read included - applies it."""
+
+    inject = CodexR8B1FinaliserExhaustion.inject
+    exhaust = CodexR8B1FinaliserExhaustion.exhaust
+    assert_terminal = CodexR8B1FinaliserExhaustion.assert_terminal
+
+    def fresh_app(self):
+        # Another instance, or this one restarted: same store, no in-process recovery.
+        return create_app(settings=settings(client_workspaces=True), store=self.store, worker=CountingWorker(),
+                          id_factory=IDs(), email_sender=self.email_sender, project_fetcher=FakeFetcher(),
+                          talk_client=FakeTalk())
+
+    def fail_outcome_writes(self, n):
+        original, left = self.store.save, {"n": n}
+
+        def save(name, state, token):
+            if name.startswith("studio_outcome_") and left["n"] > 0:
+                left["n"] -= 1
+                raise OSError("transient")
+            return original(name, state, token)
+        self.store.save = save
+        return left
+
+    def read_events(self, sid, live):
+        with TestClient(self.fresh_app()) as fresh:
+            return fresh.get("/v1/session/%s/events?once=true" % sid, headers=self.auth(live["token"]))
+
+    def test_a_transient_write_and_every_cas_loss_still_finish_on_a_fresh_controller(self):
+        for fail in (False, True):
+            worker = CountingGateWorker(fail)
+            with TestClient(self.make(worker=worker)) as client:
+                outcome_left = self.fail_outcome_writes(1)
+                # the completion save, all eight fresh finishes and all three immediate applies lose
+                live, controller, sid, out, left = self.exhaust(client, worker, extra=3, recovery_attempts=0)
+                self.assertEqual(0, outcome_left["n"])                        # the transient failure happened
+                self.assertEqual("build-exhaust", self.state(sid)["active_command"])
+                self.assertEqual(0, left["n"])
+                events = self.read_events(sid, live)                          # no client command at all
+            self.assertEqual(200, events.status_code, events.text)
+            self.assert_terminal(sid, fail, out)
+            self.assertEqual(1, worker.turns)
+
+    def test_a_restarted_controller_applies_the_durable_outcome_on_its_events_read(self):
+        worker = CountingGateWorker()
+        with TestClient(self.make(worker=worker)) as client:
+            live, controller, sid, out, left = self.exhaust(client, worker, extra=10 ** 6, recovery_attempts=0)
+            self.assertEqual("build-exhaust", self.state(sid)["active_command"])
+            self.assertIsNotNone(controller._load_outcome(sid, "build-exhaust"))
+            left["n"] = 0                                                     # the store is calm again
+            events = self.read_events(sid, live)
+        self.assertEqual(200, events.status_code, events.text)
+        self.assert_terminal(sid, False, out)
+        self.assertEqual(1, worker.turns)
+
+    def test_an_outcome_record_is_never_overwritten_by_another(self):
+        with TestClient(self.make()) as client:
+            token = self.sign_in(client).json()["token"]
+            sid = self.project_session(client, token).json()["session_id"]
+            controller = self.app.state.controller
+            mine = {"version": 1, "session_id": sid, "command_id": "c-1", "fingerprint": "f", "command_epoch": 3,
+                    "receipt": {"status": "failed"}}
+            other = dict(mine, command_epoch=2)
+            self.store.save(controller._outcome_name(sid, "c-1"), other, None)
+            self.assertFalse(controller._record_outcome(sid, mine))           # not this one: not durable
+            self.assertEqual(2, controller._load_outcome(sid, "c-1")["command_epoch"])
+            self.store.save(controller._outcome_name(sid, "c-2"), dict(mine, command_id="c-2"), None)
+            self.assertTrue(controller._record_outcome(sid, dict(mine, command_id="c-2")))  # already there: this one
+
+
+class TimedOutFetcher(FakeFetcher):
+    """A load whose worker outlives the caller's deadline (a blocked resolver)."""
+
+    def __init__(self):
+        super().__init__()
+        self.done = threading.Event()
+
+    def __call__(self, url):
+        self.calls.append(url)
+        raise FetchTimeout("the page was too slow", self.done)
+
+
+class CodexR10FetchLeases(Api):
+    """Findings 3 and 4: the page-load leases."""
+
+    second_app = CodexR8B3TwoInstances.second_app
+
+    def renewed_past(self, clock, owners=2):
+        # Both leases were renewed after the latest clock move (at most 5 s).
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            untils = []
+            for name in (CEILING_RECORD, tenant_record("nav")):
+                record = self.store.data.get(name) or {}
+                untils += [float(l["until"]) for l in ((record.get("leases") or {}).get("fetch") or {}).values()]
+            if len(untils) >= owners and min(untils) > clock() + 30:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_a_timed_out_load_holds_the_ceiling_while_its_worker_lives_across_instances(self):
+        acme = client_entry(tenant="acme", emails=("acme@example.com",), name="Acme",
+                            projects=[project("acme-site", "https://www.acme.example.com/", "acme.example.com")])
+        stuck, offset = TimedOutFetcher(), [0]
+        clock = lambda: time.time() + offset[0]  # noqa: E731
+        with _mock.patch.object(_project_page, "MAX_OUTSTANDING_FETCHES", 1), \
+                _mock.patch.object(_main, "FETCH_RENEW_SECONDS", 0.02):
+            with TestClient(self.make(fetcher=stuck, clock=clock, registry=registry_record(client_entry(), acme))) as a, \
+                    TestClient(self.second_app(clock=clock)) as b:
+                nav_token = self.sign_in(a).json()["token"]
+                acme_token = self.sign_in(b, "acme@example.com").json()["token"]
+                first = self.project_session(a, nav_token, "load-a")              # timed out; its worker lives on
+                for _ in range(3):                                                # 135 s: far past the 60 s lease
+                    offset[0] += 45
+                    self.renewed_past(clock)
+                busy = self.project_session(b, acme_token, "acme-1", project_id="acme-site")
+                same = self.project_session(b, nav_token, "load-b")
+                stuck.done.set()                                                  # the worker stops at last
+                for keeper in list(self.app.state.fetch_keepers):
+                    keeper.join(5)
+                after = self.project_session(b, acme_token, "acme-2", project_id="acme-site")
+        self.assertEqual((502, 503, 429, 200),
+                         (first.status_code, busy.status_code, same.status_code, after.status_code))
+
+    def test_a_dead_holder_still_expires(self):
+        # Crash recovery is kept: a lease nobody renews expires as before.
+        store, now = MemoryStore(), [1000.0]
+        a = DurableGuards(store, Conflict, clock=lambda: now[0])
+        fence = a.acquire(CEILING_RECORD, "fetch", "gone", 60, 1)
+        now[0] += 61
+        self.assertIsNotNone(a.acquire(CEILING_RECORD, "fetch", "next", 60, 1))
+        self.assertFalse(a.renew(CEILING_RECORD, "fetch", "gone", fence, 60))  # replaced: never renewed back
+
+    def test_a_transient_ceiling_failure_gives_the_tenant_lease_back(self):
+        for how in ("read", "write"):
+            with TestClient(self.make()) as a:
+                token = self.sign_in(a).json()["token"]
+                original_load, original_save, left = self.store.load, self.store.save, {"n": 1}
+
+                def load(name, how=how):
+                    if how == "read" and name == CEILING_RECORD and left["n"] > 0:
+                        left["n"] -= 1
+                        raise OSError("down")
+                    return original_load(name)
+
+                def save(name, state, token_, how=how):
+                    if how == "write" and name == CEILING_RECORD and left["n"] > 0:
+                        left["n"] -= 1
+                        raise OSError("down")
+                    return original_save(name, state, token_)
+                self.store.load, self.store.save = load, save
+                try:
+                    first = self.project_session(a, token, "p-1")
+                    retry = self.project_session(a, token, "p-2")                  # at once, the store healthy
+                finally:
+                    self.store.load, self.store.save = original_load, original_save
+            self.assertEqual((503, 200), (first.status_code, retry.status_code), (how, retry.text))

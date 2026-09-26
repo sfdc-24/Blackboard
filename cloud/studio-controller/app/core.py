@@ -181,6 +181,7 @@ class StudioController:
         self.recovery_poll_seconds = 0.05
         self.recovery_attempts = 40
         self.recoveries: list = []
+        self.outcome_write_attempts = 4
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
 
@@ -464,19 +465,33 @@ class StudioController:
             if not ITEM_ID_RE.fullmatch(str(command.get("item_id") or "")):
                 raise CommandError("utterance requires a contract item_id")
 
+    def _adopt_recorded_outcome(self, session_id: str, state: dict, token):
+        """(state, token, adopted): a finish that lost every compare-and-set
+        left its outcome durable (_finish_exhausted); a session that still owns
+        it takes it here, in one compare-and-set (StateConflict if the session
+        moved). Every reader calls this - a new command (execute) and the
+        events read alike - so no client command is ever needed to finish it
+        (Codex Gate 1 on 59ed871)."""
+        active = state.get("active_command")
+        receipt = (state.get("commands") or {}).get(active) or {} if active else {}
+        if not active or receipt.get("status") != "inflight":
+            return state, token, False
+        recorded = self._load_outcome(session_id, active)
+        if not recorded or not self._owns(state, recorded):
+            return state, token, False
+        self._terminalise(state, recorded)
+        token = self.repository.save(session_id, state, token)
+        return state, token, True
+
     def _recover_stale_inflight(self, session_id: str, state: dict, token):
         active = state.get("active_command")
         if not active:
             return state, token
         receipt = state.get("commands", {}).get(active) or {}
-        if receipt.get("status") == "inflight":
-            # A finish that lost every compare-and-set left its outcome durable
-            # (_finish_exhausted): applied here at once, never after the lease.
-            recorded = self._load_outcome(session_id, active)
-            if recorded and self._owns(state, recorded):
-                self._terminalise(state, recorded)
-                token = self.repository.save(session_id, state, token)
-                return state, token
+        # A durable outcome is applied at once, never after the lease.
+        state, token, adopted = self._adopt_recorded_outcome(session_id, state, token)
+        if adopted:
+            return state, token
         started_at = int(receipt.get("started_at") or 0)
         if receipt.get("status") != "inflight" or int(self.clock()) - started_at < self.inflight_lease_seconds:
             return state, token
@@ -687,15 +702,32 @@ class StudioController:
         self.recoveries[:] = [t for t in self.recoveries if t.is_alive() or t is thread][-50:]
         thread.start()
 
+    _OUTCOME_KEYS = ("session_id", "command_id", "fingerprint", "command_epoch")
+
+    def _record_outcome(self, session_id: str, outcome: dict) -> bool:
+        """Write the outcome create-only, and make sure of it (Codex Gate 1 on
+        59ed871): a write that failed, or whose answer was lost, is read back;
+        a record already there counts only when it is this one - the same
+        session, command, fingerprint and command epoch - and is never
+        overwritten. True once this exact outcome is durable."""
+        name = self._outcome_name(session_id, outcome["command_id"])
+        for _ in range(max(1, int(self.outcome_write_attempts))):
+            try:
+                self.repository.store.save(name, outcome, None)
+                return True
+            except Exception:
+                pass                      # already there, or a transient failure: read what is there
+            existing = self._load_outcome(session_id, outcome["command_id"])
+            if existing is not None:
+                return all(existing.get(k) == outcome.get(k) for k in self._OUTCOME_KEYS)
+        return False
+
     def _finish_exhausted(self, session_id: str, base: dict, command: dict, fingerprint: str,
                           receipt: dict) -> None:
         command_id = str(command["command_id"])
         outcome = {"version": 1, "session_id": session_id, "command_id": command_id, "fingerprint": fingerprint,
                    "command_epoch": base.get("command_epoch"), "receipt": dict(receipt)}
-        try:
-            self.repository.store.save(self._outcome_name(session_id, command_id), outcome, None)
-        except Exception:
-            pass                          # the in-process recovery below, and the lease, still finish it
+        self._record_outcome(session_id, outcome)   # if even that fails: the recovery below, then the lease
         if not self._apply_outcome(session_id, outcome, tries=3):
             self._schedule_recovery(session_id, outcome)
 
@@ -1294,6 +1326,15 @@ class StudioController:
         while True:
             record = self.repository.load(session_id)
             state = record.state
+            try:
+                # A durable outcome still owned is applied by this read too: a
+                # restarted controller finishes it with no client command.
+                state, token, _ = self._adopt_recorded_outcome(session_id, state, record.token)
+            except StateConflict:
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("the session is busy; reconnect") from None
+                continue
             events = state.get("events") or []
             first = int(events[0]["seq"]) if events else int(state.get("last_seq") or 0) + 1
             repair = after_seq < first - 1 or after_seq > int(state.get("last_seq") or 0)
@@ -1326,7 +1367,7 @@ class StudioController:
                 if question.get("status") == "open":
                     self._event(candidate, "question.asked", {"question": copy.deepcopy(question)})
             try:
-                self.repository.save(session_id, candidate, record.token)
+                self.repository.save(session_id, candidate, token)
                 return copy.deepcopy(candidate["events"]), True, candidate
             except StateConflict:
                 conflicts += 1

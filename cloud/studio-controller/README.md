@@ -394,12 +394,19 @@ tenant exists and still lists an address that hashes to the token's subject.
   events, 4 KB looked at per text run or attribute, 60 nodes, depth 4, 12 images, 200-character
   labels, and 2 s of parsing.
 - Links, bare domains, IPv4 and IPv6 addresses and email addresses in page text become `[link]` or
-  `[email]`. The registry's project name is kept as written. An email is replaced whole, local
-  part included, whether its host is dotted, dotless (`admin@localhost`) or a bracketed literal
-  (`user@[2001:db8::1]`). The local part is whatever the registry accepts: anything but whitespace, `@` and angle
-  brackets. So `johnsmith'alias@example.com` goes whole. Links are read first, so a link's
+  `[email]`. The registry's project name is kept as written. Links are read first, so a link's
   `user@host` goes with it.
-- Detection reads a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
+- A mailbox is found in the registry's own grammar and coordinates. The registry accepts 1-64
+  code points that are neither whitespace nor `@`, an `@`, and 1-255 more, counted in original
+  code points. So the scan reads the original text, not a compatibility view where one ligature
+  is three letters. The whole run of non-whitespace characters around an `@`, or its full-width
+  and small forms, goes, whatever its length: the local part and the domain together, dotted,
+  dotless (`admin@localhost`) or a bracketed literal (`user@[2001:db8::1]`). Only trailing
+  sentence punctuation (`.,;:!?`) stays. No window can leave a registry-valid prefix or suffix
+  behind, and punctuation the registry accepts (`secret＜alias@example.com`,
+  `user@secret：part`) does not stop it. This is over-redaction by design, and linear: one
+  character test per character. Codex Gate 1 NO-GO on 59ed871.
+- Links, IP addresses and hosts are detected on a compatibility view: each code point's NFKC mapping, the way UTS46 maps a host
   name. Circled, full-width, squared and mathematical forms of letters, digits, dots, colons and
   `@` are read as what they stand for (`secret.ⓒⓞⓜ` is `secret.com`). An offset map leads each
   match back to the page, and the complete original characters are replaced. One code point maps
@@ -449,11 +456,16 @@ cc56fea.
 - A failing worker finishes the same way.
 - There is always one terminal receipt and one audit entry, and the session is never wedged.
 - If even that finish loses every compare-and-set, the command's failed outcome is written once,
-  create-only, to its own small record, outside the contended session. It is then applied under
-  the same ownership fence by whichever comes first:
-  - at once;
-  - a scheduled background recovery, which needs no client command;
-  - the next reader of the session, before its own command.
+  create-only, to its own small record, outside the contended session.
+  - The write is made sure of. A write that failed, or whose answer was lost, is tried again and
+    read back.
+  - A record already there counts only when it is this command's: the same session, command,
+    fingerprint and command epoch. It is never overwritten.
+  - The outcome is then applied under the same ownership fence by whichever comes first:
+    - at once;
+    - a scheduled background recovery, which needs no client command;
+    - any reader of the session, on any instance: a new command, or the event stream's read. So a
+      restarted controller finishes it with no client command at all (Codex Gate 1 on 59ed871).
 
   So there is still one terminal receipt and one audit entry, and the next command is accepted at
   once (Codex Gate 1 B1 on 38bc713).
@@ -475,8 +487,15 @@ objects on one store are tested. Codex Gate 1 B3/B4 on 38bc713.
 - One page load per tenant, and the service-wide page-load ceiling (`MAX_OUTSTANDING_FETCHES`).
 - A lease has an owner, an expiry and a growing fence. Only its owner, with its fence, releases it.
   A lease that has expired is no longer counted.
-- A page load that timed out but may still be running keeps its leases until they expire. The
-  expiry (60 s) outlives any load.
+- A page load that timed out while its worker is still alive keeps both leases for as long as the
+  worker lives. A resolver can block without bound.
+  - A keeper renews them, owned and fenced, every 15 s, and gives them back once the worker stops.
+  - A renewal only extends an entry still in the record. A successful acquire rewrites the lane
+    with the live leases alone, so a renewal can never admit past the ceiling.
+  - A process that dies renews nothing, so its leases still expire after 60 s.
+  - Codex Gate 1 on 59ed871.
+- If the tenant lease is taken but the ceiling cannot be read or written, the tenant lease goes
+  back at once. A retry is then not refused as "already loading".
 - Guard state that cannot be read or written refuses the call (503). It never lets the call
   through.
 - Operator and visitor sessions keep the in-process guards. Admission, voice, commands and the

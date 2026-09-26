@@ -74,7 +74,13 @@ class FetchBusy(PageFetchError):
 
 
 class FetchTimeout(PageFetchError):
-    """The caller stopped waiting; the load's thread may still be running."""
+    """The caller stopped waiting; the load's thread may still be running.
+    ``done`` is set once that thread has really stopped, so a caller can keep
+    the load's durable leases alive until then (Codex Gate 1 on 59ed871)."""
+
+    def __init__(self, message: str, done: "threading.Event | None" = None):
+        super().__init__(message)
+        self.done = done
 
 
 # A page load keeps its slot until its thread has actually finished - a caller
@@ -143,6 +149,7 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
     if not slots.acquire(blocking=False):
         raise FetchBusy("every page-load slot is taken")
     outcome: dict = {}
+    finished = threading.Event()
 
     def work():
         try:
@@ -153,6 +160,7 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
             outcome["error"] = PageFetchError(type(exc).__name__)
         finally:
             slots.release()                  # only once the work has really stopped
+            finished.set()
 
     worker = threading.Thread(target=work, name="studio-project-fetch", daemon=True)
     try:
@@ -162,7 +170,7 @@ def fetch_page(url: str, *, resolver=None, transport=None, clock=time.monotonic)
         raise
     worker.join(TOTAL_SECONDS)
     if worker.is_alive():
-        raise FetchTimeout("the page was too slow")
+        raise FetchTimeout("the page was too slow", finished)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["html"]
@@ -384,68 +392,75 @@ def _replace_found(text: str, finder) -> str:
     return "".join(out)
 
 
-# Mailboxes, found around each "@" within bounded windows (Cursor and Codex
-# on 6081563: an unanchored regex scan could go quadratic). The local part
-# runs back from the "@" to a separator - whitespace, "@" or an angle bracket;
-# apostrophes, quotes, brackets and commas are part of it, as the registry
-# accepts - never past the previous mailbox, and at most LOCAL_MAX characters.
-# The domain runs forward: dotted or not (admin@localhost), or a bracketed
-# literal (user@[2001:db8::1]), at most DOMAIN_MAX characters. Every character
-# is tested a bounded number of times, so the scan is linear by construction;
-# the whole mailbox goes, local part included.
-LOCAL_MAX = 64            # the registry's own limits (app/clients.py)
-DOMAIN_MAX = 255
-_NOT_ADDR_CHARS = "@<>()[]{}\"',;:"
+# Mailboxes (Codex Gate 1 NO-GO on 59ed871). The registry accepts a mailbox
+# as 1-64 code points that are neither whitespace nor "@", an "@", and 1-255
+# more (app/clients.py) - counted in ORIGINAL code points, where one ligature
+# is one code point, not the three letters of its compatibility view. So the
+# scan reads the original text, in the registry's own grammar: a mailbox is the
+# whole run of non-whitespace characters around an "@" (or its full-width and
+# small forms), with something before it and something after it. The whole
+# run goes, whatever its length - local part and domain together, bracketed
+# literal or not - so no window can leave a registry-valid prefix or suffix
+# behind: not U+FB03 x30 before the "@", not a literal of 51 squared units,
+# not "secret" + a full-width "<" or ":". That is over-redaction by design.
+# Only trailing sentence punctuation (.,;:!?) stays outside it. One pass, one
+# character test per character (_email_class, counted by the linear-work
+# test): linear by construction.
+_AT_FORMS = frozenset("@\ufe6b\uff20")     # every code point whose NFKC holds "@" (checked by a test)
+_TRAIL = frozenset(".,;:!?")
+_GAP, _AT, _TRAILING, _BODY = 0, 1, 2, 3
 
 
-def _local_char(ch: str) -> bool:
-    return not (ch.isspace() or ch in "@<>")
-
-
-def _domain_char(ch: str) -> bool:
-    return not (ch.isspace() or ch in _NOT_ADDR_CHARS or ch in _DOT_CHARS)
-
-
-def _domain_end(text: str, start: int) -> int:
-    """Where the domain that starts at `start` ends; `start` when there is none."""
-    n = len(text)
-    if start < n and text[start] == "[":                 # a bracketed literal, 1 to 100 characters
-        close, limit = start + 1, min(n, start + 102)
-        while close < limit and text[close] != "]" and not text[close].isspace():
-            close += 1
-        return close + 1 if close < limit and text[close] == "]" and close > start + 1 else start
-    k, limit = start, min(n, start + DOMAIN_MAX)
-    while k < limit and _domain_char(text[k]):
-        k += 1
-    if k == start:
-        return start
-    while k + 1 < limit and text[k] in _DOT_CHARS and _domain_char(text[k + 1]):   # further labels
-        k += 1
-        while k < limit and _domain_char(text[k]):
-            k += 1
-    return k
+def _email_class(ch: str) -> int:
+    if ch.isspace():
+        return _GAP
+    if ch in _AT_FORMS:
+        return _AT
+    return _TRAILING if ch in _TRAIL else _BODY
 
 
 def _email_spans(text: str):
-    last, at = 0, text.find("@")
-    while at != -1:
-        start, floor = at, max(last, at - LOCAL_MAX)
-        while start > floor and _local_char(text[start - 1]):
-            start -= 1
-        end = _domain_end(text, at + 1) if start < at else at + 1
-        if start < at and end > at + 1:
-            yield start, end, EMAIL
-            last = end
-            at = text.find("@", end)
-        else:
-            at = text.find("@", at + 1)
+    """(start, end, EMAIL) for each run of non-whitespace characters that
+    holds an "@" with something before and after it, in original coordinates;
+    trailing sentence punctuation is left outside the span."""
+    i, n = 0, len(text)
+    while i < n:
+        kind = _email_class(text[i])
+        if kind == _GAP:
+            i += 1
+            continue
+        start, at, core = i, -1, (i if kind != _TRAILING else -1)
+        i += 1
+        while i < n:
+            kind = _email_class(text[i])
+            if kind == _GAP:
+                break
+            if kind == _AT and at < 0:
+                at = i
+            if kind != _TRAILING:
+                core = i
+            i += 1
+        if at > start and core > at:
+            yield start, core + 1, EMAIL
+
+
+def _replace_raw(text: str, finder) -> str:
+    """Spans found on the original text itself, each replaced whole."""
+    out, last = [], 0
+    for start, end, placeholder in finder(text):
+        out.append(text[last:start])
+        out.append(placeholder)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 def redact(text: str) -> str:
     """Replace every link-, domain-, IP- and email-shaped token with a
-    placeholder, each found on the compatibility view (above)."""
+    placeholder: links, IPs and domains found on the compatibility view
+    (above), mailboxes on the original text in the registry's grammar."""
     text = _replace_found(text, _regex_found(_URL_RE, LINK))      # first: a link's user@host goes with it
-    text = _replace_found(text, _email_spans)
+    text = _replace_raw(text, _email_spans)                        # the registry's grammar, original code points
     text = _replace_found(text, _regex_found(_IPV4_RE, LINK))
     text = _replace_found(text, _ipv6_found)
     return _replace_found(text, _host_spans)

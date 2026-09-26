@@ -88,6 +88,22 @@ class DurableGuards:
             return fence, True
         return self._change(name, change)
 
+    def renew(self, name: str, lane: str, owner: str, fence, ttl: float) -> bool:
+        """Extend the lease while its holder's work is still alive (Codex Gate 1
+        on 59ed871) - only with its owner and fence, and only while its entry is
+        still in the record. A successful acquire rewrites the lane with the
+        live leases alone, so an entry that is still there, even past its
+        expiry, was never replaced: renewing it can never admit more than the
+        ceiling. False when the lease is gone."""
+        def change(state, now):
+            leases = (state.get("leases") or {}).get(lane) or {}
+            held = leases.get(owner)
+            if not isinstance(held, dict) or int(held.get("fence") or 0) != int(fence or 0):
+                return False, False
+            held["until"] = now + float(ttl)
+            return True, True
+        return self._change(name, change)
+
     def release(self, name: str, lane: str, owner: str, fence) -> None:
         """Give the lease back - only with its owner and fence. A release that
         cannot be written is left to the lease's expiry."""

@@ -57,6 +57,9 @@ SERVER_ERROR = "the request could not be completed"
 # fetch or parse, so failed creation ids cannot drive repeated work.
 FETCH_ATTEMPTS_PER_HOUR = 10
 FETCH_ATTEMPTS_PER_DAY = 40
+# A timed-out page load whose worker is still alive keeps its durable leases:
+# they are renewed this often (well inside their 60 s) until the worker stops.
+FETCH_RENEW_SECONDS = 15.0
 
 
 class SummaryNotSent(RuntimeError):
@@ -1137,10 +1140,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     # One page load per tenant, and a service-wide ceiling on page loads, as
     # durable leases (Codex Gate 1 B3/B4 on 38bc713): they hold across
-    # instances. A lease outlives any load and its thread (project_page bounds
-    # connect, first byte, idle and per-chunk time), so a load that timed out
-    # but is still running keeps its leases until they expire.
+    # instances. A load that finishes gives them back. A load that timed out
+    # while its worker is still alive (a resolver can block without bound)
+    # keeps them for as long as that worker lives: a keeper renews both, owned
+    # and fenced, every FETCH_RENEW_SECONDS, and gives them back once the
+    # worker has really stopped (Codex Gate 1 on 59ed871). A process that dies
+    # renews nothing, so its leases still expire: crash recovery is kept.
     FETCH_LEASE_SECONDS = 60.0
+    app.state.fetch_keepers = []
 
     def claim_fetch(tenant: str):
         """(owner, tenant fence, ceiling fence), or "tenant" while the tenant
@@ -1149,8 +1156,14 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         tenant_fence = guards.acquire(tenant_record(tenant), "fetch", owner, FETCH_LEASE_SECONDS, 1)
         if tenant_fence is None:
             return "tenant"
-        ceiling_fence = guards.acquire(CEILING_RECORD, "fetch", owner, FETCH_LEASE_SECONDS,
-                                       project_page_module.MAX_OUTSTANDING_FETCHES)
+        try:
+            ceiling_fence = guards.acquire(CEILING_RECORD, "fetch", owner, FETCH_LEASE_SECONDS,
+                                           project_page_module.MAX_OUTSTANDING_FETCHES)
+        except GuardUnavailable:
+            # The tenant lease just taken goes back with it, or a retry would
+            # read "already loading" for a load that never ran (Codex, 59ed871).
+            guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
+            raise
         if ceiling_fence is None:
             guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
             return "ceiling"
@@ -1160,6 +1173,25 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         owner, tenant_fence, ceiling_fence = claim
         guards.release(CEILING_RECORD, "fetch", owner, ceiling_fence)
         guards.release(tenant_record(tenant), "fetch", owner, tenant_fence)
+
+    def keep_fetch_leases(tenant: str, claim, done) -> None:
+        """Renew a timed-out load's leases while its worker lives; give them
+        back once it has stopped. A renewal that cannot be written is tried
+        again at the next beat, long before the lease would expire."""
+        owner, tenant_fence, ceiling_fence = claim
+
+        def run():
+            while not done.wait(FETCH_RENEW_SECONDS):
+                for name, fence in ((CEILING_RECORD, ceiling_fence), (tenant_record(tenant), tenant_fence)):
+                    try:
+                        guards.renew(name, "fetch", owner, fence, FETCH_LEASE_SECONDS)
+                    except GuardUnavailable:
+                        pass
+            release_fetch(tenant, claim)
+
+        keeper = threading.Thread(target=run, name="studio-fetch-lease", daemon=True)
+        app.state.fetch_keepers[:] = [t for t in app.state.fetch_keepers if t.is_alive()][-50:] + [keeper]
+        keeper.start()
 
     def reserve_fetch_attempt(tenant: str, project_id: str) -> bool:
         """Spend one of the tenant's page-load attempts, by compare-and-set,
@@ -1241,7 +1273,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     raise HTTPException(429, "a page for this workspace is already loading")
                 if claim == "ceiling":
                     raise HTTPException(503, "page loading is busy; try again shortly")
-                timed_out = False
+                timed_out, still_running = False, None
                 try:
                     if not await asyncio.to_thread(reserve_fetch_attempt, tenant, project_id):
                         raise HTTPException(429, "too many page loads for this workspace; try again later")
@@ -1251,15 +1283,18 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                     except FetchBusy as exc:
                         raise HTTPException(503, "page loading is busy; try again shortly") from exc
                     except FetchTimeout as exc:
-                        timed_out = True
+                        timed_out, still_running = True, getattr(exc, "done", None)
                         raise HTTPException(502, "the project page could not be loaded") from exc
                     except PageFetchError as exc:
                         raise HTTPException(502, "the project page could not be loaded") from exc
                     except Exception as exc:
                         raise HTTPException(502, "the project page could not be loaded") from exc
                 finally:
-                    if not timed_out:                # a load still running keeps its leases until they expire
+                    if not timed_out:
                         await asyncio.to_thread(release_fetch, tenant, claim)
+                    elif still_running is not None:  # held, and renewed, until its worker stops
+                        keep_fetch_leases(tenant, claim, still_running)
+                    # (a timeout without a liveness signal keeps its leases until they expire)
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
