@@ -32,14 +32,27 @@ as a tap.
 Provider workers return event drafts; the controller alone assigns envelopes
 and versions.
 
-Every model lane gives up inside Cloud Run's 60-second request timeout. The
-builder has a 40-second client deadline with no retries and a 4000-token cap;
-the analyst has 40 seconds; the muse 25, the charter 20, talk 8. A builder
-timeout or provider error completes the command with the problem "the
-architect could not finish that build", and the visitor hears that nothing
-changed yet - so the command slot is free for the next build at once. Before
-this, one turn in the owner's run of 2026-09-26 wrote to a 16000-token cap,
-died at 60 s with a 504, and held the slot while five builds got 409.
+The builder and the analyst give up inside Cloud Run's 60-second request
+timeout by a TOTAL budget on the monotonic clock (`workers/bounded.py`), not
+the SDK's timeout, which is per read: a body trickling in a byte at a time
+never trips it. Each provider call runs on its own thread over its own
+connection pool; at the budget (35 s) the caller returns, the call's sockets
+are shut down, and whatever it returns later is never read. Behind that, the
+controller abandons any worker at 40 s and `/analyze` gives up at
+`analyze_deadline_seconds` (40, validated under 60). No lane retries.
+
+A build that did not happen still completes its command, so the slot is free
+for the next one at once, and says which kind of failure it was:
+- transient - the budget, a dropped connection, 408, 409, 429, 5xx: "The
+  architect could not finish that build, so nothing changed yet. Say it again
+  in a moment and I will build it."
+- permanent - 400, 401, 403, other 4xx, a model refusal: "The architect could
+  not build that, and saying it again will not change it."
+`/analyze` answers a permanent fault with 503 "the analyst is not available",
+which tells the page to stop calling it for the session. Before this, one turn
+in the owner's run of 2026-09-26 wrote to a 16000-token cap, died at 60 s with
+a 504, and held the slot while five builds got 409. The muse (25 s), charter
+(20 s) and talk (8 s) still use per-read timeouts.
 
 ## Optional live Lead counts
 
