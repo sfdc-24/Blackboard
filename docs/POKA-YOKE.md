@@ -228,6 +228,134 @@ in force and the rest as an explicit automation gap.
 
 ---
 
+## L-104 — Every Codex lane's verdict counts, whatever its sender tag
+
+**Incident.** On 2026-09-26, Codex gave site #222 a NO-GO at `9f965e6` (`CODEX-SITE222-9F965E6-NOGO-20260926T021638Z`). It was posted under the sender tag `CODEX-DESKTOP`.
+- The operator's watcher matched only the lowercase `chatgpt-codex`/`codex` tags, so the row went unseen for an hour.
+- In that hour #222 was rebased twice and sent back for review.
+- The architecture PDF then printed that head as "pending", which was stale.
+
+**Naive rule.** "Read the board more carefully."
+
+**Mechanism — PARTIALLY IN FORCE.**
+- In force: the watcher filter is case-insensitive and matches `codex` anywhere.
+- Operator discipline only: before any re-review request, the operator reads every verdict row for that PR.
+- Missing: a checked-in helper for that read. `tools/architecture_verdicts.py` on the held PR #276 is the first draft of one.
+- Complete when a re-review command refuses to post while an unanswered NO-GO exists for the PR.
+
+---
+
+## L-105 — Two lanes, one head, opposite verdicts: the newer GO does not cancel the older NO-GO
+
+**Incident.** Site #216 at `e5a9ae3` received two Codex verdicts:
+- a NO-GO at 00:54Z, finding three product defects;
+- a CI-only GO at 01:00Z, which did not cite the NO-GO.
+
+It merged at 01:01Z on the GO while the NO-GO still stood. Site #223 then merged on a GO that was withdrawn after the merge (`CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z`). Both were repaired by fixing forward (#221, #224).
+
+**Naive rule.** "Don't merge while a NO-GO stands."
+
+**Mechanism — NOT YET.**
+- A merge helper reads every verdict row for the exact head.
+- It refuses when any NO-GO is not explicitly superseded by a later GO that cites it in `supersedes=`.
+- Until that helper exists, the operator treats a GO that fails to cite an earlier NO-GO on the same head as not clearing it.
+
+---
+
+## L-106 — Build from the reviewed merge, after the verdict, and tag from the commit
+
+**Incident.** The r5d hotfix image was built at 02:32Z for "validation only". Codex's NO-GO on the PR landed at 02:31–02:33Z, so the build raced the review. That image is marked do-not-promote.
+
+The accepted image was then built from the reviewed merge `d2256e0`. One more slip: its tag was first typed by hand as `d2256e0a8f5c`, which is not the commit's short hash. It was re-tagged `d2256e02122b` against the same digest.
+
+**Naive rule.** "Wait for GO before building; copy tags carefully."
+
+**Mechanism — PARTIALLY IN FORCE.**
+- In force: the r6 release built from the merge commit's detached tree only after main's checks passed.
+- In force: it proved image-to-tree identity inside the container (`diff -r /srv/app`) before staging.
+- Missing: a checked-in release script that takes the PR number, confirms a GO row names the merged head, derives the tag with `git rev-parse --short=12`, and refuses otherwise.
+
+---
+
+## L-107 — A success marker must be something only success emits
+
+**Incident.** During the Codex 401 outage, a watcher reported "Codex back" at 23:29Z. It had matched `response.completed`, which also appears inside the failure text "websocket closed by server before response.completed". Codex was still failing.
+
+**Naive rule.** "Grep more carefully."
+
+**Mechanism — IN FORCE for that watcher.**
+- Success is keyed on an event only successful output produces: the `codex_core::stream_events_utils` log target.
+- The marker was checked to be absent across the known failure window before it was trusted.
+- Generalises to: every success grep ships with one negative control drawn from a real failure.
+
+---
+
+## L-108 — An additive merge join must keep the closer git factored out
+
+**Incident.** Twice tonight, joining two sides that both appended tests to the same spec produced a file that failed to parse. Git had moved the shared `});` out of the conflict block, so the joined "ours" block lost its closing line.
+
+**Naive rule.** "Check syntax after resolving."
+
+**Mechanism — IN FORCE locally, not yet checked in.**
+- The join tool copies the shared suffix lines that follow the conflict block onto the end of "ours".
+- `node --check` gates `git rebase --continue`.
+- Should move from the operator scratchpad into `tools/`.
+
+---
+
+## L-109 — Row ids carry the clock, not an estimate
+
+**Incident.** Board row ids were written ahead of the real time: `...T0406Z` posted at 03:59Z, `...T0338Z` at 03:28Z, `...T0332Z` at 03:30Z. The payload was composed before running `date -u`. This repeats the Sep 24 lesson "run date before any timestamp", which a remembered rule did not prevent.
+
+**Naive rule.** "Run `date -u` first."
+
+**Mechanism — NOT YET.**
+- `scripts/board_say.py` should stamp the id's `T` component from the clock itself, or refuse an id whose stamp is more than two minutes from now.
+- Until then, the operator runs `date -u` in a separate step before composing any payload.
+
+---
+
+## L-110 — A governing architecture artifact is not a live release dashboard
+
+**Incident.** The reviewed 2026-09-26 edition (#274) was immediately followed by #276, an edition built to chase verdicts and traffic changes. Every head was stale by the time it was reviewed. Cursor and Codex spent several rounds on provenance while release work waited.
+
+**Naive rule.** "Refresh the PDF less often."
+
+**Mechanism — IN FORCE by ruling** (`CODEX-ARCH-PDF-STATE-CHASE-POKAYOKE-20260926T0416Z`).
+- A new edition requires a material architecture change or an owner request.
+- It needs one fixed evidence cutoff and a verdict ledger read by script.
+- Moving truth lives in board rows, release receipts and the public rail.
+- #276 is held.
+
+---
+
+## L-111 — A run the host killed is evidence of nothing
+
+**Incident.** The host stopped several background test runs for low memory. One stopped run showed four failures at the moment of the kill, in tests unrelated to the change; all four passed when rerun alone. A stopped mutation run also left a mutant in place (see L-103).
+
+**Naive rule.** "Rerun when memory is low."
+
+**Mechanism — PARTIALLY IN FORCE.**
+- Heavy suites run on one worker.
+- A killed run's failures are recorded as unknown, never as regressions, and only those tests are rerun alone.
+- The authoritative full run is hosted CI on the pushed head.
+- Missing: a runner that records "killed" distinctly from "failed".
+
+---
+
+## L-112 — Label where a fact came from, or the reviewer cannot check it
+
+**Incident.** The first Converspan readiness draft (#273) stated facts the reviewer could not see from the repository: session observations, an unpushed local roadmap, board rows and a private repo. Cursor rejected each as unsupported; two rounds went to re-sourcing.
+
+**Naive rule.** "Only cite the repo."
+
+**Mechanism — IN FORCE for that document; proposed for all governing docs.**
+- Every fact carries a label: `repo`, `board` with its row id, or `session`.
+- Gate criteria are quoted verbatim from their source, never paraphrased.
+- The G2 and G4 paraphrases were exactly where conditions were lost.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
