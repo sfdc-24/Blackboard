@@ -40,7 +40,12 @@ handover. Support is chosen at handover.
 **Why:**
 - **Company page:** a small custom brochure site in Toronto commonly lands around CAD 3,000-8,000 from independents and small studios. 5,000 sits mid-range for a fast, live-prototyped build.
 - **Blog / content site:** adds templates and a CMS, and training for posting.
-- **E-commerce shop:** adds catalogue, cart, payment and pickup or shipping rules. Small shops commonly run CAD 7,000-15,000. The sample quote uses this tier.
+- **E-commerce shop:** adds catalogue, cart, payment and pickup or shipping rules. Small shops commonly run CAD 7,000-15,000.
+
+**Which numbers the samples use:**
+- The JSON holds the **company-page** column: CAD 5,000 for the website lines. That is what a live price table would carry.
+- The rendered e-commerce sample PDFs (a bakery shop) substitute this **e-commerce** column (CAD 9,300) for the website lines, for illustration only.
+- Support prices in the samples come from the JSON: 250 a month and 150 an hour.
 
 **Not included:** paid themes or plugins, hosting, domains, payment-processor fees, and product photography. These are passed through at cost, or quoted separately.
 
@@ -104,7 +109,10 @@ The JSON can hold one subscription price and one on-demand rate, so it holds Ess
 
 ## Decisions for the owner
 
-1. **Tax.** Ontario HST is 13%. It applies only if SFDC24 is registered for HST: registration is required above CAD 30,000 of taxable supplies in four consecutive quarters, and optional below. The PDF currently says "Applicable taxes are added on the invoice." and adds no tax line. Should quotes show HST as its own line?
+1. **Tax.** Ontario HST is 13%. It applies only if SFDC24 is registered for HST.
+   - Under the CRA small-supplier rule, registration becomes required once taxable supplies exceed CAD 30,000 **in a single calendar quarter**, or in total over the last four consecutive calendar quarters. Below that it is optional.
+   - The PDF currently says "Applicable taxes are added on the invoice." and adds no tax line.
+   - Should quotes show HST as its own line? This is general information, not tax advice; the owner's accountant confirms it.
 2. **Currency.** CAD only, or CAD and USD? The table supports both, one per deployment.
 3. **Rush fees.** For example, +25% for delivery in under two weeks. Nothing like this is in the table today.
 4. **Discounts.** Charities or non-profits, repeat clients, or bundles (for example, a logo with a website). None is in the table today.
