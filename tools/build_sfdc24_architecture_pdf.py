@@ -1,9 +1,12 @@
 """Build the two-page SFDC24 / Blackboard architecture brief.
 
-The PDF is deliberately evidence-aware: LIVE, PARTIAL, HELD, and TARGET are
-not interchangeable. It reads and validates the machine-readable semantic
-contract in the accepted 2026-09-25 ADR, then binds that contract's digest into
+The PDF is deliberately evidence-aware: LIVE, CURRENT, PARTIAL, REVIEW, DARK,
+HELD, and TARGET are not interchangeable. It reads and validates the
+machine-readable semantic contract in the accepted 2026-09-25 ADR (snapshot
+refreshed by its 2026-09-26 addendum), then binds that contract's digest into
 the PDF. The result is small enough to use as the Drive architecture directive.
+The 2026-09-25 edition stays committed as a historical artifact; this script
+builds the current edition only.
 
 Clean-checkout dependency install:
     python -m pip install -r tools/requirements-architecture-pdf.txt
@@ -26,7 +29,7 @@ from reportlab.platypus import Paragraph
 
 ROOT = Path(__file__).resolve().parents[1]
 ADR = ROOT / "docs" / "ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
-OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
+OUT = ROOT / "docs" / "SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
 PAGE_W, PAGE_H = landscape(TABLOID)
 
 CONTRACT_START = "<!-- architecture-pdf-contract:start -->"
@@ -132,6 +135,8 @@ PURPLE_SOFT = colors.HexColor("#F1ECF8")
 RED = colors.HexColor("#A64141")
 RED_SOFT = colors.HexColor("#FBECEC")
 GRAY_SOFT = colors.HexColor("#EDF1F5")
+REVIEW_SOFT = colors.HexColor("#FFF6D8")
+DARK_SOFT = colors.HexColor("#DFE4EA")
 
 STATUS_FILL = {
     "LIVE": GREEN_SOFT,
@@ -140,6 +145,8 @@ STATUS_FILL = {
     "HELD": RED_SOFT,
     "TARGET": BLUE_SOFT,
     "OPTIONAL": PURPLE_SOFT,
+    "REVIEW": REVIEW_SOFT,   # an open PR with an exact-head review pending
+    "DARK": DARK_SOFT,       # merged to main and switched off
 }
 
 
@@ -359,10 +366,10 @@ def tech_row(c: canvas.Canvas, x: float, top: float, w: float,
 
 
 def tech_panel_header(c: canvas.Canvas, x: float, y: float, w: float, h: float,
-                      title: str, body: str) -> float:
+                      title: str, body: str, rows_offset: float = 70) -> float:
     paragraph(c, title, x + 15, y + h - 17, w - 30, 11.5, 13, INK, True)
     paragraph(c, body, x + 15, y + h - 38, w - 30, 7.0, 8.1, MUTED)
-    return y + h - 70
+    return y + h - rows_offset
 
 
 def footer(c: canvas.Canvas, page_no: int, left: str, right: str) -> None:
@@ -381,12 +388,12 @@ def draw_current(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - current operating architecture",
-        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what was rehearsed, and what is still held",
+        f"Evidence-bound snapshot through {CONTRACT['facts_refreshed_label']}: what is live, what the owner ran, what is in review, and what is still held",
         "CURRENT STATE",
     )
     principle_strip(c, [
-        ("PRODUCTION CONTAINED", f"R5 serves {CONTRACT['production_traffic_percent']}%; advisor tag removed; next template is advisor-off", GREEN_SOFT, GREEN),
-        ("ONE AUDIO ARBITER", "Realtime host plus queued TTS; one serialized audible turn", BLUE_SOFT, BLUE),
+        ("PRODUCTION CONTAINED", f"R5b serves {CONTRACT['production_traffic_percent']}%; rollback r5-0895605-g kept; r5c at 0%", GREEN_SOFT, GREEN),
+        ("ONE AUDIO ARBITER", "Realtime host plus queued TTS; each line hears only its own response", BLUE_SOFT, BLUE),
         ("ONE ARTIFACT WRITER", "Parallel lanes propose; the controller validates and commits", PURPLE_SOFT, PURPLE),
         ("EVIDENCE LEVELS STAY SEPARATE", "Source, served bytes, provider success and E2E are distinct", ORANGE_SOFT, ORANGE),
     ])
@@ -438,11 +445,11 @@ def draw_current(c: canvas.Canvas) -> None:
     # Surface layer.
     box(c, 50, 588, 245, 64,
         "sfdc24.com authenticated owner",
-        "Authenticated owner session with voice/text input, dialogue cards, design choices and live website/app prototype.",
+        "Guided meeting, host nudge and nudge lifecycle (#209, #216, #221) on site main 88b2419; voice, text and live prototype.",
         BLUE_SOFT, BLUE, "LIVE", 8.6, 6.2)
     box(c, 310, 588, 145, 64,
         "WhatsApp",
-        "Inbound observed; outbound API accepted. Delivery remains unverified.",
+        "Outbound accepted (HTTP 200); delivery and read remain unverified.",
         GREEN_SOFT, GREEN, "PARTIAL", 8.3, 6.05)
     box(c, 470, 588, 175, 64,
         "Zoom + Ubuntu presenter",
@@ -450,40 +457,40 @@ def draw_current(c: canvas.Canvas) -> None:
         PURPLE_SOFT, PURPLE, "HELD", 8.1, 5.95)
     box(c, 660, 588, 175, 64,
         "Salesforce operator observation",
-        "PlaygroundOrg showed 22 Leads; org binding and website facts/effects stay gated.",
+        "Writes paused (BLK-059). PlaygroundOrg showed 22 Leads; facts and effects stay gated.",
         ORANGE_SOFT, ORANGE, "PARTIAL", 8.1, 5.95)
 
     # Browser media and controller layer.
     box(c, 50, 475, 165, 73,
         "OpenAI Realtime",
-        "Direct browser WebRTC host for microphone, transcript, approved host speech and interruption.",
+        "Direct browser WebRTC host. Metadata echo on created and done probed live on gpt-realtime-2.1.",
         GREEN_SOFT, GREEN, "PARTIAL", 8.25, 6.0)
     box(c, 230, 475, 160, 73,
         "Browser audio arbiter",
-        "Owns one playback queue, captions, mute/listening state and audible-turn ordering.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.15, 6.0)
+        "One playback queue; a line hears only its own response; 20 s talk deadline, aborted on end (#221).",
+        BLUE_SOFT, BLUE, "LIVE", 8.15, 6.0)
     box(c, 410, 475, 278, 73,
         f"Studio Controller - production {CONTRACT['production_controller_label']}",
-        "FastAPI session authority: auth, topic route, questions, deadlines, revision fencing, typed events, command dedupe and provider coordination.",
+        "FastAPI session authority: auth, topic route, questions, deadlines, revision fencing, typed events and command dedupe. Cloud Run: 60 s request limit, concurrency 8, 1 CPU / 512Mi, builder claude-sonnet-5.",
         BLUE_SOFT, BLUE, "LIVE", 8.65, 6.15)
     box(c, 708, 475, 127, 73,
         "OpenAI TTS",
-        "Current Architect and Muse speech returns as bounded browser audio blobs.",
+        "Architect and Muse speech returns as bounded browser audio blobs.",
         ORANGE_SOFT, ORANGE, "PARTIAL", 8.0, 5.8)
 
     # Parallel work and single commit layer.
     box(c, 50, 352, 202, 76,
         "TALK / RECAP route",
-        "Topic routing can choose Claude, OpenAI or Gemini for bounded spoken text. Real Gemini owner-path proof is pending.",
+        "Topic routing can choose Claude, OpenAI or Gemini for bounded spoken text. Gemini owner-path proof pending; #270 prompts DARK.",
         PURPLE_SOFT, PURPLE, "PARTIAL", 8.3, 5.9)
     box(c, 267, 352, 178, 76,
         "Claude builder",
-        "Authoritative builder produces the only committable typed artifact proposal.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.3, 6.05)
+        "Only committable proposal. 26 Sep: one turn hit 504 at 60 s, then a 90 s lease 409'd five builds.",
+        BLUE_SOFT, BLUE, "PARTIAL", 8.3, 6.05)
     box(c, 460, 352, 176, 76,
         "Analyst + Muse",
-        "Bounded analysis and creative directions support the build; they do not commit artifacts.",
-        GREEN_SOFT, GREEN, "CURRENT", 8.3, 5.95)
+        "Bounded analysis and creative options; no commit. /analyze also hit 504 at 60 s.",
+        GREEN_SOFT, GREEN, "PARTIAL", 8.3, 5.95)
     box(c, 661, 352, 174, 76,
         "Ordered artifact + event ledger",
         "The controller alone validates and commits; this ledger records versions, events, snapshots and receipts.",
@@ -492,7 +499,7 @@ def draw_current(c: canvas.Canvas) -> None:
     # Durable plane.
     box(c, 50, 228, 220, 78,
         "Blackboard + Apps Script",
-        "Motherboard handoff, claims, review, audit, release evidence and exact row read-back. Not in the media hot path.",
+        "Handoff, claims, review, audit and exact row read-back; not in the media path. Review lane outage 25 Sep 22:38-23:30Z: Codex upstream 401; an app restart restored it.",
         ORANGE_SOFT, ORANGE, "CURRENT", 8.45, 6.05)
     box(c, 290, 228, 165, 78,
         "Pipedream + outbox",
@@ -504,21 +511,21 @@ def draw_current(c: canvas.Canvas) -> None:
         BLUE_SOFT, BLUE, "CURRENT", 8.25, 5.9)
     box(c, 670, 228, 165, 78,
         "GitHub + public site",
-        f"Site main {CONTRACT['site_commit_label']} exactly matches served homepage bytes; CI and rollback remain versioned.",
+        f"Site main {CONTRACT['site_commit_label']} is served: two cache-busted samples each of voice, canvas and index matched main.",
         PURPLE_SOFT, PURPLE, "LIVE", 8.15, 5.85)
 
     # Evidence band.
     box(c, 50, 91, 245, 111,
-        "Authenticated R5 rehearsal - proven",
-        "Session 200; /voice 200; eight TTS blobs reached the browser; /commands, /analyze and /inspire completed concurrently; landing page, demo form and Clean Signal direction became visible; session ended cleanly.",
+        "Owner live run 26 Sep 01:00-01:10Z - proven",
+        "Session, voice, TTS, concurrent analyze/inspire/commands, recap, rating and the summary-PDF handoff (HTTP 200; delivery unverified) worked; the owner: better than the last round. Defects: builder 504 at 60 s, then 409 x5 (about 3 min of architect silence); /analyze 504 at 60 s; canvas sparse after the first build.",
         GREEN_SOFT, GREEN, "PARTIAL", 8.5, 6.0)
     box(c, 310, 91, 245, 111,
-        "Gemini advisor containment - proven",
-        "Unaccepted R6 was returned to zero traffic; adv tag removed; former URL 404; R5 restored to 100%; zero-traffic service template normalized to advisor=false. No /advise call was observed in R6 logs.",
-        BLUE_SOFT, BLUE, "CURRENT", 8.5, 5.95)
+        "Fixes in review - not deployed",
+        "Blackboard #272: 40 s builder client, no retries, max_tokens 4000, a timeout ends as a completed command, analyst 40 s, build now when the analyst asks (Cursor GO 8a9349e; Codex pending). r5d = 0895605 + #272 only; tests 62/24/84 pass. Site #222 step text; #223 builder hears the question. The owner moves traffic.",
+        REVIEW_SOFT, ORANGE, "REVIEW", 8.5, 5.95)
     box(c, 570, 91, 265, 111,
-        "Release held pending acceptance",
-        "Microphone transcription, physical-speaker/human-heard audio, real Gemini TALK, five turns, two barge-ins, ten uninterrupted minutes, replay, Salesforce website facts/effects, delivered WhatsApp receipt, and live Zoom listen/speak/share.",
+        "Held pending gates",
+        "#260 client workspaces: Gate 1 round 12 NO-GO at ecee267 (redaction before strip/cap, fetch lease deadline, cancel at send, advisor lease atomicity); #261 stacked; workspaces off, registry unseeded. DARK in main: #269 charter + quote PDF (no prices), Gemini advisor, #270 prompts. Zoom, Salesforce writes, WhatsApp delivery, Converspan.",
         RED_SOFT, RED, "HELD", 8.5, 5.9)
 
     # Connector label chips are last so no box can cover or reframe them.
@@ -539,20 +546,20 @@ def draw_current(c: canvas.Canvas) -> None:
     top = tech_panel_header(
         c, rx, ry, rw, rh,
         "Current technologies and why",
-        "LIVE serving; CURRENT present; PARTIAL bounded proof; HELD disabled/frozen; TARGET future. Foundry excluded; Meta optional/off.",
+        "LIVE serving; CURRENT present; PARTIAL bounded proof; REVIEW open PR; DARK merged, off; HELD gated; TARGET future. Foundry excluded; Meta optional/off.",
     )
     rows = [
         ("GitHub Pages + typed browser UI", "Fast versioned delivery of dialogue, prototype and release surfaces.", "LIVE", PURPLE),
-        ("Cloud Run + Python/FastAPI", "Managed controller runtime, TLS, bounded API surface and rollback revisions.", "LIVE", BLUE),
-        ("OpenAI Realtime WebRTC", "Lowest-hop browser conversation path; full microphone/audio acceptance remains open.", "PARTIAL", GREEN),
+        ("Cloud Run + Python/FastAPI", "Managed runtime and rollback revisions; its 60 s request limit is the budget every lane must fit.", "LIVE", BLUE),
+        ("OpenAI Realtime WebRTC", "Lowest-hop browser conversation path; human-heard audio acceptance remains open.", "PARTIAL", GREEN),
         ("OpenAI TTS", "Female-capable natural speech for non-host lines through the browser queue.", "PARTIAL", ORANGE),
-        ("Claude builder", "Single authoritative artifact proposal keeps revisions deterministic and reversible.", "CURRENT", BLUE),
+        ("Claude builder", "Single authoritative proposal; the 26 Sep run exposed an unbounded client (#272 in review).", "PARTIAL", BLUE),
         ("Gemini topic route", "Fast alternative TALK/RECAP provider behind the same controller policy.", "PARTIAL", GREEN),
-        ("Gemini advisor", "Merged source is quarantined; hardening, exact-head review and a real dark probe are required.", "HELD", RED),
+        ("Gemini advisor", "Merged and off; hardening, exact-head review and a real dark probe are required.", "DARK", RED),
         ("GCS CAS + event ledger", "Persistent session state, revision fencing, replay and reconnect repair.", "CURRENT", BLUE),
         ("Blackboard + Apps Script", "Durable multi-agent command, evidence, handoff and audit plane.", "CURRENT", ORANGE),
         ("Pipedream + WhatsApp API", "Existing mobile bridge; delivery/read receipts require separate proof.", "PARTIAL", GREEN),
-        ("Salesforce APIs", "Business/customer-success engine; public facts and effects remain gated.", "HELD", ORANGE),
+        ("Salesforce APIs", "Business/customer-success engine; writes paused (BLK-059), facts and effects gated.", "HELD", ORANGE),
         ("Zoom RTMS + Ubuntu presenter", "Correct split between media observer and real meeting participant; not accepted live.", "HELD", PURPLE),
     ]
     for row in rows:
@@ -560,7 +567,7 @@ def draw_current(c: canvas.Canvas) -> None:
 
     footer(
         c, 1,
-        f"Tabloid digital brief | Source: ADR-20260925 on PR265 | Facts refreshed {CONTRACT['facts_refreshed_label']}",
+        f"Tabloid digital brief | Source: ADR-20260925 + 26 Sep addendum | Facts refreshed {CONTRACT['facts_refreshed_label']}",
         "Transport proof is not human-heard end-to-end acceptance.",
     )
     c.showPage()
@@ -570,205 +577,210 @@ def draw_future(c: canvas.Canvas) -> None:
     header(
         c,
         "SFDC24 + Blackboard - future governed minibus architecture",
-        "Blackboard stays the motherboard; SFDC24, Converspan and client minibuses inherit bounded capabilities and remain revocable",
+        f"Evidence-bound through {CONTRACT['facts_refreshed_label']}: how far each component has come, what promotes it, and who gates it",
         "FUTURE STATE",
     )
     principle_strip(c, [
-        ("MOTHERBOARD COMMAND", "Registry, leases, policies, budgets, evidence, pause and kill stay central", BLUE_SOFT, BLUE),
-        ("SEAMLESS PRESENT MOMENT", "Audio, dialogue cards and live prototype revisions share one turn timeline", GREEN_SOFT, GREEN),
-        ("MULTI-AGENT, SINGLE COMMIT", "Claude builds; Gemini advises; controller validates and commits", PURPLE_SOFT, PURPLE),
-        ("SFDC24 FIRST", "Converspan production waits for audio, isolation, durability and rollback gates", ORANGE_SOFT, ORANGE),
+        ("MOTHERBOARD COMMAND", "Leases, budgets, pause and kill stay central; the board and review gates run today", BLUE_SOFT, BLUE),
+        ("SEAMLESS PRESENT MOMENT", "One turn timeline; response ownership and the talk deadline shipped in #221", GREEN_SOFT, GREEN),
+        ("MULTI-AGENT, SINGLE COMMIT", "Claude builds; analyst and creative advise; the controller alone commits", PURPLE_SOFT, PURPLE),
+        ("SFDC24 FIRST", "Converspan waits for the measured launch gate; Nav waits for #260 and #261", ORANGE_SOFT, ORANGE),
     ])
     (_, _, _, _), (rx, ry, rw, rh) = panel_shell(c)
 
     section_label(c, 43, 655, "Blackboard control and audit plane", 218)
-    section_label(c, 43, 542, "SFDC24 service minibus", 150)
-    section_label(c, 43, 201, "Sibling client minibuses and commercial plane", 270)
+    section_label(c, 43, 575, "SFDC24 service minibus", 150)
+    section_label(c, 43, 297, "Sibling client minibuses and commercial plane", 270)
 
-    # Outer minibus boundary.
+    # Outer SFDC24 minibus boundary.
     c.setFillColor(colors.HexColor("#FAFCFF"))
     c.setStrokeColor(BLUE)
     c.setLineWidth(1.1)
-    c.roundRect(45, 225, 802, 310, 11, stroke=1, fill=1)
+    c.roundRect(45, 318, 802, 253, 11, stroke=1, fill=1)
 
     # Blackboard governs SFDC24 and each client minibus as siblings. The client
     # trunk stays outside the SFDC24 boundary so leases never appear to transit it.
-    arrow(c, 445, 580, 445, 535, BLUE, 1.5)
-    ortho_arrow(c, [(807, 535), (807, 560), (680, 560), (680, 580)],
+    arrow(c, 445, 594, 445, 571, BLUE, 1.5)
+    ortho_arrow(c, [(807, 571), (807, 585), (680, 585), (680, 594)],
                 GREEN, 1.0, True)
-    ortho_arrow(c, [(840, 610), (856, 610), (856, 197)],
+    ortho_arrow(c, [(840, 622), (856, 622), (856, 292), (145, 292), (145, 288)],
                 BLUE, 1.0, True)
-    for x in (145, 360, 568):
-        ortho_arrow(c, [(856, 197), (x, 197), (x, 191)],
-                    BLUE, 0.9, True)
-        ortho_arrow(c, [(x + 5, 191), (x + 5, 194), (852, 194), (856, 197)],
-                    GREEN, 0.75, True)
-    ortho_arrow(c, [(856, 197), (870, 197), (870, 625), (840, 625)],
-                GREEN, 0.9, True)
+    for x in (360, 568):
+        ortho_arrow(c, [(x, 292), (x, 288)], BLUE, 0.9, True)
 
-    # Browser media and channel ingress. Realtime is duplex; TTS always returns
-    # through the sole audio arbiter.
-    arrow(c, 135, 452, 160, 413, BLUE, 1.1)
-    arrow(c, 255, 413, 275, 452, GREEN, 1.25)
-    arrow(c, 275, 452, 255, 413, GREEN, 1.25)
-    arrow(c, 430, 413, 405, 452, ORANGE, 1.1)
-    arrow(c, 375, 452, 255, 413, ORANGE, 1.1)
-    arrow(c, 200, 375, 330, 375, BLUE, 1.25)
-    arrow(c, 135, 452, 400, 413, BLUE, 0.9)
-    arrow(c, 530, 452, 500, 413, GREEN, 1.0)
-    arrow(c, 710, 452, 555, 413, PURPLE, 1.0)
+    # Channel row <-> coordinator row. Realtime is duplex; TTS returns only
+    # through the sole audio arbiter; web commands and ordered SSE meet the
+    # controller.
+    arrow(c, 115, 503, 115, 476, GREEN, 1.25)
+    arrow(c, 130, 476, 130, 503, GREEN, 1.25)
+    arrow(c, 257, 503, 257, 476, ORANGE, 1.15)
+    arrow(c, 340, 476, 300, 503, ORANGE, 1.0)
+    arrow(c, 380, 503, 380, 476, BLUE, 1.25)
+    arrow(c, 395, 476, 395, 503, BLUE, 1.25)
+    arrow(c, 540, 503, 520, 476, GREEN, 1.0)
+    arrow(c, 300, 445, 315, 445, BLUE, 1.2)
+    arrow(c, 587, 445, 602, 445, BLUE, 1.2)
 
-    # Multi-agent work returns through the coordinator or the single writer.
-    arrow(c, 420, 337, 195, 304, PURPLE, 1.05)
-    arrow(c, 280, 304, 505, 337, GREEN, 1.0)
-    ortho_arrow(c, [(300, 304), (300, 323), (420, 323), (420, 304)],
-                BLUE, 1.35)
-    ortho_arrow(c, [(500, 270), (600, 270), (600, 320), (720, 320), (720, 337)],
-                BLUE, 1.25)
-    arrow(c, 550, 337, 670, 304, ORANGE, 1.15)
-    ortho_arrow(c, [(827, 375), (840, 375), (840, 526), (135, 526), (135, 514)],
-                BLUE, 1.0)
+    # Coordinator row <-> work row: bounded work goes out, advice returns to
+    # the controller, and only the committer writes one fenced revision.
+    arrow(c, 334, 414, 334, 387, PURPLE, 1.1)
+    arrow(c, 321, 387, 321, 414, GREEN, 1.0)
+    arrow(c, 340, 356, 355, 356, BLUE, 1.25)
+    arrow(c, 495, 387, 620, 414, BLUE, 1.25)
 
-    # Durable external effects return receipts through capability gateways.
-    ortho_arrow(c, [(590, 304), (590, 440), (560, 440), (560, 452)],
-                GREEN, 1.0)
-    ortho_arrow(c, [(760, 304), (835, 304), (835, 430), (710, 430), (710, 452)],
+    # Durable effects return receipts through the capability gateways.
+    ortho_arrow(c, [(836, 350), (842, 350), (842, 488), (726, 488), (726, 503)],
                 PURPLE, 1.0)
-
-    # SFDC24 and client minibuses exchange only governed commercial facts with
-    # Salesforce; no model receives direct CRM authority.
-    ortho_arrow(c, [(760, 240), (840, 240), (840, 220), (755, 220), (755, 191)],
-                ORANGE, 1.1)
-    ortho_arrow(c, [(780, 191), (780, 215), (830, 215), (830, 247), (790, 247), (790, 240)],
+    ortho_arrow(c, [(836, 370), (846, 370), (846, 494), (545, 494), (545, 503)],
                 GREEN, 1.0)
-    for x in (145, 360, 568):
-        arrow(c, x, 91, x, 82, ORANGE, 0.9)
-        arrow(c, x, 77, x, 91, GREEN, 0.9)
-    ortho_arrow(c, [(145, 82), (755, 82), (755, 91)], ORANGE, 1.0)
-    ortho_arrow(c, [(775, 91), (775, 77), (145, 77)], GREEN, 1.0)
+
+    # Governed commercial facts only; no model receives CRM authority.
+    arrow(c, 760, 325, 760, 288, ORANGE, 1.1)
+    c.saveState()
+    c.setStrokeColor(ORANGE)
+    c.setLineWidth(1.0)
+    for x in (360, 568):
+        c.line(x, 205, x, 199)
+    c.restoreState()
+    ortho_arrow(c, [(145, 205), (145, 199), (755, 199), (755, 205)],
+                ORANGE, 1.0)
 
     # Blackboard motherboard.
-    box(c, 50, 580, 790, 70,
+    box(c, 50, 594, 790, 58,
         "Blackboard motherboard - control, policy, audit and lifecycle authority",
-        "Registry | signed capability/config leases | routing | budgets | release receipts | health/usage evidence | pause, quarantine, credential epoch, kill, retirement and reconciliation. Customer content stays in each tenant.",
-        BLUE_SOFT, BLUE, "TARGET", 9.1, 6.35)
+        "Registry | signed capability/config leases | routing | budgets | release receipts | health/usage evidence | pause, quarantine, kill and retirement. Now: board, claims, exact-head review receipts and row read-back run; registry, leases and kill switch are TARGET.",
+        BLUE_SOFT, BLUE, None, 9.1, 6.35)
+    # Two body lines fill this wide box, so its status sits on the title line.
+    pill(c, 50 + 790 - 62, 594 + 58 - 25, "PARTIAL")
 
-    # Channel and explicit media-provider row inside SFDC24.
-    box(c, 65, 452, 135, 62,
-        "Web / mobile",
-        "Scoped sign-in, dialogue, captions and live prototype.",
-        BLUE_SOFT, BLUE, "TARGET", 8.1)
-    box(c, 210, 452, 130, 62,
+    # Channel row inside SFDC24.
+    box(c, 60, 503, 130, 62,
         "OpenAI Realtime",
-        "Direct duplex WebRTC: mic, host speech and barge-in.",
-        GREEN_SOFT, GREEN, "TARGET", 8.0)
-    box(c, 350, 452, 110, 62,
+        "Now: live host over WebRTC; human-heard acceptance open.",
+        GREEN_SOFT, GREEN, "PARTIAL", 8.0)
+    box(c, 202, 503, 110, 62,
         "OpenAI TTS",
-        "Approved secondary-voice blobs only.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.0)
-    box(c, 470, 452, 120, 62,
+        "Now: Architect and Muse blobs, one queue.",
+        ORANGE_SOFT, ORANGE, "PARTIAL", 8.0)
+    box(c, 324, 503, 150, 62,
+        "Web / mobile + email OTP",
+        "Now: invited-operator code sign-in; public visitors off.",
+        BLUE_SOFT, BLUE, "PARTIAL", 8.0)
+    box(c, 486, 503, 118, 62,
         "WhatsApp",
-        "Signed/deduped async intake, status and approvals.",
-        GREEN_SOFT, GREEN, "TARGET", 8.0)
-    box(c, 600, 452, 227, 62,
+        "Now: outbound accepted; delivery unverified.",
+        GREEN_SOFT, GREEN, "PARTIAL", 8.0)
+    box(c, 616, 503, 220, 62,
         "Zoom RTMS + Ubuntu presenter",
-        "Consented events; on-demand speak, present, share and teardown with receipts.",
-        PURPLE_SOFT, PURPLE, "TARGET", 8.1)
+        "Now: source only; presenter VM stopped; no live meeting acceptance.",
+        PURPLE_SOFT, PURPLE, "HELD", 8.1)
 
     # Coordinator row.
-    box(c, 65, 337, 225, 76,
+    box(c, 60, 414, 240, 62,
         "One browser audio arbiter",
-        "One owner controls playback, TTS queue, interrupt, cancel, captions and consent state.",
-        GREEN_SOFT, GREEN, "TARGET", 8.4, 5.95)
-    box(c, 330, 337, 255, 76,
+        "Now: one queue; response-id ownership and a 20 s talk deadline (#221).",
+        GREEN_SOFT, GREEN, "LIVE", 8.3)
+    box(c, 315, 414, 272, 62,
         "Studio Controller turn and task arbiter",
-        "Trusted identity/reference, immutable snapshot, deadlines, cancellation, fallbacks, revision fencing and event order.",
-        BLUE_SOFT, BLUE, "TARGET", 8.55, 6.0)
-    box(c, 615, 337, 212, 76,
+        "Now: r5b serves 100%; lanes must fit Cloud Run's 60 s. r5d bounds the builder (#272).",
+        BLUE_SOFT, BLUE, "PARTIAL", 8.4)
+    box(c, 602, 414, 234, 62,
         "Session, event + CAS ledger",
-        "Durable commands, fenced revisions, replay receipts, unknown-outcome holds and snapshot repair.",
-        GRAY_SOFT, INK, "TARGET", 8.3, 5.9)
+        "Now: GCS CAS, fenced revisions, replay. Terminal outcome recovery is in #260.",
+        GRAY_SOFT, INK, "PARTIAL", 8.2)
 
     # Work/effect row.
-    box(c, 65, 240, 260, 64,
+    box(c, 60, 325, 280, 62,
         "Concurrent bounded work",
-        "Claude build goes to the writer; Gemini/creative advice returns to the controller.",
-        PURPLE_SOFT, PURPLE, "TARGET", 8.35, 5.85)
-    box(c, 340, 240, 160, 64,
+        "Now: Claude builder, analyst and creative run in parallel; Gemini advisor DARK.",
+        PURPLE_SOFT, PURPLE, "PARTIAL", 8.3)
+    box(c, 355, 325, 150, 62,
         "Single artifact committer",
-        "Validates one proposal; writes one fenced revision.",
-        BLUE_SOFT, BLUE, "TARGET", 8.15, 5.8)
-    box(c, 515, 240, 312, 64,
+        "Now: validates one proposal; one fenced revision.",
+        BLUE_SOFT, BLUE, "LIVE", 8.1)
+    box(c, 520, 325, 316, 62,
         "Durable outbox + capability gateways",
-        "Authorized, idempotent, read-back and reconciled WhatsApp, Zoom, Git, payment and Salesforce effects.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.25, 5.75)
+        "Authorized, idempotent, read-back WhatsApp, Zoom, Git, payment and Salesforce effects. Now: not built.",
+        ORANGE_SOFT, ORANGE, "TARGET", 8.2)
 
     # Client seeds and commercial engine.
-    box(c, 50, 91, 190, 100,
+    box(c, 50, 205, 190, 83,
         "Converspan minibus",
-        "Web/logo/app design on the governed core. Production stays frozen until SFDC24 foundation gates pass.",
+        "Web/logo/app design on the governed core. Production stays frozen until the measured launch gate passes.",
         PURPLE_SOFT, PURPLE, CONTRACT["converspan_production"], 8.45, 6.0)
-    box(c, 255, 91, 210, 100,
+    box(c, 255, 205, 210, 83,
         "Nav / steelworkson.ca minibus",
-        "Nav signs in directly for sites/redesigns. Separate tenant identity, state, keys, limits and audit.",
-        GREEN_SOFT, GREEN, "TARGET", 8.45, 5.95)
-    box(c, 480, 91, 175, 100,
+        "Now: #260 Gate 1 round 12 NO-GO (ecee267); #261 stacked; r5c operator slot at 0%; workspaces off.",
+        GREEN_SOFT, GREEN, "HELD", 8.45, 5.95)
+    box(c, 480, 205, 175, 83,
         "Additional client minibuses",
         "Same seed; reconfigurable, throttled, paused, upgraded or retired by Blackboard.",
         BLUE_SOFT, BLUE, "TARGET", 8.35, 5.9)
-    box(c, 670, 91, 170, 100,
+    box(c, 670, 205, 170, 83,
         "Salesforce commercial engine",
-        "Campaign, lead, opportunity, tokenized payment reference, entitlement, case, success and renewal.",
-        ORANGE_SOFT, ORANGE, "TARGET", 8.3, 5.85)
+        "Now: charter + quote PDF DARK (#269, no prices); writes paused (BLK-059).",
+        ORANGE_SOFT, ORANGE, "DARK", 8.3, 5.85)
 
-    connector_label(c, 445, 558, "SFDC24 lease + config", BLUE)
-    connector_label(c, 746, 560, "health / usage / evidence - no content", GREEN)
-    connector_label(c, 260, 433, "duplex WebRTC", GREEN)
-    connector_label(c, 390, 433, "approved TTS request + blob", ORANGE)
-    connector_label(c, 510, 526, "ordered SSE + snapshots + receipts", BLUE)
-    connector_label(c, 340, 326, "Claude proposal to writer", BLUE)
-    connector_label(c, 500, 315, "advice returns to controller", GREEN)
-    connector_label(c, 670, 326, "one fenced revision", BLUE)
-    connector_label(c, 545, 440, "send + receipt", GREEN)
-    connector_label(c, 735, 430, "speak / share / teardown", PURPLE)
-    connector_label(c, 765, 220, "SFDC24 events / authorized facts", ORANGE)
-    connector_label(c, 455, 82, "client events / authorized facts + entitlements", ORANGE)
-    connector_label(c, 690, 197, "independent leases; evidence returns", BLUE)
+    # Proof and sequence band, in page 1's style.
+    box(c, 50, 80, 255, 110,
+        "Proven toward the future",
+        "Direct realtime path: guided meeting, host nudge and nudge lifecycle (#209, #216, #221) served on site main 88b2419. One audio arbiter: each realtime line binds by its metadata and ignores other responses; Realtime echoes that metadata (probed live 26 Sep). Single committer: builder, analyst and creative lanes ran concurrently in the owner's 26 Sep run. Exact-head gates held two bad heads and passed the repairs.",
+        GREEN_SOFT, GREEN, "PARTIAL", 8.5, 5.95)
+    box(c, 318, 80, 262, 110,
+        "Next promotions, in order",
+        "1 r5d = 0895605 + #272 only (Codex GO; the owner moves traffic). 2 Owner rehearsal closes G1: 10 min, 5 turns, 2 barge-ins, 3 revisions. 3 #260 Gate 1, then #261 durable publication. 4 #269 repairs, then CX1 charter only (PDF and prices off). 5 CX2 priced quotes after the owner's price list. 6 Nav pilot. 7 Converspan onboarding after its gate. Traffic is always a separate GO.",
+        BLUE_SOFT, BLUE, "TARGET", 8.5, 5.95)
+    box(c, 593, 80, 247, 110,
+        "Converspan launch gate",
+        "Measured on production SFDC24 first: a 10 min owner session with 5 turns, 2 barge-ins and 3 revisions replayed from the ledger; zero 504s and zero 409 lease lockouts across 24 h of real sessions; #260 and #261 exact-head GO with cross-tenant, revocation and crash-replay negatives; served bytes and image digest match the reviewed commit; a rollback drill read back; a 24/48 h canary soak.",
+        RED_SOFT, RED, "HELD", 8.5, 5.9)
 
-    # Future stack panel.
+    connector_label(c, 445, 583, "SFDC24 lease + config", BLUE)
+    connector_label(c, 746, 585, "health / usage / evidence - no content", GREEN)
+    connector_label(c, 470, 292, "independent leases; evidence returns", BLUE)
+    connector_label(c, 123, 489, "duplex WebRTC", GREEN)
+    connector_label(c, 257, 489, "TTS blob", ORANGE)
+    connector_label(c, 322, 489, "TTS request", ORANGE)
+    connector_label(c, 440, 489, "commands / SSE", BLUE)
+    connector_label(c, 270, 400, "bounded work", PURPLE)
+    connector_label(c, 392, 400, "advice returns", GREEN)
+    connector_label(c, 560, 400, "one fenced revision", BLUE)
+    connector_label(c, 790, 482, "speak / share / teardown", PURPLE)
+    connector_label(c, 650, 494, "send + receipt", GREEN)
+    connector_label(c, 760, 306, "SFDC24 authorized facts", ORANGE)
+    connector_label(c, 455, 199, "client facts + entitlements", ORANGE)
+
+    # Promotion ledger: every component, what promotes it, and who gates it.
     top = tech_panel_header(
         c, rx, ry, rw, rh,
-        "Selected future stack and why",
-        "TARGET means selected future architecture, not deployed or accepted. Choices favor speed, safe autonomy and reversibility.",
+        "Promotion ledger",
+        "Status now, the test that promotes it, and who gates it. TARGET is selected design, not a deployment claim.",
+        60,
     )
     rows = [
-        ("Email OTP + scoped session tokens", "Target passwordless entry; OIDC-compatible boundary when external identity is selected.", "TARGET", GREEN),
-        ("WebRTC + OpenAI Realtime", "Direct low-hop host audio, captions and barge-in; short-lived server-minted access.", "TARGET", GREEN),
-        ("OpenAI TTS + one audio queue", "Welcoming secondary voices without competing playback authorities.", "TARGET", ORANGE),
-        ("Cloud Run + FastAPI controller", "Managed TLS/scaling with deterministic session and commit authority.", "TARGET", BLUE),
-        ("Typed JSON + DOM/SVG", "Fast, crisp and accessible live prototypes; no model HTML, script or eval.", "TARGET", PURPLE),
-        ("Claude builder + Gemini analyst", "Parallel specialized value while only one validated proposal can commit.", "TARGET", PURPLE),
-        ("GCS CAS + durable outbox", "Durable replay, revision control, effects, restart recovery and reconciliation.", "TARGET", BLUE),
-        ("Blackboard signed leases", "Central capability ceiling, budgets, rewiring, revocation and sub-60s connected kill target.", "TARGET", BLUE),
-        ("WhatsApp + Pipedream", "Low-friction mobile status/intake outside the continuous-audio path.", "TARGET", GREEN),
-        ("Zoom RTMS + Ubuntu presenter", "Backend observer plus on-demand participant for speech, presentation and screen share.", "TARGET", PURPLE),
-        ("Salesforce as CRM/success", "One attribution and customer-success spine across domains and client minibuses.", "TARGET", ORANGE),
-        ("Payment-provider boundary (TBD)", "Provider owns checkout/card data; Salesforce stores tokenized commercial references only.", "TARGET", ORANGE),
+        ("Blackboard motherboard", "Promote when a signed expiring lease pauses and kills a zero-traffic minibus within 60 s. Gate: Codex + owner.", "PARTIAL", BLUE),
+        ("OpenAI Realtime", "Promote on G1: human-heard 10 min, 5 turns, 2 barge-ins. Gate: owner rehearsal + Codex receipt.", "PARTIAL", GREEN),
+        ("OpenAI TTS", "Promote on G1 with no overlapping voices and no unexplained silence. Gate: owner rehearsal.", "PARTIAL", ORANGE),
+        ("Web / mobile + email OTP", "Promote when public visitors sign in by code under a measured cap. Gate: owner switch.", "PARTIAL", BLUE),
+        ("WhatsApp", "Promote when one message yields one delivered status with a destination receipt. Gate: G8.", "PARTIAL", GREEN),
+        ("Zoom RTMS + Ubuntu presenter", "Promote when a consented meeting hears, speaks, shares and tears down. Gate: owner entitlement + G8.", "HELD", PURPLE),
+        ("One browser audio arbiter", "Promote on G1 barge-in evidence; response ownership shipped in #221. Gate: owner rehearsal.", "LIVE", GREEN),
+        ("Studio Controller turn and task arbiter", "Promote r5d on zero 504s and zero 409 lockouts in real sessions. Gate: Codex GO on #272; owner traffic.", "PARTIAL", BLUE),
+        ("Session, event + CAS ledger", "Promote when a restart yields one outcome and one receipt. Gate: Codex Gate 1 on #260.", "PARTIAL", INK),
+        ("Concurrent bounded work", "Promote when the Gemini advisor dark-probes with no artifact authority. Gate: Codex exact-head.", "PARTIAL", PURPLE),
+        ("Single artifact committer", "Promote when the final artifact rebuilds from the ledger after a restart. Gate: G1 replay receipt.", "LIVE", BLUE),
+        ("Durable outbox + capability gateways", "Promote when a sandbox effect dispatches once, reads back and survives restart. Gate: G7 + Codex.", "TARGET", ORANGE),
+        ("Converspan minibus", "Promote only when the launch gate passes in full. Gate: non-waivable.", CONTRACT["converspan_production"], PURPLE),
+        ("Nav / steelworkson.ca minibus", "Promote after #260/#261 GO and zero-traffic cross-tenant negatives, then a pilot. Gate: Codex + owner.", "HELD", GREEN),
+        ("Additional client minibuses", "Promote after the Converspan canary soaks 24/48 h with a rollback drill. Gate: owner.", "TARGET", BLUE),
+        ("Salesforce commercial engine", "Promote read-only org-bound facts (G6), then sandbox writes (G7); priced quotes after CX2. Gate: owner.", "DARK", ORANGE),
     ]
     for row in rows:
-        top = tech_row(c, rx + 15, top, rw - 30, *row, row_h=38)
-
-    c.setFillColor(RED_SOFT)
-    c.roundRect(rx + 15, ry + 10, rw - 30, 65, 8, stroke=0, fill=1)
-    paragraph(c, "Non-waivable launch gate", rx + 27, ry + 62, rw - 54,
-              7.4, 8.4, RED, True)
-    paragraph(c,
-              "No Converspan production onboarding until SFDC24 proves continuous audio, artifact replay, tenant isolation, durable effects, source-to-runtime identity and rollback.",
-              rx + 27, ry + 45, rw - 54, 7.0, 8.0, INK)
+        top = tech_row(c, rx + 15, top, rw - 30, *row, row_h=34)
 
     footer(
         c, 2,
-        "Tabloid digital brief | Source: ADR-20260925 on PR265 | Review inputs: Claude, Gemini, Codex and Grok",
+        "Tabloid digital brief | Source: ADR-20260925 + 26 Sep addendum | Review inputs: Claude, Cursor, Gemini, Codex and Grok",
         "TARGET is selected architecture, not a deployment or acceptance claim.",
     )
     c.showPage()
@@ -783,7 +795,7 @@ def build() -> Path:
         str(OUT), pagesize=(PAGE_W, PAGE_H), pageCompression=1, invariant=1
     )
     c.setTitle("SFDC24 and Blackboard current and future architecture")
-    c.setAuthor("Codex with Claude, Gemini and Grok review input")
+    c.setAuthor("Codex and Claude Code with Cursor, Gemini and Grok review input")
     c.setSubject("Two-page evidence-bound architecture for realtime audio, live prototyping, Salesforce, WhatsApp, Zoom and governed client minibuses; ADR contract sha256:" + CONTRACT_SHA256)
     c.setKeywords("SFDC24, Blackboard, Converspan, minibus, OpenAI Realtime, Claude, Gemini, Salesforce, WhatsApp, Zoom, ADR-contract-" + CONTRACT_SHA256)
     draw_current(c)

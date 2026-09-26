@@ -8,6 +8,8 @@ on:
       - "docs/ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
   push:
@@ -18,6 +20,8 @@ on:
       - "docs/ADR-20260925-BLACKBOARD-MINIBUS-MULTIAGENT-CONTROL-PLANE.md"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
       - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+      - "docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
       - "tools/build_sfdc24_architecture_pdf.py"
       - "tools/requirements-architecture-pdf.txt"
 
@@ -72,12 +76,14 @@ jobs:
           else:
               raise SystemExit("contract-contained phrases satisfied ADR prose anchors")
           PY
-      - name: Validate the ADR contract and rebuild the artifact twice, byte for byte
+      - name: The 2026-09-25 edition stays pinned as a historical artifact
+        run: sha256sum --check docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256
+      - name: Validate the ADR contract and rebuild the current edition twice, byte for byte
         shell: bash
         run: |
           set -euo pipefail
-          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf"
-          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260925.pdf.sha256"
+          artifact="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf"
+          attestation="docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf.sha256"
           sha256sum --check "$attestation"
           cp "$artifact" /tmp/committed.pdf
           python tools/build_sfdc24_architecture_pdf.py

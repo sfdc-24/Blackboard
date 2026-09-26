@@ -22,13 +22,13 @@ published artifact.
 ```json
 {
   "schema_version": 1,
-  "facts_refreshed_label": "25 Sep 2026 12:56 UTC",
-  "facts_refreshed_iso": "2026-09-25T12:56Z",
-  "production_controller_revision": "sfdc24-studio-controller-r5-0895605-g",
-  "production_controller_label": "R5 0895605",
+  "facts_refreshed_label": "26 Sep 2026 02:30 UTC",
+  "facts_refreshed_iso": "2026-09-26T02:30Z",
+  "production_controller_revision": "sfdc24-studio-controller-r5b-0895605",
+  "production_controller_label": "R5b 0895605",
   "production_traffic_percent": 100,
-  "site_commit": "3d9b4a1b8ed1cdb34a794fc134a19820cc810d04",
-  "site_commit_label": "3d9b4a1",
+  "site_commit": "88b2419772d0e9cea0669ea6e5e962ac0beb6fe2",
+  "site_commit_label": "88b2419",
   "advisor_enabled": false,
   "converspan_production": "HELD",
   "required_adr_phrases": [
@@ -40,13 +40,17 @@ published artifact.
     "The Studio Controller is the session coordinator",
     "Salesforce is the commercial and customer-success system of record.",
     "Foundry is excluded from this architecture.",
-    "Converspan production implementation, deployment, and client onboarding"
+    "Converspan production implementation, deployment, and client onboarding",
+    "Addendum 2026-09-26",
+    "sfdc24-studio-controller-r5b-0895605",
+    "88b2419772d0e9cea0669ea6e5e962ac0beb6fe2",
+    "Every future component carries a present status, its evidence, the test that promotes it, and its gate."
   ],
   "required_pdf_phrases": [
-    "R5 serves 100%",
+    "R5b serves 100%",
     "OpenAI Realtime",
     "OpenAI TTS",
-    "Studio Controller - production R5 0895605",
+    "Studio Controller - production R5b 0895605",
     "Claude builder",
     "Gemini advisor",
     "Blackboard motherboard",
@@ -54,7 +58,11 @@ published artifact.
     "Salesforce commercial engine",
     "WhatsApp",
     "Zoom RTMS + Ubuntu presenter",
-    "Foundry excluded"
+    "Foundry excluded",
+    "Proven toward the future",
+    "Next promotions, in order",
+    "Converspan launch gate",
+    "Promotion ledger"
   ]
 }
 ```
@@ -869,3 +877,68 @@ stopping safe, non-conflicting work on another path.
   and current versus proposed capabilities labelled accurately.
 - Google Drive publication and destination read-back for the revised PDF.
 - Blackboard row linking each release receipt and final artifact digest.
+
+## Addendum 2026-09-26 - evidence refresh and future-state promotion map
+
+Refreshed through 2026-09-26T02:30Z. This addendum updates the snapshot contract
+above and the architecture PDF (`docs/SFDC24-BLACKBOARD-ARCHITECTURE-20260926.pdf`);
+the 2026-09-25 PDF stays committed as a historical artifact. The decisions above
+are unchanged.
+
+- **Production controller:** Cloud Run revision
+  `sfdc24-studio-controller-r5b-0895605` (the accepted `0895605` image with one
+  more invited operator) serves 100%; `sfdc24-studio-controller-r5-0895605-g` is
+  the rollback; r5c (one more operator) is deployed at 0%. Request timeout 60 s,
+  concurrency 8, 1 CPU / 512Mi, builder model claude-sonnet-5.
+- **Public site:** `main` `88b2419772d0e9cea0669ea6e5e962ac0beb6fe2` is served on
+  www.sfdc24.com; two cache-busted samples each of `assets/voice-conversation.js`,
+  `assets/prototype-canvas.js` and `index.html` matched main. It carries the
+  guided meeting (#209), the host nudge (#216, merged on a Codex GO at `e5a9ae3`)
+  and the nudge lifecycle repair (#221, Codex GO at `7a2685a`): a cleared nudge
+  retracts its question, each talk attempt has a 20 s deadline and is aborted on
+  end and pagehide, and a realtime line binds by the `vc` id in its response
+  metadata and ignores every other response. OpenAI Realtime echoing
+  `response.metadata` on `response.created` and `response.done` was probed live
+  on gpt-realtime-2.1.
+- **Owner live run, 2026-09-26 01:00:53Z-01:10:11Z (PARTIAL; the owner judged it
+  better than the last round):** session, voice, TTS, concurrent
+  analyze/inspire/commands, recap, rating and the summary-PDF handoff (HTTP 200;
+  delivery unverified) worked. Defects: one builder POST reached Cloud Run's 60 s
+  limit (504), after which the 90 s inflight lease returned 409 to five builds
+  (about three minutes of architect silence); `/analyze` also returned 504 at
+  60 s; the canvas stayed sparse after the first build because the builder held
+  changes back for questions the analyst lane discards.
+- **In review, not deployed:** Blackboard #272 bounds the builder (40 s client
+  timeout, no retries, max_tokens 4000, a timeout completes the command with a
+  problem, analyst 40 s, build now when the analyst asks); Cursor GO at
+  `8a9349e`, Codex pending. The proposed r5d image is `0895605` plus only #272
+  (clean cherry-pick; claude_worker 62, analyst 24 and controller 84 tests pass).
+  The owner moves traffic. Site #222 (step descriptions and image captions) and
+  #223 (the builder hears the question the visitor answered) are in review.
+- **Held:** #260 client workspaces is Gate 1 NO-GO at `ecee267` (round 12:
+  redaction after lossy strip/cap, fetch lease deadline and expired renew,
+  check-then-send cancel race, advisor lease/cap atomicity); Codex accepted its
+  outcome durability and terminalisation work. #261 is stacked;
+  `STUDIO_CLIENT_WORKSPACES` is off and the registry is unseeded. DARK in `main`:
+  #269 charter lane and quote PDF (`STUDIO_ENABLE_CHARTER=false`, empty price
+  table; an unpriced quote is not acceptable), the Gemini advisor (off) and the
+  #270 talk prompts. Zoom, Salesforce writes (BLK-059), WhatsApp delivery and
+  Converspan production remain held.
+- **Review-lane availability:** from 2026-09-25 22:38Z to 23:30Z every Codex turn
+  returned 401 from its upstream ChatGPT service-account credential; restarting
+  the Codex app restored it, and the production OpenAI key was unaffected.
+  Exact-head gates must hold when a review lane goes dark; nobody bypasses them.
+
+Every future component carries a present status, its evidence, the test that promotes it, and its gate.
+The page-2 promotion ledger is the short form. The promotion order follows
+`CODEX-R7-PLAN-AMEND-20260925T1854Z`: the r5d builder hotfix; the owner
+rehearsal closing G1; #260 Gate 1, then #261; #269 repairs, then CX1 (charter
+only, PDF and price effects off), then CX2 (quotes after the owner's price list);
+the Nav pilot; Converspan onboarding. Each traffic move remains a separate GO.
+
+Converspan launch gate, measured on production SFDC24: a ten-minute owner
+session with five turns, two barge-ins and three visible revisions replayed from
+the ledger; zero 504s and zero 409 lease lockouts across 24 hours of real
+sessions; exact-head GO on #260 and #261 with cross-tenant, revocation and
+crash-replay negative controls; served bytes and image digest matching the
+reviewed commit; a rollback drill with read-back; and a 24/48-hour canary soak.
