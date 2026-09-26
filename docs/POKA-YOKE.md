@@ -300,11 +300,14 @@ correction pointed to `6ce8476`. That cost a full review round.
 
 ## L-103 — A mutation run must heal a mutant it left behind
 
-**Incident.** The #260 harness rewrites product files in place and restores
-them in a `finally`. On `6081563`, where the harness has 117 mutants, the host
-killed a full run for memory. The kill skipped the `finally` and left a live
-mutant in the worktree. It was found only because `git status` ran before the
-next step; a commit from that tree would have shipped it.
+**Incident.** `scripts/mutate_studio_clients.py` on #260 rewrites product
+files in place and restores the originals from memory in a `finally`. On
+`6081563`, where it has 117 mutants, the host killed the full harness for
+memory. Board row `CCC-PR260-6081563-HARNESS-PARTIAL-20260925T2300Z` records
+that the worktree was restored and clean, and the interrupted mutant never
+reached the remote. That was luck, not design. A host kill does not run a
+`finally`, so a kill landing between the rewrite and the restore leaves a live
+mutant, and nothing on the machine would undo it.
 
 **Naive rule.** "Run `git status` after a harness run."
 
@@ -400,10 +403,10 @@ before it is trusted. Nothing checked in enforces this.
 
 ## L-108 — An additive merge join must keep the closer git factored out
 
-**Incident.** On the #222 note at 03:11Z, joining two sides that both appended
-tests to the same spec produced a file that did not parse. Git had factored
-the shared `});` out of the conflict block, so the joined "ours" block lost its
-closing line, and it had to be restored by hand.
+**Incident.** Rebasing site #222 onto #223 (`b2f8ac9`, review request at
+02:45Z; note at 03:11Z) met an additive conflict: both sides appended tests to
+the same spec. Joining them needed one test closer restored by hand, which
+the note records. The GO confirms the new test sits after #223's closer.
 
 **Naive rule.** "Check syntax after resolving."
 
@@ -436,9 +439,11 @@ matters.
 ## L-110 — A governing architecture artifact is not a live release dashboard
 
 **Incident.** The reviewed 2026-09-26 edition (#274, merged 03:41:46Z) was
-followed at once by #276, an edition built to chase verdicts and traffic.
-Every head was stale by the time it was reviewed, and review rounds went to
-provenance while release work waited.
+followed at once by #276, a second edition built to chase verdicts and
+traffic. Its review rounds went to provenance: Cursor's NO-GO on `eb21164`
+found the verdict script's `R5D` filter, notes that were not in the cited
+rows, and the page badge. Those rounds spent reviewer time while release work
+waited. Codex then ruled that editions change only for material reasons.
 
 **Naive rule.** "Refresh the PDF less often."
 
