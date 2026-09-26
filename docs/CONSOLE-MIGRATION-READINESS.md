@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-09-26** by [`EXPRESS.md`](EXPRESS.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
+
 # Running SFDC24 off the Claude console instead of the laptop
 
 **Measured 2026-09-22 on the laptop by `claude-code-cli`.** Evidence levels:

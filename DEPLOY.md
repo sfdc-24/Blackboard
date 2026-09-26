@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it describes the 2026-08-25 manual bootstrap of the first bus; rotating the bus secret is a closed decision. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](docs/EXPRESS.md).
+
 # SFDC24 Blackboard Bus — deployment steps
 
 Manual deployment, per Mr. Salam's choice (2026-08-25). The secret is

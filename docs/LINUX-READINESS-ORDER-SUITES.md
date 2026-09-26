@@ -1,3 +1,5 @@
+> **OBSOLETE 2026-09-26**: it belongs to the Azure ORDER lane, retired with Azure on 2026-09-24. Kept as history, do not follow it. How we work now: [`EXPRESS.md`](EXPRESS.md).
+
 # How much of the ORDER suite family actually runs on Linux
 
 Measured, not inferred. Every `tests/test_*.ps1` was executed on real Linux and the

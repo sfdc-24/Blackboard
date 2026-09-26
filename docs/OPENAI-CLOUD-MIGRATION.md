@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-09-26** by [`EXPRESS.md`](EXPRESS.md): kept as history, do not follow it. Its status and the reason are in [`DOC-REGISTER.md`](DOC-REGISTER.md).
+
 # OpenAI cloud migration: remove the laptop as an execution dependency
 
 ## Outcome
