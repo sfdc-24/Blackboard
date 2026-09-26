@@ -22,10 +22,12 @@ Input characters, nodes, depth, label length, images and parse time are capped.
 """
 from __future__ import annotations
 
+import errno
 import ipaddress
 import json
 import logging
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -165,13 +167,16 @@ _RESOLVE_OUTPUT = 65536
 def system_resolver(host: str, cancel: "threading.Event | None" = None, seconds: float | None = None,
                     deadline: "WorkDeadline | None" = None) -> list:
     limit = RESOLVE_SECONDS if seconds is None else float(seconds)
+    # A load already stopped launches no lookup child at all (Codex Gate 1 B3
+    # on cfdebac); one stopped after the launch is killed within a poll.
+    _stopped(cancel, deadline)
     child = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RESOLVE_CHILD, str(host)],
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     limit_at = time.monotonic() + limit
     try:
         while child.poll() is None:
-            if (cancel is not None and cancel.is_set()) or time.monotonic() >= limit_at \
-                    or (deadline is not None and deadline.passed()):
+            _stopped(cancel, deadline)
+            if time.monotonic() >= limit_at:
                 raise OSError("the name did not resolve in time")
             time.sleep(0.02)
         out = child.stdout.read(_RESOLVE_OUTPUT + 1)
@@ -255,6 +260,175 @@ def _stopped(cancel, deadline=None) -> None:
         raise FetchCancelled("the load's lease ran out")
 
 
+POLL_SECONDS = 0.02            # how soon a stopped load's connect, read or live socket ends
+_CONNECTING = {0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY,
+               getattr(errno, "WSAEWOULDBLOCK", 10035), getattr(errno, "WSAEINPROGRESS", 10036),
+               getattr(errno, "WSAEALREADY", 10037), getattr(errno, "WSAEINVAL", 10022)}
+
+
+class _Interrupter:
+    """Closes a load's live sockets the moment it is stopped (Codex Gate 1 B3
+    on cfdebac): an operation that began just before the stop - a connect, a
+    TLS handshake, a write or a read - fails at once instead of running on."""
+
+    def __init__(self, halted):
+        self.halted = halted                 # () -> bool: cancelled, or the deadline passed
+        self.sockets: list = []
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.fired = False
+        self.thread = threading.Thread(target=self._watch, name="studio-fetch-interrupt", daemon=True)
+        self.thread.start()
+
+    def register(self, sock) -> None:
+        with self.lock:
+            if self.fired:
+                _close_socket(sock)
+                return
+            self.sockets.append(sock)
+
+    def _watch(self) -> None:
+        while not self.done.wait(POLL_SECONDS):
+            if self.halted():
+                with self.lock:
+                    self.fired = True
+                    for sock in self.sockets:
+                        _close_socket(sock)
+                return
+
+    def stop(self) -> None:
+        self.done.set()
+
+
+def _close_socket(sock) -> None:
+    import socket as _socket
+    try:
+        sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _gated_backend(stop, interrupter):
+    """An httpcore network backend whose every step checks ``stop`` first and
+    whose sockets the interrupter can close mid-operation."""
+    import socket as _socket
+    import httpcore
+    from httpcore._backends.sync import SyncStream
+
+    class GatedStream(httpcore.NetworkStream):
+        def __init__(self, inner):
+            self.inner = inner
+            sock = inner.get_extra_info("socket")
+            if sock is not None:
+                interrupter.register(sock)
+
+        def read(self, max_bytes, timeout=None):
+            # In short slices, checking between them: a stopped load's read
+            # ends within one slice, and bytes that arrive after a stop are
+            # never used.
+            limit = None if timeout is None else time.monotonic() + float(timeout)
+            while True:
+                stop()
+                left = POLL_SECONDS if limit is None else min(POLL_SECONDS, limit - time.monotonic())
+                if left <= 0:
+                    raise httpcore.ReadTimeout("no bytes in time")
+                try:
+                    data = self.inner.read(max_bytes, left)
+                except httpcore.ReadTimeout:
+                    continue
+                except BaseException:
+                    stop()                    # the interrupter closed it: report the stop, not the error
+                    raise
+                stop()
+                return data
+
+        def write(self, buffer, timeout=None):
+            stop()
+            try:
+                self.inner.write(buffer, timeout)
+            except BaseException:
+                stop()
+                raise
+
+        def close(self):
+            self.inner.close()
+
+        def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            stop()
+            try:
+                wrapped = GatedStream(self.inner.start_tls(ssl_context, server_hostname, timeout))
+            except BaseException:
+                stop()
+                raise
+            stop()
+            return wrapped
+
+        def get_extra_info(self, info):
+            return self.inner.get_extra_info(info)
+
+    class GatedBackend(httpcore.NetworkBackend):
+        def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            stop()
+            family = _socket.AF_INET6 if ":" in str(host) else _socket.AF_INET
+            sock = _socket.socket(family, _socket.SOCK_STREAM)
+            interrupter.register(sock)        # from here the interrupter can close it
+            try:
+                if local_address is not None:
+                    sock.bind((local_address, 0))
+                # A non-blocking connect, polled: a stop ends it within one poll.
+                sock.setblocking(False)
+                limit = time.monotonic() + (CONNECT_SECONDS if timeout is None else float(timeout))
+                stop()
+                code = sock.connect_ex((host, port))
+                while True:
+                    if code == 0:
+                        break
+                    if code not in _CONNECTING:
+                        raise httpcore.ConnectError("the connection was refused")
+                    stop()
+                    if time.monotonic() >= limit:
+                        raise httpcore.ConnectTimeout("the connection took too long")
+                    _, writable, failed = select.select([], [sock], [sock], POLL_SECONDS)
+                    if writable or failed:
+                        code = sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_ERROR)
+                        if code == 0:
+                            break
+                        raise httpcore.ConnectError("the connection failed")
+                stop()
+                sock.setblocking(True)
+                for option in socket_options or ():
+                    sock.setsockopt(*option)
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            except BaseException:
+                _close_socket(sock)
+                stop()                        # a connect cut off by the stop reports the stop
+                raise
+            return GatedStream(SyncStream(sock))
+
+        def sleep(self, seconds):
+            time.sleep(seconds)
+
+    GatedBackend.stream_class = GatedStream
+    return GatedBackend()
+
+
+def _real_transport(stop, interrupter):
+    """httpx's transport with our gated backend under its connection pool."""
+    import httpcore
+    import httpx
+
+    transport = httpx.HTTPTransport(trust_env=False)
+    pool = transport._pool
+    transport._pool = httpcore.ConnectionPool(
+        ssl_context=pool._ssl_context, max_connections=1, max_keepalive_connections=0,
+        http1=True, http2=False, retries=0, network_backend=_gated_backend(stop, interrupter))
+    return transport
+
+
 def _gated(transport, stop):
     """The transport behind a gate checked inside it, immediately before a
     request is connected or written (Codex Gate 1 on ecee267): a cancel or a
@@ -275,6 +449,10 @@ def _gated(transport, stop):
     return Gated(transport if transport is not None else httpx.HTTPTransport(trust_env=False))
 
 
+def _halted(cancel, deadline) -> bool:
+    return bool((cancel is not None and cancel.is_set()) or (deadline is not None and deadline.passed()))
+
+
 def _fetch(url: str, resolver, transport, clock, cancel=None, deadline=None) -> str:
     import httpx
     parts = urlsplit(url)
@@ -285,7 +463,13 @@ def _fetch(url: str, resolver, transport, clock, cancel=None, deadline=None) -> 
     pinned = urlunsplit(("https", "[%s]" % ip if ip.version == 6 else str(ip), parts.path or "/", "", ""))
     timeout = httpx.Timeout(connect=CONNECT_SECONDS, read=IDLE_SECONDS, write=CONNECT_SECONDS,
                             pool=CONNECT_SECONDS)
-    client = httpx.Client(transport=_gated(transport, lambda: _stopped(cancel, deadline)), timeout=timeout,
+    stop = lambda: _stopped(cancel, deadline)  # noqa: E731
+    interrupter = None
+    if transport is None:
+        # The real network: every socket step gated, live sockets closed on a stop.
+        interrupter = _Interrupter(lambda: _halted(cancel, deadline))
+        transport = _real_transport(stop, interrupter)
+    client = httpx.Client(transport=_gated(transport, stop), timeout=timeout,
                           follow_redirects=False, trust_env=False)
     started = clock()
     try:
@@ -342,9 +526,13 @@ def _fetch(url: str, resolver, transport, clock, cancel=None, deadline=None) -> 
     except FetchCancelled:
         raise
     except (httpx.HTTPError, httpx.StreamError, httpx.InvalidURL, zlib.error, UnicodeError, LookupError) as exc:
+        if _halted(cancel, deadline):
+            raise FetchCancelled("the load was stopped") from None       # the interrupter closed it
         raise PageFetchError(type(exc).__name__) from None
     finally:
         client.close()
+        if interrupter is not None:
+            interrupter.stop()
 
 
 # -- the page as a tree ---------------------------------------------------------------

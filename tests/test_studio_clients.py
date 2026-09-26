@@ -3152,7 +3152,9 @@ class CodexR11FetchOutage(Api):
             timer = threading.Timer(0.3, cancel.set)
             timer.start()
             started = time.monotonic()
-            with self.assertRaises(OSError):
+            # Since round 13 a cancel is reported as the cancel it is
+            # (FetchCancelled), not as a failed lookup (OSError).
+            with self.assertRaises(FetchCancelled):
                 project_page.system_resolver("steel.example.com", cancel, seconds=20)
             self.assertLess(time.monotonic() - started, 5)                     # cancelled: killed at once
             started = time.monotonic()
@@ -3932,3 +3934,150 @@ class CodexR13B4ProviderLease(Api):
         held, code, after = _asyncio.run(scenario())
         self.assertEqual((1, 409, "next", 1), (len(held), code, after, peak[0]))
         self.assertEqual({}, self.leases(record))
+
+
+# -- round 13, B3: every network step gated or interrupted ------------------------------------
+import errno  # noqa: E402
+import socket as _socket  # noqa: E402
+
+from httpcore._backends.sync import SyncStream as _SyncStream  # noqa: E402
+
+
+class _Stop:
+    """A load's stop: a cancel event behind the same check _fetch uses."""
+
+    def __init__(self):
+        self.cancel = threading.Event()
+
+    def __call__(self):
+        project_page._stopped(self.cancel)
+
+    def halted(self):
+        return self.cancel.is_set()
+
+
+class CodexR13B3NetworkSteps(unittest.TestCase):
+    """B3 on cfdebac: the DNS child, the connect, the TLS handshake, every write
+    and every body read check the stop; a stop that lands after a check (the
+    tests pause there) ends the step within one poll, and nothing that arrives
+    after it is used."""
+
+    def backend(self, stop, interrupt=True):
+        interrupter = project_page._Interrupter(stop.halted if interrupt else (lambda: False))
+        self.addCleanup(interrupter.stop)
+        return project_page._gated_backend(stop, interrupter)
+
+    def stream(self, stop, inner, interrupt=True):
+        return self.backend(stop, interrupt).stream_class(inner)
+
+    def pair(self):
+        near, far = _socket.socketpair()
+        self.addCleanup(near.close)
+        self.addCleanup(far.close)
+        return near, far
+
+    def test_a_stopped_load_launches_no_lookup_child(self):
+        launched = []
+        with mock.patch.object(project_page.subprocess, "Popen", lambda *a, **k: launched.append(a)):
+            cancel = threading.Event()
+            cancel.set()
+            with self.assertRaises(FetchCancelled):
+                project_page.system_resolver("steel.example.com", cancel, seconds=5)
+            with self.assertRaises(FetchCancelled):
+                project_page.system_resolver("steel.example.com", None, seconds=5,
+                                             deadline=WorkDeadline(lambda: 11.0, 10.0))
+        self.assertEqual([], launched)
+
+    def test_a_stop_after_the_connect_check_ends_the_connect(self):
+        listener = _socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        stop, polls = _Stop(), []
+        backend = self.backend(stop)
+
+        def paused_select(r, w, x, timeout):
+            polls.append(1)
+            stop.cancel.set()                     # the stop lands after the loop's check ...
+            return [], [], []                     # ... while the connect is still in progress
+        with mock.patch.object(project_page.socket.socket, "connect_ex",
+                               lambda self_, address: errno.EINPROGRESS), \
+                mock.patch.object(project_page.select, "select", paused_select):
+            with self.assertRaises(FetchCancelled):
+                backend.connect_tcp("127.0.0.1", listener.getsockname()[1], timeout=5)
+        self.assertEqual(1, len(polls))           # the next check stopped it: no second poll
+
+    def test_a_stop_after_the_read_check_uses_no_late_bytes(self):
+        near, far = self.pair()
+        stop = _Stop()
+        inner = _SyncStream(near)
+        real_read = inner.read
+
+        def paused_read(max_bytes, timeout=None):
+            stop.cancel.set()                     # the stop lands after the read's check ...
+            far.sendall(b"late bytes")
+            return real_read(max_bytes, timeout)  # ... and bytes arrive in that very read
+        inner.read = paused_read
+        with self.assertRaises(FetchCancelled):
+            self.stream(stop, inner).read(4096, timeout=5)
+
+    def test_a_read_waiting_for_bytes_ends_within_a_poll_of_the_stop(self):
+        near, _ = self.pair()
+        stop = _Stop()
+        timer = threading.Timer(0.2, stop.cancel.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        started = time.monotonic()
+        with self.assertRaises(FetchCancelled):
+            # No interrupter here: the read's own short slices must notice the stop.
+            self.stream(stop, _SyncStream(near), interrupt=False).read(4096, timeout=30)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_read_still_returns_bytes_when_not_stopped(self):
+        near, far = self.pair()
+        far.sendall(b"hello")
+        self.assertEqual(b"hello", self.stream(_Stop(), _SyncStream(near)).read(4096, timeout=5))
+
+    def test_a_stopped_load_writes_nothing_and_starts_no_handshake(self):
+        stop = _Stop()
+        inner = mock.MagicMock()
+        inner.get_extra_info.return_value = None
+        gated = self.stream(stop, inner)
+        stop.cancel.set()
+        with self.assertRaises(FetchCancelled):
+            gated.write(b"GET / HTTP/1.1\r\n\r\n", timeout=5)
+        with self.assertRaises(FetchCancelled):
+            gated.start_tls(mock.MagicMock(), "steel.example.com", 5)
+        inner.write.assert_not_called()
+        inner.start_tls.assert_not_called()
+
+    def test_the_interrupter_closes_a_live_socket_on_the_stop(self):
+        near, _ = self.pair()
+        stop = _Stop()
+        interrupter = project_page._Interrupter(stop.halted)
+        self.addCleanup(interrupter.stop)
+        interrupter.register(near)
+        stop.cancel.set()
+        end = time.monotonic() + 2
+        while near.fileno() != -1 and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertEqual(-1, near.fileno())       # closed: an operation blocked on it fails at once
+
+    def test_the_real_transport_is_built_on_the_gated_backend(self):
+        stop = _Stop()
+        interrupter = project_page._Interrupter(stop.halted)
+        self.addCleanup(interrupter.stop)
+        backend = project_page._real_transport(stop, interrupter)._pool._network_backend
+        self.assertEqual("GatedBackend", type(backend).__name__)
+        stop.cancel.set()
+        with self.assertRaises(FetchCancelled):
+            backend.connect_tcp("127.0.0.1", 9, timeout=1)
+
+    def test_a_network_error_after_the_stop_is_reported_as_the_stop(self):
+        cancel = threading.Event()
+
+        def handler(request):
+            cancel.set()                          # the load is stopped while the request is out ...
+            raise httpx.ReadError("the interrupter closed the socket")    # ... and the socket dies
+        with self.assertRaises(FetchCancelled):
+            project_page._fetch(PAGE, Resolver([PUBLIC_IP]), httpx.MockTransport(handler), time.monotonic, cancel)
