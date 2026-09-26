@@ -298,16 +298,14 @@ correction pointed to `6ce8476`. That cost a full review round.
 
 ---
 
-## L-103 — A mutation run must heal a mutant it left behind
+## L-103 — A mutation harness must heal itself after a kill
 
 **Incident.** `scripts/mutate_studio_clients.py` on #260 rewrites product
 files in place and restores the originals from memory in a `finally`. On
 `6081563`, where it has 117 mutants, the host killed the full harness for
-memory. Board row `CCC-PR260-6081563-HARNESS-PARTIAL-20260925T2300Z` records
-that the worktree was restored and clean, and the interrupted mutant never
-reached the remote. That was luck, not design. A host kill does not run a
-`finally`, so a kill landing between the rewrite and the restore leaves a live
-mutant, and nothing on the machine would undo it.
+memory (the #260 comment). Board row
+`CCC-PR260-6081563-HARNESS-PARTIAL-20260925T2300Z` records that the worktree
+was restored and clean, and the interrupted mutant never reached the remote.
 
 **Naive rule.** "Run `git status` after a harness run."
 
@@ -459,8 +457,8 @@ waited. Codex then ruled that editions change only for material reasons.
 
 **Incident.** The host stopped a site suite for low memory
 (`CCC-SITE216-249127D-REVIEW-REQUEST-20260926T0019Z`). Four tests were failing
-at the moment of the kill; all four passed when rerun alone. A killed mutation
-run also left a mutant in place (L-103).
+at the moment of the kill; all four passed when rerun alone. The host also
+killed a full mutation run on #260 (L-103).
 
 **Naive rule.** "Rerun when memory is low."
 
