@@ -66,12 +66,28 @@ Assert-Equal 'critical CPU is RED' 'RED' `
 Assert-Equal 'invalid threshold ordering fails closed' 'UNKNOWN' `
     (Get-Sfdc24ResourceState -Metrics (New-Metrics 8.0 10) `
         -GreenAtFreeGB 2.5 -RedBelowFreeGB 4.0)
+Assert-Equal 'negative free-memory threshold fails closed' 'UNKNOWN' `
+    (Get-Sfdc24ResourceState -Metrics (New-Metrics 8.0 10) `
+        -RedBelowFreeGB -1)
+Assert-Equal 'out-of-range CPU threshold fails closed' 'UNKNOWN' `
+    (Get-Sfdc24ResourceState -Metrics (New-Metrics 8.0 10) `
+        -RedAtCpuPercent 101)
+Assert-Equal 'NaN threshold fails closed' 'UNKNOWN' `
+    (Get-Sfdc24ResourceState -Metrics (New-Metrics 8.0 10) `
+        -GreenAtFreeGB ([double]::NaN))
+Assert-Equal 'infinite threshold fails closed' 'UNKNOWN' `
+    (Get-Sfdc24ResourceState -Metrics (New-Metrics 8.0 10) `
+        -AmberAtCpuPercent ([double]::PositiveInfinity))
 Assert-Equal 'plain native arguments remain unquoted' 'alpha' `
     (ConvertTo-Sfdc24NativeArgument -Value 'alpha')
 Assert-Equal 'arguments with spaces are quoted' '"two words"' `
     (ConvertTo-Sfdc24NativeArgument -Value 'two words')
 Assert-Equal 'an empty argument remains present' '""' `
     (ConvertTo-Sfdc24NativeArgument -Value '')
+Assert-Equal 'trailing path backslashes survive quoting' '"C:\two words\folder\\"' `
+    (ConvertTo-Sfdc24NativeArgument -Value 'C:\two words\folder\')
+Assert-Equal 'UNC path backslashes survive quoting' '"\\server\share name\leaf\\"' `
+    (ConvertTo-Sfdc24NativeArgument -Value '\\server\share name\leaf\')
 $jsonArguments = @(ConvertFrom-Sfdc24ArgumentJson -Json '["-m","two words",""]')
 Assert-Equal 'argument JSON preserves its array width' 3 $jsonArguments.Count
 Assert-Equal 'argument JSON preserves spaces' 'two words' $jsonArguments[1]
@@ -135,6 +151,44 @@ try {
     Assert-Equal 'an accepted run returns the child exit code' 7 $childCode
     Assert-True 'metadata is removed after the child exits' `
         (-not (Test-Path -LiteralPath (Join-Path $stateRoot 'heavy-lane.json')))
+
+    $cleanupLock = Join-Path $stateRoot 'cleanup-failure.lock'
+    $cleanupObservations = @(Invoke-Sfdc24HeavyRun `
+        -Metrics (New-Metrics 8.0 5) -LaneOwner codex `
+        -Executable $env:ComSpec -Arguments @('/d', '/c', 'exit 0') `
+        -LaneLockPath $cleanupLock -LaneStateRoot $stateRoot `
+        -MetadataRemover { param($Root) throw 'TEST_CLEANUP_FAILURE' } 3>&1 6>&1)
+    $cleanupCode = [int] $cleanupObservations[-1]
+    Assert-Equal 'metadata cleanup failure preserves the child verdict' 0 $cleanupCode
+    Assert-True 'metadata cleanup failure is observable' `
+        (@($cleanupObservations | Where-Object {
+            $_.ToString() -match 'LANE_METADATA_CLEANUP_FAILED'
+        }).Count -eq 1)
+    $afterCleanupFailure = Enter-Sfdc24HeavyLane -Path $cleanupLock
+    try {
+        Assert-True 'metadata cleanup failure still releases the lane' `
+            ($null -ne $afterCleanupFailure)
+    } finally {
+        Exit-Sfdc24HeavyLane -Handle $afterCleanupFailure
+    }
+    Remove-Sfdc24LaneMetadata -Root $stateRoot
+
+    $priorityObservations = @(Invoke-Sfdc24HeavyRun `
+        -Metrics (New-Metrics 8.0 5) -LaneOwner claude `
+        -Executable $env:ComSpec -Arguments @('/d', '/c', 'exit 0') `
+        -LaneLockPath (Join-Path $stateRoot 'priority.lock') `
+        -LaneStateRoot $stateRoot `
+        -PriorityApplier { param($Process, $Target) return $false } 3>&1 6>&1)
+    $priorityCode = [int] $priorityObservations[-1]
+    Assert-Equal 'priority refusal does not discard successful work' 0 $priorityCode
+    Assert-True 'priority refusal is reported in the STARTED receipt' `
+        (@($priorityObservations | Where-Object {
+            $_.ToString() -match 'priority_target=BelowNormal priority_applied=false'
+        }).Count -eq 1)
+    Assert-True 'priority refusal emits one warning' `
+        (@($priorityObservations | Where-Object {
+            $_.ToString() -match 'CHILD_PRIORITY_NOT_APPLIED'
+        }).Count -eq 1)
 } finally {
     if (Test-Path -LiteralPath $stateRoot -PathType Container) {
         Remove-Item -LiteralPath $stateRoot -Recurse -Force

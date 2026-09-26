@@ -4,8 +4,9 @@ SFDC24 local-host resource governor.
 
 This is deliberately a gate for NEW heavy local work, not a task killer and
 not a hard memory limiter.  It keeps one cross-agent heavy lane, refuses to
-start that lane under memory/CPU pressure, and launches accepted work below
-normal priority so the interactive agents and Windows stay responsive.
+start that lane under memory/CPU pressure, and immediately requests a lower
+priority for accepted work so the interactive agents and Windows stay
+responsive.  The STARTED receipt says whether Windows applied that request.
 
 The laptop remains useful while the cloud does the bulk work:
   - full suites belong on hosted CI;
@@ -88,9 +89,24 @@ function Get-Sfdc24ResourceState {
     } catch {
         return 'UNKNOWN'
     }
+    $thresholds = @(
+        $GreenAtFreeGB,
+        $RedBelowFreeGB,
+        $AmberAtCpuPercent,
+        $RedAtCpuPercent
+    )
+    foreach ($threshold in $thresholds) {
+        if ([double]::IsNaN($threshold) -or [double]::IsInfinity($threshold)) {
+            return 'UNKNOWN'
+        }
+    }
     if ([double]::IsNaN($free) -or [double]::IsInfinity($free) -or
         [double]::IsNaN($cpu) -or [double]::IsInfinity($cpu) -or
         $free -lt 0 -or $cpu -lt 0 -or $cpu -gt 100 -or
+        $GreenAtFreeGB -lt 0.5 -or $GreenAtFreeGB -gt 64.0 -or
+        $RedBelowFreeGB -lt 0.5 -or $RedBelowFreeGB -gt 64.0 -or
+        $AmberAtCpuPercent -lt 1.0 -or $AmberAtCpuPercent -gt 100.0 -or
+        $RedAtCpuPercent -lt 1.0 -or $RedAtCpuPercent -gt 100.0 -or
         $RedBelowFreeGB -ge $GreenAtFreeGB -or
         $AmberAtCpuPercent -ge $RedAtCpuPercent) {
         return 'UNKNOWN'
@@ -221,20 +237,40 @@ function ConvertTo-Sfdc24NativeArgument {
             continue
         }
         if ($character -eq '"') {
-            $null = $builder.Append(('\' * (($slashes * 2) + 1)))
+            $null = $builder.Append((('\' * (($slashes * 2) + 1)) -join ''))
             $null = $builder.Append('"')
             $slashes = 0
             continue
         }
         if ($slashes -gt 0) {
-            $null = $builder.Append(('\' * $slashes))
+            $null = $builder.Append((('\' * $slashes) -join ''))
             $slashes = 0
         }
         $null = $builder.Append($character)
     }
-    if ($slashes -gt 0) { $null = $builder.Append(('\' * ($slashes * 2))) }
+    if ($slashes -gt 0) {
+        $null = $builder.Append((('\' * ($slashes * 2)) -join ''))
+    }
     $null = $builder.Append('"')
     return $builder.ToString()
+}
+
+function Set-Sfdc24ChildPriority {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] $Process,
+        [Parameter(Mandatory = $true)][string] $Target
+    )
+
+    try {
+        $Process.PriorityClass = [Diagnostics.ProcessPriorityClass] $Target
+        return $true
+    } catch {
+        # Very short-lived children may exit before Windows accepts the
+        # priority change. The caller reports this explicitly and keeps the
+        # pressure and exclusive-lane guarantees in force.
+        return $false
+    }
 }
 
 function ConvertFrom-Sfdc24ArgumentJson {
@@ -284,7 +320,9 @@ function Invoke-Sfdc24HeavyRun {
         [double] $RedBelowFreeGB = 2.5,
         [double] $AmberAtCpuPercent = 75.0,
         [double] $RedAtCpuPercent = 90.0,
-        [string] $ChildPriorityClass = 'BelowNormal'
+        [string] $ChildPriorityClass = 'BelowNormal',
+        [scriptblock] $PriorityApplier,
+        [scriptblock] $MetadataRemover
     )
 
     $state = Get-Sfdc24ResourceState -Metrics $Metrics `
@@ -318,15 +356,22 @@ function Invoke-Sfdc24HeavyRun {
         $child = New-Object Diagnostics.Process
         $child.StartInfo = $startInfo
         if (-not $child.Start()) { throw 'CHILD_START_RETURNED_FALSE' }
-        try {
-            $child.PriorityClass = [Diagnostics.ProcessPriorityClass] $ChildPriorityClass
-        } catch {
-            # Priority is best-effort on a child that may exit immediately. The
-            # lane and pressure gates still apply, so do not kill useful work.
+        if ($null -eq $PriorityApplier) {
+            $priorityApplied = Set-Sfdc24ChildPriority -Process $child `
+                -Target $ChildPriorityClass
+        } else {
+            try {
+                $priorityApplied = [bool] (& $PriorityApplier $child $ChildPriorityClass)
+            } catch {
+                $priorityApplied = $false
+            }
+        }
+        if (-not $priorityApplied) {
             Write-Warning 'CHILD_PRIORITY_NOT_APPLIED'
         }
-        Write-Host ("STARTED owner={0} pid={1} priority={2}" -f
-            $LaneOwner, $child.Id, $ChildPriorityClass)
+        Write-Host ("STARTED owner={0} pid={1} priority_target={2} priority_applied={3}" -f
+            $LaneOwner, $child.Id, $ChildPriorityClass,
+            ([string] $priorityApplied).ToLowerInvariant())
         $child.WaitForExit()
         # Windows PowerShell can retain the default ExitCode value after a
         # very short-lived child exits before the priority assignment. Refresh
@@ -337,10 +382,24 @@ function Invoke-Sfdc24HeavyRun {
         Write-Host ("FAILED reason={0}" -f $_.Exception.GetType().Name)
         return 22
     } finally {
-        if ($metadataWritten) {
-            Remove-Sfdc24LaneMetadata -Root $LaneStateRoot
+        try {
+            if ($metadataWritten) {
+                try {
+                    if ($null -eq $MetadataRemover) {
+                        Remove-Sfdc24LaneMetadata -Root $LaneStateRoot
+                    } else {
+                        & $MetadataRemover $LaneStateRoot
+                    }
+                } catch {
+                    # A stale metadata file is advisory and may be overwritten
+                    # by the next owner. It must never retain the authoritative
+                    # exclusive lock handle.
+                    Write-Warning 'LANE_METADATA_CLEANUP_FAILED'
+                }
+            }
+        } finally {
+            Exit-Sfdc24HeavyLane -Handle $lane
         }
-        Exit-Sfdc24HeavyLane -Handle $lane
     }
 }
 

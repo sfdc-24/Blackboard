@@ -27,9 +27,12 @@ this machine.
 
 The script does not kill a process, suspend an interactive agent, set a global
 environment variable, or impose a hard RAM cap. Those actions can corrupt work
-or make an agent disappear without a handoff. An accepted child starts at
-`BelowNormal` priority and inherits that scheduling class; the operating system
-still decides its actual memory allocation.
+or make an agent disappear without a handoff. Immediately after an accepted
+child starts, the governor requests `BelowNormal` priority. Windows can reject
+that best-effort request or a very short-lived child can finish first, so the
+`STARTED` receipt reports both `priority_target` and `priority_applied`. The
+pressure gate and exclusive lane are the guarantees; process priority is an
+observable optimization. The operating system still decides memory allocation.
 
 ## Use
 
@@ -66,6 +69,10 @@ file is harmless: Windows releases the exclusive handle when its process ends.
 While a child runs, the governor writes only owner, PID, start time and
 executable basename to the neighbouring `heavy-lane.json`. Command arguments
 are never persisted because they may contain credentials.
+
+Metadata is advisory; the exclusive file handle is authoritative. If metadata
+cleanup fails, the governor emits `LANE_METADATA_CLEANUP_FAILED` and still
+releases the lane in a nested `finally` block so the host cannot deadlock.
 
 ## Boundaries
 
