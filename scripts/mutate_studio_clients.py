@@ -351,7 +351,7 @@ def run(selected) -> int:
                                      % (name, rel, current.count(a2)))
                 io.open(path, "w", encoding="utf-8", newline="").write(current.replace(a2, b2))
             r = subprocess.run([sys.executable, "-B", "-m", "unittest", "tests.test_studio_clients"],
-                               cwd=ROOT, capture_output=True, text=True)
+                               cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
             verdict = "KILLED" if r.returncode else "SURVIVED"
             results.append((name, verdict))
             print("%-8s %s" % (verdict, name), flush=True)
