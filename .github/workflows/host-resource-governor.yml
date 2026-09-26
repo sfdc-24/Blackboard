@@ -1,0 +1,63 @@
+name: Host resource governor contracts
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/host-resource-governor.yml'
+      - 'scripts/host_resource_governor.ps1'
+      - 'tests/test_host_resource_governor.ps1'
+      - 'docs/HOST-RESOURCE-GOVERNOR.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/host-resource-governor.yml'
+      - 'scripts/host_resource_governor.ps1'
+      - 'tests/test_host_resource_governor.ps1'
+      - 'docs/HOST-RESOURCE-GOVERNOR.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: Windows PowerShell 5.1 host-governor contracts
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Require Windows PowerShell 5.1 and parse both files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or
+              $PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)"
+          }
+          foreach ($file in @('scripts\host_resource_governor.ps1',
+                              'tests\test_host_resource_governor.ps1')) {
+            $errors = $null
+            $null = [Management.Automation.PSParser]::Tokenize(
+              (Get-Content -LiteralPath $file -Raw), [ref] $errors)
+            if (@($errors).Count -ne 0) { throw "parse failure in $file" }
+            Write-Output "PARSE_OK $file"
+          }
+
+      - name: Run the offline resource-governor contract suite
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = & .\tests\test_host_resource_governor.ps1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $result = @($output | Where-Object { $_ -match '^RESULT passed=' })
+          if ($result.Count -ne 1) {
+            throw "expected exactly one RESULT line, got $($result.Count)"
+          }
+          if ($result[0] -notmatch '^RESULT passed=([1-9][0-9]*) failed=0$') {
+            throw "suite did not pass cleanly: $($result[0])"
+          }
+          if ($code -ne 0) { throw "suite exited $code" }
