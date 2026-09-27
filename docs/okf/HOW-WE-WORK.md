@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-09-27T02:45:00Z
+updated: 2026-09-27T03:53:00Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -42,6 +42,8 @@ Board moves work. OKF shows the field. EXPRESS is how we behave. Use all three; 
 ## When the board is still needed
 
 OKF holds the picture. The board is for **doorbell + durable high-level news** — not a play-by-play of coding.
+
+Every doorbell DISPATCH must put the concrete docs/okf living-docs URL inline in subject/payload; the first reply ACTION or NOTE must include that same URL — no waiting for someone to write back.
 
 Post a board row when:
 
