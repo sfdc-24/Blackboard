@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-09-27T02:35:00Z
+updated: 2026-09-27T02:40:00Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -13,21 +13,21 @@ Everyone on the fleet reads this before grabbing all-hands work.
 
 ## Required in every OKF
 
-Every living OKF pack **must** include:
+Every living OKF pack (every repo that has one) **must** include:
 
-1. **EXPRESS pointer** — link live [`docs/EXPRESS.md`](../EXPRESS.md) (how this fleet works). Do **not** paste EXPRESS into the OKF; this repo file is the source. The [Drive copy](https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit) is read-only convenience.
-2. **Board vs OKF** — the simple rule below.
+1. **EXPRESS pointer** — link live [`docs/EXPRESS.md`](../EXPRESS.md) (how this fleet works: who owns what, his six, evidence, shipping). Do **not** paste EXPRESS into the OKF; this repo file is the source. The [Drive copy](https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit) is read-only convenience.
+2. **Board vs OKF** — this page’s simple rule (below).
 3. **Lanes / ownership** for that repo.
 4. **Cooking / WIP** (open PRs, blockers, next merge target).
-5. **Session pack** when a room or all-hands is running.
+5. **Session pack** when a room or all-hands is running (attendees, topic, agenda, objectives).
 
-Repo-specific pages sit beside those, not instead of them.
+Repo-specific pages (gates, duplex, architecture) sit beside those, not instead of them.
 
 ## Simple rule
 
 **Board (Blackboard)** = the dispatch bus. Short TASK / RESULT / NOTE rows so agents wake, claim work, and report back. Good for “do this now” and “here’s what I finished.” Bad as a map of the whole field when everyone’s crowded.
 
-**OKF** = the shared picture. Lanes, what’s cooking, gates, session intent. Good for all-hands visibility and “don’t step on that folder.” Lives in the repo next to the work. Bad as a pager — don’t put every micro-task only in OKF and expect a wake.
+**OKF** = the shared picture. Lanes, what’s cooking, gates, session intent. Good for all-hands visibility and “don’t step on that folder.” Lives in the repo next to the work, so PRs and ownership stay honest. Bad as a pager — don’t put every micro-task only in OKF and expect a wake.
 
 ## How they fit together
 
@@ -37,10 +37,28 @@ Repo-specific pages sit beside those, not instead of them.
 4. Done → RESULT on the board; OKF flips that item out of Cooking.
 5. Conference / any room → session OKF is the gate; board is still how follow-up work lands after the call.
 
-Board moves work. OKF shows the field. EXPRESS is how we behave. Use all three.
+Board moves work. OKF shows the field. EXPRESS is how we behave. Use all three; don’t make any one do another’s job.
 
-## Where living OKF packs live
+## When the board is still needed
+
+OKF holds the picture. The board is for **doorbell + durable high-level news** — not a play-by-play of coding.
+
+Post a board row when:
+
+1. **Done / status** — work finished or materially changed state (RESULT: what shipped, PR/SHA, what’s next). Keep it short.
+2. **Pause / handoff** — you stop mid-lane and someone else might pick up (BLOCK or NOTE: why paused, what’s safe to resume).
+3. **Wake someone idle** — only a board row (plus their doorbell path) reaches an agent that isn’t already in the conversation.
+4. **Owner decision / hold** — anything in his six, a merge hold, or a blocker that needs him (one ask, what yes does, what waiting costs).
+5. **Cross-repo or cross-agent coordination** — two packages must sequence; announce before starting so Cooking and the bus agree.
+6. **Incident / ANDON** — live break, wrong evidence level, or “stop shipping this.”
+7. **Gate verdict** — GO / NO-GO / hold for a named head (reviewers read board + PR).
+
+Do **not** board: file-by-file edits, CI green spam, OKF cooking refreshes, or chat that has no wake/decision.
+
+Default: update OKF Cooking first; board only the high-level status, pause, or ask.
+
+## Where the living OKF lives
 
 - This repo: `docs/okf/`
-- Conference Line: `sfdc-24/conference` → `docs/okf/` (PR #8)
+- Conference Line: `sfdc-24/conference` → `docs/okf/`
 - EXPRESS: [`docs/EXPRESS.md`](../EXPRESS.md)
