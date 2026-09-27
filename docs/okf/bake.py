@@ -39,6 +39,12 @@ def request_json(url: str, token: str) -> dict | list:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+def expect_object(payload: dict | list, context: str) -> dict:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected {context} response payload type: {type(payload).__name__}")
+    return payload
+
+
 def fetch_open_prs(owner: str, repo: str, token: str) -> list[dict]:
     prs: list[dict] = []
     page = 1
@@ -57,33 +63,64 @@ def fetch_open_prs(owner: str, repo: str, token: str) -> list[dict]:
     return prs
 
 
-def fetch_pr_detail(owner: str, repo: str, number: int, token: str) -> dict:
-    return request_json(f"{API}/repos/{owner}/{repo}/pulls/{number}", token)  # type: ignore[return-value]
+def fetch_check_runs(owner: str, repo: str, sha: str, token: str) -> dict:
+    payload = request_json(f"{API}/repos/{owner}/{repo}/commits/{sha}/check-runs", token)
+    return expect_object(payload, "check-runs")
 
 
-def fetch_commit_status(owner: str, repo: str, sha: str, token: str) -> dict:
-    return request_json(f"{API}/repos/{owner}/{repo}/commits/{sha}/status", token)  # type: ignore[return-value]
+def fetch_combined_status(owner: str, repo: str, sha: str, token: str) -> dict:
+    payload = request_json(f"{API}/repos/{owner}/{repo}/commits/{sha}/status", token)
+    return expect_object(payload, "combined-status")
 
 
-def blocker_list(pr: dict, detail: dict, status: dict) -> list[str]:
+def check_runs_state(check_runs: dict) -> str:
+    runs = check_runs.get("check_runs") or []
+    if not runs:
+        return "unknown"
+    statuses = [str(r.get("status") or "") for r in runs]
+    if any(s != "completed" for s in statuses):
+        return "pending"
+    failing = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
+    conclusions = [str(r.get("conclusion") or "") for r in runs]
+    return "failure" if any(c in failing for c in conclusions) else "success"
+
+
+def checks_state(check_runs: dict, combined_status: dict) -> str:
+    run_state = check_runs_state(check_runs)
+    status_state = str(combined_status.get("state") or "unknown")
+    if run_state == "failure" or status_state in {"error", "failure"}:
+        return "failure"
+    if run_state == "pending" or status_state in {"pending", "expected"}:
+        return "pending"
+    if run_state == "success" or status_state == "success":
+        return "success"
+    return "unknown"
+
+def blocker_list(pr: dict, check_state: str) -> list[str]:
     blockers: list[str] = []
     if pr.get("draft"):
         blockers.append("Draft PR")
 
-    mergeable_state = str(detail.get("mergeable_state") or "unknown")
-    if mergeable_state == "dirty":
-        blockers.append("Merge conflicts")
-    elif mergeable_state in {"blocked", "behind", "unstable"}:
-        blockers.append(f"Mergeability: {mergeable_state}")
-
-    checks = str(status.get("state") or "unknown")
-    if checks in {"failure", "error"}:
+    if check_state == "failure":
         blockers.append("Checks failing")
-    elif checks == "pending":
+    elif check_state == "pending":
         blockers.append("Checks pending")
 
+    allowlist = {
+        "blocked",
+        "blocker",
+        "hold",
+        "on-hold",
+        "needs-decision",
+        "decision-needed",
+        "needs-ruling",
+    }
     label_names = [str(l.get("name") or "") for l in pr.get("labels") or []]
-    blocker_labels = [n for n in label_names if any(k in n.lower() for k in ("block", "hold", "decision", "needs"))]
+    blocker_labels = []
+    for label in label_names:
+        normalized = label.strip().lower()
+        if normalized in allowlist or normalized.startswith("blocker:") or normalized.startswith("hold:"):
+            blocker_labels.append(label)
     if blocker_labels:
         blockers.append("Labels: " + ", ".join(sorted(blocker_labels)))
 
@@ -133,8 +170,8 @@ def build_markdown(owner: str, repo: str, rows: list[dict]) -> str:
     lines.extend([
         "## Open PRs",
         "",
-        "| PR | Title | Author | Updated (UTC) | Checks | Mergeability | Blockers |",
-        "|---|---|---|---|---|---|---|",
+        "| PR | Title | Author | Updated (UTC) | Checks | Blockers |",
+        "|---|---|---|---|---|---|",
     ])
 
     rollup = Counter()
@@ -151,7 +188,7 @@ def build_markdown(owner: str, repo: str, rows: list[dict]) -> str:
         title = str(row["title"]).replace("|", "\\|")
         lines.append(
             f"| [#{row['number']}]({row['url']}) | {title} | @{row['author']} | "
-            f"{short_ts(row['updated_at'])} | {row['checks']} | {row['mergeable_state']} | {blocker_text} |"
+            f"{short_ts(row['updated_at'])} | {row['checks']} | {blocker_text} |"
         )
 
     lines.extend(["", "## Blocker rollup", ""])
@@ -191,8 +228,14 @@ def main(argv: list[str] | None = None) -> int:
         rows: list[dict] = []
         for pr in open_prs:
             number = int(pr["number"])
-            detail = fetch_pr_detail(args.owner, args.repo, number, token)
-            status = fetch_commit_status(args.owner, args.repo, str(pr["head"]["sha"]), token)
+            sha = str(pr["head"]["sha"])
+            check_runs = fetch_check_runs(args.owner, args.repo, sha, token)
+            run_state = check_runs_state(check_runs)
+            if run_state in {"pending", "failure", "success"}:
+                check_state = run_state
+            else:
+                combined_status = fetch_combined_status(args.owner, args.repo, sha, token)
+                check_state = checks_state(check_runs, combined_status)
             rows.append(
                 {
                     "number": number,
@@ -200,9 +243,8 @@ def main(argv: list[str] | None = None) -> int:
                     "url": str(pr.get("html_url") or ""),
                     "author": str((pr.get("user") or {}).get("login") or "unknown"),
                     "updated_at": str(pr.get("updated_at") or ""),
-                    "checks": str(status.get("state") or "unknown"),
-                    "mergeable_state": str(detail.get("mergeable_state") or "unknown"),
-                    "blockers": blocker_list(pr, detail, status),
+                    "checks": check_state,
+                    "blockers": blocker_list(pr, check_state),
                 }
             )
 
@@ -211,8 +253,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {out} with {len(rows)} open PRs")
         return 0
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
-        print(f"GitHub API HTTP {exc.code}: {detail[:500]}", file=sys.stderr)
+        status_text = getattr(exc, "reason", "request failed")
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        detail = (detail[:300] + "...") if len(detail) > 300 else detail
+        extra = f" ({detail})" if detail else ""
+        print(f"GitHub API HTTP {exc.code}: {status_text}{extra}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(f"Network error: {exc.reason}", file=sys.stderr)
