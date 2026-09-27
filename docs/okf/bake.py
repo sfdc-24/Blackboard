@@ -217,7 +217,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     out = Path(args.output).resolve()
-    token = os.environ.get(args.token_env, "").strip() or None
+    token_raw = os.environ.get(args.token_env)
+    if token_raw is None:
+        token = None
+    else:
+        token = token_raw.strip()
+        if not token:
+            print(
+                f"{args.token_env} is set but empty; unset it for unauthenticated mode or provide a valid token.",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         open_prs = fetch_open_prs(args.owner, args.repo, token)
