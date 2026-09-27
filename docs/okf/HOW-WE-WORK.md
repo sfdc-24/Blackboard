@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-09-27T02:40:00Z
+updated: 2026-09-27T02:45:00Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -32,7 +32,7 @@ Repo-specific pages (gates, duplex, architecture) sit beside those, not instead 
 ## How they fit together
 
 1. Before grabbing a lane → read EXPRESS (once per session) + OKF Cooking + Lanes.
-2. Starting real work → board a short TASK (who, what, RESULT expected).
+2. Starting real work → board a short TASK (who, what, RESULT expected). Name HITL gates in the plan first (see below).
 3. While working → keep OKF Cooking current (baker or a quick edit).
 4. Done → RESULT on the board; OKF flips that item out of Cooking.
 5. Conference / any room → session OKF is the gate; board is still how follow-up work lands after the call.
@@ -56,6 +56,30 @@ Post a board row when:
 Do **not** board: file-by-file edits, CI green spam, OKF cooking refreshes, or chat that has no wake/decision.
 
 Default: update OKF Cooking first; board only the high-level status, pause, or ask.
+
+## Human in the loop (HITL) — bake gates into the plan
+
+Speed without planned review just ships risk faster. When work moves lightning-fast, **name the approvals before agents run**. Gates are part of the plan, not a chat afterthought.
+
+### Write every gate with five fields
+
+1. **Who** — one named reviewer (owner, Cursor GO, lane lead, or all-hands). Not "someone."
+2. **What** — exact artifact (PR + head SHA, demo URL, CONFIG change, merge, live keys).
+3. **When** — before merge, before deploy, before live keys, before customer-facing.
+4. **How** — GO / NO-GO on the board (doorbell), or Cooking marked `waiting:<gate>`. Reviewers read board + PR; chat alone is not a verdict.
+5. **Timeout** — if silence past the named window, **hold**. Do not auto-advance on lightning work.
+
+### What always gets a gate
+
+Anything irreversible, customer-visible, spendy, identity-bearing, or live-key / production. Parallel work is fine; **crossing a gate is not**.
+
+### Where it lives
+
+- Put named gates in the plan / Cooking / `gates.md` **before** the TASK boards.
+- Post the **verdict** on the board (GO / NO-GO / hold + head SHA). Keep Cooking current.
+- Spike and repo checklists (e.g. Conference Spike A) are instances of this rule, not exceptions.
+
+Owner and lead agents plan HITL together. Agents do not invent a silent bypass.
 
 ## Where the living OKF lives
 
