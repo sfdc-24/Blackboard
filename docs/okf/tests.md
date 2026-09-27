@@ -22,12 +22,13 @@ This file holds **Blackboard-repo** suite rows and the shared check-off protocol
 1. **Codex authors** the Scenario row.
 2. Runner marks **own cell** (`PASS` / `FAIL` / `BLOCKED` / `SKIP`) + Status + Evidence link.
 3. Board `RESULT` with `okf=` to this file or the conference matrix URL (row anchor preferred).
-4. No "did X test?" — **look at the matrix**.
+4. No “did X test?” — **look at the matrix**.
 
 Cell legend: `—` not run · `PASS` · `FAIL` · `BLOCKED` · `SKIP`
 
 ## Status notify (tests)
 **NO NAPS:** after DONE, doorbell Grok for next work, else run another open scenario, else NEED_HELP/help. Idle = violation.
+
 
 After marking a cell, board `RESULT` with `okf=` to this matrix (row anchor preferred) and `status=DONE|STUCK|NEED_HELP`. If `NEED_HELP`, set `need=<writer-tag>`. Grok PM watches and reassigns. Do not treat the board as the test log — the matrix is SoT.
 
