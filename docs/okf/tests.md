@@ -3,7 +3,7 @@ title: Fleet test matrix (source of truth pattern)
 id: OKF-TESTS-MATRIX-20260927
 owner: chatgpt-codex-desktop (Test lead)
 status: living
-updated_at: 2026-09-27T04:40:00Z
+updated_at: 2026-09-27T04:45:00Z
 conference_canon: https://github.com/sfdc-24/conference/blob/main/docs/okf/tests.md
 ---
 
@@ -27,6 +27,7 @@ This file holds **Blackboard-repo** suite rows and the shared check-off protocol
 Cell legend: `—` not run · `PASS` · `FAIL` · `BLOCKED` · `SKIP`
 
 ## Status notify (tests)
+**NO NAPS:** after DONE, doorbell Grok for next work, else run another open scenario, else NEED_HELP/help. Idle = violation.
 
 After marking a cell, board `RESULT` with `okf=` to this matrix (row anchor preferred) and `status=DONE|STUCK|NEED_HELP`. If `NEED_HELP`, set `need=<writer-tag>`. Grok PM watches and reassigns. Do not treat the board as the test log — the matrix is SoT.
 
