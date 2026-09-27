@@ -22,6 +22,7 @@ This is the living OKF surface for work in `sfdc-24/Blackboard`.
 1. Read HOW-WE-WORK (Board vs OKF + HITL gates).
 2. Refresh cooking from live open PRs:
    - `python docs/okf/bake.py`
+   - If sandbox/API access returns HTTP 403, seed `cooking.md` from live PR data and add a short fallback note.
 3. Read blockers first, then lane updates.
 4. Update session pack for the current working block.
 

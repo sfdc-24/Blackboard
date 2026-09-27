@@ -24,17 +24,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def request_json(url: str, token: str) -> dict | list:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": "Bearer " + token,
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "blackboard-okf-bake",
-        },
-        method="GET",
-    )
+def request_json(url: str, token: str | None) -> dict | list:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "blackboard-okf-bake",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
@@ -45,7 +43,7 @@ def expect_object(payload: dict | list, context: str) -> dict:
     return payload
 
 
-def fetch_open_prs(owner: str, repo: str, token: str) -> list[dict]:
+def fetch_open_prs(owner: str, repo: str, token: str | None) -> list[dict]:
     prs: list[dict] = []
     page = 1
     while True:
@@ -63,12 +61,12 @@ def fetch_open_prs(owner: str, repo: str, token: str) -> list[dict]:
     return prs
 
 
-def fetch_check_runs(owner: str, repo: str, sha: str, token: str) -> dict:
+def fetch_check_runs(owner: str, repo: str, sha: str, token: str | None) -> dict:
     payload = request_json(f"{API}/repos/{owner}/{repo}/commits/{sha}/check-runs", token)
     return expect_object(payload, "check-runs")
 
 
-def fetch_combined_status(owner: str, repo: str, sha: str, token: str) -> dict:
+def fetch_combined_status(owner: str, repo: str, sha: str, token: str | None) -> dict:
     payload = request_json(f"{API}/repos/{owner}/{repo}/commits/{sha}/status", token)
     return expect_object(payload, "combined-status")
 
@@ -200,6 +198,7 @@ def build_markdown(owner: str, repo: str, rows: list[dict]) -> str:
         "## Refresh",
         "",
         "- Run: `python docs/okf/bake.py`",
+        "- Fallback: if API access in sandbox returns HTTP 403, seed from live PR list data and note it in this file.",
         f"- Source: `GET /repos/{owner}/{repo}/pulls` (+ per-PR detail/status)",
         "",
     ])
@@ -218,10 +217,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     out = Path(args.output).resolve()
-    token = os.environ.get(args.token_env, "").strip()
-    if not token:
-        print(f"{args.token_env} is required to refresh cooking.md", file=sys.stderr)
-        return 2
+    token_raw = os.environ.get(args.token_env)
+    if token_raw is None:
+        token = None
+    else:
+        token = token_raw.strip()
+        if not token:
+            print(
+                f"{args.token_env} is set but empty; unset it for unauthenticated mode or provide a valid token.",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         open_prs = fetch_open_prs(args.owner, args.repo, token)
@@ -261,7 +267,13 @@ def main(argv: list[str] | None = None) -> int:
             pass
         detail = (detail[:300] + "...") if len(detail) > 300 else detail
         extra = f" ({detail})" if detail else ""
-        print(f"GitHub API HTTP {exc.code}: {status_text}{extra}", file=sys.stderr)
+        if exc.code == 403:
+            print(
+                "GitHub API HTTP 403: sandbox/API access denied; seed cooking.md from live PR data and annotate the fallback.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"GitHub API HTTP {exc.code}: {status_text}{extra}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(f"Network error: {exc.reason}", file=sys.stderr)

@@ -2,15 +2,15 @@
 title: Blackboard OKF Cooking
 owner: fleet
 status: living
-updated_at: 2026-09-27T02:47:00Z
-source: live-open-prs
+updated_at: 2026-09-27T02:56:00Z
+source: live-open-prs-seeded
 ---
 
 # Cooking (WIP + blockers)
 
 All-hands visibility surface for open work in `sfdc-24/Blackboard`.
 
-_Last baked: 2026-09-27T02:47:00Z_
+_Last baked: 2026-09-27T02:56:00Z_
 
 ## Open PRs
 
@@ -50,4 +50,5 @@ _Last baked: 2026-09-27T02:47:00Z_
 ## Refresh
 
 - Run: `python docs/okf/bake.py`
+- Sandbox fallback used for this refresh: seeded from live open PR data because local bake execution lacked API auth (`GITHUB_TOKEN` unavailable in-session).
 - Source: `GET /repos/sfdc-24/Blackboard/pulls` (+ per-PR detail/status)
