@@ -228,6 +228,282 @@ in force and the rest as an explicit automation gap.
 
 ---
 
+## L-100 — Rebuild a stacked PR's conflict from the parent's exact text
+
+**Incident.** Blackboard #261 is stacked on #260. #260 went through twelve
+review rounds on 2026-09-25 and 2026-09-26. Round 12, `cfdebac`, landed at
+03:18Z on 2026-09-26 and changed the page-load path; #261 has not yet been
+restacked onto it. The earlier rounds that touched the project-start code
+conflicted with #261's saved-revision branch.
+
+- **The round-11 restack onto `ecee267`.** A hunk-by-hunk resolution kept the
+  lines git considered common, and those came from #261's side. The resulting
+  block replaced the page fetch and parse with a second lease claim. It was
+  caught locally and never committed, so it is in no PR record.
+- **The committed restack.** `b84c3fd` was made the other way: the parent's
+  block was taken byte for byte, and the diff showed only indentation. Cursor's
+  GO checked those lines.
+- **An earlier restack.** It rebuilt the CI unittest list through a shell
+  string, and a literal `\n` was committed into `python-suites.yml` in #261
+  `d6a7b61`. The next commit, `05aaa05`, repaired it.
+
+**Naive rule.** "Resolve stacked conflicts carefully."
+
+**Mechanism — PROPOSED; the procedure was followed by hand for `b84c3fd`.**
+- Never resolve a stacked conflict hunk by hunk.
+- Take the parent's block byte for byte from git (`git show <parent-head>:<file>`) and place it under the child's new branch.
+- `diff` that region against the parent's block, and commit only when the diff is indentation alone.
+- This becomes a mechanism when a checked-in helper does the take-and-diff and refuses to stage otherwise.
+- The CI-list half is simpler: a test that parses `python-suites.yml` and fails on a literal `\n` or a missing line continuation. That test is not yet written.
+
+---
+
+## L-101 — A kill must come from the test that claims it
+
+**Incident.** In #260's mutation harness at `6081563`, the mutant "email scan
+not anchored (quadratic)" reported KILLED.
+- The test written for that mutant, `test_the_redaction_is_linear_on_hostile_input`, passed on it.
+- The kill actually came from `test_the_view_is_linear_on_hostile_compatibility_input`, which hit its wall-clock cap at 24.6 s on U+33C4, on a laptop running at 100% CPU.
+- Cursor caught it.
+
+The same night, the load also failed correct code: two `10 * base` ratio
+assertions (`+ 0.25`, then `+ 1.0` in `6ce8476`) and a 20 s backstop. That is
+a false kill and false failures from one cause: timing an assertion.
+
+**Naive rule.** "Don't rely on timing in tests."
+
+**Mechanism — PARTIAL.**
+- **In force on #260 `cfdebac`:** linearity is asserted by counting work. `test_the_redaction_is_linear_on_hostile_input` counts character tests and normalization calls. The clock is only a 60 s backstop.
+- **Proposed:** a harness mode that applies one mutant and runs only the test that claims it. The harness still runs the whole `tests.test_studio_clients` suite per mutant, so today a KILLED verdict says only that some test failed.
+
+---
+
+## L-102 — Describe the commit, not the intention
+
+**Incident.** On #260, a review request at 22:26Z described a three-run, 1 s
+growth check "on `a702180`". The change was not in that commit. The edit,
+commit, push and comment had been chained with `&&` and ended with `&`, and
+the comment went out anyway. Cursor reviewed the stated SHA, found the
+function byte-identical to `132a544`, and issued a NO-GO. The 22:38Z
+correction pointed to `6ce8476`. That cost a full review round.
+
+**Naive rule.** "Check the commit before describing it."
+
+**Mechanism — PROPOSED; followed by hand since.**
+- Post a review request only after two checks pass:
+  - the remote head equals the local HEAD;
+  - `git show <sha>:<file>` proves the described change is there.
+- Never background a chain that ends in an outward-facing message.
+- This becomes a mechanism when the fleet's review-request helper runs both checks and refuses to post otherwise.
+
+---
+
+## L-103 — A mutation harness must heal itself after a kill
+
+**Incident.** `scripts/mutate_studio_clients.py` on #260 rewrites product
+files in place and restores the originals from memory in a `finally`. On
+`6081563`, where it has 117 mutants, the host killed the full harness for
+memory (the #260 comment). Board row
+`CCC-PR260-6081563-HARNESS-PARTIAL-20260925T2300Z` records that the worktree
+was restored and clean, and the interrupted mutant never reached the remote.
+
+**Naive rule.** "Run `git status` after a harness run."
+
+**Mechanism — PROPOSED.**
+- Before mutating, the harness writes the original bytes to a sidecar file.
+- On every start it restores any sidecar it finds, then deletes it, so a killed run heals itself.
+- A pre-commit guard refuses a commit while a sidecar exists.
+- Until then, run `git status` before any commit from a tree a harness has touched.
+
+---
+
+## L-104 — Every Codex lane's verdict counts, whatever its sender tag
+
+**Incident.** On 2026-09-26, Codex posted a NO-GO on site #222 at `9f965e6`
+(`CODEX-SITE222-9F965E6-NOGO-20260926T021638Z`, posted 02:17:02Z) under the
+sender tag `CODEX-DESKTOP`. The operator's scratch watcher matched only
+lowercase tags, so the row went unseen for an hour. In that hour, #222 was
+rebased once (`9f965e6` to `b2f8ac9`, 02:45Z) and then got the contrast commit
+`ee80098` (03:11Z). The architecture PDF printed that head as pending.
+
+**Naive rule.** "Read the board more carefully."
+
+**Mechanism — RULE ONLY in this repository.**
+- The operator's watcher, which is not checked in, now matches case-insensitively.
+- The checked-in addressing, `scripts/board_since.lib.ps1`, matches exact tokens, and that is correct for addressing.
+- What is missing is a checked-in read of every verdict row for a PR, under every sender tag, before a re-review is requested. `tools/architecture_verdicts.py` on open PR #276 is a first draft of one.
+
+---
+
+## L-105 — Two lanes, one head, opposite verdicts: the newer GO does not cancel the older NO-GO
+
+**Incident.** Site #216 at `e5a9ae3` received two Codex verdicts:
+- `CODEX-SITE216-E5A9AE3-NOGO-20260926T0054Z`, posted 00:55:43Z, which found three product defects;
+- `CODEX-SITE216-E5A9AE3-GO-20260926T0100Z`, posted 01:00:20Z, whose `answers=` and `clears=` do not cite the NO-GO.
+
+#216 merged at 01:01:15Z on the GO while the NO-GO still stood. #221 then
+answered that NO-GO and merged on `CODEX-SITE221-7A2685A-GO-20260926T015243Z`.
+
+Site #223 merged at 02:38:20Z on a GO posted at 02:37:17Z. That GO was withdrawn
+after the merge by `CODEX-SITE223-89E3ABC-NOGO-CORRECTION-20260926T024146Z`,
+whose `supersedes=` names it. The fix-forward is #224, which was still under
+review at the time of writing.
+
+**Naive rule.** "Don't merge while a NO-GO stands."
+
+**Mechanism — NOT YET.**
+- A merge helper reads every verdict row for the exact head.
+- It refuses to merge when any NO-GO is not explicitly superseded by a later GO that cites it in `supersedes=` or `answers=`.
+- Until that helper exists, a GO that does not cite an earlier NO-GO on the same head does not clear it.
+
+---
+
+## L-106 — Build from the reviewed merge, after the verdict, and tag from the commit
+
+**Incident.** The r5d hotfix image was built for "validation only".
+- Cloud Build finished at about 02:32Z (`CCC-R5D-IMAGE-BUILT-VALIDATION-20260926T0233Z`).
+- Codex's NO-GO `CODEX-R5D-8A9349E-NOGO-20260926T0231Z` was posted at 02:33:20Z.
+- So the build raced the review. That image is marked do-not-promote (`CCC-R5D-NOGO-ACK-20260926T0238Z`).
+
+The accepted r6 image was built from the reviewed merge. Its short hash is
+`d2256e02122b` (`git rev-parse --short=12`), and the staging row uses that tag.
+
+**Naive rule.** "Wait for GO before building; copy tags carefully."
+
+**Mechanism — RULE ONLY, done by hand once.**
+- The r6 run (`CCC-R6-D2256E0-STAGED-ZERO-TRAFFIC-20260926T0406Z`) checked main before building and ran `diff -r /srv/app` inside the digest.
+- Missing: a checked-in release script that:
+  - takes the PR number;
+  - confirms a GO row names the merged head;
+  - derives the tag with `git rev-parse --short=12`;
+  - refuses otherwise.
+
+---
+
+## L-107 — A success marker must be something only success emits
+
+**Incident.** During the Codex upstream 401 outage on 2026-09-25, Codex
+failed from 22:38:40Z (`CCC-OPENAI-CODEX-401-DIAG-20260925T2332Z`). The last
+401 was at 23:30:34Z and real output returned at 23:44:39Z
+(`CCC-OPENAI-CODEX-401-RESTORED-20260925T2353Z`).
+
+The operator's scratch watcher reported "back" early. It had matched a
+completion token that also appears inside a failure message. That false
+positive was seen in session and is not recorded in those rows.
+
+**Naive rule.** "Grep more carefully."
+
+**Mechanism — RULE ONLY.** Every success grep ships with one negative control
+drawn from a real failure line, checked absent across a known failure window
+before it is trusted. Nothing checked in enforces this.
+
+---
+
+## L-108 — An additive merge join must keep the closer git factored out
+
+**Incident.** Rebasing site #222 onto #223 (`b2f8ac9`, review request at
+02:45Z; note at 03:11Z) met an additive conflict: both sides appended tests to
+the same spec. Joining them needed one test closer restored by hand, which
+the note records. The GO confirms the new test sits after #223's closer.
+
+**Naive rule.** "Check syntax after resolving."
+
+**Mechanism — RULE ONLY.**
+- Copy the shared suffix lines that follow the conflict block onto the end of "ours".
+- Gate `git rebase --continue` on `node --check`.
+- The join script lives only in an operator scratchpad, not under `tools/`.
+
+---
+
+## L-109 — Row ids carry the clock, not an estimate
+
+**Incident.** Row ids were stamped ahead of the real time:
+- `…T0406Z` was posted at 03:59:58Z;
+- `CCC-SITE224-CF05503-MOVED-HEAD-20260926T0338Z` was posted at 03:28:47Z.
+
+The payloads were composed before `date -u` ran. Codex's
+`CODEX-SITE224-CF05503-NOGO-20260926T0332Z`, posted at 03:31:27Z, was 33
+seconds ahead. A two-minute tolerance would accept that one, so the band
+matters.
+
+**Naive rule.** "Run `date -u` first."
+
+**Mechanism — NOT YET.**
+- `scripts/board_say.py` does not stamp or check the id. It should stamp the `T` component from the clock itself, or refuse an id more than two minutes from now.
+- Until then, run `date -u` as a separate step before composing a payload.
+
+---
+
+## L-110 — A governing architecture artifact is not a live release dashboard
+
+**Incident.** The reviewed 2026-09-26 edition (#274, merged 03:41:46Z) was
+followed at once by #276, a second edition built to chase verdicts and
+traffic. Its review rounds went to provenance: Cursor's NO-GO on `eb21164`
+found the verdict script's `R5D` filter, notes that were not in the cited
+rows, and the page badge. Those rounds spent reviewer time while release work
+waited. Codex then ruled that editions change only for material reasons.
+
+**Naive rule.** "Refresh the PDF less often."
+
+**Mechanism — RULING, not enforced** (`CODEX-ARCH-PDF-STATE-CHASE-POKAYOKE-20260926T0416Z`, posted 04:17:25Z).
+- A new edition requires a material architecture change or an owner request, one fixed evidence cutoff, and a verdict ledger read by script.
+- Moving truth lives in board rows, release receipts and the public rail.
+- #276 is held.
+- No checked-in gate refuses another edition; the ruling text is what is in force.
+
+---
+
+## L-111 — A run the host killed is evidence of nothing
+
+**Incident.** The host stopped a site suite for low memory
+(`CCC-SITE216-249127D-REVIEW-REQUEST-20260926T0019Z`). Four tests were failing
+at the moment of the kill; all four passed when rerun alone. The host also
+killed a full mutation run on #260 (L-103).
+
+**Naive rule.** "Rerun when memory is low."
+
+**Mechanism — RULE ONLY; the host governor in PR #280 is the candidate mechanism.**
+- Heavy suites run one worker at a time.
+- A killed run's failures are recorded as unknown, never as regressions, and only those tests are rerun alone.
+- The authoritative full run is hosted CI on the pushed head.
+- No runner in the tree yet records "killed" separately from "failed".
+
+---
+
+## L-112 — Label where a fact came from, or the reviewer cannot check it
+
+**Incident.** The first Converspan readiness draft (#273) stated facts the
+reviewer could not see from the repository: session observations, an unpushed
+local roadmap, board rows and a private repo.
+- Cursor posted three NO-GOs (`52c846c`, `4b83237`, `76e5034`).
+- Its GO on `423ced7` came only after every fact was labelled and the gate criteria were quoted from the ADR.
+- The paraphrased G2 and G4 close lines were exactly where conditions had been lost.
+
+**Naive rule.** "Only cite the repo."
+
+**Mechanism — RULE ONLY.**
+- Every fact carries a label: `repo`, `board` with its row id, or `session`.
+- Gate criteria are quoted verbatim from their source.
+- The labels live in the merged document. No checker refuses an unlabelled fact in the next governing doc.
+
+---
+
+## L-113 — One Claude reviewer at a time, and never a budgeted duplicate
+
+**Incident.** Codex reports (`CODEX-CLAUDE-PRINT-BUDGET-POKAYOKE-20260926T0707Z`)
+that on PR #280 it launched a non-interactive `claude -p` reviewer with a USD
+ceiling while an interactive Claude session already owned the lane. For the
+second time, the reviewer spent its whole budget and returned no verdict.
+
+**Naive rule.** "Give the reviewer a bigger budget."
+
+**Mechanism — RULE ONLY; Codex's candidate, not independently re-measured.**
+- While an interactive Claude session owns the lane, ask it with one exact-head board row and its doorbell. Do not start a parallel `claude -p` reviewer.
+- Execution evidence comes from hosted CI.
+- A budget-exceeded run is never blindly retried.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
