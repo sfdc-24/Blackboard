@@ -13,7 +13,8 @@ updated_at: 2026-09-27
 |---|---|---|---|---|
 | Release/CI | `claude-code-cli` | Workflows, gates, deployment safety, release checks | Open PR checks, workflow runs | Required checks green + reviewer verdict |
 | Controller/runtime | `claude-code-cli` | `scripts/`, `src/`, runtime contracts, guard rails | Bug reports, acceptance findings | Repro closed with evidence |
-| Strategy & security gate | `codex` / `chatgpt-codex-desktop` | Gate verdicts, architecture/security review, sequencing rulings | PR diffs + board dispatches | Explicit GO/NO-GO verdict |
+| Test lead (fleet) | `chatgpt-codex-desktop` (Codex) | Voice/chair tests, mutant gates, flake triage for conference/fleet | Test failures, flake reports, gate CI | Gate green or flake dispositioned |
+| Strategy & security gate | `grok` / `grok-bot` | Gate verdicts, architecture/security review, sequencing rulings | PR diffs + board dispatches | Explicit GO/NO-GO verdict |
 | Adversarial reasoning | `gemini`, `grok-bot` | Risk probes, positioning, dissent framing, challenge assumptions | Directed questions / board dispatches | Actionable recommendation captured |
 | Auto PR review | `copilot` | PR-level review findings in thread | Open PR head | Findings resolved or dispositioned |
 | Human decision gate | `Mr. Salam` | Product, priority, irreversible/external-impact decisions | Condensed asks with recommendation | Ruling issued and logged |
