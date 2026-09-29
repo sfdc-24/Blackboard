@@ -547,7 +547,14 @@ def claim_answer(answers_id: str) -> bool:
 # Rows that ask for a result. A waker's answer to one is posted as phase=RESULT (its evidence stays
 # STATED: a model's reasoning, not a measurement), so a dispatcher's tracker sees it. The owner via
 # Grok, 2026-09-29 06:24Z: Gemini never posted a RESULT, because every waker reply was phase=DONE.
-RESULT_FOR = ("DISPATCH", "ASK", "TASK", "REQ")
+# The set is the board's measured ask set (tools/board_governor/board_facts.py ASK_PHASES; the
+# cloud image does not carry tools/, so a test holds the two equal) plus ASK, which fleet_agent
+# posts. Membership is exact: REVIEW_RESULT is not REVIEW, and REQUEST is not REQ.
+RESULT_FOR = (
+    "DISPATCH", "REVIEW_REQUEST", "REQUEST",
+    "REVIEW", "ORDER", "TASK", "HANDOFF", "BATON",
+    "ASK",
+)
 
 
 def reply_phase(row) -> str:

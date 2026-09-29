@@ -76,7 +76,7 @@ class WatermarkFloor(unittest.TestCase):
         aw.log = self._real_log
         aw.sys.modules.pop("fake_wm_adapter", None)
 
-    def _fake_post(self, me, cfg, text, to, answers, verbose):
+    def _fake_post(self, me, cfg, text, to, answers, verbose, phase="DONE"):
         self.posted.append(answers)
         return True
 

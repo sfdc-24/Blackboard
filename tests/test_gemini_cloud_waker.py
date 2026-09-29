@@ -39,7 +39,7 @@ class FakeWaker:
     def __init__(self, post_ids, die_after=None):
         self.post_ids, self.die_after, self.posted = post_ids, die_after, []
 
-    def post_reply(self, me, cfg, text, to, answers, verbose):
+    def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
         self.posted.append(answers)
         return True
 
@@ -101,9 +101,9 @@ class GeminiCloudWakerTest(unittest.TestCase):
         w = FakeWaker(["A"])
         real_post = w.post_reply
 
-        def racing_post(*a):
+        def racing_post(*a, **kw):
             store.gen += 1  # someone else wrote in between
-            return real_post(*a)
+            return real_post(*a, **kw)
         w.post_reply = racing_post
         with self.assertRaises(state_store.Conflict):
             main.run(store=store, waker=w)
@@ -118,7 +118,7 @@ class _ClaimingWaker:
     def __init__(self, calls, spawn=None, on_post=None, posts=None):
         self.calls, self.spawn, self.on_post, self.posts = calls, spawn, on_post, posts
 
-    def post_reply(self, me, cfg, text, to, answers, verbose):
+    def post_reply(self, me, cfg, text, to, answers, verbose, phase="DONE"):
         # The append is on the wire here. A second run that arrives now sees
         # no reply yet; phase=posting must already have been saved.
         if (self.spawn is not None and not self.spawn.get("done")
@@ -395,8 +395,11 @@ class QuarantineDoesNotStarveNewWork(unittest.TestCase):
         aw.load_env = lambda: {}
         aw.log = lambda me, line: None
 
-        def post_reply(me, cfg, text, to, answers, verbose):
+        phases = []
+
+        def post_reply(me, cfg, text, to, answers, verbose, phase="DONE"):
             posts.append(answers)
+            phases.append(phase)
             return True
 
         aw.post_reply = post_reply
@@ -414,6 +417,8 @@ class QuarantineDoesNotStarveNewWork(unittest.TestCase):
                          "the new row was not answered once: posts=%r calls=%d"
                          % (posts, len(calls)))
         self.assertEqual(len(calls), 1)
+        # The row carries no phase, so the cloud wrapper posts its answer as DONE (#297's control).
+        self.assertEqual(phases, ["DONE"])
         self.assertIn("NEW", store.state.get("answered_ids") or [])
         for rid in ("U1", "U2", "U3"):
             self.assertIn(rid, store.state.get("unknown_ids") or [])
