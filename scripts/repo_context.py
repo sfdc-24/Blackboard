@@ -48,6 +48,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
@@ -76,6 +77,27 @@ _REF = re.compile(
     re.IGNORECASE)
 
 
+class _StayOnGitHub(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to https://api.github.com, and never with the token.
+
+    urllib follows redirects and copies a Request's constructor headers onto the new request, so a
+    redirect to another host would carry "Authorization: Bearer <token>" there. Gemini found this in
+    its first live review of this file (board row GEMINI-WAKE-GEM-PR-READ-TEST-20260929T0832Z-
+    4b55b18b3e); a local two-host probe on Python 3.14.7 confirmed it. The token is sent as an
+    unredirected header (never copied onto a redirect), and a redirect off api.github.com is refused,
+    which also keeps another host's content out of the prompt.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        if target.scheme != "https" or target.netloc != urllib.parse.urlsplit(API).netloc:
+            raise urllib.error.HTTPError(newurl, code, "redirect off api.github.com refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_StayOnGitHub)
+
+
 class TooLarge(Exception):
     pass
 
@@ -99,10 +121,10 @@ def refs(text: str):
 def _get(path: str, token: str, timeout: float = TIMEOUT):
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                "User-Agent": "sfdc24-gemini-waker"}
-    if token:
-        headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(API + path, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    if token:
+        req.add_unredirected_header("Authorization", "Bearer " + token)   # never copied onto a redirect
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise TooLarge()

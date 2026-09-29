@@ -845,10 +845,44 @@ class RepoContextForGemini(unittest.TestCase):
         body = mock.MagicMock()
         body.read.return_value = b"x" * (self.rc.MAX_RESPONSE_BYTES + 1)
         body.__enter__.return_value = body
-        with mock.patch.object(self.rc.urllib.request, "urlopen", return_value=body):
+        with mock.patch.object(self.rc._OPENER, "open", return_value=body):
             out = self.rc.context_for("Blackboard #297", env={})
         body.read.assert_called_with(self.rc.MAX_RESPONSE_BYTES + 1)
         self.assertIn("not attached (a response was over 2000000 bytes)", out)
+
+    def test_the_token_is_never_copied_onto_a_redirect(self):
+        # Gemini's first live review (GEMINI-WAKE-GEM-PR-READ-TEST-20260929T0832Z-4b55b18b3e): urllib
+        # copies constructor headers onto a redirect, so the token would reach the redirect's host.
+        from unittest import mock
+        body = mock.MagicMock()
+        body.read.return_value = b"{}"
+        body.__enter__.return_value = body
+        with mock.patch.object(self.rc._OPENER, "open", return_value=body) as opened:
+            self.rc._get("/repos/sfdc-24/Blackboard/pulls/1", "tok")
+        req = opened.call_args[0][0]
+        self.assertEqual("Bearer tok", req.unredirected_hdrs.get("Authorization"))
+        self.assertNotIn("Authorization", req.headers)
+        # A same-host redirect is followed, without the token.
+        handler = self.rc._StayOnGitHub()
+        again = handler.redirect_request(req, None, 301, "Moved", {},
+                                         "https://api.github.com/repositories/1/pulls/1")
+        self.assertIsNotNone(again)
+        self.assertNotIn("Authorization", again.headers)
+        self.assertNotIn("Authorization", again.unredirected_hdrs)
+        # A redirect anywhere else, or to plain http, is refused.
+        import urllib.error
+        for url in ("https://evil.example/steal", "http://api.github.com/repos/x",
+                    "https://api.github.com.evil.example/x", "https://raw.githubusercontent.com/x"):
+            with self.assertRaises(urllib.error.HTTPError, msg=url):
+                handler.redirect_request(req, None, 302, "Found", {}, url)
+
+    def test_a_refused_redirect_is_a_note_and_the_answer_goes_on(self):
+        import urllib.error
+
+        def get(path, token, timeout=20):
+            raise urllib.error.HTTPError(path, 302, "redirect off api.github.com refused", {}, None)
+        out = self.rc.context_for("Blackboard #297", env={}, get=get)
+        self.assertIn("Blackboard #297: not readable (HTTP 302).", out)
 
     def test_a_spent_read_budget_stops_the_requests(self):
         from unittest import mock
