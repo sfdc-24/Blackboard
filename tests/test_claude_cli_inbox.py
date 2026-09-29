@@ -82,6 +82,25 @@ class InboxTest(unittest.TestCase):
             mark.write_text("2026-09-29T00:48:24.100000+00:00", encoding="utf-8")
             self.assertEqual(1, inbox.check(lambda since: [WA_PLAIN], mark, out=lambda _: None))
 
+    def test_rows_to_plain_claude_reach_me(self):
+        # Grok's 35 conference dispatches of 2026-09-28 23:35-00:16Z were addressed this way and
+        # none reached the session.
+        for target in ("claude,codex,gemini,all", "gemini,claude,chatgpt-codex-desktop,codex",
+                       "chatgpt-codex-desktop,codex,claude", "claude,codex"):
+            self.assertTrue(inbox.is_mine(row("2026-09-28T23:43:46Z", "grok", target,
+                                              "BCB|v=1|id=CONF-RERUN-RECORD-ARM|to=" + target)), target)
+        by_payload = row("2026-09-28T23:44:00Z", "gemini", "Blackboard", "BCB|v=1|to=codex,Claude|cc=grok")
+        self.assertTrue(inbox.is_mine(by_payload))
+
+    def test_the_standby_and_a_mention_are_not_an_address(self):
+        for target, payload in (("claude-api", "BCB|to=claude-api"), ("grok", "BCB|to=grok|claude said so"),
+                                ("claudeX,codex", "BCB|to=claudeX")):
+            self.assertFalse(inbox.is_mine(row("2026-09-28T23:44:00Z", "gemini", target, payload)), target)
+
+    def test_a_lead_s_all_reaches_me_and_a_waker_s_all_does_not(self):
+        self.assertTrue(inbox.is_mine(row("2026-09-28T23:44:00Z", "grok", "codex,gemini,all", "BCB|to=codex,gemini,all")))
+        self.assertFalse(inbox.is_mine(WAKER_ALL))
+
     def test_codex_s_other_sender_tags_are_leads(self):
         # Cursor on #294: chatgpt-codex-desktop-<session> and CODEX-DESKTOP were not matched.
         for sender in ("chatgpt-codex-desktop-7f2a", "CODEX-DESKTOP", "grok-bot", "codex"):
