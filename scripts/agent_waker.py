@@ -559,6 +559,9 @@ def claim_answer(answers_id: str) -> bool:
 # The set is the board's measured ask set (tools/board_governor/board_facts.py ASK_PHASES; the
 # cloud image does not carry tools/, so a test holds the two equal) plus ASK, which fleet_agent
 # posts. Membership is exact: REVIEW_RESULT is not REVIEW, and REQUEST is not REQ.
+# fleet_agent post appends once, then reads back; this bounds both.
+POST_TIMEOUT_SECONDS = 400
+
 RESULT_FOR = (
     "DISPATCH", "REVIEW_REQUEST", "REQUEST",
     "REVIEW", "ORDER", "TASK", "HANDOFF", "BATON",
@@ -592,7 +595,18 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
             "--id", rid,
             "--prefix", "%s-WAKE" % me.upper(),
             "--gist", text[:160]]
-    res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=400)
+    try:
+        res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # NOT CONFIRMED IS NOT FAILED. fleet_agent appends once and then reads the row back; a
+        # flapping gateway can hold the read-back past the timeout after the row has landed
+        # (gemini-waker-tmm8l, 2026-09-29: the RESULT row landed at 07:41:19Z, the read-back hung
+        # until 07:47:59Z, and the uncaught TimeoutExpired ended the pass with exit 1). Never post
+        # again from here. False stops this pass; the cloud cursor keeps phase=posting and the
+        # next run reconciles the row from the board.
+        print("    post NOT CONFIRMED after %d s: it may have landed; not posted again"
+              % POST_TIMEOUT_SECONDS)
+        return False
     out = (res.stdout or "") + (res.stderr or "")
     ok = "VERIFIED on the board" in out
     if verbose or not ok:

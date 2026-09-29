@@ -919,5 +919,73 @@ class RepoContextForGemini(unittest.TestCase):
         self.assertEqual(set(), local - copied)
 
 
+class APostThatOutlivesItsTimeout(unittest.TestCase):
+    """gemini-waker-tmm8l, 2026-09-29: the RESULT row landed, the read-back hung past 400 s, and the
+    uncaught TimeoutExpired ended the pass with exit 1. Not confirmed is not failed: the pass ends
+    cleanly, the claim stays phase=posting, and the next run reconciles it without posting again."""
+
+    def test_the_pass_ends_cleanly_and_the_next_run_reconciles_without_a_second_post(self):
+        import subprocess
+        calls, attempts = [], []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                calls.append(prompt)
+                return ("an answer", "fake-route")
+
+        rows = [["ROW-T", "2026-09-29T07:21:00Z", "grok", "gemini", "APPEND",
+                 "BCB|v=1|id=SLOW-1|phase=DISPATCH|to=gemini|ask=x"]]
+
+        def hang(args, **kw):
+            attempts.append(args)
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+
+        store = MemStore({"watermark": "2026-09-29T07:00:00Z", "answered_ids": []})
+        saved = (aw.read_since, aw.load_env, aw.log)
+        saved_module = aw.AGENTS["gemini"]["module"]
+        aw.sys.modules["fake_slow_post_adapter"] = Adapter
+        aw.AGENTS["gemini"]["module"] = "fake_slow_post_adapter"
+        aw.read_since = lambda env, since, tries=3: {"rows": [r for r in rows if str(r[1]) > since],
+                                                     "total": 1, "filtered": 1}
+        aw.load_env = lambda: {}
+        aw.log = lambda me, line: None
+        try:
+            with mock.patch.object(aw.subprocess, "run", side_effect=hang):
+                main.run(store=store, waker=aw, board_contains=lambda rid: False,
+                         argv=["--agent", "gemini", "--max", "3"])       # no exception: a clean pass
+            self.assertEqual(1, len(attempts))
+            self.assertEqual(aw.POST_TIMEOUT_SECONDS, 400)
+            self.assertEqual("posting", store.state.get("claim_phase"))
+            self.assertEqual("SLOW-1", store.state.get("inflight"))
+            self.assertNotIn("SLOW-1", store.state.get("answered_ids") or [])
+            # The reply had landed. The next run finds it on the board and records it: no model
+            # call and no second post.
+            with mock.patch.object(aw.subprocess, "run", side_effect=hang):
+                main.run(store=store, waker=aw, board_contains=lambda rid: True,
+                         argv=["--agent", "gemini", "--max", "3"])
+        finally:
+            aw.read_since, aw.load_env, aw.log = saved
+            aw.AGENTS["gemini"]["module"] = saved_module
+            aw.sys.modules.pop("fake_slow_post_adapter", None)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(attempts))
+        self.assertIn("SLOW-1", store.state.get("answered_ids") or [])
+        self.assertNotEqual("posting", store.state.get("claim_phase"))
+
+    def test_post_reply_returns_false_and_says_not_confirmed(self):
+        import io
+        import subprocess
+        from contextlib import redirect_stdout
+
+        def hang(args, **kw):
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+        buf = io.StringIO()
+        with mock.patch.object(aw.subprocess, "run", side_effect=hang), redirect_stdout(buf):
+            self.assertFalse(aw.post_reply("gemini", {"project": "FLEET"}, "t", "grok;ALL", "X", False,
+                                           phase="RESULT"))
+        self.assertIn("NOT CONFIRMED after 400 s", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
