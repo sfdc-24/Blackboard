@@ -806,7 +806,11 @@ def main(argv=None) -> int:
             print(ok)
             log(me, ok)
         else:
-            fail = "    POST FAILED for %s - watermark not advanced past it" % src_id
+            # NOT CONFIRMED, never FAILED: fleet_agent appends once, and neither a missing read-back
+            # nor a timeout proves the row is absent. A FAILED line invites a human to post it again
+            # (Codex on #300).
+            fail = ("    POST NOT CONFIRMED for %s - it may be on the board; the watermark is held and it "
+                    "is not posted again from this pass" % src_id)
             print(fail)
             log(me, fail)
             break

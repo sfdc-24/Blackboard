@@ -950,10 +950,19 @@ class APostThatOutlivesItsTimeout(unittest.TestCase):
                                                      "total": 1, "filtered": 1}
         aw.load_env = lambda: {}
         aw.log = lambda me, line: None
+        import io
+        from contextlib import redirect_stdout
+        printed = io.StringIO()
         try:
-            with mock.patch.object(aw.subprocess, "run", side_effect=hang):
+            with mock.patch.object(aw.subprocess, "run", side_effect=hang), redirect_stdout(printed):
                 main.run(store=store, waker=aw, board_contains=lambda rid: False,
                          argv=["--agent", "gemini", "--max", "3"])       # no exception: a clean pass
+            # The whole pass says NOT CONFIRMED and claims neither failure nor delivery (Codex on #300).
+            text = printed.getvalue()
+            self.assertIn("post NOT CONFIRMED after 400 s", text)
+            self.assertIn("POST NOT CONFIRMED for SLOW-1", text)
+            for claim in ("FAILED", "posted,", "VERIFIED"):
+                self.assertNotIn(claim, text)
             self.assertEqual(1, len(attempts))
             self.assertEqual(aw.POST_TIMEOUT_SECONDS, 400)
             self.assertEqual("posting", store.state.get("claim_phase"))
