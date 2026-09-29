@@ -3,6 +3,7 @@
 Mr. Salam, 2026-09-29: four WhatsApp messages to claude-code-cli went unanswered for 20 minutes;
 "fix and poka yoke that".
 """
+import io
 import os
 import sys
 import tempfile
@@ -208,6 +209,24 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(0, inbox.main(["--wait", "0"]))
         self.assertEqual(3, len(asked))
         self.assertEqual(1, len(set(asked)))                            # the same start every poll
+
+    def test_a_row_with_any_character_prints_on_a_cp1252_console(self):
+        # 2026-09-29 04:00Z: a row holding a right arrow crashed the doorbell on the Windows
+        # console before the bookmark moved, so every restart crashed on the same row.
+        arrow = row("2026-09-29T00:50:00Z", "grok", "claude-code-cli", "BCB|v=1|to=claude-code-cli|form: name \u2192 code")
+        console = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with tempfile.TemporaryDirectory() as tmp:
+            mark = Path(tmp) / "bookmark"
+            mark.write_text("2026-09-29T00:20:00+00:00", encoding="utf-8")
+            with mock.patch.object(inbox, "BOOKMARK", mark), \
+                    mock.patch.object(inbox.bus, "load_env", return_value={}), \
+                    mock.patch.object(inbox.bus, "read_rows", return_value={"rows": [arrow]}), \
+                    mock.patch("sys.stdout", console):
+                self.assertEqual(0, inbox.main([]))
+                console.flush()
+                printed = console.buffer.getvalue().decode("utf-8")
+            self.assertIn("form: name \u2192 code", printed)
+            self.assertEqual(inbox.parse_ts("2026-09-29T00:50:00Z"), inbox.read_bookmark(mark)[0])
 
     def test_a_failed_bus_read_keeps_the_bookmark(self):
         with tempfile.TemporaryDirectory() as tmp:
