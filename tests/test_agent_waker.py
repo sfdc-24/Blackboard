@@ -272,7 +272,9 @@ class GrokLane(unittest.TestCase):
         self.assertNotIn("say, in one short line before your answer, something like: this is the api "
                          "standby answering straight away; the claude-code-cli session will also see", doctrine)
         self.assertIn("your message is queued for the claude-code-cli session, which confirms here when it "
-                      "picks it up - if it has not within about 15 minutes, it is not running", doctrine)
+                      "picks it up - if it has not confirmed within about 15 minutes, it has not picked it up "
+                      "and may be unavailable", doctrine)
+        self.assertNotIn("it is not running", doctrine)            # silence is not a diagnosis (Codex on #294)
 
     def test_grok_doctrine_separates_the_api_from_the_desktop_app(self):
         """The one confusion that would make a grok reply actively misleading."""

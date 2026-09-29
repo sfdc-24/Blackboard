@@ -27,7 +27,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +36,12 @@ import bus  # noqa: E402
 BOOKMARK = Path(os.environ.get("CLAUDE_CLI_INBOX_BOOKMARK", Path.home() / ".claude-cli-inbox-bookmark"))
 MINE = re.compile(r"claude-code-cli", re.I)                      # vm-claude-code-cli too
 FLEET = re.compile(r"(^|[|;,=])\s*fleet\s*($|[|;,])", re.I)
-LEADS = ("grok", "grok-bot", "codex", "chatgpt-codex-desktop")
+# Leads whose fleet notes are for me; a prefix, since Codex posts as codex, chatgpt-codex-desktop,
+# chatgpt-codex-desktop-<session> and CODEX-DESKTOP (Cursor on #294).
+LEADS = ("grok", "codex", "chatgpt-codex-desktop")
+# With no readable bookmark (a first run, a lost file), look back this far rather than start at
+# "now" and skip what is already waiting (Cursor on #294).
+COLD_START = timedelta(hours=6)
 SELF = "claude-code-cli"
 
 
@@ -63,7 +68,8 @@ def is_mine(row) -> bool:
         return True
     if MINE.search(target) or MINE.search(payload[:400]):
         return True
-    return sender in LEADS and bool(FLEET.search(target) or FLEET.search(payload[:200]))
+    lead = any(sender.startswith(prefix) for prefix in LEADS)
+    return lead and bool(FLEET.search(target) or FLEET.search(payload[:200]))
 
 
 def new_rows(rows, since: datetime) -> list:
@@ -76,10 +82,34 @@ def new_rows(rows, since: datetime) -> list:
     return sorted(found, key=lambda pair: pair[0])
 
 
-def read_bookmark(path: Path = None) -> datetime:
+def read_bookmark(path: Path = None):
+    """(the bookmark, "ok"), or (None, "missing") or (None, "corrupt: <what it held>")."""
     path = path or BOOKMARK
-    stored = parse_ts(path.read_text(encoding="utf-8").strip()) if path.exists() else None
-    return stored or datetime.now(timezone.utc)
+    if not path.exists():
+        return None, "missing"
+    text = path.read_text(encoding="utf-8").strip()
+    stored = parse_ts(text)
+    return (stored, "ok") if stored is not None else (None, "corrupt: %r" % text[:40])
+
+
+def baseline(path: Path, out) -> datetime:
+    """The bookmark, or with none readable a deliberate start COLD_START back, written down before
+    the first read so every later poll starts from the same point, and said out loud (Codex on
+    #294: a fresh "now" each poll lost what arrived between polls, and a corrupt bookmark must not
+    pass silently)."""
+    since, status = read_bookmark(path)
+    if since is None:
+        since = datetime.now(timezone.utc) - COLD_START
+        path.write_text(since.isoformat(), encoding="utf-8")
+        out("BOOKMARK %s: starting from %s (%s back)" % (status, since.isoformat(), COLD_START))
+    return since
+
+
+def since_arg(since: datetime) -> str:
+    """The bus's `since`, a whole second before the bookmark: the bus compares text, and
+    "...:24.500Z" sorts before "...:24Z", so a row later in the bookmark's own second would be
+    dropped (Cursor on #294). new_rows then keeps only rows after the exact bookmark."""
+    return (since.replace(microsecond=0) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def line(ts: datetime, row) -> str:
@@ -89,11 +119,12 @@ def line(ts: datetime, row) -> str:
     return "%s | from %s | to %s | %s" % (ts.strftime("%Y-%m-%dT%H:%M:%SZ"), sender, target, payload[:900])
 
 
-def check(read, path: Path = None, peek: bool = False, out=print):
+def check(read, path: Path = None, peek: bool = False, out=None):
     """Print the new rows and (unless `peek`) move the bookmark past them. Returns how many, or
     None when the read failed (the bookmark stays)."""
     path = path or BOOKMARK
-    since = read_bookmark(path)
+    out = out or print                  # at call time, so a caller's print is the one used
+    since = baseline(path, out)
     try:
         rows = read(since)
     except (SystemExit, OSError, ValueError) as error:
@@ -111,21 +142,19 @@ def main(argv) -> int:
     env = bus.load_env()
 
     def read(since):
-        # A little before the bookmark: the bus's `since` compares text, and a row stamped in
-        # the same second must not fall through; new_rows compares exact times.
-        return bus.read_rows(env, since=(since.replace(microsecond=0)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        return bus.read_rows(env, since=since_arg(since))["rows"]
 
     if "--wait" in argv:
         every = float(argv[argv.index("--wait") + 1])
         while True:
-            if check(read, out=print):
+            if check(read):
                 return 0
             time.sleep(every)
     count = check(read, peek="--peek" in argv)
     if count is None:
         return 2
     if count == 0:
-        print("inbox empty since %s" % read_bookmark().isoformat())
+        print("inbox empty since %s" % read_bookmark()[0].isoformat())
     return 0
 
 
