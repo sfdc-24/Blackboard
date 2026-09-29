@@ -151,14 +151,30 @@ def _one(repo: str, number: int, token: str, room: int, get, deadline: float) ->
     return _render(repo, number, pr, files, before, room)
 
 
+def _pure_rename(f) -> bool:
+    """A rename that changes no content, proven by the record itself: its source path is named and
+    additions, deletions and changes are all present and zero. Only this may carry no patch and
+    still be COMPLETE; anything else without a patch is a gap (Codex and Cursor on #299, e7a4107)."""
+    return (f.get("status") == "renamed" and bool(f.get("previous_filename"))
+            and f.get("additions") == 0 and f.get("deletions") == 0 and f.get("changes") == 0)
+
+
+def _path(f) -> str:
+    # A rename shows where the file came from: moving a workflow out of .github/workflows/ is a
+    # change even with no content change.
+    if f.get("previous_filename"):
+        return "%s -> %s" % (f.get("previous_filename"), f.get("filename", "?"))
+    return f.get("filename", "?")
+
+
 def _render(repo, number, pr, files, shas, room) -> str:
     """Header, then COMPLETE or INCOMPLETE with every reason, then the file list and patches."""
     budget = room - RESERVE
     used, listed, patches = 0, [], []
     list_cut, missing, capped, omitted = False, 0, 0, 0
     for f in files:
-        line = "  %s %s (+%s -%s)" % (f.get("status", "?"), f.get("filename", "?"),
-                                      f.get("additions", 0), f.get("deletions", 0))
+        line = "  %s %s (+%s -%s)" % (f.get("status", "?"), _path(f),
+                                      f.get("additions", "?"), f.get("deletions", "?"))
         if used + len(line) + 1 > budget // 2:          # the list gets at most half of the room
             list_cut = True
             break
@@ -167,11 +183,12 @@ def _render(repo, number, pr, files, shas, room) -> str:
     for f in files:
         patch = f.get("patch")
         if not patch:
-            # GitHub sends no patch for a binary or too-large diff. A pure rename changes nothing.
-            if int(f.get("changes") or 0) > 0 or f.get("status") in ("added", "removed"):
+            # GitHub sends no patch for a binary or too-large diff. Only a proven pure rename has
+            # nothing to show; every other file without a patch is a gap.
+            if not _pure_rename(f):
                 missing += 1
             continue
-        piece = "\n--- %s\n%s" % (f.get("filename", "?"), patch[:PATCH_CAP])
+        piece = "\n--- %s\n%s" % (_path(f), patch[:PATCH_CAP])
         if len(patch) > PATCH_CAP:
             capped += 1
             piece += "\n[patch cut at %d of %d characters]" % (PATCH_CAP, len(patch))

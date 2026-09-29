@@ -715,9 +715,12 @@ class RepoContextForGemini(unittest.TestCase):
         self.assertIn("f100.py", out)                                        # file 101, on page 2
         self.assertIn("101 files]", out)
         self.assertNotIn("the file list has", out)
+        # Every file was listed, but none carried a patch: that is not the whole diff (Cursor, e7a4107).
+        self.assertIn("INCOMPLETE: GitHub sent no patch for 101 changed file(s).", out)
         # More files than the pages it reads: marked, with no whole-PR verdict.
         out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=many[:100], changed=450))
-        self.assertIn("INCOMPLETE: the file list has 100 of 450 files. Do not give a verdict", out)
+        self.assertIn("INCOMPLETE: the file list has 100 of 450 files;", out)
+        self.assertIn("Do not give a verdict on the whole PR", out)
 
     def test_a_head_that_moves_while_reading_is_read_again_or_refused(self):
         # A then B: the first pass is thrown away and the second, B then B, is attached as B.
@@ -759,7 +762,8 @@ class RepoContextForGemini(unittest.TestCase):
                                    "deletions": 0, "changes": 0}]
         big = self._small() + [{"filename": "big%d.py" % i, "status": "modified", "additions": 900,
                                 "deletions": 0, "changes": 900, "patch": "y" * 5900} for i in range(5)]
-        rename = self._small() + [{"filename": "moved.py", "status": "renamed", "changes": 0}]
+        workflow_out = {"filename": "docs/required.yml", "previous_filename": ".github/workflows/required.yml",
+                        "status": "renamed", "additions": 0, "deletions": 0, "changes": 0}
         cases = [
             (dict(files=binary), "GitHub sent no patch for 1 changed file(s)"),
             (dict(files=big), "patch(es) were left out to fit"),
@@ -782,9 +786,39 @@ class RepoContextForGemini(unittest.TestCase):
             self.assertIn("Do not give a verdict on the whole PR", marker)
             self.assertLess(out.index("INCOMPLETE"), out.find("\n--- ") if "\n--- " in out else len(out))
             self.assertLessEqual(len(out), self.rc.BUDGET + 400)
-        # A pure rename carries no patch and hides nothing.
-        out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=rename))
+        # A proven pure rename carries no patch and hides nothing, and its source path is shown: a
+        # required workflow moved out of .github/workflows/ is visible (Codex, e7a4107).
+        out = self.rc.context_for("Blackboard #297", env={},
+                                  get=self.fake_get([], files=self._small() + [workflow_out]))
+        self.assertTrue(self._marker(out).startswith("COMPLETE"), self._marker(out))
+        self.assertIn("  renamed .github/workflows/required.yml -> docs/required.yml (+0 -0)", out)
+
+    def test_a_file_without_a_patch_is_a_gap_unless_it_is_a_proven_pure_rename(self):
+        gaps = {
+            "modified, additions, no changes key": {"filename": "a.py", "status": "modified", "additions": 1},
+            "modified, additions 5, changes 0": {"filename": "a.py", "status": "modified", "additions": 5,
+                                                 "deletions": 0, "changes": 0},
+            "modified, deletions 4, no changes key": {"filename": "a.py", "status": "modified", "deletions": 4},
+            "modified, no counts at all": {"filename": "a.py", "status": "modified"},
+            "rename without its source path": {"filename": "b.py", "status": "renamed", "additions": 0,
+                                               "deletions": 0, "changes": 0},
+            "rename with content changes": {"filename": "b.py", "previous_filename": "a.py", "status": "renamed",
+                                            "additions": 3, "deletions": 1, "changes": 4},
+            "rename with no counts": {"filename": "b.py", "previous_filename": "a.py", "status": "renamed"},
+            "added binary": {"filename": "logo.png", "status": "added", "additions": 0, "deletions": 0,
+                             "changes": 0},
+            "removed with no patch": {"filename": "old.py", "status": "removed", "additions": 0,
+                                      "deletions": 0, "changes": 0},
+        }
+        for label, f in gaps.items():
+            out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=self._small() + [f]))
+            self.assertIn("INCOMPLETE: GitHub sent no patch for 1 changed file(s)", self._marker(out), label)
+        # A rename with content changes and its patch is COMPLETE, and names both paths.
+        moved = {"filename": "b.py", "previous_filename": "a.py", "status": "renamed", "additions": 1,
+                 "deletions": 1, "changes": 2, "patch": "@@ -1 +1 @@\n-x\n+y"}
+        out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=[moved]))
         self.assertTrue(self._marker(out).startswith("COMPLETE"))
+        self.assertIn("--- a.py -> b.py", out)
 
     def test_a_list_too_long_for_the_room_is_cut_and_marked(self):
         many = [{"filename": "deep/path/to/a/module/number_%04d_with_a_long_name.py" % i, "status": "modified",
