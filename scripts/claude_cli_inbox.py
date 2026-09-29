@@ -157,6 +157,11 @@ def check(read, path: Path = None, peek: bool = False, out=None):
 
 
 def main(argv) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        # A row can hold any character. On the Windows console (cp1252) a "\u2192" in a row
+        # crashed the doorbell before the bookmark moved (2026-09-29 04:00Z), so it would have
+        # crashed on that same row at every start: a doorbell that never rings again.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     env = bus.load_env()
 
     def read(since):
