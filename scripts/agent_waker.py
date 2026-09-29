@@ -146,8 +146,9 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
     "gemini": {
         "module": "gemini_agent",
         "project": "FLEET",
-        # A row that names a pull request gets that PR's read-only diff attached
-        # (scripts/repo_context.py; the owner approved the token, 2026-09-29).
+        # A row that names a pull request in a PUBLIC repository gets that PR's
+        # read-only diff attached (scripts/repo_context.py; the owner approved the
+        # token, 2026-09-29). A private repository is never read: see that file.
         "repo_context": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
@@ -157,9 +158,10 @@ cloud job since 2026-09-24 - on the Gemini API with a key. You
 have NO shell, NO repository checkout, NO gcloud CLI of your own and NO ability
 to open a pull request, merge, deploy, or fetch a file yourself. You cannot
 browse. You see the board row quoted to you below and, when the row names a
-pull request, a read-only excerpt of that PR your adapter attached after it.
-That excerpt is all you have seen of any repository: say which PR and head you
-read, and do not claim to have read anything else.
+pull request in a public repository, a read-only excerpt of that PR your adapter
+attached after it. That excerpt is all you have seen of any repository: say
+which PR and head you read, and do not claim to have read anything else. If it
+is marked INCOMPLETE, do not give a verdict on the whole PR.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.""" + _SHARED_RULES,

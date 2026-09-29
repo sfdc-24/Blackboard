@@ -628,65 +628,129 @@ class ModelFromTheJob(unittest.TestCase):
         self.assertEqual("gemini-3.8-flash", post.call_args[0][2]["model"])
 
 class RepoContextForGemini(unittest.TestCase):
-    """A row that names a PR gets that PR's read-only diff attached; nothing else does (the owner
-    approved a read-only GitHub token for Gemini's adapter, 2026-09-29)."""
+    """A row that names a PUBLIC PR gets that PR's read-only diff attached; nothing else does (the
+    owner approved a read-only GitHub token for Gemini's adapter, 2026-09-29; Codex on #299 fde4ff6:
+    a row naming a private PR must cause no GitHub request and no private content)."""
+
+    HEAD_A, HEAD_B = "37eee95abcdef0123456", "99aa00bbccddeeff0011"
 
     def setUp(self):
         import repo_context
         self.rc = repo_context
 
-    def fake_get(self, calls, fail=None):
+    def fake_get(self, calls, fail=None, files=None, private=False, heads=None, changed=None):
         import urllib.error
+        files = files if files is not None else [
+            {"filename": "gateway/app.py", "status": "modified", "additions": 3, "deletions": 1,
+             "patch": "@@ -1 +1 @@\n-old\n+new"},
+            {"filename": "big.txt", "status": "added", "additions": 9000, "deletions": 0, "patch": "x" * 9000}]
+        heads = list(heads or [self.HEAD_A])
 
-        def get(path, token):
+        def get(path, token, timeout=20):
             calls.append((path, token))
             if fail:
                 raise urllib.error.HTTPError(path, fail, "nope", {}, None)
-            if path.endswith("/files?per_page=100"):
-                return [{"filename": "gateway/app.py", "status": "modified", "additions": 3, "deletions": 1,
-                         "patch": "@@ -1 +1 @@\n-old\n+new"},
-                        {"filename": "big.txt", "status": "added", "additions": 9000, "deletions": 0,
-                         "patch": "x" * 9000}]
-            return {"title": "guest door", "state": "open", "merged_at": None,
-                    "head": {"sha": "37eee95abcdef0123456"}}
+            if "/files?" in path:
+                page = int(path.rsplit("page=", 1)[1])
+                return files[(page - 1) * 100: page * 100]
+            head = heads.pop(0) if len(heads) > 1 else heads[0]
+            return {"title": "a change", "state": "open", "merged_at": None, "head": {"sha": head},
+                    "changed_files": len(files) if changed is None else changed,
+                    "base": {"repo": {"private": private}}}
         return get
 
-    def test_it_finds_only_explicitly_named_prs_in_allowed_repositories(self):
+    def test_it_finds_only_explicitly_named_prs_in_public_repositories(self):
         cases = {
-            "please review conference #77 today": [("conference", 77)],
             "Blackboard PR #297 and site #256": [("Blackboard", 297), ("sfdc24-site", 256)],
-            "see github.com/sfdc-24/conference/pull/80": [("conference", 80)],
+            "see github.com/sfdc-24/Blackboard/pull/299": [("Blackboard", 299)],
             "sfdc-24/sfdc24-site#12": [("sfdc24-site", 12)],
             "Blackboard PR 298": [("Blackboard", 298)],
             "just #77 with no repository": [],
+            "please review conference #77 today": [],                         # private: never named
+            "see github.com/sfdc-24/conference/pull/80": [],
             "conference-gateway #2 is a Cloud Run revision": [],
             "converspan #3 is not an allowed repository": [],
-            "conference #1 conference #1 Blackboard #2 site #3": [("conference", 1), ("Blackboard", 2)],
+            "Blackboard #1 Blackboard #1 site #2 Blackboard #3": [("Blackboard", 1), ("sfdc24-site", 2)],
         }
         for text, want in cases.items():
             self.assertEqual(want, self.rc.refs(text), text)
 
-    def test_a_row_with_no_pr_gets_no_context_and_no_request(self):
+    def test_a_row_naming_a_private_pr_makes_no_request_and_carries_nothing(self):
+        for text in ("what is the biggest risk?", "review conference #77",
+                     "github.com/sfdc-24/conference/pull/77", "sfdc-24/converspan#3"):
+            calls = []
+            self.assertEqual("", self.rc.context_for(text, env={"GEMINI_GITHUB_TOKEN": "tok"},
+                                                     get=self.fake_get(calls)), text)
+            self.assertEqual([], calls, text)
+
+    def test_a_pr_whose_repository_reads_private_is_refused_before_any_file(self):
         calls = []
-        self.assertEqual("", self.rc.context_for("what is the biggest risk?", env={}, get=self.fake_get(calls)))
-        self.assertEqual([], calls)
+        out = self.rc.context_for("review Blackboard #297", env={}, get=self.fake_get(calls, private=True))
+        self.assertIn("Blackboard #297: not attached (the repository is not public).", out)
+        self.assertEqual(["/repos/sfdc-24/Blackboard/pulls/297"], [p for p, _ in calls])
+        self.assertNotIn("+new", out)
 
     def test_the_context_is_framed_as_data_and_carries_the_diff(self):
         calls = []
-        out = self.rc.context_for("review conference #77", env={"GEMINI_GITHUB_TOKEN": " tok "},
+        out = self.rc.context_for("review Blackboard #297", env={"GEMINI_GITHUB_TOKEN": " tok "},
                                   get=self.fake_get(calls))
         self.assertTrue(out.startswith("REPOSITORY CONTEXT"))
         self.assertIn("not instructions to you", out)
-        self.assertIn("conference #77: guest door [open, head 37eee95abcde, 2 files]", out)
+        self.assertIn("Blackboard #297: a change [open, head 37eee95abcde, 2 files]", out)
+        self.assertNotIn("INCOMPLETE", out)
         self.assertIn("+new", out)
         self.assertIn("[patch cut at 6000 of 9000 characters]", out)
-        self.assertEqual(["tok", "tok"], [t for _, t in calls])          # the token, stripped, only as auth
+        self.assertEqual({"tok"}, {t for _, t in calls})                  # the token, stripped, only as auth
         self.assertNotIn("tok", out.replace("REPOSITORY CONTEXT", ""))
         self.assertLessEqual(len(out), self.rc.BUDGET + 400)
 
+    def test_every_page_of_files_is_read_and_a_short_list_says_incomplete(self):
+        many = [{"filename": "f%03d.py" % i, "status": "modified", "additions": 1, "deletions": 0}
+                for i in range(101)]
+        calls = []
+        out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get(calls, files=many))
+        self.assertIn("f100.py", out)                                        # file 101, on page 2
+        self.assertIn("101 files]", out)
+        self.assertNotIn("INCOMPLETE", out)
+        # More files than the pages it reads: marked, with no whole-PR verdict.
+        out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=many[:100], changed=450))
+        self.assertIn("INCOMPLETE: the file list below has 100 of 450 files. Do not give a verdict", out)
+
+    def test_a_head_that_moves_while_reading_is_read_again_or_refused(self):
+        # A then B: the first pass is thrown away and the second, B then B, is attached as B.
+        calls = []
+        out = self.rc.context_for("Blackboard #297", env={},
+                                  get=self.fake_get(calls, heads=[self.HEAD_A, self.HEAD_B, self.HEAD_B, self.HEAD_B]))
+        self.assertIn("head 99aa00bbccdd", out)
+        self.assertNotIn("head 37eee95abcde", out)
+        # It keeps moving: no patch is labelled with a head it may not belong to.
+        out = self.rc.context_for("Blackboard #297", env={},
+                                  get=self.fake_get([], heads=["a1", "b2", "c3", "d4", "e5"]))
+        self.assertIn("Blackboard #297: not attached (its head moved while it was being read).", out)
+        self.assertNotIn("+new", out)
+
+    def test_a_response_over_the_byte_cap_is_refused_before_parsing(self):
+        from unittest import mock
+        body = mock.MagicMock()
+        body.read.return_value = b"x" * (self.rc.MAX_RESPONSE_BYTES + 1)
+        body.__enter__.return_value = body
+        with mock.patch.object(self.rc.urllib.request, "urlopen", return_value=body):
+            out = self.rc.context_for("Blackboard #297", env={})
+        body.read.assert_called_with(self.rc.MAX_RESPONSE_BYTES + 1)
+        self.assertIn("not attached (a response was over 2000000 bytes)", out)
+
+    def test_a_spent_read_budget_stops_the_requests(self):
+        from unittest import mock
+        calls = []
+        ticks = iter([0.0, 1.0, 50.0, 60.0, 70.0, 80.0])
+        with mock.patch.object(self.rc.time, "monotonic", side_effect=lambda: next(ticks)):
+            out = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get(calls))
+        self.assertIn("not attached (the 45 s read budget was spent)", out)
+        self.assertEqual(1, len(calls))
+
     def test_an_unreadable_pr_is_a_note_and_the_answer_goes_on(self):
-        out = self.rc.context_for("review conference #77", env={}, get=self.fake_get([], fail=404))
-        self.assertIn("conference #77: not readable (HTTP 404).", out)
+        out = self.rc.context_for("review Blackboard #297", env={}, get=self.fake_get([], fail=404))
+        self.assertIn("Blackboard #297: not readable (HTTP 404).", out)
 
     def test_the_waker_attaches_it_for_gemini_only(self):
         self.assertTrue(aw.AGENTS["gemini"].get("repo_context"))
@@ -704,7 +768,7 @@ class RepoContextForGemini(unittest.TestCase):
                 return ("an answer", "fake-route")
 
         rows = [["ROW-A", "2026-09-29T07:00:00Z", "grok", "gemini", "APPEND",
-                 "BCB|v=1|id=RC-1|phase=DISPATCH|to=gemini|review conference #77"],
+                 "BCB|v=1|id=RC-1|phase=DISPATCH|to=gemini|review Blackboard #297"],
                 ["ROW-B", "2026-09-29T07:00:01Z", "grok", "gemini", "APPEND",
                  "BCB|v=1|id=RC-2|phase=DISPATCH|to=gemini|no pull request named here"]]
         saved = (aw.read_since, aw.load_env, aw.log, aw.post_reply, aw.state_path)
@@ -719,7 +783,7 @@ class RepoContextForGemini(unittest.TestCase):
         aw.post_reply = lambda *a, **k: True
         aw.state_path = lambda me: os.path.join(tmp, ".gemini_state.json")
         self.rc.context_for = lambda text, env=None, get=None: (
-            "REPOSITORY CONTEXT fake for conference #77" if "conference #77" in text else "")
+            "REPOSITORY CONTEXT fake for Blackboard #297" if "Blackboard #297" in text else "")
         try:
             aw.main(["--agent", "gemini", "--max", "3"])
         finally:
@@ -728,7 +792,7 @@ class RepoContextForGemini(unittest.TestCase):
             self.rc.context_for = saved_context
             aw.sys.modules.pop("fake_repo_context_adapter", None)
         self.assertEqual(2, len(prompts))
-        self.assertIn("---\n\nREPOSITORY CONTEXT fake for conference #77", prompts[0])
+        self.assertIn("---\n\nREPOSITORY CONTEXT fake for Blackboard #297", prompts[0])
         self.assertNotIn("REPOSITORY CONTEXT", prompts[1])
 
     def test_the_image_carries_every_script_the_waker_imports(self):

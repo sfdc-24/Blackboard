@@ -14,8 +14,9 @@ ENV PYTHONUNBUFFERED=1
 
 # Given: BUS_URL, BUS_SECRET, BLACKBOARD_STATE_URI, AGENT, and ONLY that agent's
 # credential (GEMINI_API_KEY | ANTHROPIC_API_KEY), set per job. The Gemini job
-# alone may also get GEMINI_GITHUB_TOKEN, a fine-grained read-only token that
-# scripts/repo_context.py uses to read the PRs a row names (the owner approved
-# it, 2026-09-29).
+# alone may also get GEMINI_GITHUB_TOKEN, a fine-grained token with "Public
+# repositories (read-only)" access that scripts/repo_context.py uses to read the
+# public PRs a row names (the owner approved it, 2026-09-29). It can read no
+# private repository, whatever a row asks.
 # Not given: META_TOKEN or GH_TOKEN. It answers board rows and nothing else.
 ENTRYPOINT ["python", "/app/main.py"]
