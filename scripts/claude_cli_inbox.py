@@ -52,7 +52,8 @@ SELF = "claude-code-cli"
 
 
 def parse_ts(value) -> datetime | None:
-    """A board timestamp (ISO 8601, 'Z' or an offset) as an aware UTC datetime, or None."""
+    """A board timestamp (ISO 8601, 'Z' or an offset) as an aware UTC datetime, or None. Converted,
+    not relabelled: since_arg writes it with a Z (Codex on #294: +05:00 was sent as Z)."""
     text = str(value or "").strip()
     if not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d", text):
         return None
@@ -60,7 +61,7 @@ def parse_ts(value) -> datetime | None:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
 def addressees(row) -> set:
@@ -125,7 +126,8 @@ def since_arg(since: datetime) -> str:
     """The bus's `since`, a whole second before the bookmark: the bus compares text, and
     "...:24.500Z" sorts before "...:24Z", so a row later in the bookmark's own second would be
     dropped (Cursor on #294). new_rows then keeps only rows after the exact bookmark."""
-    return (since.replace(microsecond=0) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    utc = since.astimezone(timezone.utc)
+    return (utc.replace(microsecond=0) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def line(ts: datetime, row) -> str:

@@ -153,6 +153,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual(["2026-09-29T00:48:23Z"], asked)
         self.assertLess("2026-09-29T00:48:23Z", "2026-09-29T00:48:24.500Z")    # the later row passes
 
+    def test_a_bookmark_with_an_offset_is_asked_in_utc(self):
+        # Codex on #294: 01:00+05:00 is 20:00Z, and was sent to the bus as 00:59:59Z, so a newer
+        # 20:01Z row was filtered out before new_rows saw it.
+        later = row("2026-09-28T20:01:00Z", "whatsapp", "Blackboard Alpha DB", "Claude-code-cli after the offset")
+        code, asked, printed, after = self.run_main("2026-09-29T01:00:00+05:00", [later])
+        self.assertEqual(["2026-09-28T19:59:59Z"], asked)
+        self.assertIn("after the offset", printed[0])
+        self.assertEqual(inbox.parse_ts("2026-09-28T20:01:00Z"), inbox.parse_ts(after))
+        self.assertEqual(timezone.utc, inbox.parse_ts("2026-09-29T01:00:00+05:00").tzinfo)
+
     def test_the_doorbell_rings_with_the_first_new_row(self):
         code, _, printed, _ = self.run_main("2026-09-29T00:20:00+00:00", [WA], argv=("--wait", "0"))
         self.assertEqual(0, code)
