@@ -266,7 +266,15 @@ class GrokLane(unittest.TestCase):
         self.assertNotIn("the claude-code-cli lane is not open right now", doctrine)
         self.assertNotIn("addressed claude-code-cli and no session was open", doctrine)
         self.assertIn("you do not know whether the claude-code-cli session is open", doctrine)
-        self.assertIn("the claude-code-cli session will also see your message", doctrine)
+        # 2026-09-29: the opposite claim failed too. It promised "the claude-code-cli session will
+        # also see your message" while the session's watch had lapsed; four messages went
+        # unanswered for 20 minutes. The standby says the message is queued, and how he will know.
+        self.assertNotIn("say, in one short line before your answer, something like: this is the api "
+                         "standby answering straight away; the claude-code-cli session will also see", doctrine)
+        self.assertIn("your message is queued for the claude-code-cli session, which confirms here when it "
+                      "picks it up - if it has not confirmed within about 15 minutes, it has not picked it up "
+                      "and may be unavailable", doctrine)
+        self.assertNotIn("it is not running", doctrine)            # silence is not a diagnosis (Codex on #294)
 
     def test_grok_doctrine_separates_the_api_from_the_desktop_app(self):
         """The one confusion that would make a grok reply actively misleading."""
