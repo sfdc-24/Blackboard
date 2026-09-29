@@ -918,6 +918,20 @@ class RepoContextForGemini(unittest.TestCase):
         self.assertIn("repo_context", local)
         self.assertEqual(set(), local - copied)
 
+    def test_every_script_the_image_copies_is_uploaded_to_cloud_build(self):
+        # The Dockerfile's COPY list is not the upload list. .gcloudignore is an allowlist, and a
+        # script it does not re-admit never reaches Cloud Build: the agent-waker build at 523500b
+        # failed with "stat scripts/repo_context.py: file does not exist".
+        import re as _re
+        docker = (REPO / "cloud" / "agent-waker" / "Dockerfile").read_text(encoding="utf-8")
+        copied = set(_re.findall(r"scripts/([A-Za-z_]+)\.py", docker))
+        allow = (REPO / ".gcloudignore").read_text(encoding="utf-8").splitlines()
+        readmitted = {line[len("!/scripts/"):-3] for line in allow
+                      if line.startswith("!/scripts/") and line.endswith(".py")}
+        self.assertIn("/scripts/*", allow)                    # the directory is an allowlist
+        self.assertIn("repo_context", copied)
+        self.assertEqual(set(), copied - readmitted)
+
 
 if __name__ == "__main__":
     unittest.main()
