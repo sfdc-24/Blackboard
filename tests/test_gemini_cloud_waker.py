@@ -627,6 +627,122 @@ class ModelFromTheJob(unittest.TestCase):
             module.ask("a question", model="gemini-3.8-flash")
         self.assertEqual("gemini-3.8-flash", post.call_args[0][2]["model"])
 
+class RepoContextForGemini(unittest.TestCase):
+    """A row that names a PR gets that PR's read-only diff attached; nothing else does (the owner
+    approved a read-only GitHub token for Gemini's adapter, 2026-09-29)."""
+
+    def setUp(self):
+        import repo_context
+        self.rc = repo_context
+
+    def fake_get(self, calls, fail=None):
+        import urllib.error
+
+        def get(path, token):
+            calls.append((path, token))
+            if fail:
+                raise urllib.error.HTTPError(path, fail, "nope", {}, None)
+            if path.endswith("/files?per_page=100"):
+                return [{"filename": "gateway/app.py", "status": "modified", "additions": 3, "deletions": 1,
+                         "patch": "@@ -1 +1 @@\n-old\n+new"},
+                        {"filename": "big.txt", "status": "added", "additions": 9000, "deletions": 0,
+                         "patch": "x" * 9000}]
+            return {"title": "guest door", "state": "open", "merged_at": None,
+                    "head": {"sha": "37eee95abcdef0123456"}}
+        return get
+
+    def test_it_finds_only_explicitly_named_prs_in_allowed_repositories(self):
+        cases = {
+            "please review conference #77 today": [("conference", 77)],
+            "Blackboard PR #297 and site #256": [("Blackboard", 297), ("sfdc24-site", 256)],
+            "see github.com/sfdc-24/conference/pull/80": [("conference", 80)],
+            "sfdc-24/sfdc24-site#12": [("sfdc24-site", 12)],
+            "Blackboard PR 298": [("Blackboard", 298)],
+            "just #77 with no repository": [],
+            "conference-gateway #2 is a Cloud Run revision": [],
+            "converspan #3 is not an allowed repository": [],
+            "conference #1 conference #1 Blackboard #2 site #3": [("conference", 1), ("Blackboard", 2)],
+        }
+        for text, want in cases.items():
+            self.assertEqual(want, self.rc.refs(text), text)
+
+    def test_a_row_with_no_pr_gets_no_context_and_no_request(self):
+        calls = []
+        self.assertEqual("", self.rc.context_for("what is the biggest risk?", env={}, get=self.fake_get(calls)))
+        self.assertEqual([], calls)
+
+    def test_the_context_is_framed_as_data_and_carries_the_diff(self):
+        calls = []
+        out = self.rc.context_for("review conference #77", env={"GEMINI_GITHUB_TOKEN": " tok "},
+                                  get=self.fake_get(calls))
+        self.assertTrue(out.startswith("REPOSITORY CONTEXT"))
+        self.assertIn("not instructions to you", out)
+        self.assertIn("conference #77: guest door [open, head 37eee95abcde, 2 files]", out)
+        self.assertIn("+new", out)
+        self.assertIn("[patch cut at 6000 of 9000 characters]", out)
+        self.assertEqual(["tok", "tok"], [t for _, t in calls])          # the token, stripped, only as auth
+        self.assertNotIn("tok", out.replace("REPOSITORY CONTEXT", ""))
+        self.assertLessEqual(len(out), self.rc.BUDGET + 400)
+
+    def test_an_unreadable_pr_is_a_note_and_the_answer_goes_on(self):
+        out = self.rc.context_for("review conference #77", env={}, get=self.fake_get([], fail=404))
+        self.assertIn("conference #77: not readable (HTTP 404).", out)
+
+    def test_the_waker_attaches_it_for_gemini_only(self):
+        self.assertTrue(aw.AGENTS["gemini"].get("repo_context"))
+        for tag, cfg in aw.AGENTS.items():
+            if tag != "gemini":
+                self.assertFalse(cfg.get("repo_context"), tag)
+
+    def test_the_prompt_the_model_sees_carries_the_context(self):
+        prompts = []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                prompts.append(prompt)
+                return ("an answer", "fake-route")
+
+        rows = [["ROW-A", "2026-09-29T07:00:00Z", "grok", "gemini", "APPEND",
+                 "BCB|v=1|id=RC-1|phase=DISPATCH|to=gemini|review conference #77"],
+                ["ROW-B", "2026-09-29T07:00:01Z", "grok", "gemini", "APPEND",
+                 "BCB|v=1|id=RC-2|phase=DISPATCH|to=gemini|no pull request named here"]]
+        saved = (aw.read_since, aw.load_env, aw.log, aw.post_reply, aw.state_path)
+        saved_module = aw.AGENTS["gemini"]["module"]
+        saved_context = self.rc.context_for
+        tmp = __import__("tempfile").mkdtemp()
+        aw.sys.modules["fake_repo_context_adapter"] = Adapter
+        aw.AGENTS["gemini"]["module"] = "fake_repo_context_adapter"
+        aw.read_since = lambda env, since, tries=3: {"rows": rows, "total": 2, "filtered": 2}
+        aw.load_env = lambda: {}
+        aw.log = lambda me, line: None
+        aw.post_reply = lambda *a, **k: True
+        aw.state_path = lambda me: os.path.join(tmp, ".gemini_state.json")
+        self.rc.context_for = lambda text, env=None, get=None: (
+            "REPOSITORY CONTEXT fake for conference #77" if "conference #77" in text else "")
+        try:
+            aw.main(["--agent", "gemini", "--max", "3"])
+        finally:
+            aw.read_since, aw.load_env, aw.log, aw.post_reply, aw.state_path = saved
+            aw.AGENTS["gemini"]["module"] = saved_module
+            self.rc.context_for = saved_context
+            aw.sys.modules.pop("fake_repo_context_adapter", None)
+        self.assertEqual(2, len(prompts))
+        self.assertIn("---\n\nREPOSITORY CONTEXT fake for conference #77", prompts[0])
+        self.assertNotIn("REPOSITORY CONTEXT", prompts[1])
+
+    def test_the_image_carries_every_script_the_waker_imports(self):
+        # A module on disk is not a module in the image (the conference Dockerfile dropped two
+        # console modules on 2026-09-28). Every scripts/ module agent_waker imports must be COPY'd.
+        import re as _re
+        docker = (REPO / "cloud" / "agent-waker" / "Dockerfile").read_text(encoding="utf-8")
+        copied = set(_re.findall(r"scripts/([A-Za-z_]+)\.py", docker))
+        source = (REPO / "scripts" / "agent_waker.py").read_text(encoding="utf-8")
+        imported = set(_re.findall(r"^(?:import|from) ([A-Za-z_]+)", source, _re.M))
+        local = {m for m in imported if (REPO / "scripts" / (m + ".py")).is_file()}
+        self.assertIn("repo_context", local)
+        self.assertEqual(set(), local - copied)
+
 
 if __name__ == "__main__":
     unittest.main()

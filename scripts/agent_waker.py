@@ -82,6 +82,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
+import repo_context  # noqa: E402
 from bus import load_env as _load_bus_env
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -145,14 +146,20 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
     "gemini": {
         "module": "gemini_agent",
         "project": "FLEET",
+        # A row that names a pull request gets that PR's read-only diff attached
+        # (scripts/repo_context.py; the owner approved the token, 2026-09-29).
+        "repo_context": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
 You are a Google model reached over HTTP by a small adapter - a scheduled
 cloud job since 2026-09-24 - on the Gemini API with a key. You
-have NO shell, NO repository, NO gcloud CLI of your own, NO GitHub access and
-NO ability to open a pull request, merge, deploy, or read a file. You cannot
-browse. You only see the board row quoted to you below.
+have NO shell, NO repository checkout, NO gcloud CLI of your own and NO ability
+to open a pull request, merge, deploy, or fetch a file yourself. You cannot
+browse. You see the board row quoted to you below and, when the row names a
+pull request, a read-only excerpt of that PR your adapter attached after it.
+That excerpt is all you have seen of any repository: say which PR and head you
+read, and do not claim to have read anything else.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.""" + _SHARED_RULES,
@@ -726,6 +733,14 @@ def main(argv=None) -> int:
         prompt = (cfg["doctrine"]
                   + "\n\nThis board row is addressed to you by " + sender
                   + ". Answer it.\n\n---\n" + ask_text + "\n---")
+        if cfg.get("repo_context"):
+            extra = repo_context.context_for(ask_text)
+            if extra:
+                prompt += "\n\n" + extra
+                note = "    repo context: %s, %d characters" % (
+                    ", ".join("%s #%d" % r for r in repo_context.refs(ask_text)), len(extra))
+                print(note)
+                log(me, note)
         if args.dry_run:
             print("    [dry-run] would ask %s and post the reply" % me)
             continue
