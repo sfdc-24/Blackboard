@@ -285,7 +285,7 @@ class PendingUntilTheJobFinishes(unittest.TestCase):
             "board_watcher": {"watermark": "2026-09-24T03:40:00Z", "seen": []},
             cloud.CURSOR: {"watermark": "2026-09-24T03:40:00Z", "answered_ids": []},
         })
-        posts, starts = [], []
+        posts, starts, phases = [], [], []
 
         class Adapter(object):
             @staticmethod
@@ -301,8 +301,9 @@ class PendingUntilTheJobFinishes(unittest.TestCase):
             kept = [r for r in asks if str(r[1]) > since]
             return {"rows": kept, "total": len(asks), "filtered": len(kept)}
 
-        def post_reply(me, cfg, text, to, answers, verbose):
+        def post_reply(me, cfg, text, to, answers, verbose, phase="DONE"):
             posts.append(answers)
+            phases.append(phase)
             return True
 
         aw.read_since = read_since
@@ -341,6 +342,8 @@ class PendingUntilTheJobFinishes(unittest.TestCase):
         self.assertEqual(cloud.CURSOR, w.ROUTE_CURSORS["gemini-waker"])
         self.assertEqual(starts, ["gemini-waker", "gemini-waker"])
         self.assertEqual(posts, ["ASK-1", "ASK-2", "ASK-3", "ASK-4"])
+        # Each ask is phase=DISPATCH, so the cloud wrapper posts each answer as a RESULT (#297).
+        self.assertEqual(phases, ["RESULT"] * 4)
         answered = store.slots[cloud.CURSOR][0].get("answered_ids") or []
         self.assertEqual(answered, ["ASK-1", "ASK-2", "ASK-3", "ASK-4"])
 

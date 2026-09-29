@@ -544,7 +544,28 @@ def claim_answer(answers_id: str) -> bool:
     return True
 
 
-def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool) -> bool:
+# Rows that ask for a result. A waker's answer to one is posted as phase=RESULT (its evidence stays
+# STATED: a model's reasoning, not a measurement), so a dispatcher's tracker sees it. The owner via
+# Grok, 2026-09-29 06:24Z: Gemini never posted a RESULT, because every waker reply was phase=DONE.
+# The set is the board's measured ask set (tools/board_governor/board_facts.py ASK_PHASES; the
+# cloud image does not carry tools/, so a test holds the two equal) plus ASK, which fleet_agent
+# posts. Membership is exact: REVIEW_RESULT is not REVIEW, and REQUEST is not REQ.
+RESULT_FOR = (
+    "DISPATCH", "REVIEW_REQUEST", "REQUEST",
+    "REVIEW", "ORDER", "TASK", "HANDOFF", "BATON",
+    "ASK",
+)
+
+
+def reply_phase(row) -> str:
+    """RESULT for an answer to a row that asks for one (its payload's phase is in RESULT_FOR), else DONE."""
+    payload = str(row[C_PAYLOAD]) if len(row) > C_PAYLOAD else ""
+    m = re.search(r"(?:^|\|)phase=([A-Za-z_]+)", payload)
+    return "RESULT" if m and m.group(1).upper() in RESULT_FOR else "DONE"
+
+
+def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
+               phase: str = "DONE") -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
 
     Hand-assembled arrays column-shifted three places on 2026-09-08, putting the
@@ -556,7 +577,7 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
             "post", text[:1500],
             "--tag", me,
             "--to", to,
-            "--phase", "DONE",
+            "--phase", phase,
             "--klass", "NOTE",
             "--project", cfg["project"],
             "--id", rid,
@@ -746,7 +767,7 @@ def main(argv=None) -> int:
             + body
         )
         if post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
-                      verbose=args.verbose):
+                      verbose=args.verbose, phase=reply_phase(row)):
             state["answered_ids"].append(src_id)
             mod = sys.modules[cfg["module"]]
             usage = getattr(mod.ask, "last_usage", None) or {}

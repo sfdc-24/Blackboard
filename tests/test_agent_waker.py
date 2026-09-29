@@ -465,5 +465,51 @@ class ReplyRowId(unittest.TestCase):
         self.assertTrue(aw.reply_row_id("gemini", first).startswith("GEMINI-WAKE-" + ("L" * 40) + "-"))
 
 
+class ReplyPhaseTest(unittest.TestCase):
+    """A waker's answer to a row that asks for a result is a RESULT (the owner via Grok, 2026-09-29:
+    Gemini never posted one; every waker reply was phase=DONE)."""
+
+    def row(self, payload):
+        return ["id", "2026-09-29T06:24:08Z", "grok", "gemini", "APPEND", payload]
+
+    def test_a_dispatch_or_ask_is_answered_with_a_result(self):
+        for phase in ("DISPATCH", "REVIEW_REQUEST", "REQUEST", "REVIEW", "ORDER", "TASK", "HANDOFF",
+                      "BATON", "ASK", "dispatch"):
+            self.assertEqual("RESULT", aw.reply_phase(self.row("BCB|v=1|id=X|phase=%s|from=grok|to=gemini" % phase)), phase)
+
+    def test_anything_else_is_answered_with_done(self):
+        for payload in ("BCB|v=1|id=X|phase=NOTE|from=grok", "BCB|v=1|id=X|phase=RESULT|from=codex",
+                        "BCB|v=1|id=X|phase=REVIEW_RESULT|from=codex", "BCB|v=1|id=X|phase=REQ|from=grok",
+                        "BCB|v=1|id=X|phase=PROGRESS|from=grok", "BCB|v=1|id=X|phase=HOLD|from=grok",
+                        "no bcb payload at all", "BCB|v=1|id=X|note=phase=DISPATCH-like text"):
+            self.assertEqual("DONE", aw.reply_phase(self.row(payload)), payload)
+        self.assertEqual("DONE", aw.reply_phase(["id", "ts"]))                   # a short row
+
+    def test_the_phase_reaches_the_post(self):
+        from unittest import mock
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args)
+            return mock.Mock(stdout="VERIFIED on the board", stderr="")
+        with mock.patch.object(aw.subprocess, "run", side_effect=run):
+            self.assertTrue(aw.post_reply("gemini", {"project": "Blackboard"}, "text", "grok;ALL", "X", False,
+                                          phase="RESULT"))
+        self.assertEqual("RESULT", seen[0][seen[0].index("--phase") + 1])
+
+    def test_the_set_is_the_board_s_measured_ask_set_plus_ask(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                        "tools", "board_governor"))
+        import board_facts
+        self.assertEqual(set(board_facts.ASK_PHASES) | {"ASK"}, set(aw.RESULT_FOR))
+
+    def test_fleet_agent_parses_a_result_post(self):
+        import fleet_agent
+        args = fleet_agent.build_parser().parse_args(["post", "text", "--phase", "RESULT"])
+        self.assertEqual("RESULT", args.phase)
+        with self.assertRaises(SystemExit):                       # the choices still bind
+            fleet_agent.build_parser().parse_args(["post", "text", "--phase", "FINISHED"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

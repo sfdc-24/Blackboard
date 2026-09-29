@@ -445,10 +445,11 @@ def run(argv=None, store=None, waker=None, board_contains=None,
         return (held_now["id"] == answers_id and held_now["owner"] == owner
                 and held_now["phase"] == "posting" and live(held_now))
 
-    def post_and_record(me, cfg, text, to, answers, verbose):
+    def post_and_record(me, cfg, text, to, answers, verbose, phase="DONE"):
+        # The phase is forwarded: an answer to a DISPATCH is a RESULT (Blackboard #297).
         if not begin_post(answers):
             return False
-        ok = original_post(me, cfg, text, to, answers, verbose)
+        ok = original_post(me, cfg, text, to, answers, verbose, phase=phase)
         if ok:
             s = dict(box["state"])
             # Confirmed on the board. Record that, and drop the posting claim

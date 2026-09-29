@@ -335,7 +335,7 @@ def cmd_post(args):
         Timestamp       ISO-8601 with Z
         Source_Tag      the writing instance's tag
         Target_Surface  semicolon-delimited addressing, e.g. "claude-code-cli;ALL"
-        Action_Type     phase: WIP | OPEN | DONE | ASK | BLOCKED
+        Action_Type     phase: WIP | OPEN | DONE | ASK | BLOCKED | RESULT
         Payload         BCB|v=1|id=...|phase=...|from=...|to=...|<text>
         Category        OPEN | DONE
         Project Tag     ORDER, SITE, etc.
@@ -402,7 +402,7 @@ def cmd_archive(args):
     return 0
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(description="fleet legwork, so a model does not do it by hand")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -421,7 +421,7 @@ def main():
     po.add_argument("text")
     po.add_argument("--tag", default="claude-code-cli")
     po.add_argument("--to", default="ALL")
-    po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED"])
+    po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED", "RESULT"])
     po.add_argument("--klass", default="NOTE")
     po.add_argument("--category", default="OPEN")
     po.add_argument("--project", default="SITE")
@@ -429,8 +429,11 @@ def main():
     po.add_argument("--id", default=None)
     po.add_argument("--prefix", default="CCC-NOTE")
     po.set_defaults(fn=cmd_post)
+    return p
 
-    args = p.parse_args()
+
+def main():
+    args = build_parser().parse_args()
     sys.exit(args.fn(args))
 
 
