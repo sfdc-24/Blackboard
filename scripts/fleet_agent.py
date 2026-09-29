@@ -421,7 +421,7 @@ def main():
     po.add_argument("text")
     po.add_argument("--tag", default="claude-code-cli")
     po.add_argument("--to", default="ALL")
-    po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED"])
+    po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED", "RESULT"])
     po.add_argument("--klass", default="NOTE")
     po.add_argument("--category", default="OPEN")
     po.add_argument("--project", default="SITE")

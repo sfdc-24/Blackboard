@@ -465,5 +465,40 @@ class ReplyRowId(unittest.TestCase):
         self.assertTrue(aw.reply_row_id("gemini", first).startswith("GEMINI-WAKE-" + ("L" * 40) + "-"))
 
 
+class ReplyPhaseTest(unittest.TestCase):
+    """A waker's answer to a row that asks for a result is a RESULT (the owner via Grok, 2026-09-29:
+    Gemini never posted one; every waker reply was phase=DONE)."""
+
+    def row(self, payload):
+        return ["id", "2026-09-29T06:24:08Z", "grok", "gemini", "APPEND", payload]
+
+    def test_a_dispatch_or_ask_is_answered_with_a_result(self):
+        for phase in ("DISPATCH", "ASK", "TASK", "REQ", "dispatch"):
+            self.assertEqual("RESULT", aw.reply_phase(self.row("BCB|v=1|id=X|phase=%s|from=grok|to=gemini" % phase)), phase)
+
+    def test_anything_else_is_answered_with_done(self):
+        for payload in ("BCB|v=1|id=X|phase=NOTE|from=grok", "BCB|v=1|id=X|phase=RESULT|from=codex",
+                        "no bcb payload at all", "BCB|v=1|id=X|note=phase=DISPATCH-like text"):
+            self.assertEqual("DONE", aw.reply_phase(self.row(payload)), payload)
+        self.assertEqual("DONE", aw.reply_phase(["id", "ts"]))                   # a short row
+
+    def test_the_phase_reaches_the_post(self):
+        from unittest import mock
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args)
+            return mock.Mock(stdout="VERIFIED on the board", stderr="")
+        with mock.patch.object(aw.subprocess, "run", side_effect=run):
+            self.assertTrue(aw.post_reply("gemini", {"project": "Blackboard"}, "text", "grok;ALL", "X", False,
+                                          phase="RESULT"))
+        self.assertEqual("RESULT", seen[0][seen[0].index("--phase") + 1])
+
+    def test_fleet_agent_accepts_a_result_phase(self):
+        import fleet_agent
+        import inspect
+        self.assertIn('"RESULT"', inspect.getsource(fleet_agent))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
