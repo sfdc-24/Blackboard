@@ -587,5 +587,46 @@ def _codex_note(answers_id):
     return [rid, "2026-09-24T05:00:00Z", "codex", "ALL", "DONE", payload]
 
 
+class ModelFromTheJob(unittest.TestCase):
+    """The job picks Gemini's model and timeout (GEMINI_MODEL, GEMINI_TIMEOUT_SECONDS); unset, the
+    adapter keeps Flash and 60 s (the owner approved the Pro tier, 2026-09-29)."""
+
+    def _load(self, env):
+        with mock.patch.dict(os.environ, env, clear=False):
+            for name in ("GEMINI_MODEL", "GEMINI_TIMEOUT_SECONDS"):
+                if name not in env:
+                    os.environ.pop(name, None)
+            spec = importlib.util.spec_from_file_location("gemini_agent_for_model", REPO / "scripts" / "gemini_agent.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        return module
+
+    def _sent(self, module):
+        seen = []
+
+        def post(url, headers, payload, timeout=60):
+            seen.append((payload["model"], timeout))
+            return 200, json.dumps({"output_text": "an answer"})
+        with mock.patch.object(module, "_post", side_effect=post), \
+                mock.patch.object(module, "api_key", return_value=("GEMINI_API_KEY", "k")):
+            module.ask("a question")
+        return seen
+
+    def test_the_job_s_model_and_timeout_reach_the_request(self):
+        module = self._load({"GEMINI_MODEL": "gemini-pro-latest", "GEMINI_TIMEOUT_SECONDS": "150"})
+        self.assertEqual([("gemini-pro-latest", 150)], self._sent(module))
+
+    def test_unset_it_stays_flash_with_the_old_timeout(self):
+        module = self._load({})
+        self.assertEqual([("gemini-3.8-flash", 60)], self._sent(module))
+
+    def test_a_caller_s_model_still_wins(self):
+        module = self._load({"GEMINI_MODEL": "gemini-pro-latest"})
+        with mock.patch.object(module, "_post", return_value=(200, "{}")) as post, \
+                mock.patch.object(module, "api_key", return_value=("GEMINI_API_KEY", "k")):
+            module.ask("a question", model="gemini-3.8-flash")
+        self.assertEqual("gemini-3.8-flash", post.call_args[0][2]["model"])
+
+
 if __name__ == "__main__":
     unittest.main()

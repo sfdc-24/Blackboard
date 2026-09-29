@@ -43,7 +43,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = os.path.join(REPO, ".env")
 
 INTERACTIONS = "https://generativelanguage.googleapis.com/v1beta/interactions"
-DEFAULT_MODEL = "gemini-3.8-flash"
+# The key route's model and timeout are set by the job, so a model change is a job setting and not a
+# rebuild. The owner approved the Pro tier for the cloud waker on 2026-09-29. Measured that day on a
+# 12,000-character review ask: gemini-3.8-flash 10 s, gemini-pro-latest 13-31 s, so a Pro job sets a
+# longer timeout than the 60 s default.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
+KEY_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS") or 60)
 VERTEX_MODEL = "gemini-2.0-flash"
 KEY_NAMES = ["GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"]
 
@@ -180,7 +185,8 @@ def ask(prompt, model=None):
     if key:
         status, body = _post(INTERACTIONS,
                              {"x-goog-api-key": key},
-                             {"model": model or DEFAULT_MODEL, "input": prompt})
+                             {"model": model or DEFAULT_MODEL, "input": prompt},
+                             timeout=KEY_TIMEOUT_SECONDS)
         if status == 200:
             try:
                 d = json.loads(body)
