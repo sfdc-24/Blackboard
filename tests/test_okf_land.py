@@ -112,6 +112,21 @@ class Destination(unittest.TestCase):
             self.assertIn(why, out["error"])
             self.assertFalse(any(c[0] in ("PUT", "POST") for c in calls), calls)
 
+    def test_a_dropped_connection_or_timeout_on_the_plan_is_not_landed_and_does_not_raise(self):
+        # Cursor on 7f4174a: a URLError or TimeoutError escaped land() and would kill the waker's pass.
+        for error in (urllib.error.URLError("connection reset"), TimeoutError("timed out"), OSError("socket")):
+            calls = []
+
+            def http(method, path, token, payload=None, timeout=30, error=error):
+                calls.append((method, path))
+                raise error
+
+            out = okf_land.land(answers_id="GEM-N-3", ask_text="BCB|v=1|id=GEM-N-3|land=okf|file=call-notes",
+                                reply_body="r", env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)
+            self.assertFalse(out["ok"])
+            self.assertIn("could not read the plan's call (%s)" % type(error).__name__, out["error"])
+            self.assertFalse(any(m in ("PUT", "POST") for m, _ in calls), calls)
+
     def test_a_result_file_needs_no_plan(self):
         http, calls = fake_github(plan=None)
         self.assertTrue(okf_land.land(answers_id="GEM-X-1", ask_text=ASK, reply_body="r",

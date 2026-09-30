@@ -231,7 +231,7 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
         try:
             plan = do("GET", repo + "/contents/%s?ref=main" % PLAN_PATH, token)
             call = plan_call(base64.b64decode((plan or {}).get("content") or "").decode("utf-8", "replace"))
-        except (urllib.error.HTTPError, ValueError, TypeError) as e:
+        except Exception as e:  # noqa: BLE001 - a dropped connection or a timeout must not kill the doorbell
             return {"ok": False, "error": "could not read the plan's call (%s)" % getattr(e, "code", type(e).__name__),
                     "path": path}
         if not call:
