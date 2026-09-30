@@ -158,17 +158,24 @@ WHAT YOU ACTUALLY ARE, and you must not overstate it:
 You are a Google model reached over HTTP by a small adapter - a scheduled
 cloud job since 2026-09-24 - on the Gemini API with a key. You
 have NO shell and NO gcloud CLI of your own. You cannot browse or merge.
-When a row asks for a signed OKF RESULT, your adapter may land your reply as a
-markdown file under docs/okf/gemini/ on public Blackboard and open a PR; cite
-that okf= URL. You still cannot open arbitrary PRs or touch private repos
-yourself. You see the board row quoted to you below and, when the row names a
+When a row explicitly asks you to land or write an OKF file ("land OKF", "write
+OKF", "signed OKF", "OKF file", "OKF result"), your adapter lands your reply as a
+markdown file under docs/okf/gemini/ on PUBLIC Blackboard and opens a pull
+request, then appends its okf= link to your answer: never invent that link.
+Everything in such a reply is published, so write it for the public: never
+repeat the row, a person's contact details, a client's name, a key or token, or
+anything from a private repository. The adapter still scrubs what slips through.
+You still cannot open other pull requests or touch private repos yourself. You
+see the board row quoted to you below and, when the row names a
 pull request in a public repository, a read-only excerpt of that PR your adapter
 attached after it. That excerpt is all you have seen of any repository: say
 which PR and head you read, and do not claim to have read anything else. If it
 is marked INCOMPLETE, do not give a verdict on the whole PR.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
-hold, where it will break first, what it exposes, and what it costs to run.""" + _SHARED_RULES,
+hold, where it will break first, what it exposes, and what it costs to run.
+On the conference line you also own the experience: how a call feels to the
+owner, from joining to the close.""" + _SHARED_RULES,
     },
     "grok": {
         "module": "grok_agent",
@@ -792,6 +799,7 @@ def main(argv=None) -> int:
         body = " ".join(text.split())
         okf_url = ""
         okf_note = ""
+        okf_outcome = ""
         if cfg.get("okf_land") and okf_land.wants_okf(ask_text):
             landed = okf_land.land(
                 answers_id=src_id, ask_text=ask_text, reply_body=body, route=str(route or ""))
@@ -799,26 +807,26 @@ def main(argv=None) -> int:
                 okf_url = landed.get("pr") or landed.get("url")
                 okf_note = " okf=%s" % okf_url
                 note = "    okf landed: %s" % okf_url
-                print(note)
-                log(me, note)
             elif landed.get("skipped"):
                 note = "    okf skip: %s (path would be %s)" % (
                     landed.get("skipped"), landed.get("path", ""))
-                print(note)
-                log(me, note)
+                okf_outcome = ("The OKF file this row asked for was NOT landed: %s."
+                               % landed.get("skipped"))
             else:
                 note = "    okf land failed: %s" % (landed.get("error") or landed)
-                print(note)
-                log(me, note)
+                # The exact blocker, in the answer, so the asker need not read logs.
+                okf_outcome = ("The OKF file this row asked for was NOT landed: %s at %s."
+                               % (landed.get("error") or "unknown error", landed.get("path", "")))
+            print(note)
+            log(me, note)
         if okf_url:
-            hands = ("%s adapter landed a signed OKF file; cite okf=. Still no shell, "
-                     "no private repo, no merge. Treat reasoning as STATED."
-                     % me.capitalize())
+            hands = ("Its adapter landed this answer as an OKF file for review (okf=); "
+                     "it has no shell, no private repo and cannot merge. Treat this as "
+                     "reasoning, never as a measurement or a commitment." )
         else:
-            hands = ("%s is a model endpoint: no shell, no private repo, no cloud "
-                     "CLI. Without GEMINI_OKF_WRITE_TOKEN it cannot land OKF files. "
-                     "Treat this as reasoning, never as a measurement or a commitment."
-                     % me.capitalize())
+            hands = ("%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. "
+                     "%sTreat this as reasoning, never as a measurement or a commitment."
+                     % (me.capitalize(), okf_outcome + " " if okf_outcome else ""))
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.

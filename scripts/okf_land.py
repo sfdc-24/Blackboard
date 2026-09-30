@@ -17,15 +17,22 @@ WHAT IT DOES
 WHAT IT REFUSES
   - Any path outside docs/okf/gemini/.
   - Any repository other than Blackboard.
-  - Missing GEMINI_OKF_WRITE_TOKEN (separate from the public-read-only
-    GEMINI_GITHUB_TOKEN). Without the write token it returns a clear skip;
-    the answer still posts on the bus.
+  - No token. It uses GEMINI_OKF_WRITE_TOKEN, else GEMINI_GITHUB_TOKEN: on
+    2026-09-30 at 04:13Z the owner mounted the secret github-token-gemini-okf
+    on gemini-waker as GEMINI_GITHUB_TOKEN. Without either it returns a clear
+    skip; the answer still posts on the bus. A token that cannot write returns
+    the HTTP status as the exact blocker.
   - Auto-merge. Human / Codex review before merge.
 
 SECURITY
-  Board rows are not provenance. Content landed is the model's own reply,
-  path-allowlisted, on a public repo. The write token must be a fine-grained
-  PAT scoped to Blackboard Contents:Write + Pull requests:Write only.
+  Board rows are not provenance, and the board is private while this repo is
+  public. So the file carries the model's reply only, never the row that asked
+  for it (only its id), and the reply is scrubbed of email addresses, phone
+  numbers, token shapes and URL query strings before it is written. Landing
+  starts only on an explicit ask ("land okf", "write okf", "signed okf",
+  "okf file", "okf result"), never on a row that merely cites an OKF path.
+  The token must be a fine-grained PAT scoped to Blackboard Contents:Write +
+  Pull requests:Write only.
 """
 from __future__ import annotations
 
@@ -45,6 +52,36 @@ PATH_PREFIX = "docs/okf/gemini/"
 MAX_BYTES = 50_000
 BRANCH_PREFIX = "gemini/okf-"
 TOKEN_ENV = "GEMINI_OKF_WRITE_TOKEN"
+TOKEN_ENVS = (TOKEN_ENV, "GEMINI_GITHUB_TOKEN")
+
+# What a public file must never carry, whatever the model repeats from the row.
+_SCRUB = (
+    (re.compile(r"(?i)(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{10,}"), "[token removed]"),
+    (re.compile(r"(?i)\b(?:sk|xox[baprs])-[A-Za-z0-9-]{8,}"), "[token removed]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), "[token removed]"),
+    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "[token removed]"),
+    (re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]*?(?:-----END [A-Z ]+-----|$)"), "[key removed]"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[email removed]"),
+    (re.compile(r"(?<![\w/.-])\+?\d[\d ().-]{8,}\d(?![\w/-])"), "[number removed]"),
+    (re.compile(r"(https?://[^\s?#)]+)\?[^\s)#]*"), r"\1"),
+)
+
+
+def scrub(text: str) -> str:
+    """The reply as it may appear on a public repository."""
+    out = text or ""
+    for pattern, replacement in _SCRUB:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def token_from(env) -> tuple[str, str]:
+    """(token, the variable it came from): the write token first, then the one mounted."""
+    for name in TOKEN_ENVS:
+        value = (env.get(name) or "").strip()
+        if value:
+            return value, name
+    return "", ""
 
 
 class _StayOnGitHub(urllib.request.HTTPRedirectHandler):
@@ -64,16 +101,14 @@ _OPENER = urllib.request.build_opener(_StayOnGitHub)
 def wants_okf(ask_text: str) -> bool:
     """True when the board ask requires a signed OKF file, not bus prose alone."""
     text = (ask_text or "").lower()
+    # Only an explicit ask. "okf=", "docs/okf" and "okf path" are how rows CITE
+    # a file, and most RESULT rows cite one: each would open a public PR.
     needles = (
         "signed okf",
         "okf result",
-        "okf path",
         "okf file",
         "write okf",
-        "okf=",
-        "docs/okf",
         "land okf",
-        "okf pr",
     )
     return any(n in text for n in needles)
 
@@ -99,8 +134,7 @@ def _safe_path(slug: str) -> str:
 def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str) -> str:
     """Gemini-signed OKF markdown. evidence=STATED: model reasoning, not MEASURED."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    body = (reply_body or "").strip() or "(empty model reply)"
-    ask = (ask_text or "").strip()[:2000]
+    body = scrub((reply_body or "").strip()) or "(empty model reply)"
     return "\n".join([
         "# Gemini signed OKF RESULT",
         "",
@@ -110,12 +144,7 @@ def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str) -
         "- **answers:** %s" % (answers_id or ""),
         "- **landed_at:** %s" % now,
         "- **path_rule:** docs/okf/gemini/ only on sfdc-24/Blackboard",
-        "",
-        "## Ask (board excerpt)",
-        "",
-        "```",
-        ask,
-        "```",
+        "- **ask:** board row %s (private board; the row is not copied here)" % (answers_id or ""),
         "",
         "## RESULT",
         "",
@@ -151,9 +180,9 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
          env=None, http=None) -> dict:
     """Land the signed OKF file. Returns {ok, skipped|url|pr, path, error?}."""
     env = os.environ if env is None else env
-    token = (env.get(TOKEN_ENV) or "").strip()
+    token, _ = token_from(env)
     if not token:
-        return {"ok": False, "skipped": "no %s" % TOKEN_ENV,
+        return {"ok": False, "skipped": "no %s or %s" % TOKEN_ENVS,
                 "path": PATH_PREFIX + slug_for(answers_id, ask_text) + ".md"}
     slug = slug_for(answers_id, ask_text)
     path = _safe_path(slug)
