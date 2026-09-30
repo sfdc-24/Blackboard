@@ -60,6 +60,9 @@ REPO = "conference"
 PATH_PREFIX = "docs/okf/gemini/"
 NOTES_PATH = "docs/okf/calls/notes/gemini.md"
 PLAN_PATH = "docs/okf/calls/next.md"
+# The chair refuses a note longer than this in plain text, and never cuts it (conference
+# chair/conf_chair/okf.py NOTES_CHARS). Landing a longer one would open a PR the call can never use.
+NOTES_CHARS = 1500
 MAX_BYTES = 50_000
 BRANCH_PREFIX = "gemini/okf-"
 TOKEN_ENV = "GEMINI_OKF_WRITE_TOKEN"
@@ -156,6 +159,14 @@ def plan_call(plan_text: str) -> str:
     return calls[0] if len(calls) == 1 and calls[0] else ""
 
 
+def chair_chars(note: str) -> int:
+    """The length the chair counts for a note: plain text, as conference okf._plain makes it (front matter
+    dropped, [text](link) kept as text, runs of blank lines folded, ends stripped)."""
+    text = re.sub(r"\A---\n.*?\n---\n", "", (note or "").replace("\r\n", "\n"), count=1, flags=re.S)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    return len(re.sub(r"\n{3,}", "\n\n", text).strip())
+
+
 def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str,
                path: str = "", call: str = "") -> str:
     """The file: Gemini's reply, signed, with the asking row's id and never its text."""
@@ -241,6 +252,10 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
     raw = content.encode("utf-8")
     if len(raw) > MAX_BYTES:
         return {"ok": False, "error": "OKF body over %d bytes" % MAX_BYTES, "path": path}
+    if path == NOTES_PATH and chair_chars(content) > NOTES_CHARS:
+        # Refused whole, never cut: Gemini's words are its own. The answer says so, and Gemini can shorten.
+        return {"ok": False, "error": "the notes are %d characters, over the chair's %d, so the chair would "
+                "refuse them: not landed" % (chair_chars(content), NOTES_CHARS), "path": path}
     step = "reading %s/%s" % (OWNER, REPO)
 
     def private() -> bool:

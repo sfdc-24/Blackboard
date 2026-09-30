@@ -127,6 +127,29 @@ class Destination(unittest.TestCase):
             self.assertIn("could not read the plan's call (%s)" % type(error).__name__, out["error"])
             self.assertFalse(any(m in ("PUT", "POST") for m, _ in calls), calls)
 
+    def test_notes_the_chair_would_refuse_for_length_are_not_landed(self):
+        # Codex on b6e4a18: a long reply landed ok with a PR, and the chair refuses it (over 1500 characters).
+        notes = "BCB|v=1|id=GEM-N-4|land=okf|file=call-notes"
+        http, calls = fake_github()
+        out = okf_land.land(answers_id="GEM-N-4", ask_text=notes, reply_body="x" * 1500,
+                            env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)
+        self.assertFalse(out["ok"])
+        self.assertIn("over the chair's 1500", out["error"])
+        self.assertFalse(any(c[0] in ("PUT", "POST") for c in calls), calls)
+
+    def test_notes_at_the_chair_limit_land(self):
+        notes = "BCB|v=1|id=GEM-N-5|land=okf|file=call-notes"
+        heading = len("# What I will say\n")
+        http, calls = fake_github()
+        out = okf_land.land(answers_id="GEM-N-5", ask_text=notes, reply_body="x" * (1500 - heading),
+                            env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(1500, okf_land.chair_chars(written(calls)))
+
+    def test_chair_chars_counts_as_the_chair_does(self):
+        self.assertEqual(len("# T\nsee the plan."), okf_land.chair_chars("---\na: b\n---\n# T\nsee [the plan](x.md).\n\n\n"))
+        self.assertEqual(len("a\n\nb"), okf_land.chair_chars("a\r\n\r\n\r\n\r\nb"))
+
     def test_a_result_file_needs_no_plan(self):
         http, calls = fake_github(plan=None)
         self.assertTrue(okf_land.land(answers_id="GEM-X-1", ask_text=ASK, reply_body="r",
