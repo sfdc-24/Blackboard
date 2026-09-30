@@ -37,6 +37,7 @@
 !/scripts/gemini_agent.py
 !/scripts/claude_agent.py
 !/scripts/repo_context.py
+!/scripts/okf_land.py
 !/scripts/fleet_agent.py
 
 # Belt and braces. If a future edit above accidentally re-admits the root, these

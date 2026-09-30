@@ -62,8 +62,10 @@ DEPLOYED AS: Cloud Run job gemini-waker (us-central1), triggered by Cloud
 Scheduler gemini-waker-15min at :07/:22/:37/:52 America/Toronto, cursor
 gs://sfdc24-fleet-state/wakers gemini_waker, seeded from the laptop file.
 
-WHAT IT IS NOT GIVEN: no META_TOKEN (cannot message Mr Salam), no GH_TOKEN
-(cannot touch a repository). It holds the bus pair and GEMINI_API_KEY.
+WHAT IT IS NOT GIVEN: no META_TOKEN (cannot message Mr Salam), no broad
+GH_TOKEN. It holds the bus pair and GEMINI_API_KEY. Optional:
+GEMINI_GITHUB_TOKEN (public PR read) and GEMINI_OKF_WRITE_TOKEN (land
+signed OKF under docs/okf/gemini/ on Blackboard only via okf_land.py).
 """
 from __future__ import annotations
 

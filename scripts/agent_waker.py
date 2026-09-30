@@ -83,6 +83,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 import repo_context  # noqa: E402
+import okf_land  # noqa: E402
 from bus import load_env as _load_bus_env
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -150,14 +151,17 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
         # read-only diff attached (scripts/repo_context.py; the owner approved the
         # token, 2026-09-29). A private repository is never read: see that file.
         "repo_context": True,
+        "okf_land": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
 You are a Google model reached over HTTP by a small adapter - a scheduled
 cloud job since 2026-09-24 - on the Gemini API with a key. You
-have NO shell, NO repository checkout, NO gcloud CLI of your own and NO ability
-to open a pull request, merge, deploy, or fetch a file yourself. You cannot
-browse. You see the board row quoted to you below and, when the row names a
+have NO shell and NO gcloud CLI of your own. You cannot browse or merge.
+When a row asks for a signed OKF RESULT, your adapter may land your reply as a
+markdown file under docs/okf/gemini/ on public Blackboard and open a PR; cite
+that okf= URL. You still cannot open arbitrary PRs or touch private repos
+yourself. You see the board row quoted to you below and, when the row names a
 pull request in a public repository, a read-only excerpt of that PR your adapter
 attached after it. That excerpt is all you have seen of any repository: say
 which PR and head you read, and do not claim to have read anything else. If it
@@ -786,16 +790,45 @@ def main(argv=None) -> int:
             continue
 
         body = " ".join(text.split())
+        okf_url = ""
+        okf_note = ""
+        if cfg.get("okf_land") and okf_land.wants_okf(ask_text):
+            landed = okf_land.land(
+                answers_id=src_id, ask_text=ask_text, reply_body=body, route=str(route or ""))
+            if landed.get("ok") and (landed.get("url") or landed.get("pr")):
+                okf_url = landed.get("pr") or landed.get("url")
+                okf_note = " okf=%s" % okf_url
+                note = "    okf landed: %s" % okf_url
+                print(note)
+                log(me, note)
+            elif landed.get("skipped"):
+                note = "    okf skip: %s (path would be %s)" % (
+                    landed.get("skipped"), landed.get("path", ""))
+                print(note)
+                log(me, note)
+            else:
+                note = "    okf land failed: %s" % (landed.get("error") or landed)
+                print(note)
+                log(me, note)
+        if okf_url:
+            hands = ("%s adapter landed a signed OKF file; cite okf=. Still no shell, "
+                     "no private repo, no merge. Treat reasoning as STATED."
+                     % me.capitalize())
+        else:
+            hands = ("%s is a model endpoint: no shell, no private repo, no cloud "
+                     "CLI. Without GEMINI_OKF_WRITE_TOKEN it cannot land OKF files. "
+                     "Treat this as reasoning, never as a measurement or a commitment."
+                     % me.capitalize())
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
+            + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
-              "what it says. %s is a model endpoint: no shell, no repo, no cloud "
-              "CLI, no PR. Treat this as reasoning, never as a measurement or a "
-              "commitment. REPLY: " % (me, me, me.capitalize())
+              "what it says. %s REPLY: " % (me, me, hands)
             + body
+            + okf_note
         )
         if post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
                       verbose=args.verbose, phase=reply_phase(row)):
