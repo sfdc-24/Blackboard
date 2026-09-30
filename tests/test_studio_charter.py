@@ -23,8 +23,9 @@ import tests.test_studio_governance as gov  # noqa: E402
 from tests.test_studio_end_card import EndCard, pdf_text  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.pricing import parse_price_table  # noqa: E402
-from app.summary_pdf import (NEXT_STEP, PLAN_TERMS, PRICED_AFTER_REVIEW, TO_CONFIRM,  # noqa: E402
-                             build_summary_pdf, quote_number)
+from app import summary_pdf as sp  # noqa: E402
+from app.summary_pdf import (DRAFT_NEXT_STEP, NEXT_STEP, PLAN_TERMS, PRICED_AFTER_REVIEW, TO_CONFIRM,  # noqa: E402
+                             DesignImageError, build_summary_pdf, quote_number)
 from workers import charter as ch  # noqa: E402
 from workers.policy import USE_POLICY  # noqa: E402
 from workers.topics import CHARTER_FRAMES, DEFAULT_CHARTER_FRAME, TOPICS, charter_frame, quote_lines  # noqa: E402
@@ -391,11 +392,17 @@ def table(lines=None, support=None, currency="CAD"):
 
 
 FULL_WEBSITE = {"discovery": 800, "design": 1200, "build": 2400, "test": 600, "handover": 400.5}
+FULL_SUPPORT = {"subscription": 150, "on_demand": 120}
+
+
+def complete(lines=None):
+    """A table that prices everything the quote shows: its lines and both support options."""
+    return table({"website": lines or FULL_WEBSITE}, FULL_SUPPORT)
 
 
 class Quote(unittest.TestCase):
     def test_the_header_names_a_quote_with_a_number_a_date_validity_and_who_it_is_for(self):
-        pdf = build_summary_pdf(plan_state(), prepared_for="o***@example.com")
+        pdf = build_summary_pdf(plan_state(), prepared_for="o***@example.com", price_table=complete())
         text = text_of(pdf)
         self.assertIn("Build plan and quote", text)
         numbers = set(QUOTE_RE.findall(text))
@@ -457,16 +464,21 @@ class Quote(unittest.TestCase):
         self.assertIn(PLAN_TERMS[2], text)
         self.assertIn("Subscription", text)
         self.assertIn("On demand", text)
-        self.assertIn(NEXT_STEP, text)
+        self.assertIn(DRAFT_NEXT_STEP, text)                                 # a draft has nothing to accept yet
+        self.assertNotIn(NEXT_STEP, text)
         self.assertEqual("Reply to this email to accept, or book a kickoff at sfdc24.com.", NEXT_STEP)
+        self.assertEqual("Reply to this email with questions, or book a kickoff at sfdc24.com.", DRAFT_NEXT_STEP)
         priced = text_of(build_summary_pdf(plan_state(), price_table=table(support={"subscription": 150, "on_demand": 120})))
         self.assertIn("CAD 150.00 / month", priced)
         self.assertIn("CAD 120.00 / hour", priced)
+        full = text_of(build_summary_pdf(plan_state(), price_table=complete()))
+        self.assertIn(NEXT_STEP, full)
+        self.assertNotIn(DRAFT_NEXT_STEP, full)
 
     def test_the_discussion_is_a_short_appendix_at_the_end(self):
         text = text_of(build_summary_pdf(plan_state(said=20)))
         self.assertIn("Session notes", text)
-        self.assertGreater(text.index("Session notes"), text.index(NEXT_STEP))
+        self.assertGreater(text.index("Session notes"), text.index(DRAFT_NEXT_STEP))
         self.assertIn("A warm company site where locals order ahead.", text)
         self.assertIn("line 19", text)
         self.assertNotIn("line 11,", text + ",")                           # the last eight lines only
@@ -488,6 +500,202 @@ class Quote(unittest.TestCase):
         self.assertNotIn(PLAN_TERMS[0], text)
         self.assertIsNone(QUOTE_RE.search(text))
         self.assertEqual(1, text.count("sfdc24.com"))                        # the footer only
+
+
+def png_bytes(w, h, color=(200, 160, 110)):
+    import io as _io
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def image_widths(pdf: bytes) -> list:
+    return [int(w) for w in re.findall(rb"/Subtype /Image.*?/Width (\d+)", pdf, re.S)]
+
+
+class QuoteDesign(unittest.TestCase):
+    """Owner, 2026-09-26: "a nice looking quote PDF that has images, design
+    elements and a professional format"."""
+
+    def test_page_one_shows_the_brand_the_status_the_facts_and_what_you_get(self):
+        full = text_of(build_summary_pdf(plan_state(), price_table=complete()))
+        draft = text_of(build_summary_pdf(plan_state()))
+        for text in (full, draft):
+            self.assertIn("SFDC24", text)                                  # the wordmark in the band
+            self.assertIn("What you get", text)
+            for line in quote_lines("website"):
+                self.assertIn(line[1], text)
+        self.assertIn(sp.STATUS_READY, full)
+        self.assertNotIn(sp.STATUS_DRAFT, full)
+        self.assertIn(sp.STATUS_DRAFT, draft)
+        self.assertNotIn(sp.STATUS_READY, draft)
+
+    def test_only_a_complete_quote_can_be_accepted_support_included(self):
+        full = text_of(build_summary_pdf(plan_state(), price_table=complete()))
+        self.assertIn("Acceptance", full)
+        self.assertIn(sp.ACCEPT_LINE, full)
+        self.assertIn("Signature", full)
+        self.assertIn(sp.STATUS_READY, full)
+        self.assertNotIn(sp.DRAFT_LINE, full)
+        partial = dict(FULL_WEBSITE)
+        partial.pop("test")
+        drafts = {
+            "nothing priced": table(support=FULL_SUPPORT),
+            "a line missing": table({"website": partial}, FULL_SUPPORT),
+            "support absent": table({"website": FULL_WEBSITE}),                       # Codex on abbbd93
+            "support partial": table({"website": FULL_WEBSITE}, {"subscription": 150}),
+        }
+        for name, prices in drafts.items():
+            text = text_of(build_summary_pdf(plan_state(), price_table=prices))
+            self.assertNotIn("Acceptance", text, name)
+            self.assertNotIn("Signature", text, name)
+            self.assertNotIn(sp.STATUS_READY, text, name)
+            self.assertIn(sp.STATUS_DRAFT, text, name)
+            self.assertIn(sp.DRAFT_LINE, flow(text), name)
+
+    def test_the_milestones_keep_their_exact_words_and_say_half_when_unpriced(self):
+        draft = text_of(build_summary_pdf(plan_state()))
+        self.assertIn(PLAN_TERMS[0], draft)
+        self.assertIn(PLAN_TERMS[1], draft)
+        self.assertIn(sp.MILESTONE_UNPRICED[0], draft)
+        self.assertIn(sp.MILESTONE_UNPRICED[1], draft)
+        self.assertLess(draft.index(PLAN_TERMS[0]), draft.index(PLAN_TERMS[1]))
+
+    def test_the_snapshot_is_framed_scaled_and_captioned(self):
+        big = png_bytes(3200, 2000)
+        pdf = build_summary_pdf(plan_state(), design_png=big)
+        widths = image_widths(pdf)
+        self.assertEqual([sp.FIGURE_MAX_SIDE], widths)                     # scaled once, on page one
+        self.assertIn(sp.FIGURE_CAPTION, text_of(pdf))
+        small = build_summary_pdf(plan_state(), design_png=png_bytes(400, 300))
+        self.assertEqual([400], image_widths(small))                       # small ones are left alone
+        none = text_of(build_summary_pdf(plan_state()))
+        self.assertIn(sp.WIREFRAME_CAPTION, none)                          # no snapshot: the canvas as a wireframe
+        self.assertIn("Hero", none)
+        self.assertIn("Menu", none)
+        broken = big[:40] + b"\x00" * 200
+        with self.assertRaises(DesignImageError):
+            build_summary_pdf(plan_state(), design_png=broken)
+
+    def test_the_pages_are_bounded_and_the_backstop_refuses_more(self):
+        state = plan_state(said=400, levels={d[0]: 3 for d in charter_frame("website")})
+        for d in state["charter"]["dimensions"]:
+            d["captured"] = "x " * 200
+        state["recap"] = {"text": "long recap " * 400}
+        state["events"] = [{"type": "confirm", "payload": {"text": "built " * 80}} for _ in range(60)]
+        pdf = build_summary_pdf(state, design_png=png_bytes(1600, 4000), price_table=table({"website": FULL_WEBSITE}))
+        self.assertLessEqual(pages(pdf), sp.QUOTE_MAX_PAGES)
+        keep = sp.QUOTE_MAX_PAGES
+        try:
+            sp.QUOTE_MAX_PAGES = 1
+            with self.assertRaises(sp.SummaryTooLong):
+                build_summary_pdf(plan_state())
+        finally:
+            sp.QUOTE_MAX_PAGES = keep
+
+    def test_the_same_session_renders_the_same_bytes_dated_by_the_session(self):
+        one = build_summary_pdf(plan_state(), design_png=png_bytes(300, 200))
+        two = build_summary_pdf(plan_state(), design_png=png_bytes(300, 200))
+        self.assertEqual(one, two)
+        self.assertIn(b"/CreationDate (D:20260925", one)
+
+    def test_text_that_would_overflow_its_column_is_shortened(self):
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "", 8)
+        long = "Testing on phones and desktops, launch and go-live checks, and a lot more besides"
+        fitted = sp._fit(pdf, long, 49)
+        self.assertTrue(fitted.endswith("..."))
+        self.assertLessEqual(pdf.get_string_width(fitted), 49)
+        self.assertEqual("Short", sp._fit(pdf, "Short", 49))
+
+
+def flow(text: str) -> str:
+    """The shown strings in order, joined: wrapped lines read as one sentence."""
+    return " ".join(re.findall(r"\(((?:[^()\\]|\\.)*)\) Tj", text))
+
+
+class QuoteWording(unittest.TestCase):
+    """Coordinator review of the sample, 2026-09-26: a line's description must
+    describe its work, and the canvas appendix must read as a site map."""
+
+    def lines_text(self, state, prices=None):
+        return text_of(build_summary_pdf(state, price_table=table({"website": prices or FULL_WEBSITE})))
+
+    def test_each_line_describes_its_work_tailored_with_the_session(self):
+        state = plan_state(levels={"business": 3, "design": 2})
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "business":
+                d["captured"] = "Crumb and Co., a two-person sourdough bakery."
+            if d["id"] == "design":
+                d["captured"] = "Warm browns and cream, real photography."
+        text = self.lines_text(state)
+        raw = text.split("Line items")[1].split("Total")[0]
+        lines = flow(raw)
+        self.assertIn("Goals, audience and a page-by-page plan for Crumb and Co.", lines)
+        self.assertIn("(Crumb and Co.)", raw)                               # the name wraps as one piece
+        self.assertNotRegex(raw, r"\((and )?Co\.\)")
+        self.assertIn("Style, palette and type: warm browns and cream, real photography", lines)
+        self.assertNotIn("a two-person sourdough bakery", lines)             # not the business's own sentence
+        self.assertIn("Covers: Hero, Menu", lines)                         # build keeps its list
+        self.assertIn("Testing on phones and desktops, launch and go-live checks", lines)
+        self.assertIn("Walkthrough, admin access and documentation", lines)
+
+    def test_an_unsettled_dimension_or_no_name_leaves_the_plain_work(self):
+        state = plan_state(levels={"design": 1})
+        state["artifact"]["label"] = ""
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "design":
+                d["captured"] = "Maybe blue."
+        text = flow(self.lines_text(state))
+        self.assertIn("Goals, audience and a page-by-page plan", text)
+        self.assertNotIn("page-by-page plan for", text)
+        self.assertIn("Style, palette and type", text)
+        self.assertNotIn("Style, palette and type: maybe blue", text)
+
+    def test_a_long_fact_is_cut_at_a_word_and_a_proper_name_keeps_its_capital(self):
+        state = plan_state(levels={"design": 3})
+        state["artifact"]["label"] = "Crumb - shop"
+        for d in state["charter"]["dimensions"]:
+            if d["id"] == "design":
+                d["captured"] = "Crumb brown and cream with " + "hand drawn loaves " * 8
+        text = flow(self.lines_text(state))
+        tail = text.split("Style, palette and type: ")[1]
+        self.assertTrue(tail.startswith("Crumb brown"))                    # the project's name keeps its capital
+        self.assertIn("...", tail.split("CAD")[0])
+
+    def test_the_canvas_is_a_site_map_not_a_node_tree(self):
+        state = plan_state()
+        state["artifact"]["children"][0]["children"] = [
+            {"id": "hh", "kind": "heading", "label": "Fresh bread every morning"},
+            {"id": "sub", "kind": "section", "label": "Opening hours"}]
+        pdf = build_summary_pdf(state)
+        text = text_of(pdf)
+        self.assertIn("Site map", text)
+        self.assertNotIn("The canvas", text)
+        for kind in ("screen:", "section:", "heading:"):
+            self.assertNotIn(kind, text)
+        self.assertNotIn(b"/BaseFont /Courier", pdf)
+        notes = text.split("Site map")[1]
+        for name in ("Crumb and Co.", "Hero", "Opening hours", "Menu"):
+            self.assertIn(name, notes)
+        self.assertNotIn("Fresh bread every morning", notes)              # content, not structure
+        self.assertEqual([(0, "Crumb and Co."), (1, "Hero"), (2, "Opening hours"), (1, "Menu")],
+                         sp._site_map(state["artifact"]))
+
+    def test_the_site_map_is_bounded(self):
+        deep = {"id": "d", "kind": "section", "label": "L0", "children": []}
+        node = deep
+        for i in range(1, 8):
+            child = {"id": "d%d" % i, "kind": "section", "label": "L%d" % i, "children": []}
+            node["children"].append(child)
+            node = child
+        self.assertEqual(sp.SITE_MAP_DEPTH, max(d for d, _ in sp._site_map(deep)))
+        wide = {"id": "w", "kind": "screen", "label": "Wide", "children": [
+            {"id": "c%d" % i, "kind": "section", "label": "Part %d" % i} for i in range(80)]}
+        self.assertEqual(sp.SITE_MAP_MAX, len(sp._site_map(wide)))
 
 
 class PriceTable(unittest.TestCase):
@@ -529,7 +737,8 @@ class PriceTable(unittest.TestCase):
 class SummaryUsesTheQuote(EndCard):
     def test_the_summary_email_is_the_quote_prepared_for_the_masked_address(self):
         prices = json.dumps({"currency": "CAD", "lines": {"logo": {"discovery": 300, "design": 900, "build": 600,
-                                                                   "test": 100, "handover": 100}}})
+                                                                   "test": 100, "handover": 100}},
+                             "support": {"subscription": 150, "on_demand": 120}})
         with TestClient(self.make(price_table=prices)) as client:
             sid, headers = self.session(client)
             repo = client.app.state.controller.repository
@@ -549,6 +758,246 @@ class SummaryUsesTheQuote(EndCard):
         self.assertIsNotNone(QUOTE_RE.search(text))
         self.assertIn("CAD 2,000.00", text)                                  # the total, fully priced
         self.assertIn("A mark for a bakery", text)
+
+
+# --- Codex NO-GO on #275 at abbbd93 -------------------------------------------------
+PROBES = {
+    "email": "reach me at jane.doe+work@example.org",
+    "key": "our key is sk-proj-AbCdEf1234567890XyZ",
+    "github": "token ghp_ABCDEFGHIJKLMNOPQRSTUVWX1234",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N",
+    "password": "my password is Hunter2!",
+    "sin": "SIN 046 454 286",
+    "phone": "call 416-555-0199",
+    "bearer": "Authorization: Bearer abc.def.ghi",
+}
+LEAKS = ("jane.doe", "example.org", "sk-proj", "ghp_", "eyJhbGci", "Hunter2", "046 454 286", "416-555-0199",
+         "abc.def.ghi")
+
+
+def probed_state():
+    state = plan_state(said=0, levels={"business": 3, "design": 3})
+    joined = "; ".join(PROBES.values())
+    state["transcript"] = [{"role": "visitor", "text": t} for t in PROBES.values()]
+    state["recap"] = {"text": "Recap: " + joined}
+    state["events"] = [{"type": "confirm", "payload": {"text": "Built it for " + PROBES["email"]}}]
+    state["questions"] = [{"status": "answered", "prompt": "Who signs? " + PROBES["phone"], "options": [],
+                           "freeform_answer": PROBES["password"]}]
+    state["charter"]["next"] = "Confirm " + PROBES["sin"]
+    for d in state["charter"]["dimensions"]:
+        if d["id"] in ("business", "design"):
+            d["captured"] = "Owner " + PROBES["email"] + " " + PROBES["key"]
+    state["artifact"]["children"].append({"id": "c", "kind": "section", "label": "Contact " + PROBES["phone"]})
+    return state
+
+
+class Redaction(unittest.TestCase):
+    def test_no_probe_survives_on_any_quote_surface(self):
+        for prices in (None, complete()):
+            text = flow(text_of(build_summary_pdf(probed_state(), price_table=prices)))
+            for leak in LEAKS:
+                self.assertNotIn(leak, text, leak)
+            for mark in ("[email]", "[key]", "[token]", "password [redacted]", "[number]", "Bearer [redacted]"):
+                self.assertIn(mark, text, mark)
+
+    def test_the_plain_summary_is_redacted_too(self):
+        state = probed_state()
+        state.pop("charter")
+        text = flow(text_of(build_summary_pdf(state)))
+        for leak in LEAKS:
+            self.assertNotIn(leak, text, leak)
+
+    def test_ordinary_words_prices_and_dates_are_kept(self):
+        kept = "A menu for CAD 1,800 by 2026-11-15, open 7 am to 3 pm at 1024 Queen St W; pin the header"
+        self.assertEqual(kept, sp.redact(kept))
+        self.assertEqual("call [phone] or [number]", sp.redact("call 555-0199 or +1 (416) 555-0199"))
+
+    # A voice transcript spells an address out or spaces it, and typed text can
+    # split one with markup; each form reached the PDF before (claude-code-cli
+    # probe on the #275 repair head).
+    SPOKEN = {
+        "reach me at jane dot doe at example dot org": ("jane", "doe", "example"),
+        "email jane at gmail dot com please": ("jane", "gmail"),
+        "reach me at jane_doe at company dot ca": ("jane_doe", "company"),
+        "jane.doe @ example.org": ("jane.doe", "example.org"),
+        "jane (at) example (dot) org": ("jane", "example"),
+        "zqalice<a>@x</a>yz.com": ("zqalice", "xyz"),
+        "my password's Hunter2": ("Hunter2",),
+        "passphrase: blue horse staple": ("blue", "horse", "staple"),
+    }
+
+    def test_spoken_spaced_and_split_addresses_and_passphrases_are_redacted(self):
+        for said, leaks in self.SPOKEN.items():
+            out = sp.redact(said)
+            for leak in leaks:
+                self.assertNotIn(leak, out, (said, out))
+
+    def test_ordinary_sentences_with_at_and_dot_are_kept(self):
+        for kept in ("meet at noon, dot the i's", "we are at Queen and Bathurst", "I work at Shopify.com",
+                     "prices at 5.99 each", "the logo sits at top. Menu is next", "we meet at 10.30 daily",
+                     "a bakery at Queen . The shop"):
+            self.assertEqual(kept, sp.redact(kept))
+
+    def test_redaction_stays_linear_on_hostile_input(self):
+        # Before the address patterns were anchored to the start of a run of
+        # address characters, "a." * 2000 + "@" took about 3.6 s to redact.
+        import time
+        for hostile in ("a." * 2000 + "@", "a.b" * 1300, "x dot " * 700, "a (at) " * 600,
+                        "jane " + "dot x " * 700 + "at b", "<a" * 2000):
+            start = time.perf_counter()
+            sp.redact(hostile[:4000])
+            self.assertLess(time.perf_counter() - start, 1.0, hostile[:20])
+
+
+class DraftSemantics(unittest.TestCase):
+    def test_a_draft_is_not_styled_as_an_offer(self):
+        for prices in (None, table({"website": FULL_WEBSITE})):
+            text = flow(text_of(build_summary_pdf(plan_state(), price_table=prices)))
+            self.assertIn(sp.DRAFT_TITLE, text)
+            self.assertNotIn(sp.QUOTE_TITLE, text)
+            self.assertIsNone(QUOTE_RE.search(text))                        # no offer number
+            self.assertRegex(text, r"D-\d{8}-[0-9A-F]{6}")
+            self.assertNotIn("Valid for", text)
+            self.assertIn(sp.DRAFT_STATUS, text)
+            self.assertIn("Draft D-", text)                                   # the footer
+        full = flow(text_of(build_summary_pdf(plan_state(), price_table=complete())))
+        self.assertIn(sp.QUOTE_TITLE, full)
+        self.assertIn("Valid for 30 days", full)
+        self.assertIsNotNone(QUOTE_RE.search(full))
+        self.assertNotIn(sp.DRAFT_STATUS, full)
+        self.assertEqual(quote_number(plan_state())[2:], quote_number(plan_state(), "D")[2:])
+
+
+def longest_address():
+    domain = ("b" * 60 + ".") * 3                                         # the visitor rule's longest shape
+    domain = domain + "c" * (254 - 65 - len(domain) - 4) + ".com"
+    address = "a" * 64 + "@" + domain
+    assert len(address) == 254
+    return address
+
+
+def y_of(text, label):
+    return float(re.search(r"([\d.]+) Td [\d. ]*rg \(" + re.escape(label) + r"\) Tj", text).group(1))
+
+
+class FactsPanel(unittest.TestCase):
+    def test_the_longest_admitted_address_is_bounded_and_nothing_overlaps(self):
+        from app.summary_pdf import mask_email
+        masked = mask_email(longest_address())
+        text = text_of(build_summary_pdf(plan_state(), prepared_for=masked, price_table=complete()))
+        shown = [m for m in re.findall(r"\(([^()]*\.com)\) Tj", text) if "***@" in m]
+        self.assertEqual(1, len(shown))
+        self.assertLessEqual(len(shown[0]), sp.PREPARED_FOR_MAX)
+        self.assertIn("...", shown[0])
+        self.assertTrue(shown[0].startswith("a***@"))
+        self.assertGreater(y_of(text, "Session type") - y_of(text, "What you get"), 20)   # below the panel
+
+    def test_the_panel_grows_with_a_value_that_wraps(self):
+        from app.summary_pdf import mask_email
+        keep = sp.PREPARED_FOR_MAX
+        try:
+            sp.PREPARED_FOR_MAX = 400                                          # no bound: it wraps three lines
+            text = text_of(build_summary_pdf(plan_state(), prepared_for=mask_email(longest_address()),
+                                             price_table=complete()))
+        finally:
+            sp.PREPARED_FOR_MAX = keep
+        self.assertGreater(y_of(text, "Session type") - y_of(text, "What you get"), 20)
+
+
+def page_segments(text):
+    return re.split(r"\(Page \d+ of \) Tj", text)
+
+
+class SiteMapPlacement(unittest.TestCase):
+    def big_map_state(self):
+        state = plan_state(said=8)
+        state["artifact"]["children"] = [{"id": "p%d" % i, "kind": "section", "label": "Page %02d name" % i}
+                                         for i in range(40)]
+        return state
+
+    def test_a_full_site_map_stays_on_one_page(self):
+        text = text_of(build_summary_pdf(self.big_map_state(), price_table=complete()))
+        where = [i for i, seg in enumerate(page_segments(text)) if "(Site map)" in seg]
+        self.assertEqual(1, len(where))
+        seg = page_segments(text)[where[0]]
+        rows = re.findall(r"\(Page \d\d name\) Tj", seg)
+        self.assertEqual(sp.SITE_MAP_MAX - 1, len(rows))                     # 29 sections under the root
+        self.assertIn("(Crumb and Co.) Tj", seg)
+        for other in page_segments(text)[where[0] + 1:]:
+            self.assertNotRegex(other, r"\(Page \d\d name\) Tj")
+
+    def test_a_small_site_map_follows_on_the_same_page(self):
+        text = text_of(build_summary_pdf(plan_state(), price_table=complete()))
+        seg = next(seg for seg in page_segments(text) if "(Site map)" in seg)
+        self.assertIn("(Session notes)", seg)
+
+
+class Bounded(unittest.TestCase):
+    def maximum_state(self):
+        state = plan_state(said=0, levels={d[0]: 3 for d in charter_frame("website")})
+        for d in state["charter"]["dimensions"]:
+            d["captured"] = "words " * 40
+        state["charter"]["next"] = "next " * 60
+        state["transcript"] = [{"role": "visitor", "text": "said " * 120} for _ in range(200)]
+        state["recap"] = {"text": "recap " * 400}
+        state["events"] = [{"type": "confirm", "payload": {"text": "built " * 60}} for _ in range(60)]
+        state["questions"] = [{"status": "answered", "prompt": "question " * 25, "options": [],
+                               "freeform_answer": "answer " * 28} for _ in range(40)]
+        state["artifact"]["label"] = "label " * 20
+        state["artifact"]["children"] = [
+            {"id": "s%d" % i, "kind": "section", "label": "section name %d " % i * 6,
+             "children": [{"id": "t%d" % i, "kind": "form", "label": "form %d " % i * 8}]} for i in range(40)]
+        return state
+
+    def test_the_maximum_admitted_state_fits_the_bound(self):
+        from app.summary_pdf import mask_email
+        pdf = build_summary_pdf(self.maximum_state(), design_png=png_bytes(1600, 4000), price_table=complete(),
+                                prepared_for=mask_email(longest_address()))
+        self.assertLessEqual(pages(pdf), sp.QUOTE_MAX_PAGES)
+        self.assertIn("Session notes", text_of(pdf))                      # shortened, not dropped
+
+    def test_an_over_full_state_shortens_its_notes_to_fit(self):
+        keep = sp.QUOTE_MAX_PAGES
+        try:
+            sp.QUOTE_MAX_PAGES = 4
+            pdf = build_summary_pdf(self.maximum_state(), price_table=complete())
+        finally:
+            sp.QUOTE_MAX_PAGES = keep
+        self.assertLessEqual(pages(pdf), 4)
+        text = text_of(pdf)
+        self.assertIn(sp.QUOTE_TITLE, text)
+        self.assertIn("Acceptance", text)                                  # the offer itself is never cut
+
+    def test_long_canvas_labels_are_cut_at_a_word(self):
+        state = plan_state()
+        state["artifact"]["children"][0]["label"] = "Hero section with sourdough loaves baked at dawn daily"
+        text = flow(text_of(build_summary_pdf(state, price_table=complete())))
+        self.assertIn("Covers: Hero section with sourdough...", text)
+        self.assertEqual("Hero section with sourdough...", sp.words("Hero section with sourdough loaves", 30))
+        self.assertEqual("abcdefghijklmnopqrstuvwxyz0...", sp.words("abcdefghijklmnopqrstuvwxyz0123456789", 30))
+
+
+class SummaryTooLongRoute(EndCard):
+    def test_an_over_long_plan_is_refused_with_a_clear_422_and_nothing_is_sent(self):
+        prices = json.dumps({"currency": "CAD", "support": {"subscription": 150, "on_demand": 120}})
+        keep = sp.QUOTE_MAX_PAGES
+        try:
+            sp.QUOTE_MAX_PAGES = 1
+            with TestClient(self.make(price_table=prices)) as client:
+                sid, headers = self.session(client)
+                repo = client.app.state.controller.repository
+                record = repo.load(sid)
+                state = copy.deepcopy(record.state)
+                state["charter"] = {"revision": 1, "topic": "logo", "next": "", "updated_at": 1000,
+                                    "dimensions": [{"id": "objectives", "level": 2, "captured": "A mark"}]}
+                repo.save(sid, state, record.token)
+                r = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        finally:
+            sp.QUOTE_MAX_PAGES = keep
+        self.assertEqual(422, r.status_code, r.text)
+        self.assertIn("nothing was sent", r.json()["detail"])
+        self.assertEqual([], self.sender.calls)
+        self.assertNotIn("summary", self.state(sid))
 
 
 if __name__ == "__main__":

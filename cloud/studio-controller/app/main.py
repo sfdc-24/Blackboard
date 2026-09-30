@@ -35,7 +35,7 @@ from .state import (
     StudioRepository,
     VoiceCapacityExceeded,
 )
-from .summary_pdf import DesignImageError, build_summary_pdf, decode_design_png, mask_email
+from .summary_pdf import DesignImageError, SummaryTooLong, build_summary_pdf, decode_design_png, mask_email
 from .tokens import InvalidToken, mint_token, verify_token
 from .workers.synthetic import SyntheticWorker
 
@@ -1375,6 +1375,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                                           price_table=price_table, prepared_for=masked)
         except DesignImageError as exc:
             raise HTTPException(400, str(exc)) from exc
+        except SummaryTooLong as exc:
+            # Nothing is reserved or sent; the visitor is told how to get the plan.
+            raise HTTPException(422, "this session is too long for one PDF, so nothing was sent; "
+                                     "book a kickoff at sfdc24.com to get the plan") from exc
         now = int(clock())
         reservation = secrets.token_hex(8)
         outcome: dict = {}
