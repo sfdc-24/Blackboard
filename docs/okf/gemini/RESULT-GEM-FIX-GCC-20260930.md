@@ -1,3 +1,9 @@
+> **HISTORICAL, SUPERSEDED (2026-09-30).** This is Cursor's write-up of the first design, which
+> wrote to public Blackboard. That design was rejected in review (Codex NO-GO on #304 at 5e2a4cb)
+> and replaced: Gemini's OKF writes now go only to the private `sfdc-24/conference` repository,
+> through a pull request (`scripts/okf_land.py`). Nothing below is an instruction, and the
+> `landed_at` stamp records this file's own commit, not a Gemini write.
+
 # Gemini OKF write-path fix ? RESULT GEM-FIX-GCC-20260930
 
 - **signed_by:** cursor (execute) + grok (lead); Codex to verify
@@ -18,13 +24,11 @@
 - `scripts/agent_waker.py` ? when ask wants signed OKF and `GEMINI_OKF_WRITE_TOKEN` is set, land file then cite `okf=` on the bus RESULT.
 - Dockerfile + `.gcloudignore` allowlist updated so Cloud Build sees `okf_land.py`.
 
-## Owner blockers (required for live Gemini self-land)
+## Owner steps (superseded, do not follow)
 
-1. Create fine-grained PAT **GEMINI_OKF_WRITE_TOKEN**: repo `sfdc-24/Blackboard` only; permissions Contents:Write + Pull requests:Write; no private repos.
-2. `gcloud secrets create GEMINI_OKF_WRITE_TOKEN` (or add version); IAM bind `waker-gemini@sfdc24` secretAccessor only.
-3. Mount env `GEMINI_OKF_WRITE_TOKEN` on Cloud Run job `gemini-waker`.
-4. Rebuild/redeploy `agent-waker` image from this PR tip; leave Scheduler/board-watcher as-is.
-5. Do **not** load Claude on this thread; Codex verifies tests + review.
+Removed on 2026-09-30. The token is already mounted (secret `github-token-gemini-okf`, as
+`GEMINI_GITHUB_TOKEN`), and the lander now writes only into the private conference repository.
+See the README beside this file.
 
 ## Proof target
 

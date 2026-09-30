@@ -13,8 +13,11 @@ WHERE IT WRITES, AND WHY THERE
   ruled that no free model text from it may go to a public repository: a regex
   scrub cannot recognise a client name or a codeword, and a public commit is
   published before any review. So the only destination is sfdc-24/conference,
-  which is private and holds the conference OKF (docs/okf), and the lander asks
-  GitHub that it is still private before every write.
+  which is private and holds the conference OKF (docs/okf). The lander asks
+  GitHub that it is still private at the start and again right before each
+  write: the branch, the file and the pull request (Codex on 6d0ba6f). That
+  narrows the window in which a visibility change could publish the text; it
+  cannot close it, so the repository staying private is a deployment rule.
   - docs/okf/gemini/<row id>.md, for a signed RESULT; or
   - docs/okf/calls/notes/gemini.md, Gemini's prepared notes for the next call,
     when the row says file=call-notes.
@@ -215,16 +218,23 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
     repo = "/repos/%s/%s" % (OWNER, REPO)
     branch = BRANCH_PREFIX + slug_for(answers_id, ask_text)[:40].lower()
     step = "reading %s/%s" % (OWNER, REPO)
-    try:
+
+    def private() -> bool:
         meta = do("GET", repo, token)
-        if not isinstance(meta, dict) or meta.get("private") is not True:
-            return {"ok": False, "error": "refused: %s/%s is not private" % (OWNER, REPO), "path": path}
+        return isinstance(meta, dict) and meta.get("private") is True
+
+    refused = {"ok": False, "error": "refused: %s/%s is not private" % (OWNER, REPO), "path": path}
+    try:
+        if not private():
+            return refused
         step = "reading main"
         main = do("GET", repo + "/git/ref/heads/main", token)
         main_sha = ((main.get("object") or {}).get("sha") or "").strip()
         if not main_sha:
             return {"ok": False, "error": "main tip missing", "path": path}
         step = "creating branch %s" % branch
+        if not private():
+            return refused
         try:
             do("POST", repo + "/git/refs", token, {"ref": "refs/heads/%s" % branch, "sha": main_sha})
         except urllib.error.HTTPError as e:
@@ -246,6 +256,8 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
         if sha:
             put["sha"] = sha
         step = "writing %s" % path
+        if not private():
+            return refused
         do("PUT", repo + "/contents/%s" % urllib.parse.quote(path), token, put)
         step = "opening the pull request"
         prs = do("GET", repo + "/pulls?head=%s:%s&state=open"
@@ -253,6 +265,8 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
         if isinstance(prs, list) and prs:
             pr_url = prs[0].get("html_url") or ""
         else:
+            if not private():
+                return dict(refused, branch=branch)
             created = do("POST", repo + "/pulls", token, {
                 "title": "okf: Gemini's %s" % what,
                 "head": branch,

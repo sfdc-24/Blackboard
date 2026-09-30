@@ -98,6 +98,45 @@ class Destination(unittest.TestCase):
         self.assertEqual("docs/okf/gemini/secrets.md", okf_land._safe_path("../secrets"))
 
 
+class VisibilityFlip(unittest.TestCase):
+    """Codex on 6d0ba6f: privacy is asked again right before each write, not only at the start."""
+
+    def flips_after(self, private_answers):
+        answers = list(private_answers)
+        base, calls = fake_github()
+
+        def http(method, path, token, payload=None, timeout=30):
+            if method == "GET" and path == "/repos/sfdc-24/conference":
+                calls.append((method, path, payload, token))
+                return {"private": answers.pop(0) if answers else False}
+            return base(method, path, token, payload, timeout)
+
+        out = okf_land.land(answers_id="GEM-X-1", ask_text=ASK, reply_body="secret plan",
+                            env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)
+        return out, [c[0] + " " + c[1] for c in calls]
+
+    def test_public_after_the_first_check_means_no_branch_and_no_file(self):
+        out, calls = self.flips_after([True])
+        self.assertFalse(out["ok"])
+        self.assertIn("not private", out["error"])
+        self.assertFalse(any(c.startswith(("PUT ", "POST ")) for c in calls), calls)
+
+    def test_public_right_before_the_file_means_no_file(self):
+        out, calls = self.flips_after([True, True])
+        self.assertFalse(out["ok"])
+        self.assertFalse(any(c.startswith("PUT ") for c in calls), calls)
+
+    def test_public_right_before_the_pull_request_means_none_is_opened(self):
+        out, calls = self.flips_after([True, True, True])
+        self.assertFalse(out["ok"])
+        self.assertFalse(any(c.startswith("POST ") and c.endswith("/pulls") for c in calls), calls)
+
+    def test_private_throughout_is_checked_four_times(self):
+        out, calls = self.flips_after([True, True, True, True])
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(4, calls.count("GET /repos/sfdc-24/conference"))
+
+
 class ReviewGate(unittest.TestCase):
     """Codex on 5e2a4cb: a file written without a pull request is not landed."""
 
