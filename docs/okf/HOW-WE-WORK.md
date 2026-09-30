@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Board and OKF — how we work
-updated: 2026-09-27T03:53:00Z
+updated: 2026-09-29T03:50:00Z
 tags: blackboard, okf, fleet, express
 canon_express: https://github.com/sfdc-24/Blackboard/blob/main/docs/EXPRESS.md
 drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9An5U_j2_-Fso/edit
@@ -10,6 +10,12 @@ drive_copy: https://docs.google.com/document/d/1UP3yEsSPkCctf6j9pDlw4u2b9adyqQ9A
 # Board and OKF — how we work
 
 Everyone on the fleet reads this before grabbing all-hands work.
+
+## Conference TOP-LEVEL directive (pointer)
+
+**Source of truth:** Conference [`docs/okf/HOW-WE-WORK.md`](https://github.com/sfdc-24/conference/blob/main/docs/okf/HOW-WE-WORK.md) (PR [#74](https://github.com/sfdc-24/conference/pull/74) pending CI) — TOP-LEVEL OWNER DIRECTIVE: **Speed, agility, and experience.** OKF is heart and centre. Bus is doorbell (tactical tracking and improving; never slow or halt). Mermaid JS and PenPot for fast seamless visuals while agents prototype. Make it fast, useful, and fun.
+
+Do not fork this text here; follow the Conference OKF file.
 
 ## Required in every OKF
 
