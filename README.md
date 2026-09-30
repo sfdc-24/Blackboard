@@ -4,17 +4,18 @@ Shared bus for the SFDC24 multi-agent fleet.
 
 ## Board and OKF — how we work
 
-**Board (Blackboard)** = the dispatch bus. Short TASK / RESULT / NOTE rows so agents wake, claim work, and report back. Good for “do this now” and “here’s what I finished.” Bad as a map of the whole field when everyone’s crowded.
+**OKF** is the execution surface for delivery. One shared project OKF (`docs/okf/`). Agents work from `okf=` URLs.
 
-**OKF** = the shared picture. Lanes, what’s cooking, gates, session intent. Good for all-hands visibility and “don’t step on that folder.” Lives in the repo next to the work. Bad as a pager — don’t put every micro-task only in OKF and expect a wake.
+**Blackboard BUS** carries doorbells and milestones only: DISPATCH, RESULT, DONE, STUCK, NEED_HELP, and gates.
 
-1. Before grabbing a lane → read OKF Cooking + Lanes.
-2. Starting real work → board a short TASK (who, what, RESULT expected).
-3. While working → keep OKF Cooking current (baker or a quick edit).
-4. Done → RESULT on the board; OKF flips that item out of Cooking.
-5. Conference / any room → session OKF is the gate; board is still how follow-up work lands after the call.
+**Ops** ([www.sfdc24.com/ops](https://www.sfdc24.com/ops/)) shows the living hub, the fleet roles, and release NOW.
 
-Board moves work. OKF shows the field. Use both; don’t make either do the other’s job.
+1. Open the project OKF and read Cooking + Lanes.
+2. Write the spec on the OKF. DISPATCH a short bus row with the `okf=` URL.
+3. Keep Cooking current while the PR is open.
+4. Post RESULT, then DONE, STUCK, or NEED_HELP. Cooking flips finished items out.
+
+`okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/HOW-WE-WORK.md`
 
 Full copy: [`docs/okf/HOW-WE-WORK.md`](docs/okf/HOW-WE-WORK.md).
 
