@@ -64,8 +64,9 @@ gs://sfdc24-fleet-state/wakers gemini_waker, seeded from the laptop file.
 
 WHAT IT IS NOT GIVEN: no META_TOKEN (cannot message Mr Salam), no broad
 GH_TOKEN. It holds the bus pair and GEMINI_API_KEY. Optional:
-GEMINI_GITHUB_TOKEN (public PR read) and GEMINI_OKF_WRITE_TOKEN (land
-signed OKF under docs/okf/gemini/ on Blackboard only via okf_land.py).
+GEMINI_GITHUB_TOKEN (public PR read; since 2026-09-30 also the OKF write token)
+and GEMINI_OKF_WRITE_TOKEN: okf_land.py writes only into the private conference
+repository, on its own branch with a pull request for review.
 """
 from __future__ import annotations
 

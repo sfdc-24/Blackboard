@@ -18,8 +18,8 @@ ENV PYTHONUNBUFFERED=1
 # repositories (read-only)" access that scripts/repo_context.py uses to read the
 # public PRs a row names (the owner approved it, 2026-09-29). It can read no
 # private repository, whatever a row asks.
-# For signed OKF RESULT files, may also get GEMINI_OKF_WRITE_TOKEN (Blackboard
-# Contents:Write + Pull requests:Write only). scripts/okf_land.py lands under
-# docs/okf/gemini/ and opens a PR; never auto-merges.
+# The OKF write token (GEMINI_OKF_WRITE_TOKEN, else the mounted GEMINI_GITHUB_TOKEN):
+# scripts/okf_land.py writes only into the private sfdc-24/conference repository,
+# on its own branch with a pull request for review; it never merges.
 # Not given: META_TOKEN or a broad GH_TOKEN. It answers board rows and may land OKF.
 ENTRYPOINT ["python", "/app/main.py"]

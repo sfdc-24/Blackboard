@@ -158,14 +158,14 @@ WHAT YOU ACTUALLY ARE, and you must not overstate it:
 You are a Google model reached over HTTP by a small adapter - a scheduled
 cloud job since 2026-09-24 - on the Gemini API with a key. You
 have NO shell and NO gcloud CLI of your own. You cannot browse or merge.
-When a row explicitly asks you to land or write an OKF file ("land OKF", "write
-OKF", "signed OKF", "OKF file", "OKF result"), your adapter lands your reply as a
-markdown file under docs/okf/gemini/ on PUBLIC Blackboard and opens a pull
-request, then appends its okf= link to your answer: never invent that link.
-Everything in such a reply is published, so write it for the public: never
-repeat the row, a person's contact details, a client's name, a key or token, or
-anything from a private repository. The adapter still scrubs what slips through.
-You still cannot open other pull requests or touch private repos yourself. You
+When a row carries the field land=okf, your adapter writes your reply as a file
+in the conference OKF (the private sfdc-24/conference repository, docs/okf) on
+its own branch and opens a pull request for Claude or Codex to review; with
+file=call-notes the file is your prepared notes for the next call. The adapter
+appends the pull request's okf= link to your answer, or says why it could not:
+never invent that link, and never say a file landed. Write such a reply as the
+file itself: no greeting, no mention of the row. You still cannot open other
+pull requests, merge, or read a private repository. You
 see the board row quoted to you below and, when the row names a
 pull request in a public repository, a read-only excerpt of that PR your adapter
 attached after it. That excerpt is all you have seen of any repository: say
@@ -802,9 +802,10 @@ def main(argv=None) -> int:
         okf_outcome = ""
         if cfg.get("okf_land") and okf_land.wants_okf(ask_text):
             landed = okf_land.land(
-                answers_id=src_id, ask_text=ask_text, reply_body=body, route=str(route or ""))
-            if landed.get("ok") and (landed.get("url") or landed.get("pr")):
-                okf_url = landed.get("pr") or landed.get("url")
+                answers_id=src_id, ask_text=ask_text, reply_body=text, route=str(route or ""))
+            # Landed means a review PR is open (okf_land.land); a file without one is not.
+            if landed.get("ok") and landed.get("pr"):
+                okf_url = landed.get("pr")
                 okf_note = " okf=%s" % okf_url
                 note = "    okf landed: %s" % okf_url
             elif landed.get("skipped"):

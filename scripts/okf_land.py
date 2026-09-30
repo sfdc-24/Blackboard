@@ -1,38 +1,41 @@
 #!/usr/bin/env python3
-"""Land a Gemini-signed OKF markdown file on public Blackboard via GitHub Contents API.
+"""Land Gemini's answer as an OKF file in the PRIVATE conference repository, for review.
 
 WHY THIS EXISTS
   Gemini can post phase=RESULT on the bus (Blackboard #297/#298) and can read
-  public PR diffs (Blackboard #299/#302). It still could not land an OKF file:
-  the waker holds no write token and its doctrine said "no PR". Owner 2026-09-30
-  transferred Gemini-fix ownership to Grok+Cursor+Codex: Gemini must write
-  signed OKF RESULT files, not DONE/waker-only.
+  public PR diffs (Blackboard #299/#302). It could not write the OKF: the waker
+  held no write token and its doctrine said "no PR". The owner, 2026-09-30:
+  every agent should read and write the OKF, Gemini included, and Gemini owns
+  the conference experience for the 11:00 Toronto call.
 
-WHAT IT DOES
-  - Only repository: sfdc-24/Blackboard (public).
-  - Only paths under docs/okf/gemini/.
-  - Creates or updates a file on a dedicated branch, then opens a PR.
-  - Returns the PR / blob URL for the bus RESULT to cite as okf=.
+WHERE IT WRITES, AND WHY THERE
+  The board is private. Codex's security review of 5e2a4cb (NO-GO, 04:41Z)
+  ruled that no free model text from it may go to a public repository: a regex
+  scrub cannot recognise a client name or a codeword, and a public commit is
+  published before any review. So the only destination is sfdc-24/conference,
+  which is private and holds the conference OKF (docs/okf), and the lander asks
+  GitHub that it is still private before every write.
+  - docs/okf/gemini/<row id>.md, for a signed RESULT; or
+  - docs/okf/calls/notes/gemini.md, Gemini's prepared notes for the next call,
+    when the row says file=call-notes.
 
-WHAT IT REFUSES
-  - Any path outside docs/okf/gemini/.
-  - Any repository other than Blackboard.
-  - No token. It uses GEMINI_OKF_WRITE_TOKEN, else GEMINI_GITHUB_TOKEN: on
-    2026-09-30 at 04:13Z the owner mounted the secret github-token-gemini-okf
-    on gemini-waker as GEMINI_GITHUB_TOKEN. Without either it returns a clear
-    skip; the answer still posts on the bus. A token that cannot write returns
-    the HTTP status as the exact blocker.
-  - Auto-merge. Human / Codex review before merge.
+WHAT STARTS IT
+  A structured field in the asking row, never its prose: land=okf, a BCB field
+  (the first value wins). "Do not write OKF" or a quoted "land okf" starts
+  nothing. file=call-notes chooses the notes file.
 
-SECURITY
-  Board rows are not provenance, and the board is private while this repo is
-  public. So the file carries the model's reply only, never the row that asked
-  for it (only its id), and the reply is scrubbed of email addresses, phone
-  numbers, token shapes and URL query strings before it is written. Landing
-  starts only on an explicit ask ("land okf", "write okf", "signed okf",
-  "okf file", "okf result"), never on a row that merely cites an OKF path.
-  The token must be a fine-grained PAT scoped to Blackboard Contents:Write +
-  Pull requests:Write only.
+WHAT COUNTS AS LANDED
+  The file written on its own branch (gemini/okf-<id>) AND a pull request open
+  for it. The merge is a review by Claude or Codex. A file written without a
+  pull request is reported as NOT landed, with the branch named, so no answer
+  cites okf= for work nobody can review.
+
+TOKEN
+  GEMINI_OKF_WRITE_TOKEN, else GEMINI_GITHUB_TOKEN: on 2026-09-30 at 04:13Z the
+  owner mounted the secret github-token-gemini-okf on gemini-waker under that
+  name. A token that cannot see or write the repository comes back as the HTTP
+  status: the exact blocker, in Gemini's answer. It is sent only to
+  api.github.com, never across a redirect.
 """
 from __future__ import annotations
 
@@ -47,14 +50,16 @@ from datetime import datetime, timezone
 
 API = "https://api.github.com"
 OWNER = "sfdc-24"
-REPO = "Blackboard"
+REPO = "conference"
 PATH_PREFIX = "docs/okf/gemini/"
+NOTES_PATH = "docs/okf/calls/notes/gemini.md"
 MAX_BYTES = 50_000
 BRANCH_PREFIX = "gemini/okf-"
 TOKEN_ENV = "GEMINI_OKF_WRITE_TOKEN"
 TOKEN_ENVS = (TOKEN_ENV, "GEMINI_GITHUB_TOKEN")
 
-# What a public file must never carry, whatever the model repeats from the row.
+# Kept out of the file even in a private repository: a key, a token or a
+# person's contact details have no place in the OKF.
 _SCRUB = (
     (re.compile(r"(?i)(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{10,}"), "[token removed]"),
     (re.compile(r"(?i)\b(?:sk|xox[baprs])-[A-Za-z0-9-]{8,}"), "[token removed]"),
@@ -68,7 +73,7 @@ _SCRUB = (
 
 
 def scrub(text: str) -> str:
-    """The reply as it may appear on a public repository."""
+    """The reply without key shapes, tokens, email addresses, phone numbers or URL queries."""
     out = text or ""
     for pattern, replacement in _SCRUB:
         out = pattern.sub(replacement, out)
@@ -98,53 +103,69 @@ class _StayOnGitHub(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_StayOnGitHub)
 
 
+def fields(ask_text: str) -> dict:
+    """The asking row's BCB fields, first value wins (a later land= is a quote, not a rewrite)."""
+    out = {}
+    for segment in (ask_text or "").split("|"):
+        key, sep, value = segment.partition("=")
+        key = key.strip().lower()
+        if sep and re.fullmatch(r"[a-z_]{1,20}", key) and key not in out:
+            out[key] = value.strip()
+    return out
+
+
 def wants_okf(ask_text: str) -> bool:
-    """True when the board ask requires a signed OKF file, not bus prose alone."""
-    text = (ask_text or "").lower()
-    # Only an explicit ask. "okf=", "docs/okf" and "okf path" are how rows CITE
-    # a file, and most RESULT rows cite one: each would open a public PR.
-    needles = (
-        "signed okf",
-        "okf result",
-        "okf file",
-        "write okf",
-        "land okf",
-    )
-    return any(n in text for n in needles)
+    """True only when the row carries the structured field land=okf."""
+    return fields(ask_text).get("land", "").lower() == "okf"
 
 
 def slug_for(answers_id: str, ask_text: str = "") -> str:
     """A stable, path-safe filename stem from the source BCB id."""
-    raw = (answers_id or "anon").strip()
-    m = re.search(r"id=([A-Za-z0-9._-]{3,80})", ask_text or "")
-    if m:
-        raw = m.group(1)
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")[:80]
+    raw = fields(ask_text).get("id") or (answers_id or "anon")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw.strip()).strip("-.")[:80]
     return cleaned or "anon"
 
 
 def _safe_path(slug: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", (slug or "anon"))[:80] + ".md"
-    path = PATH_PREFIX + name
-    if not path.startswith(PATH_PREFIX) or ".." in path or path.count("/") != 3:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", (slug or "anon")).strip("-.")[:80] or "anon"
+    path = PATH_PREFIX + name + ".md"
+    if ".." in path or path.count("/") != 3:
         raise ValueError("refusing path outside %s: %s" % (PATH_PREFIX, path))
     return path
 
 
-def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str) -> str:
-    """Gemini-signed OKF markdown. evidence=STATED: model reasoning, not MEASURED."""
+def target_path(answers_id: str, ask_text: str) -> str:
+    if fields(ask_text).get("file", "").lower() == "call-notes":
+        return NOTES_PATH
+    return _safe_path(slug_for(answers_id, ask_text))
+
+
+def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str,
+               path: str = "") -> str:
+    """The file: Gemini's reply, signed, with the asking row's id and never its text."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = scrub((reply_body or "").strip()) or "(empty model reply)"
+    if path == NOTES_PATH:
+        return "\n".join([
+            "---",
+            "type: call-notes",
+            "agent: gemini",
+            "status: ready",
+            "written_by: gemini, landed by its adapter (scripts/okf_land.py) at %s" % now,
+            "answers: %s" % (answers_id or ""),
+            "---",
+            "# What I will say",
+            body,
+            "",
+        ])
     return "\n".join([
         "# Gemini signed OKF RESULT",
         "",
         "- **signed_by:** gemini",
         "- **evidence:** STATED",
         "- **route:** %s" % (route or "unknown"),
-        "- **answers:** %s" % (answers_id or ""),
+        "- **answers:** board row %s (the row is not copied here)" % (answers_id or ""),
         "- **landed_at:** %s" % now,
-        "- **path_rule:** docs/okf/gemini/ only on sfdc-24/Blackboard",
-        "- **ask:** board row %s (private board; the row is not copied here)" % (answers_id or ""),
         "",
         "## RESULT",
         "",
@@ -178,81 +199,76 @@ def _request(method: str, path: str, token: str, payload=None, timeout: float = 
 
 def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
          env=None, http=None) -> dict:
-    """Land the signed OKF file. Returns {ok, skipped|url|pr, path, error?}."""
+    """Land the file for review. Returns {ok, pr, path, branch} or {ok: False, skipped|error, path}."""
     env = os.environ if env is None else env
+    path = target_path(answers_id, ask_text)
     token, _ = token_from(env)
     if not token:
-        return {"ok": False, "skipped": "no %s or %s" % TOKEN_ENVS,
-                "path": PATH_PREFIX + slug_for(answers_id, ask_text) + ".md"}
-    slug = slug_for(answers_id, ask_text)
-    path = _safe_path(slug)
+        return {"ok": False, "skipped": "no %s or %s" % TOKEN_ENVS, "path": path}
     content = render_okf(answers_id=answers_id, ask_text=ask_text,
-                         reply_body=reply_body, route=route)
+                         reply_body=reply_body, route=route, path=path)
     raw = content.encode("utf-8")
     if len(raw) > MAX_BYTES:
         return {"ok": False, "error": "OKF body over %d bytes" % MAX_BYTES, "path": path}
 
     do = http or _request
-    branch = BRANCH_PREFIX + slug[:40].lower()
+    repo = "/repos/%s/%s" % (OWNER, REPO)
+    branch = BRANCH_PREFIX + slug_for(answers_id, ask_text)[:40].lower()
+    step = "reading %s/%s" % (OWNER, REPO)
     try:
-        main = do("GET", "/repos/%s/%s/git/ref/heads/main" % (OWNER, REPO), token)
+        meta = do("GET", repo, token)
+        if not isinstance(meta, dict) or meta.get("private") is not True:
+            return {"ok": False, "error": "refused: %s/%s is not private" % (OWNER, REPO), "path": path}
+        step = "reading main"
+        main = do("GET", repo + "/git/ref/heads/main", token)
         main_sha = ((main.get("object") or {}).get("sha") or "").strip()
         if not main_sha:
             return {"ok": False, "error": "main tip missing", "path": path}
+        step = "creating branch %s" % branch
         try:
-            do("POST", "/repos/%s/%s/git/refs" % (OWNER, REPO), token,
-               {"ref": "refs/heads/%s" % branch, "sha": main_sha})
+            do("POST", repo + "/git/refs", token, {"ref": "refs/heads/%s" % branch, "sha": main_sha})
         except urllib.error.HTTPError as e:
-            if e.code not in (422,):
+            if e.code != 422:           # 422: the branch exists (a re-ask updates it)
                 raise
         sha = None
+        step = "reading %s on %s" % (path, branch)
         try:
-            existing = do("GET", "/repos/%s/%s/contents/%s?ref=%s"
-                          % (OWNER, REPO, urllib.parse.quote(path),
-                             urllib.parse.quote(branch)), token)
+            existing = do("GET", repo + "/contents/%s?ref=%s"
+                          % (urllib.parse.quote(path), urllib.parse.quote(branch)), token)
             if isinstance(existing, dict):
                 sha = existing.get("sha")
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
-        put = {
-            "message": "docs(okf): Gemini signed RESULT %s" % slug,
-            "content": base64.b64encode(raw).decode("ascii"),
-            "branch": branch,
-        }
+        what = "call notes" if path == NOTES_PATH else "RESULT %s" % slug_for(answers_id, ask_text)
+        put = {"message": "okf: Gemini's %s" % what,
+               "content": base64.b64encode(raw).decode("ascii"), "branch": branch}
         if sha:
             put["sha"] = sha
-        written = do("PUT", "/repos/%s/%s/contents/%s"
-                     % (OWNER, REPO, urllib.parse.quote(path)), token, put)
-        pr_url = ""
-        try:
-            prs = do("GET", "/repos/%s/%s/pulls?head=%s:%s&state=open"
-                     % (OWNER, REPO, OWNER, urllib.parse.quote(branch)), token)
-            if isinstance(prs, list) and prs:
-                pr_url = prs[0].get("html_url") or ""
-            else:
-                created = do("POST", "/repos/%s/%s/pulls" % (OWNER, REPO), token, {
-                    "title": "docs(okf): Gemini signed RESULT %s" % slug,
-                    "head": branch,
-                    "base": "main",
-                    "body": (
-                        "Gemini-signed OKF RESULT landed by `scripts/okf_land.py`.\n\n"
-                        "- answers=`%s`\n"
-                        "- path=`%s`\n"
-                        "- evidence=STATED\n\n"
-                        "Do not merge without Codex/Cursor review.\n"
-                        % (answers_id, path)
-                    ),
-                })
-                pr_url = (created or {}).get("html_url") or ""
-        except urllib.error.HTTPError as e:
-            content_url = ((written or {}).get("content") or {}).get("html_url") or ""
-            return {"ok": True, "path": path, "branch": branch,
-                    "url": content_url, "pr": "", "warning": "PR open failed HTTP %s" % e.code}
-        content_url = ((written or {}).get("content") or {}).get("html_url") or ""
-        return {"ok": True, "path": path, "branch": branch,
-                "url": pr_url or content_url, "pr": pr_url, "file": content_url}
+        step = "writing %s" % path
+        do("PUT", repo + "/contents/%s" % urllib.parse.quote(path), token, put)
+        step = "opening the pull request"
+        prs = do("GET", repo + "/pulls?head=%s:%s&state=open"
+                 % (OWNER, urllib.parse.quote(branch)), token)
+        if isinstance(prs, list) and prs:
+            pr_url = prs[0].get("html_url") or ""
+        else:
+            created = do("POST", repo + "/pulls", token, {
+                "title": "okf: Gemini's %s" % what,
+                "head": branch,
+                "base": "main",
+                "body": ("Written by Gemini and landed by its adapter (Blackboard `scripts/okf_land.py`) "
+                         "for review.\n\n- answers: board row `%s`\n- path: `%s`\n- evidence: STATED\n\n"
+                         "Merge after a review by Claude or Codex." % (answers_id, path)),
+            })
+            pr_url = (created or {}).get("html_url") or ""
+        if not pr_url:
+            return {"ok": False, "error": "file written on private branch %s but no pull request "
+                    "was opened" % branch, "path": path, "branch": branch}
+        return {"ok": True, "pr": pr_url, "url": pr_url, "path": path, "branch": branch}
     except urllib.error.HTTPError as e:
-        return {"ok": False, "error": "HTTP %s" % e.code, "path": path}
+        return {"ok": False, "error": "HTTP %s while %s" % (e.code, step), "path": path,
+                "branch": branch}
     except Exception as e:  # noqa: BLE001 - landing must not crash the doorbell
-        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e), "path": path}
+        return {"ok": False, "error": "%s while %s" % (type(e).__name__, step), "path": path,
+                "branch": branch}
