@@ -20,7 +20,10 @@ WHERE IT WRITES, AND WHY THERE
   cannot close it, so the repository staying private is a deployment rule.
   - docs/okf/gemini/<row id>.md, for a signed RESULT; or
   - docs/okf/calls/notes/gemini.md, Gemini's prepared notes for the next call,
-    when the row says file=call-notes.
+    when the row says file=call-notes. The notes name the call that the plan on
+    the repository's main (docs/okf/calls/next.md, its `call:`) names, because the
+    chair gives a note only to its agent, only when ready, and only for that call
+    (conference #99). A plan that names no call lands nothing.
 
 WHAT STARTS IT
   A structured field in the asking row, never its prose: land=okf, a BCB field
@@ -56,6 +59,7 @@ OWNER = "sfdc-24"
 REPO = "conference"
 PATH_PREFIX = "docs/okf/gemini/"
 NOTES_PATH = "docs/okf/calls/notes/gemini.md"
+PLAN_PATH = "docs/okf/calls/next.md"
 MAX_BYTES = 50_000
 BRANCH_PREFIX = "gemini/okf-"
 TOKEN_ENV = "GEMINI_OKF_WRITE_TOKEN"
@@ -143,8 +147,17 @@ def target_path(answers_id: str, ask_text: str) -> str:
     return _safe_path(slug_for(answers_id, ask_text))
 
 
+def plan_call(plan_text: str) -> str:
+    """The `call:` in the plan's front matter, or "" when it has none (or has it twice)."""
+    text = (plan_text or "").replace("\r\n", "\n")
+    front = re.match(r"\A---\n(.*?)\n---\n", text, re.S)
+    calls = [line.partition(":")[2].strip() for line in (front.group(1).splitlines() if front else ())
+             if line.partition(":")[0].strip().lower() == "call"]
+    return calls[0] if len(calls) == 1 and calls[0] else ""
+
+
 def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str,
-               path: str = "") -> str:
+               path: str = "", call: str = "") -> str:
     """The file: Gemini's reply, signed, with the asking row's id and never its text."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = scrub((reply_body or "").strip()) or "(empty model reply)"
@@ -153,6 +166,7 @@ def render_okf(*, answers_id: str, ask_text: str, reply_body: str, route: str,
             "---",
             "type: call-notes",
             "agent: gemini",
+            "call: %s" % call,
             "status: ready",
             "written_by: gemini, landed by its adapter (scripts/okf_land.py) at %s" % now,
             "answers: %s" % (answers_id or ""),
@@ -208,15 +222,25 @@ def land(*, answers_id: str, ask_text: str, reply_body: str, route: str = "",
     token, _ = token_from(env)
     if not token:
         return {"ok": False, "skipped": "no %s or %s" % TOKEN_ENVS, "path": path}
-    content = render_okf(answers_id=answers_id, ask_text=ask_text,
-                         reply_body=reply_body, route=route, path=path)
-    raw = content.encode("utf-8")
-    if len(raw) > MAX_BYTES:
-        return {"ok": False, "error": "OKF body over %d bytes" % MAX_BYTES, "path": path}
 
     do = http or _request
     repo = "/repos/%s/%s" % (OWNER, REPO)
     branch = BRANCH_PREFIX + slug_for(answers_id, ask_text)[:40].lower()
+    call = ""
+    if path == NOTES_PATH:
+        try:
+            plan = do("GET", repo + "/contents/%s?ref=main" % PLAN_PATH, token)
+            call = plan_call(base64.b64decode((plan or {}).get("content") or "").decode("utf-8", "replace"))
+        except (urllib.error.HTTPError, ValueError, TypeError) as e:
+            return {"ok": False, "error": "could not read the plan's call (%s)" % getattr(e, "code", type(e).__name__),
+                    "path": path}
+        if not call:
+            return {"ok": False, "error": "the plan on main names no call, so no notes can be for it", "path": path}
+    content = render_okf(answers_id=answers_id, ask_text=ask_text,
+                         reply_body=reply_body, route=route, path=path, call=call)
+    raw = content.encode("utf-8")
+    if len(raw) > MAX_BYTES:
+        return {"ok": False, "error": "OKF body over %d bytes" % MAX_BYTES, "path": path}
     step = "reading %s/%s" % (OWNER, REPO)
 
     def private() -> bool:

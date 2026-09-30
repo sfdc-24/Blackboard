@@ -12,9 +12,11 @@ sys.path.insert(0, str(REPO / "scripts"))
 import okf_land  # noqa: E402
 
 ASK = "BCB|v=1|id=GEM-X-1|phase=DISPATCH|from=grok|to=gemini|land=okf|write your topic"
+CALL = "2026-09-30 15:00Z (11:00 Toronto)"
+PLAN = "---\ntype: call-plan\ntitle: T\ncall: %s\n---\n# Objective\nx\n" % CALL
 
 
-def fake_github(private=True, pr_fails=None, prs=(), pr_reply=None):
+def fake_github(private=True, pr_fails=None, prs=(), pr_reply=None, plan=PLAN):
     """A GitHub stand-in: records every call; `pr_fails` is the HTTP status for opening the PR."""
     calls = []
 
@@ -26,6 +28,10 @@ def fake_github(private=True, pr_fails=None, prs=(), pr_reply=None):
             return {"object": {"sha": "abc123"}}
         if method == "POST" and path.endswith("/git/refs"):
             return {}
+        if method == "GET" and path.endswith("/contents/docs/okf/calls/next.md?ref=main"):
+            if plan is None:
+                raise urllib.error.HTTPError(path, 404, "no", hdrs=None, fp=None)
+            return {"content": base64.b64encode(plan.encode("utf-8")).decode("ascii")}
         if method == "GET" and "/contents/" in path:
             raise urllib.error.HTTPError(path, 404, "no", hdrs=None, fp=None)
         if method == "PUT" and "/contents/" in path:
@@ -90,7 +96,32 @@ class Destination(unittest.TestCase):
         md = written(calls)
         self.assertIn("type: call-notes", md)
         self.assertIn("status: ready", md)
+        self.assertIn("agent: gemini", md)
+        self.assertIn("call: %s" % CALL, md)             # the plan's own call, so the chair gives it
         self.assertIn("I will propose three changes.", md)
+
+    def test_notes_for_a_plan_that_names_no_call_are_not_landed(self):
+        notes = "BCB|v=1|id=GEM-N-2|land=okf|file=call-notes"
+        for plan, why in ((PLAN.replace("call: %s\n" % CALL, ""), "names no call"),
+                          (PLAN.replace("call:", "call: a\ncall:"), "names no call"),     # two calls: ambiguous
+                          (None, "could not read the plan's call (404)")):
+            http, calls = fake_github(plan=plan)
+            out = okf_land.land(answers_id="GEM-N-2", ask_text=notes, reply_body="r",
+                                env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)
+            self.assertFalse(out["ok"])
+            self.assertIn(why, out["error"])
+            self.assertFalse(any(c[0] in ("PUT", "POST") for c in calls), calls)
+
+    def test_a_result_file_needs_no_plan(self):
+        http, calls = fake_github(plan=None)
+        self.assertTrue(okf_land.land(answers_id="GEM-X-1", ask_text=ASK, reply_body="r",
+                                      env={"GEMINI_GITHUB_TOKEN": "t"}, http=http)["ok"])
+
+    def test_plan_call_reads_one_call_from_the_front_matter(self):
+        self.assertEqual(CALL, okf_land.plan_call(PLAN))
+        self.assertEqual(CALL, okf_land.plan_call(PLAN.replace("\n", "\r\n")))
+        self.assertEqual("", okf_land.plan_call("# no front matter\ncall: x\n"))
+        self.assertEqual("", okf_land.plan_call("---\ncall:\n---\n"))
 
     def test_paths_stay_in_the_lane(self):
         with self.assertRaises(ValueError):
