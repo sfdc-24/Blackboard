@@ -6,10 +6,11 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 import time
 import uuid
 
-from .state import StateConflict, StudioRepository
+from .state import SessionNotFound, StateConflict, StudioRepository
 from .artifacts import apply_ops
 from workers.bounded import DeadlineExceeded, run_within
 from . import metadata_contract as metadata
@@ -46,6 +47,26 @@ def _command_fingerprint(command: dict) -> str:
     """Bind an idempotency key to one exact, validated command payload."""
     canonical = json.dumps(command, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_ABSENT = object()
+
+
+def _merge_three(base: dict, ours: dict, theirs: dict) -> dict | None:
+    """A top-level three-way merge of one session record: each key takes the
+    side that changed it; None when both changed the same key differently."""
+    merged = {}
+    for key in set(base) | set(ours) | set(theirs):
+        b, o, t = base.get(key, _ABSENT), ours.get(key, _ABSENT), theirs.get(key, _ABSENT)
+        if o == t or t == b:
+            value = o
+        elif o == b:
+            value = t
+        else:
+            return None
+        if value is not _ABSENT:
+            merged[key] = value
+    return merged
 
 
 def _advance_epoch(state: dict, key: str) -> None:
@@ -146,7 +167,7 @@ def reduce_event(state: dict, event: dict) -> bool:
     return True
 
 
-START_MODES = ("template", "blank")
+START_MODES = ("template", "blank", "project")
 
 
 class StudioController:
@@ -170,6 +191,12 @@ class StudioController:
         self.max_events = max_events
         self.max_commands = max_commands
         self.inflight_lease_seconds = inflight_lease_seconds
+        # A finish that lost every compare-and-set is recovered in the
+        # background (Codex Gate 1 B1): these pace it; tests shorten them.
+        self.recovery_poll_seconds = 0.05
+        self.recovery_attempts = 40
+        self.recoveries: list = []
+        self.outcome_write_attempts = 4
         self.worker_budget_seconds = worker_budget_seconds
         self.metadata_proposals_enabled = metadata_proposals_enabled
         self.metadata_org_id = metadata_org_id
@@ -199,21 +226,43 @@ class StudioController:
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
                        visitor: bool = False, admit_limit: int | None = None,
-                       analyst: bool = False, topic: str = "") -> tuple[dict, int]:
+                       analyst: bool = False, topic: str = "", client: bool = False,
+                       artifact: dict | None = None, project: str = "",
+                       tenant: str = "") -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
-            raise CommandError("start must be template or blank")
+            raise CommandError("start must be template, blank or project")
+        if visitor and client:
+            raise CommandError("a session has one kind of owner")
+        if start == "project" and not (client and project and creation_id and tenant):
+            raise CommandError("a project session belongs to a client and a creation id", 403)
+        if client and not (subject and tenant):
+            raise CommandError("a client session needs its subject and tenant", 403)
         now = int(self.clock())
         if creation_id:
-            stable = hashlib.sha256((subject + "\x00" + creation_id).encode("utf-8")).hexdigest()[:32]
-            session_id = "s-" + stable
+            session_id = self._session_key(subject, creation_id, tenant if client else "",
+                                           project if start == "project" else "")
         else:
             session_id = self.id_factory("s")
+        if start == "project" and artifact is None:
+            # Only the replay of a project session that already exists may omit
+            # its page: nothing is admitted or created for a page never loaded.
+            try:
+                existing = self.repository.load(session_id).state
+            except SessionNotFound as exc:
+                raise CommandError("the project page could not be loaded", 502) from exc
+            self._same_owner(existing, subject, visitor, client, tenant, project)
+            return copy.deepcopy(existing), self.repository.admit(admit_limit or self.daily_cap, session_id)
         # A visitor is admitted against the same daily ledger, but only up to a
         # lower limit, so the operator keeps headroom.
         admitted = self.repository.admit(admit_limit or self.daily_cap, session_id)
-        if start == "blank":
+        if start == "project":
+            # A client's existing page, as fetched and converted by the caller
+            # (app/project_page.py): the builder edits it from the first turn.
+            artifact = copy.deepcopy(artifact)
+            questions = []
+        elif start == "blank":
             # BUILT FROM WHAT THE VISITOR ASKS FOR. The template start always
             # opened on our own homepage with a question about its button, so a
             # live session could only ever edit that page. A blank start is one
@@ -253,12 +302,17 @@ class StudioController:
             "stopped": False,
             # A public visitor is never an operator: operator-only paths
             # (metadata proposals) check operator_subject, which stays empty.
-            "operator_subject": "" if visitor else subject,
+            "operator_subject": "" if (visitor or client) else subject,
             "visitor_subject": subject if visitor else "",
+            # A client (app/clients.py) is not an operator either; its session
+            # belongs to one {tenant, project} workspace.
+            "client_subject": subject if client else "",
+            "client_tenant": tenant if client else "",
+            "project": project if start == "project" else "",
             "voice_item_ids": [],
             "voice_epoch": 0,
         }
-        if analyst and start == "blank":
+        if analyst and start in ("blank", "project"):
             # A homepage (blank) session with the analyst lane: the analyst owns
             # the questions from the first turn, so the builder never opens one
             # of its own. A builder question left open made every later spoken
@@ -292,10 +346,40 @@ class StudioController:
             if not creation_id:
                 raise
             existing = self.repository.load(session_id).state
-            owner = existing.get("operator_subject") or existing.get("visitor_subject") or ""
-            if owner != subject or bool(existing.get("visitor_subject")) != bool(visitor):
-                raise StateConflict("creation_id belongs to another operator")
+            self._same_owner(existing, subject, visitor, client, tenant if client else "",
+                             project if start == "project" else "")
             return copy.deepcopy(existing), admitted
+
+    @staticmethod
+    def _session_key(subject: str, creation_id: str, tenant: str = "", project: str = "") -> str:
+        """Every client session is keyed by {tenant, project} as well as its
+        owner and creation id (project "" for blank and template), so the same
+        address moved to another tenant never reaches its old sessions. Other
+        sessions keep the key they always had."""
+        parts = [subject, creation_id] + ([tenant, project] if tenant else [])
+        return "s-" + hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    def created_session_exists(self, subject: str, creation_id: str, tenant: str = "",
+                               project: str = "") -> bool:
+        """Whether this owner's creation id already made this session (a replay)."""
+        if not creation_id or not ID_RE.fullmatch(creation_id):
+            return False
+        try:
+            self.repository.load(self._session_key(subject, creation_id, tenant, project))
+            return True
+        except SessionNotFound:
+            return False
+
+    @staticmethod
+    def _same_owner(existing: dict, subject: str, visitor: bool, client: bool,
+                    tenant: str = "", project: str = "") -> None:
+        owner = (existing.get("operator_subject") or existing.get("visitor_subject")
+                 or existing.get("client_subject") or "")
+        if (not owner or owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
+                or bool(existing.get("client_subject")) != bool(client)
+                or (existing.get("client_tenant") or "") != tenant
+                or (existing.get("project") or "") != project):
+            raise StateConflict("creation_id belongs to another operator")
 
     def _assert_live(self, state: dict) -> None:
         if int(state.get("expires_at") or 0) <= int(self.clock()):
@@ -397,11 +481,33 @@ class StudioController:
             if not ITEM_ID_RE.fullmatch(str(command.get("item_id") or "")):
                 raise CommandError("utterance requires a contract item_id")
 
+    def _adopt_recorded_outcome(self, session_id: str, state: dict, token):
+        """(state, token, adopted): a finish that lost every compare-and-set
+        left its outcome durable (_finish_exhausted); a session that still owns
+        it takes it here, in one compare-and-set (StateConflict if the session
+        moved). Every reader calls this - a new command (execute) and the
+        events read alike - so no client command is ever needed to finish it
+        (Codex Gate 1 on 59ed871)."""
+        active = state.get("active_command")
+        receipt = (state.get("commands") or {}).get(active) or {} if active else {}
+        if not active or receipt.get("status") != "inflight":
+            return state, token, False
+        recorded = self._load_outcome(session_id, active)
+        if not recorded or not self._owns(state, recorded):
+            return state, token, False
+        self._terminalise(state, recorded)
+        token = self.repository.save(session_id, state, token)
+        return state, token, True
+
     def _recover_stale_inflight(self, session_id: str, state: dict, token):
         active = state.get("active_command")
         if not active:
             return state, token
         receipt = state.get("commands", {}).get(active) or {}
+        # A durable outcome is applied at once, never after the lease.
+        state, token, adopted = self._adopt_recorded_outcome(session_id, state, token)
+        if adopted:
+            return state, token
         started_at = int(receipt.get("started_at") or 0)
         if receipt.get("status") != "inflight" or int(self.clock()) - started_at < self.inflight_lease_seconds:
             return state, token
@@ -413,6 +519,7 @@ class StudioController:
         })
         state["active_command"] = None
         _advance_epoch(state, "command_epoch")
+        self._audit_fenced(state, active, receipt)      # in the same transition that fails it
         token = self.repository.save(session_id, state, token)
         return state, token
 
@@ -453,27 +560,35 @@ class StudioController:
             "status": "inflight", "started_at": int(self.clock()),
             "expected_version": command["expected_version"],
             "fingerprint": fingerprint,
+            "command_type": str(command["type"]),       # for the audit if Stop or recovery fails it
         }
         state["active_command"] = command_id
         _advance_epoch(state, "command_epoch")
         reserved_token = self.repository.save(session_id, state, current_token)
 
+        base = copy.deepcopy(state)           # the reserved record: what a lost save finishes from
         working = copy.deepcopy(state)
         try:
             result = self._run_reserved(working, command)
         except Exception as exc:
             # Persist a terminal failure without replaying the worker. The same
             # command_id returns this failure; recovery requires a new command.
-            state["commands"][command_id] = {
+            failure = {
                 "status": "failed", "error": "worker failure: " + type(exc).__name__,
                 "finished_at": int(self.clock()), "fingerprint": fingerprint,
             }
+            state["commands"][command_id] = dict(failure)
             state["active_command"] = None
             _advance_epoch(state, "command_epoch")
+            if state.get("client_tenant"):
+                self._audit(state, command, state["artifact_version"], {}, outcome="failed")
             try:
                 self.repository.save(session_id, state, reserved_token)
             except StateConflict:
-                pass
+                try:
+                    self._finish_after_race(session_id, base, None, command, fingerprint, failure)
+                except StateConflict:
+                    pass                      # Stop or recovery owns it and has already finished it
             raise
 
         working["commands"][command_id] = {
@@ -482,8 +597,168 @@ class StudioController:
         }
         working["active_command"] = None
         _advance_epoch(working, "command_epoch")
-        self.repository.save(session_id, working, reserved_token)
+        try:
+            self.repository.save(session_id, working, reserved_token)
+        except StateConflict:
+            self._finish_after_race(session_id, base, working, command, fingerprint, None)
         return result
+
+    def _finish_after_race(self, session_id: str, base: dict, ours: dict | None, command: dict,
+                           fingerprint: str, failure: dict | None) -> None:
+        """Another writer committed while the worker ran, so the reserved token
+        is spent (Codex Gate 1 B1 on cc56fea). Finish from fresh state - only
+        while this command still owns its reservation: the same active command,
+        its inflight receipt, the same command epoch. Keys the other writer
+        changed are kept beside ours; if both changed one key, this result
+        cannot land and the command ends failed. Either way one terminal
+        receipt, one audit entry, and no wedge. Raises StateConflict when Stop
+        or recovery owns the command now (they finished it), and CommandError
+        409 when a successful result could not land."""
+        command_id = str(command["command_id"])
+        for _ in range(self.repository.attempts):
+            record = self.repository.load(session_id)
+            fresh = record.state
+            receipt = (fresh.get("commands") or {}).get(command_id) or {}
+            if (fresh.get("active_command") != command_id or receipt.get("status") != "inflight"
+                    or receipt.get("fingerprint") != fingerprint
+                    or fresh.get("command_epoch") != base.get("command_epoch")):
+                raise StateConflict("the command was fenced before it could finish")
+            merged = _merge_three(base, ours, fresh) if ours is not None else None
+            landed = merged is not None
+            if not landed:
+                merged = copy.deepcopy(fresh)
+                merged["commands"][command_id] = dict(failure or {
+                    "status": "failed", "error": "another change landed while this command ran",
+                    "finished_at": int(self.clock()), "fingerprint": fingerprint})
+                merged["active_command"] = None
+                _advance_epoch(merged, "command_epoch")
+                if merged.get("client_tenant"):
+                    self._audit(merged, command, merged["artifact_version"], {}, outcome="failed")
+            try:
+                self.repository.save(session_id, merged, record.token)
+            except StateConflict:
+                continue
+            if ours is not None and not landed:
+                raise CommandError("another change landed while this was being built; say it again", 409)
+            return
+        self._finish_exhausted(session_id, base, command, fingerprint, dict(failure or {
+            "status": "failed", "error": "the session was too busy to save this command's result",
+            "finished_at": int(self.clock()), "fingerprint": fingerprint}))
+        if ours is not None:
+            raise CommandError("the session was too busy to save this change; say it again", 409)
+
+    # -- a finish that lost every compare-and-set (Codex Gate 1 B1 on 38bc713) --------------------
+    # The command's terminal outcome is written once, create-only, to its own
+    # small record - outside the contended session record, so no session writer
+    # can take that write from it - and then applied to the session under the
+    # same ownership fence: at once, by a scheduled recovery that needs no
+    # client command, and by the next reader of the session
+    # (_recover_stale_inflight), whichever lands first. Applying it is one
+    # compare-and-set that fails the receipt, clears the command and writes its
+    # one audit entry; once it has landed, nothing owns the command any more.
+    def _outcome_name(self, session_id: str, command_id: str) -> str:
+        return "studio_outcome_%s_%s" % (session_id, hashlib.sha256(str(command_id).encode()).hexdigest()[:32])
+
+    def _load_outcome(self, session_id: str, command_id: str) -> dict | None:
+        try:
+            raw, _ = self.repository.store.load(self._outcome_name(session_id, command_id))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) and raw.get("command_id") == command_id else None
+
+    @staticmethod
+    def _owns(state: dict, outcome: dict) -> bool:
+        command_id = outcome.get("command_id")
+        receipt = (state.get("commands") or {}).get(command_id) or {}
+        return (state.get("active_command") == command_id and receipt.get("status") == "inflight"
+                and receipt.get("fingerprint") == outcome.get("fingerprint")
+                and state.get("command_epoch") == outcome.get("command_epoch"))
+
+    def _terminalise(self, state: dict, outcome: dict) -> None:
+        command_id = outcome["command_id"]
+        inflight = dict(state["commands"][command_id])
+        state["commands"][command_id] = dict(outcome["receipt"])
+        state["active_command"] = None
+        _advance_epoch(state, "command_epoch")
+        self._audit_fenced(state, command_id, inflight)     # one entry, in this same transition
+
+    def _apply_outcome(self, session_id: str, outcome: dict, tries: int = 3) -> bool:
+        """True once the outcome is in the session, or nothing owns the command
+        any more (Stop, recovery or an earlier apply finished it)."""
+        for _ in range(max(1, int(tries))):
+            try:
+                record = self.repository.load(session_id)
+            except SessionNotFound:
+                return True
+            state = record.state
+            if not self._owns(state, outcome):
+                return True
+            self._terminalise(state, outcome)
+            try:
+                self.repository.save(session_id, state, record.token)
+                return True
+            except StateConflict:
+                continue
+        return False
+
+    def _schedule_recovery(self, session_id: str, outcome: dict, durable: bool = True) -> None:
+        """Keep at it without any client command: record the outcome until it
+        is durable (Codex Gate 1 on 80dfc8f: a record that could not be made
+        at the finish is part of terminalising, not optional), and apply it
+        until it lands or nothing owns the command any more."""
+        def run():
+            delay, recorded = self.recovery_poll_seconds, durable
+            for _ in range(self.recovery_attempts):
+                self.sleep(delay)
+                if not recorded:
+                    try:
+                        recorded = self._record_outcome(session_id, outcome)
+                    except Exception:
+                        recorded = False
+                try:
+                    if self._apply_outcome(session_id, outcome, tries=1):
+                        return
+                except Exception:
+                    pass
+                delay = min(delay * 2, 2.0)
+
+        thread = threading.Thread(target=run, name="studio-command-recovery", daemon=True)
+        self.recoveries.append(thread)
+        self.recoveries[:] = [t for t in self.recoveries if t.is_alive() or t is thread][-50:]
+        thread.start()
+
+    _OUTCOME_KEYS = ("session_id", "command_id", "fingerprint", "command_epoch")
+
+    def _record_outcome(self, session_id: str, outcome: dict) -> bool:
+        """Write the outcome create-only, and make sure of it (Codex Gate 1 on
+        59ed871): a write that failed, or whose answer was lost, is read back;
+        a record already there counts only when it is this one - the same
+        session, command, fingerprint and command epoch - and is never
+        overwritten. True once this exact outcome is durable."""
+        name = self._outcome_name(session_id, outcome["command_id"])
+        for _ in range(max(1, int(self.outcome_write_attempts))):
+            try:
+                self.repository.store.save(name, outcome, None)
+                return True
+            except Exception:
+                pass                      # already there, or a transient failure: read what is there
+            existing = self._load_outcome(session_id, outcome["command_id"])
+            if existing is not None:
+                return all(existing.get(k) == outcome.get(k) for k in self._OUTCOME_KEYS)
+        return False
+
+    def _finish_exhausted(self, session_id: str, base: dict, command: dict, fingerprint: str,
+                          receipt: dict) -> None:
+        command_id = str(command["command_id"])
+        outcome = {"version": 1, "session_id": session_id, "command_id": command_id, "fingerprint": fingerprint,
+                   "command_epoch": base.get("command_epoch"), "receipt": dict(receipt)}
+        durable = self._record_outcome(session_id, outcome)
+        try:
+            applied = self._apply_outcome(session_id, outcome, tries=3)
+        except Exception:
+            applied = False               # a load or write that failed never bypasses the recovery
+        if not applied:
+            self._schedule_recovery(session_id, outcome, durable)
 
     def commit_analysis(self, session_id: str, model: dict, question: dict | None) -> list[dict]:
         """Record the analyst's data model, and at most one question, beside the builder.
@@ -604,6 +879,7 @@ class StudioController:
                     "outcome_unknown": True,
                 })
                 candidate["active_command"] = None
+                self._audit_fenced(candidate, active, receipt)   # before Stop's own entry, same CAS
             candidate["stopped"] = True
             candidate["paused"] = False
             candidate["turn_seq"] += 1
@@ -623,6 +899,8 @@ class StudioController:
                 "result": copy.deepcopy(result),
             }
             _advance_epoch(candidate, "command_epoch")
+            if candidate.get("client_tenant"):
+                self._audit(candidate, command, candidate["artifact_version"], result, outcome="applied")
             try:
                 self.repository.save(session_id, candidate, record.token)
                 cancel = getattr(self.worker, "cancel_session", None)
@@ -786,6 +1064,59 @@ class StudioController:
         })
 
     def _run_reserved(self, state: dict, command: dict) -> dict:
+        prior_revision = state["artifact_version"]
+        result = self._run_turn(state, command)
+        if state.get("client_tenant"):
+            self._audit(state, command, prior_revision, result)
+        return result
+
+    AUDIT_MAX = 200
+
+    def _audit_fenced(self, state: dict, command_id: str, receipt: dict) -> None:
+        """An accepted command that Stop fenced, or that recovery found stranded,
+        is audited as failed in the same state that marks its receipt failed
+        (Codex Gate 1 addendum on dfbcc11): its own save can never land now, so
+        this is its one entry."""
+        if not state.get("client_tenant"):
+            return
+        prior = receipt.get("expected_version")
+        self._audit(state, {"command_id": command_id, "type": receipt.get("command_type") or ""},
+                    int(prior) if isinstance(prior, int) else int(state["artifact_version"]), {}, outcome="failed")
+
+    def _audit(self, state: dict, command: dict, prior_revision: int, result: dict,
+               outcome: str | None = None) -> None:
+        """One entry per command in a client (workspace) session - stop and a
+        failure included, a replayed command_id never again: who, which
+        {tenant, project}, the revision before and after, the op id of every
+        event the command emitted, when, and the outcome. Never the page, the
+        words said, or any label."""
+        events = result.get("events") or []
+        op_ids = [e["op_id"] for e in events if e.get("op_id")]
+        if outcome is None:
+            if any(e.get("type") == "artifact.patch" for e in events):
+                outcome = "applied"
+            elif result.get("problems"):
+                outcome = "refused"
+            elif events:
+                outcome = "applied"
+            else:
+                outcome = "no_change"
+        entry = {
+            "actor": "client:" + str(state.get("client_subject") or "")[:16],
+            "token_type": "session",
+            "tenant": state.get("client_tenant", ""),
+            "project": state.get("project", ""),
+            "command_id": str(command.get("command_id") or ""),
+            "command_type": str(command.get("type") or ""),
+            "prior_revision": prior_revision,
+            "revision": state["artifact_version"],
+            "op_ids": op_ids,
+            "at": int(self.clock()),
+            "outcome": outcome,
+        }
+        state["audit"] = (state.get("audit") or [])[-(self.AUDIT_MAX - 1):] + [entry]
+
+    def _run_turn(self, state: dict, command: dict) -> dict:
         kind = command["type"]
         state["turn_seq"] += 1
         state["turn_id"] = "turn-%d" % state["turn_seq"]
@@ -1034,9 +1365,19 @@ class StudioController:
         artifact.snapshot shape at seq 1. Open decisions are re-announced only
         after that snapshot so the browser can rebuild its conversation UI.
         """
-        for _ in range(self.repository.attempts):
+        conflicts = waits = 0
+        while True:
             record = self.repository.load(session_id)
             state = record.state
+            try:
+                # A durable outcome still owned is applied by this read too: a
+                # restarted controller finishes it with no client command.
+                state, token, _ = self._adopt_recorded_outcome(session_id, state, record.token)
+            except StateConflict:
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("the session is busy; reconnect") from None
+                continue
             events = state.get("events") or []
             first = int(events[0]["seq"]) if events else int(state.get("last_seq") or 0) + 1
             repair = after_seq < first - 1 or after_seq > int(state.get("last_seq") or 0)
@@ -1047,6 +1388,14 @@ class StudioController:
                     state,
                 )
 
+            if state.get("active_command"):
+                # A build holds the record (Codex Gate 1 B1 on cc56fea): the repair
+                # waits for it rather than spending the build's reserved save.
+                waits += 1
+                if waits > self.analysis_wait_polls:
+                    raise StateConflict("snapshot repair is waiting for a build; reconnect")
+                self.sleep(self.analysis_poll_seconds)
+                continue
             candidate = copy.deepcopy(state)
             candidate["generation"] = int(candidate.get("generation") or 1) + 1
             candidate["last_seq"] = 0
@@ -1061,8 +1410,9 @@ class StudioController:
                 if question.get("status") == "open":
                     self._event(candidate, "question.asked", {"question": copy.deepcopy(question)})
             try:
-                self.repository.save(session_id, candidate, record.token)
+                self.repository.save(session_id, candidate, token)
                 return copy.deepcopy(candidate["events"]), True, candidate
             except StateConflict:
-                continue
-        raise StateConflict("snapshot repair is busy; reconnect")
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("snapshot repair is busy; reconnect") from None

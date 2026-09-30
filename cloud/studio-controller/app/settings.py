@@ -23,6 +23,15 @@ def _enabled(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Every provider a talk lane can name (workers/talk.py AGENTS).
+KNOWN_PROVIDERS = ("claude", "openai", "gemini", "meta")
+
+
+def _providers(raw: str) -> tuple[str, ...]:
+    """Comma-separated provider names, as written; validate() refuses anything odd."""
+    return tuple(part.strip() for part in raw.split(","))
+
+
 @dataclass(frozen=True)
 class Settings:
     allowed_origins: tuple[str, ...]
@@ -80,6 +89,14 @@ class Settings:
     charter_enabled: bool = False
     # The build plan's prices (app/pricing.py): the owner's numbers or nothing.
     price_table: str = ""
+    # Client workspaces (app/clients.py): a registered client signs in and
+    # sees their own projects. Off unless STUDIO_CLIENT_WORKSPACES=true.
+    client_workspaces: bool = False
+    # The providers a client (workspace) session may reach for talk, recap and
+    # advice (Codex Gate 1 NO-GO on a2d98fc): the owner-approved pair unless
+    # STUDIO_CLIENT_PROVIDERS names others. The builder (Claude) and the voice,
+    # speech and moderation calls (OpenAI) are the base of every session.
+    client_providers: tuple[str, ...] = ("claude", "openai")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -135,6 +152,8 @@ class Settings:
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
             charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
+            client_workspaces=_enabled(os.environ.get("STUDIO_CLIENT_WORKSPACES", "false")),
+            client_providers=_providers(os.environ.get("STUDIO_CLIENT_PROVIDERS", "claude,openai")),
         )
 
     @property
@@ -189,6 +208,19 @@ class Settings:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave visitors at least one daily session")
         if self.public_visitors and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave visitors at least one daily voice call")
+        if self.client_workspaces and not 1 <= self.operator_reserved_sessions < self.daily_session_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave clients at least one daily session")
+        if self.client_workspaces and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
+            raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave clients at least one daily voice call")
+        providers = self.client_providers
+        if (not isinstance(providers, tuple) or not providers or len(set(providers)) != len(providers)
+                or any(p not in KNOWN_PROVIDERS for p in providers)):
+            # Fail closed: a typo must stop the service, never widen or silently narrow it.
+            raise RuntimeError("STUDIO_CLIENT_PROVIDERS must be distinct names from: " + ", ".join(KNOWN_PROVIDERS))
+        if self.client_workspaces and self.lead_facts_enabled:
+            # Lead facts read the Salesforce org for any session; a client must
+            # never reach that path either.
+            raise RuntimeError("STUDIO_CLIENT_WORKSPACES cannot be on while STUDIO_ENABLE_LEAD_FACTS is on")
         if self.public_visitors and self.lead_facts_enabled:
             # Lead facts read the Salesforce org for any session; a public
             # visitor must never reach that path.

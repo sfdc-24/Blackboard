@@ -106,6 +106,7 @@ class AuthService:
         wait_until: Callable[[float], None] = _wait_until,
         public_visitors: bool = False,
         visitor_daily_cap: int = 100,
+        client_emails: Callable[[], Iterable[str]] | None = None,
     ):
         allowed = frozenset(allowed_emails)
         for email in allowed:
@@ -139,6 +140,9 @@ class AuthService:
         self.wait_until = wait_until
         self.public_visitors = bool(public_visitors)
         self.visitor_daily_cap = int(visitor_daily_cap)
+        # Client workspaces (app/clients.py): read at send time, so a client
+        # added to the registry can sign in without a redeploy. None = off.
+        self.client_emails = client_emails
 
     def _digest(self, purpose: str, value: str) -> str:
         message = purpose.encode("ascii") + b"\x00" + value.encode("utf-8")
@@ -274,10 +278,16 @@ class AuthService:
                          client_key: str, client_ip: str = "") -> None:
         clean = isinstance(email, str) and len(email) <= 320 and email == email.lower()
         operator = clean and email in self.allowed_emails
-        visitor = (clean and not operator and self.public_visitors
+        client = False
+        if clean and not operator and self.client_emails is not None:
+            try:
+                client = email in frozenset(self.client_emails())
+            except Exception:                # an unreadable registry admits nobody
+                client = False
+        visitor = (clean and not operator and not client and self.public_visitors
                    and len(email) <= 254 and bool(_VISITOR_EMAIL_RE.fullmatch(email)))
         eligible_client = isinstance(client_key, str) and 0 < len(client_key) <= 512
-        if not (operator or visitor) or not eligible_client:
+        if not (operator or client or visitor) or not eligible_client:
             return
 
         now = int(self.clock())
@@ -299,7 +309,7 @@ class AuthService:
             "expires_at": now + OTP_TTL_SECONDS,
             "attempts": 0,
             "used_at": None,
-            "role": "operator" if operator else "visitor",
+            "role": "operator" if operator else "client" if client else "visitor",
         }
         try:
             self.store.save(self._challenge_name(challenge_id), record, None)
@@ -358,7 +368,7 @@ class AuthService:
                 continue
             if matches:
                 # A challenge written before roles existed was an operator's.
-                role = state.get("role") if state.get("role") in ("operator", "visitor") else "operator"
+                role = state.get("role") if state.get("role") in ("operator", "visitor", "client") else "operator"
                 return {"verified": True, "subject_hash": stored_subject, "role": role}
             return failure
         return failure

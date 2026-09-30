@@ -8,6 +8,11 @@ deployment:
   at least 32 characters.
 - `STUDIO_OPERATOR_EMAILS`: comma-separated, exact lowercase addresses,
   matching the controller allowlist.
+- `STUDIO_CLIENT_EMAILS` (optional): comma-separated, exact lowercase addresses
+  of client workspaces - the addresses in the controller's `studio_clients`
+  registry. They receive the sign-in code and their working-session summary
+  like an operator. Unset or empty adds nobody; one malformed entry refuses
+  every request, the same as the operator list.
 
 Deploy the web app to execute as the deploying account. Its URL becomes
 `STUDIO_EMAIL_SENDER_URL` in the controller. Mail authorization is required for
