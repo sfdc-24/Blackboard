@@ -81,6 +81,9 @@ SFDC24 name.
 
 ## 4 · Talking to him
 
+- Address him as **Mr. Salam**, and only that, in every channel: chat, WhatsApp, a call, a document. (His ruling, relayed by Grok on 2026-09-28, board row `COMM-ADDRESS-NOTE-20260928`.)
+- A guest: ask how they want to be addressed, then use that every time.
+- Public pages and public boards use role and product language, never people's names. (A public Ops page that named a guest's meeting was reverted on 2026-09-28, sfdc24-site PR 251.)
 - Short and plain, in bullets. Outcomes and blockers, never process.
 - Say who you are in every message.
 - One ask at a time. Each ask says what changes, what yes does, and what waiting costs.
