@@ -83,6 +83,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 import repo_context  # noqa: E402
+import okf_land  # noqa: E402
 from bus import load_env as _load_bus_env
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -150,21 +151,31 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
         # read-only diff attached (scripts/repo_context.py; the owner approved the
         # token, 2026-09-29). A private repository is never read: see that file.
         "repo_context": True,
+        "okf_land": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
 WHAT YOU ACTUALLY ARE, and you must not overstate it:
 You are a Google model reached over HTTP by a small adapter - a scheduled
 cloud job since 2026-09-24 - on the Gemini API with a key. You
-have NO shell, NO repository checkout, NO gcloud CLI of your own and NO ability
-to open a pull request, merge, deploy, or fetch a file yourself. You cannot
-browse. You see the board row quoted to you below and, when the row names a
+have NO shell and NO gcloud CLI of your own. You cannot browse or merge.
+When a row carries the field land=okf, your adapter writes your reply as a file
+in the conference OKF (the private sfdc-24/conference repository, docs/okf) on
+its own branch and opens a pull request for Claude or Codex to review; with
+file=call-notes the file is your prepared notes for the next call. The adapter
+appends the pull request's okf= link to your answer, or says why it could not:
+never invent that link, and never say a file landed. Write such a reply as the
+file itself: no greeting, no mention of the row. You still cannot open other
+pull requests, merge, or read a private repository. You
+see the board row quoted to you below and, when the row names a
 pull request in a public repository, a read-only excerpt of that PR your adapter
 attached after it. That excerpt is all you have seen of any repository: say
 which PR and head you read, and do not claim to have read anything else. If it
 is marked INCOMPLETE, do not give a verdict on the whole PR.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
-hold, where it will break first, what it exposes, and what it costs to run.""" + _SHARED_RULES,
+hold, where it will break first, what it exposes, and what it costs to run.
+On the conference line you also own the experience: how a call feels to the
+owner, from joining to the close.""" + _SHARED_RULES,
     },
     "grok": {
         "module": "grok_agent",
@@ -786,16 +797,47 @@ def main(argv=None) -> int:
             continue
 
         body = " ".join(text.split())
+        okf_url = ""
+        okf_note = ""
+        okf_outcome = ""
+        if cfg.get("okf_land") and okf_land.wants_okf(ask_text):
+            landed = okf_land.land(
+                answers_id=src_id, ask_text=ask_text, reply_body=text, route=str(route or ""))
+            # Landed means a review PR is open (okf_land.land); a file without one is not.
+            if landed.get("ok") and landed.get("pr"):
+                okf_url = landed.get("pr")
+                okf_note = " okf=%s" % okf_url
+                note = "    okf landed: %s" % okf_url
+            elif landed.get("skipped"):
+                note = "    okf skip: %s (path would be %s)" % (
+                    landed.get("skipped"), landed.get("path", ""))
+                okf_outcome = ("The OKF file this row asked for was NOT landed: %s."
+                               % landed.get("skipped"))
+            else:
+                note = "    okf land failed: %s" % (landed.get("error") or landed)
+                # The exact blocker, in the answer, so the asker need not read logs.
+                okf_outcome = ("The OKF file this row asked for was NOT landed: %s at %s."
+                               % (landed.get("error") or "unknown error", landed.get("path", "")))
+            print(note)
+            log(me, note)
+        if okf_url:
+            hands = ("Its adapter landed this answer as an OKF file for review (okf=); "
+                     "it has no shell, no private repo and cannot merge. Treat this as "
+                     "reasoning, never as a measurement or a commitment." )
+        else:
+            hands = ("%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. "
+                     "%sTreat this as reasoning, never as a measurement or a commitment."
+                     % (me.capitalize(), okf_outcome + " " if okf_outcome else ""))
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
+            + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
-              "what it says. %s is a model endpoint: no shell, no repo, no cloud "
-              "CLI, no PR. Treat this as reasoning, never as a measurement or a "
-              "commitment. REPLY: " % (me, me, me.capitalize())
+              "what it says. %s REPLY: " % (me, me, hands)
             + body
+            + okf_note
         )
         if post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
                       verbose=args.verbose, phase=reply_phase(row)):
