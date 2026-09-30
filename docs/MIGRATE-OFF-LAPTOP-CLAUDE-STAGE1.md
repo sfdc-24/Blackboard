@@ -5,7 +5,7 @@
 `CCC-MIGRATE-PICKUP-20260930T1705Z`. It is a spec for review and builds nothing. Evidence levels:
 **CHECKED** means read in code, in docs or on the board today. **PROPOSED** means a design choice.
 
-**Revision 2** answers Codex's three P1 blockers on the first head (633fae9, Blackboard #306, 20:14Z):
+**Revision 3** adds the fleet rule that a routine never manages routines (Grok, 20:51Z) and test 11. **Revision 2** answered Codex's three P1 blockers on the first head (633fae9, Blackboard #306, 20:14Z):
 - The routine never sees a board row's text. Only synthetic probes are admitted, and that is enforced in code, not by the prompt.
 - An ambiguous fire is UNKNOWN and is never fired again. There is at most one board effect per Row_ID, proven by a durable claim on each side.
 - The route is labeled for what it is: a pilot on the owner's claude.ai subscription, not the Claude Console or API migration.
@@ -94,6 +94,11 @@ board row from claude-code-cloud: "PICKUP for <Row_ID>: cloud pilot receipt"
   - no API credential except the relay bearer.
   - Its repository is a dedicated empty pilot repository, not Blackboard, conference or the site, so no fleet code is in its reach. Branch protection on that repository's default branch blocks pushes.
   - The repository is an owner gate.
+- **The routine never manages routines** (Grok's fleet rule `POKA-YOKE-ROUTINE-SELF-DELETE-20260930`, after a routine deleted itself on 2026-09-30).
+  - It must not delete, pause, disable, rename or rewrite itself or any other routine.
+  - Enforced by what it holds, not by its prompt: it has no credential that can manage routines, and its network reaches only the relay.
+  - Creating, pausing or changing the routine is done by a person or the laptop session, after an owner-visible incident log entry.
+  - The pilot's rollback (pausing it) is done from outside it, never by the routine.
 
 ### Boundary 2: at most one board effect per probe, and ambiguity is UNKNOWN
 - **The dispatcher claims before it fires.** For each admitted row, it creates `fires/{Row_ID}` in Firestore with the precondition `exists=false`, then fires.
@@ -123,6 +128,10 @@ Each check has a pass condition and is run by Codex, not by me.
 8. **A duplicate session.** Two receipts for one probe (the routine fired twice by hand). PASS when there is one board row.
 9. **Rollback.** Pause the routine and the scheduler. PASS when the next probe gets no cloud receipt.
 10. **Unknown ≠ pass.** A gateway flap during any test makes that test UNKNOWN. It is repeated, never counted as a pass.
+11. **No routine management.**
+    - Read back the routine's environment: no credential other than the relay bearer, and network Custom with the relay host only.
+    - Fire a probe whose envelope task is not `probe-receipt`. PASS when the dispatcher refuses to build it, because the envelope schema admits one task.
+    - After the pilot, the routine list is unchanged: the same routines, the same names, the same schedules and on/off states as before it.
 
 ## Usage and cost: bounded, then measured
 
