@@ -99,7 +99,7 @@ class ConvertTest(unittest.TestCase):
         args, stdin = gcloud[0]
         self.assertEqual(PEM, stdin)                                    # on stdin...
         self.assertNotIn(PEM, " ".join(args))                           # ...never in argv
-        self.assertIn("GH_APP_BROKER_KEY", args)
+        self.assertIn("GITHUB_APP_BROKER_PRIVATE_KEY", args)
         self.assertIn("--data-file=-", args)
         for secret in ("TESTKEYMATERIAL", "WEBHOOKSECRET", "CLIENTSECRET"):
             self.assertNotIn(secret, out)
@@ -124,7 +124,7 @@ class ConvertTest(unittest.TestCase):
         run = Recorder(app("sfdc24-cloud-clone"), gcloud_rc=1)          # gcloud's stderr echoes its input here
         rc, out = self.run_main(["c" * 40, "sfdc24-cloud-clone"], run)
         self.assertEqual(1, rc)
-        self.assertIn("GH_APP_CLONE_KEY", out)
+        self.assertIn("GITHUB_APP_READONLY_PRIVATE_KEY", out)
         self.assertNotIn("TESTKEYMATERIAL", out)
 
     def test_a_response_without_a_key_stores_nothing(self):

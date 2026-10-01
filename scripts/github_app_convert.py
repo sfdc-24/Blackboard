@@ -27,7 +27,7 @@ from pathlib import Path
 
 PROJECT = "sfdc24"
 MANIFESTS = Path(__file__).resolve().parent.parent / "docs" / "github-apps"
-SECRET_FOR = {"sfdc24-cloud-clone": "GH_APP_CLONE_KEY", "sfdc24-ccc-broker": "GH_APP_BROKER_KEY"}
+SECRET_FOR = {"sfdc24-cloud-clone": "GITHUB_APP_READONLY_PRIVATE_KEY", "sfdc24-ccc-broker": "GITHUB_APP_BROKER_PRIVATE_KEY"}
 CODE = re.compile(r"^[0-9a-f]{20,64}$")
 
 

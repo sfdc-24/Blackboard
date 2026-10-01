@@ -7,6 +7,14 @@ which gives Cloud Run read access for its clone and the broker a narrow write pa
 This PR prepares everything. **Nothing is created, installed or stored by it.** Creating and installing an App takes
 the owner's own clicks on GitHub, and storing its key takes his own terminal.
 
+**Status, 2026-10-01 11:42–11:48Z:** the owner created and installed both Apps himself, through GitHub's settings:
+- read-only App **5148538**, installation **166845450**;
+- broker App **5148612**, installation **166846692**.
+
+He stored their IDs and private keys in Secret Manager as `GITHUB_APP_<READONLY|BROKER>_ID`, `_INSTALLATION_ID`
+and `_PRIVATE_KEY`. Those are the names the converter now writes. The click-path below is kept for re-creation or key
+rotation.
+
 ## Why GitHub Apps rather than personal tokens
 Codex and Gemini agreed with this, and the owner preferred it on 2026-10-01:
 - an App acts as its own bot identity, not as the owner's account;
@@ -52,13 +60,13 @@ and with "Pull requests: write" it allows merging through the API. These stop it
        python scripts/github_app_convert.py <the code> sfdc24-cloud-clone
 
    It checks the new App's name and permissions against the manifest. It puts the private key straight into Secret
-   Manager as `GH_APP_CLONE_KEY` and never prints it. It prints only the App id and the install link.
+   Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it. It prints only the App id and the install link.
 3. **Install the App:**
    - Open the install link it printed (`https://github.com/apps/sfdc24-cloud-clone/installations/new`).
    - Choose **Only select repositories**, pick **Blackboard** and **conference**, and click **Install**.
    - The page you land on ends in `/installations/<number>`. Send that number to Claude; it is not a secret.
 4. **Repeat steps 1 to 3** with **Create sfdc24-ccc-broker**. The permissions to check are Contents write, Pull
-   requests write and Metadata read. The secret name is `GH_APP_BROKER_KEY`.
+   requests write and Metadata read. The secret name is `GITHUB_APP_BROKER_PRIVATE_KEY`.
 
 **If something goes wrong:**
 - **The code expired** (after one hour): open the App's settings page on GitHub, generate a new private key, and ask
@@ -66,7 +74,7 @@ and with "Pull requests: write" it allows merging through the API. These stop it
 - **The converter STOPPED:** it stored nothing. Nothing about the App needs undoing except deleting it on GitHub if
   you want to start over.
 - **To revoke at any time:** github.com > Settings > Applications > the App > Uninstall, and Developer settings >
-  the App > Delete. Then delete the secret: `gcloud secrets delete GH_APP_..._KEY --project sfdc24`.
+  the App > Delete. Then delete the secret: `gcloud secrets delete GITHUB_APP_..._PRIVATE_KEY --project sfdc24`.
 
 ## After the clicks (Claude)
 - Grant `secretAccessor` on each key to its one service account, when #306's accounts exist.
