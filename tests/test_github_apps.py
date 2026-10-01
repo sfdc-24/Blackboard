@@ -206,6 +206,11 @@ class ConvertTest(unittest.TestCase):
             self.assertEqual([], run.calls, why)
             self.assert_no_secret_shown(out, run)
         self.assertIn("HTTP 404", self.run_main(["sfdc24-cloud-clone"], failures["HTTP 404"])[1])
+        # Copilot on 78a654e: a redirect or an HTTP error arrives after the POST left, so the code may be spent.
+        for why in ("HTTP 404",):
+            self.assertIn("the code is spent and the key was never shown", self.run_main(["sfdc24-cloud-clone"], failures[why])[1])
+        redirect = FakeGitHub(status=302, location="https://elsewhere.example/x")
+        self.assertIn("the code is spent and the key was never shown", self.run_main(["sfdc24-cloud-clone"], redirect)[1])
 
     def test_an_answer_cut_off_or_garbled_after_an_accepted_conversion_stops_safely(self):
         # Copilot on a450a15: IncompleteRead is an http.client.HTTPException, not an OSError, and escaped main().

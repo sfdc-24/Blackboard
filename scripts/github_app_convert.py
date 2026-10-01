@@ -59,7 +59,9 @@ class Stop(Exception):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         fp.close()
-        raise Stop("GitHub answered with a redirect (HTTP %d), which is not followed: nothing stored" % code)
+        # The POST has already left, so GitHub may have used the code before redirecting (Copilot on 78a654e).
+        raise Stop("GitHub answered with a redirect (HTTP %d), which is not followed: nothing stored. %s"
+                   % (code, SPENT))
 
 
 def opener_for(*handlers):
@@ -91,8 +93,8 @@ def convert(code: str, opener=None) -> dict:
             body = response.read()
     except urllib.error.HTTPError as error:
         error.close()                                                   # its body is never read
-        raise Stop("conversion failed (HTTP %d); the code may have expired (one hour) or been used: nothing stored"
-                   % error.code) from None
+        raise Stop("conversion failed (HTTP %d); the code may have expired (one hour) or been used: nothing stored. %s"
+                   % (error.code, SPENT)) from None
     except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         # HTTPException covers an answer cut off mid-body (IncompleteRead) or a garbled status line, which can follow
         # an accepted conversion (Copilot on a450a15). Only the exception's type is said, never its text.
