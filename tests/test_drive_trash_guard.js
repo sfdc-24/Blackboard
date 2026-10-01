@@ -71,7 +71,7 @@ function world(opts) {
     Session: { getEffectiveUser: () => ({ getEmail: () => 'owner@example.test' }) },
     UrlFetchApp: { fetch: (url, o) => { if (opts.fetchThrows) throw new Error('dns'); w.fetches.push({ url, o });
                                         const reply = 'busReply' in opts ? opts.busReply : JSON.stringify({ ok: true, _httpStatus: 200 });
-                                        return { getResponseCode: () => 200, getContentText: () => reply }; } },
+                                        return { getResponseCode: () => opts.busCode || 200, getContentText: () => reply }; } },
     Utilities: { getUuid: () => { w.uuids++; return (w.uuids.toString(16).padStart(8, '0')) + '-aaaa-bbbb-cccc-dddddddddddd'; } }
   };
   vm.createContext(w.ctx);
@@ -118,7 +118,17 @@ test('a protected file inside some other trashed folder comes back with that fol
   const r = w.ctx.guard();
   assert.deepStrictEqual(w.untrashed, [OTHER]);
   assert.ok(!w.inTrash(BUS));
-  assert.match(r.restored[0], /by untrashing its folder "name-of-unprotected-folder-id" \(unprotected-folder-id\)/);
+  assert.match(r.restored[0], /by untrashing its folder\(s\) "name-of-unprotected-folder-id" \(unprotected-folder-id\)/);
+});
+
+test('two folders trashed independently above a file: both are restored top down, and the file stays inside', () => {
+  // Codex P2 on 1a96699: restoring only the top one left the inner one trashed, and the file was pulled out alone.
+  const w = world({ trashed: ['outer', 'inner'], parents: { [BUS]: 'inner', inner: 'outer' } });
+  const r = w.ctx.guard();
+  assert.deepStrictEqual(w.untrashed, ['outer', 'inner']);
+  assert.ok(!w.inTrash(BUS) && !w.inTrash('inner') && !w.inTrash('outer'));
+  assert.ok(!w.untrashed.includes(BUS), 'the file itself was never restored on its own');
+  assert.strictEqual(r.restored.length, 1);
 });
 
 test('a file trashed itself AND inside a trashed folder: the folder first, then the file', () => {
@@ -192,13 +202,20 @@ test('two alerts in the same second get different Row_IDs (readers dedupe by Row
 test('a bus refusal is reported as NOT posted, with its error, never as delivered', () => {
   // The v1 bus answers transport 200 and puts the outcome in its JSON (Codex and Copilot on #312).
   for (const [reply, want] of [[JSON.stringify({ ok: false, error: 'Bad or missing secret.', _httpStatus: 401 }), /NOT posted \(Bad or missing secret\.\)/],
-                               ['<html>Sign in</html>', /NOT posted \(HTTP 200, no ok:true\)/],
+                               ['<html>Sign in</html>', /NOT posted \(HTTP 200 without ok:true/],
                                [JSON.stringify({ ok: 'true' }), /NOT posted/]]) {
     const w = world({ trashed: [BUS], props: BOARD, busReply: reply });
     w.ctx.guard();
     assert.match(w.mails[0].body, want, reply);
     assert.ok(!w.mails[0].body.includes(BOARD.BUS_SECRET));
   }
+});
+
+test('a non-200 after the POST is UNKNOWN, never a refusal: the row may have landed (Codex P2)', () => {
+  const w = world({ trashed: [BUS], props: BOARD, busCode: 404, busReply: 'Not Found' });
+  w.ctx.guard();
+  const rid = JSON.parse(w.fetches[0].o.payload).sheetRow[0];
+  assert.ok(w.mails[0].body.includes('Board row: UNKNOWN (HTTP 404 after the POST; the row may have landed: look for ' + rid));
 });
 
 test('with no BUS_URL or BUS_SECRET the alert is email only', () => {
@@ -217,7 +234,7 @@ test('a failed email still posts the board row, and a failed post does not throw
   const w2 = world({ trashed: [BUS], props: BOARD, fetchThrows: true });
   assert.doesNotThrow(() => w2.ctx.guard());
   assert.strictEqual(w2.mails.length, 1);
-  assert.match(w2.mails[0].body, /Board row: NOT posted \(dns\)/);
+  assert.match(w2.mails[0].body, /Board row: UNKNOWN \(dns; the row may have landed: look for DRIVE-TRASH-GUARD-/);
 });
 
 test('an error text with | or a newline cannot break the BCB payload', () => {

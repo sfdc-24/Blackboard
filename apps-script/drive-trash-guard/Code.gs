@@ -13,9 +13,10 @@
  * Every hour, guard() checks each PROTECTED folder first, then each file, then this script:
  * - In the trash: untrash it at once and raise an alert. Nothing a guard protects is
  *   meant to be in the trash.
- * - A file whose own folder is in the trash: that folder is untrashed, and the file is never
- *   restored on its own. A lone restore drops a file into My Drive root, and the bus finds
- *   the sheet by title inside FOLDER_ID (Cursor on #312).
+ * - A file whose folder is in the trash: every trashed folder above it is untrashed, top
+ *   down, and the file is never restored on its own while one is still trashed. A lone
+ *   restore drops a file into My Drive root, and the bus finds the sheet by title inside
+ *   FOLDER_ID (Cursor and Codex on #312).
  * - Not found (already purged, or access lost): raise an alert saying to run Admin
  *   console > Users > owner > Restore data (Drive) within 25 days.
  * An alert is an email to the account the guard runs as and, when BUS_URL and
@@ -65,15 +66,18 @@ function guard() {
     try {
       var f = item.folder ? DriveApp.getFolderById(item.id) : DriveApp.getFileById(item.id);
       if (!f.isTrashed()) return;
-      var top = trashedAncestor_(f);
-      if (top) {
-        top.setTrashed(false);
-        restored.push(item.what + ' (' + item.id + '), by untrashing its folder "' + clean_(top.getName()) + '" ('
-          + top.getId() + ')');
+      var above = trashedAncestors_(f);                     // nearest first
+      for (var i = above.length - 1; i >= 0; i--) {         // top down: an inner folder may be trashed on its own too
+        if (above[i].isTrashed()) above[i].setTrashed(false);
       }
-      if (f.isTrashed()) {                                  // trashed itself, inside a live folder
+      if (above.length) {
+        restored.push(item.what + ' (' + item.id + '), by untrashing its folder(s) ' + above.map(function (a) {
+          return '"' + clean_(a.getName()) + '" (' + a.getId() + ')';
+        }).join(', '));
+      }
+      if (f.isTrashed()) {                                  // trashed itself, and every folder above it is now live
         f.setTrashed(false);
-        if (!top) restored.push(item.what + ' (' + item.id + ')');
+        if (!above.length) restored.push(item.what + ' (' + item.id + ')');
       }
     } catch (e) {
       // One bad item never stops the others.
@@ -86,16 +90,16 @@ function guard() {
   return { restored: restored, problems: problems };
 }
 
-// The highest trashed folder above f (first parent at each level), or null when every folder above it is live.
-function trashedAncestor_(f) {
-  var top = null;
+// Every trashed folder above f (first parent at each level), nearest first. Empty when every folder above is live.
+function trashedAncestors_(f) {
+  var found = [];
   var it = f.getParents();
   for (var depth = 0; it.hasNext() && depth < 50; depth++) {
     var parent = it.next();
-    if (parent.isTrashed()) top = parent;
+    if (parent.isTrashed()) found.push(parent);
     it = parent.getParents();
   }
-  return top;
+  return found;
 }
 
 function alert_(restored, problems) {
@@ -141,16 +145,22 @@ function postToBoard_(text) {
       muteHttpExceptions: true,
       followRedirects: true
     });
-    // The bus always answers transport 200; the outcome is in its JSON (Codex and Copilot on #312).
+    // The bus always answers transport 200; the outcome is in its JSON (Codex and Copilot on #312). A non-200 is the
+    // redirect hop failing AFTER the POST ran, so the row may have landed: that is unknown, not a refusal (Codex).
+    var code = r.getResponseCode();
+    if (code !== 200) {
+      return 'UNKNOWN (HTTP ' + code + ' after the POST; the row may have landed: look for ' + rid + ' on the board)';
+    }
     var answer = null;
     try { answer = JSON.parse(r.getContentText()); } catch (ignored) { answer = null; }
-    if (r.getResponseCode() === 200 && answer && answer.ok === true) return 'posted as ' + rid;
-    var why = answer && answer.error ? clean_(answer.error).slice(0, 120) : 'HTTP ' + r.getResponseCode() + ', no ok:true';
+    if (answer && answer.ok === true) return 'posted as ' + rid;
+    var why = answer && answer.error ? clean_(answer.error).slice(0, 120) : 'HTTP 200 without ok:true, e.g. a sign-in page';
     console.error('board post refused: ' + why);
     return 'NOT posted (' + why + ')';
   } catch (e) {
     console.error('board post failed: ' + e);
-    return 'NOT posted (' + clean_((e && e.message) || e).slice(0, 120) + ')';
+    return 'UNKNOWN (' + clean_((e && e.message) || e).slice(0, 120) + '; the row may have landed: look for ' + rid
+      + ' on the board)';
   }
 }
 
