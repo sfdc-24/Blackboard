@@ -10,9 +10,12 @@
  * "Restore data" brought it back at about 21:55Z.
  *
  * WHAT IT DOES
- * Every hour, guard() checks each PROTECTED file and folder, and this script itself:
+ * Every hour, guard() checks each PROTECTED folder first, then each file, then this script:
  * - In the trash: untrash it at once and raise an alert. Nothing a guard protects is
  *   meant to be in the trash.
+ * - A file whose own folder is in the trash: that folder is untrashed, and the file is never
+ *   restored on its own. A lone restore drops a file into My Drive root, and the bus finds
+ *   the sheet by title inside FOLDER_ID (Cursor on #312).
  * - Not found (already purged, or access lost): raise an alert saying to run Admin
  *   console > Users > owner > Restore data (Drive) within 25 days.
  * An alert is an email to the account the guard runs as and, when BUS_URL and
@@ -53,16 +56,24 @@ function guard() {
   var restored = [];
   var problems = [];
   var items = [];
-  PROTECTED_FILES.forEach(function (p) { items.push({ id: p[0], what: p[1], folder: false }); });
+  // Folders first: a file inside a trashed folder reads as trashed, and must come back with its folder.
   PROTECTED_FOLDERS.forEach(function (p) { items.push({ id: p[0], what: p[1], folder: true }); });
+  PROTECTED_FILES.forEach(function (p) { items.push({ id: p[0], what: p[1], folder: false }); });
   items.push({ id: ScriptApp.getScriptId(), what: 'this guard itself', folder: false });
 
   items.forEach(function (item) {
     try {
       var f = item.folder ? DriveApp.getFolderById(item.id) : DriveApp.getFileById(item.id);
-      if (f.isTrashed()) {
+      if (!f.isTrashed()) return;
+      var top = trashedAncestor_(f);
+      if (top) {
+        top.setTrashed(false);
+        restored.push(item.what + ' (' + item.id + '), by untrashing its folder "' + clean_(top.getName()) + '" ('
+          + top.getId() + ')');
+      }
+      if (f.isTrashed()) {                                  // trashed itself, inside a live folder
         f.setTrashed(false);
-        restored.push(item.what + ' (' + item.id + ')');
+        if (!top) restored.push(item.what + ' (' + item.id + ')');
       }
     } catch (e) {
       // One bad item never stops the others.
@@ -73,6 +84,18 @@ function guard() {
   PropertiesService.getScriptProperties().setProperty('LAST_RUN', new Date().toISOString());
   if (restored.length || problems.length) alert_(restored, problems);
   return { restored: restored, problems: problems };
+}
+
+// The highest trashed folder above f (first parent at each level), or null when every folder above it is live.
+function trashedAncestor_(f) {
+  var top = null;
+  var it = f.getParents();
+  for (var depth = 0; it.hasNext() && depth < 50; depth++) {
+    var parent = it.next();
+    if (parent.isTrashed()) top = parent;
+    it = parent.getParents();
+  }
+  return top;
 }
 
 function alert_(restored, problems) {
@@ -90,21 +113,23 @@ function alert_(restored, problems) {
     + (restored.length ? restored.length + ' untrashed' : '') + (restored.length && problems.length ? ', ' : '')
     + (problems.length ? problems.length + ' not found' : '');
 
+  var board = postToBoard_(text);                       // first, so the email can say whether the row landed
   try {
-    MailApp.sendEmail(Session.getEffectiveUser().getEmail(), subject, text);
+    MailApp.sendEmail(Session.getEffectiveUser().getEmail(), subject, text + ' Board row: ' + board + '.');
   } catch (e) {
     console.error('mail failed: ' + e);
   }
-  postToBoard_(text);
 }
 
 function postToBoard_(text) {
   var props = PropertiesService.getScriptProperties();
   var url = props.getProperty('BUS_URL');
   var secret = props.getProperty('BUS_SECRET');
-  if (!url || !secret) return false;
+  if (!url || !secret) return 'not configured (no BUS_URL or BUS_SECRET in Script Properties)';
   var stamp = new Date().toISOString();
-  var rid = 'DRIVE-TRASH-GUARD-' + stamp.replace(/[-:]/g, '').slice(0, 13) + 'Z';
+  // Unique per alert: readers dedupe by Row_ID, so two alerts in one second must not share one (Copilot on #312).
+  var rid = 'DRIVE-TRASH-GUARD-' + stamp.replace(/[-:]/g, '').slice(0, 15) + 'Z-'
+    + Utilities.getUuid().replace(/-/g, '').slice(0, 8);
   var to = 'fleet;claude-code-cli';
   var payload = 'BCB|v=1|id=' + rid + '|phase=RESULT|class=ALERT|from=' + TAG + '|to=' + to.replace(/;/g, ',') + '|' + text;
   var row = [rid, stamp, TAG, to, 'RESULT', payload, 'OPEN', 'FLEET', text.slice(0, 180), ''];
@@ -116,10 +141,16 @@ function postToBoard_(text) {
       muteHttpExceptions: true,
       followRedirects: true
     });
-    return r.getResponseCode() === 200;
+    // The bus always answers transport 200; the outcome is in its JSON (Codex and Copilot on #312).
+    var answer = null;
+    try { answer = JSON.parse(r.getContentText()); } catch (ignored) { answer = null; }
+    if (r.getResponseCode() === 200 && answer && answer.ok === true) return 'posted as ' + rid;
+    var why = answer && answer.error ? clean_(answer.error).slice(0, 120) : 'HTTP ' + r.getResponseCode() + ', no ok:true';
+    console.error('board post refused: ' + why);
+    return 'NOT posted (' + why + ')';
   } catch (e) {
     console.error('board post failed: ' + e);
-    return false;
+    return 'NOT posted (' + clean_((e && e.message) || e).slice(0, 120) + ')';
   }
 }
 

@@ -31,19 +31,31 @@ const SELF = 'SELF-SCRIPT-ID';
 
 function world(opts) {
   opts = opts || {};
-  const trashed = new Set(opts.trashed || []);
+  const trashed = new Set(opts.trashed || []);                // explicitly trashed ids
   const missing = new Set(opts.missing || []);
+  const parents = Object.assign({}, opts.parents || {});        // id -> parent folder id (one parent, like Drive today)
   const props = Object.assign({}, opts.props || {});
   const w = { mails: [], fetches: [], untrashed: [], lookups: [], triggers: (opts.triggers || []).slice(),
-              deleted: [], created: [], props: props };
+              deleted: [], created: [], props: props, uuids: 0 };
+  const inTrash = (id) => trashed.has(id) || (parents[id] ? inTrash(parents[id]) : false);
+  function node(id) {
+    return {
+      getId: () => id,
+      getName: () => 'name-of-' + id,
+      isTrashed: () => inTrash(id),
+      setTrashed: (b) => { if (!b) { trashed.delete(id); w.untrashed.push(id); } },
+      getParents: () => {
+        const list = parents[id] ? [node(parents[id])] : [];
+        return { hasNext: () => list.length > 0, next: () => list.shift() };
+      }
+    };
+  }
   function item(id, kind) {
     w.lookups.push(kind + ':' + id);
     if (missing.has(id)) throw new Error(opts.missingText || ('No item with the given ID could be found: ' + id));
-    return {
-      isTrashed: () => trashed.has(id),
-      setTrashed: (b) => { if (!b) { trashed.delete(id); w.untrashed.push(id); } }
-    };
+    return node(id);
   }
+  w.inTrash = inTrash;
   w.ctx = {
     console: { error: () => {}, log: () => {} },
     DriveApp: { getFileById: (id) => item(id, 'file'), getFolderById: (id) => item(id, 'folder') },
@@ -58,7 +70,9 @@ function world(opts) {
     MailApp: { sendEmail: (to, subject, body) => { if (opts.mailThrows) throw new Error('quota'); w.mails.push({ to, subject, body }); } },
     Session: { getEffectiveUser: () => ({ getEmail: () => 'owner@example.test' }) },
     UrlFetchApp: { fetch: (url, o) => { if (opts.fetchThrows) throw new Error('dns'); w.fetches.push({ url, o });
-                                        return { getResponseCode: () => 200 }; } }
+                                        const reply = 'busReply' in opts ? opts.busReply : JSON.stringify({ ok: true, _httpStatus: 200 });
+                                        return { getResponseCode: () => 200, getContentText: () => reply }; } },
+    Utilities: { getUuid: () => { w.uuids++; return (w.uuids.toString(16).padStart(8, '0')) + '-aaaa-bbbb-cccc-dddddddddddd'; } }
   };
   vm.createContext(w.ctx);
   vm.runInContext(SRC, w.ctx);
@@ -69,11 +83,49 @@ const BOARD = { BUS_URL: 'https://bus.example.test/exec', BUS_SECRET: 's3cr3t-bu
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
-test('the bus, the sheet, the folder and the canary are protected (nobody drops them silently)', () => {
+test('the protected inventory is exactly the reviewed list (nothing dropped, mistyped or added silently)', () => {
   const w = world();
-  const files = w.ctx.PROTECTED_FILES.map((p) => p[0]);
-  for (const id of [BUS, SHEET, CANARY]) assert.ok(files.includes(id), id);
-  assert.ok(w.ctx.PROTECTED_FOLDERS.map((p) => p[0]).includes(FOLDER));
+  assert.deepStrictEqual(Array.from(w.ctx.PROTECTED_FILES, (p) => p[0]), [
+    BUS, SHEET,
+    '1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp',       // Governor Page API
+    '1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-',       // Blackboard Production (V2 gateway)
+    '163qeSCcvsiCtLOrtgdwOOA9627zmXoeWQr3ODsJbioTinwf8avbvhFEq',       // Studio Email Sender
+    '1PBfO1sPQmGTXPHWrAAot2wCgSCPizO2uC8RUwUKQ5hn7A7dUq0U4_Q_2',       // Glasses Intake Uploader
+    CANARY]);
+  assert.deepStrictEqual(Array.from(w.ctx.PROTECTED_FOLDERS, (p) => p[0]), [FOLDER]);
+});
+
+test('a trashed board folder is restored as a folder, and its files are never restored on their own', () => {
+  // Cursor on #312: restoring the sheet before its folder drops it in My Drive root, where the bus cannot find it.
+  const w = world({ trashed: [FOLDER], parents: { [SHEET]: FOLDER, [CANARY]: FOLDER } });
+  const r = w.ctx.guard();
+  assert.deepStrictEqual(w.untrashed, [FOLDER]);
+  assert.ok(!w.inTrash(SHEET) && !w.inTrash(CANARY));
+  assert.strictEqual(r.restored.length, 1);
+  assert.match(r.restored[0], /^the board folder/);            // folders are checked first, so the alert names it
+});
+
+test('a protected file two folders down comes back by untrashing the TOP trashed folder', () => {
+  const w = world({ trashed: ['outer'], parents: { [BUS]: 'inner', inner: 'outer' } });
+  w.ctx.guard();
+  assert.deepStrictEqual(w.untrashed, ['outer']);
+  assert.ok(!w.inTrash(BUS) && !w.inTrash('inner'));
+});
+
+test('a protected file inside some other trashed folder comes back with that folder, in place', () => {
+  const OTHER = 'unprotected-folder-id';
+  const w = world({ trashed: [OTHER], parents: { [BUS]: OTHER } });
+  const r = w.ctx.guard();
+  assert.deepStrictEqual(w.untrashed, [OTHER]);
+  assert.ok(!w.inTrash(BUS));
+  assert.match(r.restored[0], /by untrashing its folder "name-of-unprotected-folder-id" \(unprotected-folder-id\)/);
+});
+
+test('a file trashed itself AND inside a trashed folder: the folder first, then the file', () => {
+  const w = world({ trashed: [FOLDER, SHEET], parents: { [SHEET]: FOLDER } });
+  w.ctx.guard();
+  assert.deepStrictEqual(w.untrashed, [FOLDER, SHEET]);
+  assert.ok(!w.inTrash(SHEET));
 });
 
 test('nothing in the trash: no alert, every item is looked up, and the run is recorded', () => {
@@ -100,7 +152,8 @@ test('a trashed bus is untrashed at once, with an email and one board row to the
   assert.deepStrictEqual([sent.action, sent.secret, sent.title], ['append', BOARD.BUS_SECRET, 'Blackboard - Alpha DB']);
   const row = sent.sheetRow;
   assert.strictEqual(row.length, 10);
-  assert.match(row[0], /^DRIVE-TRASH-GUARD-\d{8}T\d{4}Z$/);
+  assert.match(row[0], /^DRIVE-TRASH-GUARD-\d{8}T\d{6}Z-[0-9a-f]{8}$/);
+  assert.match(w.mails[0].body, / Board row: posted as DRIVE-TRASH-GUARD-/);
   assert.deepStrictEqual([row[2], row[3], row[4], row[6], row[7]], ['drive-trash-guard', 'fleet;claude-code-cli', 'RESULT', 'OPEN', 'FLEET']);
   const fields = row[5].split('|');
   assert.strictEqual(fields.length, 8, 'BCB payload has exactly 7 delimiters');
@@ -127,11 +180,33 @@ test('a purged file is an URGENT alert with the Restore data step, and the other
   assert.ok(w.lookups.includes('file:' + SELF));
 });
 
+test('two alerts in the same second get different Row_IDs (readers dedupe by Row_ID)', () => {
+  const w = world({ trashed: [BUS], props: BOARD });
+  w.ctx.guard();
+  w.ctx.alert_(['again'], []);
+  const ids = w.fetches.map((f) => JSON.parse(f.o.payload).sheetRow[0]);
+  assert.strictEqual(ids.length, 2);
+  assert.notStrictEqual(ids[0], ids[1]);
+});
+
+test('a bus refusal is reported as NOT posted, with its error, never as delivered', () => {
+  // The v1 bus answers transport 200 and puts the outcome in its JSON (Codex and Copilot on #312).
+  for (const [reply, want] of [[JSON.stringify({ ok: false, error: 'Bad or missing secret.', _httpStatus: 401 }), /NOT posted \(Bad or missing secret\.\)/],
+                               ['<html>Sign in</html>', /NOT posted \(HTTP 200, no ok:true\)/],
+                               [JSON.stringify({ ok: 'true' }), /NOT posted/]]) {
+    const w = world({ trashed: [BUS], props: BOARD, busReply: reply });
+    w.ctx.guard();
+    assert.match(w.mails[0].body, want, reply);
+    assert.ok(!w.mails[0].body.includes(BOARD.BUS_SECRET));
+  }
+});
+
 test('with no BUS_URL or BUS_SECRET the alert is email only', () => {
   for (const props of [{}, { BUS_URL: BOARD.BUS_URL }, { BUS_SECRET: BOARD.BUS_SECRET }]) {
     const w = world({ trashed: [BUS], props });
     w.ctx.guard();
     assert.deepStrictEqual([w.mails.length, w.fetches.length], [1, 0]);
+    assert.match(w.mails[0].body, /Board row: not configured/);
   }
 });
 
@@ -142,6 +217,7 @@ test('a failed email still posts the board row, and a failed post does not throw
   const w2 = world({ trashed: [BUS], props: BOARD, fetchThrows: true });
   assert.doesNotThrow(() => w2.ctx.guard());
   assert.strictEqual(w2.mails.length, 1);
+  assert.match(w2.mails[0].body, /Board row: NOT posted \(dns\)/);
 });
 
 test('an error text with | or a newline cannot break the BCB payload', () => {
