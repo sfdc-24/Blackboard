@@ -218,6 +218,11 @@ before it runs.
 - The gemini cloud waker (`GEMINI-WAKE-CCC-TEAMROUND-PLAN-20261001T2239Z-bafba30152`): AGREE on all items it covered, from the row summary only (it cannot read the PR).
 - Grok: pending.
 
+**Carried into the implementing PRs** (Copilot on b8d7115). These are acceptance criteria for the build, not plan changes. Each implementing PR must close them, and U4 carries them forward:
+- **U1:** a Meta `wamid` with `accepted` only means queued (`scripts/wa_send.py`). The drill needs proof of delivery: a delivery-status webhook, or Mr. Salam's own receipt during the drill. The same goes for email.
+- **U2:** each receipt must quote the id of the exact wake request it answers, such as the test Row_ID, queue message id or comment id. A receipt that cannot be matched to its stimulus does not count.
+- **U3:** the registry rejects collisions across the whole case-folded namespace of tags AND aliases. Writer A's tag `foo` and writer B's alias `FOO` is a failure.
+
 **Already done today, from this round:**
 - #311 is at b59744f: @2 evidence added, Cursor GO, Copilot approval recommended.
 - #312 is at abf72a8: every reviewer finding fixed; 18 tests, 36 mutants, 0 survivors.
