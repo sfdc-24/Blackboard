@@ -49,7 +49,12 @@ and the remote". **That is not a boundary.**
 - Any code in the job, including the agent's, can ask the metadata server for a token for the job's own service
   account.
 - With that token it can read the key secret again and mint read access to both installed repositories.
-- Clearing copies is a permission rule, not a capability boundary. The same lesson is in #306 rev 5.
+- Clearing copies is a permission rule, not a capability boundary.
+
+**#306 rev 5 (41c95e6) still uses the old model for App A.** Its Boundary 3 (C2), its service-account section and
+owner gate 2 give the job's harness the read-only clone credential and rely on removing it. Until #306 is revised for
+C2, the requirement below governs App A's key, not those passages. Do not grant `GITHUB_APP_READONLY_PRIVATE_KEY` to
+the agent job by following them.
 
 **The requirement for Stage C2:**
 - The agent job's service account gets **no reader** on `GITHUB_APP_READONLY_PRIVATE_KEY`.
