@@ -71,6 +71,9 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
+      - "tests/test_github_apps.py"
+      - "scripts/github_app_convert.py"
+      - "docs/github-apps/**"
       - "tests/test_wa_outbox_cloud.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
@@ -181,6 +184,9 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
+      - "tests/test_github_apps.py"
+      - "scripts/github_app_convert.py"
+      - "docs/github-apps/**"
       - "tests/test_wa_outbox_cloud.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
@@ -291,6 +297,7 @@ jobs:
                    tests/test_state_store.py \
                    tests/test_waker_shadow.py \
                    tests/test_board_watcher.py \
+                   tests/test_github_apps.py \
                    tests/test_wa_outbox_cloud.py \
                    tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
@@ -670,6 +677,16 @@ jobs:
       # the board twice: a killed run resending, two ticks starting one job,
       # a routing error read as "not for me". ack-once, the one-shot first
       # cloud write, was retired the same day and its suite with it.
+      - name: "GitHub Apps: exact manifest permissions; the converter never shows the key (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_github_apps.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_github_apps
+          else
+            echo "not on this branch; skipping"
+          fi
+
       - name: "board watcher: one tick, no dropped or doubled ring (no network)"
         run: |
           set -euo pipefail
@@ -902,6 +919,7 @@ jobs:
              && [ ! -f tests/test_state_store.py ] \
              && [ ! -f tests/test_waker_shadow.py ] \
              && [ ! -f tests/test_board_watcher.py ] \
+             && [ ! -f tests/test_github_apps.py ] \
              && [ ! -f tests/test_wa_outbox_cloud.py ] \
              && [ ! -f tests/test_gemini_cloud_waker.py ] \
              && [ ! -f tests/test_soak_report.py ] \

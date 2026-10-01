@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- Opened by Mr. Salam from his own disk (file://). Each button POSTs one manifest to GitHub's "new App" page for the
+     sfdc-24 personal account, where he reviews it and clicks "Create GitHub App". No secret is in this file. The
+     manifests below are the JSON files beside it; tests/test_github_apps.py checks that they match. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create GitHub Apps</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 16px; }
+  form { margin: 1.5rem 0; padding: 1rem; border: 1px solid #8886; border-radius: 8px; }
+  button { font: inherit; padding: .5rem 1rem; cursor: pointer; }
+  code { font-size: .9em; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<h1>Create the two GitHub Apps</h1>
+<p>Each button opens GitHub's "Register new GitHub App" page with the settings filled in. Check the permissions, then
+click <b>Create GitHub App</b>. GitHub then opens www.sfdc24.com with <code>?code=...</code> in the address bar. Copy
+that code and run step 2 of <code>docs/github-apps/README.md</code> within one hour.</p>
+
+<form method="post" action="https://github.com/settings/apps/new?state=sfdc24-cloud-clone">
+  <h2>A. sfdc24-cloud-clone (read-only)</h2>
+  <p>Contents: <b>read</b>. Metadata: read. No webhook.</p>
+  <input type="hidden" name="manifest" id="manifest-clone">
+  <button type="submit">Create sfdc24-cloud-clone</button>
+</form>
+
+<form method="post" action="https://github.com/settings/apps/new?state=sfdc24-ccc-broker">
+  <h2>B. sfdc24-ccc-broker (write, owned branch and PR only)</h2>
+  <p>Contents: <b>write</b>. Pull requests: <b>write</b>. Metadata: read. No webhook.</p>
+  <input type="hidden" name="manifest" id="manifest-broker">
+  <button type="submit">Create sfdc24-ccc-broker</button>
+</form>
+
+<script id="manifests" type="application/json">
+{
+  "sfdc24-cloud-clone": {
+    "name": "sfdc24-cloud-clone",
+    "url": "https://www.sfdc24.com/",
+    "description": "Read-only clone for the claude-code-cloud job's harness (Blackboard #306). Contents read only; the harness removes the token before the agent starts.",
+    "public": false,
+    "hook_attributes": {"url": "https://www.sfdc24.com/", "active": false},
+    "redirect_url": "https://www.sfdc24.com/",
+    "default_permissions": {"contents": "read", "metadata": "read"},
+    "default_events": []
+  },
+  "sfdc24-ccc-broker": {
+    "name": "sfdc24-ccc-broker",
+    "url": "https://www.sfdc24.com/",
+    "description": "ccc-broker's only GitHub write path (Blackboard #306): push an owned claude-code-cloud/<work_id> branch and open one PR. The broker has no merge, close or edit operation.",
+    "public": false,
+    "hook_attributes": {"url": "https://www.sfdc24.com/", "active": false},
+    "redirect_url": "https://www.sfdc24.com/",
+    "default_permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+    "default_events": []
+  }
+}
+</script>
+<script>
+  const m = JSON.parse(document.getElementById("manifests").textContent);
+  document.getElementById("manifest-clone").value = JSON.stringify(m["sfdc24-cloud-clone"]);
+  document.getElementById("manifest-broker").value = JSON.stringify(m["sfdc24-ccc-broker"]);
+</script>
+</body>
+</html>

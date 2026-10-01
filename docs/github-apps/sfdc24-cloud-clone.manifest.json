@@ -1,0 +1,16 @@
+{
+  "name": "sfdc24-cloud-clone",
+  "url": "https://www.sfdc24.com/",
+  "description": "Read-only clone for the claude-code-cloud job's harness (Blackboard #306). Contents read only; the harness removes the token before the agent starts.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://www.sfdc24.com/",
+    "active": false
+  },
+  "redirect_url": "https://www.sfdc24.com/",
+  "default_permissions": {
+    "contents": "read",
+    "metadata": "read"
+  },
+  "default_events": []
+}

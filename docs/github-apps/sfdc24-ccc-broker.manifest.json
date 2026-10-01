@@ -1,0 +1,17 @@
+{
+  "name": "sfdc24-ccc-broker",
+  "url": "https://www.sfdc24.com/",
+  "description": "ccc-broker's only GitHub write path (Blackboard #306): push an owned claude-code-cloud/<work_id> branch and open one PR. The broker has no merge, close or edit operation.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://www.sfdc24.com/",
+    "active": false
+  },
+  "redirect_url": "https://www.sfdc24.com/",
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read"
+  },
+  "default_events": []
+}
