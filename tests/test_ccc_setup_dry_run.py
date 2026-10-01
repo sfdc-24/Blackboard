@@ -17,17 +17,19 @@ SCRIPT = ROOT / "cloud" / "claude-code-cloud" / "setup.sh"
 # CCC_FAKE_DENIED, otherwise gcloud's own NOT_FOUND. Every other command succeeds.
 FAKE = """#!/usr/bin/env bash
 echo "$*" >> "$CCC_FAKE_LOG"
+# CCC_FAKE_FLAKY="<pattern>:<n>;...": the first n calls matching <pattern> fail with CCC_FAKE_FLAKY_ERR (by default an
+# IAM grant still propagating). Describes are never flaky.
+if [[ "$*" != *" describe "* ]]; then
+  IFS=';' read -ra flaky <<< "${CCC_FAKE_FLAKY:-}"
+  for f in "${flaky[@]}"; do
+    pat="${f%:*}"; n="${f##*:}"
+    if [ -n "$pat" ] && [[ "$*" == *"$pat"* ]] && [ "$(grep -cF -- "$pat" "$CCC_FAKE_LOG")" -le "$n" ]; then
+      echo "ERROR: (gcloud.fake) ${CCC_FAKE_FLAKY_ERR:-PERMISSION_DENIED: Permission 'secretmanager.versions.access' denied}" >&2
+      exit 1
+    fi
+  done
+fi
 case "$*" in
-  *"run deploy ccc-broker"*|*"run jobs create claude-code-cloud"*)
-    # CCC_FAKE_FLAKY="<pattern>:<n>;...": the first n calls matching <pattern> fail as an IAM grant still propagating.
-    IFS=';' read -ra flaky <<< "${CCC_FAKE_FLAKY:-}"
-    for f in "${flaky[@]}"; do
-      pat="${f%:*}"; n="${f##*:}"
-      if [ -n "$pat" ] && [[ "$*" == *"$pat"* ]] && [ "$(grep -cF -- "$pat" "$CCC_FAKE_LOG")" -le "$n" ]; then
-        echo "ERROR: (gcloud.fake) PERMISSION_DENIED: Permission 'secretmanager.versions.access' denied" >&2; exit 1
-      fi
-    done
-    exit 0 ;;
   *" describe "*)
     IFS=';' read -ra denied <<< "${CCC_FAKE_DENIED:-}"
     for d in "${denied[@]}"; do
@@ -96,10 +98,13 @@ class SetupScriptTest(unittest.TestCase):
         self.bindir = bindir
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
-                   job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0"):
+                   job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0", flaky_err=None):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied, CCC_FAKE_FLAKY=flaky, CCC_IAM_WAITS=waits)
+        env.pop("CCC_FAKE_FLAKY_ERR", None)
+        if flaky_err is not None:
+            env["CCC_FAKE_FLAKY_ERR"] = flaky_err
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
                   "CCC_BROKER_TAG", "CCC_JOB_TAG", "CCC_FAKE_STATE", "CCC_FAKE_PROJECT_NUMBER"):
             env.pop(k, None)
@@ -191,7 +196,7 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertEqual(3, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
         self.assertEqual(2, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")))
-        self.assertIn("new IAM grants can take minutes", out.stderr)
+        self.assertIn("was refused while IAM propagates. Retrying", out.stderr)
         once = [c for c in mutating(calls) if not c.startswith(("run deploy ccc-broker", "run jobs create claude-code-cloud"))]
         self.assertEqual(len(once), len(set(once)))           # every other change ran exactly once
 
@@ -200,9 +205,45 @@ class SetupScriptTest(unittest.TestCase):
                                      waits="0 0")
         self.assertNotEqual(0, out.returncode)
         self.assertEqual(3, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))   # 1 + one per wait
-        self.assertIn("FAILED: deploy ccc-broker", out.stderr)
-        self.assertIn("run this one command by hand: gcloud run deploy ccc-broker", out.stderr)
+        self.assertRegex(out.stderr, r"FAILED at step \d+: deploy ccc-broker \(no public invoker\) \(still refused")
+        self.assertIn("Check it first: gcloud run services describe ccc-broker", out.stderr)
+        self.assertRegex(out.stderr, r"bash cloud/claude-code-cloud/setup.sh --print-from \d+")
         self.assertFalse([c for c in calls if c.startswith("run jobs create")])          # nothing after it ran
+
+    def test_a_failure_that_is_not_iam_propagation_is_never_retried(self):
+        # Copilot on 5a98651: a lost answer may follow a real create, so repeating it could hide a partial deployment.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:9",
+                                     flaky_err="INTERNAL: the connection was reset")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))   # exactly one attempt
+        self.assertRegex(out.stderr, r"FAILED at step \d+: deploy ccc-broker \(no public invoker\)\. Steps 1 to \d+ "
+                                     r"are applied; nothing after this one ran\.")
+        self.assertIn("The server may or may not have applied step", out.stderr)
+        self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
+
+    def test_a_binding_on_a_just_created_account_is_retried_while_iam_propagates(self):
+        # Codex P1 on 5a98651: the new service account may not be visible to IAM yet.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head,
+                                     flaky="secrets add-iam-policy-binding BUS_URL:2",
+                                     flaky_err="INVALID_ARGUMENT: Service account ccc-broker@sfdc24.iam.gserviceaccount.com does not exist.")
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual(3, sum(1 for c in calls if c.startswith("secrets add-iam-policy-binding BUS_URL")))
+
+    def test_print_from_prints_the_rest_of_the_plan_in_order_and_changes_nothing(self):
+        dry, _ = self.run_script()
+        everything = [l.strip() for l in dry.stdout.splitlines() if l.strip().startswith("gcloud ")]
+        numbered = [l for l in dry.stdout.splitlines() if l.startswith("DRY RUN: [")]
+        self.assertGreaterEqual(len(numbered), 10)
+        k = 7
+        tail, calls = self.run_script("--print-from", str(k))
+        self.assertEqual(0, tail.returncode, tail.stderr)
+        printed = [l.strip() for l in tail.stdout.splitlines() if l.strip().startswith("gcloud ")]
+        self.assertEqual(everything[k - 1:], printed)                   # step k and every step after it, in order
+        self.assertEqual([], mutating(calls))
+        for bad in ("0", "x", ""):
+            out, calls = self.run_script("--print-from", bad)
+            self.assertEqual(2, out.returncode, bad)
+            self.assertEqual([], mutating(calls), bad)
 
     def test_bad_iam_waits_are_refused_before_any_cloud_call(self):
         for waits in ("", "x", "30,60", "-5"):

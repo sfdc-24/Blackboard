@@ -32,7 +32,13 @@ REG="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 APPLY=0
-if [ "${1:-}" = "--apply" ]; then
+PRINT_FROM=1
+if [ "${1:-}" = "--print-from" ]; then
+  # After a failed apply: print step N and every step after it, in order, and change nothing (Codex P1 and Copilot on
+  # 5a98651). The owner checks the failed resource first, then runs these by hand.
+  if ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then echo "usage: setup.sh --print-from <step number>" >&2; exit 2; fi
+  PRINT_FROM="$2"
+elif [ "${1:-}" = "--apply" ]; then
   if [ -z "${CCC_OWNER_GO:-}" ]; then
     echo "REFUSED: --apply needs CCC_OWNER_GO=<the owner's GO Row_ID for Stage C1>; nothing was changed." >&2
     exit 2
@@ -52,7 +58,7 @@ if [ "${1:-}" = "--apply" ]; then
   fi
   APPLY=1
 elif [ -n "${1:-}" ]; then
-  echo "usage: setup.sh [--apply]" >&2
+  echo "usage: setup.sh [--apply | --print-from <step>]" >&2
   exit 2
 fi
 
@@ -134,47 +140,66 @@ if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   echo "DRY RUN: --apply would REFUSE on the preflight above." >&2
 fi
 
-step() {   # step <description> -- <command...>
-  local what="$1"; shift; shift
+# Every step is numbered in order, so a failed apply can say exactly where it stopped and print the rest.
+STEP_N=0
+failed_at() {   # failed_at <description> <how to check it>
+  echo "FAILED at step ${STEP_N}: $1. Steps 1 to $((STEP_N - 1)) are applied; nothing after this one ran." >&2
+  echo "The server may or may not have applied step ${STEP_N}. Check it first: $2" >&2
+  echo "Then finish in order with the commands this prints (step ${STEP_N} onward):" >&2
+  echo "  bash cloud/claude-code-cloud/setup.sh --print-from ${STEP_N}" >&2
+  exit 1
+}
+
+step() {   # step <description> <how to check it> -- <command...>   (runs once; never retried)
+  local what="$1" check="$2"; shift 3
+  STEP_N=$((STEP_N + 1))
   if [ "$APPLY" = 1 ]; then
-    echo "APPLY: $what"
-    "$@"
-  else
-    printf 'DRY RUN: %s\n    %s\n' "$what" "$*"
+    echo "APPLY: [${STEP_N}] $what"
+    "$@" || failed_at "$what" "$check"
+  elif [ "$STEP_N" -ge "$PRINT_FROM" ]; then
+    printf 'DRY RUN: [%s] %s\n    %s\n' "$STEP_N" "$what" "$*"
   fi
 }
 
-# The two runtime steps read secrets that step 2 only just granted. IAM changes take effect over minutes, and Cloud
-# Run checks secretAccessor at deploy time, so a first attempt can fail while a grant propagates (Copilot on b6fa11e).
-# Both are safe to repeat: `run deploy` creates or updates, and a failed `run jobs create` leaves nothing behind. So
-# they are retried after each wait in CCC_IAM_WAITS (seconds) before the apply gives up. Nothing else is retried.
+# New service accounts and new grants take minutes to take effect everywhere (IAM is eventually consistent). A step
+# that names a new account, or reads a new grant, can be refused meanwhile: a binding on a just-created account
+# (Codex P1 on 5a98651), and the deploy and job create that read the new secret grants (Copilot on b6fa11e). Those
+# steps are retried after each wait in CCC_IAM_WAITS (seconds), but ONLY on an error that comes before any change
+# (IAM_PENDING below). Any other failure, such as a lost answer that may have followed a change, stops at once with
+# failed_at, because repeating a create there could hide a partial deployment (Copilot on 5a98651). Bindings are also
+# idempotent. Nothing else is retried.
 IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
 [[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
-step_after_iam() {   # step_after_iam <description> -- <command...>
-  local what="$1"; shift; shift
+IAM_PENDING='PERMISSION_DENIED|[Pp]ermission .* denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
+step_after_iam() {   # step_after_iam <description> <how to check it> -- <command...>
+  local what="$1" check="$2"; shift 3
+  STEP_N=$((STEP_N + 1))
   if [ "$APPLY" != 1 ]; then
-    printf 'DRY RUN: %s\n    %s\n    (retried after %s s while new IAM grants take effect)\n' "$what" "$*" "$IAM_WAITS"
+    if [ "$STEP_N" -ge "$PRINT_FROM" ]; then
+      printf 'DRY RUN: [%s] %s\n    %s\n    (retried after %s s, only while IAM is still propagating)\n' \
+        "$STEP_N" "$what" "$*" "$IAM_WAITS"
+    fi
     return 0
   fi
-  echo "APPLY: $what"
-  local wait
-  for wait in $IAM_WAITS; do
-    if "$@"; then return 0; fi
-    echo "APPLY: $what failed; new IAM grants can take minutes to take effect. Retrying in ${wait}s." >&2
+  echo "APPLY: [${STEP_N}] $what"
+  local wait out
+  for wait in $IAM_WAITS ""; do
+    if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
+    printf '%s\n' "$out" >&2
+    if ! grep -qE "$IAM_PENDING" <<<"$out"; then failed_at "$what" "$check"; fi
+    [ -n "$wait" ] || break
+    echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
     sleep "$wait"
   done
-  if "$@"; then return 0; fi
-  echo "FAILED: $what, after waits of ${IAM_WAITS} seconds. Everything before it is in place. Check that the grants in" >&2
-  echo "step 2 are effective, then run this one command by hand: $*" >&2
-  exit 1
+  failed_at "$what (still refused after waits of ${IAM_WAITS} s)" "$check"
 }
 
 # 1. Two service accounts. Neither gets an unconditional project-level role; the broker's one project-policy binding
 #    is conditioned on a single database (step 3).
-step "service account for the agent job" -- \
+step "service account for the agent job" "gcloud iam service-accounts describe ${JOB_SA} --project ${PROJECT}" -- \
   gcloud iam service-accounts create claude-code-cloud --project "$PROJECT" \
     --display-name "claude-code-cloud (Console agent job, Blackboard #306)"
-step "service account for the broker" -- \
+step "service account for the broker" "gcloud iam service-accounts describe ${BROKER_SA} --project ${PROJECT}" -- \
   gcloud iam service-accounts create ccc-broker --project "$PROJECT" \
     --display-name "ccc-broker (board and GitHub writes for the agent, Blackboard #306)"
 
@@ -182,11 +207,11 @@ step "service account for the broker" -- \
 #    other binding, so it cannot show the reader is the only one; BUS_URL and BUS_SECRET already have other readers.
 #    The owner creates each secret and its value in his own terminal before this runs (the preflight checks it);
 #    this script never handles a value.
-step "add the agent job as a reader of the Console key" -- \
+step_after_iam "add the agent job as a reader of the Console key" "gcloud secrets get-iam-policy ANTHROPIC_API_KEY_CLOUD --project ${PROJECT}" -- \
   gcloud secrets add-iam-policy-binding ANTHROPIC_API_KEY_CLOUD --project "$PROJECT" \
     --member "serviceAccount:${JOB_SA}" --role roles/secretmanager.secretAccessor
 for s in BUS_URL BUS_SECRET; do
-  step "add the broker as a reader of ${s} (not granted to the agent job)" -- \
+  step_after_iam "add the broker as a reader of ${s} (not granted to the agent job)" "gcloud secrets get-iam-policy ${s} --project ${PROJECT}" -- \
     gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
       --member "serviceAccount:${BROKER_SA}" --role roles/secretmanager.secretAccessor
 done
@@ -196,16 +221,16 @@ echo "C2 ONLY, not applied in C1: GITHUB_APP_READONLY_PRIVATE_KEY (App 5148538) 
 #    granted that database alone, by an IAM condition on its exact name (Google's per-database form; a prefix would
 #    also cover ccc-receipts-backup and the like), so it can never touch the (default) database where the chair keeps
 #    its call checkpoints.
-step "Firestore database for broker receipts (Toronto)" -- \
+step "Firestore database for broker receipts (Toronto)" "gcloud firestore databases describe --database ccc-receipts --project ${PROJECT}" -- \
   gcloud firestore databases create --project "$PROJECT" --database ccc-receipts \
     --location northamerica-northeast2 --type firestore-native
-step "the broker may use only the ccc-receipts database" -- \
+step_after_iam "the broker may use only the ccc-receipts database" "gcloud projects get-iam-policy ${PROJECT}" -- \
   gcloud projects add-iam-policy-binding "$PROJECT" \
     --member "serviceAccount:${BROKER_SA}" --role roles/datastore.user \
     --condition "title=ccc-receipts-only,expression=resource.name==\"projects/${PROJECT}/databases/ccc-receipts\""
 
 # 4. The broker: private service, C1 operation post_receipt only. The image is built from a merged main SHA.
-step_after_iam "deploy ccc-broker (no public invoker)" -- \
+step_after_iam "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
   gcloud run deploy ccc-broker --project "$PROJECT" --region "$REGION" \
     --image "${REG}/ccc-broker:${CCC_BROKER_TAG:-UNSET}" --service-account "$BROKER_SA" \
     --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
@@ -214,13 +239,13 @@ step_after_iam "deploy ccc-broker (no public invoker)" -- \
 # This ADDS the job as an invoker. Allow policies are inherited, so a project-, folder- or organization-level
 # run.invoker (and owner or editor) also reaches the broker: the binding does not make the job its only caller
 # (Codex P2 on ee71826). The broker image must check the caller itself (README, "Who can call the broker").
-step "add the agent job as an invoker of the broker" -- \
+step_after_iam "add the agent job as an invoker of the broker" "gcloud run services get-iam-policy ccc-broker --project ${PROJECT} --region ${REGION}" -- \
   gcloud run services add-iam-policy-binding ccc-broker --project "$PROJECT" --region "$REGION" \
     --member "serviceAccount:${JOB_SA}" --role roles/run.invoker
 
 # 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3),
 #    which calls the broker at CCC_BROKER_URL with an ID token for that audience.
-step_after_iam "create the claude-code-cloud job" -- \
+step_after_iam "create the claude-code-cloud job" "gcloud run jobs describe claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
   gcloud run jobs create claude-code-cloud --project "$PROJECT" --region "$REGION" \
     --image "${REG}/claude-code-cloud:${CCC_JOB_TAG:-UNSET}" --service-account "$JOB_SA" \
     --max-retries 0 --tasks 1 --task-timeout 600s --memory 1Gi --cpu 1 \
@@ -230,7 +255,7 @@ step_after_iam "create the claude-code-cloud job" -- \
 # 6. board-watcher (resolved in step 0) may start the new job and pass each run its envelope. The envelope travels as
 #    a per-execution override, which needs run.jobs.runWithOverrides; run.invoker has only run.jobs.run (Codex P1 on
 #    80d4820). The role also holds run.executions.cancel, and is bound on this job alone.
-step "board-watcher (${WATCHER_SA}) may run the claude-code-cloud job with its envelope" -- \
+step_after_iam "board-watcher (${WATCHER_SA}) may run the claude-code-cloud job with its envelope" "gcloud run jobs get-iam-policy claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
   gcloud run jobs add-iam-policy-binding claude-code-cloud --project "$PROJECT" --region "$REGION" \
     --member "serviceAccount:${WATCHER_SA}" --role roles/run.jobsExecutorWithOverrides
 
