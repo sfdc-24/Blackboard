@@ -1,8 +1,9 @@
 # The two GitHub Apps for the Console route: what they are, and Mr. Salam's click-path
 
 **claude-code-cli, 2026-10-01.** For Grok's `ARCH-NEXT-CLAUDE-20261001T1105Z`, under the owner's architecture GO
-(`ARCH-EXECUTE-OWNER-GO-20261001T1105Z`). It follows Blackboard #306 (`docs/MIGRATE-OFF-LAPTOP-CLAUDE-CONSOLE.md`),
-which gives Cloud Run read access for its clone and the broker a narrow write path.
+(`ARCH-EXECUTE-OWNER-GO-20261001T1105Z`). It follows the spec in Blackboard PR #306,
+`docs/MIGRATE-OFF-LAPTOP-CLAUDE-CONSOLE.md` on that PR's branch; it is not on `main` until #306 merges. That spec gives
+Cloud Run read access for its clone and the broker a narrow write path.
 
 This PR prepares everything. **Nothing is created, installed or stored by it.** Creating and installing an App takes
 the owner's own clicks on GitHub, and storing its key takes his own terminal.
@@ -12,8 +13,18 @@ the owner's own clicks on GitHub, and storing its key takes his own terminal.
 - broker App **5148612**, installation **166846692**.
 
 He stored their IDs and private keys in Secret Manager as `GITHUB_APP_<READONLY|BROKER>_ID`, `_INSTALLATION_ID`
-and `_PRIVATE_KEY`. Those are the names the converter now writes. The click-path below is kept for re-creation or key
-rotation.
+and `_PRIVATE_KEY`.
+
+**What the converter does, and does not do:**
+- It is for **first-time storage of a private key only.** It runs `gcloud secrets create` for
+  `GITHUB_APP_<READONLY|BROKER>_PRIVATE_KEY`, and stops if that secret already exists, overwriting nothing.
+- It never writes `_ID` or `_INSTALLATION_ID`.
+- **Key rotation** is the owner's step:
+  1. Generate a new key on the App's settings page.
+  2. Run `gcloud secrets versions add GITHUB_APP_<..>_PRIVATE_KEY --project sfdc24 --data-file=<the .pem>`.
+  3. Disable the old version and delete the old key on GitHub.
+- **A re-created App** has new ids. Add new versions of `_ID` and `_INSTALLATION_ID` the same way, as well as the
+  key. The converter does not handle either case.
 
 ## Why GitHub Apps rather than personal tokens
 Codex and Gemini agreed with this, and the owner preferred it on 2026-10-01:
@@ -26,11 +37,28 @@ Codex and Gemini agreed with this, and the owner preferred it on 2026-10-01:
 
 | App | Permissions (exactly) | Who holds its key | Used for |
 |---|---|---|---|
-| **A. `sfdc24-cloud-clone`** | Contents: **read**. Metadata: read | the `claude-code-cloud` job's service account | The harness clones the named repo before the agent starts, then removes the token and the remote. The agent never sees it. |
+| **A. `sfdc24-cloud-clone`** | Contents: **read**. Metadata: read | a **separate clone identity, never the agent job's service account** (see below) | Cloning the named repo. The agent job receives a checkout with no credential and no remote. |
 | **B. `sfdc24-ccc-broker`** | Contents: **write**. Pull requests: **write**. Metadata: read | the `ccc-broker` service account only | `open_pr`: pushes one owned `claude-code-cloud/<work_id>-*` branch (new or fast-forward) and opens one PR to `main`. |
 
 Neither App is public. Neither has a webhook or subscribes to events. Both are installed on **`sfdc-24/Blackboard`
 and `sfdc-24/conference` only**.
+
+### Why App A's key cannot sit with the agent job (Copilot, 97b32b7)
+An earlier draft gave App A's key to the agent job's own service account: "the harness clones, then removes the token
+and the remote". **That is not a boundary.**
+- Any code in the job, including the agent's, can ask the metadata server for a token for the job's own service
+  account.
+- With that token it can read the key secret again and mint read access to both installed repositories.
+- Clearing copies is a permission rule, not a capability boundary. The same lesson is in #306 rev 5.
+
+**The requirement for Stage C2:**
+- The agent job's service account gets **no reader** on `GITHUB_APP_READONLY_PRIVATE_KEY`.
+- A separate identity, which runs no agent code, holds the key, clones, and hands the agent job a checkout with no
+  credential in it.
+- The concrete shape is a C2 decision for #306, under Codex's review. It could be a clone step under its own service
+  account, or the broker minting a single-repository read token for a clone that runs before the agent and outside
+  its job.
+- `cloud/claude-code-cloud` (#310) grants no reader on either App key in C1.
 
 ### What App B could do, and what stops it
 GitHub permissions are per repository, not per branch. "Contents: write" technically allows pushing to any branch,
