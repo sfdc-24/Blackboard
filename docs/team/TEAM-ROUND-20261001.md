@@ -210,7 +210,7 @@ before it runs.
 | U8 | **One bus client and a drift gate.** Retire inline bus callers in favour of `scripts/bus.py`. A check compares the repo's Apps Script with the deployed version, which needs a clasp credential in a runner. Fix the live bus's `since` ordering (#314) with a normal release. | claude-code-cli | CI flags an inline transport. The drift check compares the deployed `@N` with its recorded release commit and reports **repo AHEAD** (reviewed, not yet released) separately from **live AHEAD or BEHIND** (unexplained). Only unexplained drift fails (`docs/COMMS-PROTOCOL.md`, Copilot's AMEND). #314 is shipped with a before snapshot and read-back. | Yes, for the bus redeploy (#314) and any CI credential |
 
 **Confirmations** (prefix TEAMROUND-CONFIRM, or a PR comment):
-- Cursor, at 22:41:13Z by its `date -u`: AGREE U3 to U8, OBJECT U1 and U2 on their verification only. Both are amended above as Cursor asked.
+- Cursor: at 22:41:13Z by its `date -u`, AGREE U3 to U8 and OBJECT U1 and U2 on their verification only. Both were amended as asked. At 22:42:58Z, on 9641536 (comment 5942158923), it gave **AGREE U1 and U2, so it agrees with all eight**.
 - The other agents: pending.
 
 **Already done today, from this round:**
