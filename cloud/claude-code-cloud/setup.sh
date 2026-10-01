@@ -144,6 +144,31 @@ step() {   # step <description> -- <command...>
   fi
 }
 
+# The two runtime steps read secrets that step 2 only just granted. IAM changes take effect over minutes, and Cloud
+# Run checks secretAccessor at deploy time, so a first attempt can fail while a grant propagates (Copilot on b6fa11e).
+# Both are safe to repeat: `run deploy` creates or updates, and a failed `run jobs create` leaves nothing behind. So
+# they are retried after each wait in CCC_IAM_WAITS (seconds) before the apply gives up. Nothing else is retried.
+IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
+[[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
+step_after_iam() {   # step_after_iam <description> -- <command...>
+  local what="$1"; shift; shift
+  if [ "$APPLY" != 1 ]; then
+    printf 'DRY RUN: %s\n    %s\n    (retried after %s s while new IAM grants take effect)\n' "$what" "$*" "$IAM_WAITS"
+    return 0
+  fi
+  echo "APPLY: $what"
+  local wait
+  for wait in $IAM_WAITS; do
+    if "$@"; then return 0; fi
+    echo "APPLY: $what failed; new IAM grants can take minutes to take effect. Retrying in ${wait}s." >&2
+    sleep "$wait"
+  done
+  if "$@"; then return 0; fi
+  echo "FAILED: $what, after waits of ${IAM_WAITS} seconds. Everything before it is in place. Check that the grants in" >&2
+  echo "step 2 are effective, then run this one command by hand: $*" >&2
+  exit 1
+}
+
 # 1. Two service accounts. Neither gets an unconditional project-level role; the broker's one project-policy binding
 #    is conditioned on a single database (step 3).
 step "service account for the agent job" -- \
@@ -180,7 +205,7 @@ step "the broker may use only the ccc-receipts database" -- \
     --condition "title=ccc-receipts-only,expression=resource.name==\"projects/${PROJECT}/databases/ccc-receipts\""
 
 # 4. The broker: private service, C1 operation post_receipt only. The image is built from a merged main SHA.
-step "deploy ccc-broker (no public invoker)" -- \
+step_after_iam "deploy ccc-broker (no public invoker)" -- \
   gcloud run deploy ccc-broker --project "$PROJECT" --region "$REGION" \
     --image "${REG}/ccc-broker:${CCC_BROKER_TAG:-UNSET}" --service-account "$BROKER_SA" \
     --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
@@ -195,7 +220,7 @@ step "add the agent job as an invoker of the broker" -- \
 
 # 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3),
 #    which calls the broker at CCC_BROKER_URL with an ID token for that audience.
-step "create the claude-code-cloud job" -- \
+step_after_iam "create the claude-code-cloud job" -- \
   gcloud run jobs create claude-code-cloud --project "$PROJECT" --region "$REGION" \
     --image "${REG}/claude-code-cloud:${CCC_JOB_TAG:-UNSET}" --service-account "$JOB_SA" \
     --max-retries 0 --tasks 1 --task-timeout 600s --memory 1Gi --cpu 1 \

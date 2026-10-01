@@ -108,6 +108,10 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
   584). If someone created a `ccc-broker` service in the seconds between the preflight read and the deploy, the
   deploy would update it.
   - Every other step is create-only and fails on a collision: both service accounts, the database and the job.
+  - New IAM grants take minutes to take effect, and Cloud Run checks `secretAccessor` at deploy time. So the broker
+    deploy and the job create, the two steps that read the new grants, are retried after waits of 30, 60, 90, 120
+    and 180 seconds (`CCC_IAM_WAITS`). Both are safe to repeat. If the last attempt fails, the apply stops and
+    prints the one command to re-run; everything before it is in place (Copilot on b6fa11e).
   - The script runs once, by the owner, under his GO, with no other writer expected. That bounds the race; it does
     not remove it.
 - **Changes are additive.** Nothing is deleted and no existing runtime is modified. Two kinds of change touch

@@ -18,6 +18,16 @@ SCRIPT = ROOT / "cloud" / "claude-code-cloud" / "setup.sh"
 FAKE = """#!/usr/bin/env bash
 echo "$*" >> "$CCC_FAKE_LOG"
 case "$*" in
+  *"run deploy ccc-broker"*|*"run jobs create claude-code-cloud"*)
+    # CCC_FAKE_FLAKY="<pattern>:<n>;...": the first n calls matching <pattern> fail as an IAM grant still propagating.
+    IFS=';' read -ra flaky <<< "${CCC_FAKE_FLAKY:-}"
+    for f in "${flaky[@]}"; do
+      pat="${f%:*}"; n="${f##*:}"
+      if [ -n "$pat" ] && [[ "$*" == *"$pat"* ]] && [ "$(grep -cF -- "$pat" "$CCC_FAKE_LOG")" -le "$n" ]; then
+        echo "ERROR: (gcloud.fake) PERMISSION_DENIED: Permission 'secretmanager.versions.access' denied" >&2; exit 1
+      fi
+    done
+    exit 0 ;;
   *" describe "*)
     IFS=';' read -ra denied <<< "${CCC_FAKE_DENIED:-}"
     for d in "${denied[@]}"; do
@@ -86,10 +96,10 @@ class SetupScriptTest(unittest.TestCase):
         self.bindir = bindir
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
-                   job_tag=TAG, state=None, project_number=None):
+                   job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0"):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
-                   CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied)
+                   CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied, CCC_FAKE_FLAKY=flaky, CCC_IAM_WAITS=waits)
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
                   "CCC_BROKER_TAG", "CCC_JOB_TAG", "CCC_FAKE_STATE", "CCC_FAKE_PROJECT_NUMBER"):
             env.pop(k, None)
@@ -172,6 +182,33 @@ class SetupScriptTest(unittest.TestCase):
         reads = [c for c in calls if c not in printed]
         self.assertEqual(dry_calls, reads)
         self.assertEqual(reads, calls[:len(reads)])           # every read before the first change
+
+    def test_a_runtime_step_waits_for_new_iam_grants_and_is_retried_alone(self):
+        # Copilot BLOCKER on b6fa11e: the grants are eventually consistent, and a refused first deploy must not strand
+        # the apply. The deploy fails twice and the job create once, then both succeed; nothing else is repeated.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head,
+                                     flaky="run deploy ccc-broker:2;run jobs create claude-code-cloud:1")
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual(3, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
+        self.assertEqual(2, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")))
+        self.assertIn("new IAM grants can take minutes", out.stderr)
+        once = [c for c in mutating(calls) if not c.startswith(("run deploy ccc-broker", "run jobs create claude-code-cloud"))]
+        self.assertEqual(len(once), len(set(once)))           # every other change ran exactly once
+
+    def test_a_runtime_step_that_never_succeeds_stops_the_apply_with_the_one_command_to_rerun(self):
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:99",
+                                     waits="0 0")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(3, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))   # 1 + one per wait
+        self.assertIn("FAILED: deploy ccc-broker", out.stderr)
+        self.assertIn("run this one command by hand: gcloud run deploy ccc-broker", out.stderr)
+        self.assertFalse([c for c in calls if c.startswith("run jobs create")])          # nothing after it ran
+
+    def test_bad_iam_waits_are_refused_before_any_cloud_call(self):
+        for waits in ("", "x", "30,60", "-5"):
+            out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, waits=waits)
+            self.assertNotEqual(0, out.returncode, waits)
+            self.assertEqual([], mutating(calls), waits)
 
     def test_apply_refuses_on_any_collision_missing_input_or_unclear_read(self):
         cases = {}
