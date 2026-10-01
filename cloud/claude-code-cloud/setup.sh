@@ -186,7 +186,10 @@ step "deploy ccc-broker (no public invoker)" -- \
     --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
     --set-env-vars CCC_STAGE=C1 \
     --set-secrets BUS_URL=BUS_URL:latest,BUS_SECRET=BUS_SECRET:latest
-step "only the agent job may call the broker" -- \
+# This ADDS the job as an invoker. Allow policies are inherited, so a project-, folder- or organization-level
+# run.invoker (and owner or editor) also reaches the broker: the binding does not make the job its only caller
+# (Codex P2 on ee71826). The broker image must check the caller itself (README, "Who can call the broker").
+step "add the agent job as an invoker of the broker" -- \
   gcloud run services add-iam-policy-binding ccc-broker --project "$PROJECT" --region "$REGION" \
     --member "serviceAccount:${JOB_SA}" --role roles/run.invoker
 

@@ -49,13 +49,21 @@ versions until C2 is recommended, and is the owner's call.
 | SA `claude-code-cloud@` | no project role; reads only `ANTHROPIC_API_KEY_CLOUD` |
 | SA `ccc-broker@` | no unconditional project role. Its one project-policy binding is `datastore.user`, conditioned on `resource.name == "projects/<project>/databases/ccc-receipts"`: that database only, by exact name, so neither `(default)` nor a look-alike such as `ccc-receipts-backup` is covered. Reads `BUS_URL` and `BUS_SECRET` |
 | Firestore database `ccc-receipts` | northamerica-northeast2 (Toronto), native; separate from the `(default)` database that holds the chair's call checkpoints (see below: this differs from #306 rev 5) |
-| Cloud Run service `ccc-broker` | `--no-allow-unauthenticated`; only `claude-code-cloud@` holds `run.invoker`; C1 does `post_receipt` only |
+| Cloud Run service `ccc-broker` | `--no-allow-unauthenticated`; `claude-code-cloud@` is added as `run.invoker` on the service (not its only caller: see below); C1 does `post_receipt` only |
 | Cloud Run job `claude-code-cloud` | `--max-retries 0`, 1 task, 600 s timeout, 1 GiB, 1 CPU; `CCC_MAX_TURNS=4`, `CCC_MAX_BUDGET_USD=0.50`; Console key from Secret Manager; `CCC_BROKER_URL` and `CCC_BROKER_AUDIENCE`, both the broker's deterministic URL `https://ccc-broker-<project number>.<region>.run.app` |
 | `run.jobsExecutorWithOverrides` on the job | for board-watcher's identity, read live before any change. The envelope `{row_id, task}` reaches each run as a per-execution override, which needs `run.jobs.runWithOverrides`; `run.invoker` has only `run.jobs.run`. The role also holds `run.executions.cancel`. It is bound on this job alone |
 
 **Why the job is given the broker's URL.** Cloud Run does not inject another service's URL, and the job's account has
 no role that could look one up. `setup.sh` reads the project number before any change and derives the broker's
 deterministic URL from it; the job uses that URL as its ID-token audience too.
+
+**Who can call the broker.** The service binding adds the job as an invoker. It does not make the job the only
+caller. Allow policies are inherited, so any project-, folder- or organization-level `run.invoker`, and owner or
+editor, also reaches the service, and a service policy cannot take that away. `setup.sh` neither audits nor removes
+inherited grants. So the broker image must refuse, before any write, every request whose verified ID token is not
+for its own audience and whose `email` is not `claude-code-cloud@<project>.iam.gserviceaccount.com`. That check
+belongs in the broker's code, which #306 specifies (Boundary 3) and a reviewed code PR builds. The owner's C1 GO
+needs it, with a test that a second identity holding `run.invoker` is refused.
 
 **Receipts: a new database, not #306 rev 5's collection.** #306 rev 5 (owner gate 3) puts receipts in a `receipts`
 collection of the existing `(default)` database, which is already in northamerica-northeast2. This script creates a
