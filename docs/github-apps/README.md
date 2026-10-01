@@ -92,12 +92,14 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
      browsers refuse port 9, so the one-time code never leaves this laptop and never reaches a website's logs, where
      anyone watching could trade it for the key first (Codex on #309). Copy the value after `code=` from the
      address bar.
-   - **Before you use the code, check two settings on the new App's page** (github.com > Settings > Developer
-     settings > GitHub Apps > the App > General). No API can show them, and GitHub's conversion answer carries neither
-     (Copilot and Cursor on #309):
-     - **Where can this GitHub App be installed?** must be **Only on this account**;
-     - **Webhook > Active** must be **unchecked**. The webhook URL itself stays filled in (`https://www.sfdc24.com/`,
-       from the manifest); that is expected.
+   - **Before you use the code, check two settings on the new App** (github.com > Settings > Developer settings >
+     GitHub Apps > the App). No API can show them, and GitHub's conversion answer carries neither (Copilot and Cursor
+     on #309):
+     - **Private:** open the **Advanced** tab. In its Danger zone the button must read **Make public**, which means
+       the App is private now. If it reads **Make private**, the App is public: that is wrong (Cursor on #309: this
+       setting is not on the General page once the App exists).
+     - **Webhook:** on the **General** tab, **Webhook > Active** must be **unchecked**. The webhook URL itself stays
+       filled in (`https://www.sfdc24.com/`, from the manifest); that is expected.
      If either is wrong, delete the App and start step 1 again. The code is still unused, and nothing is stored.
 2. **Store its key, within one hour.** In this repo's folder, run:
 
