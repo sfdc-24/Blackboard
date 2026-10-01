@@ -245,6 +245,55 @@ class ConvertTest(unittest.TestCase):
             self.assertFalse(run.calls, "nothing stored")
             self.assert_no_secret_shown(out, run)
 
+    def test_a_refusal_never_echoes_a_response_value(self):
+        # Copilot on 4f03668: the permissions refusal printed the response's own object, which can carry any text.
+        cases = [app("sfdc24-cloud-clone", {"contents": "TESTKEYMATERIAL", "metadata": "read"}),
+                 app("sfdc24-cloud-clone", owner="TESTKEYMATERIAL"),
+                 app("TESTKEYMATERIAL", PLANNED["sfdc24-cloud-clone"])]
+        for bad in cases:
+            rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))
+            self.assertEqual(1, rc)
+            self.assertEqual([], run.calls)
+            self.assert_no_secret_shown(out, run)               # TESTKEYMATERIAL is never printed
+        rc, out, _, _ = self.run_main(["sfdc24-cloud-clone"], github_with(cases[0]))
+        self.assertIn('not exactly the manifest\'s {"contents": "read", "metadata": "read"}', out)
+
+    def test_a_refusal_after_the_conversion_says_the_code_is_spent_and_to_delete_the_app(self):
+        for bad in (app("sfdc24-cloud-clone", owner="someone-else"), app("other-slug", PLANNED["sfdc24-cloud-clone"]),
+                    app("sfdc24-cloud-clone", {"contents": "write", "metadata": "read"}),
+                    app("sfdc24-cloud-clone", pem="")):
+            rc, out, _, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))
+            self.assertEqual(1, rc)
+            self.assertIn("nothing stored. The code is spent: delete this App on GitHub", out)
+
+    def test_gcloud_is_found_before_the_code_is_spent(self):
+        # Copilot on 4f03668: a missing gcloud used to be found only after the one-time conversion.
+        def missing():
+            raise conv.Stop("gcloud was not found (not on PATH, and no Cloud SDK under LOCALAPPDATA): nothing sent, "
+                            "and the code is still unused")
+        conv.gcloud_cmd = missing
+        github = github_with(app("sfdc24-cloud-clone"))
+        rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github)
+        self.assertEqual(1, rc)
+        self.assertEqual([], github.requests)                   # the code was never sent
+        self.assertIn("the code is still unused", out)
+        self.assertNotIn("nothing stored", out)
+
+    def test_gcloud_failing_to_start_after_the_conversion_says_how_to_get_a_new_key(self):
+        def missing(args, **_):
+            raise FileNotFoundError(args[0])
+        rc, out, _, _ = self.run_main(["sfdc24-cloud-clone"], github_with(app("sfdc24-cloud-clone")), run=missing)
+        self.assertEqual(1, rc)
+        self.assertIn("The code is spent and the key was discarded: generate a new private key", out)
+
+    def test_the_ok_line_prints_the_manifest_and_the_slug_asked_for_never_response_text(self):
+        good = app("sfdc24-cloud-clone")
+        good["id"] = "TESTKEYMATERIAL"                          # a non-int id is not echoed
+        rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(good))
+        self.assertEqual(0, rc)
+        self.assertIn("App sfdc24-cloud-clone (id unknown)", out)
+        self.assert_no_secret_shown(out, run)
+
     def test_a_failed_store_says_to_check_the_secret_without_echoing_it(self):
         # Copilot on #309: once the create has started, a failure is not proof that nothing was stored.
         run = Recorder(gcloud_rc=1)                                     # gcloud's stderr echoes its input here

@@ -47,6 +47,9 @@ TIMEOUT = 30
 # Said whenever GitHub may have converted already: the one-time code is then spent and the key was shown only once.
 SPENT = ("If GitHub did convert, the code is spent and the key was never shown; generate a new private key on the "
          "App's settings page")
+# Said after a conversion that succeeded: the one-time key was returned and is now gone.
+KEY_LOST = ("The code is spent and the key was discarded: generate a new private key on the App's settings page, and "
+            "ask Claude for the one-line store command")
 
 
 class Stop(Exception):
@@ -108,19 +111,20 @@ def convert(code: str, opener=None) -> dict:
 def check(app: dict, slug: str) -> None:
     # Codex on 0928901: a browser signed in as another user creates the App under that user, with the same slug and
     # permissions. Its key must not take the sfdc-24 secret name.
+    # The refusals below say what was EXPECTED, never what the response held: a response value can carry any text,
+    # key material included (Copilot on 4f03668).
     owner = app.get("owner") if isinstance(app.get("owner"), dict) else {}
     if owner.get("login") != OWNER:
-        raise Stop("the new App belongs to %r, not %s: nothing stored. Delete it on GitHub, sign in as %s and start "
-                   "again" % (owner.get("login"), OWNER, OWNER))
+        raise Stop("the new App does not belong to %s (sign in as %s before you click Create)" % (OWNER, OWNER))
     if app.get("slug") != slug:
-        raise Stop("the new App's slug is %r, not %r: nothing stored" % (app.get("slug"), slug))
+        raise Stop("the new App's slug is not %r" % slug)
     want, got = expected(slug), app.get("permissions")
     if not isinstance(got, dict):
-        raise Stop("the new App's permissions are a %s, not an object: nothing stored" % type(got).__name__)
+        raise Stop("the new App's permissions are a %s, not an object" % type(got).__name__)
     if got != want:
-        raise Stop("the new App's permissions %s are not the manifest's %s: nothing stored" % (got, want))
+        raise Stop("the new App's permissions are not exactly the manifest's %s" % json.dumps(want, sort_keys=True))
     if not str(app.get("pem") or "").startswith("-----BEGIN"):
-        raise Stop("the response has no private key: nothing stored")
+        raise Stop("the response has no private key")
 
 
 def gcloud_cmd() -> list:
@@ -134,16 +138,17 @@ def gcloud_cmd() -> list:
     python, entry = sdk / "platform" / "bundledpython" / "python.exe", sdk / "lib" / "gcloud.py"
     if python.exists() and entry.exists():
         return [str(python), str(entry)]
-    raise Stop("gcloud was not found (not on PATH, and no Cloud SDK under LOCALAPPDATA): nothing stored")
+    raise Stop("gcloud was not found (not on PATH, and no Cloud SDK under LOCALAPPDATA): nothing sent, and the code "
+               "is still unused")
 
 
-def store(secret: str, pem: str, run=subprocess.run) -> None:
-    command = gcloud_cmd() + ["secrets", "create", secret, "--project", PROJECT, "--replication-policy", "automatic",
-                              "--data-file=-"]
+def store(secret: str, pem: str, run=subprocess.run, gcloud=None) -> None:
+    command = (gcloud or gcloud_cmd()) + ["secrets", "create", secret, "--project", PROJECT, "--replication-policy",
+                                          "automatic", "--data-file=-"]
     try:
         out = run(command, input=pem, capture_output=True, text=True)
     except OSError as error:
-        raise Stop("gcloud could not start (%s): nothing stored" % type(error).__name__) from None
+        raise Stop("gcloud could not start (%s): nothing stored. %s" % (type(error).__name__, KEY_LOST)) from None
     if out.returncode != 0:
         # Once the create has started, a failure is not proof that nothing was stored: a lost answer can follow an
         # accepted create (Copilot on #309). So the owner reads the secret back before retrying or deleting the App.
@@ -166,17 +171,28 @@ def main(argv, run=subprocess.run, say=print, ask=read_code, opener=None) -> int
         say("STOPPED: that is not a manifest code (the value after code= in the address bar): nothing sent")
         return 2
     try:
+        gcloud = gcloud_cmd()        # before the one-time code is spent: a missing gcloud must not cost the key
         app = convert(code, opener)
-        check(app, slug)
-        store(SECRET_FOR[slug], app["pem"], run)
     except Stop as stop:
         say("STOPPED: %s" % stop)
         return 1
+    try:
+        check(app, slug)
+    except Stop as stop:
+        # The conversion succeeded, so the code is spent and this App exists on GitHub.
+        say("STOPPED: %s: nothing stored. The code is spent: delete this App on GitHub (Settings > Developer settings "
+            "> GitHub Apps) and start again." % stop)
+        return 1
+    try:
+        store(SECRET_FOR[slug], app["pem"], run, gcloud)
+    except Stop as stop:
+        say("STOPPED: %s" % stop)
+        return 1
+    app_id = app.get("id") if type(app.get("id")) is int else "unknown"
     say("OK: App %s (id %s), permissions %s; private key stored as Secret Manager %s/%s (value not shown)."
-        % (app["slug"], app.get("id"), json.dumps(app.get("permissions"), sort_keys=True), PROJECT,
-           SECRET_FOR[slug]))
+        % (slug, app_id, json.dumps(expected(slug), sort_keys=True), PROJECT, SECRET_FOR[slug]))
     say("Next: install it on sfdc-24/Blackboard and sfdc-24/conference only: https://github.com/apps/%s/installations/new"
-        % app["slug"])
+        % slug)
     return 0
 
 

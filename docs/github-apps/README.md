@@ -112,9 +112,16 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
 - **The code expired** (after one hour): open the App's settings page on GitHub, generate a new private key, and ask
   Claude for the one-line store command.
 - **The converter STOPPED:** what to do depends on the step that stopped.
-  - **Any message saying "nothing stored"** came before the store step, so nothing was stored. Nothing about the App
-    needs undoing, except deleting it on GitHub if you want to start over. If the conversion never succeeded, the code
-    stays valid for up to an hour: do not share it.
+  - **"nothing sent, and the code is still unused"** (a bad code, or no gcloud found): nothing left this laptop.
+    Fix the cause and run the command again with the same code; it stays valid for up to an hour. Do not share it.
+  - **"nothing stored. The code is spent: delete this App ..."** (wrong account, slug, permissions or no key): GitHub
+    converted the code, so it cannot be reused, and the key was discarded. Delete that App on GitHub and start again
+    from step 1.
+  - **"The code is spent and the key was discarded: generate a new private key ..."** (gcloud could not start after
+    the conversion): the App is correct, but its only key is gone. Generate a new private key on the App's settings
+    page and ask Claude for the one-line store command.
+  - **"the code is spent" after a lost or garbled answer from GitHub:** GitHub may have converted it. Generate a new
+    private key on the App's settings page, as above.
   - **A message naming `gcloud secrets create`** came from the store step itself. A failure there is not proof that
     nothing was stored, because a lost answer can follow an accepted create. Before you retry or delete the App, run
     the `gcloud secrets versions list` command it printed and see what is there. The converter never overwrites an
