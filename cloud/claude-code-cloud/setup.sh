@@ -3,7 +3,7 @@
 #
 #   bash cloud/claude-code-cloud/setup.sh            # DRY RUN: reads, prints the plan, changes nothing
 #   CCC_OWNER_GO=<board Row_ID> CCC_CURSOR_GO_SHA=<40-hex commit> \
-#     CCC_BROKER_TAG=<tag> CCC_JOB_TAG=<tag> bash cloud/claude-code-cloud/setup.sh --apply
+#     CCC_BROKER_TAG=<40-hex SHA> CCC_JOB_TAG=<40-hex SHA> bash cloud/claude-code-cloud/setup.sh --apply
 #
 # --apply refuses, before any cloud call, unless:
 #   - CCC_OWNER_GO names the owner's GO row for this stage (where he confirms Codex's AGREE on #306 and his Console
@@ -12,12 +12,15 @@
 #     is unmodified from it (#306: an exact-head GO on every code PR before deployment).
 # Then every read runs before the first change (create-or-refuse): each resource this script creates must be ABSENT;
 # each secret it grants on (ANTHROPIC_API_KEY_CLOUD, which the owner creates with its value first, BUS_URL and
-# BUS_SECRET) must be PRESENT with an enabled latest version; both images must be tagged and pushed (CCC_BROKER_TAG,
-# CCC_JOB_TAG: the merged main SHA each was built from); and board-watcher's identity must resolve. Anything else -
+# BUS_SECRET) must be PRESENT with an enabled latest version; both images must be tagged with a full commit SHA and
+# pushed (CCC_BROKER_TAG, CCC_JOB_TAG: the merged main SHA each was built from); the project number must resolve (it
+# names the broker's URL); and board-watcher's identity must resolve. Anything else -
 # present, missing, or a read that fails for another reason - refuses with nothing changed. So a rerun after a
 # partial apply refuses too: the owner looks at what exists before anything more is created. Nothing here deletes,
 # and no existing runtime is modified. Changes to existing resources: a reader added on each of the three secrets,
-# and one conditional binding (datastore.user, ccc-receipts only) added to the project's IAM policy. C2 resources
+# and one conditional binding (datastore.user, ccc-receipts only) added to the project's IAM policy. The receipts
+# live in a new ccc-receipts database, not a collection in the existing (default) one as #306 rev 5 says: see the
+# README. C2 resources
 # (the GitHub App keys' readers) are listed but NOT applied in C1.
 set -euo pipefail
 
@@ -88,6 +91,17 @@ done
 expect ABSENT "Firestore database ccc-receipts" gcloud firestore databases describe --database ccc-receipts --project "$PROJECT"
 expect ABSENT "Cloud Run service ccc-broker" gcloud run services describe ccc-broker --project "$PROJECT" --region "$REGION"
 expect ABSENT "Cloud Run job claude-code-cloud" gcloud run jobs describe claude-code-cloud --project "$PROJECT" --region "$REGION"
+# The job is told the broker's URL when it is created (Copilot on 80d4820): Cloud Run injects no other service's URL,
+# and the job's account has no role that could look it up. A service's deterministic URL is
+# https://<service>-<project number>.<region>.run.app, and the job uses it as its ID-token audience too.
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+if [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]]; then
+  BROKER_URL="https://ccc-broker-${PROJECT_NUMBER}.${REGION}.run.app"
+  echo "READ: project ${PROJECT} is number ${PROJECT_NUMBER}; the broker will be ${BROKER_URL}"
+else
+  PROBLEMS+=("project ${PROJECT}'s number did not resolve (read: '${PROJECT_NUMBER}')")
+  BROKER_URL="<broker URL: project number unresolved>"
+fi
 # board-watcher's identity is read live, because the service-account plan may have moved it to its own account.
 WATCHER_SA="$(gcloud run jobs describe board-watcher --project "$PROJECT" --region "$REGION" \
   --format='value(spec.template.spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
@@ -98,16 +112,17 @@ else
   PROBLEMS+=("board-watcher's identity did not resolve (read: '${WATCHER_SA}')")
   WATCHER_SA="<board-watcher identity: unresolved>"
 fi
-# Both images must be named by a valid tag and already pushed (Codex P1 on 21ff80e: an UNSET tag failed the deploy
-# only after the accounts, secret and database were created).
-TAG_SHAPE='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+# Both images must be tagged with a full commit SHA and already pushed (Codex P1 on 21ff80e: an UNSET tag failed the
+# deploy only after the accounts, secret and database were created; Codex and Cursor on 80d4820: `latest`, `v1` or an
+# older release must not pass). The shape rejects every non-SHA tag; it does not prove the SHA is on main.
+TAG_SHAPE='^[0-9a-f]{40}$'
 for image in "ccc-broker CCC_BROKER_TAG" "claude-code-cloud CCC_JOB_TAG"; do
   name="${image% *}"; var="${image#* }"; tag="${!var:-}"
   if [[ "$tag" =~ $TAG_SHAPE ]]; then
     expect PRESENT "image ${name}:${tag}" gcloud artifacts docker images describe "${REG}/${name}:${tag}"
   else
     echo "READ: image ${name}: no valid tag in ${var}"
-    PROBLEMS+=("image ${name} has no valid tag: set ${var} to the merged main SHA it was built from")
+    PROBLEMS+=("image ${name} has no full commit SHA tag: set ${var} to the 40-hex merged main SHA it was built from")
   fi
 done
 if [ "${#PROBLEMS[@]}" -gt 0 ]; then
@@ -129,7 +144,8 @@ step() {   # step <description> -- <command...>
   fi
 }
 
-# 1. Two service accounts, each with no project-level role.
+# 1. Two service accounts. Neither gets an unconditional project-level role; the broker's one project-policy binding
+#    is conditioned on a single database (step 3).
 step "service account for the agent job" -- \
   gcloud iam service-accounts create claude-code-cloud --project "$PROJECT" \
     --display-name "claude-code-cloud (Console agent job, Blackboard #306)"
@@ -172,18 +188,21 @@ step "only the agent job may call the broker" -- \
   gcloud run services add-iam-policy-binding ccc-broker --project "$PROJECT" --region "$REGION" \
     --member "serviceAccount:${JOB_SA}" --role roles/run.invoker
 
-# 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3).
+# 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3),
+#    which calls the broker at CCC_BROKER_URL with an ID token for that audience.
 step "create the claude-code-cloud job" -- \
   gcloud run jobs create claude-code-cloud --project "$PROJECT" --region "$REGION" \
     --image "${REG}/claude-code-cloud:${CCC_JOB_TAG:-UNSET}" --service-account "$JOB_SA" \
     --max-retries 0 --tasks 1 --task-timeout 600s --memory 1Gi --cpu 1 \
-    --set-env-vars CCC_STAGE=C1,CCC_MAX_TURNS=4,CCC_MAX_BUDGET_USD=0.50 \
+    --set-env-vars "CCC_STAGE=C1,CCC_MAX_TURNS=4,CCC_MAX_BUDGET_USD=0.50,CCC_BROKER_URL=${BROKER_URL},CCC_BROKER_AUDIENCE=${BROKER_URL}" \
     --set-secrets ANTHROPIC_API_KEY=ANTHROPIC_API_KEY_CLOUD:latest
 
-# 6. board-watcher (resolved in step 0) may start the new job.
-step "board-watcher (${WATCHER_SA}) may run the claude-code-cloud job" -- \
+# 6. board-watcher (resolved in step 0) may start the new job and pass each run its envelope. The envelope travels as
+#    a per-execution override, which needs run.jobs.runWithOverrides; run.invoker has only run.jobs.run (Codex P1 on
+#    80d4820). The role also holds run.executions.cancel, and is bound on this job alone.
+step "board-watcher (${WATCHER_SA}) may run the claude-code-cloud job with its envelope" -- \
   gcloud run jobs add-iam-policy-binding claude-code-cloud --project "$PROJECT" --region "$REGION" \
-    --member "serviceAccount:${WATCHER_SA}" --role roles/run.invoker
+    --member "serviceAccount:${WATCHER_SA}" --role roles/run.jobsExecutorWithOverrides
 
 echo "Not in this script, by design:"
 echo "  - the board-watcher claude-code-cloud route: a code PR, reviewed and released on its own;"

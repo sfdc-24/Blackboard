@@ -40,11 +40,25 @@ versions until C2 is recommended, and is the owner's call.
 | Resource | Settings |
 |---|---|
 | SA `claude-code-cloud@` | no project role; reads only `ANTHROPIC_API_KEY_CLOUD` |
-| SA `ccc-broker@` | no project role except `datastore.user`, conditioned on `resource.name == "projects/<project>/databases/ccc-receipts"`: that database only, by exact name, so neither `(default)` nor a look-alike such as `ccc-receipts-backup` is covered; reads `BUS_URL` and `BUS_SECRET` |
-| Firestore database `ccc-receipts` | northamerica-northeast2 (Toronto), native; separate from the `(default)` database that holds the chair's call checkpoints |
+| SA `ccc-broker@` | no unconditional project role. Its one project-policy binding is `datastore.user`, conditioned on `resource.name == "projects/<project>/databases/ccc-receipts"`: that database only, by exact name, so neither `(default)` nor a look-alike such as `ccc-receipts-backup` is covered. Reads `BUS_URL` and `BUS_SECRET` |
+| Firestore database `ccc-receipts` | northamerica-northeast2 (Toronto), native; separate from the `(default)` database that holds the chair's call checkpoints (see below: this differs from #306 rev 5) |
 | Cloud Run service `ccc-broker` | `--no-allow-unauthenticated`; only `claude-code-cloud@` holds `run.invoker`; C1 does `post_receipt` only |
-| Cloud Run job `claude-code-cloud` | `--max-retries 0`, 1 task, 600 s timeout, 1 GiB, 1 CPU; `CCC_MAX_TURNS=4`, `CCC_MAX_BUDGET_USD=0.50`; Console key from Secret Manager |
-| `run.invoker` on the job | for board-watcher's identity, read live before any change |
+| Cloud Run job `claude-code-cloud` | `--max-retries 0`, 1 task, 600 s timeout, 1 GiB, 1 CPU; `CCC_MAX_TURNS=4`, `CCC_MAX_BUDGET_USD=0.50`; Console key from Secret Manager; `CCC_BROKER_URL` and `CCC_BROKER_AUDIENCE`, both the broker's deterministic URL `https://ccc-broker-<project number>.<region>.run.app` |
+| `run.jobsExecutorWithOverrides` on the job | for board-watcher's identity, read live before any change. The envelope `{row_id, task}` reaches each run as a per-execution override, which needs `run.jobs.runWithOverrides`; `run.invoker` has only `run.jobs.run`. The role also holds `run.executions.cancel`. It is bound on this job alone |
+
+**Why the job is given the broker's URL.** Cloud Run does not inject another service's URL, and the job's account has
+no role that could look one up. `setup.sh` reads the project number before any change and derives the broker's
+deterministic URL from it; the job uses that URL as its ID-token audience too.
+
+**Receipts: a new database, not #306 rev 5's collection.** #306 rev 5 (owner gate 3) puts receipts in a `receipts`
+collection of the existing `(default)` database, which is already in northamerica-northeast2. This script creates a
+separate `ccc-receipts` database there instead, because a Firestore IAM condition can name a database but not a
+collection: in `(default)`, the broker's `datastore.user` would also cover the chair's call checkpoints. A database's
+location cannot be changed after it is created. So this is a spec change, and it needs both of these before any apply:
+- #306's next revision (the C2 revision) adopts the separate database;
+- the owner's C1 GO names it.
+
+Its price is not quoted here. It must be quoted from Google's Firestore pricing page before the owner's GO.
 
 **Not in `setup.sh`, by design:**
 - the board-watcher route, which is a reviewed code PR;
@@ -61,9 +75,12 @@ versions until C2 is recommended, and is the owner's call.
     `ccc-broker` service and the `claude-code-cloud` job.
   - Each secret it grants on must be PRESENT with an ENABLED latest version: `ANTHROPIC_API_KEY_CLOUD`, `BUS_URL`
     and `BUS_SECRET`. Only version metadata is read.
-  - Both images must be named by a valid tag and already pushed: `CCC_BROKER_TAG` and `CCC_JOB_TAG`, the merged
-    main SHA each was built from. An unset tag used to fail the deploy only after the accounts, secret and database
-    were created.
+  - Both images must be tagged with a full 40-hex commit SHA and already pushed: `CCC_BROKER_TAG` and
+    `CCC_JOB_TAG`, the merged main SHA each was built from. A tag such as `latest`, `v1`, a short SHA or an
+    uppercase one refuses. The script checks the shape only; that the SHA is on main is confirmed at Cursor's GO and
+    the owner's. An unset tag used to fail the deploy only after the accounts, secret and database were
+    created.
+  - The project number must resolve, because it names the broker's URL.
   - board-watcher's identity must resolve to a service account.
   - ABSENT means gcloud itself said not found. Any other failed read, such as a permission error, counts as unknown.
   - On anything else, `--apply` exits 3 with nothing changed. The dry run reports the same result.

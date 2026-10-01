@@ -31,6 +31,7 @@ case "$*" in
         case "$*" in
           "run jobs describe board-watcher"*) echo "${CCC_FAKE_WATCHER:-board-watcher@sfdc24.iam.gserviceaccount.com}" ;;
           "secrets versions describe"*) echo "${CCC_FAKE_STATE:-ENABLED}" ;;
+          "projects describe"*) echo "${CCC_FAKE_PROJECT_NUMBER-123456789012}" ;;
           *) echo "found" ;;
         esac
         exit 0
@@ -40,14 +41,16 @@ case "$*" in
 esac
 exit 0
 """
-TAG = "0123abc"
+TAG = "0123abc" * 5 + "01234"   # a full 40-hex commit SHA (Codex P1 on cbce156)
 REG = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/"
 IMAGES = ("images describe %sccc-broker:%s" % (REG, TAG), "images describe %sclaude-code-cloud:%s" % (REG, TAG))
 # Each bound secret, and its latest version (Copilot on 21ff80e: Cloud Run checks :latest at deploy time).
 SECRETS = tuple("secrets describe %s " % s for s in ("ANTHROPIC_API_KEY_CLOUD", "BUS_URL", "BUS_SECRET"))
 VERSIONS = tuple("versions describe latest --secret %s " % s for s in ("ANTHROPIC_API_KEY_CLOUD", "BUS_URL",
                                                                         "BUS_SECRET"))
-EXISTING = ";".join(SECRETS + VERSIONS + ("run jobs describe board-watcher",) + IMAGES)
+PROJECT_READ = "projects describe sfdc24 "
+EXISTING = ";".join(SECRETS + VERSIONS + ("run jobs describe board-watcher", PROJECT_READ) + IMAGES)
+BROKER_URL = "https://ccc-broker-123456789012.us-central1.run.app"
 NEW = ("iam service-accounts describe claude-code-cloud@", "iam service-accounts describe ccc-broker@",
        "firestore databases describe --database ccc-receipts", "run services describe ccc-broker",
        "run jobs describe claude-code-cloud")
@@ -83,12 +86,12 @@ class SetupScriptTest(unittest.TestCase):
         self.bindir = bindir
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
-                   job_tag=TAG, state=None):
+                   job_tag=TAG, state=None, project_number=None):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied)
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
-                  "CCC_BROKER_TAG", "CCC_JOB_TAG", "CCC_FAKE_STATE"):
+                  "CCC_BROKER_TAG", "CCC_JOB_TAG", "CCC_FAKE_STATE", "CCC_FAKE_PROJECT_NUMBER"):
             env.pop(k, None)
         if go:
             env["CCC_OWNER_GO"] = go
@@ -102,6 +105,8 @@ class SetupScriptTest(unittest.TestCase):
             env["CCC_FAKE_WATCHER"] = watcher
         if state is not None:
             env["CCC_FAKE_STATE"] = state
+        if project_number is not None:
+            env["CCC_FAKE_PROJECT_NUMBER"] = project_number
         out = subprocess.run(["bash", str(self.script), *args], capture_output=True, text=True, env=env)
         calls = log.read_text().splitlines() if log.exists() else []
         return out, calls
@@ -111,8 +116,9 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertIn("DRY RUN: nothing is changed", out.stdout)
         self.assertEqual([], mutating(calls), calls)
-        # 5 new resources, 3 secrets and their latest versions, the board-watcher identity, 2 images
-        self.assertEqual(14, len(calls), calls)
+        # 5 new resources, 3 secrets and their latest versions, the project number, the board-watcher identity,
+        # 2 images
+        self.assertEqual(15, len(calls), calls)
 
     def test_apply_refuses_without_both_gos_before_any_cloud_call(self):
         cases = {
@@ -141,11 +147,16 @@ class SetupScriptTest(unittest.TestCase):
                        "--location northamerica-northeast2", "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY_CLOUD:latest",
                        "--member serviceAccount:claude-code-cloud@sfdc24.iam.gserviceaccount.com --role "
                        "roles/run.invoker",
-                       "--member serviceAccount:board-watcher@sfdc24.iam.gserviceaccount.com --role roles/run.invoker",
+                       # Codex P1 on 80d4820: the envelope is a per-execution override
+                       "--member serviceAccount:board-watcher@sfdc24.iam.gserviceaccount.com --role "
+                       "roles/run.jobsExecutorWithOverrides",
+                       # Copilot on 80d4820: the job is told the broker's URL and audience
+                       "CCC_BROKER_URL=%s,CCC_BROKER_AUDIENCE=%s" % (BROKER_URL, BROKER_URL),
                        "--image %sccc-broker:%s " % (REG, TAG), "--image %sclaude-code-cloud:%s " % (REG, TAG)):
             self.assertIn(needed, plan)
         for forbidden in ("allUsers", "allAuthenticatedUsers", "roles/owner", "roles/editor", "startsWith", "UNSET",
-                          "secrets create",
+                          "secrets create", "<broker URL",
+                          "board-watcher@sfdc24.iam.gserviceaccount.com --role roles/run.invoker",
                           "roles/secretmanager.admin", " delete ", "remove-iam-policy-binding", "--condition=None"):
             self.assertNotIn(forbidden, plan)
         # The C2 App keys are named but not granted in C1.
@@ -179,6 +190,13 @@ class SetupScriptTest(unittest.TestCase):
         cases["job tag unset"] = dict(job_tag=None)
         cases["broker tag not a tag"] = dict(broker_tag="x y")
         cases["job tag not a tag"] = dict(job_tag="-rf")
+        # Codex P1 on cbce156 and Cursor on 80d4820: only a full lowercase commit SHA passes.
+        for bad in ("latest", "v1", "0123abc", TAG.upper(), TAG + "0", TAG[:-1]):
+            cases["broker tag %s" % bad] = dict(broker_tag=bad)
+            cases["job tag %s" % bad] = dict(job_tag=bad)
+        # Copilot on 80d4820: the broker URL comes from the project number.
+        cases["project number unread"] = dict(present=EXISTING.replace(PROJECT_READ, "x-absent-x"))
+        cases["project number not a number"] = dict(project_number="")
         for image in IMAGES:
             cases["%s not pushed" % image] = dict(present=EXISTING.replace(image, "x-absent-x"))
         for why, kw in cases.items():
