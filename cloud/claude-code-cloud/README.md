@@ -20,14 +20,21 @@ Synthetic probes only. The agent gets a fixed envelope, `{row_id, task: "probe-r
 and tests 1 to 9 and 11, have the details.
 
 ## Secret Manager names
-The owner puts in every value himself, in his own terminal. No agent or script handles one.
+The owner puts in every value himself, in his own terminal. `setup.sh` never handles a value. The one script that
+can is #309's C2 converter, `scripts/github_app_convert.py`, which the owner runs: it streams each App's private
+key from GitHub's one-time answer into Secret Manager on `gcloud`'s stdin, and never prints it or writes it to disk.
 
-| Secret | Holds | Read by (secret-level grant only) | Stage |
+| Secret | Holds | Reader this adds (secret-level grant only) | Stage |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY_CLOUD` (new; the owner creates it with its value before apply) | a Console API key from the dedicated workspace `fleet-claude-cloud`, with the owner's monthly spend limit | `claude-code-cloud@` | C1 |
 | `BUS_URL`, `BUS_SECRET` (existing) | board gateway access | `ccc-broker@`, newly added; the agent job never reads them | C1 |
 | `GITHUB_APP_READONLY_PRIVATE_KEY` (new) | private key of GitHub App **5148538** (read-only clone; installation **166845450**) | a separate clone identity, **never** `claude-code-cloud@`: any code in the job can mint a metadata token for the job's account, so "removed before the agent starts" is no boundary (Blackboard #309) | C2 |
-| `GITHUB_APP_BROKER_PRIVATE_KEY` (new) | private key of GitHub App **5148612** (broker writes; installation **166846692**) | `ccc-broker@` only | C2 |
+| `GITHUB_APP_BROKER_PRIVATE_KEY` (new) | private key of GitHub App **5148612** (broker writes; installation **166846692**) | `ccc-broker@` | C2 |
+
+**Added, not exclusive.** Each grant adds one reader. `setup.sh` neither reads nor removes any other binding,
+project-level ones included, and `BUS_URL` and `BUS_SECRET` already have readers among the fleet's other runtimes.
+So the table names the reader C1 adds, not the only one. Proving exclusivity is the least-privilege review's job,
+which is tracked privately.
 
 **The App secrets are already stored.** The owner created them at 11:46–11:48Z on 2026-10-01, using his own names: for
 each App, `GITHUB_APP_<READONLY|BROKER>_ID`, `_INSTALLATION_ID` and `_PRIVATE_KEY`. This table uses those exact names.

@@ -153,13 +153,15 @@ step "service account for the broker" -- \
   gcloud iam service-accounts create ccc-broker --project "$PROJECT" \
     --display-name "ccc-broker (board and GitHub writes for the agent, Blackboard #306)"
 
-# 2. Secrets: exactly one reader each (secret-level grants, never project-level). The owner creates each secret and
-#    its value in his own terminal before this runs (the preflight checks it); this script never handles a value.
-step "only the agent job reads the Console key" -- \
+# 2. Secrets: one ADDED reader each (secret-level grants, never project-level). This neither reads nor removes any
+#    other binding, so it cannot show the reader is the only one; BUS_URL and BUS_SECRET already have other readers.
+#    The owner creates each secret and its value in his own terminal before this runs (the preflight checks it);
+#    this script never handles a value.
+step "add the agent job as a reader of the Console key" -- \
   gcloud secrets add-iam-policy-binding ANTHROPIC_API_KEY_CLOUD --project "$PROJECT" \
     --member "serviceAccount:${JOB_SA}" --role roles/secretmanager.secretAccessor
 for s in BUS_URL BUS_SECRET; do
-  step "the broker reads ${s} (the agent job never does)" -- \
+  step "add the broker as a reader of ${s} (not granted to the agent job)" -- \
     gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
       --member "serviceAccount:${BROKER_SA}" --role roles/secretmanager.secretAccessor
 done
