@@ -18,7 +18,7 @@
 <body>
 <h1>Create the two GitHub Apps</h1>
 <p>Each button opens GitHub's "Register new GitHub App" page with the settings filled in. Check the permissions, then
-click <b>Create GitHub App</b>. GitHub then opens www.sfdc24.com with <code>?code=...</code> in the address bar. Copy
+click <b>Create GitHub App</b>. GitHub then sends the browser to <code>localhost:9/?code=...</code>. That page never loads, on purpose: browsers refuse port 9, so the one-time code never leaves this laptop and never reaches a website's logs. The code is in the address bar. Copy
 that code and run step 2 of <code>docs/github-apps/README.md</code> within one hour.</p>
 
 <form method="post" action="https://github.com/settings/apps/new?state=sfdc24-cloud-clone">
@@ -43,7 +43,7 @@ that code and run step 2 of <code>docs/github-apps/README.md</code> within one h
     "description": "Read-only clone for Blackboard #306, held by a clone identity separate from the agent job; the agent gets a checkout with no credential. Contents read only.",
     "public": false,
     "hook_attributes": {"url": "https://www.sfdc24.com/", "active": false},
-    "redirect_url": "https://www.sfdc24.com/",
+    "redirect_url": "http://localhost:9/",
     "default_permissions": {"contents": "read", "metadata": "read"},
     "default_events": []
   },
@@ -53,7 +53,7 @@ that code and run step 2 of <code>docs/github-apps/README.md</code> within one h
     "description": "ccc-broker's only GitHub write path (Blackboard #306): push an owned claude-code-cloud/<work_id> branch and open one PR. The broker has no merge, close or edit operation.",
     "public": false,
     "hook_attributes": {"url": "https://www.sfdc24.com/", "active": false},
-    "redirect_url": "https://www.sfdc24.com/",
+    "redirect_url": "http://localhost:9/",
     "default_permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
     "default_events": []
   }

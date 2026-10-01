@@ -88,7 +88,10 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
    - Open `docs/github-apps/create-apps.html` from this repo on your disk (double-click it).
    - Click **Create sfdc24-cloud-clone**. GitHub shows its "Register new GitHub App" page, filled in.
    - Check the permissions: Contents read and Metadata read, nothing else. Click **Create GitHub App for sfdc-24**.
-   - GitHub then opens `https://www.sfdc24.com/?code=...`. Copy the value after `code=` from the address bar.
+   - GitHub then sends the browser to `http://localhost:9/?code=...`. The page shows an error. That is on purpose:
+     browsers refuse port 9, so the one-time code never leaves this laptop and never reaches a website's logs, where
+     anyone watching could trade it for the key first (Codex on #309). Copy the value after `code=` from the
+     address bar.
 2. **Store its key, within one hour.** In this repo's folder, run:
 
        python scripts/github_app_convert.py sfdc24-cloud-clone

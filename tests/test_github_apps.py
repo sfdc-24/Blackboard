@@ -41,6 +41,9 @@ class ManifestTest(unittest.TestCase):
             self.assertFalse(m["public"], slug)                         # installable only by sfdc-24
             self.assertFalse(m["hook_attributes"]["active"], slug)      # no webhook receives anything
             self.assertEqual([], m["default_events"], slug)
+            # The one-time code rides on this redirect: it must stay on the laptop, never reach a public site's logs
+            # (Codex on #309). Browsers refuse port 9, so no request is even made.
+            self.assertEqual("http://localhost:9/", m["redirect_url"], slug)
 
     def test_the_owner_page_posts_the_same_manifests_to_the_personal_account_page(self):
         html = (APPS / "create-apps.html").read_text(encoding="utf-8")

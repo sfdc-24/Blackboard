@@ -7,7 +7,7 @@
     "url": "https://www.sfdc24.com/",
     "active": false
   },
-  "redirect_url": "https://www.sfdc24.com/",
+  "redirect_url": "http://localhost:9/",
   "default_permissions": {
     "contents": "write",
     "pull_requests": "write",
