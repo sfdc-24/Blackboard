@@ -85,7 +85,14 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
   - ABSENT means gcloud itself said not found. Any other failed read, such as a permission error, counts as unknown.
   - On anything else, `--apply` exits 3 with nothing changed. The dry run reports the same result.
 - **A partial apply is not resumed.** A rerun finds what the first run created and refuses. The owner reviews what
-  exists before anything more is created, so `gcloud run deploy` can never update a service that is already there.
+  exists before anything more is created, so `gcloud run deploy` never updates a service that the preflight saw.
+- **One race remains (Copilot on d3194c4).** `gcloud run deploy` creates or updates, and gcloud has no create-only
+  command for a service: `gcloud run services` offers `replace` and `update`, but no `create` (read from Cloud SDK
+  584). If someone created a `ccc-broker` service in the seconds between the preflight read and the deploy, the
+  deploy would update it.
+  - Every other step is create-only and fails on a collision: both service accounts, the database and the job.
+  - The script runs once, by the owner, under his GO, with no other writer expected. That bounds the race; it does
+    not remove it.
 - **Changes are additive.** Nothing is deleted and no existing runtime is modified. Two kinds of change touch
   existing resources:
   - one added reader on each of the three secrets;
