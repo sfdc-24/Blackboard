@@ -2,6 +2,7 @@
 permissions, the owner's click page carries the same manifests, and the converter never shows the private key or the
 one-time code. The converter's request goes to a fake GitHub inside the process: nothing leaves it."""
 import email.message
+import http.client
 import io
 import json
 import re
@@ -54,8 +55,9 @@ class FakeGitHub(urllib.request.BaseHandler):
     """Answers https requests inside the process, ahead of urllib's real HTTPS handler, and remembers each one."""
     handler_order = 10
 
-    def __init__(self, status=201, body=b"", location=None, error=None):
+    def __init__(self, status=201, body=b"", location=None, error=None, read_error=None):
         self.status, self.body, self.location, self.error, self.requests = status, body, location, error, []
+        self.read_error = read_error                                    # raised by response.read(), after the status
 
     def https_open(self, req):
         self.requests.append(req)
@@ -64,7 +66,12 @@ class FakeGitHub(urllib.request.BaseHandler):
         headers = email.message.Message()
         if self.location:
             headers["Location"] = self.location
-        response = urllib.response.addinfourl(io.BytesIO(self.body), headers, req.full_url, self.status)
+        body = io.BytesIO(self.body)
+        if self.read_error is not None:
+            def cut_off(*_):
+                raise self.read_error
+            body.read = cut_off
+        response = urllib.response.addinfourl(body, headers, req.full_url, self.status)
         response.msg = "fake"
         return response
 
@@ -188,6 +195,43 @@ class ConvertTest(unittest.TestCase):
             self.assertEqual([], run.calls, why)
             self.assert_no_secret_shown(out, run)
         self.assertIn("HTTP 404", self.run_main(["sfdc24-cloud-clone"], failures["HTTP 404"])[1])
+
+    def test_an_answer_cut_off_or_garbled_after_an_accepted_conversion_stops_safely(self):
+        # Copilot on a450a15: IncompleteRead is an http.client.HTTPException, not an OSError, and escaped main().
+        cases = {
+            "IncompleteRead": FakeGitHub(read_error=http.client.IncompleteRead(b'{"pem": "TESTKEYMATERIAL', 4096)),
+            "BadStatusLine": FakeGitHub(error=http.client.BadStatusLine("TESTKEYMATERIAL")),
+            "RemoteDisconnected": FakeGitHub(read_error=http.client.RemoteDisconnected("TESTKEYMATERIAL")),
+        }
+        for why, github in cases.items():
+            rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github)
+            self.assertEqual(1, rc, why)
+            self.assertIn("STOPPED: conversion got no complete answer from GitHub (%s)" % why, out)
+            self.assertIn("the code is spent and the key was never shown", out, why)
+            self.assertEqual([], run.calls, why)
+            self.assert_no_secret_shown(out, run)
+
+    def test_json_that_is_not_an_app_object_stops_safely(self):
+        # Copilot on a450a15: null or [] reached check() and raised AttributeError, past the STOPPED handling.
+        for body in (b"null", b"[]", b'"TESTKEYMATERIAL"', b"5", b"true", b"[" * 100000 + b"]" * 100000):
+            rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], FakeGitHub(body=body))
+            self.assertEqual(1, rc, body[:20])
+            self.assertIn("STOPPED:", out, body[:20])
+            self.assertIn("nothing stored", out, body[:20])
+            self.assertIn("the code is spent", out, body[:20])
+            self.assertEqual([], run.calls, body[:20])
+            self.assert_no_secret_shown(out, run)
+
+    def test_permissions_that_are_not_an_object_store_nothing(self):
+        # dict() of a string or a number raised ValueError or TypeError, past the STOPPED handling.
+        for perms in ("ab", "TESTKEYMATERIAL", 5, [["contents", "read"], ["metadata", "read"]], True):
+            bad = app("sfdc24-cloud-clone")
+            bad["permissions"] = perms
+            rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))
+            self.assertEqual(1, rc, perms)
+            self.assertIn("not an object: nothing stored", out, perms)
+            self.assertFalse(run.calls, perms)
+            self.assert_no_secret_shown(out, run)
 
     def test_a_different_owner_slug_or_wider_permissions_store_nothing(self):
         for bad in (app("sfdc24-cloud-clone", owner="someone-else"),       # Codex on 0928901: the wrong account

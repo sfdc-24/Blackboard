@@ -26,6 +26,7 @@ key).
 from __future__ import annotations
 
 import getpass
+import http.client
 import json
 import os
 import re
@@ -43,6 +44,9 @@ SECRET_FOR = {"sfdc24-cloud-clone": "GITHUB_APP_READONLY_PRIVATE_KEY", "sfdc24-c
 CODE = re.compile(r"^[0-9a-f]{20,64}$")
 CONVERSIONS = "https://api.github.com/app-manifests/%s/conversions"
 TIMEOUT = 30
+# Said whenever GitHub may have converted already: the one-time code is then spent and the key was shown only once.
+SPENT = ("If GitHub did convert, the code is spent and the key was never shown; generate a new private key on the "
+         "App's settings page")
 
 
 class Stop(Exception):
@@ -86,14 +90,19 @@ def convert(code: str, opener=None) -> dict:
         error.close()                                                   # its body is never read
         raise Stop("conversion failed (HTTP %d); the code may have expired (one hour) or been used: nothing stored"
                    % error.code) from None
-    except (urllib.error.URLError, OSError) as error:
-        raise Stop("conversion got no answer from GitHub (%s): nothing stored. If GitHub did convert, the code is "
-                   "spent and the key was never shown; generate a new private key on the App's settings page"
-                   % type(error).__name__) from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+        # HTTPException covers an answer cut off mid-body (IncompleteRead) or a garbled status line, which can follow
+        # an accepted conversion (Copilot on a450a15). Only the exception's type is said, never its text.
+        raise Stop("conversion got no complete answer from GitHub (%s): nothing stored. %s"
+                   % (type(error).__name__, SPENT)) from None
     try:
-        return json.loads(body)
-    except ValueError:
-        raise Stop("conversion answered with something that is not JSON: nothing stored") from None
+        app = json.loads(body)
+    except (ValueError, RecursionError):
+        raise Stop("conversion answered with something that is not JSON: nothing stored. %s" % SPENT) from None
+    if not isinstance(app, dict):                                       # null, [] or a bare value is not an App
+        raise Stop("conversion answered with JSON that is not an App (%s): nothing stored. %s"
+                   % (type(app).__name__, SPENT))
+    return app
 
 
 def check(app: dict, slug: str) -> None:
@@ -105,7 +114,9 @@ def check(app: dict, slug: str) -> None:
                    "again" % (owner.get("login"), OWNER, OWNER))
     if app.get("slug") != slug:
         raise Stop("the new App's slug is %r, not %r: nothing stored" % (app.get("slug"), slug))
-    want, got = expected(slug), dict(app.get("permissions") or {})
+    want, got = expected(slug), app.get("permissions")
+    if not isinstance(got, dict):
+        raise Stop("the new App's permissions are a %s, not an object: nothing stored" % type(got).__name__)
     if got != want:
         raise Stop("the new App's permissions %s are not the manifest's %s: nothing stored" % (got, want))
     if not str(app.get("pem") or "").startswith("-----BEGIN"):
