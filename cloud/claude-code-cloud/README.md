@@ -53,6 +53,9 @@ versions until C2 is recommended, and is the owner's call.
   - Each resource the script creates must be ABSENT: both service accounts, `ANTHROPIC_API_KEY_CLOUD`, the
     `ccc-receipts` database, the `ccc-broker` service and the `claude-code-cloud` job.
   - Each resource it grants on must be PRESENT: `BUS_URL` and `BUS_SECRET`.
+  - Both images must be named by a valid tag and already pushed: `CCC_BROKER_TAG` and `CCC_JOB_TAG`, the merged
+    main SHA each was built from. An unset tag used to fail the deploy only after the accounts, secret and database
+    were created.
   - board-watcher's identity must resolve to a service account.
   - ABSENT means gcloud itself said not found. Any other failed read, such as a permission error, counts as unknown.
   - On anything else, `--apply` exits 3 with nothing changed. The dry run reports the same result.

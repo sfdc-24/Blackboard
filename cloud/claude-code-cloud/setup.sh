@@ -2,7 +2,8 @@
 # Stage C1 infrastructure for the Console route (Blackboard #306): a DRAFT that prints every command by default.
 #
 #   bash cloud/claude-code-cloud/setup.sh            # DRY RUN: reads, prints the plan, changes nothing
-#   CCC_OWNER_GO=<board Row_ID> CCC_CURSOR_GO_SHA=<40-hex commit> bash cloud/claude-code-cloud/setup.sh --apply
+#   CCC_OWNER_GO=<board Row_ID> CCC_CURSOR_GO_SHA=<40-hex commit> \
+#     CCC_BROKER_TAG=<tag> CCC_JOB_TAG=<tag> bash cloud/claude-code-cloud/setup.sh --apply
 #
 # --apply refuses, before any cloud call, unless:
 #   - CCC_OWNER_GO names the owner's GO row for this stage (where he confirms Codex's AGREE on #306 and his Console
@@ -10,7 +11,8 @@
 #   - CCC_CURSOR_GO_SHA is the full commit Cursor gave an exact-head GO, it is this checkout's HEAD, and this script
 #     is unmodified from it (#306: an exact-head GO on every code PR before deployment).
 # Then every read runs before the first change (create-or-refuse): each resource this script creates must be ABSENT,
-# each one it grants on must be PRESENT, and board-watcher's identity must resolve. Anything else - present, missing,
+# each one it grants on must be PRESENT, both images must be tagged and pushed (CCC_BROKER_TAG, CCC_JOB_TAG: the
+# merged main SHA each was built from), and board-watcher's identity must resolve. Anything else - present, missing,
 # or a read that fails for another reason - refuses with nothing changed. So a rerun after a partial apply refuses
 # too: the owner looks at what exists before anything more is created. Nothing here deletes, and no existing runtime
 # is modified; the only change to existing resources is an added reader on BUS_URL and BUS_SECRET. C2 resources
@@ -88,6 +90,18 @@ else
   PROBLEMS+=("board-watcher's identity did not resolve (read: '${WATCHER_SA}')")
   WATCHER_SA="<board-watcher identity: unresolved>"
 fi
+# Both images must be named by a valid tag and already pushed (Codex P1 on 21ff80e: an UNSET tag failed the deploy
+# only after the accounts, secret and database were created).
+TAG_SHAPE='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+for image in "ccc-broker CCC_BROKER_TAG" "claude-code-cloud CCC_JOB_TAG"; do
+  name="${image% *}"; var="${image#* }"; tag="${!var:-}"
+  if [[ "$tag" =~ $TAG_SHAPE ]]; then
+    expect PRESENT "image ${name}:${tag}" gcloud artifacts docker images describe "${REG}/${name}:${tag}"
+  else
+    echo "READ: image ${name}: no valid tag in ${var}"
+    PROBLEMS+=("image ${name} has no valid tag: set ${var} to the merged main SHA it was built from")
+  fi
+done
 if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   for p in "${PROBLEMS[@]}"; do echo "PREFLIGHT: $p" >&2; done
   if [ "$APPLY" = 1 ]; then

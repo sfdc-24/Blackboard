@@ -39,7 +39,11 @@ case "$*" in
 esac
 exit 0
 """
-EXISTING = "secrets describe BUS_URL;secrets describe BUS_SECRET;run jobs describe board-watcher"
+TAG = "0123abc"
+REG = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/"
+IMAGES = ("images describe %sccc-broker:%s" % (REG, TAG), "images describe %sclaude-code-cloud:%s" % (REG, TAG))
+EXISTING = ";".join(("secrets describe BUS_URL", "secrets describe BUS_SECRET", "run jobs describe board-watcher")
+                    + IMAGES)
 NEW = ("iam service-accounts describe claude-code-cloud@", "iam service-accounts describe ccc-broker@",
        "secrets describe ANTHROPIC_API_KEY_CLOUD", "firestore databases describe --database ccc-receipts",
        "run services describe ccc-broker", "run jobs describe claude-code-cloud")
@@ -74,16 +78,22 @@ class SetupScriptTest(unittest.TestCase):
         fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         self.bindir = bindir
 
-    def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None):
+    def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
+                   job_tag=TAG):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied)
-        for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION"):
+        for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
+                  "CCC_BROKER_TAG", "CCC_JOB_TAG"):
             env.pop(k, None)
         if go:
             env["CCC_OWNER_GO"] = go
         if sha:
             env["CCC_CURSOR_GO_SHA"] = sha
+        if broker_tag is not None:
+            env["CCC_BROKER_TAG"] = broker_tag
+        if job_tag is not None:
+            env["CCC_JOB_TAG"] = job_tag
         if watcher is not None:
             env["CCC_FAKE_WATCHER"] = watcher
         out = subprocess.run(["bash", str(self.script), *args], capture_output=True, text=True, env=env)
@@ -95,7 +105,7 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertIn("DRY RUN: nothing is changed", out.stdout)
         self.assertEqual([], mutating(calls), calls)
-        self.assertEqual(9, len(calls), calls)               # 8 existence reads and the board-watcher identity
+        self.assertEqual(11, len(calls), calls)    # 8 existence reads, the board-watcher identity, 2 images
 
     def test_apply_refuses_without_both_gos_before_any_cloud_call(self):
         cases = {
@@ -124,9 +134,10 @@ class SetupScriptTest(unittest.TestCase):
                        "--location northamerica-northeast2", "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY_CLOUD:latest",
                        "--member serviceAccount:claude-code-cloud@sfdc24.iam.gserviceaccount.com --role "
                        "roles/run.invoker",
-                       "--member serviceAccount:board-watcher@sfdc24.iam.gserviceaccount.com --role roles/run.invoker"):
+                       "--member serviceAccount:board-watcher@sfdc24.iam.gserviceaccount.com --role roles/run.invoker",
+                       "--image %sccc-broker:%s " % (REG, TAG), "--image %sclaude-code-cloud:%s " % (REG, TAG)):
             self.assertIn(needed, plan)
-        for forbidden in ("allUsers", "allAuthenticatedUsers", "roles/owner", "roles/editor", "startsWith",
+        for forbidden in ("allUsers", "allAuthenticatedUsers", "roles/owner", "roles/editor", "startsWith", "UNSET",
                           "roles/secretmanager.admin", " delete ", "remove-iam-policy-binding", "--condition=None"):
             self.assertNotIn(forbidden, plan)
         # The C2 App keys are named but not granted in C1.
@@ -152,6 +163,13 @@ class SetupScriptTest(unittest.TestCase):
         cases["permission denied on a new resource"] = dict(denied="run services describe ccc-broker")
         cases["permission denied on board-watcher"] = dict(denied="run jobs describe board-watcher")
         cases["board-watcher identity not an SA"] = dict(watcher="<read live>")
+        # Codex P1 on 21ff80e: an unset tag failed the deploy only after the first creates.
+        cases["broker tag unset"] = dict(broker_tag=None)
+        cases["job tag unset"] = dict(job_tag=None)
+        cases["broker tag not a tag"] = dict(broker_tag="x y")
+        cases["job tag not a tag"] = dict(job_tag="-rf")
+        for image in IMAGES:
+            cases["%s not pushed" % image] = dict(present=EXISTING.replace(image, "x-absent-x"))
         for why, kw in cases.items():
             out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, **kw)
             self.assertEqual(3, out.returncode, "%s: %s" % (why, out.stderr))
