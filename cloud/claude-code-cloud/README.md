@@ -60,10 +60,12 @@ deterministic URL from it; the job uses that URL as its ID-token audience too.
 **Who can call the broker.** The service binding adds the job as an invoker. It does not make the job the only
 caller. Allow policies are inherited, so any project-, folder- or organization-level `run.invoker`, and owner or
 editor, also reaches the service, and a service policy cannot take that away. `setup.sh` neither audits nor removes
-inherited grants. So the broker image must refuse, before any write, every request whose verified ID token is not
-for its own audience and whose `email` is not `claude-code-cloud@<project>.iam.gserviceaccount.com`. That check
-belongs in the broker's code, which #306 specifies (Boundary 3) and a reviewed code PR builds. The owner's C1 GO
-needs it, with a test that a second identity holding `run.invoker` is refused.
+inherited grants. So, before any write, the broker image must accept a request only when its verified ID token has
+BOTH the broker's own audience AND the `email` `claude-code-cloud@<project>.iam.gserviceaccount.com`. It refuses
+the request if either one is wrong: an inherited invoker can mint a token for the right audience under its own
+email. That check belongs in the broker's code, which #306 specifies (Boundary 3) and a reviewed code PR builds.
+The owner's C1 GO needs it, with a test that a second identity holding `run.invoker`, and a token for the right
+audience, is refused.
 
 **Receipts: a new database, not #306 rev 5's collection.** #306 rev 5 (owner gate 3) puts receipts in a `receipts`
 collection of the existing `(default)` database, which is already in northamerica-northeast2. This script creates a
