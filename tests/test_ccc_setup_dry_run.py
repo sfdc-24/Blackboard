@@ -30,6 +30,7 @@ case "$*" in
       if [ -n "$p" ] && [[ "$*" == *"$p"* ]]; then
         case "$*" in
           "run jobs describe board-watcher"*) echo "${CCC_FAKE_WATCHER:-board-watcher@sfdc24.iam.gserviceaccount.com}" ;;
+          "secrets versions describe"*) echo "${CCC_FAKE_STATE:-ENABLED}" ;;
           *) echo "found" ;;
         esac
         exit 0
@@ -42,11 +43,14 @@ exit 0
 TAG = "0123abc"
 REG = "us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/"
 IMAGES = ("images describe %sccc-broker:%s" % (REG, TAG), "images describe %sclaude-code-cloud:%s" % (REG, TAG))
-EXISTING = ";".join(("secrets describe BUS_URL", "secrets describe BUS_SECRET", "run jobs describe board-watcher")
-                    + IMAGES)
+# Each bound secret, and its latest version (Copilot on 21ff80e: Cloud Run checks :latest at deploy time).
+SECRETS = tuple("secrets describe %s " % s for s in ("ANTHROPIC_API_KEY_CLOUD", "BUS_URL", "BUS_SECRET"))
+VERSIONS = tuple("versions describe latest --secret %s " % s for s in ("ANTHROPIC_API_KEY_CLOUD", "BUS_URL",
+                                                                        "BUS_SECRET"))
+EXISTING = ";".join(SECRETS + VERSIONS + ("run jobs describe board-watcher",) + IMAGES)
 NEW = ("iam service-accounts describe claude-code-cloud@", "iam service-accounts describe ccc-broker@",
-       "secrets describe ANTHROPIC_API_KEY_CLOUD", "firestore databases describe --database ccc-receipts",
-       "run services describe ccc-broker", "run jobs describe claude-code-cloud")
+       "firestore databases describe --database ccc-receipts", "run services describe ccc-broker",
+       "run jobs describe claude-code-cloud")
 CONDITION = 'expression=resource.name=="projects/sfdc24/databases/ccc-receipts"'
 
 
@@ -79,12 +83,12 @@ class SetupScriptTest(unittest.TestCase):
         self.bindir = bindir
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
-                   job_tag=TAG):
+                   job_tag=TAG, state=None):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied)
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
-                  "CCC_BROKER_TAG", "CCC_JOB_TAG"):
+                  "CCC_BROKER_TAG", "CCC_JOB_TAG", "CCC_FAKE_STATE"):
             env.pop(k, None)
         if go:
             env["CCC_OWNER_GO"] = go
@@ -96,6 +100,8 @@ class SetupScriptTest(unittest.TestCase):
             env["CCC_JOB_TAG"] = job_tag
         if watcher is not None:
             env["CCC_FAKE_WATCHER"] = watcher
+        if state is not None:
+            env["CCC_FAKE_STATE"] = state
         out = subprocess.run(["bash", str(self.script), *args], capture_output=True, text=True, env=env)
         calls = log.read_text().splitlines() if log.exists() else []
         return out, calls
@@ -105,7 +111,8 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertIn("DRY RUN: nothing is changed", out.stdout)
         self.assertEqual([], mutating(calls), calls)
-        self.assertEqual(11, len(calls), calls)    # 8 existence reads, the board-watcher identity, 2 images
+        # 5 new resources, 3 secrets and their latest versions, the board-watcher identity, 2 images
+        self.assertEqual(14, len(calls), calls)
 
     def test_apply_refuses_without_both_gos_before_any_cloud_call(self):
         cases = {
@@ -138,6 +145,7 @@ class SetupScriptTest(unittest.TestCase):
                        "--image %sccc-broker:%s " % (REG, TAG), "--image %sclaude-code-cloud:%s " % (REG, TAG)):
             self.assertIn(needed, plan)
         for forbidden in ("allUsers", "allAuthenticatedUsers", "roles/owner", "roles/editor", "startsWith", "UNSET",
+                          "secrets create",
                           "roles/secretmanager.admin", " delete ", "remove-iam-policy-binding", "--condition=None"):
             self.assertNotIn(forbidden, plan)
         # The C2 App keys are named but not granted in C1.
@@ -158,8 +166,11 @@ class SetupScriptTest(unittest.TestCase):
         cases = {}
         for new in NEW:
             cases["%s exists" % new] = dict(present=EXISTING + ";" + new)
-        for gone in ("secrets describe BUS_URL", "secrets describe BUS_SECRET", "run jobs describe board-watcher"):
+        # Copilot on 21ff80e: a bound secret with no enabled version failed the deploy after the first creates.
+        for gone in SECRETS + VERSIONS + ("run jobs describe board-watcher",):
             cases["%s missing" % gone] = dict(present=EXISTING.replace(gone, "x-absent-x"))
+        cases["latest versions disabled"] = dict(state="DISABLED")
+        cases["latest versions destroyed"] = dict(state="DESTROYED")
         cases["permission denied on a new resource"] = dict(denied="run services describe ccc-broker")
         cases["permission denied on board-watcher"] = dict(denied="run jobs describe board-watcher")
         cases["board-watcher identity not an SA"] = dict(watcher="<read live>")

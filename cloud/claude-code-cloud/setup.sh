@@ -10,12 +10,14 @@
 #     key, which this script cannot check);
 #   - CCC_CURSOR_GO_SHA is the full commit Cursor gave an exact-head GO, it is this checkout's HEAD, and this script
 #     is unmodified from it (#306: an exact-head GO on every code PR before deployment).
-# Then every read runs before the first change (create-or-refuse): each resource this script creates must be ABSENT,
-# each one it grants on must be PRESENT, both images must be tagged and pushed (CCC_BROKER_TAG, CCC_JOB_TAG: the
-# merged main SHA each was built from), and board-watcher's identity must resolve. Anything else - present, missing,
-# or a read that fails for another reason - refuses with nothing changed. So a rerun after a partial apply refuses
-# too: the owner looks at what exists before anything more is created. Nothing here deletes, and no existing runtime
-# is modified; the only change to existing resources is an added reader on BUS_URL and BUS_SECRET. C2 resources
+# Then every read runs before the first change (create-or-refuse): each resource this script creates must be ABSENT;
+# each secret it grants on (ANTHROPIC_API_KEY_CLOUD, which the owner creates with its value first, BUS_URL and
+# BUS_SECRET) must be PRESENT with an enabled latest version; both images must be tagged and pushed (CCC_BROKER_TAG,
+# CCC_JOB_TAG: the merged main SHA each was built from); and board-watcher's identity must resolve. Anything else -
+# present, missing, or a read that fails for another reason - refuses with nothing changed. So a rerun after a
+# partial apply refuses too: the owner looks at what exists before anything more is created. Nothing here deletes,
+# and no existing runtime is modified. Changes to existing resources: a reader added on each of the three secrets,
+# and one conditional binding (datastore.user, ccc-receipts only) added to the project's IAM policy. C2 resources
 # (the GitHub App keys' readers) are listed but NOT applied in C1.
 set -euo pipefail
 
@@ -74,9 +76,15 @@ expect() {  # expect <ABSENT|PRESENT> <what> <describe command...>
 }
 expect ABSENT "service account claude-code-cloud" gcloud iam service-accounts describe "$JOB_SA" --project "$PROJECT"
 expect ABSENT "service account ccc-broker" gcloud iam service-accounts describe "$BROKER_SA" --project "$PROJECT"
-expect ABSENT "secret ANTHROPIC_API_KEY_CLOUD" gcloud secrets describe ANTHROPIC_API_KEY_CLOUD --project "$PROJECT"
-expect PRESENT "secret BUS_URL" gcloud secrets describe BUS_URL --project "$PROJECT"
-expect PRESENT "secret BUS_SECRET" gcloud secrets describe BUS_SECRET --project "$PROJECT"
+# Each secret a runtime binds as :latest must already hold an enabled version: Cloud Run checks it at deploy time
+# (Copilot on 21ff80e). The owner creates ANTHROPIC_API_KEY_CLOUD with its value first; only the version's state is
+# read here, never a value.
+for s in ANTHROPIC_API_KEY_CLOUD BUS_URL BUS_SECRET; do
+  expect PRESENT "secret ${s}" gcloud secrets describe "$s" --project "$PROJECT"
+  version="$(gcloud secrets versions describe latest --secret "$s" --project "$PROJECT" --format='value(state)' 2>/dev/null || true)"
+  echo "READ: secret ${s} latest version: ${version:-none}"
+  [ "$version" = "ENABLED" ] || PROBLEMS+=("secret ${s} has no enabled latest version (read: '${version}')")
+done
 expect ABSENT "Firestore database ccc-receipts" gcloud firestore databases describe --database ccc-receipts --project "$PROJECT"
 expect ABSENT "Cloud Run service ccc-broker" gcloud run services describe ccc-broker --project "$PROJECT" --region "$REGION"
 expect ABSENT "Cloud Run job claude-code-cloud" gcloud run jobs describe claude-code-cloud --project "$PROJECT" --region "$REGION"
@@ -129,10 +137,8 @@ step "service account for the broker" -- \
   gcloud iam service-accounts create ccc-broker --project "$PROJECT" \
     --display-name "ccc-broker (board and GitHub writes for the agent, Blackboard #306)"
 
-# 2. Secrets: names, and exactly one reader each (secret-level grants, never project-level).
-#    The VALUES are put in by the owner in his own terminal; this script never handles one.
-step "Console API key secret (the owner adds its value: workspace fleet-claude-cloud, with a spend limit)" -- \
-  gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project "$PROJECT" --replication-policy automatic
+# 2. Secrets: exactly one reader each (secret-level grants, never project-level). The owner creates each secret and
+#    its value in his own terminal before this runs (the preflight checks it); this script never handles a value.
 step "only the agent job reads the Console key" -- \
   gcloud secrets add-iam-policy-binding ANTHROPIC_API_KEY_CLOUD --project "$PROJECT" \
     --member "serviceAccount:${JOB_SA}" --role roles/secretmanager.secretAccessor
@@ -141,7 +147,7 @@ for s in BUS_URL BUS_SECRET; do
     gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
       --member "serviceAccount:${BROKER_SA}" --role roles/secretmanager.secretAccessor
 done
-echo "C2 ONLY, not applied in C1: GITHUB_APP_READONLY_PRIVATE_KEY (App 5148538) -> ${JOB_SA}; GITHUB_APP_BROKER_PRIVATE_KEY (App 5148612) -> ${BROKER_SA}"
+echo "C2 ONLY, not applied in C1: GITHUB_APP_READONLY_PRIVATE_KEY (App 5148538) -> a separate clone identity, never ${JOB_SA} (Blackboard #309); GITHUB_APP_BROKER_PRIVATE_KEY (App 5148612) -> ${BROKER_SA}"
 
 # 3. Receipts: a SEPARATE named Firestore database in Toronto (owner's rule: Canadian regions first). The broker is
 #    granted that database alone, by an IAM condition on its exact name (Google's per-database form; a prefix would

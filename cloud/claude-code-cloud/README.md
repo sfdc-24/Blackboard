@@ -5,7 +5,14 @@ Stage C1 infrastructure, as drafts only. Nothing is created until all of these h
 - Codex gives AGREE on #306;
 - Cursor gives an exact-head GO on the commit that holds `setup.sh`, passed as `CCC_CURSOR_GO_SHA`. The script checks
   that it is the checkout's HEAD and that `setup.sh` is unmodified from it;
-- the owner gives his GO for C1, by a board row passed to `setup.sh --apply` as `CCC_OWNER_GO`.
+- the owner gives his GO for C1, by a board row passed to `setup.sh --apply` as `CCC_OWNER_GO`;
+- the owner has created `ANTHROPIC_API_KEY_CLOUD` with its value, in his own terminal:
+
+      gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project sfdc24 --replication-policy automatic --data-file=-
+
+  He pastes the key, then presses Ctrl-D, or Ctrl-Z and Enter on Windows. `setup.sh` reads only the version's state,
+  never the value. Cloud Run checks a `:latest` secret at deploy time, so an empty secret would fail the job create
+  partway through.
 
 ## What C1 is
 Synthetic probes only. The agent gets a fixed envelope, `{row_id, task: "probe-receipt"}`, and one tool,
@@ -17,9 +24,9 @@ The owner puts in every value himself, in his own terminal. No agent or script h
 
 | Secret | Holds | Read by (secret-level grant only) | Stage |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY_CLOUD` (new) | a Console API key from the dedicated workspace `fleet-claude-cloud`, with the owner's monthly spend limit | `claude-code-cloud@` | C1 |
+| `ANTHROPIC_API_KEY_CLOUD` (new; the owner creates it with its value before apply) | a Console API key from the dedicated workspace `fleet-claude-cloud`, with the owner's monthly spend limit | `claude-code-cloud@` | C1 |
 | `BUS_URL`, `BUS_SECRET` (existing) | board gateway access | `ccc-broker@`, newly added; the agent job never reads them | C1 |
-| `GITHUB_APP_READONLY_PRIVATE_KEY` (new) | private key of GitHub App **5148538** (read-only clone; installation **166845450**) | `claude-code-cloud@`, harness only, removed before the agent starts | C2 |
+| `GITHUB_APP_READONLY_PRIVATE_KEY` (new) | private key of GitHub App **5148538** (read-only clone; installation **166845450**) | a separate clone identity, **never** `claude-code-cloud@`: any code in the job can mint a metadata token for the job's account, so "removed before the agent starts" is no boundary (Blackboard #309) | C2 |
 | `GITHUB_APP_BROKER_PRIVATE_KEY` (new) | private key of GitHub App **5148612** (broker writes; installation **166846692**) | `ccc-broker@` only | C2 |
 
 **The App secrets are already stored.** The owner created them at 11:46–11:48Z on 2026-10-01, using his own names: for
@@ -50,9 +57,10 @@ versions until C2 is recommended, and is the owner's call.
 - **`--apply` refuses before any cloud call** without `CCC_OWNER_GO`, or without `CCC_CURSOR_GO_SHA` as the full
   40-hex commit that is HEAD and from which `setup.sh` is unmodified.
 - **Every read runs before the first change (create-or-refuse).**
-  - Each resource the script creates must be ABSENT: both service accounts, `ANTHROPIC_API_KEY_CLOUD`, the
-    `ccc-receipts` database, the `ccc-broker` service and the `claude-code-cloud` job.
-  - Each resource it grants on must be PRESENT: `BUS_URL` and `BUS_SECRET`.
+  - Each resource the script creates must be ABSENT: both service accounts, the `ccc-receipts` database, the
+    `ccc-broker` service and the `claude-code-cloud` job.
+  - Each secret it grants on must be PRESENT with an ENABLED latest version: `ANTHROPIC_API_KEY_CLOUD`, `BUS_URL`
+    and `BUS_SECRET`. Only version metadata is read.
   - Both images must be named by a valid tag and already pushed: `CCC_BROKER_TAG` and `CCC_JOB_TAG`, the merged
     main SHA each was built from. An unset tag used to fail the deploy only after the accounts, secret and database
     were created.
@@ -61,8 +69,11 @@ versions until C2 is recommended, and is the owner's call.
   - On anything else, `--apply` exits 3 with nothing changed. The dry run reports the same result.
 - **A partial apply is not resumed.** A rerun finds what the first run created and refuses. The owner reviews what
   exists before anything more is created, so `gcloud run deploy` can never update a service that is already there.
-- **Changes are additive.** Nothing is deleted and no existing runtime is modified. The only change to existing
-  resources is the broker's added reader on `BUS_URL` and `BUS_SECRET`.
+- **Changes are additive.** Nothing is deleted and no existing runtime is modified. Two kinds of change touch
+  existing resources:
+  - one added reader on each of the three secrets;
+  - one conditional binding added to the project's IAM policy: `datastore.user` for `ccc-broker@`, on the
+    `ccc-receipts` database only.
 - `tests/test_ccc_setup_dry_run.py` checks all of this offline with a fake gcloud: each gate, each collision, a
   missing input, permission errors, read order, and printed-equals-executed. The describe calls are removed by
   content, not position.
