@@ -60,7 +60,7 @@ for s in BUS_URL BUS_SECRET; do
     gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
       --member "serviceAccount:${BROKER_SA}" --role roles/secretmanager.secretAccessor
 done
-echo "C2 ONLY, not applied in C1: GH_APP_CLONE_KEY (App 5148538) -> ${JOB_SA}; GH_APP_BROKER_KEY (App 5148612) -> ${BROKER_SA}"
+echo "C2 ONLY, not applied in C1: GITHUB_APP_READONLY_PRIVATE_KEY (App 5148538) -> ${JOB_SA}; GITHUB_APP_BROKER_PRIVATE_KEY (App 5148612) -> ${BROKER_SA}"
 
 # 3. Receipts: a SEPARATE named Firestore database in Toronto (owner's rule: Canadian regions first). The broker is
 #    granted it alone, through an IAM condition on the database name, so it can never touch the (default) database

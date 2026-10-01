@@ -17,15 +17,15 @@ The owner puts in every value himself, in his own terminal. No agent or script h
 |---|---|---|---|
 | `ANTHROPIC_API_KEY_CLOUD` (new) | a Console API key from the dedicated workspace `fleet-claude-cloud`, with the owner's monthly spend limit | `claude-code-cloud@` | C1 |
 | `BUS_URL`, `BUS_SECRET` (existing) | board gateway access | `ccc-broker@`, newly added; the agent job never reads them | C1 |
-| `GH_APP_CLONE_KEY` (new) | private key of GitHub App **5148538** (read-only clone; installation **166845450**) | `claude-code-cloud@`, harness only, removed before the agent starts | C2 |
-| `GH_APP_BROKER_KEY` (new) | private key of GitHub App **5148612** (broker writes; installation **166846692**) | `ccc-broker@` only | C2 |
+| `GITHUB_APP_READONLY_PRIVATE_KEY` (new) | private key of GitHub App **5148538** (read-only clone; installation **166845450**) | `claude-code-cloud@`, harness only, removed before the agent starts | C2 |
+| `GITHUB_APP_BROKER_PRIVATE_KEY` (new) | private key of GitHub App **5148612** (broker writes; installation **166846692**) | `ccc-broker@` only | C2 |
 
-App and installation IDs are not secrets. They go in as plain environment variables at C2.
+**The App secrets are already stored.** The owner created them at 11:46–11:48Z on 2026-10-01, using his own names: for
+each App, `GITHUB_APP_<READONLY|BROKER>_ID`, `_INSTALLATION_ID` and `_PRIVATE_KEY`. This table uses those exact names.
+The IDs are not secrets, but stay where he put them.
 
-**To store a key, in his own terminal:**
-- `gcloud secrets create GH_APP_BROKER_KEY --project sfdc24 --data-file=<the downloaded .pem>`, then delete the
-  `.pem`.
-- Or use `scripts/github_app_convert.py` from #309, which takes a fresh manifest code.
+**Until C2,** no secret-level reader is granted on either `_PRIVATE_KEY`. Nothing in C1 uses them. Disabling their
+versions until C2 is recommended, and is the owner's call.
 
 ## The C1 resources (`setup.sh`)
 | Resource | Settings |

@@ -63,7 +63,7 @@ class SetupScriptTest(unittest.TestCase):
             self.assertNotIn(forbidden, plan)
         # The C2 App keys are named but not granted in C1.
         self.assertIn("C2 ONLY, not applied in C1", plan)
-        self.assertNotIn("add-iam-policy-binding GH_APP", plan)
+        self.assertNotIn("add-iam-policy-binding GITHUB_APP", plan)
 
     def test_apply_with_a_go_runs_the_same_commands_it_printed(self):
         dry, _ = self.run_script()
