@@ -124,13 +124,21 @@ class ConvertTest(unittest.TestCase):
         for args, _ in run.calls:
             self.assertNotIn(CODE, " ".join(args))                      # the code reaches no command line
 
-    def test_gcloud_not_on_path_falls_back_to_the_sdk_or_stops_storing_nothing(self):
+    def test_no_gcloud_anywhere_stops_before_anything_is_sent(self):
+        # The real lookup, on a host with no gcloud on PATH and no Cloud SDK (Copilot and Cursor on 148104b: this test
+        # used to depend on the machine it ran on, and still expected the old wording).
         conv.gcloud_cmd = self._gcloud
+        which, env = conv.shutil.which, dict(conv.os.environ)
+        conv.shutil.which = lambda name: None
+        conv.os.environ["LOCALAPPDATA"] = str(Path(__file__).resolve().parent / "no-such-sdk-here")
         try:
-            cmd = conv.gcloud_cmd()
-            self.assertTrue(cmd[0])                                     # found one way or the other
-        except conv.Stop as stop:
-            self.assertIn("nothing stored", str(stop))
+            with self.assertRaises(conv.Stop) as caught:
+                conv.gcloud_cmd()
+            self.assertIn("nothing sent, and the code is still unused", str(caught.exception))
+        finally:
+            conv.shutil.which = which
+            conv.os.environ.clear()
+            conv.os.environ.update(env)
 
     def test_a_gcloud_that_cannot_start_stops_without_storing(self):
         def missing(args, **_):
@@ -311,6 +319,8 @@ class ConvertTest(unittest.TestCase):
         self.assertFalse(run.calls)
 
     def test_bad_arguments_or_a_bad_code_send_nothing(self):
+        rc, out, _, _ = self.run_main(["sfdc24-cloud-clone"], github_with(app("sfdc24-cloud-clone")), code="nope")
+        self.assertIn("nothing sent, and the code is still unused", out)      # the wording the README tells him to match
         for argv, code in (([], CODE), (["other-app"], CODE), (["sfdc24-cloud-clone", "extra"], CODE),
                            (["sfdc24-cloud-clone"], "not-a-code"), (["sfdc24-cloud-clone"], ""),
                            (["sfdc24-cloud-clone"], "../" + CODE)):

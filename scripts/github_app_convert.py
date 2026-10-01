@@ -81,7 +81,7 @@ def read_code() -> str:
 
 def convert(code: str, opener=None) -> dict:
     if not CODE.match(code):                                            # the URL is built from a checked code only
-        raise Stop("that is not a manifest code: nothing stored")
+        raise Stop("that is not a manifest code: nothing sent, and the code is still unused")
     opener = opener or opener_for()
     request = urllib.request.Request(CONVERSIONS % code, data=b"", method="POST", headers={
         "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
@@ -168,7 +168,7 @@ def main(argv, run=subprocess.run, say=print, ask=read_code, opener=None) -> int
     slug = argv[0]
     code = (ask() or "").strip()
     if not CODE.match(code):
-        say("STOPPED: that is not a manifest code (the value after code= in the address bar): nothing sent")
+        say("STOPPED: that is not a manifest code (the value after code= in the address bar): nothing sent, and the code is still unused")
         return 2
     try:
         gcloud = gcloud_cmd()        # before the one-time code is spent: a missing gcloud must not cost the key
