@@ -105,6 +105,11 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
    - It puts the private key straight into Secret Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it.
      It prints only the App id and the install link.
 3. **Install the App:**
+   - **First, check two settings on the App's page** (github.com > Settings > Developer settings > GitHub Apps >
+     the App). The converter cannot see them, because GitHub's conversion answer carries neither (Copilot on #309):
+     - **Where can this GitHub App be installed?** must be **Only on this account**;
+     - **Webhook > Active** must be **unchecked**.
+     If either is wrong, delete the App and start again from step 1.
    - Open the install link it printed (`https://github.com/apps/sfdc24-cloud-clone/installations/new`).
    - Choose **Only select repositories**, pick **Blackboard** and **conference**, and click **Install**.
    - The page you land on ends in `/installations/<number>`. Send that number to Claude; it is not a secret.
@@ -135,6 +140,7 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
 ## After the clicks (Claude)
 - Grant `secretAccessor` on each key to its one service account, when #306's accounts exist.
 - Read back each App's installation (repositories and permissions) with a JWT minted from its key inside the
-  service. Post the receipt on the board.
+  service: `GET /app/installations` must list only the `sfdc-24` account, with Blackboard and conference only, and
+  `GET /app/hook/config` must show no webhook URL. Post the receipt on the board.
 - **Stage C2 does not start** until Codex's #306 review, the least-privilege service-account work (tracked
   privately), and the #306 test 12 negative controls have all passed.

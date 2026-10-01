@@ -93,8 +93,8 @@ class Recorder:
         return subprocess.CompletedProcess(args, self.gcloud_rc, "", "ERROR: " + (input or ""))
 
 
-def app(slug, perms=None, pem=PEM, owner="sfdc-24"):
-    return {"id": 123, "slug": slug, "permissions": perms or PLANNED[slug], "pem": pem,
+def app(slug, perms=None, pem=PEM, owner="sfdc-24", events=()):
+    return {"id": 123, "slug": slug, "permissions": perms or PLANNED[slug], "pem": pem, "events": list(events),
             "owner": {"login": owner, "type": "User"} if owner is not None else None,
             "webhook_secret": "WEBHOOKSECRET", "client_secret": "CLIENTSECRET"}
 
@@ -254,6 +254,20 @@ class ConvertTest(unittest.TestCase):
             rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))
             self.assertEqual(1, rc, bad["slug"])
             self.assertFalse(run.calls, "nothing stored")
+            self.assert_no_secret_shown(out, run)
+
+    def test_an_app_with_event_subscriptions_or_no_events_field_stores_nothing(self):
+        # Copilot on cecaa74: the registration page is editable, and the manifests subscribe to no events.
+        with_events = app("sfdc24-cloud-clone", events=["push", "TESTKEYMATERIAL"])
+        no_field = app("sfdc24-cloud-clone")
+        del no_field["events"]
+        not_a_list = app("sfdc24-cloud-clone")
+        not_a_list["events"] = "push"
+        for bad in (with_events, no_field, not_a_list):
+            rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))
+            self.assertEqual(1, rc)
+            self.assertEqual([], run.calls)
+            self.assertIn("subscribes to events; the manifest subscribes to none", out)
             self.assert_no_secret_shown(out, run)
 
     def test_a_refusal_never_echoes_a_response_value(self):
