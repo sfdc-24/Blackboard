@@ -92,6 +92,13 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
      browsers refuse port 9, so the one-time code never leaves this laptop and never reaches a website's logs, where
      anyone watching could trade it for the key first (Codex on #309). Copy the value after `code=` from the
      address bar.
+   - **Before you use the code, check two settings on the new App's page** (github.com > Settings > Developer
+     settings > GitHub Apps > the App > General). No API can show them, and GitHub's conversion answer carries neither
+     (Copilot and Cursor on #309):
+     - **Where can this GitHub App be installed?** must be **Only on this account**;
+     - **Webhook > Active** must be **unchecked**. The webhook URL itself stays filled in (`https://www.sfdc24.com/`,
+       from the manifest); that is expected.
+     If either is wrong, delete the App and start step 1 again. The code is still unused, and nothing is stored.
 2. **Store its key, within one hour.** In this repo's folder, run:
 
        python scripts/github_app_convert.py sfdc24-cloud-clone
@@ -100,16 +107,12 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
    - **Never put the code on the command line.** It is a one-time credential that can be traded for the App's
      private key, and a command line is kept in shell history and is visible in the process list. The converter
      refuses a code given that way and sends nothing.
-   - It checks that the new App belongs to `sfdc-24`, and its name and permissions against the manifest. An App
-     created while the browser was signed in as another account is refused before anything is stored.
+   - It checks that the new App belongs to `sfdc-24`, and its name, its permissions and its event subscriptions
+     (none) against the manifest. An App created while the browser was signed in as another account is refused before
+     anything is stored.
    - It puts the private key straight into Secret Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it.
      It prints only the App id and the install link.
 3. **Install the App:**
-   - **First, check two settings on the App's page** (github.com > Settings > Developer settings > GitHub Apps >
-     the App). The converter cannot see them, because GitHub's conversion answer carries neither (Copilot on #309):
-     - **Where can this GitHub App be installed?** must be **Only on this account**;
-     - **Webhook > Active** must be **unchecked**.
-     If either is wrong, delete the App and start again from step 1.
    - Open the install link it printed (`https://github.com/apps/sfdc24-cloud-clone/installations/new`).
    - Choose **Only select repositories**, pick **Blackboard** and **conference**, and click **Install**.
    - The page you land on ends in `/installations/<number>`. Send that number to Claude; it is not a secret.
@@ -122,7 +125,8 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
 - **The converter STOPPED:** what to do depends on the step that stopped.
   - **"nothing sent, and the code is still unused"** (a bad code, or no gcloud found): nothing left this laptop.
     Fix the cause and run the command again with the same code; it stays valid for up to an hour. Do not share it.
-  - **"nothing stored. The code is spent: delete this App ..."** (wrong account, slug, permissions or no key): GitHub
+  - **"nothing stored. The code is spent: delete this App ..."** (wrong account, slug, permissions, an event
+    subscription, or no key): GitHub
     converted the code, so it cannot be reused, and the key was discarded. Delete that App on GitHub and start again
     from step 1.
   - **"The code is spent and the key was discarded: generate a new private key ..."** (gcloud could not start after
@@ -139,8 +143,14 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
 
 ## After the clicks (Claude)
 - Grant `secretAccessor` on each key to its one service account, when #306's accounts exist.
-- Read back each App's installation (repositories and permissions) with a JWT minted from its key inside the
-  service: `GET /app/installations` must list only the `sfdc-24` account, with Blackboard and conference only, and
-  `GET /app/hook/config` must show no webhook URL. Post the receipt on the board.
+- Read back each App's installation with a JWT minted from its key inside the service:
+  - `GET /app/installations` must list exactly one installation, on the `sfdc-24` account, with
+    `repository_selection: selected` and the manifest's permissions.
+  - Then, with that installation's token, `GET /installation/repositories` must list exactly `Blackboard` and
+    `conference` and nothing else (Codex on #309). An extra repository is a failure, above all on the write-capable
+    broker.
+  - Public/private and Webhook > Active have no API read-back (Cursor on #309). They rest on the owner's check in
+    step 1, made before the code is used.
+  - Post the receipt on the board.
 - **Stage C2 does not start** until Codex's #306 review, the least-privilege service-account work (tracked
   privately), and the #306 test 12 negative controls have all passed.

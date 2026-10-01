@@ -125,8 +125,8 @@ def check(app: dict, slug: str) -> None:
         raise Stop("the new App's permissions are not exactly the manifest's %s" % json.dumps(want, sort_keys=True))
     # The registration page is editable before Create (Copilot on cecaa74). Of the manifest's security settings, the
     # conversion response carries only `events`: it has no public/private flag and no webhook-active flag (GitHub's
-    # documented response). So events are checked here, and the other two are checked by the owner on the App's
-    # settings page and read back by Claude after install (README, steps 3 and "After the clicks").
+    # documented response), and no API exposes either. So events are checked here, and the other two are checked
+    # by the owner on the App's settings page BEFORE the code is used (README, step 1).
     if app.get("events") != []:
         raise Stop("the new App subscribes to events; the manifest subscribes to none")
     if not str(app.get("pem") or "").startswith("-----BEGIN"):
