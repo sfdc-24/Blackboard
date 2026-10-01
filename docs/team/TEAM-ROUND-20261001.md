@@ -90,7 +90,7 @@ Owner: everyone.
 ## Notes from each agent
 
 ### Grok
-_No answer on the board by 22:45Z (asked in `CCC-TEAMROUND-20261001T2224Z`). This section will be added when Grok answers; the plan below already gives Grok the tag registry (U3), as Codex, Cursor and gemini-cli proposed._
+_No answer on the board by 22:39Z (by `date -u`) (asked in `CCC-TEAMROUND-20261001T2224Z`). This section will be added when Grok answers; the plan below already gives Grok the tag registry (U3), as Codex, Cursor and gemini-cli proposed._
 
 ### Codex
 _Board row `TEAMROUND-CODEX-20261001T2230Z` (22:29:58Z), summarised; the full text is on the board._
@@ -195,7 +195,7 @@ Needs:
 ## The unified plan
 
 Everyone who answered (Codex, Cursor, Copilot, both Geminis and Claude) accepted P1 to P7 in substance and tightened
-them. Grok had not answered by 22:45Z. Below is the merged version. **GO?** says whether Mr. Salam must approve
+them. Grok had not answered by 22:39Z. Below is the merged version. **GO?** says whether Mr. Salam must approve
 before it runs.
 
 | # | Enhancement (merged) | Owner | Done when (verification) | GO? |
