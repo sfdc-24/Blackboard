@@ -81,7 +81,8 @@ and with "Pull requests: write" it allows merging through the API. These stop it
 
 ## Click-path for Mr. Salam: about 10 minutes, once per App
 
-**Before you start:** be signed in to github.com as `sfdc-24`, with `gcloud` signed in on this laptop.
+**Before you start:** be signed in to github.com as `sfdc-24` in the browser, with `gcloud` signed in on this
+laptop. No `gh` login is needed: the converter calls GitHub itself.
 
 1. **Create the App:**
    - Open `docs/github-apps/create-apps.html` from this repo on your disk (double-click it).
@@ -90,10 +91,15 @@ and with "Pull requests: write" it allows merging through the API. These stop it
    - GitHub then opens `https://www.sfdc24.com/?code=...`. Copy the value after `code=` from the address bar.
 2. **Store its key, within one hour.** In this repo's folder, run:
 
-       python scripts/github_app_convert.py <the code> sfdc24-cloud-clone
+       python scripts/github_app_convert.py sfdc24-cloud-clone
 
-   It checks the new App's name and permissions against the manifest. It puts the private key straight into Secret
-   Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it. It prints only the App id and the install link.
+   Paste the code at its prompt and press Enter. The prompt does not show what you paste.
+   - **Never put the code on the command line.** It is a one-time credential that can be traded for the App's
+     private key, and a command line is kept in shell history and is visible in the process list. The converter
+     refuses a code given that way and sends nothing.
+   - It checks the new App's name and permissions against the manifest.
+   - It puts the private key straight into Secret Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it.
+     It prints only the App id and the install link.
 3. **Install the App:**
    - Open the install link it printed (`https://github.com/apps/sfdc24-cloud-clone/installations/new`).
    - Choose **Only select repositories**, pick **Blackboard** and **conference**, and click **Install**.
@@ -104,8 +110,14 @@ and with "Pull requests: write" it allows merging through the API. These stop it
 **If something goes wrong:**
 - **The code expired** (after one hour): open the App's settings page on GitHub, generate a new private key, and ask
   Claude for the one-line store command.
-- **The converter STOPPED:** it stored nothing. Nothing about the App needs undoing except deleting it on GitHub if
-  you want to start over.
+- **The converter STOPPED:** what to do depends on the step that stopped.
+  - **Any message saying "nothing stored"** came before the store step, so nothing was stored. Nothing about the App
+    needs undoing, except deleting it on GitHub if you want to start over. If the conversion never succeeded, the code
+    stays valid for up to an hour: do not share it.
+  - **A message naming `gcloud secrets create`** came from the store step itself. A failure there is not proof that
+    nothing was stored, because a lost answer can follow an accepted create. Before you retry or delete the App, run
+    the `gcloud secrets versions list` command it printed and see what is there. The converter never overwrites an
+    existing secret.
 - **To revoke at any time:** github.com > Settings > Applications > the App > Uninstall, and Developer settings >
   the App > Delete. Then delete the secret: `gcloud secrets delete GITHUB_APP_..._PRIVATE_KEY --project sfdc24`.
 
