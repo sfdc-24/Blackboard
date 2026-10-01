@@ -27,7 +27,7 @@ push, version, redeploy, or otherwise mutate Apps Script.
 | `apps-script/governor-page-api/` | `1lTbqTZ3DBHI2WyJu19Lf1M0a4J01aEuH45c2VcT6Rzxy0vxE2S8FYUEp` | The site/governor endpoint. The latest source read-back in this repo is immutable **v31**; see `CICD-GOVERNOR-V31.md`. Re-read the pinned production version before every release. |
 | `apps-script/blackboard-production/` | `1XBE2qVMiIu8xOq5jks4T3BG3o6CRFx8HKsWXvbXIJ6sOefPUBN-bVOh-` | The V2/Alpha gateway. |
 | `apps-script/glasses-intake-uploader/` | `1PBfO1sPQmGTXPHWrAAot2wCgSCPizO2uC8RUwUKQ5hn7A7dUq0U4_Q_2` | Already exposes `CONTRACT_VERSION` on GET — the model citizen. |
-| `apps-script/blackboard-bus-v1/` | `1meav8p2zkRt-8obarV_fB5Q2EyExCvAaoZa3ro9_fmo4OE_95FpWkfu9` | The v1 bus. Baselined 2026-09-04. Prod deployment `AKfycbwCLtG9…RcXrjQ` is pinned at **@1**. |
+| `apps-script/blackboard-bus-v1/` | `1meav8p2zkRt-8obarV_fB5Q2EyExCvAaoZa3ro9_fmo4OE_95FpWkfu9` | The v1 bus. Re-baselined 2026-10-01 from the live **@2** ("filtered read: limit, match, since"); HEAD is identical. The prod deployment `AKfycbwCLtG9…RcXrjQ` is pinned at **@2**. **Never trash this script:** a trashed web app keeps serving until Google's 30-day trash purge deletes it. That is how the board went down on 2026-10-01 from 20:15Z until an Admin Restore data at about 21:55Z. |
 
 ## Why the version assertion exists
 

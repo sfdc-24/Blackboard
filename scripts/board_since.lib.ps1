@@ -31,7 +31,7 @@ THE TWO DEFECTS THIS FILE EXISTS TO FIX
   3. A TIMESTAMP FALLBACK ON A BOARD THAT IS NOT SORTED BY TIMESTAMP. The
      anchor-loss recovery used to scan for the first row with `ts >= lastTs`,
      which silently assumes the board is in timestamp order. It is not:
-     `apps-script/blackboard-bus-v1/Code.gs:154-155` is
+     `apps-script/blackboard-bus-v1/Code.gs:160-161` is
 
          const row = body.sheetRow || [nowStamp_(), body.text || ''];
          sheet.appendRow(row);
