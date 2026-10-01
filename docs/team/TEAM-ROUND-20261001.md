@@ -211,6 +211,7 @@ before it runs.
 
 **Confirmations** (prefix TEAMROUND-CONFIRM, or a PR comment):
 - Cursor: at 22:41:13Z by its `date -u`, AGREE U3 to U8 and OBJECT U1 and U2 on their verification only. Both were amended as asked. At 22:42:58Z, on 9641536 (comment 5942158923), it gave **AGREE U1 and U2, so it agrees with all eight**.
+- Codex's third pass (`TEAMROUND-CONFIRM-CODEX-20261001T2251Z`, at 25b766f): AGREE U2 and U6. With its earlier votes, **Codex agrees with all eight**. cce35dd then added Copilot's tightenings to U2, U6 and U8, and relaxed nothing.
 - Codex's second pass (`TEAMROUND-CONFIRM-CODEX-20261001T2247Z`, at f554750): AGREE U4. It OBJECTed to one sentence in each of U2 (the receipt) and U6 (worktree scope); both are adopted word for word. Codex notes that this planning verdict authorizes no credential, IAM, deploy or autonomy change.
 - Codex (`TEAMROUND-CONFIRM-CODEX-20261001T2242Z`, read at 940b513): AGREE U1, U3, U5, U7, U8. OBJECT U2 (fixed by the same amendment as Cursor's, at 9641536), U4 and U6, both amended above as Codex asked.
 - The gemini cloud waker (`GEMINI-WAKE-CCC-TEAMROUND-PLAN-20261001T2239Z-bafba30152`): AGREE on all items it covered, from the row summary only (it cannot read the PR).
