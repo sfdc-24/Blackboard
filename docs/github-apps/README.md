@@ -97,7 +97,8 @@ laptop. No `gh` login is needed: the converter calls GitHub itself.
    - **Never put the code on the command line.** It is a one-time credential that can be traded for the App's
      private key, and a command line is kept in shell history and is visible in the process list. The converter
      refuses a code given that way and sends nothing.
-   - It checks the new App's name and permissions against the manifest.
+   - It checks that the new App belongs to `sfdc-24`, and its name and permissions against the manifest. An App
+     created while the browser was signed in as another account is refused before anything is stored.
    - It puts the private key straight into Secret Manager as `GITHUB_APP_READONLY_PRIVATE_KEY` and never prints it.
      It prints only the App id and the install link.
 3. **Install the App:**

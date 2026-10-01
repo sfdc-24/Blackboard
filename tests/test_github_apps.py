@@ -83,8 +83,9 @@ class Recorder:
         return subprocess.CompletedProcess(args, self.gcloud_rc, "", "ERROR: " + (input or ""))
 
 
-def app(slug, perms=None, pem=PEM):
+def app(slug, perms=None, pem=PEM, owner="sfdc-24"):
     return {"id": 123, "slug": slug, "permissions": perms or PLANNED[slug], "pem": pem,
+            "owner": {"login": owner, "type": "User"} if owner is not None else None,
             "webhook_secret": "WEBHOOKSECRET", "client_secret": "CLIENTSECRET"}
 
 
@@ -188,8 +189,11 @@ class ConvertTest(unittest.TestCase):
             self.assert_no_secret_shown(out, run)
         self.assertIn("HTTP 404", self.run_main(["sfdc24-cloud-clone"], failures["HTTP 404"])[1])
 
-    def test_a_different_slug_or_wider_permissions_store_nothing(self):
-        for bad in (app("someone-else", PLANNED["sfdc24-cloud-clone"]),
+    def test_a_different_owner_slug_or_wider_permissions_store_nothing(self):
+        for bad in (app("sfdc24-cloud-clone", owner="someone-else"),       # Codex on 0928901: the wrong account
+                    app("sfdc24-cloud-clone", owner=None),
+                    app("sfdc24-cloud-clone", owner="SFDC-24-other"),
+                    app("someone-else", PLANNED["sfdc24-cloud-clone"]),
                     app("sfdc24-cloud-clone", {"contents": "write", "metadata": "read"}),
                     app("sfdc24-cloud-clone", dict(PLANNED["sfdc24-cloud-clone"], administration="write"))):
             rc, out, run, _ = self.run_main(["sfdc24-cloud-clone"], github_with(bad))

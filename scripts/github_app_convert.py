@@ -13,7 +13,8 @@ What it does:
 1. POSTs /app-manifests/<code>/conversions to api.github.com itself, unauthenticated, as GitHub's manifest flow
    expects. No `gh` login is needed (Codex on #309), no child process sees the code, a redirect is refused rather than
    followed, and the request times out after 30 seconds. The response is held in memory only.
-2. Refuses unless the App's slug is the one named and its permissions are exactly the manifest's.
+2. Refuses unless the App belongs to sfdc-24, its slug is the one named, and its permissions are exactly the
+   manifest's.
 3. Writes the private key (pem) to a NEW Secret Manager secret through `gcloud`'s stdin. It never goes on disk, in
    argv, or to stdout.
 4. Prints only the App id, slug, permissions and the secret's name, then the install link.
@@ -36,6 +37,7 @@ import urllib.request
 from pathlib import Path
 
 PROJECT = "sfdc24"
+OWNER = "sfdc-24"                  # the account both Apps must belong to
 MANIFESTS = Path(__file__).resolve().parent.parent / "docs" / "github-apps"
 SECRET_FOR = {"sfdc24-cloud-clone": "GITHUB_APP_READONLY_PRIVATE_KEY", "sfdc24-ccc-broker": "GITHUB_APP_BROKER_PRIVATE_KEY"}
 CODE = re.compile(r"^[0-9a-f]{20,64}$")
@@ -95,6 +97,12 @@ def convert(code: str, opener=None) -> dict:
 
 
 def check(app: dict, slug: str) -> None:
+    # Codex on 0928901: a browser signed in as another user creates the App under that user, with the same slug and
+    # permissions. Its key must not take the sfdc-24 secret name.
+    owner = app.get("owner") if isinstance(app.get("owner"), dict) else {}
+    if owner.get("login") != OWNER:
+        raise Stop("the new App belongs to %r, not %s: nothing stored. Delete it on GitHub, sign in as %s and start "
+                   "again" % (owner.get("login"), OWNER, OWNER))
     if app.get("slug") != slug:
         raise Stop("the new App's slug is %r, not %r: nothing stored" % (app.get("slug"), slug))
     want, got = expected(slug), dict(app.get("permissions") or {})
