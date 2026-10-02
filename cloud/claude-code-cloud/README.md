@@ -6,12 +6,14 @@ Stage C1 infrastructure, as drafts only. Nothing is created until all of these h
 - Cursor gives an exact-head GO on the commit that holds `setup.sh`, passed as `CCC_CURSOR_GO_SHA`. The script checks
   that it is the checkout's HEAD and that `setup.sh` is unmodified from it;
 - the owner gives his GO for C1, by a board row passed to `setup.sh --apply` as `CCC_OWNER_GO`;
-- the owner has created `ANTHROPIC_API_KEY_CLOUD` with its value, in his own terminal:
+- the owner has created `ANTHROPIC_API_KEY_CLOUD` with its value, in his own Git Bash terminal, at a prompt that does
+  not show what he pastes:
 
-      gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project sfdc24 --replication-policy automatic --data-file=-
+      read -rs -p "Paste the Console API key (it is not shown), then press Enter: " K && printf '%s' "$K" | gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project sfdc24 --replication-policy automatic --data-file=- ; unset K
 
-  He pastes the key, then presses Ctrl-D, or Ctrl-Z and Enter on Windows. `setup.sh` reads only the version's state,
-  never the value. Cloud Run checks a `:latest` secret at deploy time, so an empty secret would fail the job create
+  The key never appears on screen or in scrollback (Copilot on de83893). It never goes on a command line, so it is
+  not in shell history or the process list. It reaches gcloud only on stdin, without a trailing newline. `setup.sh`
+  reads only the version's state, never the value. Cloud Run checks a `:latest` secret at deploy time, so an empty secret would fail the job create
   partway through.
 
 ## What C1 is
