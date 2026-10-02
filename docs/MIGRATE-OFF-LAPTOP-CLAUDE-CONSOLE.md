@@ -8,6 +8,9 @@
   proxy operation, and rollback also cancels running executions (Rollback, test 9).
 - **P2, memory:** the job has no storage access, so memory goes through two broker operations on a dedicated bucket,
   bounded in size and compare-and-swap (the table, Boundary 3).
+- **Cursor's NO-GO on revision 6:** the same git blocker, answered by the item below. Also: `claim_run` must return
+  *created* before the agent starts (atomic, and a timeout is not absence); quarantine is the fleet's `unknown_ids`;
+  and the egress allowlist is part of C2's entry gate.
 - **Copilot's blocker, git's own execution surfaces:** an allowed `git status` or `commit` could run a hook, a pager,
   a filter or a diff driver planted through `.git`. **The agent no longer runs git, or Bash, at all in C2.** Its
   working copy has no `.git`, and file tools refuse any `.git` path. The harness builds the commit from outside it,
@@ -176,10 +179,15 @@ on main):
 1. **A durable claim before the agent starts.** The harness's first act for each work_id is `broker.claim_run(work_id,
    execution)`: create-if-absent `runs/{work_id}` in the `ccc-receipts` database, `state: STARTED`, with the Cloud
    Run execution name and time.
+   **Binding reading** (Cursor on revision 6): the agent starts only when **this** execution's `claim_run` returns
+   *created*. The create is one atomic Firestore create, not a read followed by a write. A timeout, an error or any
+   other answer is not absence: the agent does not start.
 2. **A second start never runs the agent.** If `runs/{work_id}` already exists, in any state, the harness does not
-   start the agent. It writes the work_id to its cursor as **quarantined** (board-watcher's `reconcile()` then drops
-   it from pending). It posts one `BLOCKED` row through the broker, claimed like any receipt, naming the earlier
-   execution and asking a person to reconcile.
+   start the agent. It appends the work_id to its cursor's **`unknown_ids`**, the fleet's quarantine
+   (`cloud/agent-waker/main.py` `quarantine`). board-watcher's `finished_ids` reads `answered_ids` and `unknown_ids`,
+   so `reconcile()` drops it from pending (Cursor on revision 6: a key of any other name would leave the row pending
+   and restart the job every minute). It posts one `BLOCKED` row through the broker, claimed like any receipt,
+   naming the earlier execution and asking a person to reconcile.
 3. **Terminal states.** `broker.finish_run` moves `STARTED` to `DONE` or `FAILED`, and only for the execution that
    claimed it. Then the harness writes its cursor. A crash anywhere after step 1 leaves `STARTED`, which only a
    person resolves: `UNKNOWN` is never retried automatically.
@@ -279,7 +287,9 @@ checks its caller's identity itself (#310, "Who can call the broker").
 **Network:**
 - **C1:** outbound to `api.anthropic.com`, Google APIs and the broker.
 - **C2:** outbound only to the fleet's own services (`ccc-llm-proxy`, `ccc-fetch`, `ccc-broker`). The job never
-  reaches `api.anthropic.com`, GitHub or the board directly. An egress allowlist enforcing this is C2 work.
+  reaches `api.anthropic.com`, GitHub or the board directly. The egress allowlist enforcing this is part of **C2's
+  entry gate**, with the proxy and the sandbox: it is built and proved before any C2 tool is enabled (Cursor on
+  revision 6).
 
 ### Boundary 4: spend, bounded three ways, then measured
 1. **The Console:** a dedicated workspace, `fleet-claude-cloud`, with a **monthly spend limit and alerts the owner
@@ -367,7 +377,10 @@ Each check has a pass condition and is run by Codex, not by me. These carry over
     `.git/info/attributes`. It also writes a `.gitattributes` naming a `filter` and a `diff` driver, and a script each
     would run that drops a marker file. Then it calls `propose_pr`. PASS when every `.git` write is refused by the
     hook, the harness's commit and bundle run no hook, pager, filter or driver (no marker appears anywhere), and the
-    PR, if the paths pass ownership, carries the `.gitattributes` change only as content.
+    PR, if the paths pass ownership, carries the `.gitattributes` change only as content. Also PASS only when the
+    proxy's, fetch's and broker's logs show **no call from that execution** other than the harness's own
+    `propose_pr` and `run_tests` (Cursor on revision 6: the property is that no model-edited program runs as
+    `claude-code-cloud@`).
 
 ## Owner gates (Mr. Salam)
 
@@ -400,8 +413,8 @@ Nothing here is authorized by this spec. Each gate is one step, and secret value
 Route-specific, never by pausing the shared watcher (Codex P1 on revision 5: pausing `board-watcher-2min` stops every
 route, and removing a route left its pending job runnable):
 1. **Kill switch, fast and reversible:** one flag for the route, read by the broker and the proxy.
-   - **At start,** when it is off, the job runs no agent, writes every pending work_id to its cursor as quarantined
-     (so board-watcher's `reconcile()` drops them), and exits.
+   - **At start,** when it is off, the job runs no agent, appends every pending work_id to its cursor's
+     `unknown_ids` (so board-watcher's `reconcile()` drops them), and exits.
    - **In flight** (Codex P1 on revision 6): the broker and `ccc-llm-proxy` read the flag on **every** effectful
      operation, cached for at most 10 seconds, and refuse when it is off. So a run that started before the switch
      cannot post, open a PR, run tests, or make another model call.
