@@ -33,24 +33,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 APPLY=0
 PRINT_FROM=1
-if [ "${1:-}" = "--print-from" ]; then
-  # After a failed apply: print step N and every step after it, in order, and change nothing (Codex P1 and Copilot on
-  # 5a98651). The owner checks the failed resource first, then runs these by hand.
-  if ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then echo "usage: setup.sh --print-from <step number>" >&2; exit 2; fi
-  # The printed commands are only right with the same inputs as the apply: a bare --print-from would print :UNSET
-  # images and the default project (Codex P1 on 27e1f5a). failed_at prints the full line to run.
-  if ! [[ "${CCC_BROKER_TAG:-}" =~ ^[0-9a-f]{40}$ && "${CCC_JOB_TAG:-}" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "REFUSED: --print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG (and CCC_PROJECT, CCC_REGION if set) as the apply; use the exact line the failed apply printed." >&2
-    exit 2
-  fi
-  PRINT_FROM="$2"
-elif [ "${1:-}" = "--apply" ]; then
+require_reviewed() {   # require_reviewed <mode>: the owner's GO, Cursor's exact-head GO, and this script unedited
   if [ -z "${CCC_OWNER_GO:-}" ]; then
-    echo "REFUSED: --apply needs CCC_OWNER_GO=<the owner's GO Row_ID for Stage C1>; nothing was changed." >&2
+    echo "REFUSED: $1 needs CCC_OWNER_GO=<the owner's GO Row_ID for Stage C1>; nothing was changed." >&2
     exit 2
   fi
   if ! [[ "${CCC_CURSOR_GO_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "REFUSED: --apply needs CCC_CURSOR_GO_SHA=<the full commit Cursor gave GO>; nothing was changed." >&2
+    echo "REFUSED: $1 needs CCC_CURSOR_GO_SHA=<the full commit Cursor gave GO>; nothing was changed." >&2
     exit 2
   fi
   HEAD_SHA="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || true)"
@@ -62,6 +51,22 @@ elif [ "${1:-}" = "--apply" ]; then
     echo "REFUSED: setup.sh differs from ${CCC_CURSOR_GO_SHA}, the commit Cursor reviewed; nothing was changed." >&2
     exit 2
   fi
+}
+if [ "${1:-}" = "--print-from" ]; then
+  # After a failed apply: print step N and every step after it, in order, and change nothing (Codex P1 and Copilot on
+  # 5a98651). The owner checks the failed resource first, then runs these by hand.
+  if ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then echo "usage: setup.sh --print-from <step number>" >&2; exit 2; fi
+  # The printed commands are only right with the same inputs as the apply: a bare --print-from would print :UNSET
+  # images and the default project (Codex P1 on 27e1f5a). failed_at prints the full line to run.
+  if ! [[ "${CCC_BROKER_TAG:-}" =~ ^[0-9a-f]{40}$ && "${CCC_JOB_TAG:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSED: --print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG (and CCC_PROJECT, CCC_REGION if set) as the apply; use the exact line the failed apply printed." >&2
+    exit 2
+  fi
+  # The continuation is part of the apply: it prints only from the reviewed, unedited script (Copilot on c439e16).
+  require_reviewed --print-from
+  PRINT_FROM="$2"
+elif [ "${1:-}" = "--apply" ]; then
+  require_reviewed --apply
   APPLY=1
 elif [ -n "${1:-}" ]; then
   echo "usage: setup.sh [--apply | --print-from <step>]" >&2
@@ -154,8 +159,9 @@ quoted() {   # the argv, shell-quoted, so a printed command runs exactly as writ
   printf '%s' "${out% }"
 }
 recovery_line() {   # recovery_line <first step>: the --print-from command, with every input the apply was given
-  printf 'CCC_PROJECT=%s CCC_REGION=%s CCC_BROKER_TAG=%s CCC_JOB_TAG=%s bash cloud/claude-code-cloud/setup.sh --print-from %s' \
-    "$(quoted "$PROJECT")" "$(quoted "$REGION")" "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
+  printf 'CCC_OWNER_GO=%s CCC_CURSOR_GO_SHA=%s CCC_PROJECT=%s CCC_REGION=%s CCC_BROKER_TAG=%s CCC_JOB_TAG=%s bash cloud/claude-code-cloud/setup.sh --print-from %s' \
+    "$(quoted "${CCC_OWNER_GO:-}")" "$(quoted "${CCC_CURSOR_GO_SHA:-}")" "$(quoted "$PROJECT")" "$(quoted "$REGION")" \
+    "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
 }
 CUR_DEPLOY=0
 CUR_PROBE=()
@@ -200,7 +206,7 @@ step() {   # step <description> <how to check it> -- <command...>   (runs once; 
 # partial deployment (Copilot on 5a98651). Bindings are idempotent. Nothing else is retried.
 IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
 [[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
-IAM_PENDING='PERMISSION_DENIED|[Pp]ermission .* denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
+IAM_PENDING='PERMISSION_DENIED|[Pp]ermission( .*)? denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
 step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how to check it> -- <command...>
   # --create / --deploy: the check is a describe of what the command creates. A permission error does not prove
   # nothing was created (a failed deploy can leave the service), so just before any retry, AFTER the wait, it is

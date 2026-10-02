@@ -266,7 +266,7 @@ class SetupScriptTest(unittest.TestCase):
         numbered = [l for l in dry.stdout.splitlines() if l.startswith("DRY RUN: [")]
         self.assertGreaterEqual(len(numbered), 10)
         k = 7
-        tail, calls = self.run_script("--print-from", str(k))
+        tail, calls = self.run_script("--print-from", str(k), go="OWNER-GO-TEST", sha=self.head)
         self.assertEqual(0, tail.returncode, tail.stderr)
         printed = [l.strip() for l in tail.stdout.splitlines() if l.strip().startswith("gcloud ")]
         self.assertEqual(everything[k - 1:], printed)                   # step k and every step after it, in order
@@ -321,12 +321,29 @@ class SetupScriptTest(unittest.TestCase):
         out, _ = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:9",
                                  flaky_err="INTERNAL: reset")
         line = [l.strip() for l in out.stderr.splitlines() if "--print-from" in l and "bash" in l][0]
-        for part in ("CCC_PROJECT=sfdc24", "CCC_REGION=us-central1", "CCC_BROKER_TAG=" + TAG, "CCC_JOB_TAG=" + TAG):
+        for part in ("CCC_OWNER_GO=OWNER-GO-TEST", "CCC_CURSOR_GO_SHA=" + self.head, "CCC_PROJECT=sfdc24",
+                     "CCC_REGION=us-central1", "CCC_BROKER_TAG=" + TAG, "CCC_JOB_TAG=" + TAG):
             self.assertIn(part, line)
         bare, calls = self.run_script("--print-from", "3", broker_tag=None, job_tag=None)
         self.assertEqual(2, bare.returncode)
         self.assertIn("--print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG", bare.stderr)
         self.assertEqual([], mutating(calls))
+
+    def test_print_from_has_the_same_gate_as_apply(self):
+        # Copilot BLOCKER on c439e16: the continuation must come from the reviewed, unedited script.
+        for kw in ({}, {"go": "OWNER-GO-TEST"}, {"sha": self.head}, {"go": "OWNER-GO-TEST", "sha": "f" * 40}):
+            out, calls = self.run_script("--print-from", "5", **kw)
+            self.assertEqual(2, out.returncode, kw)
+            self.assertIn("REFUSED", out.stderr, kw)
+            self.assertEqual([], calls, kw)                              # refused before any cloud call, reads included
+
+    def test_cloud_runs_plain_permission_denied_on_a_secret_is_retried(self):
+        # Codex P2 on c439e16: Cloud Run's own wording has no PERMISSION_DENIED code.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:1",
+                                     flaky_err="Permission denied on secret: projects/123/secrets/BUS_URL/versions/latest "
+                                               "for Revision service account ccc-broker@sfdc24.iam.gserviceaccount.com.")
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual(2, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
 
     def test_printed_commands_are_shell_quoted_and_round_trip(self):
         # Codex P1 and Copilot on 27e1f5a: $* lost the argument boundaries, and "(" broke a pasted command.

@@ -9,12 +9,12 @@ Stage C1 infrastructure, as drafts only. Nothing is created until all of these h
 - the owner has created `ANTHROPIC_API_KEY_CLOUD` with its value, in his own Git Bash terminal, at a prompt that does
   not show what he pastes:
 
-      read -rs -p "Paste the Console API key (it is not shown), then press Enter: " K && printf '%s' "$K" | gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project sfdc24 --replication-policy automatic --data-file=- ; unset K
+      read -rs -p "Paste the Console API key (it is not shown), then press Enter: " K; echo; if [ -n "$K" ]; then printf '%s' "$K" | gcloud secrets create ANTHROPIC_API_KEY_CLOUD --project sfdc24 --replication-policy automatic --data-file=-; else echo "Nothing was pasted: nothing stored."; fi; unset K
 
   The key never appears on screen or in scrollback (Copilot on de83893). It never goes on a command line, so it is
-  not in shell history or the process list. It reaches gcloud only on stdin, without a trailing newline. `setup.sh`
-  reads only the version's state, never the value. Cloud Run checks a `:latest` secret at deploy time, so an empty secret would fail the job create
-  partway through.
+  not in shell history or the process list. It reaches gcloud only on stdin, without a trailing newline. An empty
+  paste stores nothing (Copilot on c439e16). Nothing else would catch it: `setup.sh` reads only the version's state,
+  never the value, and Cloud Run does not check that a key works.
 
 ## What C1 is
 Synthetic probes only. The agent gets a fixed envelope, `{row_id, task: "probe-receipt"}`, and one tool,
@@ -123,8 +123,9 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     for a person to look (Codex on 708b0a2). Any other failure stops at once, because a lost answer may have
     followed a real change (Copilot and Codex on b6fa11e and 5a98651).
   - Every step is numbered. A failed apply says which step stopped and how to check that resource, and prints
-    the exact recovery line, with the same `CCC_PROJECT`, `CCC_REGION`, `CCC_BROKER_TAG` and `CCC_JOB_TAG` as the
-    apply, ending in `--print-from <N>`. That prints step N and every step after it, in order, **shell-quoted** so
+    the exact recovery line, with the same `CCC_OWNER_GO`, `CCC_CURSOR_GO_SHA`, `CCC_PROJECT`, `CCC_REGION`,
+    `CCC_BROKER_TAG` and `CCC_JOB_TAG` as the apply, ending in `--print-from <N>`. `--print-from` passes the same
+    gate as `--apply` (the owner's GO, Cursor's exact head, an unedited script) before it prints anything. That prints step N and every step after it, in order, **shell-quoted** so
     each can be pasted as written, and changes nothing. `--print-from` refuses to run without both image tags.
     Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. The
     **broker deploy is the exception**: on any failure the apply points back to the deploy itself, because a service
