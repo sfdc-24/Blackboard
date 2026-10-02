@@ -116,10 +116,15 @@ SHA_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
 # "BLOCKER - READ-NOT-DEMONSTRATED", "READ-NOT-DEMONSTRATED (blocker):"
 # and "VERDICT: BLOCKER" on this repository's PRs.
 BLOCKER_WORD = re.compile(r"(?i)(?<![A-Za-z0-9])blocker(?![A-Za-z0-9])")
-# A finding reference in a Copilot review body: severity badge and the
-# thread anchor sit on one line.
+# A finding reference in a Copilot review body: a severity badge
+# introduces the thread anchor that follows it. They usually share a
+# line, but not necessarily, so they are matched as one ordered
+# stream rather than per line.
 FINDING_LINE = re.compile(r'alt="(High|Critical) severity"')
 DISCUSSION_ANCHOR = re.compile(r"#discussion_r(\d+)")
+BADGE_OR_ANCHOR = re.compile(
+    r'alt="(?P<severity>High|Critical) severity"|#discussion_r(?P<did>\d+)'
+)
 CODEX_MARKER = re.compile(r"^CODEX-[A-Za-z0-9][A-Za-z0-9-]*$")
 CODEX_VERDICT = re.compile(r"\b(NO-GO|NO-MAJOR|GO)\b")
 CURSOR_VERDICT = re.compile(r"^(NO-GO|GO)(?![A-Za-z0-9-])")
@@ -147,7 +152,22 @@ def utc_now() -> str:
     )
 
 
+def raw_login(login: str | None) -> str:
+    """The login exactly as GitHub gave it, case-folded only.
+
+    The relay check uses this, never norm_login: an App called
+    `sfdc-24[bot]` must not pass for the account `sfdc-24`.
+    """
+    return str(login or "").strip().lower()
+
+
 def norm_login(login: str | None) -> str:
+    """The login with a `[bot]` suffix removed.
+
+    REST calls Cursor `cursor[bot]` and GraphQL calls it `cursor`, so
+    matching THOSE identities needs the suffix off. Nothing that
+    grants authority by account name may use this.
+    """
     s = str(login or "")
     return s[:-5] if s.endswith("[bot]") else s
 
@@ -195,7 +215,7 @@ def codex_verdict(comment: dict, named_sha: str,
     receipt for an older head that merely mentions this SHA later is
     not a verdict for this SHA.
     """
-    if norm_login(comment.get("author")) not in relays:
+    if raw_login(comment.get("author")) not in {raw_login(r) for r in relays}:
         return None
     body = str(comment.get("body") or "")
     shas = SHA_IN_TEXT.findall(body.lower())
@@ -253,15 +273,23 @@ def copilot_finding_anchors(reviews: list[dict]) -> dict[str, str]:
     for review in copilot_reviews(reviews):
         body = str(review.get("body") or "")
         summary_blocked = bool(blocker_lines(body))
-        for line in body.splitlines():
-            severity = FINDING_LINE.search(line)
-            for did in DISCUSSION_ANCHOR.findall(line):
-                if severity:
-                    anchors[did] = f"{severity.group(1).lower()}-severity"
-                elif summary_blocked:
-                    anchors.setdefault(
-                        did, "anchored in a review whose summary carried a blocker"
-                    )
+        # Walk badges and anchors in document ORDER, not line by line:
+        # a badge and the link it introduces may be split across lines,
+        # and a per-line scan silently dropped such a finding.
+        pending = ""
+        for token in BADGE_OR_ANCHOR.finditer(body):
+            badge = token.group("severity")
+            if badge:
+                pending = f"{badge.lower()}-severity"
+                continue
+            did = token.group("did")
+            if pending:
+                anchors[did] = pending
+            elif summary_blocked:
+                anchors.setdefault(
+                    did, "anchored in a review whose summary carried a blocker"
+                )
+            pending = ""
     return anchors
 
 
@@ -331,7 +359,8 @@ class Judgement:
 
 def judge(inputs: dict, require_codex: bool = True,
           codex_relays: frozenset | set = CODEX_RELAY_LOGINS,
-          required_checks: tuple | list = REQUIRED_CHECKS) -> Judgement:
+          required_checks: tuple | list = REQUIRED_CHECKS,
+          accept_superseded: frozenset | set = frozenset()) -> Judgement:
     out = Judgement()
     if inputs.get("schema") != SCHEMA:
         raise GateError(f"inputs schema is not {SCHEMA}")
@@ -401,11 +430,37 @@ def judge(inputs: dict, require_codex: bool = True,
     for run in check_runs:
         runs_by_name[str(run.get("name") or "")] = run  # the latest wins
     missing = [name for name in required_checks if name not in runs_by_name]
+    # Present is not passed: a required run that was skipped, neutral
+    # or carries no conclusion at all has not said this SHA is good.
+    # And a run with no URL cannot be linked, which is what the
+    # handoff is FOR, so it refuses rather than printing "None".
+    not_green: list[str] = []
+    unlinkable: list[str] = []
+    for name in required_checks:
+        run = runs_by_name.get(name)
+        if run is None:
+            continue
+        status = str(run.get("status") or "")
+        conclusion = str(run.get("conclusion") or "")
+        if status != "completed" or conclusion != "success":
+            not_green.append(f"{name}={conclusion or status or 'no conclusion'}")
+        elif not str(run.get("html_url") or ""):
+            unlinkable.append(name)
     ci = ci_state(check_runs, combined)
     if missing:
         out.open.append(
             "the required check(s) " + ", ".join(missing)
             + " never ran on this SHA: silence is not a GO"
+        )
+    elif not_green:
+        out.open.append(
+            "the required check(s) did not pass on this SHA: " + "; ".join(not_green)
+            + " (only `success` is a pass)"
+        )
+    elif unlinkable:
+        out.open.append(
+            "the required check(s) " + ", ".join(unlinkable)
+            + " carry no run URL, so the handoff cannot link the run U4 requires"
         )
     elif ci == "success":
         required_links = "; ".join(
@@ -471,23 +526,31 @@ def judge(inputs: dict, require_codex: bool = True,
             )
         # A blocker in an EARLIER head's summary is carried forward
         # through its anchors, which rule 7 requires to be resolved.
-        # A summary blocker that anchored nothing has no thread to
-        # resolve: there, and only there, Copilot's own clean review
-        # on the named SHA supersedes its earlier summary - and the
-        # card says so, so the reader can disagree.
-        superseded = [
-            r for r in copilot_reviews(reviews)
-            if str(r.get("commit_id") or "").lower() != named_sha
-            and blocker_lines(str(r.get("body") or ""))
-            and not DISCUSSION_ANCHOR.findall(str(r.get("body") or ""))
-        ]
-        if superseded and not hits:
-            urls = ", ".join(str(r.get("html_url") or "") for r in superseded)
-            out.closed.append(
-                f"{len(superseded)} earlier head(s) carried a summary blocker that "
-                f"anchored no finding; Copilot's clean review on this SHA supersedes "
-                f"it: {urls}"
-            )
+        # A summary blocker that anchored NOTHING has no thread to
+        # resolve, so nothing can demonstrate it was addressed: it
+        # refuses. A reader who judges it superseded by Copilot's
+        # later clean review says so explicitly with
+        # --accept-superseded <review url>, and the card records that
+        # it was a person's call, not the tool's.
+        for review in copilot_reviews(reviews):
+            body = str(review.get("body") or "")
+            url = str(review.get("html_url") or "")
+            if (str(review.get("commit_id") or "").lower() == named_sha
+                    or not blocker_lines(body)
+                    or DISCUSSION_ANCHOR.search(body)):
+                continue
+            if url and url in accept_superseded:
+                out.closed.append(
+                    "an earlier head's summary blocker that anchored no finding was "
+                    f"accepted as superseded by whoever ran this: {url}"
+                )
+            else:
+                out.open.append(
+                    "an earlier head's summary carried a blocker that anchored no "
+                    f"finding, so no thread can show it was addressed: {url}. Ask "
+                    "Copilot to re-review this SHA, or record your own judgement "
+                    f"with --accept-superseded {url}"
+                )
 
     # 7. Copilot findings from EVERY head, judged by thread resolution.
     high_anchors = copilot_finding_anchors(reviews)
@@ -834,6 +897,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="a check that must exist and pass on the SHA "
                          f"(repeatable; default: {', '.join(REQUIRED_CHECKS)}). "
                          "Passing it replaces the default list")
+    ap.add_argument("--accept-superseded", action="append", default=None,
+                    metavar="REVIEW_URL",
+                    help="record YOUR judgement that this earlier Copilot review's "
+                         "summary blocker, which anchored no finding, is superseded "
+                         "by the clean review on the named SHA (repeatable). The card "
+                         "names it as a person's call")
     ap.add_argument("--snapshot", help="write the gathered inputs JSON here")
     ap.add_argument("--inputs", help="judge this recorded inputs JSON; no network")
     ap.add_argument("--token-env", default="GITHUB_TOKEN")
@@ -861,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
             require_codex=not args.codex_optional,
             codex_relays=frozenset(args.codex_relay) if args.codex_relay else CODEX_RELAY_LOGINS,
             required_checks=tuple(args.required_check) if args.required_check else REQUIRED_CHECKS,
+            accept_superseded=frozenset(args.accept_superseded or ()),
         )
     except GateError as exc:
         print(f"cannot judge: {exc}", file=sys.stderr)

@@ -390,7 +390,11 @@ class CursorReviewRound1(unittest.TestCase):
         for did in ("4168464680", "4168464717"):
             self.assertTrue(any(f"discussion_r{did}" in l for l in j.open), (did, j.open))
 
-    def test_an_earlier_summary_blocker_with_no_anchor_is_named_as_superseded(self):
+    def test_an_earlier_summary_blocker_with_no_anchor_refuses_until_accepted(self):
+        # Cursor flagged this twice. Nothing can demonstrate an
+        # anchor-less summary blocker was addressed, so the tool
+        # refuses; a person may record their own judgement, and the
+        # card then says it was theirs.
         inputs = green_inputs()
         inputs["reviews"].insert(0, {
             "id": 9, "author": "copilot-pull-request-reviewer[bot]",
@@ -400,9 +404,24 @@ class CursorReviewRound1(unittest.TestCase):
             "html_url": "https://example.test/r/9",
         })
         j = judged(inputs)
-        self.assertTrue(j.passed, j.open)
+        self.assertFalse(j.passed)
         self.assertTrue(
-            any("supersedes" in l and "example.test/r/9" in l for l in j.closed), j.closed
+            any("anchored no finding" in l and "example.test/r/9" in l for l in j.open),
+            j.open,
+        )
+        accepted = gate_card.judge(
+            inputs, accept_superseded={"https://example.test/r/9"}
+        )
+        self.assertTrue(accepted.passed, accepted.open)
+        self.assertTrue(
+            any("accepted as superseded by whoever ran this" in l
+                for l in accepted.closed),
+            accepted.closed,
+        )
+        # Accepting one review does not accept another.
+        inputs["reviews"][0]["html_url"] = "https://example.test/r/other"
+        self.assertFalse(
+            gate_card.judge(inputs, accept_superseded={"https://example.test/r/9"}).passed
         )
 
     def test_a_codex_marker_id_containing_go_does_not_outvote_a_no_go_body(self):
@@ -451,6 +470,70 @@ class CursorReviewRound1(unittest.TestCase):
         inputs["pr_after"]["draft"] = False
         j = judged(inputs)
         self.assertTrue(j.passed, j.open)
+
+
+class CursorReviewRound2(unittest.TestCase):
+    """Regressions for Cursor's second NO-GO, on ed88b99."""
+
+    def test_a_required_check_that_did_not_pass_is_not_a_pass(self):
+        # Present is not passed: skipped, neutral, empty or still
+        # running all refuse, and the refusal names the conclusion.
+        for conclusion, status in (("skipped", "completed"),
+                                   ("neutral", "completed"),
+                                   ("", "completed"),
+                                   ("success", "in_progress")):
+            inputs = green_inputs()
+            inputs["check_runs"][0]["conclusion"] = conclusion
+            inputs["check_runs"][0]["status"] = status
+            j = judged(inputs)
+            self.assertFalse(j.passed, (conclusion, status))
+            self.assertTrue(
+                any("only `success` is a pass" in l for l in j.open),
+                (conclusion, status, j.open),
+            )
+
+    def test_a_required_run_with_no_url_cannot_be_linked_so_it_refuses(self):
+        inputs = green_inputs()
+        inputs["check_runs"][0]["html_url"] = ""
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("cannot link the run" in l for l in j.open), j.open)
+        # And no card ever prints "required-ci None".
+        self.assertNotIn("required-ci None", gate_card.render(inputs, j))
+
+    def test_a_bot_suffix_does_not_make_an_app_the_relay_account(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][1]["author"] = "sfdc-24[bot]"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Codex" in l and "silence" in l for l in j.open), j.open)
+        # The real account still counts, in any case.
+        inputs["issue_comments"][1]["author"] = "SFDC-24"
+        self.assertTrue(judged(inputs).passed)
+
+    def test_a_badge_and_its_anchor_split_across_lines_is_still_a_finding(self):
+        inputs = green_inputs()
+        inputs["reviews"].insert(0, {
+            "id": 9, "author": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED", "commit_id": OTHER,
+            "body": '- <img alt="High severity">\n  [Split finding](#discussion_r55)',
+            "submitted_at": "2026-10-01T00:00:00Z",
+            "html_url": "https://example.test/r/9",
+        })
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("discussion_r55" in l and "never observed" in l for l in j.open), j.open
+        )
+
+    def test_each_anchor_keeps_its_own_badge_in_a_list(self):
+        body = ('- <img alt="High severity"> [A](#discussion_r11)\n'
+                '- <img alt="Low severity"> [B](#discussion_r12)\n'
+                '- <img alt="Critical severity"> [C](#discussion_r13)')
+        anchors = gate_card.copilot_finding_anchors([{
+            "author": "copilot-pull-request-reviewer[bot]", "body": body,
+        }])
+        self.assertEqual(anchors, {"11": "high-severity", "13": "critical-severity"})
 
 
 class CursorGate(unittest.TestCase):
@@ -738,7 +821,9 @@ class GatherAndCli(unittest.TestCase):
         self.assertEqual(len(inputs["check_runs"]), 101)
         j = gate_card.judge(inputs, require_codex=False)
         self.assertFalse(j.passed)
-        self.assertTrue(any("CI on this SHA is failure" in l for l in j.open), j.open)
+        self.assertTrue(
+            any("required-ci=failure" in l for l in j.open), j.open
+        )
 
     def test_a_check_runs_count_mismatch_is_an_error_not_a_verdict(self):
         payloads = [{"total_count": 7, "check_runs": [
