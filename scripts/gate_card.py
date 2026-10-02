@@ -12,25 +12,36 @@ WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
   - The named SHA is one full 40-hex commit, it is the pull request's
     head before AND after the reads (a moved head restarts the reviews),
     and the PR is open, not merged and not a draft.
-  - CI on that SHA is green: at least one check run, every run completed
-    without a failing conclusion, and the combined commit status is not
-    failure or pending. Silence is not a GO: zero runs refuse.
+  - CI on that SHA is green: every named required check (default
+    required-ci; --required-check overrides) is present, every run
+    completed without a failing conclusion, and the combined commit
+    status is not failure or pending. Silence is not a GO: zero runs
+    refuse, and so does a SHA where only unrelated checks ran. The
+    card links the required run itself, as U4 asks.
   - Cursor's latest verdict naming that SHA is GO. The verdict must be
     authored by cursor[bot] itself and start the comment; silence or
     NO-GO refuses, and a GO on any other SHA is no GO here.
   - Codex's latest verdict naming that SHA is GO or NO-MAJOR. A Codex
     verdict is a comment whose FIRST line is its marker (CODEX-... or
-    "## Codex:"), because dispatches quote "GO or NO-GO" in passing.
-    Where Codex does not own the scope (docs/EXPRESS.md section 2),
-    --codex-optional waives a MISSING verdict; a present NO-GO still
-    refuses.
+    "## Codex:"), because dispatches quote "GO or NO-GO" in passing,
+    AND whose author is on the trusted relay list (--codex-relay;
+    default sfdc-24, the owner account that relays Codex on this
+    repository): a marker alone must not let any commenter speak for
+    Codex. While every agent shares that one login, this bounds who
+    can forge a verdict at "can post as the owner", not less - real
+    per-agent identity is U6's job. Where Codex does not own the
+    scope (docs/EXPRESS.md section 2), --codex-optional waives a
+    MISSING verdict; a present NO-GO still refuses.
   - A Copilot review exists on the exact SHA and the latest one carries
     no blocker in its summary ("a BLOCKER can sit in the summary alone"
     - Copilot's own amendment to U4).
   - Every Copilot finding that is high/critical severity or worded as a
     blocker, FROM ANY HEAD of this PR, sits in a resolved thread. A
     moved head cannot drop one: unresolved findings from earlier heads
-    carry forward (Codex's amendment to U4).
+    carry forward (Codex's amendment to U4). A high/critical anchor
+    whose thread was never fetched refuses: resolution that was not
+    observed is not resolution. A thread with more comments than one
+    page refuses whatever its resolved flag says.
 
 WHAT IT NEVER DOES
   It performs no merge, no write, no state change anywhere: it reads and
@@ -78,6 +89,12 @@ SCHEMA = "gate-card-inputs-v1"
 
 CURSOR_LOGIN = "cursor"
 COPILOT_LOGIN = "copilot-pull-request-reviewer"
+# Who may relay a Codex verdict. On this repository Codex posts through
+# the owner account; a marker-first body from anyone else is not Codex.
+CODEX_RELAY_LOGINS = frozenset({"sfdc-24"})
+# The checks that must exist AND pass on the named SHA. An unrelated
+# green check cannot stand in for the repository's required run.
+REQUIRED_CHECKS = ("required-ci",)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # "blocker" as a standalone word, any case: Copilot has written
@@ -139,13 +156,17 @@ def cursor_verdict(comment: dict, named_sha: str) -> str | None:
     return m.group(1) if m else None
 
 
-def codex_verdict(comment: dict, named_sha: str) -> str | None:
+def codex_verdict(comment: dict, named_sha: str,
+                  relays: frozenset | set = CODEX_RELAY_LOGINS) -> str | None:
     """GO/NO-GO when this comment is a Codex verdict naming the SHA.
 
     Only a comment whose first non-empty line IS the marker counts:
     dispatches say "Reply GO or NO-GO" and cite CODEX-... ids mid-body,
-    and neither of those is a verdict.
+    and neither of those is a verdict. Only a trusted relay login may
+    carry one: a marker is text anyone can type, an author is not.
     """
+    if norm_login(comment.get("author")) not in relays:
+        return None
     body = str(comment.get("body") or "")
     if named_sha not in body.lower():
         return None
@@ -207,9 +228,12 @@ def thread_discussion_ids(thread: dict) -> set[str]:
 
 
 def thread_gate_reason(thread: dict, high_anchors: dict[str, str]) -> str | None:
-    """Why this thread gates the merge, or None when it does not."""
-    if thread.get("truncated"):
-        return "not fully read (more comments than one page); refusing to judge half a thread"
+    """Why this thread gates the merge, or None when it does not.
+
+    Truncation is judged separately in judge(): a half-read thread
+    refuses whatever its resolved flag says, so it must never be
+    weighed here as though its contents were known.
+    """
     for comment in thread.get("comments") or []:
         if norm_login(comment.get("author")) != COPILOT_LOGIN:
             continue
@@ -256,7 +280,9 @@ class Judgement:
         return not self.open
 
 
-def judge(inputs: dict, require_codex: bool = True) -> Judgement:
+def judge(inputs: dict, require_codex: bool = True,
+          codex_relays: frozenset | set = CODEX_RELAY_LOGINS,
+          required_checks: tuple | list = REQUIRED_CHECKS) -> Judgement:
     out = Judgement()
     if inputs.get("schema") != SCHEMA:
         raise GateError(f"inputs schema is not {SCHEMA}")
@@ -303,11 +329,28 @@ def judge(inputs: dict, require_codex: bool = True) -> Judgement:
             line += f", mergeable_state {mergeable}"
         out.closed.append(line)
 
-    # 3. CI on the named SHA.
+    # 3. CI on the named SHA. The required run must itself be present:
+    # an unrelated green check cannot stand in for it, and the card
+    # links the required run, as U4 asks.
+    runs_by_name: dict[str, dict] = {}
+    for run in check_runs:
+        runs_by_name[str(run.get("name") or "")] = run  # the latest wins
+    missing = [name for name in required_checks if name not in runs_by_name]
     ci = ci_state(check_runs, combined)
-    if ci == "success":
+    if missing:
+        out.open.append(
+            "the required check(s) " + ", ".join(missing)
+            + " never ran on this SHA: silence is not a GO"
+        )
+    elif ci == "success":
+        required_links = "; ".join(
+            f"{name} {runs_by_name[name].get('html_url')}" for name in required_checks
+        )
         names = ", ".join(sorted(str(r.get("name") or "?") for r in check_runs))
-        out.closed.append(f"CI on this SHA: success ({len(check_runs)} check runs: {names})")
+        out.closed.append(
+            f"CI on this SHA: success - required run(s): {required_links} "
+            f"({len(check_runs)} check runs in all: {names})"
+        )
     elif ci == "unknown":
         out.open.append("CI on this SHA reports nothing: silence is not a GO")
     else:
@@ -330,7 +373,10 @@ def judge(inputs: dict, require_codex: bool = True) -> Judgement:
         out.closed.append(f"Cursor GO: {cursor[1].get('html_url')}")
 
     # 5. Codex.
-    codex = latest_verdict(comments, named_sha, codex_verdict)
+    codex = latest_verdict(
+        comments, named_sha,
+        lambda c, s: codex_verdict(c, s, relays=codex_relays),
+    )
     if codex is not None and codex[0] != "GO":
         out.open.append(f"Codex's latest verdict on this SHA is NO-GO: {codex[1].get('html_url')}")
     elif codex is not None:
@@ -363,7 +409,23 @@ def judge(inputs: dict, require_codex: bool = True) -> Judgement:
     high_anchors = copilot_finding_anchors(reviews)
     tracked = 0
     open_findings = 0
+    mapped_ids: set[str] = set()
     for thread in threads:
+        mapped_ids |= thread_discussion_ids(thread)
+        # A half-read thread refuses whatever its resolved flag says:
+        # judging it from its first page would be judging data we do
+        # not have.
+        if thread.get("truncated"):
+            tracked += 1
+            open_findings += 1
+            url = ""
+            for comment in thread.get("comments") or []:
+                url = str(comment.get("html_url") or "") or url
+            out.open.append(
+                "a review thread was not fully read (more comments than one "
+                f"page); refusing to judge half a thread - {url or thread.get('id')}"
+            )
+            continue
         reason = thread_gate_reason(thread, high_anchors)
         if reason is None:
             continue
@@ -374,6 +436,17 @@ def judge(inputs: dict, require_codex: bool = True) -> Judgement:
             for comment in thread.get("comments") or []:
                 url = str(comment.get("html_url") or "") or url
             out.open.append(f"unresolved {reason} - {url or thread.get('id')}")
+    # A high/critical anchor whose thread was never fetched is not
+    # resolved: resolution that was not observed is not resolution.
+    for did in sorted(high_anchors):
+        if did not in mapped_ids:
+            tracked += 1
+            open_findings += 1
+            out.open.append(
+                f"Copilot {high_anchors[did].lower()}-severity finding "
+                f"discussion_r{did} has no fetched thread: its resolution "
+                "was never observed"
+            )
     if open_findings == 0:
         out.closed.append(
             f"Copilot findings across every head of this PR: all resolved ({tracked} tracked)"
@@ -382,7 +455,9 @@ def judge(inputs: dict, require_codex: bool = True) -> Judgement:
     # Awareness only: open threads that do not gate still deserve eyes.
     other_open = [
         t for t in threads
-        if not t.get("is_resolved") and thread_gate_reason(t, high_anchors) is None
+        if not t.get("is_resolved")
+        and not t.get("truncated")
+        and thread_gate_reason(t, high_anchors) is None
     ]
     if other_open:
         urls = []
@@ -636,6 +711,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--codex-optional", action="store_true",
                     help="waive a MISSING Codex verdict where Codex does not own "
                          "the scope (docs/EXPRESS.md); a present NO-GO still refuses")
+    ap.add_argument("--codex-relay", action="append", default=None,
+                    metavar="LOGIN",
+                    help="a login trusted to relay Codex verdicts (repeatable; "
+                         f"default: {', '.join(sorted(CODEX_RELAY_LOGINS))}). "
+                         "Passing it replaces the default list")
+    ap.add_argument("--required-check", action="append", default=None,
+                    metavar="NAME",
+                    help="a check that must exist and pass on the SHA "
+                         f"(repeatable; default: {', '.join(REQUIRED_CHECKS)}). "
+                         "Passing it replaces the default list")
     ap.add_argument("--snapshot", help="write the gathered inputs JSON here")
     ap.add_argument("--inputs", help="judge this recorded inputs JSON; no network")
     ap.add_argument("--token-env", default="GITHUB_TOKEN")
@@ -658,7 +743,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("one of --pr or --inputs is required", file=sys.stderr)
             return 2
-        judgement = judge(inputs, require_codex=not args.codex_optional)
+        judgement = judge(
+            inputs,
+            require_codex=not args.codex_optional,
+            codex_relays=frozenset(args.codex_relay) if args.codex_relay else CODEX_RELAY_LOGINS,
+            required_checks=tuple(args.required_check) if args.required_check else REQUIRED_CHECKS,
+        )
     except GateError as exc:
         print(f"cannot judge: {exc}", file=sys.stderr)
         return 2

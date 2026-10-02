@@ -158,6 +158,8 @@ class RecordedAcceptance(unittest.TestCase):
         self.assertIn("issuecomment-5961353819", card)   # Cursor GO
         self.assertIn("issuecomment-5961720850", card)   # Codex GO / NO-MAJOR
         self.assertIn("pullrequestreview-5396810985", card)  # Copilot on the SHA
+        # U4: the card links the required CI run itself, not just a count.
+        self.assertIn("required-ci https://github.com/sfdc-24/Blackboard/actions/runs/37063813304/job/111026549269", card)
         self.assertIn("restarts the reviews", card)
 
     def test_315s_dispatch_comment_is_not_a_codex_verdict(self):
@@ -292,6 +294,71 @@ class CopilotGates(unittest.TestCase):
         self.assertTrue(any("not fully read" in l for l in j.open))
 
 
+class CopilotReviewRound1(unittest.TestCase):
+    """Regressions for the four blockers Copilot filed on #316 itself
+    (discussion_r4170636359, _r4170636390, _r4170636412, _r4170636428)."""
+
+    def test_a_codex_marker_from_an_untrusted_author_is_not_a_verdict(self):
+        # r4170636359: any commenter could type a marker-first GO body.
+        inputs = green_inputs()
+        inputs["issue_comments"][1]["author"] = "some-passerby"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Codex" in l and "silence" in l for l in j.open), j.open)
+        # A caller may name a different trusted relay set explicitly.
+        self.assertTrue(gate_card.judge(inputs, codex_relays={"some-passerby"}).passed)
+
+    def test_an_unrelated_green_check_cannot_stand_in_for_required_ci(self):
+        # r4170636390: CI must include the repository's required run.
+        inputs = green_inputs()
+        inputs["check_runs"] = [{
+            "name": "something-else", "status": "completed",
+            "conclusion": "success", "html_url": "https://example.test/ci/9",
+        }]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("required-ci" in l and "never ran" in l for l in j.open), j.open)
+
+    def test_a_truncated_thread_refuses_even_when_marked_resolved(self):
+        # r4170636412: truncation is not excused by the resolved flag.
+        inputs = green_inputs()
+        inputs["threads"] = [{
+            "id": "T1", "is_resolved": True, "is_outdated": False, "truncated": True,
+            "comments": [{
+                "discussion_id": 1, "author": "copilot-pull-request-reviewer",
+                "body": "first of many", "created_at": "t",
+                "html_url": "https://example.test/d/1",
+            }],
+        }]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("not fully read" in l for l in j.open), j.open)
+        self.assertFalse(any("all resolved" in l for l in j.closed), j.closed)
+
+    def test_a_high_anchor_without_a_fetched_thread_refuses(self):
+        # r4170636428: resolution that was never observed is not resolution.
+        inputs = green_inputs()
+        inputs["reviews"][0]["body"] += (
+            '\n- <img alt="High severity"> [Unfetched](#discussion_r99)'
+        )
+        inputs["threads"] = []
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("discussion_r99" in l and "never observed" in l for l in j.open), j.open
+        )
+        # Fetching it resolved closes the gate again.
+        inputs["threads"] = [{
+            "id": "T99", "is_resolved": True, "is_outdated": False, "truncated": False,
+            "comments": [{
+                "discussion_id": 99, "author": "copilot-pull-request-reviewer",
+                "body": "fixed", "created_at": "t",
+                "html_url": "https://example.test/d/99",
+            }],
+        }]
+        self.assertTrue(judged(inputs).passed)
+
+
 class CursorGate(unittest.TestCase):
     def test_silence_is_not_a_go(self):
         inputs = green_inputs()
@@ -420,7 +487,10 @@ class CiGate(unittest.TestCase):
     def test_zero_runs_refuse_as_silence(self):
         inputs = green_inputs(check_runs=[], combined_status={"state": "unknown"})
         j = judged(inputs)
-        self.assertTrue(any("silence is not a GO" in l and "CI" in l for l in j.open))
+        self.assertTrue(
+            any("silence is not a GO" in l and "required-ci" in l for l in j.open),
+            j.open,
+        )
 
 
 class RefusalCompleteness(unittest.TestCase):
