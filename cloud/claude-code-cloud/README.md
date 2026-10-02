@@ -123,8 +123,10 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     the apply stops and reads its Ready condition, because existence is not readiness (Codex P1 on d3ec70d): a
     create refused while IAM propagates can leave a job whose Ready condition is False. Only a job that reads Ready
     True points to the next step. One that exists but is not ready prints its repair, the same command with
-    `run jobs update` in place of `create`, and the owner describes it again before the watcher binding. Every other
-    failure of the job create is described the same way. If the broker service now exists, the apply stops and points back
+    `run jobs update` in place of `create`, and the describe to read again. It prints no continuation: the next step
+    binds the watcher to this job (Cursor and Codex on f3c65f9). `--print-from` for any step after the job create
+    reads the job itself and refuses, exit 4, until it reads Ready True. Every other failure of the job create is
+    described the same way. If the broker service now exists, the apply stops and points back
     to the deploy itself: a failed deploy can leave the service without a ready revision, and `run deploy` updates
     it. Nothing moves on to the invoker binding until the service has a ready revision (Cursor on 27e1f5a and
     de83893). If the describe itself fails for another reason, the apply stops

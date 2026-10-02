@@ -67,6 +67,7 @@ case "$*" in
           "run jobs describe board-watcher"*) echo "${CCC_FAKE_WATCHER:-board-watcher@sfdc24.iam.gserviceaccount.com}" ;;
           "secrets versions describe"*) echo "${CCC_FAKE_STATE:-ENABLED}" ;;
           "projects describe"*) echo "${CCC_FAKE_PROJECT_NUMBER-123456789012}" ;;
+          *"status.conditions"*) printf 'Ready;ResourcesAvailable\\t%s;True\\n' "${CCC_FAKE_READY-True}" ;;
           *) echo "found" ;;
         esac
         exit 0
@@ -343,10 +344,39 @@ class SetupScriptTest(unittest.TestCase):
             want = shlex.split(create)
             want[want.index("create")] = "update"
             self.assertEqual(want, shlex.split(repair[0]), why)
-            self.assertIn("go on only when it reads Ready True", out.stderr, why)
             self.assertFalse([c for c in calls if c.startswith(("run jobs update", "run jobs add-iam-policy-binding"))], why)
-            job_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
-            self.assertIn("--print-from %d" % (job_step + 1), out.stderr, why)
+            # Cursor NO-GO and Codex on f3c65f9: no continuation is printed for a job that is not Ready True. The
+            # next step binds the watcher to it, and a printed recovery line is a line that gets run.
+            self.assertIn("Nothing after step", out.stderr, why)
+            self.assertNotIn("--print-from", out.stderr, why)
+            self.assertNotIn("Then finish in order", out.stderr, why)
+            self.assertEqual(1, out.returncode, why)
+
+    def test_print_from_past_the_job_create_needs_the_job_ready_now(self):
+        # The continuation itself reads the job: the steps after its create bind the watcher to it.
+        dry, _ = self.run_script()
+        numbered = [l for l in dry.stdout.splitlines() if l.startswith("DRY RUN: [")]
+        job_step = [int(l.split("[")[1].split("]")[0]) for l in numbered if "create the claude-code-cloud job" in l][0]
+        job = ";run jobs describe claude-code-cloud"
+        cases = {"the job is absent": dict(present=EXISTING), "Ready False": dict(present=EXISTING + job, ready="False"),
+                 "Ready Unknown": dict(present=EXISTING + job, ready="Unknown"),
+                 "Ready unreadable": dict(present=EXISTING + job, ready=""),
+                 "the describe is denied": dict(present=EXISTING + job, denied="run jobs describe claude-code-cloud")}
+        for why, kw in cases.items():
+            out, calls = self.run_script("--print-from", str(job_step + 1), go="OWNER-GO-TEST", sha=self.head, **kw)
+            self.assertEqual(4, out.returncode, "%s: %s" % (why, out.stderr))
+            self.assertIn("REFUSED: --print-from %d is past step %d" % (job_step + 1, job_step), out.stderr, why)
+            self.assertNotIn("gcloud ", out.stdout, why)                # not one command is printed
+            self.assertEqual([], mutating(calls), why)
+        ready, calls = self.run_script("--print-from", str(job_step + 1), go="OWNER-GO-TEST", sha=self.head,
+                                       present=EXISTING + job)
+        self.assertEqual(0, ready.returncode, ready.stderr)
+        self.assertIn("gcloud run jobs add-iam-policy-binding claude-code-cloud", ready.stdout)
+        self.assertEqual([], mutating(calls))
+        # At the job create itself, or before it, nothing is read: that continuation creates or repairs the job.
+        at, _ = self.run_script("--print-from", str(job_step), go="OWNER-GO-TEST", sha=self.head)
+        self.assertEqual(0, at.returncode, at.stderr)
+        self.assertIn("gcloud run jobs create claude-code-cloud", at.stdout)
 
     def test_a_job_create_that_failed_and_left_nothing_points_back_to_itself(self):
         out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run jobs create claude-code-cloud:9",

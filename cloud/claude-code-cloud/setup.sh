@@ -203,10 +203,14 @@ failed_at() {   # failed_at <description> <how to check it> [<step to continue f
         from=$((STEP_N + 1))
         echo "${4:-The job exists and is ready, so step ${STEP_N} is not repeated.} Check it: $2" >&2 ;;
       PRESENT/*)
-        from=$((STEP_N + 1))
+        # No continuation is printed here (Cursor NO-GO and Codex on f3c65f9): the next step binds the watcher to
+        # this job, and a recovery line for it would be run. Recovery stays on the repair. --print-from for a
+        # later step reads the job again itself and refuses until it is Ready True.
         echo "The job exists but is not ready, so it is not done being created, and step ${STEP_N} is not repeated: a create would fail on the existing job. Once the grants are effective, repair it with:" >&2
         echo "  $(quoted "${CUR_REPAIR[@]}")" >&2
-        echo "Then describe it again, and go on only when it reads Ready True; if it still does not, stop and read its condition's message. Check it: $2 --format='value(status.conditions[].type,status.conditions[].status)'" >&2 ;;
+        echo "Then describe it again: $2 --format='value(status.conditions[].type,status.conditions[].status)'" >&2
+        echo "Nothing after step ${STEP_N} is printed until that reads Ready True. If it still does not after the repair, stop and read its condition's message. Once it does, ask this script for the steps after ${STEP_N} with the same inputs as this apply: it reads the job again and refuses while it is not Ready True." >&2
+        exit 1 ;;
       ABSENT/*)
         from="$STEP_N"
         echo "The job does not exist, so step ${STEP_N} itself is run again once the grants are effective. Check it: $2" >&2 ;;
@@ -276,6 +280,19 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
   fi
   STEP_N=$((STEP_N + 1))
   if [ "$APPLY" != 1 ]; then
+    if [ "$create" = 1 ] && [ "$deploy" = 0 ] && [ "$PRINT_FROM" -gt "$STEP_N" ]; then
+      # A continuation past the job create is printed only for a job that reads Ready True now (Cursor NO-GO and
+      # Codex on f3c65f9): the steps after it bind the watcher to it.
+      local -a job
+      local now_ready
+      read -ra job <<<"$check"
+      now_ready="$(ready_state "${job[@]}")"
+      if [ "$now_ready" != True ]; then
+        echo "REFUSED: --print-from ${PRINT_FROM} is past step ${STEP_N}, the job create, and the job reads Ready ${now_ready}, not True. Nothing is printed. Repair or create the job first (start from step ${STEP_N}), and read it again: ${check}" >&2
+        exit 4
+      fi
+      echo "READ: the claude-code-cloud job reads Ready True, so the steps after ${STEP_N} are printed."
+    fi
     if [ "$STEP_N" -ge "$PRINT_FROM" ]; then
       printf 'DRY RUN: [%s] %s\n    %s\n    (retried after %s s, only while IAM is still propagating%s)\n' \
         "$STEP_N" "$what" "$(quoted "$@")" "$IAM_WAITS" "$([ "$create" = 1 ] && echo ', and only while the resource is still absent')"
