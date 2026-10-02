@@ -38,6 +38,15 @@ case "$*" in
         echo "ERROR: (gcloud.fake) PERMISSION_DENIED: caller lacks permission" >&2; exit 1
       fi
     done
+    # CCC_FAKE_PROBE_FAILS="<describe pattern>@<create pattern>": once the create was attempted, that describe fails
+    # with an error that is not a not-found (a network or permission failure of the probe itself).
+    IFS=';' read -ra pfails <<< "${CCC_FAKE_PROBE_FAILS:-}"
+    for e in "${pfails[@]}"; do
+      dpat="${e%@*}"; cpat="${e#*@}"
+      if [ -n "$dpat" ] && [[ "$*" == *"$dpat"* ]] && grep -qF -- "$cpat" "$CCC_FAKE_LOG"; then
+        echo "ERROR: (gcloud.fake) UNAVAILABLE: the connection was reset" >&2; exit 1
+      fi
+    done
     IFS=';' read -ra leaves <<< "${CCC_FAKE_LEAVES:-}"
     for e in "${leaves[@]}"; do
       dpat="${e%@*}"; cpat="${e#*@}"
@@ -111,12 +120,13 @@ class SetupScriptTest(unittest.TestCase):
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
                    job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0", flaky_err=None,
-                   leaves=""):
+                   leaves="", probe_fails=""):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied, CCC_FAKE_FLAKY=flaky, CCC_IAM_WAITS=waits)
         env.pop("CCC_FAKE_FLAKY_ERR", None)
         env["CCC_FAKE_LEAVES"] = leaves
+        env["CCC_FAKE_PROBE_FAILS"] = probe_fails
         if flaky_err is not None:
             env["CCC_FAKE_FLAKY_ERR"] = flaky_err
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
@@ -271,6 +281,16 @@ class SetupScriptTest(unittest.TestCase):
         deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
         self.assertIn("--print-from %d" % (deploy_step + 1), out.stderr)
         self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
+
+    def test_an_inconclusive_describe_stops_instead_of_retrying_the_create(self):
+        # Codex P1 on 708b0a2: only a confirmed not-found may lead to a second create.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:9",
+                                     probe_fails="run services describe ccc-broker@run deploy ccc-broker")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
+        self.assertIn("could not tell whether what it creates exists, so it is not retried", out.stderr)
+        deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+        self.assertIn("--print-from %d" % deploy_step, out.stderr)            # this step, after a person looks
 
     def test_the_recovery_line_carries_the_apply_inputs_and_print_from_needs_them(self):
         # Codex P1 on 27e1f5a: a bare --print-from printed :UNSET images and the default project.

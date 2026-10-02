@@ -186,7 +186,7 @@ step() {   # step <description> <how to check it> -- <command...>   (runs once; 
 # that names a new account, or reads a new grant, can be refused meanwhile: a binding on a just-created account
 # (Codex P1 on 5a98651), and the deploy and job create that read the new secret grants (Copilot on b6fa11e). Those
 # steps are retried after each wait in CCC_IAM_WAITS (seconds), but only on an IAM-pending error (IAM_PENDING below),
-# and a create only while a describe shows it is still absent (--create). Any other failure, such as a lost answer
+# and a create only while a describe CONFIRMS it is still absent (--create; an inconclusive describe stops). Any other failure, such as a lost answer
 # that may have followed a change, stops at once with failed_at, because repeating a create there could hide a
 # partial deployment (Copilot on 5a98651). Bindings are idempotent. Nothing else is retried.
 IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
@@ -214,9 +214,16 @@ step_after_iam() {   # step_after_iam [--create] <description> <how to check it>
     if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
     printf '%s\n' "$out" >&2
     if ! grep -qE "$IAM_PENDING" <<<"$out"; then failed_at "$what" "$check"; fi
-    if [ "$create" = 1 ] && "${probe[@]}" >/dev/null 2>&1; then
-      failed_at "$what" "$check" "$((STEP_N + 1))" \
-        "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created."
+    if [ "$create" = 1 ]; then
+      # Retry only on a CONFIRMED not-found. A describe that fails for any other reason (network, permission) is
+      # unknown, and unknown stops for a person to look (Codex P1 on 708b0a2).
+      case "$(state "${probe[@]}")" in
+        PRESENT) failed_at "$what" "$check" "$((STEP_N + 1))" \
+          "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created." ;;
+        ABSENT) ;;
+        *) failed_at "$what" "$check" "$STEP_N" \
+          "Step ${STEP_N} reported an error, and a describe could not tell whether what it creates exists, so it is not retried." ;;
+      esac
     fi
     [ -n "$wait" ] || break
     echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
