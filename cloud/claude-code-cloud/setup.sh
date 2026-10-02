@@ -37,6 +37,12 @@ if [ "${1:-}" = "--print-from" ]; then
   # After a failed apply: print step N and every step after it, in order, and change nothing (Codex P1 and Copilot on
   # 5a98651). The owner checks the failed resource first, then runs these by hand.
   if ! [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then echo "usage: setup.sh --print-from <step number>" >&2; exit 2; fi
+  # The printed commands are only right with the same inputs as the apply: a bare --print-from would print :UNSET
+  # images and the default project (Codex P1 on 27e1f5a). failed_at prints the full line to run.
+  if ! [[ "${CCC_BROKER_TAG:-}" =~ ^[0-9a-f]{40}$ && "${CCC_JOB_TAG:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSED: --print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG (and CCC_PROJECT, CCC_REGION if set) as the apply; use the exact line the failed apply printed." >&2
+    exit 2
+  fi
   PRINT_FROM="$2"
 elif [ "${1:-}" = "--apply" ]; then
   if [ -z "${CCC_OWNER_GO:-}" ]; then
@@ -142,11 +148,26 @@ fi
 
 # Every step is numbered in order, so a failed apply can say exactly where it stopped and print the rest.
 STEP_N=0
-failed_at() {   # failed_at <description> <how to check it>
+quoted() {   # the argv, shell-quoted, so a printed command runs exactly as written (Codex P1, Copilot on 27e1f5a)
+  local out="" a
+  for a in "$@"; do out+="$(printf '%q' "$a") "; done
+  printf '%s' "${out% }"
+}
+recovery_line() {   # recovery_line <first step>: the --print-from command, with every input the apply was given
+  printf 'CCC_PROJECT=%s CCC_REGION=%s CCC_BROKER_TAG=%s CCC_JOB_TAG=%s bash cloud/claude-code-cloud/setup.sh --print-from %s' \
+    "$(quoted "$PROJECT")" "$(quoted "$REGION")" "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
+}
+failed_at() {   # failed_at <description> <how to check it> [<step to continue from> <why>]
+  local from="${3:-$STEP_N}"
   echo "FAILED at step ${STEP_N}: $1. Steps 1 to $((STEP_N - 1)) are applied; nothing after this one ran." >&2
-  echo "The server may or may not have applied step ${STEP_N}. Check it first: $2" >&2
-  echo "Then finish in order with the commands this prints (step ${STEP_N} onward):" >&2
-  echo "  bash cloud/claude-code-cloud/setup.sh --print-from ${STEP_N}" >&2
+  if [ -n "${4:-}" ]; then
+    echo "$4 Check it: $2" >&2
+  else
+    echo "The server may or may not have applied step ${STEP_N}. Check it first: $2" >&2
+    echo "If the check shows step ${STEP_N} already applied, start from step $((STEP_N + 1)) instead; never run a create twice." >&2
+  fi
+  echo "Then finish in order with the commands this prints (step ${from} onward):" >&2
+  echo "  $(recovery_line "$from")" >&2
   exit 1
 }
 
@@ -157,36 +178,46 @@ step() {   # step <description> <how to check it> -- <command...>   (runs once; 
     echo "APPLY: [${STEP_N}] $what"
     "$@" || failed_at "$what" "$check"
   elif [ "$STEP_N" -ge "$PRINT_FROM" ]; then
-    printf 'DRY RUN: [%s] %s\n    %s\n' "$STEP_N" "$what" "$*"
+    printf 'DRY RUN: [%s] %s\n    %s\n' "$STEP_N" "$what" "$(quoted "$@")"
   fi
 }
 
 # New service accounts and new grants take minutes to take effect everywhere (IAM is eventually consistent). A step
 # that names a new account, or reads a new grant, can be refused meanwhile: a binding on a just-created account
 # (Codex P1 on 5a98651), and the deploy and job create that read the new secret grants (Copilot on b6fa11e). Those
-# steps are retried after each wait in CCC_IAM_WAITS (seconds), but ONLY on an error that comes before any change
-# (IAM_PENDING below). Any other failure, such as a lost answer that may have followed a change, stops at once with
-# failed_at, because repeating a create there could hide a partial deployment (Copilot on 5a98651). Bindings are also
-# idempotent. Nothing else is retried.
+# steps are retried after each wait in CCC_IAM_WAITS (seconds), but only on an IAM-pending error (IAM_PENDING below),
+# and a create only while a describe shows it is still absent (--create). Any other failure, such as a lost answer
+# that may have followed a change, stops at once with failed_at, because repeating a create there could hide a
+# partial deployment (Copilot on 5a98651). Bindings are idempotent. Nothing else is retried.
 IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
 [[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
 IAM_PENDING='PERMISSION_DENIED|[Pp]ermission .* denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
-step_after_iam() {   # step_after_iam <description> <how to check it> -- <command...>
+step_after_iam() {   # step_after_iam [--create] <description> <how to check it> -- <command...>
+  # --create: the check is a describe of what the command creates. A permission error does not prove nothing was
+  # created (a failed deploy can leave the service), so before any retry it is described, and retried only while it
+  # is still absent (Cursor NO-GO on 27e1f5a). Bindings are idempotent and need no probe.
+  local create=0
+  if [ "$1" = "--create" ]; then create=1; shift; fi
   local what="$1" check="$2"; shift 3
   STEP_N=$((STEP_N + 1))
   if [ "$APPLY" != 1 ]; then
     if [ "$STEP_N" -ge "$PRINT_FROM" ]; then
-      printf 'DRY RUN: [%s] %s\n    %s\n    (retried after %s s, only while IAM is still propagating)\n' \
-        "$STEP_N" "$what" "$*" "$IAM_WAITS"
+      printf 'DRY RUN: [%s] %s\n    %s\n    (retried after %s s, only while IAM is still propagating%s)\n' \
+        "$STEP_N" "$what" "$(quoted "$@")" "$IAM_WAITS" "$([ "$create" = 1 ] && echo ', and only while the resource is still absent')"
     fi
     return 0
   fi
   echo "APPLY: [${STEP_N}] $what"
-  local wait out
+  local wait out probe
+  read -ra probe <<<"$check"
   for wait in $IAM_WAITS ""; do
     if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
     printf '%s\n' "$out" >&2
     if ! grep -qE "$IAM_PENDING" <<<"$out"; then failed_at "$what" "$check"; fi
+    if [ "$create" = 1 ] && "${probe[@]}" >/dev/null 2>&1; then
+      failed_at "$what" "$check" "$((STEP_N + 1))" \
+        "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created."
+    fi
     [ -n "$wait" ] || break
     echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
     sleep "$wait"
@@ -230,7 +261,7 @@ step_after_iam "the broker may use only the ccc-receipts database" "gcloud proje
     --condition "title=ccc-receipts-only,expression=resource.name==\"projects/${PROJECT}/databases/ccc-receipts\""
 
 # 4. The broker: private service, C1 operation post_receipt only. The image is built from a merged main SHA.
-step_after_iam "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
+step_after_iam --create "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
   gcloud run deploy ccc-broker --project "$PROJECT" --region "$REGION" \
     --image "${REG}/ccc-broker:${CCC_BROKER_TAG:-UNSET}" --service-account "$BROKER_SA" \
     --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
@@ -245,7 +276,7 @@ step_after_iam "add the agent job as an invoker of the broker" "gcloud run servi
 
 # 5. The agent job: max-retries 0, one task, bounded time. In C1 the only tool is post_receipt (#306, Boundary 3),
 #    which calls the broker at CCC_BROKER_URL with an ID token for that audience.
-step_after_iam "create the claude-code-cloud job" "gcloud run jobs describe claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
+step_after_iam --create "create the claude-code-cloud job" "gcloud run jobs describe claude-code-cloud --project ${PROJECT} --region ${REGION}" -- \
   gcloud run jobs create claude-code-cloud --project "$PROJECT" --region "$REGION" \
     --image "${REG}/claude-code-cloud:${CCC_JOB_TAG:-UNSET}" --service-account "$JOB_SA" \
     --max-retries 0 --tasks 1 --task-timeout 600s --memory 1Gi --cpu 1 \

@@ -110,13 +110,18 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
   - Every other step is create-only and fails on a collision: both service accounts, the database and the job.
   - New service accounts and grants take minutes to take effect, and Cloud Run checks `secretAccessor` at deploy
     time. Every step that names a new account or reads a new grant (the bindings, the broker deploy and the job
-    create) is retried after waits of 30, 60, 90, 120 and 180 seconds (`CCC_IAM_WAITS`), but **only on an error
-    that comes before any change** (permission denied, or the account does not exist yet). Any other failure stops
-    at once, because a lost answer may have followed a real change (Copilot and Codex on b6fa11e and 5a98651).
-  - Every step is numbered. A failed apply says which step stopped and how to check that resource, and
-    `bash cloud/claude-code-cloud/setup.sh --print-from <N>` prints that step and every step after it, in order,
-    changing nothing. Check the failed resource first, then run the rest by hand. A plain re-run would refuse on
-    the resources already created.
+    create) is retried after waits of 30, 60, 90, 120 and 180 seconds (`CCC_IAM_WAITS`), only on an IAM-pending
+    error (permission denied, or the account does not exist yet). A permission error does not prove that nothing
+    was created: a failed deploy can leave the service. So before retrying the deploy or the job create, the script
+    describes the resource, and **retries only while it is still absent**. If it now exists, the apply stops and
+    points to the next step (Cursor on 27e1f5a). Any other failure stops at once, because a lost answer may have
+    followed a real change (Copilot and Codex on b6fa11e and 5a98651).
+  - Every step is numbered. A failed apply says which step stopped and how to check that resource, and prints
+    the exact recovery line, with the same `CCC_PROJECT`, `CCC_REGION`, `CCC_BROKER_TAG` and `CCC_JOB_TAG` as the
+    apply, ending in `--print-from <N>`. That prints step N and every step after it, in order, **shell-quoted** so
+    each can be pasted as written, and changes nothing. `--print-from` refuses to run without both image tags.
+    Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. A plain
+    re-run would refuse on the resources already created.
   - The script runs once, by the owner, under his GO, with no other writer expected. That bounds the race; it does
     not remove it.
 - **Changes are additive.** Nothing is deleted and no existing runtime is modified. Two kinds of change touch

@@ -3,6 +3,7 @@ the owner's GO and Cursor's exact-head GO, every read runs before the first chan
 holds exactly the least-privilege shape the spec names. Runs offline. A fake `gcloud` on PATH records every call, so
 a dry run or a refusal that calls any mutating gcloud command fails the test."""
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,11 @@ case "$*" in
       if [ -n "$d" ] && [[ "$*" == *"$d"* ]]; then
         echo "ERROR: (gcloud.fake) PERMISSION_DENIED: caller lacks permission" >&2; exit 1
       fi
+    done
+    IFS=';' read -ra leaves <<< "${CCC_FAKE_LEAVES:-}"
+    for e in "${leaves[@]}"; do
+      dpat="${e%@*}"; cpat="${e#*@}"
+      if [ -n "$dpat" ] && [[ "$*" == *"$dpat"* ]] && grep -qF -- "$cpat" "$CCC_FAKE_LOG"; then echo "found"; exit 0; fi
     done
     IFS=';' read -ra present <<< "${CCC_FAKE_PRESENT:-}"
     for p in "${present[@]}"; do
@@ -73,6 +79,12 @@ def mutating(calls):
     return [c for c in calls if " describe " not in " %s " % c]
 
 
+def decoded(stdout):
+    """The plan with each printed command un-quoted (the script prints them shell-quoted), joined like the fake's log."""
+    return "\n".join(" ".join(shlex.split(l.strip())) if l.strip().startswith("gcloud ") else l
+                     for l in stdout.splitlines())
+
+
 @unittest.skipIf(sys.platform == "win32", "bash and a fake gcloud on PATH: run on Linux CI")
 class SetupScriptTest(unittest.TestCase):
     def setUp(self):
@@ -98,11 +110,13 @@ class SetupScriptTest(unittest.TestCase):
         self.bindir = bindir
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
-                   job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0", flaky_err=None):
+                   job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0", flaky_err=None,
+                   leaves=""):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied, CCC_FAKE_FLAKY=flaky, CCC_IAM_WAITS=waits)
         env.pop("CCC_FAKE_FLAKY_ERR", None)
+        env["CCC_FAKE_LEAVES"] = leaves
         if flaky_err is not None:
             env["CCC_FAKE_FLAKY_ERR"] = flaky_err
         for k in ("CCC_OWNER_GO", "CCC_CURSOR_GO_SHA", "CCC_FAKE_WATCHER", "CCC_PROJECT", "CCC_REGION",
@@ -157,7 +171,7 @@ class SetupScriptTest(unittest.TestCase):
 
     def test_the_plan_has_the_least_privilege_shape(self):
         out, _ = self.run_script()
-        plan = out.stdout
+        plan = decoded(out.stdout)
         for needed in ("--no-allow-unauthenticated", "--max-retries 0", "title=ccc-receipts-only," + CONDITION,
                        "--location northamerica-northeast2", "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY_CLOUD:latest",
                        "--member serviceAccount:claude-code-cloud@sfdc24.iam.gserviceaccount.com --role "
@@ -182,7 +196,8 @@ class SetupScriptTest(unittest.TestCase):
         dry, dry_calls = self.run_script()
         out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head)
         self.assertEqual(0, out.returncode, out.stderr)
-        printed = [line.strip()[len("gcloud "):] for line in dry.stdout.splitlines() if line.strip().startswith("gcloud ")]
+        printed = [line.strip()[len("gcloud "):] for line in decoded(dry.stdout).splitlines()
+                   if line.strip().startswith("gcloud ")]
         self.assertEqual(printed, mutating(calls))            # the describes are removed by content, not position
         reads = [c for c in calls if c not in printed]
         self.assertEqual(dry_calls, reads)
@@ -244,6 +259,40 @@ class SetupScriptTest(unittest.TestCase):
             out, calls = self.run_script("--print-from", bad)
             self.assertEqual(2, out.returncode, bad)
             self.assertEqual([], mutating(calls), bad)
+
+    def test_a_create_that_left_its_resource_is_never_sent_again(self):
+        # Cursor NO-GO on 27e1f5a: a permission error does not prove nothing was created. The deploy fails with an IAM
+        # error but leaves the service; the describe finds it, so the deploy is not repeated and recovery starts after it.
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:9",
+                                     leaves="run services describe ccc-broker@run deploy ccc-broker")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
+        self.assertIn("what it creates now exists, so it is not repeated", out.stderr)
+        deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+        self.assertIn("--print-from %d" % (deploy_step + 1), out.stderr)
+        self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
+
+    def test_the_recovery_line_carries_the_apply_inputs_and_print_from_needs_them(self):
+        # Codex P1 on 27e1f5a: a bare --print-from printed :UNSET images and the default project.
+        out, _ = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run deploy ccc-broker:9",
+                                 flaky_err="INTERNAL: reset")
+        line = [l.strip() for l in out.stderr.splitlines() if "--print-from" in l and "bash" in l][0]
+        for part in ("CCC_PROJECT=sfdc24", "CCC_REGION=us-central1", "CCC_BROKER_TAG=" + TAG, "CCC_JOB_TAG=" + TAG):
+            self.assertIn(part, line)
+        bare, calls = self.run_script("--print-from", "3", broker_tag=None, job_tag=None)
+        self.assertEqual(2, bare.returncode)
+        self.assertIn("--print-from needs the same CCC_BROKER_TAG and CCC_JOB_TAG", bare.stderr)
+        self.assertEqual([], mutating(calls))
+
+    def test_printed_commands_are_shell_quoted_and_round_trip(self):
+        # Codex P1 and Copilot on 27e1f5a: $* lost the argument boundaries, and "(" broke a pasted command.
+        dry, _ = self.run_script()
+        create = [l.strip() for l in dry.stdout.splitlines() if l.strip().startswith("gcloud iam service-accounts create claude-code-cloud")][0]
+        argv = shlex.split(create)
+        self.assertEqual("claude-code-cloud (Console agent job, Blackboard #306)", argv[argv.index("--display-name") + 1])
+        cond = [l.strip() for l in dry.stdout.splitlines() if l.strip().startswith("gcloud projects add-iam-policy-binding")][0]
+        argv = shlex.split(cond)
+        self.assertEqual("title=ccc-receipts-only," + CONDITION, argv[argv.index("--condition") + 1])
 
     def test_bad_iam_waits_are_refused_before_any_cloud_call(self):
         for waits in ("", "x", "30,60", "-5"):
