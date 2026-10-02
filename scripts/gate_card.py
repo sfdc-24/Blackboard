@@ -267,12 +267,22 @@ def codex_verdict(comment: dict, named_sha: str,
     shas = SHA_IN_TEXT.findall(scan.lower())
     if not shas or shas[0] != named_sha:
         return None
-    tokens = set(CODEX_VERDICT.findall(scan))
-    if not tokens:
+    # A GO must be STATED, not merely mentioned. The token has to open
+    # the verdict-bearing line - the first line below a CODEX-... id,
+    # or the "## Codex:" heading itself - because prose anywhere below
+    # it may be discussing a verdict rather than giving one: "Review
+    # pending; this is not a GO" and "No GO has been issued" both read
+    # as approval when the whole body is searched.
+    verdict_line = (lines[1] if id_line and len(lines) > 1 else lines[0]).strip()
+    for prefix in ("## Codex:", "#### Codex:", "###### Codex:"):
+        if verdict_line.startswith(prefix):
+            verdict_line = verdict_line[len(prefix):].strip()
+            break
+    verdict_line = verdict_line.lstrip("*_ ").strip()
+    m = CODEX_VERDICT.match(verdict_line)
+    if m is None:
         return None
-    if "NO-GO" in tokens:
-        return "NO-GO"
-    return "GO"
+    return "NO-GO" if m.group(1) == "NO-GO" else "GO"
 
 
 def latest_verdict(comments: list[dict], named_sha: str, reader) -> tuple[str, dict] | None:
@@ -780,6 +790,27 @@ def make_graphql(token: str | None):
     return graphql
 
 
+def page_has_more(info, where: str) -> bool:
+    """Whether another page follows, refusing to GUESS that none does.
+
+    A page that does not state `hasNextPage` as a boolean has not told
+    us it is the last one. Treating that silence as "no more pages"
+    ended a read early and left comments - and any blocker on them -
+    out of the judgement entirely.
+    """
+    if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+        raise GateError(
+            f"{where}: the page does not say whether more follow; refusing to "
+            "judge a partly read list"
+        )
+    if info["hasNextPage"] and not info.get("endCursor"):
+        raise GateError(
+            f"{where}: more pages follow but no cursor advances to them; "
+            "refusing to judge a partly read list"
+        )
+    return info["hasNextPage"]
+
+
 def comment_fields(c: dict) -> dict:
     return {
         "discussion_id": c.get("databaseId"),
@@ -896,7 +927,8 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
             # `truncated` is for a thread that could NOT be read whole,
             # not for one that simply runs past the first page.
             pages = 1
-            while info.get("hasNextPage"):
+            more_follows = page_has_more(info, f"thread {thread_id} page 1")
+            while more_follows:
                 if pages >= MAX_THREAD_PAGES:
                     break
                 more = graphql(THREAD_COMMENTS_QUERY,
@@ -909,19 +941,22 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
                         "refusing to judge a partly read thread"
                     )
                 comments_out.extend(comment_fields(c) for c in nxt["nodes"])
-                info = nxt.get("pageInfo") or {}
+                info = nxt.get("pageInfo")
                 pages += 1
+                more_follows = page_has_more(
+                    info, f"thread {thread_id} page {pages}"
+                )
             threads.append(
                 {
                     "id": thread_id,
                     "is_resolved": bool(node.get("isResolved")),
                     "is_outdated": bool(node.get("isOutdated")),
-                    "truncated": bool(info.get("hasNextPage")),
+                    "truncated": more_follows,
                     "comments": comments_out,
                 }
             )
-        info = conn.get("pageInfo") or {}
-        if not info.get("hasNextPage"):
+        info = conn.get("pageInfo")
+        if not page_has_more(info, "review threads page"):
             break
         cursor = info.get("endCursor")
 

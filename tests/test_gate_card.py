@@ -600,6 +600,23 @@ class CodexVerdictShapes(unittest.TestCase):
         # lead line parses as neither an id nor a heading.
         self.assertEqual(self._verdict(f"CODEX-PR316-NO-GO-20261002 `{SHA}`"), "NO-GO")
 
+    def test_negated_or_pending_prose_is_never_an_approval(self):
+        # Copilot discussion_r4170740189: searching the whole body for
+        # a verdict word turned "this is not a GO" and "No GO has been
+        # issued" into approvals. A GO must OPEN the verdict-bearing
+        # line - the first line below the id, or the heading itself.
+        self.assertIsNone(self._verdict(
+            f"CODEX-PR316-PENDING\n\nTarget `{SHA}`. Review pending; this is not a GO."
+        ))
+        self.assertIsNone(self._verdict(
+            f"## Codex: review pending for `{SHA}`\n\nNo GO has been issued."
+        ))
+        self.assertIsNone(self._verdict(
+            f"CODEX-X\n\nI cannot reach a verdict on `{SHA}` yet; expect a GO tomorrow."
+        ))
+        # A stated verdict still reads, bold or plain.
+        self.assertEqual(self._verdict(f"CODEX-X\n\n**GO** at `{SHA}`."), "GO")
+
     def test_a_dispatch_that_quotes_go_or_no_go_is_still_silence(self):
         # The real one-line #315 dispatch: it cites a CODEX-... id and
         # quotes "Reply GO or NO-GO", from the relay account. Reading
@@ -924,6 +941,61 @@ class GatherAndCli(unittest.TestCase):
         self.assertTrue(inputs["threads"][0]["truncated"])
         j = gate_card.judge(inputs, require_codex=False)
         self.assertTrue(any("could not be read whole" in l for l in j.open), j.open)
+
+    def _thread_page(self, has_next, cursor, dids, tid="T7", resolved=True):
+        info = {}
+        if has_next is not None:
+            info["hasNextPage"] = has_next
+        if cursor is not None:
+            info["endCursor"] = cursor
+        return {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"id": tid, "isResolved": resolved, "isOutdated": False,
+                           "comments": {"pageInfo": info,
+                                        "nodes": [self._comment(d) for d in dids]}}]}
+
+    def test_a_follow_up_page_that_never_says_it_is_the_last_is_an_error(self):
+        # Cursor's case: page 1 says more follow; page 2 returns an
+        # ordinary comment and no pageInfo. That silence used to end
+        # the read with truncated=False, leaving page 3's BLOCKER out
+        # of the judgement entirely.
+        pages = [self._thread_page(True, "c1", [1])]
+        for omission in ({}, {"endCursor": "c2"}, None):
+            thread_pages = {"T7": [
+                {"nodes": [self._comment(2)],
+                 **({} if omission is None else {"pageInfo": omission})},
+            ]}
+            with self.assertRaises(gate_card.GateError):
+                gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                                 self._fake_graphql(pages, thread_pages))
+
+    def test_a_first_page_that_never_says_it_is_the_last_is_an_error(self):
+        for info_args in ((None, None), (None, "c1")):
+            pages = [self._thread_page(info_args[0], info_args[1], [1])]
+            with self.assertRaises(gate_card.GateError):
+                gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                                 self._fake_graphql(pages, {"T7": []}))
+
+    def test_more_pages_with_no_cursor_to_reach_them_is_an_error(self):
+        pages = [self._thread_page(True, None, [1])]
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                             self._fake_graphql(pages, {"T7": []}))
+
+    def test_a_blocker_living_only_on_a_later_page_still_refuses(self):
+        pages = [self._thread_page(True, "c1", [1], resolved=False)]
+        thread_pages = {"T7": [
+            {"pageInfo": {"hasNextPage": False, "endCursor": None},
+             "nodes": [{"databaseId": 2,
+                        "body": "BLOCKER - this only exists on page two.",
+                        "createdAt": "t", "url": "https://example.test/d/2",
+                        "author": {"login": "copilot-pull-request-reviewer"}}]},
+        ]}
+        inputs = gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                                  self._fake_graphql(pages, thread_pages))
+        self.assertFalse(inputs["threads"][0]["truncated"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Copilot blocker" in l for l in j.open), j.open)
 
     def test_a_null_node_reply_mid_thread_is_an_error(self):
         pages = [{"pageInfo": {"hasNextPage": False, "endCursor": None},
