@@ -102,6 +102,10 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
   - The project number must resolve, because it names the broker's URL.
   - board-watcher's identity must resolve to a service account.
   - ABSENT means gcloud itself said not found. Any other failed read, such as a permission error, counts as unknown.
+  - gcloud never prompts: the script exports `CLOUDSDK_CORE_DISABLE_PROMPTS=1` and
+    `CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API=false` before its first cloud call (Copilot on d3ec70d). Otherwise a
+    describe of a disabled API could offer to enable it, and accepting would change the project during a dry run. A
+    disabled API reads as unknown and refuses.
   - On anything else, `--apply` exits 3 with nothing changed. The dry run reports the same result.
 - **A partial apply is not resumed.** A rerun finds what the first run created and refuses. The owner reviews what
   exists before anything more is created, so `gcloud run deploy` never updates a service that the preflight saw.
@@ -116,7 +120,11 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     error (permission denied, or the account does not exist yet). A permission error does not prove that nothing
     was created: a failed deploy can leave the service. So before retrying the deploy or the job create, the script
     describes the resource after the wait, and **retries only on a confirmed not-found**. If the job now exists,
-    the apply stops and points to the next step. If the broker service now exists, the apply stops and points back
+    the apply stops and reads its Ready condition, because existence is not readiness (Codex P1 on d3ec70d): a
+    create refused while IAM propagates can leave a job whose Ready condition is False. Only a job that reads Ready
+    True points to the next step. One that exists but is not ready prints its repair, the same command with
+    `run jobs update` in place of `create`, and the owner describes it again before the watcher binding. Every other
+    failure of the job create is described the same way. If the broker service now exists, the apply stops and points back
     to the deploy itself: a failed deploy can leave the service without a ready revision, and `run deploy` updates
     it. Nothing moves on to the invoker binding until the service has a ready revision (Cursor on 27e1f5a and
     de83893). If the describe itself fails for another reason, the apply stops
@@ -127,7 +135,8 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     `CCC_BROKER_TAG` and `CCC_JOB_TAG` as the apply, ending in `--print-from <N>`. `--print-from` passes the same
     gate as `--apply` (the owner's GO, Cursor's exact head, an unedited script) before it prints anything. That prints step N and every step after it, in order, **shell-quoted** so
     each can be pasted as written, and changes nothing. `--print-from` refuses to run without both image tags.
-    Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. The
+    Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. For
+    the job, applied means it exists and reads Ready True. The
     **broker deploy is the exception**: on any failure the apply points back to the deploy itself, because a service
     a failed deploy left may have no ready revision and `run deploy` updates it. Do not go on to the invoker binding
     until the describe shows a ready revision. A plain re-run would refuse on the resources already created.

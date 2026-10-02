@@ -18,6 +18,8 @@ SCRIPT = ROOT / "cloud" / "claude-code-cloud" / "setup.sh"
 # CCC_FAKE_DENIED, otherwise gcloud's own NOT_FOUND. Every other command succeeds.
 FAKE = """#!/usr/bin/env bash
 echo "$*" >> "$CCC_FAKE_LOG"
+# What gcloud would read about prompting (Copilot on d3ec70d): the script must set both for every call.
+echo "${CLOUDSDK_CORE_DISABLE_PROMPTS:-unset} ${CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API:-unset}" >> "$CCC_FAKE_ENV_LOG"
 # CCC_FAKE_FLAKY="<pattern>:<n>;...": the first n calls matching <pattern> fail with CCC_FAKE_FLAKY_ERR (by default an
 # IAM grant still propagating). Describes are never flaky.
 if [[ "$*" != *" describe "* ]]; then
@@ -50,7 +52,13 @@ case "$*" in
     IFS=';' read -ra leaves <<< "${CCC_FAKE_LEAVES:-}"
     for e in "${leaves[@]}"; do
       dpat="${e%@*}"; cpat="${e#*@}"
-      if [ -n "$dpat" ] && [[ "$*" == *"$dpat"* ]] && grep -qF -- "$cpat" "$CCC_FAKE_LOG"; then echo "found"; exit 0; fi
+      if [ -n "$dpat" ] && [[ "$*" == *"$dpat"* ]] && grep -qF -- "$cpat" "$CCC_FAKE_LOG"; then
+        # The left resource's conditions, as `value(status.conditions[].type,status.conditions[].status)` prints them;
+        # CCC_FAKE_READY is the Ready status (Codex P1 on d3ec70d: a left job may not be ready).
+        if [[ "$*" == *"status.conditions"* ]]; then printf 'Ready;ResourcesAvailable\\t%s;True\\n' "${CCC_FAKE_READY-True}"
+        else echo "found"; fi
+        exit 0
+      fi
     done
     IFS=';' read -ra present <<< "${CCC_FAKE_PRESENT:-}"
     for p in "${present[@]}"; do
@@ -120,12 +128,19 @@ class SetupScriptTest(unittest.TestCase):
 
     def run_script(self, *args, go=None, sha=None, present=EXISTING, denied="", watcher=None, broker_tag=TAG,
                    job_tag=TAG, state=None, project_number=None, flaky="", waits="0 0 0", flaky_err=None,
-                   leaves="", probe_fails=""):
+                   leaves="", probe_fails="", ready=None, extra_env=None):
         log = self.tmp / ("calls-%d.log" % len(list(self.tmp.glob("calls-*.log"))))
         env = dict(os.environ, PATH="%s:%s" % (self.bindir, os.environ.get("PATH", "")), CCC_FAKE_LOG=str(log),
                    CCC_FAKE_PRESENT=present, CCC_FAKE_DENIED=denied, CCC_FAKE_FLAKY=flaky, CCC_IAM_WAITS=waits)
         env.pop("CCC_FAKE_FLAKY_ERR", None)
         env["CCC_FAKE_LEAVES"] = leaves
+        self.env_log = self.tmp / ("env-%d.log" % len(list(self.tmp.glob("env-*.log"))))
+        env["CCC_FAKE_ENV_LOG"] = str(self.env_log)
+        for k in ("CLOUDSDK_CORE_DISABLE_PROMPTS", "CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API", "CCC_FAKE_READY"):
+            env.pop(k, None)
+        if ready is not None:
+            env["CCC_FAKE_READY"] = ready
+        env.update(extra_env or {})
         env["CCC_FAKE_PROBE_FAILS"] = probe_fails
         if flaky_err is not None:
             env["CCC_FAKE_FLAKY_ERR"] = flaky_err
@@ -299,10 +314,67 @@ class SetupScriptTest(unittest.TestCase):
                                      leaves="run jobs describe claude-code-cloud@run jobs create claude-code-cloud")
         self.assertNotEqual(0, out.returncode)
         self.assertEqual(1, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")))
-        self.assertIn("what it creates now exists, so it is not repeated", out.stderr)
+        self.assertIn("what it creates now exists and reads Ready True, so it is not repeated", out.stderr)
+        self.assertIn("A describe of the job now reads: PRESENT, Ready True.", out.stderr)
         job_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
         self.assertIn("--print-from %d" % (job_step + 1), out.stderr)
         self.assertFalse([c for c in calls if c.startswith("run jobs add-iam-policy-binding")])
+
+    def test_a_job_left_not_ready_is_repaired_before_the_next_step(self):
+        # Codex P1 on d3ec70d: existence is not readiness. A create refused while IAM propagates can leave a job whose
+        # Ready condition is False; recovery must not move on to the watcher binding as if it were done.
+        dry, _ = self.run_script()
+        create = [l.strip() for l in dry.stdout.splitlines() if l.strip().startswith("gcloud run jobs create")][0]
+        for why, kw in {"Ready False, refused while IAM propagates": dict(flaky="run jobs create claude-code-cloud:9"),
+                        "Ready Unknown": dict(flaky="run jobs create claude-code-cloud:9", ready="Unknown"),
+                        "Ready unreadable": dict(flaky="run jobs create claude-code-cloud:9", ready=""),
+                        "Ready False after a non-IAM failure": dict(flaky="run jobs create claude-code-cloud:9",
+                                                                     flaky_err="INTERNAL: the connection was reset")}.items():
+            kw.setdefault("ready", "False")
+            out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head,
+                                         leaves="run jobs describe claude-code-cloud@run jobs create claude-code-cloud", **kw)
+            self.assertNotEqual(0, out.returncode, why)
+            self.assertEqual(1, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")), why)
+            self.assertIn("The job exists but is not ready", out.stderr, why)
+            self.assertNotIn("reads Ready True, so it is not repeated", out.stderr, why)
+            # The repair is the reviewed create with `update` in its place, every flag kept, and it is printed, not run.
+            repair = [l.strip() for l in out.stderr.splitlines() if l.strip().startswith("gcloud run jobs update")]
+            self.assertEqual(1, len(repair), why)
+            want = shlex.split(create)
+            want[want.index("create")] = "update"
+            self.assertEqual(want, shlex.split(repair[0]), why)
+            self.assertIn("go on only when it reads Ready True", out.stderr, why)
+            self.assertFalse([c for c in calls if c.startswith(("run jobs update", "run jobs add-iam-policy-binding"))], why)
+            job_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+            self.assertIn("--print-from %d" % (job_step + 1), out.stderr, why)
+
+    def test_a_job_create_that_failed_and_left_nothing_points_back_to_itself(self):
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head, flaky="run jobs create claude-code-cloud:9",
+                                     flaky_err="INTERNAL: the connection was reset")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(1, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")))
+        self.assertIn("A describe of the job now reads: ABSENT, Ready n/a.", out.stderr)
+        self.assertNotIn("start from step", out.stderr)
+        job_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+        self.assertIn("--print-from %d" % job_step, out.stderr)
+        self.assertNotIn("--print-from %d" % (job_step + 1), out.stderr)
+
+    def test_gcloud_never_prompts(self):
+        # Copilot on d3ec70d: a prompt (such as "enable this API and retry?") accepted during a dry run would change
+        # the project. Every gcloud call, reads included, runs with prompts disabled, even if the caller's shell says
+        # otherwise.
+        runs = {"dry run": ((), {}),
+                "apply": (("--apply",), dict(go="OWNER-GO-TEST", sha=self.head)),
+                "print-from": (("--print-from", "3"), dict(go="OWNER-GO-TEST", sha=self.head)),
+                "caller set prompts on": ((), dict(extra_env={"CLOUDSDK_CORE_DISABLE_PROMPTS": "0",
+                                                            "CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API": "true"}))}
+        for why, (args, kw) in runs.items():
+            out, calls = self.run_script(*args, **kw)
+            self.assertEqual(0, out.returncode, "%s: %s" % (why, out.stderr))
+            seen = self.env_log.read_text().splitlines()
+            self.assertTrue(calls, why)
+            self.assertEqual(len(calls), len(seen), why)
+            self.assertEqual({"1 false"}, set(seen), why)
 
     def test_an_inconclusive_describe_stops_instead_of_retrying_the_create(self):
         # Codex P1 on 708b0a2: only a confirmed not-found may lead to a second create.

@@ -23,6 +23,10 @@
 # README. C2 resources
 # (the GitHub App keys' readers) are listed but NOT applied in C1.
 set -euo pipefail
+# gcloud never asks anything here. A prompt answered during a dry run could change the project (a describe of a
+# disabled API offers to enable it and retry), so every prompt takes its default and API enablement is never offered
+# (Copilot on d3ec70d). A disabled API then reads as UNKNOWN, and the preflight refuses.
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1 CLOUDSDK_CORE_SHOULD_PROMPT_TO_ENABLE_API=false
 
 PROJECT="${CCC_PROJECT:-sfdc24}"
 REGION="${CCC_REGION:-us-central1}"
@@ -85,6 +89,21 @@ state() {   # state <describe command...>: PRESENT, ABSENT (gcloud itself said n
   else
     echo UNKNOWN
   fi
+}
+ready_state() {   # ready_state <describe command...>: the Ready condition's status (True, False, Unknown) or UNREAD
+  local out types="" statuses="" i
+  local -a t s
+  out="$("$@" --format='value(status.conditions[].type,status.conditions[].status)' 2>/dev/null)" || { echo UNREAD; return 0; }
+  IFS=$'\t' read -r types statuses <<<"${out//$'\r'/}" || true
+  IFS=';' read -ra t <<<"$types"
+  IFS=';' read -ra s <<<"$statuses"
+  for i in "${!t[@]}"; do
+    if [ "${t[$i]}" = Ready ]; then
+      case "${s[$i]:-}" in True|False|Unknown) echo "${s[$i]}" ;; *) echo UNREAD ;; esac
+      return 0
+    fi
+  done
+  echo UNREAD
 }
 PROBLEMS=()
 expect() {  # expect <ABSENT|PRESENT> <what> <describe command...>
@@ -164,11 +183,38 @@ recovery_line() {   # recovery_line <first step>: the --print-from command, with
     "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
 }
 CUR_DEPLOY=0
+CUR_JOB=0
 CUR_PROBE=()
+CUR_REPAIR=()
 failed_at() {   # failed_at <description> <how to check it> [<step to continue from> <why>]
   local from="${3:-$STEP_N}"
   echo "FAILED at step ${STEP_N}: $1. Steps 1 to $((STEP_N - 1)) are applied; nothing after this one ran." >&2
-  if [ "$CUR_DEPLOY" = 1 ]; then
+  if [ "$CUR_JOB" = 1 ]; then
+    # Existence is not readiness (Codex P1 on d3ec70d). A create refused while IAM propagates can leave a job whose
+    # Ready condition is False, and binding the watcher to it would leave a job no run can use. So every failure of the
+    # job create is described again here, and the job counts as created only when it reads Ready True. One that
+    # exists but is not ready is repaired with `run jobs update` and the same flags, then read again, before step N+1.
+    local got ready="n/a"
+    got="$(state "${CUR_PROBE[@]}")"
+    [ "$got" != PRESENT ] || ready="$(ready_state "${CUR_PROBE[@]}")"
+    echo "A describe of the job now reads: ${got}, Ready ${ready}." >&2
+    case "$got/$ready" in
+      PRESENT/True)
+        from=$((STEP_N + 1))
+        echo "${4:-The job exists and is ready, so step ${STEP_N} is not repeated.} Check it: $2" >&2 ;;
+      PRESENT/*)
+        from=$((STEP_N + 1))
+        echo "The job exists but is not ready, so it is not done being created, and step ${STEP_N} is not repeated: a create would fail on the existing job. Once the grants are effective, repair it with:" >&2
+        echo "  $(quoted "${CUR_REPAIR[@]}")" >&2
+        echo "Then describe it again, and go on only when it reads Ready True; if it still does not, stop and read its condition's message. Check it: $2 --format='value(status.conditions[].type,status.conditions[].status)'" >&2 ;;
+      ABSENT/*)
+        from="$STEP_N"
+        echo "The job does not exist, so step ${STEP_N} itself is run again once the grants are effective. Check it: $2" >&2 ;;
+      *)
+        from="$STEP_N"
+        echo "Whether the job exists could not be read, so nothing is assumed. Check it first: $2. If it exists and reads Ready True, start from step $((STEP_N + 1)) instead; if it exists and is not ready, repair it with \`$(quoted "${CUR_REPAIR[@]}")\` first. Never run a create twice." >&2 ;;
+    esac
+  elif [ "$CUR_DEPLOY" = 1 ]; then
     # Every failure of the broker deploy, on any path (waits exhausted, a non-IAM error), is described and points back
     # to the deploy itself: a failed deploy can leave the service without a ready revision, so "already applied, go
     # on" would skip it (Cursor NO-GO on 75cd35a).
@@ -189,6 +235,7 @@ step() {   # step <description> <how to check it> -- <command...>   (runs once; 
   local what="$1" check="$2"; shift 3
   STEP_N=$((STEP_N + 1))
   CUR_DEPLOY=0
+  CUR_JOB=0
   if [ "$APPLY" = 1 ]; then
     echo "APPLY: [${STEP_N}] $what"
     "$@" || failed_at "$what" "$check"
@@ -211,12 +258,22 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
   # --create / --deploy: the check is a describe of what the command creates. A permission error does not prove
   # nothing was created (a failed deploy can leave the service), so just before any retry, AFTER the wait, it is
   # described, and the command is re-sent only on a confirmed not-found (Cursor on 27e1f5a and de83893).
-  # If it exists: a job that exists is done being created, so recovery continues at the next step (--create). A
-  # service a failed deploy left may have no ready revision, and `run deploy` updates it, so recovery re-runs THIS
-  # step (--deploy) and never moves on to the invoker binding first. Bindings are idempotent and need no probe.
+  # If it exists: a job (--create) is done being created only when it reads Ready True (Codex P1 on d3ec70d); then
+  # recovery continues at the next step, and a job that is not ready is repaired with `run jobs update` first
+  # (failed_at). A service a failed deploy left may have no ready revision, and `run deploy` updates it, so recovery
+  # re-runs THIS step (--deploy) and never moves on to the invoker binding first. Bindings are idempotent and need no
+  # probe.
   local create=0 deploy=0
   if [ "$1" = "--create" ]; then create=1; shift; elif [ "$1" = "--deploy" ]; then create=1; deploy=1; shift; fi
   local what="$1" check="$2"; shift 3
+  if [ "$create" = 1 ] && [ "$deploy" = 0 ]; then
+    # The repair for a job that exists but is not ready: the same command with `update` in place of `create`.
+    local a
+    CUR_REPAIR=()
+    for a in "$@"; do
+      if [ "$a" = create ] && [ "${#CUR_REPAIR[@]}" = 3 ]; then CUR_REPAIR+=(update); else CUR_REPAIR+=("$a"); fi
+    done
+  fi
   STEP_N=$((STEP_N + 1))
   if [ "$APPLY" != 1 ]; then
     if [ "$STEP_N" -ge "$PRINT_FROM" ]; then
@@ -229,6 +286,7 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
   local wait out probe
   read -ra probe <<<"$check"
   CUR_DEPLOY="$deploy"
+  CUR_JOB=$((create && !deploy))
   CUR_PROBE=("${probe[@]}")
   for wait in $IAM_WAITS ""; do
     if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
@@ -247,7 +305,7 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
             failed_at "$what (the service now exists, so the deploy is not re-sent automatically)" "$check"
           else
             failed_at "$what" "$check" "$((STEP_N + 1))" \
-              "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created."
+              "Step ${STEP_N} reported an error, but what it creates now exists and reads Ready True, so it is not repeated: a permission error does not prove nothing was created."
           fi ;;
         ABSENT) ;;
         *) failed_at "$what" "$check" "$STEP_N" \
