@@ -115,8 +115,11 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     create) is retried after waits of 30, 60, 90, 120 and 180 seconds (`CCC_IAM_WAITS`), only on an IAM-pending
     error (permission denied, or the account does not exist yet). A permission error does not prove that nothing
     was created: a failed deploy can leave the service. So before retrying the deploy or the job create, the script
-    describes the resource, and **retries only on a confirmed not-found**. If it now exists, the apply stops and
-    points to the next step (Cursor on 27e1f5a). If the describe itself fails for another reason, the apply stops
+    describes the resource after the wait, and **retries only on a confirmed not-found**. If the job now exists,
+    the apply stops and points to the next step. If the broker service now exists, the apply stops and points back
+    to the deploy itself: a failed deploy can leave the service without a ready revision, and `run deploy` updates
+    it. Nothing moves on to the invoker binding until the service has a ready revision (Cursor on 27e1f5a and
+    de83893). If the describe itself fails for another reason, the apply stops
     for a person to look (Codex on 708b0a2). Any other failure stops at once, because a lost answer may have
     followed a real change (Copilot and Codex on b6fa11e and 5a98651).
   - Every step is numbered. A failed apply says which step stopped and how to check that resource, and prints

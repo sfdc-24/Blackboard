@@ -277,10 +277,24 @@ class SetupScriptTest(unittest.TestCase):
                                      leaves="run services describe ccc-broker@run deploy ccc-broker")
         self.assertNotEqual(0, out.returncode)
         self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
-        self.assertIn("what it creates now exists, so it is not repeated", out.stderr)
+        # Cursor on de83893: a service a failed deploy left may have no ready revision, so recovery re-runs the deploy
+        # itself (an update), never the invoker binding first.
+        self.assertIn("the service now exists; a failed deploy can leave it without a ready revision", out.stderr)
+        self.assertIn("`run deploy` updates the existing service", out.stderr)
         deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
-        self.assertIn("--print-from %d" % (deploy_step + 1), out.stderr)
+        self.assertIn("--print-from %d" % deploy_step, out.stderr)
         self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
+
+    def test_a_job_create_that_left_its_job_continues_at_the_next_step(self):
+        out, calls = self.run_script("--apply", go="OWNER-GO-TEST", sha=self.head,
+                                     flaky="run jobs create claude-code-cloud:9",
+                                     leaves="run jobs describe claude-code-cloud@run jobs create claude-code-cloud")
+        self.assertNotEqual(0, out.returncode)
+        self.assertEqual(1, sum(1 for c in calls if c.startswith("run jobs create claude-code-cloud")))
+        self.assertIn("what it creates now exists, so it is not repeated", out.stderr)
+        job_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+        self.assertIn("--print-from %d" % (job_step + 1), out.stderr)
+        self.assertFalse([c for c in calls if c.startswith("run jobs add-iam-policy-binding")])
 
     def test_an_inconclusive_describe_stops_instead_of_retrying_the_create(self):
         # Codex P1 on 708b0a2: only a confirmed not-found may lead to a second create.

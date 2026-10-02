@@ -192,12 +192,15 @@ step() {   # step <description> <how to check it> -- <command...>   (runs once; 
 IAM_WAITS="${CCC_IAM_WAITS-30 60 90 120 180}"   # unset: the default; set but empty: refused
 [[ "$IAM_WAITS" =~ ^[0-9]+( [0-9]+)*$ ]] || { echo "REFUSED: CCC_IAM_WAITS must be seconds separated by spaces." >&2; exit 2; }
 IAM_PENDING='PERMISSION_DENIED|[Pp]ermission .* denied|[Ss]ervice account .* does not exist|does not exist\. Please verify|INVALID_ARGUMENT: .*(member|[Ss]ervice account)'
-step_after_iam() {   # step_after_iam [--create] <description> <how to check it> -- <command...>
-  # --create: the check is a describe of what the command creates. A permission error does not prove nothing was
-  # created (a failed deploy can leave the service), so before any retry it is described, and retried only while it
-  # is still absent (Cursor NO-GO on 27e1f5a). Bindings are idempotent and need no probe.
-  local create=0
-  if [ "$1" = "--create" ]; then create=1; shift; fi
+step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how to check it> -- <command...>
+  # --create / --deploy: the check is a describe of what the command creates. A permission error does not prove
+  # nothing was created (a failed deploy can leave the service), so just before any retry, AFTER the wait, it is
+  # described, and the command is re-sent only on a confirmed not-found (Cursor on 27e1f5a and de83893).
+  # If it exists: a job that exists is done being created, so recovery continues at the next step (--create). A
+  # service a failed deploy left may have no ready revision, and `run deploy` updates it, so recovery re-runs THIS
+  # step (--deploy) and never moves on to the invoker binding first. Bindings are idempotent and need no probe.
+  local create=0 deploy=0
+  if [ "$1" = "--create" ]; then create=1; shift; elif [ "$1" = "--deploy" ]; then create=1; deploy=1; shift; fi
   local what="$1" check="$2"; shift 3
   STEP_N=$((STEP_N + 1))
   if [ "$APPLY" != 1 ]; then
@@ -214,20 +217,27 @@ step_after_iam() {   # step_after_iam [--create] <description> <how to check it>
     if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
     printf '%s\n' "$out" >&2
     if ! grep -qE "$IAM_PENDING" <<<"$out"; then failed_at "$what" "$check"; fi
+    [ -n "$wait" ] || break
+    echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
+    sleep "$wait"
     if [ "$create" = 1 ]; then
-      # Retry only on a CONFIRMED not-found. A describe that fails for any other reason (network, permission) is
-      # unknown, and unknown stops for a person to look (Codex P1 on 708b0a2).
+      # Described AFTER the wait, just before the retry, so a resource that appeared meanwhile is seen (Cursor on
+      # de83893). Retry only on a CONFIRMED not-found; a describe that fails for any other reason (network,
+      # permission) is unknown, and unknown stops for a person to look (Codex P1 on 708b0a2).
       case "$(state "${probe[@]}")" in
-        PRESENT) failed_at "$what" "$check" "$((STEP_N + 1))" \
-          "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created." ;;
+        PRESENT)
+          if [ "$deploy" = 1 ]; then
+            failed_at "$what" "$check" "$STEP_N" \
+              "Step ${STEP_N} reported an error, but the service now exists; a failed deploy can leave it without a ready revision. It is not re-sent automatically. Once the grants are effective, re-run this step: \`run deploy\` updates the existing service. Do not go on to the invoker binding until the describe shows a ready revision."
+          else
+            failed_at "$what" "$check" "$((STEP_N + 1))" \
+              "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created."
+          fi ;;
         ABSENT) ;;
         *) failed_at "$what" "$check" "$STEP_N" \
           "Step ${STEP_N} reported an error, and a describe could not tell whether what it creates exists, so it is not retried." ;;
       esac
     fi
-    [ -n "$wait" ] || break
-    echo "APPLY: [${STEP_N}] $what was refused while IAM propagates. Retrying in ${wait}s." >&2
-    sleep "$wait"
   done
   failed_at "$what (still refused after waits of ${IAM_WAITS} s)" "$check"
 }
@@ -268,7 +278,7 @@ step_after_iam "the broker may use only the ccc-receipts database" "gcloud proje
     --condition "title=ccc-receipts-only,expression=resource.name==\"projects/${PROJECT}/databases/ccc-receipts\""
 
 # 4. The broker: private service, C1 operation post_receipt only. The image is built from a merged main SHA.
-step_after_iam --create "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
+step_after_iam --deploy "deploy ccc-broker (no public invoker)" "gcloud run services describe ccc-broker --project ${PROJECT} --region ${REGION}" -- \
   gcloud run deploy ccc-broker --project "$PROJECT" --region "$REGION" \
     --image "${REG}/ccc-broker:${CCC_BROKER_TAG:-UNSET}" --service-account "$BROKER_SA" \
     --no-allow-unauthenticated --ingress all --min-instances 0 --max-instances 2 \
