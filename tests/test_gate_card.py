@@ -536,6 +536,42 @@ class CursorReviewRound2(unittest.TestCase):
         self.assertEqual(anchors, {"11": "high-severity", "13": "critical-severity"})
 
 
+class CodexVerdictShapes(unittest.TestCase):
+    """Copilot discussion_r4170699606: the marker line is an ID, and the
+    `## Codex:` heading form must still be read as a verdict."""
+
+    def _verdict(self, body: str) -> str | None:
+        return gate_card.codex_verdict({"author": "sfdc-24", "body": body}, SHA)
+
+    def test_a_marker_id_containing_go_is_not_a_verdict_on_its_own(self):
+        self.assertIsNone(self._verdict(
+            f"CODEX-PR316-GO-RECEIPT\n\nTarget SHA `{SHA}`. Review pending."
+        ))
+        self.assertIsNone(self._verdict(f"CODEX-PR316-NO-GO-20261002 `{SHA}`"))
+
+    def test_both_live_receipt_shapes_are_read(self):
+        # The #315 shape: an HTML marker, then the heading.
+        self.assertEqual(self._verdict(
+            f"<!-- CODEX-PR315-X -->\n\n## Codex: GO / NO-MAJOR\n\n"
+            f"Exact reviewed head: `{SHA}`."
+        ), "GO")
+        # The heading alone, leading the comment: Copilot's "retain
+        # the `## Codex: GO...` form". Dropping the lead line blindly
+        # would refuse this, which is a false refusal of a real GO.
+        self.assertEqual(self._verdict(
+            f"## Codex: GO / NO-MAJOR for `{SHA}`\n\nNo findings."
+        ), "GO")
+        self.assertEqual(self._verdict(
+            f"## Codex: NO-GO for `{SHA}`\n\nThree findings."
+        ), "NO-GO")
+        self.assertEqual(self._verdict(f"CODEX-PR316-X\n\nGO at `{SHA}`."), "GO")
+
+    def test_a_marker_id_with_go_never_lifts_a_no_go_body(self):
+        self.assertEqual(
+            self._verdict(f"CODEX-PR316-GO-CHECK\n\nNO-GO at `{SHA}`."), "NO-GO"
+        )
+
+
 class CursorGate(unittest.TestCase):
     def test_silence_is_not_a_go(self):
         inputs = green_inputs()

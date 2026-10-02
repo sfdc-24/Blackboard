@@ -226,13 +226,17 @@ def codex_verdict(comment: dict, named_sha: str,
         lead = lead[4:].replace("-->", "", 1).strip()
     if not (CODEX_MARKER.match(lead) or lead.startswith("## Codex:")):
         return None
-    # The marker line is an ID, not a verdict: an id like
-    # CODEX-...-GO-... must not decide a NO-GO body. And where both
-    # tokens appear anywhere in the rest (a quoted "Reply GO or NO-GO",
-    # a cited earlier verdict), NO-GO wins: the safe direction is a
-    # false refusal, never a false GO.
-    rest_lines = [ln for ln in str(body or "").splitlines() if ln.strip()][1:]
-    tokens = set(CODEX_VERDICT.findall("\n".join(rest_lines)))
+    # A bare CODEX-... line is an opaque ID, not a verdict: an id like
+    # CODEX-...-GO-... must not decide anything, so it is dropped
+    # before the tokens are read. A "## Codex: GO / NO-MAJOR" heading
+    # is the opposite - it carries the verdict - so it is kept even
+    # when it leads the comment. Where both tokens appear in what is
+    # read (a quoted "Reply GO or NO-GO", a cited earlier verdict),
+    # NO-GO wins: the safe direction is a false refusal, never a
+    # false GO.
+    lines = [ln for ln in str(body or "").splitlines() if ln.strip()]
+    scan = lines[1:] if CODEX_MARKER.match(lead) else lines
+    tokens = set(CODEX_VERDICT.findall("\n".join(scan)))
     if not tokens:
         return None
     if "NO-GO" in tokens:
