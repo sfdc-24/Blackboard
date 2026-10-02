@@ -231,8 +231,12 @@ class SetupScriptTest(unittest.TestCase):
         self.assertNotEqual(0, out.returncode)
         self.assertEqual(3, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))   # 1 + one per wait
         self.assertRegex(out.stderr, r"FAILED at step \d+: deploy ccc-broker \(no public invoker\) \(still refused")
-        self.assertIn("Check it first: gcloud run services describe ccc-broker", out.stderr)
-        self.assertRegex(out.stderr, r"bash cloud/claude-code-cloud/setup.sh --print-from \d+")
+        # Cursor NO-GO on 75cd35a: the waits-exhausted attempt is described too and points back to the deploy.
+        self.assertIn("A describe of the service now reads: ABSENT", out.stderr)
+        self.assertIn("re-run this step: `run deploy` updates an existing service", out.stderr)
+        self.assertNotIn("start from step", out.stderr)
+        deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
+        self.assertIn("--print-from %d" % deploy_step, out.stderr)
         self.assertFalse([c for c in calls if c.startswith("run jobs create")])          # nothing after it ran
 
     def test_a_failure_that_is_not_iam_propagation_is_never_retried(self):
@@ -243,7 +247,9 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))   # exactly one attempt
         self.assertRegex(out.stderr, r"FAILED at step \d+: deploy ccc-broker \(no public invoker\)\. Steps 1 to \d+ "
                                      r"are applied; nothing after this one ran\.")
-        self.assertIn("The server may or may not have applied step", out.stderr)
+        self.assertIn("A describe of the service now reads:", out.stderr)               # the deploy wording, not the generic
+        self.assertIn("Do not go on to the invoker binding until the describe shows a ready revision", out.stderr)
+        self.assertNotIn("start from step", out.stderr)
         self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
 
     def test_a_binding_on_a_just_created_account_is_retried_while_iam_propagates(self):
@@ -279,8 +285,10 @@ class SetupScriptTest(unittest.TestCase):
         self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
         # Cursor on de83893: a service a failed deploy left may have no ready revision, so recovery re-runs the deploy
         # itself (an update), never the invoker binding first.
-        self.assertIn("the service now exists; a failed deploy can leave it without a ready revision", out.stderr)
-        self.assertIn("`run deploy` updates the existing service", out.stderr)
+        self.assertIn("the service now exists, so the deploy is not re-sent automatically", out.stderr)
+        self.assertIn("A describe of the service now reads: PRESENT", out.stderr)
+        self.assertIn("`run deploy` updates an existing service", out.stderr)
+        self.assertNotIn("start from step", out.stderr)
         deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
         self.assertIn("--print-from %d" % deploy_step, out.stderr)
         self.assertFalse([c for c in calls if c.startswith(("run services add-iam-policy-binding", "run jobs create"))])
@@ -302,7 +310,9 @@ class SetupScriptTest(unittest.TestCase):
                                      probe_fails="run services describe ccc-broker@run deploy ccc-broker")
         self.assertNotEqual(0, out.returncode)
         self.assertEqual(1, sum(1 for c in calls if c.startswith("run deploy ccc-broker")))
-        self.assertIn("could not tell whether what it creates exists, so it is not retried", out.stderr)
+        # For the broker deploy, every failure uses the deploy wording (Cursor on 75cd35a); here the describe is UNKNOWN.
+        self.assertIn("A describe of the service now reads: UNKNOWN", out.stderr)
+        self.assertIn("re-run this step: `run deploy` updates an existing service", out.stderr)
         deploy_step = int(out.stderr.split("FAILED at step ")[1].split(":")[0])
         self.assertIn("--print-from %d" % deploy_step, out.stderr)            # this step, after a person looks
 

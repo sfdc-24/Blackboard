@@ -157,10 +157,18 @@ recovery_line() {   # recovery_line <first step>: the --print-from command, with
   printf 'CCC_PROJECT=%s CCC_REGION=%s CCC_BROKER_TAG=%s CCC_JOB_TAG=%s bash cloud/claude-code-cloud/setup.sh --print-from %s' \
     "$(quoted "$PROJECT")" "$(quoted "$REGION")" "$(quoted "${CCC_BROKER_TAG:-}")" "$(quoted "${CCC_JOB_TAG:-}")" "$1"
 }
+CUR_DEPLOY=0
+CUR_PROBE=()
 failed_at() {   # failed_at <description> <how to check it> [<step to continue from> <why>]
   local from="${3:-$STEP_N}"
   echo "FAILED at step ${STEP_N}: $1. Steps 1 to $((STEP_N - 1)) are applied; nothing after this one ran." >&2
-  if [ -n "${4:-}" ]; then
+  if [ "$CUR_DEPLOY" = 1 ]; then
+    # Every failure of the broker deploy, on any path (waits exhausted, a non-IAM error), is described and points back
+    # to the deploy itself: a failed deploy can leave the service without a ready revision, so "already applied, go
+    # on" would skip it (Cursor NO-GO on 75cd35a).
+    from="$STEP_N"
+    echo "The deploy failed. A describe of the service now reads: $(state "${CUR_PROBE[@]}"). A failed deploy can leave the service without a ready revision. Once the grants are effective, re-run this step: \`run deploy\` updates an existing service. Do not go on to the invoker binding until the describe shows a ready revision. Check it: $2" >&2
+  elif [ -n "${4:-}" ]; then
     echo "$4 Check it: $2" >&2
   else
     echo "The server may or may not have applied step ${STEP_N}. Check it first: $2" >&2
@@ -174,6 +182,7 @@ failed_at() {   # failed_at <description> <how to check it> [<step to continue f
 step() {   # step <description> <how to check it> -- <command...>   (runs once; never retried)
   local what="$1" check="$2"; shift 3
   STEP_N=$((STEP_N + 1))
+  CUR_DEPLOY=0
   if [ "$APPLY" = 1 ]; then
     echo "APPLY: [${STEP_N}] $what"
     "$@" || failed_at "$what" "$check"
@@ -213,6 +222,8 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
   echo "APPLY: [${STEP_N}] $what"
   local wait out probe
   read -ra probe <<<"$check"
+  CUR_DEPLOY="$deploy"
+  CUR_PROBE=("${probe[@]}")
   for wait in $IAM_WAITS ""; do
     if out="$("$@" 2>&1)"; then printf '%s\n' "$out"; return 0; fi
     printf '%s\n' "$out" >&2
@@ -227,8 +238,7 @@ step_after_iam() {   # step_after_iam [--create | --deploy] <description> <how t
       case "$(state "${probe[@]}")" in
         PRESENT)
           if [ "$deploy" = 1 ]; then
-            failed_at "$what" "$check" "$STEP_N" \
-              "Step ${STEP_N} reported an error, but the service now exists; a failed deploy can leave it without a ready revision. It is not re-sent automatically. Once the grants are effective, re-run this step: \`run deploy\` updates the existing service. Do not go on to the invoker binding until the describe shows a ready revision."
+            failed_at "$what (the service now exists, so the deploy is not re-sent automatically)" "$check"
           else
             failed_at "$what" "$check" "$((STEP_N + 1))" \
               "Step ${STEP_N} reported an error, but what it creates now exists, so it is not repeated: a permission error does not prove nothing was created."

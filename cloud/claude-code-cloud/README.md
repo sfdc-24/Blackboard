@@ -126,8 +126,10 @@ Its price is not quoted here. It must be quoted from Google's Firestore pricing 
     the exact recovery line, with the same `CCC_PROJECT`, `CCC_REGION`, `CCC_BROKER_TAG` and `CCC_JOB_TAG` as the
     apply, ending in `--print-from <N>`. That prints step N and every step after it, in order, **shell-quoted** so
     each can be pasted as written, and changes nothing. `--print-from` refuses to run without both image tags.
-    Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. A plain
-    re-run would refuse on the resources already created.
+    Check the failed resource first. If it was already applied, start from N+1: a create is never run twice. The
+    **broker deploy is the exception**: on any failure the apply points back to the deploy itself, because a service
+    a failed deploy left may have no ready revision and `run deploy` updates it. Do not go on to the invoker binding
+    until the describe shows a ready revision. A plain re-run would refuse on the resources already created.
   - The script runs once, by the owner, under his GO, with no other writer expected. That bounds the race; it does
     not remove it.
 - **Changes are additive.** Nothing is deleted and no existing runtime is modified. Two kinds of change touch
