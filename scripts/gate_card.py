@@ -11,7 +11,9 @@ WHY THIS EXISTS
 WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
   - The named SHA is one full 40-hex commit, it is the pull request's
     head before AND after the reads (a moved head restarts the reviews),
-    and the PR is open, not merged and not a draft.
+    and the PR is open, not merged and not a draft in BOTH of those
+    reads: a merge or a draft conversion landing mid-read is not
+    hidden by the first read's word.
   - CI on that SHA is green: every named required check (default
     required-ci; --required-check overrides) is present, every run
     completed without a failing conclusion, and the combined commit
@@ -20,7 +22,10 @@ WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
     card links the required run itself, as U4 asks.
   - Cursor's latest verdict naming that SHA is GO. The verdict must be
     authored by cursor[bot] itself and start the comment; silence or
-    NO-GO refuses, and a GO on any other SHA is no GO here.
+    NO-GO refuses, and a GO on any other SHA is no GO here. The
+    verdict line must name this SHA and no other full SHA, and must
+    carry one verdict token: "GO or NO-GO ..." is a question, not a
+    verdict.
   - Codex's latest verdict naming that SHA is GO or NO-MAJOR. A Codex
     verdict is a comment whose FIRST line is its marker (CODEX-... or
     "## Codex:"), because dispatches quote "GO or NO-GO" in passing,
@@ -34,7 +39,12 @@ WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
     MISSING verdict; a present NO-GO still refuses.
   - A Copilot review exists on the exact SHA and the latest one carries
     no blocker in its summary ("a BLOCKER can sit in the summary alone"
-    - Copilot's own amendment to U4).
+    - Copilot's own amendment to U4). A blocker in an EARLIER head's
+    summary is carried forward through its anchors, every one of which
+    must then be resolved whatever its badge. The single supersession
+    allowed: a summary blocker that anchored no finding at all has no
+    thread to resolve, so Copilot's own clean review on the named SHA
+    supersedes it - and the card says which, so a reader can disagree.
   - Every Copilot finding that is high/critical severity or worded as a
     blocker, FROM ANY HEAD of this PR, sits in a resolved thread. A
     moved head cannot drop one: unresolved findings from earlier heads
@@ -85,7 +95,11 @@ from datetime import datetime, timezone
 API = "https://api.github.com"
 DEFAULT_OWNER = "sfdc-24"
 DEFAULT_REPO = "Blackboard"
-SCHEMA = "gate-card-inputs-v1"
+# v2 carries the whole second PR read (`pr_after`), not just its head
+# SHA: a merge or a conversion to draft landing between the reads has
+# to be seen. A v1 snapshot cannot answer that, so it is refused
+# rather than judged on partial evidence.
+SCHEMA = "gate-card-inputs-v2"
 
 CURSOR_LOGIN = "cursor"
 COPILOT_LOGIN = "copilot-pull-request-reviewer"
@@ -97,6 +111,7 @@ CODEX_RELAY_LOGINS = frozenset({"sfdc-24"})
 REQUIRED_CHECKS = ("required-ci",)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
 # "blocker" as a standalone word, any case: Copilot has written
 # "BLOCKER - READ-NOT-DEMONSTRATED", "READ-NOT-DEMONSTRATED (blocker):"
 # and "VERDICT: BLOCKER" on this repository's PRs.
@@ -145,15 +160,24 @@ def first_nonempty_line(body: str | None) -> str:
 
 
 def cursor_verdict(comment: dict, named_sha: str) -> str | None:
-    """GO/NO-GO when this comment is a Cursor verdict naming the SHA."""
+    """GO/NO-GO when this comment is a Cursor verdict naming the SHA.
+
+    The verdict binds to the SHA its own verdict line names, and to
+    that one alone: a GO "on `other-sha`" is no GO here even when the
+    same line goes on to mention this SHA. A verdict line carrying
+    both tokens ("GO or NO-GO ...") is ambiguous, and so is one naming
+    two full SHAs: both are silence.
+    """
     if norm_login(comment.get("author")) != CURSOR_LOGIN:
         return None
-    body = str(comment.get("body") or "")
-    if named_sha not in body.lower():
+    lead_raw = first_nonempty_line(str(comment.get("body") or ""))
+    if set(SHA_IN_TEXT.findall(lead_raw.lower())) != {named_sha}:
         return None
-    lead = first_nonempty_line(body).lstrip("*").strip()
-    m = CURSOR_VERDICT.match(lead)
-    return m.group(1) if m else None
+    m = CURSOR_VERDICT.match(lead_raw.lstrip("*").strip())
+    if m is None:
+        return None
+    tokens = set(re.findall(r"\b(NO-GO|GO)\b", lead_raw))
+    return m.group(1) if tokens == {m.group(1)} else None
 
 
 def codex_verdict(comment: dict, named_sha: str,
@@ -164,21 +188,36 @@ def codex_verdict(comment: dict, named_sha: str,
     dispatches say "Reply GO or NO-GO" and cite CODEX-... ids mid-body,
     and neither of those is a verdict. Only a trusted relay login may
     carry one: a marker is text anyone can type, an author is not.
+
+    A Codex receipt names the head it reviewed FIRST and the base it
+    was read against after it ("Exact reviewed head: X. Current main:
+    Y"), so the verdict binds to the first full SHA in the body: a
+    receipt for an older head that merely mentions this SHA later is
+    not a verdict for this SHA.
     """
     if norm_login(comment.get("author")) not in relays:
         return None
     body = str(comment.get("body") or "")
-    if named_sha not in body.lower():
+    shas = SHA_IN_TEXT.findall(body.lower())
+    if not shas or shas[0] != named_sha:
         return None
     lead = first_nonempty_line(body)
     if lead.startswith("<!--"):
         lead = lead[4:].replace("-->", "", 1).strip()
     if not (CODEX_MARKER.match(lead) or lead.startswith("## Codex:")):
         return None
-    m = CODEX_VERDICT.search(body)
-    if m is None:
+    # The marker line is an ID, not a verdict: an id like
+    # CODEX-...-GO-... must not decide a NO-GO body. And where both
+    # tokens appear anywhere in the rest (a quoted "Reply GO or NO-GO",
+    # a cited earlier verdict), NO-GO wins: the safe direction is a
+    # false refusal, never a false GO.
+    rest_lines = [ln for ln in str(body or "").splitlines() if ln.strip()][1:]
+    tokens = set(CODEX_VERDICT.findall("\n".join(rest_lines)))
+    if not tokens:
         return None
-    return "NO-GO" if m.group(1) == "NO-GO" else "GO"
+    if "NO-GO" in tokens:
+        return "NO-GO"
+    return "GO"
 
 
 def latest_verdict(comments: list[dict], named_sha: str, reader) -> tuple[str, dict] | None:
@@ -200,19 +239,29 @@ def copilot_reviews(reviews: list[dict]) -> list[dict]:
 
 
 def copilot_finding_anchors(reviews: list[dict]) -> dict[str, str]:
-    """discussion id -> severity, from EVERY Copilot review on any head.
+    """discussion id -> why it is tracked, over EVERY head's reviews.
 
-    This is the carry-forward: a high/critical finding stays tracked
-    after the head moves, until its thread resolves.
+    This is the carry-forward. Two kinds of finding stay tracked until
+    their thread is seen resolved:
+      - any high/critical-severity finding, by its severity badge;
+      - EVERY finding anchored in a review whose summary carried a
+        blocker, whatever its badge, because that review's verdict was
+        "blocked" and the badge alone does not say which finding did
+        it.
     """
     anchors: dict[str, str] = {}
     for review in copilot_reviews(reviews):
-        for line in str(review.get("body") or "").splitlines():
+        body = str(review.get("body") or "")
+        summary_blocked = bool(blocker_lines(body))
+        for line in body.splitlines():
             severity = FINDING_LINE.search(line)
-            if not severity:
-                continue
             for did in DISCUSSION_ANCHOR.findall(line):
-                anchors[did] = severity.group(1)
+                if severity:
+                    anchors[did] = f"{severity.group(1).lower()}-severity"
+                elif summary_blocked:
+                    anchors.setdefault(
+                        did, "anchored in a review whose summary carried a blocker"
+                    )
     return anchors
 
 
@@ -241,9 +290,9 @@ def thread_gate_reason(thread: dict, high_anchors: dict[str, str]) -> str | None
         if hits:
             return "Copilot blocker: " + hits[0][:200]
     for did in thread_discussion_ids(thread):
-        severity = high_anchors.get(did)
-        if severity:
-            return f"Copilot {severity.lower()}-severity finding (discussion_r{did})"
+        why = high_anchors.get(did)
+        if why:
+            return f"Copilot finding, {why} (discussion_r{did})"
     return None
 
 
@@ -289,6 +338,7 @@ def judge(inputs: dict, require_codex: bool = True,
 
     named_sha = str(inputs.get("named_sha") or "").lower()
     pr = dict(inputs.get("pr") or {})
+    pr_after = dict(inputs.get("pr_after") or {})
     comments = list(inputs.get("issue_comments") or [])
     reviews = list(inputs.get("reviews") or [])
     threads = list(inputs.get("threads") or [])
@@ -299,8 +349,10 @@ def judge(inputs: dict, require_codex: bool = True,
     if not SHA_RE.match(named_sha):
         raise GateError("the card names ONE full 40-hex commit; got "
                         f"{len(named_sha)} characters")
+    if not pr or not pr_after:
+        raise GateError("the inputs must carry both PR reads (pr, pr_after)")
     head = str(pr.get("head_sha") or "").lower()
-    head_after = str(inputs.get("pr_after_head_sha") or "").lower()
+    head_after = str(pr_after.get("head_sha") or "").lower()
     if head != named_sha:
         out.open.append(
             f"the PR head is {head[:12]} but the card names {named_sha[:12]}: "
@@ -314,17 +366,30 @@ def judge(inputs: dict, require_codex: bool = True,
     else:
         out.closed.append(f"One SHA: `{named_sha}` is the head before and after the reads")
 
-    # 2. The pull request itself.
-    state = str(pr.get("state") or "")
-    if pr.get("merged"):
-        out.open.append("the PR is already merged; there is nothing to hand over")
-    elif state != "open":
-        out.open.append(f"the PR is {state or 'in an unknown state'}, not open")
-    elif pr.get("draft"):
-        out.open.append("the PR is a draft; a draft cannot merge (mark it ready first)")
-    else:
-        line = "PR: open, not a draft"
-        mergeable = str(pr.get("mergeable_state") or "")
+    # 2. The pull request itself, in BOTH reads: a merge or a
+    # conversion to draft that lands between them must not slip
+    # through on the first read's word.
+    bad_state = False
+    for label, read in (("", pr), (" (by the end of the reads)", pr_after)):
+        state = str(read.get("state") or "")
+        if read.get("merged"):
+            out.open.append(
+                f"the PR is already merged{label}; there is nothing to hand over"
+            )
+        elif state != "open":
+            out.open.append(
+                f"the PR is {state or 'in an unknown state'}, not open{label}"
+            )
+        elif read.get("draft"):
+            out.open.append(
+                f"the PR is a draft{label}; a draft cannot merge (mark it ready first)"
+            )
+        else:
+            continue
+        bad_state = True
+    if not bad_state:
+        line = "PR: open and not a draft, before and after the reads"
+        mergeable = str(pr_after.get("mergeable_state") or pr.get("mergeable_state") or "")
         if mergeable:
             line += f", mergeable_state {mergeable}"
         out.closed.append(line)
@@ -404,6 +469,25 @@ def judge(inputs: dict, require_codex: bool = True,
             out.closed.append(
                 f"Copilot review on this SHA: no blocker in the summary ({latest.get('html_url')})"
             )
+        # A blocker in an EARLIER head's summary is carried forward
+        # through its anchors, which rule 7 requires to be resolved.
+        # A summary blocker that anchored nothing has no thread to
+        # resolve: there, and only there, Copilot's own clean review
+        # on the named SHA supersedes its earlier summary - and the
+        # card says so, so the reader can disagree.
+        superseded = [
+            r for r in copilot_reviews(reviews)
+            if str(r.get("commit_id") or "").lower() != named_sha
+            and blocker_lines(str(r.get("body") or ""))
+            and not DISCUSSION_ANCHOR.findall(str(r.get("body") or ""))
+        ]
+        if superseded and not hits:
+            urls = ", ".join(str(r.get("html_url") or "") for r in superseded)
+            out.closed.append(
+                f"{len(superseded)} earlier head(s) carried a summary blocker that "
+                f"anchored no finding; Copilot's clean review on this SHA supersedes "
+                f"it: {urls}"
+            )
 
     # 7. Copilot findings from EVERY head, judged by thread resolution.
     high_anchors = copilot_finding_anchors(reviews)
@@ -436,16 +520,15 @@ def judge(inputs: dict, require_codex: bool = True,
             for comment in thread.get("comments") or []:
                 url = str(comment.get("html_url") or "") or url
             out.open.append(f"unresolved {reason} - {url or thread.get('id')}")
-    # A high/critical anchor whose thread was never fetched is not
-    # resolved: resolution that was not observed is not resolution.
+    # A tracked anchor whose thread was never fetched is not resolved:
+    # resolution that was not observed is not resolution.
     for did in sorted(high_anchors):
         if did not in mapped_ids:
             tracked += 1
             open_findings += 1
             out.open.append(
-                f"Copilot {high_anchors[did].lower()}-severity finding "
-                f"discussion_r{did} has no fetched thread: its resolution "
-                "was never observed"
+                f"Copilot finding discussion_r{did} ({high_anchors[did]}) has "
+                "no fetched thread: its resolution was never observed"
             )
     if open_findings == 0:
         out.closed.append(
@@ -620,12 +703,22 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
         for r in _paged(rest, f"/repos/{owner}/{repo}/pulls/{number}/reviews", {})
     ]
 
+    # Page until a SHORT page, never on total_count: a missing count
+    # would otherwise end the read after page 1 and hide a failing run
+    # on page 2. The count, when the API gives one, is then a
+    # cross-check - a mismatch means the read was not whole, so it is
+    # an error rather than a judgement on partial CI.
     check_runs: list[dict] = []
     page = 1
+    total: int | None = None
     while True:
         payload = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/check-runs",
                        {"per_page": 100, "page": page})
-        chunk = payload.get("check_runs") or []
+        chunk = payload.get("check_runs")
+        if not isinstance(chunk, list):
+            raise GateError("unexpected check-runs payload: no check_runs list")
+        if page == 1 and isinstance(payload.get("total_count"), int):
+            total = int(payload["total_count"])
         check_runs.extend(
             {
                 "name": str(r.get("name") or ""),
@@ -635,9 +728,16 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
             }
             for r in chunk
         )
-        if len(check_runs) >= int(payload.get("total_count") or 0) or not chunk:
+        if len(chunk) < 100:
             break
         page += 1
+        if page > 50:
+            raise GateError("check-runs paging did not end; refusing to judge a partial read")
+    if total is not None and total != len(check_runs):
+        raise GateError(
+            f"check-runs read is not whole: the API counted {total}, this read "
+            f"has {len(check_runs)} (runs were created mid-read?); try again"
+        )
 
     combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status")
 
@@ -647,8 +747,16 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
         payload = graphql(THREADS_QUERY,
                           {"owner": owner, "repo": repo, "number": number,
                            "cursor": cursor})
-        conn = (((payload.get("data") or {}).get("repository") or {})
-                .get("pullRequest") or {}).get("reviewThreads") or {}
+        # A null repository or pullRequest with no `errors` must not
+        # read as "this PR has no review threads".
+        repository = (payload.get("data") or {}).get("repository")
+        pull = (repository or {}).get("pullRequest")
+        conn = (pull or {}).get("reviewThreads")
+        if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+            raise GateError(
+                "GraphQL returned no reviewThreads for this PR (null repository, "
+                "pull request or connection); refusing to treat that as 'no threads'"
+            )
         for node in conn.get("nodes") or []:
             inner = node.get("comments") or {}
             threads.append(
@@ -676,6 +784,16 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
 
     pr_after = rest(f"/repos/{owner}/{repo}/pulls/{number}")
 
+    def pr_fields(payload: dict) -> dict:
+        return {
+            "state": str(payload.get("state") or ""),
+            "draft": bool(payload.get("draft")),
+            "merged": bool(payload.get("merged")),
+            "head_sha": str((payload.get("head") or {}).get("sha") or "").lower(),
+            "mergeable_state": str(payload.get("mergeable_state") or ""),
+            "html_url": str(payload.get("html_url") or ""),
+        }
+
     return {
         "schema": SCHEMA,
         "owner": owner,
@@ -683,15 +801,10 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
         "number": number,
         "named_sha": named_sha,
         "gathered_at": utc_now(),
-        "pr": {
-            "state": str(pr.get("state") or ""),
-            "draft": bool(pr.get("draft")),
-            "merged": bool(pr.get("merged")),
-            "head_sha": head,
-            "mergeable_state": str(pr.get("mergeable_state") or ""),
-            "html_url": str(pr.get("html_url") or ""),
-        },
-        "pr_after_head_sha": str((pr_after.get("head") or {}).get("sha") or "").lower(),
+        "pr": pr_fields(pr),
+        # The whole second read, not just its head: a merge or a
+        # conversion to draft during the reads has to be visible.
+        "pr_after": pr_fields(pr_after),
         "issue_comments": comments,
         "reviews": reviews,
         "threads": threads,

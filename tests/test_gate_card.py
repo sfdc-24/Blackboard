@@ -75,7 +75,14 @@ def green_inputs(**overrides) -> dict:
             "mergeable_state": "clean",
             "html_url": "https://example.test/pr/999",
         },
-        "pr_after_head_sha": SHA,
+        "pr_after": {
+            "state": "open",
+            "draft": False,
+            "merged": False,
+            "head_sha": SHA,
+            "mergeable_state": "clean",
+            "html_url": "https://example.test/pr/999",
+        },
         "issue_comments": [
             {
                 "id": 1,
@@ -145,12 +152,14 @@ class RecordedAcceptance(unittest.TestCase):
     def test_315_refuses_only_on_the_draft_flag(self):
         j = judged(fixture("pr315_ee4c0c1.json"))
         self.assertFalse(j.passed)
-        self.assertEqual(len(j.open), 1, j.open)
-        self.assertIn("draft", j.open[0])
+        # One line per PR read, both the draft flag and nothing else.
+        self.assertEqual(len(j.open), 2, j.open)
+        self.assertTrue(all("draft" in line for line in j.open), j.open)
 
     def test_315_with_the_draft_cleared_closes_every_item_and_prints_the_card(self):
         inputs = fixture("pr315_ee4c0c1.json")
         inputs["pr"]["draft"] = False
+        inputs["pr_after"]["draft"] = False
         j = judged(inputs)
         self.assertTrue(j.passed, j.open)
         card = gate_card.render(inputs, j)
@@ -359,6 +368,91 @@ class CopilotReviewRound1(unittest.TestCase):
         self.assertTrue(judged(inputs).passed)
 
 
+class CursorReviewRound1(unittest.TestCase):
+    """Regressions for Cursor's NO-GO on d5b6757 (comment 5962984331)."""
+
+    def test_an_earlier_head_summary_blocker_carries_forward_by_its_anchors(self):
+        # Cursor's repro: clear #315's draft flag and remove its
+        # threads; the 76bd36c review still carries VERDICT: BLOCKER
+        # and High finding discussion_r4168464602.
+        inputs = fixture("pr315_ee4c0c1.json")
+        inputs["pr"]["draft"] = False
+        inputs["pr_after"]["draft"] = False
+        inputs["threads"] = []
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("discussion_r4168464602" in l and "never observed" in l for l in j.open),
+            j.open,
+        )
+        # EVERY anchor of a blocker-carrying review is tracked, not
+        # only the high ones: the mediums of that review too.
+        for did in ("4168464680", "4168464717"):
+            self.assertTrue(any(f"discussion_r{did}" in l for l in j.open), (did, j.open))
+
+    def test_an_earlier_summary_blocker_with_no_anchor_is_named_as_superseded(self):
+        inputs = green_inputs()
+        inputs["reviews"].insert(0, {
+            "id": 9, "author": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED", "commit_id": OTHER,
+            "body": "## Copilot review overview\n\nVERDICT: BLOCKER - no inline findings.",
+            "submitted_at": "2026-10-01T00:00:00Z",
+            "html_url": "https://example.test/r/9",
+        })
+        j = judged(inputs)
+        self.assertTrue(j.passed, j.open)
+        self.assertTrue(
+            any("supersedes" in l and "example.test/r/9" in l for l in j.closed), j.closed
+        )
+
+    def test_a_codex_marker_id_containing_go_does_not_outvote_a_no_go_body(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][1]["body"] = (
+            f"CODEX-PR999-GO-CHECK-20261002\n\nNO-GO at exact head `{SHA}`."
+        )
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Codex" in l and "NO-GO" in l for l in j.open), j.open)
+
+    def test_a_quoted_go_or_no_go_before_a_codex_no_go_stays_no_go(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][1]["body"] = (
+            f"CODEX-PR999-TEST\n\nYou asked: Reply GO or NO-GO for `{SHA}`.\n\n"
+            "## Codex: NO-GO\n\nThe retry path is unsound."
+        )
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Codex" in l and "NO-GO" in l for l in j.open), j.open)
+
+    def test_a_cursor_go_for_another_sha_in_its_verdict_line_is_not_this_go(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][0]["body"] = (
+            f"**GO** on `{OTHER}`. Against main the tree also matches {SHA}."
+        )
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Cursor" in l and "silence" in l for l in j.open), j.open)
+
+    def test_a_cursor_comment_starting_go_or_no_go_is_not_a_go(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][0]["body"] = (
+            f"GO or NO-GO for `{SHA}`? I am still reading."
+        )
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Cursor" in l and "silence" in l for l in j.open), j.open)
+
+    def test_the_real_cursor_and_codex_verdict_shapes_still_count(self):
+        # The live bodies of #315 at ee4c0c1 must keep passing: the
+        # strictness above must not break the shapes Cursor and the
+        # Codex relay actually write.
+        inputs = fixture("pr315_ee4c0c1.json")
+        inputs["pr"]["draft"] = False
+        inputs["pr_after"]["draft"] = False
+        j = judged(inputs)
+        self.assertTrue(j.passed, j.open)
+
+
 class CursorGate(unittest.TestCase):
     def test_silence_is_not_a_go(self):
         inputs = green_inputs()
@@ -446,7 +540,8 @@ class HeadAndPrGates(unittest.TestCase):
         self.assertTrue(any("moved head restarts the reviews" in l for l in j.open))
 
     def test_a_head_that_moved_during_the_reads_refuses(self):
-        inputs = green_inputs(pr_after_head_sha=OTHER)
+        inputs = green_inputs()
+        inputs["pr_after"]["head_sha"] = OTHER
         j = judged(inputs)
         self.assertFalse(j.passed)
         self.assertTrue(any("during the reads" in l for l in j.open))
@@ -464,9 +559,37 @@ class HeadAndPrGates(unittest.TestCase):
         ):
             inputs = green_inputs()
             inputs["pr"].update(patch)
+            inputs["pr_after"].update(patch)
             j = judged(inputs)
             self.assertFalse(j.passed, patch)
             self.assertTrue(any(needle in l for l in j.open), (patch, j.open))
+
+    def test_a_state_that_changes_during_the_reads_refuses(self):
+        # Cursor's case: a merge (or a draft conversion) landing between
+        # the two PR reads must not pass on the first read's word.
+        for patch, needle in (
+            ({"merged": True, "state": "closed"}, "already merged"),
+            ({"draft": True}, "draft"),
+            ({"state": "closed"}, "not open"),
+        ):
+            inputs = green_inputs()
+            inputs["pr_after"].update(patch)
+            j = judged(inputs)
+            self.assertFalse(j.passed, patch)
+            self.assertTrue(
+                any(needle in l and "by the end of the reads" in l for l in j.open),
+                (patch, j.open),
+            )
+
+    def test_a_v1_snapshot_is_refused_rather_than_judged(self):
+        inputs = green_inputs()
+        inputs["schema"] = "gate-card-inputs-v1"
+        with self.assertRaises(gate_card.GateError):
+            judged(inputs)
+        inputs = green_inputs()
+        del inputs["pr_after"]
+        with self.assertRaises(gate_card.GateError):
+            judged(inputs)
 
 
 class CiGate(unittest.TestCase):
@@ -509,7 +632,7 @@ class RefusalCompleteness(unittest.TestCase):
 
 
 class GatherAndCli(unittest.TestCase):
-    def _fake_rest(self, calls):
+    def _fake_rest(self, calls, check_payloads=None, pr_after=None):
         comments_p1 = [
             {"id": i, "user": {"login": "cursor[bot]"},
              "body": "page-one filler", "created_at": "t", "html_url": f"u{i}"}
@@ -520,12 +643,19 @@ class GatherAndCli(unittest.TestCase):
             "body": f"**GO** on `{SHA}`.", "created_at": "t2", "html_url": "u200",
         }]
 
+        base_pr = {"state": "open", "draft": False, "merged": False,
+                   "head": {"sha": SHA}, "mergeable_state": "clean",
+                   "html_url": "https://example.test/pr/999"}
+
         def rest(path, params=None):
             calls.append((path, dict(params or {})))
             if path.endswith("/pulls/999"):
-                return {"state": "open", "draft": False, "merged": False,
-                        "head": {"sha": SHA}, "mergeable_state": "clean",
-                        "html_url": "https://example.test/pr/999"}
+                first = not any(
+                    p.endswith("/pulls/999") for p, _ in calls[:-1]
+                )
+                if first or pr_after is None:
+                    return dict(base_pr)
+                return {**base_pr, **pr_after}
             if path.endswith("/issues/999/comments"):
                 return comments_p1 if params.get("page") == 1 else comments_p2 if params.get("page") == 2 else []
             if path.endswith("/pulls/999/reviews"):
@@ -533,6 +663,8 @@ class GatherAndCli(unittest.TestCase):
                          "state": "COMMENTED", "commit_id": SHA, "body": "ok",
                          "submitted_at": "t", "html_url": "r1"}]
             if path.endswith(f"/commits/{SHA}/check-runs"):
+                if check_payloads is not None:
+                    return check_payloads[int(params.get("page", 1)) - 1]
                 return {"total_count": 1, "check_runs": [
                     {"name": "required-ci", "status": "completed",
                      "conclusion": "success", "html_url": "ci1"}]}
@@ -583,6 +715,63 @@ class GatherAndCli(unittest.TestCase):
         with self.assertRaises(gate_card.GateError):
             graphql("query", {})
 
+    def _one_thread_page(self):
+        return [{"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}]
+
+    def test_check_runs_page_two_is_read_when_total_count_is_missing(self):
+        # Cursor's case: paging stopped on total_count, so a missing
+        # count ended the read after page 1 and a failing run on page
+        # 2 never reached judge().
+        full = [{"name": f"c{i}", "status": "completed", "conclusion": "success",
+                 "html_url": f"u{i}"} for i in range(100)]
+        payloads = [
+            {"check_runs": full},  # no total_count at all
+            {"check_runs": [
+                {"name": "required-ci", "status": "completed",
+                 "conclusion": "failure", "html_url": "uFAIL"}]},
+        ]
+        inputs = gate_card.gather(
+            "o", "r", 999, None,
+            self._fake_rest([], check_payloads=payloads),
+            self._fake_graphql(self._one_thread_page() * 2),
+        )
+        self.assertEqual(len(inputs["check_runs"]), 101)
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("CI on this SHA is failure" in l for l in j.open), j.open)
+
+    def test_a_check_runs_count_mismatch_is_an_error_not_a_verdict(self):
+        payloads = [{"total_count": 7, "check_runs": [
+            {"name": "required-ci", "status": "completed",
+             "conclusion": "success", "html_url": "u"}]}]
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None,
+                             self._fake_rest([], check_payloads=payloads),
+                             self._fake_graphql(self._one_thread_page()))
+
+    def test_a_null_graphql_repository_is_an_error_not_an_empty_thread_list(self):
+        def graphql(query, variables):
+            return {"data": {"repository": None}}
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, self._fake_rest([]), graphql)
+
+    def test_gather_records_the_whole_second_pr_read(self):
+        # A merge landing between the reads has to be visible, not
+        # inherited from the first read.
+        inputs = gate_card.gather(
+            "o", "r", 999, None,
+            self._fake_rest([], pr_after={"merged": True, "state": "closed"}),
+            self._fake_graphql(self._one_thread_page()),
+        )
+        self.assertFalse(inputs["pr"]["merged"])
+        self.assertTrue(inputs["pr_after"]["merged"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("already merged" in l and "by the end of the reads" in l for l in j.open),
+            j.open,
+        )
+
     def _run_cli(self, argv, env=None):
         old_env = dict(os.environ)
         os.environ.update(env or {})
@@ -607,6 +796,7 @@ class GatherAndCli(unittest.TestCase):
 
         passing = fixture("pr315_ee4c0c1.json")
         passing["pr"]["draft"] = False
+        passing["pr_after"]["draft"] = False
         tmp = FIXTURES / "_tmp_passing.json"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -660,7 +850,19 @@ class PureHelpers(unittest.TestCase):
         anchors = gate_card.copilot_finding_anchors([{
             "author": "copilot-pull-request-reviewer[bot]", "body": body,
         }])
-        self.assertEqual(anchors, {"11": "High", "13": "Critical"})
+        self.assertEqual(anchors, {"11": "high-severity", "13": "critical-severity"})
+
+    def test_every_anchor_of_a_blocker_review_is_tracked_whatever_its_badge(self):
+        body = ('VERDICT: BLOCKER - deadlines.\n'
+                '- <img alt="High severity"> [A](#discussion_r11)\n'
+                '- <img alt="Medium severity"> [B](#discussion_r12)\n'
+                '- [C](#discussion_r13)')
+        anchors = gate_card.copilot_finding_anchors([{
+            "author": "copilot-pull-request-reviewer[bot]", "body": body,
+        }])
+        self.assertEqual(anchors["11"], "high-severity")
+        self.assertIn("summary carried a blocker", anchors["12"])
+        self.assertIn("summary carried a blocker", anchors["13"])
 
 
 if __name__ == "__main__":

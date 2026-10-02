@@ -1,6 +1,6 @@
 {
  "_note": "sfdc-24/Blackboard#310 at head 23cce47 as recorded on 2026-10-02: the latest Copilot review (5389914511) is on this exact head and names two open high-severity findings whose threads discussion_r4164225511 and discussion_r4162376205 are unresolved; discussion_r4157677050 (a blocker from the earlier head b6fa11e) is resolved by now and must not refuse; discussion_r4164234088 is an unresolved chatgpt-codex-connector thread and must be reported without gating. Bodies distilled from the live records (picture tags shortened, long sections trimmed; marker-bearing lines verbatim). The Cursor comment, Codex comment and check runs are synthetic green stand-ins so the two unresolved Copilot findings are the only open gates.",
- "schema": "gate-card-inputs-v1",
+ "schema": "gate-card-inputs-v2",
  "owner": "sfdc-24",
  "repo": "Blackboard",
  "number": 310,
@@ -14,7 +14,14 @@
   "mergeable_state": "clean",
   "html_url": "https://github.com/sfdc-24/Blackboard/pull/310"
  },
- "pr_after_head_sha": "23cce47c552f59327633d99e445c56f97c565162",
+ "pr_after": {
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "head_sha": "23cce47c552f59327633d99e445c56f97c565162",
+  "mergeable_state": "clean",
+  "html_url": "https://github.com/sfdc-24/Blackboard/pull/310"
+ },
  "issue_comments": [
   {
    "id": 1,
@@ -37,7 +44,7 @@
    "author": "copilot-pull-request-reviewer[bot]",
    "state": "COMMENTED",
    "commit_id": "23cce47c552f59327633d99e445c56f97c565162",
-   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### 🟡 Changes recommended\n\nThe apply path omits a required C1 rollback control and contains documentation that conflicts with the current linked architecture.\n\n**Findings:** 2 <img alt=\"High severity\">\n\n<details open>\n<summary><strong>Open (2)</strong></summary>\n\n- <img alt=\"High severity\"> [Missing C1 control bucket provisioning and broker wiring](#discussion_r4164225511) · New\n- <img alt=\"High severity\"> [Database IAM equality omits descendant receipt document paths](#discussion_r4162376205)\n</details>",
+   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nThe apply path omits a required C1 rollback control and contains documentation that conflicts with the current linked architecture.\n\n**Findings:** 2 <img alt=\"High severity\">\n\n<details open>\n<summary><strong>Open (2)</strong></summary>\n\n- <img alt=\"High severity\"> [Missing C1 control bucket provisioning and broker wiring](#discussion_r4164225511) \u00b7 New\n- <img alt=\"High severity\"> [Database IAM equality omits descendant receipt document paths](#discussion_r4162376205)\n</details>",
    "submitted_at": "2026-10-02T08:52:30Z",
    "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#pullrequestreview-5389914511"
   }
@@ -52,7 +59,7 @@
     {
      "discussion_id": 4164225511,
      "author": "copilot-pull-request-reviewer",
-     "body": "BLOCKER — READ-NOT-DEMONSTRATED: Linked PR #306 revision 8 makes the `ccc-control` bucket part of C1 and requires the broker to enforce its fail-closed kill switch on every operation; that PR explicitly notes that #310 does not hold the bucket yet. This deploy wires only `CCC_STAGE` and the bus secrets, with no bucket preflight/provisioning, broker read grant, or bucket configuration, so `--apply` can succeed while the required C1 rollback control is absent.",
+     "body": "BLOCKER \u2014 READ-NOT-DEMONSTRATED: Linked PR #306 revision 8 makes the `ccc-control` bucket part of C1 and requires the broker to enforce its fail-closed kill switch on every operation; that PR explicitly notes that #310 does not hold the bucket yet. This deploy wires only `CCC_STAGE` and the bus secrets, with no bucket preflight/provisioning, broker read grant, or bucket configuration, so `--apply` can succeed while the required C1 rollback control is absent.",
      "created_at": "2026-10-02T08:52:29Z",
      "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#discussion_r4164225511"
     }
@@ -67,7 +74,7 @@
     {
      "discussion_id": 4162376205,
      "author": "copilot-pull-request-reviewer",
-     "body": "BLOCKER — READ-NOT-DEMONSTRATED: This exact equality does not authorize the broker's receipt document reads/writes. Firestore data operations evaluate descendant names such as `projects/.../databases/ccc-receipts/documents/...`; Google's per-database IAM guidance therefore uses `resource.name.startsWith(...)`. As written, infrastructure apply can succeed but `post_receipt` will receive `PERMISSION_DENIED`.",
+     "body": "BLOCKER \u2014 READ-NOT-DEMONSTRATED: This exact equality does not authorize the broker's receipt document reads/writes. Firestore data operations evaluate descendant names such as `projects/.../databases/ccc-receipts/documents/...`; Google's per-database IAM guidance therefore uses `resource.name.startsWith(...)`. As written, infrastructure apply can succeed but `post_receipt` will receive `PERMISSION_DENIED`.",
      "created_at": "2026-10-02T02:33:18Z",
      "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#discussion_r4162376205"
     }
@@ -82,7 +89,7 @@
     {
      "discussion_id": 4157677050,
      "author": "copilot-pull-request-reviewer",
-     "body": "BLOCKER — READ-NOT-DEMONSTRATED: the linked PR #306 at current head `41c95e6` specifies a receipts collection in a Firestore database that already exists in `northamerica-northeast2`; this script instead requires `ccc-receipts` to be absent and creates a new database.",
+     "body": "BLOCKER \u2014 READ-NOT-DEMONSTRATED: the linked PR #306 at current head `41c95e6` specifies a receipts collection in a Firestore database that already exists in `northamerica-northeast2`; this script instead requires `ccc-receipts` to be absent and creates a new database.",
      "created_at": "2026-10-01T16:09:18Z",
      "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#discussion_r4157677050"
     }
@@ -105,8 +112,20 @@
   }
  ],
  "check_runs": [
-  {"name": "required-ci", "status": "completed", "conclusion": "success", "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/1"},
-  {"name": "suites", "status": "completed", "conclusion": "success", "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/2"}
+  {
+   "name": "required-ci",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/1"
+  },
+  {
+   "name": "suites",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/2"
+  }
  ],
- "combined_status": {"state": "success"}
+ "combined_status": {
+  "state": "success"
+ }
 }
