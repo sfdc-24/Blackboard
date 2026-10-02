@@ -905,7 +905,7 @@ class GatherAndCli(unittest.TestCase):
              "nodes": [self._comment(4)]},
         ]}
         gql_vars = []
-        inputs = gate_card.gather(
+        inputs = gate_card.gather_once(
             "o", "r", 999, None, self._fake_rest(calls),
             self._fake_graphql(pages, thread_pages, calls=gql_vars),
         )
@@ -936,7 +936,7 @@ class GatherAndCli(unittest.TestCase):
         endless = [{"pageInfo": {"hasNextPage": True, "endCursor": f"c{i}"},
                     "nodes": [self._comment(i + 2)]}
                    for i in range(gate_card.MAX_THREAD_PAGES + 2)]
-        inputs = gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+        inputs = gate_card.gather_once("o", "r", 999, None, self._fake_rest([]),
                                   self._fake_graphql(pages, {"T9": endless}))
         self.assertTrue(inputs["threads"][0]["truncated"])
         j = gate_card.judge(inputs, require_codex=False)
@@ -965,20 +965,20 @@ class GatherAndCli(unittest.TestCase):
                  **({} if omission is None else {"pageInfo": omission})},
             ]}
             with self.assertRaises(gate_card.GateError):
-                gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                gate_card.gather_once("o", "r", 999, None, self._fake_rest([]),
                                  self._fake_graphql(pages, thread_pages))
 
     def test_a_first_page_that_never_says_it_is_the_last_is_an_error(self):
         for info_args in ((None, None), (None, "c1")):
             pages = [self._thread_page(info_args[0], info_args[1], [1])]
             with self.assertRaises(gate_card.GateError):
-                gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                gate_card.gather_once("o", "r", 999, None, self._fake_rest([]),
                                  self._fake_graphql(pages, {"T7": []}))
 
     def test_more_pages_with_no_cursor_to_reach_them_is_an_error(self):
         pages = [self._thread_page(True, None, [1])]
         with self.assertRaises(gate_card.GateError):
-            gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+            gate_card.gather_once("o", "r", 999, None, self._fake_rest([]),
                              self._fake_graphql(pages, {"T7": []}))
 
     def test_a_blocker_living_only_on_a_later_page_still_refuses(self):
@@ -990,7 +990,7 @@ class GatherAndCli(unittest.TestCase):
                         "createdAt": "t", "url": "https://example.test/d/2",
                         "author": {"login": "copilot-pull-request-reviewer"}}]},
         ]}
-        inputs = gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+        inputs = gate_card.gather_once("o", "r", 999, None, self._fake_rest([]),
                                   self._fake_graphql(pages, thread_pages))
         self.assertFalse(inputs["threads"][0]["truncated"])
         j = gate_card.judge(inputs, require_codex=False)
@@ -1010,7 +1010,108 @@ class GatherAndCli(unittest.TestCase):
             return {"data": {"repository": {"pullRequest":
                                             {"reviewThreads": pages[0]}}}}
         with self.assertRaises(gate_card.GateError):
-            gate_card.gather("o", "r", 999, None, self._fake_rest([]), graphql)
+            gate_card.gather_once("o", "r", 999, None, self._fake_rest([]), graphql)
+
+    def test_gather_judges_only_a_snapshot_it_saw_twice_unchanged(self):
+        # Copilot: "the final consistency check rereads only the PR
+        # object" - a same-SHA Cursor NO-GO, a Copilot blocker review,
+        # a reopened thread or a CI re-run could land while the other
+        # resources were being fetched, with the head never moving.
+        reads = {"n": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                reads["n"] += 1
+                # A Cursor NO-GO lands between the first and second read.
+                body = (f"**GO** on `{SHA}`." if reads["n"] == 1
+                        else f"**NO-GO** on `{SHA}`.")
+                return [{"id": 1, "user": {"login": "cursor[bot]"}, "body": body,
+                         "created_at": "t", "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return []
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success"}
+            raise AssertionError(path)
+
+        threads = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest":
+                                            {"reviewThreads": threads}}}}
+
+        # Reads 2 and 3 agree, so the settled snapshot is judged - and
+        # it carries the NO-GO, not the GO the first read saw.
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        self.assertIn("NO-GO", inputs["issue_comments"][0]["body"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+
+    def test_a_pr_that_never_settles_is_an_error_not_a_card(self):
+        reads = {"n": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                reads["n"] += 1
+                return [{"id": reads["n"], "user": {"login": "cursor[bot]"},
+                         "body": f"**GO** on `{SHA}`. read {reads['n']}",
+                         "created_at": "t", "html_url": f"u{reads['n']}"}]
+            if path.endswith("/pulls/999/reviews"):
+                return []
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success"}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}}
+
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, rest, graphql)
+
+    def test_the_fingerprint_notices_each_kind_of_gate_change(self):
+        base = green_inputs()
+        first = gate_card.gate_fingerprint(base)
+        self.assertEqual(first, gate_card.gate_fingerprint(green_inputs()))
+        for mutate in (
+            lambda i: i["issue_comments"].append(
+                {"id": 9, "author": "cursor[bot]", "body": "late",
+                 "created_at": "t", "html_url": "u9"}),
+            lambda i: i["reviews"].append(
+                {"id": 9, "author": "copilot-pull-request-reviewer[bot]",
+                 "state": "COMMENTED", "commit_id": SHA, "body": "VERDICT: BLOCKER",
+                 "submitted_at": "t", "html_url": "r9"}),
+            lambda i: i["check_runs"].append(
+                {"name": "late", "status": "in_progress", "conclusion": "",
+                 "html_url": "u"}),
+            lambda i: i["threads"].append(
+                {"id": "T9", "is_resolved": False, "is_outdated": False,
+                 "truncated": False, "comments": []}),
+            lambda i: i["pr"].update(draft=True),
+            lambda i: i["combined_status"].update(state="failure"),
+        ):
+            changed = green_inputs()
+            mutate(changed)
+            self.assertNotEqual(first, gate_card.gate_fingerprint(changed))
 
     def test_graphql_without_a_token_is_an_error_not_a_pass(self):
         graphql = gate_card.make_graphql(None)
@@ -1032,7 +1133,7 @@ class GatherAndCli(unittest.TestCase):
                 {"name": "required-ci", "status": "completed",
                  "conclusion": "failure", "html_url": "uFAIL"}]},
         ]
-        inputs = gate_card.gather(
+        inputs = gate_card.gather_once(
             "o", "r", 999, None,
             self._fake_rest([], check_payloads=payloads),
             self._fake_graphql(self._one_thread_page() * 2),
@@ -1049,7 +1150,7 @@ class GatherAndCli(unittest.TestCase):
             {"name": "required-ci", "status": "completed",
              "conclusion": "success", "html_url": "u"}]}]
         with self.assertRaises(gate_card.GateError):
-            gate_card.gather("o", "r", 999, None,
+            gate_card.gather_once("o", "r", 999, None,
                              self._fake_rest([], check_payloads=payloads),
                              self._fake_graphql(self._one_thread_page()))
 
@@ -1057,12 +1158,12 @@ class GatherAndCli(unittest.TestCase):
         def graphql(query, variables):
             return {"data": {"repository": None}}
         with self.assertRaises(gate_card.GateError):
-            gate_card.gather("o", "r", 999, None, self._fake_rest([]), graphql)
+            gate_card.gather_once("o", "r", 999, None, self._fake_rest([]), graphql)
 
     def test_gather_records_the_whole_second_pr_read(self):
         # A merge landing between the reads has to be visible, not
         # inherited from the first read.
-        inputs = gate_card.gather(
+        inputs = gate_card.gather_once(
             "o", "r", 999, None,
             self._fake_rest([], pr_after={"merged": True, "state": "closed"}),
             self._fake_graphql(self._one_thread_page()),
@@ -1133,13 +1234,49 @@ class GatherAndCli(unittest.TestCase):
 
 
 class PureHelpers(unittest.TestCase):
-    def test_copilot_author_matches_with_and_without_the_bot_suffix(self):
-        # REST reviews say "copilot-pull-request-reviewer[bot]"; GraphQL
-        # thread authors say "copilot-pull-request-reviewer". Both are it.
-        self.assertEqual(gate_card.norm_login("copilot-pull-request-reviewer[bot]"),
-                         gate_card.COPILOT_LOGIN)
-        self.assertEqual(gate_card.norm_login("copilot-pull-request-reviewer"),
-                         gate_card.COPILOT_LOGIN)
+    def test_authority_needs_the_exact_app_login_detection_takes_either(self):
+        # Copilot discussion_r4170760384: `cursor` and
+        # `copilot-pull-request-reviewer` are registrable account
+        # names, so authority must require the exact App login. Only
+        # DETECTING a finding may accept either spelling, because
+        # looseness there can merely add refusals.
+        self.assertFalse(hasattr(gate_card, "norm_login"))
+        self.assertEqual(gate_card.CURSOR_VERDICT_LOGIN, "cursor[bot]")
+        self.assertEqual(gate_card.COPILOT_REVIEW_LOGIN,
+                         "copilot-pull-request-reviewer[bot]")
+        self.assertEqual(gate_card.COPILOT_FINDING_LOGINS, frozenset({
+            "copilot-pull-request-reviewer",
+            "copilot-pull-request-reviewer[bot]",
+        }))
+
+    def test_a_suffixless_cursor_account_cannot_give_a_go(self):
+        inputs = green_inputs()
+        inputs["issue_comments"][0]["author"] = "cursor"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("Cursor" in l and "silence" in l for l in j.open), j.open)
+
+    def test_a_suffixless_copilot_account_is_not_the_review_on_the_sha(self):
+        inputs = green_inputs()
+        inputs["reviews"][0]["author"] = "copilot-pull-request-reviewer"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("no Copilot review on this exact SHA" in l for l in j.open), j.open
+        )
+
+    def test_a_graphql_thread_author_without_the_suffix_still_gates(self):
+        # The loose direction, which only ever adds refusals.
+        inputs = green_inputs()
+        inputs["threads"] = [{
+            "id": "T1", "is_resolved": False, "is_outdated": False, "truncated": False,
+            "comments": [{
+                "discussion_id": 1, "author": "copilot-pull-request-reviewer",
+                "body": "BLOCKER - from the GraphQL spelling.",
+                "created_at": "t", "html_url": "https://example.test/d/1",
+            }],
+        }]
+        self.assertFalse(judged(inputs).passed)
 
     def test_blocker_word_boundaries(self):
         self.assertTrue(gate_card.blocker_lines("VERDICT: BLOCKER - x"))

@@ -15,11 +15,13 @@ WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
     reads: a merge or a draft conversion landing mid-read is not
     hidden by the first read's word.
   - CI on that SHA is green: every named required check (default
-    required-ci; --required-check overrides) is present, every run
-    completed without a failing conclusion, and the combined commit
-    status is not failure or pending. Silence is not a GO: zero runs
-    refuse, and so does a SHA where only unrelated checks ran. The
-    card links the required run itself, as U4 asks.
+    required-ci; --required-check overrides) is present and concluded
+    exactly `success` - skipped, neutral, cancelled, empty or still
+    running is NOT a pass - and carries a run URL for the card to
+    link, as U4 asks. Every other check must merely be completed
+    without a failing conclusion, and the combined commit status must
+    not be failure or pending. Silence is not a GO: zero runs refuse,
+    and so does a SHA where only unrelated checks ran.
   - Cursor's latest verdict naming that SHA is GO. The verdict must be
     authored by cursor[bot] itself and start the comment; silence or
     NO-GO refuses, and a GO on any other SHA is no GO here. The
@@ -41,17 +43,18 @@ WHAT A CLOSED GATE MEANS HERE (all of these, else REFUSED):
     no blocker in its summary ("a BLOCKER can sit in the summary alone"
     - Copilot's own amendment to U4). A blocker in an EARLIER head's
     summary is carried forward through its anchors, every one of which
-    must then be resolved whatever its badge. The single supersession
-    allowed: a summary blocker that anchored no finding at all has no
-    thread to resolve, so Copilot's own clean review on the named SHA
-    supersedes it - and the card says which, so a reader can disagree.
+    must then be resolved whatever its badge. A summary blocker that
+    anchored no finding at all has no thread to resolve, so nothing
+    can show it was addressed: it refuses, and a reader who judges it
+    superseded records that with --accept-superseded <review url>,
+    which the card names as their call rather than the tool's.
   - Every Copilot finding that is high/critical severity or worded as a
     blocker, FROM ANY HEAD of this PR, sits in a resolved thread. A
     moved head cannot drop one: unresolved findings from earlier heads
     carry forward (Codex's amendment to U4). A high/critical anchor
     whose thread was never fetched refuses: resolution that was not
-    observed is not resolution. A thread with more comments than one
-    page refuses whatever its resolved flag says.
+    observed is not resolution. A thread that could not be read whole
+    refuses whatever its resolved flag says.
 
 WHAT IT NEVER DOES
   It performs no merge, no write, no state change anywhere: it reads and
@@ -71,6 +74,14 @@ KNOWN LIMITS (deliberate, fail-closed):
   - Thread resolution state only exists in GitHub's GraphQL API, so a
     live run needs a token; `--inputs` judges a recorded snapshot with
     no network at all.
+  - The whole read is repeated until the same gate state comes back
+    twice running, because a verdict, review, thread or check can move
+    while the OTHER resources are being fetched and the head never
+    changes. A PR that will not settle is an error, not a card. Even
+    so, a card is evidence about the moment it was read: it is not a
+    lock, and nothing stops a NO-GO landing a second after it prints.
+    That is why the card says it holds for that SHA only, and why the
+    merge stays a person's decision.
 
 USAGE
   python3 scripts/gate_card.py --pr 310                      # live, GITHUB_TOKEN
@@ -85,6 +96,7 @@ every open item listed; 2 the inputs could not be read or gathered.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -103,8 +115,19 @@ DEFAULT_REPO = "Blackboard"
 # rather than judged on partial evidence.
 SCHEMA = "gate-card-inputs-v2"
 
-CURSOR_LOGIN = "cursor"
-COPILOT_LOGIN = "copilot-pull-request-reviewer"
+# Identity, split by what it is FOR. A login that grants authority -
+# Cursor's GO, the existence of a Copilot review on the SHA - must be
+# the exact App login REST reports, because `cursor` and
+# `copilot-pull-request-reviewer` are registrable account names a
+# person could hold. A login used only to DETECT a finding may accept
+# either form, because GraphQL reports thread authors without the
+# suffix and being loose there can only ever add refusals.
+CURSOR_VERDICT_LOGIN = "cursor[bot]"
+COPILOT_REVIEW_LOGIN = "copilot-pull-request-reviewer[bot]"
+COPILOT_FINDING_LOGINS = frozenset({
+    "copilot-pull-request-reviewer",
+    "copilot-pull-request-reviewer[bot]",
+})
 # Who may relay a Codex verdict. On this repository Codex posts through
 # the owner account; a marker-first body from anyone else is not Codex.
 CODEX_RELAY_LOGINS = frozenset({"sfdc-24"})
@@ -159,21 +182,15 @@ def utc_now() -> str:
 def raw_login(login: str | None) -> str:
     """The login exactly as GitHub gave it, case-folded only.
 
-    The relay check uses this, never norm_login: an App called
-    `sfdc-24[bot]` must not pass for the account `sfdc-24`.
+    Every identity check uses this. There is deliberately NO helper
+    that strips a `[bot]` suffix: one existed, and it let the account
+    `sfdc-24` pass as the App `sfdc-24[bot]` and the account `cursor`
+    pass as `cursor[bot]`. Where both spellings of a reviewer must be
+    accepted, the set of accepted spellings is written out in full
+    (COPILOT_FINDING_LOGINS), so that looseness is visible at the
+    place it applies rather than hidden in a shared helper.
     """
     return str(login or "").strip().lower()
-
-
-def norm_login(login: str | None) -> str:
-    """The login with a `[bot]` suffix removed.
-
-    REST calls Cursor `cursor[bot]` and GraphQL calls it `cursor`, so
-    matching THOSE identities needs the suffix off. Nothing that
-    grants authority by account name may use this.
-    """
-    s = str(login or "")
-    return s[:-5] if s.endswith("[bot]") else s
 
 
 def first_nonempty_line(body: str | None) -> str:
@@ -192,7 +209,7 @@ def cursor_verdict(comment: dict, named_sha: str) -> str | None:
     both tokens ("GO or NO-GO ...") is ambiguous, and so is one naming
     two full SHAs: both are silence.
     """
-    if norm_login(comment.get("author")) != CURSOR_LOGIN:
+    if raw_login(comment.get("author")) != CURSOR_VERDICT_LOGIN:
         return None
     lead_raw = first_nonempty_line(str(comment.get("body") or ""))
     if set(SHA_IN_TEXT.findall(lead_raw.lower())) != {named_sha}:
@@ -300,7 +317,8 @@ def blocker_lines(body: str) -> list[str]:
 
 
 def copilot_reviews(reviews: list[dict]) -> list[dict]:
-    return [r for r in reviews if norm_login(r.get("author")) == COPILOT_LOGIN]
+    return [r for r in reviews
+            if raw_login(r.get("author")) == COPILOT_REVIEW_LOGIN]
 
 
 def copilot_finding_anchors(reviews: list[dict]) -> dict[str, str]:
@@ -357,7 +375,7 @@ def thread_gate_reason(thread: dict, high_anchors: dict[str, str]) -> str | None
     weighed here as though its contents were known.
     """
     for comment in thread.get("comments") or []:
-        if norm_login(comment.get("author")) != COPILOT_LOGIN:
+        if raw_login(comment.get("author")) not in COPILOT_FINDING_LOGINS:
             continue
         hits = blocker_lines(str(comment.get("body") or ""))
         if hits:
@@ -834,8 +852,57 @@ def _paged(rest, path: str, params: dict) -> list[dict]:
         page += 1
 
 
+def gate_fingerprint(inputs: dict) -> str:
+    """Everything the judgement depends on, as one comparable string.
+
+    A point-in-time read is not enough for a gate: a same-SHA Cursor
+    NO-GO, a Copilot blocker review, a thread being reopened or a CI
+    re-run can all land while the OTHER resources are being fetched,
+    and the head never moves. So the whole read is repeated and
+    compared on this, and only a snapshot seen twice unchanged is
+    judged.
+    """
+    parts: list[str] = [
+        json.dumps(inputs.get("pr"), sort_keys=True),
+        json.dumps(inputs.get("pr_after"), sort_keys=True),
+        json.dumps(inputs.get("combined_status"), sort_keys=True),
+    ]
+    for c in inputs.get("issue_comments") or []:
+        parts.append(f"c:{c.get('id')}:{c.get('author')}:{hash_text(c.get('body'))}")
+    for r in inputs.get("reviews") or []:
+        parts.append(f"r:{r.get('id')}:{r.get('author')}:{r.get('commit_id')}:"
+                     f"{hash_text(r.get('body'))}")
+    for run in inputs.get("check_runs") or []:
+        parts.append(f"k:{run.get('name')}:{run.get('status')}:{run.get('conclusion')}")
+    for th in inputs.get("threads") or []:
+        parts.append(f"t:{th.get('id')}:{th.get('is_resolved')}:{th.get('truncated')}:"
+                     + ",".join(str(c.get("discussion_id"))
+                                for c in th.get("comments") or []))
+    return hash_text("\n".join(parts))
+
+
+def hash_text(text) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def gather(owner: str, repo: str, number: int, sha: str | None,
-           rest, graphql) -> dict:
+           rest, graphql, attempts: int = 3) -> dict:
+    """Read the PR until the same gate state is seen twice running."""
+    previous: dict | None = None
+    for attempt in range(1, max(2, attempts) + 1):
+        current = gather_once(owner, repo, number, sha, rest, graphql)
+        if previous is not None and gate_fingerprint(previous) == gate_fingerprint(current):
+            return current
+        previous = current
+    raise GateError(
+        f"the PR kept changing while it was being read ({attempts} attempts): a "
+        "verdict, review, thread or check moved under the read. Try again once it "
+        "settles - a card from a snapshot that never held is worth nothing"
+    )
+
+
+def gather_once(owner: str, repo: str, number: int, sha: str | None,
+                rest, graphql) -> dict:
     pr = rest(f"/repos/{owner}/{repo}/pulls/{number}")
     head = str((pr.get("head") or {}).get("sha") or "").lower()
     named_sha = (sha or head).lower()
