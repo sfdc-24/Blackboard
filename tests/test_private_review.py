@@ -7,11 +7,12 @@ import contextlib
 import hashlib
 import io
 import json
+import ssl
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -79,11 +80,12 @@ class Rig:
     """Every door the runner goes through, faked and counted. Nothing here opens a socket."""
 
     def __init__(self, *, heads=(HEAD,), blobs=None, reply=None, private=(True,), used=(), link=LINK,
-                 stored=None, took=0.0, fetch_takes=0.0):
+                 stored=None, took=0.0, fetch_takes=0.0, claim_takes=0.0):
         self.heads, self.private, self.link, self.stored = list(heads), list(private), link, stored
         self.blobs = {"docs/synthetic.md": MD, "docs/synthetic.pdf": PDF} if blobs is None else blobs
         self.reply = answer() if reply is None else reply
         self.used, self.took, self.fetch_takes, self.t = set(used), took, fetch_takes, 0.0
+        self.claim_takes = claim_takes
         self.events, self.asked, self.written, self.lines = [], [], [], []
 
     def pr_head(self, repo, number):
@@ -104,6 +106,7 @@ class Rig:
 
     def claim(self, review_id):
         self.events.append("claim")
+        self.t += self.claim_takes
         if review_id in self.used:
             return False
         self.used.add(review_id)
@@ -619,11 +622,59 @@ class Answer(unittest.TestCase):
     def test_an_error_or_a_timeout_from_the_provider(self):
         for error, why in ((TimeoutError(SENTINEL), "TimeoutError from the provider"),
                            (http_error(self, 429), "HTTP 429 from the provider"),
+                           (pr.ProviderStatus(503), "HTTP 503 from the provider"),
                            (urllib.error.URLError(SENTINEL), "URLError from the provider"),
                            (ValueError(GOOD), "ValueError from the provider"),
                            (json.JSONDecodeError(SENTINEL, GOOD, 0), "JSONDecodeError from the provider")):
             rig, out = self.incomplete(error, why)
             self.assertNotIn(SENTINEL, json.dumps(out) + "\n".join(rig.lines))
+
+    def test_text_that_is_not_valid_unicode_is_never_kept_and_the_receipt_is_still_written(self):
+        # Valid JSON can carry a lone surrogate. It cannot be stored, and the id is already spent.
+        for finish in ("STOP", "MAX_TOKENS"):
+            for text in (GOOD + "\ud800 fine\n", "\udfff", "VERDICT: AGREE\n\ud83d"):
+                rig, out = self.incomplete(answer(text, finish=finish), "not valid Unicode; its text is not kept")
+                self.assertEqual(1, len(rig.written))
+                stored = rig.written[0][1].decode("utf-8")
+                self.assertIn("(no text)", stored)
+                self.assertNotIn("reads the same in both", stored)
+                self.assertEqual(["write", "read back"], rig.events[-2:])
+                self.assertEqual(LINK, out["board"]["result"])
+                (json.dumps(out, ensure_ascii=False) + "\n".join(rig.lines)).encode("utf-8")
+        halves = {"content": {"parts": [{"text": "VERDICT: AGREE\n\ud83d"}, {"text": "\ude00"}]},
+                  "finishReason": "STOP"}
+        self.incomplete(answer(candidates=[halves]), "not valid Unicode")
+        whole = pr.read_answer(answer("VERDICT: AGREE\n\U0001f600 and caf\xe9\n"))   # a whole pair and an accent are text
+        self.assertEqual(("AGREE", True), (whole["verdict"], whole["complete"]))
+
+    def test_a_result_that_cannot_be_rendered_still_leaves_a_receipt_with_none_of_the_answer(self):
+        real = pr.read_answer
+        # Stands in for any way unstorable text could get past read_answer: the render is guarded on its own.
+        slipped = lambda response: real(response) if response is None else dict(real(response), text=GOOD + "\ud800")
+        rig = Rig()
+        with mock.patch.object(pr, "read_answer", side_effect=slipped):
+            out = rig.run()
+        self.assertEqual(("INCOMPLETE", 1), (out["status"], out["provider_calls"]))
+        self.assertIn("UnicodeEncodeError while the result was rendered; nothing of the answer is kept",
+                      out["reason"])
+        self.assertEqual(1, len(rig.written))
+        stored = rig.written[0][1].decode("utf-8")
+        self.assertIn("- **status:** INCOMPLETE", stored)
+        self.assertIn("(no text)", stored)
+        self.assertNotIn("AGREE", stored)
+        self.assertNotIn("reads the same in both", stored)
+        self.assertEqual(LINK, out["board"]["result"])
+
+    def test_a_receipt_that_cannot_be_rendered_at_all_is_blocked_and_says_the_call_was_made(self):
+        rig = Rig()
+        with mock.patch.object(pr, "render_result", side_effect=ValueError(SENTINEL)) as render:
+            out = rig.run()
+        self.assertEqual(2, render.call_count)
+        self.assertEqual(("BLOCKED", 1), (out["status"], out["provider_calls"]))
+        self.assertEqual("ValueError while rendering the private result; the provider was called once",
+                         out["reason"])
+        self.assertEqual([], rig.written)
+        self.assertNotIn(SENTINEL, json.dumps(out) + "\n".join(rig.lines))
 
     def test_the_grammar_is_a_whole_line_never_a_substring(self):
         read = pr.read_answer(answer(GOOD))
@@ -659,6 +710,37 @@ class Deadline(unittest.TestCase):
 
     def test_an_answer_just_inside_the_deadline_counts(self):
         self.assertEqual("AGREE", Rig(took=150.0).run()["status"])
+
+    def test_time_spent_recording_the_id_comes_out_of_the_calls_budget(self):
+        rig = Rig(fetch_takes=5.0, claim_takes=30.0)
+        self.assertEqual("AGREE", rig.run()["status"])
+        self.assertEqual(110.0, rig.asked[0]["timeout"])
+        rig = Rig(claim_takes=0.75)
+        self.assertEqual("AGREE", rig.run(manifest(deadline_seconds=1))["status"])
+        self.assertEqual(0.25, rig.asked[0]["timeout"])
+
+    def test_a_deadline_spent_recording_the_id_leaves_it_spent_and_asks_nothing(self):
+        for claim_takes in (2.0, 1.0):                      # past the deadline, and exactly on it
+            rig = Rig(claim_takes=claim_takes)
+            out = rig.run(manifest(deadline_seconds=1))
+            self.assertEqual(("BLOCKED", 0), (out["status"], out["provider_calls"]))
+            self.assertEqual("the deadline was spent recording the review id: the id is used, no provider call",
+                             out["reason"])
+            self.assertEqual(([], []), (rig.asked, rig.written))
+            self.assertEqual("claim", rig.events[-1])
+            self.assertEqual({RID}, rig.used)
+            rig.claim_takes = 0.0                           # and a later run cannot have the id back
+            again = rig.run(manifest(deadline_seconds=1))
+            self.assertEqual("BLOCKED", again["status"])
+            self.assertIn("already used", again["reason"])
+            self.assertEqual([], rig.asked)
+
+    def test_a_deadline_spent_before_the_id_is_recorded_does_not_spend_it(self):
+        rig = Rig(fetch_takes=1.0)
+        out = rig.run(manifest(deadline_seconds=1))
+        self.assertEqual(("BLOCKED", "the deadline was spent before the provider call"), (out["status"], out["reason"]))
+        self.assertEqual((set(), []), (rig.used, rig.asked))
+        self.assertNotIn("claim", rig.events)
 
 
 class PrivateResult(unittest.TestCase):
@@ -823,85 +905,186 @@ class BoardAndLogs(unittest.TestCase):
             pr.board_payload(dict(manifest(), note=GOOD), "AGREE")
 
 
-class FakeResponse:
-    def __init__(self, raw):
-        self.raw = raw
+class FakeSocket:
+    """Stands in for the provider's TLS socket. It keeps what was sent and each timeout set, and takes virtual time."""
 
-    def __enter__(self):
-        return self
+    def __init__(self, now, reads=()):
+        self.now, self.reads = now, list(reads)             # reads: (seconds it takes, the bytes it gives)
+        self.timeout, self.timeouts, self.read_timeouts = None, [], []
+        self.sent, self.closed = b"", 0
 
-    def __exit__(self, *exc):
-        return False
+    def settimeout(self, seconds):
+        self.timeout = seconds
+        self.timeouts.append(seconds)
 
-    def read1(self, n):
-        chunk, self.raw = self.raw[:n], self.raw[n:]
-        return chunk
+    def sendall(self, data):
+        self.sent += data
+
+    def recv_into(self, into):
+        self.read_timeouts.append(self.timeout)
+        takes, data = self.reads.pop(0) if self.reads else (0.0, b"")
+        if takes > self.timeout:
+            self.now[0] += self.timeout                     # a real socket gives up when its timeout runs out
+            raise TimeoutError("timed out")
+        self.now[0] += takes
+        data, rest = data[:len(into)], data[len(into):]
+        if rest:
+            self.reads.insert(0, (0.0, rest))
+        into[:len(data)] = data
+        return len(data)
+
+    def close(self):
+        self.closed += 1
 
 
-class FakeOpener:
-    """Stands in for urllib's opener, so the real call's request can be read without sending it."""
-
-    def __init__(self, raw=b"{}"):
-        self.raw, self.requests = raw, []
-
-    def open(self, req, timeout=None):
-        self.requests.append((req, timeout))
-        return FakeResponse(self.raw)
+def http_reply(body, status="200 OK", headers=()):
+    head = ["HTTP/1.1 " + status, "Content-Type: application/json", *headers]
+    if not any(h.startswith("Transfer-Encoding") for h in headers):
+        head.append("Content-Length: %d" % len(body))
+    return "\r\n".join(head).encode("ascii") + b"\r\n\r\n" + body
 
 
-class RealCall(unittest.TestCase):
-    """call_gemini, the default provider, with its opener replaced: the request is built and never sent."""
+class Wire:
+    """call_gemini over a FakeSocket and a virtual clock: http.client runs for real, and nothing is sent."""
 
     KEY = "synthetic-key-not-a-secret"
     HOW = dict(route="api-key", model="gemini-pro-latest", key_env="GEMINI_API_KEY", timeout=100.0)
 
-    def test_the_key_is_an_unredirected_header_never_the_url_and_never_printed(self):
+    def __init__(self, reads=()):
+        self.now, self.opened = [0.0], []
+        self.sock = FakeSocket(self.now, reads)
+
+    def connect(self, host, left):
+        self.opened.append((host, left()))
+        return self.sock
+
+    def call(self, body=None, env=None, **over):
+        return pr.call_gemini({} if body is None else body, env={"GEMINI_API_KEY": self.KEY} if env is None else env,
+                              connect=self.connect, clock=lambda: self.now[0], **dict(self.HOW, **over))
+
+
+class RealCall(unittest.TestCase):
+    """call_gemini, the default provider, with its socket replaced: the request is built and never sent."""
+
+    KEY, HOW = Wire.KEY, Wire.HOW
+    WHOLE = http_reply(json.dumps(answer()).encode("utf-8"))
+
+    def test_the_key_is_a_header_to_the_one_host_never_the_path_and_never_printed(self):
         body = pr.build_request(manifest(), MD, PDF)
-        opener = FakeOpener(json.dumps(answer()).encode("utf-8"))
+        wire = Wire([(0.0, self.WHOLE)])
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
-            got = pr.call_gemini(body, env={"GEMINI_API_KEY": self.KEY}, opener=opener, **self.HOW)
+            got = wire.call(body)
         self.assertEqual(answer(), got)
-        req, timeout = opener.requests[0]
-        self.assertEqual("https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent",
-                         req.full_url)
-        self.assertEqual(self.KEY, req.unredirected_hdrs["X-goog-api-key"])
-        self.assertNotIn(self.KEY, req.full_url + json.dumps(dict(req.headers)))
-        self.assertEqual(("POST", 100.0), (req.get_method(), timeout))
-        self.assertEqual(body, json.loads(req.data))
+        self.assertEqual([("generativelanguage.googleapis.com", 100.0)], wire.opened)
+        head, _, sent_body = wire.sock.sent.partition(b"\r\n\r\n")
+        request, *lines = head.decode("ascii").split("\r\n")
+        headers = dict(line.split(": ", 1) for line in lines)
+        self.assertEqual("POST /v1beta/models/gemini-pro-latest:generateContent HTTP/1.1", request)
+        self.assertEqual("generativelanguage.googleapis.com", headers["Host"])
+        self.assertEqual(self.KEY, headers["x-goog-api-key"])
+        self.assertEqual(1, wire.sock.sent.count(self.KEY.encode("ascii")))
+        self.assertEqual(body, json.loads(sent_body))
         self.assertEqual("", printed.getvalue())
+        self.assertEqual(1, wire.sock.closed)
 
-    def test_no_key_or_a_name_outside_the_closed_sets_sends_nothing(self):
-        opener = FakeOpener()
+    def test_no_key_or_a_name_outside_the_closed_sets_opens_nothing(self):
+        wire = Wire()
         with self.assertRaises(LookupError):
-            pr.call_gemini({}, env={}, opener=opener, **self.HOW)
+            wire.call(env={})
         for over in ({"route": "vertex-adc"}, {"model": "gemini-x/../../files"}, {"key_env": "GEMINI_GITHUB_TOKEN"}):
             with self.assertRaises(ValueError):
-                pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY, "GEMINI_GITHUB_TOKEN": "t"}, opener=opener,
-                               **dict(self.HOW, **over))
+                wire.call(env={"GEMINI_API_KEY": self.KEY, "GEMINI_GITHUB_TOKEN": "t"}, **over)
         with self.assertRaises(TimeoutError):
-            pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY}, opener=opener, **dict(self.HOW, timeout=0))
-        self.assertEqual([], opener.requests)
+            wire.call(timeout=0)
+        self.assertEqual(([], b""), (wire.opened, wire.sock.sent))
 
-    def test_a_redirect_is_refused_not_followed(self):
-        self.assertTrue(any(isinstance(h, pr._NoRedirect) for h in pr._OPENER.handlers))
-        req = urllib.request.Request(pr.GENERATE % "gemini-pro-latest")
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            pr._NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://elsewhere.test/collect")
-        caught.exception.close()
+    def test_a_redirect_or_any_status_but_200_is_refused_with_its_number_only(self):
+        for status in ("302 Found", "307 Temporary Redirect", "204 No Content", "429 Too Many Requests",
+                       "500 Internal Server Error"):
+            wire = Wire([(0.0, http_reply(SENTINEL.encode("ascii"), status,
+                                          ["Location: https://elsewhere.test/collect"]))])
+            with self.assertRaises(pr.ProviderStatus) as caught:
+                wire.call()
+            self.assertEqual("HTTP " + status[:3], pr._err(caught.exception))
+            self.assertNotIn(SENTINEL, str(caught.exception))
+            # Nothing was followed: one socket, to the one host, and the key went out once.
+            self.assertEqual(["generativelanguage.googleapis.com"], [host for host, _ in wire.opened])
+            self.assertEqual(1, wire.sock.sent.count(self.KEY.encode("ascii")))
+            self.assertEqual(1, wire.sock.closed)
 
-    def test_the_deadline_is_checked_between_reads(self):
-        ticks = iter([0.0, 0.0, 100.0])
+    def test_a_read_that_starts_late_gets_only_what_is_left(self):
+        # The fault this replaced: a read that began at 0.9 s of a 1 s budget came back at 1.8 s.
+        cut = self.WHOLE.index(b"\r\n\r\n") + 4
+        for reads in ([(0.9, self.WHOLE[:cut]), (0.9, self.WHOLE[cut:])],      # late in the body
+                      [(0.9, self.WHOLE[:20]), (0.9, self.WHOLE[20:])]):       # late in the headers
+            wire = Wire(reads)
+            with self.assertRaises(TimeoutError):
+                wire.call(timeout=1.0)
+            self.assertEqual(2, len(wire.sock.read_timeouts))
+            self.assertEqual(1.0, wire.sock.read_timeouts[0])
+            self.assertAlmostEqual(0.1, wire.sock.read_timeouts[1])
+            self.assertAlmostEqual(1.0, wire.now[0])
+            self.assertEqual(1, wire.sock.closed)
+
+    def test_every_read_of_a_slow_answer_gets_less_and_the_whole_stays_inside_the_budget(self):
+        quarter = len(self.WHOLE) // 4
+        pieces = [self.WHOLE[:quarter], self.WHOLE[quarter:2 * quarter], self.WHOLE[2 * quarter:3 * quarter],
+                  self.WHOLE[3 * quarter:]]
+        wire = Wire([(0.2, piece) for piece in pieces])
+        self.assertEqual(answer(), wire.call(timeout=1.0))
+        self.assertEqual(4, len(wire.sock.read_timeouts))
+        for want, got in zip((1.0, 0.8, 0.6, 0.4), wire.sock.read_timeouts):
+            self.assertAlmostEqual(want, got)
+        # Sent a byte at a time, it would never end. It ends at the deadline.
+        wire = Wire([(0.3, bytes([byte])) for byte in self.WHOLE])
         with self.assertRaises(TimeoutError):
-            pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY}, opener=FakeOpener(b"{" + b" " * 70000 + b"}"),
-                           clock=lambda: next(ticks), **self.HOW)
+            wire.call(timeout=1.0)
+        self.assertAlmostEqual(1.0, wire.now[0])
+        self.assertEqual(4, len(wire.sock.read_timeouts))
+        self.assertEqual(1, wire.sock.closed)
 
-    def test_an_answer_over_the_cap_or_not_json_raises(self):
-        with self.assertRaises(ValueError):
-            pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY}, clock=lambda: 0.0,
-                           opener=FakeOpener(b" " * (pr.MAX_RESPONSE_BYTES + 1)), **self.HOW)
-        with self.assertRaises(ValueError):
-            pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY}, opener=FakeOpener(b"<html>"), **self.HOW)
+    def test_no_read_or_send_is_started_with_nothing_left(self):
+        wire = Wire([(1.0, self.WHOLE[:20]), (0.0, self.WHOLE[20:])])
+        with self.assertRaises(TimeoutError):
+            wire.call(timeout=1.0)
+        self.assertEqual(1, len(wire.sock.read_timeouts))    # the second read was never started
+        self.assertEqual(1, wire.sock.closed)
+        wire = Wire([(0.0, self.WHOLE)])
+
+        def slow_connect(host, left):
+            wire.now[0] += 1.0                               # the connect used the whole budget
+            return wire.sock
+
+        with self.assertRaises(TimeoutError):
+            pr.call_gemini({}, env={"GEMINI_API_KEY": self.KEY}, connect=slow_connect, clock=lambda: wire.now[0],
+                           **dict(self.HOW, timeout=1.0))
+        self.assertEqual((b"", 1), (wire.sock.sent, wire.sock.closed))        # no key and no document went out
+
+    def test_a_chunked_answer_is_read_whole(self):
+        raw = json.dumps(answer()).encode("utf-8")
+        chunked = b"".join(b"%x\r\n%s\r\n" % (len(part), part) for part in (raw[:100], raw[100:])) + b"0\r\n\r\n"
+        wire = Wire([(0.0, http_reply(chunked, headers=["Transfer-Encoding: chunked"]))])
+        self.assertEqual(answer(), wire.call())
+
+    def test_an_answer_over_the_cap_or_not_json_raises_and_the_socket_is_closed(self):
+        over = b"{" + b" " * pr.MAX_RESPONSE_BYTES + b"}"                     # JSON, and two bytes too long
+        for body in (over, b"<html>", b"\xff\xfe"):
+            wire = Wire([(0.0, http_reply(body))])
+            with self.assertRaises(ValueError):
+                wire.call()
+            self.assertEqual(1, wire.sock.closed)
+        wire = Wire([(0.0, b"not http at all\r\n\r\n")])
+        with self.assertRaises(Exception) as caught:
+            wire.call()
+        self.assertEqual("BadStatusLine", pr._err(caught.exception))
+        self.assertEqual(1, wire.sock.closed)
+
+    def test_json_with_a_lone_surrogate_comes_through_the_call_and_is_not_an_answer(self):
+        raw = json.dumps(answer("VERDICT: AGREE\n\ud800")).encode("ascii")     # valid JSON: the escape, six bytes
+        self.assertIn(b"\\ud800", raw)
+        read = pr.read_answer(Wire([(0.0, http_reply(raw))]).call())
+        self.assertEqual((False, "", ""), (read["complete"], read["verdict"], read["text"]))
 
     def test_run_without_a_provider_uses_it_once_with_the_manifests_route(self):
         rig = Rig()
@@ -913,6 +1096,127 @@ class RealCall(unittest.TestCase):
         self.assertEqual(dict(self.HOW, timeout=150.0, env=env),
                          {k: v for k, v in real.call_args.kwargs.items() if k != "clock"})
         self.assertNotIn(self.KEY, json.dumps(out) + "\n".join(rig.lines) + rig.written[0][1].decode("utf-8"))
+
+
+class FakeRawSocket:
+    """Stands in for socket.socket in _open: each connect takes virtual time, and may fail."""
+
+    def __init__(self, now, plan, made):
+        self.now, self.timeouts, self.closed, self.connected = now, [], 0, None
+        self.takes, self.error = plan
+        made.append(self)
+
+    def settimeout(self, seconds):
+        self.timeouts.append(seconds)
+
+    def connect(self, address):
+        self.connected = address
+        self.now[0] += self.takes
+        if self.error:
+            raise self.error
+
+    def close(self):
+        self.closed += 1
+
+
+class Opening(unittest.TestCase):
+    """_open and _resolve, the default way to the provider: every step gets only what is left of the deadline."""
+
+    HOST = "generativelanguage.googleapis.com"
+    ADDRESSES = [(2, 1, 6, "", ("192.0.2.1", 443)), (2, 1, 6, "", ("192.0.2.2", 443))]
+
+    def open(self, plans, addresses=None, lookup_takes=0.0, budget=1.0, handshake=None):
+        self.now, self.made, self.wrapped = [0.0], [], []
+        plans = list(plans)
+        self.context = mock.Mock()
+
+        def wrap(sock, server_hostname=None):
+            self.wrapped.append((sock, server_hostname))
+            if handshake:
+                raise handshake
+            return ("tls", sock)
+
+        def lookup(host, port, type=None):
+            self.now[0] += lookup_takes
+            return self.ADDRESSES if addresses is None else addresses
+
+        def left():
+            remaining = budget - self.now[0]
+            if remaining <= 0:
+                raise TimeoutError("none left")
+            return remaining
+
+        self.context.wrap_socket.side_effect = wrap
+        with mock.patch.object(pr.socket, "getaddrinfo", side_effect=lookup) as self.lookups, \
+                mock.patch.object(pr.socket, "socket",
+                                  side_effect=lambda *a: FakeRawSocket(self.now, plans.pop(0), self.made)), \
+                mock.patch.object(pr.ssl, "create_default_context", return_value=self.context):
+            return pr._open(self.HOST, left)
+
+    def test_the_connect_and_the_handshake_each_get_what_is_left(self):
+        tls = self.open([(0.3, ConnectionRefusedError(SENTINEL)), (0.2, None)])
+        first, second = self.made
+        self.assertEqual(("tls", second), tls)
+        self.assertEqual(([1.0], 1, ("192.0.2.1", 443)), (first.timeouts, first.closed, first.connected))
+        self.assertEqual(2, len(second.timeouts))
+        self.assertAlmostEqual(0.7, second.timeouts[0])       # the connect
+        self.assertAlmostEqual(0.5, second.timeouts[1])       # the handshake
+        self.assertEqual(0, second.closed)
+        self.assertEqual([(second, self.HOST)], self.wrapped)  # the certificate is checked against the one host
+        self.lookups.assert_called_once_with(self.HOST, 443, type=pr.socket.SOCK_STREAM)
+        self.context.set_alpn_protocols.assert_called_once_with(["http/1.1"])
+
+    def test_a_connect_that_times_out_ends_it_and_no_other_address_is_tried(self):
+        with self.assertRaises(TimeoutError):
+            self.open([(1.0, TimeoutError("timed out")), (0.0, None)])
+        self.assertEqual(1, len(self.made))
+        self.assertEqual(1, self.made[0].closed)
+        self.assertEqual([], self.wrapped)
+
+    def test_a_lookup_that_used_the_budget_connects_nowhere(self):
+        with self.assertRaises(TimeoutError):
+            self.open([(0.0, None)], lookup_takes=1.0)
+        self.assertEqual([None], [sock.connected for sock in self.made])
+        self.assertEqual([1], [sock.closed for sock in self.made])
+
+    def test_every_address_refusing_or_none_at_all_raises_and_leaves_no_socket_open(self):
+        with self.assertRaises(ConnectionRefusedError):
+            self.open([(0.1, ConnectionRefusedError()), (0.1, ConnectionRefusedError())])
+        self.assertEqual([1, 1], [sock.closed for sock in self.made])
+        with self.assertRaises(OSError):
+            self.open([], addresses=[])
+        self.assertEqual([], self.made)
+
+    def test_a_failed_handshake_closes_the_socket(self):
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            self.open([(0.0, None), (0.0, None)], handshake=ssl.SSLCertVerificationError("synthetic"))
+        self.assertEqual([1, 1], [sock.closed for sock in self.made])
+
+    def test_the_default_context_verifies_the_certificate_and_the_host_name(self):
+        made, real = [], ssl.create_default_context
+
+        def default():
+            made.append(real())
+            return made[-1]
+
+        with mock.patch.object(pr.socket, "getaddrinfo", return_value=[]), \
+                mock.patch.object(pr.ssl, "create_default_context", side_effect=default):
+            with self.assertRaises(OSError):
+                pr._open(self.HOST, lambda: 1.0)
+        self.assertEqual((ssl.CERT_REQUIRED, True), (made[0].verify_mode, made[0].check_hostname))
+
+    def test_a_name_lookup_that_hangs_is_left_at_the_deadline(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with mock.patch.object(pr.socket, "getaddrinfo", side_effect=lambda *a, **k: release.wait(10)):
+            with self.assertRaises(TimeoutError):
+                pr._resolve(self.HOST, lambda: 0.05)
+
+    def test_a_name_lookup_that_fails_raises_its_own_error(self):
+        with mock.patch.object(pr.socket, "getaddrinfo", side_effect=pr.socket.gaierror(SENTINEL)):
+            with self.assertRaises(pr.socket.gaierror) as caught:
+                pr._resolve(self.HOST, lambda: 5.0)
+        self.assertEqual("gaierror", pr._err(caught.exception))
 
 
 class CommandLine(unittest.TestCase):
@@ -978,8 +1282,8 @@ class NotActivated(unittest.TestCase):
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add(node.module)
-        self.assertEqual({"__future__", "argparse", "base64", "datetime", "hashlib", "json", "os", "re", "sys",
-                          "time", "urllib.error", "urllib.request"}, imported)
+        self.assertEqual({"__future__", "argparse", "base64", "datetime", "hashlib", "http.client", "io", "json",
+                          "os", "re", "socket", "ssl", "sys", "threading", "time", "urllib.error"}, imported)
 
 
 if __name__ == "__main__":

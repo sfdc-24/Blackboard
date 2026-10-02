@@ -44,8 +44,10 @@ ONE USE
 WHAT COUNTS AS AN ANSWER
   One candidate, finish reason STOP, non-empty text whose first line is exactly
   `VERDICT: AGREE` or `VERDICT: BLOCKERS`, and no line giving the other verdict.
-  Anything else (cut at the token cap, blocked, empty, no verdict line, an
-  error, a timeout, an answer after the deadline) is INCOMPLETE, never AGREE.
+  Anything else (cut at the token cap, blocked, empty, no verdict line, text
+  that is not valid Unicode, an error, a timeout, an answer after the deadline)
+  is INCOMPLETE, never AGREE. The deadline is one absolute time: recording the
+  id, the name lookup, the connect and every send and read come out of it.
 
 WHERE THE REVIEW GOES
   The complete result (status, the model's whole text, and a receipt of the
@@ -72,16 +74,23 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
+import io
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import threading
 import time
 import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 
-GENERATE = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+# The one host the key and the document go to, and the one path on it.
+HOST = "generativelanguage.googleapis.com"
+PATH = "/v1beta/models/%s:generateContent"
+GENERATE = "https://" + HOST + PATH
 # The only repository a review may read from or write its result to. Private, like okf_land's.
 REPOS = ("sfdc-24/conference",)
 PROVIDER = "gemini"
@@ -151,6 +160,14 @@ class Blocked(Exception):
     """Refused before any provider call. The message is metadata: never artifact, row or model text."""
 
 
+class ProviderStatus(Exception):
+    """The provider answered with a status that is not 200. Only the number is kept, never the body."""
+
+    def __init__(self, code: int):
+        super().__init__("HTTP %d" % code)
+        self.code = code
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -161,7 +178,7 @@ def _utc_now() -> str:
 
 def _err(e: BaseException) -> str:
     """An error as its HTTP status or its type, never its message (a message can quote content)."""
-    if isinstance(e, urllib.error.HTTPError) and type(e.code) is int:
+    if isinstance(e, (urllib.error.HTTPError, ProviderStatus)) and type(e.code) is int:
         return "HTTP %d" % e.code
     return type(e).__name__
 
@@ -350,23 +367,99 @@ def build_request(manifest, markdown: bytes, pdf: bytes) -> dict:
     return body
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """The key and the document go to one host. A redirect anywhere is refused, never followed."""
+def _resolve(host: str, left) -> list:
+    """The host's addresses. A resolver takes no timeout, so it is waited for only as long as is left."""
+    found = []
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+    def look():
+        try:
+            found.append(socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM))
+        except BaseException as e:  # noqa: BLE001 - carried to the caller's thread, raised there
+            found.append(e)
+
+    wait = left()
+    # Abandoned if it outlives the deadline. Nothing private is in a name lookup, and nothing is sent after it.
+    lookup = threading.Thread(target=look, daemon=True)
+    lookup.start()
+    lookup.join(wait)
+    if not found:
+        raise TimeoutError("the deadline passed while the provider's name was looked up")
+    if isinstance(found[0], BaseException):
+        raise found[0]
+    return found[0]
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+def _open(host: str, left):
+    """A verified TLS socket to host:443. Each address tried, and the handshake, gets only what is left.
+
+    `left()` gives the seconds left of the deadline and raises TimeoutError when there are none.
+    """
+    context = ssl.create_default_context()      # verifies the certificate and the host name
+    context.set_alpn_protocols(["http/1.1"])
+    refused = None
+    for family, kind, proto, _name, address in _resolve(host, left):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(left())
+            sock.connect(address)
+            sock.settimeout(left())
+            return context.wrap_socket(sock, server_hostname=host)
+        except TimeoutError:
+            sock.close()
+            raise
+        except OSError as e:
+            sock.close()
+            refused = e
+    raise refused or OSError("the provider's name has no address")
+
+
+class _Reads(io.RawIOBase):
+    """What http.client reads the response from. Every read sets the socket's timeout to what is left."""
+
+    def __init__(self, sock, left):
+        super().__init__()
+        self._sock, self._left = sock, left
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, into) -> int:
+        self._sock.settimeout(self._left())
+        return self._sock.recv_into(into)
+
+
+class _Deadlined:
+    """The socket as http.client sees it: one deadline over every send and every read.
+
+    A socket timeout set once is per operation: it let a read that began just before the deadline run a
+    whole budget past it, and a response sent a little at a time run on without end. Here each send and
+    each read first takes what is left, and none is started with nothing left.
+    """
+
+    def __init__(self, sock, left):
+        self._sock, self._left = sock, left
+
+    def sendall(self, data) -> None:
+        self._sock.settimeout(self._left())
+        self._sock.sendall(data)
+
+    def makefile(self, mode="rb", *_args, **_kwargs):
+        return io.BufferedReader(_Reads(self._sock, self._left))
+
+    def close(self) -> None:
+        """Nothing: http.client closes its side as soon as the server says it will. call_gemini closes the socket."""
 
 
 def call_gemini(body: dict, *, route: str, model: str, key_env: str, timeout: float,
-                env=None, opener=None, clock=None) -> dict:
-    """The real provider call: one POST, no retry. Returns the decoded response or raises.
+                env=None, connect=None, clock=None) -> dict:
+    """The real provider call: one POST to one host, no retry, no redirect. Returns the decoded response or raises.
 
-    The key is read from the named variable at call time, sent as a header that is never copied
-    onto a redirect, and never logged or put in a URL. `timeout` is the whole budget: the socket
-    timeout alone would let a slow answer run on, so the clock is checked between reads too.
+    The key is read from the named variable at call time and sent as a header to HOST only, over a verified
+    TLS socket; it is never logged or put in a URL. Nothing is followed: a redirect is a status that is not
+    200, and raises with its number only.
+    `timeout` is the whole budget: the name lookup, the connect, the handshake, the request, the response's
+    headers and its body together. Every step that can block is given only what is left of it, and the
+    socket is closed however the call ends. connect(host, left) -> the connected socket (default: _open).
     """
     env = os.environ if env is None else env
     clock = clock or time.monotonic
@@ -378,21 +471,33 @@ def call_gemini(body: dict, *, route: str, model: str, key_env: str, timeout: fl
     if timeout <= 0:
         raise TimeoutError("no time left to call in")
     ends = clock() + timeout
-    req = urllib.request.Request(
-        GENERATE % model, data=json.dumps(body).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "sfdc24-private-review"})
-    req.add_unredirected_header("x-goog-api-key", key)
-    raw = b""
-    with (opener or _OPENER).open(req, timeout=timeout) as r:
+
+    def left() -> float:
+        remaining = ends - clock()
+        if remaining <= 0:
+            raise TimeoutError("the deadline passed during the provider call")
+        return remaining
+
+    sock = (connect or _open)(HOST, left)
+    try:
+        conn = http.client.HTTPSConnection(HOST)
+        conn.sock = _Deadlined(sock, left)      # already connected: http.client frames and parses, nothing more
+        conn.request("POST", PATH % model, body=json.dumps(body).encode("utf-8"),
+                     headers={"Content-Type": "application/json", "User-Agent": "sfdc24-private-review",
+                              "Connection": "close", "x-goog-api-key": key})
+        response = conn.getresponse()
+        if response.status != 200:
+            raise ProviderStatus(response.status)
+        raw = b""
         while True:
-            if clock() >= ends:
-                raise TimeoutError("the deadline passed while the answer was being read")
-            chunk = r.read1(65536)
+            chunk = response.read1(65536)
             if not chunk:
                 break
             raw += chunk
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ValueError("the answer is over %d bytes" % MAX_RESPONSE_BYTES)
+    finally:
+        sock.close()
     return json.loads(raw.decode("utf-8"))
 
 
@@ -428,6 +533,12 @@ def read_answer(response) -> dict:
     # The model's thinking is not its answer: a thought part is never text, and never a verdict.
     out["text"] = "".join(p["text"] for p in (parts if type(parts) is list else ())
                           if type(p) is dict and type(p.get("text")) is str and p.get("thought") is not True)
+    try:
+        out["text"].encode("utf-8")
+    except UnicodeEncodeError:
+        # Valid JSON can hold a lone surrogate, which is not text and cannot be stored. It is not kept at
+        # all, whatever the finish: kept, it broke the receipt after the review id was already spent.
+        return dict(out, text="", why="the answer holds characters that are not valid Unicode; its text is not kept")
     if finish != "STOP":
         return dict(out, why="finish reason %s is not a normal stop"
                     % (out["finish_reason"] or "(missing or unrecognised)"))
@@ -594,6 +705,11 @@ def run(manifest, *, pr_head=None, fetch=None, is_private=None, claim=None, prov
             return done(BLOCKED, "the review id is already used: no second provider call")
     except Exception as e:  # noqa: BLE001 - an unrecorded id must not be spent
         return done(BLOCKED, "%s while recording the review id" % _err(e))
+    # The budget is taken again: recording the id takes time too, and the call gets only what is left of
+    # the deadline now. With none left the id stays spent, and nothing is asked.
+    left = m["deadline_seconds"] - (clock() - began)
+    if left <= 0:
+        return done(BLOCKED, "the deadline was spent recording the review id: the id is used, no provider call")
 
     say("private_review %s: id recorded; asking %s %s once, cap %d tokens, %.0f s left"
         % (m["review_id"], m["route"], m["model"], m["max_output_tokens"], left))
@@ -611,8 +727,20 @@ def run(manifest, *, pr_head=None, fetch=None, is_private=None, claim=None, prov
     say("private_review %s: provider finish %s, response id %s"
         % (m["review_id"], answer["finish_reason"] or "(none)", answer["response_id"] or "(none)"))
 
-    content = render_result(m, status=status, answer=answer, sent=sent, started_at=started_at,
-                            called_at=called_at, answered_at=answered_at).encode("utf-8")
+    def receipt() -> bytes:
+        return render_result(m, status=status, answer=answer, sent=sent, started_at=started_at,
+                             called_at=called_at, answered_at=answered_at).encode("utf-8")
+
+    try:
+        content = receipt()
+    except Exception as e:  # noqa: BLE001 - the id is spent: the receipt is still owed, with none of the answer in it
+        status = INCOMPLETE
+        answer = dict(read_answer(None), why="%s while the result was rendered; nothing of the answer is kept"
+                      % _err(e))
+        try:
+            content = receipt()
+        except Exception as e:  # noqa: BLE001 - nothing to store: say so, and say the call was made
+            return done(BLOCKED, "%s while rendering the private result; the provider was called once" % _err(e))
     digest = _sha256(content)
     step = "asking whether %s is still private" % destination["repo"]
     try:
