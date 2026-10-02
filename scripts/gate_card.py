@@ -64,8 +64,10 @@ KNOWN LIMITS (deliberate, fail-closed):
     word "blocker" (say, a docs PR about blockers) refuses; the refusal
     quotes the matched line so a human can adjudicate. The safe failure
     direction is a false refusal, never a false pass.
-  - A review thread with more comments than one page is "not fully
-    read" and refuses rather than judging half a thread.
+  - A long review thread is PAGINATED, as U4 asks, so running past one
+    page is not a refusal. Only a thread still unfinished after
+    MAX_THREAD_PAGES pages is "not fully read", and that refuses
+    rather than judging half a thread.
   - Thread resolution state only exists in GitHub's GraphQL API, so a
     live run needs a token; `--inputs` judges a recorded snapshot with
     no network at all.
@@ -573,8 +575,9 @@ def judge(inputs: dict, require_codex: bool = True,
             for comment in thread.get("comments") or []:
                 url = str(comment.get("html_url") or "") or url
             out.open.append(
-                "a review thread was not fully read (more comments than one "
-                f"page); refusing to judge half a thread - {url or thread.get('id')}"
+                "a review thread could not be read whole (still unfinished after "
+                f"{MAX_THREAD_PAGES} pages); refusing to judge half a thread - "
+                f"{url or thread.get('id')}"
             )
             continue
         reason = thread_gate_reason(thread, high_anchors)
@@ -688,7 +691,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           isResolved
           isOutdated
           comments(first: 100) {
-            pageInfo { hasNextPage }
+            pageInfo { hasNextPage endCursor }
             nodes { databaseId body createdAt url author { login } }
           }
         }
@@ -697,6 +700,27 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }
 """
+
+# A long thread's remaining comments, by the thread's node id. U4 asks
+# for every review and comment to be paginated, and a thread that
+# merely runs past one page must be READ, not refused for ever.
+THREAD_COMMENTS_QUERY = """
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId body createdAt url author { login } }
+      }
+    }
+  }
+}
+"""
+
+# How many pages of one thread's comments to read before giving up and
+# refusing it as unread. 50 pages is 5000 comments: past that, some
+# other thing is wrong.
+MAX_THREAD_PAGES = 50
 
 
 def make_graphql(token: str | None):
@@ -725,6 +749,16 @@ def make_graphql(token: str | None):
         return payload
 
     return graphql
+
+
+def comment_fields(c: dict) -> dict:
+    return {
+        "discussion_id": c.get("databaseId"),
+        "author": str((c.get("author") or {}).get("login") or ""),
+        "body": str(c.get("body") or ""),
+        "created_at": str(c.get("createdAt") or ""),
+        "html_url": str(c.get("url") or ""),
+    }
 
 
 def _paged(rest, path: str, params: dict) -> list[dict]:
@@ -826,22 +860,35 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
             )
         for node in conn.get("nodes") or []:
             inner = node.get("comments") or {}
+            thread_id = str(node.get("id") or "")
+            comments_out = [comment_fields(c) for c in inner.get("nodes") or []]
+            info = inner.get("pageInfo") or {}
+            # Read the rest of a long thread rather than refusing it:
+            # `truncated` is for a thread that could NOT be read whole,
+            # not for one that simply runs past the first page.
+            pages = 1
+            while info.get("hasNextPage"):
+                if pages >= MAX_THREAD_PAGES:
+                    break
+                more = graphql(THREAD_COMMENTS_QUERY,
+                               {"id": thread_id, "cursor": info.get("endCursor")})
+                nxt = (((more.get("data") or {}).get("node") or {})
+                       .get("comments"))
+                if not isinstance(nxt, dict) or not isinstance(nxt.get("nodes"), list):
+                    raise GateError(
+                        f"GraphQL returned no further comments for thread {thread_id}; "
+                        "refusing to judge a partly read thread"
+                    )
+                comments_out.extend(comment_fields(c) for c in nxt["nodes"])
+                info = nxt.get("pageInfo") or {}
+                pages += 1
             threads.append(
                 {
-                    "id": str(node.get("id") or ""),
+                    "id": thread_id,
                     "is_resolved": bool(node.get("isResolved")),
                     "is_outdated": bool(node.get("isOutdated")),
-                    "truncated": bool((inner.get("pageInfo") or {}).get("hasNextPage")),
-                    "comments": [
-                        {
-                            "discussion_id": c.get("databaseId"),
-                            "author": str((c.get("author") or {}).get("login") or ""),
-                            "body": str(c.get("body") or ""),
-                            "created_at": str(c.get("createdAt") or ""),
-                            "html_url": str(c.get("url") or ""),
-                        }
-                        for c in inner.get("nodes") or []
-                    ],
+                    "truncated": bool(info.get("hasNextPage")),
+                    "comments": comments_out,
                 }
             )
         info = conn.get("pageInfo") or {}

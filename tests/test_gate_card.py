@@ -300,7 +300,7 @@ class CopilotGates(unittest.TestCase):
         }]
         j = judged(inputs)
         self.assertFalse(j.passed)
-        self.assertTrue(any("not fully read" in l for l in j.open))
+        self.assertTrue(any("could not be read whole" in l for l in j.open))
 
 
 class CopilotReviewRound1(unittest.TestCase):
@@ -341,7 +341,7 @@ class CopilotReviewRound1(unittest.TestCase):
         }]
         j = judged(inputs)
         self.assertFalse(j.passed)
-        self.assertTrue(any("not fully read" in l for l in j.open), j.open)
+        self.assertTrue(any("could not be read whole" in l for l in j.open), j.open)
         self.assertFalse(any("all resolved" in l for l in j.closed), j.closed)
 
     def test_a_high_anchor_without_a_fetched_thread_refuses(self):
@@ -793,12 +793,35 @@ class GatherAndCli(unittest.TestCase):
 
         return rest
 
-    def _fake_graphql(self, pages):
+    def _fake_graphql(self, pages, thread_pages=None, calls=None):
+        """Serve both the threads query and the thread-comments query.
+
+        `thread_pages` maps a thread node id to the list of further
+        comment pages the node query should return, in order.
+        """
+        served = {"thread": 0}
+        taken: dict[str, int] = {}
+
         def graphql(query, variables):
-            cursor = variables.get("cursor")
-            page = pages[0] if cursor is None else pages[1]
+            if calls is not None:
+                calls.append(variables)
+            if "PullRequestReviewThread" in query:
+                tid = variables["id"]
+                seq = (thread_pages or {}).get(tid) or []
+                i = taken.get(tid, 0)
+                if i >= len(seq):
+                    raise AssertionError(f"no more comment pages for {tid}")
+                taken[tid] = i + 1
+                return {"data": {"node": {"comments": seq[i]}}}
+            page = pages[served["thread"]]
+            served["thread"] = min(served["thread"] + 1, len(pages) - 1)
             return {"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}
         return graphql
+
+    def _comment(self, did, body="b"):
+        return {"databaseId": did, "body": body, "createdAt": "t",
+                "url": f"https://example.test/d/{did}",
+                "author": {"login": "copilot-pull-request-reviewer"}}
 
     def test_gather_reads_every_page_and_rereads_the_head(self):
         calls = []
@@ -806,28 +829,73 @@ class GatherAndCli(unittest.TestCase):
             {"pageInfo": {"hasNextPage": True, "endCursor": "C1"},
              "nodes": [{"id": "T1", "isResolved": True, "isOutdated": False,
                         "comments": {"pageInfo": {"hasNextPage": False},
-                                     "nodes": [{"databaseId": 1, "body": "b",
-                                                "createdAt": "t", "url": "u",
-                                                "author": {"login": "copilot-pull-request-reviewer"}}]}}]},
+                                     "nodes": [self._comment(1)]}}]},
             {"pageInfo": {"hasNextPage": False, "endCursor": None},
-             "nodes": [{"id": "T2", "isResolved": False, "isOutdated": False,
-                        "comments": {"pageInfo": {"hasNextPage": True},
-                                     "nodes": []}}]},
+             "nodes": [{"id": "T2", "isResolved": True, "isOutdated": False,
+                        "comments": {"pageInfo": {"hasNextPage": True,
+                                                  "endCursor": "IC1"},
+                                     "nodes": [self._comment(2)]}}]},
         ]
-        inputs = gate_card.gather("o", "r", 999, None,
-                                  self._fake_rest(calls), self._fake_graphql(pages))
+        # T2 runs past its first page; U4 says paginate, so gather
+        # reads the rest instead of refusing the thread for ever.
+        thread_pages = {"T2": [
+            {"pageInfo": {"hasNextPage": True, "endCursor": "IC2"},
+             "nodes": [self._comment(3)]},
+            {"pageInfo": {"hasNextPage": False, "endCursor": None},
+             "nodes": [self._comment(4)]},
+        ]}
+        gql_vars = []
+        inputs = gate_card.gather(
+            "o", "r", 999, None, self._fake_rest(calls),
+            self._fake_graphql(pages, thread_pages, calls=gql_vars),
+        )
         self.assertEqual(inputs["named_sha"], SHA)
         self.assertEqual(len(inputs["issue_comments"]), 101)
         self.assertEqual(inputs["issue_comments"][-1]["body"], f"**GO** on `{SHA}`.")
         self.assertEqual([t["id"] for t in inputs["threads"]], ["T1", "T2"])
-        self.assertTrue(inputs["threads"][1]["truncated"])
+        # Every comment of the long thread is present, and it is NOT
+        # marked unread.
+        self.assertEqual([c["discussion_id"] for c in inputs["threads"][1]["comments"]],
+                         [2, 3, 4])
+        self.assertFalse(inputs["threads"][1]["truncated"])
+        self.assertEqual([v.get("cursor") for v in gql_vars if "id" in v],
+                         ["IC1", "IC2"])
         # The PR is read once before and once after everything else.
         pr_reads = [i for i, (p, _) in enumerate(calls) if p.endswith("/pulls/999")]
         self.assertEqual(pr_reads[0], 0)
         self.assertEqual(pr_reads[-1], len(calls) - 1)
-        # The truncated thread fails closed when judged.
         j = gate_card.judge(inputs, require_codex=False)
-        self.assertTrue(any("not fully read" in l for l in j.open), j.open)
+        self.assertFalse(any("could not be read whole" in l for l in j.open), j.open)
+
+    def test_a_thread_longer_than_the_page_cap_is_refused_as_unread(self):
+        pages = [{"pageInfo": {"hasNextPage": False, "endCursor": None},
+                  "nodes": [{"id": "T9", "isResolved": True, "isOutdated": False,
+                             "comments": {"pageInfo": {"hasNextPage": True,
+                                                       "endCursor": "c0"},
+                                          "nodes": [self._comment(1)]}}]}]
+        endless = [{"pageInfo": {"hasNextPage": True, "endCursor": f"c{i}"},
+                    "nodes": [self._comment(i + 2)]}
+                   for i in range(gate_card.MAX_THREAD_PAGES + 2)]
+        inputs = gate_card.gather("o", "r", 999, None, self._fake_rest([]),
+                                  self._fake_graphql(pages, {"T9": endless}))
+        self.assertTrue(inputs["threads"][0]["truncated"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertTrue(any("could not be read whole" in l for l in j.open), j.open)
+
+    def test_a_null_node_reply_mid_thread_is_an_error(self):
+        pages = [{"pageInfo": {"hasNextPage": False, "endCursor": None},
+                  "nodes": [{"id": "T8", "isResolved": True, "isOutdated": False,
+                             "comments": {"pageInfo": {"hasNextPage": True,
+                                                       "endCursor": "c0"},
+                                          "nodes": [self._comment(1)]}}]}]
+
+        def graphql(query, variables):
+            if "PullRequestReviewThread" in query:
+                return {"data": {"node": None}}
+            return {"data": {"repository": {"pullRequest":
+                                            {"reviewThreads": pages[0]}}}}
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, self._fake_rest([]), graphql)
 
     def test_graphql_without_a_token_is_an_error_not_a_pass(self):
         graphql = gate_card.make_graphql(None)
