@@ -129,6 +129,14 @@ _VERDICT = re.compile(r"VERDICT: (AGREE|BLOCKERS)")
 _REASON = re.compile(r"[A-Z][A-Z0-9_]{0,39}")
 _RESPONSE_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _MODEL_VERSION = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+# The provider's labels that may be named in a log line or a reason: these, exactly. A shape is not enough: a
+# label is the provider's own text, and "ZQX-PRIVATE-SENTINEL-7f3a91c4" has the shape of a response id (Copilot
+# and Codex on 9607d08: a shape-valid responseId reached stdout). Any other label, and every response id and
+# model version, is kept in the private receipt and nowhere else.
+PUBLIC_REASONS = frozenset((
+    "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "LANGUAGE", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+    "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY", "UNEXPECTED_TOOL_CALL", "FINISH_REASON_UNSPECIFIED",
+    "BLOCK_REASON_UNSPECIFIED", "PROMPT_BLOCKED"))
 
 # The field a row selects with, and the fields a row may never carry beside it.
 ROW_FIELD = "review"
@@ -502,14 +510,26 @@ def call_gemini(body: dict, *, route: str, model: str, key_env: str, timeout: fl
 
 
 def _shaped(value, pattern) -> str:
-    """A provider-supplied label if it has a label's shape, else "": it is logged, so it is never free text."""
+    """A provider-supplied label if it has a label's shape, else "". Shaped, it may go into the private
+    receipt. It is still the provider's text: only _public() of it may be logged or put in a reason."""
     return value if type(value) is str and pattern.fullmatch(value) else ""
 
 
+def _public(reason: str, unlisted: str = "(not a listed reason)", none: str = "") -> str:
+    """A finish or block reason as it may be named outside the private receipt: itself when it is one of
+    PUBLIC_REASONS, the fixed words `unlisted` for any other label, `none` when there is no label."""
+    if not reason:
+        return none
+    return reason if reason in PUBLIC_REASONS else unlisted
+
+
 def read_answer(response) -> dict:
-    """The provider's response, read fail-closed. `complete` is True only for a whole, well-formed answer."""
-    out = {"complete": False, "verdict": "", "text": "", "finish_reason": "", "response_id": "",
-           "model_version": "", "usage": {}, "why": ""}
+    """The provider's response, read fail-closed. `complete` is True only for a whole, well-formed answer.
+    `why` is public (it is logged and returned): it names a provider label only through _public(). The
+    labels themselves (`finish_reason`, `block_reason`, `response_id`, `model_version`) are for the private
+    receipt only."""
+    out = {"complete": False, "verdict": "", "text": "", "finish_reason": "", "block_reason": "",
+           "response_id": "", "model_version": "", "usage": {}, "why": ""}
     if type(response) is not dict:
         return dict(out, why="the provider's answer is not an object")
     out["response_id"] = _shaped(response.get("responseId"), _RESPONSE_ID)
@@ -521,8 +541,10 @@ def read_answer(response) -> dict:
                         if type(usage.get(k)) is int}
     feedback = response.get("promptFeedback")
     if type(feedback) is dict and feedback.get("blockReason"):
-        return dict(out, finish_reason="PROMPT_BLOCKED", why="the provider blocked the request (%s)"
-                    % (_shaped(feedback.get("blockReason"), _REASON) or "reason not named"))
+        blocked = _shaped(feedback.get("blockReason"), _REASON)
+        return dict(out, finish_reason="PROMPT_BLOCKED", block_reason=blocked,
+                    why="the provider blocked the request (%s)"
+                    % _public(blocked, unlisted="a reason that is not listed", none="reason not named"))
     candidates = response.get("candidates")
     if type(candidates) is not list or len(candidates) != 1 or type(candidates[0]) is not dict:
         return dict(out, why="the answer does not hold exactly one candidate")
@@ -541,7 +563,7 @@ def read_answer(response) -> dict:
         return dict(out, text="", why="the answer holds characters that are not valid Unicode; its text is not kept")
     if finish != "STOP":
         return dict(out, why="finish reason %s is not a normal stop"
-                    % (out["finish_reason"] or "(missing or unrecognised)"))
+                    % _public(out["finish_reason"], none="(missing or unrecognised)"))
     if not out["text"].strip():
         return dict(out, why="the answer is empty")
     lines = out["text"].split("\n")
@@ -574,6 +596,7 @@ def render_result(manifest, *, status: str, answer: dict, sent: list,
         "- **deadline_seconds:** %d" % manifest["deadline_seconds"],
         "- **response_id:** %s" % (answer["response_id"] or "not reported"),
         "- **finish_reason:** %s" % (answer["finish_reason"] or "not reported"),
+        "- **block_reason:** %s" % (answer["block_reason"] or "none"),
         "- **tokens:** %s" % (", ".join("%s %d" % kv for kv in sorted(usage.items())) or "not reported"),
         "- **started_at:** %s" % started_at,
         "- **called_at:** %s" % called_at,
@@ -724,8 +747,8 @@ def run(manifest, *, pr_head=None, fetch=None, is_private=None, claim=None, prov
     if answer["complete"] and clock() - began > m["deadline_seconds"]:
         answer = dict(answer, complete=False, verdict="", why="the answer arrived after the deadline")
     status = answer["verdict"] if answer["complete"] else INCOMPLETE
-    say("private_review %s: provider finish %s, response id %s"
-        % (m["review_id"], answer["finish_reason"] or "(none)", answer["response_id"] or "(none)"))
+    # The response id is not logged: it is the provider's text, whatever its shape. It is in the private receipt.
+    say("private_review %s: provider finish %s" % (m["review_id"], _public(answer["finish_reason"], none="(none)")))
 
     def receipt() -> bytes:
         return render_result(m, status=status, answer=answer, sent=sent, started_at=started_at,

@@ -644,7 +644,7 @@ class Answer(unittest.TestCase):
         halves = {"content": {"parts": [{"text": "VERDICT: AGREE\n\ud83d"}, {"text": "\ude00"}]},
                   "finishReason": "STOP"}
         self.incomplete(answer(candidates=[halves]), "not valid Unicode")
-        whole = pr.read_answer(answer("VERDICT: AGREE\n\U0001f600 and caf\xe9\n"))   # a whole pair and an accent are text
+        whole = pr.read_answer(answer("VERDICT: AGREE\n\U0001f600 and caf\xe9\n"))      # both are text
         self.assertEqual(("AGREE", True), (whole["verdict"], whole["complete"]))
 
     def test_a_result_that_cannot_be_rendered_still_leaves_a_receipt_with_none_of_the_answer(self):
@@ -691,6 +691,54 @@ class Answer(unittest.TestCase):
         self.assertEqual(("", "", "", {}), (read["finish_reason"], read["response_id"], read["model_version"],
                                             read["usage"]))
         self.assertFalse(read["complete"])
+
+    def test_a_label_with_the_right_shape_is_still_the_providers_text_and_stays_private(self):
+        # Copilot and Codex on 9607d08: the shape filter passed a response id that was a private-looking marker,
+        # and the log line printed it. A shape is not a closed set. These markers have each label's shape.
+        reason = "ZQX_PRIVATE_SENTINEL_7F3A91C4"
+        self.assertTrue(pr._RESPONSE_ID.fullmatch(SENTINEL) and pr._MODEL_VERSION.fullmatch(SENTINEL)
+                        and pr._REASON.fullmatch(reason))
+        for name, reply, marker, status in (
+                ("response id", answer(GOOD, responseId=SENTINEL), SENTINEL, "AGREE"),
+                ("model version", answer(GOOD, modelVersion=SENTINEL), SENTINEL, "AGREE"),
+                ("finish reason", answer("VERDICT: AGREE\nfine\n", finish=reason), reason, "INCOMPLETE"),
+                ("block reason", answer("VERDICT: AGREE\nfine\n", promptFeedback={"blockReason": reason}), reason,
+                 "INCOMPLETE")):
+            rig = Rig(reply=reply)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+                out = rig.run(log=None)                             # the default log: print
+            self.assertEqual(status, out["status"], name)
+            public = "\n".join([json.dumps(out), json.dumps(out["board"]), pr.board_line(out["board"]),
+                                printed.getvalue()])
+            self.assertTrue(printed.getvalue().strip(), name)
+            self.assertNotIn(marker, public, name)
+            self.assertNotIn("SENTINEL", public, name)
+            self.assertIn(marker, rig.written[0][1].decode("utf-8"), name)  # kept, in the private receipt only
+        # What is said in public of a label that is not listed, and of the listed ones.
+        self.assertEqual("finish reason (not a listed reason) is not a normal stop",
+                         pr.read_answer(answer(GOOD, finish=reason))["why"])
+        self.assertEqual("the provider blocked the request (a reason that is not listed)",
+                         pr.read_answer(answer(GOOD, promptFeedback={"blockReason": reason}))["why"])
+        self.assertEqual("finish reason MAX_TOKENS is not a normal stop",
+                         pr.read_answer(answer(GOOD, finish="MAX_TOKENS"))["why"])
+        self.assertEqual("the provider blocked the request (SAFETY)",
+                         pr.read_answer(answer(GOOD, promptFeedback={"blockReason": "SAFETY"}))["why"])
+        self.assertEqual(("", "STOP", "(not a listed reason)"),
+                         (pr._public(""), pr._public("STOP"), pr._public("stop")))
+        self.assertEqual(sorted(pr.PUBLIC_REASONS), sorted(r for r in pr.PUBLIC_REASONS if pr._REASON.fullmatch(r)))
+
+    def test_the_log_names_a_listed_finish_and_never_the_response_id(self):
+        rig = Rig(reply=answer(GOOD, finish="MAX_TOKENS", responseId="resp-synth-9"))
+        rig.run()
+        logged = "\n".join(rig.lines)
+        self.assertIn("private_review %s: provider finish MAX_TOKENS" % RID, logged)
+        self.assertNotIn("resp-synth-9", logged)
+        self.assertNotIn("response id", logged)
+        self.assertIn("- **response_id:** resp-synth-9", rig.written[0][1].decode("utf-8"))
+        timed_out = Rig(reply=TimeoutError("timed out"))
+        timed_out.run()
+        self.assertIn("private_review %s: provider finish (none)" % RID, timed_out.lines)
 
 
 class Deadline(unittest.TestCase):
@@ -840,6 +888,8 @@ class BoardAndLogs(unittest.TestCase):
         yield "provider error", Rig(reply=RuntimeError(SENTINEL)), ROW
         yield "label abuse", Rig(reply=answer(GOOD, finish=SENTINEL, responseId="id " + SENTINEL,
                                               modelVersion=SENTINEL + " " + GOOD)), ROW
+        # The sentinel has the shape of a response id and of a model version (Copilot and Codex on 9607d08).
+        yield "shaped labels", Rig(reply=answer(GOOD, responseId=SENTINEL, modelVersion=SENTINEL)), ROW
         yield "clipped", Rig(blobs=clipped), ROW
         yield "fetch error", Rig(blobs={"docs/synthetic.md": KeyError(SENTINEL), "docs/synthetic.pdf": PDF}), ROW
         yield "moved", Rig(heads=[HEAD, SENTINEL]), ROW
