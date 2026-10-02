@@ -128,6 +128,8 @@ BADGE_OR_ANCHOR = re.compile(
     r'alt="(?P<severity>High|Critical) severity"|#discussion_r(?P<did>\d+)'
 )
 CODEX_MARKER = re.compile(r"^CODEX-[A-Za-z0-9][A-Za-z0-9-]*$")
+# A line that is ENTIRELY one HTML comment, and nothing else.
+HTML_COMMENT_ONLY = re.compile(r"^<!--\s*(.+?)\s*-->$")
 CODEX_VERDICT = re.compile(r"\b(NO-GO|NO-MAJOR|GO)\b")
 CURSOR_VERDICT = re.compile(r"^(NO-GO|GO)(?![A-Za-z0-9-])")
 
@@ -220,25 +222,52 @@ def codex_verdict(comment: dict, named_sha: str,
     if raw_login(comment.get("author")) not in {raw_login(r) for r in relays}:
         return None
     body = str(comment.get("body") or "")
-    shas = SHA_IN_TEXT.findall(body.lower())
-    if not shas or shas[0] != named_sha:
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    if not lines:
         return None
-    lead = first_nonempty_line(body)
-    if lead.startswith("<!--"):
-        lead = lead[4:].replace("-->", "", 1).strip()
-    if not (CODEX_MARKER.match(lead) or lead.startswith("## Codex:")):
+    # Unwrap the lead line ONLY when the whole line is one HTML
+    # comment. Stripping `<!--` and the first `-->` from a line with
+    # trailing text glues that text onto the id: `<!-- CODEX-ID-->NO-GO`
+    # became the marker `CODEX-IDNO-GO`, which then swallowed the
+    # NO-GO along with the line.
+    first = lines[0].strip()
+    wrapped = HTML_COMMENT_ONLY.match(first)
+    lead = wrapped.group(1).strip() if wrapped else first
+    id_line = bool(CODEX_MARKER.match(lead))
+    heading = lead.startswith("## Codex:")
+    if not (id_line or heading):
+        # A comment that CLAIMS to be a Codex receipt but whose lead
+        # line parses as neither an id nor a heading cannot be read,
+        # and silence would let an earlier GO stand. So, naming this
+        # SHA, it refuses. A dispatch that merely quotes "GO or NO-GO"
+        # does not claim to be a receipt and stays silence.
+        probe = first[4:].strip() if first.startswith("<!--") else first
+        if (probe.startswith("CODEX-") or probe.startswith("## Codex:")) \
+                and named_sha in body.lower():
+            return "NO-GO"
         return None
+    # Within a Codex comment, a NO-GO ANYWHERE sinks the verdict - the
+    # opaque id line included. Text may never lift a verdict to GO,
+    # but it must always be able to sink it, so a NO-GO cannot be
+    # hidden on the line that GO parsing drops.
+    if named_sha in body.lower() and re.search(r"\bNO-GO\b", body):
+        return "NO-GO"
     # A bare CODEX-... line is an opaque ID, not a verdict: an id like
     # CODEX-...-GO-... must not decide anything, so it is dropped
     # before the tokens are read. A "## Codex: GO / NO-MAJOR" heading
     # is the opposite - it carries the verdict - so it is kept even
-    # when it leads the comment. Where both tokens appear in what is
-    # read (a quoted "Reply GO or NO-GO", a cited earlier verdict),
-    # NO-GO wins: the safe direction is a false refusal, never a
-    # false GO.
-    lines = [ln for ln in str(body or "").splitlines() if ln.strip()]
-    scan = lines[1:] if CODEX_MARKER.match(lead) else lines
-    tokens = set(CODEX_VERDICT.findall("\n".join(scan)))
+    # when it leads the comment.
+    #
+    # The SUBJECT and the TOKEN must come from the SAME text, or the
+    # two rules can be aimed at each other: an id line naming this SHA
+    # with a heading saying "GO for <another SHA>" would otherwise
+    # return GO for a commit the heading never reviewed. So the SHA is
+    # sought in exactly the text the token is read from.
+    scan = "\n".join(lines[1:] if id_line else lines)
+    shas = SHA_IN_TEXT.findall(scan.lower())
+    if not shas or shas[0] != named_sha:
+        return None
+    tokens = set(CODEX_VERDICT.findall(scan))
     if not tokens:
         return None
     if "NO-GO" in tokens:

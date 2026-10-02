@@ -544,10 +544,12 @@ class CodexVerdictShapes(unittest.TestCase):
         return gate_card.codex_verdict({"author": "sfdc-24", "body": body}, SHA)
 
     def test_a_marker_id_containing_go_is_not_a_verdict_on_its_own(self):
+        # A clean id line over a body with no verdict is silence. (An
+        # id line that does NOT parse cleanly is a different case and
+        # refuses instead - see the unreadable-receipt test below.)
         self.assertIsNone(self._verdict(
             f"CODEX-PR316-GO-RECEIPT\n\nTarget SHA `{SHA}`. Review pending."
         ))
-        self.assertIsNone(self._verdict(f"CODEX-PR316-NO-GO-20261002 `{SHA}`"))
 
     def test_both_live_receipt_shapes_are_read(self):
         # The #315 shape: an HTML marker, then the heading.
@@ -570,6 +572,47 @@ class CodexVerdictShapes(unittest.TestCase):
         self.assertEqual(
             self._verdict(f"CODEX-PR316-GO-CHECK\n\nNO-GO at `{SHA}`."), "NO-GO"
         )
+
+    def test_the_subject_and_the_token_come_from_the_same_text(self):
+        # Cursor's attack: an id line naming THIS SHA with a heading
+        # that GOes for ANOTHER commit. The heading never reviewed
+        # this SHA, so this must never be a GO here.
+        got = self._verdict(f"CODEX-X-20261002 `{SHA}`\n\n## Codex: GO for `{OTHER}`")
+        self.assertNotEqual(got, "GO")
+        # And the mirror: an id naming another SHA with a heading that
+        # NO-GOes this one. The NO-GO must not be lost, or an earlier
+        # GO would stay the latest verdict.
+        self.assertEqual(
+            self._verdict(f"CODEX-X-{OTHER[:8]}\n\n## Codex: NO-GO for `{SHA}`"),
+            "NO-GO",
+        )
+
+    def test_unwrapping_cannot_manufacture_a_marker_that_swallows_a_no_go(self):
+        # `<!-- CODEX-ID-->NO-GO` once became the marker
+        # `CODEX-IDNO-GO`, dropping the line and the NO-GO with it.
+        self.assertEqual(
+            self._verdict(f"<!-- CODEX-ID-->NO-GO\n\n## Codex: GO for `{SHA}`"),
+            "NO-GO",
+        )
+
+    def test_a_receipt_that_cannot_be_read_refuses_rather_than_going_quiet(self):
+        # It claims to be a Codex receipt and names this SHA, but its
+        # lead line parses as neither an id nor a heading.
+        self.assertEqual(self._verdict(f"CODEX-PR316-NO-GO-20261002 `{SHA}`"), "NO-GO")
+
+    def test_a_dispatch_that_quotes_go_or_no_go_is_still_silence(self):
+        # The real one-line #315 dispatch: it cites a CODEX-... id and
+        # quotes "Reply GO or NO-GO", from the relay account. Reading
+        # it as a NO-GO would refuse every PR the moment a review is
+        # asked for - the over-strict failure, which is also a failure.
+        self.assertIsNone(self._verdict(
+            f"@cursor Please check exact commit {SHA} on this PR. It answers "
+            "Copilot 4169273881 and Codex's CODEX-RISK-315-RESPONSE-ID-LOG-20261002. "
+            "Reply GO or NO-GO for this exact commit."
+        ))
+
+    def test_a_go_for_another_sha_is_not_a_verdict_here(self):
+        self.assertIsNone(self._verdict(f"CODEX-X\n\nGO at `{OTHER}`."))
 
 
 class CursorGate(unittest.TestCase):
