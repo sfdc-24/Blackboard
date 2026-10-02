@@ -1,7 +1,16 @@
 # Claude off the laptop: the Claude Console API, run by Cloud Run
 
-**claude-code-cli, 2026-10-02. Revision 6.** It answers Codex's NO-GO on revision 5 (`41c95e6`, Blackboard #306
-comment 5943835443, board `CODEX-PR306-NOGO-20261002T0125Z`):
+**claude-code-cli, 2026-10-02. Revision 7.** It answers Codex's review of revision 6 (`9cf6802`):
+- **P1, the sandbox's data channel:** a no-role sandbox had no way to get the bundle or return its log. The broker now
+  gives it two single-object V4 signed URLs: GET for its bundle, PUT for its result. Its identity still holds no
+  role, and its egress is closed except to Cloud Storage (Boundary 3).
+- **P1, in-flight runs:** the kill switch was read once, at start. It is now checked on every effectful broker and
+  proxy operation, and rollback also cancels running executions (Rollback, test 9).
+- **P2, memory:** the job has no storage access, so memory goes through two broker operations on a dedicated bucket,
+  bounded in size and compare-and-swap (the table, Boundary 3).
+
+**Revision 6** answered Codex's NO-GO on revision 5 (`41c95e6`, Blackboard #306 comment 5943835443, board
+`CODEX-PR306-NOGO-20261002T0125Z`):
 - **P1, credentials:** in C2, model-influenced tests ran under an identity that could read the Console key and the
   clone credential. From C2 the job holds **no credential and no secret access at all**. The Console key sits behind
   a key-injecting proxy. The repository comes from a separate clone identity. Tests run in a sandbox job whose
@@ -69,7 +78,7 @@ What it carries over from revisions 2–3, which answered Codex's three P1 block
 | The `gh` user login | **`ccc-broker`**, a Cloud Run service that holds the only GitHub write credential and performs only "push an owned `claude-code-cloud/` branch and open its PR". The repository arrives as a read-only git bundle from **`ccc-fetch`**, which runs as a separate clone identity holding only the read-only App key (#309). The job never holds a GitHub credential | C2 |
 | The `gcloud` user login (read-backs, logs) | not in the job: its identity holds no role but `run.invoker` on the fleet's own services. Read-backs are broker operations, added one at a time with review | C2 |
 | Posting to the board with `BUS_SECRET` | **`ccc-broker`** also holds `BUS_SECRET` and posts the board rows. It authenticates the job by its Google identity (an OIDC ID token, so there is no new shared secret) | C1 |
-| My memory directory | a GCS prefix, synced at the start and end of each run, compare-and-swap as `wakers` cursors already are | C2 |
+| My memory directory | the bucket `ccc-memory`, reached only through the broker's `memory_get` (at the start) and `memory_put` (at the end of a DONE run): at most 1 MiB, compare-and-swap on the object generation as `wakers` cursors already are. The job itself has no storage access | C2 |
 | Mutation suites | GitHub Actions; already done for conference #126 (16 shards, 19/19 green at `e931980`) | done |
 | The call-log watch | a Cloud Monitoring log-based alert on `conference-chair-pool`, posting through the broker | C4 |
 | Rehearsal calls | a Cloud Run job that runs `live_rehearsal.py` against `conference-chair-dev` | C4 |
@@ -117,7 +126,8 @@ board row to claude-code-cloud            (C1: probes only; C2: fleet rows; C3: 
    ▼
 claude-code-cloud  (Cloud Run job, max-retries 0, own service account)
    │  harness, FIRST: broker.claim_run(work_id) -- create-if-absent runs/{work_id}; EXISTS => stop, no agent (Boundary 2)
-   │  harness: broker.control() -- the route's kill switch; disabled => quarantine pending, no agent (Rollback)
+   │  harness: broker.control() -- the route's kill switch; disabled => quarantine pending, no agent (Rollback);
+   │           the broker and the proxy also check it on every effectful operation
    │  C2+: ccc-fetch returns a read-only git bundle; no GitHub credential ever enters the job
    │  Agent SDK: dontAsk; tools REMOVED by name per stage; a PreToolUse hook allowlist; max_turns and max_budget_usd per run
    │  C1: Console key in the job (one tool, no code execution).  C2+: ANTHROPIC_BASE_URL = ccc-llm-proxy, no key in the job
@@ -128,7 +138,8 @@ ccc-broker  (Cloud Run service, --no-allow-unauthenticated; the job is added as 
    │  claim_run / finish_run: runs/{work_id} in the ccc-receipts database (Boundary 2)
    │  post_receipt / post_result: claims receipts/{work_id} (create-if-absent), posts with BUS_SECRET
    │  open_pr (C2): takes a git bundle; validates repo, owned branch, fast-forward, ownership paths; pushes; opens the PR
-   │  run_tests (C2): starts ccc-sandbox with the bundle; returns its exit status and log
+   │  run_tests (C2): bundle to ccc-sandbox-io; starts ccc-sandbox with signed GET/PUT URLs; returns {exit, log}
+   │  memory_get / memory_put (C2): ccc-memory, at most 1 MiB, compare-and-swap
    ▼
 board row from claude-code-cloud, read back by Row_ID;  PR on a claude-code-cloud/ branch, never merged by the agent
 ```
@@ -204,8 +215,17 @@ holds no secret access and no role but `run.invoker` on the fleet's own services
   App key (#309). It returns a git bundle of the named ref and has no other operation. The agent works on an offline
   copy with no remote.
 - **Tests** run in **`ccc-sandbox`**, a Cloud Run job whose identity holds **no role at all**: no secret, no invoker,
-  no storage. `broker.run_tests` starts it with the agent's bundle and returns the exit status and the log. Edited
-  test code that asks the metadata server for a token gets one for an identity that can do nothing.
+  no storage. Edited test code that asks the metadata server for a token gets one for an identity that can do
+  nothing. The data channel (Codex P1 on revision 6) is two V4 signed URLs, which need no identity:
+  1. `broker.run_tests` writes the agent's bundle to `gs://ccc-sandbox-io/in/<work_id>/<execution>.bundle`;
+  2. it starts `ccc-sandbox` with two per-execution overrides: a signed **GET** URL for exactly that object, and a
+     signed **PUT** URL for exactly `out/<work_id>/<execution>.json`, each valid for 15 minutes;
+  3. the sandbox fetches the bundle, runs `python -m unittest`, and PUTs `{exit, log}` (the log capped at 256 KiB);
+  4. the broker waits for the execution to end, reads the result object, and returns it to the agent. A missing,
+     oversize or malformed result is reported as UNKNOWN, never as a pass.
+
+  Its **egress** goes only to Cloud Storage (Private Google Access, no NAT), so test code cannot send a private
+  repository anywhere else. The bucket has a 1-day lifecycle delete.
 - **The GitHub write credential** exists only in the broker's identity.
 - `gh` and `gcloud` are not installed in the image.
 - **C1 is unchanged:** the Console key is in the job (#310), because C1's only tool is `post_receipt` and no code is
@@ -234,8 +254,11 @@ holds no secret access and no role but `run.invoker` on the fleet's own services
   In C1 it also holds `secretAccessor` on `ANTHROPIC_API_KEY_CLOUD`, which C2 removes. Nothing else: no
   `run.jobs.update`, `run.services.update`, `cloudscheduler.*`, IAM write, storage or deploy right. So the agent
   cannot change its own schedule, image, route or the broker, and the poka-yoke is enforced by IAM.
-- **`ccc-broker@`:** `BUS_URL` and `BUS_SECRET`, the broker App key (C2), `datastore.user` on `ccc-receipts` only,
-  and `run.jobsExecutorWithOverrides` on `ccc-sandbox` (C2).
+- **`ccc-broker@`:** `BUS_URL` and `BUS_SECRET`, the broker App key (C2), `datastore.user` on `ccc-receipts` only.
+  From C2 it also holds:
+  - `run.jobsExecutorWithOverrides` and `run.viewer` on `ccc-sandbox`, to start it and wait for its end;
+  - `storage.objectAdmin` on the buckets `ccc-sandbox-io` and `ccc-memory` only;
+  - `iam.serviceAccountTokenCreator` on itself only, to sign the sandbox's URLs.
 - **`ccc-llm@`** (proxy, C2): `secretAccessor` on `ANTHROPIC_API_KEY_CLOUD` only.
 - **`ccc-clone@`** (fetch, C2): `secretAccessor` on `GITHUB_APP_READONLY_PRIVATE_KEY` only.
 - **`ccc-sandbox@`** (C2): no role.
@@ -289,7 +312,10 @@ Each check has a pass condition and is run by Codex, not by me. These carry over
      board-watcher drops it), and posts no receipt;
    - separately, revoke board-watcher's `run.jobsExecutorWithOverrides` on the job. PASS when that route's start
      fails and is held, and only that route;
-   - in both cases, PASS only if the **other routes keep starting** on the same ticks (board-watcher's log), and the
+   - **in flight** (Codex P1 on revision 6): turn the switch off while a run is mid-task. PASS when that run's next
+     broker or proxy call is refused within 10 seconds, it opens no PR and posts no result, and the cancelled
+     execution reads back as cancelled;
+   - in every case, PASS only if the **other routes keep starting** on the same ticks (board-watcher's log), and the
      laptop lane still answers `claude-code-cli`. `board-watcher-2min` is never paused for this.
 10. **C2 work.** A real Codex task to `claude-code-cloud` (for example "fix this test and open a PR"). PASS when a PR
     exists on a `claude-code-cloud/` branch, CI ran, nothing merged, and one RESULT row names it.
@@ -322,7 +348,9 @@ Each check has a pass condition and is run by Codex, not by me. These carry over
     `ANTHROPIC_API_KEY_CLOUD` and `GITHUB_APP_READONLY_PRIVATE_KEY` from Secret Manager, and to call `ccc-llm-proxy`,
     `ccc-fetch` and the broker. The test prints only booleans and error types, never a value. PASS when every
     secret read is denied, the token's identity is `ccc-sandbox@` with no role, every service refuses that identity,
-    and the same attempts from the agent's own Bash are denied by the hook.
+    and the same attempts from the agent's own Bash are denied by the hook. Also PASS only when the signed GET URL
+    cannot read any other object in `ccc-sandbox-io`, the signed PUT URL cannot write any other object, and a request
+    from the sandbox to any host other than Cloud Storage fails.
 
 ## Owner gates (Mr. Salam)
 
@@ -340,8 +368,9 @@ Nothing here is authorized by this spec. Each gate is one step, and secret value
    - C1 (#310): the `claude-code-cloud` job and its service account, the `ccc-broker` service and its service account,
      and the separate **`ccc-receipts`** Firestore database in northamerica-northeast2 (adopted from #310, in place of a
      collection in `(default)`, so the broker's `datastore.user` can be scoped to one database);
-   - C2: `ccc-llm-proxy`, `ccc-fetch` and the `ccc-sandbox` job, each with its own service account;
-   - the GCS memory prefix.
+   - C2: `ccc-llm-proxy`, `ccc-fetch` and the `ccc-sandbox` job, each with its own service account; the buckets
+     `ccc-sandbox-io` (1-day lifecycle) and `ccc-memory`; and the sandbox's closed egress (a VPC with Private Google
+     Access and no NAT).
 4. **C3:** the GO to let the agent read his WhatsApp text.
 5. **C5:** the cutover and the laptop decommission.
 
@@ -353,9 +382,16 @@ Nothing here is authorized by this spec. Each gate is one step, and secret value
 ## Rollback
 Route-specific, never by pausing the shared watcher (Codex P1 on revision 5: pausing `board-watcher-2min` stops every
 route, and removing a route left its pending job runnable):
-1. **Kill switch, fast and reversible:** `broker.control()` reads one flag for the route. When it is off, the job
-   runs no agent, writes every pending work_id to its cursor as quarantined (so board-watcher's `reconcile()` drops
-   them), and exits. Turning it on again lets new rows through. Quarantined rows are reported, not replayed.
+1. **Kill switch, fast and reversible:** one flag for the route, read by the broker and the proxy.
+   - **At start,** when it is off, the job runs no agent, writes every pending work_id to its cursor as quarantined
+     (so board-watcher's `reconcile()` drops them), and exits.
+   - **In flight** (Codex P1 on revision 6): the broker and `ccc-llm-proxy` read the flag on **every** effectful
+     operation, cached for at most 10 seconds, and refuse when it is off. So a run that started before the switch
+     cannot post, open a PR, run tests, or make another model call.
+   - **Then cancel** the route's running executions: `gcloud run jobs executions cancel` on each execution of
+     `claude-code-cloud` that is still running. The owner runs it, and board-watcher's identity is the only other one
+     holding `run.executions.cancel` on this job.
+   - Turning the flag on again lets new rows through. Quarantined rows are reported, not replayed.
 2. **IAM revoke, the hard stop:** remove board-watcher's `run.jobsExecutorWithOverrides` on `claude-code-cloud`.
    Starts for this route fail and are held; board-watcher already isolates a failed start to its own route.
 3. **Then the code revert** of the route in board-watcher, with pending reconciled first by step 1.
