@@ -58,6 +58,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # failure raised client-side can arrive after the row has already landed.
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 from bus import fetch as _bus_fetch, load_env as _bus_load_env  # noqa: E402
+import loop_guard  # noqa: E402  - L-114's mechanism, in the path rather than in anyone's memory
 ENV = os.path.join(REPO, ".env")
 BOARD = "Blackboard - Alpha DB"
 BACKUPS = os.path.join(os.path.dirname(REPO), "blackboard-backups")
@@ -351,6 +352,13 @@ def cmd_post(args):
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rid = args.id or ("%s-%s" % (args.prefix, dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%MZ")))
     to = args.to
+    # L-114 (his ruling of 2026-10-03): no agent, alone or with a peer, can talk itself into a loop.
+    # The count lives here because every local agent posts through this one path, and because at each
+    # step of a loop everyone is behaving correctly, so there is no rule anyone could have remembered.
+    allowed, why = loop_guard.allow(tag, to, args.project, rid, args.answers or "", args.owner_asked or "")
+    if not allowed:
+        print("  " + why)
+        return 2
     payload = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|%s" % (
         rid, args.phase, args.klass, tag, to.replace(";", ","), args.text)
     row = [rid, now, tag, to, args.phase, payload, args.category, args.project, args.gist or args.text[:180], ""]
@@ -428,6 +436,10 @@ def build_parser():
     po.add_argument("--gist", default=None)
     po.add_argument("--id", default=None)
     po.add_argument("--prefix", default="CCC-NOTE")
+    po.add_argument("--answers", default=None,
+                    help="the Row_ID this answers: how L-114's guard sees the chain it is part of")
+    po.add_argument("--owner-asked", dest="owner_asked", default=None,
+                    help="his words, when he has asked for an exchange the loop guard would stop")
     po.set_defaults(fn=cmd_post)
     return p
 

@@ -504,6 +504,78 @@ second time, the reviewer spent its whole budget and returned no verdict.
 
 ---
 
+## L-115 — Nobody can talk themselves, or a peer, into a loop
+
+**Incident.** Mr. Salam, 2026-10-03, looking at what is on a timer: *"There is a
+risk here of creating recursive loops, can you file this as poke yoke and make
+sure any agent, including you; will have preventative checks to make sure no one
+individually or collectively fall into a recursive loop while working."* He said
+it before one had run away, which is the only useful time to say it.
+
+The shape is already built. The board cannot push, so one watcher reads it and
+starts a job for every route a new row is addressed to (`cloud/board-watcher`).
+That job answers by writing a row, and a row is what starts a job. Nothing in
+that circuit counts how many times it has gone round: A asks B, B answers A, A
+answers B, and **every step is individually correct**. The same shape needs no
+peer at all — a review that always finds something, answered forever, is one
+agent going round on its own. On the night of 2026-10-02 the conference chair
+review went ten rounds between two agents in nine hours; each round closed a real
+finding, so nothing was wrong, and nothing in the path would have noticed if the
+rounds had stopped closing anything.
+
+**Naive rule.** "Notice when you are looping and stop." Worthless here, and not
+because agents are careless: at each step there is no rule anyone has broken, so
+there is no moment where remembering a rule would help. By the time the loop is
+visible as a loop, it is visible only from outside it.
+
+**The contract is L-114**, `docs/AGENT-LOOP-PREVENTION.md`, which Codex filed the same morning for every agent including itself. This entry is the one narrow mechanism L-114 asks for in the path local agents post through; it is not the whole contract, and what it leaves to L-114 is listed at the end.
+
+**Mechanism — on `main`.** `scripts/loop_guard.py`, called by `cmd_post` in
+`scripts/fleet_agent.py`, which is the one path every local agent posts through.
+Before a row is written, the guard reads this instance's own ledger of what it
+has sent in the last half hour and refuses two shapes:
+
+- **a burst** — more than `CAP` (8) rows from this tag to the same target in the
+  same project inside the window. In a two-agent ping-pong each side's own count
+  rises, so each side's own guard trips. No shared state, no agreement needed,
+  and it works even if the peer is running code that has never heard of this;
+- **a chain** — a row answering a row that answered a row, deeper than
+  `MAX_CHAIN` (6) within the window, counted from the `--answers` ids this
+  instance has seen.
+
+A refusal is not a transient error to retry: it names what tripped and says to
+put the unresolved thing in front of the owner instead. The ledger records
+refusals as well as posts, so an override does not reset the count.
+
+**The override is deliberate.** `--owner-asked "<his words>"` lets a specific
+post through and writes his words into the ledger. A mechanism with no door gets
+a hole cut in it; a door with a name on it gets used honestly. His own
+"keep working through with codex, gemini, grok and cursor" is exactly the case
+the door exists for.
+
+**What this does not cover, stated rather than implied.**
+
+- Chains that never pass through `fleet_agent.py`: the cloud wakers post by
+  their own path, and `cloud/board-watcher` starts jobs without posting at all.
+  The watcher's half — a per-route start budget, and a refusal to start a route
+  whose rows have been going round — is **proposed, not built**, and is on
+  Codex in `CCC-SCHEDULER-WHY-20261003T0946Z`.
+- Loops outside the board entirely: a pull-request review round is not a post,
+  so nothing counts it. The rule there, which is a rule and is written here as
+  one rather than dressed up: **a round that closes no new finding ends the
+  loop**, and the next round goes to the owner.
+- A guard that cannot write its ledger refuses the post, because a guard that
+  cannot count is not a guard. That is the one case where this mechanism can
+  stop ordinary work, and it is the right way round.
+
+**Tests.** `tests/test_loop_guard.py`, eleven of them, each one a shape a loop is
+made of: the pair going round, the chain of answers, a chain that points at
+itself, the window falling away, another target being its own count, the
+override being written down, a refusal still being counted, and the ledger that
+cannot be written or cannot be read.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
