@@ -859,8 +859,12 @@ class GatherAndCli(unittest.TestCase):
         `thread_pages` maps a thread node id to the list of further
         comment pages the node query should return, in order.
         """
+        # gather_once walks the lists TWICE (an opening pass and the
+        # closing copy it keeps), so these fakes must answer the same
+        # cursor the same way however often it is asked. Pages are
+        # keyed by the cursor that requests them, not by call order.
         served = {"thread": 0}
-        taken: dict[str, int] = {}
+        order: dict[str, list] = {}
 
         def graphql(query, variables):
             if calls is not None:
@@ -868,13 +872,20 @@ class GatherAndCli(unittest.TestCase):
             if "PullRequestReviewThread" in query:
                 tid = variables["id"]
                 seq = (thread_pages or {}).get(tid) or []
-                i = taken.get(tid, 0)
+                seen = order.setdefault(tid, [])
+                cursor = variables.get("cursor")
+                if cursor not in seen:
+                    seen.append(cursor)
+                i = seen.index(cursor)
                 if i >= len(seq):
                     raise AssertionError(f"no more comment pages for {tid}")
-                taken[tid] = i + 1
                 return {"data": {"node": {"comments": seq[i]}}}
-            page = pages[served["thread"]]
-            served["thread"] = min(served["thread"] + 1, len(pages) - 1)
+            # A walk over the threads list always begins with no
+            # cursor, which is where the page sequence restarts.
+            if variables.get("cursor") is None:
+                served["thread"] = 0
+            page = pages[min(served["thread"], len(pages) - 1)]
+            served["thread"] += 1
             return {"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}
         return graphql
 
@@ -1238,6 +1249,141 @@ class GatherAndCli(unittest.TestCase):
 
         inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
         self.assertTrue(gate_card.judge(inputs, require_codex=False).passed)
+
+    def _rest_with_late_nogo(self, land_after_comment_reads):
+        """A Cursor NO-GO that lands mid-walk and STAYS.
+
+        It appears once the comments list has been sampled
+        `land_after_comment_reads` times, so with a single-pass walk it
+        is live and permanent while the reviews, checks, threads and
+        closing PR read are still ahead - and no revert is needed to
+        keep it out of the snapshot.
+        """
+        seen = {"comments": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                seen["comments"] += 1
+                live = seen["comments"] > land_after_comment_reads
+                body = (f"**NO-GO** on `{SHA}`." if live
+                        else f"**GO** on `{SHA}`.")
+                return [{"id": 1, "user": {"login": "cursor[bot]"}, "body": body,
+                         "created_at": "t", "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success"}
+            raise AssertionError(path)
+
+        return rest
+
+    def test_churn_within_one_read_makes_that_read_not_count(self):
+        # The provable half of the closing-pass change: when the two
+        # passes of ONE read disagree, that read describes no single
+        # moment, so it is not comparable and the attempt is spent
+        # rather than silently resolved to one of the two states.
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        # Every read churns: reads 1,2 differ, 3,4 differ, 5,6 differ.
+        every = {"n": 0}
+
+        def rest_churning(path, params=None):
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                every["n"] += 1
+                return [{"id": 1, "user": {"login": "cursor[bot]"},
+                         "body": f"**GO** on `{SHA}`. read {every['n']}",
+                         "created_at": "t", "html_url": "u1"}]
+            return self._rest_with_late_nogo(99)(path, params)
+
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, rest_churning, graphql)
+
+        # Churn that stops: reads 1,2 differ (attempt 1 spent), then
+        # everything settles and the card can be judged.
+        settling = {"n": 0}
+
+        def rest_settling(path, params=None):
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                settling["n"] += 1
+                suffix = " churn" if settling["n"] == 1 else ""
+                return [{"id": 1, "user": {"login": "cursor[bot]"},
+                         "body": f"**GO** on `{SHA}`.{suffix}",
+                         "created_at": "t", "html_url": "u1"}]
+            return self._rest_with_late_nogo(99)(path, params)
+
+        inputs = gate_card.gather("o", "r", 999, None, rest_settling, graphql)
+        self.assertTrue(gate_card.judge(inputs, require_codex=False).passed)
+
+    def test_a_verdict_landing_mid_walk_is_inside_the_snapshot(self):
+        # Cursor's hole: with one pass per read, a NO-GO that lands
+        # after the comments were copied and stays was in NEITHER
+        # read's comment sample, both fingerprints matched the green
+        # copy, and the card printed over a live NO-GO. The lists are
+        # now kept from a CLOSING pass, so the NO-GO is in the
+        # snapshot that gets judged.
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        # It lands during the first walk's own stagger: the opening
+        # pass sees GO, every later sample sees NO-GO.
+        inputs = gate_card.gather("o", "r", 999, None,
+                                  self._rest_with_late_nogo(1), graphql)
+        self.assertIn("NO-GO", inputs["issue_comments"][0]["body"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("NO-GO" in l for l in j.open), j.open)
+
+    def test_a_merge_conflict_refuses_and_restarts_settling(self):
+        # mergeable_state is kept out of the fingerprint because it
+        # flickers, but what it MEANS is not: `dirty` is a real
+        # conflict and a handoff cannot stand over one.
+        inputs = green_inputs()
+        inputs["pr"]["mergeable_state"] = "dirty"
+        inputs["pr_after"]["mergeable_state"] = "dirty"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("merge conflict" in l for l in j.open), j.open)
+        # A conflict appearing in the closing read alone still refuses.
+        late = green_inputs()
+        late["pr_after"]["mergeable_state"] = "dirty"
+        j2 = judged(late)
+        self.assertFalse(j2.passed)
+        self.assertTrue(
+            any("merge conflict" in l and "by the end of the reads" in l
+                for l in j2.open), j2.open
+        )
+        # And a flip to dirty changes the fingerprint, so it cannot be
+        # settled past, while the unknown/clean flicker still can.
+        clean = green_inputs()
+        self.assertNotEqual(gate_card.gate_fingerprint(clean),
+                            gate_card.gate_fingerprint(inputs))
+        flicker = green_inputs()
+        flicker["pr"]["mergeable_state"] = "unknown"
+        self.assertEqual(gate_card.gate_fingerprint(clean),
+                         gate_card.gate_fingerprint(flicker))
 
     def test_graphql_without_a_token_is_an_error_not_a_pass(self):
         graphql = gate_card.make_graphql(None)

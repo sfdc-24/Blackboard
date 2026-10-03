@@ -479,6 +479,13 @@ def judge(inputs: dict, require_codex: bool = True,
         else:
             continue
         bad_state = True
+    for label, read in (("", pr), (" (by the end of the reads)", pr_after)):
+        if is_conflicted(read):
+            out.open.append(
+                f"the branch has a merge conflict with its base{label} "
+                "(mergeable_state dirty): resolve it before any handoff"
+            )
+            bad_state = True
     if not bad_state:
         line = "PR: open and not a draft, before and after the reads"
         mergeable = str(pr_after.get("mergeable_state") or pr.get("mergeable_state") or "")
@@ -808,6 +815,18 @@ def make_graphql(token: str | None):
     return graphql
 
 
+def is_conflicted(read: dict | None) -> bool:
+    """Whether this PR read says the branch has a merge conflict.
+
+    GitHub's `mergeable_state` is computed asynchronously and flickers
+    between "unknown" and a settled value, which is why the raw string
+    is kept out of the fingerprint. `dirty` is different: it is a real
+    conflict, it does not clear by itself, and a handoff card cannot
+    stand over one.
+    """
+    return str((read or {}).get("mergeable_state") or "").lower() == "dirty"
+
+
 def page_has_more(info, where: str) -> bool:
     """Whether another page follows, refusing to GUESS that none does.
 
@@ -875,11 +894,19 @@ def gate_fingerprint(inputs: dict) -> str:
     card as it was read - so including it would risk a read that can
     never settle, which is its own kind of failure.
     """
-    volatile = ("mergeable_state",)
+    # `mergeable_state` itself is excluded (see above), but what it
+    # MEANS for the gate is not: a flip to `dirty` is a merge
+    # conflict, and that must restart settling. So the raw string is
+    # replaced by the one derived fact the judgement uses, which is
+    # stable under the unknown/clean flicker.
+    def pr_part(read: dict) -> dict:
+        part = {k: v for k, v in (read or {}).items() if k != "mergeable_state"}
+        part["conflicted"] = is_conflicted(read)
+        return part
+
     gate = {
-        "pr": {k: v for k, v in (inputs.get("pr") or {}).items() if k not in volatile},
-        "pr_after": {k: v for k, v in (inputs.get("pr_after") or {}).items()
-                     if k not in volatile},
+        "pr": pr_part(inputs.get("pr")),
+        "pr_after": pr_part(inputs.get("pr_after")),
         "issue_comments": inputs.get("issue_comments") or [],
         "reviews": inputs.get("reviews") or [],
         "threads": inputs.get("threads") or [],
@@ -909,12 +936,20 @@ def gather(owner: str, repo: str, number: int, sha: str | None,
     )
 
 
-def gather_once(owner: str, repo: str, number: int, sha: str | None,
-                rest, graphql) -> dict:
-    pr = rest(f"/repos/{owner}/{repo}/pulls/{number}")
-    head = str((pr.get("head") or {}).get("sha") or "").lower()
-    named_sha = (sha or head).lower()
+def pr_fields(payload: dict) -> dict:
+    return {
+        "state": str(payload.get("state") or ""),
+        "draft": bool(payload.get("draft")),
+        "merged": bool(payload.get("merged")),
+        "head_sha": str((payload.get("head") or {}).get("sha") or "").lower(),
+        "mergeable_state": str(payload.get("mergeable_state") or ""),
+        "html_url": str(payload.get("html_url") or ""),
+    }
 
+
+def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
+                    rest, graphql) -> dict:
+    """One pass over every list the judgement reads."""
     comments = [
         {
             "id": c.get("id"),
@@ -1035,17 +1070,42 @@ def gather_once(owner: str, repo: str, number: int, sha: str | None,
             break
         cursor = info.get("endCursor")
 
-    pr_after = rest(f"/repos/{owner}/{repo}/pulls/{number}")
+    return {
+        "issue_comments": comments,
+        "reviews": reviews,
+        "threads": threads,
+        "check_runs": check_runs,
+        "combined_status": {"state": str((combined or {}).get("state") or "unknown")},
+    }
 
-    def pr_fields(payload: dict) -> dict:
-        return {
-            "state": str(payload.get("state") or ""),
-            "draft": bool(payload.get("draft")),
-            "merged": bool(payload.get("merged")),
-            "head_sha": str((payload.get("head") or {}).get("sha") or "").lower(),
-            "mergeable_state": str(payload.get("mergeable_state") or ""),
-            "html_url": str(payload.get("html_url") or ""),
-        }
+
+def gather_once(owner: str, repo: str, number: int, sha: str | None,
+                rest, graphql) -> dict:
+    """One read of the PR: the head, every gate list, then the head again.
+
+    WHAT THIS CANNOT SEE, stated because it was tempting to paper over.
+    The lists are sampled one after another, so a change that lands
+    after a list was read and persists is absent from this read. The
+    outer loop catches it on the next read, UNLESS it lands after the
+    last sample of the read that gets returned - then two reads agree
+    and the card prints over something already live.
+
+    I tried closing that by keeping a second, later copy of every
+    list. It shrinks the window but I could not demonstrate it: two
+    mutants that removed the mechanism entirely left the whole suite
+    green, because the retry loop subsumes it and read-count fakes
+    cannot express a wall-clock window. Shipping machinery I cannot
+    show working would be the same "green is not proof" mistake this
+    repository exists to avoid, so it is not here. The residual is
+    real and documented instead: a card is evidence about the moment
+    it was read, not a lock.
+    """
+    pr = rest(f"/repos/{owner}/{repo}/pulls/{number}")
+    head = str((pr.get("head") or {}).get("sha") or "").lower()
+    named_sha = (sha or head).lower()
+
+    lists = read_gate_lists(owner, repo, number, named_sha, rest, graphql)
+    pr_after = rest(f"/repos/{owner}/{repo}/pulls/{number}")
 
     return {
         "schema": SCHEMA,
@@ -1058,11 +1118,7 @@ def gather_once(owner: str, repo: str, number: int, sha: str | None,
         # The whole second read, not just its head: a merge or a
         # conversion to draft during the reads has to be visible.
         "pr_after": pr_fields(pr_after),
-        "issue_comments": comments,
-        "reviews": reviews,
-        "threads": threads,
-        "check_runs": check_runs,
-        "combined_status": {"state": str((combined or {}).get("state") or "unknown")},
+        **lists,
     }
 
 
