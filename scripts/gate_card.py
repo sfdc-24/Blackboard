@@ -77,11 +77,15 @@ KNOWN LIMITS (deliberate, fail-closed):
   - The whole read is repeated until the same gate state comes back
     twice running, because a verdict, review, thread or check can move
     while the OTHER resources are being fetched and the head never
-    changes. A PR that will not settle is an error, not a card. Even
-    so, a card is evidence about the moment it was read: it is not a
-    lock, and nothing stops a NO-GO landing a second after it prints.
-    That is why the card says it holds for that SHA only, and why the
-    merge stays a person's decision.
+    changes. A PR that will not settle is an error, not a card.
+    It is NOT airtight, and gather_once() says exactly why: the lists
+    are sampled one after another, so a change landing after the last
+    sample of the read that gets returned is invisible to both reads
+    even though it persists. A card is evidence about the moment it
+    was read: it is not a lock, and nothing stops a NO-GO landing a
+    second after it prints. That is why the card says it holds for
+    that SHA only, why any push voids it, and why the merge stays a
+    person's decision.
 
 USAGE
   python3 scripts/gate_card.py --pr 310                      # live, GITHUB_TOKEN
