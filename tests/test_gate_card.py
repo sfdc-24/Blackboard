@@ -1499,21 +1499,101 @@ class CursorReviewRound6(unittest.TestCase):
         self.assertTrue(judged(inputs).passed, judged(inputs).open)
 
 
-    def test_the_two_workflows_one_app_residual_is_pinned_not_hidden(self):
-        # Cursor's two cases, which still print, and which it ruled
-        # should NOT be repaired by grouping on suite id: "Re-run all
-        # jobs" creates a new suite and leaves the failed run on the
-        # commit, so suite grouping would make a green re-run
-        # unsatisfiable again, and nothing in this payload tells that
-        # new suite from a second workflow.
+    def test_two_workflows_one_app_are_two_checks_by_workflow_run(self):
+        # Copilot discussion_r4171053430, the finding Cursor had
+        # already ruled could not be repaired with a suite id - and it
+        # was right about the suite id. The workflow-run id in the job
+        # URL is the key neither named, and it separates these cases.
         #
-        # This test asserts the TRADE, not a desired behaviour. If a
-        # future change makes either case refuse, that is progress and
-        # this test should be deleted with the reason recorded - what
-        # it exists to prevent is the residual being closed by
-        # accident, or drifting back into a green re-run refusing.
+        # DEMONSTRATED live at eb184d7: three workflows posted on one
+        # commit under ONE app with run ids 37085487303, 37085487344
+        # and 37085487304. The URLs below are that live shape.
+        def job(run_id, job_id):
+            return (f"https://github.com/sfdc-24/Blackboard/actions/runs/"
+                    f"{run_id}/job/{job_id}")
+
         required = green_inputs()
         required["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": job(37085487344, 1)},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "11", "html_url": job(37085487303, 2)},
+        ]
+        j = judged(required)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("required-ci=failure" in l for l in j.open), j.open)
+
+        lint = green_inputs()
+        lint["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": job(37085487344, 3)},
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:20:00Z", "app_id": "15368",
+             "html_url": job(37085487303, 4)},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:20:00Z", "app_id": "15368",
+             "html_url": job(37085487304, 5)},
+        ]
+        j = judged(lint)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("lint=failure" in l for l in j.open), j.open)
+
+        # And Cursor's constraint, which is the reason suite id was
+        # the wrong key: a re-run is a new ATTEMPT of the SAME run,
+        # with a new job id. It must still pass, and the card must not
+        # link the superseded run.
+        rerun = green_inputs()
+        rerun["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "99", "html_url": job(37085487344, 111094779070)},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": job(37085487344, 111026549269)},
+        ]
+        ok = judged(rerun)
+        self.assertTrue(ok.passed, ok.open)
+        self.assertNotIn("111026549269", gate_card.render(rerun, ok))
+
+    def test_details_url_is_read_when_the_linked_url_carries_no_run(self):
+        # html_url is what a card links and could be anything, so the
+        # run id is read from details_url too.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": "https://example.test/pretty/ci"},
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:20:00Z", "app_id": "15368",
+             "html_url": "https://example.test/pretty/a",
+             "details_url": "https://github.com/o/r/actions/runs/1/job/9"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:20:00Z", "app_id": "15368",
+             "html_url": "https://example.test/pretty/b",
+             "details_url": "https://github.com/o/r/actions/runs/2/job/8"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("lint=failure" in l for l in j.open), j.open)
+
+    def test_the_narrowed_residual_is_pinned_as_a_trade(self):
+        # What remains is a property of the PUBLISHER, not of GitHub
+        # Actions: an app whose check-run URLs carry no workflow-run
+        # id has no lineage in this payload, so two same-named runs
+        # fall back to newest-by-time and a failing one can still read
+        # as superseded. These are Cursor's two cases verbatim, whose
+        # synthetic URLs are exactly that shape.
+        #
+        # This test asserts the TRADE, not a desired behaviour. If a
+        # future change closes it honestly, delete this test with the
+        # reason recorded; what it exists to prevent is the residual
+        # being closed by accident, or drifting back into a green
+        # re-run refusing.
+        residual = green_inputs()
+        residual["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "success",
              "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
              "check_suite_id": "10", "html_url": "ci/wf-a"},
@@ -1521,41 +1601,72 @@ class CursorReviewRound6(unittest.TestCase):
              "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
              "check_suite_id": "11", "html_url": "ci/wf-b"},
         ]
-        self.assertTrue(judged(required).passed, judged(required).open)
-
-        lint = green_inputs()
-        lint["check_runs"] = [
-            {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
-             "check_suite_id": "10", "html_url": "ci"},
-            {"name": "lint", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T00:20:00Z", "app_id": "15368",
-             "check_suite_id": "10", "html_url": "lint/wf-a"},
-            {"name": "lint", "status": "completed", "conclusion": "failure",
-             "started_at": "2026-10-02T00:20:00Z", "app_id": "15368",
-             "check_suite_id": "11", "html_url": "lint/wf-b"},
-        ]
-        self.assertTrue(judged(lint).passed, judged(lint).open)
-        # The reason it is a trade and not a shrug: the same pair with
-        # the re-run shape - one suite, newest green - MUST pass, and
-        # suite grouping would have broken exactly that.
-        rerun = green_inputs()
-        rerun["check_runs"] = [
-            {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
-             "check_suite_id": "99", "html_url": "ci/new"},
-            {"name": "required-ci", "status": "completed", "conclusion": "failure",
-             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
-             "check_suite_id": "10", "html_url": "ci/old"},
-        ]
-        ok = judged(rerun)
-        self.assertTrue(ok.passed, ok.open)
-        self.assertNotIn("ci/old", gate_card.render(rerun, ok))
-        # And the docstring must carry the residual, since that is
-        # where Cursor ruled it belongs.
+        self.assertTrue(judged(residual).passed, judged(residual).open)
         doc = " ".join((gate_card.current_check_runs.__doc__ or "").split())
-        self.assertIn("THE RESIDUAL", doc)
-        self.assertIn("Suite id is recorded for the reader", doc)
+        self.assertIn("THE RESIDUAL IS NOW NARROWER", doc)
+        self.assertIn("Suite id stays recorded for the reader", doc)
+        # And the half of the premise that is not demonstrated here
+        # must stay labelled as such, with its failure mode named.
+        helper_doc = " ".join((gate_card.workflow_run_id.__doc__ or "").split())
+        self.assertIn("READ, NOT DEMONSTRATED", helper_doc)
+        self.assertIn("a green re-run refuses instead of passing", helper_doc)
+
+
+class CopilotReviewRound7(unittest.TestCase):
+    """Copilot discussion_r4171053459 and the "previously missed"
+    finding on the CI chain: a refusal that lists every open item."""
+
+    def test_a_missing_required_check_does_not_hide_a_failing_one(self):
+        # The if/elif chain: `missing` consumed the branch, so the
+        # failing `lint` the same read had seen was never printed.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "111",
+             "html_url": "lint"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("required-ci" in l and "never ran" in l
+                            for l in j.open), j.open)
+        self.assertTrue(any("lint=failure" in l for l in j.open), j.open)
+
+    def test_the_aggregate_line_does_not_repeat_the_required_line(self):
+        # Both facts must appear, neither twice: the required line
+        # names which failing run was required, the aggregate line
+        # names the ones it did not.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": "ci"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "111",
+             "html_url": "lint"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        required_lines = [l for l in j.open if "required check(s) did not pass" in l]
+        self.assertEqual(len(required_lines), 1, j.open)
+        self.assertIn("required-ci=failure", required_lines[0])
+        aggregate = [l for l in j.open if l.startswith("CI on this SHA is")]
+        self.assertEqual(len(aggregate), 1, j.open)
+        self.assertIn("lint=failure", aggregate[0])
+        self.assertNotIn("required-ci", aggregate[0])
+
+    def test_a_green_aggregate_is_not_closed_while_a_required_item_is_open(self):
+        # "CI on this SHA: success" printed beside "required-ci never
+        # ran" is a card contradicting its own refusal.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "suites", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": "suites"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertFalse(any("CI on this SHA: success" in l for l in j.closed),
+                         j.closed)
 
 
 class RefusalCompleteness(unittest.TestCase):

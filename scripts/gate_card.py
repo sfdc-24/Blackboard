@@ -141,6 +141,14 @@ REQUIRED_CHECKS = ("required-ci",)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
+
+# A GitHub Actions check run links its job as
+# /actions/runs/<workflow run id>/job/<job id>. That workflow run id
+# is the lineage `app_id` cannot see: two WORKFLOWS are one app with
+# two run ids, while a re-run is a new ATTEMPT of the SAME run id
+# with a new job id. See workflow_run_id() for which half of that is
+# demonstrated and which is read from GitHub's model.
+ACTIONS_RUN_IN_URL = re.compile(r"/actions/runs/(\d+)(?:[/?#]|$)")
 # "blocker" as a standalone word, any case: Copilot has written
 # "BLOCKER - READ-NOT-DEMONSTRATED", "READ-NOT-DEMONSTRATED (blocker):"
 # and "VERDICT: BLOCKER" on this repository's PRs.
@@ -487,6 +495,37 @@ def parse_time(value) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def workflow_run_id(run: dict) -> str:
+    """The Actions workflow-run id this check run belongs to, or "".
+
+    DEMONSTRATED, from a live read of this repository at head
+    `eb184d7`: three workflows posted `test (...)`, `required-ci` and
+    `suites` on one commit under ONE app, with three different run
+    ids in their job URLs - 37085487303, 37085487344, 37085487304.
+    So the run id is exactly the lineage `app_id` collapses, and it
+    is already in the payload this tool gathers.
+
+    READ, NOT DEMONSTRATED: that a re-run keeps the run id and only
+    adds an ATTEMPT. GitHub's run object carries `run_attempt` and
+    `previous_attempt_url`, which is what makes an attempt a property
+    of one run rather than a new run, and re-running posts to
+    /actions/runs/<run id>/rerun. No commit in this repository has a
+    second attempt, so this half is not demonstrated here.
+
+    If that half is WRONG, a green re-run refuses instead of passing:
+    a false refusal, loud, and naming both runs. The alternative
+    error - grouping on (app, name) alone - prints a card over a
+    check that is currently failing in another workflow, silently.
+    For a fail-closed tool that is the worse side to be wrong on, so
+    this is the trade, not an oversight.
+    """
+    for key in ("html_url", "details_url"):
+        hit = ACTIONS_RUN_IN_URL.search(str(run.get(key) or ""))
+        if hit:
+            return hit.group(1)
+    return ""
+
+
 def outcomes_agree(runs: list[dict]) -> bool:
     """Whether these runs all report the same status and conclusion."""
     return len({(str(r.get("status") or ""), str(r.get("conclusion") or ""))
@@ -510,21 +549,37 @@ def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[tuple]]
 
     The question is not which run is newest but WHICH RUNS ARE THE
     SAME CHECK. Two runs are attempts of one check when the same APP
-    posted them; the same name from a different app is a different
-    check, and both are current. So the newest attempt per (app, name)
-    is current, and every such run is judged.
+    posted them INSIDE THE SAME WORKFLOW RUN; the same name from a
+    different app, or from a different workflow run, is a different
+    check, and both are current. So the newest attempt per
+    (app, workflow run, name) is current, and every such run is
+    judged.
 
-    THE RESIDUAL, which is not reducible from this payload, and which
-    Cursor ruled on rather than let me "fix": two workflows under
-    GitHub Actions are ONE app, so `required-ci` in two different
-    workflows collapses to the newer of them, and a failing
-    same-named check in the other workflow is hidden. Grouping by
-    check suite instead does not repair it - "Re-run all jobs"
-    creates a NEW suite and leaves the failed run on the commit, so
-    suite grouping would make a green re-run unsatisfiable again, and
-    nothing here can tell that new suite from a second workflow. Suite
-    id is recorded for the reader, deliberately unused, and this is
-    the trade rather than a bug waiting on a guard.
+    The workflow run is the part two reviewers disagreed about, so
+    the reasoning is recorded rather than the answer. Copilot found
+    that `app_id` alone is not lineage: every GitHub Actions workflow
+    shares one app id, so a failing `required-ci` in a second
+    workflow was being discarded as a superseded attempt of a green
+    one. Cursor had already ruled against the repair I offered for
+    exactly that - grouping on CHECK SUITE - because "Re-run all
+    jobs" creates a new suite, which would make a green re-run
+    unsatisfiable, "and this payload cannot tell that new suite from
+    a second workflow."
+
+    Both are right, and the payload CAN tell them apart, through a
+    key neither named: the Actions workflow-run id in the job URL.
+    It differs between workflows and holds across re-run attempts -
+    see workflow_run_id(), which states which half of that is
+    demonstrated from a live read and which is taken from GitHub's
+    documented attempt model. Suite id stays recorded for the reader
+    and deliberately unused: Cursor's objection to it stands.
+
+    THE RESIDUAL IS NOW NARROWER, and it is a property of the
+    publisher rather than of GitHub Actions: an app whose check-run
+    URLs carry no workflow-run id has no lineage here at all, so two
+    same-named runs from it fall back to newest-by-time, and a
+    failing one can still be read as superseded. Nothing in this
+    payload improves on that.
 
     Where runs of one name cannot be sorted into attempts at all - no
     app recorded, or one app with no start times - they are only
@@ -552,10 +607,11 @@ def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[tuple]]
                                       "check cannot be told from another app's "
                                       "check of the same name"))
             continue
-        by_app: dict[str, list[dict]] = {}
+        by_lineage: dict[tuple, list[dict]] = {}
         for run in runs:
-            by_app.setdefault(str(run.get("app_id")), []).append(run)
-        for attempts in by_app.values():
+            by_lineage.setdefault(
+                (str(run.get("app_id")), workflow_run_id(run)), []).append(run)
+        for attempts in by_lineage.values():
             if len(attempts) == 1:
                 current.append(attempts[0])
                 continue
@@ -787,31 +843,45 @@ def judge(inputs: dict, require_codex: bool = True,
             f"the check `{name}` ran more than once on this SHA with different "
             f"outcomes, and {why}: the evidence cannot say which run is current"
         )
+    # The required checks and the aggregate are reported
+    # INDEPENDENTLY. They were one if/elif chain, so a missing
+    # `required-ci` consumed the branch and a failing `lint` the same
+    # read had seen was never printed - this program's deliverable is
+    # a refusal that lists EVERY open item, and that chain quietly
+    # made it list the first.
     if missing:
         out.open.append(
             "the required check(s) " + ", ".join(missing)
             + " never ran on this SHA: silence is not a GO"
         )
-    elif not_green:
+    if not_green:
         out.open.append(
             "the required check(s) did not pass on this SHA: " + "; ".join(not_green)
             + " (only `success` is a pass)"
         )
-    elif unlinkable:
+    if unlinkable:
         out.open.append(
             "the required check(s) " + ", ".join(unlinkable)
             + " carry no run URL, so the handoff cannot link the run U4 requires"
         )
-    elif ci == "success":
-        required_links = "; ".join(
-            f"{name} {run.get('html_url')}"
-            for name in required_checks for run in runs_by_name.get(name) or []
-        )
-        names = ", ".join(sorted(str(r.get("name") or "?") for r in check_runs))
-        out.closed.append(
-            f"CI on this SHA: success - required run(s): {required_links} "
-            f"({len(check_runs)} check runs in all: {names})"
-        )
+    # What the required lines above already named is not repeated in
+    # the aggregate line; what they did not is the whole point of it.
+    rest = [b for b in bad if b not in set(not_green)]
+    if ci == "success":
+        # Only CLOSED when the required side is closed too: the
+        # aggregate can be green while a required check never ran,
+        # and "CI: success" printed beside "required-ci never ran"
+        # is a card contradicting its own refusal.
+        if not (missing or not_green or unlinkable):
+            required_links = "; ".join(
+                f"{name} {run.get('html_url')}"
+                for name in required_checks for run in runs_by_name.get(name) or []
+            )
+            names = ", ".join(sorted(str(r.get("name") or "?") for r in check_runs))
+            out.closed.append(
+                f"CI on this SHA: success - required run(s): {required_links} "
+                f"({len(check_runs)} check runs in all: {names})"
+            )
     elif ci == "partial":
         out.open.append(
             "the legacy status list for this SHA was not read whole "
@@ -824,8 +894,8 @@ def judge(inputs: dict, require_codex: bool = True,
                             + "; ".join(bad))
     elif ci == "unknown":
         out.open.append("CI on this SHA reports nothing: silence is not a GO")
-    else:
-        detail = "; ".join(bad) if bad else f"combined status {combined.get('state')}"
+    elif rest or not (missing or not_green or unlinkable):
+        detail = "; ".join(rest) if rest else f"combined status {combined.get('state')}"
         out.open.append(f"CI on this SHA is {ci}: {detail}")
 
     # 4. Cursor.
@@ -1274,8 +1344,15 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
                 "conclusion": str(r.get("conclusion") or ""),
                 "started_at": str(r.get("started_at") or ""),
                 "html_url": str(r.get("html_url") or ""),
-                # Lineage: same app + same name = attempts of one
-                # check; same name from another app = another check.
+                # `details_url` is recorded as a second place to read
+                # the Actions workflow-run id from, since html_url is
+                # the one a card links and could be anything.
+                "details_url": str(r.get("details_url") or ""),
+                # Lineage: same app + same WORKFLOW RUN + same name =
+                # attempts of one check. Another app, or another
+                # workflow run, is another check. See
+                # current_check_runs() for why the workflow run is in
+                # that key and the check suite is not.
                 "app_id": str(((r.get("app") or {}).get("id")) or ""),
                 "check_suite_id": str(((r.get("check_suite") or {}).get("id")) or ""),
             }
