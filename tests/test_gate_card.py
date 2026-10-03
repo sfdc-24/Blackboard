@@ -996,7 +996,8 @@ class GatherAndCli(unittest.TestCase):
                          [2, 3, 4])
         self.assertFalse(inputs["threads"][1]["truncated"])
         self.assertEqual([v.get("cursor") for v in gql_vars if "id" in v],
-                         ["IC1", "IC2"])
+        # Two passes per read, each paging the long thread whole.
+                         ["IC1", "IC2", "IC1", "IC2"])
         # The PR is read once before and once after everything else.
         pr_reads = [i for i, (p, _) in enumerate(calls) if p.endswith("/pulls/999")]
         self.assertEqual(pr_reads[0], 0)
@@ -1400,6 +1401,64 @@ class GatherAndCli(unittest.TestCase):
 
         inputs = gate_card.gather("o", "r", 999, None, rest_settling, graphql)
         self.assertTrue(gate_card.judge(inputs, require_codex=False).passed)
+
+    def test_a_nogo_landing_inside_one_reads_stagger_is_not_missed(self):
+        """Copilot discussion_r4170895032, and its harness design.
+
+        My own attempts keyed the change on the number of COMMENT
+        reads, which moves with the number of samples, so a
+        single-pass mutant passed every test. Copilot's trick is to
+        flip the state from a LATER endpoint's fetch: the change then
+        lands inside one read's own stagger, after that read's
+        comments were copied, and PERSISTS. With one pass per read the
+        two reads agree on the stale GO and the card prints over a
+        live NO-GO.
+        """
+        state = {"nogo": False, "reviews": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                if params.get("page") != 1:
+                    return []
+                body = (f"**NO-GO** on `{SHA}`." if state["nogo"]
+                        else f"**GO** on `{SHA}`.")
+                return [{"id": 1, "user": {"login": "cursor[bot]"}, "body": body,
+                         "created_at": "t", "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                state["reviews"] += 1
+                # The NO-GO goes live during the second pass of the
+                # first read, after that pass copied the comments.
+                if state["reviews"] == 2:
+                    state["nogo"] = True
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "started_at": "2026-10-03T00:00:00Z",
+                     "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "pending", "total_count": 0, "statuses": []}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        # The live state is NO-GO, so the snapshot judged must carry it.
+        self.assertIn("NO-GO", inputs["issue_comments"][0]["body"])
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("NO-GO" in l for l in j.open), j.open)
 
     def test_a_verdict_landing_mid_walk_is_inside_the_snapshot(self):
         # Cursor's hole: with one pass per read, a NO-GO that lands

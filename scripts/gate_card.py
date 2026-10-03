@@ -77,15 +77,15 @@ KNOWN LIMITS (deliberate, fail-closed):
   - The whole read is repeated until the same gate state comes back
     twice running, because a verdict, review, thread or check can move
     while the OTHER resources are being fetched and the head never
-    changes. A PR that will not settle is an error, not a card.
-    It is NOT airtight, and gather_once() says exactly why: the lists
-    are sampled one after another, so a change landing after the last
-    sample of the read that gets returned is invisible to both reads
-    even though it persists. A card is evidence about the moment it
-    was read: it is not a lock, and nothing stops a NO-GO landing a
-    second after it prints. That is why the card says it holds for
-    that SHA only, why any push voids it, and why the merge stays a
-    person's decision.
+    changes. Each read keeps its lists from a closing pass, so a
+    change inside a read's own stagger is seen by the next one.
+    It is still NOT airtight, and gather_once() says what is left: a
+    change that reverts before the next read, one inside the closing
+    pass's own stagger, and anything landing after gather() returns.
+    A card is evidence about the moment it was read: it is not a lock,
+    and nothing stops a NO-GO landing a second after it prints. That
+    is why the card says it holds for that SHA only, why any push
+    voids it, and why the merge stays a person's decision.
 
 USAGE
   python3 scripts/gate_card.py --pr 310                      # live, GITHUB_TOKEN
@@ -1145,30 +1145,39 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
 
 def gather_once(owner: str, repo: str, number: int, sha: str | None,
                 rest, graphql) -> dict:
-    """One read of the PR: the head, every gate list, then the head again.
+    """One read of the PR, whose lists are kept from a CLOSING pass.
 
-    WHAT THIS CANNOT SEE, stated because it was tempting to paper over.
     The lists are sampled one after another, so a change that lands
-    after a list was read and persists is absent from this read. The
-    outer loop catches it on the next read, UNLESS it lands after the
-    last sample of the read that gets returned - then two reads agree
-    and the card prints over something already live.
+    after a list was copied and PERSISTS is absent from that read.
+    With one pass per read, a change landing after the last comment
+    sample of the second read sat outside both reads, they agreed on
+    the stale copy, and the card printed over something already live.
+    No revert was needed. Walking the lists twice and keeping the
+    SECOND copy moves each sample to the end of the read, so the next
+    read sees the change and settling restarts.
 
-    I tried closing that by keeping a second, later copy of every
-    list. It shrinks the window but I could not demonstrate it: two
-    mutants that removed the mechanism entirely left the whole suite
-    green, because the retry loop subsumes it and read-count fakes
-    cannot express a wall-clock window. Shipping machinery I cannot
-    show working would be the same "green is not proof" mistake this
-    repository exists to avoid, so it is not here. The residual is
-    real and documented instead: a card is evidence about the moment
-    it was read, not a lock.
+    The history is worth keeping. This mechanism was written, could
+    not be shown working, and was reverted: two mutants that removed
+    it left the suite green, because the fakes keyed their change on
+    the number of COMMENT reads, which moves with the number of
+    samples. Copilot supplied the harness that distinguishes them -
+    trigger the change from a LATER endpoint's fetch, so it lands
+    inside one read's own stagger - and the mechanism is back with a
+    regression that kills the single-pass mutant. The lesson was
+    mine: "I cannot prove it" meant my test design was inadequate,
+    not that the fix was worthless.
+
+    What is still open, and cannot be read away: a change that reverts
+    before the next read, a change inside the closing pass's own
+    stagger, and anything landing after gather() returns. A card is
+    evidence about the moment it was read, not a lock.
     """
     pr = rest(f"/repos/{owner}/{repo}/pulls/{number}")
     head = str((pr.get("head") or {}).get("sha") or "").lower()
     named_sha = (sha or head).lower()
 
-    lists = read_gate_lists(owner, repo, number, named_sha, rest, graphql)
+    read_gate_lists(owner, repo, number, named_sha, rest, graphql)  # opening pass
+    lists = read_gate_lists(owner, repo, number, named_sha, rest, graphql)  # kept
     pr_after = rest(f"/repos/{owner}/{repo}/pulls/{number}")
 
     return {
