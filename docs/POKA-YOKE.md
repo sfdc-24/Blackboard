@@ -502,6 +502,36 @@ second time, the reviewer spent its whole budget and returned no verdict.
 - Execution evidence comes from hosted CI.
 - A budget-exceeded run is never blindly retried.
 
+## L-116 — Authorization never comes from the thing being authorized
+
+**Incident.** Conference #161 landed his directive that `docs/okf/` has one writer
+and the pen is handed over during a call, written down in `docs/okf/floor.md`. The
+checker read that file **from the checkout it was checking**, and CI checks out the
+candidate's own tree. Codex's exact-head review (conference #161, `ab72d7a`) built a
+branch that added its own grant line under **Open grants** and was admitted by it, for
+the OKF and for `floor.md` itself; the identical no-grant control was refused. Copilot
+found the same thing independently. The rule had a positive test for a legitimate grant
+and no control for a forged one, so it looked tested.
+
+**Naive rule.** "Keep the floor file tidy" / "review the grant lines in the diff."
+
+**Mechanism.**
+- A guard reads its authorization from state the candidate cannot edit: the protected
+  base (`git show <base>:<path>`), not the working tree. On a pull request that is
+  `origin/<base_ref>`, which only a merged PR changes.
+- The file that grants authority is never itself grantable, however wide the grant.
+- Missing authorization state fails CLOSED and says which state was missing, so a
+  refusal is legible rather than mysterious.
+- Overlapping grants refuse rather than union: two writers on one page is the conflict
+  the rule exists to stop.
+- Every such guard ships a NEGATIVE control: the forged grant, written by the candidate,
+  admitting nothing. A positive test alone proves only that the happy path works.
+
+**Where it is.** `scripts/okf_ownership.py` and `tests/test_okf_ownership.py` here;
+`tools/check_ownership.py` on the conference line (PR #162).
+
+---
+
 ---
 
 ## The first thing this file failed to prevent
