@@ -43,6 +43,7 @@ USAGE
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -246,6 +247,68 @@ MUTANTS = [
 ]
 
 
+FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\S+)", re.MULTILINE)
+
+
+def failed_tests(text: str) -> set:
+    """The names of the tests that actually FAILED or ERRORED.
+
+    Copilot discussion_r4171248431: the previous check was
+    `must_fail in text`, and the suite runs with verbosity=2, so EVERY
+    test name - passing ones included - appears in the output. The
+    expression was therefore true whenever the designated test merely
+    existed, which made WRONG-TEST unenforceable: an unrelated failure
+    still certified the guard. Only a FAIL:/ERROR: line counts.
+    """
+    return set(FAILED_TEST.findall(text or ""))
+
+
+def classify(rc: int, text: str, must_fail: str) -> str:
+    """"survived", "wrong" or "killed" for one mutant's suite run."""
+    if rc == 0:
+        return "survived"
+    return "killed" if must_fail in failed_tests(text) else "wrong"
+
+
+# (rc, suite output, designated test, expected verdict). The second
+# case is Copilot's: the designated test PASSED and something else
+# failed, which the old check read as a kill.
+SELF_CHECK = [
+    (0, "test_guard (x) ... ok\nOK\n", "test_guard", "survived"),
+    (1, "test_guard (x) ... ok\ntest_other (x) ... FAIL\n"
+        "FAIL: test_other (x.y)\n", "test_guard", "wrong"),
+    (1, "test_guard (x) ... FAIL\nFAIL: test_guard (x.y)\n",
+     "test_guard", "killed"),
+    (1, "test_guard (x) ... ERROR\nERROR: test_guard (x.y)\n",
+     "test_guard", "killed"),
+    # An import failure names no test at all.
+    (1, "Traceback (most recent call last):\nImportError: boom\n",
+     "test_guard", "wrong"),
+    # A prefix must not match: test_guard_extra is a different test.
+    (1, "FAIL: test_guard_extra (x.y)\n", "test_guard", "wrong"),
+]
+
+
+def self_check() -> int:
+    """Check the CLASSIFIER before trusting it on real mutants.
+
+    This exists because this file has been the defect three rounds in
+    a row: stale bytecode attributing one mutant's victims to another,
+    a killed-count that swallowed wrong-test, and then a wrong-test
+    check that could never fire. A harness that is the evidence for
+    every other claim on a PR has to be able to fail.
+    """
+    bad = 0
+    for rc, text, must_fail, want in SELF_CHECK:
+        got = classify(rc, text, must_fail)
+        if got != want:
+            bad += 1
+            print("  SELF-CHECK FAILED: rc=%d must_fail=%s wanted %s, got %s"
+                  % (rc, must_fail, want, got))
+    print("  self-check: %d case(s), %d wrong" % (len(SELF_CHECK), bad))
+    return bad
+
+
 def run_suite(tree: Path):
     """Run the gate-card suite inside a scratch tree. Returns (rc, text)."""
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
@@ -265,6 +328,13 @@ def stage() -> Path:
 
 
 def main() -> int:
+    print("SELF-CHECK: the classifier must be able to fail, or no verdict "
+          "below means anything.")
+    if self_check():
+        print("  The harness cannot classify its own outcomes. Nothing here is")
+        print("  evidence until that is fixed.")
+        return 1
+
     print("BASELINE: the unmutated suite must pass, or no verdict below means "
           "anything.")
     tree = stage()
@@ -302,14 +372,14 @@ def main() -> int:
         finally:
             shutil.rmtree(tree, ignore_errors=True)
 
-        named_test_failed = must_fail in text and rc != 0
-        if rc == 0:
+        verdict = classify(rc, text, must_fail)
+        if verdict == "survived":
             survived.append(name)
             print("\nSURVIVED     %s" % name)
             print("  predicted breakage: %s" % why)
             print("  The suite passed with the guard REMOVED, so nothing in it")
             print("  constrains this behaviour. The guard is an untested claim.")
-        elif not named_test_failed:
+        elif verdict == "wrong":
             # Copilot discussion_r4171172342: counting this as killed
             # lets an UNRELATED failure certify a guard - an import or
             # collection error fails the suite without any test having
