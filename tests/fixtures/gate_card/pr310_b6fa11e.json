@@ -86,16 +86,20 @@
    "name": "required-ci",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/1"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/1",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "suites",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/2"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/2",
+   "started_at": "2026-10-02T20:56:58Z"
   }
  ],
  "combined_status": {
-  "state": "success"
+  "state": "pending",
+  "total_count": 0,
+  "contexts": []
  }
 }

@@ -402,8 +402,30 @@ def check_runs_state(check_runs: list[dict]) -> str:
 
 
 def ci_state(check_runs: list[dict], combined_status: dict) -> str:
+    """The SHA's CI state from its check runs and its legacy statuses.
+
+    GitHub reports a commit's COMBINED STATUS as "pending" when it has
+    no legacy status contexts at all, which is the normal case for a
+    repository that uses check runs. Reading that as real pending CI
+    made the gate unable to pass any modern PR - the worst kind of
+    false refusal, since it would have sent every operator around the
+    tool. A count of zero therefore means "no legacy statuses", not
+    "waiting"; a genuinely pending CONTEXT still refuses.
+    """
     run_state = check_runs_state(check_runs)
-    status_state = str((combined_status or {}).get("state") or "unknown")
+    combined = combined_status or {}
+    status_state = str(combined.get("state") or "unknown")
+    contexts = combined.get("contexts")
+    total = combined.get("total_count")
+    if isinstance(total, int):
+        empty = total == 0
+    elif isinstance(contexts, list):
+        empty = not contexts
+    else:
+        # An older snapshot that recorded only the word: trust it.
+        empty = False
+    if empty and status_state in {"pending", "expected", "unknown", ""}:
+        status_state = "absent"
     if run_state == "failure" or status_state in {"error", "failure"}:
         return "failure"
     if run_state == "pending" or status_state in {"pending", "expected"}:
@@ -500,9 +522,31 @@ def judge(inputs: dict, require_codex: bool = True,
     # 3. CI on the named SHA. The required run must itself be present:
     # an unrelated green check cannot stand in for it, and the card
     # links the required run, as U4 asks.
-    runs_by_name: dict[str, dict] = {}
+    # The check-runs endpoint can return the same NAME from more than
+    # one suite, newest first. Assigning each in turn left the OLDEST
+    # in hand, so `[required-ci=skipped (new), required-ci=success
+    # (old)]` linked the old success and passed. The latest run is
+    # chosen by start time, falling back to the order given; when
+    # duplicates cannot be ordered and disagree, the evidence is
+    # ambiguous and that refuses.
+    by_name: dict[str, list[dict]] = {}
     for run in check_runs:
-        runs_by_name[str(run.get("name") or "")] = run  # the latest wins
+        by_name.setdefault(str(run.get("name") or ""), []).append(run)
+    runs_by_name: dict[str, dict] = {}
+    ambiguous: list[str] = []
+    for name, runs in by_name.items():
+        if len(runs) == 1:
+            runs_by_name[name] = runs[0]
+            continue
+        stamps = [str(r.get("started_at") or "") for r in runs]
+        if all(stamps) and len(set(stamps)) == len(stamps):
+            runs_by_name[name] = max(runs, key=lambda r: str(r.get("started_at")))
+            continue
+        runs_by_name[name] = runs[0]  # newest first, as the API gives them
+        outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
+                    for r in runs}
+        if len(outcomes) > 1 and name in required_checks:
+            ambiguous.append(name)
     missing = [name for name in required_checks if name not in runs_by_name]
     # Present is not passed: a required run that was skipped, neutral
     # or carries no conclusion at all has not said this SHA is good.
@@ -521,6 +565,12 @@ def judge(inputs: dict, require_codex: bool = True,
         elif not str(run.get("html_url") or ""):
             unlinkable.append(name)
     ci = ci_state(check_runs, combined)
+    if ambiguous:
+        out.open.append(
+            "the required check(s) " + ", ".join(sorted(ambiguous))
+            + " ran more than once on this SHA with different outcomes and no "
+              "start time to order them: the evidence cannot say which is current"
+        )
     if missing:
         out.open.append(
             "the required check(s) " + ", ".join(missing)
@@ -999,6 +1049,7 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
                 "name": str(r.get("name") or ""),
                 "status": str(r.get("status") or ""),
                 "conclusion": str(r.get("conclusion") or ""),
+                "started_at": str(r.get("started_at") or ""),
                 "html_url": str(r.get("html_url") or ""),
             }
             for r in chunk
@@ -1079,7 +1130,16 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
         "reviews": reviews,
         "threads": threads,
         "check_runs": check_runs,
-        "combined_status": {"state": str((combined or {}).get("state") or "unknown")},
+        # The COUNT matters as much as the word: see ci_state().
+        "combined_status": {
+            "state": str((combined or {}).get("state") or "unknown"),
+            "total_count": int((combined or {}).get("total_count") or 0),
+            "contexts": [
+                {"context": str(s.get("context") or ""),
+                 "state": str(s.get("state") or "")}
+                for s in ((combined or {}).get("statuses") or [])
+            ],
+        },
     }
 
 

@@ -155,46 +155,55 @@
    "name": "copilot-pull-request-reviewer",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063819200/job/111026574320"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063819200/job/111026574320",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "test (3.14, crlf)",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552615"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552615",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "test (3.14, lf)",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552569"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552569",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "test (3.12, lf)",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552552"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552552",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "test (3.12, crlf)",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552395"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552395",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "suites",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813372/job/111026549780"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813372/job/111026549780",
+   "started_at": "2026-10-02T20:56:58Z"
   },
   {
    "name": "required-ci",
    "status": "completed",
    "conclusion": "success",
-   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813304/job/111026549269"
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813304/job/111026549269",
+   "started_at": "2026-10-02T20:56:58Z"
   }
  ],
  "combined_status": {
-  "state": "unknown"
+  "state": "pending",
+  "total_count": 0,
+  "contexts": []
  }
 }

@@ -795,6 +795,72 @@ class CiGate(unittest.TestCase):
         )
 
 
+class CopilotReviewRound3(unittest.TestCase):
+    """Copilot's two CI-state findings on 9a98937."""
+
+    def test_an_empty_legacy_status_is_not_pending_ci(self):
+        # discussion: GitHub reports the combined status as "pending"
+        # when a commit has NO legacy status contexts, which is normal
+        # for a check-runs repository. Reading that as pending CI made
+        # the gate unable to pass any modern PR.
+        inputs = green_inputs()
+        inputs["combined_status"] = {"state": "pending", "total_count": 0,
+                                     "contexts": []}
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+        # A genuinely pending CONTEXT still refuses.
+        inputs["combined_status"] = {
+            "state": "pending", "total_count": 1,
+            "contexts": [{"context": "legacy/deploy", "state": "pending"}],
+        }
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("pending" in l for l in j.open), j.open)
+        # And a failing context refuses whatever the runs say.
+        inputs["combined_status"] = {
+            "state": "failure", "total_count": 1,
+            "contexts": [{"context": "legacy/deploy", "state": "failure"}],
+        }
+        self.assertFalse(judged(inputs).passed)
+
+    def test_a_superseded_duplicate_run_cannot_stand_in_for_the_latest(self):
+        # discussion_r4170880070: the endpoint can return one NAME
+        # from several suites, newest first, and the old success was
+        # winning over a new skipped run.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "skipped",
+             "started_at": "2026-10-03T00:10:00Z",
+             "html_url": "https://example.test/ci/new"},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-02T00:10:00Z",
+             "html_url": "https://example.test/ci/old"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("only `success` is a pass" in l for l in j.open), j.open)
+        # The card must never link the superseded run.
+        self.assertNotIn("ci/old", gate_card.render(inputs, j))
+        # The newest being green is what passes, and it is the one linked.
+        inputs["check_runs"][0]["conclusion"] = "success"
+        ok = judged(inputs)
+        self.assertTrue(ok.passed, ok.open)
+        self.assertIn("ci/new", gate_card.render(inputs, ok))
+
+    def test_unorderable_duplicates_that_disagree_are_ambiguous(self):
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "skipped",
+             "started_at": "", "html_url": "https://example.test/ci/a"},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "", "html_url": "https://example.test/ci/b"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("cannot say which is current" in l for l in j.open), j.open
+        )
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()
