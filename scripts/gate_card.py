@@ -643,11 +643,21 @@ def judge(inputs: dict, require_codex: bool = True,
     elif ci == "unknown":
         out.open.append("CI on this SHA reports nothing: silence is not a GO")
     else:
+        # Name the thing that is actually wrong. Listing the rollup
+        # word said "combined status pending" when a FAILING legacy
+        # context was the cause, and a refusal that misnames its own
+        # reason sends the reader to the wrong place.
         bad = [
             f"{r.get('name')}={r.get('conclusion') or r.get('status')}"
-            for r in check_runs
+            for r in runs_by_name.values()
             if str(r.get("status") or "") != "completed"
             or str(r.get("conclusion") or "") in FAILING_CONCLUSIONS
+        ]
+        bad += [
+            f"legacy status {c.get('context')}={c.get('state')}"
+            for c in (combined.get("contexts") or [])
+            if str(c.get("state") or "").lower()
+            in {"failure", "error", "pending", "expected"}
         ]
         detail = "; ".join(bad) if bad else f"combined status {combined.get('state')}"
         out.open.append(f"CI on this SHA is {ci}: {detail}")

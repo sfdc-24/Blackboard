@@ -1,5 +1,5 @@
 {
- "_note": "sfdc-24/Blackboard#315 at head ee4c0c1 as recorded on 2026-10-02: Cursor's GO (comment 5961352572/5961353819), Codex's GO / NO-MAJOR (comment 5961720850), Copilot's clean review (5396810985), all four review threads resolved, all seven check runs green - and the PR still a draft. Bodies are distilled from the live records (picture tags shortened, long sections trimmed; the verdict-bearing first lines and SHAs are verbatim). The four thread bodies are stand-ins for the recorded findings; their ids, authors and resolved state are the recorded ones. The one open gate is the draft flag, so flipping pr.draft to false is the all-clear case. Provenance of the two fields added later: each check run's started_at is the recorded value from that live read; combined_status is the shape GitHub returns for a commit with no legacy status contexts (state pending, total_count 0), which is what this SHA has - it was wrongly recorded as \"unknown\" until Copilot caught that the gate read it as pending CI.",
+ "_note": "sfdc-24/Blackboard#315 at head ee4c0c1 as recorded on 2026-10-02: Cursor's GO (comment 5961352572/5961353819), Codex's GO / NO-MAJOR (comment 5961720850), Copilot's clean review (5396810985), all four review threads resolved, all seven check runs green - and the PR still a draft. Bodies are distilled from the live records (picture tags shortened, long sections trimmed; the verdict-bearing first lines and SHAs are verbatim). The four thread bodies are stand-ins for the recorded findings; their ids, authors and resolved state are the recorded ones. The one open gate is the draft flag, so flipping pr.draft to false is the all-clear case. Provenance of the two fields added later: each check run's started_at is the recorded value from that live read; combined_status is the shape GitHub returns for a commit with no legacy status contexts (state pending, total_count 0), which is what this SHA has - it was wrongly recorded as \"unknown\" until Copilot caught that the gate read it as pending CI. Two further divergences Cursor identified and this note did not state: thread T-4168464717's is_outdated was true here and false live (judge() never reads the field, so no verdict moves) - now corrected to the live value; and issue_comments is a SUBSET, omitting Cursor's earlier GO on 9607d08 (5960217714) and several owner comments. Nothing omitted is later than the ee4c0c1 GO or the Codex receipt, so the latest verdict for this SHA is the live one, which is the only thing the verdict readers use.",
  "schema": "gate-card-inputs-v2",
  "owner": "sfdc-24",
  "repo": "Blackboard",
@@ -122,7 +122,7 @@
   {
    "id": "T-4168464717",
    "is_resolved": true,
-   "is_outdated": true,
+   "is_outdated": false,
    "truncated": false,
    "comments": [
     {
