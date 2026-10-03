@@ -166,7 +166,18 @@ CODEX_MARKER = re.compile(r"^CODEX-[A-Za-z0-9][A-Za-z0-9-]*$")
 # A line that is ENTIRELY one HTML comment, and nothing else.
 HTML_COMMENT_ONLY = re.compile(r"^<!--\s*(.+?)\s*-->$")
 CODEX_VERDICT = re.compile(r"\b(NO-GO|NO-MAJOR|GO)\b")
-CURSOR_VERDICT = re.compile(r"^(NO-GO|GO)(?![A-Za-z0-9-])")
+# Verdict tokens. SINKING reads these case-insensitively and
+# LIFTING does not, which is not an oversight: text may never lift a
+# verdict to GO, but it must always be able to sink one. VERDICT_LINE
+# below already matched case-insensitively while the token extraction
+# did not, so `**no-go** on <head>` opened a verdict line, yielded no
+# token, and became SILENCE - leaving an older GO as the latest
+# verdict and printing a card over Cursor's withdrawal. A lowercase
+# `go` stays silence instead, which is safe for the same reason it
+# was wrong for no-go: silence leaves the previous verdict standing,
+# and a reviewer writing `go` was not trying to reverse one.
+VERDICT_TOKEN = re.compile(r"\b(NO-GO|GO)\b", re.IGNORECASE)
+NO_GO_ANYWHERE = re.compile(r"\bNO-GO\b", re.IGNORECASE)
 # A verdict LINE: the token opens the line, optionally wrapped in **
 # or __, and is followed by punctuation, end of line, or on/at/for.
 # Without that tail, "**GO** through the remaining tests on <sha>"
@@ -279,10 +290,13 @@ def cursor_verdict(comment: dict, named_sha: str) -> str | None:
         shas = set(SHA_IN_TEXT.findall(line.lower()))
         if named_sha not in shas:
             continue
-        tokens = set(re.findall(r"\b(NO-GO|GO)\b", line))
+        spellings = VERDICT_TOKEN.findall(line)
+        tokens = {t.upper() for t in spellings}
         if "NO-GO" in tokens:
             return "NO-GO"
-        if tokens == {"GO"} and shas == {named_sha}:
+        # A GO must be SPELT as one: the sink above takes any casing,
+        # this does not.
+        if tokens == {"GO"} and shas == {named_sha} and "GO" in spellings:
             go_found = True
     return "GO" if go_found else None
 
@@ -333,7 +347,7 @@ def codex_verdict(comment: dict, named_sha: str,
     # opaque id line included. Text may never lift a verdict to GO,
     # but it must always be able to sink it, so a NO-GO cannot be
     # hidden on the line that GO parsing drops.
-    if named_sha in body.lower() and re.search(r"\bNO-GO\b", body):
+    if named_sha in body.lower() and NO_GO_ANYWHERE.search(body):
         return "NO-GO"
     # A bare CODEX-... line is an opaque ID, not a verdict: an id like
     # CODEX-...-GO-... must not decide anything, so it is dropped

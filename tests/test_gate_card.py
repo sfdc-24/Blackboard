@@ -1669,6 +1669,130 @@ class CopilotReviewRound7(unittest.TestCase):
                          j.closed)
 
 
+class CopilotReviewRound8(unittest.TestCase):
+    """Copilot discussion_r4171127211: VERDICT_LINE matched case
+    -insensitively and the token extraction did not, so a lowercase
+    withdrawal became silence and an older GO stood."""
+
+    def _cursor(self, body):
+        return gate_card.cursor_verdict(
+            {"author": "cursor[bot]", "body": body}, SHA)
+
+    def _codex(self, body):
+        return gate_card.codex_verdict({"author": "sfdc-24", "body": body}, SHA)
+
+    def test_every_spelling_of_no_go_sinks_a_cursor_verdict(self):
+        for token in ("NO-GO", "no-go", "No-Go", "nO-gO"):
+            self.assertEqual(
+                self._cursor(f"**{token}** on `{SHA}`."), "NO-GO", token)
+
+    def test_a_lowercase_withdrawal_sinks_an_older_go_end_to_end(self):
+        # The fail-open as Copilot reported it: the card printed.
+        inputs = green_inputs()
+        inputs["issue_comments"] = list(inputs["issue_comments"]) + [{
+            "id": 9, "author": "cursor[bot]",
+            "created_at": "2026-10-03T02:00:00Z",
+            "html_url": "https://example.test/c/9",
+            "body": f"**no-go** on `{SHA}`. Withdrawing the earlier approval.",
+        }]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("NO-GO" in l for l in j.open), j.open)
+
+    def test_a_lowercase_no_go_sinks_a_codex_receipt(self):
+        self.assertEqual(self._codex(f"## Codex: no-go for `{SHA}`"), "NO-GO")
+        # And body-wide, which is where the Codex sink lives.
+        self.assertEqual(
+            self._codex(f"CODEX-X\n\nGO at `{SHA}`.\n\nCorrection: no-go."),
+            "NO-GO")
+
+    def test_lifting_to_go_still_needs_the_exact_token(self):
+        # The asymmetry is the invariant, not an oversight. A
+        # lowercase `go` is silence, which leaves the previous verdict
+        # standing - safe, because a reviewer writing `go` is not
+        # trying to reverse one.
+        self.assertEqual(self._cursor(f"**GO** on `{SHA}`."), "GO")
+        self.assertIsNone(self._cursor(f"**go** on `{SHA}`."))
+        self.assertIsNone(self._cursor(f"**Go** on `{SHA}`."))
+        # Silence leaves an older NO-GO in force rather than lifting it.
+        comments = [
+            {"id": 1, "author": "cursor[bot]", "created_at": "2026-10-02T00:00:00Z",
+             "html_url": "c1", "body": f"**NO-GO** on `{SHA}`."},
+            {"id": 2, "author": "cursor[bot]", "created_at": "2026-10-03T00:00:00Z",
+             "html_url": "c2", "body": f"**go** on `{SHA}`."},
+        ]
+        latest = gate_card.latest_verdict(comments, SHA, gate_card.cursor_verdict)
+        self.assertEqual(latest[0], "NO-GO")
+
+    def test_a_lowercase_token_inside_a_go_line_still_reads_as_go(self):
+        # Normalising must not make the GO path stricter by accident:
+        # the lowercase "go" here is prose on an otherwise valid line.
+        self.assertEqual(
+            self._cursor(f"**GO** on `{SHA}`. Nothing left to go through."), "GO")
+
+    def test_the_unused_cursor_verdict_pattern_is_gone(self):
+        # An unused pattern that looks authoritative is the trap
+        # norm_login was: it invites a future call site.
+        self.assertFalse(hasattr(gate_card, "CURSOR_VERDICT"))
+
+
+class RequiredItemsAreIndependent(unittest.TestCase):
+    """Found by a mutant that SURVIVED once the mutation runner was
+    fixed: chaining the three required-check items to each other was
+    untested, because every existing case had only one of them.
+
+    With two required names, `missing` and `not_green` and
+    `unlinkable` can all be live at once, and an `elif` between them
+    drops an open item. For `unlinkable` the fact is lost entirely:
+    a green run with no URL appears nowhere in the aggregate line.
+    """
+
+    def test_a_missing_required_check_does_not_hide_a_failing_required_one(self):
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "111",
+             "html_url": "lint"},
+        ]
+        j = gate_card.judge(inputs, required_checks=("required-ci", "lint"))
+        self.assertFalse(j.passed)
+        self.assertTrue(any("required-ci" in l and "never ran" in l
+                            for l in j.open), j.open)
+        self.assertTrue(any("did not pass" in l and "lint=failure" in l
+                            for l in j.open), j.open)
+
+    def test_a_missing_required_check_does_not_hide_an_unlinkable_one(self):
+        # The one that is lost rather than merely reframed: a green
+        # run with no URL is not in the aggregate line at all.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "111",
+             "html_url": ""},
+        ]
+        j = gate_card.judge(inputs, required_checks=("required-ci", "lint"))
+        self.assertFalse(j.passed)
+        self.assertTrue(any("required-ci" in l and "never ran" in l
+                            for l in j.open), j.open)
+        self.assertTrue(any("carry no run URL" in l for l in j.open), j.open)
+
+    def test_a_failing_required_check_does_not_hide_an_unlinkable_one(self):
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": "ci"},
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "111",
+             "html_url": ""},
+        ]
+        j = gate_card.judge(inputs, required_checks=("required-ci", "lint"))
+        self.assertFalse(j.passed)
+        self.assertTrue(any("did not pass" in l and "required-ci=failure" in l
+                            for l in j.open), j.open)
+        self.assertTrue(any("carry no run URL" in l for l in j.open), j.open)
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()

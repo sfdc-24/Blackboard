@@ -131,6 +131,7 @@ on:
       - "tests/test_board_governor.py"
       - "scripts/gate_card.py"
       - "tests/test_gate_card.py"
+      - "tests/mutate_gate_card.py"
       - "tests/fixtures/gate_card/**"
       - ".github/workflows/python-suites.yml"
   push:
@@ -244,6 +245,7 @@ on:
       - "tests/test_board_governor.py"
       - "scripts/gate_card.py"
       - "tests/test_gate_card.py"
+      - "tests/mutate_gate_card.py"
       - "tests/fixtures/gate_card/**"
       - ".github/workflows/python-suites.yml"
 
@@ -942,6 +944,25 @@ jobs:
           if [ -f tests/test_gate_card.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_gate_card.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The green count above is not the evidence; this step is. Every
+      # guard in gate_card.py is deleted on purpose and a NAMED test must
+      # fail. This exists because the harness that produced the same claim
+      # during review lived outside the repository and was wrong: two
+      # mutants that delete the same number of characters produce files of
+      # identical size, Python validates a .pyc by mtime and size, and one
+      # mutant's bytecode was served to the next. Fixing that exposed a
+      # guard with no test behind it. Hence -B, and hence this being here
+      # rather than in someone's notes.
+      - name: "gate card guards are load-bearing (mutation, no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/mutate_gate_card.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/mutate_gate_card.py
           else
             echo "not on this branch; skipping"
           fi
