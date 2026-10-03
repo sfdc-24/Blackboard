@@ -1,0 +1,37 @@
+name: okf-ownership
+
+# His directive of 2026-10-03 (GROK-OKF-LIVE-WRITE-20261003T1426Z): docs/okf/ has one writer and
+# everyone else reads it, with the pen handed over during a call. scripts/okf_ownership.py is the
+# rule; this is what runs it. The handover is read from the pull request's BASE, never from the
+# branch being checked, so a branch cannot write its own grant and be admitted by it (Codex's P1 on
+# conference #161). The check has an opinion about docs/okf/ and about nothing else in this repo.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  okf:
+    name: okf-ownership / one writer
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The rule's own tests
+        run: python tests/test_okf_ownership.py
+      - name: This PR writes the OKF only where it may
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff --name-only "origin/${BASE_REF}...HEAD" > changed.txt
+          cat changed.txt
+          python scripts/okf_ownership.py "${HEAD_REF}" --base "origin/${BASE_REF}" $(cat changed.txt)
