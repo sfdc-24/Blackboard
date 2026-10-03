@@ -194,6 +194,27 @@ MUTANTS = [
         "test_a_green_aggregate_is_not_closed_while_a_required_item_is_open",
     ),
     (
+        "unknown-mergeability-reads-as-clean",
+        GATE,
+        '    if state in NO_CONFLICT_STATES:\n        return "clear"\n'
+        '    return "unknown"',
+        '    return "clear"',
+        "GitHub computes mergeability asynchronously, so a genuinely "
+        "conflicted PR answers `unknown` until it lands - and absence of "
+        "evidence would be read as evidence of absence",
+        "test_an_unrecognised_mergeable_state_is_not_a_promise",
+    ),
+    (
+        "newest-wins-inside-one-workflow-run",
+        GATE,
+        "            if lineage:",
+        "            if False:",
+        "a matrix sibling and a re-run attempt are indistinguishable inside "
+        "one workflow run, so taking the newest hides a currently failing "
+        "sibling job",
+        "test_two_workflows_one_app_are_two_checks_by_workflow_run",
+    ),
+    (
         "cursor-sink-case-sensitive",
         GATE,
         'VERDICT_TOKEN = re.compile(r"\\b(NO-GO|GO)\\b", re.IGNORECASE)',
@@ -258,7 +279,7 @@ def main() -> int:
     ran = [ln for ln in text.splitlines() if ln.startswith("Ran ")]
     print("  baseline ok  %s" % (ran[0] if ran else "?"))
 
-    killed, survived, missed = [], [], []
+    killed, survived, missed, wrong = [], [], [], []
     for name, relpath, find, repl, why, must_fail in MUTANTS:
         tree = stage()
         try:
@@ -289,21 +310,28 @@ def main() -> int:
             print("  The suite passed with the guard REMOVED, so nothing in it")
             print("  constrains this behaviour. The guard is an untested claim.")
         elif not named_test_failed:
-            killed.append(name)
-            print("\nkilled       %s  (suite failed, but not via %s)"
-                  % (name, must_fail))
-            print("  counted as killed; the predicted test was not the one that "
-                  "caught it.")
+            # Copilot discussion_r4171172342: counting this as killed
+            # lets an UNRELATED failure certify a guard - an import or
+            # collection error fails the suite without any test having
+            # constrained the behaviour at all. The named test is the
+            # contract; if it did not fire, this mutant proved nothing.
+            wrong.append(name)
+            print("\nWRONG-TEST   %s" % name)
+            print("  the suite failed, but NOT via %s." % must_fail)
+            print("  predicted breakage: %s" % why)
+            print("  Something else broke, so the designated regression did not")
+            print("  constrain this guard. Fix the prediction or the test.")
         else:
             killed.append(name)
             print("\nkilled       %s  via %s" % (name, must_fail))
 
-    print("\n%d killed, %d survived, %d anchor-miss, of %d mutants"
-          % (len(killed), len(survived), len(missed), len(MUTANTS)))
-    if survived or missed:
+    print("\n%d killed, %d survived, %d anchor-miss, %d wrong-test, of %d mutants"
+          % (len(killed), len(survived), len(missed), len(wrong), len(MUTANTS)))
+    if survived or missed or wrong:
         print("NOT CLEAN. A survivor is a guard no test can fail; an anchor-miss")
-        print("is a mutant that never ran. Both mean the suite is weaker than its")
-        print("green count suggests.")
+        print("is a mutant that never ran; a wrong-test is a mutant caught by")
+        print("something other than its designated regression. All three mean the")
+        print("suite is weaker than its green count suggests.")
         return 1
     print("Every guard above is load-bearing: removing it breaks the suite.")
     return 0

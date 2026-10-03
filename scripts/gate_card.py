@@ -625,16 +625,39 @@ def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[tuple]]
         for run in runs:
             by_lineage.setdefault(
                 (str(run.get("app_id")), workflow_run_id(run)), []).append(run)
-        for attempts in by_lineage.values():
+        for (_, lineage), attempts in by_lineage.items():
             if len(attempts) == 1:
                 current.append(attempts[0])
                 continue
+            if outcomes_agree(attempts):
+                current.append(attempts[0])
+                continue
+            if lineage:
+                # ONE workflow run, one name, runs that disagree. A
+                # matrix sibling and a re-run attempt are INDISTINGUISHABLE
+                # here: both are same app, same run id, same name, with
+                # different job ids and different start times. Taking the
+                # newest hides a currently failing sibling, which is what
+                # Copilot demonstrated; so this refuses and says why.
+                #
+                # The datum that would settle it is `run_attempt`, which
+                # the Actions jobs endpoint carries and the check-runs
+                # payload does not. Reading it is the real repair and is
+                # not done here.
+                current.extend(attempts)
+                unclear.append((
+                    name,
+                    "they belong to one workflow run, where a matrix sibling "
+                    "and a re-run attempt look identical without the attempt "
+                    "number this payload does not carry"))
+                continue
+            # No workflow-run lineage at all - the documented residual.
+            # Newest by time still wins here, because this is where a
+            # re-run of a non-Actions check lives and refusing would make
+            # a recovered check unsatisfiable.
             times = [parse_time(r.get("started_at")) for r in attempts]
             if all(x is not None for x in times) and len(set(times)) == len(times):
                 current.append(max(zip(times, attempts), key=lambda pair: pair[0])[1])
-                continue
-            if outcomes_agree(attempts):
-                current.append(attempts[0])
                 continue
             current.extend(attempts)
             unclear.append((name, "its attempts carry no start time to order them"))
@@ -786,10 +809,20 @@ def judge(inputs: dict, require_codex: bool = True,
             continue
         bad_state = True
     for label, read in (("", pr), (" (by the end of the reads)", pr_after)):
-        if is_conflicted(read):
+        where = conflict_state(read)
+        if where == "conflict":
             out.open.append(
                 f"the branch has a merge conflict with its base{label} "
                 "(mergeable_state dirty): resolve it before any handoff"
+            )
+            bad_state = True
+        elif where == "unknown":
+            out.open.append(
+                "GitHub has not said whether this branch conflicts with its "
+                f"base{label} (mergeable_state "
+                f"{read.get('mergeable_state') or 'absent'!r}): mergeability is "
+                "computed asynchronously, so read again rather than treat no "
+                "answer as a clean merge"
             )
             bad_state = True
     if not bad_state:
@@ -1174,16 +1207,47 @@ def make_graphql(token: str | None):
     return graphql
 
 
-def is_conflicted(read: dict | None) -> bool:
-    """Whether this PR read says the branch has a merge conflict.
+# The `mergeable_state` values that are affirmatively NOT a conflict.
+# `blocked` (reviews outstanding), `behind` (base moved) and `unstable`
+# (a non-required check is failing) all merge cleanly; they are other
+# gates' business, not this one's.
+NO_CONFLICT_STATES = frozenset({
+    "clean", "has_hooks", "unstable", "behind", "blocked", "draft",
+})
 
-    GitHub's `mergeable_state` is computed asynchronously and flickers
-    between "unknown" and a settled value, which is why the raw string
-    is kept out of the fingerprint. `dirty` is different: it is a real
-    conflict, it does not clear by itself, and a handoff card cannot
-    stand over one.
+
+def conflict_state(read: dict | None) -> str:
+    """"clear", "conflict" or "unknown" for this PR read.
+
+    Copilot discussion_r4171172316: treating everything except `dirty`
+    as proof of no conflict is a fail-open. GitHub computes
+    mergeability ASYNCHRONOUSLY, so a genuinely conflicted PR answers
+    `unknown` until the computation lands - and `unknown` was passing.
+    Absence of evidence was being read as evidence of absence, which is
+    the one inference a fail-closed tool may never make.
+
+    So a conflict refuses, and so does the absence of an answer: only
+    a state that AFFIRMATIVELY says there is no conflict closes this
+    gate. An unrecognised state is "unknown" too - a value this reader
+    has never seen is not a promise about anything.
+
+    The over-strict risk is real and bounded. Fetching the PR is what
+    asks GitHub to compute mergeability, and gather() reads the PR
+    twice per attempt over up to three attempts, so `unknown` normally
+    resolves inside one run; when it does not, the refusal says to try
+    again rather than claiming a conflict that may not exist.
     """
-    return str((read or {}).get("mergeable_state") or "").lower() == "dirty"
+    state = str((read or {}).get("mergeable_state") or "").lower()
+    if state == "dirty":
+        return "conflict"
+    if state in NO_CONFLICT_STATES:
+        return "clear"
+    return "unknown"
+
+
+def is_conflicted(read: dict | None) -> bool:
+    """Kept as the narrow question: is this read a KNOWN conflict?"""
+    return conflict_state(read) == "conflict"
 
 
 def page_has_more(info, where: str) -> bool:
@@ -1262,6 +1326,13 @@ def gate_fingerprint(inputs: dict) -> str:
     # stable under the unknown/clean flicker.
     def pr_part(read: dict) -> dict:
         part = {k: v for k, v in (read or {}).items() if k != "mergeable_state"}
+        # Deliberately the two-valued question, not conflict_state():
+        # `unknown` flickers to `clean` between reads, and the GATE
+        # already refuses on `unknown` from either read, so putting the
+        # three-way state here would only turn an informative refusal
+        # into "this PR will not settle". A flip to `dirty` still
+        # changes this flag and restarts settling, which is what it is
+        # for.
         part["conflicted"] = is_conflicted(read)
         return part
 

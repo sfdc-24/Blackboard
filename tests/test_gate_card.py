@@ -1541,12 +1541,15 @@ class CursorReviewRound6(unittest.TestCase):
         self.assertFalse(j.passed)
         self.assertTrue(any("lint=failure" in l for l in j.open), j.open)
 
-        # And Cursor's constraint, which is the reason suite id was
-        # the wrong key: a re-run is a new ATTEMPT of the SAME run,
-        # with a new job id. It must still pass, and the card must not
-        # link the superseded run.
-        rerun = green_inputs()
-        rerun["check_runs"] = [
+        # Two runs of one name INSIDE one workflow run refuse, and
+        # Copilot discussion_r4171172285 is why: a matrix sibling and a
+        # re-run attempt are indistinguishable here. Both are same app,
+        # same run id, same name, different job ids, different start
+        # times. Taking the newest would hide a failing sibling; taking
+        # both would make a green re-run unsatisfiable. Neither is
+        # knowable from this payload, so it refuses and says so.
+        same_run = green_inputs()
+        same_run["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "success",
              "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
              "check_suite_id": "99", "html_url": job(37085487344, 111094779070)},
@@ -1554,9 +1557,22 @@ class CursorReviewRound6(unittest.TestCase):
              "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
              "check_suite_id": "10", "html_url": job(37085487344, 111026549269)},
         ]
-        ok = judged(rerun)
-        self.assertTrue(ok.passed, ok.open)
-        self.assertNotIn("111026549269", gate_card.render(rerun, ok))
+        j = judged(same_run)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("one workflow run" in l and "attempt number" in l
+                            for l in j.open), j.open)
+        # Runs of one name in one workflow run that AGREE need no
+        # attempt number: a matrix of same-named green jobs passes.
+        agreeing = green_inputs()
+        agreeing["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
+             "html_url": job(37085487344, 1)},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:11:00Z", "app_id": "15368",
+             "html_url": job(37085487344, 2)},
+        ]
+        self.assertTrue(judged(agreeing).passed, judged(agreeing).open)
 
     def test_details_url_is_read_when_the_linked_url_carries_no_run(self):
         # html_url is what a card links and could be anything, so the
@@ -2209,10 +2225,13 @@ class GatherAndCli(unittest.TestCase):
         with self.assertRaises(gate_card.GateError):
             gate_card.gather("o", "r", 999, None, rest, graphql)
 
-    def test_a_flickering_mergeable_state_does_not_stop_the_read_settling(self):
+    def test_a_flickering_mergeable_state_settles_but_unknown_refuses(self):
         # GitHub computes mergeable_state asynchronously, so it can
-        # read "unknown" then "clean". It gates nothing, and a read
-        # that can never settle is its own failure.
+        # read "unknown" then "clean". The flicker must still SETTLE -
+        # the fingerprint carries the two-valued conflict question, not
+        # the raw state - but `unknown` is no longer read as proof of a
+        # clean merge, so a read that saw it refuses and says to read
+        # again (Copilot discussion_r4171172316).
         reads = {"n": 0}
 
         def rest(path, params=None):
@@ -2246,8 +2265,40 @@ class GatherAndCli(unittest.TestCase):
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
                 "nodes": []}}}}}
 
+        # It settles: gather returns rather than erroring.
         inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("has not said whether this branch conflicts" in l
+                            for l in j.open), j.open)
+        # And with mergeability actually answered, the gate closes.
+        inputs["pr"]["mergeable_state"] = "clean"
+        inputs["pr_after"]["mergeable_state"] = "clean"
         self.assertTrue(gate_card.judge(inputs, require_codex=False).passed)
+
+    def test_an_unrecognised_mergeable_state_is_not_a_promise(self):
+        inputs = green_inputs()
+        for state in ("unknown", "", "some-new-state-github-invented"):
+            inputs["pr"]["mergeable_state"] = state
+            inputs["pr_after"]["mergeable_state"] = state
+            j = judged(inputs)
+            self.assertFalse(j.passed, state)
+            self.assertTrue(any("has not said whether this branch conflicts" in l
+                                for l in j.open), (state, j.open))
+        # The states that affirmatively say "no conflict" all close it,
+        # including the ones that mean another gate is unhappy.
+        for state in ("clean", "blocked", "behind", "unstable", "has_hooks"):
+            inputs["pr"]["mergeable_state"] = state
+            inputs["pr_after"]["mergeable_state"] = state
+            self.assertTrue(judged(inputs).passed, state)
+
+    def test_unknown_in_only_the_second_read_still_refuses(self):
+        inputs = green_inputs()
+        inputs["pr_after"]["mergeable_state"] = "unknown"
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("by the end of the reads" in l and
+                            "has not said whether" in l for l in j.open), j.open)
 
     def _rest_with_late_nogo(self, land_after_comment_reads):
         """A Cursor NO-GO that lands mid-walk and STAYS.

@@ -943,7 +943,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_gate_card.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" tests/test_gate_card.py
+            sudo unshare -n -- "$python_bin" -W error tests/test_gate_card.py
           else
             echo "not on this branch; skipping"
           fi
