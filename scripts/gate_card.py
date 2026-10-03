@@ -238,6 +238,17 @@ def cursor_verdict(comment: dict, named_sha: str) -> str | None:
     to err on, since a clean GO clears it while the opposite error
     prints a card over a live NO-GO.
 
+    Cursor reviewed this shape and named the residual it leaves, so
+    it is recorded rather than guessed at: a GO comment that also
+    carries a bare line OPENING with `**NO-GO**` and naming this SHA
+    sinks. QUOTING A PREVIOUS VERDICT AS SUCH A LINE INSIDE AN
+    APPROVAL IS THEREFORE A FALSE REFUSAL. A markdown blockquote -
+    `> **NO-GO** on <this sha>` - does not open a verdict line and
+    does not sink, which is the quoting form to use. The trade is
+    deliberate: the alternative is guessing which bare NO-GO line in
+    an approval is a quotation, and a wrong guess there prints a card
+    over a live NO-GO.
+
     Both question forms - "GO or NO-GO for <head>?" and "NO-GO or GO
     for <head>?" - are silence, because the token is followed by "or"
     rather than by punctuation or on/at/for, so neither opens a
@@ -476,7 +487,13 @@ def parse_time(value) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[str]]:
+def outcomes_agree(runs: list[dict]) -> bool:
+    """Whether these runs all report the same status and conclusion."""
+    return len({(str(r.get("status") or ""), str(r.get("conclusion") or ""))
+                for r in runs}) <= 1
+
+
+def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[tuple]]:
     """Every CURRENT check run, and the names whose lineage is unclear.
 
     Two reviewers found the opposite horns of one dilemma, and both
@@ -491,30 +508,49 @@ def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[str]]:
       different, currently failing check that happens to share a
       display name with another app's check.
 
-    Neither is a matter of taste: they need LINEAGE. Two runs are
-    attempts of the same check when the same APP posted them; two
-    runs of the same name from different apps are different checks,
-    and both are current. So the newest attempt per (app, name) is
-    current, and every such run is judged.
+    The question is not which run is newest but WHICH RUNS ARE THE
+    SAME CHECK. Two runs are attempts of one check when the same APP
+    posted them; the same name from a different app is a different
+    check, and both are current. So the newest attempt per (app, name)
+    is current, and every such run is judged.
 
-    When a name appears more than once and the runs carry no app to
-    tell them apart, nothing here can prove they are attempts of one
-    check, so that name is reported as unclear rather than guessed -
-    the caller refuses. A single run of a name needs no lineage.
+    THE RESIDUAL, which is not reducible from this payload, and which
+    Cursor ruled on rather than let me "fix": two workflows under
+    GitHub Actions are ONE app, so `required-ci` in two different
+    workflows collapses to the newer of them, and a failing
+    same-named check in the other workflow is hidden. Grouping by
+    check suite instead does not repair it - "Re-run all jobs"
+    creates a NEW suite and leaves the failed run on the commit, so
+    suite grouping would make a green re-run unsatisfiable again, and
+    nothing here can tell that new suite from a second workflow. Suite
+    id is recorded for the reader, deliberately unused, and this is
+    the trade rather than a bug waiting on a guard.
+
+    Where runs of one name cannot be sorted into attempts at all - no
+    app recorded, or one app with no start times - they are only
+    UNCLEAR if they disagree about the outcome. Runs that agree need
+    no lineage: there is nothing to pick between. An unclear name
+    refuses whether or not it is required, because a check whose
+    current run is unknown cannot be judged either way.
     """
     by_name: dict[str, list[dict]] = {}
     for run in check_runs:
         by_name.setdefault(str(run.get("name") or ""), []).append(run)
 
     current: list[dict] = []
-    unclear: list[str] = []
+    unclear: list[tuple] = []
     for name, runs in by_name.items():
         if len(runs) == 1:
             current.append(runs[0])
             continue
         if any(not str(r.get("app_id") or "") for r in runs):
-            unclear.append(name)
-            current.extend(runs)  # judged as they are, pending the refusal
+            if outcomes_agree(runs):
+                current.append(runs[0])
+            else:
+                current.extend(runs)
+                unclear.append((name, "no app is recorded, so an attempt of one "
+                                      "check cannot be told from another app's "
+                                      "check of the same name"))
             continue
         by_app: dict[str, list[dict]] = {}
         for run in runs:
@@ -527,14 +563,11 @@ def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[str]]:
             if all(x is not None for x in times) and len(set(times)) == len(times):
                 current.append(max(zip(times, attempts), key=lambda pair: pair[0])[1])
                 continue
-            # Same app, same name, no way to order them: the newest
-            # first, as the API gives them, and unclear if they
-            # disagree about the outcome.
-            current.append(attempts[0])
-            outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
-                        for r in attempts}
-            if len(outcomes) > 1 and name not in unclear:
-                unclear.append(name)
+            if outcomes_agree(attempts):
+                current.append(attempts[0])
+                continue
+            current.extend(attempts)
+            unclear.append((name, "its attempts carry no start time to order them"))
     return current, unclear
 
 
@@ -710,7 +743,10 @@ def judge(inputs: dict, require_codex: bool = True,
     runs_by_name: dict[str, list[dict]] = {}
     for run in current:
         runs_by_name.setdefault(str(run.get("name") or ""), []).append(run)
-    ambiguous = [n for n in unclear if n in required_checks]
+    # An unclear name refuses whether or not it is required: filtering
+    # to required names let a non-required check whose current run was
+    # unknown print a card over a failing run.
+    ambiguous = list(unclear)
     missing = [name for name in required_checks if name not in runs_by_name]
     # Present is not passed: a required run that was skipped, neutral
     # or carries no conclusion at all has not said this SHA is good.
@@ -746,11 +782,10 @@ def judge(inputs: dict, require_codex: bool = True,
         if str(c.get("state") or "").lower()
         in {"failure", "error", "pending", "expected"}
     ]
-    if ambiguous:
+    for name, why in sorted(ambiguous):
         out.open.append(
-            "the required check(s) " + ", ".join(sorted(ambiguous))
-            + " ran more than once on this SHA with different outcomes and no "
-              "start time to order them: the evidence cannot say which is current"
+            f"the check `{name}` ran more than once on this SHA with different "
+            f"outcomes, and {why}: the evidence cannot say which run is current"
         )
     if missing:
         out.open.append(

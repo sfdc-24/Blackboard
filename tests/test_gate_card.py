@@ -859,7 +859,11 @@ class CopilotReviewRound3(unittest.TestCase):
         j = judged(inputs)
         self.assertFalse(j.passed)
         self.assertTrue(
-            any("cannot say which is current" in l for l in j.open), j.open
+            any("the evidence cannot say which run is current" in l
+                for l in j.open), j.open
+        )
+        self.assertTrue(
+            any("carry no start time to order them" in l for l in j.open), j.open
         )
 
 
@@ -1355,7 +1359,11 @@ class CopilotReviewRound6(unittest.TestCase):
         ]
         j = judged(inputs)
         self.assertFalse(j.passed)
-        self.assertTrue(any("cannot say which is current" in l for l in j.open), j.open)
+        self.assertTrue(
+            any("the evidence cannot say which run is current" in l
+                for l in j.open), j.open
+        )
+        self.assertTrue(any("no app is recorded" in l for l in j.open), j.open)
 
     def test_gather_records_the_lineage(self):
         def rest(path, params=None):
@@ -1386,6 +1394,109 @@ class CopilotReviewRound6(unittest.TestCase):
         run = inputs["check_runs"][0]
         self.assertEqual(run["app_id"], "15368")
         self.assertEqual(run["check_suite_id"], "987")
+
+
+class CursorReviewRound6(unittest.TestCase):
+    """Cursor's NO-GO on 04b0716: the ambiguity rule was false in both
+    directions.
+
+    Its words: "A repeated required name with no `app_id` refuses even
+    when every run succeeded... Both clauses are false." And: "The
+    same unorderable pair on `lint` - same app, empty `started_at`,
+    success listed first, failure second - sets `unclear` and then
+    drops it because the name is not required. The card prints."
+    """
+
+    def test_runs_that_agree_need_no_lineage(self):
+        # No app recorded, so nothing can tell an attempt from another
+        # app's check - but both ran and both succeeded, so there is
+        # nothing to pick between and the question does not arise.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "html_url": "a"},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-02T00:10:00Z", "html_url": "b"},
+        ]
+        j = judged(inputs)
+        self.assertTrue(j.passed, j.open)
+        # And the same pair with unorderable times, one app, agreeing.
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "", "app_id": "15368", "html_url": "a"},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "", "app_id": "15368", "html_url": "b"},
+        ]
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+
+    def test_an_unclear_name_refuses_even_when_it_is_not_required(self):
+        # `lint` is not a required check, so the old code computed the
+        # ambiguity and then filtered it away by name - and the
+        # SUCCESS was listed first, so the newest-wins fallback also
+        # hid the failure. The card printed over a failing run whose
+        # currency nothing could establish.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "html_url": "ci"},
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "", "app_id": "111", "html_url": "lint/a"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "", "app_id": "111", "html_url": "lint/b"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("`lint`" in l and "the evidence cannot say which run is current" in l
+                for l in j.open), j.open
+        )
+
+    def test_the_refusal_names_the_reason_that_actually_applies(self):
+        # One message for both causes said whichever was wired in; the
+        # reader cannot act on "no app is recorded" when every run
+        # carries an app.
+        no_app = green_inputs()
+        no_app["check_runs"] = [
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "html_url": "a"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:00:00Z", "html_url": "b"},
+        ]
+        lines = judged(no_app).open
+        self.assertTrue(any("no app is recorded" in l for l in lines), lines)
+        self.assertFalse(any("no start time" in l for l in lines), lines)
+
+        no_time = green_inputs()
+        no_time["check_runs"] = [
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "", "app_id": "111", "html_url": "a"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "", "app_id": "111", "html_url": "b"},
+        ]
+        lines = judged(no_time).open
+        self.assertTrue(any("no start time to order them" in l for l in lines), lines)
+        self.assertFalse(any("no app is recorded" in l for l in lines), lines)
+
+
+    def test_a_quoted_no_go_sinks_bare_and_does_not_sink_blockquoted(self):
+        # Cursor's reading of the verdict shape, recorded as a test so
+        # the documented trade is the one the code makes.
+        inputs = green_inputs()
+        bare = {"id": 9, "author": "cursor[bot]",
+                "created_at": "2026-10-03T02:00:00Z",
+                "html_url": "https://example.test/c/9",
+                "body": f"**GO** on `{SHA}`.\n\nMy earlier call:\n\n"
+                        f"**NO-GO** on `{SHA}`."}
+        base = list(inputs["issue_comments"])
+        inputs["issue_comments"] = base + [bare]
+        self.assertFalse(judged(inputs).passed)
+
+        quoted = dict(bare)
+        quoted["body"] = (f"**GO** on `{SHA}`.\n\nMy earlier call:\n\n"
+                          f"> **NO-GO** on `{SHA}`.")
+        inputs["issue_comments"] = base + [quoted]
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
 
 
 class RefusalCompleteness(unittest.TestCase):
