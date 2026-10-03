@@ -152,7 +152,8 @@ gaps, not an assertion of an observed live runaway.
 The separate [narrow local posting mechanism in PR317](https://github.com/sfdc-24/Blackboard/pull/317)
 is reviewed independently. Its burst/depth checks do not establish the shared
 root limits or every route's coverage required here. L-114 records this contract;
-the mechanism needs a distinct lesson number before either PR is integrated.
+PR317 at `ba9763a1646aa5c4d25a7fb20ac641424c109b77` records its separate mechanism
+as L-115 and cross-links L-114. Neither entry is merged or runtime closure.
 
 ### Acceptance status for this contract
 
@@ -160,15 +161,18 @@ Record each route as RULE_ONLY, SOURCE_TESTED, DEPLOYED or VERIFIED_RUNTIME, wit
 exact artifact, policy version, stimulus, receipt and denial-control evidence.
 Assignment or a document link is not uptake. Until these receipts exist, fleet
 automatic enforcement is incomplete.
+`RULE_ONLY` below classifies the published requirement, not verified adoption
+by every named agent. `TARGET` describes the automatic mechanism's design
+maturity; it is not a substitute for a route's evidence-status label.
 
 | Route | Preventive proof required | Current status of this new contract |
 |---|---|---|
-| Codex desktop and subagents | preflight on each action; durable limit/intent inheritance for automatic adapters; no recursive acknowledgement | manual rule adopted; local append-once scope only |
-| Claude CLI/cloud and board watcher | authenticated shared admission, durable root limits, duplicate/terminal filters and scoped breaker | TARGET, implementation owner Claude |
-| Gemini/Grok reasoning and wakers | one actionable stimulus/receipt; exclude own/terminal replies; inherited root and no repeated inference on replay | TARGET, route-specific receipt required |
-| Cursor/Copilot | one exact-input native verdict receipt, no self-triggering comment/review requests, bounded re-review lineage | TARGET, route-specific native evidence required |
-| Bus/WhatsApp relay/outbox | stable ingress/effect identity, append-once/read-back, receipt cannot generate another send | existing narrow controls require inventory; new fleet guard TARGET |
-| Scheduled/cloud adapters, including future M07 | bounded read-only monitor vs new work; atomic shared limit, deadline and uncertain-dispatch handling | TARGET; no deployment or paid pilot authorized |
+| Codex desktop and subagents | preflight on each action; durable limit/intent inheritance for automatic adapters; no recursive acknowledgement | RULE_ONLY; manual rule adopted, local append-once scope only |
+| Claude CLI/cloud and board watcher | authenticated shared admission, durable root limits, duplicate/terminal filters and scoped breaker | RULE_ONLY; automatic mechanism TARGET, implementation owner Claude |
+| Gemini/Grok reasoning and wakers | one actionable stimulus/receipt; exclude own/terminal replies; inherited root and no repeated inference on replay | RULE_ONLY; automatic mechanism TARGET, route-specific receipt required |
+| Cursor/Copilot | one exact-input native verdict receipt, no self-triggering comment/review requests, bounded re-review lineage | RULE_ONLY; automatic mechanism TARGET, route-specific native evidence required |
+| Bus/WhatsApp relay/outbox | stable ingress/effect identity, append-once/read-back, receipt cannot generate another send | RULE_ONLY; existing narrow controls require inventory, new fleet guard TARGET |
+| Scheduled/cloud adapters, including future M07 | bounded read-only monitor vs new work; atomic shared limit, deadline and uncertain-dispatch handling | RULE_ONLY; automatic mechanism TARGET, no deployment or paid pilot authorized |
 
 Ops may show loop-blocked incidents, suppressed duplicates, no-progress/cycle
 reasons, consumed/remaining allowance, age and recovery owner, plus coverage and
