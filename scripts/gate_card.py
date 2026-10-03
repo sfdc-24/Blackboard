@@ -207,22 +207,36 @@ def first_nonempty_line(body: str | None) -> str:
 def cursor_verdict(comment: dict, named_sha: str) -> str | None:
     """GO/NO-GO when this comment is a Cursor verdict naming the SHA.
 
-    The verdict binds to the SHA its own verdict line names, and to
-    that one alone: a GO "on `other-sha`" is no GO here even when the
-    same line goes on to mention this SHA. A verdict line carrying
-    both tokens ("GO or NO-GO ...") is ambiguous, and so is one naming
-    two full SHAs: both are silence.
+    The asymmetry is the point, and it is the same one the Codex
+    reader already had: TEXT MAY NEVER LIFT A VERDICT TO GO, BUT IT
+    MUST ALWAYS BE ABLE TO SINK ONE.
+
+    A NO-GO that opens the line and names this SHA therefore counts,
+    however many other SHAs the line goes on to mention - "NO-GO on
+    <head>; compared against <base>" is a NO-GO here. Discarding it
+    as ambiguous let an OLDER GO stay the latest verdict, so an extra
+    SHA could resurrect an approval the reviewer had just withdrawn.
+
+    A GO stays strict: it must open the line, the line must carry one
+    verdict token, and this SHA must be the only full SHA on it. A GO
+    "on `other-sha`" that mentions this one later is silence, and so
+    is a line asking "GO or NO-GO ...".
     """
     if raw_login(comment.get("author")) != CURSOR_VERDICT_LOGIN:
         return None
     lead_raw = first_nonempty_line(str(comment.get("body") or ""))
-    if set(SHA_IN_TEXT.findall(lead_raw.lower())) != {named_sha}:
+    shas = set(SHA_IN_TEXT.findall(lead_raw.lower()))
+    if named_sha not in shas:
         return None
-    m = CURSOR_VERDICT.match(lead_raw.lstrip("*").strip())
+    m = CURSOR_VERDICT.match(lead_raw.lstrip("*_ ").strip())
     if m is None:
         return None
+    if m.group(1) == "NO-GO":
+        return "NO-GO"
     tokens = set(re.findall(r"\b(NO-GO|GO)\b", lead_raw))
-    return m.group(1) if tokens == {m.group(1)} else None
+    if tokens != {"GO"} or shas != {named_sha}:
+        return None
+    return "GO"
 
 
 def codex_verdict(comment: dict, named_sha: str,

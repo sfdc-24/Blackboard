@@ -1061,6 +1061,47 @@ class CopilotReviewRound4(unittest.TestCase):
             gate_card.gather("o", "r", 999, None, rest, graphql)
 
 
+class CopilotReviewRound5(unittest.TestCase):
+    """Copilot discussion_r4170964361: a NO-GO must not be discardable."""
+
+    def _verdict(self, body: str) -> str | None:
+        return gate_card.cursor_verdict({"author": "cursor[bot]", "body": body}, SHA)
+
+    def test_a_nogo_naming_this_head_and_another_sha_still_counts(self):
+        # The extra SHA used to make the line "ambiguous", so the
+        # NO-GO was discarded and an OLDER GO stayed the latest
+        # verdict - an extra SHA could resurrect a withdrawn approval.
+        self.assertEqual(
+            self._verdict(f"**NO-GO** on `{SHA}`; compared against `{OTHER}`"),
+            "NO-GO",
+        )
+
+    def test_a_newer_nogo_with_an_extra_sha_sinks_an_older_go(self):
+        inputs = green_inputs()
+        inputs["issue_comments"].append({
+            "id": 7, "author": "cursor[bot]",
+            "body": f"**NO-GO** on `{SHA}`; compared against `{OTHER}`",
+            "created_at": "2026-10-03T00:40:00Z",
+            "html_url": "https://example.test/c/7",
+        })
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("Cursor" in l and "NO-GO" in l for l in j.open), j.open
+        )
+
+    def test_a_go_stays_strict_in_every_way_it_was(self):
+        # Text may never LIFT a verdict to GO: all of these stay silence.
+        self.assertIsNone(self._verdict(
+            f"**GO** on `{OTHER}`. Against main the tree also matches {SHA}."))
+        self.assertIsNone(self._verdict(f"GO or NO-GO for `{SHA}`?"))
+        self.assertIsNone(self._verdict(f"**GO** on `{SHA}`. It sits on `{OTHER}`."))
+        self.assertIsNone(self._verdict(f"**NO-GO** on `{OTHER}`."))
+        # And the live shape, whose base SHA is short, still reads.
+        self.assertEqual(
+            self._verdict(f"**GO** on `{SHA}`. It sits directly on `9607d08`."), "GO")
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()
