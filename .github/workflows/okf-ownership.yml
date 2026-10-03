@@ -27,11 +27,19 @@ jobs:
           python-version: "3.12"
       - name: The rule's own tests
         run: python tests/test_okf_ownership.py
-      - name: This PR writes the OKF only where it may
+      # The rule is taken from the protected branch and run from outside the checkout. CI used to
+      # run scripts/okf_ownership.py out of the candidate's own tree, so the branch being judged
+      # could edit its judge (Codex 20:26Z). A pull request may still change the rule, but the
+      # change enforces nothing until it is merged. The changed paths come from git inside the
+      # rule, not from this step: `--name-only` showed only where a rename landed.
+      - name: This PR writes the OKF only where it may, by the rule on the protected branch
         env:
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff --name-only "origin/${BASE_REF}...HEAD" > changed.txt
-          cat changed.txt
-          python scripts/okf_ownership.py "${HEAD_REF}" --base "origin/${BASE_REF}" $(cat changed.txt)
+          mkdir -p "${RUNNER_TEMP}/trusted"
+          git show origin/main:scripts/okf_ownership.py > "${RUNNER_TEMP}/trusted/okf_ownership.py"
+          sha256sum "${RUNNER_TEMP}/trusted/okf_ownership.py"
+          git -c core.quotePath=false diff --name-status -M -C "origin/${BASE_REF}...HEAD"
+          python "${RUNNER_TEMP}/trusted/okf_ownership.py" "${HEAD_REF}" \
+            --protected origin/main --base "origin/${BASE_REF}" --repo .

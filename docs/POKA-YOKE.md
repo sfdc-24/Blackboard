@@ -532,6 +532,62 @@ and no control for a forged one, so it looked tested.
 
 ---
 
+## L-117 — A guard that runs from the tree it guards, and a diff that hides a rename
+
+**Incident.** L-116's repair shipped: the grant comes from the protected base, the
+floor file is non-delegable, overlapping grants refuse, and a forged grant has its own
+negative control. Codex's exact-head review of both heads (conference #162 `a2f3ac0`,
+Blackboard #319 `c33cf11`, 2026-10-03 20:26Z) got past it **six ways**, and every supplied
+test still passed:
+
+1. **The judge came from the dock.** CI ran `tools/check_ownership.py` out of the
+   candidate's own checkout, so the branch being judged supplied the rule that judged it.
+   A one-line edit to the decision admitted everything, including `floor.md`.
+2. **`--base` was believed.** A pull request may target an unmerged branch of its own, and
+   that branch's floor was read as authority. Protected-base state was asserted, not
+   established.
+3. **A rename was invisible.** `git diff --name-only` prints only where a renamed file
+   landed, so moving `docs/okf/floor.md` to `docs/okf/old-floor.md` showed the check a
+   path the mover was allowed to write, and handed it the page that hands out the pen.
+4. **A quoted path is a different path.** git C-quotes a name that is not plain ASCII, and
+   the quoted string matched no rule. The same output decoded in this box's code page
+   turned one page into another.
+5. **The call was read from the wrong place, twice.** The checker took the first `call:`
+   anywhere in the plan; the chair takes the last one in the front matter. A plan
+   declaring two calls bound a grant to a call the room was not having, and a `call:` in
+   the prose was admitted as a declaration.
+6. **Only the base was validated.** The candidate could PROPOSE two pens on one page, and
+   a protected floor already in that state refused even the operator's repair of it, so
+   the only way out of the conflict was blocked.
+
+**Naive rule.** "Review the guard's diff carefully" / "add more tests to the guard."
+
+**Mechanism.**
+- Enforcement runs a copy of the rule taken from the protected branch, from outside the
+  checkout (`git show origin/main:<rule> > "$RUNNER_TEMP"/...`), with the repository passed
+  in. A pull request may still change the rule; the change enforces nothing until merged.
+- The rule proves its own controls before it judges anything (`controls_hold`): a dozen
+  answers that cannot change, positive and negative. Tamper with the decision and the
+  controls stop holding, so the run refuses instead of admitting.
+- Authorization state is named by a CLOSED list of refs, not by whatever the caller calls
+  protected. `main-ish` is not main.
+- The changed set comes from git itself, `-z --name-status -M -C`: a rename names both of
+  its ends, nothing is quoted, and the output is decoded as UTF-8. A path handed in quoted
+  is unquoted before it is judged.
+- Where two parsers read one declaration, they read the same place, the same way, and
+  ambiguity is REFUSED rather than resolved: exactly one `call:` in the front matter.
+- A guard that can refuse everything needs the one narrow path out: here, the operator
+  repairing the page that is in conflict, alone in its pull request, and never the branch
+  that proposed the conflict.
+- When the guard cannot see what changed, it refuses everyone who could gain by that
+  blindness, and only them.
+
+**Where it is.** `scripts/okf_ownership.py` and `tests/test_okf_ownership.py` here (47
+checks), `tools/check_ownership.py` and `tools/test_check_ownership.py` on the conference
+line (42 tests), and the two workflows that take the rule from `origin/main`.
+
+---
+
 ---
 
 ## The first thing this file failed to prevent
