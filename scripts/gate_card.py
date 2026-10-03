@@ -473,7 +473,16 @@ def ci_state(check_runs: list[dict], combined_status: dict) -> str:
     total = combined.get("total_count")
 
     if isinstance(contexts, list):
+        # A list shorter than the count the API reported is a PARTIAL
+        # read, and trusting it over the rollup word is how a failure
+        # on a later page went missing. Same for a rollup that says
+        # failure while nothing recorded does: something was not read.
+        if isinstance(total, int) and len(contexts) != total:
+            return "partial"
         states = {str(c.get("state") or "").lower() for c in contexts}
+        if (word.lower() in {"failure", "error"}
+                and not states & {"failure", "error"}):
+            return "partial"
         if states & {"failure", "error"}:
             status_state = "failure"
         elif states & {"pending", "expected"}:
@@ -639,6 +648,13 @@ def judge(inputs: dict, require_codex: bool = True,
         out.closed.append(
             f"CI on this SHA: success - required run(s): {required_links} "
             f"({len(check_runs)} check runs in all: {names})"
+        )
+    elif ci == "partial":
+        out.open.append(
+            "the legacy status list for this SHA was not read whole "
+            f"({len(combined.get('contexts') or [])} context(s) recorded, the API "
+            f"counted {combined.get('total_count')}, rollup "
+            f"{combined.get('state')}): refusing to judge a partial read"
         )
     elif ci == "unknown":
         out.open.append("CI on this SHA reports nothing: silence is not a GO")
@@ -1122,7 +1138,31 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
             f"has {len(check_runs)} (runs were created mid-read?); try again"
         )
 
-    combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status")
+    # The combined-status endpoint PAGINATES its contexts (30 by
+    # default). One unparameterized request plus "trust the contexts
+    # over the rollup word" meant a failing context on page 2 was
+    # simply absent, and the word that would have refused was being
+    # ignored. Page it, then prove the read is whole against the
+    # count the API itself reports.
+    combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
+                    {"per_page": 100, "page": 1})
+    statuses = list((combined or {}).get("statuses") or [])
+    page = 1
+    while len((combined or {}).get("statuses") or []) == 100:
+        page += 1
+        if page > 50:
+            raise GateError(
+                "legacy status paging did not end; refusing to judge a partial read"
+            )
+        combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
+                        {"per_page": 100, "page": page})
+        statuses.extend((combined or {}).get("statuses") or [])
+    status_total = (combined or {}).get("total_count")
+    if isinstance(status_total, int) and status_total != len(statuses):
+        raise GateError(
+            f"legacy status read is not whole: the API counted {status_total}, "
+            f"this read has {len(statuses)}; try again"
+        )
 
     threads: list[dict] = []
     cursor = None
@@ -1194,13 +1234,11 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
         # list beside it.
         "combined_status": {
             "state": str((combined or {}).get("state") or "unknown"),
-            "total_count": ((combined or {}).get("total_count")
-                            if isinstance((combined or {}).get("total_count"), int)
-                            else None),
+            "total_count": status_total if isinstance(status_total, int) else None,
             "contexts": [
                 {"context": str(s.get("context") or ""),
                  "state": str(s.get("state") or "")}
-                for s in ((combined or {}).get("statuses") or [])
+                for s in statuses
             ],
         },
     }

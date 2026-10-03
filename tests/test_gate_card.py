@@ -950,6 +950,117 @@ class CursorReviewRound3(unittest.TestCase):
         self.assertGreater(len(set(stamps.values())), 1)
 
 
+class CopilotReviewRound4(unittest.TestCase):
+    """Copilot discussion_r4170938756: the legacy statuses paginate."""
+
+    def test_copilots_exact_repro_refuses(self):
+        # state=failure, total_count=2, one visible successful context:
+        # trusting the partial list over the rollup word passed it.
+        inputs = green_inputs()
+        inputs["combined_status"] = {
+            "state": "failure", "total_count": 2,
+            "contexts": [{"context": "legacy/a", "state": "success"}],
+        }
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("not read whole" in l for l in j.open), j.open)
+
+    def test_a_rollup_failure_with_nothing_failing_recorded_refuses(self):
+        # The same inconsistency with no count to catch it.
+        inputs = green_inputs()
+        inputs["combined_status"] = {
+            "state": "failure", "total_count": None,
+            "contexts": [{"context": "legacy/a", "state": "success"}],
+        }
+        self.assertFalse(judged(inputs).passed)
+
+    def test_a_short_context_list_is_a_partial_read(self):
+        inputs = green_inputs()
+        inputs["combined_status"] = {
+            "state": "success", "total_count": 3,
+            "contexts": [{"context": "legacy/a", "state": "success"}],
+        }
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("not read whole" in l for l in j.open), j.open)
+        # Complete and green passes.
+        inputs["combined_status"]["total_count"] = 1
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+
+    def test_gather_pages_the_legacy_statuses_and_finds_a_later_failure(self):
+        # The failure lives on page 2, which an unparameterized read
+        # never asked for.
+        page1 = [{"context": f"legacy/ok-{i}", "state": "success"}
+                 for i in range(100)]
+        page2 = [{"context": "legacy/deploy", "state": "failure"}]
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return [] if params.get("page") != 1 else [
+                    {"id": 1, "user": {"login": "cursor[bot]"},
+                     "body": f"**GO** on `{SHA}`.", "created_at": "t",
+                     "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "started_at": "2026-10-03T00:00:00Z",
+                     "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                if params.get("page") == 1:
+                    return {"state": "failure", "total_count": 101,
+                            "statuses": page1}
+                return {"state": "failure", "total_count": 101, "statuses": page2}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        self.assertEqual(len(inputs["combined_status"]["contexts"]), 101)
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+        self.assertTrue(
+            any("legacy status legacy/deploy=failure" in l for l in j.open), j.open
+        )
+
+    def test_a_legacy_count_that_disagrees_with_the_read_is_an_error(self):
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return []
+            if path.endswith("/pulls/999/reviews"):
+                return []
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 0, "check_runs": []}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success", "total_count": 7,
+                        "statuses": [{"context": "a", "state": "success"}]}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, rest, graphql)
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()
