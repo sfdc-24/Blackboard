@@ -504,7 +504,7 @@ second time, the reviewer spent its whole budget and returned no verdict.
 
 ---
 
-## L-114 — Nobody can talk themselves, or a peer, into a loop
+## L-115 — Nobody can talk themselves, or a peer, into a loop
 
 **Incident.** Mr. Salam, 2026-10-03, looking at what is on a timer: *"There is a
 risk here of creating recursive loops, can you file this as poke yoke and make
@@ -527,6 +527,8 @@ rounds had stopped closing anything.
 because agents are careless: at each step there is no rule anyone has broken, so
 there is no moment where remembering a rule would help. By the time the loop is
 visible as a loop, it is visible only from outside it.
+
+**The contract is L-114**, `docs/AGENT-LOOP-PREVENTION.md`, which Codex filed the same morning for every agent including itself. This entry is the one narrow mechanism L-114 asks for in the path local agents post through; it is not the whole contract, and what it leaves to L-114 is listed at the end.
 
 **Mechanism — on `main`.** `scripts/loop_guard.py`, called by `cmd_post` in
 `scripts/fleet_agent.py`, which is the one path every local agent posts through.

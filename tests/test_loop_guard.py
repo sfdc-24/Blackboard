@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""L-114's mechanism: scripts/loop_guard.py refuses the shapes a loop is made of.
+"""L-115's mechanism: scripts/loop_guard.py refuses the shapes a loop is made of.
 
 Each test is one of the ways the fleet could go round: the same pair answering each other, a chain
 of answers to answers, and the guard losing the ability to count. Nothing here touches the board.
@@ -86,16 +86,22 @@ class LoopGuardTest(unittest.TestCase):
         allowed, why = self.post(rid="asked", owner_asked="keep working through with codex", at=self.now + 60)
         self.assertTrue(allowed)
         self.assertEqual("", why)
-        last = json.loads(Path(self.dir.name, "post_ledger.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-        self.assertEqual("keep working through with codex", last["owner_asked"])
+        lines = [json.loads(l) for l in
+                 Path(self.dir.name, "post_ledger.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual("keep working through with codex",
+                         [r for r in lines if r["kind"] == "intent"][-1]["owner_asked"])
 
     def test_a_refused_post_is_still_counted(self):
         for i in range(loop_guard.CAP):
             self.post(rid="R%d" % i, at=self.now + i * 60)
         self.post(rid="refused-one", at=self.now + 60)
-        lines = Path(self.dir.name, "post_ledger.jsonl").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(loop_guard.CAP + 1, len(lines))
-        self.assertIn("refused", json.loads(lines[-1]))
+        lines = [json.loads(l) for l in
+                 Path(self.dir.name, "post_ledger.jsonl").read_text(encoding="utf-8").splitlines()]
+        intents = [r for r in lines if r["kind"] == "intent"]
+        decisions = [r for r in lines if r["kind"] == "decision"]
+        self.assertEqual(loop_guard.CAP + 1, len(intents))       # the refused one is in the count
+        self.assertFalse(decisions[-1]["allowed"])
+        self.assertIn("refused", decisions[-1])
 
     def test_a_guard_that_cannot_count_refuses(self):
         loop_guard.os.environ["SFDC24_STATE_DIR"] = str(Path(self.dir.name, "a-file"))
@@ -104,9 +110,43 @@ class LoopGuardTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("cannot count", why)
 
-    def test_a_ledger_that_cannot_be_read_does_not_block_the_work(self):
-        Path(self.dir.name, "post_ledger.jsonl").write_text("{not json\n\x00", encoding="utf-8")
-        self.assertTrue(self.post(rid="after-bad-ledger")[0])
+    def test_one_bad_line_is_not_a_bad_ledger(self):
+        Path(self.dir.name, "post_ledger.jsonl").write_text("{not json\n", encoding="utf-8")
+        self.assertTrue(self.post(rid="after-bad-line")[0])
+        self.assertEqual([], list(Path(self.dir.name).glob("*.corrupt-*.jsonl")))
+
+    def test_a_ledger_that_cannot_be_decoded_is_moved_aside_and_the_guard_goes_on_counting(self):
+        # Codex on 294bc100: one invalid byte made every later read return an empty history while the
+        # guard went on appending to the same file, so it was disabled permanently and silently.
+        led = Path(self.dir.name, "post_ledger.jsonl")
+        led.write_bytes(b'{"kind": "intent", "at": 1, "tag": "x"}\n\xff\xfe not utf-8\n')
+        self.assertTrue(self.post(rid="first-after-corrupt")[0])
+        moved = list(Path(self.dir.name).glob("*.corrupt-*.jsonl"))
+        self.assertEqual(1, len(moved), "the undecodable ledger was not kept")
+        self.assertTrue(led.exists(), "no fresh ledger was started")
+        # The guard counts again from the new file: the cap still trips.
+        for i in range(loop_guard.CAP - 1):
+            self.assertTrue(self.post(rid="N%d" % i, at=self.now + i)[0])
+        self.assertFalse(self.post(rid="over-after-corrupt", at=self.now + 1)[0])
+
+    def test_two_posts_racing_both_refuse_rather_than_both_going_ahead(self):
+        # Codex on 294bc100: the cap was read before the row was recorded, so two processes could each
+        # read an under-cap history and both go ahead. The intent is written first, so each sees the
+        # other. Both refusing is the right way round for a loop guard.
+        for i in range(loop_guard.CAP - 1):
+            self.assertTrue(self.post(rid="R%d" % i, at=self.now + i)[0])
+        led = loop_guard.ledger_path()
+        racer = {"kind": "intent", "at": self.now, "tag": "claude-code-cli", "to": "codex",
+                 "project": "CONFERENCE", "rid": "the-other-process", "answers": ""}
+        loop_guard._append(led, racer)                 # the other process got its intent in first
+        allowed, why = self.post(rid="mine", at=self.now)
+        self.assertFalse(allowed)
+        self.assertIn("LOOP GUARD", why)
+
+    def test_a_post_is_not_counted_against_itself(self):
+        allowed, why = self.post(rid="only-one")
+        self.assertTrue(allowed, why)
+        self.assertEqual(1, loop_guard.chain_of("", []))
 
 
 if __name__ == "__main__":
