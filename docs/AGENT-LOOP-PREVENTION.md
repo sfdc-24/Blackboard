@@ -110,11 +110,16 @@ mechanism for in-flight automatic work where supported. Preserve checkpoints,
 uncertain dispatches and evidence. Never kill, suspend or hard-cap interactive
 agents, shut down the shared watcher, or abandon unrelated task ownership.
 
-Reserve at most one diagnostic per root/breaker epoch and destination. It names
-the guard reason, owner, safe continuation and evidence pointer. Its own delivery
-does not reopen the root. If delivery is ambiguous or fails, keep the durable
-incident locally/in the control record for bounded read-only reconciliation;
-do not create a succession of new alert IDs or restart a paid notifier.
+Keep one stable incident identity for the entire root, across breaker epochs,
+reopenings and destinations. Append epoch/recovery history beneath that identity;
+neither another trip nor another participant may mint a replacement incident.
+It names the guard reason, owner, safe continuation and evidence pointer.
+Deliveries beneath it have stable deduplication keys, a finite aggregate limit
+and a pre-authorized bounded destination set; a worker cannot expand that set
+to evade the limit. Its own delivery does not reopen the root. If delivery is
+ambiguous or fails, keep the durable incident locally/in the control record for
+bounded read-only reconciliation; do not create new alert IDs or restart a paid
+notifier.
 
 Read-only reconciliation remains available under a finite recovery allowance.
 It does not permit new provider execution or replenishment. Reopening requires
@@ -143,6 +148,11 @@ Check `scripts/board_say.py`, `scripts/board_waker.py`, `scripts/agent_waker.py`
 fresh IDs, terminal-message eligibility, limits that reset per invocation, and
 unchanged alarms emitted on repeated passes. This is source evidence of coverage
 gaps, not an assertion of an observed live runaway.
+
+The separate [narrow local posting mechanism in PR317](https://github.com/sfdc-24/Blackboard/pull/317)
+is reviewed independently. Its burst/depth checks do not establish the shared
+root limits or every route's coverage required here. L-114 records this contract;
+the mechanism needs a distinct lesson number before either PR is integrated.
 
 ### Acceptance status for this contract
 
@@ -180,7 +190,7 @@ provider calls, credentials, IAM or deploy are needed for these tests.
 | Restart/reconnect, moved head, delegation or fresh process | original absolute deadline and spent root counters retained |
 | Concurrent children claiming last allowance | one atomic winner; aggregate fan-out/depth cannot exceed policy |
 | ACK-of-ACK, own RESULT, terminal BLOCKED, outbox receipt | zero new task/wake/inference/notification |
-| Recursive guard failure or ambiguous incident append | one incident intent; no notification-of-notification chain |
+| Recursive guard failure, repeated trip/resume or expanding destinations | one stable root incident; finite deduplicated deliveries; no new incident, destination expansion or notification-of-notification chain |
 | Crash before/after effect or provider acceptance | known outcome reconciled; unknown quarantined; no blind re-execution |
 | Legitimate repaired source/new dependency | bounded continuation allowed; unchanged-source denial does not hide new findings |
 | Scheduled unchanged observation and duplicate tick | bounded read-only sample allowed; zero business effects or spam; duplicate occurrence shares counters; overlap/backlog/failure bounds hold |

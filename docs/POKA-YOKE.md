@@ -532,6 +532,9 @@ notification recursion. Reconcile unknown effects instead of retrying them.
 Require per-route stimulus and exact receipt before calling any agent protected;
 documentation, agreement and source-only CI do not establish runtime coverage.
 No new paid calls, credentials, deployment or production policy are authorized.
+The narrower posting mechanism proposed in [PR317](https://github.com/sfdc-24/Blackboard/pull/317)
+is separate; it must use a distinct lesson number and must not claim this whole
+contract's coverage.
 
 ---
 
