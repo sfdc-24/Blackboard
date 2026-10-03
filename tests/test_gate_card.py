@@ -1499,6 +1499,65 @@ class CursorReviewRound6(unittest.TestCase):
         self.assertTrue(judged(inputs).passed, judged(inputs).open)
 
 
+    def test_the_two_workflows_one_app_residual_is_pinned_not_hidden(self):
+        # Cursor's two cases, which still print, and which it ruled
+        # should NOT be repaired by grouping on suite id: "Re-run all
+        # jobs" creates a new suite and leaves the failed run on the
+        # commit, so suite grouping would make a green re-run
+        # unsatisfiable again, and nothing in this payload tells that
+        # new suite from a second workflow.
+        #
+        # This test asserts the TRADE, not a desired behaviour. If a
+        # future change makes either case refuse, that is progress and
+        # this test should be deleted with the reason recorded - what
+        # it exists to prevent is the residual being closed by
+        # accident, or drifting back into a green re-run refusing.
+        required = green_inputs()
+        required["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": "ci/wf-a"},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "11", "html_url": "ci/wf-b"},
+        ]
+        self.assertTrue(judged(required).passed, judged(required).open)
+
+        lint = green_inputs()
+        lint["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:00:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": "ci"},
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:20:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": "lint/wf-a"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:20:00Z", "app_id": "15368",
+             "check_suite_id": "11", "html_url": "lint/wf-b"},
+        ]
+        self.assertTrue(judged(lint).passed, judged(lint).open)
+        # The reason it is a trade and not a shrug: the same pair with
+        # the re-run shape - one suite, newest green - MUST pass, and
+        # suite grouping would have broken exactly that.
+        rerun = green_inputs()
+        rerun["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "99", "html_url": "ci/new"},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
+             "check_suite_id": "10", "html_url": "ci/old"},
+        ]
+        ok = judged(rerun)
+        self.assertTrue(ok.passed, ok.open)
+        self.assertNotIn("ci/old", gate_card.render(rerun, ok))
+        # And the docstring must carry the residual, since that is
+        # where Cursor ruled it belongs.
+        doc = " ".join((gate_card.current_check_runs.__doc__ or "").split())
+        self.assertIn("THE RESIDUAL", doc)
+        self.assertIn("Suite id is recorded for the reader", doc)
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()
