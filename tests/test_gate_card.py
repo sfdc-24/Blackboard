@@ -1113,6 +1113,132 @@ class GatherAndCli(unittest.TestCase):
             mutate(changed)
             self.assertNotEqual(first, gate_card.gate_fingerprint(changed))
 
+    def test_the_fingerprint_covers_every_field_the_judgement_reads(self):
+        # Copilot discussion_r4170826289: the first fingerprint listed
+        # fields by hand and omitted each thread comment's author and
+        # body and each check run's URL, so a Copilot comment edited
+        # from BLOCKER to benign text compared equal and a state seen
+        # ONCE was called settled.
+        def with_thread(body, author="copilot-pull-request-reviewer"):
+            i = green_inputs()
+            i["threads"] = [{
+                "id": "T1", "is_resolved": False, "is_outdated": False,
+                "truncated": False,
+                "comments": [{"discussion_id": 1, "author": author, "body": body,
+                              "created_at": "t", "html_url": "https://example.test/d/1"}],
+            }]
+            return i
+
+        blocker = with_thread("BLOCKER - a real finding.")
+        benign = with_thread("Looks fine to me.")
+        self.assertNotEqual(gate_card.gate_fingerprint(blocker),
+                            gate_card.gate_fingerprint(benign))
+        # One refuses and the other passes, so they must never be
+        # mistaken for the same state.
+        self.assertFalse(judged(blocker).passed)
+        self.assertTrue(judged(benign).passed, judged(benign).open)
+        # The author matters too: the same text from another account
+        # does not gate, so it is a different state.
+        self.assertNotEqual(
+            gate_card.gate_fingerprint(blocker),
+            gate_card.gate_fingerprint(with_thread("BLOCKER - a real finding.",
+                                                   author="someone-else")),
+        )
+        # And the required run's URL, which the card links.
+        moved = green_inputs()
+        moved["check_runs"][0]["html_url"] = "https://example.test/ci/moved"
+        self.assertNotEqual(gate_card.gate_fingerprint(green_inputs()),
+                            gate_card.gate_fingerprint(moved))
+
+    def test_an_edited_thread_comment_stops_the_read_settling(self):
+        # The same thing end to end: the body changes between reads,
+        # so no two reads agree and gather refuses rather than
+        # returning a state it saw once.
+        reads = {"n": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return [] if params.get("page") != 1 else [
+                    {"id": 1, "user": {"login": "cursor[bot]"},
+                     "body": f"**GO** on `{SHA}`.", "created_at": "t",
+                     "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success"}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            reads["n"] += 1
+            body = ("BLOCKER - a real finding." if reads["n"] == 1
+                    else f"edited {reads['n']}")
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"id": "T1", "isResolved": True, "isOutdated": False,
+                           "comments": {
+                               "pageInfo": {"hasNextPage": False, "endCursor": None},
+                               "nodes": [{"databaseId": 1, "body": body,
+                                          "createdAt": "t",
+                                          "url": "https://example.test/d/1",
+                                          "author": {
+                                              "login":
+                                              "copilot-pull-request-reviewer"}}]}}]}}}}}
+
+        with self.assertRaises(gate_card.GateError):
+            gate_card.gather("o", "r", 999, None, rest, graphql)
+
+    def test_a_flickering_mergeable_state_does_not_stop_the_read_settling(self):
+        # GitHub computes mergeable_state asynchronously, so it can
+        # read "unknown" then "clean". It gates nothing, and a read
+        # that can never settle is its own failure.
+        reads = {"n": 0}
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                reads["n"] += 1
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA},
+                        "mergeable_state": "unknown" if reads["n"] % 2 else "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return [] if params.get("page") != 1 else [
+                    {"id": 1, "user": {"login": "cursor[bot]"},
+                     "body": f"**GO** on `{SHA}`.", "created_at": "t",
+                     "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "success"}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        self.assertTrue(gate_card.judge(inputs, require_codex=False).passed)
+
     def test_graphql_without_a_token_is_an_error_not_a_pass(self):
         graphql = gate_card.make_graphql(None)
         with self.assertRaises(gate_card.GateError):

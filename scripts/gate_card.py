@@ -861,24 +861,32 @@ def gate_fingerprint(inputs: dict) -> str:
     and the head never moves. So the whole read is repeated and
     compared on this, and only a snapshot seen twice unchanged is
     judged.
+
+    This fingerprints the COMPLETE records rather than fields picked
+    by hand. The first version listed what it thought mattered and
+    left out each thread comment's author and body and each check
+    run's URL, so an existing Copilot comment edited from BLOCKER to
+    benign text compared equal and a state seen once was called
+    settled. Whatever judge() reads is in here by construction.
+
+    The one documented exception is `mergeable_state`, which GitHub
+    computes asynchronously and can report as "unknown" on one read
+    and "clean" on the next. It gates nothing - it is printed on the
+    card as it was read - so including it would risk a read that can
+    never settle, which is its own kind of failure.
     """
-    parts: list[str] = [
-        json.dumps(inputs.get("pr"), sort_keys=True),
-        json.dumps(inputs.get("pr_after"), sort_keys=True),
-        json.dumps(inputs.get("combined_status"), sort_keys=True),
-    ]
-    for c in inputs.get("issue_comments") or []:
-        parts.append(f"c:{c.get('id')}:{c.get('author')}:{hash_text(c.get('body'))}")
-    for r in inputs.get("reviews") or []:
-        parts.append(f"r:{r.get('id')}:{r.get('author')}:{r.get('commit_id')}:"
-                     f"{hash_text(r.get('body'))}")
-    for run in inputs.get("check_runs") or []:
-        parts.append(f"k:{run.get('name')}:{run.get('status')}:{run.get('conclusion')}")
-    for th in inputs.get("threads") or []:
-        parts.append(f"t:{th.get('id')}:{th.get('is_resolved')}:{th.get('truncated')}:"
-                     + ",".join(str(c.get("discussion_id"))
-                                for c in th.get("comments") or []))
-    return hash_text("\n".join(parts))
+    volatile = ("mergeable_state",)
+    gate = {
+        "pr": {k: v for k, v in (inputs.get("pr") or {}).items() if k not in volatile},
+        "pr_after": {k: v for k, v in (inputs.get("pr_after") or {}).items()
+                     if k not in volatile},
+        "issue_comments": inputs.get("issue_comments") or [],
+        "reviews": inputs.get("reviews") or [],
+        "threads": inputs.get("threads") or [],
+        "check_runs": inputs.get("check_runs") or [],
+        "combined_status": inputs.get("combined_status") or {},
+    }
+    return hash_text(json.dumps(gate, sort_keys=True, default=str))
 
 
 def hash_text(text) -> str:
