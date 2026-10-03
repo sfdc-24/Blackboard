@@ -489,13 +489,25 @@ def ci_state(check_runs: list[dict], combined_status: dict) -> str:
     if isinstance(contexts, list):
         # A list shorter than the count the API reported is a PARTIAL
         # read, and trusting it over the rollup word is how a failure
-        # on a later page went missing. Same for a rollup that says
-        # failure while nothing recorded does: something was not read.
+        # on a later page went missing.
         if isinstance(total, int) and len(contexts) != total:
             return "partial"
         states = {str(c.get("state") or "").lower() for c in contexts}
+        # A context whose state cannot be read is not evidence of
+        # anything, least of all success. An absent `state` field was
+        # being stored as "" and then counted as a passing context.
+        if states - {"success", "failure", "error", "pending", "expected"}:
+            return "partial"
+        # The rollup must not claim worse than the contexts show, in
+        # EITHER direction: the first version checked only the failing
+        # word, so a "pending" rollup over nothing pending - its exact
+        # twin - still passed. The empty list is left alone, because
+        # pending over no contexts is GitHub's no-legacy-status shape.
         if (word.lower() in {"failure", "error"}
                 and not states & {"failure", "error"}):
+            return "partial"
+        if (word.lower() in {"pending", "expected"} and states
+                and not states & {"failure", "error", "pending", "expected"}):
             return "partial"
         if states & {"failure", "error"}:
             status_state = "failure"
@@ -633,6 +645,23 @@ def judge(inputs: dict, require_codex: bool = True,
         elif not str(run.get("html_url") or ""):
             unlinkable.append(name)
     ci = ci_state(check_runs, combined)
+    # Everything known to be wrong, computed ONCE. The partial-read
+    # branch used to return before this was built, so a count mismatch
+    # suppressed the failing check run and the failing context the
+    # read HAD seen - the refusal named only the partial read and sent
+    # the reader looking for the wrong thing.
+    bad = [
+        f"{r.get('name')}={r.get('conclusion') or r.get('status')}"
+        for r in runs_by_name.values()
+        if str(r.get("status") or "") != "completed"
+        or str(r.get("conclusion") or "") in FAILING_CONCLUSIONS
+    ]
+    bad += [
+        f"legacy status {c.get('context')}={c.get('state')}"
+        for c in (combined.get("contexts") or [])
+        if str(c.get("state") or "").lower()
+        in {"failure", "error", "pending", "expected"}
+    ]
     if ambiguous:
         out.open.append(
             "the required check(s) " + ", ".join(sorted(ambiguous))
@@ -670,25 +699,12 @@ def judge(inputs: dict, require_codex: bool = True,
             f"counted {combined.get('total_count')}, rollup "
             f"{combined.get('state')}): refusing to judge a partial read"
         )
+        if bad:
+            out.open.append("and what this read DID see is already wrong: "
+                            + "; ".join(bad))
     elif ci == "unknown":
         out.open.append("CI on this SHA reports nothing: silence is not a GO")
     else:
-        # Name the thing that is actually wrong. Listing the rollup
-        # word said "combined status pending" when a FAILING legacy
-        # context was the cause, and a refusal that misnames its own
-        # reason sends the reader to the wrong place.
-        bad = [
-            f"{r.get('name')}={r.get('conclusion') or r.get('status')}"
-            for r in runs_by_name.values()
-            if str(r.get("status") or "") != "completed"
-            or str(r.get("conclusion") or "") in FAILING_CONCLUSIONS
-        ]
-        bad += [
-            f"legacy status {c.get('context')}={c.get('state')}"
-            for c in (combined.get("contexts") or [])
-            if str(c.get("state") or "").lower()
-            in {"failure", "error", "pending", "expected"}
-        ]
         detail = "; ".join(bad) if bad else f"combined status {combined.get('state')}"
         out.open.append(f"CI on this SHA is {ci}: {detail}")
 
@@ -1158,20 +1174,27 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
     # simply absent, and the word that would have refused was being
     # ignored. Page it, then prove the read is whole against the
     # count the API itself reports.
-    combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
-                    {"per_page": 100, "page": 1})
-    statuses = list((combined or {}).get("statuses") or [])
+    first_status = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
+                        {"per_page": 100, "page": 1}) or {}
+    statuses = list(first_status.get("statuses") or [])
+    # The rollup word and the count are taken from PAGE 1 and kept, as
+    # they already were for check runs. Reassigning `combined` each
+    # page read them from the LAST body, so a final empty page could
+    # erase a `failure` rollup and its count - and the card printed.
+    status_word = first_status.get("state")
+    status_total = first_status.get("total_count")
     page = 1
-    while len((combined or {}).get("statuses") or []) == 100:
+    chunk = statuses
+    while len(chunk) == 100:
         page += 1
         if page > 50:
             raise GateError(
                 "legacy status paging did not end; refusing to judge a partial read"
             )
-        combined = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
-                        {"per_page": 100, "page": page})
-        statuses.extend((combined or {}).get("statuses") or [])
-    status_total = (combined or {}).get("total_count")
+        payload = rest(f"/repos/{owner}/{repo}/commits/{named_sha}/status",
+                       {"per_page": 100, "page": page}) or {}
+        chunk = list(payload.get("statuses") or [])
+        statuses.extend(chunk)
     if isinstance(status_total, int) and status_total != len(statuses):
         raise GateError(
             f"legacy status read is not whole: the API counted {status_total}, "
@@ -1247,7 +1270,7 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
         # as "no legacy statuses" while a failing context sat in the
         # list beside it.
         "combined_status": {
-            "state": str((combined or {}).get("state") or "unknown"),
+            "state": str(status_word or "unknown"),
             "total_count": status_total if isinstance(status_total, int) else None,
             "contexts": [
                 {"context": str(s.get("context") or ""),

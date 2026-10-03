@@ -1102,6 +1102,121 @@ class CopilotReviewRound5(unittest.TestCase):
             self._verdict(f"**GO** on `{SHA}`. It sits directly on `9607d08`."), "GO")
 
 
+class CursorReviewRound4(unittest.TestCase):
+    """Cursor's NO-GO on 657c2b4: four holes in the legacy-status code
+    I had written twenty minutes earlier."""
+
+    def test_the_pending_twin_of_the_failure_disagreement_refuses(self):
+        # The first disagreement check covered only the failing word,
+        # so "pending" over nothing pending - its exact twin - passed.
+        for word in ("pending", "expected"):
+            for total in (1, None):
+                inputs = green_inputs()
+                inputs["combined_status"] = {
+                    "state": word, "total_count": total,
+                    "contexts": [{"context": "legacy/deploy", "state": "success"}],
+                }
+                j = judged(inputs)
+                self.assertFalse(j.passed, (word, total))
+                self.assertTrue(any("not read whole" in l for l in j.open),
+                                (word, total, j.open))
+
+    def test_a_context_with_no_state_is_not_a_passing_context(self):
+        # An absent `state` was stored as "" and then counted as
+        # success. The rollup word here is `success` and the count
+        # matches, so NOTHING else can refuse it - only the rule that
+        # an unreadable state is not evidence.
+        for state in ("", "something-new"):
+            inputs = green_inputs()
+            inputs["combined_status"] = {
+                "state": "success", "total_count": 1,
+                "contexts": [{"context": "legacy/deploy", "state": state}],
+            }
+            j = judged(inputs)
+            self.assertFalse(j.passed, state)
+            self.assertTrue(any("not read whole" in l for l in j.open),
+                            (state, j.open))
+        # A readable success in the same position passes.
+        ok = green_inputs()
+        ok["combined_status"] = {
+            "state": "success", "total_count": 1,
+            "contexts": [{"context": "legacy/deploy", "state": "success"}],
+        }
+        self.assertTrue(judged(ok).passed, judged(ok).open)
+
+    def test_githubs_no_legacy_status_shape_still_passes(self):
+        # The counterweight: pending over NO contexts is what GitHub
+        # returns for a commit with no legacy status, and it must pass.
+        inputs = green_inputs()
+        inputs["combined_status"] = {"state": "pending", "total_count": 0,
+                                     "contexts": []}
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+
+    def test_a_partial_read_still_names_what_it_did_see(self):
+        # The early return skipped the detail, so a count mismatch
+        # hid both a failing check run and a failing context.
+        inputs = green_inputs()
+        inputs["check_runs"].append(
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-03T00:00:00Z", "html_url": "u"})
+        inputs["combined_status"] = {
+            "state": "pending", "total_count": 5,
+            "contexts": [{"context": "legacy/deploy", "state": "failure"},
+                         {"context": "legacy/a", "state": "success"}],
+        }
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        text = "\n".join(j.open)
+        self.assertIn("not read whole", text)
+        self.assertIn("legacy status legacy/deploy=failure", text)
+        self.assertIn("lint=failure", text)
+
+    def test_the_rollup_word_and_count_come_from_page_one(self):
+        # Reassigning `combined` per page read them from the LAST
+        # body, so a final empty page erased a `failure` rollup.
+        page1 = [{"context": f"legacy/ok-{i}", "state": "success"}
+                 for i in range(100)]
+
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return [] if params.get("page") != 1 else [
+                    {"id": 1, "user": {"login": "cursor[bot]"},
+                     "body": f"**GO** on `{SHA}`.", "created_at": "t",
+                     "html_url": "u1"}]
+            if path.endswith("/pulls/999/reviews"):
+                return [{"id": 1,
+                         "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                         "state": "COMMENTED", "commit_id": SHA,
+                         "body": "**Findings:** None", "submitted_at": "t",
+                         "html_url": "r1"}]
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "started_at": "2026-10-03T00:00:00Z",
+                     "html_url": "ci"}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                if params.get("page") == 1:
+                    return {"state": "failure", "total_count": 100,
+                            "statuses": page1}
+                return {"statuses": []}  # a last page that says nothing
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        self.assertEqual(inputs["combined_status"]["state"], "failure")
+        self.assertEqual(inputs["combined_status"]["total_count"], 100)
+        j = gate_card.judge(inputs, require_codex=False)
+        self.assertFalse(j.passed)
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()
