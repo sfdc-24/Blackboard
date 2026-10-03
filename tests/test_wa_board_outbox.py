@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -160,7 +161,7 @@ class DryRunAndState(unittest.TestCase):
             with mock.patch.object(ox, "send_via_notify") as send:
                 rc = ox.run_once(
                     rows, state, dry_run=True, send=False, note=False,
-                    state_path=state_path,
+                    state_path=state_path, max_age_hours=0,
                 )
             self.assertEqual(rc, 0)
             send.assert_not_called()
@@ -174,13 +175,53 @@ class DryRunAndState(unittest.TestCase):
             with mock.patch.object(ox, "send_via_notify", return_value=(True, "HTTP 200")):
                 rc = ox.run_once(
                     rows, state, dry_run=False, send=True, note=False,
-                    state_path=state_path,
+                    state_path=state_path, max_age_hours=0,
                 )
             self.assertEqual(rc, 0)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIn("WRK-1", saved["delivered_row_ids"])
             again = ox.select_undelivered(rows, saved)
             self.assertEqual(again, [])
+
+    def test_a_row_older_than_the_limit_is_retired_and_never_sent(self):
+        """2026-10-03 23:58Z: one EOD send delivered eighteen notices queued between Sep 21 and
+        Oct 2 to his phone in one burst, because nothing drains this outbox on a schedule and the
+        state file was not empty, so the first-run prime did not apply. An old row is retired."""
+        rows = [row("WRK-OLD", WA_SEND)]
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = {"delivered_row_ids": ["seed"], "delivered_bcb_ids": []}
+            with mock.patch.object(ox, "send_via_notify") as send:
+                rc = ox.run_once(rows, state, dry_run=False, send=True, note=False,
+                                 state_path=state_path, max_age_hours=12)
+            self.assertEqual(rc, 0)
+            send.assert_not_called()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("WRK-OLD", saved["delivered_row_ids"])
+            self.assertEqual([], ox.select_undelivered(rows, saved),
+                             "a retired row must not come back")
+
+    def test_a_row_inside_the_limit_still_sends(self):
+        fresh = row("WRK-NEW", WA_SEND)
+        fresh[1] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = {"delivered_row_ids": ["seed"], "delivered_bcb_ids": []}
+            with mock.patch.object(ox, "send_via_notify",
+                                   return_value=(True, "HTTP 200")) as send:
+                rc = ox.run_once([fresh], state, dry_run=False, send=True, note=False,
+                                 state_path=state_path, max_age_hours=12)
+            self.assertEqual(rc, 0)
+            self.assertEqual(1, send.call_count)
+
+    def test_a_timestamp_that_cannot_be_read_is_not_young(self):
+        unreadable = row("WRK-ODD", WA_SEND)
+        unreadable[1] = "BCB|v=1|id=the-payload-went-in-the-timestamp-column"
+        self.assertIsNone(ox.age_hours(unreadable[1]))
+        fresh, stale = ox.split_by_age([{"ts": unreadable[1], "row_id": "WRK-ODD",
+                                         "kind": "STATUS", "tag": "codex"}], 12)
+        self.assertEqual([], fresh)
+        self.assertEqual(1, len(stale))
 
     def test_failed_send_is_not_marked_delivered(self):
         rows = [row("WRK-1", WA_SEND)]
@@ -190,7 +231,7 @@ class DryRunAndState(unittest.TestCase):
             with mock.patch.object(ox, "send_via_notify", return_value=(False, "SEND FAILED")):
                 rc = ox.run_once(
                     rows, state, dry_run=False, send=True, note=False,
-                    state_path=state_path,
+                    state_path=state_path, max_age_hours=0,
                 )
             self.assertEqual(rc, 1)
             self.assertNotIn("WRK-1", state["delivered_row_ids"])
@@ -220,10 +261,10 @@ class DryRunAndState(unittest.TestCase):
                  mock.patch.object(wa_notify, "load_env", return_value=env), \
                  mock.patch.object(ox, "append_log"):
                 ox.run_once(rows, state, dry_run=False, send=True, note=False,
-                            state_path=state_path)
+                            state_path=state_path, max_age_hours=0)
                 again = ox.load_state(state_path)
                 ox.run_once(rows, again, dry_run=False, send=True, note=False,
-                            state_path=state_path)
+                            state_path=state_path, max_age_hours=0)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(len(sends), 1, "a response-loss timeout was sent again")
         self.assertNotIn("WRK-1", saved.get("delivered_row_ids") or [])
@@ -249,7 +290,7 @@ class DryRunAndState(unittest.TestCase):
             with mock.patch.object(ox, "send_via_notify", side_effect=fake_send), \
                  mock.patch.object(ox, "append_log"):
                 ox.run_once(rows, state, dry_run=False, send=True, note=False,
-                            state_path=state_path)
+                            state_path=state_path, max_age_hours=0)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(sends, ["ROW-C"])
         self.assertIn("EVENT-A", saved.get("unknown_row_ids") or [])
@@ -274,10 +315,10 @@ class DryRunAndState(unittest.TestCase):
                  mock.patch.object(wa_notify, "load_env", return_value=env), \
                  mock.patch.object(ox, "append_log"):
                 ox.run_once(rows, state, dry_run=False, send=True, note=False,
-                            state_path=state_path)
+                            state_path=state_path, max_age_hours=0)
                 again = ox.load_state(state_path)
                 ox.run_once(rows, again, dry_run=False, send=True, note=False,
-                            state_path=state_path)
+                            state_path=state_path, max_age_hours=0)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(len(sends), 2, "a refused send was not retried")
         self.assertNotIn("WRK-1", saved.get("delivered_row_ids") or [])
@@ -291,7 +332,7 @@ class DryRunAndState(unittest.TestCase):
             with mock.patch.object(ox, "send_via_notify") as send:
                 rc = ox.run_once(
                     rows, state, dry_run=False, send=True, note=False,
-                    state_path=state_path,
+                    state_path=state_path, max_age_hours=0,
                 )
             self.assertEqual(rc, 0)
             send.assert_not_called()
