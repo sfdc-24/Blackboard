@@ -1217,6 +1217,73 @@ class CursorReviewRound4(unittest.TestCase):
         self.assertFalse(j.passed)
 
 
+class CursorReviewRound5(unittest.TestCase):
+    """Cursor's NO-GO on 509d9b0: three verdict-reader holes."""
+
+    def _verdict(self, body: str) -> str | None:
+        return gate_card.cursor_verdict({"author": "cursor[bot]", "body": body}, SHA)
+
+    def test_a_nogo_below_the_lead_line_still_sinks(self):
+        # The sink only read the lead line, so a NO-GO on line two of
+        # a comment whose first line said GO was ignored.
+        self.assertEqual(self._verdict(
+            f"**GO** on `{SHA}`\n\n**NO-GO** on `{SHA}`; compared against `{OTHER}`"
+        ), "NO-GO")
+        # And a lead line that says both, which used to be silence and
+        # therefore left an older GO standing.
+        self.assertEqual(self._verdict(f"**GO** on `{SHA}`. NO-GO."), "NO-GO")
+
+    def test_go_as_a_verb_is_not_a_verdict(self):
+        # Stripping decoration loosely turned a bullet into a GO.
+        # "go through the remaining tests" is not an approval.
+        self.assertIsNone(self._verdict(
+            f"* **GO** through the remaining tests on `{SHA}`."))
+        self.assertIsNone(self._verdict(f"* **GO** on `{SHA}`."))
+        self.assertIsNone(self._verdict(f"__**GO**__ on `{SHA}`."))
+        self.assertIsNone(self._verdict(f"**GO** ahead and merge `{SHA}` later."))
+        # The live shape still reads.
+        self.assertEqual(
+            self._verdict(f"**GO** on `{SHA}`. It sits directly on `9607d08`."), "GO")
+
+    def test_both_question_forms_mean_the_same_thing(self):
+        # The defect was that one refused and the other was ignored,
+        # depending on word order. A question is not a verdict.
+        self.assertIsNone(self._verdict(f"GO or NO-GO for `{SHA}`?"))
+        self.assertIsNone(self._verdict(f"NO-GO or GO for `{SHA}`?"))
+
+    def test_a_newer_nogo_wins_whatever_order_the_list_is_in(self):
+        # latest_verdict's docstring claimed created_at; the code kept
+        # the last match in LIST order. A live gather asks for
+        # `created` ascending, which hid it.
+        newer_nogo = {"id": 1, "author": "cursor[bot]",
+                      "body": f"**NO-GO** on `{SHA}`.",
+                      "created_at": "2026-10-03T00:40:00Z", "html_url": "new"}
+        older_go = {"id": 2, "author": "cursor[bot]",
+                    "body": f"**GO** on `{SHA}`.",
+                    "created_at": "2026-10-02T00:01:00Z", "html_url": "old"}
+        for order in ([newer_nogo, older_go], [older_go, newer_nogo]):
+            got = gate_card.latest_verdict(order, SHA, gate_card.cursor_verdict)
+            self.assertEqual(got[0], "NO-GO", order[0]["html_url"])
+            self.assertEqual(got[1]["html_url"], "new")
+        # End to end, in the order that used to pass.
+        inputs = green_inputs()
+        inputs["issue_comments"] = [newer_nogo, older_go] + inputs["issue_comments"][1:]
+        self.assertFalse(judged(inputs).passed)
+
+    def test_an_untimed_verdict_later_in_the_list_still_wins(self):
+        # All that is known about a verdict with no readable timestamp
+        # is where it sits, so it cannot be ruled out as the newer one.
+        timed_go = {"id": 1, "author": "cursor[bot]",
+                    "body": f"**GO** on `{SHA}`.",
+                    "created_at": "2026-10-03T00:40:00Z", "html_url": "timed"}
+        untimed_nogo = {"id": 2, "author": "cursor[bot]",
+                        "body": f"**NO-GO** on `{SHA}`.",
+                        "created_at": "", "html_url": "untimed"}
+        got = gate_card.latest_verdict([timed_go, untimed_nogo], SHA,
+                                       gate_card.cursor_verdict)
+        self.assertEqual(got[0], "NO-GO")
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()

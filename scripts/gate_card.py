@@ -159,6 +159,14 @@ CODEX_MARKER = re.compile(r"^CODEX-[A-Za-z0-9][A-Za-z0-9-]*$")
 HTML_COMMENT_ONLY = re.compile(r"^<!--\s*(.+?)\s*-->$")
 CODEX_VERDICT = re.compile(r"\b(NO-GO|NO-MAJOR|GO)\b")
 CURSOR_VERDICT = re.compile(r"^(NO-GO|GO)(?![A-Za-z0-9-])")
+# A verdict LINE: the token opens the line, optionally wrapped in **
+# or __, and is followed by punctuation, end of line, or on/at/for.
+# Without that tail, "**GO** through the remaining tests on <sha>"
+# read as a GO. A list bullet is deliberately not accepted.
+VERDICT_LINE = re.compile(
+    r"^(?:\*\*|__)?(?:NO-GO|GO)(?:\*\*|__)?\s*(?:[.:,;!?)\]]|on\b|at\b|for\b|$)",
+    re.IGNORECASE,
+)
 
 FAILING_CONCLUSIONS = {
     "failure",
@@ -208,35 +216,56 @@ def cursor_verdict(comment: dict, named_sha: str) -> str | None:
     """GO/NO-GO when this comment is a Cursor verdict naming the SHA.
 
     The asymmetry is the point, and it is the same one the Codex
-    reader already had: TEXT MAY NEVER LIFT A VERDICT TO GO, BUT IT
-    MUST ALWAYS BE ABLE TO SINK ONE.
+    reader has: TEXT MAY NEVER LIFT A VERDICT TO GO, BUT IT MUST
+    ALWAYS BE ABLE TO SINK ONE.
 
-    A NO-GO that opens the line and names this SHA therefore counts,
-    however many other SHAs the line goes on to mention - "NO-GO on
-    <head>; compared against <base>" is a NO-GO here. Discarding it
-    as ambiguous let an OLDER GO stay the latest verdict, so an extra
-    SHA could resurrect an approval the reviewer had just withdrawn.
+    EVERY line is read, not just the first. A NO-GO on the second
+    line of a comment whose first line said GO was being ignored, and
+    so was a lead line reading "GO on <head>. NO-GO." - in both cases
+    an older GO stayed the latest verdict and the card printed over a
+    withdrawal.
 
-    A GO stays strict: it must open the line, the line must carry one
-    verdict token, and this SHA must be the only full SHA on it. A GO
-    "on `other-sha`" that mentions this one later is silence, and so
-    is a line asking "GO or NO-GO ...".
+    A VERDICT LINE opens with GO or NO-GO, optionally wrapped in ** or
+    __, and that token must be followed by punctuation, end of line,
+    or on/at/for. That last rule exists because stripping decoration
+    loosely turned the bullet "* **GO** through the remaining tests on
+    <head>." into a GO: "go" is a verb as often as a verdict, and a
+    list bullet is not a verdict line at all.
+
+    Once a line IS a verdict line and names this SHA, a NO-GO token
+    anywhere on it sinks the comment. So "NO-GO on <base>. <head> is
+    unaffected." refuses: that is a false refusal and the right side
+    to err on, since a clean GO clears it while the opposite error
+    prints a card over a live NO-GO.
+
+    Both question forms - "GO or NO-GO for <head>?" and "NO-GO or GO
+    for <head>?" - are silence, because the token is followed by "or"
+    rather than by punctuation or on/at/for, so neither opens a
+    verdict line. The previous version refused one and ignored the
+    other depending on which word came first, which was the real
+    defect: a question is not a verdict, and the two forms must not
+    mean different things.
+
+    A GO is strict: its line must carry one verdict token and name
+    this SHA and no other full SHA.
     """
     if raw_login(comment.get("author")) != CURSOR_VERDICT_LOGIN:
         return None
-    lead_raw = first_nonempty_line(str(comment.get("body") or ""))
-    shas = set(SHA_IN_TEXT.findall(lead_raw.lower()))
-    if named_sha not in shas:
-        return None
-    m = CURSOR_VERDICT.match(lead_raw.lstrip("*_ ").strip())
-    if m is None:
-        return None
-    if m.group(1) == "NO-GO":
-        return "NO-GO"
-    tokens = set(re.findall(r"\b(NO-GO|GO)\b", lead_raw))
-    if tokens != {"GO"} or shas != {named_sha}:
-        return None
-    return "GO"
+    lines = [ln for ln in str(comment.get("body") or "").splitlines() if ln.strip()]
+    go_found = False
+    for raw in lines:
+        line = raw.strip()
+        if VERDICT_LINE.match(line) is None:
+            continue
+        shas = set(SHA_IN_TEXT.findall(line.lower()))
+        if named_sha not in shas:
+            continue
+        tokens = set(re.findall(r"\b(NO-GO|GO)\b", line))
+        if "NO-GO" in tokens:
+            return "NO-GO"
+        if tokens == {"GO"} and shas == {named_sha}:
+            go_found = True
+    return "GO" if go_found else None
 
 
 def codex_verdict(comment: dict, named_sha: str,
@@ -321,13 +350,35 @@ def codex_verdict(comment: dict, named_sha: str,
 
 
 def latest_verdict(comments: list[dict], named_sha: str, reader) -> tuple[str, dict] | None:
-    """The newest (created_at, then list order) verdict for the SHA."""
-    found: tuple[str, dict] | None = None
-    for comment in comments:
+    """The newest verdict for the SHA, by created_at and then order.
+
+    The docstring claimed created_at and the code never read it: it
+    kept the last match in LIST order. A live gather happens to ask
+    for `created` ascending, which hid that - but a snapshot in any
+    other order left an older GO standing in front of a newer NO-GO.
+    A verdict with no readable timestamp is ordered by its position,
+    which is all that is known about it.
+    """
+    found: list[tuple] = []
+    for index, comment in enumerate(comments):
         verdict = reader(comment, named_sha)
-        if verdict is not None:
-            found = (verdict, comment)
-    return found
+        if verdict is None:
+            continue
+        when = parse_time(comment.get("created_at"))
+        found.append((when is not None, when, index, verdict, comment))
+    if not found:
+        return None
+    timed = [f for f in found if f[0]]
+    if timed:
+        best = max(timed, key=lambda f: (f[1], f[2]))
+        # An untimed verdict later in the list cannot be ruled out as
+        # newer, so it still wins its position.
+        untimed_after = [f for f in found if not f[0] and f[2] > best[2]]
+        if untimed_after:
+            best = max(untimed_after, key=lambda f: f[2])
+    else:
+        best = max(found, key=lambda f: f[2])
+    return best[3], best[4]
 
 
 def blocker_lines(body: str) -> list[str]:
