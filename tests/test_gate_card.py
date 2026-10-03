@@ -861,6 +861,95 @@ class CopilotReviewRound3(unittest.TestCase):
         )
 
 
+class CursorReviewRound3(unittest.TestCase):
+    """Cursor's NO-GO on 7f61076: four ways the CI reading was wrong."""
+
+    def test_a_green_rerun_clears_an_older_failed_attempt(self):
+        # The over-strict one, and the worst of the four: GitHub
+        # leaves a failed attempt on the commit beside its green
+        # re-run, and every run was being judged, so a check that
+        # failed once could never pass again however often it was
+        # re-run green.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z",
+             "html_url": "https://example.test/ci/new"},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z",
+             "html_url": "https://example.test/ci/old"},
+        ]
+        j = judged(inputs)
+        self.assertTrue(j.passed, j.open)
+        self.assertIn("ci/new", gate_card.render(inputs, j))
+        # A non-required check re-run green must not refuse either.
+        inputs["check_runs"] += [
+            {"name": "lint", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:20:00Z", "html_url": "u"},
+            {"name": "lint", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:20:00Z", "html_url": "u"},
+        ]
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+        # And the latest failing still refuses.
+        inputs["check_runs"][0]["conclusion"] = "failure"
+        self.assertFalse(judged(inputs).passed)
+
+    def test_runs_are_ordered_in_time_not_in_text(self):
+        # 2026-10-02T23:00:00-04:00 is 03:00Z - LATER than
+        # 2026-10-03T01:00:00Z - and sorts earlier as a string.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "skipped",
+             "started_at": "2026-10-02T23:00:00-04:00",
+             "html_url": "https://example.test/ci/actually-newer"},
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T01:00:00Z",
+             "html_url": "https://example.test/ci/earlier-success"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("only `success` is a pass" in l for l in j.open), j.open)
+        self.assertNotIn("ci/earlier-success", gate_card.render(inputs, j))
+
+    def test_a_legacy_context_is_judged_whatever_the_rollup_says(self):
+        # A missing count was stored as 0 and read as "no legacy
+        # statuses", so a pending or failing CONTEXT beside it passed;
+        # and a rollup of "success" could sit over a failing context.
+        for word, state in (("pending", "failure"), ("success", "failure"),
+                            ("success", "pending"), ("pending", "pending")):
+            inputs = green_inputs()
+            inputs["combined_status"] = {
+                "state": word, "total_count": None,
+                "contexts": [{"context": "legacy/deploy", "state": state}],
+            }
+            j = judged(inputs)
+            self.assertFalse(j.passed, (word, state))
+            self.assertTrue(any("CI on this SHA is" in l for l in j.open),
+                            (word, state, j.open))
+        # A green context passes, and no contexts at all is not pending.
+        ok = green_inputs()
+        ok["combined_status"] = {
+            "state": "success", "total_count": 1,
+            "contexts": [{"context": "legacy/deploy", "state": "success"}],
+        }
+        self.assertTrue(judged(ok).passed, judged(ok).open)
+        empty = green_inputs()
+        empty["combined_status"] = {"state": "pending", "total_count": None,
+                                    "contexts": []}
+        self.assertTrue(judged(empty).passed, judged(empty).open)
+
+    def test_the_fixtures_carry_the_real_per_run_start_times(self):
+        # Cursor spotted one invented value stamped across every run.
+        # The #315 fixture is a recorded read, so its stamps differ.
+        fixture_315 = fixture("pr315_ee4c0c1.json")
+        stamps = {r["name"]: r["started_at"] for r in fixture_315["check_runs"]}
+        self.assertEqual(stamps["copilot-pull-request-reviewer"],
+                         "2026-10-02T20:57:04Z")
+        self.assertEqual(stamps["test (3.14, lf)"], "2026-10-02T20:56:59Z")
+        self.assertEqual(stamps["test (3.12, lf)"], "2026-10-02T20:57:34Z")
+        self.assertGreater(len(set(stamps.values())), 1)
+
+
 class RefusalCompleteness(unittest.TestCase):
     def test_every_open_item_is_listed_not_just_the_first(self):
         inputs = green_inputs()

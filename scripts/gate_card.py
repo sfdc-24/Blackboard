@@ -391,12 +391,65 @@ def thread_gate_reason(thread: dict, high_anchors: dict[str, str]) -> str | None
     return None
 
 
+def parse_time(value) -> datetime | None:
+    """An ISO 8601 instant, or None when it cannot be read as one.
+
+    String comparison is not time comparison: a run stamped
+    2026-10-02T23:00:00-04:00 is LATER than one stamped
+    2026-10-03T01:00:00Z, and sorts earlier. GitHub returns Z today;
+    that is not a reason to compare text.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def latest_runs_by_name(check_runs: list[dict]) -> tuple[dict, list[str]]:
+    """The current run for each name, and the names that cannot be told.
+
+    The check-runs endpoint can return one NAME from several suites,
+    and GitHub leaves a failed attempt on the commit beside its green
+    re-run. Judging EVERY run meant a check that failed once could
+    never pass again, however many times it was re-run green - an
+    unsatisfiable gate, which is its own failure. Only the current run
+    per name is judged. Where duplicates cannot be ordered in time AND
+    disagree, the evidence cannot say which is current.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for run in check_runs:
+        grouped.setdefault(str(run.get("name") or ""), []).append(run)
+    latest: dict[str, dict] = {}
+    ambiguous: list[str] = []
+    for name, runs in grouped.items():
+        if len(runs) == 1:
+            latest[name] = runs[0]
+            continue
+        times = [parse_time(r.get("started_at")) for r in runs]
+        if all(t is not None for t in times) and len(set(times)) == len(times):
+            latest[name] = max(zip(times, runs), key=lambda pair: pair[0])[1]
+            continue
+        latest[name] = runs[0]  # newest first, as the API gives them
+        outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
+                    for r in runs}
+        if len(outcomes) > 1:
+            ambiguous.append(name)
+    return latest, ambiguous
+
+
 def check_runs_state(check_runs: list[dict]) -> str:
     if not check_runs:
         return "unknown"
-    if any(str(r.get("status") or "") != "completed" for r in check_runs):
+    current = list(latest_runs_by_name(check_runs)[0].values())
+    if any(str(r.get("status") or "") != "completed" for r in current):
         return "pending"
-    if any(str(r.get("conclusion") or "") in FAILING_CONCLUSIONS for r in check_runs):
+    if any(str(r.get("conclusion") or "") in FAILING_CONCLUSIONS for r in current):
         return "failure"
     return "success"
 
@@ -404,28 +457,36 @@ def check_runs_state(check_runs: list[dict]) -> str:
 def ci_state(check_runs: list[dict], combined_status: dict) -> str:
     """The SHA's CI state from its check runs and its legacy statuses.
 
-    GitHub reports a commit's COMBINED STATUS as "pending" when it has
-    no legacy status contexts at all, which is the normal case for a
-    repository that uses check runs. Reading that as real pending CI
-    made the gate unable to pass any modern PR - the worst kind of
-    false refusal, since it would have sent every operator around the
-    tool. A count of zero therefore means "no legacy statuses", not
-    "waiting"; a genuinely pending CONTEXT still refuses.
+    The legacy side is judged by its CONTEXTS wherever they are
+    recorded, because the rollup word alone misleads in both
+    directions: GitHub reports "pending" for a commit with NO
+    contexts at all (normal for a check-runs repository, and reading
+    it as pending CI made the gate unable to pass any modern PR),
+    while a rollup can read "success" beside a context that is
+    failing. A count or a word is only trusted when the contexts
+    themselves were not recorded.
     """
     run_state = check_runs_state(check_runs)
     combined = combined_status or {}
-    status_state = str(combined.get("state") or "unknown")
     contexts = combined.get("contexts")
+    word = str(combined.get("state") or "unknown")
     total = combined.get("total_count")
-    if isinstance(total, int):
-        empty = total == 0
-    elif isinstance(contexts, list):
-        empty = not contexts
-    else:
-        # An older snapshot that recorded only the word: trust it.
-        empty = False
-    if empty and status_state in {"pending", "expected", "unknown", ""}:
+
+    if isinstance(contexts, list):
+        states = {str(c.get("state") or "").lower() for c in contexts}
+        if states & {"failure", "error"}:
+            status_state = "failure"
+        elif states & {"pending", "expected"}:
+            status_state = "pending"
+        elif states:
+            status_state = "success"
+        else:
+            status_state = "absent"  # no contexts: nothing legacy to wait for
+    elif isinstance(total, int) and total == 0:
         status_state = "absent"
+    else:
+        status_state = word  # an older snapshot that recorded only the word
+
     if run_state == "failure" or status_state in {"error", "failure"}:
         return "failure"
     if run_state == "pending" or status_state in {"pending", "expected"}:
@@ -529,24 +590,8 @@ def judge(inputs: dict, require_codex: bool = True,
     # chosen by start time, falling back to the order given; when
     # duplicates cannot be ordered and disagree, the evidence is
     # ambiguous and that refuses.
-    by_name: dict[str, list[dict]] = {}
-    for run in check_runs:
-        by_name.setdefault(str(run.get("name") or ""), []).append(run)
-    runs_by_name: dict[str, dict] = {}
-    ambiguous: list[str] = []
-    for name, runs in by_name.items():
-        if len(runs) == 1:
-            runs_by_name[name] = runs[0]
-            continue
-        stamps = [str(r.get("started_at") or "") for r in runs]
-        if all(stamps) and len(set(stamps)) == len(stamps):
-            runs_by_name[name] = max(runs, key=lambda r: str(r.get("started_at")))
-            continue
-        runs_by_name[name] = runs[0]  # newest first, as the API gives them
-        outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
-                    for r in runs}
-        if len(outcomes) > 1 and name in required_checks:
-            ambiguous.append(name)
+    runs_by_name, unorderable = latest_runs_by_name(check_runs)
+    ambiguous = [n for n in unorderable if n in required_checks]
     missing = [name for name in required_checks if name not in runs_by_name]
     # Present is not passed: a required run that was skipped, neutral
     # or carries no conclusion at all has not said this SHA is good.
@@ -942,11 +987,13 @@ def gate_fingerprint(inputs: dict) -> str:
     benign text compared equal and a state seen once was called
     settled. Whatever judge() reads is in here by construction.
 
-    The one documented exception is `mergeable_state`, which GitHub
-    computes asynchronously and can report as "unknown" on one read
-    and "clean" on the next. It gates nothing - it is printed on the
-    card as it was read - so including it would risk a read that can
-    never settle, which is its own kind of failure.
+    The one documented exception is the `mergeable_state` STRING,
+    which GitHub computes asynchronously and can report as "unknown"
+    on one read and "clean" on the next; including it would risk a
+    read that can never settle, which is its own kind of failure. The
+    one thing it means to the judgement is not excluded: `dirty` is a
+    merge conflict and refuses, so the derived `conflicted` flag is
+    fingerprinted in its place.
     """
     # `mergeable_state` itself is excluded (see above), but what it
     # MEANS for the gate is not: a flip to `dirty` is a merge
@@ -1131,9 +1178,15 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
         "threads": threads,
         "check_runs": check_runs,
         # The COUNT matters as much as the word: see ci_state().
+        # The CONTEXTS are what gets judged; a missing count is left
+        # missing rather than invented as zero, which would have read
+        # as "no legacy statuses" while a failing context sat in the
+        # list beside it.
         "combined_status": {
             "state": str((combined or {}).get("state") or "unknown"),
-            "total_count": int((combined or {}).get("total_count") or 0),
+            "total_count": ((combined or {}).get("total_count")
+                            if isinstance((combined or {}).get("total_count"), int)
+                            else None),
             "contexts": [
                 {"context": str(s.get("context") or ""),
                  "state": str(s.get("state") or "")}
