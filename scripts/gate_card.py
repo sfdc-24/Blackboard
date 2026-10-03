@@ -476,42 +476,72 @@ def parse_time(value) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def latest_runs_by_name(check_runs: list[dict]) -> tuple[dict, list[str]]:
-    """The current run for each name, and the names that cannot be told.
+def current_check_runs(check_runs: list[dict]) -> tuple[list[dict], list[str]]:
+    """Every CURRENT check run, and the names whose lineage is unclear.
 
-    The check-runs endpoint can return one NAME from several suites,
-    and GitHub leaves a failed attempt on the commit beside its green
-    re-run. Judging EVERY run meant a check that failed once could
-    never pass again, however many times it was re-run green - an
-    unsatisfiable gate, which is its own failure. Only the current run
-    per name is judged. Where duplicates cannot be ordered in time AND
-    disagree, the evidence cannot say which is current.
+    Two reviewers found the opposite horns of one dilemma, and both
+    were right:
+
+      Judging EVERY run means a check that failed once can never pass
+      again, because GitHub leaves the failed attempt on the commit
+      beside its green re-run. That gate is unsatisfiable, and an
+      unsatisfiable gate gets worked around by hand.
+
+      Keeping only the newest run per NAME hides a genuinely
+      different, currently failing check that happens to share a
+      display name with another app's check.
+
+    Neither is a matter of taste: they need LINEAGE. Two runs are
+    attempts of the same check when the same APP posted them; two
+    runs of the same name from different apps are different checks,
+    and both are current. So the newest attempt per (app, name) is
+    current, and every such run is judged.
+
+    When a name appears more than once and the runs carry no app to
+    tell them apart, nothing here can prove they are attempts of one
+    check, so that name is reported as unclear rather than guessed -
+    the caller refuses. A single run of a name needs no lineage.
     """
-    grouped: dict[str, list[dict]] = {}
+    by_name: dict[str, list[dict]] = {}
     for run in check_runs:
-        grouped.setdefault(str(run.get("name") or ""), []).append(run)
-    latest: dict[str, dict] = {}
-    ambiguous: list[str] = []
-    for name, runs in grouped.items():
+        by_name.setdefault(str(run.get("name") or ""), []).append(run)
+
+    current: list[dict] = []
+    unclear: list[str] = []
+    for name, runs in by_name.items():
         if len(runs) == 1:
-            latest[name] = runs[0]
+            current.append(runs[0])
             continue
-        times = [parse_time(r.get("started_at")) for r in runs]
-        if all(t is not None for t in times) and len(set(times)) == len(times):
-            latest[name] = max(zip(times, runs), key=lambda pair: pair[0])[1]
+        if any(not str(r.get("app_id") or "") for r in runs):
+            unclear.append(name)
+            current.extend(runs)  # judged as they are, pending the refusal
             continue
-        latest[name] = runs[0]  # newest first, as the API gives them
-        outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
-                    for r in runs}
-        if len(outcomes) > 1:
-            ambiguous.append(name)
-    return latest, ambiguous
+        by_app: dict[str, list[dict]] = {}
+        for run in runs:
+            by_app.setdefault(str(run.get("app_id")), []).append(run)
+        for attempts in by_app.values():
+            if len(attempts) == 1:
+                current.append(attempts[0])
+                continue
+            times = [parse_time(r.get("started_at")) for r in attempts]
+            if all(x is not None for x in times) and len(set(times)) == len(times):
+                current.append(max(zip(times, attempts), key=lambda pair: pair[0])[1])
+                continue
+            # Same app, same name, no way to order them: the newest
+            # first, as the API gives them, and unclear if they
+            # disagree about the outcome.
+            current.append(attempts[0])
+            outcomes = {(str(r.get("status") or ""), str(r.get("conclusion") or ""))
+                        for r in attempts}
+            if len(outcomes) > 1 and name not in unclear:
+                unclear.append(name)
+    return current, unclear
 
 
 def check_runs_state(check_runs: list[dict]) -> str:
     if not check_runs:
         return "unknown"
-    current = list(latest_runs_by_name(check_runs)[0].values())
+    current = current_check_runs(check_runs)[0]
     if any(str(r.get("status") or "") != "completed" for r in current):
         return "pending"
     if any(str(r.get("conclusion") or "") in FAILING_CONCLUSIONS for r in current):
@@ -676,8 +706,11 @@ def judge(inputs: dict, require_codex: bool = True,
     # chosen by start time, falling back to the order given; when
     # duplicates cannot be ordered and disagree, the evidence is
     # ambiguous and that refuses.
-    runs_by_name, unorderable = latest_runs_by_name(check_runs)
-    ambiguous = [n for n in unorderable if n in required_checks]
+    current, unclear = current_check_runs(check_runs)
+    runs_by_name: dict[str, list[dict]] = {}
+    for run in current:
+        runs_by_name.setdefault(str(run.get("name") or ""), []).append(run)
+    ambiguous = [n for n in unclear if n in required_checks]
     missing = [name for name in required_checks if name not in runs_by_name]
     # Present is not passed: a required run that was skipped, neutral
     # or carries no conclusion at all has not said this SHA is good.
@@ -686,15 +719,15 @@ def judge(inputs: dict, require_codex: bool = True,
     not_green: list[str] = []
     unlinkable: list[str] = []
     for name in required_checks:
-        run = runs_by_name.get(name)
-        if run is None:
-            continue
-        status = str(run.get("status") or "")
-        conclusion = str(run.get("conclusion") or "")
-        if status != "completed" or conclusion != "success":
-            not_green.append(f"{name}={conclusion or status or 'no conclusion'}")
-        elif not str(run.get("html_url") or ""):
-            unlinkable.append(name)
+        # EVERY current run of a required name must pass: two apps can
+        # both post a check by that name, and both are the gate.
+        for run in runs_by_name.get(name) or []:
+            status = str(run.get("status") or "")
+            conclusion = str(run.get("conclusion") or "")
+            if status != "completed" or conclusion != "success":
+                not_green.append(f"{name}={conclusion or status or 'no conclusion'}")
+            elif not str(run.get("html_url") or ""):
+                unlinkable.append(name)
     ci = ci_state(check_runs, combined)
     # Everything known to be wrong, computed ONCE. The partial-read
     # branch used to return before this was built, so a count mismatch
@@ -703,7 +736,7 @@ def judge(inputs: dict, require_codex: bool = True,
     # the reader looking for the wrong thing.
     bad = [
         f"{r.get('name')}={r.get('conclusion') or r.get('status')}"
-        for r in runs_by_name.values()
+        for r in current
         if str(r.get("status") or "") != "completed"
         or str(r.get("conclusion") or "") in FAILING_CONCLUSIONS
     ]
@@ -736,7 +769,8 @@ def judge(inputs: dict, require_codex: bool = True,
         )
     elif ci == "success":
         required_links = "; ".join(
-            f"{name} {runs_by_name[name].get('html_url')}" for name in required_checks
+            f"{name} {run.get('html_url')}"
+            for name in required_checks for run in runs_by_name.get(name) or []
         )
         names = ", ".join(sorted(str(r.get("name") or "?") for r in check_runs))
         out.closed.append(
@@ -1205,6 +1239,10 @@ def read_gate_lists(owner: str, repo: str, number: int, named_sha: str,
                 "conclusion": str(r.get("conclusion") or ""),
                 "started_at": str(r.get("started_at") or ""),
                 "html_url": str(r.get("html_url") or ""),
+                # Lineage: same app + same name = attempts of one
+                # check; same name from another app = another check.
+                "app_id": str(((r.get("app") or {}).get("id")) or ""),
+                "check_suite_id": str(((r.get("check_suite") or {}).get("id")) or ""),
             }
             for r in chunk
         )

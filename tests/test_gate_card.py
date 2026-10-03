@@ -829,10 +829,10 @@ class CopilotReviewRound3(unittest.TestCase):
         inputs = green_inputs()
         inputs["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "skipped",
-             "started_at": "2026-10-03T00:10:00Z",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
              "html_url": "https://example.test/ci/new"},
             {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-02T00:10:00Z",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
              "html_url": "https://example.test/ci/old"},
         ]
         j = judged(inputs)
@@ -850,9 +850,11 @@ class CopilotReviewRound3(unittest.TestCase):
         inputs = green_inputs()
         inputs["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "skipped",
-             "started_at": "", "html_url": "https://example.test/ci/a"},
+             "started_at": "", "app_id": "15368",
+             "html_url": "https://example.test/ci/a"},
             {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "", "html_url": "https://example.test/ci/b"},
+             "started_at": "", "app_id": "15368",
+             "html_url": "https://example.test/ci/b"},
         ]
         j = judged(inputs)
         self.assertFalse(j.passed)
@@ -873,10 +875,10 @@ class CursorReviewRound3(unittest.TestCase):
         inputs = green_inputs()
         inputs["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T00:10:00Z",
+             "started_at": "2026-10-03T00:10:00Z", "app_id": "15368",
              "html_url": "https://example.test/ci/new"},
             {"name": "required-ci", "status": "completed", "conclusion": "failure",
-             "started_at": "2026-10-02T00:10:00Z",
+             "started_at": "2026-10-02T00:10:00Z", "app_id": "15368",
              "html_url": "https://example.test/ci/old"},
         ]
         j = judged(inputs)
@@ -885,9 +887,11 @@ class CursorReviewRound3(unittest.TestCase):
         # A non-required check re-run green must not refuse either.
         inputs["check_runs"] += [
             {"name": "lint", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T00:20:00Z", "html_url": "u"},
+             "started_at": "2026-10-03T00:20:00Z", "app_id": "15368",
+             "html_url": "u"},
             {"name": "lint", "status": "completed", "conclusion": "failure",
-             "started_at": "2026-10-02T00:20:00Z", "html_url": "u"},
+             "started_at": "2026-10-02T00:20:00Z", "app_id": "15368",
+             "html_url": "u"},
         ]
         self.assertTrue(judged(inputs).passed, judged(inputs).open)
         # And the latest failing still refuses.
@@ -900,10 +904,10 @@ class CursorReviewRound3(unittest.TestCase):
         inputs = green_inputs()
         inputs["check_runs"] = [
             {"name": "required-ci", "status": "completed", "conclusion": "skipped",
-             "started_at": "2026-10-02T23:00:00-04:00",
+             "started_at": "2026-10-02T23:00:00-04:00", "app_id": "15368",
              "html_url": "https://example.test/ci/actually-newer"},
             {"name": "required-ci", "status": "completed", "conclusion": "success",
-             "started_at": "2026-10-03T01:00:00Z",
+             "started_at": "2026-10-03T01:00:00Z", "app_id": "15368",
              "html_url": "https://example.test/ci/earlier-success"},
         ]
         j = judged(inputs)
@@ -1282,6 +1286,106 @@ class CursorReviewRound5(unittest.TestCase):
         got = gate_card.latest_verdict([timed_go, untimed_nogo], SHA,
                                        gate_card.cursor_verdict)
         self.assertEqual(got[0], "NO-GO")
+
+
+class CopilotReviewRound6(unittest.TestCase):
+    """Copilot discussion_r4171030308: same name, different apps.
+
+    This is the opposite horn of Cursor's green-rerun finding, and the
+    pair of them is why the rule needs LINEAGE rather than a choice.
+    """
+
+    def _run(self, name, conclusion, app, when, url="u"):
+        return {"name": name, "status": "completed", "conclusion": conclusion,
+                "app_id": app, "started_at": when, "html_url": url}
+
+    def test_two_apps_posting_one_name_are_two_checks_not_attempts(self):
+        # Copilot's repro: a newer successful `lint` and an older
+        # failing `lint`. Grouping by name alone kept the success and
+        # passed, though the failing one is a DIFFERENT check that is
+        # currently failing.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            self._run("required-ci", "success", "15368", "2026-10-03T00:00:00Z", "ci"),
+            self._run("lint", "success", "111", "2026-10-03T00:20:00Z", "lint/new-app"),
+            self._run("lint", "failure", "222", "2026-10-02T00:20:00Z", "lint/other-app"),
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("lint=failure" in l for l in j.open), j.open)
+
+    def test_attempts_of_one_check_still_collapse_to_the_newest(self):
+        # Cursor's case, which must keep working: one app, two
+        # attempts, the newer green.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            self._run("required-ci", "success", "15368", "2026-10-03T00:00:00Z", "ci"),
+            self._run("lint", "success", "111", "2026-10-03T00:20:00Z"),
+            self._run("lint", "failure", "111", "2026-10-02T00:20:00Z"),
+        ]
+        self.assertTrue(judged(inputs).passed, judged(inputs).open)
+
+    def test_every_current_run_of_a_required_name_must_pass(self):
+        # Two apps both post `required-ci`; both are the gate.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            self._run("required-ci", "success", "111", "2026-10-03T00:00:00Z", "ci/a"),
+            self._run("required-ci", "failure", "222", "2026-10-03T00:00:00Z", "ci/b"),
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("only `success` is a pass" in l for l in j.open), j.open)
+        # Both green passes, and the card links both.
+        inputs["check_runs"][1]["conclusion"] = "success"
+        ok = judged(inputs)
+        self.assertTrue(ok.passed, ok.open)
+        card = gate_card.render(inputs, ok)
+        self.assertIn("ci/a", card)
+        self.assertIn("ci/b", card)
+
+    def test_same_name_runs_with_no_app_cannot_be_proven_attempts(self):
+        # Nothing here can tell an attempt from another app's check,
+        # so it refuses rather than guessing either way.
+        inputs = green_inputs()
+        inputs["check_runs"] = [
+            {"name": "required-ci", "status": "completed", "conclusion": "success",
+             "started_at": "2026-10-03T00:10:00Z", "html_url": "a"},
+            {"name": "required-ci", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-10-02T00:10:00Z", "html_url": "b"},
+        ]
+        j = judged(inputs)
+        self.assertFalse(j.passed)
+        self.assertTrue(any("cannot say which is current" in l for l in j.open), j.open)
+
+    def test_gather_records_the_lineage(self):
+        def rest(path, params=None):
+            if path.endswith("/pulls/999"):
+                return {"state": "open", "draft": False, "merged": False,
+                        "head": {"sha": SHA}, "mergeable_state": "clean",
+                        "html_url": "https://example.test/pr/999"}
+            if path.endswith("/issues/999/comments"):
+                return []
+            if path.endswith("/pulls/999/reviews"):
+                return []
+            if path.endswith(f"/commits/{SHA}/check-runs"):
+                return {"total_count": 1, "check_runs": [
+                    {"name": "required-ci", "status": "completed",
+                     "conclusion": "success", "started_at": "2026-10-03T00:00:00Z",
+                     "html_url": "ci", "app": {"id": 15368},
+                     "check_suite": {"id": 987}}]}
+            if path.endswith(f"/commits/{SHA}/status"):
+                return {"state": "pending", "total_count": 0, "statuses": []}
+            raise AssertionError(path)
+
+        def graphql(query, variables):
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": []}}}}}
+
+        inputs = gate_card.gather("o", "r", 999, None, rest, graphql)
+        run = inputs["check_runs"][0]
+        self.assertEqual(run["app_id"], "15368")
+        self.assertEqual(run["check_suite_id"], "987")
 
 
 class RefusalCompleteness(unittest.TestCase):
