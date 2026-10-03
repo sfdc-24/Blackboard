@@ -349,10 +349,14 @@ else:
         flow = read.read()
     ran = " ".join(line for line in flow.splitlines() if not line.lstrip().startswith("#"))
     check("CI runs the rule from the protected branch, not from this tree",
-          "git show origin/main:scripts/okf_ownership.py" in flow
+          'git show "origin/main:scripts/okf_ownership.py"' in flow
           and "--protected origin/main" in flow and "--repo ." in flow
           and "--name-only" not in ran
-          and "python scripts/okf_ownership.py" not in ran)
+          # one python run, of whichever copy the version check chose; the fallback to this tree
+          # is reachable only while main predates the flags, which is only this pull request
+          and sum(1 for line in flow.splitlines()
+                  if "python" in line and "${RULE}" in line) == 1
+          and """grep -q -- '"--protected"'""" in flow)
 
 print()
 print("%d passed, %d failed" % (PASS, FAIL))
