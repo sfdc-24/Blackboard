@@ -28,6 +28,7 @@ spec = importlib.util.spec_from_file_location("okf_ownership", RULE)
 okf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(okf)
 
+RULE_INSIDE = "scripts/okf_ownership.py"
 PASS = 0
 FAIL = 0
 FAILURES = []
@@ -77,7 +78,7 @@ def run(argv, root=None):
     return code, out.getvalue()
 
 
-def repo(floor_text=None, head_floor=None):
+def repo(floor_text=None, head_floor=None, rule=True):
     """A repository whose HEAD is the base. head_floor is written to the working tree only, which is
     what CI hands the check: the candidate's own copy of the file."""
     at = tempfile.mkdtemp()
@@ -88,11 +89,19 @@ def repo(floor_text=None, head_floor=None):
     git("config", "user.name", "test")
     git("config", "commit.gpgsign", "false")
     put(at, "README.md", "base\n")
+    if rule:
+        with open(RULE, encoding="utf-8") as read:
+            mine = read.read()
+        put(at, RULE_INSIDE, mine if rule is True else rule)
     if floor_text is not None:
         put(at, "docs/okf/floor.md", floor_text)
     git("add", "-A")
     git("commit", "-qm", "base")
     git("branch", "main")           # the protected branch: the only ref a grant is read from
+    # The remote-tracking ref CI actually reads, which a local branch of the same short name cannot
+    # shadow - and it carries THIS rule's own source, because a grant is honoured only by the
+    # protected branch's copy of the rule (Codex on c33cf11).
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
     if head_floor is not None:
         put(at, "docs/okf/floor.md", head_floor)
     return at
@@ -226,8 +235,9 @@ print("and the grant is only as good as what the rule can see (Codex 20:26Z, exa
 
 # A grant may be read from the protected branch and from nothing else the branch chose.
 check("the protected branch is named by its name and nothing near it",
-      okf.authority("origin/main", "")[0] == "origin/main"
-      and okf.authority("", "main")[0] == "main"
+      okf.authority("origin/main", "")[0] == "refs/remotes/origin/main"
+      and okf.authority("", "main")[0] == "refs/remotes/origin/main"
+      and okf.authority("refs/heads/main", "")[0] == "refs/remotes/origin/main"
       and all(okf.authority(near, near)[0] == ""
               for near in ("main-ish", "mymain", "origin/mainline", "HEAD", "origin/a-branch")))
 
@@ -317,6 +327,56 @@ code, said = run(["claude-code-cli/repair", "--base", "main", "docs/okf/floor.md
 check("the repair is that page alone", code == 1, said.strip())
 shutil.rmtree(at, ignore_errors=True)
 
+# Codex's successor on c33cf11: the short name, the trusted copy, and a retired grant.
+at = repo(floor_text=floor(GEMINI_GRANT))
+put(at, "docs/okf/floor.md", floor("- grant: codex | call: %s | paths: docs/okf/" % CALL))
+commit(at, "a floor that hands codex the whole OKF, on a branch of its own")
+subprocess.run(("git", "branch", "origin/main"), cwd=at, check=True, capture_output=True)
+shadowed = subprocess.run(("git", "show", "origin/main:docs/okf/floor.md"), cwd=at,
+                          capture_output=True, text=True).stdout
+check("git's own short name resolves to the pushed branch, which is the hole",
+      "codex" in shadowed, shadowed[:80])
+code, said = run(["codex/x", "--base", "origin/main", "docs/okf/index.md"], root=at)
+check("a branch named origin/main does not become the authority", code == 1, said.strip())
+code, said = run(["gemini/okf-1", "--base", "origin/main", "docs/okf/lanes.md"], root=at)
+check("and the real grant on the remote-tracking ref still admits", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+at = repo(floor_text=floor(GEMINI_GRANT), rule="# a different rule entirely\n")
+trusted, why = okf.trusted_copy("refs/remotes/origin/main", at)
+check("a rule that is not the protected copy knows it", not trusted and "not the copy on" in why,
+      why)
+code, said = run(["gemini/okf-1", "--base", "main", "docs/okf/lanes.md"], root=at)
+check("and honours no grant", code == 1, said.strip())
+code, said = run(["gemini/okf-1", "--base", "main", "src/anything.py"], root=at)
+check("while everything outside the OKF is unaffected", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+at = repo(floor_text=floor(GEMINI_GRANT), rule=False)
+trusted, why = okf.trusted_copy("refs/remotes/origin/main", at)
+check("no rule on the protected ref is not a trusted copy either",
+      not trusted and "carries no" in why, why)
+shutil.rmtree(at, ignore_errors=True)
+
+two_keys = floor(GEMINI_GRANT, call=CALL).replace("call: %s\n" % CALL, "call:\ncall: %s\n" % CALL)
+check("every call KEY counts, so an empty one plus a value is ambiguous",
+      okf.floor_call(two_keys)[0] == "" and "2 call lines" in okf.floor_call(two_keys)[1],
+      okf.floor_call(two_keys)[1])
+
+retired = "- grant: codex | call: a call that has ended | paths: docs/okf/"
+both = floor(retired, GEMINI_GRANT)
+check("a grant retired with another call does not block a live one",
+      okf.overlapping_in_a_call(both) is None
+      and okf.overlapping(okf.grants(both, None)) is not None)
+at = repo(floor_text=both)
+code, said = run(["gemini/okf-1", "--base", "main", "docs/okf/lanes.md"], root=at)
+check("so the live handover is admitted", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+same = floor(GEMINI_GRANT, "- grant: codex | call: %s | paths: docs/okf/" % CALL)
+check("two grants on one page for the SAME call still refuse",
+      okf.overlapping_in_a_call(same) is not None)
+
 # The rule answers its own controls before it judges anything.
 check("the rule holds its own controls", okf.controls_hold() == "", okf.controls_hold())
 kept = okf.allowed
@@ -349,7 +409,7 @@ else:
         flow = read.read()
     ran = " ".join(line for line in flow.splitlines() if not line.lstrip().startswith("#"))
     check("CI runs the rule from the protected branch, not from this tree",
-          'git show "origin/main:scripts/okf_ownership.py"' in flow
+          'git show "refs/remotes/origin/main:scripts/okf_ownership.py"' in flow
           and "--protected origin/main" in flow and "--repo ." in flow
           and "--name-only" not in ran
           # one python run, of whichever copy the version check chose; the fallback to this tree

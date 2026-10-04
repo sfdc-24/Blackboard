@@ -47,6 +47,17 @@ AND THE GRANT IS ONLY AS GOOD AS WHAT THE RULE CAN SEE. Codex's exact-head revie
     copy from the protected branch, outside the checkout, because the branch being judged was
     supplying its own judge.
 
+AND CODEX GOT PAST THAT THREE MORE WAYS (00:25Z, on c33cf11 and conference a4abec9):
+
+  * the short name was shadowable - `git show origin/main:f` prefers `refs/heads/origin/main`, and
+    anyone may push a branch by that name - so every short name now resolves through `FULL`;
+  * the decision to USE the trusted copy was the candidate's, since the step that extracts it lives
+    in the candidate's workflow, so the rule proves which copy it is (`trusted_copy`) and honours no
+    grant while it is not the protected branch's own;
+  * a collision is judged within one call (`overlapping_in_a_call`), because a grant retired with an
+    older call was blocking a valid new one;
+  * and every `call:` KEY counts, not every non-empty value.
+
 A branch prefix is attribution, not an authenticated identity: everyone pushes as the same account.
 That is as true here as it is on the conference line, and a grant trusts the prefix the same way.
 
@@ -81,6 +92,15 @@ GRANT = re.compile(r"^\s*-\s*grant:\s*([a-z0-9-]+)\s*\|\s*call:\s*([^|]+?)\s*\|\
 # target an unmerged branch of its own and that branch may carry anything (Codex 20:26Z, exact-head
 # review of conference 162 and this PR). A closed list, never a pattern: `main-ish` is not main.
 PROTECTED = ("main", "origin/main", "refs/heads/main", "refs/remotes/origin/main")
+# What a short name is resolved AS. `git show origin/main:file` prefers refs/heads/origin/main over
+# refs/remotes/origin/main, so a branch literally named `origin/main` - which anyone may push -
+# becomes the "protected" copy and hands itself the rule and the floor. Codex reproduced that on
+# c33cf11: a trusted-copy refusal turned into an admission. Short names resolve through here, and
+# nothing else is believed.
+FULL = {"main": "refs/remotes/origin/main",
+        "origin/main": "refs/remotes/origin/main",
+        "refs/heads/main": "refs/remotes/origin/main",
+        "refs/remotes/origin/main": "refs/remotes/origin/main"}
 
 
 def front_matter(text: str) -> str:
@@ -140,6 +160,25 @@ def overlapping(grants_map: dict):
     return None
 
 
+def calls_named(floor_text: str) -> tuple:
+    """Every call the open grants name, in the order they appear, without repeats."""
+    return tuple(dict.fromkeys(call.strip()
+                               for _, call, _ in GRANT.findall(open_section(floor_text))))
+
+
+def overlapping_in_a_call(floor_text: str):
+    """The first pair of DIFFERENT agents granted one page FOR THE SAME CALL.
+
+    Two pens on one page is a conflict only while both are open. Judging the whole file at once
+    made a grant retired with an older call block a valid new one (Codex on c33cf11).
+    """
+    for call in calls_named(floor_text):
+        clash = overlapping(grants(floor_text, call))
+        if clash:
+            return clash
+    return None
+
+
 def handed_over(branch: str, path: str, floor_text: str, call: str = None) -> bool:
     """Whether the floor hands `branch`'s agent the pen for `path`, right now."""
     for prefix, paths in grants(floor_text, call).items():
@@ -156,16 +195,22 @@ def floor_call(floor_text: str) -> tuple:
     would be bound to a call nobody is having: the ambiguity is refused rather than guessed (Codex
     20:26Z found the pair on the conference line, where the plan declared the call).
     """
-    said = []
+    said, keys = [], 0
     for line in front_matter(floor_text or "").splitlines():
         key, _, value = line.partition(":")
-        if key.strip().lower() == "call" and value.strip():
+        if key.strip().lower() != "call":
+            continue
+        # EVERY key counts, empty or not. `call:` with `call: an old call` under it declares two,
+        # and accepting "the one non-empty value" admitted it - while a reader that keeps the LAST
+        # value would have read the empty one and had no call at all (Codex on c33cf11).
+        keys += 1
+        if value.strip():
             said.append(value.strip())
+    if keys > 1:
+        return "", ("its front matter declares %d call lines (%s), which is ambiguous"
+                    % (keys, ", ".join(repr(s) for s in said) or "all empty"))
     if not said:
         return "", "its front matter names no call"
-    if len(said) > 1:
-        return "", "its front matter names %d calls (%s), which is ambiguous" % (
-            len(said), ", ".join(repr(s) for s in said))
     return said[0], ""
 
 
@@ -178,12 +223,45 @@ def authority(base: str, protected: str) -> tuple:
     """
     for ref in (protected, base):
         if ref and ref in PROTECTED:
-            return ref, ""
+            # Always the full remote-tracking path, never a short name a local branch can shadow.
+            return FULL[ref], ""
     if protected:
         return "", "%r is not the protected branch, so it carries no grant" % protected
     if base:
         return "", "%r is not the protected branch, so no grant is read from it" % base
     return "", "no protected branch was named, so no grant can be in force"
+
+
+def own_source() -> str:
+    """This file's bytes as they are running, or "" when they cannot be read."""
+    try:
+        return Path(__file__).resolve().read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def trusted_copy(ref: str, root=None) -> tuple:
+    """(whether this running rule IS the protected branch's copy, why it is not).
+
+    CI takes the rule from the protected ref and runs it from outside the checkout, but the step
+    that does so lives in the candidate's own workflow, so the DECISION to use the trusted copy is
+    the candidate's to make. This is the half that does not depend on it: the rule compares what it
+    is running with what the protected ref holds, and while they differ it honours NO GRANT at all.
+    Everything outside docs/okf/ is unaffected, and so is a writer's own standing access, so an
+    ordinary pull request never notices; only a handover waits for the merge.
+    """
+    if not ref:
+        return False, "no protected branch was named"
+    theirs = _show(ref, 'scripts/okf_ownership.py', root)
+    if theirs is None:
+        return False, "%s carries no %s to compare this rule against" % (ref, 'scripts/okf_ownership.py')
+    mine = own_source()
+    if not mine:
+        return False, "this rule cannot read its own source to prove which copy it is"
+    if mine.replace("\r\n", "\n") != theirs.replace("\r\n", "\n"):
+        return False, ("this rule is not the copy on %s, so no grant is in force; a grant counts "
+                       "only once the rule enforcing it is merged" % ref)
+    return True, ""
 
 
 def _unquote(path: str) -> str:
@@ -368,6 +446,14 @@ def main(argv, root=None) -> int:
     floor, call, why = in_force(ref, root)
     if not ref:
         why = why_authority
+    # A HANDOVER IS HONOURED ONLY BY THE PROTECTED BRANCH'S OWN COPY OF THIS RULE. CI takes the
+    # rule from that ref, but the step that does so is in the candidate's workflow, so the decision
+    # is the candidate's; this does not depend on it.
+    trusted, untrusted = trusted_copy(ref, root)
+    if not trusted:
+        floor = ""
+        if ref:                     # with no ref, the authority already said which one and why
+            why = untrusted or why
     # What changed is git's account, not the caller's: a rename names both of its ends.
     if base:
         found, blind = changed(base, root)
@@ -388,7 +474,7 @@ def main(argv, root=None) -> int:
     # Two pens on one page: refused when this branch proposes it, and when the protected floor
     # already carries it - except for the one repair that can close that.
     candidate = _candidate_floor(root)
-    proposed = overlapping(grants(candidate, None)) if candidate and candidate != floor else None
+    proposed = overlapping_in_a_call(candidate) if candidate and candidate != floor else None
     if proposed:
         print("REFUSED: this branch's own %s hands one page to two agents: %s has %s and %s has %s."
               % ((FLOOR,) + proposed))

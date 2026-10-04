@@ -43,7 +43,7 @@ jobs:
           # until it merges there is nothing trusted to take: the step tries, says which copy it
           # ran, and every pull request after this one gets the copy from main.
           RULE="scripts/okf_ownership.py"
-          if git show "origin/main:scripts/okf_ownership.py" > "${RUNNER_TEMP}/trusted/okf_ownership.py" 2>/dev/null \
+          if git show "refs/remotes/origin/main:scripts/okf_ownership.py" > "${RUNNER_TEMP}/trusted/okf_ownership.py" 2>/dev/null \
              && grep -q -- '"--protected"' "${RUNNER_TEMP}/trusted/okf_ownership.py"; then
             RULE="${RUNNER_TEMP}/trusted/okf_ownership.py"
             sha256sum "${RULE}"
