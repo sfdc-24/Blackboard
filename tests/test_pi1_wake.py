@@ -414,6 +414,69 @@ class TheSecondReview(Fixture):
                          json.loads(self.state_path.read_text(encoding="utf-8"))["watermark"],
                          "a refusal must leave the broken cursor exactly as it found it")
 
+    def test_a_watermark_of_only_whitespace_refuses_too(self):
+        """My first repair wrote `mark.strip()`, which was the same hole wearing whitespace
+        (Codex on eae027d). `"   "` is TRUTHY to one_pass, so priming is skipped, and unparseable
+        to read_ts, so the read loses its `since`: a cursor that looks blank and rings a
+        fortnight. Both halves are asserted here, so the fixture cannot stop meaning this."""
+        for blank in ("   ", "\t", "\n", " \t "):
+            self.state_path.write_text(json.dumps({"watermark": blank}), encoding="utf-8")
+            self.assertTrue(bool(blank), "a falsy string would take the first-run path instead")
+            self.assertIsNone(pw.read_ts(blank), blank)
+            with self.assertRaises(pw.StateUnreadable, msg=repr(blank)):
+                pw.load_state(self.state_path)
+        with mock.patch.object(pw.bus, "load_env", return_value=self.env), \
+             mock.patch.object(pw, "rows_since") as read:
+            rc = pw.main(["--cmd", "wake.sh", "--state", str(self.state_path),
+                          "--inbox", str(self.inbox)])
+        self.assertEqual(2, rc)
+        read.assert_not_called()
+
+    def test_rows_recorded_as_seen_with_no_cursor_refuse(self):
+        """The same finding by its other route: seen ids make one_pass skip priming, and a missing
+        watermark makes the read unfiltered - no invalid string anywhere to catch. Every state
+        this script writes carries both, so one without the other was never written here."""
+        for broken in ({"seen_row_ids": ["A", "B"]},
+                       {"enqueued_row_ids": ["A"]},
+                       {"watermark": "", "seen_row_ids": ["A"]}):
+            self.state_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaises(pw.StateUnreadable, msg=repr(broken)):
+                pw.load_state(self.state_path)
+        kept = self.state_path.read_text(encoding="utf-8")
+        with mock.patch.object(pw.bus, "load_env", return_value=self.env), \
+             mock.patch.object(pw, "rows_since") as read:
+            rc = pw.main(["--cmd", "wake.sh", "--state", str(self.state_path),
+                          "--inbox", str(self.inbox)])
+        self.assertEqual(2, rc)
+        read.assert_not_called()
+        self.assertEqual(kept, self.state_path.read_text(encoding="utf-8"),
+                         "a refusal must leave the broken cursor exactly as it found it")
+
+    def test_a_cursor_with_its_history_is_still_accepted(self):
+        """The shape this script actually writes: both, together. It must not be collateral."""
+        good = {"watermark": pw.stamp(T0), "seen_row_ids": ["A"], "enqueued_row_ids": ["A"]}
+        self.state_path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(good, pw.load_state(self.state_path))
+
+    def test_the_suite_may_not_be_absent_while_the_doorbell_is_present(self):
+        """Codex on eae027d: the CI step skipped when tests/test_pi1_wake.py was missing, and the
+        workflow's broader "no eligible suite" guard stayed green because other suites exist - so
+        deleting these controls would go green. Reads the workflow off the disk, and says so
+        instead of failing when the files here are not the version under test."""
+        flow = REPO / ".github" / "workflows" / "python-suites.yml"
+        rule = REPO / "scripts" / "pi1_wake.py"
+        if not (flow.is_file() and rule.is_file()
+                and "def reconcile_inbox(" in rule.read_text(encoding="utf-8")):
+            self.skipTest("the files on this disk are not the version under test")
+        text = flow.read_text(encoding="utf-8")
+        live = " ".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn("[ -f scripts/pi1_wake.py ] && [ ! -f tests/test_pi1_wake.py ]", live,
+                      "absence of the suite must fail the step, not skip it")
+        self.assertIn("exit 1", live)
+        self.assertIn("tests/test_pi1_wake.py \\", text,
+                      "the suite must also be counted by the no-eligible-suite control")
+        self.assertIn("unshare -n", live)
+
     def test_an_empty_watermark_is_no_cursor_rather_than_a_broken_one(self):
         self.state_path.write_text(json.dumps({"watermark": ""}), encoding="utf-8")
         self.assertEqual({"watermark": ""}, pw.load_state(self.state_path))

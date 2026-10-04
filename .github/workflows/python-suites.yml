@@ -757,11 +757,21 @@ jobs:
       - name: pi1 doorbell cursor, journal and refusals (no network)
         run: |
           set -euo pipefail
+          # ABSENCE OF THE SUITE IS A FAILURE, NOT A SKIP, whenever the script it guards is here.
+          # The `if [ -f ]` idiom above exists because suites arrive on different branches - and
+          # Codex's review of eae027d pointed out what it costs: delete tests/test_pi1_wake.py and
+          # this step goes green, while the workflow's broader "no eligible suite" guard stays
+          # green too because other suites exist. The doorbell may not ship without its controls.
+          if [ -f scripts/pi1_wake.py ] && [ ! -f tests/test_pi1_wake.py ]; then
+            echo "::error::scripts/pi1_wake.py is present and tests/test_pi1_wake.py is not." \
+                 "A silent skip is how a deleted suite stays green." >&2
+            exit 1
+          fi
           if [ -f tests/test_pi1_wake.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/test_pi1_wake.py
           else
-            echo "not on this branch; skipping"
+            echo "neither the doorbell nor its suite is on this branch; nothing to run"
           fi
 
       # FastAPI and its in-process TestClient are needed only by the controller

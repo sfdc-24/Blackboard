@@ -39,9 +39,12 @@ AND FROM THE SECOND REVIEW (Codex on f2eaee0, three P2s: CODEX-SUCCESSOR-QC-RESU
     cursor on a full read does not make the rows it left out reachable - the next read returns the
     same newest n, and the bus has no `until` to page back with. So --limit is accepted only with
     --dry-run, and a pass that could ring or move the cursor reads uncapped.
-  * A CURSOR THAT IS NOT A TIMESTAMP FAILS CLOSED. A nonempty string that will not parse used to
-    fail open twice over: the read went out unfiltered, and priming was skipped because the
-    watermark was truthy. It is validated in load_state, before any read.
+  * A CURSOR THAT IS NOT A TIMESTAMP FAILS CLOSED. A nonempty string that will not parse failed
+    open twice over: the read went out unfiltered, and priming was skipped because the watermark
+    was truthy. It is validated in load_state, before any read - and "nonempty" means nonempty,
+    not nonempty-after-stripping, because `"   "` wore that distinction as a disguise. A state
+    that records rows as SEEN while carrying no usable cursor is refused for the same reason: it
+    reaches an unfiltered read with priming skipped, by another route.
   * THE INBOX FILE IS THE JOURNAL. It is appended and fsynced before the state records it, so a
     kill between the two left a row the state did not know about. Recovery reads the inbox's own
     Row_IDs, and a torn final line is truncated so the row is written once, whole.
@@ -167,17 +170,32 @@ def load_state(path: Path) -> dict:
     mark = data.get("watermark")
     if mark is not None and not isinstance(mark, str):
         raise StateUnreadable("%s has a watermark that is not a string" % path)
-    if isinstance(mark, str) and mark.strip() and read_ts(mark) is None:
-        # A cursor that is a string but not a timestamp used to fail OPEN, and that was the worst
-        # of the ways out: read_ts() returned None, so the read went out UNFILTERED over the whole
-        # board, while the watermark was still truthy, so first-run priming was skipped. The
-        # doorbell would then ring for every row in the board's history inside the age window
-        # (Codex's second P2 on f2eaee0). Validated here, before anything is read.
+    if isinstance(mark, str) and mark != "" and read_ts(mark) is None:
+        # A cursor that is a string but not a timestamp fails OPEN, and that is the worst of the
+        # ways out: read_ts() returns None, so the read goes out UNFILTERED over the whole board,
+        # while the watermark is still truthy, so first-run priming is skipped. The doorbell then
+        # rings for every row in the board's history inside the age window (Codex's second P2 on
+        # f2eaee0).
+        #
+        # MY FIRST REPAIR WROTE `mark.strip()` HERE, which was the same hole wearing whitespace
+        # (Codex on eae027d). `"   "` is TRUTHY to one_pass, so priming is skipped, and
+        # unparseable to read_ts, so the read loses its `since`: a cursor that looks blank and
+        # rings a fortnight. The test is now "nonempty", not "nonempty after stripping".
         raise StateUnreadable(
-            "%s has a watermark that is not a timestamp (%r)" % (path, mark.strip()[:48]))
+            "%s has a watermark that is not a timestamp (%r)" % (path, mark[:48]))
     for key in ("seen_row_ids", "enqueued_row_ids"):
         if key in data and not isinstance(data[key], list):
             raise StateUnreadable("%s has a %s that is not a list" % (path, key))
+    # A HISTORY WITHOUT A CURSOR IS ALSO A BROKEN CURSOR (Codex on eae027d, the same finding by
+    # its other route). Rows recorded as seen make one_pass skip first-run priming, and a missing
+    # or empty watermark makes the read unfiltered - the identical flood with no invalid string
+    # anywhere to catch. Every state this script writes carries both, so one without the other was
+    # never written here, and refusing it costs nothing a working install would notice.
+    if (data.get("seen_row_ids") or data.get("enqueued_row_ids")) and read_ts(mark or "") is None:
+        raise StateUnreadable(
+            "%s records %d row(s) as already seen and carries no usable cursor, so a read would"
+            " cover the whole board without priming"
+            % (path, len(data.get("seen_row_ids") or []) + len(data.get("enqueued_row_ids") or [])))
     return data
 
 

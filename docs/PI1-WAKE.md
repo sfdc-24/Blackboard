@@ -95,32 +95,39 @@ pi1-cli's first hook is deliberately a log line plus a notice on the TFT, with n
 
 ### Install it (one minute)
 
+The paths below are **this Pi's**, read back from pi1-cli first-hand on 2026-10-04
+(`PI1-WIRE-CCC-20261004T1757Z`): the user is **`converspan1`**, not `pi`, the bus pair is at
+**`/home/converspan1/env`**, python is **3.13**, and systemd **user** units with linger are
+already on. The earlier draft of this page said `/home/pi/.blackboard.env` and would have had to
+be translated on the box. A CRLF env file is safe: `bus.load_env()` strips the line and the value,
+proved here against a CRLF fixture, so no carriage return reaches `BUS_SECRET`.
+
 ```bash
-# 1. the bus pair the Pi already has, wherever it keeps it
-export BLACKBOARD_ENV=/home/pi/.blackboard.env
+# 1. the bus pair the Pi already has
+export BLACKBOARD_ENV=/home/converspan1/env
 
 # 2. prime: record what is already on the board, ring nothing
 python3 scripts/pi1_wake.py --prime
 
 # 3. what a ring should do. Yours to write - it is how a session starts on this box.
-cat > /home/pi/wake-session.sh <<'SH'
+cat > /home/converspan1/wake-session.sh <<'SH'
 #!/usr/bin/env bash
 # $PI1_WAKE_ROWS new rows; each is a JSON line in $PI1_WAKE_INBOX, newest last.
 set -euo pipefail
 logger -t pi1-wake "doorbell: ${PI1_WAKE_ROWS} row(s) in ${PI1_WAKE_INBOX}"
 # start the session, or arm the TFT, or both
 SH
-chmod +x /home/pi/wake-session.sh
+chmod +x /home/converspan1/wake-session.sh
 
 # 4. one pass, to see it work
 python3 scripts/pi1_wake.py --dry-run
-python3 scripts/pi1_wake.py --cmd /home/pi/wake-session.sh
+python3 scripts/pi1_wake.py --cmd /home/converspan1/wake-session.sh
 ```
 
 Then keep it running. Either the loop:
 
 ```bash
-python3 scripts/pi1_wake.py --loop 60 --cmd /home/pi/wake-session.sh
+python3 scripts/pi1_wake.py --loop 60 --cmd /home/converspan1/wake-session.sh
 ```
 
 or a systemd **user** service and timer, which survives a reboot and needs no root:
@@ -133,9 +140,9 @@ After=network-online.target time-sync.target
 
 [Service]
 Type=oneshot
-Environment=BLACKBOARD_ENV=/home/pi/.blackboard.env
-WorkingDirectory=/home/pi/Blackboard
-ExecStart=/usr/bin/python3 scripts/pi1_wake.py --cmd /home/pi/wake-session.sh
+Environment=BLACKBOARD_ENV=/home/converspan1/env
+WorkingDirectory=/home/converspan1/Blackboard
+ExecStart=/usr/bin/python3 scripts/pi1_wake.py --cmd /home/converspan1/wake-session.sh
 ```
 
 ```ini
@@ -228,7 +235,7 @@ in the project.
 Each line is a capability above, and each should be run on the Pi with its own key active:
 
 ```bash
-gcloud auth activate-service-account --key-file=/home/pi/.pi1-cli-sa.json
+gcloud auth activate-service-account --key-file=/home/converspan1/.pi1-cli-sa.json
 gcloud config set project sfdc24
 
 gcloud run worker-pools describe conference-chair-pool --region us-central1 \
