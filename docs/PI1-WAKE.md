@@ -145,6 +145,16 @@ in the project.
    the chair can read. The alternative is a deploy-only Cloud Run job the Pi may merely *invoke*,
    holding no path to the chair's identity — a new resource, so his word, and Gemini has the design
    question (`CCC-GEMINI-PI1-ACCESS-20261004T0045Z`, Q1 and Q2).
+   **Gemini's design, asked for by him and answered at 00:18Z** (`GEMINI-WAKE-CCC-GEMINI-PI1-ACCESS-20261004T0045Z-6f6f7a5de1`):
+   build a Cloud Run **deployer or broker** that holds the GCP roles, and grant the Pi only
+   `roles/run.invoker` on it — or let the Pi sign its request with the bus pair it already has and
+   have the broker verify and act. Either way no GCP credential leaves the cloud boundary. That is
+   the same shape as the alternative above, so it is now the design of record for duty 4, and it is
+   a new resource, so it waits for his word. One correction, because Gemini is a model endpoint and
+   its answer is reasoning rather than a measurement: it named `roles/run.admin` for the deploy. The
+   pool deploy in `chair/deploy.sh` needs `roles/run.developer`, which is what he granted and which
+   is the narrower of the two.
+
 2. **The bucket condition permits listing the whole bucket, not only the transcripts.** It reads
    `resource.type == "storage.googleapis.com/Bucket" || resource.name.startsWith(".../objects/conference/transcripts/")`.
    Object **bytes** are restricted to the transcripts prefix, which is what matters; but
@@ -153,6 +163,13 @@ in the project.
    data, state objects. Dropping that disjunct would also stop the Pi listing the transcripts
    prefix at all, which is survivable (the operator gets the exact object path from the chair's own
    log line and the call's record). Left as he set it, named here, his to tighten.
+
+3. **The key exists, and Gemini says it should not.** Its answer: *"Do not put a long-lived GCP
+   JSON key on the Pi."* He created one at 00:18:32Z, which is what makes duties 1 to 3 possible
+   tonight, so the honest position is a sequence rather than a contradiction: keep the key while the
+   Pi files records, plans and floor grants; build the broker for the deploy; then disable the key
+   and rotate nothing because there is nothing left to rotate. Until then the key is a secret on a
+   device in his house, and that is a known, written-down exposure rather than an oversight.
 
 ### Verify it from the Pi, first-hand
 
@@ -189,9 +206,16 @@ minus `docs/okf/floor.md`, which hands out the pen, and `docs/okf/gemini/`.
 not know the prefix, and refuses its OKF edits. So the first thing a merge unblocks is pi1-cli
 writing the OKF at all.
 
-The push credential is the other half, and it is Gemini's Q3: the whole fleet pushes as one GitHub
-user, so the question is whether the Pi gets a fine-grained token scoped to those repositories with
-contents and pull-request write, a GitHub App installation, or a deploy key per repository — and
-what CI should check so that a `pi1-cli` token pushing a `claude-code-cli/` branch is **refused**
-rather than merely noticed. Until that is decided the Pi keeps its read-only clone and hands its
-diffs to the operator.
+The push credential is the other half. Gemini's answer names the shape — *"a fine-grained Personal
+Access Token scoped strictly to the required repositories and actions"* — which for this fleet means
+contents and pull-requests write on `sfdc-24/conference`, `sfdc-24/Blackboard` and
+`sfdc-24/sfdc24-site`, and nothing else: no workflow scope, no admin, no other repository. Creating
+that token is his tap, like every credential here.
+
+It did not answer the second half of that question, so it stays open and it matters: a fine-grained
+token cannot tell CI **which** agent pushed, because the whole fleet pushes as one user and the
+branch prefix is attribution, not an identity. A `pi1-cli` token pushing a `claude-code-cli/` branch
+would be admitted by the ownership rule today. The honest options are a GitHub App installation per
+agent (a real identity, and a build), or accepting the prefix as a convention and saying so. Until
+one is chosen, the Pi keeps its read-only clone for anything outside `docs/okf/` and hands its diffs
+to the operator.
