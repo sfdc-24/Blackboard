@@ -9,7 +9,14 @@ during a slow wake, a corrupt cursor that silently primed pending work away, two
 one row across a failed then successful wake, and a genuine ALL row missed because the fixture
 meant to test ALL also carried `to=pi1-cli`.
 
-Run: python3 -m unittest tests.test_pi1_wake
+Codex's second pass, on head f2eaee0, found three more (P2,
+CODEX-SUCCESSOR-QC-RESULT-20261004T1336Z) and they are the `TheSecondReview` group: a capped read
+whose held cursor could never reach the rows the cap left out, because `limit` on this bus is the
+NEWEST n; a cursor string that would not parse and so failed OPEN, reading the whole board
+unfiltered while skipping the priming that a missing cursor gets; and an inbox and a state file
+written one after the other, so a kill between them wrote the row a second time on restart.
+
+Run: python3 tests/test_pi1_wake.py   (or python3 -m unittest tests.test_pi1_wake)
 """
 import json
 import sys
@@ -98,7 +105,13 @@ class Addressing(unittest.TestCase):
         self.assertFalse(pw.to_everyone(["R8", pw.stamp(T0)]))
 
 
-class Passes(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    """One pass against a temporary state file and inbox, on a clock the test moves.
+
+    Carries no tests of its own: the groups below inherit it so that a second group does not have
+    to re-run the first group's controls to reach the same setUp.
+    """
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -138,6 +151,8 @@ class Passes(unittest.TestCase):
         return [json.loads(l)["row_id"] for l in
                 self.inbox.read_text(encoding="utf-8").splitlines() if l.strip()]
 
+
+class Passes(Fixture):
     # --- the first run -------------------------------------------------------------------------
     def test_the_first_run_primes_and_rings_nothing(self):
         rc, run = self.pass_with([row("OLD-1"), row("OLD-2")], state={})
@@ -329,6 +344,147 @@ class Passes(unittest.TestCase):
         state = {"watermark": pw.stamp(T0), "seen_row_ids": ["x%d" % i for i in range(600)]}
         pw.save_state(state, self.state_path)
         self.assertEqual(pw.SEEN_CAP, len(self.saved()["seen_row_ids"]))
+
+
+class TheSecondReview(Fixture):
+    """Codex's three P2s on head f2eaee0 (CODEX-SUCCESSOR-QC-RESULT-20261004T1336Z), plus the
+    clock the Pi does not keep.
+
+    Each one failed in a direction that looked safe in the source and is not: a capped read whose
+    cursor was held, a cursor string that would not parse, and two files written one after the
+    other.
+    """
+
+    # --- P2 one: `limit` is the NEWEST n, so holding the cursor is not a repair ------------------
+    def test_a_ringing_pass_refuses_a_limit(self):
+        """Nothing is read, rung or written: not even the cursor file appears."""
+        with mock.patch.object(pw, "rows_since") as read:
+            rc = pw.main(["--limit", "50", "--cmd", "wake.sh",
+                          "--state", str(self.state_path), "--inbox", str(self.inbox)])
+        self.assertEqual(2, rc)
+        read.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+        self.assertEqual([], self.inbox_ids())
+
+    def test_priming_refuses_a_limit_too(self):
+        """Priming on the newest n would record only those as seen, and leave the rest to ring."""
+        with mock.patch.object(pw, "rows_since") as read:
+            rc = pw.main(["--prime", "--limit", "5", "--state", str(self.state_path)])
+        self.assertEqual(2, rc)
+        read.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+
+    def test_a_dry_run_may_still_be_capped(self):
+        """A person looking at the newest few rows is not a doorbell; that use stays."""
+        with mock.patch.object(pw.bus, "load_env", return_value=self.env), \
+             mock.patch.object(pw, "rows_since", return_value=[row("N1")]) as read:
+            rc = pw.main(["--limit", "7", "--dry-run", "--cmd", "wake.sh",
+                          "--state", str(self.state_path), "--inbox", str(self.inbox)])
+        self.assertEqual(0, rc)
+        self.assertEqual(7, read.call_args.kwargs["limit"])
+        self.assertFalse(self.state_path.exists())
+
+    def test_the_cursor_is_still_held_on_a_read_that_came_back_full(self):
+        """The belt behind the refusal. one_pass keeps the rule, so a caller that reaches it with
+        a limit some other way still cannot move the cursor over rows it never saw."""
+        self.pass_with([], state={})
+        held = self.saved()["watermark"]
+        self.clock.tick(600)
+        rc, run = self.pass_with([row("N1"), row("N2")], limit=2, cmd="")
+        self.assertEqual(held, self.saved()["watermark"])
+        self.assertEqual(["N1", "N2"], self.inbox_ids())
+
+    # --- P2 two: a cursor that is a string but not a timestamp used to fail OPEN ----------------
+    def test_a_watermark_that_is_not_a_timestamp_refuses_the_pass(self):
+        """It failed open twice over: read_ts() gave None, so the read went out with no `since` at
+        all, and the watermark was still truthy, so first-run priming was skipped. Every row in
+        the board's history inside the age window would have rung."""
+        self.state_path.write_text(json.dumps({"watermark": "yesterday-ish",
+                                               "seen_row_ids": ["A"]}), encoding="utf-8")
+        with self.assertRaises(pw.StateUnreadable):
+            pw.load_state(self.state_path)
+        with mock.patch.object(pw.bus, "load_env", return_value=self.env), \
+             mock.patch.object(pw, "rows_since") as read:
+            rc = pw.main(["--cmd", "wake.sh", "--state", str(self.state_path),
+                          "--inbox", str(self.inbox)])
+        self.assertEqual(2, rc)
+        read.assert_not_called()
+        self.assertEqual([], self.inbox_ids())
+        self.assertEqual("yesterday-ish",
+                         json.loads(self.state_path.read_text(encoding="utf-8"))["watermark"],
+                         "a refusal must leave the broken cursor exactly as it found it")
+
+    def test_an_empty_watermark_is_no_cursor_rather_than_a_broken_one(self):
+        self.state_path.write_text(json.dumps({"watermark": ""}), encoding="utf-8")
+        self.assertEqual({"watermark": ""}, pw.load_state(self.state_path))
+        rc, run = self.pass_with([row("OLD-1")])
+        self.assertEqual(0, rc)
+        run.assert_not_called()
+        self.assertEqual(pw.stamp(T0), self.saved()["watermark"])
+
+    def test_a_real_timestamp_is_accepted_in_either_spelling(self):
+        for mark in ("2026-10-04T12:00:00Z", "2026-10-04T12:00:00+00:00",
+                     "2026-10-04T12:00:00"):
+            self.state_path.write_text(json.dumps({"watermark": mark}), encoding="utf-8")
+            self.assertEqual(mark, pw.load_state(self.state_path)["watermark"], mark)
+
+    # --- P2 three: the inbox and the state are two files, and a kill lands between them ---------
+    def test_the_journal_names_the_rows_the_inbox_already_holds(self):
+        pw.append_inbox([row("A"), row("B")], self.inbox)
+        self.assertEqual({"A", "B"}, pw.reconcile_inbox(self.inbox))
+        self.assertEqual(set(), pw.reconcile_inbox(Path(self.tmp.name) / "never-written.jsonl"))
+
+    def test_a_kill_between_the_inbox_and_the_state_does_not_write_the_row_twice(self):
+        """The inbox is appended and fsynced BEFORE the state records that it was, because the
+        other order loses the notification outright. So the state is not the only record of what
+        was written down - the inbox is read back on recovery."""
+        self.pass_with([], state={})
+        with mock.patch.object(pw, "save_state", side_effect=RuntimeError("killed")):
+            with self.assertRaises(RuntimeError):
+                self.pass_with([row("N1")])
+        self.assertEqual(["N1"], self.inbox_ids(), "the inbox took the row")
+        self.assertNotIn("N1", self.saved().get("enqueued_row_ids") or [],
+                         "the state did not get to record it - which is the gap")
+        rc, run = self.pass_with([row("N1")])
+        self.assertEqual(0, rc)
+        self.assertEqual(["N1"], self.inbox_ids(), "one row became two inbox entries")
+        self.assertEqual(1, run.call_count, "the notification is still delivered after the kill")
+
+    def test_a_torn_last_line_is_repaired_and_the_row_written_once_whole(self):
+        """A kill DURING the append leaves a fragment. It is not an entry, and it holds no
+        readable Row_ID, so it is truncated away and the row is written again, complete."""
+        self.pass_with([], state={})
+        self.inbox.write_bytes(b'{"row_id": "N1", "ts": "2026-10-04T12:0')
+        rc, run = self.pass_with([row("N1")])
+        self.assertEqual(0, rc)
+        text = self.inbox.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith("\n"), "the inbox was left mid-line")
+        self.assertEqual(1, text.count('"row_id"'))
+        self.assertEqual(["N1"], self.inbox_ids())
+
+    def test_a_complete_inbox_is_left_alone(self):
+        pw.append_inbox([row("A")], self.inbox)
+        before = self.inbox.read_bytes()
+        pw.reconcile_inbox(self.inbox)
+        self.assertEqual(before, self.inbox.read_bytes())
+
+    # --- the Pi has no clock battery ------------------------------------------------------------
+    def test_the_cursor_is_never_moved_backwards_by_a_stale_clock(self):
+        """A boot that reads the board before time-sync.target lands carries whatever hour the
+        clock believes in. A cursor that followed it down would re-ring everything since."""
+        self.pass_with([], state={})
+        ahead = self.saved()["watermark"]
+        self.clock.at = T0 - timedelta(hours=6)
+        rc, run = self.pass_with([], cmd="")
+        self.assertEqual(0, rc)
+        self.assertEqual(ahead, self.saved()["watermark"])
+
+    def test_the_cursor_still_moves_forward(self):
+        self.pass_with([], state={})
+        self.clock.tick(600)
+        read_at = self.clock.at
+        self.pass_with([], cmd="")
+        self.assertEqual(pw.stamp(read_at), self.saved()["watermark"])
 
 
 class TheReadIsFiltered(unittest.TestCase):

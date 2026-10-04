@@ -35,15 +35,28 @@ file as JSON lines, and runs the wake command **once for the pass**.
   read, so a row that lands while the wake command runs is the next pass's business. The old code
   stamped the clock *after* the work, so a five-minute wake moved the cursor past everything that
   arrived during it.
-* **A read that came back capped holds the cursor.** As many rows as `--limit` allows is not
-  evidence the window was covered, so nothing moves and the next pass re-reads it. Row_ID dedupe
-  makes that free.
+* **A capped read is refused, not held.** Holding the cursor on a full read was the first
+  version, and it was not a repair: `limit` on this bus means the **newest n rows**, so the next
+  read returns the same newest n and the older addressed rows the cap left out are never reachable
+  — the bus has no `until` to page back with. So `--limit` is accepted **only with `--dry-run`**,
+  and any pass that could ring or move the cursor reads uncapped (exit 2 otherwise). The held
+  cursor stays in the code as a belt behind that refusal.
 * **A corrupt cursor fails closed.** Missing means first run, which primes; **unreadable means
   refuse** — exit 2, nothing read, rung or written. Treating a truncated file as "no history" is
   how a doorbell primes away everything pending. The cursor is also written atomically now, so a
-  kill mid-write leaves the old file rather than half a new one.
+  kill mid-write leaves the old file rather than half a new one. **A cursor that is a string but
+  not a timestamp counts as unreadable**, and is checked before anything is read: it used to fail
+  open in both directions at once — the read lost its `since` and went out over the whole board,
+  while the watermark was still truthy so priming was skipped — which would have rung for every
+  row in the board's history inside the age window.
 * **One row is one inbox entry**, whether the wake failed, succeeded, or was killed between the
-  two. What has been *written down* is recorded separately from what has been *handled*.
+  two. What has been *written down* is recorded separately from what has been *handled* — and
+  **the inbox file is the journal**, not just the state. The inbox is appended and fsynced *before*
+  the state records that it was, because the other order loses the notification outright; so a kill
+  landing between those two writes used to put the row in the inbox twice on restart. Recovery now
+  reads the inbox's own Row_IDs, and a **torn final line** — a kill *during* the append — is
+  truncated away so the row is written once, whole. The notification itself is at-least-once by
+  design: after a kill the Pi is woken again, and the inbox still holds one entry.
 * **A row to ALL is a row to this Pi.** `agent_waker.addressed_to` answers for a *named* tag, so a
   genuine `ALL` row — target `ALL`, payload `to=ALL`, naming nobody — was missed, and the test that
   was supposed to cover it had been passing only because its fixture also carried `to=pi1-cli`.
@@ -59,8 +72,21 @@ And two from the night it was written:
   the wake does not run for it. A timestamp that cannot be read counts as old, because this board
   has rows whose timestamp column holds a BCB payload.
 
+And one from the Pi's own hardware:
+
+* **The cursor never moves backwards.** This Pi has no clock battery. A boot that reads the board
+  before `time-sync.target` lands carries whatever hour the clock believes in, and a cursor that
+  followed it down would re-ring everything since. The pass says `CLOCK WENT BACKWARDS`, holds the
+  cursor and keeps going. It is the same dead battery that opened the 2 PM TFT an hour late, which
+  is also why the timer unit carries `After=time-sync.target` and `Persistent=false`.
+
 And a failed wake **holds the watermark**, so the next pass rings again rather than forgetting —
 the watcher's rule, for the watcher's reason.
+
+**The suite runs in CI.** `tests/test_pi1_wake.py` (45 controls) is wired into
+`.github/workflows/python-suites.yml`, in an empty network namespace, on every change to it or to
+`scripts/pi1_wake.py`. Until that was wired, the green tick on the pull request came from the MCP
+and semantic checks and this suite was the author's word for its own claims.
 
 **It is a notification, never a task.** A row's content never reaches a shell: the wake command is
 the Pi's own script, and all it is told is how many rows arrived (`PI1_WAKE_ROWS`) and where they

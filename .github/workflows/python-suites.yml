@@ -72,6 +72,8 @@ on:
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
       - "tests/test_wa_outbox_cloud.py"
+      - "scripts/pi1_wake.py"
+      - "tests/test_pi1_wake.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
@@ -182,6 +184,8 @@ on:
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
       - "tests/test_wa_outbox_cloud.py"
+      - "scripts/pi1_wake.py"
+      - "tests/test_pi1_wake.py"
       - "tests/test_gemini_cloud_waker.py"
       - "tests/test_soak_report.py"
       - "tests/test_studio_controller.py"
@@ -292,6 +296,7 @@ jobs:
                    tests/test_waker_shadow.py \
                    tests/test_board_watcher.py \
                    tests/test_wa_outbox_cloud.py \
+                   tests/test_pi1_wake.py \
                    tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
                    tests/test_studio_controller.py \
@@ -738,6 +743,27 @@ jobs:
             echo "not on this branch; skipping"
           fi
 
+      # The Pi's doorbell. Codex's second pass on it (P2,
+      # CODEX-SUCCESSOR-QC-RESULT-20261004T1336Z) found the gap that matters
+      # most here: "32 current test methods exist, but no workflow runs this
+      # suite... Green checks are not Pi-suite acceptance." The green tick that
+      # head f2eaee0 carried came from the MCP and semantic checks, and
+      # required-ci is an echo. Every claim this file's own docstring makes
+      # about skipped arrivals, a corrupt cursor, one row one entry, ALL
+      # addressing, capped reads and a stale clock was the author's word.
+      # Offline by construction: the bus read and the wake command are both
+      # replaced by fakes, and the state and inbox live in a temp directory -
+      # which `unshare -n` is what proves rather than asserts.
+      - name: pi1 doorbell cursor, journal and refusals (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_pi1_wake.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_pi1_wake.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
       # FastAPI and its in-process TestClient are needed only by the controller
       # suite. Installation happens before the network namespace is removed;
       # the suite itself still runs with no network and all provider clients
@@ -917,6 +943,7 @@ jobs:
              && [ ! -f tests/test_studio_metadata_operations.py ] \
              && [ ! -f tests/test_studio_metadata_provider.py ] \
              && [ ! -f tests/test_agent_waker.py ] \
+             && [ ! -f tests/test_pi1_wake.py ] \
              && [ ! -f tests/test_board_governor.py ]; then
             echo "No eligible suite is present, so this check proved nothing." >&2
             echo "A passing check over zero assertions is worse than no check." >&2

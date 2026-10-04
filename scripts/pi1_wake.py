@@ -31,7 +31,20 @@ WHAT ONE PASS DOES
   4. appends the new ones to an inbox file, ONCE each, and records that it did before running
      anything, so a retry after a failed wake does not write a second copy;
   5. runs the wake command once for the pass;
-  6. advances the watermark only if the wake succeeded AND the read was covered.
+  6. advances the watermark only if the wake succeeded AND the read was covered - and never to an
+     earlier moment than the cursor already stands at.
+
+AND FROM THE SECOND REVIEW (Codex on f2eaee0, three P2s: CODEX-SUCCESSOR-QC-RESULT-20261004T1336Z)
+  * A CAPPED READ IS REFUSED, NOT HELD. `limit` on this bus is the NEWEST n rows. Holding the
+    cursor on a full read does not make the rows it left out reachable - the next read returns the
+    same newest n, and the bus has no `until` to page back with. So --limit is accepted only with
+    --dry-run, and a pass that could ring or move the cursor reads uncapped.
+  * A CURSOR THAT IS NOT A TIMESTAMP FAILS CLOSED. A nonempty string that will not parse used to
+    fail open twice over: the read went out unfiltered, and priming was skipped because the
+    watermark was truthy. It is validated in load_state, before any read.
+  * THE INBOX FILE IS THE JOURNAL. It is appended and fsynced before the state records it, so a
+    kill between the two left a row the state did not know about. Recovery reads the inbox's own
+    Row_IDs, and a torn final line is truncated so the row is written once, whole.
 
 THE FOUR THINGS IT REFUSES TO DO, each one Codex's finding on head 0a440cc (NO-GO,
 CODEX-PI-WA-QC-RESULT-20261004T012631Z), each with its own control
@@ -70,7 +83,7 @@ timer wants. `docs/PI1-WAKE.md` has the unit, the timer and the one-minute insta
     --inbox <path>        where rows are appended (default ~/.pi1_inbox.jsonl)
     --state <path>        the cursor (default ~/.pi1_wake_state.json)
     --max-age-hours <n>   older rows are marked seen, not rung (0 rings anyway)
-    --limit <n>           rows to ask the bus for; a full read holds the cursor
+    --limit <n>           rows to ask the bus for; --dry-run only (it reads the NEWEST n)
     --once / --loop <s>   one pass, or every s seconds
     --dry-run             say what would ring; touch neither the state nor the command
     --prime               record everything visible as seen and ring nothing
@@ -151,8 +164,17 @@ def load_state(path: Path) -> dict:
         raise StateUnreadable("%s is not readable JSON (%s)" % (path, broke))
     if not isinstance(data, dict):
         raise StateUnreadable("%s does not hold an object" % path)
-    if data.get("watermark") is not None and not isinstance(data.get("watermark"), str):
+    mark = data.get("watermark")
+    if mark is not None and not isinstance(mark, str):
         raise StateUnreadable("%s has a watermark that is not a string" % path)
+    if isinstance(mark, str) and mark.strip() and read_ts(mark) is None:
+        # A cursor that is a string but not a timestamp used to fail OPEN, and that was the worst
+        # of the ways out: read_ts() returned None, so the read went out UNFILTERED over the whole
+        # board, while the watermark was still truthy, so first-run priming was skipped. The
+        # doorbell would then ring for every row in the board's history inside the age window
+        # (Codex's second P2 on f2eaee0). Validated here, before anything is read.
+        raise StateUnreadable(
+            "%s has a watermark that is not a timestamp (%r)" % (path, mark.strip()[:48]))
     for key in ("seen_row_ids", "enqueued_row_ids"):
         if key in data and not isinstance(data[key], list):
             raise StateUnreadable("%s has a %s that is not a list" % (path, key))
@@ -251,6 +273,53 @@ def append_inbox(rows, inbox: Path) -> None:
         os.fsync(out.fileno())
 
 
+def reconcile_inbox(inbox: Path) -> set:
+    """The Row_IDs the inbox file already holds, after repairing a half-written last line.
+
+    THE INBOX FILE IS THE JOURNAL. `append_inbox` writes and fsyncs BEFORE the state records that
+    it did, because the other order loses notifications outright. A kill between those two steps
+    therefore leaves a row in the inbox that the state does not know about, and the next pass used
+    to write it a second time: atomically replacing the state file does not make a two-file
+    transition atomic (Codex's third P2 on f2eaee0). So recovery reads the journal rather than
+    trusting the state alone, and one row stays one inbox entry across a kill.
+
+    A kill DURING the append can also leave a torn final line. A fragment is not a delivered entry
+    and cannot be read for its Row_ID, so it is truncated back to the last complete line and the
+    row is written again, whole. Only the final line can be torn; an unreadable line anywhere else
+    is skipped rather than repaired, and is named in the output.
+    """
+    try:
+        raw = inbox.read_bytes()
+    except FileNotFoundError:
+        return set()
+    except OSError as broke:
+        raise StateUnreadable("%s cannot be read (%s)" % (inbox, broke))
+    if raw and not raw.endswith(b"\n"):
+        keep = raw.rfind(b"\n") + 1
+        with open(inbox, "r+b") as out:
+            out.truncate(keep)
+            out.flush()
+            os.fsync(out.fileno())
+        print("INBOX REPAIRED: a torn last line of %d byte(s) was dropped; if it was a row, it is "
+              "written again, whole." % (len(raw) - keep))
+        raw = raw[:keep]
+    ids, unreadable = set(), 0
+    for chunk in raw.decode("utf-8", "replace").splitlines():
+        if not chunk.strip():
+            continue
+        try:
+            entry = json.loads(chunk)
+        except ValueError:
+            unreadable += 1
+            continue
+        if isinstance(entry, dict) and entry.get("row_id"):
+            ids.add(str(entry["row_id"]))
+    if unreadable:
+        print("INBOX: %d line(s) could not be read; the rows they held may be written again"
+              % unreadable)
+    return ids
+
+
 def wake(cmd: str, rows, inbox: Path, run=subprocess.run) -> bool:
     """Run the wake command once for the pass. True when there is nothing to run, or it succeeded.
 
@@ -315,8 +384,9 @@ def one_pass(env, state: dict, *, me: str, cmd: str, inbox: Path, state_path: Pa
         return 0
 
     # Written down before anything is run, and recorded as written down, so a retry after a failed
-    # wake does not append a second copy of the same row.
-    enqueued = set(state.get("enqueued_row_ids") or [])
+    # wake does not append a second copy of the same row. The inbox file is consulted as well as
+    # the state, because the two are written one after the other and a kill can land between them.
+    enqueued = set(state.get("enqueued_row_ids") or []) | reconcile_inbox(inbox)
     fresh = [r for r in ring if str(r[aw.C_ROW_ID]) not in enqueued]
     if fresh:
         append_inbox(fresh, inbox)
@@ -328,8 +398,15 @@ def one_pass(env, state: dict, *, me: str, cmd: str, inbox: Path, state_path: Pa
     if rang:
         state["seen_row_ids"].extend(str(r[aw.C_ROW_ID]) for r in ring)
         if covered:
-            # Only a covered read may move the cursor, and only to the moment of the read.
-            state["watermark"] = stamp(read_at)
+            # Only a covered read may move the cursor, only to the moment of the read, and NEVER
+            # BACKWARDS. This Pi has no clock battery: a boot that reads the board before
+            # time-sync.target lands carries a stale clock, and a cursor that followed it down
+            # would re-ring every row since whatever hour the clock believes in. It is the same
+            # dead battery that opened the 2 PM TFT an hour late.
+            if since and since > read_at:
+                print("CLOCK WENT BACKWARDS: the cursor stands at %s and this read stamped %s. "
+                      "The cursor is held; check time-sync." % (stamp(since), stamp(read_at)))
+            state["watermark"] = stamp(max(read_at, since) if since else read_at)
     state["last_pass_at"] = stamp(now())
     save_state(state, state_path)
     return 0 if rang else 1
@@ -353,7 +430,9 @@ def main(argv=None) -> int:
     ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
     ap.add_argument("--max-age-hours", type=sane_hours, default=DEFAULT_MAX_AGE_HOURS,
                     help="older rows are marked seen, not rung (default %(default)s; 0 rings anyway)")
-    ap.add_argument("--limit", type=int, default=None, help="rows to ask the bus for")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="rows to ask the bus for; --dry-run only, it reads the NEWEST n and a "
+                         "ringing pass must not skip older rows")
     ap.add_argument("--loop", type=float, default=0.0, metavar="SECONDS",
                     help="keep running, this many seconds between passes")
     ap.add_argument("--once", action="store_true", help="one pass (the default)")
@@ -361,6 +440,19 @@ def main(argv=None) -> int:
     ap.add_argument("--prime", action="store_true",
                     help="record everything visible as seen and ring nothing")
     args = ap.parse_args(argv)
+
+    if args.limit is not None and not args.dry_run:
+        # `limit` on this bus means THE NEWEST N ROWS - scripts/bus.py says so in as many words.
+        # Holding the cursor on a full read, which is what f2eaee0 did, does not make the omitted
+        # rows reachable: the next read returns the same newest n, and the older addressed rows
+        # inside the window are never seen again. The bus has no `until`, so there is nothing to
+        # page forward past them with either. Codex's first P2 on f2eaee0 offered the choice of
+        # proving a complete progression or refusing capped operation; there is no progression to
+        # prove, so a capped pass is refused outright instead of being silently incomplete.
+        print("REFUSED: --limit asks the bus for the NEWEST %s rows, and any older row addressed "
+              "to this tag in the same window would be skipped for good. A pass that rings or "
+              "writes the cursor reads uncapped. Use --limit only with --dry-run." % args.limit)
+        return 2
 
     env = bus.load_env()
     if args.prime:
