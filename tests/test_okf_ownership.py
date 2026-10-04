@@ -14,6 +14,7 @@ Run: python3 tests/test_okf_ownership.py
 """
 import importlib.util
 import io
+import json
 import contextlib
 import os
 import shutil
@@ -63,6 +64,8 @@ type: floor
 
 CALL = "2026-10-03 18:00Z"
 GEMINI_GRANT = "- grant: gemini | call: %s | paths: docs/okf/lanes.md" % CALL
+OKF_INDEX = "docs/okf/index.md"
+GRANT_GROK = "- grant: grok | call: %s | paths: %s" % (CALL, OKF_INDEX)
 
 
 def floor(*lines, call=CALL):
@@ -441,11 +444,12 @@ _LISTS = [0]
 
 
 def changed_list(at, *paths):
-    """The forge's own changed-path list, written the way the trusted workflow writes it."""
+    """The forge's own changed-path list, written the way the trusted workflow writes it: a JSON
+    array, because a path is bytes and one path per line plus strip() was lossy."""
     _LISTS[0] += 1
-    where = os.path.join(at, "_changed-%d.txt" % _LISTS[0])
+    where = os.path.join(at, "_changed-%d.json" % _LISTS[0])
     with open(where, "w", encoding="utf-8", newline="") as out:
-        out.write("".join(p + "\n" for p in paths))
+        json.dump(list(paths), out)
     return where
 
 
@@ -515,6 +519,113 @@ code, said = run(["claude-code-cli/repair", "--trusted-base", BASE, "--base-ref"
                   "--candidate-floor", CAND], root=at)
 check("a branch that proposes two pens on one page is refused on the forge's copy of its floor",
       code == 1 and "this branch's own" in said, said.strip())
+
+# ===================== A PATH IS BYTES, AND strip() ATE SOME =====================
+# Codex on the conference twin (2496937): paths_from() stripped each reported filename, and a
+# leading or trailing space is a VALID PATH BYTE - so the unowned " docs/okf/index.md" arrived as
+# the owned "docs/okf/index.md" and changed the answer. The list is JSON now and nothing is
+# transformed at all.
+print()
+print("the forge's list is lossless")
+
+at = repo(floor_text=floor())
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+for sneaky in (" docs/okf/index.md", "docs/okf/index.md ", "\tdocs/okf/index.md"):
+    found, why = okf.paths_from(changed_list(at, sneaky))
+    check("a path is read byte for byte, not stripped (%r)" % sneaky,
+          found == {sneaky} and not why, "%r %s" % (found, why))
+check("and a stripped copy is a DIFFERENT path, which is the whole point",
+      " docs/okf/index.md" != "docs/okf/index.md")
+# The consequence, end to end: the operator owns docs/okf/index.md, and " docs/okf/index.md" is
+# not that path, so it falls outside the OKF and this rule has no opinion - but it must never be
+# silently promoted INTO the OKF either. What matters is that the bytes reaching allowed() are the
+# bytes the forge reported.
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, " " + OKF_INDEX)], root=at)
+check("so a space-prefixed path is judged as itself", code == 0, said.strip())
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("while the real one is still refused to grok", code == 1, said.strip())
+found, why = okf.paths_from(os.path.join(at, "_never-json.json"))
+check("a list that is not there still refuses", not found and "was not read" in why, why)
+with open(os.path.join(at, "_lines.json"), "w", encoding="utf-8", newline="") as out:
+    out.write("docs/okf/index.md\n")
+found, why = okf.paths_from(os.path.join(at, "_lines.json"))
+check("and the old line format is refused rather than guessed at",
+      not found and "JSON" in why, why)
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== AN AUTHORITY FILE MUST BE A REGULAR BLOB =====================
+# Codex on a1e1e4f and 2496937: the base floor read followed symlinks. Point docs/okf/floor.md at
+# an ordinary file elsewhere ONCE, and every later edit to that target hands out the pen while the
+# non-delegable path looks untouched. The mode comes from git's own tree, so a checkout that
+# materialises symlinks as text cannot disguise one either.
+print()
+print("an authority file that is not a regular file is not an authority file")
+
+at = repo(floor_text=floor(GRANT_GROK))
+subprocess.run(("git", "rm", "-q", "--cached", "docs/okf/floor.md"), cwd=at, check=True,
+               capture_output=True)
+put(at, "elsewhere.md", floor(GRANT_GROK))
+# A symlink entry written straight into the index, which is how it would arrive from a Linux box
+# and does not need symlink support on this one.
+blob = subprocess.run(("git", "hash-object", "-w", "--stdin"), cwd=at, input="elsewhere.md",
+                      capture_output=True, text=True, check=True).stdout.strip()
+subprocess.run(("git", "update-index", "--add", "--cacheinfo", "120000,%s,docs/okf/floor.md" % blob),
+               cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "add", "elsewhere.md"), cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+                "the floor becomes a symlink"), cwd=at, check=True, capture_output=True)
+CROOKED = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                         text=True).stdout.strip()
+mode, kind, _ = okf.tree_entry(CROOKED, okf.FLOOR, at)
+check("the fixture really does carry a symlink entry, which is the bypass",
+      mode == "120000" and kind == "blob", "%s %s" % (mode, kind))
+text, crooked = okf.authority_at(CROOKED, okf.FLOOR, at)
+check("and authority_at refuses it by its mode", text == "" and "symlink" in crooked, crooked)
+code, said = run(["grok/x", "--trusted-base", CROOKED, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("so the gate judges nothing rather than reading the target",
+      code == 1 and "symlink" in said, said.strip())
+check("a regular floor is still read, so the refusal is not blanket",
+      okf.authority_at(CROOKED, "elsewhere.md", at)[0] is not None)
+check("and a path the commit does not carry is absence, not a refusal",
+      okf.authority_at(CROOKED, "docs/okf/nope.md", at) == (None, ""))
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== THE FILES THAT DECIDE ARE NOT OPEN SEASON =====================
+# Codex's third P1 on a1e1e4f: allowed() returned True for every path outside docs/okf/, which
+# included this rule, its suite and BOTH workflow definitions - so any branch could weaken the
+# gate and keep the expected check name, and later pull requests would pass a toothless check.
+print()
+print("the files that enforce the floor are the operator's")
+
+for path in okf.AUTHORITY:
+    check("nobody else writes %s" % path,
+          not okf.allowed("grok/x", path) and not okf.allowed("codex/x", path)
+          and not okf.allowed("pi1-cli/notes", path)
+          and okf.allowed("claude-code-cli/x", path))
+check("and no grant reaches them, however wide",
+      not okf.allowed("grok/x", "scripts/okf_ownership.py",
+                      floor("- grant: grok | call: %s | paths: docs/okf/" % CALL), CALL)
+      and not okf.allowed("grok/x", ".github/workflows/okf-ownership-trusted.yml",
+                          floor("- grant: grok | call: %s | paths: scripts/" % CALL), CALL))
+check("while an ordinary path outside the OKF is still nobody's business here",
+      okf.allowed("grok/x", "scripts/append.py") and okf.allowed("codex/x", "src/bus_server.py"))
+
+at = repo(floor_text=floor())
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main", "--changed-from",
+                  changed_list(at, ".github/workflows/okf-ownership-trusted.yml")], root=at)
+check("the gate refuses a branch that edits the gate",
+      code == 1 and "okf-ownership-trusted.yml" in said, said.strip())
+code, said = run(["claude-code-cli/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from",
+                  changed_list(at, ".github/workflows/okf-ownership-trusted.yml")], root=at)
+check("and admits the operator, which is how it ever gets repaired", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
 
 # THE REANCHORING, EXECUTED. This is the mechanism Codex said remained unclosed across three
 # reviews: candidate code repoints the local remote-tracking ref at a commit of its own carrying an
@@ -599,6 +710,19 @@ else:
               and not line.strip().startswith("-")]
     check("its token can read and not write",
           sorted(grants) == ["contents: read", "pull-requests: read"], grants)
+    # Codex's round-two findings, each one a property of the workflow text.
+    check("it refuses a base that is no longer the protected branch's tip",
+          "git/ref/heads/" in ran and 'tip}" != "${BASE_SHA}"' in ran and "exit 1" in ran)
+    check("and it re-runs when the base branch is retargeted",
+          "edited" in ran, "the edited trigger is what carries base retargeting")
+    check("the forge's list is JSON, not lines that would be stripped",
+          "@json" in ran and "jq -s" in ran and "changed.json" in ran
+          and "changed.txt" not in ran)
+    check("the candidate floor fails closed: only a confirmed 404 is absence",
+          '= "404" ]' in ran and '!= "file" ]' in ran and '!= "base64" ]' in ran
+          and '!= "${size}" ]' in ran
+          and ran.count("exit 1") >= 5, ran.count("exit 1"))
+
     check("and its actions are pinned to commit shas, not tags",
           "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in ran
           and "@v4" not in ran and "@v5" not in ran)

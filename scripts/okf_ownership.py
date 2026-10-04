@@ -94,6 +94,37 @@ base that is not the protected branch all refuse. Run without `--trusted-base` -
 `okf-ownership.yml` and a person at a terminal do - the rule prints `ADVISORY ... this run is not
 the gate and decides nothing`, and `trusted_copy()` still withholds every grant.
 
+AND THEN FOUR MORE, ON THE GATE ITSELF (Codex on a1e1e4f and conference 2496937):
+
+  * A PATH IS BYTES. `paths_from()` read one path per line and stripped each one, which is lossy:
+    a leading or trailing space is a valid path byte, so the unowned `" docs/okf/index.md"`
+    arrived as the owned `"docs/okf/index.md"` and changed the answer. The forge's list is a JSON
+    array now and nothing is transformed at all.
+  * AN AUTHORITY FILE MUST BE A REGULAR BLOB. Reading the floor from the working tree followed
+    symlinks, which is a bypass with no edit to the protected path: point `docs/okf/floor.md` at
+    an ordinary file elsewhere ONCE, and every later edit to that target hands out the pen while
+    the non-delegable path looks untouched. `authority_at()` reads it through the commit's own
+    tree entry and refuses mode `120000`, or anything that is not a blob - so a checkout that
+    materialises symlinks as text cannot disguise one either.
+  * THE CANDIDATE FLOOR FAILS CLOSED. The workflow turned every fetch failure into an empty
+    floor - a 403, a 500, a `type: symlink`, and the documented case where the contents API omits
+    base64 content for a blob over 1 MiB - and an empty floor proposes nothing, so each of those
+    silently skipped the proposed-overlap refusal. Only a confirmed 404 means absence now; only a
+    `file` with base64 content whose decoded length matches the declared size is read; anything
+    else fails the gate.
+  * THE FILES THAT DECIDE ARE THE OPERATOR'S. Everything outside `docs/okf/` passes this rule by
+    design, and that included this rule, its suite and BOTH workflow definitions - so any branch
+    could weaken the gate while keeping the expected check name, and later pull requests would
+    pass a toothless check. `AUTHORITY` is refused to every prefix but the operator's, and no
+    grant reaches it however wide.
+
+AND WHAT THE REPOSITORY STILL HAS TO SAY, which no file here can. Measured 2026-10-04: `main`'s
+protection requires exactly one context, `required-ci`, with `strict: false` and zero required
+approvals. So a stale green tick can still be merged, and this gate is not yet a merge barrier at
+all. The gate refuses a base that is not the protected branch's current tip, which is strict-base
+enforced from the inside; making it binding needs `okf-ownership / the gate` added as a required
+context AND "require branches to be up to date", and both are the repository owner's settings.
+
 WHAT NONE OF IT SETTLES: a branch prefix is attribution, not an authenticated identity. The whole
 fleet pushes as one GitHub account, so this rule says which paths a prefix may write and not who
 holds it. That needs a GitHub App per agent, which is a build and his word.
@@ -103,6 +134,7 @@ That is as true here as it is on the conference line, and a grant trusts the pre
 
     python scripts/okf_ownership.py <branch> [--base <ref>] <changed-path>...
 """
+import json
 import re
 import subprocess
 import sys
@@ -132,6 +164,16 @@ WRITERS = OPERATORS + ("pi1-cli/",)
 # anyone else, which is the reviewed path, and the controls below prove both halves.
 GEMINI = OKF + "gemini/"
 FLOOR = OKF + "floor.md"
+# THE FILES THAT DECIDE. Everything outside docs/okf/ passes this rule by design - Blackboard has
+# no package ownership map and this is not the place to invent one - but that included the rule
+# itself, its suite and both workflow definitions, so any branch could weaken the gate and keep
+# the expected check name (Codex's third P1 on a1e1e4f). They are the operator's alone now. It is
+# not identity: a prefix is attribution, and the fleet pushes as one account. It is the same level
+# of control as the floor file, applied to the things that enforce the floor file.
+AUTHORITY = ("scripts/okf_ownership.py",
+             "tests/test_okf_ownership.py",
+             ".github/workflows/okf-ownership.yml",
+             ".github/workflows/okf-ownership-trusted.yml")
 OPEN_GRANTS = "## Open grants"
 GRANT = re.compile(r"^\s*-\s*grant:\s*([a-z0-9-]+)\s*\|\s*call:\s*([^|]+?)\s*\|\s*paths:\s*(.+?)\s*$",
                    re.M)
@@ -385,11 +427,61 @@ def head_sha(root=None) -> str:
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def worktree_floor(root=None) -> str:
-    """docs/okf/floor.md as the CHECKOUT has it. Trusted only because of whose commit that is."""
+def tree_entry(sha: str, path: str, root=None) -> tuple:
+    """(mode, object type, oid) for `path` in commit `sha`, or ("", "", "") when it is not there.
+
+    `git ls-tree` on a COMMIT SHA, which is content-addressed and immutable - not a ref. The sha is
+    the one `trusted_posture()` has already matched against `git rev-parse HEAD`, so this reads the
+    same bytes the checkout holds without going anywhere near a name a push can move.
+    """
     at = Path(root) if root else Path(__file__).resolve().parent.parent
-    here = at.joinpath(*FLOOR.split("/"))
-    return here.read_text(encoding="utf-8") if here.is_file() else None
+    try:
+        done = subprocess.run(["git", "-c", "core.quotePath=false", "ls-tree", "-z", sha,
+                               "--", path], cwd=str(at), capture_output=True, text=True,
+                              encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return "", "", ""
+    if done.returncode != 0 or not done.stdout.strip():
+        return "", "", ""
+    head = done.stdout.split("\0")[0]
+    meta = head.split("\t")[0].split()
+    if len(meta) < 3:
+        return "", "", ""
+    return meta[0], meta[1], meta[2]
+
+
+REGULAR = ("100644", "100755")
+
+
+def authority_at(sha: str, path: str, root=None) -> tuple:
+    """(the file's text, why it carries no authority). None text means it is simply not there.
+
+    AN AUTHORITY FILE MUST BE A REGULAR BLOB. Reading it from the working tree followed symlinks,
+    which is a bypass with no edit to the protected path at all: point `docs/okf/floor.md` at an
+    ordinary file elsewhere once, and every later edit to THAT file changes who holds the pen while
+    the non-delegable path looks untouched (Codex on a1e1e4f and 2496937). A `120000` entry is
+    refused here, and so is anything that is not a blob - a gitlink, a directory. The mode comes
+    from git's own tree, not from the filesystem, which also means a checkout that materialises
+    symlinks as text files cannot disguise one.
+    """
+    mode, kind, oid = tree_entry(sha, path, root)
+    if not mode:
+        return None, ""
+    if mode == "120000":
+        return "", ("%s is a symlink in %s, and an authority file may not be one: an edit to its "
+                    "target would hand out the pen without touching this path"
+                    % (path, sha[:12]))
+    if kind != "blob" or mode not in REGULAR:
+        return "", "%s is a %s with mode %s in %s, not a regular file" % (path, kind, mode, sha[:12])
+    at = Path(root) if root else Path(__file__).resolve().parent.parent
+    try:
+        done = subprocess.run(["git", "cat-file", "blob", oid], cwd=str(at), capture_output=True,
+                              text=True, encoding="utf-8", errors="surrogateescape")
+    except OSError as broke:
+        return "", "%s could not be read out of %s (%s)" % (path, sha[:12], broke)
+    if done.returncode != 0:
+        return "", "%s could not be read out of %s" % (path, sha[:12])
+    return done.stdout, ""
 
 
 def trusted_posture(base_sha: str, root=None) -> tuple:
@@ -431,8 +523,14 @@ def paths_from(listing: str, root=None) -> tuple:
     """(the changed paths the forge itself reported, why they could not be read).
 
     Not a local diff. `git diff <ref>...HEAD` needs a ref and a candidate commit, and both were
-    reachable by candidate code; the forge's own `pulls/<n>/files` is neither. One path per line,
-    renames naming both ends, written by the trusted workflow.
+    reachable by candidate code; the forge's own `pulls/<n>/files` is neither.
+
+    A JSON ARRAY, NOT LINES, AND NOTHING IS STRIPPED. The first version read one path per line and
+    called `.strip()` on each, which is lossy: a leading or trailing space is a VALID PATH BYTE, so
+    the unowned `" docs/okf/index.md"` arrived as the owned `"docs/okf/index.md"` and changed the
+    authorization answer (Codex on 2496937, the conference twin of this rule). A newline in a path
+    would have been worse still. JSON is lossless for every byte a path can hold, the forge already
+    speaks it, and the only transformation left is none.
     """
     at = Path(listing)
     if not at.is_file():
@@ -441,10 +539,15 @@ def paths_from(listing: str, root=None) -> tuple:
         text = at.read_text(encoding="utf-8")
     except OSError as broke:
         return set(), "%s cannot be read (%s)" % (listing, broke)
-    found = {line.strip() for line in text.splitlines() if line.strip()}
+    try:
+        found = json.loads(text)
+    except ValueError as broke:
+        return set(), "%s is not the forge's JSON path list (%s)" % (listing, broke)
+    if not isinstance(found, list) or not all(isinstance(q, str) for q in found):
+        return set(), "%s does not hold a JSON array of path strings" % listing
     if not found:
         return set(), "%s is empty, so no changed path was reported" % listing
-    return found, ""
+    return set(found), ""
 
 
 def _candidate_floor(root=None) -> str:
@@ -486,7 +589,11 @@ def in_force(base: str, root=None):
 
 
 def allowed(branch: str, path: str, floor: str = "", call: str = None) -> bool:
-    """Whether `branch` may change `path`. Only `docs/okf/` is this check's business."""
+    """Whether `branch` may change `path`. `docs/okf/` and the files that enforce it."""
+    if path in AUTHORITY:
+        # No grant reaches these, however wide: a floor grant that could hand over the rule would
+        # be a grant that hands out grants.
+        return any(branch.startswith(p) for p in OPERATORS)
     if not path.startswith(OKF):
         return True
     if path == FLOOR:
@@ -520,6 +627,14 @@ _CONTROLS = (
     ("gemini/okf-1", GEMINI + "RESULT-1.md", _GRANTED_GEMINI, True),
     ("claude-code-cli/x", GEMINI + "RESULT-1.md", "", True),
     ("grok/x", "scripts/append.py", "", True),          # outside the OKF this rule has no opinion
+    # The files that decide, which used to be open season outside docs/okf/.
+    ("grok/x", "scripts/okf_ownership.py", "", False),
+    ("pi1-cli/notes", "scripts/okf_ownership.py", "", False),
+    ("codex/x", "tests/test_okf_ownership.py", "", False),
+    ("grok/x", ".github/workflows/okf-ownership-trusted.yml", "", False),
+    ("grok/x", ".github/workflows/okf-ownership.yml", "", False),
+    ("claude-code-cli/x", "scripts/okf_ownership.py", "", True),
+    ("grok/x", "scripts/okf_ownership.py", _GRANTED_WIDE, False),
     ("grok/x", OKF + "index.md", _GRANTED, True),       # an open grant still hands the pen over
     ("grok/x", FLOOR, _GRANTED_WIDE, False),            # and never the page that hands it out
 )
@@ -607,7 +722,15 @@ def main(argv, root=None) -> int:
             why = ("%r is not the protected branch, so the floor it carries hands over nothing"
                    % base_ref)
         else:
-            floor = worktree_floor(root)
+            # Read out of the COMMIT, by its tree entry: a sha is content-addressed and the one
+            # trusted_posture() already matched against HEAD, so this is the checkout's own bytes
+            # without touching a name a push can move. The mode is checked because an authority
+            # file that is a symlink hands out the pen from somewhere else entirely.
+            floor, crooked = authority_at(trusted_base, FLOOR, root)
+            if crooked:
+                print("REFUSED: %s. An authority file that is not a regular file is not an"
+                      " authority file, so this run judges nothing." % crooked)
+                return 1
             if floor is None:
                 floor, call = "", ""
                 why = "%s carries no %s, so no grant is in force" % (ref, FLOOR)

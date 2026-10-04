@@ -52,7 +52,11 @@ name: okf-ownership-trusted
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # `edited` is here because GitHub fires it when the BASE BRANCH IS CHANGED, and retargeting
+    # is one of the two ways a green gate run can stop describing the pull request in front of
+    # you (Codex's fourth finding on the conference twin). The other is main moving under it,
+    # which the "current tip" step below refuses.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -74,6 +78,38 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
+
+      # THE BASE MUST BE THE PROTECTED BRANCH'S CURRENT TIP.
+      #
+      # A green run says "these paths were allowed by the floor as main held it AT base.sha". Main
+      # moves. A grant REVOKED on main after this ran leaves the green tick in place and says
+      # nothing about the floor as it now stands (Codex: "A previously green grant may remain
+      # green after that grant is revoked"). So the gate refuses to answer about a base that is no
+      # longer the tip, which is strict-base enforced inside the gate rather than hoped for.
+      #
+      # WHAT THIS DOES NOT CLOSE, stated rather than implied: an OLD green tick already on the
+      # pull request is still an old green tick. Only branch protection can require the gate as a
+      # context AND require the branch to be up to date, and that is the repository owner's
+      # setting. Until he turns both on, this is a strong advisory gate, not a merge barrier.
+      - name: The base must be the protected branch as it stands right now
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          tip=$(gh api "repos/${REPO}/git/ref/heads/${BASE_REF}" --jq '.object.sha')
+          echo "base.sha from the event : ${BASE_SHA}"
+          echo "${BASE_REF} tip right now : ${tip}"
+          if [ "${tip}" != "${BASE_SHA}" ]; then
+            echo "::error::${BASE_REF} has moved since this pull request was last synchronized," \
+                 "so a verdict taken against ${BASE_SHA} would not describe the floor as it now" \
+                 "stands. Push to the branch (or merge ${BASE_REF} into it) and the gate re-runs" \
+                 "against the new tip." >&2
+            exit 1
+          fi
+          echo "the base is the current tip, so the floor this run reads is the live one"
 
       - name: Say which commit this gate is running out of
         env:
@@ -100,29 +136,79 @@ jobs:
           set -euo pipefail
           # BOTH ends of a rename. `--name-only` showed only where a file landed, which is how a
           # renamed floor.md would have gone unseen; the forge reports previous_filename for it.
+          #
+          # A JSON ARRAY, NOT LINES. The first version wrote one path per line and the rule
+          # stripped each one, which is lossy: a leading or trailing space is a VALID PATH BYTE,
+          # so the unowned " docs/okf/index.md" arrived as the owned "docs/okf/index.md" (Codex on
+          # the conference twin). `@json` encodes each path as a JSON string on its own line - so
+          # even a path containing a newline survives the line split - and `jq -s` collects them.
           gh api --paginate "repos/${REPO}/pulls/${PR}/files" \
-            --jq '.[].filename, (.[].previous_filename // empty)' | sort -u \
-            > "${RUNNER_TEMP}/changed.txt"
+            --jq '.[] | (.filename, (.previous_filename // empty)) | @json' \
+            | jq -s 'unique' > "${RUNNER_TEMP}/changed.json"
           # `pulls/<n>/files` is capped at 3000 entries. A pull request larger than that cannot
           # have its changed set confirmed, so it is refused rather than judged on a partial list.
-          named=$(gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[].filename' \
-                  | sort -u | wc -l)
+          named=$(gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[].filename | @json' \
+                  | jq -s 'unique | length')
           echo "the forge declares ${DECLARED} changed file(s); ${named} name(s) came back"
           if [ "${named}" -ne "${DECLARED}" ]; then
             echo "::error::the changed-file list is incomplete (${named} of ${DECLARED}); the OKF" \
                  "cannot be judged on a partial set" >&2
             exit 1
           fi
-          echo "changed paths, both ends of every rename included:"
-          cat "${RUNNER_TEMP}/changed.txt"
-          # The branch's own floor.md, read ONLY to refuse: a branch may not propose two pens on
-          # one page. Fetched as DATA from the forge - never checked out, never executed. A branch
-          # that does not carry the file leaves an empty file behind, which proposes nothing.
-          : > "${RUNNER_TEMP}/candidate-floor.md"
-          gh api "repos/${HEAD_REPO}/contents/docs/okf/floor.md?ref=${HEAD_SHA}" --jq '.content' \
-            2>/dev/null | base64 -d > "${RUNNER_TEMP}/candidate-floor.md" \
-            || : > "${RUNNER_TEMP}/candidate-floor.md"
-          wc -c < "${RUNNER_TEMP}/candidate-floor.md"
+          echo "changed paths, both ends of every rename included, byte for byte:"
+          jq -r '.[] | @json' "${RUNNER_TEMP}/changed.json"
+          # THE BRANCH'S OWN floor.md, READ ONLY TO REFUSE, AND FAILING CLOSED.
+          #
+          # It is read so a branch cannot propose two pens on one page, and it is fetched as DATA
+          # from the forge: never checked out, never executed. The first version turned EVERY
+          # failure into an empty floor - a 403, a 500, a `type: symlink`, and the documented case
+          # where the contents API omits base64 content for a blob over 1 MiB. An empty floor
+          # proposes nothing, so each of those silently skipped the overlap refusal for an
+          # operator change to floor.md (Codex on a1e1e4f and 2496937). Now: only a confirmed 404
+          # means absence, only a `file` with base64 content whose decoded length matches the
+          # declared size is read, and anything else fails the gate.
+          cand="${RUNNER_TEMP}/candidate-floor.md"
+          : > "$cand"
+          set +e
+          gh api -i "repos/${HEAD_REPO}/contents/docs/okf/floor.md?ref=${HEAD_SHA}" \
+            > "${RUNNER_TEMP}/floor.http" 2> "${RUNNER_TEMP}/floor.err"
+          set -e
+          code=$(awk 'NR==1 {print $2; exit}' "${RUNNER_TEMP}/floor.http")
+          echo "the contents API answered HTTP ${code:-<none>} for the branch's floor.md"
+          if [ "${code}" = "404" ]; then
+            echo "confirmed absent on the candidate: this branch proposes no floor"
+          elif [ "${code}" = "200" ]; then
+            body=$(sed -n '/^[[{]/,$p' "${RUNNER_TEMP}/floor.http")
+            kind=$(printf '%s' "$body" | jq -r '.type // "missing"')
+            enc=$(printf '%s' "$body" | jq -r '.encoding // "missing"')
+            size=$(printf '%s' "$body" | jq -r '.size // -1')
+            if [ "${kind}" != "file" ]; then
+              echo "::error::the branch's docs/okf/floor.md is a '${kind}', not a file. An" \
+                   "authority file may not be a symlink, a directory or a submodule." >&2
+              exit 1
+            fi
+            if [ "${enc}" != "base64" ]; then
+              echo "::error::the contents API returned encoding '${enc}' for the branch's" \
+                   "floor.md (declared size ${size}), so its bytes were never verified. A blob" \
+                   "over 1 MiB comes back this way, and an unverified floor is not an empty" \
+                   "floor." >&2
+              exit 1
+            fi
+            printf '%s' "$body" | jq -r '.content' | base64 -d > "$cand"
+            got=$(wc -c < "$cand")
+            if [ "${got}" != "${size}" ]; then
+              echo "::error::decoded ${got} byte(s) of the branch's floor.md and the API declared" \
+                   "${size}." >&2
+              exit 1
+            fi
+            echo "verified ${got} byte(s) of the branch's own floor.md"
+          else
+            echo "::error::the contents API answered HTTP ${code:-<none>} for the branch's" \
+                 "floor.md. ONLY a confirmed 404 may mean absence; every other answer leaves the" \
+                 "proposed-overlap refusal unable to run, so the gate fails instead." >&2
+            cat "${RUNNER_TEMP}/floor.err" >&2 || true
+            exit 1
+          fi
 
       # The base branch's own tests, over the base branch's own rule. No candidate input reaches
       # them; this is the gate checking that the copy of the rule it is about to run still answers
@@ -140,6 +226,6 @@ jobs:
           python -B scripts/okf_ownership.py "${HEAD_REF}" \
             --trusted-base "${BASE_SHA}" \
             --base-ref "${BASE_REF}" \
-            --changed-from "${RUNNER_TEMP}/changed.txt" \
+            --changed-from "${RUNNER_TEMP}/changed.json" \
             --candidate-floor "${RUNNER_TEMP}/candidate-floor.md" \
             --repo .
