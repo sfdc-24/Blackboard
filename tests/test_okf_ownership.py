@@ -590,6 +590,24 @@ check("so the gate judges nothing rather than reading the target",
       code == 1 and "symlink" in said, said.strip())
 check("a regular floor is still read, so the refusal is not blanket",
       okf.authority_at(CROOKED, "elsewhere.md", at)[0] is not None)
+# A GITLINK at the same path: mode 160000, object type commit. A symlink is caught by its own
+# branch, so without this the "not a regular blob" guard could be deleted and nothing would say
+# so - which is exactly what a surviving mutant told me.
+subprocess.run(("git", "update-index", "--add", "--cacheinfo",
+                "160000,%s,docs/okf/floor.md" % CROOKED), cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+                "the floor becomes a gitlink"), cwd=at, check=True, capture_output=True)
+LINKED = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                        text=True).stdout.strip()
+mode, kind, _ = okf.tree_entry(LINKED, okf.FLOOR, at)
+check("the fixture really does carry a gitlink entry", mode == "160000" and kind == "commit",
+      "%s %s" % (mode, kind))
+text, crooked = okf.authority_at(LINKED, okf.FLOOR, at)
+check("and a gitlink is refused as well, by type and mode",
+      text == "" and "not a regular file" in crooked, crooked)
+code, said = run(["grok/x", "--trusted-base", LINKED, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("so the gate judges nothing on a gitlink floor either", code == 1, said.strip())
 check("and a path the commit does not carry is absence, not a refusal",
       okf.authority_at(CROOKED, "docs/okf/nope.md", at) == (None, ""))
 shutil.rmtree(at, ignore_errors=True)
@@ -719,7 +737,11 @@ else:
           "@json" in ran and "jq -s" in ran and "changed.json" in ran
           and "changed.txt" not in ran)
     check("the candidate floor fails closed: only a confirmed 404 is absence",
-          '= "404" ]' in ran and '!= "file" ]' in ran and '!= "base64" ]' in ran
+          # The `= "200"` branch is asserted too, because without it the three refusals below can
+          # be left in place while the branch that guards them is turned into `true` - which is
+          # what a surviving mutant did.
+          '= "404" ]' in ran and 'elif [ "${code}" = "200" ]' in ran
+          and '!= "file" ]' in ran and '!= "base64" ]' in ran
           and '!= "${size}" ]' in ran
           and ran.count("exit 1") >= 5, ran.count("exit 1"))
 
