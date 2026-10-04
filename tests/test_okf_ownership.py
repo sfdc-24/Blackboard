@@ -15,6 +15,7 @@ Run: python3 tests/test_okf_ownership.py
 import importlib.util
 import io
 import json
+import ast
 import contextlib
 import os
 import shutil
@@ -643,6 +644,106 @@ code, said = run(["claude-code-cli/x", "--trusted-base", BASE, "--base-ref", "ma
                   "--changed-from",
                   changed_list(at, ".github/workflows/okf-ownership-trusted.yml")], root=at)
 check("and admits the operator, which is how it ever gets repaired", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== A BRANCH NAME IS NOT A REF ALIAS =====================
+# Codex's P1 on f209b38: --base-ref carries pull_request.base.ref, a repository BRANCH NAME, and
+# PROTECTED also holds advisory git spellings - so a pull request targeting an ordinary branch
+# literally named `origin/main`, which anyone may push, was treated as protected and its floor
+# grants honoured. The aliases stay for resolving a REF; a branch name compares only with main.
+print()
+print("a branch name is compared with the protected branch, not with a ref alias")
+
+at = repo(floor_text=floor(GEMINI_GRANT))
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+LANES = changed_list(at, "docs/okf/lanes.md")
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", LANES], root=at)
+check("the real protected branch still admits its grant", code == 0, said.strip())
+for alias in ("origin/main", "refs/heads/main", "refs/remotes/origin/main"):
+    code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", alias,
+                      "--changed-from", changed_list(at, "docs/okf/lanes.md")], root=at)
+    check("a branch named %r is NOT the protected branch" % alias,
+          code == 1 and "not the protected branch" in said, said.strip())
+check("and the aliases are still believed where a REF is meant",
+      okf.authority("origin/main", "")[0] == "refs/remotes/origin/main"
+      and okf.PROTECTED_BRANCH == "main")
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== NOTHING SHADOWS A MODULE THE GATE IMPORTS =====================
+# Codex's P1 on f209b38: `python tests/x.py` puts tests/ at the front of sys.path and
+# `python scripts/x.py` puts scripts/ there, so a non-operator could add tests/json.py or
+# scripts/json.py - paths this rule allowed - and once merged they would execute at import time
+# on EVERY later gate run, before either protected file, needing only to exit 0 to keep the check
+# green while bypassing the tests and the decision.
+print()
+print("a file that shadows a module the gate imports is the gate, by another road")
+
+for who in ("grok/x", "codex/x", "pi1-cli/notes", "gemini/okf-1"):
+    check("%s may not add a module the gate imports" % who,
+          not okf.allowed(who, "scripts/json.py") and not okf.allowed(who, "tests/json.py")
+          and not okf.allowed(who, "scripts/subprocess.py"))
+check("the operator may, because someone has to be able to repair it",
+      okf.allowed("claude-code-cli/x", "scripts/json.py")
+      and okf.allowed("vm-claude-code-cli/x", "tests/re.py"))
+check("and the fence is exactly as wide as the risk, not wider",
+      okf.allowed("grok/x", "scripts/deeper/json.py")      # never on sys.path[0]
+      and okf.allowed("grok/x", "scripts/json.txt")        # not importable
+      and okf.allowed("grok/x", "scripts/notashadow.py")   # a name the gate does not import
+      and okf.allowed("grok/x", "docs/json.py"))           # not a directory the gate runs from
+check("no grant reaches a shadow module either",
+      not okf.allowed("grok/x", "scripts/json.py",
+                      floor("- grant: grok | call: %s | paths: docs/okf/" % CALL), CALL))
+
+# THE TUPLE MUST NOT DRIFT. If either file gains a top-level import this fence does not name, the
+# fence has a hole and nothing else would say so.
+_imports = set()
+for _f in (RULE, os.path.join(HERE, "test_okf_ownership.py")):
+    if not os.path.isfile(_f):
+        continue
+    with open(_f, encoding="utf-8") as _read:
+        _tree = ast.parse(_read.read())
+    for _node in _tree.body:                      # top level only: that is when shadowing bites
+        if isinstance(_node, ast.Import):
+            _imports.update(a.name.split(".")[0] for a in _node.names)
+        elif isinstance(_node, ast.ImportFrom) and _node.module and _node.level == 0:
+            _imports.add(_node.module.split(".")[0])
+_missed = sorted(m for m in _imports if m not in okf.SHADOWABLE and m != "okf_ownership")
+check("SHADOWABLE names every top-level import of the gate's two files", not _missed,
+      "not fenced: %s" % ", ".join(_missed))
+
+# ===================== A CROOKED FLOOR MUST BE REPAIRABLE =====================
+# Codex on f209b38: once a crooked floor is on the protected branch, refusing every run fails
+# EVERY later pull request - including the one restoring the floor. A gate that cannot be repaired
+# is a denial of service wearing a security control.
+print()
+print("a crooked floor on the protected branch can still be repaired")
+
+at = repo(floor_text=floor(GRANT_GROK))
+subprocess.run(("git", "rm", "-q", "--cached", "docs/okf/floor.md"), cwd=at, check=True,
+               capture_output=True)
+put(at, "elsewhere.md", floor(GRANT_GROK))
+_blob = subprocess.run(("git", "hash-object", "-w", "--stdin"), cwd=at, input="elsewhere.md",
+                       capture_output=True, text=True, check=True).stdout.strip()
+subprocess.run(("git", "update-index", "--add", "--cacheinfo",
+                "120000,%s,docs/okf/floor.md" % _blob), cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "add", "elsewhere.md"), cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+                "the floor becomes a symlink"), cwd=at, check=True, capture_output=True)
+BENT = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+code, said = run(["grok/x", "--trusted-base", BENT, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("an ordinary branch is still refused on a crooked floor", code == 1 and "symlink" in said,
+      said.strip())
+code, said = run(["claude-code-cli/repair", "--trusted-base", BENT, "--base-ref", "main",
+                  "--changed-from", changed_list(at, okf.FLOOR)], root=at)
+check("and the operator, changing that page ALONE, is the way out",
+      code == 0 and "way out" in said, said.strip())
+code, said = run(["claude-code-cli/repair", "--trusted-base", BENT, "--base-ref", "main",
+                  "--changed-from", changed_list(at, okf.FLOOR, OKF_INDEX)], root=at)
+check("but not while carrying another page with it", code == 1, said.strip())
 shutil.rmtree(at, ignore_errors=True)
 
 # THE REANCHORING, EXECUTED. This is the mechanism Codex said remained unclosed across three

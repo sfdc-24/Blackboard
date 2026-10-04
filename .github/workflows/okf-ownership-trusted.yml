@@ -169,6 +169,22 @@ jobs:
           # declared size is read, and anything else fails the gate.
           cand="${RUNNER_TEMP}/candidate-floor.md"
           : > "$cand"
+          # THE TREE ENTRY FIRST, because the Contents API DEREFERENCES a symlink that points
+          # inside the repository: GitHub documents that such a link comes back in the normal-file
+          # response format, so `type: file` is not evidence of a regular file (Codex's P1 on
+          # f209b38). The git trees API gives the mode and does not dereference anything. A
+          # candidate floor that is not mode 100644 or 100755 fails the gate here, before its
+          # bytes are ever read, rather than passing now and bricking every later pull request
+          # once the crooked entry is on the protected branch.
+          mode=$(gh api "repos/${HEAD_REPO}/git/trees/${HEAD_SHA}:docs/okf" \
+                   --jq '.tree[] | select(.path == "floor.md") | .mode' 2>/dev/null || true)
+          echo "the candidate's tree entry for docs/okf/floor.md: mode=${mode:-<absent>}"
+          if [ -n "${mode}" ] && [ "${mode}" != "100644" ] && [ "${mode}" != "100755" ]; then
+            echo "::error::the branch's docs/okf/floor.md has tree mode ${mode}, not a regular" \
+                 "file. An authority file may not be a symlink, a gitlink or a directory, and" \
+                 "the Contents API would have dereferenced it into looking like one." >&2
+            exit 1
+          fi
           set +e
           gh api -i "repos/${HEAD_REPO}/contents/docs/okf/floor.md?ref=${HEAD_SHA}" \
             > "${RUNNER_TEMP}/floor.http" 2> "${RUNNER_TEMP}/floor.err"
@@ -213,8 +229,16 @@ jobs:
       # The base branch's own tests, over the base branch's own rule. No candidate input reaches
       # them; this is the gate checking that the copy of the rule it is about to run still answers
       # its own controls.
+      # `-I` IS LOAD-BEARING, not tidiness. Codex's P1 on f209b38: `python tests/x.py` puts
+      # `tests/` at the FRONT of sys.path and `python scripts/x.py` puts `scripts/` there, so a
+      # non-operator pull request could add `tests/json.py` or `scripts/json.py` - paths the rule
+      # happily allowed - and once merged those files would execute at import time on every later
+      # gate run, before either protected file. They need only exit 0 to keep this check green
+      # while bypassing the tests and the ownership decision entirely. Isolated mode drops the
+      # script directory from sys.path and ignores PYTHON* environment variables, so there is no
+      # such slot to fill. The module fence in the rule is the belt behind this brace.
       - name: The rule's own tests, from the base tree
-        run: python -B tests/test_okf_ownership.py
+        run: python -I -B tests/test_okf_ownership.py
 
       - name: This pull request writes the OKF only where the protected branch says it may
         env:
@@ -223,7 +247,7 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          python -B scripts/okf_ownership.py "${HEAD_REF}" \
+          python -I -B scripts/okf_ownership.py "${HEAD_REF}" \
             --trusted-base "${BASE_SHA}" \
             --base-ref "${BASE_REF}" \
             --changed-from "${RUNNER_TEMP}/changed.json" \

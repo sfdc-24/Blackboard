@@ -170,6 +170,17 @@ FLOOR = OKF + "floor.md"
 # the expected check name (Codex's third P1 on a1e1e4f). They are the operator's alone now. It is
 # not identity: a prefix is attribution, and the fleet pushes as one account. It is the same level
 # of control as the floor file, applied to the things that enforce the floor file.
+# THE MODULES THE GATE IMPORTS, which can be shadowed by a file that merely SITS somewhere.
+# `python tests/x.py` puts `tests/` at the front of sys.path and `python scripts/x.py` puts
+# `scripts/` there, so `tests/json.py` or `scripts/json.py` - paths this rule happily allowed -
+# would execute at import time on every later gate run, before either protected file, and need
+# only exit 0 to keep the check green while bypassing everything (Codex's P1 on f209b38). The
+# gate runs `python -I`, which drops the script directory from sys.path and closes that at the
+# source; this tuple is the belt behind that brace, and a control asserts it still names every
+# top-level import of both files, so it cannot drift silently.
+SHADOWABLE = ("ast", "json", "re", "subprocess", "sys", "pathlib", "contextlib", "importlib",
+              "io", "os", "shutil", "tempfile", "unittest")
+SHADOW_DIRS = ("scripts/", "tests/")
 AUTHORITY = ("scripts/okf_ownership.py",
              "tests/test_okf_ownership.py",
              ".github/workflows/okf-ownership.yml",
@@ -182,6 +193,12 @@ GRANT = re.compile(r"^\s*-\s*grant:\s*([a-z0-9-]+)\s*\|\s*call:\s*([^|]+?)\s*\|\
 # target an unmerged branch of its own and that branch may carry anything (Codex 20:26Z, exact-head
 # review of conference 162 and this PR). A closed list, never a pattern: `main-ish` is not main.
 PROTECTED = ("main", "origin/main", "refs/heads/main", "refs/remotes/origin/main")
+# THE PROTECTED BRANCH'S NAME, which is not the same thing as the ref aliases above. `--base-ref`
+# carries `pull_request.base.ref`, a repository BRANCH NAME, and PROTECTED also holds advisory git
+# spellings - so a pull request targeting an ordinary branch literally named `origin/main` was
+# treated as protected and its floor grants honoured (Codex's P1 on f209b38). Anyone may push a
+# branch by that name. The aliases stay for resolving a REF; a branch name is compared only here.
+PROTECTED_BRANCH = "main"
 # What a short name is resolved AS. `git show origin/main:file` prefers refs/heads/origin/main over
 # refs/remotes/origin/main, so a branch literally named `origin/main` - which anyone may push -
 # becomes the "protected" copy and hands itself the rule and the floor. Codex reproduced that on
@@ -588,9 +605,21 @@ def in_force(base: str, root=None):
     return floor, call, ""
 
 
+def shadows_the_gate(path: str) -> bool:
+    """Whether `path` is a file that could be imported in place of a module the gate needs.
+
+    Only a .py sitting DIRECTLY in one of the two directories the gate runs out of counts: a
+    deeper path is never on sys.path[0], and a name the gate does not import shadows nothing.
+    """
+    for where in SHADOW_DIRS:
+        if path.startswith(where) and "/" not in path[len(where):] and path.endswith(".py"):
+            return path[len(where):-3] in SHADOWABLE
+    return False
+
+
 def allowed(branch: str, path: str, floor: str = "", call: str = None) -> bool:
     """Whether `branch` may change `path`. `docs/okf/` and the files that enforce it."""
-    if path in AUTHORITY:
+    if path in AUTHORITY or shadows_the_gate(path):
         # No grant reaches these, however wide: a floor grant that could hand over the rule would
         # be a grant that hands out grants.
         return any(branch.startswith(p) for p in OPERATORS)
@@ -635,6 +664,14 @@ _CONTROLS = (
     ("grok/x", ".github/workflows/okf-ownership.yml", "", False),
     ("claude-code-cli/x", "scripts/okf_ownership.py", "", True),
     ("grok/x", "scripts/okf_ownership.py", _GRANTED_WIDE, False),
+    # A file that shadows a module the gate imports is the gate, by another road.
+    ("grok/x", "scripts/json.py", "", False),
+    ("codex/x", "tests/json.py", "", False),
+    ("pi1-cli/notes", "scripts/subprocess.py", "", False),
+    ("claude-code-cli/x", "scripts/json.py", "", True),
+    ("grok/x", "scripts/deeper/json.py", "", True),      # never on sys.path[0]
+    ("grok/x", "scripts/json.txt", "", True),            # not importable
+    ("grok/x", "scripts/notashadow.py", "", True),       # a name the gate does not import
     ("grok/x", OKF + "index.md", _GRANTED, True),       # an open grant still hands the pen over
     ("grok/x", FLOOR, _GRANTED_WIDE, False),            # and never the page that hands it out
 )
@@ -714,7 +751,7 @@ def main(argv, root=None) -> int:
             return 1
         paths = {_unquote(p) for p in found}
         ref = "the base commit %s" % trusted_base[:12]
-        if base_ref not in PROTECTED:
+        if base_ref != PROTECTED_BRANCH:
             # The checkout IS the base commit, but the base is not the protected branch: standing
             # access and everything outside the OKF still hold, and a handover does not. This is
             # the hole from conference #161 in its last shape - a branch targeting a branch.
@@ -727,10 +764,20 @@ def main(argv, root=None) -> int:
             # without touching a name a push can move. The mode is checked because an authority
             # file that is a symlink hands out the pen from somewhere else entirely.
             floor, crooked = authority_at(trusted_base, FLOOR, root)
-            if crooked:
+            if crooked and not (any(branch.startswith(p) for p in OPERATORS)
+                                and paths == {FLOOR}):
                 print("REFUSED: %s. An authority file that is not a regular file is not an"
                       " authority file, so this run judges nothing." % crooked)
                 return 1
+            if crooked:
+                # THE WAY OUT, and it has to exist. Codex on f209b38: once a crooked floor is on
+                # the protected branch, refusing every run would fail EVERY later pull request -
+                # including the one restoring the floor - and a gate that cannot be repaired is a
+                # denial of service wearing a security control. The operator, changing that page
+                # and nothing else, is admitted exactly as it is for two pens on one page.
+                print("OK: %s; the operator's repair of that page, alone, is the way out."
+                      % crooked)
+                return 0
             if floor is None:
                 floor, call = "", ""
                 why = "%s carries no %s, so no grant is in force" % (ref, FLOOR)
