@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -55,6 +56,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
 STATE_PATH = REPO / "logs" / "wa_board_outbox_state.json"
+# How old a queued row may be and still be delivered. Nothing drains this outbox on a
+# schedule, so rows accumulate: at 23:58Z on 2026-10-03 one EOD send delivered eighteen
+# notices queued between Sep 21 and Oct 2 to his phone in one burst. Anything older than
+# this is retired into the state file instead - recorded as handled, never sent, and never
+# surfacing again. 0 turns the limit off.
+DEFAULT_MAX_AGE_HOURS = 12.0
 LOG_PATH = REPO / "logs" / "wa_board_outbox.jsonl"
 NOTIFY = SCRIPTS / "wa_notify.ps1"
 BOARD = "Blackboard - Alpha DB"
@@ -267,6 +274,55 @@ def select_undelivered(rows, state: dict) -> list[dict]:
         seen.update(keys)
         found.append(req)
     return found
+
+
+def age_hours(ts: str, now=None) -> float | None:
+    """How old a row is in hours, or None when its timestamp cannot be read.
+
+    Unreadable is not young: the caller retires it rather than sending it, because the one thing
+    worse than losing an old notice is delivering it as if it were news.
+    """
+    text = (ts or "").strip().replace("Z", "+00:00")
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - when).total_seconds() / 3600.0
+
+
+def sane_hours(value) -> float:
+    """An age in hours, or a refusal before anything is sent.
+
+    float() accepts "nan", "inf" and "-1", and each of them breaks the comparison in a different
+    direction: NaN makes every comparison false, so every stale row is delivered; -1 retires
+    everything including the row just written. Codex's P2 on this PR: reject them rather than let
+    the flag decide what the limit means (gcloud and argparse will not).
+    """
+    hours = float(value)
+    if math.isnan(hours) or math.isinf(hours) or hours < 0:
+        raise argparse.ArgumentTypeError(
+            "--max-age-hours must be a finite number of hours, not %r" % (value,))
+    return hours
+
+
+def split_by_age(pending: list[dict], max_age_hours: float) -> tuple[list[dict], list[dict]]:
+    """(the rows still worth sending, the rows to retire unsent).
+
+    His phone is not an archive. A row that has waited longer than the limit has already been
+    overtaken by whatever happened since, and delivering it reads as a fault in the fleet - which
+    is exactly how it read at 23:58Z on 2026-10-03, when one EOD arrived with eighteen notices
+    from the fortnight before it. `--max-age-hours 0` turns the limit off.
+    """
+    if not max_age_hours:
+        return list(pending), []
+    fresh, stale = [], []
+    for req in pending:
+        old = age_hours(req.get("ts"))
+        (stale if old is None or old > max_age_hours else fresh).append(req)
+    return fresh, stale
 
 
 def prime_state(rows, state: dict) -> dict:
@@ -496,7 +552,7 @@ def load_fixture(path: Path) -> list:
 
 
 def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
-             state_path: Path) -> int:
+             state_path: Path, max_age_hours: float = DEFAULT_MAX_AGE_HOURS) -> int:
     # Dry-run touches neither Graph nor the state file. A live pass settles
     # a leftover claim before it selects, so an unknown send is not pending.
     if not dry_run:
@@ -511,7 +567,17 @@ def run_once(rows, state: dict, *, dry_run: bool, send: bool, note: bool,
         return 0
 
     pending = select_undelivered(rows, state)
-    print(f"pending={len(pending)}")
+    pending, stale = split_by_age(pending, max_age_hours)
+    for req in stale:
+        old = age_hours(req.get("ts"))
+        print("  RETIRED %s  [%s - %s]  %s old, not sent"
+              % (req["row_id"][:12], req["kind"], req["tag"],
+                 ("%.0f h" % old) if old is not None else "no readable timestamp"))
+        if not dry_run:
+            mark_delivered(state, req)
+    if stale and not dry_run:
+        save_state(state, state_path)
+    print(f"pending={len(pending)} retired={len(stale)}")
     sent = 0
     failed = 0
     for req in pending:
@@ -594,6 +660,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Most-recent rows to ask the bus for, per match token")
     ap.add_argument("--fixture", type=Path,
                     help="JSON rows file; skip the live board (for dry-run / tests)")
+    ap.add_argument("--max-age-hours", type=sane_hours, default=DEFAULT_MAX_AGE_HOURS,
+                    help="Retire a queued row older than this instead of sending it "
+                         "(default %(default)s; 0 sends whatever is pending)")
     ap.add_argument("--state", type=Path, default=STATE_PATH,
                     help="Override the delivered-id state file")
     args = ap.parse_args(argv)
@@ -614,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
     return run_once(
         rows, state,
         dry_run=args.dry_run, send=send, note=args.note, state_path=args.state,
+        max_age_hours=args.max_age_hours,
     )
 
 

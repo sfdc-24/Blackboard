@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,10 +24,17 @@ cloud = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cloud)
 
 
-def waker_row(rid, tag, target, reply="REPLY: Here is the answer."):
+def waker_row(rid, tag, target, reply="REPLY: Here is the answer.", ts=None):
+    """A waker answer, stamped NOW unless the caller wants an old one.
+
+    The stamp used to be a fixed date in 2026-09, which made every row in this suite older than
+    the sender's age limit once that limit existed - and the limit is here because eighteen rows
+    that old reached his phone in one burst on 2026-10-03.
+    """
     payload = ("BCB|v=1|id=%s|phase=DONE|class=NOTE|from=%s|to=%s|wakerreply=1|answers=WRK-1|"
                "evidence=STATED|Answered by the waker. %s" % (rid, tag, target, reply))
-    return [rid, "2026-09-24T03:00:00Z", tag, target, "DONE", payload]
+    stamp = ts or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return [rid, stamp, tag, target, "DONE", payload]
 
 
 class WakerReplyParsing(unittest.TestCase):
@@ -124,6 +132,16 @@ class CloudWrapper(unittest.TestCase):
              mock.patch.object(outbox, "append_log"):
             return cloud.run(store=store, outbox=outbox)
 
+    def test_a_stale_row_is_retired_in_the_cloud_too(self):
+        """The cloud job is the drainer, and it retires what is too old to be news rather than
+        delivering it (2026-10-03: a burst of eighteen notices queued over twelve days)."""
+        self.rows = [waker_row("GEMINI-WAKE-OLD", "gemini", "whatsapp;ALL",
+                               ts="2026-09-24T03:00:00Z")]
+        store = MemStore({"delivered_row_ids": ["seed"], "delivered_bcb_ids": []})
+        self.assertEqual(self.run_cloud(store), 0)
+        self.assertEqual(self.sent, [])
+        self.assertIn("GEMINI-WAKE-OLD", store.state["delivered_row_ids"])
+
     def test_refuses_without_a_seeded_cursor(self):
         self.assertEqual(self.run_cloud(MemStore(None)), 2)
         self.assertEqual(self.run_cloud(MemStore({"delivered_row_ids": []})), 2)
@@ -200,9 +218,10 @@ class CloudWrapper(unittest.TestCase):
 
     def test_a_killed_receipt_quarantines_both_ids_so_the_alias_is_sent_once(self):
         """ROW-A/EVENT-A is accepted, the receipt save dies, ROW-B/EVENT-A must not send."""
-        row_a = ["ROW-A", "2026-09-24T03:00:00Z", "codex", "wa-outbox", "APPEND",
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        row_a = ["ROW-A", now, "codex", "wa-outbox", "APPEND",
                  "BCB|v=1|id=EVENT-A|phase=WA_SEND|from=codex|to=wa-outbox|text=hello"]
-        row_b = ["ROW-B", "2026-09-24T03:00:01Z", "codex", "wa-outbox", "APPEND",
+        row_b = ["ROW-B", now, "codex", "wa-outbox", "APPEND",
                  "BCB|v=1|id=EVENT-A|phase=WA_SEND|from=codex|to=wa-outbox|text=hello again"]
         store = MemStore({"schema": 1, "delivered_row_ids": ["OLD"], "delivered_bcb_ids": []})
         self.rows = [row_a]
