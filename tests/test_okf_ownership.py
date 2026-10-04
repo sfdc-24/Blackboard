@@ -915,6 +915,15 @@ else:
           [line for line in live if "ref:" in line])
     check("it hands the rule the posture, the target branch and the forge's list",
           all(flag in ran for flag in ("--trusted-base", "--base-ref", "--changed-from")))
+    # TWO MUTANTS SURVIVED FOR WANT OF THESE. I controlled what the RULE does with a fork and
+    # with its sys.path, and never that the WORKFLOW still hands it either - so dropping
+    # `--head-repo`, or dropping `-I`, changed nothing any control could see. The wiring is part
+    # of the repair, not a detail of it.
+    check("it tells the rule which repository the head came from",
+          "--head-repo" in ran and "--this-repo" in ran
+          and "head.repo.full_name" in ran and "github.repository" in ran)
+    check("and it runs python ISOLATED, so no file can shadow a module the gate imports",
+          ran.count("python -I -B") >= 2 and "python -B " not in ran)
     check("it asks the forge for both ends of a rename",
           "previous_filename" in ran and "--name-only" not in ran)
     check("it reads no ref for its authority",
