@@ -183,6 +183,24 @@ class DryRunAndState(unittest.TestCase):
             again = ox.select_undelivered(rows, saved)
             self.assertEqual(again, [])
 
+    def test_an_age_must_be_a_finite_number_of_hours(self):
+        """float() takes "nan", "inf" and "-1", and each breaks the comparison differently: NaN
+        makes every comparison false, so every stale row goes out; -1 retires the row just written.
+        Codex's P2 on this pull request."""
+        self.assertEqual(12.0, ox.sane_hours("12"))
+        self.assertEqual(0.0, ox.sane_hours("0"))
+        for junk in ("nan", "inf", "-inf", "-1", "-0.5"):
+            with self.assertRaises(Exception, msg=junk):
+                ox.sane_hours(junk)
+
+    def test_a_nan_limit_would_have_sent_every_stale_row(self):
+        """The behaviour the guard above prevents, stated as a fact about the comparison."""
+        self.assertFalse(float("nan") > 12.0)
+        rows = [{"ts": "2026-09-21T00:00:00Z", "row_id": "OLD", "kind": "STATUS", "tag": "codex"}]
+        fresh, stale = ox.split_by_age(rows, float("nan"))
+        self.assertEqual(1, len(fresh), "with NaN as the limit nothing is retired")
+        self.assertEqual([], stale)
+
     def test_a_row_older_than_the_limit_is_retired_and_never_sent(self):
         """2026-10-03 23:58Z: one EOD send delivered eighteen notices queued between Sep 21 and
         Oct 2 to his phone in one burst, because nothing drains this outbox on a schedule and the

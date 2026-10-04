@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -290,6 +291,21 @@ def age_hours(ts: str, now=None) -> float | None:
         when = when.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
     return (now - when).total_seconds() / 3600.0
+
+
+def sane_hours(value) -> float:
+    """An age in hours, or a refusal before anything is sent.
+
+    float() accepts "nan", "inf" and "-1", and each of them breaks the comparison in a different
+    direction: NaN makes every comparison false, so every stale row is delivered; -1 retires
+    everything including the row just written. Codex's P2 on this PR: reject them rather than let
+    the flag decide what the limit means (gcloud and argparse will not).
+    """
+    hours = float(value)
+    if math.isnan(hours) or math.isinf(hours) or hours < 0:
+        raise argparse.ArgumentTypeError(
+            "--max-age-hours must be a finite number of hours, not %r" % (value,))
+    return hours
 
 
 def split_by_age(pending: list[dict], max_age_hours: float) -> tuple[list[dict], list[dict]]:
@@ -644,7 +660,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="Most-recent rows to ask the bus for, per match token")
     ap.add_argument("--fixture", type=Path,
                     help="JSON rows file; skip the live board (for dry-run / tests)")
-    ap.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
+    ap.add_argument("--max-age-hours", type=sane_hours, default=DEFAULT_MAX_AGE_HOURS,
                     help="Retire a queued row older than this instead of sending it "
                          "(default %(default)s; 0 sends whatever is pending)")
     ap.add_argument("--state", type=Path, default=STATE_PATH,
