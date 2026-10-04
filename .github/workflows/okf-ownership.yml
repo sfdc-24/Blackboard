@@ -1,10 +1,25 @@
 name: okf-ownership
 
+# ADVISORY, AND NOT THE GATE. Read this before relying on a green tick here.
+#
 # His directive of 2026-10-03 (GROK-OKF-LIVE-WRITE-20261003T1426Z): docs/okf/ has one writer and
 # everyone else reads it, with the pen handed over during a call. scripts/okf_ownership.py is the
-# rule; this is what runs it. The handover is read from the pull request's BASE, never from the
-# branch being checked, so a branch cannot write its own grant and be admitted by it (Codex's P1 on
-# conference #161). The check has an opinion about docs/okf/ and about nothing else in this repo.
+# rule. THE CHECK THAT ENFORCES IT IS `okf-ownership-trusted.yml`, which runs on
+# `pull_request_target` from the base branch. This workflow runs on `pull_request`, which means
+# GitHub takes its definition from the pull request's own merge ref - so the branch being judged
+# can edit this file, replace the step below with a no-op, or delete the job, and the tick is
+# still green. That is Codex's P1, it cannot be closed from inside a candidate-defined workflow,
+# and this workflow stops pretending to close it.
+#
+# It still earns its place: it gives an author the rule's verdict in seconds, from their own tree,
+# before a reviewer looks. The rule itself prints `ADVISORY: ... this run is not the gate and
+# decides nothing` whenever it is run without `--trusted-base`, which is every run here.
+#
+# WHAT IT NO LONGER DOES. It used to extract the rule from `refs/remotes/origin/main` and call that
+# copy trusted. That ref is local, the step above it runs candidate code, and candidate code can
+# repoint it - so the byte comparison agreed with whatever had been put there. The gate reads no
+# ref at all: it checks out the forge-named base commit and takes the changed set from the forge's
+# own file list.
 
 on:
   pull_request:
@@ -14,44 +29,27 @@ permissions:
 
 jobs:
   okf:
-    name: okf-ownership / one writer
+    name: okf-ownership / advisory (not the gate)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to commit shas rather than tags, as the gate is: a tag is repointed by its
+      # maintainers, so the code a workflow runs can change with no commit here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
       - name: The rule's own tests
-        run: python tests/test_okf_ownership.py
-      # The rule is taken from the protected branch and run from outside the checkout. CI used to
-      # run scripts/okf_ownership.py out of the candidate's own tree, so the branch being judged
-      # could edit its judge (Codex 20:26Z). A pull request may still change the rule, but the
-      # change enforces nothing until it is merged. The changed paths come from git inside the
-      # rule, not from this step: `--name-only` showed only where a rename landed.
-      - name: This PR writes the OKF only where it may, by the rule on the protected branch
+        run: python -B tests/test_okf_ownership.py
+      - name: What the rule says about this branch, out of this branch's own tree
         env:
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          mkdir -p "${RUNNER_TEMP}/trusted"
-          # The rule that judges this pull request is the copy on main, taken out of the checkout
-          # the branch controls. This pull request is the one that puts that version THERE, so
-          # until it merges there is nothing trusted to take: the step tries, says which copy it
-          # ran, and every pull request after this one gets the copy from main.
-          RULE="scripts/okf_ownership.py"
-          if git show "refs/remotes/origin/main:scripts/okf_ownership.py" > "${RUNNER_TEMP}/trusted/okf_ownership.py" 2>/dev/null \
-             && grep -q -- '"--protected"' "${RUNNER_TEMP}/trusted/okf_ownership.py"; then
-            RULE="${RUNNER_TEMP}/trusted/okf_ownership.py"
-            sha256sum "${RULE}"
-            echo "the rule comes from origin/main"
-          else
-            echo "origin/main does not carry this version of the rule yet:"
-            echo "running this pull request's own copy, which its review reads anyway"
-          fi
+          set -euo pipefail
           git -c core.quotePath=false diff --name-status -M -C "origin/${BASE_REF}...HEAD"
-          python "${RULE}" "${HEAD_REF}" \
+          python -B scripts/okf_ownership.py "${HEAD_REF}" \
             --protected origin/main --base "origin/${BASE_REF}" --repo .

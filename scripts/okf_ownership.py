@@ -15,8 +15,14 @@ the same rule for Blackboard, and it is DELIBERATELY NARROW:
     map and this is not the place to invent one, so every path outside the OKF passes;
   * `claude-code-cli` and `pi1-cli` both write the OKF's pages (his words of 19:45Z added the Pi);
     the floor file stays with the operator of the calls alone;
-  * `docs/okf/gemini/` stays Gemini's own corner, which is where `scripts/okf_land.py` lands its
-    signed RESULTs from `gemini/okf-<row>` branches;
+  * `docs/okf/gemini/` is an ORDINARY OKF PAGE here, with no standing exception for `gemini/*`.
+    The README sitting in that folder is the policy of record: Gemini lands its signed RESULTs in
+    the PRIVATE conference repository, "never here", because Codex's security review of #304
+    (5e2a4cb) ruled that no free model text from the board goes to a public repository - and this
+    repository is public. `scripts/okf_land.py` hard-codes conference for the same reason. The
+    rule used to grant `gemini/*` unconditional write to that path and so contradicted all three
+    (Codex's second P1 on 2ec9ee0). Gemini is handed that corner by a floor grant like anyone
+    else, which is the reviewed path;
   * a handover is read from the PROTECTED BASE (`--base`), never from the branch being checked. The
     conference's first version read the candidate's own copy of the floor file, so a branch could
     add its own grant line and be admitted by it (Codex's P1 on conference #161). Here that mistake
@@ -43,9 +49,7 @@ AND THE GRANT IS ONLY AS GOOD AS WHAT THE RULE CAN SEE. Codex's exact-head revie
     rather than this box's code page;
   * a branch may not PROPOSE two pens on one page, and a protected floor already in that state
     refuses every run but one: the operator's repair of that page, alone in its pull request;
-  * the rule answers its own controls before it judges anything (`controls_hold`), and CI runs the
-    copy from the protected branch, outside the checkout, because the branch being judged was
-    supplying its own judge.
+  * the rule answers its own controls before it judges anything (`controls_hold`).
 
 AND CODEX GOT PAST THAT THREE MORE WAYS (00:25Z, on c33cf11 and conference a4abec9):
 
@@ -57,6 +61,42 @@ AND CODEX GOT PAST THAT THREE MORE WAYS (00:25Z, on c33cf11 and conference a4abe
   * a collision is judged within one call (`overlapping_in_a_call`), because a grant retired with an
     older call was blocking a valid new one;
   * and every `call:` KEY counts, not every non-empty value.
+
+AND THEN THE ONE THAT COULD NOT BE CLOSED IN THIS FILE AT ALL (Codex's P1 on 2ec9ee0 and on
+conference 133529f, the third review running: "independent enforcement remains absent...
+Self-comparison cannot establish independent authority"). Two holes, both structural:
+
+  * a `pull_request` workflow's own definition comes from the candidate's merge ref, so the branch
+    being judged could replace the enforcement step with a no-op, or delete the job;
+  * everything above was read with `git show <ref>:<path>` against a LOCAL remote-tracking ref,
+    and candidate code - run by an earlier step of that same candidate workflow, `python
+    tests/test_okf_ownership.py` out of the candidate's tree - could repoint it at a commit of its
+    choosing carrying an unmodified rule and a fabricated grant. `trusted_copy()` then compared
+    two things the same contamination reached and agreed with the fabrication. No amount of
+    hashing fixes that: a hash of a contaminated ref is a hash of a contaminated ref.
+
+So provenance stopped being claimed from inside this file. THE GATE IS
+`.github/workflows/okf-ownership-trusted.yml`, a `pull_request_target` workflow - the one
+pull-request trigger whose definition GitHub takes from the BASE BRANCH - which checks out the
+forge-named base commit, never the candidate's, runs no candidate code at all, and hands this rule:
+
+    --trusted-base <base sha>      and `trusted_posture()` REFUSES unless `git rev-parse HEAD` IS
+                                   that sha, so the posture cannot be claimed from a command line
+    --base-ref <branch>            which must name the protected branch, or no grant counts: a
+                                   pull request may target an unmerged branch of its own
+    --changed-from <file>          the forge's own `pulls/<n>/files`, both ends of every rename,
+                                   instead of a local diff against a ref that could be moved
+    --candidate-floor <file>       the branch's own floor.md, fetched as DATA and read ONLY to
+                                   refuse two pens on one page. Never checked out, never executed
+
+There is NO FALLBACK. A missing changed-path list, a checkout that is not the base commit, or a
+base that is not the protected branch all refuse. Run without `--trusted-base` - which is what
+`okf-ownership.yml` and a person at a terminal do - the rule prints `ADVISORY ... this run is not
+the gate and decides nothing`, and `trusted_copy()` still withholds every grant.
+
+WHAT NONE OF IT SETTLES: a branch prefix is attribution, not an authenticated identity. The whole
+fleet pushes as one GitHub account, so this rule says which paths a prefix may write and not who
+holds it. That needs a GitHub App per agent, which is a build and his word.
 
 A branch prefix is attribution, not an authenticated identity: everyone pushes as the same account.
 That is as true here as it is on the conference line, and a grant trusts the prefix the same way.
@@ -82,6 +122,14 @@ OPERATORS = ("claude-code-cli/", "vm-claude-code-cli/")
 # second writer on it is the self-grant hole Codex found on conference #161 in another shape. If he
 # wants pi1-cli to hand out pens as well, one word changes this tuple.
 WRITERS = OPERATORS + ("pi1-cli/",)
+# docs/okf/gemini/ holds a README and one historical write-up, and NOT a standing exception. The
+# policy of record is the README sitting in it: Gemini lands its signed RESULTs in the PRIVATE
+# conference repository, "never here", because Codex's security review of #304 (5e2a4cb,
+# 2026-09-30) ruled that no free model text from the board goes to a public repository - and this
+# repository is public. scripts/okf_land.py hard-codes conference for the same reason. The rule
+# used to contradict all three by granting gemini/* unconditional write to this path (Codex's
+# second P1 on 2ec9ee0). The exception is gone: Gemini is handed this corner by a floor grant like
+# anyone else, which is the reviewed path, and the controls below prove both halves.
 GEMINI = OKF + "gemini/"
 FLOOR = OKF + "floor.md"
 OPEN_GRANTS = "## Open grants"
@@ -302,6 +350,10 @@ def changed(base: str, root=None) -> tuple:
     gives the status, BOTH ends of a rename or a copy, and no quoting at all.
     """
     at = Path(root) if root else Path(__file__).resolve().parent.parent
+    # The diff base resolves through FULL too. A short name here was the other half of the same
+    # shadowing: `origin/main...HEAD` prefers refs/heads/origin/main, so a branch anyone may push
+    # could decide what counts as changed as well as what counts as authority.
+    base = FULL.get(base, base)
     try:
         done = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "-z", "--name-status",
                                "-M", "-C", "%s...HEAD" % base],
@@ -320,6 +372,79 @@ def changed(base: str, root=None) -> tuple:
         paths.update(fields[i:i + both])
         i += both
     return paths, ""
+
+
+def head_sha(root=None) -> str:
+    """The commit the checkout is actually on, or "" when git cannot say."""
+    at = Path(root) if root else Path(__file__).resolve().parent.parent
+    try:
+        done = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(at), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def worktree_floor(root=None) -> str:
+    """docs/okf/floor.md as the CHECKOUT has it. Trusted only because of whose commit that is."""
+    at = Path(root) if root else Path(__file__).resolve().parent.parent
+    here = at.joinpath(*FLOOR.split("/"))
+    return here.read_text(encoding="utf-8") if here.is_file() else None
+
+
+def trusted_posture(base_sha: str, root=None) -> tuple:
+    """(whether this run IS the forge-named base commit, why it is not).
+
+    THE HALF THAT COULD NOT BE DONE FROM INSIDE THE REPOSITORY. Codex's P1, carried across three
+    reviews: a `pull_request` workflow's own definition comes from the candidate's merge ref, so
+    the candidate can replace the enforcement step; and everything this rule read came through
+    `git show <ref>:<path>` against a LOCAL remote-tracking ref, which candidate code - run by an
+    earlier step of that same candidate workflow - could repoint. Comparing the rule's bytes with
+    that ref is self-comparison: "neither a printed hash nor equality to the contaminated ref
+    establishes independent provenance".
+
+    So provenance is no longer claimed from inside. It is established by WHERE the run happens:
+    `.github/workflows/okf-ownership-trusted.yml` is a `pull_request_target` workflow, whose
+    definition GitHub takes from the base branch and not from the pull request, and which checks
+    out the forge-named base commit and never the candidate's. No candidate code runs in it at
+    all, so there is no earlier step to contaminate anything.
+
+    What this function does is check that story against the checkout: the commit the rule is
+    running out of must BE the base commit the forge named. If it is not - a candidate tree, a
+    merge ref, a reanchored ref - the run refuses. It cannot be talked into the trusted posture
+    from the command line, because the sha has to match a tree the caller does not control.
+    """
+    if not base_sha:
+        return False, "no trusted base commit was named"
+    if not re.fullmatch(r"[0-9a-f]{40}", base_sha.strip().lower()):
+        return False, "%r is not a commit sha" % base_sha[:48]
+    here = head_sha(root)
+    if not here:
+        return False, "git cannot say which commit this checkout is on"
+    if here.lower() != base_sha.strip().lower():
+        return False, ("this checkout is %s and the trusted base commit is %s: the rule is not "
+                       "running out of the base tree" % (here[:12], base_sha.strip()[:12]))
+    return True, ""
+
+
+def paths_from(listing: str, root=None) -> tuple:
+    """(the changed paths the forge itself reported, why they could not be read).
+
+    Not a local diff. `git diff <ref>...HEAD` needs a ref and a candidate commit, and both were
+    reachable by candidate code; the forge's own `pulls/<n>/files` is neither. One path per line,
+    renames naming both ends, written by the trusted workflow.
+    """
+    at = Path(listing)
+    if not at.is_file():
+        return set(), "%s is not a file, so the forge's changed-path list was not read" % listing
+    try:
+        text = at.read_text(encoding="utf-8")
+    except OSError as broke:
+        return set(), "%s cannot be read (%s)" % (listing, broke)
+    found = {line.strip() for line in text.splitlines() if line.strip()}
+    if not found:
+        return set(), "%s is empty, so no changed path was reported" % listing
+    return found, ""
 
 
 def _candidate_floor(root=None) -> str:
@@ -367,9 +492,6 @@ def allowed(branch: str, path: str, floor: str = "", call: str = None) -> bool:
     if path == FLOOR:
         # The page that hands out the pen stays with the operator of the calls.
         return any(branch.startswith(p) for p in OPERATORS)
-    if path.startswith(GEMINI):
-        # Gemini's own corner, where scripts/okf_land.py lands its signed RESULTs.
-        return branch.startswith("gemini/") or any(branch.startswith(p) for p in OPERATORS)
     if any(branch.startswith(p) for p in WRITERS):
         return True
     return handed_over(branch, path, floor, call)
@@ -380,6 +502,7 @@ def allowed(branch: str, path: str, floor: str = "", call: str = None) -> bool:
 # branch's own copy of the rule, and a `True` in place of allowed() admitted the floor file).
 _GRANTED = OPEN_GRANTS + "\n- grant: grok | call: a call | paths: " + OKF + "index.md\n"
 _GRANTED_WIDE = OPEN_GRANTS + "\n- grant: grok | call: a call | paths: " + OKF + "\n"
+_GRANTED_GEMINI = (OPEN_GRANTS + "\n- grant: gemini | call: a call | paths: " + OKF + "gemini/\n")
 _CONTROLS = (
     # branch, path, the floor it is judged against, and whether it may write it
     ("grok/x", FLOOR, "", False),
@@ -392,7 +515,10 @@ _CONTROLS = (
     ("pi1-cli/notes", OKF + "index.md", "", True),
     ("claude-code-cli/x", OKF + "index.md", "", True),
     ("codex/x", GEMINI + "RESULT-1.md", "", False),
-    ("gemini/okf-1", GEMINI + "RESULT-1.md", "", True),
+    # No standing exception for gemini/ in a PUBLIC repository, and the floor is still the way in.
+    ("gemini/okf-1", GEMINI + "RESULT-1.md", "", False),
+    ("gemini/okf-1", GEMINI + "RESULT-1.md", _GRANTED_GEMINI, True),
+    ("claude-code-cli/x", GEMINI + "RESULT-1.md", "", True),
     ("grok/x", "scripts/append.py", "", True),          # outside the OKF this rule has no opinion
     ("grok/x", OKF + "index.md", _GRANTED, True),       # an open grant still hands the pen over
     ("grok/x", FLOOR, _GRANTED_WIDE, False),            # and never the page that hands it out
@@ -424,13 +550,19 @@ def _taken(argv: list, flag: str) -> str:
 
 
 USAGE = ("usage: okf_ownership.py <branch> [--protected <ref>] [--base <ref>] [--repo <path>]"
-         " <changed-path>...")
+         " <changed-path>...\n"
+         "   or: okf_ownership.py <branch> --trusted-base <sha> --base-ref <name>"
+         " --changed-from <file> [--candidate-floor <file>] [--repo <path>]    (the gate)")
 
 
 def main(argv, root=None) -> int:
     argv = list(argv)
     base = _taken(argv, "--base")
     protected = _taken(argv, "--protected")
+    trusted_base = _taken(argv, "--trusted-base")
+    base_ref = _taken(argv, "--base-ref")
+    changed_from = _taken(argv, "--changed-from")
+    candidate_from = _taken(argv, "--candidate-floor")
     root = root or _taken(argv, "--repo") or None
     if not argv:
         print(USAGE)
@@ -441,39 +573,93 @@ def main(argv, root=None) -> int:
         print("REFUSED: this rule no longer holds its own controls (%s), so it judges nothing"
               % broken)
         return 1
-    # A grant is read from the protected branch, which is NOT the branch's own base ref.
-    ref, why_authority = authority(base, protected)
-    floor, call, why = in_force(ref, root)
-    if not ref:
-        why = why_authority
-    # A HANDOVER IS HONOURED ONLY BY THE PROTECTED BRANCH'S OWN COPY OF THIS RULE. CI takes the
-    # rule from that ref, but the step that does so is in the candidate's workflow, so the decision
-    # is the candidate's; this does not depend on it.
-    trusted, untrusted = trusted_copy(ref, root)
-    if not trusted:
-        floor = ""
-        if ref:                     # with no ref, the authority already said which one and why
-            why = untrusted or why
-    # What changed is git's account, not the caller's: a rename names both of its ends.
-    if base:
-        found, blind = changed(base, root)
+
+    if trusted_base:
+        # THE GATE. Everything below comes from the base commit the forge named, or from the forge
+        # itself, and nothing from a ref or a tree the candidate can reach. There is no fallback:
+        # a posture that does not check out refuses, and so does a missing changed-path list.
+        posture, why_posture = trusted_posture(trusted_base, root)
+        if not posture:
+            print("REFUSED: %s. This run claims the gate's posture and is not in it, so it judges"
+                  " nothing rather than judging from a tree the candidate can reach." % why_posture)
+            return 1
+        if not changed_from:
+            print("REFUSED: the gate must be handed the forge's own changed-path list"
+                  " (--changed-from). A local diff needs a ref and a candidate commit, which is"
+                  " exactly what this posture exists not to trust.")
+            return 1
+        if not base_ref:
+            print("REFUSED: the gate must be told which branch the pull request targets"
+                  " (--base-ref). A pull request may target an unmerged branch of its own, and"
+                  " that branch may carry any floor it likes.")
+            return 1
+        found, blind = paths_from(changed_from, root)
         if blind:
-            # The operator may be judged on the set it was given: the floor is already its own, so
-            # no rename of it hands it anything it does not have. For anyone else writing the OKF
-            # the unseen rename IS the escalation, and outside the OKF this rule has no opinion.
-            if any(p.startswith(OKF) for p in paths) and not any(branch.startswith(p)
-                                                                 for p in OPERATORS):
-                print("REFUSED: %s, so the changed paths cannot be confirmed and a rename of %s"
-                      " would be invisible" % (blind, FLOOR))
+            print("REFUSED: %s" % blind)
+            return 1
+        paths = {_unquote(p) for p in found}
+        ref = "the base commit %s" % trusted_base[:12]
+        if base_ref not in PROTECTED:
+            # The checkout IS the base commit, but the base is not the protected branch: standing
+            # access and everything outside the OKF still hold, and a handover does not. This is
+            # the hole from conference #161 in its last shape - a branch targeting a branch.
+            floor, call = "", ""
+            why = ("%r is not the protected branch, so the floor it carries hands over nothing"
+                   % base_ref)
+        else:
+            floor = worktree_floor(root)
+            if floor is None:
+                floor, call = "", ""
+                why = "%s carries no %s, so no grant is in force" % (ref, FLOOR)
+            else:
+                call, why = floor_call(floor)
+                if not call:
+                    why = "%s on %s: %s, so no grant belongs to a call" % (FLOOR, ref, why)
+                    floor = ""
+        candidate = ""
+        if candidate_from and Path(candidate_from).is_file():
+            try:
+                candidate = Path(candidate_from).read_text(encoding="utf-8")
+            except OSError as broke:
+                print("REFUSED: the branch's own %s was fetched and cannot be read (%s)"
+                      % (FLOOR, broke))
                 return 1
-            print("NOTE: %s; judging the %d path(s) given" % (blind, len(paths)))
-        paths |= found
+    else:
+        # ADVISORY. Same rule, same answers, but its provenance is the candidate's checkout, so
+        # the grant half holds nothing: a handover counts only once the rule enforcing it is the
+        # protected branch's own copy. Useful to a person and to a pull request's own CI; it is
+        # not the gate, and it says so.
+        ref, why_authority = authority(base, protected)
+        floor, call, why = in_force(ref, root)
+        if not ref:
+            why = why_authority
+        trusted, untrusted = trusted_copy(ref, root)
+        if not trusted:
+            floor = ""
+            if ref:                 # with no ref, the authority already said which one and why
+                why = untrusted or why
+        if base:
+            # What changed is git's account, not the caller's: a rename names both of its ends.
+            found, blind = changed(base, root)
+            if blind:
+                # The operator may be judged on the set it was given: the floor is already its
+                # own, so no rename of it hands it anything it does not have. For anyone else
+                # writing the OKF the unseen rename IS the escalation, and outside the OKF this
+                # rule has no opinion.
+                if any(p.startswith(OKF) for p in paths) and not any(branch.startswith(p)
+                                                                     for p in OPERATORS):
+                    print("REFUSED: %s, so the changed paths cannot be confirmed and a rename of"
+                          " %s would be invisible" % (blind, FLOOR))
+                    return 1
+                print("NOTE: %s; judging the %d path(s) given" % (blind, len(paths)))
+            paths |= found
+        candidate = _candidate_floor(root)
+
     if not paths:
         print(USAGE)
         return 2
     # Two pens on one page: refused when this branch proposes it, and when the protected floor
     # already carries it - except for the one repair that can close that.
-    candidate = _candidate_floor(root)
     proposed = overlapping_in_a_call(candidate) if candidate and candidate != floor else None
     if proposed:
         print("REFUSED: this branch's own %s hands one page to two agents: %s has %s and %s has %s."
@@ -498,6 +684,9 @@ def main(argv, root=None) -> int:
         print("OK: %d OKF path(s) of %d, for %s%s"
               % (len(okf), len(paths), branch.split("/")[0],
                  (", floor from %s" % ref) if ref else ""))
+    if not trusted_base:
+        print("ADVISORY: no --trusted-base, so this run is not the gate and decides nothing."
+              " The gate is okf-ownership-trusted, which runs from the base branch.")
     return 1 if bad else 0
 
 

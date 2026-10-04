@@ -1,0 +1,145 @@
+name: okf-ownership-trusted
+
+# THE GATE. This is the check that decides, and it is the only one that can.
+#
+# WHY A SECOND WORKFLOW EXISTS AT ALL
+#   Codex's P1, carried across three exact-head reviews of this rule (receipts 5974974573 and
+#   5974974901, and the verdict on 2ec9ee0): "independent enforcement remains absent". Two separate
+#   holes, both of them structural rather than a bug in the rule:
+#
+#   1. A `pull_request` workflow's own definition comes from the pull request's merge ref. The
+#      candidate can therefore EDIT THE ENFORCEMENT STEP - replace the python run with a no-op, or
+#      delete the job - and CI is still green. No rule written in Python can close that from inside
+#      the repository it is judging.
+#   2. `okf-ownership.yml` ran `python tests/test_okf_ownership.py` out of the candidate's tree
+#      BEFORE extracting the trusted rule, and then read the rule and the floor through
+#      `git show refs/remotes/origin/main:<path>`. That is a LOCAL ref. Candidate code - run by that
+#      earlier step of the candidate's own workflow - could repoint it at a commit of its choosing,
+#      carrying an unmodified rule and a fabricated grant. The rule's byte-comparison against that
+#      ref then agreed with the fabrication. Self-comparison cannot establish authority.
+#
+# HOW THIS CLOSES BOTH
+#   `pull_request_target` is the one pull-request trigger whose workflow definition GitHub takes
+#   from the BASE BRANCH and not from the pull request. Editing this file on a branch changes
+#   nothing until that edit is merged. And because the job never checks out the candidate's commit
+#   and never runs a line of its code, there is no earlier step left to contaminate anything:
+#
+#     * the checkout is the forge-named base commit, pinned by sha;
+#     * scripts/okf_ownership.py verifies that - `git rev-parse HEAD` must BE that sha - and
+#       refuses outright otherwise, so the posture cannot be claimed from the command line;
+#     * the changed-path set comes from the forge's own `pulls/<n>/files`, not from a local diff
+#       against a ref, so there is no ref to shadow and no `--name-only` rename to hide behind;
+#     * the floor is the base commit's working tree, read from the checkout rather than through
+#       `git show <ref>:`;
+#     * the branch's own floor.md is fetched as DATA, read only to refuse a branch that proposes
+#       two pens on one page. It is never checked out and never executed;
+#     * `--base-ref` is passed and must name the protected branch, or no grant counts: a pull
+#        request may target an unmerged branch of its own, and that branch may carry anything.
+#
+#   There is no fallback. A missing changed-path list, a checkout that is not the base commit, or a
+#   base that is not the protected branch all REFUSE. "Do not silently fall back to candidate
+#   enforcement" was the instruction, and nothing here does.
+#
+# WHAT IT IS NOT
+#   A branch prefix is attribution, not an authenticated identity - the whole fleet pushes as one
+#   GitHub account. This gate says which paths a prefix may write; it does not say who holds it.
+#   That needs a GitHub App per agent, which is a build and his word, and is written down as such.
+#
+# BOOTSTRAP, SAID PLAINLY
+#   Until this file is on main, GitHub has no base-branch copy of it to run, so the pull request
+#   that lands it is not gated by it. That is the honest state of any first commit of a gate, and
+#   it is why the step below prints which commit it is running out of.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    name: okf-ownership / the gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # PINNED TO COMMIT SHAs, not tags: a tag is repointed by its maintainers, so the code this
+      # workflow runs could change without a commit here - and this workflow is the authority.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Say which commit this gate is running out of
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "base ref  : ${BASE_REF}"
+          echo "base sha  : ${BASE_SHA}"
+          echo "checkout  : $(git rev-parse HEAD)"
+          echo "candidate : ${HEAD_SHA}  (not checked out, not run)"
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
+
+      - name: What the forge says changed, and the branch's own floor as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DECLARED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          # BOTH ends of a rename. `--name-only` showed only where a file landed, which is how a
+          # renamed floor.md would have gone unseen; the forge reports previous_filename for it.
+          gh api --paginate "repos/${REPO}/pulls/${PR}/files" \
+            --jq '.[].filename, (.[].previous_filename // empty)' | sort -u \
+            > "${RUNNER_TEMP}/changed.txt"
+          # `pulls/<n>/files` is capped at 3000 entries. A pull request larger than that cannot
+          # have its changed set confirmed, so it is refused rather than judged on a partial list.
+          named=$(gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[].filename' \
+                  | sort -u | wc -l)
+          echo "the forge declares ${DECLARED} changed file(s); ${named} name(s) came back"
+          if [ "${named}" -ne "${DECLARED}" ]; then
+            echo "::error::the changed-file list is incomplete (${named} of ${DECLARED}); the OKF" \
+                 "cannot be judged on a partial set" >&2
+            exit 1
+          fi
+          echo "changed paths, both ends of every rename included:"
+          cat "${RUNNER_TEMP}/changed.txt"
+          # The branch's own floor.md, read ONLY to refuse: a branch may not propose two pens on
+          # one page. Fetched as DATA from the forge - never checked out, never executed. A branch
+          # that does not carry the file leaves an empty file behind, which proposes nothing.
+          : > "${RUNNER_TEMP}/candidate-floor.md"
+          gh api "repos/${HEAD_REPO}/contents/docs/okf/floor.md?ref=${HEAD_SHA}" --jq '.content' \
+            2>/dev/null | base64 -d > "${RUNNER_TEMP}/candidate-floor.md" \
+            || : > "${RUNNER_TEMP}/candidate-floor.md"
+          wc -c < "${RUNNER_TEMP}/candidate-floor.md"
+
+      # The base branch's own tests, over the base branch's own rule. No candidate input reaches
+      # them; this is the gate checking that the copy of the rule it is about to run still answers
+      # its own controls.
+      - name: The rule's own tests, from the base tree
+        run: python -B tests/test_okf_ownership.py
+
+      - name: This pull request writes the OKF only where the protected branch says it may
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          python -B scripts/okf_ownership.py "${HEAD_REF}" \
+            --trusted-base "${BASE_SHA}" \
+            --base-ref "${BASE_REF}" \
+            --changed-from "${RUNNER_TEMP}/changed.txt" \
+            --candidate-floor "${RUNNER_TEMP}/candidate-floor.md" \
+            --repo .

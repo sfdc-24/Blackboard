@@ -130,18 +130,30 @@ check("pi1-cli writes the OKF's pages too (his words, 2026-10-03 19:45Z)",
       okf.allowed("pi1-cli/device-notes", "docs/okf/index.md")
       and okf.allowed("pi1-cli/device-notes", "docs/okf/lanes.md"))
 check("pi1-cli does not write the floor, the page that hands out the pen",
-      not okf.allowed("pi1-cli/x", "docs/okf/floor.md")
-      and not okf.allowed("pi1-cli/x", "docs/okf/gemini/RESULT-1.md"))
+      not okf.allowed("pi1-cli/x", "docs/okf/floor.md"))
 check("nobody else writes it without a grant",
       not any(okf.allowed(b, "docs/okf/index.md")
               for b in ("codex/x", "grok/x", "cursor/x", "copilot/x", "gemini/okf-1")))
 check("every path outside the OKF passes, for everyone",
       all(okf.allowed(b, p) for b in ("codex/x", "grok/x", "cursor/x", "claude-code-cli/x")
           for p in ("scripts/append.py", "docs/POKA-YOKE.md", "src/bus_server.py", "README.md")))
-check("Gemini keeps its own corner, where okf_land.py puts its RESULTs",
-      okf.allowed("gemini/okf-1", "docs/okf/gemini/RESULT-1.md")
-      and okf.allowed("claude-code-cli/x", "docs/okf/gemini/RESULT-1.md")
+# Codex's second P1 on 2ec9ee0: the rule granted gemini/* unconditional write to docs/okf/gemini/
+# in THIS repository, while the README sitting in that folder says Gemini lands in the private
+# conference repository and "never here", and scripts/okf_land.py hard-codes conference. The
+# exception is gone. The folder is an ordinary OKF page here: standing writers write it, everyone
+# else - Gemini included - needs the floor, which is the reviewed path.
+check("no standing exception hands a public OKF folder to gemini",
+      not okf.allowed("gemini/okf-1", "docs/okf/gemini/RESULT-1.md")
       and not okf.allowed("codex/x", "docs/okf/gemini/RESULT-1.md"))
+check("the standing OKF writers write it like any other OKF page",
+      okf.allowed("claude-code-cli/x", "docs/okf/gemini/RESULT-1.md")
+      and okf.allowed("pi1-cli/notes", "docs/okf/gemini/RESULT-1.md"))
+check("and the floor is still the way in for gemini",
+      okf.allowed("gemini/okf-1", "docs/okf/gemini/RESULT-1.md",
+                  floor("- grant: gemini | call: %s | paths: docs/okf/gemini/" % CALL), CALL)
+      and not okf.allowed("codex/x", "docs/okf/gemini/RESULT-1.md",
+                          floor("- grant: gemini | call: %s | paths: docs/okf/gemini/" % CALL),
+                          CALL))
 
 print()
 print("the floor hands the pen over, for the paths and the call it names")
@@ -338,6 +350,19 @@ check("git's own short name resolves to the pushed branch, which is the hole",
       "codex" in shadowed, shadowed[:80])
 code, said = run(["codex/x", "--base", "origin/main", "docs/okf/index.md"], root=at)
 check("a branch named origin/main does not become the authority", code == 1, said.strip())
+# The short name no longer decides what COUNTS AS CHANGED either, which was the other half of the
+# same shadowing: `git diff origin/main...HEAD` preferred refs/heads/origin/main, and that branch
+# was the candidate's own commit, so the diff came back empty and the floor.md edit it carried was
+# invisible. Resolved through FULL, the edit is in the changed set and refused by name.
+code, said = run(["gemini/okf-1", "--base", "origin/main", "docs/okf/lanes.md"], root=at)
+check("the shadow's own floor.md edit is now in the changed set, and refused",
+      code == 1 and "docs/okf/floor.md" in said, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+# The same grant, with nobody shadowing anything: it still admits.
+at = repo(floor_text=floor(GEMINI_GRANT))
+put(at, "docs/okf/lanes.md", "the lane gemini was handed\n")
+commit(at, "gemini writes the page its grant names")
 code, said = run(["gemini/okf-1", "--base", "origin/main", "docs/okf/lanes.md"], root=at)
 check("and the real grant on the remote-tracking ref still admits", code == 0, said.strip())
 shutil.rmtree(at, ignore_errors=True)
@@ -393,30 +418,199 @@ finally:
     okf.allowed = kept
 check("the controls hold again once it is put back", okf.controls_hold() == "")
 
-# This one check reads two files off the disk. A review harness that loads the rule's source
-# from pinned git objects into another checkout reads that checkout's files, which are a
-# different version and not what is under test, so it says so instead of failing.
+# ================= THE GATE: the posture it demands, and everything it refuses without ========
+#
+# Codex's P1, three reviews running: "independent enforcement remains absent... Self-comparison
+# cannot establish independent authority." Two structural holes, neither closable in Python from
+# inside a candidate-defined workflow: a `pull_request` workflow's definition comes from the
+# candidate's merge ref, so the enforcement step can be replaced; and everything the rule read
+# came through `git show <local ref>:<path>`, which candidate code run by an earlier step of that
+# same workflow could repoint.
+#
+# The answer is not a cleverer comparison. It is WHERE the run happens:
+# .github/workflows/okf-ownership-trusted.yml is a `pull_request_target` workflow, whose
+# definition GitHub takes from the base branch, which checks out the forge-named base commit and
+# never the candidate's, and which takes the changed set from the forge's own pulls/<n>/files.
+# What the rule can check from inside is that this story is true of the tree it is running in -
+# and that is what these controls are about. There is no fallback anywhere in it.
+print()
+print("the gate: the posture it demands, and what it refuses without")
+
+
+_LISTS = [0]
+
+
+def changed_list(at, *paths):
+    """The forge's own changed-path list, written the way the trusted workflow writes it."""
+    _LISTS[0] += 1
+    where = os.path.join(at, "_changed-%d.txt" % _LISTS[0])
+    with open(where, "w", encoding="utf-8", newline="") as out:
+        out.write("".join(p + "\n" for p in paths))
+    return where
+
+
+at = repo(floor_text=floor(GEMINI_GRANT))
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+LANES = changed_list(at, "docs/okf/lanes.md")
+
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", LANES], root=at)
+check("the gate reads the floor out of the base commit it is standing on", code == 0, said.strip())
+check("and does not call itself advisory", "ADVISORY" not in said, said.strip())
+
+code, said = run(["claude-code-cli/x", "docs/okf/index.md"], root=at)
+check("while a run without the posture says it decides nothing",
+      "ADVISORY" in said and "not the gate" in said, said.strip())
+
+code, said = run(["gemini/okf-1", "--trusted-base", "main", "--base-ref", "main",
+                  "--changed-from", LANES], root=at)
+check("the posture cannot be claimed with a ref name in place of a sha",
+      code == 1 and "not a commit sha" in said, said.strip())
+
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "docs/okf/lanes.md"], root=at)
+check("and not without the forge's own changed-path list",
+      code == 1 and "--changed-from" in said, said.strip())
+
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--changed-from", LANES], root=at)
+check("and not without being told which branch the pull request targets",
+      code == 1 and "--base-ref" in said, said.strip())
+
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", os.path.join(at, "_never-written.txt")], root=at)
+check("a changed-path list that is not there refuses rather than judging nothing",
+      code == 1 and "was not read" in said, said.strip())
+
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at)], root=at)
+check("and an empty one refuses too", code == 1 and "no changed path" in said, said.strip())
+
+# A pull request may target an unmerged branch of its own, and that branch may carry any floor it
+# likes. The checkout is still honestly the base commit; the base is just not the protected branch.
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "gemini/a-branch",
+                  "--changed-from", LANES], root=at)
+check("a pull request targeting a branch of its own is handed no grant by it",
+      code == 1 and "not the protected branch" in said, said.strip())
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "gemini/a-branch",
+                  "--changed-from", changed_list(at, "scripts/append.py")], root=at)
+check("while outside the OKF that changes nothing", code == 0, said.strip())
+
+# THE CHANGED SET IS THE FORGE'S ACCOUNT, NOT A LOCAL DIFF. Here the checkout IS the base commit,
+# so `git diff base...HEAD` is empty and a local diff would have found nothing to judge. The gate
+# judges what the forge reported, which is also why a rename cannot hide: the workflow asks for
+# previous_filename as well as filename.
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, "docs/okf/lanes.md", "docs/okf/floor.md")],
+                 root=at)
+check("the gate judges the forge's list even where a local diff is empty",
+      code == 1 and "docs/okf/floor.md" in said, said.strip())
+
+# The branch's own floor is fetched as DATA by the trusted workflow and read ONLY to refuse.
+CAND = os.path.join(at, "_candidate-floor.md")
+with open(CAND, "w", encoding="utf-8", newline="") as out:
+    out.write(floor(GEMINI_GRANT, "- grant: codex | call: %s | paths: docs/okf/" % CALL))
+code, said = run(["claude-code-cli/repair", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, "docs/okf/floor.md"),
+                  "--candidate-floor", CAND], root=at)
+check("a branch that proposes two pens on one page is refused on the forge's copy of its floor",
+      code == 1 and "this branch's own" in said, said.strip())
+
+# THE REANCHORING, EXECUTED. This is the mechanism Codex said remained unclosed across three
+# reviews: candidate code repoints the local remote-tracking ref at a commit of its own carrying an
+# otherwise unmodified rule and a FABRICATED GRANT, and every read the rule made through
+# `git show refs/remotes/origin/main:<path>` then agreed with the fabrication. Here the base commit
+# carries no grant at all, refs/remotes/origin/main carries one, and the checkout is the base. The
+# gate must read the tree it is standing in.
+#
+# It is also the control that was missing. A racing pair of mutation runs left the gate reading
+# `_show("origin/main", FLOOR)` in place of `worktree_floor()` and the suite still passed 82 of 82,
+# because every other fixture has HEAD and refs/remotes/origin/main at the same commit, so nothing
+# could tell the two reads apart.
+at = repo(floor_text=floor())                      # the base: no grant to anyone
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+put(at, "docs/okf/floor.md", floor(GEMINI_GRANT))  # a commit that hands gemini a page
+commit(at, "a fabricated grant, on a commit of the candidate's own")
+FAKE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+subprocess.run(("git", "update-ref", "refs/remotes/origin/main", FAKE), cwd=at, check=True,
+               capture_output=True)
+subprocess.run(("git", "reset", "-q", "--hard", BASE), cwd=at, check=True, capture_output=True)
+check("the reanchored ref really does carry the fabricated grant, which is the hole",
+      "gemini" in subprocess.run(("git", "show", "refs/remotes/origin/main:docs/okf/floor.md"),
+                                 cwd=at, capture_output=True, text=True).stdout)
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, "docs/okf/lanes.md")], root=at)
+check("and the gate reads its own checkout, so the fabricated grant admits nothing",
+      code == 1 and "docs/okf/lanes.md" in said, said.strip())
+# The same fixture, read the old way, to prove the control is not vacuous: the ref's grant is real
+# enough to admit if anything believed it.
+check("while the fabricated grant WOULD have admitted, had a ref been believed",
+      okf.allowed("gemini/okf-1", "docs/okf/lanes.md",
+                  okf._show("refs/remotes/origin/main", "docs/okf/floor.md", at), CALL))
+shutil.rmtree(at, ignore_errors=True)
+
+at = repo(floor_text=floor(GEMINI_GRANT))
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+LANES = changed_list(at, "docs/okf/lanes.md")
+# And a candidate tree cannot wear the posture: once a commit lands on top, HEAD is not the base.
+put(at, "docs/okf/lanes.md", "a candidate commit\n")
+commit(at, "the candidate's own commit")
+code, said = run(["gemini/okf-1", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", LANES], root=at)
+check("a checkout that is not the base commit refuses outright",
+      code == 1 and "not running out of the base tree" in said, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+# These two checks read the workflow files off the disk. A review harness that loads the rule's
+# source from pinned git objects into another checkout reads that checkout's files, which are a
+# different version and not what is under test, so they say so instead of failing.
+GATE_AT = os.path.join(HERE, "..", ".github", "workflows", "okf-ownership-trusted.yml")
 FLOW_AT = os.path.join(HERE, "..", ".github", "workflows", "okf-ownership.yml")
 SAME_TREE = False
 if os.path.isfile(RULE):
     with open(RULE, encoding="utf-8") as read:
-        SAME_TREE = "def controls_hold(" in read.read()
-if not (SAME_TREE and os.path.isfile(FLOW_AT)):
-    print("  skip CI runs the rule from the protected branch"
+        SAME_TREE = "def trusted_posture(" in read.read()
+if not (SAME_TREE and os.path.isfile(GATE_AT) and os.path.isfile(FLOW_AT)):
+    print("  skip the gate workflow's own shape"
           " (the files on this disk are not the version under test)")
 else:
+    with open(GATE_AT, encoding="utf-8") as read:
+        gate = read.read()
+    live = [line for line in gate.splitlines() if not line.lstrip().startswith("#")]
+    ran = " ".join(live)
+    check("the gate is the one trigger whose definition comes from the base branch",
+          "pull_request_target:" in ran and "pull_request:" not in ran, ran[:120])
+    check("it checks out the forge-named base commit",
+          "ref: ${{ github.event.pull_request.base.sha }}" in ran)
+    check("and never the candidate's commit",
+          not any("ref:" in line and "pull_request.head" in line for line in live),
+          [line for line in live if "ref:" in line])
+    check("it hands the rule the posture, the target branch and the forge's list",
+          all(flag in ran for flag in ("--trusted-base", "--base-ref", "--changed-from")))
+    check("it asks the forge for both ends of a rename",
+          "previous_filename" in ran and "--name-only" not in ran)
+    check("it reads no ref for its authority",
+          "refs/remotes/origin/main" not in ran and "git show" not in ran)
+    grants = [line.strip() for line in live
+              if line.strip().endswith((": read", ": write", ": none"))
+              and not line.strip().startswith("-")]
+    check("its token can read and not write",
+          sorted(grants) == ["contents: read", "pull-requests: read"], grants)
+    check("and its actions are pinned to commit shas, not tags",
+          "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in ran
+          and "@v4" not in ran and "@v5" not in ran)
     with open(FLOW_AT, encoding="utf-8") as read:
-        flow = read.read()
-    ran = " ".join(line for line in flow.splitlines() if not line.lstrip().startswith("#"))
-    check("CI runs the rule from the protected branch, not from this tree",
-          'git show "refs/remotes/origin/main:scripts/okf_ownership.py"' in flow
-          and "--protected origin/main" in flow and "--repo ." in flow
-          and "--name-only" not in ran
-          # one python run, of whichever copy the version check chose; the fallback to this tree
-          # is reachable only while main predates the flags, which is only this pull request
-          and sum(1 for line in flow.splitlines()
-                  if "python" in line and "${RULE}" in line) == 1
-          and """grep -q -- '"--protected"'""" in flow)
+        advisory = read.read()
+    said_live = " ".join(line for line in advisory.splitlines()
+                         if not line.lstrip().startswith("#"))
+    check("the pull_request workflow calls itself advisory and claims nothing",
+          "advisory (not the gate)" in said_live
+          and "refs/remotes/origin/main" not in said_live
+          and "--trusted-base" not in said_live)
+
 
 print()
 print("%d passed, %d failed" % (PASS, FAIL))
