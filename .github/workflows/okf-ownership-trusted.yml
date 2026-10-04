@@ -176,15 +176,25 @@ jobs:
           # candidate floor that is not mode 100644 or 100755 fails the gate here, before its
           # bytes are ever read, rather than passing now and bricking every later pull request
           # once the crooked entry is on the protected branch.
-          mode=$(gh api "repos/${HEAD_REPO}/git/trees/${HEAD_SHA}:docs/okf" \
-                   --jq '.tree[] | select(.path == "floor.md") | .mode' 2>/dev/null || true)
-          echo "the candidate's tree entry for docs/okf/floor.md: mode=${mode:-<absent>}"
-          if [ -n "${mode}" ] && [ "${mode}" != "100644" ] && [ "${mode}" != "100755" ]; then
-            echo "::error::the branch's docs/okf/floor.md has tree mode ${mode}, not a regular" \
-                 "file. An authority file may not be a symlink, a gitlink or a directory, and" \
-                 "the Contents API would have dereferenced it into looking like one." >&2
-            exit 1
-          fi
+          # Every authority file, not just the floor: if the branch proposes the RULE itself as
+          # a symlink, the gate that runs after the merge executes whatever it points at, and
+          # that target is an ordinary path the rule lets anyone edit.
+          for guarded in "docs/okf:floor.md" "scripts:okf_ownership.py" \
+                         "tests:test_okf_ownership.py" \
+                         ".github/workflows:okf-ownership.yml" \
+                         ".github/workflows:okf-ownership-trusted.yml"; do
+            dir="${guarded%%:*}"; leaf="${guarded##*:}"
+            mode=$(gh api "repos/${HEAD_REPO}/git/trees/${HEAD_SHA}:${dir}" \
+                     --jq --arg leaf "${leaf}" \
+                     '.tree[] | select(.path == $leaf) | .mode' 2>/dev/null || true)
+            echo "candidate tree entry ${dir}/${leaf}: mode=${mode:-<absent>}"
+            if [ -n "${mode}" ] && [ "${mode}" != "100644" ] && [ "${mode}" != "100755" ]; then
+              echo "::error::the branch's ${dir}/${leaf} has tree mode ${mode}, not a regular" \
+                   "file. An authority file may not be a symlink, a gitlink or a directory, and" \
+                   "the Contents API would have dereferenced a symlink into looking like one." >&2
+              exit 1
+            fi
+          done
           set +e
           gh api -i "repos/${HEAD_REPO}/contents/docs/okf/floor.md?ref=${HEAD_SHA}" \
             > "${RUNNER_TEMP}/floor.http" 2> "${RUNNER_TEMP}/floor.err"
@@ -245,11 +255,20 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # --head-repo and --this-repo are what stop a FORK buying a privileged prefix. This
+          # repository is public: anyone may fork it and name their branch claude-code-cli/x, and
+          # the rule read that prefix and handed them standing writer access, the floor and the
+          # gate's own files included (Codex's P1 on a9de3c7). A prefix was always attribution
+          # rather than identity, but from a fork it is a string a stranger chose.
           python -I -B scripts/okf_ownership.py "${HEAD_REF}" \
             --trusted-base "${BASE_SHA}" \
             --base-ref "${BASE_REF}" \
+            --head-repo "${HEAD_REPO}" \
+            --this-repo "${THIS_REPO}" \
             --changed-from "${RUNNER_TEMP}/changed.json" \
             --candidate-floor "${RUNNER_TEMP}/candidate-floor.md" \
             --repo .

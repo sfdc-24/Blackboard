@@ -605,6 +605,22 @@ def in_force(base: str, root=None):
     return floor, call, ""
 
 
+FORK = "fork/"
+
+
+def rights_of(branch: str, from_fork: bool) -> str:
+    """The branch name this rule may read rights from. A fork's name buys nothing.
+
+    THIS REPOSITORY IS PUBLIC. Anyone may fork it and name their branch `claude-code-cli/x` or
+    `pi1-cli/x`, and until now `allowed()` read that prefix and handed them standing writer access
+    - the floor and the gate's own files included (Codex's P1 on a9de3c7). A branch prefix was
+    always attribution rather than identity, but inside ONE repository it is at least attribution
+    among people who can push to it; from a fork it is a string a stranger chose. So a fork's
+    branch is rewritten to a prefix that owns nothing, and the run says so.
+    """
+    return branch if not from_fork else FORK + branch
+
+
 def shadows_the_gate(path: str) -> bool:
     """Whether `path` is a file that could be imported in place of a module the gate needs.
 
@@ -713,6 +729,8 @@ def main(argv, root=None) -> int:
     protected = _taken(argv, "--protected")
     trusted_base = _taken(argv, "--trusted-base")
     base_ref = _taken(argv, "--base-ref")
+    head_repo = _taken(argv, "--head-repo")
+    this_repo = _taken(argv, "--this-repo")
     changed_from = _taken(argv, "--changed-from")
     candidate_from = _taken(argv, "--candidate-floor")
     root = root or _taken(argv, "--repo") or None
@@ -740,6 +758,11 @@ def main(argv, root=None) -> int:
                   " (--changed-from). A local diff needs a ref and a candidate commit, which is"
                   " exactly what this posture exists not to trust.")
             return 1
+        if head_repo and this_repo and head_repo != this_repo:
+            was, branch = branch, rights_of(branch, True)
+            print("NOTE: %s comes from the fork %s, not from %s, so its branch prefix carries no"
+                  " standing access here; it is judged as %r."
+                  % (was, head_repo, this_repo, branch))
         if not base_ref:
             print("REFUSED: the gate must be told which branch the pull request targets"
                   " (--base-ref). A pull request may target an unmerged branch of its own, and"
@@ -749,7 +772,24 @@ def main(argv, root=None) -> int:
         if blind:
             print("REFUSED: %s" % blind)
             return 1
-        paths = {_unquote(p) for p in found}
+        # THE GATE'S OWN FILES MUST BE REGULAR BLOBS, and this is checked before anything is
+        # judged. If the rule, its suite or either workflow is a SYMLINK on the protected branch,
+        # the gate executes whatever the link points at - and that target is an ordinary path the
+        # rule lets anyone edit, so a later pull request silently owns every decision while the
+        # base copy still looks benign (Codex's P1 on a9de3c7). authority_at() was checking this
+        # for floor.md alone.
+        for guarded in AUTHORITY:
+            _, bent = authority_at(trusted_base, guarded, root)
+            if bent:
+                print("REFUSED: %s. The gate will not run out of a tree where one of its own"
+                      " files is not a regular file." % bent)
+                return 1
+        # NOT _unquote()d. The forge's list is already JSON-decoded into literal filenames, and
+        # _unquote treats anything wrapped in quote characters as git C-quoting - so a path
+        # literally named "docs/okf/index.md", quotes included, was rewritten into a different
+        # path and judged as that one (Codex's P1 on a9de3c7). It contradicted the byte-for-byte
+        # guarantee two lines above it. _unquote belongs to CLI input, which may be C-quoted.
+        paths = set(found)
         ref = "the base commit %s" % trusted_base[:12]
         if base_ref != PROTECTED_BRANCH:
             # The checkout IS the base commit, but the base is not the protected branch: standing

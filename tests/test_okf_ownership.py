@@ -646,6 +646,101 @@ code, said = run(["claude-code-cli/x", "--trusted-base", BASE, "--base-ref", "ma
 check("and admits the operator, which is how it ever gets repaired", code == 0, said.strip())
 shutil.rmtree(at, ignore_errors=True)
 
+# ===================== A FORK'S BRANCH NAME BUYS NOTHING =====================
+# Codex's P1 on a9de3c7, and it is the sharpest one yet: THIS REPOSITORY IS PUBLIC. Anyone may
+# fork it, name their branch claude-code-cli/x or pi1-cli/x, and allowed() read that prefix and
+# handed them standing writer access - the floor and the gate's own files included. A prefix was
+# always attribution rather than identity, but inside one repository it is at least attribution
+# among people who can push to it; from a fork it is a string a stranger chose.
+print()
+print("a fork's branch name buys nothing")
+
+at = repo(floor_text=floor())
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+for who, what in (("claude-code-cli/x", okf.FLOOR),
+                  ("claude-code-cli/x", "scripts/okf_ownership.py"),
+                  ("pi1-cli/notes", OKF_INDEX),
+                  ("vm-claude-code-cli/x", ".github/workflows/okf-ownership-trusted.yml")):
+    code, said = run([who, "--trusted-base", BASE, "--base-ref", "main",
+                      "--head-repo", "a-stranger/Blackboard", "--this-repo", "sfdc-24/Blackboard",
+                      "--changed-from", changed_list(at, what)], root=at)
+    check("a fork using %s may not write %s" % (who.split("/")[0], what),
+          code == 1 and "fork" in said, said.strip()[:150])
+code, said = run(["claude-code-cli/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--head-repo", "sfdc-24/Blackboard", "--this-repo", "sfdc-24/Blackboard",
+                  "--changed-from", changed_list(at, okf.FLOOR)], root=at)
+check("while the same branch from THIS repository still writes the floor", code == 0, said.strip())
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--head-repo", "a-stranger/Blackboard", "--this-repo", "sfdc-24/Blackboard",
+                  "--changed-from", changed_list(at, "scripts/append.py")], root=at)
+check("and a fork is not refused for an ordinary path outside the OKF", code == 0, said.strip())
+check("the rewrite is what does it, and it is plain",
+      okf.rights_of("claude-code-cli/x", True) == "fork/claude-code-cli/x"
+      and okf.rights_of("claude-code-cli/x", False) == "claude-code-cli/x"
+      and not okf.allowed("fork/claude-code-cli/x", okf.FLOOR))
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== THE FORGE'S BYTES ARE NOT C-QUOTED =====================
+# Codex on a9de3c7: the forge's list is already JSON-decoded into literal filenames, and _unquote
+# treats anything wrapped in quote characters as git C-quoting - so a path literally named
+# "docs/okf/index.md", quotes included, was rewritten into a DIFFERENT path and judged as that
+# one, contradicting the byte-for-byte guarantee two lines above it.
+print()
+print("the forge's bytes reach allowed() unchanged")
+
+at = repo(floor_text=floor())
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+QUOTED = '"docs/okf/index.md"'
+check("_unquote really would rewrite it, which is why this matters",
+      okf._unquote(QUOTED) == OKF_INDEX and QUOTED != OKF_INDEX)
+found, why = okf.paths_from(changed_list(at, QUOTED))
+check("but paths_from hands it over untouched", found == {QUOTED} and not why, "%r %s" % (found, why))
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, QUOTED)], root=at)
+check("so a path that merely LOOKS quoted is judged as itself, not as the OKF page",
+      code == 0, said.strip())
+code, said = run(["grok/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("while the real page is still refused to grok", code == 1, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
+# ===================== THE GATE WILL NOT RUN OUT OF A CROOKED TREE =====================
+# Codex on a9de3c7: if the RULE itself is a symlink on the protected branch, the gate executes
+# whatever it points at - and that target is an ordinary path the rule lets anyone edit, so a
+# later pull request silently owns every decision while the base copy still looks benign.
+# authority_at() was checking this for floor.md alone.
+print()
+print("the gate refuses to run out of a tree where one of its own files is crooked")
+
+at = repo(floor_text=floor())
+subprocess.run(("git", "rm", "-q", "--cached", RULE_INSIDE), cwd=at, check=True,
+               capture_output=True)
+_blob = subprocess.run(("git", "hash-object", "-w", "--stdin"), cwd=at, input="../elsewhere.py",
+                       capture_output=True, text=True, check=True).stdout.strip()
+subprocess.run(("git", "update-index", "--add", "--cacheinfo",
+                "120000,%s,%s" % (_blob, RULE_INSIDE)), cwd=at, check=True, capture_output=True)
+subprocess.run(("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+                "the rule becomes a symlink"), cwd=at, check=True, capture_output=True)
+BENTRULE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                          text=True).stdout.strip()
+check("the fixture really does carry a symlinked rule",
+      okf.tree_entry(BENTRULE, RULE_INSIDE, at)[0] == "120000")
+code, said = run(["claude-code-cli/x", "--trusted-base", BENTRULE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("and the gate refuses outright, for the operator as much as anyone",
+      code == 1 and "its own files" in said, said.strip()[:160])
+shutil.rmtree(at, ignore_errors=True)
+
+at = repo(floor_text=floor())
+BASE = subprocess.run(("git", "rev-parse", "HEAD"), cwd=at, capture_output=True,
+                      text=True).stdout.strip()
+code, said = run(["claude-code-cli/x", "--trusted-base", BASE, "--base-ref", "main",
+                  "--changed-from", changed_list(at, OKF_INDEX)], root=at)
+check("while an honest tree runs as before", code == 0, said.strip())
+shutil.rmtree(at, ignore_errors=True)
+
 # ===================== A BRANCH NAME IS NOT A REF ALIAS =====================
 # Codex's P1 on f209b38: --base-ref carries pull_request.base.ref, a repository BRANCH NAME, and
 # PROTECTED also holds advisory git spellings - so a pull request targeting an ordinary branch
