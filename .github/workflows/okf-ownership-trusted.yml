@@ -184,9 +184,30 @@ jobs:
                          ".github/workflows:okf-ownership.yml" \
                          ".github/workflows:okf-ownership-trusted.yml"; do
             dir="${guarded%%:*}"; leaf="${guarded##*:}"
+            # gh's own --jq takes ONE argument, so the filter goes to REAL jq over the
+            # response - and the error is NOT masked. `|| true` here meant gh's rejection of
+            # `--jq --arg` was swallowed, every mode came back empty, and the guard below skipped
+            # the refusal: the check reported success for never having run (Codex, reproduced
+            # twice at 5217f5e and a4d07ef). A 404 is a directory this branch does not carry;
+            # anything else fails the gate.
+            set +e
+            gh api -i "repos/${HEAD_REPO}/git/trees/${HEAD_SHA}:${dir}" \
+              > "${RUNNER_TEMP}/tree.http" 2> "${RUNNER_TEMP}/tree.err"
+            set -e
+            tcode=$(awk 'NR==1 {print $2; exit}' "${RUNNER_TEMP}/tree.http")
+            if [ "${tcode}" = "404" ]; then
+              echo "candidate tree entry ${dir}/${leaf}: the directory is not on this branch"
+              continue
+            fi
+            if [ "${tcode}" != "200" ]; then
+              echo "::error::the git trees API answered HTTP ${tcode:-<none>} for ${dir}; the" \
+                   "candidate's tree modes could not be read, so the gate fails rather than" \
+                   "assuming they are regular files." >&2
+              cat "${RUNNER_TEMP}/tree.err" >&2 || true
+              exit 1
+            fi
             mode=$(gh api "repos/${HEAD_REPO}/git/trees/${HEAD_SHA}:${dir}" \
-                     --jq --arg leaf "${leaf}" \
-                     '.tree[] | select(.path == $leaf) | .mode' 2>/dev/null || true)
+                     --jq ".tree[] | select(.path == \"${leaf}\") | .mode")
             echo "candidate tree entry ${dir}/${leaf}: mode=${mode:-<absent>}"
             if [ -n "${mode}" ] && [ "${mode}" != "100644" ] && [ "${mode}" != "100755" ]; then
               echo "::error::the branch's ${dir}/${leaf} has tree mode ${mode}, not a regular" \

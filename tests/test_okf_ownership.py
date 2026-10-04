@@ -941,6 +941,14 @@ else:
     check("the forge's list is JSON, not lines that would be stripped",
           "@json" in ran and "jq -s" in ran and "changed.json" in ran
           and "changed.txt" not in ran)
+    # THE TREE-MODE STEP MUST ACTUALLY RUN. Codex reproduced `gh api --jq --arg` failing with
+    # "accepts 1 arg(s), received 4" twice against exact heads: the `|| true` swallowed it, every
+    # mode came back empty, and the guard skipped the refusal - a check reporting success for
+    # never having run. gh embeds jq and takes ONE filter argument, and the error is not masked.
+    check("the candidate tree-mode check uses a form gh accepts, and masks no error",
+          "--jq --arg" not in ran and "|| true)" not in ran
+          and 'git/trees/${HEAD_SHA}:${dir}' in ran
+          and '= "404" ]' in ran and 'tcode}" != "200" ]' in ran)
     check("the candidate floor fails closed: only a confirmed 404 is absence",
           # The `= "200"` branch is asserted too, because without it the three refusals below can
           # be left in place while the branch that guards them is turned into `true` - which is
