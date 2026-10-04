@@ -28,7 +28,28 @@ Each pass it reads only the rows new since its own cursor, keeps the ones addres
 what "addressed to" means), drops its own rows and waker replies, appends each new row to an inbox
 file as JSON lines, and runs the wake command **once for the pass**.
 
-Two refusals, both learned the same night it was written:
+**Four refusals Codex's review put there** (NO-GO on head `0a440cc`,
+`CODEX-PI-WA-QC-RESULT-20261004T012631Z`), each with its own control:
+
+* **It never skips an arrival.** The watermark is the **read's own moment**, stamped before the
+  read, so a row that lands while the wake command runs is the next pass's business. The old code
+  stamped the clock *after* the work, so a five-minute wake moved the cursor past everything that
+  arrived during it.
+* **A read that came back capped holds the cursor.** As many rows as `--limit` allows is not
+  evidence the window was covered, so nothing moves and the next pass re-reads it. Row_ID dedupe
+  makes that free.
+* **A corrupt cursor fails closed.** Missing means first run, which primes; **unreadable means
+  refuse** — exit 2, nothing read, rung or written. Treating a truncated file as "no history" is
+  how a doorbell primes away everything pending. The cursor is also written atomically now, so a
+  kill mid-write leaves the old file rather than half a new one.
+* **One row is one inbox entry**, whether the wake failed, succeeded, or was killed between the
+  two. What has been *written down* is recorded separately from what has been *handled*.
+* **A row to ALL is a row to this Pi.** `agent_waker.addressed_to` answers for a *named* tag, so a
+  genuine `ALL` row — target `ALL`, payload `to=ALL`, naming nobody — was missed, and the test that
+  was supposed to cover it had been passing only because its fixture also carried `to=pi1-cli`.
+  `ALL`, `everyone` and `fleet` are explicit now, in `to=`, `cc=`, `cast=` and the target column.
+
+And two from the night it was written:
 
 * **It primes on first run.** With no cursor it records what is on the board as seen and wakes
   nothing. Hours earlier, one EOD send put nineteen WhatsApp messages on his phone because a queue
@@ -40,6 +61,11 @@ Two refusals, both learned the same night it was written:
 
 And a failed wake **holds the watermark**, so the next pass rings again rather than forgetting —
 the watcher's rule, for the watcher's reason.
+
+**It is a notification, never a task.** A row's content never reaches a shell: the wake command is
+the Pi's own script, and all it is told is how many rows arrived (`PI1_WAKE_ROWS`) and where they
+are written (`PI1_WAKE_INBOX`). That is Codex's R2 — a notice is not task or reply authority — and
+pi1-cli's first hook is deliberately a log line plus a notice on the TFT, with no session start.
 
 ### Install it (one minute)
 
