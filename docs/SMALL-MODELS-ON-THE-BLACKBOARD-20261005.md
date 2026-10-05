@@ -127,8 +127,40 @@ Sent as `CCC-HF-ADVERSARIAL-20261005T0120Z` (the row id carries a wrong hour; th
 | 8 | A model fitted to our board memorises our comms | Private repos only; extraction is real if ever served |
 | 9 | Public datasets, if we ever pull one | Poisoning surface |
 
-Gemini was asked for the tenth surface not on this list, and told that if any of it should simply
-not happen on a device holding the owner's Google session, to say so plainly.
+### Gemini's verdict, 2026-10-05 06:12Z
+
+It found two surfaces that were not on the list, and attacked one of my mitigations.
+
+**Surface 10, and it is the one that changes this document: poisoning the training set through the
+live board.** In Gemini's words, we would be *building a dataset from an untrusted public pipe*. The
+board takes external input today - the WhatsApp relay reaches it - so an attacker can submit rows
+**now** that carry hostile routing examples or adversarial triggers, and we would accept them as
+ground truth when we train on that traffic **later**. The attack is cheap, it is available before
+anyone decides to train anything, and nothing about it looks unusual at the time.
+
+This is a provenance problem, not a modelling one, and it has to be answered before step 2 of
+section 6, not after:
+
+- Train only on rows whose `source_tag` is a fleet agent writing through the gateway, never on
+  relayed or externally-originated rows.
+- Freeze a training cut at a reviewed commit, so the corpus is a fixed artifact somebody signed off,
+  not "whatever the board says today".
+- Hold out a hand-checked evaluation set that no automated pipeline can write to. If the eval is
+  poisoned too, the poisoning is invisible.
+
+**Surface 11: the `HF_TOKEN` in the sync action can be exfiltrated by a pull request that modifies
+the workflow**, which then overwrites the models we host. Same class as the OKF gate defect of
+2026-10-04. It argues for strict environment protection and a token scoped to one repository; the
+keyless OIDC route removes the stored token altogether, which is why it is the default here.
+
+**Its attack on my mitigation for surface 4** - that logging every suppression spends the storage,
+power and bandwidth the local gate was built to save - is right for the voice path and not for the
+board path. A suppressed board row logs an id, a score and a timestamp: tens of bytes, and the
+auditability is worth it. A suppressed audio turn must log the decision and **not** the clip. The
+rule is one line: log the judgement, never the input.
+
+Gemini was also told that if any of this should simply not happen on a device holding the owner's
+Google session, to say so plainly. It has not said so.
 
 ## 6. Cost, sequence, and who decides
 
