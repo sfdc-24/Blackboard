@@ -31,6 +31,8 @@
 !/scripts/bus.py
 !/scripts/redis_dual.py
 !/scripts/bus_reconcile.py
+!/scripts/bus_request.py
+!/scripts/append.py
 !/scripts/board_say.py
 !/scripts/state_store.py
 !/scripts/board_waker.py

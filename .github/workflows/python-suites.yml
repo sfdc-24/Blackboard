@@ -113,6 +113,8 @@ on:
       - "tests/test_redis_dual.py"
       - "scripts/bus_reconcile.py"
       - "tests/test_bus_reconcile.py"
+      - "scripts/bus_request.py"
+      - "tests/test_bus_request.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -856,6 +858,20 @@ jobs:
           if [ -f tests/mutate_bus_filters.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The bounded diagnostic a board request may ask for. The board has NO authenticated
+      # sender, so the tests that matter are about what a FORGED request can do: it cannot
+      # choose the key, the TTL or the command, a malformed flood produces no rows, and no
+      # nonce or key name reaches the board.
+      - name: "bus requests: a forged ask cannot choose the key, the TTL or the command (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_request.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_request -v
           else
             echo "not on this branch; skipping"
           fi

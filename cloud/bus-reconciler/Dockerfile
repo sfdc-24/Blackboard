@@ -25,6 +25,12 @@ COPY cloud/bus-reconciler/main.py /app/main.py
 # The connectivity probe. One key under its own prefix, read back, deleted. It exists so that
 # "does the pipe work" can be answered without running the reconciler, which is under hold.
 COPY cloud/bus-reconciler/probe.py /app/probe.py
+# The request-handling mode and its entrypoint. append.py comes with them because it is the
+# ONE board-write path on this fleet that sends a single transport attempt and then reads the
+# row back by Row_ID; a second implementation in here would be a second thing to get wrong.
+COPY scripts/bus_request.py /app/bus_request.py
+COPY scripts/append.py /app/append.py
+COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
 
 # No credential in the image. BUS_URL, BUS_SECRET and the Redis AUTH string all
 # arrive at runtime - the first two as secret-backed environment variables, the
