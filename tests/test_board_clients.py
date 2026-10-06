@@ -111,7 +111,7 @@ class AppendClientTests(unittest.TestCase):
         return result, raised, output.getvalue(), send, read
 
     def test_ambiguous_write_is_not_replayed_and_resolves_by_full_count(self):
-        spec = {"row_id": "WRK-one", "source_tag": "test-agent", "payload": "BCB|v=1|id=ONE|phase=RESULT"}
+        spec = {"row_id": "WRK-one", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=ONE|from=claude-code-cli|phase=RESULT"}
         reads = [
             {"rows": [row("older")], "total": 9, "filtered": 1},
             {"rows": [row("WRK-one", spec["payload"])], "total": 9, "filtered": 1},
@@ -124,7 +124,7 @@ class AppendClientTests(unittest.TestCase):
         self.assertIn("READ-BACK OK", output)
 
     def test_nonadjacent_full_sheet_duplicates_exit_two_without_repost(self):
-        spec = {"row_id": "WRK-dupe", "source_tag": "test-agent", "payload": "BCB|v=1|id=DUPE|phase=RESULT"}
+        spec = {"row_id": "WRK-dupe", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=DUPE|from=claude-code-cli|phase=RESULT"}
         rows = [row("WRK-dupe"), row("other"), row("WRK-dupe")]
         _, raised, _, send, read = self.run_client(spec, [{"rows": rows}])
         self.assertEqual(raised.code, 2)
@@ -132,7 +132,7 @@ class AppendClientTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
 
     def test_success_looking_response_still_uses_count_and_detects_duplicate(self):
-        spec = {"row_id": "WRK-dupe", "source_tag": "test-agent", "payload": "BCB|v=1|id=DUPE|phase=RESULT"}
+        spec = {"row_id": "WRK-dupe", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=DUPE|from=claude-code-cli|phase=RESULT"}
         rows = [row("WRK-dupe"), row("WRK-dupe")]
         _, raised, _, send, read = self.run_client(spec, [{"rows": rows}], write_result='{"ok":true}')
         self.assertEqual(raised.code, 2)
@@ -140,7 +140,7 @@ class AppendClientTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
 
     def test_three_zero_hit_reads_exit_unresolved_without_repost(self):
-        spec = {"row_id": "WRK-missing", "source_tag": "test-agent", "payload": "BCB|v=1|id=MISSING|phase=RESULT"}
+        spec = {"row_id": "WRK-missing", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=MISSING|from=claude-code-cli|phase=RESULT"}
         empty = {"rows": [row("other")], "total": 9, "filtered": 1}
         _, raised, output, send, read = self.run_client(spec, [empty, empty, empty])
         self.assertEqual(raised.code, 1)
@@ -149,7 +149,7 @@ class AppendClientTests(unittest.TestCase):
         self.assertIn("before re-running", output)
 
     def test_source_tag_is_required_before_write(self):
-        spec = {"row_id": "WRK-wrong-owner", "payload": "BCB|v=1|id=OWNER|phase=RESULT"}
+        spec = {"row_id": "WRK-wrong-owner", "payload": "BCB|v=1|id=OWNER|from=claude-code-cli|phase=RESULT"}
         opened = mock.mock_open(read_data=json.dumps(spec))
         with mock.patch.object(sys, "argv", ["append.py", "row.json"]), mock.patch("builtins.open", opened), mock.patch.object(
             append_client, "load_env", return_value={"BUS_URL": "https://example.invalid", "BUS_SECRET": "CANARY_SECRET"}
@@ -235,7 +235,7 @@ class MatchIsNotIdentityTests(unittest.TestCase):
     """
 
     def test_quoting_rows_do_not_read_as_duplicates(self):
-        spec = {"row_id": "WRK-cited", "source_tag": "test-agent", "payload": "BCB|v=1|id=CITED|phase=RESULT"}
+        spec = {"row_id": "WRK-cited", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=CITED|from=claude-code-cli|phase=RESULT"}
         quoting = row("WRK-later", "BCB|v=1|id=LATER|phase=RESULT|note=supersedes WRK-cited")
         also = row("WRK-later2", "BCB|v=1|id=LATER2|phase=RESULT|note=see WRK-cited above")
         served = {"rows": [row("WRK-cited", spec["payload"]), quoting, also], "total": 2953, "filtered": 3}
@@ -246,14 +246,14 @@ class MatchIsNotIdentityTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
 
     def test_a_real_duplicate_is_still_caught_through_the_same_filter(self):
-        spec = {"row_id": "WRK-real-dupe", "source_tag": "test-agent", "payload": "BCB|v=1|id=RD|phase=RESULT"}
+        spec = {"row_id": "WRK-real-dupe", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=RD|from=claude-code-cli|phase=RESULT"}
         served = {"rows": [row("WRK-real-dupe"), row("WRK-real-dupe")], "total": 2953, "filtered": 2}
         _, raised, output, _, _ = AppendClientTests().run_client(spec, [served])
         self.assertEqual(raised.code, 2)
         self.assertIn("DUPLICATE", output)
 
     def test_the_read_back_narrows_by_this_row_id(self):
-        spec = {"row_id": "WRK-narrow", "source_tag": "test-agent", "payload": "BCB|v=1|id=N|phase=RESULT"}
+        spec = {"row_id": "WRK-narrow", "source_tag": "claude-code-cli", "payload": "BCB|v=1|id=N|from=claude-code-cli|phase=RESULT"}
         served = {"rows": [row("WRK-narrow", spec["payload"])], "total": 2953, "filtered": 1}
         _, _, _, _, read = AppendClientTests().run_client(spec, [served])
         self.assertEqual(read.call_args.kwargs.get("match"), "WRK-narrow")
