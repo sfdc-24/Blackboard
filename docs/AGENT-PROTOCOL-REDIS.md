@@ -115,18 +115,49 @@ XACK  mbox:codex grp:codex <id>
 ```
 
 **The pending entries list is the receipt ledger, and we did not have to build it.** An entry that
-has been delivered and not acknowledged sits in the PEL with its idle time. So:
+has been delivered and not acknowledged sits in the PEL with its idle time.
 
-- *Did it arrive?* `XPENDING` shows it delivered.
-- *Has it been acknowledged?* It is in the PEL, so no.
-- *How long have they sat on it?* The idle time, in milliseconds.
+### Three separate facts, three separate mechanisms
 
-That is the whole of "inability to confirm receipts" answered by a primitive rather than a
-convention. **An ACK means "I have it and I own it" — it is not an answer**, and a `RESULT` is a
-separate message, because conflating the two is how a read receipt gets mistaken for progress.
+Codex's first quality condition on `19ec3f7`, and it is right: I had two of these collapsed into one
+word. "Acknowledged" was doing the work of "arrived" and "owned" at once, which is the receipt
+problem wearing a new coat.
+
+| The question | The mechanism | What it does NOT mean |
+|---|---|---|
+| Did it reach the agent's mailbox? | `XADD` returned an id | Nobody has read it |
+| Did a reader take it off the stream? | **`XACK`** — a transport fact | Nobody has agreed to do it |
+| Does a session own the work? | an **`ACK` message**, from the session that will do it | It is not done |
+| Is it done? | a **`RESULT`** message | — |
+
+So `XACK` is **transport only**. A cheap always-on reader may send it, because all it asserts is that
+the bytes were taken off the stream and will not be redelivered to that consumer. **It must never be
+read as ownership.** A task stays `ready` — not `claimed` — until an `ACK` *message* arrives from the
+session that will do the work, and only that session may send one.
+
+The consequence is the one Codex wanted stated: **a transport-acknowledged message with no owning
+ACK is still outstanding**, and it is counted that way. `XACK` clears the PEL entry; the task's own
+`ack_due` timer keeps running. Losing that distinction is how a read receipt gets mistaken for
+progress, which is exactly what the board already did to us.
+
+### Reclaiming from a dead session, fenced
 
 A session that dies holding messages does not swallow them: `XAUTOCLAIM` moves entries idle past the
-threshold to another consumer of the same agent, or to the escalation path in §7 when none is live.
+threshold to another consumer of the same agent. **Fenced, because otherwise it is a claim war** —
+Codex's third condition, and Gemini's words for the failure: a flapping heartbeat causes a consumer
+group claim war and drains Redis memory.
+
+The fence is a monotonic **epoch** per agent, `claim:epoch:<agent>`, bumped with `INCR` by whoever
+reclaims:
+
+- A reclaim reads the epoch, bumps it, and stamps the claim with the new value.
+- A consumer whose stamp is below the current epoch **has been fenced and must stop** — it may not
+  `XACK`, may not send an `ACK`, and may not write a `RESULT`. The work is no longer its.
+- A reclaim is attempted **at most twice** for one entry. The second failure sends the entry to the
+  §7 ladder instead of a third consumer, because an entry that two consumers could not hold is a
+  problem for a human to look at and not a thing to keep passing around.
+- A heartbeat that flaps — appearing and vanishing inside the idle threshold — is treated as **not
+  live** for reclaim purposes. Flapping is not liveness, and trusting it is what starts the war.
 
 ---
 
@@ -203,17 +234,33 @@ secret reaches git or the board, and no change goes live without the old path pr
 
 The ladder, and it fires on a clock rather than on someone noticing:
 
-1. `ack_due` passes with no ACK → the message is re-delivered once, and an `ESCALATE` goes to **Grok**
-   naming the sender, the recipient, the idle time and the task.
+1. `ack_due` passes with no owning ACK → the message is re-delivered **once**, and an `ESCALATE` goes
+   to **Grok** naming the sender, the recipient, the idle time and the task.
 2. A task is overdue in `task:due` → `ESCALATE` to **Grok**, which re-sequences or reassigns.
 3. Two agents disagree on a technical shape → `ASK` to **Gemini**, whose answer is recorded as the
    decision, not as an opinion.
 4. A task wants `done` and touches acceptance → `review` by **Codex**. No self-certification.
-5. Nothing above resolves it within the lane's window → WhatsApp to **Mr. Salam**, and only then.
+5. Nothing above resolves it within the lane's window → WhatsApp to **Mr. Salam**, under §9's rules,
+   which today mean it is queued and **not sent by a timer**.
+
+### Bounded, because an escalation ladder is a loop waiting to happen
+
+Codex's second condition on `19ec3f7`, and Gemini named the failure: without bounds, an endless
+escalation loop that drains Redis memory. Four rules, and they are hard limits rather than guidance:
+
+- **An `ESCALATE` can never itself escalate.** It has no `ack_due` and no rung above it. A ladder whose
+  rungs can each produce another rung is not a ladder.
+- **One rung per message, ever.** Each rung is attempted at most once for a given message id, recorded
+  in `esc:done:<id>` as a set of rungs already fired. A rung already in that set is skipped, so a
+  message cannot ride the ladder twice however many timers notice it.
+- **Re-delivery is once, not a retry policy.** After one re-delivery the message is the ladder's
+  problem and never the sender's again.
+- **A cap per hour per lane**, and when the cap is hit the ladder stops and writes one summary row
+  instead of N escalations. The scar: one send delivered nineteen messages, eighteen of them stale.
 
 **Nobody waits silently.** The failure we are leaving behind is not that an agent was slow; it is that
-its slowness was invisible until somebody went looking. Every wait above has a timer, and every timer
-has a named destination.
+its slowness was invisible until somebody went looking. Every wait above has a timer, every timer has
+a named destination, and now every destination has a counter that stops it.
 
 ---
 
@@ -240,8 +287,11 @@ bus:compare         STREAM  one entry per reconciliation: counts, never contents
 and `XADD`s each row under an id derived from its `Row_ID`, so a flapping read that returns the same
 rows twice mirrors them once. The cursor only ever moves forward. Nothing reads from Redis yet. A
 reconciler then diffs the two by `Row_ID` and writes counts to `bus:compare`: rows in the Sheet and
-not in Redis, rows in Redis and not in the Sheet, and rows whose ten cells differ. **The gate out of
-phase 1 is a run of zero divergence over a span Codex accepts** — not one clean comparison, a span.
+not in Redis, rows in Redis and not in the Sheet, and rows whose ten cells differ. **The gate out of phase 1 is TWO zero-divergence runs: 24 hours and then 48 hours**, which is
+Codex's ruling on `19ec3f7` and not my number. One clean comparison is not a span, and a single
+span can be a quiet window - 24 hours followed by 48 hours makes a quiet window insufficient on
+its own. The reconciler reports UNKNOWN rather than zero when it could not compare, so neither
+span can be satisfied by a run that measured nothing.
 
 **Phase 2 — read from Redis, with the Sheet still the answer.** Readers take the Redis copy *and* the
 gateway copy, serve the gateway's, and log divergence. This is `scripts/redis_dual.py` already built
@@ -263,10 +313,17 @@ with, because the chair serves the OKF **baked into its image** and will keep do
 where the fleet reads the OKF, never where the chair gets it, or we reintroduce a live plan changing
 under a call.
 
-**Nothing is reachable yet.** Every Cloud Run service we own is `us-central1`; the first instance is
-`us-east4`. He has agreed on us-central1. Until that instance and VPC egress exist, every phase above
-is unbuilt and this protocol runs on the board transport with the Redis path off — and the envelope in
-§3 is already expressible as a BCB row, so no message has to wait for Redis to be sayable.
+**The infrastructure now exists, and the protocol still does not run.** As of 2026-10-06, relayed by
+Grok from the owner: `redis-central` in us-central1 is the SOLE instance - the us-east4 one is
+deleted and must not be wired - with auth on and TLS `SERVER_AUTHENTICATION`; the AUTH string is
+Secret Manager `REDIS_AUTH_STRING` version 2 and goes on neither the board nor git; and Direct VPC
+egress, private-ranges-only on `default`/`default`, is set on `conference-gateway`,
+`conference-chair`, `sfdc24-stt-relay` and `sfdc24-studio-controller`.
+
+**The dual-run nevertheless stays OFF**, by Grok's sequencing and Codex's hold: the conference
+what-closed-leaves-the-room holds on PR 167 come first, and Codex verifies the scaffold, before
+anything connects. Until then this protocol runs on the board transport, and the envelope in §3 is
+already expressible as a BCB row, so no message waits for Redis to be sayable.
 
 ---
 
@@ -317,10 +374,28 @@ got the conference lane moving again while my session had been idle for ten hour
 reach me.
 
 What I should have asked is not *which channel* but **what may pull the trigger**: may a timer alone
-send, or must a lane lead look first? As Redis control lead that is mine to decide, and I am deciding
-it rather than handing it back:
+send, or must a lane lead look first? I decided as Redis control lead that a timer could send
+unasked, for a named class, with brakes.
 
-**A timer may send without asking, for a named class only, with three brakes.**
+**That decision is overruled and the timer is OFF.** Two rulings, hours apart, and both outrank me:
+
+- The owner at 08:15 ET on 2026-10-06, relayed by Grok: *"escalations WhatsApp only. No direct machine
+  wakes to owner."*
+- Codex, quality and improvement lead, on `19ec3f7`: *keep timer WhatsApp off without owner trigger
+  authority.* Gemini backed it in the same hour: *the owner must control when the system escalates to
+  their phone.*
+
+So the standing rule is: **WhatsApp is the only channel, and no timer sends on it.** A rung-5
+escalation is QUEUED, with everything below still true about what it may contain and how old it may
+be, and a human or a lane lead releases it. Nothing in this protocol may reach him by any other
+route, and no mechanism here may wake him directly.
+
+Trigger authority is the owner's to grant and he has not granted it. If he ever does, the table below
+is what I would ask him to authorise rather than a thing that would already be running — and the
+sensible first step is a far narrower grant than I had written, perhaps client-impacting breakage
+alone.
+
+**Held, not built: what a timer WOULD be allowed, if the owner ever grants trigger authority.**
 
 | | Rule | The scar behind it |
 |---|---|---|
@@ -329,9 +404,14 @@ it rather than handing it back:
 | Rate cap | At most one message an hour, and a digest rather than N messages. | The same |
 | Quiet hours | Nothing 01:00–07:00 Toronto unless it is client-impacting. | He went to bed at about 02:30 on 2026-10-06 |
 
-Every automatic send names **why the timer fired and who did not answer**, so it is actionable in one
+Any such send would name **why the timer fired and who did not answer**, so it is actionable in one
 read rather than a notification he has to go and investigate. The thresholds themselves — how long is
 overdue, what counts as a spend anomaly — are Codex's, as quality and improvement lead.
+
+**Until that authority is granted, the queue is the product.** A rung-5 escalation becomes a line
+somebody can see and release, which is what Aya already does by hand and does effectively. The
+difference between that and what I had designed is who decides it is worth his attention, and all
+three of them said it should not be a timer.
 
 ---
 
