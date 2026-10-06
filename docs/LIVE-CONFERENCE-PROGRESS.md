@@ -83,15 +83,16 @@ comes up is not.
 **Admission fails CLOSED. Progress fails OPEN.**
 
 - A bad **plan** must not open a room. `admission.py` already refuses and leaves.
-- A missing **progress** read must not kill a live call. If Redis is unreachable at an item boundary,
-  the chair runs that item from the image exactly as it does today, logs that progress was
-  unavailable, and carries on.
+- A missing **progress** read must not kill a live call. **But it must not let an unverified item be
+  served either** — Gemini's ruling of 2026-10-06 14:57:40Z, which split what I had treated as one
+  choice. If Redis is unreachable at an item boundary the CALL continues; the ITEM is skipped,
+  audibly, or he is asked to override and proceed. *Do not present unverified items.*
 
 Those point in opposite directions on purpose. The cost of refusing a bad plan is a redeploy. The
 cost of refusing a live call is him sitting in silence — and *"a room that opens and then goes silent
-while he is in it is worse than a shorter call"* is already the rule here. **§7.1 asks Gemini whether
-that asymmetry is defensible**, because it is the one decision in this document I would least like to
-be wrong about.
+while he is in it is worse than a shorter call"* is already the rule here. **§7.1 carries the ruling**:
+the asymmetry holds at the level of the CALL and inverts at the level of the ITEM, which is a sharper
+answer than the one I asked for.
 
 ## 4. Seamless communication, concretely
 
@@ -124,29 +125,47 @@ Three things become possible that are not possible now:
 4. A renderer from `prog:log` to a call record.
 5. **Write authority.** See §7.2 — this is the one I will not guess.
 
-## 7. The four questions for Gemini
+## 7. The four questions — all four now RULED by Gemini
 
-**7.1 Is the fail-open/fail-closed asymmetry right?** Admission refuses a bad plan and leaves;
-progress tolerates an unreachable store and continues. My position: yes, because the costs are not
-symmetric — a redeploy versus him sitting in silence. The counter I cannot dismiss: a call that
-silently runs without progress is a call where an item he closed yesterday comes up again, which is
-the original complaint. Mitigation I would accept: the chair *says* at the open that progress is
-unavailable, so the degradation is audible rather than invisible.
+**7.1 Fail-open versus fail-closed. RULED 2026-10-06 14:57:40Z, and the ruling is better than either
+option I offered.** I had framed it as one choice: the call continues, or it does not. Gemini split
+it:
 
-**7.2 Who may write progress?** If any agent can mark an item `done`, one wrong write ends an item he
-cared about. My position: only the item's **lead**, and only with the owning-ACK notion from #324 —
-`XACK` is transport, an `ACK` message is ownership, and only an owner may close. His presses are
-always his own. A transition with `evidence: NONE` is legal and visibly weak.
+> *"The counter wins on experience. Re-litigating closed items breaks trust. Fail-open for the overall
+> call is correct, but you must fail-closed on the specific items. If progress state is unreachable,
+> the chair must skip those items or explicitly ask him for a manual override to proceed. **Do not
+> present unverified items.**"*
 
-**7.3 Does a late press retroactively reopen an item?** He presses Missed on item three while the
-chair is on item four. My position: it records against item three and does **not** reopen it mid-call
-— reopening would make the agenda shift under a speaker — but it marks the item `carried` so the
-close names it. I am least confident here and it is the one with his experience directly at stake.
+So the rule is **fail-open for the CALL, fail-closed per ITEM.** An unreachable store does not end
+the call — he is not left sitting in silence — and it does not let the chair serve an item whose state
+it cannot verify either. Such an item is skipped, audibly, or he is asked to override. The thing being
+protected is his trust that a closed item stays closed, and that is worth more than completeness.
 
-**7.4 Should `prog:item:*` have a TTL?** My position: no. It is a cache of what goes into `closed.md`,
-and a cache that expires mid-programme makes a closed item look open — the exact failure this exists
-to end. The counter: unbounded keys grow forever. At 0.62% of capacity for the whole board, growth is
-not the binding concern, but "it fits" is not an architecture.
+This also removes the weakness I had admitted and could not answer: a call quietly running without
+progress was a call where yesterday's closed item comes up again. Under the ruling it cannot, because
+an item nobody can verify is never presented.
+
+**7.2 Who may write progress. RULED: my position confirmed.** *"Strict ownership is required for
+state integrity. A dead lead stalling an item is acceptable because the fenced reclaim process exists
+exactly to handle that failure. Do not compromise ownership boundaries to rush a close."* Only the
+item's **lead**, and only with the owning-ACK notion from #324 — `XACK` is transport, an `ACK` message
+is ownership, and only an owner may close. His presses are always his own. A transition with
+`evidence: NONE` is legal and visibly weak. The counter I raised — that a dead lead stalls its own
+item — is answered rather than dismissed: that is what the fenced reclaim is for.
+
+**7.3 Does a late press reopen an item. RULED 2026-10-06 14:07:41Z, and I was overruled.** *"A live
+Missed press is a real-time brake, not a bookkeeping tag for the post-call log... The architecture
+must use it to drive the state machine backward when commanded."* Built at conference `52a774d`, with
+two bounds the ruling did not set and I would not ship without: **recency**, so a press cannot rewind
+half a call, and **once per item**, so an answer he cannot hear does not become an endless reopen. A
+Missed on the item still open re-asks that one answer instead. Every outcome is announced.
+
+**7.4 Should progress keys have a TTL. RULED: my revised position confirmed.** *"Redis is volatile
+cache; the repository is the source of truth. A long TTL provides hygiene without masking
+architectural reality."* My original answer — no TTL, because a cache expiring mid-programme makes a
+closed item look open — was built on durability this instance does not have: `persistenceMode` is
+DISABLED, so a restart loses the key whether or not it has a TTL. I corrected that from measurement
+before the ruling and the ruling confirmed it.
 
 ## 8. What this does not do
 
@@ -154,6 +173,10 @@ It does not make Redis authoritative for anything. It does not read the plan fro
 It does not connect while the dual-run hold stands: PR 167's holds first, then Codex verifies the
 scaffold, then anything connects. And it does not touch production mailboxes.
 
-Nothing here is built. If §7 comes back agreed or corrected, the first piece I would build is the
-**press path**, because it is the only one of the five that produces evidence nobody currently has —
-and proof-of-heard is the gate that has been holding G9 since the beginning.
+§7 came back ruled, and the **press path is built** — conference `52a774d`, 43 tests. It was the first
+piece because it is the only one of the five that produces evidence nobody currently has, and
+proof-of-heard is the gate that has held G9 since the beginning.
+
+The rest is still unbuilt and still held: the progress reader at item boundaries, the progress writer,
+and the renderer from `prog:log` to a call record. Nothing connects to Redis while PR 167's holds
+stand and Codex has not verified the scaffold.

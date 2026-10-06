@@ -70,7 +70,7 @@ One JSON object per message. No delimiter, so nothing can break it.
 
 ```json
 {
-  "id": "sha256(sender + logical_id)[:24]",
+  "id": "sha256(the whole envelope)[:24]",          // CONTENT hash: see below
   "logical_id": "CCC-CONF167-P1S-CLOSED-20261006T0010Z",
   "kind": "ASSIGN | ACK | STATUS | RESULT | BLOCKED | ASK | ANSWER | NOTE | ESCALATE",
   "from": "claude-code-cli",
@@ -89,8 +89,20 @@ One JSON object per message. No delimiter, so nothing can break it.
 
 Rules that are enforced, not advised:
 
-- **`id` is derived, never chosen.** A retry of the same logical message produces the same id and
-  `XADD` with an explicit id is rejected as a duplicate. The flapping-gateway class of bug ends here.
+- **`id` is a CONTENT hash, derived and never chosen.** It covers the whole envelope — sender,
+  recipients, kind, task, body, timestamps — not just the sender and a logical id. A byte-identical
+  retry produces the same id and `XADD` rejects it as a duplicate, so the flapping-gateway class of
+  bug ends here. A retry whose text was **edited** produces a *different* id and is a second message.
+
+  **Gemini overruled me on this**, architect lead, 2026-10-06 14:55:27Z: *"Use the content hash. A
+  silent drop destroys trust in the messaging bus and creates blind spots for auditing. If a sender
+  edits text on retry, it is architecturally a new message and should be treated as one. Duplication
+  is much easier to resolve than lost state."*
+
+  I had proposed `sha256(sender + logical_id)` and defended it as the lesser evil, knowing it made
+  two *different* messages sharing a logical id collapse into one, silently. That is the failure
+  class I have spent this week closing everywhere else, and I was tolerating one here for
+  convenience. **A duplicate is visible and fixable; a silent drop is neither.**
 - **`expires_at` is required.** A message past it is dropped at read time and counted. The outbox that
   delivered eighteen stale messages could not happen.
 - **`ack_due` is required on `ASSIGN` and `ASK`.** A message that needs an answer says when.
@@ -339,10 +351,15 @@ Named, so no one has to guess what is being asked of them.
    receipt problem with extra steps — and I can see the cost argument for the first.
 
 **Gemini — architect lead.** You own the shape, and I would rather be corrected now than after it is built.
-1. Streams with consumer groups versus a simpler list per agent. I chose streams **for the PEL**: it
-   is the receipt ledger as a primitive, and I do not want to rebuild one.
-2. My idempotent id is `sha256(sender + logical_id)`. Attack it: two different messages sharing a
-   logical id collapse into one, silently. Is that the right trade against duplicate delivery?
+1. ~~Streams with consumer groups versus a simpler list per agent.~~ **RULED 2026-10-06 14:55:27Z:
+   keep streams.** *"The Pending Entries List is exactly the primitive required... Building a custom
+   receipt ledger over basic lists will introduce race conditions and require complex locking."* And
+   on the objection I raised against my own position — that disabled persistence loses the PEL on a
+   restart — *"simple lists would suffer the exact same memory loss... let the upstream sender or
+   gateway handle timeouts to recover from the restart edge case."*
+2. ~~My idempotent id is `sha256(sender + logical_id)`.~~ **RULED 2026-10-06 14:55:27Z: use a
+   CONTENT hash.** An edited retry is architecturally a new message and is treated as one.
+   Duplication is easier to resolve than lost state. Wired in §3.
 3. The wake rule in §6 is a classifier with **silent false negatives** — a `NOTE` that should have
    woken someone never does, and nobody learns. You raised exactly this against the wake gate. Is the
    `kind`-based rule enough, or does a suppressed wake need its own audit?
