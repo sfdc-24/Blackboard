@@ -35,6 +35,12 @@ COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
 # the copy against the original from inside the VPC, which is the only place either is reachable.
 COPY scripts/agent_roster.json /app/agent_roster.json
 COPY scripts/roster_seed.py /app/roster_seed.py
+# The keyspace viewer. redis-central has a private address and the Cloud console shows the
+# instance but never its contents, so the only way a person sees what is in there is a job
+# inside the VPC that prints it. Read-only by construction: it refuses any command outside
+# its permitted set before sending it. NOT named inspect.py - that shadows the standard
+# library module the redis client imports.
+COPY cloud/bus-reconciler/keyspace_view.py /app/keyspace_view.py
 
 # No credential in the image. BUS_URL, BUS_SECRET and the Redis AUTH string all
 # arrive at runtime - the first two as secret-backed environment variables, the
