@@ -31,6 +31,10 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 COPY scripts/bus_request.py /app/bus_request.py
 COPY scripts/append.py /app/append.py
 COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
+# The roster: the file is the ORIGINAL, Redis gets a copy. Both travel so the seeder can verify
+# the copy against the original from inside the VPC, which is the only place either is reachable.
+COPY scripts/agent_roster.json /app/agent_roster.json
+COPY scripts/roster_seed.py /app/roster_seed.py
 
 # No credential in the image. BUS_URL, BUS_SECRET and the Redis AUTH string all
 # arrive at runtime - the first two as secret-backed environment variables, the

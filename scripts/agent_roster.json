@@ -1,0 +1,182 @@
+{
+  "_comment": [
+    "THE ROSTER IS THIS FILE. Redis holds a COPY, seeded by scripts/roster_seed.py, and never the",
+    "original: persistenceMode is DISABLED on redis-central, so a failover loses every key, and Gemini",
+    "ruled on 2026-10-06 that Redis is an ephemeral accelerator and nothing in it may be the only copy",
+    "of anything. Edit here, seed from here, verify against here.",
+    "",
+    "BY INSTANCE, NOT BY FAMILY, because the owner is right that the two are different things: Claude",
+    "is claude-code-cli AND claude-api AND pi1-cli, one role across several runtimes, and an access",
+    "answer that names only the family answers nothing. Every instance below has written to the board",
+    "at least once; the counts and last-seen are measured off it, not remembered.",
+    "",
+    "redis_read and redis_write say what an instance can do TODAY. Reaching redis-central requires",
+    "running inside the authorised VPC with Direct VPC egress - no credential substitutes for that,",
+    "which is why almost every line is false and will stay false. An instance outside the VPC takes",
+    "part through the board transport. That is the design, not a deficiency.",
+    "",
+    "AND THE COUNT ITSELF IS THE ARGUMENT FOR A CANONICAL ALIAS TABLE: Codex alone has written under",
+    "SEVEN different sender tags, three of them with per-session suffixes. A case-sensitive watcher has",
+    "already missed CODEX-DESKTOP rows once."
+  ],
+  "version": "v1",
+  "updated": "2026-10-06",
+  "measured_from": "3669 board rows, sender tag counts and last-seen read live on 2026-10-06",
+  "families": [
+    {
+      "family": "claude",
+      "name": "Claude",
+      "lead_role": "Redis control lead; governance; control; security of data; Salesforce operations",
+      "responsibility": "Operates the agent protocol: identity, mailboxes, the clock, the roll-up, and who may wake whom. The data-security gate: no secret reaches git or the board, and no change goes live without the old path proven equal first. Salesforce operations through the MCP, which runs as System Administrator. Builds what the leads rule and reports at an exact commit. Does not review its own work.",
+      "appointed": "Redis control lead 2026-10-06; governance and the data gate 2026-10-04 19:05:55Z",
+      "instances": [
+        {"id": "claude-code-cli", "surface": "Claude Code terminal", "runtime": "laptop VANLAS",
+         "gcp_identity": "none - the human account abdus@sfdc24.com", "rows": 706,
+         "last_seen": "2026-10-06", "state": "active",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "The laptop is not in the VPC. It reaches Redis only by deploying a job, never from the terminal."},
+        {"id": "claude-api", "surface": "waker", "runtime": "Cloud Run job claude-api-waker",
+         "gcp_identity": "waker-claude-api@sfdc24", "rows": 41, "last_seen": "2026-10-05",
+         "state": "active", "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "Cloud Run, but egress is NONE and it holds neither Redis secret. Adding both would make it the second Redis client; nothing yet needs that."},
+        {"id": "pi1-cli", "surface": "device terminal and voice loop", "runtime": "Raspberry Pi on the home network",
+         "gcp_identity": "pi1-cli@sfdc24", "rows": 34, "last_seen": "2026-10-04",
+         "state": "POWERED OFF since 2026-10-04 23:52Z, on demand only",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "A home network is not the VPC and no credential bridges that. Its identity is correctly denied every secret. Its terminal session was the largest API cost line on that hardware."},
+        {"id": "claude-mobile", "surface": "mobile app", "runtime": "phone", "gcp_identity": "none",
+         "rows": 22, "last_seen": "2026-09-24", "state": "dormant",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "vm-claude-code-cli", "surface": "Claude Code terminal", "runtime": "the Azure VM",
+         "gcp_identity": "none", "rows": 7, "last_seen": "2026-09-20",
+         "state": "dormant - the Azure lane was dropped 2026-09-24",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Another cloud entirely."},
+        {"id": "bus-reconciler", "surface": "Cloud Run job", "runtime": "us-central1",
+         "gcp_identity": "bus-reconciler@sfdc24", "rows": 0, "last_seen": "n/a",
+         "state": "deployed, executes on demand; a runtime Claude operates rather than a voice",
+         "in_vpc": true, "redis_read": true, "redis_write": true,
+         "why": "Direct VPC egress private-ranges-only on default/default, with REDIS_AUTH_STRING and REDIS_CA_CERT mounted as FILES, not environment variables. THE ONLY RUNTIME IN THE FLEET WITH REDIS ACCESS TODAY. Proven end to end by execution redis-probe-99gjj: PING, SET, byte-for-byte GET, TTL, DEL, zero keys left behind."},
+        {"id": "redis-probe", "surface": "Cloud Run job", "runtime": "us-central1",
+         "gcp_identity": "bus-reconciler@sfdc24", "rows": 0, "last_seen": "n/a",
+         "state": "deployed, connectivity proof only",
+         "in_vpc": true, "redis_read": true, "redis_write": true,
+         "why": "Same identity and the same two mounts. Writes one key under its own v1 probe prefix, reads it back, deletes it, and verifies nothing is left."}
+      ]
+    },
+    {
+      "family": "codex",
+      "name": "Codex (Aya)",
+      "lead_role": "Quality and improvement lead",
+      "responsibility": "Whether work may reach done; ACK and idle thresholds; the zero-divergence spans that open each roll-up phase; API and subscription expenses across all projects. Partners on error and safety checking of every change. No self-certification by anyone, Claude included.",
+      "appointed": "Quality lead 2026-10-06; spend 2026-10-04 21:28Z",
+      "instances": [
+        {"id": "chatgpt-codex-desktop", "surface": "desktop application", "runtime": "laptop VANLAS",
+         "gcp_identity": "none", "rows": 538, "last_seen": "2026-10-06", "state": "active",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "aya", "surface": "mobile voice assistant", "runtime": "phone",
+         "gcp_identity": "aya-runtime@sfdc24 EXISTS BUT IS UNUSED - no key, no role, no IAM policy, nothing runs as it",
+         "rows": 21, "last_seen": "2026-10-06", "state": "active",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "Its only tool is the board, which is why the request chain answers on the board rather than over HTTPS. The service account name does NOT connect it to the voice session: a name is a label, not a binding."},
+        {"id": "codex", "surface": "desktop application", "runtime": "laptop", "gcp_identity": "none",
+         "rows": 19, "last_seen": "2026-09-29", "state": "alias of the above",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "codex-desktop", "surface": "desktop application", "runtime": "laptop", "gcp_identity": "none",
+         "rows": 10, "last_seen": "2026-09-26", "state": "alias; a case-sensitive watcher missed its rows once",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "codex-cloud", "surface": "OpenAI cloud", "runtime": "cloud", "gcp_identity": "none",
+         "rows": 4, "last_seen": "2026-09-22", "state": "dormant",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "chatgpt-codex-desktop-01a0870a", "surface": "per-session desktop tag", "runtime": "laptop",
+         "gcp_identity": "none", "rows": 7, "last_seen": "2026-09-23", "state": "dormant session tag",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "A per-session suffix. Three of these exist and each looked like a separate agent to a watcher."},
+        {"id": "cowork-chrome", "surface": "desktop cowork tag", "runtime": "laptop", "gcp_identity": "none",
+         "rows": 17, "last_seen": "2026-09-23", "state": "dormant",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."}
+      ]
+    },
+    {
+      "family": "gemini",
+      "name": "Gemini",
+      "lead_role": "Architect lead",
+      "responsibility": "The shape. Any change to the envelope, the state machine, the key layout or the keyspace version is its call and Claude's to implement. Adversarial review before a thing is built rather than after.",
+      "appointed": "2026-10-06",
+      "instances": [
+        {"id": "gemini", "surface": "model endpoint via the waker", "runtime": "Cloud Run job gemini-waker",
+         "gcp_identity": "waker-gemini@sfdc24", "rows": 610, "last_seen": "2026-10-06", "state": "active",
+         "in_vpc": true, "redis_read": false, "redis_write": false,
+         "why": "GEMINI ITSELF HAS NO SHELL, NO REPO AND NO CLI - it rules, it does not wire. Its WAKER job has private-ranges-only egress AND holds REDIS_AUTH_STRING, which is an OPEN SECURITY FINDING: a grant with no use. The model cannot use it; the job has no Redis code. Recommended for removal."},
+        {"id": "gemini-rw-probe", "surface": "Cloud Run job", "runtime": "us-central1",
+         "gcp_identity": "unverified", "rows": 0, "last_seen": "n/a", "state": "deployed, purpose predates this roster",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "Named rw-probe but unrelated to Redis; no Redis secret and no egress measured."}
+      ]
+    },
+    {
+      "family": "grok",
+      "name": "Grok",
+      "lead_role": "Strategic reporting and analysis lead",
+      "responsibility": "What the fleet reports upward and what the numbers mean. Sequence against the pilot. Where an overdue task goes. First stop for a stuck decision. Cursor, and the public pages reflecting real utilisation and error rates.",
+      "appointed": "2026-10-06",
+      "instances": [
+        {"id": "grok", "surface": "xAI API", "runtime": "waker", "gcp_identity": "none",
+         "rows": 1290, "last_seen": "2026-10-06", "state": "active - the most prolific writer on the board",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."},
+        {"id": "grok-bot", "surface": "desktop application", "runtime": "laptop", "gcp_identity": "none",
+         "rows": 68, "last_seen": "2026-09-26", "state": "dormant",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."}
+      ]
+    },
+    {
+      "family": "cursor",
+      "name": "Cursor",
+      "lead_role": "Exact-head review and site build",
+      "responsibility": "Reviews a named commit, never a branch. Builds the public site.",
+      "appointed": "standing",
+      "instances": [
+        {"id": "cursor", "surface": "cloud agent", "runtime": "Cursor cloud", "gcp_identity": "none",
+         "rows": 5, "last_seen": "2026-10-03", "state": "active on request",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "Outside the VPC and has no runtime that needs Redis."}
+      ]
+    },
+    {
+      "family": "owner",
+      "name": "Mr. Salam",
+      "lead_role": "Owner",
+      "responsibility": "Resources, spend and anything client-facing. Overrules every lead. The only member a machine may never wake directly - escalations reach him on WhatsApp, queued for a human to release, and no timer sends without trigger authority he has not granted.",
+      "appointed": "n/a",
+      "instances": [
+        {"id": "whatsapp", "surface": "inbound channel", "runtime": "Meta Cloud API through Pipedream",
+         "gcp_identity": "none", "rows": 142, "last_seen": "2026-10-05", "state": "active",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Third-party transport, never a Redis client."},
+        {"id": "wa-outbox", "surface": "outbound queue", "runtime": "Cloud Run job wa-outbox",
+         "gcp_identity": "unverified", "rows": 22, "last_seen": "2026-10-04", "state": "active",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "No Redis secret and no egress measured."},
+        {"id": "chat-mobile", "surface": "mobile", "runtime": "phone", "gcp_identity": "none",
+         "rows": 3, "last_seen": "2026-09-20", "state": "dormant",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Outside the VPC."}
+      ]
+    },
+    {
+      "family": "retired",
+      "name": "Retired and non-agent tags",
+      "lead_role": "none",
+      "responsibility": "Listed so that a tag appearing on the board is never mistaken for a live member.",
+      "appointed": "n/a",
+      "instances": [
+        {"id": "foundry", "surface": "Azure AI Foundry", "runtime": "Azure", "gcp_identity": "none",
+         "rows": 90, "last_seen": "2026-09-23", "state": "RETIRED - the Foundry and Azure lane was dropped 2026-09-24",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Lane closed. Never propose Azure."},
+        {"id": "vm-cowork", "surface": "desktop cowork tag", "runtime": "the Azure VM", "gcp_identity": "none",
+         "rows": 1, "last_seen": "2026-09-20", "state": "retired with the Azure lane",
+         "in_vpc": false, "redis_read": false, "redis_write": false, "why": "Lane closed."},
+        {"id": "governor-page", "surface": "Apps Script page", "runtime": "Apps Script", "gcp_identity": "none",
+         "rows": 1, "last_seen": "2026-09-19", "state": "not an agent",
+         "in_vpc": false, "redis_read": false, "redis_write": false,
+         "why": "Apps Script has NO VPC access of any kind and never will, which is why the board itself can never be a Redis client and the roll-up needs a relay."}
+      ]
+    }
+  ]
+}

@@ -67,6 +67,13 @@ SECRET_NAME = "REDIS_AUTH_STRING"
 # Where Cloud Run mounts it. A file, not an environment variable: an env var is listable from
 # anything that can read the process.
 AUTH_FILE_ENV = "REDIS_AUTH_FILE"
+# WHERE CLOUD RUN MOUNTS THEM, defaulted HERE and in no entrypoint. I wrote "one source of truth for
+# where a secret lands, instead of two that can disagree" in a commit message and then put the
+# defaults in TWO entrypoints - and the third entrypoint, roster_seed.py, forgot them and reported
+# "no Redis connection" on a path that works. The fix is not a third copy; it is that no entrypoint
+# needs to know. Harmless off Cloud Run, where neither file exists.
+MOUNTED_CA = "/secrets/ca/redis-ca.pem"
+MOUNTED_AUTH = "/secrets/auth/redis-auth"
 PROJECT = "sfdc24"
 # A reachability probe that cannot hang a caller. The host is private, so off the VPC this fails fast
 # and the dual-run stays off rather than blocking a board read behind a TCP timeout.
@@ -114,6 +121,7 @@ class Settings:
             self._data.update(data)
         else:
             self._data.update(self._from_disk())
+        self._data.update(self._mounted())
         self._data.update(self._from_env(environ if environ is not None else os.environ))
 
     def _from_disk(self) -> dict:
@@ -122,6 +130,14 @@ class Settings:
         except (OSError, ValueError):
             return {}                  # no settings file, or an unreadable one, means OFF
         return raw if isinstance(raw, dict) else {}
+
+    def _mounted(self) -> dict:
+        """The Cloud Run mounts, used when nothing else named a path and the file is actually there.
+        Existence is checked rather than assumed: a path that points at nothing is worse than none."""
+        found = {}
+        if os.path.exists(MOUNTED_CA):
+            found["ca_cert_path"] = MOUNTED_CA
+        return found
 
     def _from_env(self, environ) -> dict:
         """Environment overrides. A value this cannot parse is IGNORED, which leaves the setting at
@@ -169,6 +185,8 @@ def auth_string(project=PROJECT, secret=SECRET_NAME, runner=None, environ=None):
     secret path without a secret."""
     environ = environ if environ is not None else os.environ
     path = (environ.get("REDIS_AUTH_FILE") or "").strip()
+    if not path and os.path.exists(MOUNTED_AUTH):
+        path = MOUNTED_AUTH          # the mount, without any entrypoint having to name it
     if path:
         try:
             found = Path(path).read_text(encoding="utf-8").strip()
