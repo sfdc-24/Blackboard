@@ -16,6 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import redis_dual                                                        # noqa: E402
 
+def KEY(name):
+    """A key as the code builds it. Never the literal: the prefix carries a VERSION now, and a test
+    that hardcodes it would have to be edited on every migration - which is the thing the version
+    exists to make cheap."""
+    return redis_dual.Settings.DEFAULTS["key_prefix"] + name
+
+
 ON = {"enabled": True, "host": "10.0.0.1"}
 OFF = {"enabled": False, "host": "10.0.0.1"}
 
@@ -140,15 +147,46 @@ class TheEnvironmentOverrides(unittest.TestCase):
         self.assertEqual("", committed["host"])
 
 
+class EveryKeyCarriesTheVersion(unittest.TestCase):
+    """Gemini, architect lead, 2026-10-06 15:21:43Z: implement the v1 prefix immediately, because
+    schemas always change and without a version namespace a migration forces downtime or key
+    collisions. I had applied the dual-run philosophy to every store EXCEPT the keyspace itself."""
+
+    def test_the_default_prefix_is_versioned(self):
+        self.assertTrue(redis_dual.Settings.DEFAULTS["key_prefix"].startswith(redis_dual.KEY_VERSION))
+
+    def test_the_shipped_settings_file_is_versioned(self):
+        path = Path(__file__).resolve().parents[1] / "scripts" / "redis_dual.settings.json"
+        self.assertTrue(json.loads(path.read_text(encoding="utf-8"))["key_prefix"]
+                        .startswith(redis_dual.KEY_VERSION))
+
+    def test_every_key_this_fleet_writes_is_versioned(self):
+        """One assertion over every module that names a key, so a new one cannot forget."""
+        import sys as _sys
+        root = Path(__file__).resolve().parents[1]
+        _sys.path.insert(0, str(root / "cloud" / "bus-reconciler"))
+        import bus_reconcile, bus_request                                # noqa: PLC0415
+        keys = [bus_reconcile.ROW_KEY, bus_reconcile.INDEX_KEY, bus_reconcile.COMPARE_KEY,
+                bus_request.PROBE_NAMESPACE, redis_dual.Settings.DEFAULTS["key_prefix"]]
+        for key in keys:
+            self.assertTrue(key.startswith(redis_dual.KEY_VERSION), key)
+
+    def test_a_shadow_read_uses_the_versioned_key(self):
+        run, fake, _ = dual()
+        run.read("rows", lambda: "x", wait=True)
+        run.drain()
+        self.assertEqual([redis_dual.Settings.DEFAULTS["key_prefix"] + "rows"], fake.gets)
+
+
 class TheOldPathAnswers(unittest.TestCase):
     def test_the_authoritative_answer_is_returned_when_the_cache_disagrees(self):
-        run, _, lines = dual(fake=Fake({"blackboard:k": "STALE"}))
+        run, _, lines = dual(fake=Fake({KEY("k"): "STALE"}))
         self.assertEqual("fresh", run.read("k", lambda: "fresh", wait=True))
         self.assertEqual(1, run.drain()["diverged"])
         self.assertTrue(any("DIVERGED" in line for line in lines), lines)
 
     def test_the_authoritative_answer_is_returned_when_the_cache_agrees(self):
-        run, _, _ = dual(fake=Fake({"blackboard:k": "same"}))
+        run, _, _ = dual(fake=Fake({KEY("k"): "same"}))
         self.assertEqual("same", run.read("k", lambda: "same", wait=True))
         self.assertEqual(1, run.drain()["agreed"])
 
@@ -166,7 +204,7 @@ class TheOldPathAnswers(unittest.TestCase):
 
     def test_the_divergence_line_names_sizes_and_never_contents(self):
         """The board carries his words and other people's; they do not belong in a cache log."""
-        run, _, lines = dual(fake=Fake({"blackboard:k": "SECRET-CACHED-VALUE"}))
+        run, _, lines = dual(fake=Fake({KEY("k"): "SECRET-CACHED-VALUE"}))
         run.read("k", lambda: "SECRET-REAL-VALUE", wait=True)
         run.drain()
         joined = " ".join(lines)
@@ -178,7 +216,7 @@ class TheOldPathAnswers(unittest.TestCase):
         run, fake, _ = dual()
         run.read("rows", lambda: "x", wait=True)
         run.drain()
-        self.assertEqual(["blackboard:rows"], fake.gets)
+        self.assertEqual([KEY("rows")], fake.gets)
 
 
 class WriteThrough(unittest.TestCase):
@@ -189,7 +227,7 @@ class WriteThrough(unittest.TestCase):
         run = redis_dual.DualRun(settings=redis_dual.Settings(dict(ON)), factory=lambda s: fake)
         run.write("k", "v", lambda: order.append("authoritative"))
         self.assertEqual(["authoritative"], order)
-        self.assertEqual(["blackboard:k"], fake.sets)
+        self.assertEqual([KEY("k")], fake.sets)
 
     def test_a_mirror_failure_never_reaches_the_caller(self):
         run, _, _ = dual(fake=Fake(fail=True))
@@ -199,7 +237,7 @@ class WriteThrough(unittest.TestCase):
     def test_a_ttl_is_honoured(self):
         run, fake, _ = dual()
         run.write("k", "v", lambda: None, ttl=60)
-        self.assertEqual([("blackboard:k", 60)], fake.ttls)
+        self.assertEqual([(KEY("k"), 60)], fake.ttls)
 
     def test_write_through_can_be_turned_off_alone(self):
         run, fake, _ = dual(settings=dict(ON, write_through=False))
@@ -214,7 +252,7 @@ class WriteThrough(unittest.TestCase):
     def test_a_structure_is_mirrored_as_json(self):
         run, fake, _ = dual()
         run.write("rows", {"a": 1}, lambda: None)
-        self.assertEqual({"a": 1}, json.loads(fake.store["blackboard:rows"]))
+        self.assertEqual({"a": 1}, json.loads(fake.store[KEY("rows")]))
 
 
 class TheOffSwitch(unittest.TestCase):
@@ -230,11 +268,11 @@ class TheOffSwitch(unittest.TestCase):
             try:
                 run.read("k", lambda: "x", wait=True)
                 run.drain()
-                self.assertEqual(["blackboard:k"], fake.gets)
+                self.assertEqual([KEY("k")], fake.gets)
                 path.write_text(json.dumps(OFF), encoding="utf-8")
                 run.read("k", lambda: "x", wait=True)
                 run.drain()
-                self.assertEqual(["blackboard:k"], fake.gets, "the off-switch did not take effect")
+                self.assertEqual([KEY("k")], fake.gets, "the off-switch did not take effect")
             finally:
                 redis_dual.SETTINGS_PATH = old
 

@@ -37,7 +37,7 @@ import redis_dual                                                        # noqa:
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("redis-probe")
 
-PREFIX = "probe:claude:"
+PREFIX = redis_dual.KEY_VERSION + "probe:claude:"
 TTL_SECONDS = 120
 
 MOUNTED_CA = "/secrets/ca/redis-ca.pem"

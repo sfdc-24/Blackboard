@@ -59,7 +59,7 @@ _FIELD = re.compile(r"(?:^|\|)\s*%s\s*=\s*([^|]*)")
 
 STALE_MINUTES = 30          # the outbox that delivered 18 stale messages; a late diagnostic is noise
 MAX_PER_RUN = 3             # a forged flood is not free, so it is not unbounded either
-PROBE_NAMESPACE = "synth:probe:"
+PROBE_NAMESPACE = "v1:synth:probe:"
 PROBE_TTL_SECONDS = 10
 
 

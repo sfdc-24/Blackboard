@@ -49,9 +49,9 @@ import redis_dual                                                        # noqa:
 # WHICH column differs without quoting what it holds.
 COLUMNS = ("row_id", "ts", "source_tag", "target_surface", "action_type",
            "payload", "category", "project_tag", "gist", "subgist")
-ROW_KEY = "bus:row:%s"              # HASH, one per Row_ID
-INDEX_KEY = "bus:rowids"            # SET of every mirrored Row_ID
-COMPARE_KEY = "bus:compare"         # STREAM, one entry per run: counts only
+ROW_KEY = redis_dual.KEY_VERSION + "bus:row:%s"              # HASH, one per Row_ID
+INDEX_KEY = redis_dual.KEY_VERSION + "bus:rowids"            # SET of every mirrored Row_ID
+COMPARE_KEY = redis_dual.KEY_VERSION + "bus:compare"         # STREAM, one entry per run: counts only
 AGREE, DIVERGE, UNKNOWN = "AGREE", "DIVERGE", "UNKNOWN"
 
 

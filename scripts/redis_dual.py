@@ -54,6 +54,15 @@ REPO = Path(__file__).resolve().parents[1]
 SETTINGS_PATH = Path(os.environ.get("REDIS_DUAL_SETTINGS", REPO / "scripts" / "redis_dual.settings.json"))
 # Memorystore's own default is 6379; his instance answers on 6378 with TLS required.
 DEFAULT_PORT = 6378
+# EVERY KEY THIS FLEET WRITES CARRIES A VERSION. Gemini, architect lead, 2026-10-06 15:21:43Z:
+# "Implement the v1 colon prefix immediately... schemas always change. Without a version namespace,
+# future migrations break your dual-run philosophy and force either downtime or key collisions. Since
+# the keyspace is currently empty, fixing this architectural gap now costs nothing."
+#
+# I had applied the dual-run philosophy - old path authoritative, run both, compare - to every store
+# in this fleet EXCEPT the keyspace itself, and only noticed while listing decisions for review. Three
+# bytes a key against the ability to run v1 and v2 side by side is not a trade worth thinking about.
+KEY_VERSION = "v1:"
 SECRET_NAME = "REDIS_AUTH_STRING"
 # Where Cloud Run mounts it. A file, not an environment variable: an env var is listable from
 # anything that can read the process.
@@ -81,7 +90,7 @@ class Settings:
         "ca_cert_path": "",            # the instance CA; TLS verification needs it
         "shadow_reads": True,          # read Redis in the BACKGROUND and compare; never serve from it
         "write_through": True,         # mirror a write after the authoritative write succeeds
-        "key_prefix": "blackboard:",
+        "key_prefix": KEY_VERSION + "blackboard:",
         "note": "Set enabled=false to stop the dual-run immediately. Read on every call, no redeploy.",
     }
 
@@ -447,7 +456,7 @@ def selftest() -> int:
     assert touched == [], "a disabled dual-run touched the client factory"
 
     # 2. ON, and Redis disagrees: the authoritative answer is still served.
-    fake = Fake({"blackboard:k": "STALE"})
+    fake = Fake({on.key_prefix + "k": "STALE"})
     dual = DualRun(settings=on, factory=lambda s: fake, log=lines.append)
     assert dual.read("k", lambda: "fresh", wait=True) == "fresh"
     counts = dual.drain()
@@ -464,7 +473,7 @@ def selftest() -> int:
     order, fake = [], Fake()
     dual = DualRun(settings=on, factory=lambda s: fake, log=lines.append)
     dual.write("k", "v", lambda: order.append("authoritative"))
-    assert order == ["authoritative"] and fake.sets == ["blackboard:k"], (order, fake.sets)
+    assert order == ["authoritative"] and fake.sets == [on.key_prefix + "k"], (order, fake.sets)
 
     # 5. The off-switch takes effect mid-run, with no restart.
     flip = {"enabled": True, "host": "10.0.0.1"}

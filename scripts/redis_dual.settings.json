@@ -6,6 +6,6 @@
   "ca_cert_path": "",
   "shadow_reads": true,
   "write_through": true,
-  "key_prefix": "blackboard:",
-  "note": "OFF. Set enabled=true and host=<us-central1 Memorystore private IP> to start the dual-run. Re-read on every call, so setting enabled=false stops it immediately with no redeploy and no restart."
+  "key_prefix": "v1:blackboard:",
+  "note": "OFF. Set enabled=true and host=<us-central1 Memorystore private IP> to start the dual-run. Re-read on every call, so setting enabled=false stops it immediately with no redeploy and no restart. key_prefix carries a VERSION: change it only to migrate, and then run v1 and v2 side by side rather than in place."
 }
