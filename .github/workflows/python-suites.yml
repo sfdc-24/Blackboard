@@ -108,6 +108,9 @@ on:
       - "tests/test_studio_metadata_provider.py"
       - "tests/test_studio_voice_sweep_job.py"
       - "tests/test_sf360.py"
+      - "scripts/redis_dual.py"
+      - "scripts/redis_dual.settings.json"
+      - "tests/test_redis_dual.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -851,6 +854,22 @@ jobs:
           if [ -f tests/mutate_bus_filters.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The Memorystore dual-run wrapper. Offline by construction: no redis library is
+      # installed, no host is configured, and the committed settings file is OFF - which the
+      # suite asserts rather than assumes. It proves the four promises of his GO: the old path
+      # answers even when the cache disagrees, a disabled dual-run touches nothing at all, a
+      # mirror failure never reaches the caller, and the off-switch works without a restart.
+      - name: "Memorystore dual-run: off by default, never answers, never breaks the caller (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_dual.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_dual -v
+            sudo unshare -n -- "$python_bin" -B scripts/redis_dual.py selftest
           else
             echo "not on this branch; skipping"
           fi

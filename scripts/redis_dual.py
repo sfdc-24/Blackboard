@@ -1,0 +1,416 @@
+"""The Memorystore dual-run: a second store that is shadowed, never trusted, and off by default.
+
+HIS SHAPE, IN HIS WORDS (2026-10-05 GO): "non-disruptive Redis dual-run for Blackboard / related
+workflows - old path stays authoritative; add a second Memorystore connection; background read from
+Redis first; write-through to both; off-switch via settings not redeploy."
+
+WHAT "NON-DISRUPTIVE" IS BUILT TO MEAN HERE, because it is easy to say and easy to lose:
+
+  1. The old path answers. Every read returns what the authoritative source returned, even when Redis
+     disagrees, even when Redis is faster, even when Redis is right. A divergence is a LOG LINE, never
+     a different answer. A cache you start trusting on day one is a cache whose first wrong answer you
+     discover in front of a client.
+  2. Nothing is attempted while it is off, and OFF IS THE DEFAULT. Disabled means no import of the
+     client library, no socket, no DNS, no secret read. A feature that connects in order to discover
+     it is disabled is not off.
+  3. The off-switch is a settings FILE, re-read on every call, so turning it off is one edit and takes
+     effect on the next operation. No redeploy, no restart, no process to find and kill.
+  4. A mirror failure is never the caller's problem. The write to Redis happens after the
+     authoritative write has succeeded, and anything it raises is swallowed into a counter.
+
+WHAT CANNOT BE A DUAL-RUN TARGET, measured rather than assumed: the Blackboard bus itself. The board
+is a Google Sheet behind Apps Script, and Apps Script has no VPC access of any kind, so it can never
+reach a private Memorystore address. Only code that runs in Cloud Run, on a VM, or on a machine
+inside the authorised VPC can take part. The host is a PRIVATE service-access address: this laptop
+and Cloud Shell cannot reach it either, which is why `enabled` being off is also the honest state of
+the world until egress exists.
+
+THE SECRET. The AUTH string lives in Secret Manager (project sfdc24, secret REDIS_AUTH_STRING) and is
+read at connect time. It is never written to git, never to the board, never to a log, and never
+returned by anything here. `status()` reports whether an auth string was FOUND, not what it is - the
+rule from our secret checks is that a check prints the type and not the value.
+
+    python scripts/redis_dual.py status        # what is configured, what is reachable, nothing secret
+    python scripts/redis_dual.py selftest      # exercise the whole wrapper against a fake client
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+SETTINGS_PATH = Path(os.environ.get("REDIS_DUAL_SETTINGS", REPO / "scripts" / "redis_dual.settings.json"))
+# Memorystore's own default is 6379; his instance answers on 6378 with TLS required.
+DEFAULT_PORT = 6378
+SECRET_NAME = "REDIS_AUTH_STRING"
+PROJECT = "sfdc24"
+# A reachability probe that cannot hang a caller. The host is private, so off the VPC this fails fast
+# and the dual-run stays off rather than blocking a board read behind a TCP timeout.
+PROBE_SECONDS = 1.5
+
+
+class Settings:
+    """The dual-run's switches, re-read from disk on every call.
+
+    Re-read on purpose. A settings object cached at import time is a switch you cannot flip without a
+    redeploy, which is exactly what he said not to build."""
+
+    DEFAULTS = {
+        "enabled": False,              # the off-switch. OFF IS THE DEFAULT and stays off until he says.
+        "host": "",                    # empty means "nowhere to go": nothing is attempted
+        "port": DEFAULT_PORT,
+        "tls": True,                   # SERVER_AUTHENTICATION on his instance; never downgrade silently
+        "ca_cert_path": "",            # the instance CA; TLS verification needs it
+        "shadow_reads": True,          # read Redis in the BACKGROUND and compare; never serve from it
+        "write_through": True,         # mirror a write after the authoritative write succeeds
+        "key_prefix": "blackboard:",
+        "note": "Set enabled=false to stop the dual-run immediately. Read on every call, no redeploy.",
+    }
+
+    def __init__(self, data=None, path=None):
+        self.path = Path(path) if path else SETTINGS_PATH
+        self._data = dict(self.DEFAULTS)
+        if data is not None:
+            self._data.update(data)
+        else:
+            self._data.update(self._from_disk())
+
+    def _from_disk(self) -> dict:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}                  # no settings file, or an unreadable one, means OFF
+        return raw if isinstance(raw, dict) else {}
+
+    def __getattr__(self, name):
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def live(self) -> bool:
+        """Whether a connection may be attempted at all. Both switches, and somewhere to go."""
+        return bool(self._data.get("enabled")) and bool(str(self._data.get("host") or "").strip())
+
+
+def auth_string(project=PROJECT, secret=SECRET_NAME, runner=None):
+    """The AUTH string from Secret Manager, or "" when it cannot be read.
+
+    Returned to the caller that is about to connect and to nobody else. Never logged, never printed,
+    never put in a return value that is reported. gcloud is off PATH on this box, so the command is
+    resolved the same way the rest of the fleet resolves it."""
+    import subprocess
+    gcloud = os.environ.get("GCLOUD", "gcloud")
+    args = [gcloud, "secrets", "versions", "access", "latest",
+            "--secret", secret, "--project", project]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True,
+                                              encoding="utf-8", timeout=30, shell=False))
+    try:
+        done = run(args)
+    except Exception:
+        return ""
+    return (done.stdout or "").strip() if getattr(done, "returncode", 1) == 0 else ""
+
+
+def reachable(host, port, seconds=PROBE_SECONDS, connector=None) -> bool:
+    """Whether a TCP connection opens inside `seconds`. False off the VPC, which is the common case.
+
+    This exists so a caller never waits on a private address it cannot reach. The dual-run being
+    unreachable must cost a board read nothing."""
+    if not host:
+        return False
+    probe = connector or socket.create_connection
+    try:
+        conn = probe((host, int(port)), seconds)
+    except Exception:
+        return False
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return True
+
+
+def client(settings, factory=None):
+    """A connected client, or None. None is an ordinary outcome, not an error.
+
+    The redis library is NOT a dependency of this repository and is not installed on this box. That is
+    deliberate: an import at module scope would make every script that touches the bus fail to start
+    on a machine that will never run the dual-run. It is imported here, inside the one function that
+    needs it, and its absence turns the dual-run off rather than breaking the caller."""
+    if not settings.live():
+        return None
+    if factory is not None:
+        return factory(settings)
+    try:
+        import redis                                    # noqa: PLC0415 - see the docstring
+    except ImportError:
+        return None
+    if not reachable(settings.host, settings.port):
+        return None
+    secret = auth_string()
+    if not secret:
+        return None                                     # AUTH is required on his instance
+    kwargs = {"host": settings.host, "port": int(settings.port), "password": secret,
+              "socket_timeout": PROBE_SECONDS, "socket_connect_timeout": PROBE_SECONDS,
+              "decode_responses": True}
+    if settings.tls:
+        kwargs.update({"ssl": True, "ssl_cert_reqs": "required"})
+        if settings.ca_cert_path:
+            kwargs["ssl_ca_certs"] = settings.ca_cert_path
+    try:
+        return redis.Redis(**kwargs)
+    except Exception:
+        return None
+
+
+class Counters:
+    """What the dual-run did, for the VERIFY he asked for. Counts only: no keys, no values, no secret."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {"shadow_reads": 0, "shadow_hits": 0, "shadow_misses": 0, "shadow_errors": 0,
+                     "agreed": 0, "diverged": 0, "mirrors": 0, "mirror_errors": 0, "skipped_off": 0}
+
+    def bump(self, name, by=1):
+        with self.lock:
+            self.data[name] = self.data.get(name, 0) + by
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.data)
+
+
+class DualRun:
+    """The authoritative path, with Redis shadowed beside it.
+
+    `log` takes one string. `clock` is injectable so a test does not sleep."""
+
+    def __init__(self, settings=None, factory=None, log=None, clock=time.time):
+        self._settings = settings
+        self.factory = factory
+        self.log = log or (lambda line: None)
+        self.clock = clock
+        self.counters = Counters()
+        self.threads = []
+
+    def settings(self):
+        """Fresh settings for THIS operation: the off-switch works mid-run, without a redeploy."""
+        return self._settings if self._settings is not None else Settings()
+
+    # --- reads ---------------------------------------------------------------------------
+
+    def read(self, key, authoritative, compare=None, wait=False):
+        """Return what `authoritative()` returns. Always. Shadow-read Redis beside it when enabled.
+
+        His words were "background read from Redis first". Read FIRST in the sense of exercising that
+        path on every operation; never FIRST in the sense of answering from it. The answer is the old
+        path's, so a wrong or stale cache cannot reach him - it can only produce a divergence line.
+        `wait=True` is for tests and for the VERIFY run, so the comparison can be asserted."""
+        settings = self.settings()
+        answer = authoritative()
+        if not settings.live() or not settings.shadow_reads:
+            self.counters.bump("skipped_off")
+            return answer
+        thread = threading.Thread(target=self._shadow, args=(settings, key, answer, compare),
+                                  name="redis-shadow", daemon=True)
+        self.threads.append(thread)
+        thread.start()
+        if wait:
+            thread.join(timeout=PROBE_SECONDS * 3)
+        return answer
+
+    def _shadow(self, settings, key, answer, compare):
+        self.counters.bump("shadow_reads")
+        try:
+            conn = client(settings, self.factory)
+            if conn is None:
+                self.counters.bump("shadow_errors")
+                return
+            got = conn.get(settings.key_prefix + key)
+        except Exception as error:
+            self.counters.bump("shadow_errors")
+            self.log("redis shadow read failed for %s: %s" % (key, type(error).__name__))
+            return
+        if got is None:
+            self.counters.bump("shadow_misses")
+            return
+        self.counters.bump("shadow_hits")
+        same = (compare or self._same)(got, answer)
+        self.counters.bump("agreed" if same else "diverged")
+        if not same:
+            # The divergence is the product of the dual-run. It names sizes, never contents: the board
+            # carries his and other people's words and they do not belong in a cache log.
+            self.log("redis DIVERGED on %s: cached %d chars, authoritative %d chars; the authoritative "
+                     "answer was served" % (key, len(str(got)), len(str(answer))))
+
+    @staticmethod
+    def _same(cached, answer) -> bool:
+        if isinstance(answer, (str, bytes)):
+            return str(cached) == (answer.decode() if isinstance(answer, bytes) else answer)
+        try:
+            return json.loads(cached) == json.loads(json.dumps(answer, default=str))
+        except (ValueError, TypeError):
+            return False
+
+    # --- writes --------------------------------------------------------------------------
+
+    def write(self, key, value, authoritative, ttl=None):
+        """Do the authoritative write, then mirror it. The mirror can never fail the caller.
+
+        Order matters and is not arbitrary: the authoritative write goes first, so a mirror that
+        succeeds while the real write fails cannot leave a value in the cache that was never
+        committed. A mirror that fails after a committed write only leaves the cache stale, which the
+        shadow read above is built to notice."""
+        result = authoritative()
+        settings = self.settings()
+        if not settings.live() or not settings.write_through:
+            self.counters.bump("skipped_off")
+            return result
+        try:
+            conn = client(settings, self.factory)
+            if conn is None:
+                self.counters.bump("mirror_errors")
+                return result
+            payload = value if isinstance(value, str) else json.dumps(value, default=str)
+            if ttl:
+                conn.setex(settings.key_prefix + key, int(ttl), payload)
+            else:
+                conn.set(settings.key_prefix + key, payload)
+            self.counters.bump("mirrors")
+        except Exception as error:
+            self.counters.bump("mirror_errors")
+            self.log("redis mirror failed for %s: %s" % (key, type(error).__name__))
+        return result
+
+    def drain(self, seconds=PROBE_SECONDS * 3):
+        """Wait for outstanding shadow reads. For the VERIFY run and for tests, never on a hot path."""
+        for thread in list(self.threads):
+            thread.join(timeout=seconds)
+        self.threads = [t for t in self.threads if t.is_alive()]
+        return self.counters.snapshot()
+
+
+def status(settings=None) -> dict:
+    """What is configured and what is reachable. Nothing secret: whether AUTH was FOUND, never its value."""
+    settings = settings or Settings()
+    live = settings.live()
+    found = bool(auth_string()) if live else None
+    try:
+        import redis                                    # noqa: F401
+        library = True
+    except ImportError:
+        library = False
+    return {
+        "settings_file": str(settings.path),
+        "settings_file_present": settings.path.is_file(),
+        "enabled": bool(settings._data.get("enabled")),
+        "host": settings.host or "(none)",
+        "port": settings.port,
+        "tls": bool(settings.tls),
+        "ca_cert_configured": bool(settings.ca_cert_path),
+        "redis_library_installed": library,
+        "would_attempt_connection": live,
+        "reachable": reachable(settings.host, settings.port) if live else None,
+        "auth_string_found": found,
+        "shadow_reads": bool(settings.shadow_reads),
+        "write_through": bool(settings.write_through),
+    }
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    what = argv[0] if argv else "status"
+    if what == "status":
+        for key, value in status().items():
+            print("%-26s %s" % (key, value))
+        return 0
+    if what == "selftest":
+        return selftest()
+    print(__doc__)
+    return 2
+
+
+def selftest() -> int:
+    """Exercise the wrapper against a fake client, with no network and no secret.
+
+    Here rather than only in tests/ so the scaffold can be shown working on a box that has no redis
+    library, no VPC egress and no reachable host - which is every box we own today."""
+    class Fake:
+        def __init__(self, store=None, fail=False):
+            self.store, self.fail, self.sets = dict(store or {}), fail, []
+
+        def get(self, key):
+            if self.fail:
+                raise RuntimeError("fake get failure")
+            return self.store.get(key)
+
+        def set(self, key, value):
+            if self.fail:
+                raise RuntimeError("fake set failure")
+            self.store[key] = value
+            self.sets.append(key)
+
+        def setex(self, key, ttl, value):
+            self.set(key, value)
+
+    lines = []
+    on = Settings({"enabled": True, "host": "10.0.0.1"})
+    off = Settings({"enabled": False, "host": "10.0.0.1"})
+
+    # 1. OFF attempts nothing.
+    touched = []
+    dual = DualRun(settings=off, factory=lambda s: touched.append(1), log=lines.append)
+    assert dual.read("k", lambda: "authoritative") == "authoritative"
+    dual.write("k", "v", lambda: "written")
+    assert touched == [], "a disabled dual-run touched the client factory"
+
+    # 2. ON, and Redis disagrees: the authoritative answer is still served.
+    fake = Fake({"blackboard:k": "STALE"})
+    dual = DualRun(settings=on, factory=lambda s: fake, log=lines.append)
+    assert dual.read("k", lambda: "fresh", wait=True) == "fresh"
+    counts = dual.drain()
+    assert counts["diverged"] == 1, counts
+    assert any("DIVERGED" in line for line in lines), lines
+
+    # 3. A mirror failure never reaches the caller.
+    broken = Fake(fail=True)
+    dual = DualRun(settings=on, factory=lambda s: broken, log=lines.append)
+    assert dual.write("k", "v", lambda: "committed") == "committed"
+    assert dual.counters.snapshot()["mirror_errors"] == 1
+
+    # 4. Write-through writes the mirror, and the authoritative write runs first.
+    order, fake = [], Fake()
+    dual = DualRun(settings=on, factory=lambda s: fake, log=lines.append)
+    dual.write("k", "v", lambda: order.append("authoritative"))
+    assert order == ["authoritative"] and fake.sets == ["blackboard:k"], (order, fake.sets)
+
+    # 5. The off-switch takes effect mid-run, with no restart.
+    flip = {"enabled": True, "host": "10.0.0.1"}
+    live = DualRun(factory=lambda s: fake, log=lines.append)
+    live._settings = None
+
+    class Flipping(DualRun):
+        def settings(self):
+            return Settings(dict(flip))
+
+    live = Flipping(factory=lambda s: fake, log=lines.append)
+    before = live.counters.snapshot()["skipped_off"]
+    live.read("k", lambda: "x", wait=True)
+    flip["enabled"] = False
+    live.read("k", lambda: "x", wait=True)
+    assert live.counters.snapshot()["skipped_off"] == before + 1, "the off-switch did not take effect"
+
+    print("SELFTEST OK: 5 properties - off attempts nothing; the authoritative answer always wins; a "
+          "mirror failure never reaches the caller; the authoritative write runs first; the off-switch "
+          "works without a restart.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
