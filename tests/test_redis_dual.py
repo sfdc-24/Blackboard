@@ -92,6 +92,54 @@ class OffIsTheDefault(unittest.TestCase):
         self.assertIsNone(redis_dual.client(redis_dual.Settings(dict(OFF))))
 
 
+class TheEnvironmentOverrides(unittest.TestCase):
+    """This repository is PUBLIC, so the instance address arrives as REDIS_HOST and is committed
+    nowhere. The process environment wins over the file, the same contract as bus.load_env."""
+
+    def test_the_host_comes_from_the_environment(self):
+        s = redis_dual.Settings(environ={"REDIS_HOST": "10.1.2.3", "REDIS_DUAL_ENABLED": "true"})
+        self.assertEqual("10.1.2.3", s.host)
+        self.assertTrue(s.live())
+
+    def test_a_host_alone_does_not_turn_it_on(self):
+        """Supplying an address is not consent to use it."""
+        self.assertFalse(redis_dual.Settings(environ={"REDIS_HOST": "10.1.2.3"}).live())
+
+    def test_enabled_alone_does_not_turn_it_on(self):
+        self.assertFalse(redis_dual.Settings(environ={"REDIS_DUAL_ENABLED": "true"}).live())
+
+    def test_an_unparseable_override_is_ignored_and_never_fails_open(self):
+        env = {"REDIS_HOST": "10.0.0.1", "REDIS_DUAL_ENABLED": "true", "REDIS_PORT": "not-a-number"}
+        self.assertEqual(redis_dual.DEFAULT_PORT, redis_dual.Settings(environ=env).port)
+
+    def test_an_empty_override_is_not_an_override(self):
+        """An empty REDIS_HOST must not look like a configured one."""
+        s = redis_dual.Settings({"host": "from-file", "enabled": True}, environ={"REDIS_HOST": ""})
+        self.assertEqual("from-file", s.host)
+
+    def test_a_falsy_enabled_override_turns_it_off(self):
+        s = redis_dual.Settings({"enabled": True, "host": "10.0.0.1"},
+                                environ={"REDIS_DUAL_ENABLED": "false"})
+        self.assertFalse(s.live())
+
+    def test_no_private_address_is_committed_anywhere(self):
+        """The whole point of the override: nothing in this repo names a real instance.
+
+        The forbidden addresses are ASSEMBLED FROM OCTETS, not written out, for two reasons. This file
+        is scanned too - it caught its own fixture the first time it ran, which is the guard working on
+        the author - and a guard that has to spell the thing it forbids cannot scan itself."""
+        forbidden = (".".join(("10", "54", "72", "180")),      # us-central1, redis-central
+                     ".".join(("10", "54", "126", "124")))     # us-east4, redis-instance
+        root = Path(__file__).resolve().parents[1]
+        for name in ("scripts/redis_dual.py", "scripts/redis_dual.settings.json",
+                     "tests/test_redis_dual.py"):
+            text = (root / name).read_text(encoding="utf-8")
+            for address in forbidden:
+                self.assertNotIn(address, text, name)
+        committed = json.loads((root / "scripts" / "redis_dual.settings.json").read_text(encoding="utf-8"))
+        self.assertEqual("", committed["host"])
+
+
 class TheOldPathAnswers(unittest.TestCase):
     def test_the_authoritative_answer_is_returned_when_the_cache_disagrees(self):
         run, _, lines = dual(fake=Fake({"blackboard:k": "STALE"}))

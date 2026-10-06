@@ -30,6 +30,13 @@ read at connect time. It is never written to git, never to the board, never to a
 returned by anything here. `status()` reports whether an auth string was FOUND, not what it is - the
 rule from our secret checks is that a check prints the type and not the value.
 
+WHERE THE ADDRESS AND THE CERT LIVE, and why not here. This repository is PUBLIC. The AUTH string is
+in Secret Manager and never leaves it. The instance's private address and its server CA are not
+credentials, but they are topology, and topology beside everything else this repo says about our fleet
+is needless disclosure - so the committed settings file is a TEMPLATE with an empty host, and the real
+values arrive as REDIS_HOST and REDIS_CA_CERT_PATH in the environment. Process environment wins over
+the file, the same contract as bus.load_env.
+
     python scripts/redis_dual.py status        # what is configured, what is reachable, nothing secret
     python scripts/redis_dual.py selftest      # exercise the whole wrapper against a fake client
 """
@@ -72,13 +79,27 @@ class Settings:
         "note": "Set enabled=false to stop the dual-run immediately. Read on every call, no redeploy.",
     }
 
-    def __init__(self, data=None, path=None):
+    # The process environment wins over the file, the same contract as bus.load_env: a sandbox or a
+    # Cloud Run service can supply these without a credential or an address being copied into the
+    # checkout. THIS REPOSITORY IS PUBLIC, so the committed settings file is a TEMPLATE with an empty
+    # host. The instance's private address is infrastructure detail - low risk on its own, needless
+    # disclosure beside everything else this repo says about our topology - so it arrives here as
+    # REDIS_HOST and is not committed anywhere.
+    FROM_ENV = {
+        "REDIS_DUAL_ENABLED": ("enabled", lambda v: v.strip().lower() in ("1", "true", "yes", "on")),
+        "REDIS_HOST": ("host", str.strip),
+        "REDIS_PORT": ("port", lambda v: int(v.strip())),
+        "REDIS_CA_CERT_PATH": ("ca_cert_path", str.strip),
+    }
+
+    def __init__(self, data=None, path=None, environ=None):
         self.path = Path(path) if path else SETTINGS_PATH
         self._data = dict(self.DEFAULTS)
         if data is not None:
             self._data.update(data)
         else:
             self._data.update(self._from_disk())
+        self._data.update(self._from_env(environ if environ is not None else os.environ))
 
     def _from_disk(self) -> dict:
         try:
@@ -86,6 +107,21 @@ class Settings:
         except (OSError, ValueError):
             return {}                  # no settings file, or an unreadable one, means OFF
         return raw if isinstance(raw, dict) else {}
+
+    def _from_env(self, environ) -> dict:
+        """Environment overrides. A value this cannot parse is IGNORED, which leaves the setting at
+        whatever the file said - and for `enabled` the file says false. A malformed override must
+        never fail open into a live connection."""
+        found = {}
+        for name, (key, cast) in self.FROM_ENV.items():
+            raw = environ.get(name)
+            if raw is None or raw == "":
+                continue
+            try:
+                found[key] = cast(raw)
+            except (ValueError, TypeError):
+                continue
+        return found
 
     def __getattr__(self, name):
         try:
