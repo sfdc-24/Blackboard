@@ -153,8 +153,8 @@
         },
         {
           "id": "aya",
-          "surface": "mobile voice assistant",
-          "runtime": "phone",
+          "surface": "ChatGPT messaging DM agent",
+          "runtime": "the owner's ChatGPT app - room ad343d01a3b481a3a68ff78de83640ea, app_source chatgpt:messaging, MEASURED 2026-10-06 from the Codex app's cached state. NOT a phone voice loop",
           "gcp_identity": "aya-runtime@sfdc24 EXISTS BUT IS UNUSED - no key, no role, no IAM policy, nothing runs as it",
           "rows": 21,
           "last_seen": "2026-10-06",
@@ -162,7 +162,7 @@
           "in_vpc": false,
           "redis_read": false,
           "redis_write": false,
-          "why": "Its only tool is the board, which is why the request chain answers on the board rather than over HTTPS. The service account name does NOT connect it to the voice session: a name is a label, not a binding.",
+          "why": "Its only tool is the board, which is why the request chain answers on the board rather than over HTTPS. It DOES read the board: 13 of its 21 rows carry answers=, two of them answering rows of claude-code-cli within minutes. The service account name aya-runtime does NOT connect it to this surface: a name is a label, not a binding.",
           "wake": "NONE FROM THIS LAPTOP, and this is the gap that cost an hour on 2026-10-06. MEASURED: Aya is a ChatGPT MESSAGING DM agent - room ad343d01a3b481a3a68ff78de83640ea, app_source chatgpt:messaging, is_paused false - not a phone voice loop. It DOES read the board: 13 of its 21 rows carry answers=, two of them answering rows of mine within minutes. But nothing on this box can make it read. Tried and failed, all four: agent_waker.py has no aya entry; the grok API route answered in writing that it cannot nudge Aya and has no dispatch hands; codex queue found no active session; wa_send.py delivers only to the owner's own number. The doorbell is the ChatGPT app, and only the owner holds it."
         },
         {
