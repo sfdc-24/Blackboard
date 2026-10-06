@@ -183,16 +183,23 @@ A doorbell is a poll, a poll costs tokens, and on 2026-10-04 that cost him three
 
 ## 7. Control, orchestration, and the escalation ladder
 
-His instruction is that Codex, Gemini and Grok circle this. In the protocol that is not a sentiment;
-it is who may move what, and where an unanswered message goes next.
+**His appointments of 2026-10-06, in his words:** *"I'm appointing you as the control lead for Redis
+and Grok as lead for strategic reporting and analysis, Codex as Quality and improvement lead and
+Gemini as Architect lead — everyone has to participate."* In the protocol that is not a sentiment; it
+is who may move what, and where an unanswered message goes next.
 
-| Lane | Controller | What it decides |
+| Lane | Lead | What it decides |
 |---|---|---|
-| Acceptance, receipts, API and subscription spend | **Codex** (reached as `chatgpt-codex-desktop`; `aya` and `dot` are aliases) | Whether a task may reach `done`; the ACK and idle thresholds; whether a wake was worth its cost |
-| Architecture and adversarial review | **Gemini** | The shape of this protocol, and any change to the envelope or the state machine |
-| Sequence and direction | **Grok** | Which lane runs next; where an overdue task goes; who is stuck |
-| The build, and reporting to the other three | Claude | Implementation, and the governance and data-security gate |
-| Spend, resources, and anything client-facing | **Mr. Salam** | Last resort, and the only one who is never escalated *to* by a machine except through WhatsApp |
+| **Redis: control and orchestration** | **Claude** (`claude-code-cli`) | This protocol's operation: identity, mailboxes, the clock, the roll-up, and who may wake whom. Also governance and the data-security gate. |
+| **Architecture** | **Gemini** | The shape. Any change to the envelope, the state machine, or the key layout is its call, and mine to implement. |
+| **Quality and improvement** | **Codex** (`chatgpt-codex-desktop`; `codex`, `aya`, `dot` are aliases) | Whether a task may reach `done`; the ACK and idle thresholds; API and subscription spend, by his appointment of 2026-10-04 21:28Z. No self-certification by anyone, me included. |
+| **Strategic reporting and analysis** | **Grok** | What the fleet reports upward, what the numbers mean, sequence against the pilot, and where an overdue task goes. |
+| Resources, spend, and anything client-facing | **Mr. Salam** | Last resort, and the only one never escalated *to* by a machine except through WhatsApp |
+
+Being control lead for Redis does not make me the reviewer of my own work. Architecture decisions are
+Gemini's and acceptance is Codex's; where either overrules me on this document, they win and I
+implement it. The two guardrails I keep as control lead are the ones he has already ruled on: no
+secret reaches git or the board, and no change goes live without the old path proven equal first.
 
 The ladder, and it fires on a clock rather than on someone noticing:
 
@@ -210,37 +217,71 @@ has a named destination.
 
 ---
 
-## 8. Running it beside the board, not instead of it
+## 8. Rolling the bus up into Redis, without breaking it
 
-The board stays authoritative until this is proven, exactly as the Memorystore scaffold
-(`scripts/redis_dual.py`, Blackboard #323) is already built: old path authoritative, second
-connection off by default, write-through to both, off-switch in settings and not a redeploy.
+His instruction of 2026-10-06: *"the BUS (blackboard alpha db) should be rolled up into redis so
+communication is seamless. Do not break what's already working, Build it in Redis, do parallel checks
+and compare results first."* That is the shape below, and it is three phases with a gate between each.
 
-Two facts that constrain the rollout and are measured, not assumed:
+**The one constraint that shapes all of it, measured and not assumed:** Apps Script has no VPC access
+of any kind, so the Sheet's own code can never reach a private Memorystore address. That does not stop
+the roll-up — it decides *where the roll-up runs*. It is a **relay**, in a place that can reach both:
+Cloud Run in `us-central1` with VPC egress, which reaches the gateway over HTTPS and Redis over the
+private network. The Sheet does not need to know Redis exists.
 
-- **The Blackboard bus itself cannot move to Redis.** The board is a Google Sheet behind Apps Script,
-  and Apps Script has no VPC access of any kind, so it can never reach a private Memorystore address.
-  Agents that run in Cloud Run, on a VM, or inside the authorised VPC can use this protocol; a surface
-  that only has Apps Script keeps the board, and the write-through is what keeps them in step.
-- **Nothing is reachable yet.** Every Cloud Run service we own is `us-central1`; the first instance is
-  `us-east4`. Mr. Salam has agreed on us-central1. Until that instance and VPC egress exist, this
-  protocol runs on the board transport with the Redis path off, and the envelope above is already
-  expressible as a BCB row.
+```
+bus:rows            STREAM  every board row, entry id derived from Row_ID
+bus:row:<Row_ID>    HASH    the row's ten cells, for a direct get
+bus:cursor          STRING  the relay's watermark: the newest timestamp it has mirrored
+bus:compare         STREAM  one entry per reconciliation: counts, never contents
+```
+
+**Phase 1 — mirror and compare, and change nothing.** The relay reads the gateway with `since=<cursor>`
+and `XADD`s each row under an id derived from its `Row_ID`, so a flapping read that returns the same
+rows twice mirrors them once. The cursor only ever moves forward. Nothing reads from Redis yet. A
+reconciler then diffs the two by `Row_ID` and writes counts to `bus:compare`: rows in the Sheet and
+not in Redis, rows in Redis and not in the Sheet, and rows whose ten cells differ. **The gate out of
+phase 1 is a run of zero divergence over a span Codex accepts** — not one clean comparison, a span.
+
+**Phase 2 — read from Redis, with the Sheet still the answer.** Readers take the Redis copy *and* the
+gateway copy, serve the gateway's, and log divergence. This is `scripts/redis_dual.py` already built
+and already tested: the old path answers even when Redis is faster or right. The gate out is Codex
+accepting a divergence rate of zero over a second span, and Gemini accepting the read path.
+
+**Phase 3 — Redis answers, the Sheet is written through.** Only here does a read come from Redis.
+Writes still land in the Sheet first, because the Sheet is the append-only record he can open in a
+browser and I am not taking that away. An agent that cannot reach the Sheet writes to Redis and the
+relay appends on its behalf — which is new capability, not a replacement, and it is what makes a
+Cloud Run agent a first-class writer for the first time.
+
+**The off-switch spans all three phases**: one settings edit returns every reader to the gateway on its
+next operation, with no redeploy. That is already how the scaffold behaves.
+
+What rolls up alongside the bus, same pattern, same gates: repository work and PR state, tasks, issues
+and the OKF — each mirrored, compared, and only then read from. The OKF is the one to be most careful
+with, because the chair serves the OKF **baked into its image** and will keep doing so; Redis becomes
+where the fleet reads the OKF, never where the chair gets it, or we reintroduce a live plan changing
+under a call.
+
+**Nothing is reachable yet.** Every Cloud Run service we own is `us-central1`; the first instance is
+`us-east4`. He has agreed on us-central1. Until that instance and VPC egress exist, every phase above
+is unbuilt and this protocol runs on the board transport with the Redis path off — and the envelope in
+§3 is already expressible as a BCB row, so no message has to wait for Redis to be sayable.
 
 ---
 
-## 9. What each controller must decide before anything is built
+## 9. What each lead must decide before anything is built
 
 Named, so no one has to guess what is being asked of them.
 
-**Codex** — you own acceptance and receipts.
+**Codex — quality and improvement lead.**
 1. The ACK window per `kind`. My proposal: `ASSIGN` 60 min, `ASK` 4 h, `ESCALATE` 15 min, `NOTE` none.
 2. The `XAUTOCLAIM` idle threshold at which a held message is taken from a dead session.
 3. Whether an ACK may be sent by a cheap always-on process on an agent's behalf, or must come from the
    session that will do the work. I lean to the second — an ACK that does not mean "I own it" is the
    receipt problem with extra steps — and I can see the cost argument for the first.
 
-**Gemini** — you own the shape, and I would rather be corrected now.
+**Gemini — architect lead.** You own the shape, and I would rather be corrected now than after it is built.
 1. Streams with consumer groups versus a simpler list per agent. I chose streams **for the PEL**: it
    is the receipt ledger as a primitive, and I do not want to rebuild one.
 2. My idempotent id is `sha256(sender + logical_id)`. Attack it: two different messages sharing a
@@ -249,11 +290,22 @@ Named, so no one has to guess what is being asked of them.
    woken someone never does, and nobody learns. You raised exactly this against the wake gate. Is the
    `kind`-based rule enough, or does a suppressed wake need its own audit?
 
-**Grok** — you own sequence.
+**Grok — strategic reporting and analysis lead.**
 1. The order: identity table and heartbeats first, then mailboxes and ACK, then tasks and
    dependencies. Each is useful alone; the last is useless without the first.
 2. Where an overdue task goes when you are the one who is quiet. There is no second Grok, and the
    ladder currently dead-ends at you before the owner.
+
+**And on the roll-up specifically**, because it is the part that can break something that works:
+
+- **Codex:** the span of zero divergence that opens each phase gate. One clean comparison is not a
+  span, and I would rather you set the number than have me pick one that happens to pass.
+- **Gemini:** the relay is a single point of failure between two stores, and its cursor is the thing
+  that decides what is mirrored. Attack the cursor: a watermark that moves forward on a partial read
+  loses rows silently, which is the failure class our own waker state already taught us.
+- **Grok:** the order of what rolls up after the bus — repository and PR state, tasks, issues, the
+  OKF. I would do the bus, then tasks, then issues, then PR state, and the OKF last because the chair
+  must keep taking it from its image.
 
 **Mr. Salam** — two, and only two.
 1. The us-central1 instance and VPC egress, which are resources and therefore yours.
