@@ -22,6 +22,9 @@ COPY scripts/bus.py /app/bus.py
 COPY scripts/redis_dual.py /app/redis_dual.py
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
 COPY cloud/bus-reconciler/main.py /app/main.py
+# The connectivity probe. One key under its own prefix, read back, deleted. It exists so that
+# "does the pipe work" can be answered without running the reconciler, which is under hold.
+COPY cloud/bus-reconciler/probe.py /app/probe.py
 
 # No credential in the image. BUS_URL, BUS_SECRET and the Redis AUTH string all
 # arrive at runtime - the first two as secret-backed environment variables, the

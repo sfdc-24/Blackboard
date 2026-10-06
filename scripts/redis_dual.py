@@ -61,7 +61,10 @@ AUTH_FILE_ENV = "REDIS_AUTH_FILE"
 PROJECT = "sfdc24"
 # A reachability probe that cannot hang a caller. The host is private, so off the VPC this fails fast
 # and the dual-run stays off rather than blocking a board read behind a TCP timeout.
-PROBE_SECONDS = 1.5
+PROBE_SECONDS = float(os.environ.get("REDIS_PROBE_SECONDS", "1.5"))
+# The real connect gets longer than the pre-check. The pre-check exists to fail fast on a hot
+# path; a connection that is actually wanted should not inherit a hot path's impatience.
+CONNECT_SECONDS = float(os.environ.get("REDIS_CONNECT_SECONDS", "10"))
 
 
 class Settings:
@@ -199,7 +202,7 @@ def reachable(host, port, seconds=PROBE_SECONDS, connector=None) -> bool:
     return True
 
 
-def client(settings, factory=None):
+def client(settings, factory=None, precheck=True):
     """A connected client, or None. None is an ordinary outcome, not an error.
 
     The redis library is NOT a dependency of this repository and is not installed on this box. That is
@@ -214,13 +217,22 @@ def client(settings, factory=None):
         import redis                                    # noqa: PLC0415 - see the docstring
     except ImportError:
         return None
-    if not reachable(settings.host, settings.port):
+    # THE PRE-CHECK IS A LATENCY GUARD, NOT A REACHABILITY VERDICT, and conflating the two produced a
+    # false negative the first time it mattered: a 1.5-second TCP probe from a cold gen2 container
+    # whose VPC interface was still coming up said "unreachable" and the connectivity probe reported
+    # FAIL on a path that worked seconds earlier from an identically configured job.
+    #
+    # On a hot path - a board read that must not hang behind a private address - a fast "no" is worth
+    # more than a correct "yes", so the guard stays there. A job whose whole purpose is to connect
+    # should not be gated by it: it passes precheck=False and lets the real connect, with its own
+    # timeout, be the authority. The answer from an attempt beats the answer from a guess.
+    if precheck and not reachable(settings.host, settings.port):
         return None
     secret = auth_string()
     if not secret:
         return None                                     # AUTH is required on his instance
     kwargs = {"host": settings.host, "port": int(settings.port), "password": secret,
-              "socket_timeout": PROBE_SECONDS, "socket_connect_timeout": PROBE_SECONDS,
+              "socket_timeout": CONNECT_SECONDS, "socket_connect_timeout": CONNECT_SECONDS,
               "decode_responses": True}
     if settings.tls:
         kwargs.update({"ssl": True, "ssl_cert_reqs": "required"})

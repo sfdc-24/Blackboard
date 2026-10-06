@@ -243,6 +243,36 @@ class TheOffSwitch(unittest.TestCase):
                         "settings must be resolved per call, not held on the instance")
 
 
+class ThePrecheckIsNotTheVerdict(unittest.TestCase):
+    """A 1.5-second TCP pre-check from a cold gen2 container said "unreachable" and made the
+    connectivity probe report FAIL on a path that had worked seconds earlier from an identically
+    configured job. A latency guard is not a reachability verdict."""
+
+    def test_the_precheck_can_be_skipped(self):
+        """A job whose whole purpose is to connect must let the connect be the answer."""
+        made = []
+        settings = redis_dual.Settings(dict(ON))
+        got = redis_dual.client(settings, factory=lambda s: made.append(1) or "conn", precheck=False)
+        self.assertEqual("conn", got)
+        self.assertEqual([1], made)
+
+    def test_the_connect_timeout_is_longer_than_the_precheck(self):
+        """A connection that is actually wanted should not inherit a hot path's impatience."""
+        self.assertGreater(redis_dual.CONNECT_SECONDS, redis_dual.PROBE_SECONDS)
+
+    def test_the_precheck_window_is_configurable(self):
+        """1.5 s was chosen for a laptop and is used from a cold container."""
+        self.assertIn("REDIS_PROBE_SECONDS", (Path(__file__).resolve().parents[1]
+                                              / "scripts" / "redis_dual.py").read_text(encoding="utf-8"))
+
+    def test_off_still_means_off_even_without_the_precheck(self):
+        """Skipping the guard must not skip the switch."""
+        touched = []
+        self.assertIsNone(redis_dual.client(redis_dual.Settings(dict(OFF)),
+                                            factory=lambda s: touched.append(1), precheck=False))
+        self.assertEqual([], touched)
+
+
 class TheSecretStaysSecret(unittest.TestCase):
     def test_status_reports_whether_auth_was_found_not_what_it_is(self):
         """Our rule from the secret checks: print the type, never the value."""
