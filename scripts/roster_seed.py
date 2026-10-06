@@ -55,7 +55,7 @@ CANON = redis_dual.KEY_VERSION + "agent:canon"
 SEEDED = redis_dual.KEY_VERSION + "agent:seeded"
 
 FIELDS = ("family", "name", "role", "responsibility", "surface", "runtime", "gcp_identity",
-          "state", "in_vpc", "redis_read", "redis_write", "why", "rows", "last_seen")
+          "state", "in_vpc", "redis_read", "redis_write", "why", "wake", "rows", "last_seen")
 
 
 def load(path=None) -> dict:
@@ -110,6 +110,21 @@ def check(data) -> list:
                 problems.append("%s: %s must be true or false, not %r" % (rid, flag, row.get(flag)))
         if not row.get("why"):
             problems.append("%s: no reason given for its access verdict" % rid)
+        # EVERY INSTANCE MUST NAME ITS DOORBELL, and "NONE" is a legitimate answer.
+        #
+        # On 2026-10-06 the owner said "wake Aya and get it to post the row". Four channels were
+        # tried in turn before the answer was known: agent_waker.py (no aya entry), the grok API
+        # route (answered in writing that it has no dispatch hands), `codex queue` (no active
+        # session) and wa_send.py (delivers only to the owner's own number). Aya had been carried
+        # here for a day as "mobile voice assistant / phone" - a surface, never a route - so the
+        # hour went on rediscovering that nothing on this box can ring it.
+        #
+        # A roster that lists who exists and not how to reach them turns every wake request into
+        # the same search. So an instance with no `wake` is REFUSED, and an instance nothing can
+        # wake must say NONE and say what it would take. The gap is then written down once.
+        if not row.get("wake"):
+            problems.append("%s: no wake path named. Say how to ring it, or NONE and what it "
+                            "would take - an unnamed doorbell gets rediscovered every time" % rid)
         # An access claim that contradicts reachability is the kind of thing that goes unnoticed.
         if row.get("redis_read") and not row.get("in_vpc"):
             problems.append("%s claims redis_read while outside the VPC, which is not possible" % rid)
