@@ -58,6 +58,10 @@ on:
       - "tests/test_wa_board_outbox.py"
       - "scripts/wa_notify.py"
       - "tests/test_wa_notify.py"
+      - "scripts/signature.py"
+      - "scripts/agent_roster.json"
+      - "scripts/append.py"
+      - "tests/test_signature.py"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -168,6 +172,10 @@ on:
       - "tests/test_wa_board_outbox.py"
       - "scripts/wa_notify.py"
       - "tests/test_wa_notify.py"
+      - "scripts/signature.py"
+      - "scripts/agent_roster.json"
+      - "scripts/append.py"
+      - "tests/test_signature.py"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -851,6 +859,23 @@ jobs:
           if [ -f tests/mutate_bus_filters.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # WHO WROTE A ROW, AND HOW IT GOT HERE. Mr Salam, 2026-10-06: "signs should reflect
+      # who its from; claude mobile or claude code cli makes a difference, also good to know
+      # who relayed the message, direct or by aya". The suite is a NEGATIVE control first -
+      # the first version of this guard would have refused 198 of 200 live rows, so what
+      # matters is the shapes it rejects, not the ones it waves through. It also checks the
+      # roster the guard reads, because a duplicate id or a missing wake path turns the guard
+      # into something that passes rows it should refuse.
+      - name: "row attribution: an instance signs, a relay names its relayer (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_signature.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_signature -v
           else
             echo "not on this branch; skipping"
           fi

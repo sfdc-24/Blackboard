@@ -11,6 +11,7 @@ import json
 import re
 import sys
 
+import signature
 from bus import fetch, load_env, read_rows
 
 TITLE = "Blackboard - Alpha DB"
@@ -89,6 +90,24 @@ def main():
             "far as any reader is concerned. Rewrite the value without pipes "
             "(say 'v=1 then v=999' rather than 'v=1|v=999'). Refusing to append."
         )
+    # WHO WROTE THIS, AND HOW DID IT GET HERE.
+    #
+    # Mr Salam, 2026-10-06: "signs should reflect who its from; claude mobile or claude code cli
+    # makes a difference, also good to know who relayed the message, direct or by aya".
+    #
+    # Checked at the WRITER for the same reason the ambiguity check is: the board is append-only and
+    # a row that misattributes itself cannot be taken back. See scripts/signature.py for the three
+    # checks and for what this deliberately does NOT claim - it makes a signature unambiguous and
+    # traceable, never true, because this board has no authenticated sender.
+    #
+    # NOTE ON MERGE ORDER: this refuses every row if scripts/agent_roster.json is missing, which is
+    # correct - a guard that cannot run has not passed - but it means append.py and the roster must
+    # land together.
+    signature_problems = signature.check(spec.get("source_tag"), payload)
+    if signature_problems:
+        raise SystemExit(
+            "ROW_ATTRIBUTION_UNCLEAR: refusing to append.\n  - "
+            + "\n  - ".join(signature_problems))
     # tries=1 is deliberately explicit even though fetch() now enforces the same
     # rule for every append. The v1 bus does not dedup, and a googleusercontent
     # 404 on the redirect hop can be raised client-side AFTER the row has already
