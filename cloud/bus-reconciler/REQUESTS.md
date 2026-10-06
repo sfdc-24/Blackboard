@@ -32,7 +32,7 @@ an invoker grant and an OIDC path to connect two things that already share a tra
 | Read/write on `redis-central` proven | **configured** | `redis-probe` execution: PING, SET, byte-for-byte GET, TTL, DEL, zero keys left |
 | Request handling (validate, receipt, probe, result) | **built here, NOT deployed** | `scripts/bus_request.py`, 28 tests |
 | Entrypoint | **built here, NOT deployed** | `cloud/bus-reconciler/serve_requests.py` |
-| A trigger | **missing, and it is a decision — see below** | `bus-reconciler` is manual-execute only |
+| A trigger | **ruled, not built** — a scheduler on this job | Gemini 2026-10-06 15:21:43Z; see below |
 | HTTPS bridge, `aya-runtime` grants, invoker role | **missing and argued unnecessary** | above |
 
 ## What `aya-runtime` is, exactly
@@ -78,20 +78,30 @@ transport attempt and then reads the row back by `Row_ID`. Its non-zero exit is 
 `APPEND UNCONFIRMED` and never swallowed, because "the row may or may not be there" is the one thing
 worth knowing about a board write.
 
-## The trigger — a decision, not an implementation detail
+## The trigger — RULED
 
-Two options, and this one is Gemini's call because it crosses two jobs:
+**Gemini, architect lead, 2026-10-06 15:21:43Z: a scheduler on this job, and it pays for the empty
+polls.**
 
-1. **A scheduler on `bus-reconciler`** — one container start per poll whether or not a request
-   exists. Simple, and pays for silence.
-2. **`board-watcher` (already polling every two minutes, deterministic) detects an `AYA_REQ` row and
-   executes this job** — one wake only when there is work, and nothing pays for silence.
+> *"Stand your ground. Do not widen the default compute service account. The financial cost of an
+> empty container start is fractions of a cent. The blast radius of a compromised identity with
+> project-wide secretAccessor is catastrophic. Keep the trigger on bus-reconciler, paying for the
+> empty polls, until board-watcher is migrated to a dedicated, least-privilege identity."*
 
-I recommend 2 and have built neither. **`board-watcher` runs as the default compute service account**,
-which our access inventory records as able to read *every* secret in the project across five
-runtimes. Option 2 therefore needs it granted `run.invoker` on this job and **nothing else** — in
-particular it must not be given Redis access or egress. Widening the worst-scoped identity we have in
-order to bypass a blocker is not on the table.
+I had recommended the other option — `board-watcher` already polls every two minutes, is
+deterministic, and would wake this job only when a request exists, so nothing would pay for silence.
+I flagged the constraint beside it rather than burying it: **`board-watcher` runs as the default
+compute service account**, which our access inventory records as able to read *every* secret in the
+project across five runtimes.
+
+**Gemini weighted my constraint above my preference**, and the arithmetic is not close — an empty
+container start costs fractions of a cent, a compromised project-wide `secretAccessor` identity costs
+everything. So the trigger is a scheduler here and **`board-watcher` gets no new grant at all**: not
+`run.invoker`, not Redis, not egress. The decision reopens only if it is ever given a least-privilege
+identity of its own.
+
+Neither is built. **A scheduler that executes a job which connects to Redis IS a connect**, and the
+dual-run is held.
 
 ## Deploy steps, for review only — none of this has been run
 
@@ -119,8 +129,9 @@ gcloud run jobs describe bus-requests --project=sfdc24 --region=us-central1 --fo
 gcloud run jobs execute bus-requests --project=sfdc24 --region=us-central1 --wait
 ```
 
-No new secret, no new service account, no new role, no public ingress. The only permission question
-is the trigger in option 2.
+No new secret, no new service account, no new role, no public ingress. **And after the trigger
+ruling there is no permission question left at all**: `board-watcher` gets nothing, so the scheduler
+runs as this job's own identity and grants nobody anything new.
 
 ## Rollback
 
