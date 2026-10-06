@@ -26,6 +26,18 @@
 
 set -euo pipefail
 
+# WHY THE TWO PATHS ARE NOT PASSED AS ENVIRONMENT VARIABLES
+# Git Bash rewrites anything that looks like a Unix path before gcloud sees it, and it does so
+# INCONSISTENTLY: the first deploy of this job put
+#   REDIS_CA_CERT_PATH=C:/Program Files/Git/secrets/ca/redis-ca.pem
+# into the container while REDIS_AUTH_FILE came through untouched. The job would have mounted the CA
+# correctly and then looked for it somewhere that does not exist. Only the read-back caught it.
+# Setting MSYS_NO_PATHCONV globally here was the obvious fix and it broke gcloud's own bash wrapper,
+# which needs that conversion to find its lib directory.
+# So the mount PATHS stay (they survive conversion, inside --set-secrets) and the VALUES are gone:
+# cloud/bus-reconciler/main.py defaults them to the mount layout it is deployed with. One source of
+# truth for where a secret lands, instead of two that can disagree.
+
 PROJECT="${PROJECT:-sfdc24}"
 REGION="${REGION:-us-central1}"
 JOB="${JOB:-bus-reconciler}"
@@ -45,19 +57,25 @@ REDIS_HOST="${REDIS_HOST:?set REDIS_HOST to the Memorystore private address; it 
 REDIS_PORT="${REDIS_PORT:-6378}"
 # The server CA is mounted as a FILE from Secret Manager, because Memorystore's CA is not in the
 # image's system trust store and SERVER_AUTHENTICATION means the client must verify against it.
-CA_PATH="/secrets/redis-ca.pem"
+#
+# EACH MOUNTED SECRET NEEDS ITS OWN DIRECTORY. Cloud Run mounts a secret by mounting the directory
+# that holds it, so two secrets sharing /secrets is refused: "a different secret is already mounted
+# in the same directory". Found on the first deploy attempt, which is what a first deploy is for.
+CA_DIR="/secrets/ca"
+CA_PATH="${CA_DIR}/redis-ca.pem"
 # The AUTH string is MOUNTED AS A FILE, not passed as an environment variable: an env var is listable
 # from anything that can read the process, and a mounted file is not. The image also has no gcloud in
 # it - python:3.12-slim carries no Cloud SDK - so a file is the only way it can arrive at all. Found
 # while deploying rather than after, which is the only reason it is here and not a defect.
-AUTH_PATH="/secrets/redis-auth"
+AUTH_DIR="/secrets/auth"
+AUTH_PATH="${AUTH_DIR}/redis-auth"
 NETWORK="${NETWORK:-default}"
 SUBNET="${SUBNET:-default}"
 # private-ranges-only, NEVER all-traffic. all-traffic would route the job's every outbound call
 # through the VPC, and the gateway it reads is on the public internet - that is how you break the
 # thing you were trying not to touch.
 EGRESS="private-ranges-only"
-WINDOW_MINUTES="${WINDOW_MINUTES:-90}"
+WINDOW_MINUTES="${WINDOW_MINUTES:-1440}"
 
 setup() {
   "$GCLOUD" iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 ||
@@ -82,7 +100,7 @@ deploy() {
   "$GCLOUD" run jobs "$verb" "$JOB" --project "$PROJECT" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --set-secrets "BUS_URL=BUS_URL:latest,BUS_SECRET=BUS_SECRET:latest,${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest" \
-    --set-env-vars "REDIS_DUAL_ENABLED=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},REDIS_CA_CERT_PATH=${CA_PATH},REDIS_AUTH_FILE=${AUTH_PATH},RECONCILE_WINDOW_MINUTES=${WINDOW_MINUTES},RECONCILE_MIRROR=1" \
+    --set-env-vars "REDIS_DUAL_ENABLED=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},RECONCILE_WINDOW_MINUTES=${WINDOW_MINUTES},RECONCILE_MIRROR=1" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --max-retries 1 --task-timeout 10m --cpu 1 --memory 512Mi
   echo "job ${JOB} ${verb}d in ${REGION} with ${EGRESS} egress on ${NETWORK}/${SUBNET}"

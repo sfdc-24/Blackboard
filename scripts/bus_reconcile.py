@@ -79,11 +79,24 @@ def as_mapping(cells) -> dict:
 
 
 def board_rows(env, since=None, limit=None, reader=None) -> list:
-    """The window of the board to compare, from the authoritative gateway."""
+    """The window of the board to compare, from the authoritative gateway.
+
+    bus.read_rows returns a DICT, {"rows": [...]}, not a list. The first version of this iterated the
+    return value directly, which yields the dict's KEYS - one string - so `isinstance(r, list)`
+    rejected everything and every window came back empty, for every filter, forever.
+
+    It took a Cloud Run execution to find, and the only reason it was found rather than believed is
+    that an empty read is UNKNOWN here and not zero divergence. Written the obvious way this bug
+    would have reported AGREE on a comparison it never made, on every run, and the phase gate would
+    have opened on it."""
     if reader is not None:
-        return reader(since=since, limit=limit)
-    from bus import read_rows                                            # noqa: PLC0415
-    return [r for r in read_rows(env, since=since, limit=limit) if isinstance(r, list)]
+        found = reader(since=since, limit=limit)
+    else:
+        from bus import read_rows                                        # noqa: PLC0415
+        found = read_rows(env, since=since, limit=limit)
+    if isinstance(found, dict):
+        found = found.get("rows") or []
+    return [r for r in found if isinstance(r, list)]
 
 
 def mirror(conn, rows) -> dict:
@@ -118,6 +131,15 @@ def compare(conn, rows) -> dict:
             duplicates.append(row_id)
             continue
         board[row_id] = as_mapping(cells)
+
+    if not board:
+        # An empty window is UNKNOWN and needs no connection to say so. The first execution of this
+        # job spent a connection reaching SMEMBERS to learn that the board had been quiet.
+        return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
+                "differing": 0, "extra_in_redis": 0, "duplicate_row_ids": len(duplicates),
+                "rows_without_an_id": no_id, "columns_that_differ": {},
+                "missing_ids": [], "differing_ids": [], "extra_ids": [], "duplicate_ids": [],
+                "note": "no board rows in the window: nothing to compare, which is not agreement"}
 
     missing, differing, columns = [], [], {}
     for row_id, mapped in board.items():
@@ -179,10 +201,25 @@ def record(conn, result, window) -> None:
 
 
 def run(conn, rows, do_mirror=False, window="") -> dict:
+    """Mirror and compare, turning any store failure into UNKNOWN rather than a traceback.
+
+    The first execution of this job died with a redis AuthenticationError stack trace. A stack trace
+    in a scheduled job's log is a failure nobody reads; UNKNOWN with one line of reason is one
+    somebody acts on - and UNKNOWN is the honest verdict either way, because nothing was compared.
+    The reason names the EXCEPTION TYPE and never its message: a client's error text can quote what
+    it was sent."""
     result = {}
-    if do_mirror:
-        result.update(mirror(conn, rows))
-    result.update(compare(conn, rows))
+    try:
+        if do_mirror:
+            result.update(mirror(conn, rows))
+        result.update(compare(conn, rows))
+    except Exception as error:
+        return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
+                "differing": 0, "extra_in_redis": 0, "duplicate_row_ids": 0,
+                "rows_without_an_id": 0, "columns_that_differ": {}, "missing_ids": [],
+                "differing_ids": [], "extra_ids": [], "duplicate_ids": [], "recorded": False,
+                "note": "the store could not be used (%s): nothing was compared, which is not "
+                        "agreement" % type(error).__name__}
     try:
         record(conn, result, window)
         result["recorded"] = True

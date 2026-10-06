@@ -70,6 +70,94 @@ class AnEmptyRedisIsUnknown(unittest.TestCase):
         self.assertEqual(1, result["missing_from_redis"])
 
 
+class TheReaderShape(unittest.TestCase):
+    """bus.read_rows returns a DICT, {"rows": [...]}, and the first version of board_rows iterated it
+    directly - yielding the dict's keys, so every window came back empty for every filter, forever.
+
+    This is the test that would have cost nothing and saved a Cloud Run execution. It is here because
+    the bug was only FOUND rather than BELIEVED by the rule that an empty read is UNKNOWN: written the
+    obvious way, the reconciler would have reported AGREE on a comparison it never made, on every
+    run, and the phase gate would have opened on it."""
+
+    def test_a_dict_return_yields_its_rows(self):
+        got = rec.board_rows(None, reader=lambda since, limit: {"rows": [list(A), list(B)]})
+        self.assertEqual(2, len(got))
+        self.assertEqual("R-1", got[0][0])
+
+    def test_a_plain_list_return_still_works(self):
+        self.assertEqual(1, len(rec.board_rows(None, reader=lambda since, limit: [list(A)])))
+
+    def test_a_dict_with_no_rows_key_is_empty_not_a_crash(self):
+        self.assertEqual([], rec.board_rows(None, reader=lambda since, limit: {"ok": True}))
+
+    def test_a_health_ping_does_not_read_as_an_empty_board(self):
+        """The gateway's broken read path returns a health ping with no rows at all. That is UNKNOWN,
+        never 'the board is empty' - and compare() is what turns it into UNKNOWN."""
+        rows = rec.board_rows(None, reader=lambda since, limit: {"ok": True, "service": "bus"})
+        self.assertEqual([], rows)
+        self.assertEqual(rec.UNKNOWN, rec.compare(FakeRedis(), rows)["verdict"])
+
+    def test_non_row_entries_are_dropped(self):
+        got = rec.board_rows(None, reader=lambda since, limit: {"rows": [list(A), "junk", None]})
+        self.assertEqual(1, len(got))
+
+
+class WhatTheFirstRealExecutionTaught(unittest.TestCase):
+    """Two defects the first Cloud Run execution found, both of mine."""
+
+    def test_an_empty_window_needs_no_connection_to_say_unknown(self):
+        """It reached SMEMBERS on a quiet board - a connection spent to learn nothing."""
+        class Refuses:
+            def smembers(self, key):
+                raise AssertionError("an empty window must not touch the store")
+
+            def hgetall(self, key):
+                raise AssertionError("an empty window must not touch the store")
+
+        result = rec.compare(Refuses(), [])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertIn("not agreement", result["note"])
+
+    def test_a_store_failure_is_a_controlled_unknown_not_a_traceback(self):
+        """The first execution died with a redis AuthenticationError stack trace. A stack trace in a
+        scheduled job's log is a failure nobody reads."""
+        class Broken:
+            def hset(self, *a, **k):
+                raise RuntimeError("AuthenticationError-ish")
+
+            def sadd(self, *a, **k):
+                raise RuntimeError("nope")
+
+            def hgetall(self, *a, **k):
+                raise RuntimeError("nope")
+
+            def smembers(self, *a, **k):
+                raise RuntimeError("nope")
+
+            def xadd(self, *a, **k):
+                raise RuntimeError("nope")
+
+        result = rec.run(Broken(), [list(A)], do_mirror=True)
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertIn("RuntimeError", result["note"])
+
+    def test_the_failure_note_names_the_type_and_never_the_message(self):
+        """A client's error text can quote what it was sent, and what it was sent is an AUTH string."""
+        class Leaky:
+            def hset(self, *a, **k):
+                raise RuntimeError("invalid username-password pair: tried hunter2")
+
+            def sadd(self, *a, **k):
+                raise RuntimeError("x")
+
+            def xadd(self, *a, **k):
+                raise RuntimeError("x")
+
+        result = rec.run(Leaky(), [list(A)], do_mirror=True)
+        self.assertNotIn("hunter2", repr(result))
+        self.assertNotIn("username-password", repr(result))
+
+
 class MirroringIsIdempotent(unittest.TestCase):
     def test_the_same_row_twice_mirrors_once(self):
         """This gateway flaps and returns the same rows again; that must not invent duplicates."""

@@ -6,9 +6,9 @@
 # not something to hand-roll on a socket, and a hand-rolled RESP client is a far
 # worse dependency than a pinned library.
 #
-# A RANGE rather than an exact pin, deliberately, and only for the first build: I
-# will not invent a version number I have not seen resolve. The first successful
-# build's resolved version is read back out of the image and pinned exactly here,
-# because a range is a different image on every rebuild and that is not something
-# to leave in place.
-redis>=5,<6
+# PINNED EXACTLY, now that a real build has resolved it. The range this file
+# carried for its first two builds was deliberate - I would not write a version
+# number I had not seen resolve - and the job's own log reported 5.3.1 on its
+# first execution, which is where this came from. A range is a different image on
+# every rebuild, which is not something to leave in place.
+redis==5.3.1

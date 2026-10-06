@@ -21,7 +21,7 @@ zero divergence - which is the property `bus_reconcile.compare` is built around.
 WHAT IT READS FROM THE ENVIRONMENT
     BUS_URL, BUS_SECRET          secret-backed, by the job's own least-privilege service account
     REDIS_HOST, REDIS_PORT       the instance; never committed to this public repository
-    REDIS_CA_CERT_PATH           the server CA, for SERVER_AUTHENTICATION
+    REDIS_CA_CERT_PATH           the server CA; defaults to the mount above when the file is there
     REDIS_DUAL_ENABLED           the off-switch; this job sets it for itself and nothing else does
     RECONCILE_WINDOW_MINUTES     how far back to compare (default 90)
     RECONCILE_MIRROR             "1" to backfill the window before comparing (default on for this job)
@@ -45,7 +45,23 @@ import redis_dual                                                        # noqa:
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("bus-reconciler")
 
-WINDOW_MINUTES = int(os.environ.get("RECONCILE_WINDOW_MINUTES", "90"))
+# WHERE THIS JOB'S SECRETS LAND, as cloud/bus-reconciler/deploy.sh mounts them. Defaulted HERE
+# rather than passed in as environment values, for two reasons. Git Bash rewrites a Unix path on its
+# way to gcloud and did so inconsistently - the first deploy of this job received
+# REDIS_CA_CERT_PATH=C:/Program Files/Git/secrets/ca/redis-ca.pem while the auth path came through
+# untouched, so the CA was mounted correctly and then looked for somewhere that does not exist. And
+# more durably: the mount layout is one fact, and a deploy flag plus an environment variable is two
+# places for it to be written down and disagree.
+MOUNTED_CA = "/secrets/ca/redis-ca.pem"
+MOUNTED_AUTH = "/secrets/auth/redis-auth"
+for _name, _default in (("REDIS_CA_CERT_PATH", MOUNTED_CA), ("REDIS_AUTH_FILE", MOUNTED_AUTH)):
+    if not os.environ.get(_name) and os.path.exists(_default):
+        os.environ[_name] = _default
+
+# 24 hours by default. The first execution used 90 minutes and the board had been quiet, so it
+# measured nothing - a window too narrow to contain rows makes the job report UNKNOWN for a
+# reason that has nothing to do with the two stores agreeing.
+WINDOW_MINUTES = int(os.environ.get("RECONCILE_WINDOW_MINUTES", "1440"))
 MIRROR = os.environ.get("RECONCILE_MIRROR", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -96,6 +112,8 @@ def main() -> int:
              verdict, result["checked"], result["agreed"], result["missing_from_redis"],
              result["differing"], result["extra_in_redis"], result["duplicate_row_ids"],
              result["rows_without_an_id"])
+    if result.get("note"):
+        log.warning("%s", result["note"])
     if result.get("columns_that_differ"):
         log.warning("columns that differ: %s", json.dumps(result["columns_that_differ"], sort_keys=True))
     if not result.get("recorded"):
