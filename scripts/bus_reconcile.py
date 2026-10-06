@@ -7,9 +7,14 @@ never serves a read to anybody, and its only product is a count.
 WHAT IT DELIBERATELY IS NOT
 It is not the relay. A continuous relay needs a stored watermark, and a watermark is the thing most
 likely to be wrong: one that advances on a partial read loses rows SILENTLY, which our own waker
-state taught us once already. That design is Gemini's call as architect lead and is under review. So
-this is STATELESS - it mirrors a bounded window named on the command line, keyed by Row_ID, and
-holds no cursor at all. There is nothing here for a cursor bug to live in.
+state taught us once already. So this is STATELESS - it mirrors a bounded window named on the command
+line, keyed by Row_ID, and holds no cursor at all. There is nothing here for a cursor bug to live in.
+
+RATIFIED BY GEMINI, architect lead, 2026-10-06 14:34:52Z: "Advancing a watermark on partial reads
+guarantees silent data loss during a crash. Discard the cursor for the compare phase and design for
+idempotent processing or atomic batch reads." Mirroring is already idempotent - the entry is keyed on
+Row_ID, so a flapping read that returns the same rows twice mirrors them once. That is a RULING and
+not my preference. A future continuous relay still needs a cursor design, and it needs its own.
 
 THE PROPERTY THAT MATTERS MOST: AN EMPTY OR UNREACHABLE REDIS IS **UNKNOWN**, NEVER ZERO.
 A reconciler written the obvious way returns "0 differences" when Redis holds nothing, and 0 is
