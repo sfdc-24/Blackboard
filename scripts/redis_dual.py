@@ -55,6 +55,9 @@ SETTINGS_PATH = Path(os.environ.get("REDIS_DUAL_SETTINGS", REPO / "scripts" / "r
 # Memorystore's own default is 6379; his instance answers on 6378 with TLS required.
 DEFAULT_PORT = 6378
 SECRET_NAME = "REDIS_AUTH_STRING"
+# Where Cloud Run mounts it. A file, not an environment variable: an env var is listable from
+# anything that can read the process.
+AUTH_FILE_ENV = "REDIS_AUTH_FILE"
 PROJECT = "sfdc24"
 # A reachability probe that cannot hang a caller. The host is private, so off the VPC this fails fast
 # and the dual-run stays off rather than blocking a board read behind a TCP timeout.
@@ -134,14 +137,38 @@ class Settings:
         return bool(self._data.get("enabled")) and bool(str(self._data.get("host") or "").strip())
 
 
-def auth_string(project=PROJECT, secret=SECRET_NAME, runner=None):
-    """The AUTH string from Secret Manager, or "" when it cannot be read.
+def auth_string(project=PROJECT, secret=SECRET_NAME, runner=None, environ=None):
+    """The AUTH string, or "" when it cannot be read. A FILE first, then gcloud.
 
     Returned to the caller that is about to connect and to nobody else. Never logged, never printed,
-    never put in a return value that is reported. gcloud is off PATH on this box, so the command is
-    resolved the same way the rest of the fleet resolves it."""
+    never put in a return value that is reported.
+
+    THE FILE PATH EXISTS BECAUSE THE CONTAINER HAS NO GCLOUD, and I found that while deploying rather
+    than after. `python:3.12-slim` has no Cloud SDK in it, so the gcloud route below - which is the
+    right one on a developer box - would have failed inside the job and reported "no auth string",
+    which reads as a configuration mistake rather than as the missing binary it is. Cloud Run mounts
+    a secret as a file, so REDIS_AUTH_FILE is how it arrives in production.
+
+    A FILE rather than an environment variable, deliberately: an env var is listable from anything
+    that can read the process, and a mounted file is not. The CA goes the same way for consistency,
+    though a CA is not a secret.
+
+    gcloud stays as the LOCAL fallback. It is also why this takes a runner: the only way to test the
+    secret path without a secret."""
+    environ = environ if environ is not None else os.environ
+    path = (environ.get("REDIS_AUTH_FILE") or "").strip()
+    if path:
+        try:
+            found = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            found = ""
+        if found:
+            return found
+        # An empty or unreadable mount is NOT a reason to fall through to gcloud: in production the
+        # mount is the source, and quietly reaching for something else hides a broken deployment.
+        return ""
     import subprocess
-    gcloud = os.environ.get("GCLOUD", "gcloud")
+    gcloud = environ.get("GCLOUD", "gcloud")
     args = [gcloud, "secrets", "versions", "access", "latest",
             "--secret", secret, "--project", project]
     run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True,
@@ -354,6 +381,7 @@ def status(settings=None) -> dict:
         "would_attempt_connection": live,
         "reachable": reachable(settings.host, settings.port) if live else None,
         "auth_string_found": found,
+        "auth_source": ("file" if os.environ.get(AUTH_FILE_ENV) else "gcloud"),
         "shadow_reads": bool(settings.shadow_reads),
         "write_through": bool(settings.write_through),
     }
