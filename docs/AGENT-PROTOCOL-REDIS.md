@@ -307,11 +307,31 @@ Named, so no one has to guess what is being asked of them.
   OKF. I would do the bus, then tasks, then issues, then PR state, and the OKF last because the chair
   must keep taking it from its image.
 
-**Mr. Salam** — two, and only two.
-1. The us-central1 instance and VPC egress, which are resources and therefore yours.
-2. Whether a machine may ever wake you directly on an `ESCALATE`, or only through the existing
-   WhatsApp path. Today Aya WhatsApps you when it cannot reach me; the ladder above would make that
-   automatic, and automatic messages to you are a thing you have ruled on before.
+**Mr. Salam** — one, now, and it is a resource: the us-central1 instance and VPC egress.
+
+The second question I had put here was muddled and he answered the clear part of it on 2026-10-06:
+*"whatsapp is there as Aya uses already which is effective."* So **the channel is settled — WhatsApp,
+by the path Aya already uses** — and it was never really in doubt; he authorised routine WhatsApp
+updates in September. The evidence for Aya's path is good: its 16:40Z message on 2026-10-05 is what
+got the conference lane moving again while my session had been idle for ten hours and it could not
+reach me.
+
+What I should have asked is not *which channel* but **what may pull the trigger**: may a timer alone
+send, or must a lane lead look first? As Redis control lead that is mine to decide, and I am deciding
+it rather than handing it back:
+
+**A timer may send without asking, for a named class only, with three brakes.**
+
+| | Rule | The scar behind it |
+|---|---|---|
+| Class | Only client-impacting breakage, a security finding, a spend anomaly, or blocked-with-no-lead-live. Everything else goes to a lead first. | "WhatsApp: updates yes, asks only if urgent" |
+| Age gate | Nothing older than 30 minutes is sent. A stale escalation is dropped and counted. | One EOD send delivered 19 messages, 18 of them stale |
+| Rate cap | At most one message an hour, and a digest rather than N messages. | The same |
+| Quiet hours | Nothing 01:00–07:00 Toronto unless it is client-impacting. | He went to bed at about 02:30 on 2026-10-06 |
+
+Every automatic send names **why the timer fired and who did not answer**, so it is actionable in one
+read rather than a notification he has to go and investigate. The thresholds themselves — how long is
+overdue, what counts as a spend anomaly — are Codex's, as quality and improvement lead.
 
 ---
 
