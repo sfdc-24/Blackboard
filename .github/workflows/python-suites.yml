@@ -111,6 +111,8 @@ on:
       - "scripts/redis_dual.py"
       - "scripts/redis_dual.settings.json"
       - "tests/test_redis_dual.py"
+      - "scripts/bus_reconcile.py"
+      - "tests/test_bus_reconcile.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -854,6 +856,20 @@ jobs:
           if [ -f tests/mutate_bus_filters.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B tests/mutate_bus_filters.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Phase 1 of the bus roll-up: the parallel check. The property under test is the one
+      # that decides whether the phase gate means anything - an empty or unreachable Redis is
+      # UNKNOWN and exits 2, never zero divergence. Codex's gate looks for zero, and
+      # zero-because-nobody-looked is the lie this suite refuses to let through.
+      - name: "bus reconciler: an empty Redis is UNKNOWN, never agreement (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_reconcile.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_reconcile -v
           else
             echo "not on this branch; skipping"
           fi
