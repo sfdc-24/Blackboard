@@ -5,7 +5,10 @@
 # its own private copy would be self-defeating.
 #
 # What reaches the build is controlled by /.gcloudignore, which is an ALLOWLIST:
-# these four files and nothing else. The repo is 332 MB and holds a .env with
+# a named allowlist and nothing else - it was four files when this was written and is fifteen
+# now, which Codex flagged as a comment that had quietly stopped being true. The count is in
+# .gcloudignore and tests/test_image_layout.py checks the two agree. The repo is 332 MB and
+# holds a .env with
 # live credentials; neither goes up. Verified with
 # `gcloud meta list-files-for-upload` before the first submit.
 FROM python:3.12-slim

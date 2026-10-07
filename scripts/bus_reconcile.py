@@ -26,7 +26,12 @@ CONTENTS NEVER LEAVE. A divergence is reported as the Row_ID and the NAMES of th
 differ. Never a value, on either side. The board carries his words and other people's, and a
 comparison log is not a place to copy them.
 
-    python scripts/bus_reconcile.py --since 2026-10-05T00:00:00Z            # compare only, read-only
+    python scripts/bus_reconcile.py --since 2026-10-05T00:00:00Z            # compare only
+
+"read-only" was wrong even for a compare-only run and Codex called it: every run APPENDS
+its verdict to the bus:compare stream. It writes nothing to the BOARD and no bus:row key
+unless --mirror is given, which is the distinction worth making - it cannot alter the thing
+it is comparing. Exit codes: 0 AGREE, 1 DIVERGE or a store failure, 2 UNKNOWN, 3 NO_SAMPLE.
     python scripts/bus_reconcile.py --since 2026-10-05T00:00:00Z --mirror   # backfill the window first
     python scripts/bus_reconcile.py --limit 200 --json                      # the newest 200 rows
 
@@ -52,6 +57,7 @@ COLUMNS = ("row_id", "ts", "source_tag", "target_surface", "action_type",
 ROW_KEY = redis_dual.KEY_VERSION + "bus:row:%s"              # HASH, one per Row_ID
 INDEX_KEY = redis_dual.KEY_VERSION + "bus:rowids"            # SET of every mirrored Row_ID
 COMPARE_KEY = redis_dual.KEY_VERSION + "bus:compare"         # STREAM, one entry per run: counts only
+# FOUR VERDICTS, not three - NO_SAMPLE joined them and the docs said three for a while.
 AGREE, DIVERGE, UNKNOWN = "AGREE", "DIVERGE", "UNKNOWN"
 # NO_SAMPLE: the board window held nothing to compare. Distinct from UNKNOWN on Codex's
 # request - "I looked and the board was quiet" and "I could not tell" need different

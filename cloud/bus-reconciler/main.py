@@ -107,7 +107,12 @@ def main() -> int:
     rows = bus_reconcile.board_rows(load_env(), since=since)
     log.info("window since=%s: %d board row(s)", since, len(rows))
 
-    result = bus_reconcile.run(conn, rows, do_mirror=MIRROR, window="since=%s" % since)
+    # THE REQUESTED CUTOFF REACHES compare(). Codex, third pass: I threaded `since` through
+    # the CLI in bus_reconcile.main() and left the Cloud Run entrypoint - the path that
+    # actually runs - calling run() without it, so the job kept inferring its own ceiling.
+    # The same shape as the STATUS_FOR_LOG miss: fixed where I was reading, not where it runs.
+    result = bus_reconcile.run(conn, rows, do_mirror=MIRROR, window="since=%s" % since,
+                               since=bus_reconcile.read_ts(since))
     verdict = result["verdict"]
 
     # Counts and column NAMES only. Contents never reach a log line: the board carries his words and

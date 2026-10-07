@@ -81,8 +81,12 @@ def values(payload, key) -> list:
     found = re.findall(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload), re.I)
     seen, out = set(), []
     for raw in found:
+        # AN EMPTY VALUE COUNTS. Codex, third pass: `via=|via=direct` passed here while append.py
+        # refused it, because this skipped the blank and saw one distinct value. "Said nothing" and
+        # "said direct" are two different answers to one question, and a reader scanning forwards
+        # gets the first.
         value = raw.strip().lower()
-        if value and value not in seen:
+        if value not in seen:
             seen.add(value)
             out.append(value)
     return out

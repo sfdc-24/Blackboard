@@ -237,11 +237,27 @@ function handleRead_(params, cfg) {
     } else {
       rows = sheet.getDataRange().getValues();
       if (since) {
+        const sinceMs = Date.parse(since);
+        // A cutoff we cannot parse must not silently return everything or nothing; refuse.
+        if (isNaN(sinceMs)) return respond({ error: 'since is not a parseable timestamp' });
         rows = rows.filter(function (r) {
           for (let i = 0; i < r.length; i++) {
             const cell = r[i];
-            if (cell instanceof Date) return cell.toISOString() >= since;
-            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) return cell >= since;
+            // PARSED, NOT COMPARED AS TEXT. Codex found the same defect here that it found in
+            // scripts/bus_reconcile.py, except this one is upstream of every `since` reader on the
+            // fleet and it is DEPLOYED. An ISO string compare drops a row whose stamp carries
+            // sub-second precision at the cutoff second:
+            //     "2026-10-07T03:32:22.588753Z" >= "2026-10-07T03:32:22Z"   is FALSE
+            // because "." sorts below "Z". scripts/append.py stamps microseconds, so this silently
+            // excluded rows the caller asked for - and a row no reader receives is a row no
+            // reconciler can find missing.
+            if (cell instanceof Date) return cell.getTime() >= sinceMs;
+            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) {
+              const t = Date.parse(cell);
+              // Unparseable means UNKNOWN, and a filter cannot return unknown - so the row is KEPT.
+              // Dropping it would hide it from every reader; keeping it costs one extra row.
+              return isNaN(t) ? true : t >= sinceMs;
+            }
           }
           return false;   // a row with no timestamp cannot satisfy a since
         });

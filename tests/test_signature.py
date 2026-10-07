@@ -274,6 +274,15 @@ class ARowCannotStateAFieldTwice(unittest.TestCase):
             "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile"
                    "|claimed_author=claude-mobile|to=ALL", self.known))
 
+    def test_a_blank_repeated_value_is_a_contradiction_too(self):
+        """Codex, third pass: `via=|via=direct` passed here while append.py refused it, because the
+        blank was filtered out and one distinct value remained. "Said nothing" and "said direct" are
+        two different answers, and a reader scanning forwards gets the first."""
+        problems = signature.check(
+            "claude-code-cli", "BCB|v=1|id=X|from=claude-code-cli|via=|via=direct|to=ALL",
+            self.known)
+        self.assertTrue(any("stated 2 times" in p for p in problems), problems)
+
     def test_the_relay_fields_are_authority_keys_in_append(self):
         """The other half of the fix. append.py refuses a duplicated authority key outright, and
         these three were not on its list."""
