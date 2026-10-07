@@ -5,7 +5,7 @@ that exists today unless it says HELD or PLANNED.<br>
 **Date:** 2026-10-07 · Claude (`claude-code-cli`), Redis control lead<br>
 **Asked for by:** Mr. Salam — *"high level process maps for onboarding, communication, check in and
 out, read/write/append delete permissions, roster and id's - administration processes"*<br>
-**For:** Gemini to layer architecture onto · Codex to render as the PDF
+**For:** the owner · architecture layered by Gemini (§8-§10) · rendered as a PDF by Codex
 
 ---
 
@@ -229,6 +229,112 @@ flowchart TD
    five times and its latest answer is that no span rule is sound until the record can prove the
    Redis key inventory was enumerated and the sheet held still — and the gateway exposes no
    revision token or lock to prove the second with.
+
+---
+
+## 8. The tiers — Gemini's architecture layer
+
+> *"Four tiers: Public Ingress; Authority Tier; Runtime VPC; and Client Projection. Mark Sheets and
+> git as authoritative; mark Redis, board mirrors, and PDFs strictly as ephemeral projections."*
+> — Gemini, architect lead, 2026-10-07
+
+```mermaid
+flowchart TD
+    subgraph T1["1 · PUBLIC INGRESS"]
+      G1[Apps Script gateway]
+      G2[OKF pull-request webhooks]
+    end
+    subgraph T2["2 · AUTHORITY — the only tier that may be believed"]
+      A1[(Board · Google Sheets<br/>the primary ledger)]
+      A2[(GitHub · code, docs, the roster)]
+    end
+    subgraph T3["3 · RUNTIME VPC"]
+      R1[Agent adapter runners<br/>Cloud Run jobs]
+      R2[(redis-central · cache)]
+    end
+    subgraph T4["4 · CLIENT PROJECTION — ephemeral by definition"]
+      P1[Read-only dashboard views]
+      P2[Generated PDFs, including this one]
+    end
+    G1 --> A1
+    G2 --> A2
+    A1 --> R1
+    A2 --> R1
+    R1 <--> R2
+    A1 --> P1
+    A2 --> P2
+```
+
+**The rule the tiers exist to make unmissable:** tier 2 is authoritative, tiers 3 and 4 are
+**projections**. Redis, the board mirror and this PDF are all the same kind of thing — a derived
+copy that may be stale, and must be rebuildable from tier 2 without anybody's permission.
+
+---
+
+## 9. Secrets and credential boundaries — the map that was missing
+
+> *"Missing entirely: secrets management and credential boundaries. The maps omit where API keys and
+> tokens live, who holds write scopes to Sheets vs GitHub, and how lease expirations trigger
+> revocation."* — Gemini
+
+He is right, and it was the largest hole in the first six maps.
+
+```mermaid
+flowchart TD
+    SM[(Secret Manager · project sfdc24<br/>27 secrets)] -->|mounted as FILES| J[Cloud Run jobs]
+    SM -->|env, secret-backed| SVC[Cloud Run services]
+    ENV[[.env on the laptop · gitignored]] -->|never committed, never sourced in bash| CLI[Local agents]
+    J --> B{{Board gateway secret}}
+    CLI --> B
+    J --> RA{{Redis AUTH + CA}}
+    GH[[GitHub · ONE user account]] --> PR[Code and docs write scope]
+```
+
+| Boundary | Who holds it | How it is bounded |
+|---|---|---|
+| Board gateway secret | every agent that writes a row | append-only; no delete path; guarded at the writer |
+| Redis AUTH + CA | **2 of 25** instances, by their own service accounts | mounted as files, not env vars; per-secret grants |
+| GitHub write | one user account | branch + PR + CI; the serial queue |
+| Sheets write | the gateway's own identity | agents never hold a Sheets credential directly |
+| Keys, spend, DNS, deletion | **the owner** | not delegated, not automatable |
+
+**Three honest gaps**, stated because a credential map that hides them is worse than none:
+
+1. **No lease expiry anywhere.** Nothing rotates on a clock; nothing expires. Revocation today means
+   the owner removing a grant by hand.
+2. **The default compute service account can read every secret in the project** across five
+   runtimes. Recorded in the access inventory, not yet reduced, and the reason every new runtime
+   gets its own account instead.
+3. **The board has no authenticated sender.** `Source_Tag` is caller-supplied, so no credential
+   boundary exists *inside* the board at all — which is why the one Redis action a request may ask
+   for is harmless by construction rather than trusted.
+
+---
+
+## 10. Failure and partition map — the diagram Gemini asked for
+
+> *"A Failure and Partition Map: show exactly which agent loops survive when Apps Script 429s,
+> GitHub rate-limits, or Redis drops."* — Gemini
+
+```mermaid
+flowchart TD
+    F1{{"Apps Script 429s<br/>or the deployment breaks"}} --> X1["EVERYTHING STOPS.<br/>No agent can read or write.<br/>No failover exists."]
+    F2{{"GitHub rate-limits"}} --> X2["Board traffic unaffected.<br/>Reviews, CI and PR lanes stall.<br/>Gemini loses PR diffs."]
+    F3{{"Redis drops or fails over"}} --> X3["Nothing stops.<br/>Roster copy and chunk digests lost,<br/>rebuildable from the repo and board.<br/>Dual-run is OFF, so no reader is affected."]
+    F4{{"The laptop is off"}} --> X4["Cloud Run jobs keep running.<br/>Local agents, wakers and the<br/>WhatsApp doorbell stop."]
+```
+
+**Read that first panel again.** The single point of failure for the entire fleet is one
+**unversioned** Apps Script deployment with hard quotas and no rollback automation — Gemini's first
+seam, and the one the maps above could not show because every arrow passes through it.
+
+**The seams, in the order Gemini ranked them**
+
+1. **The Apps Script gateway.** Unversioned, quota-bound, no staging, no suite, no rollback. Two
+   corrections to it are sitting in the branch **undeployed** for exactly this reason.
+2. **Watermark head-of-line blocking.** The wakers are oldest-first, so a burst of backlog starves a
+   fresh ask — measured at 378 rows ahead of a two-minute-old request.
+3. **Nothing wakes an idle agent on a schedule.** Autonomy is currently a person pressing a key.
 
 ---
 
