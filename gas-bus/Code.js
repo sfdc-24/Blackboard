@@ -239,7 +239,12 @@ function handleRead_(params, cfg) {
       if (since) {
         const sinceMs = Date.parse(since);
         // A cutoff we cannot parse must not silently return everything or nothing; refuse.
-        if (isNaN(sinceMs)) return respond({ error: 'since is not a parseable timestamp' });
+        // jsonOut_, not respond(): respond is not a function in this file and I wrote it an hour
+        // ago while fixing the filter above. It would have thrown a ReferenceError on exactly the
+        // input it was added to handle - a guard that breaks on the case it guards.
+        if (isNaN(sinceMs)) {
+          return jsonOut_({ ok: false, error: 'since is not a parseable timestamp' }, 400);
+        }
         rows = rows.filter(function (r) {
           for (let i = 0; i < r.length; i++) {
             const cell = r[i];
