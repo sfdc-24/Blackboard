@@ -57,6 +57,28 @@ COLUMNS = ("row_id", "ts", "source_tag", "target_surface", "action_type",
 # edited together with its own digest still fails the predicate.
 RATIFIED_DIGEST = "ced284b2333c27dd"
 
+# The CENSUS digest, pinned the same way and for a sharper reason.
+#
+# CODEX FOUND THE HOLE, 2026-10-07 22:05Z, on exact head 7bfa1be: naming an id forgave it with
+# UNBOUNDED MULTIPLICITY. duplicates_ratified simply incremented for every repeat of a listed id, so
+# a NEW duplicate of an already-listed id - a 56th occurrence - still produced AGREE and
+# gate_eligible=True. It proved it synthetically: two occurrences AGREE, three occurrences of the
+# SAME listed id, still AGREE. The test for a 47th DISTINCT id never covered it, and the stored
+# duplicate_occurrences_at_ratification=55 was decoration - nothing read it.
+#
+# So the exemption is now bounded by a per-id census: each listed id is forgiven UP TO the number of
+# duplicate occurrences it had when the owner ratified it, and one more fails.
+#
+# None, deliberately, until a measured census is ratified. While this is None, ANY board holding a
+# duplicate is ineligible - the HOLD is enforced in code rather than promised in a comment. The
+# census cannot be invented; it has to come off a run that walked the whole board.
+#
+# AND IT COVERS THE IDLESS POSITIONS TOO, which aya found on the same head: id_list_digest hashes
+# duplicated_ids and NOTHING ELSE, so idless_positions could be widened quietly - add a position,
+# the digest still matches, four forgiven rows become five. One new ratification closes both holes
+# rather than two ratifications closing one each.
+RATIFIED_CENSUS_DIGEST = None
+
 AGREE, DIVERGE, UNKNOWN, NO_SAMPLE = "AGREE", "DIVERGE", "UNKNOWN", "NO_SAMPLE"
 DEFAULT_CHUNK = 200
 RECHECK_POSITIONS = 8
@@ -79,11 +101,18 @@ def ratified(path=None) -> dict:
 
     A missing or unreadable file means NOTHING is exempt. That direction is deliberate: an absent
     exemption makes the gate stricter, never looser.
+
+    THE CENSUS is the second half, and the half that was missing. Naming an id said WHETHER it was
+    forgiven; the census says HOW MANY TIMES. It is carried in its own field with its own digest, so
+    the id list keeps the digest the owner already ratified and the multiplicity bound is a separate,
+    separately-ratified fact. An absent census is reported as absent and forgives no multiplicity -
+    again stricter, never looser.
     """
     try:
         data = json.loads(Path(path or RATIFIED).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"ids": set(), "idless": set(), "digest": "", "readable": False}
+        return {"ids": set(), "idless": set(), "digest": "", "readable": False,
+                "census": {}, "census_digest": "", "census_present": False}
     ids = sorted(str(i) for i in data.get("duplicated_ids") or [])
     computed = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
     if computed != str(data.get("id_list_digest") or ""):
@@ -91,9 +120,53 @@ def ratified(path=None) -> dict:
         # has been edited by something that did not understand what the digest was for.
         return {"ids": set(), "idless": set(), "digest": "",
                 "readable": False, "digest_mismatch": True,
-                "computed": computed, "stored": data.get("id_list_digest")}
-    return {"ids": set(ids), "idless": {int(p) for p in data.get("idless_positions") or []},
-            "digest": computed, "readable": True}
+                "computed": computed, "stored": data.get("id_list_digest"),
+                "census": {}, "census_digest": "", "census_present": False}
+    idless = {int(p) for p in data.get("idless_positions") or []}
+    census, digest, present = _census(data, set(ids), idless)
+    return {"ids": set(ids), "idless": idless,
+            "digest": computed, "readable": True,
+            "census": census, "census_digest": digest, "census_present": present}
+
+
+def census_digest(census, idless) -> str:
+    """The digest over EVERY bounded claim: each id with its count, and each idless position.
+
+    Separate from id_list_digest on purpose - that one is the digest the owner already ratified over
+    the names alone, and it stays as it is. This one covers what the names alone could not say: how
+    many times each is forgiven, and which id-less positions are forgiven at all. Two prefixes keep
+    an id and a position from ever colliding in the body."""
+    body = "\n".join(
+        ["count:%s=%d" % (i, int(census[i])) for i in sorted(census)]
+        + ["idless:%d" % p for p in sorted(idless)])
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+def _census(data, ids, idless) -> tuple:
+    """Load duplicate_census if it is present, self-consistent, and about exactly the listed ids.
+
+    Every rejection below returns an ABSENT census rather than a partial one, because a partial
+    census is the same failure as the unbounded exemption: some ids bounded, some not, and no way to
+    tell from the record which."""
+    raw = data.get("duplicate_census")
+    if not isinstance(raw, dict) or not raw:
+        return {}, "", False
+    try:
+        census = {str(k): int(v) for k, v in raw.items()}
+    except (TypeError, ValueError):
+        return {}, "", False
+    if any(v < 1 for v in census.values()):
+        # A census entry of zero would say "listed but never duplicated", which the list itself
+        # contradicts. Refuse rather than guess which of the two is wrong.
+        return {}, "", False
+    if set(census) != ids:
+        # The census must cover the ratified ids and nothing else. A census naming an id the list
+        # does not would forgive multiplicity for an id with no exemption at all.
+        return {}, "", False
+    digest = census_digest(census, idless)
+    if digest != str(data.get("census_digest") or ""):
+        return {}, "", False
+    return census, digest, True
 
 
 def canonical(cell) -> str:
@@ -216,8 +289,11 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
         "matched": 0, "missing_from_redis": 0, "differing": 0, "extra_in_redis": 0,
         "duplicate_row_ids": 0, "rows_without_an_id": 0,
         "duplicates_ratified": 0, "duplicates_unratified": 0,
+        "duplicates_over_census": 0, "over_census_ids": [],
+        "duplicate_counts": {},
         "idless_ratified": 0, "idless_unratified": 0,
         "ratification_digest": "", "ratification_readable": False,
+        "census_present": False, "census_digest": "",
         "chunks_total": 0, "chunks_read": 0, "read_failures": 0,
         "positions_rechecked": 0, "positions_shifted": 0, "observed_positions": {},
         "writes_performed": 0, "chunk_size": size,
@@ -237,6 +313,8 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
     exempt = ratified() if exempt is None else exempt
     record["ratification_digest"] = exempt.get("digest", "")
     record["ratification_readable"] = bool(exempt.get("readable"))
+    record["census_present"] = bool(exempt.get("census_present"))
+    record["census_digest"] = exempt.get("census_digest", "")
     covered_to = 0
     for first, count in bounds:
         try:
@@ -285,6 +363,10 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
                 # a reader of this record can always see how many duplicates the board holds.
                 record["duplicate_row_ids"] += 1
                 record["duplicate_ids"].append(row_id)
+                # PER ID, because the total never could have caught a new repeat of a listed id.
+                # Counted for every duplicate, listed or not, so the census comparison below is a
+                # predicate over the whole record rather than a decision taken row by row.
+                record["duplicate_counts"][row_id] = record["duplicate_counts"].get(row_id, 0) + 1
                 if row_id in exempt.get("ids", set()):
                     record["duplicates_ratified"] += 1
                 else:
@@ -339,11 +421,38 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
             record["read_failures"] += 1
             record["read_failure_reasons"].append("index:%s" % type(error).__name__)
 
+    _apply_census(record, exempt)
     record["verdict"] = _verdict(record)
     record["missing_ids"] = record["missing_ids"][:20]
     record["differing_ids"] = record["differing_ids"][:20]
     record["duplicate_ids"] = record["duplicate_ids"][:20]
     return record
+
+
+def _apply_census(record, exempt) -> None:
+    """Bound the named exemption by the ratified per-id count. One occurrence over, and it fails.
+
+    This is the repair for Codex's 22:05Z finding on 7bfa1be. It is deliberately a pass over the
+    FINISHED tally rather than a test inside the row loop: the question "has this id appeared more
+    often than the owner forgave" cannot be answered while the walk is still running, and the
+    previous code answered a different question - "is this id on the list" - because that one can be.
+
+    `duplicate_counts` is left whole. The exemption has never been allowed to reduce the
+    measurement, and an over-census id is still reported as the duplicate it is; it is the verdict
+    that changes.
+    """
+    census = exempt.get("census") or {}
+    if not record.get("census_present"):
+        # No ratified census: nothing is bounded, so nothing is forgiven by multiplicity. The
+        # over-count is every duplicate occurrence of a listed id, which is what makes a board with
+        # duplicates ineligible until a census is ratified.
+        over = {i: n for i, n in record["duplicate_counts"].items()
+                if i in exempt.get("ids", set())}
+    else:
+        over = {i: n - census[i] for i, n in record["duplicate_counts"].items()
+                if i in census and n > census[i]}
+    record["duplicates_over_census"] = sum(over.values())
+    record["over_census_ids"] = sorted(over)[:20]
 
 
 def apply_recheck(record, after) -> dict:
@@ -385,7 +494,10 @@ def _verdict(record) -> str:
     if record["positions_shifted"]:
         return UNKNOWN
     if (record["missing_from_redis"] or record["differing"] or record["extra_in_redis"]
-            or record["duplicates_unratified"]):
+            or record["duplicates_unratified"]
+            # An occurrence beyond the ratified count is divergence, not a forgiven repeat. Without
+            # this the verdict said AGREE while the record itself showed the id had grown.
+            or record.get("duplicates_over_census", 0)):
         return DIVERGE
     if record["idless_unratified"] or not record["header_matches_schema"]:
         return UNKNOWN
@@ -428,6 +540,14 @@ def gate_eligible(record) -> bool:
         and (record.get("duplicate_row_ids", 0) == 0
              or (record.get("ratification_readable") is True
                  and record.get("ratification_digest") == RATIFIED_DIGEST))
+        # AND THE EXEMPTION MUST BE BOUNDED. Naming an id said whether it was forgiven and never how
+        # many times, so a 56th occurrence of a listed id passed. A board with duplicates is now
+        # eligible only against a ratified census, and only while no id has exceeded its count.
+        and record.get("duplicates_over_census", 1) == 0
+        and (record.get("duplicate_row_ids", 0) == 0
+             or (record.get("census_present") is True
+                 and bool(RATIFIED_CENSUS_DIGEST)
+                 and record.get("census_digest") == RATIFIED_CENSUS_DIGEST))
     )
 
 

@@ -15,6 +15,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -200,9 +201,29 @@ class TheAdversarialCasesCodexSupplied(unittest.TestCase):
                        if "join(" in line and ("u001f" in line or "u001e" in line)]
         self.assertEqual([], serialisers, "a row serialiser has come back")
         hashes = [line.strip() for line in statements if "sha256(" in line]
-        self.assertEqual(1, len(hashes), hashes)
-        self.assertIn("join(ids)", hashes[0],
-                      "the only hash in this file must be over the ratified id list")
+        # COUNTING THE HASHES WAS ITSELF A PROXY, and it expired the moment the exemption needed a
+        # second digest for its census. The property that was always meant is that NO hash is taken
+        # over row content - the ratification metadata is a different thing entirely. So name the
+        # permitted inputs and forbid the row vocabulary, instead of pinning an arity that has to be
+        # edited every time a legitimate digest is added.
+        permitted = ("join(ids)", "body.encode(")
+        for line in hashes:
+            self.assertTrue(any(ok in line for ok in permitted),
+                            "a hash over something that is not ratification metadata: %s" % line)
+        for forbidden in ("cells", "row_id", "payload", "mapping", "stored", "COLUMNS"):
+            for line in hashes:
+                self.assertNotIn(forbidden, line,
+                                 "a hash has reached row content: %s" % line)
+        # `body` is the census digest's input, and it is built across several lines. Prove the whole
+        # function is about the census and the id-less positions and nothing else, so
+        # "body.encode(" above cannot become a row digest in disguise.
+        where = source.index("def census_digest(")
+        func = source[where:source.index("\ndef ", where)]
+        self.assertIn("census[i]", func)
+        self.assertIn("sorted(idless)", func)
+        for forbidden in ("cells", "row_id", "payload", "mapping", "COLUMNS"):
+            self.assertNotIn(forbidden, func,
+                             "the census digest has reached row content via %s" % forbidden)
 
     def test_no_timestamp_is_parsed_anywhere(self):
         source = (Path(__file__).resolve().parents[1] / "scripts" / "bus_verify.py").read_text(
@@ -309,7 +330,12 @@ class TheRatifiedExemption(unittest.TestCase):
         self.assertEqual(bv.RATIFIED_DIGEST, self.exempt["digest"])
         self.assertEqual({1563, 1564, 1565, 1566}, self.exempt["idless"])
 
-    def test_a_ratified_duplicate_does_not_fail_the_gate(self):
+    def test_a_named_duplicate_is_still_NOT_eligible_without_a_ratified_census(self):
+        """This asserted AGREE and gate_eligible=True until 2026-10-07, and that was the hole.
+
+        Naming an id forgave it with UNBOUNDED multiplicity. The shipped list carries no census yet,
+        so a named duplicate now counts as over-census and the board is ineligible. The HOLD Codex
+        asked for is this assertion, not a promise in a comment."""
         dup = sorted(self.exempt["ids"])[0]
         board = [HEADER, row(1), row(2)]
         board[2][0] = dup
@@ -324,8 +350,10 @@ class TheRatifiedExemption(unittest.TestCase):
         self.assertEqual(1, result["duplicate_row_ids"])
         self.assertEqual(1, result["duplicates_ratified"])
         self.assertEqual(0, result["duplicates_unratified"])
-        self.assertEqual(bv.AGREE, result["verdict"])
-        self.assertTrue(bv.gate_eligible(result))
+        self.assertFalse(result["census_present"], "the shipped list carries no census yet")
+        self.assertEqual(1, result["duplicates_over_census"])
+        self.assertEqual(bv.DIVERGE, result["verdict"])
+        self.assertFalse(bv.gate_eligible(result))
 
     def test_a_FORTY_SEVENTH_duplicate_fails(self):
         """The whole point. An id nobody ratified is divergence, however old it looks."""
@@ -390,10 +418,16 @@ class TheRatifiedExemption(unittest.TestCase):
                   "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
                   "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
                   "idless_unratified": 0, "duplicate_row_ids": 1,
-                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST}
-        self.assertTrue(bv.gate_eligible(record))
-        record["ratification_digest"] = "0000000000000000"
-        self.assertFalse(bv.gate_eligible(record), "a different list must not be waved through")
+                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
+                  # The census half has to be satisfied too, or this would test nothing but the
+                  # census - the predicate now demands BOTH pinned digests.
+                  "duplicates_over_census": 0, "census_present": True,
+                  "census_digest": "feedfacefeedface"}
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", "feedfacefeedface"):
+            self.assertTrue(bv.gate_eligible(record))
+            record["ratification_digest"] = "0000000000000000"
+            self.assertFalse(bv.gate_eligible(record),
+                             "a different list must not be waved through")
 
     def test_the_measurement_is_never_reduced_by_the_exemption(self):
         """duplicate_row_ids counts every duplicate the board holds, exempt or not. The exemption
@@ -404,6 +438,220 @@ class TheRatifiedExemption(unittest.TestCase):
         board[2][0] = dup
         result = bv.verify(FakeStore(), gateway(board), len(board), size=3, exempt=self.exempt)
         self.assertEqual(1, result["duplicate_row_ids"])
+
+
+def census_file(tmp, ids, census, idless=(1563, 1564, 1565, 1566), **override):
+    """A ratification file on disk with a self-consistent id list AND census.
+
+    Built rather than hand-written so a test cannot accidentally assert against a digest it typed
+    out itself. `override` replaces any top-level field AFTER the digests are computed, which is how
+    the tamper tests make exactly one thing wrong."""
+    ids = sorted(str(i) for i in ids)
+    data = {
+        "duplicated_ids": ids,
+        "id_list_digest": __import__("hashlib").sha256(
+            "\n".join(ids).encode("utf-8")).hexdigest()[:16],
+        "idless_positions": sorted(int(p) for p in idless),
+        "duplicate_census": {str(k): int(v) for k, v in census.items()},
+        "census_digest": bv.census_digest({str(k): int(v) for k, v in census.items()},
+                                          {int(p) for p in idless}),
+    }
+    data.update(override)
+    path = Path(tmp) / "ratified.json"
+    path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    return path
+
+
+class TheExemptionIsBoundedByACensus(unittest.TestCase):
+    """CODEX, 2026-10-07 22:05Z, exact head 7bfa1be: the named exemption was unbounded in
+    multiplicity.
+
+    `duplicates_ratified` incremented for every repeat of a listed id, and `_verdict()` and
+    `gate_eligible()` only ever required zero UNRATIFIED duplicates - so a NEW duplicate of an
+    already-listed id still produced AGREE and gate_eligible=True. Codex ran it: two occurrences
+    AGREE, three occurrences of the SAME listed id, still AGREE. `duplicate_occurrences_at_
+    ratification = 55` sat in the file and nothing read it.
+
+    The repair is a per-id census: a listed id is forgiven up to the count the owner ratified, and
+    one occurrence more is divergence. Every test below is a negative control over the RECORD, which
+    is the shape the previous guard lacked - it asked "is this id listed", a question answerable
+    while the walk is still running, instead of "has this id grown", which is not."""
+
+    DUP = "DUP-THE-OWNER-FORGAVE-ONCE"
+
+    def board_with(self, occurrences):
+        board = [HEADER] + [row(i) for i in range(1, occurrences + 1)]
+        for at in range(1, occurrences + 1):
+            board[at][0] = self.DUP
+        return board
+
+    def run_verify(self, board, exempt):
+        conn = FakeStore()
+        bv.verify(conn, gateway(board), len(board), size=50, mirror=True, exempt=exempt)
+        points = bv.recheck_points(len(board))
+        result = bv.verify(conn, gateway(board), len(board), size=50, remember=points,
+                           total_at_end=len(board), exempt=exempt)
+        bv.apply_recheck(result, {at: (board[at - 1][0] if at - 1 < len(board) else "")
+                                  for at in points})
+        return result
+
+    def loaded(self, tmp, census):
+        return bv.ratified(census_file(tmp, [self.DUP], census))
+
+    def test_exactly_the_ratified_count_is_eligible(self):
+        """Two occurrences is one duplicate, and the owner forgave one. This is the control that
+        proves the others are testing the bound and not just refusing everything."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            exempt = self.loaded(tmp, {self.DUP: 1})
+            self.assertTrue(exempt["census_present"])
+            result = self.run_verify(self.board_with(2), exempt)
+        self.assertEqual(1, result["duplicate_row_ids"])
+        self.assertEqual(0, result["duplicates_over_census"])
+        self.assertEqual(bv.AGREE, result["verdict"])
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", result["census_digest"]), \
+                mock.patch.object(bv, "RATIFIED_DIGEST", result["ratification_digest"]):
+            self.assertTrue(bv.gate_eligible(result))
+
+    def test_an_EXTRA_occurrence_of_an_ALREADY_LISTED_id_fails(self):
+        """THE FINDING. Three occurrences of the same listed id against a census of one.
+
+        Under the old predicate this was AGREE with gate_eligible=True. It is now DIVERGE, and it
+        stays ineligible even with both digests pinned to what this record carries - because the
+        failure is the count, not the provenance."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            exempt = self.loaded(tmp, {self.DUP: 1})
+            result = self.run_verify(self.board_with(3), exempt)
+        self.assertEqual(2, result["duplicate_row_ids"], "both repeats are still measured")
+        self.assertEqual(2, result["duplicates_ratified"], "and both are still named")
+        self.assertEqual(0, result["duplicates_unratified"])
+        self.assertEqual(1, result["duplicates_over_census"], "one occurrence beyond the census")
+        self.assertEqual([self.DUP], result["over_census_ids"])
+        self.assertEqual(bv.DIVERGE, result["verdict"])
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", result["census_digest"]), \
+                mock.patch.object(bv, "RATIFIED_DIGEST", result["ratification_digest"]):
+            self.assertFalse(bv.gate_eligible(result))
+
+    def test_the_per_id_count_is_in_the_record(self):
+        """The total could never have caught this, so the record carries the tally per id. A reviewer
+        reads the census off a run instead of taking the number on trust."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_verify(self.board_with(4), self.loaded(tmp, {self.DUP: 9}))
+        self.assertEqual({self.DUP: 3}, result["duplicate_counts"])
+        self.assertEqual(0, result["duplicates_over_census"], "9 forgiven, 3 seen")
+
+    def test_no_census_means_no_multiplicity_is_forgiven(self):
+        """An absent census is stricter, never looser - the same direction as an absent file."""
+        exempt = {"ids": {self.DUP}, "idless": set(), "digest": "x", "readable": True,
+                  "census": {}, "census_digest": "", "census_present": False}
+        result = self.run_verify(self.board_with(2), exempt)
+        self.assertFalse(result["census_present"])
+        self.assertEqual(1, result["duplicates_over_census"])
+        self.assertEqual(bv.DIVERGE, result["verdict"])
+        self.assertFalse(bv.gate_eligible(result))
+
+    def test_a_census_naming_an_id_the_list_does_not_is_refused_whole(self):
+        """Partial is the same failure as unbounded: some ids bounded, some not, and the record
+        cannot say which."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            got = bv.ratified(census_file(tmp, [self.DUP],
+                                          {self.DUP: 1, "AN-ID-NOBODY-LISTED": 3}))
+        self.assertFalse(got["census_present"])
+        self.assertEqual({}, got["census"])
+        self.assertTrue(got["readable"], "the id list itself is still fine")
+
+    def test_a_census_missing_a_listed_id_is_refused_whole(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            got = bv.ratified(census_file(tmp, [self.DUP, "SECOND-LISTED-ID"], {self.DUP: 1}))
+        self.assertFalse(got["census_present"])
+
+    def test_a_count_raised_without_its_digest_is_refused(self):
+        """Widening the exemption by editing a number has to fail loudly, the same way slipping in
+        an id does."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = census_file(tmp, [self.DUP], {self.DUP: 1},
+                               duplicate_census={self.DUP: 99})
+            got = bv.ratified(path)
+        self.assertFalse(got["census_present"])
+        self.assertEqual({}, got["census"])
+
+    def test_a_zero_count_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            got = bv.ratified(census_file(tmp, [self.DUP], {self.DUP: 0}))
+        self.assertFalse(got["census_present"])
+
+    def test_the_census_digest_COVERS_THE_IDLESS_POSITIONS(self):
+        """aya, 2026-10-07, same head: id_list_digest hashes duplicated_ids and nothing else, so
+        idless_positions could be widened quietly - add a position, the digest still matches, four
+        forgiven rows become five. The census digest covers them, so it cannot."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            honest = bv.ratified(census_file(tmp, [self.DUP], {self.DUP: 1},
+                                             idless=(1563, 1564)))
+            self.assertTrue(honest["census_present"])
+            # One extra forgiven position, every other field and both digests left alone.
+            slipped = bv.ratified(census_file(tmp, [self.DUP], {self.DUP: 1},
+                                              idless=(1563, 1564),
+                                              idless_positions=[1563, 1564, 9999]))
+        self.assertFalse(slipped["census_present"],
+                         "an added idless position must break the census digest")
+        self.assertNotEqual(bv.census_digest({self.DUP: 1}, {1563, 1564}),
+                            bv.census_digest({self.DUP: 1}, {1563, 1564, 9999}))
+
+    def test_an_id_and_a_position_cannot_collide_in_the_digest_body(self):
+        """The two claims are prefixed, so a numeric id can never be mistaken for a position."""
+        self.assertNotEqual(bv.census_digest({"1563": 1}, set()),
+                            bv.census_digest({}, {1563}))
+
+    def test_the_predicate_requires_a_PINNED_census_digest(self):
+        """A file edited together with BOTH its digests still fails, because the census digest the
+        owner ratifies is pinned in the module too."""
+        record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
+                  "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
+                  "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
+                  "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
+                  "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
+                  "idless_unratified": 0, "duplicate_row_ids": 1,
+                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
+                  "duplicates_over_census": 0, "census_present": True,
+                  "census_digest": "aaaaaaaaaaaaaaaa"}
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", "aaaaaaaaaaaaaaaa"):
+            self.assertTrue(bv.gate_eligible(record))
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", "bbbbbbbbbbbbbbbb"):
+            self.assertFalse(bv.gate_eligible(record),
+                             "a census the owner did not ratify must not be waved through")
+
+    def test_an_UNRATIFIED_census_digest_blocks_the_gate_today(self):
+        """RATIFIED_CENSUS_DIGEST is None until a measured census is ratified, and while it is None
+        no board holding a duplicate can be eligible. This is the HOLD, in code."""
+        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST)
+        record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
+                  "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
+                  "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
+                  "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
+                  "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
+                  "idless_unratified": 0, "duplicate_row_ids": 1,
+                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
+                  "duplicates_over_census": 0, "census_present": True, "census_digest": ""}
+        self.assertFalse(bv.gate_eligible(record))
+
+    def test_a_board_with_NO_duplicates_is_unaffected(self):
+        """The census bounds an exemption. A board that needs no exemption must not be held up by
+        one that has not been ratified yet."""
+        board = [HEADER, row(1), row(2), row(3)]
+        exempt = {"ids": set(), "idless": set(), "digest": bv.RATIFIED_DIGEST, "readable": True,
+                  "census": {}, "census_digest": "", "census_present": False}
+        result = self.run_verify(board, exempt)
+        self.assertEqual(0, result["duplicate_row_ids"])
+        self.assertEqual(0, result["duplicates_over_census"])
+        self.assertEqual(bv.AGREE, result["verdict"])
+        self.assertTrue(bv.gate_eligible(result))
 
 
 class ItSharesTheMirrorKeyspace(unittest.TestCase):
