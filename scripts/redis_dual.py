@@ -489,6 +489,17 @@ class DualRun:
         return self.counters.snapshot()
 
 
+# THE KEYS AN ENTRYPOINT LOGS, named once.
+#
+# Renaming `enabled` to `enabled_in_file` here broke all three Cloud Run entrypoints with a KeyError
+# at startup, and no suite caught it: every test exercises status() directly and none of them tested
+# what the entrypoints READ out of it. A dict lookup across a module boundary is an interface. This
+# is that interface, and tests/test_redis_dual.py asserts every name in it exists.
+STATUS_FOR_LOG = ("dual_run_live", "connect_permitted", "settings_file_readable",
+                  "enabled_in_file", "would_attempt_connection", "auth_string_found",
+                  "auth_source", "ca_cert_configured")
+
+
 def status(settings=None) -> dict:
     """What is configured and what is reachable. Nothing secret: whether AUTH was FOUND, never its value."""
     settings = settings or Settings()

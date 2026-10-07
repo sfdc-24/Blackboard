@@ -64,6 +64,8 @@ on:
       - "tests/test_signature.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
+      - "tests/test_image_layout.py"
+      - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -194,6 +196,8 @@ on:
       - "tests/test_bus_request.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
+      - "tests/test_image_layout.py"
+      - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -921,6 +925,21 @@ jobs:
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_dual -v
             sudo unshare -n -- "$python_bin" -B scripts/redis_dual.py selftest
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The image's FLAT layout. Two failures in one evening were invisible to every other
+      # suite: a module the Dockerfile forgot to COPY, and a starred expression that was a
+      # SyntaxError in three entrypoints at once. All 61 unit tests passed while three of the four
+      # deployed jobs could not start, because no suite imports the entrypoints. This reproduces
+      # /app from the Dockerfile itself and imports each one.
+      - name: "image layout: every entrypoint imports from the flat /app (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_image_layout.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_image_layout -v
           else
             echo "not on this branch; skipping"
           fi

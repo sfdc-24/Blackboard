@@ -87,9 +87,7 @@ def appender(env):
 def main() -> int:
     settings = redis_dual.Settings()
     status = redis_dual.status(settings)
-    log.info("dual-run status: %s", json.dumps({k: status[k] for k in (
-        "enabled", "would_attempt_connection", "auth_string_found", "auth_source",
-        "ca_cert_configured")}))
+    log.info("dual-run status: %s", json.dumps({k: status[k] for k in redis_dual.STATUS_FOR_LOG}))
 
     conn = redis_dual.client(settings, precheck=False)
     if conn is None:
