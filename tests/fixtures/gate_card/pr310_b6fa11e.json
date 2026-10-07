@@ -1,0 +1,105 @@
+{
+ "_note": "The recorded moment U4 exists for: sfdc-24/Blackboard#310 at head b6fa11e on 2026-10-01, when a merge command was handed over while a Copilot BLOCKER was open. The Copilot review (id 5386057722) and the thread discussion_r4157677050 are distilled from the live records of 2026-10-02 (picture tags shortened, bodies trimmed; the marker-bearing lines are verbatim, and the thread is unresolved here because it was unresolved at that moment). The Cursor comment, Codex comment and check runs are synthetic green stand-ins so this fixture isolates the Copilot blocker as the only open gate. The check runs here are synthetic green stand-ins, so their started_at values are synthetic too; combined_status is the shape GitHub returns for a commit with no legacy status contexts (state pending, total_count 0), not a recorded read of this SHA's status endpoint.",
+ "schema": "gate-card-inputs-v2",
+ "owner": "sfdc-24",
+ "repo": "Blackboard",
+ "number": 310,
+ "named_sha": "b6fa11eb5604452a8f4c1cbaf6639dc048c8f169",
+ "gathered_at": "2026-10-01T22:00:00Z",
+ "pr": {
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "head_sha": "b6fa11eb5604452a8f4c1cbaf6639dc048c8f169",
+  "mergeable_state": "clean",
+  "html_url": "https://github.com/sfdc-24/Blackboard/pull/310"
+ },
+ "pr_after": {
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "head_sha": "b6fa11eb5604452a8f4c1cbaf6639dc048c8f169",
+  "mergeable_state": "clean",
+  "html_url": "https://github.com/sfdc-24/Blackboard/pull/310"
+ },
+ "issue_comments": [
+  {
+   "id": 1,
+   "author": "cursor[bot]",
+   "body": "**GO** on `b6fa11eb5604452a8f4c1cbaf6639dc048c8f169`. (Synthetic stand-in: the fixture isolates the Copilot blocker.)",
+   "created_at": "2026-10-01T21:57:00Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#issuecomment-1"
+  },
+  {
+   "id": 2,
+   "author": "sfdc-24",
+   "body": "CODEX-PR310-B6FA11E-FIXTURE\n\nGO for this fixture at exact head `b6fa11eb5604452a8f4c1cbaf6639dc048c8f169`. (Synthetic stand-in.)",
+   "created_at": "2026-10-01T21:58:00Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#issuecomment-2"
+  }
+ ],
+ "reviews": [
+  {
+   "id": 5386057722,
+   "author": "copilot-pull-request-reviewer[bot]",
+   "state": "COMMENTED",
+   "commit_id": "b6fa11eb5604452a8f4c1cbaf6639dc048c8f169",
+   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udd35 Needs a closer look\n\nRuntime deployment must wait until newly granted secret access is effective.\n\n**Review effort:** Balanced\n**Findings:** 1 <img alt=\"High severity\"> \u00b7 2 <img alt=\"Low severity\">\n\n<details open>\n<summary><strong>Open (3)</strong></summary>\n\n- <img alt=\"High severity\"> [Script conflicts with existing Firestore database specification](#discussion_r4157677050)\n- <img alt=\"Low severity\"> [Align PR description with broker-side identity verification](#discussion_r4160831954)\n- <img alt=\"Low severity\"> [Correct the PR description secret names](#discussion_r4155127058)\n</details>\n\n<details>\n<summary><img alt=\"Medium severity\"> Prevent Cloud Run deployment failures from IAM propagation delays</summary>\n\n`cloud/claude-code-cloud/setup.sh:162`\n\nBLOCKER \u2014 READ-NOT-DEMONSTRATED: these new secret IAM grants are consumed by the Cloud Run deployments later in the same one-shot apply, but IAM policy changes are eventually consistent (Google documents policy propagation as typically minutes). Cloud Run validates `secretAccessor` at deployment, so either deployment can transiently fail after the accounts, grants, and database have been created; the create-or-refuse preflight then prevents a clean retry. Split grant/provisioning from deployment, or add an effective-permission readiness gate before creating the runtimes, so propagation cannot strand the apply.\n</details>",
+   "submitted_at": "2026-10-01T21:56:32Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#pullrequestreview-5386057722"
+  }
+ ],
+ "threads": [
+  {
+   "id": "PRRT_kwDOUD24Q86oB6Jz",
+   "is_resolved": false,
+   "is_outdated": false,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4157677050,
+     "author": "copilot-pull-request-reviewer",
+     "body": "BLOCKER \u2014 READ-NOT-DEMONSTRATED: the linked PR #306 at current head `41c95e6` specifies a receipts collection in a Firestore database that already exists in `northamerica-northeast2`; this script instead requires `ccc-receipts` to be absent and creates a new database. Because this PR says it implements #306's C1 resources and Firestore location is immutable, reconcile the spec/owner approval with this creation before apply.",
+     "created_at": "2026-10-01T16:09:18Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#discussion_r4157677050"
+    }
+   ]
+  },
+  {
+   "id": "PRRT_kwDOUD24Q86oJrnw",
+   "is_resolved": true,
+   "is_outdated": false,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4160831954,
+     "author": "copilot-pull-request-reviewer",
+     "body": "NIT \u2014 READ-NOT-DEMONSTRATED: This corrected note says inherited principals can invoke the broker, but the PR description still claims \u201conly the job may invoke it.\u201d Update the PR description so the reviewed security model consistently relies on broker-side identity verification rather than exclusive Cloud Run IAM.",
+     "created_at": "2026-10-01T21:47:18Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/310#discussion_r4160831954"
+    }
+   ]
+  }
+ ],
+ "check_runs": [
+  {
+   "name": "required-ci",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/1",
+   "started_at": "2026-10-02T20:56:58Z"
+  },
+  {
+   "name": "suites",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/0/job/2",
+   "started_at": "2026-10-02T20:56:58Z"
+  }
+ ],
+ "combined_status": {
+  "state": "pending",
+  "total_count": 0,
+  "contexts": []
+ }
+}

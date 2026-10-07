@@ -1,0 +1,209 @@
+{
+ "_note": "sfdc-24/Blackboard#315 at head ee4c0c1 as recorded on 2026-10-02: Cursor's GO (comment 5961352572/5961353819), Codex's GO / NO-MAJOR (comment 5961720850), Copilot's clean review (5396810985), all four review threads resolved, all seven check runs green - and the PR still a draft. Bodies are distilled from the live records (picture tags shortened, long sections trimmed; the verdict-bearing first lines and SHAs are verbatim). The four thread bodies are stand-ins for the recorded findings; their ids, authors and resolved state are the recorded ones. The one open gate is the draft flag, so flipping pr.draft to false is the all-clear case. Provenance of the two fields added later: each check run's started_at is the recorded value from that live read; combined_status is the shape GitHub returns for a commit with no legacy status contexts (state pending, total_count 0), which is what this SHA has - it was wrongly recorded as \"unknown\" until Copilot caught that the gate read it as pending CI. Two further divergences Cursor identified and this note did not state: thread T-4168464717's is_outdated was true here and false live (judge() never reads the field, so no verdict moves) - now corrected to the live value; and issue_comments is a SUBSET, omitting Cursor's earlier GO on 9607d08 (5960217714) and several owner comments. Nothing omitted is later than the ee4c0c1 GO or the Codex receipt, so the latest verdict for this SHA is the live one, which is the only thing the verdict readers use.",
+ "schema": "gate-card-inputs-v2",
+ "owner": "sfdc-24",
+ "repo": "Blackboard",
+ "number": 315,
+ "named_sha": "ee4c0c12d88b30feb0d241fb58266e5d1910a848",
+ "gathered_at": "2026-10-02T22:00:00Z",
+ "pr": {
+  "state": "open",
+  "draft": true,
+  "merged": false,
+  "head_sha": "ee4c0c12d88b30feb0d241fb58266e5d1910a848",
+  "mergeable_state": "clean",
+  "html_url": "https://github.com/sfdc-24/Blackboard/pull/315"
+ },
+ "pr_after": {
+  "state": "open",
+  "draft": true,
+  "merged": false,
+  "head_sha": "ee4c0c12d88b30feb0d241fb58266e5d1910a848",
+  "mergeable_state": "clean",
+  "html_url": "https://github.com/sfdc-24/Blackboard/pull/315"
+ },
+ "issue_comments": [
+  {
+   "id": 5958224717,
+   "author": "cursor[bot]",
+   "body": "**GO** on `76bd36c4f83e8e40888a8ef6d600fcce6d55b472`. The diff from `main` (`789ba35`) is two new files and additions to `.github/workflows/python-suites.yml` only.",
+   "created_at": "2026-10-02T17:57:49Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#issuecomment-5958224717"
+  },
+  {
+   "id": 5959884822,
+   "author": "sfdc-24",
+   "body": "CODEX-PR315-REVIEW-20261002T1929Z\n\nNO-GO for functional source acceptance of #315 at `76bd36c4f83e8e40888a8ef6d600fcce6d55b472`, whole diff from current main `789ba351b208b1a513808fe14e92430d5a499e61`. Keep this unwired draft inert.",
+   "created_at": "2026-10-02T19:28:25Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#issuecomment-5959884822"
+  },
+  {
+   "id": 5961352572,
+   "author": "sfdc-24",
+   "body": "@cursor Please check exact commit ee4c0c12d88b30feb0d241fb58266e5d1910a848 on this PR. One change since your GO on 9607d08: a provider label is public only when it is on a closed list (PUBLIC_REASONS); the response id and model version are in the private receipt only and the log line no longer names the id. It answers Copilot 4169273881 and Codex's CODEX-RISK-315-RESPONSE-ID-LOG-20261002. Reply GO or NO-GO for this exact commit.",
+   "created_at": "2026-10-02T20:56:51Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#issuecomment-5961352572"
+  },
+  {
+   "id": 5961353819,
+   "author": "cursor[bot]",
+   "body": "**GO** on `ee4c0c12d88b30feb0d241fb58266e5d1910a848`. It sits directly on `9607d08`. The only changes are `scripts/private_review.py` and `tests/test_private_review.py`. Against `main` the tree is still those two files plus the same workflow additions. The suite is 107 tests, green. Nothing new is wired.",
+   "created_at": "2026-10-02T20:56:56Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#issuecomment-5961353819"
+  },
+  {
+   "id": 5961720850,
+   "author": "sfdc-24",
+   "body": "<!-- CODEX-PR315-EE4C0C1-20261002 -->\n\n## Codex: GO / NO-MAJOR for inert, unwired source only\n\nExact reviewed head: `ee4c0c12d88b30feb0d241fb58266e5d1910a848`.\nCurrent main: `789ba351b208b1a513808fe14e92430d5a499e61`.\n\nNo remaining source-blocking finding or new major issue in the three-file whole diff. This supersedes my predecessor-head source receipt at `9607d088` for the successor's source disposition only.",
+   "created_at": "2026-10-02T21:25:22Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#issuecomment-5961720850"
+  }
+ ],
+ "reviews": [
+  {
+   "id": 5395138145,
+   "author": "copilot-pull-request-reviewer[bot]",
+   "state": "COMMENTED",
+   "commit_id": "76bd36c4f83e8e40888a8ef6d600fcce6d55b472",
+   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nThree deadline and malformed-response failure paths must be corrected before approval.\n\n**Findings:** 1 <img alt=\"High severity\"> \u00b7 2 <img alt=\"Medium severity\">\n\n<details open>\n<summary><strong>Open (3)</strong></summary>\n\n- <img alt=\"High severity\"> [Reject answer text containing unencodable surrogates](#discussion_r4168464602) \u00b7 New\n- <img alt=\"Medium severity\"> [Apply remaining deadline to each blocking read](#discussion_r4168464680) \u00b7 New\n- <img alt=\"Medium severity\"> [Recompute provider timeout after claiming the deadline](#discussion_r4168464717) \u00b7 New\n</details>\n\nVERDICT: BLOCKER \u2014 Deadline enforcement can fail around ledger claims and blocking reads. Malformed Unicode responses can bypass INCOMPLETE handling.",
+   "submitted_at": "2026-10-02T18:07:51Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#pullrequestreview-5395138145"
+  },
+  {
+   "id": 5396151702,
+   "author": "copilot-pull-request-reviewer[bot]",
+   "state": "COMMENTED",
+   "commit_id": "9607d0884ea7d164daec411d5cd541211397f4be",
+   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nThe public-log privacy invariant is violated by verbatim provider response IDs.\n\n**Findings:** 1 <img alt=\"Medium severity\">\n\n<details open>\n<summary><strong>Open (1)</strong></summary>\n\n- <img alt=\"Medium severity\"> [Prevent provider-controlled response IDs from entering public logs](#discussion_r4169273881) \u00b7 New\n</details>\n\n<details>\n<summary><strong>Resolved since last review (3)</strong></summary>\n\n- <img alt=\"High severity\"> [Reject answer text containing unencodable surrogates](#discussion_r4168464602)\n- <img alt=\"Medium severity\"> [Recompute provider timeout after claiming the deadline](#discussion_r4168464717)\n- <img alt=\"Medium severity\"> [Apply remaining deadline to each blocking read](#discussion_r4168464680)\n</details>",
+   "submitted_at": "2026-10-02T19:51:42Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#pullrequestreview-5396151702"
+  },
+  {
+   "id": 5396810985,
+   "author": "copilot-pull-request-reviewer[bot]",
+   "state": "COMMENTED",
+   "commit_id": "ee4c0c12d88b30feb0d241fb58266e5d1910a848",
+   "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe2 Approval recommended\n\nThe adapter remains inactive, fails closed, and has comprehensive offline CI coverage.\n\n**Review effort:** Balanced\n**Findings:** None\n\n<details>\n<summary><strong>Resolved since last review (1)</strong></summary>\n\n- <img alt=\"Medium severity\"> [Prevent provider-controlled response IDs from entering public logs](#discussion_r4169273881)\n</details>",
+   "submitted_at": "2026-10-02T21:01:44Z",
+   "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#pullrequestreview-5396810985"
+  }
+ ],
+ "threads": [
+  {
+   "id": "T-4168464602",
+   "is_resolved": true,
+   "is_outdated": true,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4168464602,
+     "author": "copilot-pull-request-reviewer",
+     "body": "Reject answer text containing unencodable surrogates (recorded finding; body stand-in).",
+     "created_at": "2026-10-02T18:07:51Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#discussion_r4168464602"
+    }
+   ]
+  },
+  {
+   "id": "T-4168464680",
+   "is_resolved": true,
+   "is_outdated": true,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4168464680,
+     "author": "copilot-pull-request-reviewer",
+     "body": "Apply remaining deadline to each blocking read (recorded finding; body stand-in).",
+     "created_at": "2026-10-02T18:07:51Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#discussion_r4168464680"
+    }
+   ]
+  },
+  {
+   "id": "T-4168464717",
+   "is_resolved": true,
+   "is_outdated": false,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4168464717,
+     "author": "copilot-pull-request-reviewer",
+     "body": "Recompute provider timeout after claiming the deadline (recorded finding; body stand-in).",
+     "created_at": "2026-10-02T18:07:51Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#discussion_r4168464717"
+    }
+   ]
+  },
+  {
+   "id": "T-4169273881",
+   "is_resolved": true,
+   "is_outdated": true,
+   "truncated": false,
+   "comments": [
+    {
+     "discussion_id": 4169273881,
+     "author": "copilot-pull-request-reviewer",
+     "body": "Prevent provider-controlled response IDs from entering public logs (recorded finding; body stand-in).",
+     "created_at": "2026-10-02T19:51:42Z",
+     "html_url": "https://github.com/sfdc-24/Blackboard/pull/315#discussion_r4169273881"
+    }
+   ]
+  }
+ ],
+ "check_runs": [
+  {
+   "name": "copilot-pull-request-reviewer",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063819200/job/111026574320",
+   "started_at": "2026-10-02T20:57:04Z"
+  },
+  {
+   "name": "test (3.14, crlf)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552615",
+   "started_at": "2026-10-02T20:56:58Z"
+  },
+  {
+   "name": "test (3.14, lf)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552569",
+   "started_at": "2026-10-02T20:56:59Z"
+  },
+  {
+   "name": "test (3.12, lf)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552552",
+   "started_at": "2026-10-02T20:57:34Z"
+  },
+  {
+   "name": "test (3.12, crlf)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813358/job/111026552395",
+   "started_at": "2026-10-02T20:56:58Z"
+  },
+  {
+   "name": "suites",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813372/job/111026549780",
+   "started_at": "2026-10-02T20:56:58Z"
+  },
+  {
+   "name": "required-ci",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/sfdc-24/Blackboard/actions/runs/37063813304/job/111026549269",
+   "started_at": "2026-10-02T20:56:58Z"
+  }
+ ],
+ "combined_status": {
+  "state": "pending",
+  "total_count": 0,
+  "contexts": []
+ }
+}
