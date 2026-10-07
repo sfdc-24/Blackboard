@@ -129,7 +129,7 @@ flowchart TD
     subgraph REDIS["Redis · redis-central"]
       Q1[CONNECT] --> Q1a[In-VPC runtimes with their own SA<br/>and both secrets. 2 of 25 instances.]
       Q2[READ / WRITE keys] --> Q2a[Same runtimes. Keyspace versioned v1:]
-      Q3[DELETE keys] --> Q3a[Only the server-named probe key it just wrote.<br/>No agent can name a key to delete.]
+      Q3[DELETE keys] --> Q3a[The two in-VPC runtimes CAN delete any key.<br/>A REQUEST cannot name one: the probe deletes<br/>only the server-named key it just wrote.]
       Q4[FLUSH] --> Q4a[Nobody. Not reachable from any request.]
     end
 ```
@@ -215,7 +215,7 @@ flowchart TD
 | Board → Redis → board request chain | **PROVEN from Aya's own surface** — `AYA-PROOF-2`, 86 ms |
 | Read-only keyspace viewer | **LIVE** — `redis-view` job; the console shows the instance, never its contents |
 | Row attribution guard | **MERGED** to main |
-| The bus mirror and its verification | **HELD** — the comparison design is on its fifth review round |
+| The bus mirror and its verification | **HELD** — five Codex reviews, five NO-GOs |
 | Dual-run (shadow reads, write-through) | **OFF**, and the settings file vetoes the environment |
 | Progress keys, task mailboxes, OKF roll-up | **PLANNED, unbuilt** |
 
@@ -226,7 +226,8 @@ flowchart TD
    microseconds. That affects **every** `since` reader on the fleet. Fixed in the repo, **not
    deployed**, because the board gateway is load-bearing for every agent.
 2. **Whether the verification gate is worth more rounds.** Codex has refused the comparison design
-   five times and its latest answer is that no span rule is sound until the record can prove the
+   five times, all five concluded, and its latest answer is that no span rule is sound until the
+   record can prove the
    Redis key inventory was enumerated and the sheet held still — and the gateway exposes no
    revision token or lock to prove the second with.
 
