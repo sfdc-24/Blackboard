@@ -90,6 +90,25 @@ class TheImageLayout(unittest.TestCase):
         self.assertTrue((self.app / "signature.py").is_file())
         self.assertTrue((self.app / "agent_roster.json").is_file())
 
+    def test_the_settings_file_travels_and_resolves_inside_the_image(self):
+        """THE THIRD ONE TONIGHT, and the sharpest. redis_dual.settings.json had never been copied
+        into the image, and under the old code nobody could tell: a missing file read as {} and
+        REDIS_DUAL_ENABLED in the job's environment turned the dual-run on regardless. Once an
+        unreadable file correctly vetoes both switches, the absence stopped the job dead - the first
+        execution on the fixed image reported settings_file_readable=false and refused to connect.
+
+        Asserting the COPY is not enough: the path has to RESOLVE from /app, where parents[1] is "/"
+        and the repo-shaped path points at /scripts/... which cannot exist."""
+        self.assertTrue((self.app / "redis_dual.settings.json").is_file(),
+                        "the switches are not in the image")
+        probe = ("import redis_dual, sys; s = redis_dual.Settings();"
+                 "sys.exit(0 if s.file_ok else 1)")
+        result = subprocess.run([sys.executable, "-c", probe], cwd=str(self.app),
+                                capture_output=True, text=True)
+        self.assertEqual(0, result.returncode,
+                         "the settings file does not resolve from the flat layout: %s"
+                         % (result.stderr or "").strip()[-200:])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

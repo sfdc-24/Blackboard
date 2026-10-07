@@ -51,7 +51,31 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-SETTINGS_PATH = Path(os.environ.get("REDIS_DUAL_SETTINGS", REPO / "scripts" / "redis_dual.settings.json"))
+
+
+def _settings_path():
+    """Where the switches live, in a repository checkout AND in the flat Cloud Run image.
+
+    In the repo this module sits in scripts/ beside its settings file. In the image every file is
+    copied individually into /app, so parents[1] is "/" and the repo-shaped path pointed at
+    /scripts/redis_dual.settings.json, which cannot exist. Under the old code a missing file meant
+    "{}" and the environment could still turn the dual-run on - so the jobs connected and nobody
+    noticed the file had never travelled at all. Once an unreadable file correctly VETOES both
+    switches, that absence became a hard stop, which is exactly how it surfaced: the first run on
+    the fixed image reported settings_file_readable=false and refused to connect.
+
+    Fail-closed was right and found a real gap. The order is written out so the next layout does not
+    have to rediscover it: the environment, then the repository shape, then beside this module."""
+    named = os.environ.get("REDIS_DUAL_SETTINGS")
+    if named:
+        return Path(named)
+    in_repo = REPO / "scripts" / "redis_dual.settings.json"
+    if in_repo.is_file():
+        return in_repo
+    return Path(__file__).resolve().parent / "redis_dual.settings.json"
+
+
+SETTINGS_PATH = _settings_path()
 # Memorystore's own default is 6379; his instance answers on 6378 with TLS required.
 DEFAULT_PORT = 6378
 # EVERY KEY THIS FLEET WRITES CARRIES A VERSION. Gemini, architect lead, 2026-10-06 15:21:43Z:
