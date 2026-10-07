@@ -33,6 +33,13 @@ function doPost(e) {
       return studioEmailResponse_(false);
     }
     var allowed = rawAllowlist.split(',').map(function (entry) { return entry.trim(); });
+    // Client workspaces (the controller's registry): these addresses get the
+    // sign-in code and their summary too. Optional; an empty or unset property
+    // adds nobody, and one malformed entry refuses everything like the list above.
+    var rawClients = properties.getProperty('STUDIO_CLIENT_EMAILS');
+    if (typeof rawClients === 'string' && rawClients.trim()) {
+      allowed = allowed.concat(rawClients.split(',').map(function (entry) { return entry.trim(); }));
+    }
     if (!allowed.every(function (entry) {
       return entry && entry === entry.toLowerCase() &&
           /^[^\s@]+@[^\s@]+$/.test(entry);
