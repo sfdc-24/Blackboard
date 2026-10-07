@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -51,9 +52,48 @@ VERIFY_LOG = redis_dual.KEY_VERSION + "bus:verify"
 COLUMNS = ("row_id", "ts", "source_tag", "target_surface", "action_type",
            "payload", "category", "project_tag", "gist", "subgist")
 
+# The digest the owner ratified on 2026-10-07, board row
+# CCC-RATIFY-KNOWN-DUPLICATES-20261007T1900Z. Pinned HERE as well as in the file, so a file
+# edited together with its own digest still fails the predicate.
+RATIFIED_DIGEST = "ced284b2333c27dd"
+
 AGREE, DIVERGE, UNKNOWN, NO_SAMPLE = "AGREE", "DIVERGE", "UNKNOWN", "NO_SAMPLE"
 DEFAULT_CHUNK = 200
 RECHECK_POSITIONS = 8
+
+
+RATIFIED = Path(__file__).resolve().parent / "board_known_duplicates.json"
+
+
+def ratified(path=None) -> dict:
+    """The exemption the owner ratified, with its own digest checked before it is trusted.
+
+    BY IDENTITY, NOT BY POSITION, and measurement forced that: the newest duplicate sits at physical
+    row 3736, the LAST row on the board. A position cut-off set there checks nothing and set lower
+    fails forever on everything above it. Naming the ids means a 47th duplicate - any id not on the
+    list - is unratified and fails the gate, which is the property worth having.
+
+    THE DIGEST IS THE GUARD. It is recomputed from the list and compared with the stored value, so a
+    quiet edit that slips another id in fails loudly instead of widening the exemption. A deliberate
+    addition means a new digest and a new board row, reviewable in git beside its reason.
+
+    A missing or unreadable file means NOTHING is exempt. That direction is deliberate: an absent
+    exemption makes the gate stricter, never looser.
+    """
+    try:
+        data = json.loads(Path(path or RATIFIED).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"ids": set(), "idless": set(), "digest": "", "readable": False}
+    ids = sorted(str(i) for i in data.get("duplicated_ids") or [])
+    computed = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
+    if computed != str(data.get("id_list_digest") or ""):
+        # Refuse the whole file rather than part of it. A list whose digest disagrees with itself
+        # has been edited by something that did not understand what the digest was for.
+        return {"ids": set(), "idless": set(), "digest": "",
+                "readable": False, "digest_mismatch": True,
+                "computed": computed, "stored": data.get("id_list_digest")}
+    return {"ids": set(ids), "idless": {int(p) for p in data.get("idless_positions") or []},
+            "digest": computed, "readable": True}
 
 
 def canonical(cell) -> str:
@@ -159,7 +199,7 @@ def recheck_points(total, how_many=RECHECK_POSITIONS):
 
 
 def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total_at_end=None,
-           remember=()) -> dict:
+           remember=(), exempt=None) -> dict:
     """Walk the whole board, compare every data row against its own mirror, report every caveat.
 
     `reader(first, count)` returns the gateway's reply dict for that closed range.
@@ -175,6 +215,9 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
         "data_rows": 0, "unique_row_ids": 0,
         "matched": 0, "missing_from_redis": 0, "differing": 0, "extra_in_redis": 0,
         "duplicate_row_ids": 0, "rows_without_an_id": 0,
+        "duplicates_ratified": 0, "duplicates_unratified": 0,
+        "idless_ratified": 0, "idless_unratified": 0,
+        "ratification_digest": "", "ratification_readable": False,
         "chunks_total": 0, "chunks_read": 0, "read_failures": 0,
         "positions_rechecked": 0, "positions_shifted": 0, "observed_positions": {},
         "writes_performed": 0, "chunk_size": size,
@@ -191,6 +234,9 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
 
     seen, positions = {}, {}
     wanted = set(remember or ())
+    exempt = ratified() if exempt is None else exempt
+    record["ratification_digest"] = exempt.get("digest", "")
+    record["ratification_readable"] = bool(exempt.get("readable"))
     covered_to = 0
     for first, count in bounds:
         try:
@@ -225,11 +271,24 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
                 record["observed_positions"][str(at)] = row_id
             if not row_id:
                 record["rows_without_an_id"] += 1
+                # Ratified by POSITION for these four, because a row with no id has no identity to
+                # name. They are four consecutive rows, 1563-1566, and the board is append-only, so
+                # the set cannot grow by accident.
+                if at in exempt.get("idless", set()):
+                    record["idless_ratified"] += 1
+                else:
+                    record["idless_unratified"] += 1
                 continue
             record["data_rows"] += 1
             if row_id in seen:
+                # STILL COUNTED IN FULL. The exemption changes the VERDICT, never the measurement:
+                # a reader of this record can always see how many duplicates the board holds.
                 record["duplicate_row_ids"] += 1
                 record["duplicate_ids"].append(row_id)
+                if row_id in exempt.get("ids", set()):
+                    record["duplicates_ratified"] += 1
+                else:
+                    record["duplicates_unratified"] += 1
                 continue
             seen[row_id] = at
 
@@ -326,10 +385,14 @@ def _verdict(record) -> str:
     if record["positions_shifted"]:
         return UNKNOWN
     if (record["missing_from_redis"] or record["differing"] or record["extra_in_redis"]
-            or record["duplicate_row_ids"]):
+            or record["duplicates_unratified"]):
         return DIVERGE
-    if record["rows_without_an_id"] or not record["header_matches_schema"]:
+    if record["idless_unratified"] or not record["header_matches_schema"]:
         return UNKNOWN
+    if record["duplicate_row_ids"] and not record["ratification_readable"]:
+        # Duplicates exist and no ratification could be read: that is not agreement, and it is not
+        # the moment to assume the exemption file was meant to be there.
+        return DIVERGE
     if record["data_rows"] == 0:
         # A header and nothing else. Codex: a header-only sheet produced an eligible AGREE with zero
         # data rows, which is agreement about nothing.
@@ -345,8 +408,10 @@ def gate_eligible(record) -> bool:
         and record.get("covered_to") == record.get("frozen_total")
         and record.get("frozen_total") == record.get("total_at_end")
         and record.get("data_rows", 0) > 0
-        and record.get("unique_row_ids") == record.get("data_rows")
-        and record.get("matched") == record.get("data_rows")
+        # data_rows counts every row with an id; unique_row_ids counts the ids. They differ by
+        # exactly the duplicate occurrences, so the identity to check is that EVERY unique id
+        # matched its mirror - not that there were no duplicates.
+        and record.get("matched") == record.get("unique_row_ids")
         and record.get("header_matches_schema") is True
         and record.get("writes_performed", 1) == 0
         and record.get("read_failures", 1) == 0
@@ -355,8 +420,14 @@ def gate_eligible(record) -> bool:
         and record.get("missing_from_redis") == 0
         and record.get("differing") == 0
         and record.get("extra_in_redis") == 0
-        and record.get("duplicate_row_ids") == 0
-        and record.get("rows_without_an_id") == 0
+        and record.get("duplicates_unratified") == 0
+        and record.get("idless_unratified") == 0
+        # The ratified exemption must have been READ, and its digest must be the one the owner
+        # ratified. A record that forgives duplicates without saying which list it used is a record
+        # a gate cannot check.
+        and (record.get("duplicate_row_ids", 0) == 0
+             or (record.get("ratification_readable") is True
+                 and record.get("ratification_digest") == RATIFIED_DIGEST))
     )
 
 

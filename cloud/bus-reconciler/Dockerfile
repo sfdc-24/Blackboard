@@ -46,6 +46,10 @@ COPY scripts/bus_request.py /app/bus_request.py
 # Redis mirror. It replaces a digest runner that compared the board to a digest written from the
 # board and so never read the mirror at all - Codex broke that in one move.
 COPY scripts/bus_verify.py /app/bus_verify.py
+# The RATIFIED exemption. Without it in the image the verifier forgives nothing and every run
+# reports the 46 historical duplicates as divergence - the safe direction, and still wrong.
+# ratified() recomputes the digest and refuses the whole file if it disagrees with itself.
+COPY scripts/board_known_duplicates.json /app/board_known_duplicates.json
 # Its entrypoint. Shipping it changes NOTHING: the job still runs main.py until somebody points
 # it here with --args=-B,verify_board.py, which is an owner decision and not a build artefact.
 COPY cloud/bus-reconciler/verify_board.py /app/verify_board.py

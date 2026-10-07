@@ -189,8 +189,20 @@ class TheAdversarialCasesCodexSupplied(unittest.TestCase):
         cross-row digest here at all: rows are compared field by field against their own mirror."""
         source = (Path(__file__).resolve().parents[1] / "scripts" / "bus_verify.py").read_text(
             encoding="utf-8")
-        self.assertNotIn("hashlib", source)
-        self.assertNotIn("sha256", source)
+        # THE ASSERTION USED TO BE "hashlib is not imported", which was a PROXY and stopped being a
+        # true one the moment the ratified exemption needed a digest of its ID LIST. Its replacement
+        # then matched the module docstring, which DESCRIBES the old collision - a test reading
+        # prose as if it were code. Scanning statements only, which is what it always meant.
+        statements = [line for line in source.splitlines()
+                      if line.strip() and not line.strip().startswith("#")
+                      and '"""' not in line]
+        serialisers = [line.strip() for line in statements
+                       if "join(" in line and ("u001f" in line or "u001e" in line)]
+        self.assertEqual([], serialisers, "a row serialiser has come back")
+        hashes = [line.strip() for line in statements if "sha256(" in line]
+        self.assertEqual(1, len(hashes), hashes)
+        self.assertIn("join(ids)", hashes[0],
+                      "the only hash in this file must be over the ratified id list")
 
     def test_no_timestamp_is_parsed_anywhere(self):
         source = (Path(__file__).resolve().parents[1] / "scripts" / "bus_verify.py").read_text(
@@ -274,6 +286,124 @@ class ThePredicate(unittest.TestCase):
         changed[3][8] = "something private he wrote"
         blob = repr(full(conn, changed))
         self.assertNotIn("something private", blob)
+
+
+class TheRatifiedExemption(unittest.TestCase):
+    """The owner chose to annotate rather than repair: the board is append-only and deletion is his
+    carve-out, so 46 historical duplicate ids and 4 id-less rows are forgiven by NAME.
+
+    BY IDENTITY, NOT POSITION, and measurement forced it: the newest duplicate sat at physical row
+    3736, the LAST row on the board. A position cut-off set there checks nothing; set lower it fails
+    forever on everything above it.
+
+    The property that makes this a gate and not an amnesty: a 47th duplicate - any id not on the
+    list - is unratified and fails."""
+
+    def setUp(self):
+        self.exempt = bv.ratified()
+        if not self.exempt["readable"]:
+            raise AssertionError("the ratified file did not load, so none of this tested anything")
+
+    def test_the_shipped_list_matches_its_own_digest_and_the_pinned_one(self):
+        self.assertEqual(46, len(self.exempt["ids"]))
+        self.assertEqual(bv.RATIFIED_DIGEST, self.exempt["digest"])
+        self.assertEqual({1563, 1564, 1565, 1566}, self.exempt["idless"])
+
+    def test_a_ratified_duplicate_does_not_fail_the_gate(self):
+        dup = sorted(self.exempt["ids"])[0]
+        board = [HEADER, row(1), row(2)]
+        board[2][0] = dup
+        board[1][0] = dup                          # the same id twice, and it is on the list
+        conn = FakeStore()
+        bv.verify(conn, gateway(board), len(board), size=3, mirror=True, exempt=self.exempt)
+        points = bv.recheck_points(len(board))
+        result = bv.verify(conn, gateway(board), len(board), size=3, remember=points,
+                           total_at_end=len(board), exempt=self.exempt)
+        bv.apply_recheck(result, {at: (board[at - 1][0] if at - 1 < len(board) else "")
+                                  for at in points})
+        self.assertEqual(1, result["duplicate_row_ids"])
+        self.assertEqual(1, result["duplicates_ratified"])
+        self.assertEqual(0, result["duplicates_unratified"])
+        self.assertEqual(bv.AGREE, result["verdict"])
+        self.assertTrue(bv.gate_eligible(result))
+
+    def test_a_FORTY_SEVENTH_duplicate_fails(self):
+        """The whole point. An id nobody ratified is divergence, however old it looks."""
+        board = [HEADER, row(1), row(1)]
+        conn = FakeStore()
+        bv.verify(conn, gateway(board), len(board), size=3, mirror=True, exempt=self.exempt)
+        result = bv.verify(conn, gateway(board), len(board), size=3, total_at_end=len(board),
+                           exempt=self.exempt)
+        self.assertEqual(1, result["duplicates_unratified"])
+        self.assertEqual(bv.DIVERGE, result["verdict"])
+        self.assertFalse(bv.gate_eligible(result))
+
+    def test_an_idless_row_at_an_unratified_position_fails(self):
+        board = [HEADER, row(1), ["", "x", "y"]]
+        conn = FakeStore()
+        bv.verify(conn, gateway(board), len(board), size=3, mirror=True, exempt=self.exempt)
+        result = bv.verify(conn, gateway(board), len(board), size=3, total_at_end=len(board),
+                           exempt=self.exempt)
+        self.assertEqual(1, result["idless_unratified"])
+        self.assertEqual(bv.UNKNOWN, result["verdict"])
+
+    def test_a_tampered_list_is_refused_whole(self):
+        """Slipping an id in changes the digest, and the loader then trusts NOTHING - rather than
+        trusting the part that still matches, which is how an exemption quietly widens."""
+        import json as _json
+        import tempfile
+        data = _json.loads((Path(__file__).resolve().parents[1] / "scripts"
+                            / "board_known_duplicates.json").read_text(encoding="utf-8"))
+        data["duplicated_ids"].append("SOMETHING-I-SLIPPED-IN")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tampered.json"
+            path.write_text(_json.dumps(data), encoding="utf-8")
+            got = bv.ratified(path)
+        self.assertFalse(got["readable"])
+        self.assertTrue(got.get("digest_mismatch"))
+        self.assertEqual(set(), got["ids"], "a mismatched digest must forgive nothing")
+
+    def test_a_missing_file_forgives_nothing(self):
+        """Absent means stricter, never looser."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            got = bv.ratified(Path(tmp) / "nope.json")
+        self.assertFalse(got["readable"])
+        self.assertEqual(set(), got["ids"])
+
+    def test_duplicates_with_no_readable_ratification_are_divergence(self):
+        board = [HEADER, row(1), row(1)]
+        conn = FakeStore()
+        none = {"ids": set(), "idless": set(), "digest": "", "readable": False}
+        bv.verify(conn, gateway(board), len(board), size=3, mirror=True, exempt=none)
+        result = bv.verify(conn, gateway(board), len(board), size=3, total_at_end=len(board),
+                           exempt=none)
+        self.assertEqual(bv.DIVERGE, result["verdict"])
+        self.assertFalse(bv.gate_eligible(result))
+
+    def test_the_predicate_demands_the_PINNED_digest(self):
+        """A file edited together with its own digest still fails, because the digest the owner
+        ratified is pinned in the module as well."""
+        record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
+                  "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
+                  "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
+                  "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
+                  "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
+                  "idless_unratified": 0, "duplicate_row_ids": 1,
+                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST}
+        self.assertTrue(bv.gate_eligible(record))
+        record["ratification_digest"] = "0000000000000000"
+        self.assertFalse(bv.gate_eligible(record), "a different list must not be waved through")
+
+    def test_the_measurement_is_never_reduced_by_the_exemption(self):
+        """duplicate_row_ids counts every duplicate the board holds, exempt or not. The exemption
+        changes the VERDICT, never what a reader can see."""
+        dup = sorted(self.exempt["ids"])[0]
+        board = [HEADER, row(1), row(2)]
+        board[1][0] = dup
+        board[2][0] = dup
+        result = bv.verify(FakeStore(), gateway(board), len(board), size=3, exempt=self.exempt)
+        self.assertEqual(1, result["duplicate_row_ids"])
 
 
 class ItSharesTheMirrorKeyspace(unittest.TestCase):

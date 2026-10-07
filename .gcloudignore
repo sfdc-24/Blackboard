@@ -37,6 +37,7 @@
 !/scripts/roster_seed.py
 !/scripts/signature.py
 !/scripts/agent_roster.json
+!/scripts/board_known_duplicates.json
 !/scripts/append.py
 !/scripts/board_say.py
 !/scripts/state_store.py
