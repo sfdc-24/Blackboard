@@ -511,5 +511,57 @@ class ReplyPhaseTest(unittest.TestCase):
             fleet_agent.build_parser().parse_args(["post", "text", "--phase", "FINISHED"])
 
 
+class TheBoardIsTheSharedDEDUPE(unittest.TestCase):
+    """MEASURED ON THE LIVE BOARD, 2026-10-07. One Row_ID,
+    GEMINI-WAKE-CCC-GEMINI-COMPARISON-DESIGN-20261007T04-be7c918643, appended TWICE with DIFFERENT
+    answers 4.5 minutes apart - 989 characters at 05:21:14Z and 874 at 05:25:56Z. One identifier,
+    two different statements of what Gemini said.
+
+    reply_row_id() is deterministic, so a second answer necessarily reuses the first's Row_ID. The
+    only dedupe was `answered_ids`, the laptop's state file, with claim_answer() returning True
+    because "the laptop waker is the only writer of its file, so the claim is free" - true of the
+    FILE, false of the BOARD. cloud/agent-waker dedupes against a shared GCS store instead, so the
+    laptop pass and the cloud pass each looked in their own store and each answered.
+
+    The board is the only store both runners share."""
+
+    def test_an_ask_already_answered_on_the_board_is_not_selected(self):
+        """With EMPTY local state, which is the cloud runner's view of a laptop pass."""
+        ask = row("claude-code-cli", "gemini", "BCB|v=1|id=ASK-1|phase=ASK|text=q",
+                  ts="2026-09-19T12:00:00Z", rid="ASK-1")
+        reply = row("gemini", "claude-code-cli;ALL",
+                    "BCB|v=1|id=GEMINI-WAKE-ASK-1|wakerreply=1|answers=ASK-1|text=a",
+                    ts="2026-09-19T12:04:00Z", rid="GEMINI-WAKE-ASK-1")
+        self.assertEqual([], aw.select([ask, reply], set(), "gemini"),
+                         "the board already shows this answered")
+
+    def test_an_unanswered_ask_is_still_selected(self):
+        """The positive control. If this ever fails, the guard above is a mute button."""
+        ask = row("claude-code-cli", "gemini", "BCB|v=1|id=ASK-2|phase=ASK|text=q",
+                  ts="2026-09-19T12:00:00Z", rid="ASK-2")
+        self.assertEqual(1, len(aw.select([ask], set(), "gemini")))
+
+    def test_another_agents_reply_does_not_count_as_mine(self):
+        """grok answering ASK-3 must not stop gemini from answering it."""
+        ask = row("claude-code-cli", "gemini;grok", "BCB|v=1|id=ASK-3|phase=ASK|text=q",
+                  ts="2026-09-19T12:00:00Z", rid="ASK-3")
+        theirs = row("grok", "claude-code-cli;ALL",
+                     "BCB|v=1|id=GROK-WAKE-ASK-3|wakerreply=1|answers=ASK-3|text=a",
+                     ts="2026-09-19T12:01:00Z", rid="GROK-WAKE-ASK-3")
+        self.assertEqual(1, len(aw.select([ask, theirs], set(), "gemini")))
+
+    def test_answered_on_board_reads_only_my_marked_replies(self):
+        mine = row("gemini", "x;ALL", "BCB|v=1|wakerreply=1|answers=A-1", rid="r1")
+        unmarked = row("gemini", "x;ALL", "BCB|v=1|answers=A-2", rid="r2")
+        other = row("grok", "x;ALL", "BCB|v=1|wakerreply=1|answers=A-3", rid="r3")
+        self.assertEqual({"A-1"}, aw.answered_on_board([mine, unmarked, other], "gemini"))
+
+    def test_the_reply_row_id_is_deterministic_which_is_why_this_matters(self):
+        """Two answers to one ask cannot coexist: they are the same Row_ID by construction. The
+        dedupe has to happen BEFORE the model call, not be caught at the append."""
+        self.assertEqual(aw.reply_row_id("gemini", "ASK-1"),
+                         aw.reply_row_id("gemini", "ASK-1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

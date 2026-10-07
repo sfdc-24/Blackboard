@@ -449,10 +449,53 @@ def sender_of(row) -> str:
     return who or "ALL"
 
 
+def answered_on_board(rows, me: str) -> set:
+    """The bcb ids this agent has ALREADY answered according to the board itself.
+
+    THE BOARD IS THE ONLY STORE THE RUNNERS SHARE, and that is why this exists. Measured on the
+    live board 2026-10-07: GEMINI-WAKE-CCC-GEMINI-COMPARISON-DESIGN-20261007T04-be7c918643 was
+    appended TWICE with DIFFERENT answers, 989 characters at 05:21:14Z and 874 at 05:25:56Z. One
+    identifier, two different statements of what Gemini said; a reader taking the first and one
+    taking the last disagree, and nothing says which is meant.
+
+    reply_row_id() is deterministic, so a second answer necessarily reuses the first's Row_ID. And
+    the only dedupe was `answered_ids` - the LAPTOP's state file - with claim_answer() returning
+    True unconditionally because "the laptop waker is the only writer of its file, so the claim is
+    free". True of the file; false of the board. cloud/agent-waker/main.py dedupes against a shared
+    GCS store instead, so the laptop pass and the cloud pass each looked in their own store, each
+    saw the row unanswered, and each answered it.
+
+    scripts/bus_request.answered() already reads idempotency off the board for exactly this reason.
+    This is that, a month late.
+
+    Free, because the rows are already in hand. Sound on the window, because a reply is always newer
+    than its ask and the window is open above - so an ask inside the window has its reply inside it
+    too.
+    """
+    mine = set()
+    for row in rows:
+        if len(row) <= C_PAYLOAD:
+            continue
+        if str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower() != me.lower():
+            continue
+        payload = str(row[C_PAYLOAD])
+        if WAKER_REPLY_MARK not in payload:
+            continue
+        m = re.search(r"\banswers=([^|]*)", payload)
+        if m and m.group(1).strip():
+            mine.add(m.group(1).strip())
+    return mine
+
+
 def select(rows, answered_ids, me: str):
-    """Newest row per BCB id, addressed to me, not already answered."""
+    """Newest row per BCB id, addressed to me, not already answered.
+
+    "Already answered" is the union of this runner's own state and what the BOARD shows this agent
+    has answered. The second term is the one that matters: the first is per-runner and two runners
+    exist."""
     groups = {}
     seen_count = {}
+    on_board = answered_on_board(rows, me)
     for row in rows:
         if (len(row) <= C_PAYLOAD or is_from(row, me)
                 or is_waker_reply(row) or not addressed_to(row, me)):
@@ -461,7 +504,7 @@ def select(rows, answered_ids, me: str):
         if ts is None:
             continue  # "Friday, September 4" and friends: skipped, never guessed
         key = bcb_id(row)
-        if key in answered_ids:
+        if key in answered_ids or key in on_board:
             continue
         # Counted OUTSIDE the newest-wins branch. The first version reset the
         # tally every time a newer row replaced the group, so three re-asks
