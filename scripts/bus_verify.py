@@ -80,11 +80,34 @@ def looks_like_header(cells) -> bool:
     return bool(cells) and canonical(cells[0]).lower() in ("row_id", "rowid", "row id")
 
 
+# WHAT THE SHEET ACTUALLY CALLS ITS COLUMNS, which is not what this code calls them.
+#
+# COLUMNS above are INTERNAL names used for the mirror's hash fields. Two of them were never the
+# sheet's labels: the sheet says "Timestamp" where the code says `ts`, and "Sub-Gist" where the code
+# says `subgist`. The first live run reported header_matches_schema=False against a perfectly healthy
+# board - my checker comparing one vocabulary to the other, and normalising spaces but not hyphens.
+#
+# It mattered more than a wrong flag: _verdict degrades to UNKNOWN on a header it does not
+# recognise, so once the mirror was populated EVERY run would have been ineligible, forever, for a
+# schema that had never drifted. No unit test could find it - the fixture used the internal names,
+# so the fixture agreed with the bug.
+HEADER_LABELS = ("row_id", "timestamp", "source_tag", "target_surface", "action_type",
+                 "payload", "category", "project_tag", "gist", "sub_gist")
+
+
+def normalise_label(cell) -> str:
+    """A header cell as a comparable token: lowercased, spaces AND hyphens to underscores."""
+    return canonical(cell).lower().replace(" ", "_").replace("-", "_")
+
+
 def header_matches(cells) -> bool:
-    """Whether the header names the columns this code believes in. A schema that has drifted makes
-    every comparison below it meaningless, so it is checked once and reported."""
-    got = [canonical(c).lower().replace(" ", "_") for c in cells[:len(COLUMNS)]]
-    return got == list(COLUMNS)
+    """Whether the header names the columns the board is expected to have, IN ORDER.
+
+    Checked against the sheet's own labels, because a schema that has really drifted makes every
+    comparison below it meaningless - and a checker that cries drift at a healthy board makes every
+    run ineligible, which is the same damage from the other direction."""
+    got = [normalise_label(c) for c in cells[:len(HEADER_LABELS)]]
+    return got == list(HEADER_LABELS)
 
 
 def check_reply(reply, first, count) -> str:
@@ -338,12 +361,29 @@ def record_run(conn, result, log=None) -> bool:
     line["gate_eligible"] = gate_eligible(result)
     if log is not None:
         log(json.dumps(line, sort_keys=True))
-    flat = {k: (json.dumps(v) if isinstance(v, (list, dict)) else ("" if v is None else v))
-            for k, v in line.items()}
+    # EVERY VALUE AS A STRING. redis-py refuses to encode a bool, and this record carries four of
+    # them - so the stream copy raised, record_run returned False, and NOTHING said why. The live
+    # run wrote its durable line and left no Redis copy at all, which I noticed only because the
+    # keyspace viewer showed v1:bus:* empty afterwards.
+    flat = {}
+    for key, value in line.items():
+        if isinstance(value, bool):
+            flat[key] = "true" if value else "false"
+        elif isinstance(value, (list, dict)):
+            flat[key] = json.dumps(value, sort_keys=True)
+        elif value is None:
+            flat[key] = ""
+        else:
+            flat[key] = value
     try:
         conn.xadd(VERIFY_LOG, flat)
         return True
-    except Exception:
+    except Exception as error:
+        # SAY SO. A silent False is how a missing copy looks exactly like a copy nobody looked for.
+        if log is not None:
+            log(json.dumps({"stream_write_failed": type(error).__name__,
+                            "note": "the durable line above is the record; the Redis copy is an "
+                                    "accelerator and this run has none"}, sort_keys=True))
         return False
 
 

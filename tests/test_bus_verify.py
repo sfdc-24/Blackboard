@@ -20,7 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import bus_verify as bv                                                 # noqa: E402
 
-HEADER = list(bv.COLUMNS)
+# THE SHEET'S OWN LABELS, not the code's internal field names. The old fixture used
+# bv.COLUMNS, so it agreed with the bug the live run found: header_matches compared one
+# vocabulary to the other and reported drift on a healthy board. A fixture built from the
+# code under test cannot catch the code under test being wrong about the world.
+HEADER = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
+          "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
 
 
 def row(i, gist=None):
@@ -251,10 +256,16 @@ class ThePredicate(unittest.TestCase):
         self.assertIn("at", written)
 
     def test_losing_the_stream_does_not_lose_the_answer(self):
+        """The durable line is written BEFORE the stream is tried, so a stream failure costs the
+        accelerator and not the answer. There are two lines now, not one: the record, then the
+        failure - because a silent False is how a missing copy came to look like a copy nobody
+        looked for."""
         conn = FakeStore(fail_xadd=True)
         lines = []
         self.assertFalse(bv.record_run(conn, {"verdict": bv.AGREE}, log=lines.append))
-        self.assertEqual(1, len(lines))
+        self.assertEqual(2, len(lines))
+        self.assertIn('"verdict"', lines[0])
+        self.assertIn("stream_write_failed", lines[1])
 
     def test_no_cell_contents_reach_the_record(self):
         """It walks his words and other people's. A divergence names ids and COLUMN NAMES."""
@@ -276,6 +287,60 @@ class ItSharesTheMirrorKeyspace(unittest.TestCase):
     def test_the_columns_match_the_writers(self):
         import bus_reconcile
         self.assertEqual(bus_reconcile.COLUMNS, bv.COLUMNS)
+
+
+class TheHeaderCheckMatchesTheREALBoard(unittest.TestCase):
+    """From the first live run. header_matches_schema came back False against a perfectly healthy
+    board, because the check compared the sheet's LABELS to this module's INTERNAL names - the sheet
+    says "Timestamp" and "Sub-Gist" where the code says ts and subgist - and normalised spaces but
+    not hyphens.
+
+    It was worse than a wrong flag: _verdict degrades to UNKNOWN on an unrecognised header, so once
+    the mirror was populated EVERY run would have been ineligible forever, for a schema that had
+    never drifted."""
+
+    def test_the_live_boards_header_matches(self):
+        """These ten strings are what the board actually holds, read from it on 2026-10-07."""
+        live = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type",
+                "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
+        self.assertTrue(bv.header_matches(live))
+
+    def test_hyphens_and_spaces_both_normalise(self):
+        self.assertEqual("sub_gist", bv.normalise_label("Sub-Gist"))
+        self.assertEqual("project_tag", bv.normalise_label("Project Tag"))
+
+    def test_a_real_drift_is_still_caught(self):
+        """The positive control: if this ever passes anything, the check is decoration."""
+        drifted = ["Row_ID", "Timestamp", "Sender", "Target_Surface", "Action_Type",
+                   "Payload", "Category", "Project Tag", "Gist", "Sub-Gist"]
+        self.assertFalse(bv.header_matches(drifted))
+
+    def test_a_reordered_header_is_drift(self):
+        swapped = ["Timestamp", "Row_ID"] + HEADER[2:]
+        self.assertFalse(bv.header_matches(swapped))
+
+
+class TheStreamWriteIsHonest(unittest.TestCase):
+    """The live run wrote its durable line and left NO Redis copy, and said nothing about it:
+    redis-py cannot encode a bool and this record carries four, so xadd raised and record_run
+    returned a silent False. A missing copy then looks exactly like a copy nobody looked for."""
+
+    def test_booleans_do_not_break_the_stream_write(self):
+        conn = FakeStore()
+        result = full(seeded(BOARD), BOARD)
+        self.assertIn(True, [v for v in result.values() if isinstance(v, bool)])
+        self.assertTrue(bv.record_run(conn, result, log=lambda line: None))
+        written = conn.stream[0]
+        self.assertFalse(any(isinstance(v, bool) for v in written.values()),
+                         "a bool reached the stream payload")
+        self.assertIn(written["gate_eligible"], ("true", "false"))
+
+    def test_a_failed_stream_write_says_so(self):
+        conn = FakeStore(fail_xadd=True)
+        lines = []
+        self.assertFalse(bv.record_run(conn, {"verdict": bv.AGREE}, log=lines.append))
+        self.assertEqual(2, len(lines), "the record, then the failure")
+        self.assertIn("stream_write_failed", lines[1])
 
 
 if __name__ == "__main__":
