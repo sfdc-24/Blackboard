@@ -68,6 +68,8 @@ on:
       - "scripts/bus_verify.py"
       - "scripts/board_known_duplicates.json"
       - "tests/test_bus_verify.py"
+      - "tests/test_gate_regressions.py"
+      - "cloud/bus-reconciler/verify_board.py"
       - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -204,6 +206,8 @@ on:
       - "scripts/bus_verify.py"
       - "scripts/board_known_duplicates.json"
       - "tests/test_bus_verify.py"
+      - "tests/test_gate_regressions.py"
+      - "cloud/bus-reconciler/verify_board.py"
       - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -948,7 +952,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_bus_verify.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_verify -v
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_verify tests.test_gate_regressions -v
           else
             echo "not on this branch; skipping"
           fi

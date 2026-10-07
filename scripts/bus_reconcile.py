@@ -111,8 +111,14 @@ def board_rows(env, since=None, limit=None, reader=None) -> list:
         from bus import read_rows                                        # noqa: PLC0415
         found = read_rows(env, since=since, limit=limit)
     if isinstance(found, dict):
-        found = found.get("rows") or []
-    return [r for r in found if isinstance(r, list)]
+        if "rows" not in found or not isinstance(found["rows"], list):
+            raise ValueError("the board reply did not contain a rows list")
+        found = found["rows"]
+    if not isinstance(found, list):
+        raise ValueError("the board reply was not a rows list")
+    if not all(isinstance(r, list) and r for r in found):
+        raise ValueError("the board reply contained malformed rows")
+    return found
 
 
 def mirror(conn, rows) -> dict:
@@ -235,14 +241,16 @@ def compare(conn, rows, since=None) -> dict:
         # one reaching SMEMBERS to learn the board had been quiet. Not UNKNOWN: "the board was
         # quiet" is a different fact from "I could not tell", and a gate wants to skip the first
         # without treating it as a doubt.
-        return {"verdict": NO_SAMPLE, "checked": 0, "agreed": 0, "missing_from_redis": 0,
+        return {"verdict": UNKNOWN if no_id else NO_SAMPLE,
+                "checked": 0, "agreed": 0, "missing_from_redis": 0,
                 "differing": 0, "extra_in_redis": 0, "outside_the_window": 0,
                 "unplaceable_in_redis": 0, "boundary_ties": 0,
                 "board_rows_with_unreadable_ts": 0, "duplicate_row_ids": len(duplicates),
                 "rows_without_an_id": no_id, "window_edge": "", "window_edge_trusted": False,
                 "columns_that_differ": {},
                 "missing_ids": [], "differing_ids": [], "extra_ids": [], "duplicate_ids": [],
-                "note": "no board rows in the window: nothing to compare, which is not agreement"}
+                "note": ("board rows lacked identities: comparison is unavailable" if no_id else
+                         "no board rows in the window: nothing to compare, which is not agreement")}
 
     missing, differing, columns = [], [], {}
     for row_id, mapped in board.items():
@@ -472,11 +480,22 @@ def main(argv=None) -> int:
         return 2
 
     from bus import load_env                                             # noqa: PLC0415
-    rows = board_rows(load_env(), since=args.since, limit=args.limit)
     window = "since=%s" % args.since if args.since else "limit=%d" % args.limit
-    # The REQUESTED cutoff reaches compare(), parsed once here. It is the only boundary that is
-    # authoritative rather than inferred, and withholding it is what let a Redis row newer than
-    # every board row read as out of scope.
+    try:
+        rows = board_rows(load_env(), since=args.since, limit=args.limit)
+    except (Exception, SystemExit) as error:
+        # An unavailable gateway did not establish a quiet window. Preserve the
+        # structured failure for both JSON callers and the comparison stream.
+        result = compare(conn, [])
+        result.update(verdict=UNKNOWN, measured="read_failed", read_failures=1,
+                      note="board read failed (%s)" % type(error).__name__, recorded=False)
+        print(json.dumps(result, sort_keys=True))
+        try:
+            record(conn, result, window)
+            result["recorded"] = True
+        except (Exception, SystemExit):
+            pass
+        return 2
     result = run(conn, rows, do_mirror=args.mirror, window=window,
                  since=read_ts(args.since) if args.since else None)
 
