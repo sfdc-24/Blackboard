@@ -195,7 +195,7 @@ def read_rows(env, title="Blackboard - Alpha DB", tries=4,
         except json.JSONDecodeError:
             print(f"[attempt {attempt+1}] non-JSON: {body[:200]}", file=sys.stderr)
             continue
-        if "rows" not in obj:
+        if not isinstance(obj, dict) or "rows" not in obj:
             print(f"[attempt {attempt+1}] health blob, retrying", file=sys.stderr)
             continue
         # An older bus deployment ignores unknown keys and answers a filtered
@@ -208,7 +208,9 @@ def read_rows(env, title="Blackboard - Alpha DB", tries=4,
                 "almost certainly ignored " + ", ".join(asked) + " and returned "
                 "the whole board. Refusing to pass that off as a filtered slice."
             )
-        rows = [r for r in obj.get("rows") or [] if r]
+        rows = obj.get("rows")
+        if not isinstance(rows, list) or not all(isinstance(r, list) and r for r in rows):
+            raise SystemExit("bus returned malformed rows; refusing to drop physical entries")
         # Defensive: should a future deployment ever include the header in a
         # filtered reply, drop it rather than hand the caller a fake data row.
         if rows and str((list(rows[0]) + [""])[0]).strip() == "Row_ID":
@@ -253,7 +255,7 @@ def read_range(env, start, count, title="Blackboard - Alpha DB", tries=4):
         except json.JSONDecodeError:
             print(f"[attempt {attempt+1}] non-JSON: {body[:200]}", file=sys.stderr)
             continue
-        if "rows" not in obj:
+        if not isinstance(obj, dict) or "rows" not in obj:
             print(f"[attempt {attempt+1}] health blob, retrying", file=sys.stderr)
             continue
         # A gateway that does not KNOW about start would ignore it and answer with the whole board,
@@ -273,12 +275,14 @@ def read_range(env, start, count, title="Blackboard - Alpha DB", tries=4):
                 "asked the bus for start=%d and it echoed start=%r. These rows are not the rows "
                 "that were requested, and treating them as a slice would record coverage of "
                 "positions nobody read." % (start, obj.get("start")))
-        returned = [r for r in obj.get("rows") or [] if r]
+        returned = obj.get("rows")
+        if not isinstance(returned, list) or not all(isinstance(r, list) and r for r in returned):
+            raise SystemExit("bus returned malformed rows; refusing to drop physical entries")
         if obj.get("count") not in (None, len(returned)):
             raise SystemExit(
                 "the bus echoed count=%r for a ranged read and sent %d row(s); the reply does not "
                 "describe itself consistently." % (obj.get("count"), len(returned)))
-        rows = [r for r in obj.get("rows") or [] if r]
+        rows = returned
         return {"rows": rows, "total": obj.get("total"),
                 "filtered": obj.get("filtered", len(rows)),
                 "start": obj.get("start"), "count": obj.get("count", len(rows))}

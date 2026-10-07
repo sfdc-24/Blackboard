@@ -131,22 +131,17 @@ class TheReaderShape(unittest.TestCase):
     def test_a_plain_list_return_still_works(self):
         self.assertEqual(1, len(rec.board_rows(None, reader=lambda since, limit: [list(A)])))
 
-    def test_a_dict_with_no_rows_key_is_empty_not_a_crash(self):
-        self.assertEqual([], rec.board_rows(None, reader=lambda since, limit: {"ok": True}))
+    def test_a_dict_with_no_rows_key_is_unavailable_not_empty(self):
+        with self.assertRaises(ValueError):
+            rec.board_rows(None, reader=lambda since, limit: {"ok": True})
 
     def test_a_health_ping_does_not_read_as_an_empty_board(self):
-        """The gateway's broken read path returns a health ping with no rows at all. compare() calls
-        that NO_SAMPLE now rather than UNKNOWN - still not agreement, which is the property that
-        matters, and the one a verdict of AGREE here would have destroyed."""
-        rows = rec.board_rows(None, reader=lambda since, limit: {"ok": True, "service": "bus"})
-        self.assertEqual([], rows)
-        verdict = rec.compare(FakeRedis(), rows)["verdict"]
-        self.assertEqual(rec.NO_SAMPLE, verdict)
-        self.assertNotEqual(rec.AGREE, verdict)
+        with self.assertRaises(ValueError):
+            rec.board_rows(None, reader=lambda since, limit: {"ok": True, "service": "bus"})
 
-    def test_non_row_entries_are_dropped(self):
-        got = rec.board_rows(None, reader=lambda since, limit: {"rows": [list(A), "junk", None]})
-        self.assertEqual(1, len(got))
+    def test_non_row_entries_are_rejected(self):
+        with self.assertRaises(ValueError):
+            rec.board_rows(None, reader=lambda since, limit: {"rows": [list(A), "junk", None]})
 
 
 class WhatTheFirstRealExecutionTaught(unittest.TestCase):

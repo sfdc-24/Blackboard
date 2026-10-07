@@ -232,11 +232,14 @@ def check_reply(reply, first, count) -> str:
     evidence the right rows came back, so they are checked rather than trusted."""
     if not isinstance(reply, dict):
         return "the reply was not an object"
-    if reply.get("start") != first:
+    if type(reply.get("start")) is not int or reply["start"] != first:
         return "asked for start=%s and the gateway echoed start=%r" % (first, reply.get("start"))
-    rows = [r for r in (reply.get("rows") or []) if r]
-    if reply.get("count") not in (None, len(rows)):
-        return "the gateway echoed count=%r and sent %d row(s)" % (reply.get("count"), len(rows))
+    rows = reply.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(r, list) and r for r in rows):
+        return "the gateway did not return a list of nonempty physical rows"
+    echoed_count = reply.get("count")
+    if echoed_count is not None and (type(echoed_count) is not int or echoed_count != len(rows)):
+        return "the gateway echoed count=%r and sent %d row(s)" % (echoed_count, len(rows))
     if len(rows) != count:
         return "asked for %d row(s) at %d and received %d" % (count, first, len(rows))
     return ""
@@ -271,17 +274,8 @@ def recheck_points(total, how_many=RECHECK_POSITIONS):
     return sorted({int(round(1 + i * step)) for i in range(how_many)})
 
 
-def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total_at_end=None,
-           remember=(), exempt=None) -> dict:
-    """Walk the whole board, compare every data row against its own mirror, report every caveat.
-
-    `reader(first, count)` returns the gateway's reply dict for that closed range.
-    `remember` is the positions whose Row_ID to record as the walk passes them, so a caller can
-    look at those positions again afterwards and notice the sheet moving underneath it. The
-    comparison is done by `apply_recheck`, not here, because this function must not read the board
-    a second time - a walk that re-reads is a walk with two opinions about what it saw.
-    """
-    record = {
+def empty_record(total_at_start=None, size=DEFAULT_CHUNK, total_at_end=None, remember=()):
+    return {
         "verdict": UNKNOWN, "frozen_total": total_at_start, "total_at_end": total_at_end,
         "covered_from": 0, "covered_to": 0,
         "header_present": False, "header_matches_schema": False,
@@ -295,11 +289,24 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
         "ratification_digest": "", "ratification_readable": False,
         "census_present": False, "census_digest": "",
         "chunks_total": 0, "chunks_read": 0, "read_failures": 0,
-        "positions_rechecked": 0, "positions_shifted": 0, "observed_positions": {},
+        "positions_expected": len(set(remember or ())), "positions_rechecked": 0, "positions_shifted": 0, "observed_positions": {},
         "writes_performed": 0, "chunk_size": size,
         "columns_that_differ": {}, "missing_ids": [], "differing_ids": [], "extra_ids": [],
         "duplicate_ids": [], "read_failure_reasons": [],
     }
+
+
+def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total_at_end=None,
+           remember=(), exempt=None) -> dict:
+    """Walk the whole board, compare every data row against its own mirror, report every caveat.
+
+    `reader(first, count)` returns the gateway's reply dict for that closed range.
+    `remember` is the positions whose Row_ID to record as the walk passes them, so a caller can
+    look at those positions again afterwards and notice the sheet moving underneath it. The
+    comparison is done by `apply_recheck`, not here, because this function must not read the board
+    a second time - a walk that re-reads is a walk with two opinions about what it saw.
+    """
+    record = empty_record(total_at_start, size, total_at_end, remember)
 
     bounds = chunk_bounds(total_at_start, size)
     record["chunks_total"] = len(bounds)
@@ -340,6 +347,8 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
         for offset, cells in enumerate(rows):
             at = first + offset
             if at == 1:
+                if at in wanted:
+                    record["observed_positions"][str(at)] = canonical(cells[0] if cells else "")
                 record["header_present"] = looks_like_header(cells)
                 record["header_matches_schema"] = header_matches(cells)
                 continue
@@ -456,22 +465,17 @@ def _apply_census(record, exempt) -> None:
 
 
 def apply_recheck(record, after) -> dict:
-    """Fold a second look at remembered positions into the record, then re-decide the verdict.
-
-    `after` maps position -> the Row_ID found there NOW. A position whose Row_ID changed means rows
-    moved while the walk was running, which invalidates the whole claim: every comparison after the
-    shift was against a row at a position it no longer occupies.
-
-    This cannot PROVE the sheet held still. Nothing reachable through this gateway can - there is no
-    revision token and no lock, which Codex was right to name. It detects a shift instead of
-    assuming one did not happen, and says how many positions it looked at so a reader can judge the
-    strength of that for themselves."""
+    """Count only remembered positions, and reject an incomplete or unrelated recheck."""
     observed = record.get("observed_positions") or {}
     checked = {str(k): canonical(v) for k, v in (after or {}).items()}
-    record["positions_rechecked"] = len(checked)
+    common = set(checked) & set(observed)
+    record["positions_rechecked"] = len(common)
     record["positions_shifted"] = sum(
-        1 for at, row_id in checked.items()
-        if at in observed and row_id != canonical(observed[at]))
+        checked[at] != canonical(observed[at]) for at in common)
+    if (not observed or set(checked) != set(observed)
+            or len(observed) != record.get("positions_expected")):
+        record["read_failures"] += 1
+        record["read_failure_reasons"].append("recheck:incomplete_or_unexpected_positions")
     record["verdict"] = _verdict(record)
     return record
 
@@ -505,6 +509,10 @@ def _verdict(record) -> str:
         # Duplicates exist and no ratification could be read: that is not agreement, and it is not
         # the moment to assume the exemption file was meant to be there.
         return DIVERGE
+    if record["idless_ratified"] and not record.get("census_present"):
+        # An ID-only v1 list does not bind the idless positions. This applies even
+        # on a board with no duplicate IDs, which previously bypassed the census gate.
+        return UNKNOWN
     if record["data_rows"] == 0:
         # A header and nothing else. Codex: a header-only sheet produced an eligible AGREE with zero
         # data rows, which is agreement about nothing.
@@ -529,6 +537,10 @@ def gate_eligible(record) -> bool:
         and record.get("read_failures", 1) == 0
         and record.get("positions_shifted", 1) == 0
         and record.get("positions_rechecked", 0) > 0
+        and record.get("positions_rechecked") == record.get("positions_expected")
+        and record.get("positions_expected") == len(recheck_points(record["frozen_total"]))
+        and set(record.get("observed_positions") or {})
+            == {str(at) for at in recheck_points(record["frozen_total"])}
         and record.get("missing_from_redis") == 0
         and record.get("differing") == 0
         and record.get("extra_in_redis") == 0
@@ -537,14 +549,16 @@ def gate_eligible(record) -> bool:
         # The ratified exemption must have been READ, and its digest must be the one the owner
         # ratified. A record that forgives duplicates without saying which list it used is a record
         # a gate cannot check.
-        and (record.get("duplicate_row_ids", 0) == 0
+        and ((record.get("duplicate_row_ids", 0) == 0
+              and record.get("rows_without_an_id", 0) == 0)
              or (record.get("ratification_readable") is True
                  and record.get("ratification_digest") == RATIFIED_DIGEST))
         # AND THE EXEMPTION MUST BE BOUNDED. Naming an id said whether it was forgiven and never how
         # many times, so a 56th occurrence of a listed id passed. A board with duplicates is now
         # eligible only against a ratified census, and only while no id has exceeded its count.
         and record.get("duplicates_over_census", 1) == 0
-        and (record.get("duplicate_row_ids", 0) == 0
+        and ((record.get("duplicate_row_ids", 0) == 0
+              and record.get("rows_without_an_id", 0) == 0)
              or (record.get("census_present") is True
                  and bool(RATIFIED_CENSUS_DIGEST)
                  and record.get("census_digest") == RATIFIED_CENSUS_DIGEST))
@@ -558,6 +572,8 @@ def record_run(conn, result, log=None) -> bool:
     line["gate_eligible"] = gate_eligible(result)
     if log is not None:
         log(json.dumps(line, sort_keys=True))
+    if conn is None:
+        return False
     # EVERY VALUE AS A STRING. redis-py refuses to encode a bool, and this record carries four of
     # them - so the stream copy raised, record_run returned False, and NOTHING said why. The live
     # run wrote its durable line and left no Redis copy at all, which I noticed only because the
@@ -584,6 +600,69 @@ def record_run(conn, result, log=None) -> bool:
         return False
 
 
+def failed_record(stage, error):
+    result = empty_record()
+    result["read_failures"] = 1
+    result["read_failure_reasons"] = ["%s:%s" % (stage, type(error).__name__)]
+    return result
+
+
+
+def verified_read(reader, first, count):
+    reply = reader(first, count)
+    why = check_reply(reply, first, count)
+    if why:
+        raise ValueError(why)
+    return reply
+
+
+
+def run_checked(conn, reader, size=DEFAULT_CHUNK, mirror=False):
+    """Shared CLI/cloud lifecycle. Every operational read failure returns a receipt."""
+    try:
+        if type(size) is not int or size < 1:
+            raise ValueError("chunk size must be a positive integer")
+        head = reader(1, 1)
+        # An explicitly empty physical board is a sample of zero, not a failed read.
+        if (isinstance(head, dict) and type(head.get("total")) is int
+                and head["total"] == 0 and type(head.get("start")) is int
+                and head["start"] == 1 and type(head.get("count")) is int
+                and head["count"] == 0 and head.get("rows") == []):
+            result = empty_record(0, size, 0)
+            result.update(verdict=NO_SAMPLE, note="the gateway explicitly returned an empty board")
+            return result
+        why = check_reply(head, 1, 1)
+        if why:
+            raise ValueError(why)
+        total = head.get("total")
+        if type(total) is not int or total < 1:
+            raise ValueError("no usable row count")
+    except (Exception, SystemExit) as error:
+        return failed_record("initial_read", error)
+    points = recheck_points(total)
+    result = verify(conn, reader, total, size=size, mirror=mirror, remember=points)
+    # A partial walk already has an honest failure. Do not obscure it with more reads.
+    if result["read_failures"]:
+        return result
+    try:
+        after = {}
+        for at in points:
+            reply = verified_read(reader, at, 1)
+            after[at] = canonical(reply["rows"][0][0])
+        tail = verified_read(reader, 1, 1)
+        end = tail.get("total")
+        if type(end) is not int or end < 1:
+            raise ValueError("no usable final row count")
+        result["total_at_end"] = end
+        apply_recheck(result, after)
+    except (Exception, SystemExit) as error:
+        result["read_failures"] += 1
+        result["read_failure_reasons"].append("recheck:%s" % type(error).__name__)
+        result["verdict"] = _verdict(result)
+    return result
+
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="Verify the whole board against its Redis mirror")
@@ -594,47 +673,25 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
-    settings = redis_dual.Settings()
-    conn = redis_dual.client(settings, precheck=False)
-    if conn is None:
-        print("UNKNOWN: no Redis connection, so nothing was compared. NOT zero divergence.")
-        return 2
-
-    from bus import load_env, read_range                                # noqa: PLC0415
-    env = load_env()
-    head = read_range(env, 1, 1)
-    total = head.get("total")
-    if not isinstance(total, int) or total < 1:
-        print("UNKNOWN: the gateway reported no usable row count. Nothing was compared.")
-        return 2
-
-    points = recheck_points(total)
-    result = verify(conn, lambda f, c: read_range(env, f, c), total,
-                    size=args.chunk, mirror=args.mirror, remember=points)
-
-    # LOOK AGAIN: the ceiling, and the Row_ID at a spread of positions the walk already passed.
-    # Gemini said to freeze the ceiling; Codex pointed out that a frozen ceiling is only a valid
-    # PREFIX claim if positions below it cannot shift, and a middle insert or delete shifts them.
+    conn = None
     try:
-        after = {}
-        for at in points:
-            reply = read_range(env, at, 1)
-            rows = [r for r in (reply.get("rows") or []) if r]
-            after[at] = canonical(rows[0][0]) if rows else ""
-        tail = read_range(env, 1, 1)
-        result["total_at_end"] = tail.get("total")
-        apply_recheck(result, after)
-    except Exception as error:
-        result["read_failures"] += 1
-        result["read_failure_reasons"].append("recheck:%s" % type(error).__name__)
-        result["verdict"] = _verdict(result)
+        settings = redis_dual.Settings()
+        conn = redis_dual.client(settings, precheck=False)
+        if conn is None:
+            raise ConnectionError("no Redis connection")
+        from bus import load_env, read_range                            # noqa: PLC0415
+        env = load_env()
+        result = run_checked(conn, lambda f, c: read_range(env, f, c),
+                             size=args.chunk, mirror=args.mirror)
+    except (Exception, SystemExit) as error:
+        result = failed_record("startup", error)
 
     record_run(conn, result, log=print)
 
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print("%s: %d data row(s), %d matched, rows %d-%d of %d"
+        print("%s: %d data row(s), %d matched, rows %d-%d of %s"
               % (result["verdict"], result["data_rows"], result["matched"],
                  result["covered_from"], result["covered_to"], result["frozen_total"]))
         print("gate eligible: %s" % gate_eligible(result))

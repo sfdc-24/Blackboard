@@ -31,62 +31,35 @@ import redis_dual                                                      # noqa: E
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("verify-board")
 
-CHUNK = int(os.environ.get("VERIFY_CHUNK", "200"))
+CHUNK = 200
 # OFF by default. A run that writes is ineligible for a span by construction, so a scheduled
 # verification must not quietly become a repair.
 MIRROR = os.environ.get("VERIFY_MIRROR", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def main() -> int:
-    settings = redis_dual.Settings()
-    status = redis_dual.status(settings)
-    log.info("dual-run status: %s", json.dumps({k: status[k] for k in redis_dual.STATUS_FOR_LOG}))
-
-    conn = redis_dual.client(settings, precheck=False)
-    if conn is None:
-        log.error("UNKNOWN: no Redis connection, so nothing was compared. THIS IS NOT ZERO "
-                  "DIVERGENCE. Check connect, the host, egress, and the AUTH secret.")
-        return 1
-
-    from bus import load_env, read_range                                # noqa: PLC0415
-    env = load_env()
+    conn = None
     try:
-        head = read_range(env, 1, 1)
-    except SystemExit as refusal:
-        # The refusal IS the finding: the deployed gateway predates start/count, so a ranged read
-        # cannot be trusted and nothing should be compared.
-        log.error("UNKNOWN: the gateway refused or mishandled a ranged read: %s", refusal)
-        return 2
-    total = head.get("total")
-    if not isinstance(total, int) or total < 1:
-        log.error("UNKNOWN: the gateway reported no usable row count, so no ceiling could be "
-                  "frozen. Nothing was compared.")
-        return 2
-
-    points = bus_verify.recheck_points(total)
-    result = bus_verify.verify(conn, lambda f, c: read_range(env, f, c), total,
-                               size=CHUNK, mirror=MIRROR, remember=points)
-    try:
-        after = {}
-        for at in points:
-            reply = read_range(env, at, 1)
-            rows = [r for r in (reply.get("rows") or []) if r]
-            after[at] = bus_verify.canonical(rows[0][0]) if rows else ""
-        result["total_at_end"] = read_range(env, 1, 1).get("total")
-        bus_verify.apply_recheck(result, after)
+        settings = redis_dual.Settings()
+        status = redis_dual.status(settings)
+        log.info("dual-run status: %s", json.dumps({k: status[k] for k in redis_dual.STATUS_FOR_LOG}))
+        conn = redis_dual.client(settings, precheck=False)
+        if conn is None:
+            raise ConnectionError("no Redis connection")
+        from bus import load_env, read_range                            # noqa: PLC0415
+        env = load_env()
+        chunk = int(os.environ.get("VERIFY_CHUNK", str(CHUNK)))
+        result = bus_verify.run_checked(conn, lambda f, c: read_range(env, f, c),
+                                        size=chunk, mirror=MIRROR)
     except (Exception, SystemExit) as error:
-        # Same reason as in verify(): read_range raises SystemExit on a flapping gateway, and a
-        # recheck that could not run must not cost the record of the walk that did.
-        result["read_failures"] += 1
-        result["read_failure_reasons"].append("recheck:%s" % type(error).__name__)
-        result["verdict"] = bus_verify._verdict(result)
+        result = bus_verify.failed_record("startup", error)
 
     # The durable line goes to stdout, which here is Cloud Logging: redis-central has persistence
     # DISABLED, so the stream is an accelerator and this is the record.
     bus_verify.record_run(conn, result, log=print)
 
     eligible = bus_verify.gate_eligible(result)
-    log.info("%s: %d data row(s), %d matched, rows %d-%d of %d, gate_eligible=%s",
+    log.info("%s: %d data row(s), %d matched, rows %d-%d of %s, gate_eligible=%s",
              result["verdict"], result["data_rows"], result["matched"], result["covered_from"],
              result["covered_to"], result["frozen_total"], eligible)
     for name in ("missing_from_redis", "differing", "extra_in_redis", "duplicate_row_ids",
