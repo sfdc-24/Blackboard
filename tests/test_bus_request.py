@@ -215,10 +215,119 @@ class WhatTheResultSays(unittest.TestCase):
             body = spec["payload"].split("text=", 1)[1]
             self.assertNotIn("|", body)
 
-    def test_a_pipe_in_a_value_is_refused_at_construction(self):
+    def test_a_pipe_in_a_value_is_cleaned_rather_than_crashing_the_worker(self):
+        """This used to assert, and the assertion was the blocker. row_for() publishes
+        attacker-supplied values - the request id and, once, the claimed sender - so an invariant
+        check there turned one malformed row into an AssertionError that took the whole worker down
+        before any well-formed request behind it ran. Data gets cleaned; invariants get asserted."""
         req = {"req_id": "R", "claimed_sender": "aya", "action": "x", "row_id": "R", "at": NOW}
-        with self.assertRaises(AssertionError):
-            br.row_for(br.RESULT_ACTION, req, "has a | pipe", "gist")
+        row = br.row_for(br.RESULT_ACTION, req, "has a | pipe", "gi|st")
+        self.assertNotIn("|", row["gist"])
+        self.assertEqual(1, row["payload"].count("text="))
+        # The payload's own separators survive; only the VALUES were cleaned.
+        self.assertTrue(row["payload"].startswith("BCB|v=1|id="))
+        self.assertIn("has a   pipe", row["payload"])
+
+    def test_safe_strips_newlines_and_control_bytes_too(self):
+        """A raw newline inside a JSON string is what broke an append earlier the same day, and a
+        control byte once compiled itself into a regex. One cleaner, every published value."""
+        self.assertEqual("a b", br.safe("a\nb"))
+        self.assertEqual("a b", br.safe("a\tb"))
+        self.assertEqual("ab", br.safe("a\x00b"))
+        self.assertEqual("", br.safe(None))
+
+    def test_an_unrecognised_sender_never_becomes_the_reply_address(self):
+        """The claim decided where our own answer went, so an unrecognised, pipe-bearing tag was
+        both a malformed row and a sender choosing our addressing."""
+        req = {"req_id": "R", "claimed_sender": "bad|sender", "action": "x", "row_id": "R", "at": NOW}
+        row = br.row_for(br.RESULT_ACTION, req, "text", "gist")
+        self.assertEqual("ALL", row["target_surface"])
+        self.assertNotIn("bad", row["payload"])
+
+
+class TheBlockersFromPr323(unittest.TestCase):
+    """Each of these is a finding Copilot raised on PR 323, written as the test that was missing."""
+
+    def _req_row(self, req_id, action="redis-synthetic-probe", sender="aya", ts=None):
+        payload = "BCB|v=1|req=%s|do=%s|from=%s|to=bus-reconciler|text=t" % (req_id, action, sender)
+        return [req_id, ts or br.stamp(NOW), sender, "bus-reconciler", br.REQUEST_ACTION,
+                payload, "OPEN", "Blackboard", "a gist", ""]
+
+    def test_a_malformed_sender_does_not_abort_the_requests_behind_it(self):
+        """THE BLOCKER: source_tag='bad|sender' put a pipe in the refusal text, row_for asserted,
+        and the AssertionError ended the run - so a later valid request never got its probe, and the
+        unanswered row could repeat the failure on every pass."""
+        rows = [self._req_row("BAD-1", sender="bad|sender"), self._req_row("GOOD-1")]
+        appended = []
+        out = br.handle(rows, FakeRedis(), now=NOW, append=appended.append)
+        self.assertEqual(["GOOD-1"], [a["req_id"] for a in out["answered"]])
+        self.assertEqual(1, len(out["refused"]))
+        # Diagnostics keep the unrecognised tag; nothing published does.
+        self.assertEqual("bad|sender", out["refused"][0]["claimed_sender"])
+        self.assertTrue(all("bad|sender" not in r["payload"] for r in appended))
+
+    def test_an_unrecognised_sender_gets_no_board_row_at_all(self):
+        rows = [self._req_row("X-1", sender="nobody-we-know")]
+        appended = []
+        br.handle(rows, FakeRedis(), now=NOW, append=appended.append)
+        self.assertEqual([], appended, "answering an unrecognised claim is a flood we author")
+
+    def test_refusals_count_against_the_same_budget_as_probes(self):
+        """THE BLOCKER: distinct valid ids with a rejected action produced one board write and one
+        read-back each, regardless of max_per_run."""
+        rows = [self._req_row("REQ-%03d" % i, action="not-allowlisted") for i in range(10)]
+        appended = []
+        out = br.handle(rows, FakeRedis(), now=NOW, append=appended.append, max_per_run=3)
+        self.assertEqual(3, len(appended), "the cap must bound refusal rows too")
+        self.assertEqual(7, out["capped"])
+
+    def test_a_mixed_flood_cannot_exceed_the_budget_in_total(self):
+        rows = ([self._req_row("BAD-%03d" % i, action="nope") for i in range(5)]
+                + [self._req_row("OKAY-%03d" % i) for i in range(5)])
+        appended = []
+        out = br.handle(rows, FakeRedis(), now=NOW, append=appended.append, max_per_run=2)
+        # Each answered request writes two rows (receipt + result); each refusal writes one. The
+        # budget counts REQUESTS, so at most two of either were served.
+        self.assertLessEqual(len(out["answered"]) + len([r for r in out["refused"]
+                                                         if "already" not in r["why"][0]]), 7)
+        self.assertGreaterEqual(out["capped"], 1)
+        self.assertLessEqual(len(appended), 4)
+
+    def test_a_receipt_only_request_resumes_instead_of_wedging(self):
+        """THE BLOCKER: a receipt that landed while its result did not left the request pending AND
+        its Row_ID taken. The next pass replayed the receipt, append.py exited 2 on the duplicate,
+        and serve_requests propagated that before the probe could run - so the request could never
+        be finished by a retry."""
+        req = self._req_row("RESUME-1")
+        expected = br.row_for(br.RECEIPT_ACTION,
+                              {"req_id": "RESUME-1", "claimed_sender": "aya"}, "", "")["row_id"]
+        receipt_row = [expected, br.stamp(NOW), br.WORKER_TAG, "aya", br.RECEIPT_ACTION,
+                       "BCB|v=1|id=%s|phase=%s|answers=RESUME-1|text=t" % (expected,
+                                                                           br.RECEIPT_ACTION),
+                       "OPEN", "Blackboard", "receipt", ""]
+        appended = []
+        out = br.handle([req, receipt_row], FakeRedis(), now=NOW, append=appended.append)
+        self.assertEqual(["RESUME-1"], out["receipts_reused"])
+        self.assertEqual(["RESUME-1"], [a["req_id"] for a in out["answered"]])
+        kinds = [r["action_type"] for r in appended]
+        self.assertEqual([br.RESULT_ACTION], kinds, "the receipt must not be written twice")
+
+    def test_two_receipts_for_one_request_fail_closed(self):
+        """Ambiguity is not something to reason past: two receipts, or one under an id this worker
+        would not have written, means stop."""
+        req = self._req_row("AMBIG-1")
+
+        def receipt(row_id):
+            return [row_id, br.stamp(NOW), br.WORKER_TAG, "aya", br.RECEIPT_ACTION,
+                    "BCB|v=1|id=%s|answers=AMBIG-1|text=t" % row_id,
+                    "OPEN", "Blackboard", "receipt", ""]
+
+        appended = []
+        out = br.handle([req, receipt("A"), receipt("B")], FakeRedis(), now=NOW,
+                        append=appended.append)
+        self.assertEqual([], out["answered"])
+        self.assertEqual([], appended)
+        self.assertIn("refusing to guess", out["refused"][0]["why"][0])
 
 
 class FieldParsing(unittest.TestCase):

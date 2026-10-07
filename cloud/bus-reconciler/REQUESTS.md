@@ -116,7 +116,7 @@ gcloud run jobs create bus-requests --project=sfdc24 --region=us-central1 \
   --service-account bus-reconciler@sfdc24.iam.gserviceaccount.com \
   --command python --args=-B,serve_requests.py \
   --set-secrets "BUS_URL=BUS_URL:latest,BUS_SECRET=BUS_SECRET:latest,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:latest,/secrets/auth/redis-auth=REDIS_AUTH_STRING:latest" \
-  --set-env-vars "REDIS_DUAL_ENABLED=true,REDIS_HOST=<private address>,REDIS_PORT=6378" \
+  --set-env-vars "REDIS_CONNECT=true,REDIS_HOST=<private address>,REDIS_PORT=6378" \
   --network default --subnet default --vpc-egress private-ranges-only \
   --max-retries 0 --task-timeout 5m --cpu 1 --memory 512Mi
 
@@ -132,6 +132,19 @@ gcloud run jobs execute bus-requests --project=sfdc24 --region=us-central1 --wai
 No new secret, no new service account, no new role, no public ingress. **And after the trigger
 ruling there is no permission question left at all**: `board-watcher` gets nothing, so the scheduler
 runs as this job's own identity and grants nobody anything new.
+
+## The two switches, and which one this job needs
+
+`REDIS_CONNECT`, not `REDIS_DUAL_ENABLED`. They were one setting until Copilot found that
+`REDIS_DUAL_ENABLED=true` in a job's environment beat a settings file saying `enabled=false` - so
+the documented off-switch did not work on any deployed job, this one included. Separating them
+showed why it had to: `enabled` means *the dual-run is on*, `connect` means *this process may open
+a socket*. A request worker only ever wanted the second, and asserting the first to get it is
+exactly what let the dual-run's off-switch be bypassed.
+
+The file wins on both. `scripts/redis_dual.settings.json` ships `enabled=false, connect=true`, and
+neither can be switched back on from the environment; a missing or malformed file reads as both off.
+`bash cloud/bus-reconciler/deploy.sh off` sets both to false, and needs no address to do it.
 
 ## Rollback
 

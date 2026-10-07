@@ -18,12 +18,47 @@ A = ["R-1", "2026-10-05T10:00:00Z", "claude-code-cli", "ALL", "APPEND", "BCB|v=1
 B = ["R-2", "2026-10-05T11:00:00Z", "grok", "claude-code-cli", "DISPATCH", "BCB|v=1|y", "OPEN", "FLEET", "another", ""]
 
 
+class FakePipeline:
+    """A queued transaction, because the mirror REPLACES a row now rather than merging into it.
+
+    Modelled rather than stubbed away: a pipeline that applied each command the moment it was
+    queued would let the test pass while proving nothing about the DELETE and the HSET landing
+    together, which is the whole reason the transaction is there."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.queued = []
+
+    def delete(self, key):
+        self.queued.append(("delete", (key,)))
+        return self
+
+    def hset(self, key, mapping=None):
+        self.queued.append(("hset", (key, mapping)))
+        return self
+
+    def sadd(self, key, member):
+        self.queued.append(("sadd", (key, member)))
+        return self
+
+    def execute(self):
+        for name, args in self.queued:
+            if name == "hset":
+                self.conn.hset(args[0], mapping=args[1])
+            else:
+                getattr(self.conn, name)(*args)
+        self.conn.transactions += 1
+        self.queued = []
+        return []
+
+
 class FakeRedis:
-    """Only the five commands this uses. No network, no library."""
+    """Only the commands this uses. No network, no library."""
 
     def __init__(self, fail_xadd=False):
         self.hashes, self.sets, self.streams = {}, {}, {}
         self.fail_xadd = fail_xadd
+        self.transactions = 0
 
     def hset(self, key, mapping=None):
         self.hashes.setdefault(key, {}).update(mapping or {})
@@ -31,8 +66,17 @@ class FakeRedis:
     def hgetall(self, key):
         return dict(self.hashes.get(key, {}))
 
+    def delete(self, key):
+        self.hashes.pop(key, None)
+
+    def pipeline(self, transaction=True):
+        return FakePipeline(self)
+
     def sadd(self, key, member):
         self.sets.setdefault(key, set()).add(member)
+
+    def srem(self, key, member):
+        self.sets.get(key, set()).discard(member)
 
     def smembers(self, key):
         return set(self.sets.get(key, set()))
@@ -125,6 +169,12 @@ class WhatTheFirstRealExecutionTaught(unittest.TestCase):
             def hset(self, *a, **k):
                 raise RuntimeError("AuthenticationError-ish")
 
+            def delete(self, *a, **k):
+                raise RuntimeError("nope")
+
+            def pipeline(self, *a, **k):
+                raise RuntimeError("nope")
+
             def sadd(self, *a, **k):
                 raise RuntimeError("nope")
 
@@ -212,13 +262,94 @@ class WhatCountsAsADifference(unittest.TestCase):
         crlf[8] = "a gist"
         self.assertEqual(rec.AGREE, rec.compare(conn, [crlf])["verdict"])
 
-    def test_a_row_only_in_redis_is_a_difference(self):
+    def test_a_row_only_in_redis_and_inside_the_window_is_a_difference(self):
+        """Still a real finding: a row Redis holds that the board does not, WITHIN the span the
+        board was asked about. The fixture puts it between the two board rows deliberately - the
+        old version of this test used a row outside the window and so was really asserting the
+        bug Copilot found."""
+        middle = ["R-MID", "2026-10-05T10:30:00Z", "grok", "ALL", "APPEND", "BCB|v=1|z",
+                  "OPEN", "Blackboard", "inside the window", ""]
         conn = FakeRedis()
-        rec.mirror(conn, [list(A), list(B)])
-        result = rec.compare(conn, [list(A)])
+        rec.mirror(conn, [list(A), list(B), list(middle)])
+        result = rec.compare(conn, [list(A), list(B)])
         self.assertEqual(rec.DIVERGE, result["verdict"])
         self.assertEqual(1, result["extra_in_redis"])
-        self.assertEqual(["R-2"], result["extra_ids"])
+        self.assertEqual(["R-MID"], result["extra_ids"])
+        self.assertEqual(0, result["outside_the_window"])
+
+    def test_narrowing_the_window_is_not_divergence(self):
+        """THE BLOCKER. bus:rowids holds every row ever mirrored; the board window holds only what
+        was asked for. Mirror two rows, then compare with --limit 1, and the older row used to be
+        reported as extra and the verdict as DIVERGE while the stores agreed exactly. A reconciler
+        that diverges because it narrowed its own question is one everybody learns to ignore."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), list(B)])
+        result = rec.compare(conn, [list(B)])                # the newest row only, as --limit 1 does
+        self.assertEqual(rec.AGREE, result["verdict"])
+        self.assertEqual(0, result["extra_in_redis"])
+        self.assertEqual(1, result["outside_the_window"])
+        self.assertEqual([], result["extra_ids"])
+
+    def test_advancing_since_is_not_divergence_either(self):
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), list(B)])
+        self.assertEqual(rec.AGREE, rec.compare(conn, [list(A)])["verdict"])
+
+    def test_a_stored_row_with_no_timestamp_cannot_be_placed_and_forces_unknown(self):
+        """A row Redis holds whose own stamp is empty cannot be put inside or outside the window.
+        Waving it through would be the same mistake in the other direction, so it is counted and
+        the otherwise-clean verdict degrades to UNKNOWN."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        conn.hset(rec.ROW_KEY % "R-NOSTAMP", mapping={"row_id": "R-NOSTAMP", "ts": ""})
+        conn.sadd(rec.INDEX_KEY, "R-NOSTAMP")
+        result = rec.compare(conn, [list(A)])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["unplaceable_in_redis"])
+
+    def test_an_id_less_row_beside_a_matching_one_is_unknown_not_agree(self):
+        """THE BLOCKER. Rows without an id were counted and skipped but never touched the verdict,
+        so one matching row beside one id-less row returned AGREE with a count of 1: a clean answer
+        about a window that was not wholly compared."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        headless = ["", "2026-10-05T10:15:00Z", "grok", "ALL", "APPEND", "BCB|v=1|n",
+                    "OPEN", "Blackboard", "no id at all", ""]
+        result = rec.compare(conn, [list(A), list(headless)])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["rows_without_an_id"])
+        self.assertEqual(1, result["agreed"], "the row that DID match is still reported as matching")
+
+    def test_a_real_difference_still_outranks_an_id_less_row(self):
+        """DIVERGE must win over the degrade-to-UNKNOWN: a found difference is knowledge, and
+        losing it behind 'I am not sure' would be the worse error."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        changed = list(A)
+        changed[8] = "a different gist"
+        headless = ["", "2026-10-05T10:15:00Z", "grok", "ALL", "APPEND", "BCB|v=1|n",
+                    "OPEN", "Blackboard", "no id at all", ""]
+        result = rec.compare(conn, [changed, headless])
+        self.assertEqual(rec.DIVERGE, result["verdict"])
+
+    def test_remirroring_a_shortened_row_clears_the_field_it_dropped(self):
+        """HSET merges. A row mirrored with an eleventh cell, then remirrored without it, used to
+        keep the stale col11 forever - so the comparison kept reporting a difference the backfill
+        had already repaired."""
+        wide = list(A) + ["an eleventh cell"]
+        conn = FakeRedis()
+        rec.mirror(conn, [wide])
+        self.assertEqual("an eleventh cell", conn.hgetall(rec.ROW_KEY % "R-1").get("col11"))
+        rec.mirror(conn, [list(A)])
+        stored = conn.hgetall(rec.ROW_KEY % "R-1")
+        self.assertNotIn("col11", stored, "the dropped cell survived the remirror")
+        self.assertEqual(rec.AGREE, rec.compare(conn, [list(A)])["verdict"])
+
+    def test_the_replace_is_one_transaction(self):
+        """The DELETE and the HSET must land together, or a concurrent reader sees an empty row."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), list(B)])
+        self.assertEqual(2, conn.transactions)
 
     def test_a_duplicate_row_id_is_its_own_finding(self):
         """An append-only board should never hold a Row_ID twice. That is a finding, not an error."""
@@ -250,7 +381,9 @@ class TheRunIsRecorded(unittest.TestCase):
         conn = FakeRedis()
         rec.run(conn, [list(A), list(B)], do_mirror=True, window="limit=2")
         entry = conn.streams[rec.COMPARE_KEY][0]
-        self.assertEqual(rec.AGREE, entry["verdict"])
+        # UNKNOWN, not AGREE. The store was empty before this run, and the recorded verdict is the
+        # one measured BEFORE the backfill - see TheBackfillCannotGradeItself below.
+        self.assertEqual(rec.UNKNOWN, entry["verdict"])
         self.assertEqual(2, entry["checked"])
         blob = repr(entry)
         self.assertNotIn("R-1", blob)
@@ -260,8 +393,56 @@ class TheRunIsRecorded(unittest.TestCase):
         """Losing the audit entry is not losing the answer."""
         conn = FakeRedis(fail_xadd=True)
         result = rec.run(conn, [list(A)], do_mirror=True)
-        self.assertEqual(rec.AGREE, result["verdict"])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
         self.assertFalse(result["recorded"])
+
+    def test_a_compare_only_run_over_a_seeded_store_records_agree(self):
+        """The positive control for the two above: when the stores really do agree and nothing was
+        written during the run, AGREE is recorded."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), list(B)])
+        rec.run(conn, [list(A), list(B)], do_mirror=False, window="limit=2")
+        self.assertEqual(rec.AGREE, conn.streams[rec.COMPARE_KEY][0]["verdict"])
+
+
+class TheBackfillCannotGradeItself(unittest.TestCase):
+    """THE BLOCKER. The job defaulted to mirroring and deploy.sh set RECONCILE_MIRROR=1, so run()
+    overwrote Redis and then compared against the rows it had just written. An empty or badly stale
+    store produced an AGREE record with no trace of what it had been - and a span of those records
+    cannot establish zero divergence, which is the whole gate."""
+
+    def test_a_mirroring_run_over_an_empty_store_reports_unknown_not_agree(self):
+        conn = FakeRedis()
+        result = rec.run(conn, [list(A), list(B)], do_mirror=True)
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual("pre_backfill", result["measured"])
+        self.assertEqual(2, result["mirrored"], "the backfill still happened")
+
+    def test_the_post_backfill_state_is_reported_beside_it_not_instead_of_it(self):
+        conn = FakeRedis()
+        result = rec.run(conn, [list(A), list(B)], do_mirror=True)
+        self.assertEqual(rec.AGREE, result["after_backfill"]["verdict"])
+        self.assertNotEqual(result["verdict"], result["after_backfill"]["verdict"])
+
+    def test_a_stale_row_is_measured_before_it_is_repaired(self):
+        """The case that matters most: Redis holds an out-of-date copy. The run must say DIVERGE and
+        then fix it, not fix it and say AGREE."""
+        conn = FakeRedis()
+        stale = list(A)
+        stale[8] = "what Redis used to think"
+        rec.mirror(conn, [stale])
+        result = rec.run(conn, [list(A)], do_mirror=True)
+        self.assertEqual(rec.DIVERGE, result["verdict"])
+        self.assertEqual(1, result["differing"])
+        self.assertEqual(rec.AGREE, result["after_backfill"]["verdict"])
+
+    def test_a_compare_only_run_says_so_and_has_no_second_verdict(self):
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        result = rec.run(conn, [list(A)], do_mirror=False)
+        self.assertEqual("compare_only", result["measured"])
+        self.assertNotIn("after_backfill", result)
+        self.assertEqual(rec.AGREE, result["verdict"])
 
 
 class TheCommandLine(unittest.TestCase):

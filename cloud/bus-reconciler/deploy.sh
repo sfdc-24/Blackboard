@@ -52,8 +52,15 @@ GCLOUD="${GCLOUD:-gcloud}"
 SECRETS=(BUS_URL BUS_SECRET REDIS_AUTH_STRING REDIS_CA_CERT)
 
 # The instance. Passed in rather than written here: this repository is PUBLIC and the private address
-# is topology. REDIS_HOST must be set in the environment running this script.
-REDIS_HOST="${REDIS_HOST:?set REDIS_HOST to the Memorystore private address; it is not committed here}"
+# is topology.
+#
+# REQUIRED ONLY WHERE IT IS USED. Copilot, PR 323: this expansion was `${REDIS_HOST:?...}` at the
+# top of the file, so it ran before the command dispatch and `deploy.sh off` exited unless the
+# address was supplied - even though disabling a job never needs it. The off-switch asking for
+# connection details before it will switch anything off is the worst possible place for a
+# prerequisite, and it blocked setup, build, run and readback for no reason either. The check moved
+# into deploy(), which is the only action that writes the address anywhere.
+REDIS_HOST="${REDIS_HOST:-}"
 REDIS_PORT="${REDIS_PORT:-6378}"
 # The server CA is mounted as a FILE from Secret Manager, because Memorystore's CA is not in the
 # image's system trust store and SERVER_AUTHENTICATION means the client must verify against it.
@@ -95,12 +102,13 @@ build() {
 }
 
 deploy() {
+  : "${REDIS_HOST:?set REDIS_HOST to the Memorystore private address; it is not committed here}"
   local verb=create
   "$GCLOUD" run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" >/dev/null 2>&1 && verb=update
   "$GCLOUD" run jobs "$verb" "$JOB" --project "$PROJECT" --region "$REGION" \
     --image "$IMAGE" --service-account "$SA" \
     --set-secrets "BUS_URL=BUS_URL:latest,BUS_SECRET=BUS_SECRET:latest,${CA_PATH}=REDIS_CA_CERT:latest,${AUTH_PATH}=REDIS_AUTH_STRING:latest" \
-    --set-env-vars "REDIS_DUAL_ENABLED=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},RECONCILE_WINDOW_MINUTES=${WINDOW_MINUTES},RECONCILE_MIRROR=1" \
+    --set-env-vars "REDIS_CONNECT=true,REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT},RECONCILE_WINDOW_MINUTES=${WINDOW_MINUTES},RECONCILE_MIRROR=0" \
     --network "$NETWORK" --subnet "$SUBNET" --vpc-egress "$EGRESS" \
     --max-retries 1 --task-timeout 10m --cpu 1 --memory 512Mi
   echo "job ${JOB} ${verb}d in ${REGION} with ${EGRESS} egress on ${NETWORK}/${SUBNET}"
@@ -117,11 +125,18 @@ readback() {
 }
 
 off() {
-  # The off-switch at the job level. redis_dual re-reads its settings on every call, so inside a run
-  # this is already honoured; this stops the next execution from connecting at all.
+  # The off-switch at the job level, and it needs NO connection configuration - which is the point
+  # of the finding above. redis_dual re-reads its settings on every call, so inside a running
+  # execution this is already honoured; this stops the next execution from connecting at all.
+  #
+  # BOTH switches, because there are two now. REDIS_DUAL_ENABLED alone stops the dual-run and
+  # leaves every diagnostic connecting, which is not what "off" says. REDIS_CONNECT=false is the
+  # one that closes the socket.
   "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
-    --update-env-vars "REDIS_DUAL_ENABLED=false"
-  echo "${JOB}: REDIS_DUAL_ENABLED=false. It will run and report UNKNOWN rather than connect."
+    --update-env-vars "REDIS_DUAL_ENABLED=false,REDIS_CONNECT=false"
+  echo "${JOB}: REDIS_DUAL_ENABLED=false and REDIS_CONNECT=false. It will run and report UNKNOWN"
+  echo "rather than connect. Note the FILE also wins: scripts/redis_dual.settings.json with"
+  echo "enabled=false cannot be overridden back on from the environment."
 }
 
 case "${1:-}" in

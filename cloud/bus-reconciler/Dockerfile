@@ -30,6 +30,11 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
 COPY scripts/append.py /app/append.py
+# append.py imports signature: a row must name the INSTANCE that wrote it and how it got here,
+# checked at the writer. WITHOUT THIS LINE THE IMAGE DIES ON IMPORT - the request worker's only
+# board-write path would fail to load, which is the merge-order hazard the guard's own commit
+# warned about, reappearing inside the container. The roster it reads is already copied below.
+COPY scripts/signature.py /app/signature.py
 COPY cloud/bus-reconciler/serve_requests.py /app/serve_requests.py
 # The roster: the file is the ORIGINAL, Redis gets a copy. Both travel so the seeder can verify
 # the copy against the original from inside the VPC, which is the only place either is reachable.

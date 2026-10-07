@@ -89,8 +89,23 @@ class Settings:
     Re-read on purpose. A settings object cached at import time is a switch you cannot flip without a
     redeploy, which is exactly what he said not to build."""
 
+    # TWO SWITCHES, BECAUSE ONE WAS DOING TWO JOBS.
+    #
+    # Copilot, PR 323: with REDIS_DUAL_ENABLED=true in the environment, a file saying
+    # enabled=false - and equally a malformed file, or no file at all - still left live() true. The
+    # environment merge defeated the file off-switch for both reads and writes. Correct, and worse
+    # than it reads: the deployed bus-requests job carries exactly that variable, so "set
+    # enabled=false and it stops immediately, no redeploy" was false for every job actually running.
+    #
+    # Fixing it exposed the real defect. `enabled` was answering two different questions:
+    #     "is the DUAL-RUN on?"       - shadow reads and write-through beside a production path
+    #     "may this process CONNECT?" - a deliberate probe, reconciler or request run
+    # The diagnostic jobs only ever wanted the second, so they asserted the first to get it, and
+    # that is precisely why turning the dual-run off could not turn them off either. They are two
+    # settings now: `enabled` governs the dual-run, `connect` governs opening a socket at all.
     DEFAULTS = {
         "enabled": False,              # the off-switch. OFF IS THE DEFAULT and stays off until he says.
+        "connect": False,              # may a deliberate job open a socket? Also off by default.
         "host": "",                    # empty means "nowhere to go": nothing is attempted
         "port": DEFAULT_PORT,
         "tls": True,                   # SERVER_AUTHENTICATION on his instance; never downgrade silently
@@ -98,17 +113,19 @@ class Settings:
         "shadow_reads": True,          # read Redis in the BACKGROUND and compare; never serve from it
         "write_through": True,         # mirror a write after the authoritative write succeeds
         "key_prefix": KEY_VERSION + "blackboard:",
-        "note": "Set enabled=false to stop the dual-run immediately. Read on every call, no redeploy.",
+        "note": "Set enabled=false to stop the dual-run and connect=false to stop every connection. "
+                "The FILE WINS: neither can be switched back on from the environment, and a missing "
+                "or malformed file reads as both off. Re-read on every call, no redeploy.",
     }
 
-    # The process environment wins over the file, the same contract as bus.load_env: a sandbox or a
-    # Cloud Run service can supply these without a credential or an address being copied into the
-    # checkout. THIS REPOSITORY IS PUBLIC, so the committed settings file is a TEMPLATE with an empty
-    # host. The instance's private address is infrastructure detail - low risk on its own, needless
-    # disclosure beside everything else this repo says about our topology - so it arrives here as
-    # REDIS_HOST and is not committed anywhere.
+    # Settings the environment may only turn DOWN, never up. Everything else - the address, the port,
+    # the CA path - the environment supplies freely, because THIS REPOSITORY IS PUBLIC and the
+    # instance's private address is not committed anywhere.
+    FILE_WINS = ("enabled", "connect")
+
     FROM_ENV = {
         "REDIS_DUAL_ENABLED": ("enabled", lambda v: v.strip().lower() in ("1", "true", "yes", "on")),
+        "REDIS_CONNECT": ("connect", lambda v: v.strip().lower() in ("1", "true", "yes", "on")),
         "REDIS_HOST": ("host", str.strip),
         "REDIS_PORT": ("port", lambda v: int(v.strip())),
         "REDIS_CA_CERT_PATH": ("ca_cert_path", str.strip),
@@ -117,19 +134,27 @@ class Settings:
     def __init__(self, data=None, path=None, environ=None):
         self.path = Path(path) if path else SETTINGS_PATH
         self._data = dict(self.DEFAULTS)
+        # Whether the file was READ, kept apart from what it said. A file that is missing or
+        # unparseable is not a file that said nothing: it is a file that cannot authorise anything,
+        # and it vetoes the environment exactly as an explicit false would.
+        self.file_ok = data is not None
         if data is not None:
             self._data.update(data)
         else:
-            self._data.update(self._from_disk())
+            on_disk = self._from_disk()
+            self.file_ok = on_disk is not None
+            self._data.update(on_disk or {})
         self._data.update(self._mounted())
         self._data.update(self._from_env(environ if environ is not None else os.environ))
 
-    def _from_disk(self) -> dict:
+    def _from_disk(self):
+        """What the file says, or None when there is no readable file. None and {} are different:
+        {} is a file that omitted a key, None is no authority at all."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {}                  # no settings file, or an unreadable one, means OFF
-        return raw if isinstance(raw, dict) else {}
+            return None                # no settings file, or an unreadable one: authorises nothing
+        return raw if isinstance(raw, dict) else None
 
     def _mounted(self) -> dict:
         """The Cloud Run mounts, used when nothing else named a path and the file is actually there.
@@ -141,17 +166,26 @@ class Settings:
 
     def _from_env(self, environ) -> dict:
         """Environment overrides. A value this cannot parse is IGNORED, which leaves the setting at
-        whatever the file said - and for `enabled` the file says false. A malformed override must
-        never fail open into a live connection."""
+        whatever the file said. A malformed override must never fail open into a live connection.
+
+        For the two switches in FILE_WINS the environment can only agree with the file or turn it
+        off - never on. That is the whole fix for the defeated off-switch: an operator editing the
+        file stops the dual-run even while every deployed job still carries REDIS_DUAL_ENABLED=true,
+        and no amount of environment can put it back."""
         found = {}
         for name, (key, cast) in self.FROM_ENV.items():
             raw = environ.get(name)
             if raw is None or raw == "":
                 continue
             try:
-                found[key] = cast(raw)
+                value = cast(raw)
             except (ValueError, TypeError):
                 continue
+            if key in self.FILE_WINS:
+                # A switch is on only when BOTH the file and the environment say so, and only when
+                # the file was readable at all. One veto is enough.
+                value = bool(value) and bool(self._data.get(key)) and self.file_ok
+            found[key] = value
         return found
 
     def __getattr__(self, name):
@@ -160,9 +194,19 @@ class Settings:
         except KeyError:
             raise AttributeError(name) from None
 
+    def _switch(self, name) -> bool:
+        """One switch, with the file's veto applied. A file that could not be read vetoes both."""
+        return self.file_ok and bool(self._data.get(name))
+
     def live(self) -> bool:
-        """Whether a connection may be attempted at all. Both switches, and somewhere to go."""
-        return bool(self._data.get("enabled")) and bool(str(self._data.get("host") or "").strip())
+        """Whether the DUAL-RUN is on: shadow reads and write-through beside a production path."""
+        return self._switch("enabled") and bool(str(self._data.get("host") or "").strip())
+
+    def connect_ok(self) -> bool:
+        """Whether a deliberate job - a probe, the reconciler, the request worker - may open a
+        socket. Separate from live() on purpose: those jobs are measurements, not a dual-run, and
+        conflating them is what let the dual-run's off-switch be bypassed by an env var."""
+        return self._switch("connect") and bool(str(self._data.get("host") or "").strip())
 
 
 def auth_string(project=PROJECT, secret=SECRET_NAME, runner=None, environ=None):
@@ -235,8 +279,11 @@ def client(settings, factory=None, precheck=True):
     The redis library is NOT a dependency of this repository and is not installed on this box. That is
     deliberate: an import at module scope would make every script that touches the bus fail to start
     on a machine that will never run the dual-run. It is imported here, inside the one function that
-    needs it, and its absence turns the dual-run off rather than breaking the caller."""
-    if not settings.live():
+    needs it, and its absence turns the dual-run off rather than breaking the caller.
+
+    GATED ON connect_ok(), NOT live(). A probe or a reconciler run is a measurement, not a dual-run,
+    and giving them the dual-run's switch to assert is what let an env var defeat its off-switch."""
+    if not settings.connect_ok():
         return None
     if factory is not None:
         return factory(settings)
@@ -293,17 +340,47 @@ class DualRun:
 
     `log` takes one string. `clock` is injectable so a test does not sleep."""
 
-    def __init__(self, settings=None, factory=None, log=None, clock=time.time):
+    # The most shadow reads allowed in flight at once. Copilot, PR 323: every enabled read appended
+    # a worker and only drain() ever removed one, so 20 reads left 20 dead Thread objects and slow
+    # reads left unbounded LIVE ones. A diagnostic that can exhaust the process it is observing is
+    # worse than no diagnostic - so admission is bounded and NON-BLOCKING: over the ceiling the
+    # shadow is skipped and counted, never queued, because the authoritative answer must not wait
+    # on a cache that is already struggling.
+    MAX_SHADOWS = 8
+
+    def __init__(self, settings=None, factory=None, log=None, clock=time.time, max_shadows=None):
         self._settings = settings
         self.factory = factory
-        self.log = log or (lambda line: None)
+        self._log = log or (lambda line: None)
         self.clock = clock
         self.counters = Counters()
         self.threads = []
+        self.max_shadows = self.MAX_SHADOWS if max_shadows is None else max_shadows
+        self._lock = threading.Lock()
+
+    def log(self, line):
+        """Diagnostics must never become the failure. Copilot, PR 323: a log callback raising
+        OSError after a committed mirror made write() raise, so a caller would retry a write that
+        had already landed - the diagnostic turning a success into a duplicate. Everything here is
+        observation, so a logger that throws is swallowed and counted."""
+        try:
+            self._log(line)
+        except Exception:
+            self.counters.bump("log_errors")
 
     def settings(self):
         """Fresh settings for THIS operation: the off-switch works mid-run, without a redeploy."""
         return self._settings if self._settings is not None else Settings()
+
+    def _admit(self, thread) -> bool:
+        """Reap finished workers and admit this one only if there is room. Both under one lock, so
+        two concurrent reads cannot each see room for the last slot."""
+        with self._lock:
+            self.threads = [t for t in self.threads if t.is_alive()]
+            if len(self.threads) >= self.max_shadows:
+                return False
+            self.threads.append(thread)
+            return True
 
     # --- reads ---------------------------------------------------------------------------
 
@@ -321,8 +398,19 @@ class DualRun:
             return answer
         thread = threading.Thread(target=self._shadow, args=(settings, key, answer, compare),
                                   name="redis-shadow", daemon=True)
-        self.threads.append(thread)
-        thread.start()
+        if not self._admit(thread):
+            self.counters.bump("shadow_shed")
+            return answer
+        try:
+            thread.start()
+        except (RuntimeError, OSError) as error:
+            # Out of threads. The authoritative answer is already in hand and is what the caller
+            # asked for; a failure to start an OBSERVER must not become the caller's failure.
+            with self._lock:
+                self.threads = [t for t in self.threads if t is not thread]
+            self.counters.bump("shadow_errors")
+            self.log("redis shadow could not start for %s: %s" % (key, type(error).__name__))
+            return answer
         if wait:
             thread.join(timeout=PROBE_SECONDS * 3)
         return answer
@@ -392,9 +480,12 @@ class DualRun:
 
     def drain(self, seconds=PROBE_SECONDS * 3):
         """Wait for outstanding shadow reads. For the VERIFY run and for tests, never on a hot path."""
-        for thread in list(self.threads):
+        with self._lock:
+            pending = list(self.threads)
+        for thread in pending:
             thread.join(timeout=seconds)
-        self.threads = [t for t in self.threads if t.is_alive()]
+        with self._lock:
+            self.threads = [t for t in self.threads if t.is_alive()]
         return self.counters.snapshot()
 
 
@@ -402,7 +493,8 @@ def status(settings=None) -> dict:
     """What is configured and what is reachable. Nothing secret: whether AUTH was FOUND, never its value."""
     settings = settings or Settings()
     live = settings.live()
-    found = bool(auth_string()) if live else None
+    may_connect = settings.connect_ok()
+    found = bool(auth_string()) if may_connect else None
     try:
         import redis                                    # noqa: F401
         library = True
@@ -411,14 +503,19 @@ def status(settings=None) -> dict:
     return {
         "settings_file": str(settings.path),
         "settings_file_present": settings.path.is_file(),
-        "enabled": bool(settings._data.get("enabled")),
+        # The raw value AND the effective one. A reader that sees only the raw value cannot tell a
+        # dual-run that is off from one the file has vetoed, and the difference is the whole fix.
+        "enabled_in_file": bool(settings._data.get("enabled")),
+        "settings_file_readable": settings.file_ok,
+        "dual_run_live": live,
+        "connect_permitted": may_connect,
         "host": settings.host or "(none)",
         "port": settings.port,
         "tls": bool(settings.tls),
         "ca_cert_configured": bool(settings.ca_cert_path),
         "redis_library_installed": library,
-        "would_attempt_connection": live,
-        "reachable": reachable(settings.host, settings.port) if live else None,
+        "would_attempt_connection": may_connect,
+        "reachable": reachable(settings.host, settings.port) if may_connect else None,
         "auth_string_found": found,
         "auth_source": ("file" if os.environ.get(AUTH_FILE_ENV) else "gcloud"),
         "shadow_reads": bool(settings.shadow_reads),
@@ -463,8 +560,10 @@ def selftest() -> int:
             self.set(key, value)
 
     lines = []
-    on = Settings({"enabled": True, "host": "10.0.0.1"})
-    off = Settings({"enabled": False, "host": "10.0.0.1"})
+    # BOTH switches on: client() gates on `connect`, DualRun on `enabled`. A fixture setting one
+    # of them would exercise a configuration no deployed job has.
+    on = Settings({"enabled": True, "connect": True, "host": "10.0.0.1"})
+    off = Settings({"enabled": False, "connect": False, "host": "10.0.0.1"})
 
     # 1. OFF attempts nothing.
     touched = []
@@ -494,7 +593,7 @@ def selftest() -> int:
     assert order == ["authoritative"] and fake.sets == [on.key_prefix + "k"], (order, fake.sets)
 
     # 5. The off-switch takes effect mid-run, with no restart.
-    flip = {"enabled": True, "host": "10.0.0.1"}
+    flip = {"enabled": True, "connect": True, "host": "10.0.0.1"}
     live = DualRun(factory=lambda s: fake, log=lines.append)
     live._settings = None
 

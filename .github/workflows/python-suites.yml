@@ -62,6 +62,8 @@ on:
       - "scripts/agent_roster.json"
       - "scripts/append.py"
       - "tests/test_signature.py"
+      - "scripts/roster_seed.py"
+      - "tests/test_roster_seed.py"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -183,6 +185,15 @@ on:
       - "scripts/agent_roster.json"
       - "scripts/append.py"
       - "tests/test_signature.py"
+      - "scripts/redis_dual.py"
+      - "scripts/redis_dual.settings.json"
+      - "tests/test_redis_dual.py"
+      - "scripts/bus_reconcile.py"
+      - "tests/test_bus_reconcile.py"
+      - "scripts/bus_request.py"
+      - "tests/test_bus_request.py"
+      - "scripts/roster_seed.py"
+      - "tests/test_roster_seed.py"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
       - "scripts/board_waker.py"
@@ -910,6 +921,21 @@ jobs:
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_dual -v
             sudo unshare -n -- "$python_bin" -B scripts/redis_dual.py selftest
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The roster seeder. Redis holds a COPY and the repository holds the original, so the two
+      # properties under test are convergence and honesty: a seed must be able to REMOVE what the
+      # file dropped - it could only ever add, so a renamed instance reported as drift forever -
+      # and verify() must be able to say no, which it could not when a missing instance hash was
+      # silently skipped and the family, alias and metadata hashes went uncompared.
+      - name: "roster seed: the copy converges on the file, and verify can say no (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_roster_seed.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_roster_seed -v
           else
             echo "not on this branch; skipping"
           fi

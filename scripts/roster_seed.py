@@ -135,53 +135,110 @@ def check(data) -> list:
     return problems
 
 
-def seed(conn, data) -> dict:
-    counts = {"instances": 0, "families": 0, "aliases": 0}
+def expected(data) -> dict:
+    """Exactly what a seed writes: {key: mapping} for every hash, plus the membership set.
+
+    One description, used by BOTH seed() and verify(). They used to describe the copy separately,
+    which is how verify() came to check the instance hashes and silently ignore the families, the
+    alias table and the seed metadata - so a half-written copy produced an empty drift list and the
+    CLI's "the copy matches the file"."""
+    hashes = {}
     for row in instances(data):
-        mapping = {f: ("true" if row.get(f) is True else "false" if row.get(f) is False
-                       else str(row.get(f, "")))
-                   for f in FIELDS}
-        conn.hset(AGENT_KEY % row["id"], mapping=mapping)
-        conn.sadd(ROSTER_SET, row["id"])
-        counts["instances"] += 1
+        hashes[AGENT_KEY % row["id"]] = {
+            f: ("true" if row.get(f) is True else "false" if row.get(f) is False
+                else str(row.get(f, ""))) for f in FIELDS}
     for family in data["families"]:
-        conn.hset(FAMILY_KEY % family["family"], mapping={
+        hashes[FAMILY_KEY % family["family"]] = {
             "name": family["name"], "role": family["lead_role"],
             "responsibility": family["responsibility"], "appointed": family.get("appointed", ""),
-            "instances": ",".join(i["id"] for i in family["instances"])})
-        counts["families"] += 1
+            "instances": ",".join(i["id"] for i in family["instances"])}
     table = aliases(data)
     if table:
-        conn.hset(CANON, mapping=table)
-        counts["aliases"] = len(table)
-    conn.hset(SEEDED, mapping={"at": data.get("updated", ""), "file_digest": digest(),
-                               "version": data.get("version", ""), "by": "roster_seed.py"})
+        hashes[CANON] = dict(table)
+    hashes[SEEDED] = {"at": data.get("updated", ""), "file_digest": digest(),
+                      "version": data.get("version", ""), "by": "roster_seed.py"}
+    return {"hashes": hashes, "members": {row["id"] for row in instances(data)}}
+
+
+def seed(conn, data) -> dict:
+    """Make the copy match the file. Adds, replaces AND removes.
+
+    THE SEED MUST CONVERGE. Copilot, PR 323: seeding only ever added, so an instance removed or
+    renamed in the file left its membership and its hash behind in Redis, every later verify
+    reported that id as drift, and the documented seeding operation could not bring the copy back
+    into agreement - the one thing a seeder exists to do. Each hash is REPLACED rather than merged,
+    for the same reason: a field dropped from the file would otherwise survive forever.
+
+    It removes only what IT manages - the ids in the roster set and the aliases in the canon hash.
+    An unrelated key under v1: is none of this function's business and is left alone."""
+    want = expected(data)
+    counts = {"instances": 0, "families": 0, "aliases": 0, "removed_instances": 0,
+              "removed_aliases": 0}
+
+    stale_ids = set(conn.smembers(ROSTER_SET) or set()) - want["members"]
+    for row_id in sorted(stale_ids):
+        conn.delete(AGENT_KEY % row_id)
+        conn.srem(ROSTER_SET, row_id)
+        counts["removed_instances"] += 1
+
+    stale_aliases = set(conn.hgetall(CANON) or {}) - set(want["hashes"].get(CANON, {}))
+    for alias in sorted(stale_aliases):
+        conn.hdel(CANON, alias)
+        counts["removed_aliases"] += 1
+
+    for key, mapping in want["hashes"].items():
+        conn.delete(key)                      # replace, never merge
+        conn.hset(key, mapping=mapping)
+        if key.startswith(redis_dual.KEY_VERSION + "agent:family:"):
+            counts["families"] += 1
+        elif key == CANON:
+            counts["aliases"] = len(mapping)
+        elif key != SEEDED:
+            counts["instances"] += 1
+    for row_id in sorted(want["members"]):
+        conn.sadd(ROSTER_SET, row_id)
     return counts
 
 
 def verify(conn, data) -> list:
     """Drift between the file and the copy. Reported, never corrected: a verify that fixes what it
-    finds is a seed wearing a read-only name."""
+    finds is a seed wearing a read-only name.
+
+    IT CHECKS EVERYTHING A SEED WRITES. Copilot, PR 323: a missing instance hash was silently
+    skipped, and the family hashes, the alias table and the seed metadata were never compared at
+    all - so an incomplete or corrupted copy produced an empty drift list and the CLI printed "the
+    copy matches the file". A verify that can only confirm is not a verify. It now walks expected()
+    - the same description seed() writes from - so the two cannot drift apart either."""
     drift = []
+    want = expected(data)
+
     stored_ids = set(conn.smembers(ROSTER_SET) or set())
-    file_ids = {row["id"] for row in instances(data)}
-    for extra in sorted(stored_ids - file_ids):
+    for extra in sorted(stored_ids - want["members"]):
         drift.append("in Redis and not in the file: %s" % extra)
-    for missing in sorted(file_ids - stored_ids):
+    for missing in sorted(want["members"] - stored_ids):
         drift.append("in the file and not in Redis: %s" % missing)
-    for row in instances(data):
-        stored = conn.hgetall(AGENT_KEY % row["id"]) or {}
+
+    for key, mapping in sorted(want["hashes"].items()):
+        stored = conn.hgetall(key) or {}
         if not stored:
+            # NOT skipped. An id in the membership set whose hash is absent is the exact shape of a
+            # half-written copy, and silence about it was what let that pass as agreement.
+            drift.append("missing from Redis entirely: %s" % key)
             continue
-        for f in FIELDS:
-            want = ("true" if row.get(f) is True else "false" if row.get(f) is False
-                    else str(row.get(f, "")))
-            if stored.get(f, "") != want:
-                drift.append("%s: field %s differs" % (row["id"], f))
-    seeded = conn.hgetall(SEEDED) or {}
-    if seeded.get("file_digest") and seeded["file_digest"] != digest():
-        drift.append("the file has changed since it was seeded (digest %s, now %s)"
-                     % (seeded["file_digest"], digest()))
+        if key == SEEDED:
+            # The metadata is compared on the one field that means anything: whether the copy was
+            # made from THIS file. Absent metadata is itself drift.
+            if not stored.get("file_digest"):
+                drift.append("%s: no file_digest, so the copy cannot be traced to a file" % key)
+            elif stored["file_digest"] != digest():
+                drift.append("the file has changed since it was seeded (digest %s, now %s)"
+                             % (stored["file_digest"], digest()))
+            continue
+        for name, value in sorted(mapping.items()):
+            if stored.get(name, "") != value:
+                drift.append("%s: field %s differs" % (key, name))
+        for name in sorted(set(stored) - set(mapping)):
+            drift.append("%s: field %s is in Redis and not in the file" % (key, name))
     return drift
 
 

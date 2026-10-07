@@ -24,7 +24,10 @@ WHAT IT READS FROM THE ENVIRONMENT
     REDIS_CA_CERT_PATH           the server CA; defaults to the mount above when the file is there
     REDIS_DUAL_ENABLED           the off-switch; this job sets it for itself and nothing else does
     RECONCILE_WINDOW_MINUTES     how far back to compare (default 90)
-    RECONCILE_MIRROR             "1" to backfill the window before comparing (default on for this job)
+    RECONCILE_MIRROR             "1" to backfill the window as well as compare it. DEFAULT OFF.
+                                 A measurement run does not write. When it is on, the verdict
+                                 recorded is the one from BEFORE the backfill, with the state
+                                 after it reported separately - a backfill cannot grade itself.
 
 The Redis AUTH string is NOT here. redis_dual reads it from Secret Manager at connect time, so it
 never becomes an environment variable anyone can list.
@@ -62,7 +65,10 @@ for _name, _default in (("REDIS_CA_CERT_PATH", MOUNTED_CA), ("REDIS_AUTH_FILE", 
 # measured nothing - a window too narrow to contain rows makes the job report UNKNOWN for a
 # reason that has nothing to do with the two stores agreeing.
 WINDOW_MINUTES = int(os.environ.get("RECONCILE_WINDOW_MINUTES", "1440"))
-MIRROR = os.environ.get("RECONCILE_MIRROR", "1").strip().lower() in ("1", "true", "yes", "on")
+# DEFAULT OFF. Copilot, PR 323: this defaulted to on and deploy.sh set it explicitly, so every
+# scheduled execution repaired the store and then compared against what it had just written. The
+# span of AGREE records that produced could not establish zero divergence, which is the gate.
+MIRROR = os.environ.get("RECONCILE_MIRROR", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def since_iso(minutes: int) -> str:
@@ -108,10 +114,18 @@ def main() -> int:
 
     # Counts and column NAMES only. Contents never reach a log line: the board carries his words and
     # other people's, and this job's output is readable by anyone with log access.
-    log.info("%s: checked=%d agreed=%d missing=%d differing=%d extra=%d duplicates=%d no_id=%d",
-             verdict, result["checked"], result["agreed"], result["missing_from_redis"],
-             result["differing"], result["extra_in_redis"], result["duplicate_row_ids"],
-             result["rows_without_an_id"])
+    log.info("%s (%s): checked=%d agreed=%d missing=%d differing=%d extra=%d out_of_window=%d "
+             "unplaceable=%d duplicates=%d no_id=%d",
+             verdict, result.get("measured", "?"), result["checked"], result["agreed"],
+             result["missing_from_redis"], result["differing"], result["extra_in_redis"],
+             result.get("outside_the_window", 0), result.get("unplaceable_in_redis", 0),
+             result["duplicate_row_ids"], result["rows_without_an_id"])
+    if result.get("after_backfill"):
+        # Said plainly, because the two numbers are easy to confuse and only one of them is the
+        # measurement: the verdict above is the state this run FOUND, this line is what it LEFT.
+        log.info("after the backfill: %s. The verdict above is the pre-repair measurement and is "
+                 "the one recorded; this line is the state this run left behind.",
+                 json.dumps(result["after_backfill"], sort_keys=True))
     if result.get("note"):
         log.warning("%s", result["note"])
     if result.get("columns_that_differ"):

@@ -103,6 +103,40 @@ def parse_request(row):
     }
 
 
+def safe(value) -> str:
+    """A string fit to publish in a BCB payload: no pipe, no newline, no control character.
+
+    SANITISE AT THE BOUNDARY RATHER THAN ASSERT. Copilot, PR 323: a request claiming to be from
+    'bad|sender' put a pipe into the refusal text, row_for() hit its assert, and the AssertionError
+    took the whole worker down before any later request ran - so one malformed row could park every
+    well-formed one behind it indefinitely. An assertion is the right tool for an invariant the code
+    controls; the sender tag is attacker-supplied data, and data gets cleaned, not asserted."""
+    text = "" if value is None else str(value)
+    for bad in ("|", "\r", "\n", "\t"):
+        text = text.replace(bad, " ")
+    return "".join(ch for ch in text if ch >= " ").strip()
+
+
+def receipts(rows) -> dict:
+    """req_id -> the Row_IDs of receipt rows already on the board for it.
+
+    WHY THIS IS READ AT ALL. Copilot, PR 323: if a receipt lands and the execution stops before its
+    result does, the request stays pending - correctly, it was never answered - but the next pass
+    appends the SAME receipt Row_ID again. append.py sees the duplicate and exits 2, and that
+    propagates out of serve_requests before the probe can run. So the request could never be
+    finished by a retry: it was wedged by its own half-done attempt."""
+    found = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) <= PAYLOAD:
+            continue
+        if str(row[ACTION] or "").strip().upper() != RECEIPT_ACTION:
+            continue
+        got = field(str(row[PAYLOAD] or ""), "answers")
+        if got:
+            found.setdefault(got, []).append(str(row[ROW_ID] or "").strip())
+    return found
+
+
 def answered(rows) -> set:
     """Request ids that already have a RESULT row. Idempotency, read off the board itself.
 
@@ -128,7 +162,11 @@ def refusals(req, now, already) -> list:
     if req["claimed_sender"] not in SENDERS:
         # Named honestly: the sender is a CLAIM. This refuses an unrecognised claim, which is worth
         # doing and is not the same as verifying anybody.
-        out.append("the claimed sender %r is not one this worker answers" % req["claimed_sender"])
+        #
+        # THE TAG ITSELF IS NOT QUOTED HERE. It is attacker-supplied, it reaches a payload with no
+        # escaping, and a refusal that echoes it hands the sender a way to shape our rows. The
+        # unrecognised value stays in the run's diagnostics, where nothing publishes it.
+        out.append("the claimed sender is not one this worker answers")
     if req["action"] not in ACTIONS:
         out.append("the action %r is not allowlisted; the only one is %s"
                    % (req["action"], ", ".join(ACTIONS)))
@@ -171,22 +209,34 @@ def synthetic_probe(conn, req_id) -> dict:
             "latency_ms": int((time.time() - started) * 1000)}
 
 
+def reply_to(req) -> str:
+    """Where a reply is addressed. An ALLOWLISTED sender or "ALL" - never the raw claim.
+
+    The claim is data. Putting it in Target_Surface made an unrecognised, pipe-bearing tag the
+    address of our own row, which is both a malformed row and a sender choosing where our answer
+    goes."""
+    claimed = (req.get("claimed_sender") or "").strip().lower()
+    return claimed if claimed in SENDERS else "ALL"
+
+
 def row_for(kind, req, text, gist) -> dict:
-    """A board row spec for scripts/append.py. No value here may contain a pipe: the payload has no
-    escaping, and a literal pipe would split the row."""
-    assert "|" not in text and "|" not in gist, "a BCB value cannot contain a pipe"
-    row_id = "%s-%s-%s" % (WORKER_TAG.upper(), kind.split("_")[-1], req["req_id"])
+    """A board row spec for scripts/append.py.
+
+    Every published value goes through safe(): the payload has no escaping, so a literal pipe would
+    split the row, and the values here include an attacker-supplied request id."""
+    req_id = safe(req["req_id"])
+    row_id = safe("%s-%s-%s" % (WORKER_TAG.upper(), kind.split("_")[-1], req_id))[:120]
+    target = reply_to(req)
     return {
-        "row_id": row_id[:120],
+        "row_id": row_id,
         "source_tag": WORKER_TAG,
-        "target_surface": req["claimed_sender"] or "ALL",
+        "target_surface": target,
         "action_type": kind,
         "category": "OPEN",
         "project_tag": "Blackboard",
-        "gist": gist,
+        "gist": safe(gist),
         "payload": "BCB*v=1*id=%s*phase=%s*from=%s*to=%s*answers=%s*evidence=MEASURED*text=%s".replace(
-            "*", "|") % (row_id[:120], kind, WORKER_TAG, req["claimed_sender"] or "ALL",
-                         req["req_id"], text),
+            "*", "|") % (row_id, kind, WORKER_TAG, target, req_id, safe(text)),
     }
 
 
@@ -197,32 +247,68 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
     contract and the only thing that closes an ambiguous append on this gateway."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     already = answered(rows)
+    seen_receipts = receipts(rows)
     requests = [r for r in (parse_request(row) for row in rows) if r]
     # Oldest first, so a flood cannot starve the request that has waited longest.
     requests.sort(key=lambda r: r["at"] or now)
 
-    out = {"seen": len(requests), "answered": [], "refused": [], "capped": 0, "errors": []}
+    # ONE BUDGET FOR EVERY BOARD RESPONSE, refusals included.
+    #
+    # Copilot, PR 323: refusals were appended before the cap was consulted and never counted toward
+    # it, so a flood of DISTINCT valid request ids carrying a rejected action produced one board
+    # write and one read-back each - max_per_run=3 and all of them answered. The cap exists because
+    # a forged flood costs him money, and a cap that only counts the expensive path is not a cap.
+    budget = max(0, int(max_per_run))
+    out = {"seen": len(requests), "answered": [], "refused": [], "capped": 0, "errors": [],
+           "receipts_reused": []}
     for req in requests:
         why = refusals(req, now, already)
         if why:
-            # A refusal is only WRITTEN BACK when the id is usable and it is not a duplicate -
-            # otherwise a malformed flood becomes a flood of refusal rows, which is the same problem
-            # with our name on it.
-            out["refused"].append({"req_id": req["req_id"], "why": why})
-            if append and _REQ_ID.match(req["req_id"] or "") and req["req_id"] not in already:
+            out["refused"].append({"req_id": req["req_id"], "why": why,
+                                   # The unrecognised tag is recorded HERE, where nothing publishes it.
+                                   "claimed_sender": req["claimed_sender"]})
+            # A refusal is only WRITTEN BACK when the id is usable, it is not a duplicate, the
+            # claimed sender is one we answer at all, and there is budget left. An unrecognised
+            # sender gets diagnostics and no row: answering it would let anyone who can append make
+            # us write, which is the flood with our name on it.
+            publishable = (append and _REQ_ID.match(req["req_id"] or "")
+                           and req["req_id"] not in already
+                           and req["claimed_sender"] in SENDERS)
+            if publishable and budget <= 0:
+                out["capped"] += 1
+                continue
+            if publishable:
+                budget -= 1
                 already.add(req["req_id"])
                 append(row_for(RESULT_ACTION, req, "REFUSED. " + "; ".join(why),
                                "Refused: " + why[0][:80]))
             continue
-        if len(out["answered"]) >= max_per_run:
+        if budget <= 0:
             out["capped"] += 1
             continue
+        budget -= 1
 
         if append:
-            append(row_for(RECEIPT_ACTION, req,
-                           "Received and owned by %s at %s. Running the bounded synthetic probe; the "
-                           "result follows under the same request id." % (WORKER_TAG, stamp(now)),
-                           "Receipt for " + req["req_id"][:60]))
+            # REUSE AN EXISTING RECEIPT RATHER THAN REPLAY IT. A receipt that landed while the
+            # result did not leaves the request pending and its receipt Row_ID taken; appending it
+            # again makes append.py exit 2 on the duplicate, which killed the run before the probe.
+            mine = seen_receipts.get(req["req_id"], [])
+            expected = row_for(RECEIPT_ACTION, req, "", "")["row_id"]
+            if len(mine) > 1 or (mine and mine[0] != expected):
+                # Ambiguous or conflicting: FAIL CLOSED. Two receipts for one request, or one under
+                # an id this worker would not have written, is not something to reason past.
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["%d receipt row(s) already exist for this request "
+                                               "and at least one is not the one this worker would "
+                                               "write; refusing to guess" % len(mine)]})
+                continue
+            if mine:
+                out["receipts_reused"].append(req["req_id"])
+            else:
+                append(row_for(RECEIPT_ACTION, req,
+                               "Received and owned by %s at %s. Running the bounded synthetic probe; "
+                               "the result follows under the same request id." % (WORKER_TAG, stamp(now)),
+                               "Receipt for " + req["req_id"][:60]))
         receipt = synthetic_probe(conn, req["req_id"])
         text = ("%s. write=%s read_back=%s ttl=%s cleanup=%s latency_ms=%d. The key, its namespace, "
                 "its nonce and its TTL were all chosen by the server; the request selected none of "

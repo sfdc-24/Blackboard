@@ -33,6 +33,7 @@
 !/scripts/bus_reconcile.py
 !/scripts/bus_request.py
 !/scripts/roster_seed.py
+!/scripts/signature.py
 !/scripts/agent_roster.json
 !/scripts/append.py
 !/scripts/board_say.py

@@ -108,17 +108,44 @@ def mirror(conn, rows) -> dict:
     """Write the window into Redis, keyed by Row_ID. Idempotent: the same row mirrors once.
 
     Keyed by Row_ID and not by arrival, so a flapping read that returns the same rows twice - which
-    this gateway does - writes them once instead of inventing duplicates."""
+    this gateway does - writes them once instead of inventing duplicates.
+
+    REPLACED, NOT MERGED. Copilot, PR 323: HSET merges fields, so mirroring a row that had a
+    non-empty col11 and then mirroring its shortened version left the old col11 behind, and every
+    later comparison kept reporting a difference that the backfill had already fixed. A stale field
+    nobody can clear is a permanent false DIVERGE. The DELETE and the HSET go in one transaction so
+    a reader never sees the gap between them."""
     wrote, skipped = 0, 0
     for cells in rows:
         row_id = canonical(cells[0] if cells else "")
         if not row_id:
             skipped += 1                       # a row with no id cannot be compared or mirrored
             continue
-        conn.hset(ROW_KEY % row_id, mapping=as_mapping(cells))
-        conn.sadd(INDEX_KEY, row_id)
+        key = ROW_KEY % row_id
+        mapping = as_mapping(cells)
+        pipe = conn.pipeline(transaction=True) if hasattr(conn, "pipeline") else None
+        if pipe is None:                       # a stub without pipelines, in tests
+            conn.delete(key)
+            conn.hset(key, mapping=mapping)
+            conn.sadd(INDEX_KEY, row_id)
+        else:
+            pipe.delete(key)
+            pipe.hset(key, mapping=mapping)
+            pipe.sadd(INDEX_KEY, row_id)
+            pipe.execute()
         wrote += 1
     return {"mirrored": wrote, "unmirrorable": skipped}
+
+
+def window_bounds(board) -> tuple:
+    """The oldest and newest timestamp in the board window, as strings, or ("", "").
+
+    ISO-8601 UTC stamps sort correctly as text, which is why no parsing happens here: a parser is
+    one more thing that can disagree with the gateway about a format, and the only question asked of
+    these values is whether one lies between two others. A row whose stamp is empty contributes no
+    bound - it is already counted as unplaceable where it matters."""
+    stamps = sorted(s for s in (canonical(m.get("ts")) for m in board.values()) if s)
+    return (stamps[0], stamps[-1]) if stamps else ("", "")
 
 
 def compare(conn, rows) -> dict:
@@ -141,8 +168,10 @@ def compare(conn, rows) -> dict:
         # An empty window is UNKNOWN and needs no connection to say so. The first execution of this
         # job spent a connection reaching SMEMBERS to learn that the board had been quiet.
         return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
-                "differing": 0, "extra_in_redis": 0, "duplicate_row_ids": len(duplicates),
-                "rows_without_an_id": no_id, "columns_that_differ": {},
+                "differing": 0, "extra_in_redis": 0, "outside_the_window": 0,
+                "unplaceable_in_redis": 0, "duplicate_row_ids": len(duplicates),
+                "rows_without_an_id": no_id, "window_oldest": "", "window_newest": "",
+                "columns_that_differ": {},
                 "missing_ids": [], "differing_ids": [], "extra_ids": [], "duplicate_ids": [],
                 "note": "no board rows in the window: nothing to compare, which is not agreement"}
 
@@ -159,7 +188,29 @@ def compare(conn, rows) -> dict:
             for name in changed:
                 columns[name] = columns.get(name, 0) + 1
 
-    extra = sorted(set(conn.smembers(INDEX_KEY) or set()) - set(board))
+    # EXTRA MEANS EXTRA INSIDE THE WINDOW, NOT EVERYTHING OLDER THAN IT.
+    #
+    # Copilot, PR 323: bus:rowids holds every row ever mirrored, while `board` holds only the rows
+    # the window asked for. So after mirroring two rows, a later `--limit 1` comparison called the
+    # older row "extra" and returned DIVERGE while the two stores agreed perfectly. Advancing
+    # `--since` did the same. A reconciler that reports divergence for narrowing its own question
+    # teaches everyone to ignore it - which is the failure mode this file was written against.
+    #
+    # The fence is the window the BOARD actually returned: its oldest and newest timestamps. A
+    # stored id outside that span was never in scope. An id whose own timestamp cannot be placed is
+    # not waved through either - it is counted as unplaceable and makes the verdict UNKNOWN, because
+    # "I could not tell" is not "they agree".
+    oldest, newest = window_bounds(board)
+    stored_ids = set(conn.smembers(INDEX_KEY) or set())
+    extra, out_of_window, unplaceable = [], 0, 0
+    for row_id in sorted(stored_ids - set(board)):
+        stamp = canonical((conn.hgetall(ROW_KEY % row_id) or {}).get("ts"))
+        if not stamp:
+            unplaceable += 1
+        elif oldest and newest and oldest <= stamp <= newest:
+            extra.append(row_id)
+        else:
+            out_of_window += 1
 
     checked = len(board)
     agreed = checked - len(missing) - len(differing)
@@ -171,6 +222,14 @@ def compare(conn, rows) -> dict:
         verdict = UNKNOWN
     elif missing or differing or extra or duplicates:
         verdict = DIVERGE
+    elif no_id or unplaceable or not (oldest and newest):
+        # AGREEMENT ON A WINDOW THAT WAS NOT WHOLLY COMPARED IS NOT AGREEMENT.
+        #
+        # Copilot, PR 323: rows without an id were counted and skipped but did not touch the
+        # verdict, so one matching row beside one id-less row returned AGREE with a count of 1 - a
+        # clean answer about a window nobody fully examined. DIVERGE still wins when a real
+        # difference was found; it is only the otherwise-clean case that degrades to UNKNOWN.
+        verdict = UNKNOWN
     else:
         verdict = AGREE
     return {
@@ -180,8 +239,12 @@ def compare(conn, rows) -> dict:
         "missing_from_redis": len(missing),
         "differing": len(differing),
         "extra_in_redis": len(extra),
+        "outside_the_window": out_of_window,
+        "unplaceable_in_redis": unplaceable,
         "duplicate_row_ids": len(duplicates),
         "rows_without_an_id": no_id,
+        "window_oldest": oldest,
+        "window_newest": newest,
         "columns_that_differ": columns,
         "missing_ids": missing[:20],
         "differing_ids": differing[:20],
@@ -212,12 +275,36 @@ def run(conn, rows, do_mirror=False, window="") -> dict:
     in a scheduled job's log is a failure nobody reads; UNKNOWN with one line of reason is one
     somebody acts on - and UNKNOWN is the honest verdict either way, because nothing was compared.
     The reason names the EXCEPTION TYPE and never its message: a client's error text can quote what
-    it was sent."""
+    it was sent.
+
+    THE PRE-REPAIR VERDICT IS RECORDED SEPARATELY, AND IT IS THE MEASUREMENT.
+
+    Copilot, PR 323: the job defaulted to mirroring and deploy.sh set RECONCILE_MIRROR=1, so run()
+    overwrote Redis and then compared - against the rows it had just written. An empty or badly
+    stale store therefore produced an AGREE record with no trace of what it had been. Those records
+    cannot establish zero divergence over a span, which is the entire gate Codex set, because a
+    backfill followed by a comparison always agrees.
+
+    So a mirroring run now compares FIRST, keeps that verdict as `verdict` - the honest one - and
+    reports the post-backfill state beside it as `after_backfill`. A run with do_mirror=False is a
+    pure measurement and has no second comparison to make. `measured` says which kind of run it was,
+    so nobody downstream has to infer it.
+    """
     result = {}
     try:
         if do_mirror:
-            result.update(mirror(conn, rows))
-        result.update(compare(conn, rows))
+            before = compare(conn, rows)             # what the stores looked like BEFORE any repair
+            backfill = mirror(conn, rows)
+            after = compare(conn, rows)
+            result.update(before)
+            result.update(backfill)
+            result["measured"] = "pre_backfill"
+            result["after_backfill"] = {k: after[k] for k in
+                                        ("verdict", "checked", "agreed", "missing_from_redis",
+                                         "differing", "extra_in_redis") if k in after}
+        else:
+            result.update(compare(conn, rows))
+            result["measured"] = "compare_only"
     except Exception as error:
         return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
                 "differing": 0, "extra_in_redis": 0, "duplicate_row_ids": 0,

@@ -1,5 +1,6 @@
 {
   "enabled": false,
+  "connect": true,
   "host": "",
   "port": 6378,
   "tls": true,
@@ -7,5 +8,5 @@
   "shadow_reads": true,
   "write_through": true,
   "key_prefix": "v1:blackboard:",
-  "note": "OFF. Set enabled=true and host=<us-central1 Memorystore private IP> to start the dual-run. Re-read on every call, so setting enabled=false stops it immediately with no redeploy and no restart. key_prefix carries a VERSION: change it only to migrate, and then run v1 and v2 side by side rather than in place."
+  "note": "DUAL-RUN OFF. enabled=false means no shadow reads and no write-through beside any production path, and THE FILE WINS: REDIS_DUAL_ENABLED=true in a job's environment cannot switch it back on. connect=true permits a deliberate job - the probe, the reconciler, the request worker, the keyspace viewer - to open a socket; set it false to stop every connection at once. A missing or malformed file reads as BOTH off. Re-read on every call, so either change takes effect with no redeploy and no restart. host stays empty because this repository is PUBLIC; it arrives as REDIS_HOST."
 }
