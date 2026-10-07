@@ -144,6 +144,8 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "scripts/private_review.py"
+      - "tests/test_private_review.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -269,6 +271,8 @@ on:
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
+      - "scripts/private_review.py"
+      - "tests/test_private_review.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -767,6 +771,19 @@ jobs:
           else
             echo "not on this branch; skipping"
           fi
+
+      # One owner-approved private document pair to Gemini (scripts/private_review.py).
+      # It is not wired, not in any image and imported by nothing, so this suite is
+      # the whole of what exists. Counting fakes prove the zero-call controls (a
+      # forged manifest, a mismatched head, length or digest, a clipped artifact, a
+      # repeated id), and the empty namespace proves the suite makes no call itself.
+      - name: "private review adapter: verified first, asked once, kept private (no network)"
+        run: |
+          set -euo pipefail
+          test -f scripts/private_review.py
+          test -f tests/test_private_review.py
+          python_bin="$(command -v python3)"
+          sudo unshare -n -- "$python_bin" tests/test_private_review.py
 
       # FastAPI and its in-process TestClient are needed only by the controller
       # suite. Installation happens before the network namespace is removed;
