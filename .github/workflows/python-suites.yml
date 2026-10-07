@@ -141,6 +141,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/loop_guard.py"
+      - "tests/test_loop_guard.py"
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
@@ -266,6 +268,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/loop_guard.py"
+      - "tests/test_loop_guard.py"
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
@@ -339,6 +343,7 @@ jobs:
                    tests/test_sf360.py \
                    tests/test_org_publish.py \
                    tests/test_agent_waker.py \
+                   tests/test_loop_guard.py \
                    tests/test_board_governor.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
@@ -764,6 +769,19 @@ jobs:
           if [ -f tests/test_agent_waker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_agent_waker.py
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # L-115's mechanism (scripts/loop_guard.py): the burst and chain caps, the write-then-decide
+      # order two racing posts depend on, and the ledger that is quarantined rather than ignored.
+      # Offline by construction: it touches one file under SFDC24_STATE_DIR and nothing else.
+      - name: loop guard caps, order and ledger (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_loop_guard.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_loop_guard -v
           else
             echo "not on this branch; skipping"
           fi
