@@ -30,6 +30,7 @@
 /scripts/*
 !/scripts/bus.py
 !/scripts/redis_dual.py
+!/scripts/redis_dual.settings.json
 !/scripts/bus_reconcile.py
 !/scripts/bus_request.py
 !/scripts/roster_seed.py

@@ -20,6 +20,7 @@ forgetting one fails here in milliseconds instead of in us-central1.
 No network. No redis library needed: redis_dual imports it lazily, which is what makes this
 possible at all.
 """
+import fnmatch
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,68 @@ def copied_paths():
             if len(parts) >= 3:
                 out.append(parts[1])
     return out
+
+
+def in_build_context(path, rules):
+    """Whether .gcloudignore lets `path` reach Cloud Build. Last matching rule wins, as git does.
+
+    THE LINK BETWEEN TWO DESCRIPTIONS OF THE IMAGE. Adding the settings file to the Dockerfile was
+    not enough: .gcloudignore is an ALLOWLIST, the file was not in it, and the build died with
+    "file not found in build context" after a green test run and a merge. The Dockerfile says what
+    the image needs; .gcloudignore says what the build may see; nothing compared them.
+
+    A directory rule hides everything under it, so each ancestor is tested too - that is exactly how
+    `/scripts/*` re-excludes a file that `!/scripts` had admitted.
+    """
+    candidates = [path]
+    parts = path.split("/")
+    for i in range(1, len(parts)):
+        candidates.append("/".join(parts[:i]))
+
+    verdict = True                       # nothing matched means nothing excluded it
+    for negated, pattern in rules:
+        for candidate in candidates:
+            if fnmatch.fnmatch(candidate, pattern) or fnmatch.fnmatch(candidate + "/", pattern):
+                verdict = negated
+                break
+    return verdict
+
+
+def gcloudignore_rules(text):
+    """(negated, pattern) in file order, leading slashes and comments stripped."""
+    rules = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        rules.append((negated, line.lstrip("/").rstrip("/")))
+    return rules
+
+
+class TheBuildContext(unittest.TestCase):
+    """Every file the Dockerfile COPYs must be a file the build is allowed to see."""
+
+    def test_every_copy_source_reaches_the_build(self):
+        rules = gcloudignore_rules((ROOT / ".gcloudignore").read_text(encoding="utf-8"))
+        for rel in copied_paths():
+            with self.subTest(path=rel):
+                self.assertTrue(in_build_context(rel, rules),
+                                "%s is COPYed by the Dockerfile but excluded by .gcloudignore, so "
+                                "the build will fail with 'file not found in build context'" % rel)
+
+    def test_the_allowlist_still_refuses_the_env_file(self):
+        """The positive control for the matcher. If this ever passes a .env, the test above is
+        meaningless and the allowlist has stopped being one."""
+        rules = gcloudignore_rules((ROOT / ".gcloudignore").read_text(encoding="utf-8"))
+        for secret in (".env", "scripts/.env", "some/path/.env"):
+            self.assertFalse(in_build_context(secret, rules), secret)
+
+    def test_every_copy_source_exists_in_the_repository(self):
+        for rel in copied_paths():
+            self.assertTrue((ROOT / rel).is_file(), "%s is COPYed and does not exist" % rel)
 
 
 class TheImageLayout(unittest.TestCase):
