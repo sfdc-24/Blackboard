@@ -242,5 +242,45 @@ class ARelayCannotNameThreeAuthors(unittest.TestCase):
         self.assertTrue(any("both cannot be on the record" in p for p in problems))
 
 
+class ARowCannotStateAFieldTwice(unittest.TestCase):
+    """Codex, reviewing PR 336: a payload repeating claimed_author with claude-mobile AND
+    claude-code-cli passed check() and append.py's conflict check both - a row naming two authors,
+    through the one guard written to stop exactly that.
+
+    Two causes, both worth keeping a test on: field() returns the FIRST match, so a second value was
+    invisible here; and append.py's AUTHORITY_KEYS list predated the relay fields, so the newest
+    authority keys on the fleet were the only ones a duplicate could slip past."""
+
+    def setUp(self):
+        self.known = signature.roster()
+        if not self.known["instances"]:
+            raise AssertionError("no roster, so this tested nothing")
+
+    def test_a_repeated_claimed_author_with_two_values_is_refused(self):
+        problems = signature.check(
+            "aya",
+            "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile"
+            "|claimed_author=claude-code-cli|to=ALL", self.known)
+        self.assertTrue(any("stated 2 times" in p for p in problems), problems)
+
+    def test_a_repeated_from_is_refused(self):
+        problems = signature.check(
+            "claude-code-cli", "BCB|v=1|id=X|from=claude-code-cli|from=pi1-cli|to=ALL", self.known)
+        self.assertTrue(any("stated 2 times" in p for p in problems), problems)
+
+    def test_the_same_value_twice_is_not_a_contradiction(self):
+        """Redundant, not ambiguous. Refusing it would fail rows that say one thing clearly."""
+        self.assertEqual([], signature.check(
+            "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile"
+                   "|claimed_author=claude-mobile|to=ALL", self.known))
+
+    def test_the_relay_fields_are_authority_keys_in_append(self):
+        """The other half of the fix. append.py refuses a duplicated authority key outright, and
+        these three were not on its list."""
+        import append
+        for key in ("relayer", "claimed_author", "via"):
+            self.assertIn(key, append.AUTHORITY_KEYS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

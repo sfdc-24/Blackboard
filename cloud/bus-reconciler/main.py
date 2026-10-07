@@ -124,6 +124,12 @@ def main() -> int:
         log.info("after the backfill: %s. The verdict above is the pre-repair measurement and is "
                  "the one recorded; this line is the state this run left behind.",
                  json.dumps(result["after_backfill"], sort_keys=True))
+    if verdict == bus_reconcile.UNKNOWN:
+        log.warning("why UNKNOWN: no_id=%d unplaceable=%d boundary_ties=%d bad_board_ts=%d "
+                    "edge=%s trusted=%s", result.get("rows_without_an_id", 0),
+                    result.get("unplaceable_in_redis", 0), result.get("boundary_ties", 0),
+                    result.get("board_rows_with_unreadable_ts", 0),
+                    result.get("window_edge") or "(none)", result.get("window_edge_trusted"))
     if result.get("note"):
         log.warning("%s", result["note"])
     if result.get("columns_that_differ"):
@@ -132,8 +138,17 @@ def main() -> int:
         log.warning("the run could not be written to %s; the verdict above still stands",
                     bus_reconcile.COMPARE_KEY)
 
+    if verdict == bus_reconcile.NO_SAMPLE:
+        # NOT a failure and NOT a doubt: the board was quiet in this window. Exiting 0 so a
+        # scheduler does not retry a quiet board, while the recorded verdict keeps it out of any
+        # zero-divergence span. Codex asked for these two to stop being one verdict, and the
+        # reason is exactly this line - they want opposite handling.
+        log.info("NO_SAMPLE: no board rows in the window. Nothing was compared, which is not "
+                 "agreement - and not something to retry either.")
+        return 0
     if verdict == bus_reconcile.UNKNOWN:
-        log.error("UNKNOWN: nothing in Redis to compare against. Not zero divergence.")
+        log.error("UNKNOWN: the window could not be fully compared. Not zero divergence. See the "
+                  "caveat counts above for which part could not be placed.")
         return 1
     if verdict == bus_reconcile.DIVERGE:
         # Deliberately 0: the measurement worked. Retrying a divergence changes nothing, and a job

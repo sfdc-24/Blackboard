@@ -24,8 +24,11 @@ COPY scripts/redis_dual.py /app/redis_dual.py
 # nobody noticed: a missing settings file read as {} and REDIS_DUAL_ENABLED in the environment
 # turned the dual-run on anyway. Now that an unreadable file vetoes both switches - which is the
 # fix to the off-switch - its absence stops the job dead, correctly. It ships enabled=false and
-# connect=true, holds no address and no credential, and is re-read on every call, so editing it
-# stops the dual-run with no redeploy.
+# connect=true, holds no address and no credential, and is re-read on every call.
+# AND NOTE WHICH COPY THAT IS. Because this line BAKES the file in, editing the repository copy does
+# NOT change this job - a claim I wrote here while correcting the same claim elsewhere, which Codex
+# caught. To operate the switches without a rebuild, mount a copy and set REDIS_DUAL_SETTINGS; see
+# cloud/bus-reconciler/REQUESTS.md.
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
 COPY cloud/bus-reconciler/main.py /app/main.py

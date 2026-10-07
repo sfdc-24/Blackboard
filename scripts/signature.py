@@ -62,9 +62,30 @@ def roster(path=None) -> dict:
 
 
 def field(payload, key):
-    """The value of one BCB key, or None. BCB-1 has no escaping, so a value ends at the next pipe."""
+    """The value of one BCB key, or None. BCB-1 has no escaping, so a value ends at the next pipe.
+
+    THE FIRST OCCURRENCE, which is why values() exists beside it: a reader taking the first value
+    and a reader taking the last disagree about a payload that states a key twice, and that
+    disagreement is the whole attack. Use values() wherever the answer must be unambiguous."""
     m = re.search(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload), re.I)
     return m.group(1).strip() if m else None
+
+
+def values(payload, key) -> list:
+    """Every DISTINCT value a key is given. More than one means the row says two things.
+
+    Codex, reviewing PR 336: a payload repeating claimed_author with claude-mobile and
+    claude-code-cli passed check() and append.py's conflict check both - a row naming two authors,
+    waved through by the guard written to stop exactly that. field() returns the first match, so a
+    second value was simply invisible here."""
+    found = re.findall(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload), re.I)
+    seen, out = set(), []
+    for raw in found:
+        value = raw.strip().lower()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 def check(source_tag, payload, known=None) -> list:
@@ -78,6 +99,15 @@ def check(source_tag, payload, known=None) -> list:
                 "this row's attribution was verified. This is not approval."]
 
     problems = []
+    # STATED TWICE WITH TWO ANSWERS IS A REFUSAL, before anything else is checked. Which of the two
+    # a reader believes depends only on whether it scans forwards or backwards, and no amount of
+    # care downstream can recover an intent the row did not express.
+    for key in ("from", "relayer", "claimed_author", "via"):
+        many = values(payload, key)
+        if len(many) > 1:
+            problems.append("%s is stated %d times with different values (%s). A row that names "
+                            "two answers for one field names neither."
+                            % (key, len(many), ", ".join(repr(v) for v in many)))
     src = (source_tag or "").strip().lower()
     relayer = (field(payload, "relayer") or "").lower()
     author = (field(payload, "claimed_author") or "").lower()

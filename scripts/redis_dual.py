@@ -13,8 +13,15 @@ WHAT "NON-DISRUPTIVE" IS BUILT TO MEAN HERE, because it is easy to say and easy 
   2. Nothing is attempted while it is off, and OFF IS THE DEFAULT. Disabled means no import of the
      client library, no socket, no DNS, no secret read. A feature that connects in order to discover
      it is disabled is not off.
-  3. The off-switch is a settings FILE, re-read on every call, so turning it off is one edit and takes
-     effect on the next operation. No redeploy, no restart, no process to find and kill.
+  3. The off-switch is a settings FILE, re-read on every call, so turning it off is one edit and
+     takes effect on the next operation IN WHATEVER PROCESS READS THAT FILE. No restart, no
+     process to find and kill.
+     BOUNDED, because the unbounded version of this sentence was wrong and shipped: a deployed
+     Cloud Run job reads the copy BAKED INTO ITS IMAGE, so editing the repository file changes
+     nothing there without a rebuild. Mount a copy and point REDIS_DUAL_SETTINGS at it to make the
+     file operable on a job, or use the job's environment (REDIS_CONNECT=false) for the next
+     execution. Neither stops an execution already connected. See Settings and
+     cloud/bus-reconciler/REQUESTS.md.
   4. A mirror failure is never the caller's problem. The write to Redis happens after the
      authoritative write has succeeded, and anything it raises is swallowed into a counter.
 
@@ -153,7 +160,8 @@ class Settings:
         "key_prefix": KEY_VERSION + "blackboard:",
         "note": "Set enabled=false to stop the dual-run and connect=false to stop every connection. "
                 "The FILE WINS: neither can be switched back on from the environment, and a missing "
-                "or malformed file reads as both off. Re-read on every call, no redeploy.",
+                "or malformed file reads as both off. Re-read on every call - in whatever process "
+                "reads THIS file; a deployed job reads the copy in its image.",
     }
 
     # Settings the environment may only turn DOWN, never up. Everything else - the address, the port,
@@ -407,7 +415,10 @@ class DualRun:
             self.counters.bump("log_errors")
 
     def settings(self):
-        """Fresh settings for THIS operation: the off-switch works mid-run, without a redeploy."""
+        """Fresh settings for THIS operation, so the off-switch takes effect mid-run.
+
+        "Without a redeploy" belongs to the process reading the file, not to a deployed job whose
+        copy is in its image. The Settings docstring has the full table."""
         return self._settings if self._settings is not None else Settings()
 
     def _admit(self, thread) -> bool:
