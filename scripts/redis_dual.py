@@ -110,8 +110,22 @@ CONNECT_SECONDS = float(os.environ.get("REDIS_CONNECT_SECONDS", "10"))
 class Settings:
     """The dual-run's switches, re-read from disk on every call.
 
-    Re-read on purpose. A settings object cached at import time is a switch you cannot flip without a
-    redeploy, which is exactly what he said not to build."""
+    Re-read on purpose. A settings object cached at import time is a switch you cannot flip without
+    a redeploy, which is exactly what he said not to build.
+
+    BUT RE-READING IS NOT THE SAME AS BEING OPERABLE, and I claimed the stronger thing. Codex,
+    reviewing 314bead: the Dockerfile bakes this file into the image, so for a deployed Cloud Run
+    job "edit the file, no redeploy" was false - the copy being re-read is the one inside the
+    image. The veto itself held; the operational promise did not.
+
+    What is actually true, stated so nobody relies on the wrong one:
+      a checkout        editing the file takes effect on the next call. No restart.
+      a Cloud Run job   the image's copy is read. Point REDIS_DUAL_SETTINGS at a mounted file to
+                        make it operable without a rebuild; otherwise the switch is the job's
+                        environment (REDIS_CONNECT=false), which applies to the NEXT execution.
+      either            nothing here stops an execution that is already connected. The bound on
+                        that is the task timeout and the probe's own 10-second TTL, not this file.
+    """
 
     # TWO SWITCHES, BECAUSE ONE WAS DOING TWO JOBS.
     #
@@ -643,9 +657,14 @@ def selftest() -> int:
     live.read("k", lambda: "x", wait=True)
     assert live.counters.snapshot()["skipped_off"] == before + 1, "the off-switch did not take effect"
 
+    # "works without a restart" was the overclaim Codex caught, and a selftest is the worst place
+    # to leave one: it is the line somebody quotes. Bounded to what this actually proves - the
+    # switch takes effect inside THIS process, mid-run, because the settings are re-read on every
+    # call. Whether an operator can reach that file on a deployed job is a separate question, and
+    # the Settings docstring answers it.
     print("SELFTEST OK: 5 properties - off attempts nothing; the authoritative answer always wins; a "
-          "mirror failure never reaches the caller; the authoritative write runs first; the off-switch "
-          "works without a restart.")
+          "mirror failure never reaches the caller; the authoritative write runs first; and the "
+          "off-switch takes effect mid-run IN THIS PROCESS, with no restart.")
     return 0
 
 

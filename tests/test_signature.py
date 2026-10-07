@@ -186,5 +186,61 @@ class RosterIsUsable(unittest.TestCase):
             self.assertTrue(fam["instances"], "family %s has no instances" % fam["family"])
 
 
+class ARelayCannotNameThreeAuthors(unittest.TestCase):
+    """Codex, reviewing 314bead: Source_Tag=aya, relayer=aya, claimed_author=claude-mobile and
+    from=claude-code-cli passed with NO problems - three different authors in one row, waved through
+    by the rule that exists to remove exactly that ambiguity.
+
+    The cause was narrow and worth naming: the DIRECT branch compared from= against Source_Tag, and
+    the relay branch compared nothing at all. So the field a reader is most likely to trust went
+    unchecked precisely where it is most likely to lie."""
+
+    def setUp(self):
+        self.known = signature.roster()
+        if not self.known["instances"]:
+            raise AssertionError("no roster, so this tested nothing")
+
+    def test_a_relay_whose_from_contradicts_its_author_is_refused(self):
+        problems = signature.check(
+            "aya",
+            "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile|from=claude-code-cli|to=ALL",
+            self.known)
+        self.assertTrue(problems)
+        self.assertIn("may only restate its author", " ".join(problems))
+
+    def test_a_relay_whose_from_names_the_relayer_is_refused(self):
+        """Not allowed either: the relayer is already in relayer= and in Source_Tag, so letting
+        from= name it too gives a reader two plausible authors and nothing to choose between."""
+        problems = signature.check(
+            "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile|from=aya|to=ALL",
+            self.known)
+        self.assertTrue(problems)
+
+    def test_a_relay_may_restate_its_author_in_from(self):
+        """Allowed, because it adds no second answer: from= says what claimed_author says."""
+        self.assertEqual([], signature.check(
+            "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile|from=claude-mobile|to=ALL",
+            self.known))
+
+    def test_a_relay_with_no_from_is_still_fine(self):
+        """The shape Aya actually writes. The fix must not punish the agent that got there first."""
+        self.assertEqual([], signature.check(
+            "aya", "BCB|v=1|id=CM-1|relayer=aya|claimed_author=claude-mobile|to=ALL"
+                   "|relay_only=true|source_claims=unverified",
+            self.known))
+
+    def test_via_cannot_name_a_different_carrier(self):
+        problems = signature.check(
+            "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile|via=grok|to=ALL",
+            self.known)
+        self.assertTrue(any("two different carriers" in p for p in problems))
+
+    def test_via_direct_on_a_relay_is_refused(self):
+        problems = signature.check(
+            "aya", "BCB|v=1|id=X|relayer=aya|claimed_author=claude-mobile|via=direct|to=ALL",
+            self.known)
+        self.assertTrue(any("both cannot be on the record" in p for p in problems))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

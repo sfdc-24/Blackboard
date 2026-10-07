@@ -137,15 +137,46 @@ def mirror(conn, rows) -> dict:
     return {"mirrored": wrote, "unmirrorable": skipped}
 
 
-def window_bounds(board) -> tuple:
-    """The oldest and newest timestamp in the board window, as strings, or ("", "").
+def read_ts(cell):
+    """An aware datetime from a board timestamp, or None when the cell is not one.
 
-    ISO-8601 UTC stamps sort correctly as text, which is why no parsing happens here: a parser is
-    one more thing that can disagree with the gateway about a format, and the only question asked of
-    these values is whether one lies between two others. A row whose stamp is empty contributes no
-    bound - it is already counted as unplaceable where it matters."""
-    stamps = sorted(s for s in (canonical(m.get("ts")) for m in board.values()) if s)
-    return (stamps[0], stamps[-1]) if stamps else ("", "")
+    PARSED, NOT COMPARED AS TEXT. The first version of this fence said ISO-8601 stamps "sort
+    correctly as text, which is why no parsing happens here". They do not, and Codex reproduced it
+    on its first pass:
+
+        "2026-10-05T10:00:00.500Z" < "2026-10-05T10:00:00Z"   is True
+
+    because "." sorts below "Z". A row stamped mid-second therefore fell OUTSIDE a window that
+    plainly contains it, and the comparison returned AGREE where the answer was DIVERGE. Not a
+    corner case either: scripts/append.py stamps microseconds, so most rows this fleet writes look
+    like 03:32:22.588753Z. The reasoning in that docstring WAS the defect - avoiding a parser so as
+    not to disagree with the gateway produced a comparison that disagreed with arithmetic."""
+    text = canonical(cell)
+    if len(text) < 19 or text[4:5] != "-":
+        return None
+    try:
+        value = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
+
+
+def window_bounds(board) -> tuple:
+    """(oldest, newest, unreadable): two datetimes and a count, or (None, None, n).
+
+    `unreadable` counts board rows whose own stamp would not parse. Those do more than fail to
+    contribute a bound - they mean the window's edges are not fully known, so the caller degrades
+    its verdict rather than fencing against a boundary it cannot trust."""
+    stamps, bad = [], 0
+    for mapped in board.values():
+        when = read_ts(mapped.get("ts"))
+        if when is None:
+            bad += 1
+        else:
+            stamps.append(when)
+    if not stamps:
+        return (None, None, bad)
+    return (min(stamps), max(stamps), bad)
 
 
 def compare(conn, rows) -> dict:
@@ -169,7 +200,8 @@ def compare(conn, rows) -> dict:
         # job spent a connection reaching SMEMBERS to learn that the board had been quiet.
         return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
                 "differing": 0, "extra_in_redis": 0, "outside_the_window": 0,
-                "unplaceable_in_redis": 0, "duplicate_row_ids": len(duplicates),
+                "unplaceable_in_redis": 0, "boundary_ties": 0,
+                "board_rows_with_unreadable_ts": 0, "duplicate_row_ids": len(duplicates),
                 "rows_without_an_id": no_id, "window_oldest": "", "window_newest": "",
                 "columns_that_differ": {},
                 "missing_ids": [], "differing_ids": [], "extra_ids": [], "duplicate_ids": [],
@@ -196,18 +228,30 @@ def compare(conn, rows) -> dict:
     # `--since` did the same. A reconciler that reports divergence for narrowing its own question
     # teaches everyone to ignore it - which is the failure mode this file was written against.
     #
-    # The fence is the window the BOARD actually returned: its oldest and newest timestamps. A
-    # stored id outside that span was never in scope. An id whose own timestamp cannot be placed is
-    # not waved through either - it is counted as unplaceable and makes the verdict UNKNOWN, because
-    # "I could not tell" is not "they agree".
-    oldest, newest = window_bounds(board)
+    # The fence is the window the BOARD actually returned: its oldest and newest timestamps,
+    # PARSED - see read_ts for why comparing them as text produced a false AGREE. A stored id
+    # outside that span was never in scope. An id whose own timestamp cannot be placed is not waved
+    # through either: "I could not tell" is not "they agree".
+    #
+    # AND A TIE AT THE EDGE IS AMBIGUOUS, NOT EXTRA. Codex, reviewing 314bead: with `--limit 1` a
+    # healthy older row sharing the selected row's timestamp was reported as extra and the verdict
+    # as DIVERGE. It is neither. `limit` selects the n most recent ROWS, so when several share the
+    # boundary instant the gateway's choice among them is arbitrary and this comparison cannot know
+    # which it meant. Counted and degraded to UNKNOWN rather than guessed in either direction.
+    oldest, newest, board_unreadable = window_bounds(board)
     stored_ids = set(conn.smembers(INDEX_KEY) or set())
-    extra, out_of_window, unplaceable = [], 0, 0
+    extra, out_of_window, unplaceable, boundary_ties = [], 0, 0, 0
     for row_id in sorted(stored_ids - set(board)):
-        stamp = canonical((conn.hgetall(ROW_KEY % row_id) or {}).get("ts"))
-        if not stamp:
+        when = read_ts((conn.hgetall(ROW_KEY % row_id) or {}).get("ts"))
+        if when is None:
+            # Empty OR malformed. The old code only caught empty, so "not-a-timestamp" compared as
+            # text, fell outside the window and produced a clean AGREE.
             unplaceable += 1
-        elif oldest and newest and oldest <= stamp <= newest:
+        elif oldest is None or newest is None:
+            unplaceable += 1
+        elif when == oldest or when == newest:
+            boundary_ties += 1
+        elif oldest < when < newest:
             extra.append(row_id)
         else:
             out_of_window += 1
@@ -222,13 +266,18 @@ def compare(conn, rows) -> dict:
         verdict = UNKNOWN
     elif missing or differing or extra or duplicates:
         verdict = DIVERGE
-    elif no_id or unplaceable or not (oldest and newest):
+    elif (no_id or unplaceable or boundary_ties or board_unreadable
+          or oldest is None or newest is None):
         # AGREEMENT ON A WINDOW THAT WAS NOT WHOLLY COMPARED IS NOT AGREEMENT.
         #
         # Copilot, PR 323: rows without an id were counted and skipped but did not touch the
         # verdict, so one matching row beside one id-less row returned AGREE with a count of 1 - a
         # clean answer about a window nobody fully examined. DIVERGE still wins when a real
         # difference was found; it is only the otherwise-clean case that degrades to UNKNOWN.
+        #
+        # Codex added two more ways to be unsure, both of which used to read as AGREE: a stored row
+        # whose stamp is malformed rather than empty, and a board row whose own stamp will not
+        # parse - which leaves the window's own edges unknown.
         verdict = UNKNOWN
     else:
         verdict = AGREE
@@ -241,10 +290,12 @@ def compare(conn, rows) -> dict:
         "extra_in_redis": len(extra),
         "outside_the_window": out_of_window,
         "unplaceable_in_redis": unplaceable,
+        "boundary_ties": boundary_ties,
+        "board_rows_with_unreadable_ts": board_unreadable,
         "duplicate_row_ids": len(duplicates),
         "rows_without_an_id": no_id,
-        "window_oldest": oldest,
-        "window_newest": newest,
+        "window_oldest": oldest.isoformat() if oldest else "",
+        "window_newest": newest.isoformat() if newest else "",
         "columns_that_differ": columns,
         "missing_ids": missing[:20],
         "differing_ids": differing[:20],
@@ -254,18 +305,43 @@ def compare(conn, rows) -> dict:
 
 
 def record(conn, result, window) -> None:
-    """Append the run to bus:compare. Counts and the verdict; no ids, no columns, no contents."""
-    conn.xadd(COMPARE_KEY, {
+    """Append the run to bus:compare. Counts and the verdict; no ids, no columns, no contents.
+
+    IT CARRIES ITS OWN PROVENANCE. Codex, reviewing 314bead: run() returned `measured` and
+    `after_backfill`, and the DURABLE entry carried neither - so a gate reading this stream could
+    not tell a compare-only measurement from a run that had repaired the store first. Codex's
+    answer to the question was explicit: for a zero-divergence span it wants compare-only runs. It
+    cannot have them unless the stream says which these were.
+
+    `measured` and the caveat counts are therefore part of the entry, not just the return value. A
+    verdict whose provenance lives only in a log line the gate does not read is a verdict the gate
+    has to take on trust."""
+    entry = {
         "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "verdict": result["verdict"],
+        # compare_only or pre_backfill. A gate selecting a span filters on this.
+        "measured": result.get("measured", "unknown"),
         "checked": result["checked"],
         "agreed": result["agreed"],
         "missing": result["missing_from_redis"],
         "differing": result["differing"],
         "extra": result["extra_in_redis"],
         "duplicates": result["duplicate_row_ids"],
+        # Why a verdict might be UNKNOWN, so a reader can tell "nothing to compare" from "could not
+        # place a row" without going back to the logs.
+        "no_id": result.get("rows_without_an_id", 0),
+        "unplaceable": result.get("unplaceable_in_redis", 0),
+        "boundary_ties": result.get("boundary_ties", 0),
+        "bad_board_ts": result.get("board_rows_with_unreadable_ts", 0),
         "window": window,
-    })
+    }
+    after = result.get("after_backfill") or {}
+    if after:
+        # Named so it can never be mistaken for the run's own verdict: this is the state the run
+        # LEFT, and the gate must not count it as the state it FOUND.
+        entry["after_backfill_verdict"] = after.get("verdict", "")
+        entry["after_backfill_agreed"] = after.get("agreed", "")
+    conn.xadd(COMPARE_KEY, entry)
 
 
 def run(conn, rows, do_mirror=False, window="") -> dict:
@@ -308,7 +384,9 @@ def run(conn, rows, do_mirror=False, window="") -> dict:
     except Exception as error:
         return {"verdict": UNKNOWN, "checked": 0, "agreed": 0, "missing_from_redis": 0,
                 "differing": 0, "extra_in_redis": 0, "duplicate_row_ids": 0,
-                "rows_without_an_id": 0, "columns_that_differ": {}, "missing_ids": [],
+                "rows_without_an_id": 0, "boundary_ties": 0,
+                "board_rows_with_unreadable_ts": 0, "outside_the_window": 0,
+                "unplaceable_in_redis": 0, "columns_that_differ": {}, "missing_ids": [],
                 "differing_ids": [], "extra_ids": [], "duplicate_ids": [], "recorded": False,
                 "note": "the store could not be used (%s): nothing was compared, which is not "
                         "agreement" % type(error).__name__}

@@ -135,8 +135,9 @@ off() {
   "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "REDIS_DUAL_ENABLED=false,REDIS_CONNECT=false"
   echo "${JOB}: REDIS_DUAL_ENABLED=false and REDIS_CONNECT=false. It will run and report UNKNOWN"
-  echo "rather than connect. Note the FILE also wins: scripts/redis_dual.settings.json with"
-  echo "enabled=false cannot be overridden back on from the environment."
+  echo "rather than connect. Two bounds on that sentence, both from Codex's review: this applies"
+  echo "to the NEXT execution and does not stop one already connected, and the settings file is"
+  echo "BAKED INTO THE IMAGE - editing the repository copy changes nothing without a rebuild."
 }
 
 case "${1:-}" in

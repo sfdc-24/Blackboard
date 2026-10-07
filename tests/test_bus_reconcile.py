@@ -475,5 +475,97 @@ class ItHoldsNoCursor(unittest.TestCase):
             self.assertNotIn("%s =" % word, source)
 
 
+class WhatCodexFoundAtThisHead(unittest.TestCase):
+    """Codex's post-merge review of 314bead. Each of these returned the WRONG verdict before.
+
+    Worth keeping together: all four are the same mistake in different clothes - a comparison that
+    answered confidently about something it had not actually established."""
+
+    def test_a_fractional_second_stamp_is_inside_the_window(self):
+        """THE P1, and it was live: scripts/append.py stamps microseconds, so most rows this fleet
+        writes look like 03:32:22.588753Z. Compared as TEXT, "...00.500Z" sorts BELOW "...00Z"
+        because "." is below "Z" - so a row stamped mid-second fell outside a window containing it
+        and the comparison returned AGREE."""
+        self.assertLess("2026-10-05T10:00:00.500Z", "2026-10-05T10:00:00Z",
+                        "if this ever fails, text ordering was fine and this test is pointless")
+        mid = ["R-FRAC", "2026-10-05T10:00:00.500Z", "grok", "ALL", "APPEND", "BCB|v=1|z",
+               "OPEN", "Blackboard", "mid-second", ""]
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), list(B), mid])
+        result = rec.compare(conn, [list(A), list(B)])
+        self.assertEqual(rec.DIVERGE, result["verdict"])
+        self.assertEqual(["R-FRAC"], result["extra_ids"])
+        self.assertEqual(0, result["outside_the_window"])
+
+    def test_a_malformed_stored_stamp_is_unplaceable_not_outside(self):
+        """The old check only caught an EMPTY stamp, so "not-a-timestamp" compared as text, landed
+        outside the window and produced a clean AGREE about a row nobody could place."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        conn.hset(rec.ROW_KEY % "R-JUNK", mapping={"row_id": "R-JUNK", "ts": "not-a-timestamp"})
+        conn.sadd(rec.INDEX_KEY, "R-JUNK")
+        result = rec.compare(conn, [list(A)])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["unplaceable_in_redis"])
+        self.assertEqual(0, result["outside_the_window"])
+
+    def test_a_tie_on_the_window_boundary_is_ambiguous_not_extra(self):
+        """With --limit 1, a healthy older row sharing the selected row's timestamp was called extra
+        and the verdict DIVERGE. It is neither: `limit` selects the n most recent ROWS, so when
+        several share the boundary instant the gateway's choice among them is arbitrary and this
+        comparison cannot know which it meant."""
+        twin = ["R-TWIN", "2026-10-05T11:00:00Z", "grok", "ALL", "APPEND", "BCB|v=1|t",
+                "OPEN", "Blackboard", "same instant", ""]
+        conn = FakeRedis()
+        rec.mirror(conn, [list(B), twin])
+        result = rec.compare(conn, [list(B)])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["boundary_ties"])
+        self.assertEqual([], result["extra_ids"])
+
+    def test_an_unreadable_board_stamp_leaves_the_window_edges_unknown(self):
+        """A board row whose own stamp will not parse means the fence itself is not fully known, so
+        agreement cannot be claimed even when every compared row matches."""
+        headless_ts = ["R-NOTS", "whenever", "grok", "ALL", "APPEND", "BCB|v=1|n",
+                       "OPEN", "Blackboard", "no usable stamp", ""]
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A), headless_ts])
+        result = rec.compare(conn, [list(A), headless_ts])
+        self.assertEqual(rec.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["board_rows_with_unreadable_ts"])
+
+    def test_the_durable_entry_says_which_kind_of_run_it_was(self):
+        """THE GATE'S OWN REQUIREMENT. run() returned `measured` and `after_backfill` and the stream
+        entry carried neither, so a gate reading bus:compare could not exclude backfill runs from a
+        zero-divergence span. Codex asked for compare-only runs; it cannot have them unless the
+        durable record says which these were."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        rec.run(conn, [list(A)], do_mirror=False, window="limit=1")
+        entry = conn.streams[rec.COMPARE_KEY][0]
+        self.assertEqual("compare_only", entry["measured"])
+        self.assertNotIn("after_backfill_verdict", entry)
+
+    def test_a_backfill_run_is_labelled_and_carries_both_verdicts(self):
+        conn = FakeRedis()
+        rec.run(conn, [list(A), list(B)], do_mirror=True, window="limit=2")
+        entry = conn.streams[rec.COMPARE_KEY][0]
+        self.assertEqual("pre_backfill", entry["measured"])
+        self.assertEqual(rec.UNKNOWN, entry["verdict"], "the store was empty before this run")
+        self.assertEqual(rec.AGREE, entry["after_backfill_verdict"])
+
+    def test_the_caveat_counts_reach_the_stream(self):
+        """So a reader can tell "nothing to compare" from "could not place a row" without going
+        back to a log line the gate does not read."""
+        conn = FakeRedis()
+        rec.mirror(conn, [list(A)])
+        conn.hset(rec.ROW_KEY % "R-JUNK", mapping={"row_id": "R-JUNK", "ts": "nope"})
+        conn.sadd(rec.INDEX_KEY, "R-JUNK")
+        rec.run(conn, [list(A)], do_mirror=False)
+        entry = conn.streams[rec.COMPARE_KEY][0]
+        self.assertEqual(rec.UNKNOWN, entry["verdict"])
+        self.assertEqual(1, entry["unplaceable"])
+
+
 if __name__ == "__main__":
     unittest.main()

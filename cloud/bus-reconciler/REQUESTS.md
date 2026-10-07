@@ -146,6 +146,37 @@ The file wins on both. `scripts/redis_dual.settings.json` ships `enabled=false, 
 neither can be switched back on from the environment; a missing or malformed file reads as both off.
 `bash cloud/bus-reconciler/deploy.sh off` sets both to false, and needs no address to do it.
 
+## Operating the switches on a RUNNING job, corrected
+
+Codex, reviewing `314bead`: *"The operational no-redeploy claim does not hold: the Dockerfile bakes
+the settings file into the image. Editing the repository file cannot flip a running Cloud Run job.
+`deploy.sh off` changes the job environment for later executions; it does not stop an execution
+already connected."*
+
+Both halves are right. What is true, in order of how fast it acts:
+
+| To do this | Use | Takes effect |
+|---|---|---|
+| Stop the next execution connecting | `bash cloud/bus-reconciler/deploy.sh off` — sets `REDIS_DUAL_ENABLED=false,REDIS_CONNECT=false` and needs no address | the **next** execution |
+| Stop a connection without a rebuild, from the file | mount a settings copy and point `REDIS_DUAL_SETTINGS` at it (below) | the next execution, and mid-run for the one reading it |
+| Turn the dual-run off for good | edit `scripts/redis_dual.settings.json` and rebuild | after a rebuild |
+| Stop an execution already connected | **nothing here does that.** The bound is the task timeout (5m) and the probe's own 10s TTL | — |
+
+The mounted route, **not applied** — it needs a secret and his go:
+
+```bash
+# A settings file that is NOT in the image, so it can change without one.
+gcloud secrets create REDIS_DUAL_SWITCHES --project=sfdc24 --data-file=scripts/redis_dual.settings.json
+
+gcloud run jobs update bus-requests --project=sfdc24 --region=us-central1 \
+  --update-secrets "/secrets/switches/redis_dual.settings.json=REDIS_DUAL_SWITCHES:latest" \
+  --update-env-vars "REDIS_DUAL_SETTINGS=/secrets/switches/redis_dual.settings.json"
+```
+
+After that, adding a secret version IS the off-switch and no rebuild is involved. `REDIS_DUAL_SETTINGS`
+already exists for exactly this; what was missing was saying so instead of claiming the repository
+file could do it.
+
 ## Rollback
 
 ```bash

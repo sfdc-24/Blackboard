@@ -121,6 +121,27 @@ def check(source_tag, payload, known=None) -> list:
         if relayer and author and relayer == author:
             problems.append("relayer and claimed_author are both %r, so nothing was relayed. Drop "
                             "both and write via=direct." % relayer)
+        # THE RELAY BRANCH NEVER LOOKED AT from=, AND THAT WAS THE HOLE.
+        #
+        # Codex, reviewing 314bead: Source_Tag=aya, relayer=aya, claimed_author=claude-mobile and
+        # from=claude-code-cli passed with NO problems - three different authors in one row, waved
+        # through by the rule that exists to remove exactly that ambiguity. The direct branch
+        # compared from= against Source_Tag; this branch compared nothing, so the one field a
+        # reader is most likely to trust was unchecked precisely where it is most likely to lie.
+        #
+        # On a relay, from= may only restate the author. Not the relayer: the relayer is already in
+        # relayer= and in Source_Tag, and letting from= name it too gives a reader two plausible
+        # authors with nothing to choose between them.
+        if frm and author and frm != author:
+            problems.append("from=%r on a relayed row whose claimed_author is %r. A relay's from= "
+                            "may only restate its author - three names for one author is the "
+                            "ambiguity this rule exists to remove." % (frm, author))
+        if via and relayer and via != relayer:
+            problems.append("via=%r but relayer=%r. The path a row travelled cannot name two "
+                            "different carriers." % (via, relayer))
+        if via == "direct":
+            problems.append("via=direct on a row that names a relayer. It was relayed or it was "
+                            "not; both cannot be on the record.")
     else:
         # NO relayer MEANS DIRECT, and `via=direct` is optional rather than required.
         #
