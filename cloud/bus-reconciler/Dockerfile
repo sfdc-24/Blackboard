@@ -20,6 +20,13 @@ COPY scripts/bus.py /app/bus.py
 # authoritative answer always wins. The reconciler borrows its client and its
 # settings rather than opening a second connection with different rules.
 COPY scripts/redis_dual.py /app/redis_dual.py
+# THE SWITCHES THEMSELVES. This file had never travelled into the image, and under the old code
+# nobody noticed: a missing settings file read as {} and REDIS_DUAL_ENABLED in the environment
+# turned the dual-run on anyway. Now that an unreadable file vetoes both switches - which is the
+# fix to the off-switch - its absence stops the job dead, correctly. It ships enabled=false and
+# connect=true, holds no address and no credential, and is re-read on every call, so editing it
+# stops the dual-run with no redeploy.
+COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
 COPY cloud/bus-reconciler/main.py /app/main.py
 # The connectivity probe. One key under its own prefix, read back, deleted. It exists so that
