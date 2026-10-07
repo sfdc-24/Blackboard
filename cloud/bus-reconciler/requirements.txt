@@ -1,0 +1,14 @@
+# The ONE dependency this image has, and the reason it has one at all.
+#
+# cloud/board-probe is stdlib-only on purpose - "an import that is absent in a
+# sandbox is the dependency this whole migration exists to remove". That is still
+# the right default, and it cannot hold here: speaking Redis over TLS with AUTH is
+# not something to hand-roll on a socket, and a hand-rolled RESP client is a far
+# worse dependency than a pinned library.
+#
+# PINNED EXACTLY, now that a real build has resolved it. The range this file
+# carried for its first two builds was deliberate - I would not write a version
+# number I had not seen resolve - and the job's own log reported 5.3.1 on its
+# first execution, which is where this came from. A range is a different image on
+# every rebuild, which is not something to leave in place.
+redis==5.3.1

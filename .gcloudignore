@@ -24,10 +24,18 @@
 !/cloud/agent-waker
 !/cloud/ack-once
 !/cloud/studio-controller
+!/cloud/bus-reconciler
 
 !/scripts
 /scripts/*
 !/scripts/bus.py
+!/scripts/redis_dual.py
+!/scripts/bus_reconcile.py
+!/scripts/bus_request.py
+!/scripts/roster_seed.py
+!/scripts/signature.py
+!/scripts/agent_roster.json
+!/scripts/append.py
 !/scripts/board_say.py
 !/scripts/state_store.py
 !/scripts/board_waker.py
