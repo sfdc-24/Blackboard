@@ -65,6 +65,9 @@ on:
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
+      - "scripts/bus_ranges.py"
+      - "tests/test_bus_ranges.py"
+      - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
@@ -197,6 +200,9 @@ on:
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
+      - "scripts/bus_ranges.py"
+      - "tests/test_bus_ranges.py"
+      - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
       - "tests/test_cloud_runtime_contract.py"
@@ -925,6 +931,22 @@ jobs:
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_dual -v
             sudo unshare -n -- "$python_bin" -B scripts/redis_dual.py selftest
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The range runner: a verdict a gate can CHECK. Codex refused the time-windowed
+      # reconciler three times and the third refusal was the design - "no predicate over the
+      # current entry fields can distinguish that record from genuine agreement". Gemini ruled
+      # closed physical index ranges, so this compares ENUMERATED rows and states its coverage.
+      # The suite asks of every case whether a predicate over the RECORD can tell it from genuine
+      # agreement, and asserts that no timestamp is parsed anywhere in the file.
+      - name: "range runner: agreement about an enumerated set, with coverage (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_ranges.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_ranges -v
           else
             echo "not on this branch; skipping"
           fi

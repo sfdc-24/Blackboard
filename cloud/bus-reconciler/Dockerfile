@@ -42,6 +42,10 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # ONE board-write path on this fleet that sends a single transport attempt and then reads the
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
+# The RANGE runner, which is the comparison the gate can actually read. Gemini ruled closed
+# physical index ranges after Codex established that no predicate over a time-windowed verdict
+# could distinguish genuine agreement from a window that missed a row.
+COPY scripts/bus_ranges.py /app/bus_ranges.py
 COPY scripts/append.py /app/append.py
 # append.py imports signature: a row must name the INSTANCE that wrote it and how it got here,
 # checked at the writer. WITHOUT THIS LINE THE IMAGE DIES ON IMPORT - the request worker's only

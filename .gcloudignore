@@ -33,6 +33,7 @@
 !/scripts/redis_dual.settings.json
 !/scripts/bus_reconcile.py
 !/scripts/bus_request.py
+!/scripts/bus_ranges.py
 !/scripts/roster_seed.py
 !/scripts/signature.py
 !/scripts/agent_roster.json

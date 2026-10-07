@@ -218,6 +218,44 @@ function handleRead_(params, cfg) {
     const limit = parseInt(params.limit, 10);
     const match = String(params.match || '').toLowerCase();
     const since = String(params.since || '');
+
+    // A CLOSED PHYSICAL RANGE: start is 1-based and INCLUSIVE, count is how many rows.
+    //
+    // Gemini, architect lead, 2026-10-07: "Drop time completely. Physical index range is the
+    // correct architectural boundary. Comparing a closed interval [start, end] turns an
+    // indeterminate time query into an exact identity and count match, eliminating timestamp jitter
+    // and lexical comparison bugs." Codex had already shown that no predicate over a time-windowed
+    // verdict can establish zero divergence, because this sheet's ROW ORDER IS NOT ITS TIMESTAMP
+    // ORDER and both existing filters lean on time.
+    //
+    // The machinery was already here - `limit` is getRange(total - n + 1, ...), a physical tail -
+    // and simply not exposed. This exposes it without moving the tail path: start says where, so a
+    // caller can walk 1..total in chunks and know exactly which rows it has seen.
+    //
+    // It is an ADDITIVE parameter. A caller that does not send start behaves exactly as before.
+    const start = parseInt(params.start, 10);
+    const count = parseInt(params.count, 10);
+    const ranged = start > 0;
+    if (ranged) {
+      if (!(count > 0)) {
+        return jsonOut_({ ok: false, error: 'count must be a positive integer when start is given' }, 400);
+      }
+      if (start > total) {
+        // Past the end is not an error and not an empty board: it is an empty RANGE, and the
+        // caller needs `total` back to know that is why.
+        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: [],
+                          total: total, filtered: 0, start: start, count: 0 });
+      }
+      const n = Math.min(count, total - start + 1);
+      const ranged_rows = sheet.getRange(start, 1, n, cols).getValues();
+      // `total` travels with every ranged read ON PURPOSE. Gemini: "The reconciler must read total
+      // first, freeze end_index to that snapshot, and query only that closed slice. A floating
+      // upper bound reintroduces edge leaks." The caller freezes it; this makes that possible by
+      // telling it what the sheet held at the moment of the read.
+      return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: ranged_rows,
+                        total: total, filtered: ranged_rows.length, start: start, count: n });
+    }
+
     const filtered = (limit > 0) || !!match || !!since;
 
     if (!filtered) {

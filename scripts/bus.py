@@ -222,6 +222,55 @@ def read_rows(env, title="Blackboard - Alpha DB", tries=4,
     raise SystemExit("bus never returned rows")
 
 
+def read_range(env, start, count, title="Blackboard - Alpha DB", tries=4):
+    """A CLOSED PHYSICAL SLICE of the board: rows `start` through `start + count - 1`, 1-based.
+
+    WHY A THIRD READ SHAPE. read_board() returns everything with a header row; read_rows() returns a
+    time- or substring-filtered slice with no header. Neither can answer "which rows have I seen",
+    because both are ordered by a thing the sheet is not ordered by. Gemini, architect lead,
+    2026-10-07: "Physical index range is the correct architectural boundary. Comparing a closed
+    interval [start, end] turns an indeterminate time query into an exact identity and count match."
+
+    THE RETURN CARRIES `total`, AND THAT IS THE POINT. A caller freezes it on the first read and
+    walks only up to that snapshot - Gemini again: "A floating upper bound reintroduces edge leaks."
+    The board is append-only, so a row that arrives mid-walk lands above the frozen ceiling and is
+    simply the next run's work.
+
+    Shape: {"rows": [...], "total": n, "filtered": k, "start": s, "count": c}. `rows` holds DATA
+    rows as the sheet stores them, header included if the range covers row 1 - the caller asked for
+    physical positions and gets them, with nothing hidden.
+    """
+    if not isinstance(start, int) or isinstance(start, bool) or start < 1:
+        raise ValueError("start must be a 1-based positive integer")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError("count must be a positive integer")
+    payload = {"action": "read", "secret": env["BUS_SECRET"], "title": title,
+               "start": start, "count": count}
+    for attempt in range(tries):
+        body = fetch(env["BUS_URL"], payload)
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            print(f"[attempt {attempt+1}] non-JSON: {body[:200]}", file=sys.stderr)
+            continue
+        if "rows" not in obj:
+            print(f"[attempt {attempt+1}] health blob, retrying", file=sys.stderr)
+            continue
+        # A gateway that does not KNOW about start would ignore it and answer with the whole board,
+        # which is the worst outcome available: the caller would believe it holds rows 1-50 and
+        # actually hold 3,700. The echoed `start` is the proof it understood. Refuse without it.
+        if "start" not in obj:
+            raise SystemExit(
+                "the bus answered a ranged read without echoing `start`, so it almost certainly "
+                "ignored the range and returned something else. The deployed gateway may predate "
+                "the start/count parameter. Refusing to treat this as a slice.")
+        rows = [r for r in obj.get("rows") or [] if r]
+        return {"rows": rows, "total": obj.get("total"),
+                "filtered": obj.get("filtered", len(rows)),
+                "start": obj.get("start"), "count": obj.get("count", len(rows))}
+    raise SystemExit("bus never returned rows for the ranged read")
+
+
 def main():
     env = load_env()
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 25
