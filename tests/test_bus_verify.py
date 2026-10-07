@@ -343,5 +343,46 @@ class TheStreamWriteIsHonest(unittest.TestCase):
         self.assertIn("stream_write_failed", lines[1])
 
 
+class AFlappingGatewayStILLProducesARecord(unittest.TestCase):
+    """From the first verification run after the backfill. bus.read_range raises SystemExit when the
+    gateway answers four times without rows - a flap, which this gateway does - and SystemExit is a
+    BaseException, so `except Exception` let it through. The job exited 1 and wrote NO RECORD AT ALL.
+
+    No record is the one outcome this design exists to prevent. "I could not finish" is an answer;
+    silence is not."""
+
+    def test_a_systemexit_from_the_reader_is_a_counted_read_failure(self):
+        def flapping(first, count):
+            if first == 1:
+                return {"rows": BOARD[0:count], "total": len(BOARD), "start": 1, "count": count}
+            raise SystemExit("bus never returned rows for the ranged read")
+
+        result = bv.verify(seeded(BOARD), flapping, len(BOARD), size=3)
+        self.assertEqual(bv.UNKNOWN, result["verdict"])
+        self.assertEqual(1, result["read_failures"])
+        self.assertTrue(any("SystemExit" in r for r in result["read_failure_reasons"]))
+        self.assertFalse(bv.gate_eligible(result))
+
+    def test_the_partial_coverage_is_reported_rather_than_claimed(self):
+        def flapping(first, count):
+            if first > 3:
+                raise SystemExit("flap")
+            return {"rows": BOARD[first - 1:first - 1 + count], "total": len(BOARD),
+                    "start": first, "count": count}
+
+        result = bv.verify(seeded(BOARD), flapping, len(BOARD), size=3)
+        self.assertEqual(3, result["covered_to"], "it must not claim rows it never read")
+        self.assertNotEqual(result["frozen_total"], result["covered_to"])
+
+    def test_a_systemexit_from_the_store_is_also_caught(self):
+        class Exiting(FakeStore):
+            def hgetall(self, key):
+                raise SystemExit("the client gave up")
+
+        result = bv.verify(Exiting(), gateway(BOARD), len(BOARD), size=3)
+        self.assertEqual(bv.UNKNOWN, result["verdict"])
+        self.assertGreaterEqual(result["read_failures"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

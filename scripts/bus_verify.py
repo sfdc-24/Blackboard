@@ -195,7 +195,13 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
     for first, count in bounds:
         try:
             reply = reader(first, count)
-        except Exception as error:
+        except (Exception, SystemExit) as error:
+            # SystemExit IS caught here, deliberately. bus.read_range raises it when the gateway
+            # answers four times without rows - a flap, which this gateway does - and SystemExit is
+            # a BaseException, so `except Exception` let it straight through. The first live
+            # verification after the backfill died on exactly that: the job exited 1 and wrote NO
+            # RECORD AT ALL, which is the one outcome this whole design exists to prevent. A flap
+            # mid-walk is a counted read failure and an UNKNOWN with a record, not silence.
             record["read_failures"] += 1
             record["read_failure_reasons"].append("%d:%s" % (first, type(error).__name__))
             break
@@ -230,7 +236,7 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
             mapped = as_mapping(cells)
             try:
                 stored = conn.hgetall(ROW_KEY % row_id) or {}
-            except Exception as error:
+            except (Exception, SystemExit) as error:
                 record["read_failures"] += 1
                 record["read_failure_reasons"].append("%s:store:%s" % (row_id, type(error).__name__))
                 stored = None
@@ -270,7 +276,7 @@ def verify(conn, reader, total_at_start, size=DEFAULT_CHUNK, mirror=False, total
             extra = sorted(stored_ids - set(seen))
             record["extra_in_redis"] = len(extra)
             record["extra_ids"] = extra[:20]
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             record["read_failures"] += 1
             record["read_failure_reasons"].append("index:%s" % type(error).__name__)
 

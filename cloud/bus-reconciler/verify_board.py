@@ -74,7 +74,9 @@ def main() -> int:
             after[at] = bus_verify.canonical(rows[0][0]) if rows else ""
         result["total_at_end"] = read_range(env, 1, 1).get("total")
         bus_verify.apply_recheck(result, after)
-    except Exception as error:
+    except (Exception, SystemExit) as error:
+        # Same reason as in verify(): read_range raises SystemExit on a flapping gateway, and a
+        # recheck that could not run must not cost the record of the walk that did.
         result["read_failures"] += 1
         result["read_failure_reasons"].append("recheck:%s" % type(error).__name__)
         result["verdict"] = bus_verify._verdict(result)
