@@ -264,6 +264,20 @@ def read_range(env, start, count, title="Blackboard - Alpha DB", tries=4):
                 "the bus answered a ranged read without echoing `start`, so it almost certainly "
                 "ignored the range and returned something else. The deployed gateway may predate "
                 "the start/count parameter. Refusing to treat this as a slice.")
+        # AND IT MUST ECHO THE START WE ASKED FOR. Codex: requiring the field to be PRESENT and
+        # never to MATCH let a gateway return the header for both row 1 and row 2, echoing start=1
+        # each time, while the caller recorded coverage of 1..2. Presence proves the parameter was
+        # understood; equality proves the question asked is the question answered.
+        if obj.get("start") != start:
+            raise SystemExit(
+                "asked the bus for start=%d and it echoed start=%r. These rows are not the rows "
+                "that were requested, and treating them as a slice would record coverage of "
+                "positions nobody read." % (start, obj.get("start")))
+        returned = [r for r in obj.get("rows") or [] if r]
+        if obj.get("count") not in (None, len(returned)):
+            raise SystemExit(
+                "the bus echoed count=%r for a ranged read and sent %d row(s); the reply does not "
+                "describe itself consistently." % (obj.get("count"), len(returned)))
         rows = [r for r in obj.get("rows") or [] if r]
         return {"rows": rows, "total": obj.get("total"),
                 "filtered": obj.get("filtered", len(rows)),

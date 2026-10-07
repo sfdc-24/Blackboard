@@ -33,7 +33,7 @@ DOCKERFILE = ROOT / "cloud" / "bus-reconciler" / "Dockerfile"
 
 # Everything the image is expected to be able to import, entrypoints first.
 MODULES = ("serve_requests", "main", "probe", "keyspace_view", "roster_seed",
-           "bus_request", "bus_reconcile", "bus_ranges", "append", "signature",
+           "bus_request", "bus_reconcile", "bus_verify", "verify_board", "append", "signature",
            "redis_dual", "bus")
 
 

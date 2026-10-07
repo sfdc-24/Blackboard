@@ -42,10 +42,13 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # ONE board-write path on this fleet that sends a single transport attempt and then reads the
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
-# The RANGE runner, which is the comparison the gate can actually read. Gemini ruled closed
-# physical index ranges after Codex established that no predicate over a time-windowed verdict
-# could distinguish genuine agreement from a window that missed a row.
-COPY scripts/bus_ranges.py /app/bus_ranges.py
+# The WHOLE-BOARD verifier: coverage from closed physical positions, CONTENT from each row's own
+# Redis mirror. It replaces a digest runner that compared the board to a digest written from the
+# board and so never read the mirror at all - Codex broke that in one move.
+COPY scripts/bus_verify.py /app/bus_verify.py
+# Its entrypoint. Shipping it changes NOTHING: the job still runs main.py until somebody points
+# it here with --args=-B,verify_board.py, which is an owner decision and not a build artefact.
+COPY cloud/bus-reconciler/verify_board.py /app/verify_board.py
 COPY scripts/append.py /app/append.py
 # append.py imports signature: a row must name the INSTANCE that wrote it and how it got here,
 # checked at the writer. WITHOUT THIS LINE THE IMAGE DIES ON IMPORT - the request worker's only

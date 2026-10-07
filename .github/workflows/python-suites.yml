@@ -65,8 +65,8 @@ on:
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
-      - "scripts/bus_ranges.py"
-      - "tests/test_bus_ranges.py"
+      - "scripts/bus_verify.py"
+      - "tests/test_bus_verify.py"
       - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -200,8 +200,8 @@ on:
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
-      - "scripts/bus_ranges.py"
-      - "tests/test_bus_ranges.py"
+      - "scripts/bus_verify.py"
+      - "tests/test_bus_verify.py"
       - "gas-bus/Code.js"
       - "cloud/bus-reconciler/Dockerfile"
       - "scripts/grok_wa_inbox.py"
@@ -941,12 +941,12 @@ jobs:
       # closed physical index ranges, so this compares ENUMERATED rows and states its coverage.
       # The suite asks of every case whether a predicate over the RECORD can tell it from genuine
       # agreement, and asserts that no timestamp is parsed anywhere in the file.
-      - name: "range runner: agreement about an enumerated set, with coverage (no network)"
+      - name: "board verify: coverage from positions, content from the mirror (no network)"
         run: |
           set -euo pipefail
-          if [ -f tests/test_bus_ranges.py ]; then
+          if [ -f tests/test_bus_verify.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_ranges -v
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_verify -v
           else
             echo "not on this branch; skipping"
           fi
