@@ -468,6 +468,39 @@ class TheCommandLine(unittest.TestCase):
             self.assertEqual(2, redis_dual.main(["nonsense"]))
 
 
+class TheStatusKeysAreAnInterface(unittest.TestCase):
+    """Three Cloud Run entrypoints read fixed key names out of status(). Renaming one of them -
+    `enabled` to `enabled_in_file` - broke all three with a KeyError at STARTUP, and every suite
+    still passed, because they all exercise status() directly and none tested what the entrypoints
+    READ out of it. The re-prove execution found it. A dict lookup across a module boundary is an
+    interface, and this is the test that was missing for it."""
+
+    def test_every_key_an_entrypoint_logs_exists(self):
+        report = redis_dual.status(redis_dual.Settings(dict(OFF)))
+        for name in redis_dual.STATUS_FOR_LOG:
+            self.assertIn(name, report)
+
+    def test_the_entrypoints_name_no_key_of_their_own(self):
+        """They must spell the set once, in redis_dual, or this test is the only thing standing
+        between a rename and another startup KeyError in production."""
+        root = Path(__file__).resolve().parents[1]
+        for rel in ("cloud/bus-reconciler/serve_requests.py", "cloud/bus-reconciler/main.py",
+                    "cloud/bus-reconciler/probe.py"):
+            source = (root / rel).read_text(encoding="utf-8")
+            if "status[k]" in source:
+                self.assertIn("redis_dual.STATUS_FOR_LOG", source, rel)
+
+    def test_the_status_report_distinguishes_vetoed_from_simply_off(self):
+        """The field that makes the off-switch fix visible: with the environment asserting the
+        dual-run and the file refusing it, a reader must be able to see both facts at once."""
+        report = redis_dual.status(redis_dual.Settings({"enabled": False, "connect": True,
+                                                        "host": "10.0.0.1"},
+                                                       environ={"REDIS_DUAL_ENABLED": "true"}))
+        self.assertFalse(report["dual_run_live"])
+        self.assertTrue(report["connect_permitted"])
+        self.assertTrue(report["settings_file_readable"])
+
+
 class TheDiagnosticCannotBecomeTheFailure(unittest.TestCase):
     """Copilot, PR 323, two findings about the observer harming what it observes."""
 

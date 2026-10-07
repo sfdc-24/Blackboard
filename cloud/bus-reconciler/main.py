@@ -92,9 +92,7 @@ def main() -> int:
     log.info("redis library version: %s", library_version())
     settings = redis_dual.Settings()
     status = redis_dual.status(settings)
-    log.info("dual-run status: %s", json.dumps({k: status[k] for k in (
-        "enabled", "would_attempt_connection", "reachable", "redis_library_installed",
-        "auth_string_found", "ca_cert_configured")}))
+    log.info("dual-run status: %s", json.dumps({k: status[k] for k in redis_dual.STATUS_FOR_LOG}))
 
     conn = redis_dual.client(settings)
     if conn is None:

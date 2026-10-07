@@ -50,9 +50,7 @@ for _name, _default in (("REDIS_CA_CERT_PATH", MOUNTED_CA), ("REDIS_AUTH_FILE", 
 def main() -> int:
     settings = redis_dual.Settings()
     status = redis_dual.status(settings)
-    log.info("status: %s", json.dumps({k: status[k] for k in (
-        "enabled", "would_attempt_connection", "reachable", "redis_library_installed",
-        "auth_string_found", "auth_source", "ca_cert_configured", "tls")}))
+    log.info("status: %s", json.dumps({k: status[k] for k in redis_dual.STATUS_FOR_LOG}))
 
     # precheck=False on purpose: see redis_dual.client. A 1.5-second TCP pre-check from a cold
     # container said unreachable and made this probe report FAIL on a path that worked. A probe
