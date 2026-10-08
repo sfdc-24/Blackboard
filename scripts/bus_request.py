@@ -68,15 +68,11 @@ WORKER_TAG = "bus-reconciler"
 
 # Who MAY ask. Not who DID ask: see the module docstring. This bounds the claim, never the identity.
 SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp")
-# What may be asked. The probe selects no key, command or TTL.
-#
-# redis-op IS NOT LISTED YET, deliberately. The governed path (scripts/redis_gov.py) is built and
-# tested, but the hunk in handle() that executes it was refused by the agent-permission layer on the
-# laptop that wrote it. Listing the action without that hunk would route a redis-op request into the
-# SYNTHETIC PROBE path and answer it "OK" - a result for something that was never done. So the action
-# stays unlisted, a redis-op request is refused as "not allowlisted", and enabling it is one reviewed
-# change: add "redis-op" here AND the handle() branch, together.
-ACTIONS = ("redis-synthetic-probe",)
+# What may be asked. The probe selects no key, command or TTL. redis-op selects a key and an op -
+# inside scripts/redis_gov.py's grammar, its access list and its protected namespaces, every use
+# audited. It is listed TOGETHER with its branch in handle(), never without it: listed alone, a
+# redis-op request would fall into the synthetic-probe path and be answered "OK" for nothing done.
+ACTIONS = ("redis-synthetic-probe", "redis-op")
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
 _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
@@ -308,10 +304,13 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
     # write and one read-back each - max_per_run=3 and all of them answered. The cap exists because
     # a forged flood costs him money, and a cap that only counts the expensive path is not a cap.
     budget = max(0, int(max_per_run))
+    # ONE access list per run, so every decision in a run is made under the same rules - and its
+    # digest goes into every audit entry those decisions write.
+    acl = redis_gov.load_acl()
     out = {"seen": len(requests), "answered": [], "refused": [], "capped": 0, "errors": [],
-           "receipts_reused": []}
+           "receipts_reused": [], "acl": acl.get("digest", "")}
     for req in requests:
-        why = refusals(req, now, already)
+        why = refusals(req, now, already, acl)
         if why:
             out["refused"].append({"req_id": req["req_id"], "why": why,
                                    # The unrecognised tag is recorded HERE, where nothing publishes it.
@@ -322,7 +321,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # us write, which is the flood with our name on it.
             publishable = (append and _REQ_ID.match(req["req_id"] or "")
                            and req["req_id"] not in already
-                           and req["claimed_sender"] in SENDERS)
+                           and recognised(req, acl))
             if publishable and budget <= 0:
                 out["capped"] += 1
                 continue
@@ -336,6 +335,32 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             out["capped"] += 1
             continue
         budget -= 1
+
+        if req["action"] == "redis-op":
+            # ONE ROW, NOT TWO. The probe writes a RECEIPT then a RESULT because it takes a moment;
+            # a governed op is one round trip, and every row addressed to an agent can wake it (a row
+            # is money he pays). The op is in gov:audit whether or not this row lands.
+            try:
+                count = int(req.get("count") or 10)
+            except ValueError:
+                count = 10
+            result = redis_gov.execute(conn, acl, req["claimed_sender"],
+                                       "%s/%s" % (req["req_id"], req["row_id"]),
+                                       req.get("op"), req.get("key"), field=req.get("field") or "",
+                                       raw_value=req.get("val") or "", enc=req.get("enc") or "",
+                                       count=count, now=now)
+            if append:
+                append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
+                               ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
+                                              req.get("op") or "?", req.get("key") or "?"))[:100]))
+            already.add(req["req_id"])
+            status = ("OK" if result.get("ok")
+                      else "REFUSED" if "refused" in result else "ERROR")
+            if status == "ERROR":
+                out["errors"].append(req["req_id"])
+            out["answered"].append({"req_id": req["req_id"], "status": status,
+                                    "op": req.get("op"), "key": req.get("key")})
+            continue
 
         if append:
             # REUSE AN EXISTING RECEIPT RATHER THAN REPLAY IT. A receipt that landed while the

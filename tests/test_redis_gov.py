@@ -446,6 +446,106 @@ class TheServerSetsTheTTL(unittest.TestCase):
         self.assertNotIn(gov.AUDIT_STREAM, conn.ttls)
 
 
+class EndToEndThroughTheBoardWorker(unittest.TestCase):
+    """A board row in, a Redis change and ONE RESULT row out - through bus_request.handle(), the
+    function the bus-requests job actually runs."""
+
+    NOW = None
+
+    def setUp(self):
+        import datetime
+        import bus_request
+        self.br = bus_request
+        self.now = datetime.datetime(2026, 10, 8, 2, 0, tzinfo=datetime.timezone.utc)
+
+    def row(self, tag, payload, req="REQ-0001", ts="2026-10-08T01:59:00Z"):
+        return ["ROW-" + req, ts, tag, "bus-reconciler", "AYA_REQ",
+                "BCB|v=1|id=%s|req=%s|%s" % (req, req, payload), "", "", "", ""]
+
+    def run_rows(self, rows, conn=None):
+        conn = conn if conn is not None else FakeRedis()
+        out_rows = []
+        out = self.br.handle(rows, conn, now=self.now, append=out_rows.append)
+        return out, out_rows, conn
+
+    def test_grok_writes_and_the_result_is_one_row(self):
+        out, rows, conn = self.run_rows([self.row(
+            "grok", "do=redis-op|op=set|key=conf:2026-10-07:scorecard|val=green")])
+        self.assertEqual("green", conn.data["conf:2026-10-07:scorecard"])
+        self.assertEqual(1, len(rows), "one RESULT row, no separate receipt")
+        self.assertEqual("AYA_RESULT", rows[0]["action_type"])
+        self.assertIn("OK set conf:2026-10-07:scorecard", rows[0]["payload"])
+        self.assertEqual("grok", rows[0]["target_surface"], "answered under its own tag")
+        self.assertEqual("OK", out["answered"][0]["status"])
+        self.assertEqual("grok", conn.audit()[-1]["actor"])
+        self.assertTrue(conn.audit()[-1]["via"].startswith("REQ-0001/"), "the audit names the row")
+
+    def test_each_agent_he_named_reaches_redis_through_the_board(self):
+        rows = [self.row(tag, "do=redis-op|op=set|key=fleet:hello:%s|val=hi" % tag, req="REQ-%04d" % n)
+                for n, tag in enumerate(("chatgpt-codex-desktop", "grok", "cursor", "gemini",
+                                         "codex", "aya"), start=1)]
+        out, written, conn = self.run_rows(rows)
+        self.assertEqual(["OK"] * 6, [a["status"] for a in out["answered"]])
+        for tag in ("chatgpt-codex-desktop", "grok", "cursor", "gemini", "codex", "aya"):
+            self.assertEqual("hi", conn.data["fleet:hello:%s" % tag])
+
+    def test_a_read_comes_back_in_the_result(self):
+        conn = FakeRedis()
+        conn.set("fleet:status", "amber")
+        out, rows, _ = self.run_rows(
+            [self.row("cursor", "do=redis-op|op=get|key=fleet:status")], conn)
+        self.assertIn("amber", rows[0]["payload"])
+
+    def test_a_protected_write_is_refused_on_the_board_and_in_the_audit(self):
+        out, rows, conn = self.run_rows([self.row(
+            "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=forged")])
+        self.assertNotIn("v1:bus:row:R-1", conn.data)
+        self.assertIn("REFUSED", rows[0]["payload"])
+        self.assertEqual("REFUSED", out["answered"][0]["status"])
+        self.assertEqual("0", conn.audit()[-1]["ok"])
+
+    def test_a_STALE_request_from_an_access_list_agent_is_told_why(self):
+        """Refused before the op is even considered - and still answered, because the sender is
+        someone the access list recognises. The first version of this file had no test for it: a
+        mutation that restricted refusal rows to the probe's old SENDERS list passed everything, so
+        grok, cursor and gemini would have heard silence for a stale request."""
+        out, rows, conn = self.run_rows([self.row(
+            "grok", "do=redis-op|op=set|key=fleet:x|val=1", ts="2026-10-08T00:00:00Z")])
+        self.assertNotIn("fleet:x", conn.data)
+        self.assertEqual(1, len(rows), "a recognised sender is told it was refused")
+        self.assertIn("older than", rows[0]["payload"])
+        self.assertEqual("grok", rows[0]["target_surface"])
+
+    def test_an_unknown_sender_gets_no_row_and_touches_nothing(self):
+        """The flood rule, unchanged: a tag nobody recognises does not make us write a row."""
+        out, rows, conn = self.run_rows([self.row(
+            "a-stranger", "do=redis-op|op=set|key=fleet:x|val=1")])
+        self.assertEqual([], rows)
+        self.assertNotIn("fleet:x", conn.data)
+        self.assertEqual(1, len(out["refused"]))
+
+    def test_a_replayed_request_id_does_nothing_the_second_time(self):
+        first = self.row("grok", "do=redis-op|op=set|key=fleet:x|val=1")
+        out, rows, conn = self.run_rows([first])
+        answered_row = [rows[0]["row_id"], "2026-10-08T01:59:30Z", "bus-reconciler", "grok",
+                        "AYA_RESULT", rows[0]["payload"], "", "", "", ""]
+        out2, rows2, _ = self.run_rows([first, answered_row], conn)
+        self.assertEqual([], rows2, "already answered: no second write, no second row")
+        self.assertEqual(1, len([e for e in conn.audit() if e["op"] == "set"]))
+
+    def test_the_probe_still_works_exactly_as_before(self):
+        out, rows, conn = self.run_rows([self.row("aya", "do=redis-synthetic-probe")])
+        self.assertEqual(["AYA_RECEIPT", "AYA_RESULT"], [r["action_type"] for r in rows],
+                         "the probe keeps its receipt-then-result shape")
+
+    def test_redis_op_is_listed_TOGETHER_with_its_branch(self):
+        """Listed without the branch, a redis-op would fall into the probe path and say OK for
+        nothing done. Both halves, or neither."""
+        import inspect
+        self.assertIn("redis-op", self.br.ACTIONS)
+        self.assertIn('if req["action"] == "redis-op":', inspect.getsource(self.br.handle))
+
+
 class NothingLeaks(unittest.TestCase):
     def test_a_store_error_reports_the_type_not_the_message(self):
         class Broken(FakeRedis):
