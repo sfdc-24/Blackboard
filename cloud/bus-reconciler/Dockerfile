@@ -5,7 +5,10 @@
 # its own private copy would be self-defeating.
 #
 # What reaches the build is controlled by /.gcloudignore, which is an ALLOWLIST:
-# these four files and nothing else. The repo is 332 MB and holds a .env with
+# a named allowlist and nothing else - it was four files when this was written and is fifteen
+# now, which Codex flagged as a comment that had quietly stopped being true. The count is in
+# .gcloudignore and tests/test_image_layout.py checks the two agree. The repo is 332 MB and
+# holds a .env with
 # live credentials; neither goes up. Verified with
 # `gcloud meta list-files-for-upload` before the first submit.
 FROM python:3.12-slim
@@ -24,8 +27,11 @@ COPY scripts/redis_dual.py /app/redis_dual.py
 # nobody noticed: a missing settings file read as {} and REDIS_DUAL_ENABLED in the environment
 # turned the dual-run on anyway. Now that an unreadable file vetoes both switches - which is the
 # fix to the off-switch - its absence stops the job dead, correctly. It ships enabled=false and
-# connect=true, holds no address and no credential, and is re-read on every call, so editing it
-# stops the dual-run with no redeploy.
+# connect=true, holds no address and no credential, and is re-read on every call.
+# AND NOTE WHICH COPY THAT IS. Because this line BAKES the file in, editing the repository copy does
+# NOT change this job - a claim I wrote here while correcting the same claim elsewhere, which Codex
+# caught. To operate the switches without a rebuild, mount a copy and set REDIS_DUAL_SETTINGS; see
+# cloud/bus-reconciler/REQUESTS.md.
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
 COPY cloud/bus-reconciler/main.py /app/main.py
@@ -36,6 +42,17 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # ONE board-write path on this fleet that sends a single transport attempt and then reads the
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
+# The WHOLE-BOARD verifier: coverage from closed physical positions, CONTENT from each row's own
+# Redis mirror. It replaces a digest runner that compared the board to a digest written from the
+# board and so never read the mirror at all - Codex broke that in one move.
+COPY scripts/bus_verify.py /app/bus_verify.py
+# The RATIFIED exemption. Without it in the image the verifier forgives nothing and every run
+# reports the 46 historical duplicates as divergence - the safe direction, and still wrong.
+# ratified() recomputes the digest and refuses the whole file if it disagrees with itself.
+COPY scripts/board_known_duplicates.json /app/board_known_duplicates.json
+# Its entrypoint. Shipping it changes NOTHING: the job still runs main.py until somebody points
+# it here with --args=-B,verify_board.py, which is an owner decision and not a build artefact.
+COPY cloud/bus-reconciler/verify_board.py /app/verify_board.py
 COPY scripts/append.py /app/append.py
 # append.py imports signature: a row must name the INSTANCE that wrote it and how it got here,
 # checked at the writer. WITHOUT THIS LINE THE IMAGE DIES ON IMPORT - the request worker's only

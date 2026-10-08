@@ -11,18 +11,27 @@
 # Our own access inventory records the default compute service account reading EVERY secret in the
 # project across five runtimes. That is the thing not to repeat. This job gets its own service
 # account with secretAccessor on exactly four secrets and nothing else: no project-level grant, no
-# bucket, no Firestore, no ability to write to the board.
+# bucket, no Firestore.
 #
-# WHAT IT CANNOT DO, BY CONSTRUCTION
-# Nothing in the image appends to the board. The reconciler reads the gateway and writes only to
-# Redis keys under bus:. A compare run cannot alter the thing it is comparing.
+# WHAT IT CAN AND CANNOT DO - CORRECTED, because the previous version of this comment was true when
+# written and became false when the request worker shipped. Codex caught it still standing.
+#
+# IT CAN APPEND TO THE BOARD. The image carries scripts/append.py and serve_requests.py and the job
+# holds BUS_URL and BUS_SECRET, so the request entrypoint writes AYA_RECEIPT and AYA_RESULT rows.
+# That is the whole point of that entrypoint; pretending otherwise in a deploy script is worse than
+# the capability.
+#
+# WHAT IS STILL TRUE: the RECONCILER entrypoint (main.py) reads the gateway and writes only to Redis
+# keys under bus:, so a compare run cannot alter the thing it is comparing. The capability belongs
+# to a different entrypoint of the same image, which is why the distinction has to be stated rather
+# than assumed from the service account.
 #
 #   bash cloud/bus-reconciler/deploy.sh setup    # service account and the four secret grants
 #   bash cloud/bus-reconciler/deploy.sh build    # build the image from the repo root
 #   bash cloud/bus-reconciler/deploy.sh deploy   # create or update the job, with egress
 #   bash cloud/bus-reconciler/deploy.sh run      # execute it once and wait
 #   bash cloud/bus-reconciler/deploy.sh readback # what is actually deployed, printed
-#   bash cloud/bus-reconciler/deploy.sh off      # REDIS_DUAL_ENABLED=false, no redeploy of anything else
+#   bash cloud/bus-reconciler/deploy.sh off      # both switches false for the NEXT execution
 
 set -euo pipefail
 
@@ -135,8 +144,9 @@ off() {
   "$GCLOUD" run jobs update "$JOB" --project "$PROJECT" --region "$REGION" \
     --update-env-vars "REDIS_DUAL_ENABLED=false,REDIS_CONNECT=false"
   echo "${JOB}: REDIS_DUAL_ENABLED=false and REDIS_CONNECT=false. It will run and report UNKNOWN"
-  echo "rather than connect. Note the FILE also wins: scripts/redis_dual.settings.json with"
-  echo "enabled=false cannot be overridden back on from the environment."
+  echo "rather than connect. Two bounds on that sentence, both from Codex's review: this applies"
+  echo "to the NEXT execution and does not stop one already connected, and the settings file is"
+  echo "BAKED INTO THE IMAGE - editing the repository copy changes nothing without a rebuild."
 }
 
 case "${1:-}" in

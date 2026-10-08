@@ -33,7 +33,8 @@ DOCKERFILE = ROOT / "cloud" / "bus-reconciler" / "Dockerfile"
 
 # Everything the image is expected to be able to import, entrypoints first.
 MODULES = ("serve_requests", "main", "probe", "keyspace_view", "roster_seed",
-           "bus_request", "bus_reconcile", "append", "signature", "redis_dual", "bus")
+           "bus_request", "bus_reconcile", "bus_verify", "verify_board", "append", "signature",
+           "redis_dual", "bus")
 
 
 def copied_paths():
@@ -152,6 +153,10 @@ class TheImageLayout(unittest.TestCase):
         run has not passed - so an image with append.py and no roster writes nothing at all."""
         self.assertTrue((self.app / "signature.py").is_file())
         self.assertTrue((self.app / "agent_roster.json").is_file())
+        # And the ratified exemption, for the same reason: without it the verifier forgives
+        # nothing and every run reports 46 historical duplicates as divergence.
+        self.assertTrue((self.app / "board_known_duplicates.json").is_file(),
+                        "the ratified exemption is not in the image")
 
     def test_the_settings_file_travels_and_resolves_inside_the_image(self):
         """THE THIRD ONE TONIGHT, and the sharpest. redis_dual.settings.json had never been copied

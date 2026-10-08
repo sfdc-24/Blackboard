@@ -13,8 +13,15 @@ WHAT "NON-DISRUPTIVE" IS BUILT TO MEAN HERE, because it is easy to say and easy 
   2. Nothing is attempted while it is off, and OFF IS THE DEFAULT. Disabled means no import of the
      client library, no socket, no DNS, no secret read. A feature that connects in order to discover
      it is disabled is not off.
-  3. The off-switch is a settings FILE, re-read on every call, so turning it off is one edit and takes
-     effect on the next operation. No redeploy, no restart, no process to find and kill.
+  3. The off-switch is a settings FILE, re-read on every call, so turning it off is one edit and
+     takes effect on the next operation IN WHATEVER PROCESS READS THAT FILE. No restart, no
+     process to find and kill.
+     BOUNDED, because the unbounded version of this sentence was wrong and shipped: a deployed
+     Cloud Run job reads the copy BAKED INTO ITS IMAGE, so editing the repository file changes
+     nothing there without a rebuild. Mount a copy and point REDIS_DUAL_SETTINGS at it to make the
+     file operable on a job, or use the job's environment (REDIS_CONNECT=false) for the next
+     execution. Neither stops an execution already connected. See Settings and
+     cloud/bus-reconciler/REQUESTS.md.
   4. A mirror failure is never the caller's problem. The write to Redis happens after the
      authoritative write has succeeded, and anything it raises is swallowed into a counter.
 
@@ -110,8 +117,22 @@ CONNECT_SECONDS = float(os.environ.get("REDIS_CONNECT_SECONDS", "10"))
 class Settings:
     """The dual-run's switches, re-read from disk on every call.
 
-    Re-read on purpose. A settings object cached at import time is a switch you cannot flip without a
-    redeploy, which is exactly what he said not to build."""
+    Re-read on purpose. A settings object cached at import time is a switch you cannot flip without
+    a redeploy, which is exactly what he said not to build.
+
+    BUT RE-READING IS NOT THE SAME AS BEING OPERABLE, and I claimed the stronger thing. Codex,
+    reviewing 314bead: the Dockerfile bakes this file into the image, so for a deployed Cloud Run
+    job "edit the file, no redeploy" was false - the copy being re-read is the one inside the
+    image. The veto itself held; the operational promise did not.
+
+    What is actually true, stated so nobody relies on the wrong one:
+      a checkout        editing the file takes effect on the next call. No restart.
+      a Cloud Run job   the image's copy is read. Point REDIS_DUAL_SETTINGS at a mounted file to
+                        make it operable without a rebuild; otherwise the switch is the job's
+                        environment (REDIS_CONNECT=false), which applies to the NEXT execution.
+      either            nothing here stops an execution that is already connected. The bound on
+                        that is the task timeout and the probe's own 10-second TTL, not this file.
+    """
 
     # TWO SWITCHES, BECAUSE ONE WAS DOING TWO JOBS.
     #
@@ -139,7 +160,8 @@ class Settings:
         "key_prefix": KEY_VERSION + "blackboard:",
         "note": "Set enabled=false to stop the dual-run and connect=false to stop every connection. "
                 "The FILE WINS: neither can be switched back on from the environment, and a missing "
-                "or malformed file reads as both off. Re-read on every call, no redeploy.",
+                "or malformed file reads as both off. Re-read on every call - in whatever process "
+                "reads THIS file; a deployed job reads the copy in its image.",
     }
 
     # Settings the environment may only turn DOWN, never up. Everything else - the address, the port,
@@ -393,7 +415,10 @@ class DualRun:
             self.counters.bump("log_errors")
 
     def settings(self):
-        """Fresh settings for THIS operation: the off-switch works mid-run, without a redeploy."""
+        """Fresh settings for THIS operation, so the off-switch takes effect mid-run.
+
+        "Without a redeploy" belongs to the process reading the file, not to a deployed job whose
+        copy is in its image. The Settings docstring has the full table."""
         return self._settings if self._settings is not None else Settings()
 
     def _admit(self, thread) -> bool:
@@ -643,9 +668,14 @@ def selftest() -> int:
     live.read("k", lambda: "x", wait=True)
     assert live.counters.snapshot()["skipped_off"] == before + 1, "the off-switch did not take effect"
 
+    # "works without a restart" was the overclaim Codex caught, and a selftest is the worst place
+    # to leave one: it is the line somebody quotes. Bounded to what this actually proves - the
+    # switch takes effect inside THIS process, mid-run, because the settings are re-read on every
+    # call. Whether an operator can reach that file on a deployed job is a separate question, and
+    # the Settings docstring answers it.
     print("SELFTEST OK: 5 properties - off attempts nothing; the authoritative answer always wins; a "
-          "mirror failure never reaches the caller; the authoritative write runs first; the off-switch "
-          "works without a restart.")
+          "mirror failure never reaches the caller; the authoritative write runs first; and the "
+          "off-switch takes effect mid-run IN THIS PROCESS, with no restart.")
     return 0
 
 

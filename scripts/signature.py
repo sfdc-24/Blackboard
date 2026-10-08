@@ -62,9 +62,34 @@ def roster(path=None) -> dict:
 
 
 def field(payload, key):
-    """The value of one BCB key, or None. BCB-1 has no escaping, so a value ends at the next pipe."""
+    """The value of one BCB key, or None. BCB-1 has no escaping, so a value ends at the next pipe.
+
+    THE FIRST OCCURRENCE, which is why values() exists beside it: a reader taking the first value
+    and a reader taking the last disagree about a payload that states a key twice, and that
+    disagreement is the whole attack. Use values() wherever the answer must be unambiguous."""
     m = re.search(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload), re.I)
     return m.group(1).strip() if m else None
+
+
+def values(payload, key) -> list:
+    """Every DISTINCT value a key is given. More than one means the row says two things.
+
+    Codex, reviewing PR 336: a payload repeating claimed_author with claude-mobile and
+    claude-code-cli passed check() and append.py's conflict check both - a row naming two authors,
+    waved through by the guard written to stop exactly that. field() returns the first match, so a
+    second value was simply invisible here."""
+    found = re.findall(r"(?:^|\|)" + re.escape(key) + r"=([^|]*)", str(payload), re.I)
+    seen, out = set(), []
+    for raw in found:
+        # AN EMPTY VALUE COUNTS. Codex, third pass: `via=|via=direct` passed here while append.py
+        # refused it, because this skipped the blank and saw one distinct value. "Said nothing" and
+        # "said direct" are two different answers to one question, and a reader scanning forwards
+        # gets the first.
+        value = raw.strip().lower()
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 def check(source_tag, payload, known=None) -> list:
@@ -78,6 +103,15 @@ def check(source_tag, payload, known=None) -> list:
                 "this row's attribution was verified. This is not approval."]
 
     problems = []
+    # STATED TWICE WITH TWO ANSWERS IS A REFUSAL, before anything else is checked. Which of the two
+    # a reader believes depends only on whether it scans forwards or backwards, and no amount of
+    # care downstream can recover an intent the row did not express.
+    for key in ("from", "relayer", "claimed_author", "via"):
+        many = values(payload, key)
+        if len(many) > 1:
+            problems.append("%s is stated %d times with different values (%s). A row that names "
+                            "two answers for one field names neither."
+                            % (key, len(many), ", ".join(repr(v) for v in many)))
     src = (source_tag or "").strip().lower()
     relayer = (field(payload, "relayer") or "").lower()
     author = (field(payload, "claimed_author") or "").lower()
@@ -121,6 +155,27 @@ def check(source_tag, payload, known=None) -> list:
         if relayer and author and relayer == author:
             problems.append("relayer and claimed_author are both %r, so nothing was relayed. Drop "
                             "both and write via=direct." % relayer)
+        # THE RELAY BRANCH NEVER LOOKED AT from=, AND THAT WAS THE HOLE.
+        #
+        # Codex, reviewing 314bead: Source_Tag=aya, relayer=aya, claimed_author=claude-mobile and
+        # from=claude-code-cli passed with NO problems - three different authors in one row, waved
+        # through by the rule that exists to remove exactly that ambiguity. The direct branch
+        # compared from= against Source_Tag; this branch compared nothing, so the one field a
+        # reader is most likely to trust was unchecked precisely where it is most likely to lie.
+        #
+        # On a relay, from= may only restate the author. Not the relayer: the relayer is already in
+        # relayer= and in Source_Tag, and letting from= name it too gives a reader two plausible
+        # authors with nothing to choose between them.
+        if frm and author and frm != author:
+            problems.append("from=%r on a relayed row whose claimed_author is %r. A relay's from= "
+                            "may only restate its author - three names for one author is the "
+                            "ambiguity this rule exists to remove." % (frm, author))
+        if via and relayer and via != relayer:
+            problems.append("via=%r but relayer=%r. The path a row travelled cannot name two "
+                            "different carriers." % (via, relayer))
+        if via == "direct":
+            problems.append("via=direct on a row that names a relayer. It was relayed or it was "
+                            "not; both cannot be on the record.")
     else:
         # NO relayer MEANS DIRECT, and `via=direct` is optional rather than required.
         #

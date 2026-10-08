@@ -21,6 +21,13 @@ TITLE = "Blackboard - Alpha DB"
 # a key the writer must refuse to publish ambiguously.
 AUTHORITY_KEYS = ("v", "id", "from", "to", "pr", "verdict", "hold",
                   "clears", "supersedes",
+                  # The attribution fields, added after Codex found that repeating
+                  # claimed_author with two different values passed BOTH this check and
+                  # signature.check() - a row naming two authors, through the one guard written to
+                  # stop exactly that. They carry authority, so they belong on this list; leaving
+                  # them off meant the newest authority keys on the fleet were the only ones a
+                  # duplicate could sneak through.
+                  "relayer", "claimed_author", "via",
                   "exact_head", "reviewed_head", "head", "merged_head", "new_head")
 
 

@@ -3,7 +3,7 @@
 # Same shape and the same reason as cloud/board-probe/cloudbuild.yaml: the image
 # must copy scripts/bus.py, so the context cannot be this directory, and the
 # Dockerfile is therefore named with -f. /.gcloudignore keeps the upload to the
-# four files the image needs.
+# files the image needs, which .gcloudignore names and tests/test_image_layout.py verifies.
 
 substitutions:
   _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/bus-reconciler:v1

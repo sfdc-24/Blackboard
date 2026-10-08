@@ -29,7 +29,11 @@ harmless is what makes the missing authentication survivable - and when a reques
 something that matters, it needs a real identity first, not a longer allowlist.
 
 The rest of the bounds exist so a forged flood is not free: a stale request is ignored, a repeat for
-a request id already answered does nothing, and the number honoured per run and per hour is capped.
+a request id already answered does nothing, and the number honoured PER RUN is capped.
+There is no per-hour cap: Codex caught this sentence claiming one. Per run is the only
+bound in the code, and because nothing schedules this job today, runs happen when somebody
+causes them - so the real rate limit is currently a person. Say so rather than implying a
+limiter that would have to exist before a scheduler does.
 """
 from __future__ import annotations
 
