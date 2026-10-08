@@ -538,6 +538,49 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertEqual(["AYA_RECEIPT", "AYA_RESULT"], [r["action_type"] for r in rows],
                          "the probe keeps its receipt-then-result shape")
 
+    def test_every_answer_carries_every_key_the_ENTRYPOINT_reads(self):
+        """THE BUG THE FIRST LIVE RUN FOUND. bus-requests-hl95p, 2026-10-08 02:25Z: all four test ops
+        ran correctly and all four results landed - then cloud/bus-reconciler/serve_requests.py logged
+        item["latency_ms"] for each answer, the redis-op answers had no such key, and the job exited 1.
+        Every test here drove handle() and none drove what consumes its output.
+
+        So the keys are READ FROM THE ENTRYPOINT'S SOURCE, not listed here: if serve_requests.py starts
+        reading a new key, this test asks for it too, rather than passing on a stale copy of the list."""
+        import re
+        source = (ROOT / "cloud" / "bus-reconciler" / "serve_requests.py").read_text(encoding="utf-8")
+        # Each `for item in out["<name>"]:` loop BODY - the lines indented deeper than the for - and
+        # nothing after it. (The first version sliced to the next blank line, which swept the refused
+        # loop's item["why"] into the answered keys and demanded a key no answer should carry.)
+        lines = source.splitlines()
+        loops = {}
+        for name in ("answered", "refused"):
+            head = next(n for n, line in enumerate(lines)
+                        if line.strip() == 'for item in out["%s"]:' % name)
+            indent = len(lines[head]) - len(lines[head].lstrip())
+            body = []
+            for line in lines[head + 1:]:
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                body.append(line)
+            loops[name] = set(re.findall(r'item\["([a-z_]+)"\]', "\n".join(body)))
+        self.assertEqual({"req_id", "status", "latency_ms"}, loops["answered"],
+                         "if this changes, the entrypoint changed - read it, then update this line")
+        self.assertIn("latency_ms", loops["answered"], "the entrypoint reads latency_ms - keep it")
+        conn = FakeRedis()
+        out, _, _ = self.run_rows([
+            self.row("grok", "do=redis-op|op=set|key=fleet:x|val=1", req="REQ-0001"),
+            self.row("cursor", "do=redis-op|op=set|key=v1:bus:row:1|val=x", req="REQ-0002"),
+            self.row("aya", "do=redis-synthetic-probe", req="REQ-0003"),
+            self.row("a-stranger", "do=redis-op|op=get|key=fleet:x", req="REQ-0004"),
+        ], conn)
+        self.assertEqual(3, len(out["answered"]))
+        for item in out["answered"]:
+            missing = loops["answered"] - set(item)
+            self.assertEqual(set(), missing, "answer %s lacks %s" % (item.get("req_id"), missing))
+        for item in out["refused"]:
+            missing = loops["refused"] - set(item)
+            self.assertEqual(set(), missing, "refusal %s lacks %s" % (item.get("req_id"), missing))
+
     def test_redis_op_is_listed_TOGETHER_with_its_branch(self):
         """Listed without the branch, a redis-op would fall into the probe path and say OK for
         nothing done. Both halves, or neither."""

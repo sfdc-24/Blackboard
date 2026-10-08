@@ -344,6 +344,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                 count = int(req.get("count") or 10)
             except ValueError:
                 count = 10
+            started = time.time()
             result = redis_gov.execute(conn, acl, req["claimed_sender"],
                                        "%s/%s" % (req["req_id"], req["row_id"]),
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
@@ -358,8 +359,13 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                       else "REFUSED" if "refused" in result else "ERROR")
             if status == "ERROR":
                 out["errors"].append(req["req_id"])
+            # latency_ms is part of the contract, not decoration: cloud/bus-reconciler/serve_requests.py
+            # logs item["latency_ms"] for every answer. The first live run, bus-requests-hl95p at
+            # 02:25Z, did all four test ops correctly, posted all four results - and then exited 1
+            # on a KeyError here, so Cloud Run recorded a FAILED execution over a run that had worked.
             out["answered"].append({"req_id": req["req_id"], "status": status,
-                                    "op": req.get("op"), "key": req.get("key")})
+                                    "op": req.get("op"), "key": req.get("key"),
+                                    "latency_ms": int((time.time() - started) * 1000)})
             continue
 
         if append:
