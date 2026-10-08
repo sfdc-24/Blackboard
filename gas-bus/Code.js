@@ -158,7 +158,20 @@ function handleAppend_(body, cfg) {
       const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
       if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
       const row = body.sheetRow || [nowStamp_(), body.text || ''];
+      // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
+      const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
+      if (dup) {
+        return jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
+                          existing_row: dup.row }, 409);
+      }
       sheet.appendRow(row);
+      if (Array.isArray(body.sheetRow)) {
+        const trigger = maybeTriggerWorker_(body.sheetRow);
+        if (trigger !== 'off' && trigger !== 'not-a-request') {
+          return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                            worker: trigger });
+        }
+      }
     } else {
       return jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
     }
@@ -166,6 +179,84 @@ function handleAppend_(body, cfg) {
     return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
   } finally {
     lock.releaseLock();
+  }
+}
+
+// ---- PY-01: NO ROW TWICE ---------------------------------------------
+//
+// Grok's poka-yoke audit, 2026-10-08: overnight a client POST retry appended five Grok rows TWICE,
+// same Row_ID, same millisecond. The client was fixed at 2:12 PM ET; this makes it impossible at the
+// one place every writer passes. A sheetRow whose Row_ID (column A) is already on the sheet, or whose
+// BCB `id=` already appears as the id of an earlier payload (column F), is refused with DUPLICATE and
+// the row it collides with - nothing is appended. Both lookups are server-side TextFinder searches
+// over one column, not a read of the sheet. APPEND_DEDUP=off (Script Property) turns it off without
+// a redeploy; absent, it is ON.
+//
+// What it does not catch, stated: a row written with a DIFFERENT Row_ID and NO BCB id. There is
+// nothing to compare it on, and guessing from the text would refuse honest repeats.
+
+// THE BCB-ID HALF CHANGES A HABIT, stated: an agent that re-asks by re-posting the SAME id= (the
+// wakers collapse such re-asks) is now refused, and must re-ask under a new id. APPEND_DEDUP=rowid
+// keeps the Row_ID check alone if that habit turns out to matter more than the retry it stops.
+
+function findDuplicate_(sheet, sheetRow) {
+  const mode = PropertiesService.getScriptProperties().getProperty('APPEND_DEDUP');
+  if (mode === 'off') return null;
+  const last = sheet.getLastRow();
+  if (last < 1) return null;
+  const rowId = String(sheetRow[0] == null ? '' : sheetRow[0]).trim();
+  if (rowId) {
+    const hit = sheet.getRange(1, 1, last, 1).createTextFinder(rowId).matchEntireCell(true)
+      .matchCase(true).findNext();
+    if (hit) return { kind: 'row_id', id: rowId, row: hit.getRow() };
+  }
+  const bcb = mode === 'rowid' ? '' : bcbId_(sheetRow[5]);
+  if (bcb) {
+    const pattern = '(^|\\|)id=' + bcb.replace(/[.\-]/g, '\\$&') + '(\\||$)';
+    const hit = sheet.getRange(1, 6, last, 1).createTextFinder(pattern).useRegularExpression(true)
+      .matchCase(true).findNext();
+    if (hit) return { kind: 'bcb_id', id: bcb, row: hit.getRow() };
+  }
+  return null;
+}
+
+// The payload's own `id=` - the field, never a substring of another (answers=, req=, row_id=).
+function bcbId_(payload) {
+  const m = /(?:^|\|)id=([A-Za-z0-9._-]{1,200})(?:\||$)/.exec(String(payload == null ? '' : payload));
+  return m ? m[1] : '';
+}
+
+// ---- PY-02: A REQUEST STARTS THE WORKER, NO POLLING ---------------------
+//
+// SHIPPED OFF. Grok's audit asked for it and said "the trigger and IAM need owner GO", so it does
+// nothing unless the Script Property WORKER_TRIGGER is exactly 'on'. When on: an appended AYA_REQ row
+// addressed to bus-reconciler starts ONE execution of the Cloud Run job bus-requests, as the script's
+// owner (ScriptApp.getOAuthToken, which needs the cloud-platform scope in appsscript.json). At most
+// one start per WORKER_DEBOUNCE_S (default 45 s): a burst of requests is served by the run already
+// starting, which reads every unanswered request in its window. The append never fails because the
+// trigger did - the row is on the board either way, and the response says what the trigger did.
+
+function maybeTriggerWorker_(sheetRow) {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('WORKER_TRIGGER') !== 'on') return 'off';
+  const target = String(sheetRow[3] == null ? '' : sheetRow[3]).trim().toLowerCase();
+  const action = String(sheetRow[4] == null ? '' : sheetRow[4]).trim().toUpperCase();
+  if (action !== 'AYA_REQ' || target !== 'bus-reconciler') return 'not-a-request';
+  const cache = CacheService.getScriptCache();
+  if (cache.get('worker-trigger')) return 'debounced';
+  const seconds = Math.max(10, Math.min(300, Number(props.getProperty('WORKER_DEBOUNCE_S')) || 45));
+  cache.put('worker-trigger', String(Date.now()), seconds);
+  const job = props.getProperty('WORKER_JOB') ||
+    'projects/sfdc24/locations/us-central1/jobs/bus-requests';
+  if (!/^projects\/[a-z0-9-]+\/locations\/[a-z0-9-]+\/jobs\/[a-z0-9-]+$/.test(job)) return 'bad-job-name';
+  try {
+    const resp = UrlFetchApp.fetch('https://run.googleapis.com/v2/' + job + ':run', {
+      method: 'post', contentType: 'application/json', payload: '{}', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    });
+    return 'started-http-' + resp.getResponseCode();
+  } catch (err) {
+    return 'start-failed';
   }
 }
 
@@ -218,6 +309,43 @@ function handleRead_(params, cfg) {
     const limit = parseInt(params.limit, 10);
     const match = String(params.match || '').toLowerCase();
     const since = String(params.since || '');
+
+    // A CLOSED PHYSICAL RANGE: start is 1-based and INCLUSIVE, count is how many rows.
+    //
+    // Gemini, architect lead, 2026-10-07: "Drop time completely. Physical index range is the
+    // correct architectural boundary. Comparing a closed interval [start, end] turns an
+    // indeterminate time query into an exact identity and count match, eliminating timestamp
+    // jitter and lexical comparison bugs." Codex had shown that no predicate over a time-windowed
+    // verdict can establish zero divergence, because this sheet's ROW ORDER IS NOT ITS TIMESTAMP
+    // ORDER and both other filters lean on time.
+    //
+    // The machinery was already here - `limit` is getRange(total - n + 1, ...), a physical tail -
+    // and simply not exposed. This exposes it without moving the tail path.
+    //
+    // ADDITIVE: a caller that does not send start behaves exactly as before.
+    const start = parseInt(params.start, 10);
+    const count = parseInt(params.count, 10);
+    if (start > 0) {
+      if (!(count > 0)) {
+        return jsonOut_({ ok: false,
+                          error: 'count must be a positive integer when start is given' }, 400);
+      }
+      if (start > total) {
+        // Past the end is not an error and not an empty board: it is an empty RANGE, and the
+        // caller needs `total` back to know that is why.
+        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: [],
+                          total: total, filtered: 0, start: start, count: 0 });
+      }
+      const n = Math.min(count, total - start + 1);
+      const rangedRows = sheet.getRange(start, 1, n, cols).getValues();
+      // `total` travels with every ranged read ON PURPOSE. Gemini: "The reconciler must read total
+      // first, freeze end_index to that snapshot, and query only that closed slice. A floating
+      // upper bound reintroduces edge leaks." The caller freezes it; this tells it what the sheet
+      // held at the moment of the read. The echoed start and count are how a caller knows the
+      // gateway understood the question rather than ignoring it and answering with everything.
+      return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: rangedRows,
+                        total: total, filtered: rangedRows.length, start: start, count: n });
+    }
     const filtered = (limit > 0) || !!match || !!since;
 
     if (!filtered) {
@@ -237,11 +365,30 @@ function handleRead_(params, cfg) {
     } else {
       rows = sheet.getDataRange().getValues();
       if (since) {
+        const sinceMs = Date.parse(since);
+        // jsonOut_, not respond(): a cutoff we cannot parse must not silently return everything or
+        // nothing. 400 with ok:false, the way every other error path in this file answers.
+        if (isNaN(sinceMs)) {
+          return jsonOut_({ ok: false, error: 'since is not a parseable timestamp' }, 400);
+        }
         rows = rows.filter(function (r) {
           for (let i = 0; i < r.length; i++) {
             const cell = r[i];
-            if (cell instanceof Date) return cell.toISOString() >= since;
-            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) return cell >= since;
+            // PARSED, NOT COMPARED AS TEXT. Codex found the same defect in the Python reconciler,
+            // except this one is upstream of every `since` reader on the fleet and it is DEPLOYED.
+            // An ISO string compare drops a row whose stamp carries sub-second precision at the
+            // cutoff second:
+            //     "2026-10-07T03:32:22.588753Z" >= "2026-10-07T03:32:22Z"   is FALSE
+            // because "." sorts below "Z". scripts/append.py stamps microseconds, so this silently
+            // excluded rows the caller asked for - and a row no reader receives is a row no
+            // reconciler can find missing.
+            if (cell instanceof Date) return cell.getTime() >= sinceMs;
+            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) {
+              const t = Date.parse(cell);
+              // Unparseable means UNKNOWN, and a filter cannot return unknown - so the row is KEPT.
+              // Dropping it would hide it from every reader; keeping it costs one extra row.
+              return isNaN(t) ? true : t >= sinceMs;
+            }
           }
           return false;   // a row with no timestamp cannot satisfy a since
         });

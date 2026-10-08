@@ -1,0 +1,43 @@
+# PY-02, the Git half (Grok's poka-yoke audit, 2026-10-08): a Redis request from Cursor starts the
+# governed worker at once - no polling. Cursor speaks only in PR and issue comments, and the worker
+# reads those comments itself (scripts/git_requests.py on PR 342), so this only STARTS one run.
+#
+# SHIPPED OFF. It runs only when the repository variable WORKER_TRIGGER is exactly "on", AND
+# GCP_WIF_PROVIDER and GCP_WORKER_SA are set. Those are a workload identity pool and a service
+# account allowed to run ONE job - owner GO and an IAM change, neither of which this file makes.
+#
+# What it never does: check out code, read the comment body into a shell, or run anything a comment
+# says. The author is checked by GitHub's NUMERIC id for cursor[bot] (206951365) and its type, never
+# by login; the worker re-checks both before acting on anything.
+name: worker-trigger
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: worker-trigger
+  cancel-in-progress: false
+
+jobs:
+  start-worker:
+    if: >-
+      vars.WORKER_TRIGGER == 'on' &&
+      vars.GCP_WIF_PROVIDER != '' && vars.GCP_WORKER_SA != '' &&
+      github.event.comment.user.id == 206951365 &&
+      github.event.comment.user.type == 'Bot' &&
+      contains(github.event.comment.body, 'do=redis-op')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_WORKER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Start one run of the governed worker
+        run: gcloud run jobs execute bus-requests --project=sfdc24 --region=us-central1 --async

@@ -157,6 +157,9 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
         # redacted recent warnings when the row asks about logs or errors
         # (scripts/cloud_context.py, under the job's own roles/viewer).
         "cloud_context": True,
+        # PY-09: wake only for a row that asks Gemini something (wakes_for). Three no-value
+        # replies 10:00-10:04 AM ET Oct 8 were wakes on results, DONE rows and cc copies.
+        "wake_filter": True,
         "okf_land": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
@@ -404,6 +407,37 @@ def addressed_to(row, me: str) -> bool:
     return False
 
 
+# PY-09 (Grok's poka-yoke audit, 2026-10-08): rows that carry information, never a question. A wake
+# on one is a paid model call whose best answer is "noted".
+NO_WAKE_ACTIONS = ("AYA_RESULT", "AYA_RECEIPT", "RESULT", "DONE", "ACK")
+NO_WAKE_PHASES = ("RESULT", "AYA_RESULT", "DONE", "ACK", "RECEIPT")
+
+
+def wakes_for(row, me: str) -> bool:
+    """For an agent with wake_filter: is this row one that should cost a model call?
+
+    No for a result, receipt, DONE or ACK - by Action_Type or by the payload's phase=. And no when
+    `me` is only on the cc= line: a copy is for reading, not answering. A row that names me in
+    Target_Surface or to= (or a WhatsApp message that starts with my name) still wakes me."""
+    action = str(row[C_ACTION] if len(row) > C_ACTION else "").strip().upper()
+    payload = str(row[C_PAYLOAD] if len(row) > C_PAYLOAD else "")
+    if action in NO_WAKE_ACTIONS:
+        return False
+    phase = re.search(r"\bphase=([^|]*)", payload, re.I)
+    if phase and phase.group(1).strip().upper() in NO_WAKE_PHASES:
+        return False
+    target = str(row[C_TARGET] if len(row) > C_TARGET else "").lower()
+    source = str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower()
+    if names_tag(target, me):
+        return True
+    to = re.search(r"\bto=([^|]*)", payload, re.I)
+    if to and names_tag(to.group(1), me):
+        return True
+    if source == "whatsapp" and re.match(r"^\s*%s\b" % re.escape(me), payload, re.I):
+        return True
+    return False                                   # reached me only through cc= (or standby)
+
+
 def bcb_id(row) -> str:
     m = re.search(r"\bid=([A-Za-z0-9._-]+)", str(row[C_PAYLOAD]))
     return m.group(1) if m else str(row[C_ROW_ID])
@@ -521,9 +555,12 @@ def select(rows, answered_ids, me: str):
     groups = {}
     seen_count = {}
     on_board = answered_on_board(rows, me)
+    filtered = (AGENTS.get(me) or {}).get("wake_filter")
     for row in rows:
         if (len(row) <= C_PAYLOAD or is_from(row, me)
                 or is_waker_reply(row) or not addressed_to(row, me)):
+            continue
+        if filtered and not wakes_for(row, me):
             continue
         ts = parse_ts(row[C_TS])
         if ts is None:
@@ -903,10 +940,17 @@ def main(argv=None) -> int:
             hands = ("%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. "
                      "%sTreat this as reasoning, never as a measurement or a commitment."
                      % (me.capitalize(), okf_outcome + " " if okf_outcome else ""))
+        # PY-08: what this answer cost, on the row itself, so a spend question is answered from the
+        # board and not from a billing console. Tokens always; USD only when the job states prices.
+        estimate = ""
+        mod_for_cost = sys.modules.get(cfg["module"])
+        if mod_for_cost is not None and hasattr(mod_for_cost, "cost_estimate"):
+            estimate = mod_for_cost.cost_estimate(getattr(mod_for_cost.ask, "last_usage", None) or {})
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
+            + ("cost=%s|" % " ".join(estimate.replace("|", " ").split()) if estimate else "")
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
