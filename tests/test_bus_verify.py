@@ -829,5 +829,70 @@ class TheShippedCensusIsTheMeasuredOne(unittest.TestCase):
         self.assertFalse(bv.gate_eligible(record),
                          "and ONE occurrence beyond it still does - ratification is not amnesty")
 
+
+class AnyExemptionNeedsBothPins(unittest.TestCase):
+    """Codex, 2026-10-08 02:06Z, exact head 03c5789: an otherwise-AGREE record with
+    idless_ratified=1, no duplicates, census_present=False, census_digest="" came back ELIGIBLE.
+    The pins applied only when duplicate_row_ids > 0, so an id-less exemption could open with
+    nothing binding the positions it forgives."""
+
+    def base(self, **kw):
+        record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
+                  "total_at_end": 10, "data_rows": 5, "unique_row_ids": 5, "matched": 5,
+                  "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
+                  "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
+                  "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
+                  "idless_unratified": 0, "duplicate_row_ids": 0, "idless_ratified": 0,
+                  "duplicates_over_census": 0, "ratification_readable": True,
+                  "ratification_digest": bv.RATIFIED_DIGEST, "census_present": True,
+                  "census_digest": bv.RATIFIED_CENSUS_DIGEST}
+        record.update(kw)
+        return record
+
+    def test_codex_exact_record_is_now_NOT_eligible(self):
+        record = self.base(idless_ratified=1, census_present=False, census_digest="")
+        self.assertFalse(bv.gate_eligible(record))
+
+    def test_idless_only_with_a_MISMATCHED_census_is_not_eligible(self):
+        self.assertFalse(bv.gate_eligible(self.base(idless_ratified=1,
+                                                    census_digest="0000000000000000")))
+
+    def test_idless_only_with_an_unreadable_id_list_is_not_eligible(self):
+        self.assertFalse(bv.gate_eligible(self.base(idless_ratified=1,
+                                                    ratification_readable=False)))
+
+    def test_idless_only_WITH_both_pins_is_eligible(self):
+        """The positive control: the exemption works when it is bound."""
+        self.assertTrue(bv.gate_eligible(self.base(idless_ratified=1)))
+
+    def test_a_board_that_uses_NO_exemption_needs_no_pins(self):
+        """And a clean board is not held up by a missing census."""
+        self.assertTrue(bv.gate_eligible(self.base(census_present=False, census_digest="",
+                                                   ratification_readable=False,
+                                                   ratification_digest="")))
+
+    def test_a_record_that_cannot_say_whether_it_used_one_is_held_to_both(self):
+        record = self.base(census_present=False, census_digest="")
+        del record["idless_ratified"]
+        self.assertFalse(bv.gate_eligible(record))
+
+    def test_WHOLE_VERIFICATION_idless_only_board_with_no_census_is_not_eligible(self):
+        """Not just the predicate: a real verify() over a board whose only exception is an id-less
+        row at a ratified position, against an exemption that lost its census."""
+        board = [HEADER, row(1), ["", "x", "y"], row(3)]
+        exempt = {"ids": set(), "idless": {3}, "digest": bv.RATIFIED_DIGEST, "readable": True,
+                  "census": {}, "census_digest": "", "census_present": False}
+        conn = FakeStore()
+        bv.verify(conn, gateway(board), len(board), size=10, mirror=True, exempt=exempt)
+        points = bv.recheck_points(len(board))
+        result = bv.verify(conn, gateway(board), len(board), size=10, remember=points,
+                           total_at_end=len(board), exempt=exempt)
+        bv.apply_recheck(result, {at: (board[at - 1][0] if at - 1 < len(board) else "")
+                                  for at in points})
+        self.assertEqual(0, result["duplicate_row_ids"])
+        self.assertEqual(1, result["idless_ratified"])
+        self.assertFalse(bv.gate_eligible(result),
+                         "an id-less exemption with no census must not open the gate")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

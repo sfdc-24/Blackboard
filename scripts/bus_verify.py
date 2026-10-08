@@ -545,18 +545,34 @@ def gate_eligible(record) -> bool:
         # The ratified exemption must have been READ, and its digest must be the one the owner
         # ratified. A record that forgives duplicates without saying which list it used is a record
         # a gate cannot check.
-        and (record.get("duplicate_row_ids", 0) == 0
-             or (record.get("ratification_readable") is True
-                 and record.get("ratification_digest") == RATIFIED_DIGEST))
         # AND THE EXEMPTION MUST BE BOUNDED. Naming an id said whether it was forgiven and never how
-        # many times, so a 56th occurrence of a listed id passed. A board with duplicates is now
+        # many times, so a 56th occurrence of a listed id passed. A board using any exemption is
         # eligible only against a ratified census, and only while no id has exceeded its count.
         and record.get("duplicates_over_census", 1) == 0
-        and (record.get("duplicate_row_ids", 0) == 0
-             or (record.get("census_present") is True
+        # BOTH PINS WHENEVER ANY EXEMPTION IS USED - a duplicate id OR a ratified id-less position.
+        #
+        # Codex, 2026-10-08 02:06Z, on exact head 03c5789: these two terms used to apply only when
+        # duplicate_row_ids > 0. A record with idless_ratified=1, no duplicates, census_present
+        # False and census_digest "" came back ELIGIBLE - and it is reachable: ratified() keeps the
+        # id list and the id-less positions readable while _census() rejects a missing or tampered
+        # census. Repair the historical duplicates and the id-less exemption would have opened with
+        # nothing binding the positions it forgives - the census digest is the only thing that
+        # does. aya found the same gap on the verdict side (PR 339). A board that uses NO exemption
+        # needs neither pin.
+        and (not _uses_exemption(record)
+             or (record.get("ratification_readable") is True
+                 and record.get("ratification_digest") == RATIFIED_DIGEST
+                 and record.get("census_present") is True
                  and bool(RATIFIED_CENSUS_DIGEST)
                  and record.get("census_digest") == RATIFIED_CENSUS_DIGEST))
     )
+
+
+def _uses_exemption(record) -> bool:
+    """Did this record forgive anything at all? A duplicate id, or an id-less row at a ratified
+    position. Missing fields count as USED, so a record that cannot say is held to both pins."""
+    return (record.get("duplicate_row_ids", 1) != 0
+            or record.get("idless_ratified", 1) != 0)
 
 
 def record_run(conn, result, log=None) -> bool:
