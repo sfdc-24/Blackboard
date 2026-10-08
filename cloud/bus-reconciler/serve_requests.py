@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, "/app")
 
@@ -99,35 +100,87 @@ def main() -> int:
 
     from bus import load_env                                             # noqa: PLC0415
     env = load_env()
-    now = datetime.datetime.now(datetime.timezone.utc)
     execution = os.environ.get("CLOUD_RUN_EXECUTION", "")
+    until = _loop_until(os.environ.get("LOOP_UNTIL", ""))
+    if until is None:
+        one_pass(conn, env, execution, with_git=True)
+        return 0
+    # LIVE MODE, for a meeting. Mr. Salam, 2026-10-08: "Do not create barriers in agent's ability to read,
+    # write, share ideas, propose changes during the meeting (without audio) ... like a background task
+    # that runs as side conversation." A request posted during the call is answered within about
+    # LOOP_INTERVAL seconds instead of whenever someone starts a run - one execution, a plain loop, no
+    # model, ending at LOOP_UNTIL (at most LOOP_MAX_MINUTES from start, whatever LOOP_UNTIL says).
+    # GitHub is read at most once a minute: its unauthenticated limit is 60 calls an hour.
+    interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
+    started = datetime.datetime.now(datetime.timezone.utc)
+    hard_stop = started + datetime.timedelta(minutes=int(os.environ.get("LOOP_MAX_MINUTES", "240")))
+    stop = min(until, hard_stop)
+    log.info("live mode: every %ds until %s", interval, stop.strftime("%H:%M:%SZ"))
+    last_git, passes = None, 0
+    while datetime.datetime.now(datetime.timezone.utc) < stop:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with_git = last_git is None or (now - last_git).total_seconds() >= 60
+        try:
+            one_pass(conn, env, execution, with_git=with_git, quiet=True)
+        except Exception as error:                                       # noqa: BLE001
+            # One bad pass (a board flap, a lost reply) must not end the meeting's channel.
+            log.warning("pass failed: %s", type(error).__name__)
+        if with_git:
+            last_git = now
+        passes += 1
+        time.sleep(interval)
+    log.info("live mode ended after %d passes", passes)
+    return 0
+
+
+def _loop_until(text):
+    """LOOP_UNTIL as an aware datetime, or None for the normal single pass. Unparseable is single."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        when = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        log.error("LOOP_UNTIL %r is not an ISO time; running one pass", text)
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
+
+
+def one_pass(conn, env, execution, with_git=True, quiet=False):
+    """Read the board (and GitHub), answer what is allowed, beat the heartbeat. One pass."""
+    now = datetime.datetime.now(datetime.timezone.utc)
     bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = bus_reconcile.board_rows(env, since=since)
-    log.info("window since=%s: %d board row(s)", since, len(rows))
+    if not quiet:
+        log.info("window since=%s: %d board row(s)", since, len(rows))
     # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list
     # binds by numeric id - Cursor's only way in. Appended AFTER the board rows, so the board's RESULT
     # rows are what makes a git request "already answered" too. A GitHub failure costs this channel one
     # run and nothing else.
-    import git_requests                                                  # noqa: PLC0415
-    git = git_requests.git_rows(now - datetime.timedelta(minutes=WINDOW_MINUTES),
-                                token=os.environ.get("GITHUB_READ_TOKEN") or None, log=log.warning)
-    log.info("git channel: %d request row(s)", len(git))
-    rows = list(rows) + git
+    if with_git:
+        import git_requests                                              # noqa: PLC0415
+        git = git_requests.git_rows(now - datetime.timedelta(minutes=WINDOW_MINUTES),
+                                    token=os.environ.get("GITHUB_READ_TOKEN") or None, log=log.warning)
+        if not quiet or git:
+            log.info("git channel: %d request row(s)", len(git))
+        rows = list(rows) + git
 
     out = bus_request.handle(rows, conn, now=now, append=appender(env), max_per_run=MAX_PER_RUN)
-    log.info("requests: %s", bus_request.summary(out))
+    if not quiet or out["answered"] or out["capped"]:
+        log.info("requests: %s", bus_request.summary(out))
     for item in out["answered"]:
         log.info("answered %s: %s in %dms", item["req_id"], item["status"], item["latency_ms"])
-    for item in out["refused"]:
-        log.warning("refused %s: %s", item["req_id"] or "(no id)", "; ".join(item["why"]))
+    if not quiet:
+        for item in out["refused"]:
+            log.warning("refused %s: %s", item["req_id"] or "(no id)", "; ".join(item["why"]))
     if out["capped"]:
         log.warning("%d request(s) left for the next run by the per-run cap", out["capped"])
     bus_request.heartbeat(conn, "idle", execution=execution, answered=len(out["answered"]),
                           refused=len(out["refused"]), capped=out["capped"], acl=out.get("acl", ""))
     # A refusal is a correct outcome and an error inside the probe is a reported one, so neither
     # fails the execution. Only being unable to reach Redis at all does, above.
-    return 0
+    return out
 
 
 if __name__ == "__main__":
