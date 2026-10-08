@@ -83,6 +83,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 import repo_context  # noqa: E402
+import cloud_context  # noqa: E402
 import okf_land  # noqa: E402
 from bus import load_env as _load_bus_env
 
@@ -147,13 +148,18 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
     "gemini": {
         "module": "gemini_agent",
         "project": "FLEET",
-        # A row that names a pull request in a PUBLIC repository gets that PR's
-        # read-only diff attached (scripts/repo_context.py; the owner approved the
-        # token, 2026-09-29). A private repository is never read: see that file.
+        # A row that names a pull request gets that PR's read-only diff attached
+        # (scripts/repo_context.py; the owner approved the token, 2026-09-29). A
+        # private repository only when GEMINI_PRIVATE_REPOS names it (owner,
+        # 2026-10-08: "gemini needs access to everything that you can access").
         "repo_context": True,
         # PY-09: wake only for a row that asks Gemini something (wakes_for). Three no-value
         # replies 10:00-10:04 AM ET Oct 8 were wakes on results, DONE rows and cc copies.
         "wake_filter": True,
+        # A row that names a Cloud Run resource gets its read-only state, and its
+        # redacted recent warnings when the row asks about logs or errors
+        # (scripts/cloud_context.py, under the job's own roles/viewer).
+        "cloud_context": True,
         "okf_land": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
@@ -168,12 +174,18 @@ file=call-notes the file is your prepared notes for the next call. The adapter
 appends the pull request's okf= link to your answer, or says why it could not:
 never invent that link, and never say a file landed. Write such a reply as the
 file itself: no greeting, no mention of the row. You still cannot open other
-pull requests, merge, or read a private repository. You
-see the board row quoted to you below and, when the row names a
-pull request in a public repository, a read-only excerpt of that PR your adapter
-attached after it. That excerpt is all you have seen of any repository: say
-which PR and head you read, and do not claim to have read anything else. If it
-is marked INCOMPLETE, do not give a verdict on the whole PR.
+pull requests or merge. You see the board row quoted to you below and, after
+it, what your adapter attached for it:
+- when the row names a pull request (Blackboard, sfdc24-site, or the private
+  conference repository), a read-only excerpt of that PR. A PRIVATE excerpt is
+  marked so: your reply is posted to the board, so quote only what you need.
+- when the row names a Cloud Run service, job or worker pool, its read-only
+  state from Google Cloud (environment VALUES are withheld), and when the row
+  asks about logs or errors, its recent warnings, redacted.
+Those excerpts are all you have seen: say which PR and head, or which resource,
+you read, and do not claim to have read anything else. If an excerpt is marked
+INCOMPLETE, do not give a verdict on the whole PR. Mr. Salam's role for you,
+2026-10-08: architect and adversarial reviewer.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.
@@ -859,6 +871,13 @@ def main(argv=None) -> int:
                 prompt += "\n\n" + extra
                 note = "    repo context: %s, %d characters" % (
                     ", ".join("%s #%d" % r for r in repo_context.refs(ask_text)), len(extra))
+                print(note)
+                log(me, note)
+        if cfg.get("cloud_context"):
+            extra = cloud_context.context_for(ask_text)
+            if extra:
+                prompt += "\n\n" + extra
+                note = "    cloud context: %d characters" % len(extra)
                 print(note)
                 log(me, note)
         if args.dry_run:
