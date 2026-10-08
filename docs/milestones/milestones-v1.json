@@ -1,0 +1,167 @@
+{
+ "_status": "DURABLE COPY. Mr. Salam, 2026-10-08 ~18:05Z: 'keep the repo copy, Redis as the live copy'. This file is the record; proj:milestones:v1:* in Redis is the live copy the conference screen reads, written from this file by hput (one request per hash) and expiring after 30 days unless rewritten.",
+ "_write_plan": [
+  "Writer: Claude via the governed worker (proj: prefix is writable; every op audited in gov:audit).",
+  "One HSET per field set; no TTL (durable project record) unless Gemini rules otherwise; Gemini may refine the layout (RED-M3).",
+  "Readers (conference screen): HGETALL proj:milestones:v1:mermaid, verify sha256 of source before rendering with Mermaid JS.",
+  "Bump version and sha256 on every change; keep the previous version's sha in a changelog entry.",
+  "Check the worker's value size cap before writing the gantt source (7101 bytes)."
+ ],
+ "keys": {
+  "proj:milestones:v1:meta": {
+   "type": "hash",
+   "fields": {
+    "schema": "proj:milestones:v1",
+    "version": "2026-10-08.1",
+    "updated_at": "2026-10-08T13:50:00-04:00",
+    "updated_by": "grok (prepared), writer: claude-code-cli governed worker",
+    "as_of": "Oct 8, 2026 1:50 PM ET",
+    "overall_pct": "39",
+    "overall_pct_prev": "21",
+    "milestones_total": "60",
+    "counts": "{\"done\": 16, \"prog\": 15, \"blocked\": 7, \"todo\": 20, \"unknown\": 2}",
+    "pct_rule": "(done + 0.5 x in progress) / all milestones; blocked, not started, unknown = 0",
+    "prev_source": "conf:2026-10-07:scorecard (readback 2026-10-08T03:34:29Z) counts, same rule applied",
+    "sources": "10pm-milestones.json (Oct 7 9:30 PM ET); Blackboard rows to 2026-10-08T17:46Z; GitHub sfdc-24 PR state read 1:55 PM ET Oct 8",
+    "workstreams": "[\"redis\", \"deepgram\", \"livekit\", \"cloud\", \"site\", \"converspan\", \"demo\"]"
+   }
+  },
+  "proj:milestones:v1:redis": {
+   "type": "hash",
+   "fields": {
+    "name": "Redis mainboard (shared state + rules of engagement)",
+    "rag": "AMBER",
+    "owner": "Claude (Codex verifies, Gemini layout)",
+    "pct": "47",
+    "pct_prev": "15",
+    "counts": "{\"done\": 4, \"prog\": 6, \"blocked\": 2, \"todo\": 3, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 1, \"prog\": 2, \"blocked\": 3, \"todo\": 7, \"total\": 13}",
+    "remaining": "Codex rerun of 26 attack tests on governed route fix; worker job update (owner); bridge verify + deploy; comparison gate GO; real per-agent identity",
+    "next": "Codex exact-head rerun on governed route fix (no date given)",
+    "milestones": "[{\"id\": \"RED-M1\", \"title\": \"Bridge source opened for review\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-07\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"RED-N1\", \"title\": \"All 5 agents pass governed Redis read/write (Claude, Grok, Codex, Gemini, Cursor)\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-08 9:51 AM\", \"date_kind\": \"actual\", \"change\": \"new\"}, {\"id\": \"RED-M11\", \"title\": \"Owner ratifies duplicate-row census (digest 0c52ebc3)\", \"owner\": \"Mr. Salam\", \"status\": \"done\", \"date\": \"2026-10-07 9:38 PM\", \"date_kind\": \"actual\", \"change\": \"upd\"}, {\"id\": \"RED-M6\", \"title\": \"Codex/Aya read + write (done via governed worker, not the bridge)\", \"owner\": \"Codex\", \"status\": \"done\", \"date\": \"2026-10-07 11:36 PM\", \"date_kind\": \"actual\", \"change\": \"upd\"}, {\"id\": \"RED-N2\", \"title\": \"Governed route (Blackboard: governed read/write for every agent): Codex acceptance + job on new image\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"\", \"date_kind\": \"\", \"change\": \"new\"}, {\"id\": \"RED-M7\", \"title\": \"Grok/Cursor/Gemini caller paths (relay works; real identity not built; Gemini tool broken)\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"upd\"}, {\"id\": \"RED-M8\", \"title\": \"Change log + snapshots (gov:audit live; snapshots + restore test not done)\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"upd\"}, {\"id\": \"RED-M9\", \"title\": \"Milestones roll up to Redis (scorecard in conf:, not yet proj:*)\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"upd\"}, {\"id\": \"RED-M3\", \"title\": \"Gemini rules concrete key layout\", \"owner\": \"Gemini\", \"status\": \"prog\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M13\", \"title\": \"Agent protocol reviewed + merged\", \"owner\": \"Gemini\", \"status\": \"prog\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M2\", \"title\": \"Codex exact-head verification of bridge source\", \"owner\": \"Codex\", \"status\": \"todo\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M4\", \"title\": \"Owner TokenCreator grant on aya-runtime\", \"owner\": \"Mr. Salam\", \"status\": \"todo\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M5\", \"title\": \"Deploy reviewed bridge, with read-back\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M10\", \"title\": \"Comparison gate: Codex GO\", \"owner\": \"Codex\", \"status\": \"blocked\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"RED-M12\", \"title\": \"Sheet-to-Redis mirror + 24h clock (HOLD)\", \"owner\": \"Claude\", \"status\": \"blocked\", \"date\": \"2026-10-10\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:deepgram": {
+   "type": "hash",
+   "fields": {
+    "name": "Deepgram (speech-to-text / text-to-speech)",
+    "rag": "AMBER",
+    "owner": "Claude",
+    "pct": "33",
+    "pct_prev": "33",
+    "counts": "{\"done\": 2, \"prog\": 0, \"blocked\": 0, \"todo\": 4, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 2, \"prog\": 0, \"blocked\": 0, \"todo\": 4, \"total\": 6}",
+    "remaining": "Hold-until-VAD-end fix (0.5 s vs Gemini's 1.0 s); transcript enrichment; Claude voice decision (D1); captions + language set (D5)",
+    "next": "DG-M3 VAD hangover fix, Oct 9 (proposed)",
+    "milestones": "[{\"id\": \"DG-M1\", \"title\": \"Flux turn detection + Silero VAD in the chair\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-07\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"DG-M2\", \"title\": \"STT relay on Cloud Run\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-07\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"DG-M3\", \"title\": \"Hold final until VAD end + hangover\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"DG-M4\", \"title\": \"Transcript enrichment into the OKF\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-15\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"DG-M5\", \"title\": \"Claude voice side-by-side, Aura-2 vs front end (D1)\", \"owner\": \"Mr. Salam\", \"status\": \"todo\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"DG-M6\", \"title\": \"Live captions + first language set (D5)\", \"owner\": \"Gemini\", \"status\": \"todo\", \"date\": \"2026-10-16\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:livekit": {
+   "type": "hash",
+   "fields": {
+    "name": "LiveKit agents (room, chair, AI voices)",
+    "rag": "AMBER",
+    "owner": "Claude (Cursor: agents worker)",
+    "pct": "28",
+    "pct_prev": "21",
+    "counts": "{\"done\": 0, \"prog\": 5, \"blocked\": 2, \"todo\": 2, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 0, \"prog\": 3, \"blocked\": 2, \"todo\": 2, \"total\": 7}",
+    "remaining": "Architecture sign-off (Codex + Claude replies missing); plan safety (Codex holds, D2); chair still loads Oct 3 agenda baked in image; Redis projection + project-task flow under Codex review",
+    "next": "LK-M0 sign-off, Oct 8 (proposed, still open)",
+    "milestones": "[{\"id\": \"LK-M0\", \"title\": \"Architecture sign-off (Gemini 4 changes in; Codex + Claude pending)\", \"owner\": \"Grok\", \"status\": \"prog\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-M2\", \"title\": \"Speech rules in code\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-M4\", \"title\": \"Codex realtime duplex: owner-heard acceptance\", \"owner\": \"Mr. Salam\", \"status\": \"prog\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-N1\", \"title\": \"Chair Redis projection: 6 Codex findings fixed at f35e6e8, rerun pending, OFF\", \"owner\": \"Claude\", \"status\": \"prog\", \"date\": \"\", \"date_kind\": \"\", \"change\": \"new\"}, {\"id\": \"LK-N2\", \"title\": \"Live project-task flow (draft; Aya owns integration)\", \"owner\": \"Codex\", \"status\": \"prog\", \"date\": \"\", \"date_kind\": \"\", \"change\": \"new\"}, {\"id\": \"LK-M1\", \"title\": \"Plan safety: what closed leaves the room (Codex holds, D2)\", \"owner\": \"Claude\", \"status\": \"blocked\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-M6\", \"title\": \"Named agent per AI; land official LiveKit Agents worker\", \"owner\": \"Cursor\", \"status\": \"blocked\", \"date\": \"2026-10-20\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-M3\", \"title\": \"Dynamic chair (today: Oct 3 plan baked in image)\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"LK-M5\", \"title\": \"Native listening for Gemini + Grok\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-15\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:cloud": {
+   "type": "hash",
+   "fields": {
+    "name": "Docker / off the laptop to cloud",
+    "rag": "AMBER",
+    "owner": "Claude",
+    "pct": "36",
+    "pct_prev": "36",
+    "counts": "{\"done\": 2, \"prog\": 1, \"blocked\": 0, \"todo\": 4, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 2, \"prog\": 1, \"blocked\": 0, \"todo\": 4, \"total\": 7}",
+    "remaining": "Off-laptop spec approval; deploy receipts per revision; rollback drill; Stage C1 infra; a full call with no laptop (Claude and the Redis worker were offline with the laptop 10:07 AM to about 1:30 PM)",
+    "next": "CLD-M3 deploy discipline, Oct 13 (proposed)",
+    "milestones": "[{\"id\": \"CLD-M1\", \"title\": \"Build route: Cloud Build + Artifact Registry\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-06\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"CLD-M2\", \"title\": \"Conference services on Cloud Run (gateway, chair, STT, studio)\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-06\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"CLD-M5\", \"title\": \"Claude off the laptop: spec approved\", \"owner\": \"Mr. Salam\", \"status\": \"prog\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CLD-M3\", \"title\": \"Deploy discipline: image read-back + receipt\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CLD-M4\", \"title\": \"Rollback drill on production\", \"owner\": \"Codex\", \"status\": \"todo\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CLD-M6\", \"title\": \"Stage C1 infrastructure applied\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-16\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CLD-M7\", \"title\": \"Full call end to end, no laptop\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-20\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:site": {
+   "type": "hash",
+   "fields": {
+    "name": "sfdc24.com pages",
+    "rag": "AMBER",
+    "owner": "Cursor",
+    "pct": "36",
+    "pct_prev": "17",
+    "counts": "{\"done\": 2, \"prog\": 1, \"blocked\": 2, \"todo\": 2, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 0, \"prog\": 2, \"blocked\": 2, \"todo\": 2, \"total\": 6}",
+    "remaining": "Conference page still draft; footer test; Ops refresh on HOLD for Codex review; site Redis read API; live Redis views (HOLD until Redis proven)",
+    "next": "SITE-M3 conference page, Oct 8 (proposed, still draft)",
+    "milestones": "[{\"id\": \"SITE-M1\", \"title\": \"Process board merged\", \"owner\": \"Cursor\", \"status\": \"done\", \"date\": \"2026-10-07 9:36 PM\", \"date_kind\": \"actual\", \"change\": \"upd\"}, {\"id\": \"SITE-N1\", \"title\": \"Public pages use persona names (live 9:28 AM)\", \"owner\": \"Cursor\", \"status\": \"done\", \"date\": \"2026-10-08 9:26 AM\", \"date_kind\": \"actual\", \"change\": \"new\"}, {\"id\": \"SITE-M3\", \"title\": \"Conference page: Redis floor views + diagrams (draft)\", \"owner\": \"Cursor\", \"status\": \"prog\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"SITE-M2\", \"title\": \"Shared footer test green (status unverified)\", \"owner\": \"Cursor\", \"status\": \"todo\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"SITE-M5\", \"title\": \"Site Redis read API through the bridge\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-13\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"SITE-M4\", \"title\": \"Ops refresh: Codex review then merge (HOLD)\", \"owner\": \"Codex\", \"status\": \"blocked\", \"date\": \"2026-10-09\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"SITE-M6\", \"title\": \"Live Redis views switched on (HOLD)\", \"owner\": \"Mr. Salam\", \"status\": \"blocked\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:converspan": {
+   "type": "hash",
+   "fields": {
+    "name": "Converspan roll-out (AI conference line as a service)",
+    "rag": "RED",
+    "owner": "Mr. Salam (Claude deploys, Gemini architecture)",
+    "pct": "35",
+    "pct_prev": "13",
+    "counts": "{\"done\": 3, \"prog\": 1, \"blocked\": 1, \"todo\": 5, \"unknown\": 0}",
+    "counts_prev": "{\"done\": 1, \"prog\": 0, \"blocked\": 1, \"todo\": 6, \"total\": 8}",
+    "remaining": "converspan.com DNS propagation + Firebase certificate; pi1-cli launch (D4); pricing + cost cap (D6); SIP; guest access; G9 foundation gate; first paying client",
+    "next": "converspan.com check 2:16 PM ET today (Grok)",
+    "milestones": "[{\"id\": \"CSP-M1\", \"title\": \"Readiness assessment written\", \"owner\": \"Grok\", \"status\": \"done\", \"date\": \"2026-09-26\", \"date_kind\": \"actual\", \"change\": \"\"}, {\"id\": \"CSP-N1\", \"title\": \"Early-access site live, converspan.web.app (Claude as chair)\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-07 11:01 PM\", \"date_kind\": \"actual\", \"change\": \"new\"}, {\"id\": \"CSP-N2\", \"title\": \"Converspan build principles v0.1 in repo\", \"owner\": \"Grok\", \"status\": \"done\", \"date\": \"2026-10-07\", \"date_kind\": \"actual\", \"change\": \"new\"}, {\"id\": \"CSP-M7\", \"title\": \"converspan.com DNS set 1:41 PM; propagation + certificate pending\", \"owner\": \"Grok\", \"status\": \"prog\", \"date\": \"2026-10-08 2:16 PM\", \"date_kind\": \"agreed\", \"change\": \"upd\"}, {\"id\": \"CSP-M2\", \"title\": \"pi1-cli launch: spend-capped key + service account (D4)\", \"owner\": \"Mr. Salam\", \"status\": \"blocked\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CSP-M3\", \"title\": \"Pricing + per-call cost cap (D6)\", \"owner\": \"Mr. Salam\", \"status\": \"todo\", \"date\": \"2026-10-14\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CSP-M4\", \"title\": \"SIP dial-in on test URI, then number (D3)\", \"owner\": \"Claude\", \"status\": \"todo\", \"date\": \"2026-10-21\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CSP-M5\", \"title\": \"Guest access (VERIFY + owner GO)\", \"owner\": \"Codex\", \"status\": \"todo\", \"date\": \"2026-10-27\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CSP-M6\", \"title\": \"G9 foundation gate\", \"owner\": \"Codex\", \"status\": \"todo\", \"date\": \"2026-10-30\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"CSP-M8\", \"title\": \"First paying client\", \"owner\": \"Mr. Salam\", \"status\": \"todo\", \"date\": \"2026-11-09\", \"date_kind\": \"prop\", \"change\": \"\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:demo": {
+   "type": "hash",
+   "fields": {
+    "name": "Prospect demo, Oct 8 10:30 AM",
+    "rag": "GREY",
+    "owner": "Mr. Salam",
+    "pct": "58",
+    "pct_prev": "17",
+    "counts": "{\"done\": 3, \"prog\": 1, \"blocked\": 0, \"todo\": 0, \"unknown\": 2}",
+    "counts_prev": "{\"done\": 0, \"prog\": 2, \"blocked\": 0, \"todo\": 4, \"total\": 6}",
+    "remaining": "Outcome not recorded on the board; dry run not evidenced; conference page not merged; chair ran Oct 3 agenda",
+    "next": "Mr. Salam to share demo outcome",
+    "milestones": "[{\"id\": \"DEMO-M1\", \"title\": \"Claude, Codex, Gemini readiness replies\", \"owner\": \"Claude\", \"status\": \"done\", \"date\": \"2026-10-07 9:39 PM\", \"date_kind\": \"actual\", \"change\": \"upd\"}, {\"id\": \"DEMO-M2\", \"title\": \"10 PM call checkpoint (held; no formal PASS recorded)\", \"owner\": \"Grok\", \"status\": \"done\", \"date\": \"2026-10-07 10 PM\", \"date_kind\": \"agreed\", \"change\": \"upd\"}, {\"id\": \"DEMO-M4\", \"title\": \"Demo validation: chair/gateway PASS, agenda FAIL, live call UNTESTED\", \"owner\": \"Codex\", \"status\": \"done\", \"date\": \"2026-10-08 9:18 AM\", \"date_kind\": \"actual\", \"change\": \"upd\"}, {\"id\": \"DEMO-M3\", \"title\": \"Demo page merged or on staging (still draft)\", \"owner\": \"Cursor\", \"status\": \"prog\", \"date\": \"2026-10-08\", \"date_kind\": \"prop\", \"change\": \"\"}, {\"id\": \"DEMO-M5\", \"title\": \"Dry run then freeze (freeze held; dry run not evidenced)\", \"owner\": \"Claude\", \"status\": \"unknown\", \"date\": \"2026-10-08 8:30 AM\", \"date_kind\": \"agreed\", \"change\": \"upd\"}, {\"id\": \"DEMO-M6\", \"title\": \"Prospect demo (outcome unknown)\", \"owner\": \"Mr. Salam\", \"status\": \"unknown\", \"date\": \"2026-10-08 10:30 AM\", \"date_kind\": \"agreed\", \"change\": \"upd\"}]",
+    "updated_at": "2026-10-08T13:50:00-04:00"
+   }
+  },
+  "proj:milestones:v1:mermaid": {
+   "type": "hash",
+   "fields": {
+    "kind": "gantt",
+    "source": "---\ntitle: Conference line milestones, Oct 8, 2026 1:50 PM ET\n---\n%% Source of truth: /workspace/milestones-1008/data.py. Only dated milestones appear on the timeline;\n%% undated ones are listed in the progress view and the Redis payload. done=done, active=in progress, crit=blocked.\ngantt\n    dateFormat YYYY-MM-DD\n    axisFormat %b %d\n    tickInterval 1week\n    section Redis 47% AMBER\n    ✓ RED-M1 Bridge source opened for review - Claude :milestone, done, red_m1, 2026-10-07, 0d\n    ✓ RED-N1 All 5 agents pass governed Redis read/write (Claude, Grok, Codex, Gemini… - Claude :milestone, done, red_n1, 2026-10-08, 0d\n    ✓ RED-M11 Owner ratifies duplicate-row census (digest 0c52ebc3) - Mr. Salam :milestone, done, red_m11, 2026-10-07, 0d\n    ✓ RED-M6 Codex/Aya read + write (done via governed worker, not the bridge) - Codex :milestone, done, red_m6, 2026-10-07, 0d\n    ◐ RED-M7 Grok/Cursor/Gemini caller paths (relay works, real identity not built, G… (prop.) - Claude :milestone, active, red_m7, 2026-10-13, 0d\n    ◐ RED-M8 Change log + snapshots (gov꞉audit live, snapshots + restore test not don… (prop.) - Claude :milestone, active, red_m8, 2026-10-13, 0d\n    ◐ RED-M9 Milestones roll up to Redis (scorecard in conf꞉, not yet proj꞉*) (prop.) - Claude :milestone, active, red_m9, 2026-10-09, 0d\n    ◐ RED-M3 Gemini rules concrete key layout (prop.) - Gemini :milestone, active, red_m3, 2026-10-08, 0d\n    ◐ RED-M13 Agent protocol reviewed + merged (prop.) - Gemini :milestone, active, red_m13, 2026-10-14, 0d\n    ○ RED-M2 Codex exact-head verification of bridge source (prop.) - Codex :milestone, red_m2, 2026-10-08, 0d\n    ○ RED-M4 Owner TokenCreator grant on aya-runtime (prop.) - Mr. Salam :milestone, red_m4, 2026-10-08, 0d\n    ○ RED-M5 Deploy reviewed bridge, with read-back (prop.) - Claude :milestone, red_m5, 2026-10-09, 0d\n    ! RED-M10 Comparison gate꞉ Codex GO (prop.) - Codex :milestone, crit, red_m10, 2026-10-09, 0d\n    ! RED-M12 Sheet-to-Redis mirror + 24h clock (HOLD) (prop.) - Claude :milestone, crit, red_m12, 2026-10-10, 0d\n    section Deepgram 33% AMBER\n    ✓ DG-M1 Flux turn detection + Silero VAD in the chair - Claude :milestone, done, dg_m1, 2026-10-07, 0d\n    ✓ DG-M2 STT relay on Cloud Run - Claude :milestone, done, dg_m2, 2026-10-07, 0d\n    ○ DG-M3 Hold final until VAD end + hangover (prop.) - Claude :milestone, dg_m3, 2026-10-09, 0d\n    ○ DG-M4 Transcript enrichment into the OKF (prop.) - Claude :milestone, dg_m4, 2026-10-15, 0d\n    ○ DG-M5 Claude voice side-by-side, Aura-2 vs front end (D1) (prop.) - Mr. Salam :milestone, dg_m5, 2026-10-14, 0d\n    ○ DG-M6 Live captions + first language set (D5) (prop.) - Gemini :milestone, dg_m6, 2026-10-16, 0d\n    section LiveKit agents 28% AMBER\n    ◐ LK-M0 Architecture sign-off (Gemini 4 changes in, Codex + Claude pending) (prop.) - Grok :milestone, active, lk_m0, 2026-10-08, 0d\n    ◐ LK-M2 Speech rules in code (prop.) - Claude :milestone, active, lk_m2, 2026-10-13, 0d\n    ◐ LK-M4 Codex realtime duplex꞉ owner-heard acceptance (prop.) - Mr. Salam :milestone, active, lk_m4, 2026-10-13, 0d\n    ! LK-M1 Plan safety꞉ what closed leaves the room (Codex holds, D2) (prop.) - Claude :milestone, crit, lk_m1, 2026-10-09, 0d\n    ! LK-M6 Named agent per AI, land official LiveKit Agents worker (prop.) - Cursor :milestone, crit, lk_m6, 2026-10-20, 0d\n    ○ LK-M3 Dynamic chair (today꞉ Oct 3 plan baked in image) (prop.) - Claude :milestone, lk_m3, 2026-10-09, 0d\n    ○ LK-M5 Native listening for Gemini + Grok (prop.) - Claude :milestone, lk_m5, 2026-10-15, 0d\n    section Off the laptop 36% AMBER\n    ✓ CLD-M1 Build route꞉ Cloud Build + Artifact Registry - Claude :milestone, done, cld_m1, 2026-10-06, 0d\n    ✓ CLD-M2 Conference services on Cloud Run (gateway, chair, STT, studio) - Claude :milestone, done, cld_m2, 2026-10-06, 0d\n    ◐ CLD-M5 Claude off the laptop꞉ spec approved (prop.) - Mr. Salam :milestone, active, cld_m5, 2026-10-14, 0d\n    ○ CLD-M3 Deploy discipline꞉ image read-back + receipt (prop.) - Claude :milestone, cld_m3, 2026-10-13, 0d\n    ○ CLD-M4 Rollback drill on production (prop.) - Codex :milestone, cld_m4, 2026-10-14, 0d\n    ○ CLD-M6 Stage C1 infrastructure applied (prop.) - Claude :milestone, cld_m6, 2026-10-16, 0d\n    ○ CLD-M7 Full call end to end, no laptop (prop.) - Claude :milestone, cld_m7, 2026-10-20, 0d\n    section sfdc24.com 36% AMBER\n    ✓ SITE-M1 Process board merged - Cursor :milestone, done, site_m1, 2026-10-07, 0d\n    ✓ SITE-N1 Public pages use persona names (live 9꞉28 AM) - Cursor :milestone, done, site_n1, 2026-10-08, 0d\n    ◐ SITE-M3 Conference page꞉ Redis floor views + diagrams (draft) (prop.) - Cursor :milestone, active, site_m3, 2026-10-08, 0d\n    ○ SITE-M2 Shared footer test green (status unverified) (prop.) - Cursor :milestone, site_m2, 2026-10-08, 0d\n    ○ SITE-M5 Site Redis read API through the bridge (prop.) - Claude :milestone, site_m5, 2026-10-13, 0d\n    ! SITE-M4 Ops refresh꞉ Codex review then merge (HOLD) (prop.) - Codex :milestone, crit, site_m4, 2026-10-09, 0d\n    ! SITE-M6 Live Redis views switched on (HOLD) (prop.) - Mr. Salam :milestone, crit, site_m6, 2026-10-14, 0d\n    section Converspan 35% RED\n    ✓ CSP-M1 Readiness assessment written - Grok :milestone, done, csp_m1, 2026-09-26, 0d\n    ✓ CSP-N1 Early-access site live, converspan.web.app (Claude as chair) - Claude :milestone, done, csp_n1, 2026-10-07, 0d\n    ✓ CSP-N2 Converspan build principles v0.1 in repo - Grok :milestone, done, csp_n2, 2026-10-07, 0d\n    ◐ CSP-M7 converspan.com DNS set 1꞉41 PM, propagation + certificate pending (agreed) - Grok :milestone, active, csp_m7, 2026-10-08, 0d\n    ! CSP-M2 pi1-cli launch꞉ spend-capped key + service account (D4) (prop.) - Mr. Salam :milestone, crit, csp_m2, 2026-10-14, 0d\n    ○ CSP-M3 Pricing + per-call cost cap (D6) (prop.) - Mr. Salam :milestone, csp_m3, 2026-10-14, 0d\n    ○ CSP-M4 SIP dial-in on test URI, then number (D3) (prop.) - Claude :milestone, csp_m4, 2026-10-21, 0d\n    ○ CSP-M5 Guest access (VERIFY + owner GO) (prop.) - Codex :milestone, csp_m5, 2026-10-27, 0d\n    ○ CSP-M6 G9 foundation gate (prop.) - Codex :milestone, csp_m6, 2026-10-30, 0d\n    ○ CSP-M8 First paying client (prop.) - Mr. Salam :milestone, csp_m8, 2026-11-09, 0d\n    section Prospect demo 58% UNKNOWN\n    ✓ DEMO-M1 Claude, Codex, Gemini readiness replies - Claude :milestone, done, demo_m1, 2026-10-07, 0d\n    ✓ DEMO-M2 10 PM call checkpoint (held, no formal PASS recorded) (agreed) - Grok :milestone, done, demo_m2, 2026-10-07, 0d\n    ✓ DEMO-M4 Demo validation꞉ chair/gateway PASS, agenda FAIL, live call UNTESTED - Codex :milestone, done, demo_m4, 2026-10-08, 0d\n    ◐ DEMO-M3 Demo page merged or on staging (still draft) (prop.) - Cursor :milestone, active, demo_m3, 2026-10-08, 0d\n    ? DEMO-M5 Dry run then freeze (freeze held, dry run not evidenced) (agreed) - Claude :milestone, demo_m5, 2026-10-08, 0d\n    ? DEMO-M6 Prospect demo (outcome unknown) (agreed) - Mr. Salam :milestone, demo_m6, 2026-10-08, 0d\n",
+    "version": "2026-10-08.1",
+    "sha256": "327df50bd1329cf9352a2cc6ff8f48ea9572d5d7ca6f494d08fbdf4151d574de",
+    "bytes": "7101",
+    "updated_at": "2026-10-08T13:50:00-04:00",
+    "render_check": "mmdc 12.0.0 exit 0, 2026-10-08 ~2:05 PM ET"
+   }
+  },
+  "proj:milestones:v1:mermaid:progress": {
+   "type": "hash",
+   "fields": {
+    "kind": "xychart-beta",
+    "source": "---\ntitle: Percent complete by workstream (bars = Oct 8 1:50 PM ET, line = Oct 7 11:03 PM scorecard)\nconfig:\n  xyChart:\n    showDataLabel: true\n  themeVariables:\n    xyChart:\n      plotColorPalette: \"#e0a100, #1b2430\"\n---\n%% % = (done + 0.5 x in progress) / all milestones\nxychart-beta\n    x-axis [\"Redis\", \"Deepgram\", \"LiveKit\", \"Off laptop\", \"sfdc24.com\", \"Converspan\", \"Demo\"]\n    y-axis \"% complete\" 0 --> 100\n    bar [47, 33, 28, 36, 36, 35, 58]\n    line [15, 33, 21, 36, 17, 13, 17]\n",
+    "version": "2026-10-08.1",
+    "sha256": "5e4ee68630cdab3b6886f72607b377464c7ebad2bf7050442661ceabf4ba8c12",
+    "bytes": "489",
+    "updated_at": "2026-10-08T13:50:00-04:00",
+    "render_check": "mmdc 12.0.0 exit 0"
+   }
+  }
+ },
+ "_source": "Grok, board row GROK-MILESTONES-REDIS-PAYLOAD-1401, 2026-10-08T18:00:02Z; checksums verified before commit."
+}
