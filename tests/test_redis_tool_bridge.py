@@ -209,6 +209,29 @@ class Defect4SecretsAreFilesNotEnvironmentVariables(unittest.TestCase):
             self.assertNotIn(forbidden, SOURCE)
 
 
+class TheDeployScriptIsCorrectNotJustSafe(unittest.TestCase):
+    """Two real deploy bugs in the first version of deploy.sh, both invisible to every auth test."""
+
+    def test_the_private_address_is_not_committed(self):
+        """cloud/bus-reconciler/main.py: the instance is 'never committed to this public repository'."""
+        import re
+        self.assertIsNone(re.search(r"\b10\.\d+\.\d+\.\d+\b", DEPLOY),
+                          "a private address is written into a public repository")
+        self.assertIn("${REDIS_HOST}", DEPLOY)
+
+    def test_set_env_vars_appears_ONCE(self):
+        """--set-env-vars REPLACES the environment. Repeated, only the last survives - which would
+        have shipped a bridge with no audience, no host and no CA path."""
+        flags = [line for line in DEPLOY.splitlines() if "--set-env-vars=" in line]
+        self.assertEqual(1, len(flags), flags)
+        for name in ("REDIS_HOST", "REDIS_PORT", "REDIS_AUTH_FILE", "REDIS_CA_CERT_PATH",
+                     "BRIDGE_AUDIENCE", "BRIDGE_CALLERS"):
+            self.assertIn(name + "=", flags[0], "%s is missing from the one env flag" % name)
+
+    def test_a_deploy_without_REDIS_HOST_refuses(self):
+        self.assertIn('if [ -z "${REDIS_HOST:-}" ]', DEPLOY)
+
+
 class ItCannotDoAnythingButProbe(unittest.TestCase):
     """The caller selects no key, no command, no namespace and no TTL. Absence, not refusal."""
 

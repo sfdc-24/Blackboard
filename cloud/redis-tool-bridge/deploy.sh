@@ -48,9 +48,22 @@ deploy_cmds() {
   # BRIDGE_AUDIENCE must be the service's own https URL. Chicken-and-egg on a FIRST deploy: the URL
   # is not known until the service exists. It is known here, because the service already exists, and
   # it is read back rather than guessed.
+  # REDIS_HOST COMES FROM THE OPERATOR, never from this file. The first version of this script wrote the
+  # private address in, in a PUBLIC repository whose own cloud/bus-reconciler/main.py says the instance
+  # is "never committed to this public repository". A private address is not a credential, but a rule
+  # this repo states is not mine to break quietly.
+  if [ -z "${REDIS_HOST:-}" ]; then
+    echo "refusing: set REDIS_HOST in the environment (the instance's private address)" >&2
+    return 1
+  fi
   local url
   url="$(gcloud run services describe "${SERVICE}" --project="${PROJECT}" --region="${REGION}" \
           --format='value(status.url)')"
+  # ONE --set-env-vars, not four. The first version repeated the flag, and --set-env-vars REPLACES the
+  # whole environment rather than adding to it - so only the last one, BRIDGE_CALLERS, would have
+  # survived, and the service would have started with no audience, no host and no CA path. It would then
+  # have refused every request with 503, which is the fail-closed behaviour working, on a deploy that was
+  # simply wrong.
   cat <<CMD
 gcloud run deploy ${SERVICE} \\
   --project=${PROJECT} --region=${REGION} \\
@@ -60,10 +73,7 @@ gcloud run deploy ${SERVICE} \\
   --ingress=all \\
   --network=default --subnet=default --vpc-egress=private-ranges-only \\
   --set-secrets=/secrets/auth/redis-auth=REDIS_AUTH_STRING:2,/secrets/ca/redis-ca.pem=REDIS_CA_CERT:1 \\
-  --set-env-vars=REDIS_HOST=10.54.72.180,REDIS_PORT=6378 \\
-  --set-env-vars=REDIS_AUTH_FILE=/secrets/auth/redis-auth,REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem \\
-  --set-env-vars=BRIDGE_AUDIENCE=${url} \\
-  --set-env-vars=BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com
+  --set-env-vars=REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT:-6378},REDIS_AUTH_FILE=/secrets/auth/redis-auth,REDIS_CA_CERT_PATH=/secrets/ca/redis-ca.pem,BRIDGE_AUDIENCE=${url},BRIDGE_CALLERS=aya-runtime@${PROJECT}.iam.gserviceaccount.com
 CMD
   # --no-allow-unauthenticated is the platform half of defect 3. The application allowlist
   # (BRIDGE_CALLERS) is the half this repository can review. Both, independently.
