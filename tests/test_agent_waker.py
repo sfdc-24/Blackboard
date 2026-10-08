@@ -361,6 +361,29 @@ class PeerEcho(unittest.TestCase):
         self.assertFalse(aw.is_waker_reply(r))
         self.assertEqual(len(aw.select([r], set(), "foundry")), 1)
 
+    def test_answers_in_the_TEXT_is_not_a_reply(self):
+        """2026-10-08: the board watcher dropped the one Gemini review Mr. Salam approved, because
+        Grok's text told Gemini how to reply: "Reply RESULT answers=..."."""
+        r = row("grok", "gemini",
+                "BCB|v=1|id=GROK-GOV-ARCH-REVIEW-GEMINI-1415|phase=REQUEST|from=grok|to=gemini|text=ONE "
+                "ASK for Gemini. Reply RESULT answers=GROK-GOV-ARCH-REVIEW-GEMINI-1415 with evidence=STATED.")
+        self.assertFalse(aw.is_waker_reply(r))
+        self.assertEqual(len(aw.select([r], set(), "gemini")), 1)
+        # Even where the phase is not an ask phase, a mention in the text is not the field.
+        for payload in ("BCB|v=1|id=U-1|phase=UPDATE|to=gemini|text=re-check, then reply answers=U-1",
+                        "BCB|v=1|id=U-2|to=gemini|text=see answers=X for the format"):
+            self.assertFalse(aw.is_waker_reply(row("grok", "gemini", payload)), payload)
+
+    def test_a_peers_dispatch_that_follows_up_is_still_an_ask(self):
+        for phase in ("DISPATCH", "REQUEST", "TASK", "ASK"):
+            r = row("grok", "gemini", "BCB|v=1|id=G-%s|phase=%s|answers=EARLIER-1|ask=review this" % (phase, phase))
+            self.assertFalse(aw.is_waker_reply(r), phase)
+
+    def test_a_peers_result_or_done_with_the_field_is_still_a_reply(self):
+        for phase in ("RESULT", "DONE", "NOTE"):
+            r = row("grok", "gemini", "BCB|v=1|id=G-%s|phase=%s|answers=EARLIER-1|text=done" % (phase, phase))
+            self.assertTrue(aw.is_waker_reply(r), phase)
+
     def test_his_whatsapp_is_never_mistaken_for_an_echo(self):
         r = row("whatsapp", "Blackboard Alpha DB", "Grok can you reply?")
         self.assertFalse(aw.is_waker_reply(r))
