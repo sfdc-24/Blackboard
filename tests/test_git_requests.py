@@ -63,8 +63,16 @@ class TheSenderIsTheAuthenticatedAuthor(unittest.TestCase):
         rows = gr.rows_from_comments("Blackboard", [comment(body)], BOTS)
         self.assertEqual(["GH-Blackboard-9001-1"], [br.parse_request(r)["req_id"] for r in rows])
 
-    def test_a_fenced_line_is_accepted(self):
-        self.assertEqual(1, len(gr.rows_from_comments("Blackboard", [comment("```" + GET + "```")], BOTS)))
+    def test_a_quoted_request_is_not_a_request(self):
+        # bus-requests-54r88: Cursor's report QUOTED its two lines in a fence and the set ran twice.
+        report = ("I posted the live Redis round trip.\n\n```\n" + SET + "\n" + GET + "\n```\n\n"
+                  "Inline `" + GET + "` and\n> " + GET + "\n~~~\n" + SET + "\n~~~")
+        self.assertEqual([], gr.rows_from_comments("Blackboard", [comment(report)], BOTS))
+
+    def test_a_bare_line_after_a_closed_fence_still_counts(self):
+        body = "```\n" + SET + "\n```\n" + GET
+        rows = gr.rows_from_comments("Blackboard", [comment(body)], BOTS)
+        self.assertEqual(["get"], [br.parse_request(r)["op"] for r in rows])
 
     def test_one_comment_cannot_spend_the_whole_run(self):
         rows = gr.rows_from_comments("Blackboard", [comment("\n".join([GET] * 40))], BOTS)

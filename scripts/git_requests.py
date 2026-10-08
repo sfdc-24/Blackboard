@@ -38,7 +38,13 @@ API = "https://api.github.com"
 MAX_PAGES = 5                    # 500 comments a run is far beyond any real window; the cap bounds a flood
 MAX_LINES_PER_COMMENT = 10       # one comment cannot spend the whole run's budget
 MAX_RESPONSE_BYTES = 2_000_000
-_LINE = re.compile(r"^\s*`{0,3}\s*(BCB\|v=1\|.*\bdo=redis-op\b.*?)\s*`{0,3}\s*$")
+# A request is a BARE line: nothing before BCB but whitespace. Not inside a ``` fence, not in `code`,
+# not after a > quote. The first live run (bus-requests-54r88) executed Cursor's set TWICE: Cursor
+# posted the two lines, then edited its "Taking a look!" comment into a report that QUOTED them in a
+# fence, and the old pattern, which allowed backticks, read the quote as a second request. A report
+# about a request is not a request.
+_LINE = re.compile(r"^\s*(BCB\|v=1\|.*\bdo=redis-op\b.*?)\s*$")
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 _NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 NOTHING = {"owner": "", "repos": [], "bots": {}}
 
@@ -105,7 +111,13 @@ def rows_from_comments(repo, comments, bots) -> list:
         except (TypeError, ValueError):
             continue
         n = 0
+        fenced = False
         for line in str(c.get("body") or "").splitlines():
+            if _FENCE.match(line):
+                fenced = not fenced
+                continue
+            if fenced:
+                continue
             m = _LINE.match(line)
             if not m:
                 continue
