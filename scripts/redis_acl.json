@@ -24,7 +24,8 @@
     "copilot":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "claude-api":            {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
     "claude-mobile":         {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
-    "pi1-cli":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]}
+    "pi1-cli":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "milestones-sync":       {"read": ["proj:milestones:"], "write": ["proj:milestones:"]}
   },
   "ttl_seconds": {
     "conf:": 604800,

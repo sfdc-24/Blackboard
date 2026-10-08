@@ -36,6 +36,7 @@
 !/scripts/redis_gov.py
 !/scripts/redis_acl.json
 !/scripts/git_requests.py
+!/scripts/milestones_sync.py
 !/scripts/roster_seed.py
 !/scripts/signature.py
 !/scripts/agent_roster.json
