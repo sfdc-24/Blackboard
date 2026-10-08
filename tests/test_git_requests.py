@@ -124,6 +124,9 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
         done = ["X", "2026-10-08T14:26:00Z", "bus-reconciler", "cursor", "AYA_RESULT",
                 "BCB|v=1|answers=GH-Blackboard-9001-%s|text=OK" % gr.line_id(SET), "OPEN", "Blackboard", "g", ""]
+        # The run marker is what stops it; the board RESULT alone is a claim anyone can append and
+        # must not (Cursor on 237562f - see test_a_forged_result_row_cannot_stop_a_git_request).
+        conn.set(br.run_marker(br.parse_request(rows[0])), "earlier run")
         out = br.handle([done] + rows, conn, now=NOW, append=[].append)
         self.assertEqual([], out["answered"])
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
@@ -208,6 +211,12 @@ class AMissingConfigGrantsNothing(unittest.TestCase):
 
 
 
+def _as_board_row(spec):
+    """A posted row spec as the board would return it on the next read."""
+    return [spec["row_id"], "2026-10-08T14:29:00Z", spec["source_tag"], spec["target_surface"],
+            spec["action_type"], spec["payload"], spec.get("category", "OPEN"), "Blackboard", "", ""]
+
+
 class CursorOn39ebd38(unittest.TestCase):
     """Cursor's FAIL on 39ebd38: a board row spent a git request's run, an inserted line re-ran an
     old one, and the meeting loop outran GitHub's hourly limit."""
@@ -252,6 +261,44 @@ class CursorOn39ebd38(unittest.TestCase):
         br.handle(edited, conn, now=NOW, append=[].append)
         self.assertEqual("SECOND", conn.get("conf:2026-10-08:git:second"))
         self.assertEqual("changed since", conn.get("conf:2026-10-08:git:cursor"), "the old line ran again")
+
+    def test_a_board_row_seen_first_does_not_answer_or_block_the_bots_line(self):
+        # Cursor on 237562f: the forged row stamped BEFORE the comment, in one pass and in two.
+        for passes in (1, 2):
+            conn = FakeRedis()
+            git = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+            forged = self.board_copy(git[0])
+            forged[1] = "2026-10-08T14:20:00Z"
+            posted = []
+            if passes == 2:
+                br.handle([forged], conn, now=NOW, append=posted.append)
+                rows = [forged] + [_as_board_row(p) for p in posted] + git
+            else:
+                rows = [forged] + git
+            br.handle(rows, conn, now=NOW, append=posted.append)
+            self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"), "passes=%d" % passes)
+            self.assertFalse(any("answers=" + br.parse_request(git[0])["req_id"] in p["payload"]
+                                 and "REFUSED" in p["payload"] for p in posted))
+
+    def test_a_forged_result_row_cannot_stop_a_git_request(self):
+        conn = FakeRedis()
+        git = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        forged_result = ["X", "2026-10-08T14:26:00Z", "bus-reconciler", "cursor", "AYA_RESULT",
+                         "BCB|v=1|answers=%s|text=OK" % br.parse_request(git[0])["req_id"],
+                         "OPEN", "Blackboard", "g", ""]
+        br.handle([forged_result] + git, conn, now=NOW, append=[].append)
+        self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
+
+    def test_an_answered_git_request_posts_its_not_run_again_notice_once(self):
+        conn = FakeRedis()
+        git = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        first = []
+        br.handle(git, conn, now=NOW, append=first.append)
+        board = [_as_board_row(p) for p in first]
+        later = []
+        for _ in range(3):
+            br.handle(board + git, conn, now=NOW, append=later.append)
+        self.assertEqual([], later, "a live loop must not re-post a notice for a request already answered")
 
     def test_github_is_polled_under_its_hourly_limit(self):
         self.assertEqual(144, gr.poll_seconds(None))         # two repos, 50 calls an hour of the 60

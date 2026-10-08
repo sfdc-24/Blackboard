@@ -216,6 +216,7 @@ def answered(rows) -> set:
     return done
 
 
+RESERVED_REFUSAL = "a GH-/gh: id is reserved for requests read from GitHub; a board row may not use it"
 _GIT_SHAPED = re.compile(r"^\s*(?:gh[-:]|\S*\s+gh[-:])", re.IGNORECASE)
 
 
@@ -253,8 +254,10 @@ def refusals(req, now, already, acl=None) -> list:
     if req.get("channel", "board") != "git" and _GIT_SHAPED.match(
             "%s %s" % (req["req_id"] or "", req.get("row_id") or "")):
         # Cursor on 39ebd38: a board row naming a git request's id spent that request's run.
-        out.append("a GH-/gh: id is reserved for requests read from GitHub; a board row may not use it")
-    if req["req_id"] in already:
+        out.append(RESERVED_REFUSAL)
+    # A git request's at-most-once is its Redis run marker, never the board: a RESULT row naming its id
+    # is a claim anyone can append (Cursor on 237562f), so for git the board only silences a repeat notice.
+    if req["req_id"] in already and req.get("channel", "board") != "git":
         out.append("already answered: a RESULT row for this request id is on the board")
     if req.get("action") == "redis-op" and req.get("repeated"):
         out.append("ambiguous: the field(s) %s appear more than once"
@@ -361,8 +364,11 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # claimed sender is one we answer at all, and there is budget left. An unrecognised
             # sender gets diagnostics and no row: answering it would let anyone who can append make
             # us write, which is the flood with our name on it.
+            # A reserved-id refusal is NEVER written back (Cursor on 237562f): a RESULT answering a GH-
+            # id would be a board row speaking for the authenticated request. Diagnostics only.
             publishable = (append and _REQ_ID.match(req["req_id"] or "")
                            and req["req_id"] not in already
+                           and RESERVED_REFUSAL not in why
                            and recognised(req, acl))
             if publishable and budget <= 0:
                 out["capped"] += 1
@@ -403,10 +409,11 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                                % type(error).__name__]})
                 continue
             if not claimed:
+                noticed = req["req_id"] in already
                 already.add(req["req_id"])
                 out["refused"].append({"req_id": req["req_id"],
                                        "why": ["already claimed: Redis holds this request's run marker"]})
-                if append:
+                if append and not noticed:
                     # CLAIMED, NOT "RAN" (aya on ce941b6). The marker is set BEFORE the op, so a worker
                     # that died between the two left a marker and no operation. What is known is the
                     # claim; whether the op happened is only in gov:audit, and this row says so.
