@@ -42,8 +42,9 @@ class TheSenderIsTheAuthenticatedAuthor(unittest.TestCase):
         self.assertEqual("cursor", req["claimed_sender"])
         self.assertEqual("redis-op", req["action"])
         self.assertEqual(("set", "conf:2026-10-08:git:cursor", "from git"), (req["op"], req["key"], req["val"]))
-        self.assertEqual("GH-Blackboard-9001-1", req["req_id"])
-        self.assertEqual("gh:Blackboard:9001:1", req["row_id"])
+        self.assertEqual("GH-Blackboard-9001-" + gr.line_id(SET), req["req_id"])
+        self.assertEqual("gh:Blackboard:9001:" + gr.line_id(SET), req["row_id"])
+        self.assertEqual("git", req["channel"])
 
     def test_the_login_alone_is_not_enough(self):
         # Anyone can register a name; nobody else can be user 206951365.
@@ -55,7 +56,7 @@ class TheSenderIsTheAuthenticatedAuthor(unittest.TestCase):
     def test_the_body_cannot_name_its_own_request_id(self):
         body = "BCB|v=1|id=GH-Blackboard-1-1|req=AYA-COST-SET|do=redis-op|op=get|key=conf:x"
         req = br.parse_request(gr.rows_from_comments("Blackboard", [comment(body)], BOTS)[0])
-        self.assertEqual("GH-Blackboard-9001-1", req["req_id"])
+        self.assertEqual("GH-Blackboard-9001-" + gr.line_id(body), req["req_id"])
         self.assertNotIn("AYA-COST-SET", gr.rows_from_comments("Blackboard", [comment(body)], BOTS)[0][5])
 
     def test_a_comment_of_only_requests_is_a_request_comment(self):
@@ -109,7 +110,7 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual(["OK", "OK"], [a["status"] for a in out["answered"]])
         self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
         self.assertTrue(all(p["target_surface"] == "cursor" for p in posted))
-        self.assertIn("gh:Blackboard:9001:1", json.dumps(conn.audit()))
+        self.assertIn("gh:Blackboard:9001:" + gr.line_id(SET), json.dumps(conn.audit()))
 
     def test_a_protected_namespace_is_still_refused(self):
         conn = FakeRedis()
@@ -122,7 +123,7 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
         done = ["X", "2026-10-08T14:26:00Z", "bus-reconciler", "cursor", "AYA_RESULT",
-                "BCB|v=1|answers=GH-Blackboard-9001-1|text=OK", "OPEN", "Blackboard", "g", ""]
+                "BCB|v=1|answers=GH-Blackboard-9001-%s|text=OK" % gr.line_id(SET), "OPEN", "Blackboard", "g", ""]
         out = br.handle([done] + rows, conn, now=NOW, append=[].append)
         self.assertEqual([], out["answered"])
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
@@ -151,7 +152,7 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         conn = FakeRedis()
         rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
         req_id = br.parse_request(rows[0])["req_id"]
-        conn.set(br.DONE_PREFIX + __import__("hashlib").sha256(req_id.encode()).hexdigest()[:32], "x")
+        conn.set(br.run_marker(br.parse_request(rows[0])), "x")
         posted = []
         br.handle(rows, conn, now=NOW, append=posted.append)
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
@@ -204,6 +205,57 @@ class AMissingConfigGrantsNothing(unittest.TestCase):
         seen = []
         self.assertEqual([], gr.git_rows(NOW, opener=broken, log=seen.append))
         self.assertTrue(seen)
+
+
+
+class CursorOn39ebd38(unittest.TestCase):
+    """Cursor's FAIL on 39ebd38: a board row spent a git request's run, an inserted line re-ran an
+    old one, and the meeting loop outran GitHub's hourly limit."""
+
+    def board_copy(self, git_row, source="cursor"):
+        # Everything a board writer can copy from a public comment: ids, payload, sender tag.
+        row = list(git_row)
+        row[2] = source
+        row[1] = "2026-10-08T14:28:00Z"
+        return row
+
+    def test_a_board_row_with_a_git_id_is_refused_and_the_bots_line_still_runs(self):
+        conn = FakeRedis()
+        git = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        forged = self.board_copy(git[0])
+        forged[5] = forged[5].replace("val=from git", "val=stolen")
+        posted = []
+        out = br.handle([forged] + git, conn, now=NOW, append=posted.append)
+        self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
+        self.assertEqual(1, len([a for a in out["answered"] if a["status"] == "OK"]))
+        self.assertTrue(any("reserved for requests read from GitHub" in "; ".join(r["why"])
+                            for r in out["refused"]))
+
+    def test_a_board_row_cannot_pass_as_git_by_its_cells(self):
+        git = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        self.assertEqual("board", br.parse_request(self.board_copy(git[0]))["channel"])
+        self.assertEqual("git", br.parse_request(git[0])["channel"])
+
+    def test_the_git_and_board_run_markers_never_share_a_key(self):
+        git = br.parse_request(gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)[0])
+        board = dict(git, channel="board")
+        self.assertNotEqual(br.run_marker(git), br.run_marker(board))
+
+    def test_inserting_a_line_above_runs_only_the_new_line(self):
+        conn = FakeRedis()
+        first = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        br.handle(first, conn, now=NOW, append=[].append)
+        conn.set("conf:2026-10-08:git:cursor", "changed since")
+        new = "BCB|v=1|do=redis-op|op=set|key=conf:2026-10-08:git:second|val=SECOND"
+        edited = gr.rows_from_comments("Blackboard", [comment(new + chr(10) + SET)], BOTS)
+        self.assertEqual(br.parse_request(first[0])["req_id"], br.parse_request(edited[1])["req_id"])
+        br.handle(edited, conn, now=NOW, append=[].append)
+        self.assertEqual("SECOND", conn.get("conf:2026-10-08:git:second"))
+        self.assertEqual("changed since", conn.get("conf:2026-10-08:git:cursor"), "the old line ran again")
+
+    def test_github_is_polled_under_its_hourly_limit(self):
+        self.assertEqual(144, gr.poll_seconds(None))         # two repos, 50 calls an hour of the 60
+        self.assertEqual(60, gr.poll_seconds("a-token"))
 
 
 if __name__ == "__main__":

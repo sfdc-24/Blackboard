@@ -26,7 +26,7 @@ always has words in it, and a comment with words in it asks for nothing.
 The lines go through exactly the board grammar, so the same validation, the same access list, the
 same protected namespaces and the same gov:audit apply, through bus_request.handle(). Each line
 becomes a board-shaped row whose request id is SERVER-NAMED from the repository, the comment id and
-the line number (GH-<repo>-<comment id>-<n>), so it is unique and cannot collide with a board request.
+a digest of the line (GH-<repo>-<comment id>-<sha12>), and a board row may not use that shape.
 A line whose fields repeat a key is refused (bus_request), never read first-value-wins. Running it at
 most once is bus_request's job too: a Redis-side marker is claimed before the operation, so neither a
 lost result row nor a second run over a stale snapshot can apply it again. The row id names the
@@ -38,7 +38,9 @@ the pull request thread needs a GitHub write token in this job, which is a secre
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -121,6 +123,31 @@ def request_lines(body) -> list:
     return lines
 
 
+class GitRow(list):
+    """A request row built HERE, from a comment GitHub authenticated. Its type is the only proof of
+    that: a row read from the board is a plain list, whatever its cells say, so a board row that
+    copies a git row's ids cannot pass as one (Cursor on 39ebd38: a board row with source `cursor`
+    and req `GH-Blackboard-<cid>-1` claimed the run marker and the bot's own line was refused)."""
+    channel = "git"
+
+
+def line_id(line) -> str:
+    """A request line's id: a digest of the line itself, not its position. Cursor on 39ebd38: with
+    the line NUMBER, inserting a line above an answered one gave the new line the old id (refused
+    as claimed, never run) and re-ran the old line under the next number. A digest moves with its
+    line. Two identical lines in one comment are one request, answered once."""
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def poll_seconds(token=None, acl_path=None) -> int:
+    """How often live mode may read GitHub: one call per repo per poll, under the hourly limit with
+    room to spare (Cursor on 39ebd38: two repos once a minute is 120 calls an hour against the 60
+    an unauthenticated caller gets, and after half an hour every fetch fails)."""
+    repos = len(config(acl_path)["repos"]) or 1
+    budget = 4000 if token else 50          # GitHub allows 5000/h with a token, 60/h without
+    return max(60, math.ceil(3600.0 * repos / budget))
+
+
 def rows_from_comments(repo, comments, bots) -> list:
     """Board-shaped request rows from the comments a BOUND bot wrote. Everything else is ignored.
 
@@ -138,12 +165,13 @@ def rows_from_comments(repo, comments, bots) -> list:
             cid = int(c.get("id"))
         except (TypeError, ValueError):
             continue
-        for n, line in enumerate(request_lines(c.get("body")), start=1):
-            req_id = "GH-%s-%d-%d" % (re.sub(r"[^A-Za-z0-9]", "", repo)[:20], cid, n)
+        for line in request_lines(c.get("body")):
+            digest = line_id(line)
+            req_id = "GH-%s-%d-%s" % (re.sub(r"[^A-Za-z0-9]", "", repo)[:20], cid, digest)
             # The body's own id/req fields are dropped: the server names the request.
             payload = re.sub(r"\|\s*(?:id|req)\s*=[^|]*", "", line) + "|req=" + req_id
-            rows.append([
-                "gh:%s:%d:%d" % (repo, cid, n),
+            rows.append(GitRow([
+                "gh:%s:%d:%s" % (repo, cid, digest),
                 str(c.get("created_at") or ""),
                 who,
                 "bus-reconciler",
@@ -153,7 +181,7 @@ def rows_from_comments(repo, comments, bots) -> list:
                 "Blackboard",
                 "git request from %s" % who,
                 str(c.get("html_url") or "")[:200],
-            ])
+            ]))
     return rows
 
 

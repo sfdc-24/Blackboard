@@ -110,16 +110,21 @@ def main() -> int:
     # that runs as side conversation." A request posted during the call is answered within about
     # LOOP_INTERVAL seconds instead of whenever someone starts a run - one execution, a plain loop, no
     # model, ending at LOOP_UNTIL (at most LOOP_MAX_MINUTES from start, whatever LOOP_UNTIL says).
-    # GitHub is read at most once a minute: its unauthenticated limit is 60 calls an hour.
+    # GitHub is read at most every git_requests.poll_seconds(): one call per repo, under the hourly
+    # limit (60 without a token, so 144 s for two repos; once a minute with GITHUB_READ_TOKEN).
+    # THE JOB'S --task-timeout MUST COVER LOOP_UNTIL: Cloud Run kills the execution at its timeout,
+    # whatever this loop intends (the job's default spec is 5 minutes - see REQUESTS.md).
+    import git_requests                                                  # noqa: PLC0415
+    git_every = git_requests.poll_seconds(os.environ.get("GITHUB_READ_TOKEN") or None)
     interval = max(5, min(60, int(os.environ.get("LOOP_INTERVAL", "10"))))
     started = datetime.datetime.now(datetime.timezone.utc)
     hard_stop = started + datetime.timedelta(minutes=int(os.environ.get("LOOP_MAX_MINUTES", "240")))
     stop = min(until, hard_stop)
-    log.info("live mode: every %ds until %s", interval, stop.strftime("%H:%M:%SZ"))
+    log.info("live mode: every %ds, GitHub every %ds, until %s", interval, git_every, stop.strftime("%H:%M:%SZ"))
     last_git, passes = None, 0
     while datetime.datetime.now(datetime.timezone.utc) < stop:
         now = datetime.datetime.now(datetime.timezone.utc)
-        with_git = last_git is None or (now - last_git).total_seconds() >= 60
+        with_git = last_git is None or (now - last_git).total_seconds() >= git_every
         try:
             one_pass(conn, env, execution, with_git=with_git, quiet=True)
         except Exception as error:                                       # noqa: BLE001

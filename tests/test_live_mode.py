@@ -36,7 +36,7 @@ class LiveMode(unittest.TestCase):
         def fake_sleep(seconds):
             clock["t"] = clock["t"] + datetime.timedelta(seconds=seconds)
 
-        env = {"LOOP_UNTIL": "2026-10-09T02:02:00Z", "LOOP_INTERVAL": "10"}
+        env = {"LOOP_UNTIL": "2026-10-09T02:02:00Z", "LOOP_INTERVAL": "10", "GITHUB_READ_TOKEN": "t"}
         with mock.patch.object(sr.datetime, "datetime", FakeDT), \
                 mock.patch.object(sr, "one_pass", side_effect=fake_pass), \
                 mock.patch.object(sr.time, "sleep", side_effect=fake_sleep), \
@@ -45,7 +45,22 @@ class LiveMode(unittest.TestCase):
                 mock.patch("bus.load_env", return_value={}):
             self.assertEqual(0, sr.main())
         self.assertEqual(12, len(passes), "every 10 s for two minutes")
-        self.assertEqual(2, sum(git_flags), "GitHub at most once a minute")
+        self.assertEqual(2, sum(git_flags), "with a token, GitHub at most once a minute")
+
+    def test_without_a_token_github_is_read_every_144_seconds(self):
+        flags = []
+        clock = {"t": datetime.datetime(2026, 10, 9, 2, 0, tzinfo=datetime.timezone.utc)}
+
+        class FakeDT(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock["t"]
+
+        env = {"LOOP_UNTIL": "2026-10-09T02:05:00Z", "LOOP_INTERVAL": "10", "GITHUB_READ_TOKEN": ""}
+        with mock.patch.object(sr.datetime, "datetime", FakeDT),                 mock.patch.object(sr, "one_pass", side_effect=lambda *a, **k: flags.append(k["with_git"])),                 mock.patch.object(sr.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + datetime.timedelta(seconds=s))),                 mock.patch.object(sr.redis_dual, "client", return_value=object()),                 mock.patch.dict(sr.os.environ, env),                 mock.patch("bus.load_env", return_value={}):
+            self.assertEqual(0, sr.main())
+        self.assertEqual(30, len(flags))
+        self.assertEqual(2, sum(flags), "at 0 and 150 s in five minutes: two repos stay under 60 calls an hour")
 
     def test_a_failed_pass_does_not_end_the_channel(self):
         calls = {"n": 0}

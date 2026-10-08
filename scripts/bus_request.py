@@ -136,6 +136,9 @@ def parse_request(row):
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
         "repeated": repeated_keys(payload),
+        # Where the row came from: "git" only for a row git_requests built from an authenticated
+        # comment (its type says so; no cell can), "board" for everything else.
+        "channel": getattr(row, "channel", "board"),
     }
 
 
@@ -213,6 +216,17 @@ def answered(rows) -> set:
     return done
 
 
+_GIT_SHAPED = re.compile(r"^\s*(?:gh[-:]|\S*\s+gh[-:])", re.IGNORECASE)
+
+
+def run_marker(req) -> str:
+    """The Redis key that claims a request's one run. A git request's marker is in its own space, so
+    nothing a board row names can reach it; a board request's key is unchanged from 39ebd38, so the
+    markers already set today still hold."""
+    name = req["req_id"] if req.get("channel", "board") != "git" else "git " + req["req_id"]
+    return DONE_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+
+
 def refusals(req, now, already, acl=None) -> list:
     """Every reason not to act on this request. Empty means act."""
     out = []
@@ -236,6 +250,10 @@ def refusals(req, now, already, acl=None) -> list:
         out.append("the request is older than %d minutes" % STALE_MINUTES)
     elif req["at"] > now + datetime.timedelta(minutes=5):
         out.append("the request is stamped in the future")
+    if req.get("channel", "board") != "git" and _GIT_SHAPED.match(
+            "%s %s" % (req["req_id"] or "", req.get("row_id") or "")):
+        # Cursor on 39ebd38: a board row naming a git request's id spent that request's run.
+        out.append("a GH-/gh: id is reserved for requests read from GitHub; a board row may not use it")
     if req["req_id"] in already:
         out.append("already answered: a RESULT row for this request id is on the board")
     if req.get("action") == "redis-op" and req.get("repeated"):
@@ -375,7 +393,7 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # the run is CLAIMED first with SET NX on a marker under gov:, which no agent can write.
             # Claimed before the op on purpose: a crash between the claim and the op loses that op
             # and says so - it never applies one twice.
-            marker = DONE_PREFIX + hashlib.sha256(req["req_id"].encode("utf-8")).hexdigest()[:32]
+            marker = run_marker(req)
             try:
                 claimed = conn.set(marker, safe(req["row_id"])[:120] or "-", nx=True, ex=DONE_TTL_SECONDS)
             except Exception as error:
