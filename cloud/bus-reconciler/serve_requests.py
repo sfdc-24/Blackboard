@@ -100,6 +100,8 @@ def main() -> int:
     from bus import load_env                                             # noqa: PLC0415
     env = load_env()
     now = datetime.datetime.now(datetime.timezone.utc)
+    execution = os.environ.get("CLOUD_RUN_EXECUTION", "")
+    bus_request.heartbeat(conn, "running", now=now, execution=execution)
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = bus_reconcile.board_rows(env, since=since)
     log.info("window since=%s: %d board row(s)", since, len(rows))
@@ -121,6 +123,8 @@ def main() -> int:
         log.warning("refused %s: %s", item["req_id"] or "(no id)", "; ".join(item["why"]))
     if out["capped"]:
         log.warning("%d request(s) left for the next run by the per-run cap", out["capped"])
+    bus_request.heartbeat(conn, "idle", execution=execution, answered=len(out["answered"]),
+                          refused=len(out["refused"]), capped=out["capped"], acl=out.get("acl", ""))
     # A refusal is a correct outcome and an error inside the probe is a reported one, so neither
     # fails the execution. Only being unable to reach Redis at all does, above.
     return 0

@@ -461,6 +461,24 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
     return out
 
 
+HEARTBEAT_KEY = "gov:worker:heartbeat"
+HEARTBEAT_TTL_SECONDS = 3600
+
+
+def heartbeat(conn, state, now=None, **fields) -> bool:
+    """PY-02 (Grok's poka-yoke audit, 2026-10-08): where the worker says when it last ran, so a poster
+    can check before sending instead of posting into a worker that is not coming. One JSON string at
+    gov:worker:heartbeat - under gov:, which no agent may write, and which every agent may READ with
+    a redis-op get. It expires an hour after the last run: an absent key means "no run in the last
+    hour", never "running". Never raises: a heartbeat must not cost the run it reports."""
+    value = dict(fields, state=state, at=stamp(now))
+    try:
+        conn.set(HEARTBEAT_KEY, json.dumps(value, sort_keys=True), ex=HEARTBEAT_TTL_SECONDS)
+        return True
+    except Exception:                                                   # noqa: BLE001
+        return False
+
+
 def summary(out) -> str:
     return json.dumps({k: (len(v) if isinstance(v, list) else v) for k, v in out.items()},
                       sort_keys=True)
