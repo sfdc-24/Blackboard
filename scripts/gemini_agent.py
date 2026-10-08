@@ -50,6 +50,46 @@ INTERACTIONS = "https://generativelanguage.googleapis.com/v1beta/interactions"
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
 KEY_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS") or 60)
 VERTEX_MODEL = "gemini-2.0-flash"
+# PY-08, Grok's poka-yoke audit 2026-10-08: EVERY Gemini call is bounded. Aya could not approve a
+# CAD 1 review because this route sent no output or thinking cap, so nothing bounded what one call
+# could cost. The Interactions API's generation_config takes max_output_tokens and thinking_level
+# (minimal | low | medium | high), per ai.google.dev/api/interactions-api, read 2026-10-08. Both are
+# job settings. 4096 is not arbitrary: on 2026-09-17 a 1024-token cap came back EMPTY on another model
+# whose thinking counted against the cap, and the same ask answered at 4096.
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS") or 4096)
+THINKING_LEVEL = (os.environ.get("GEMINI_THINKING_LEVEL") or "low").strip().lower()
+THINKING_LEVELS = ("minimal", "low", "medium", "high")
+# USD per million tokens, input and output (thought tokens bill as output). Unset = no estimate: a
+# price written into code would be a price nobody checked, so the job states the price it is billed.
+PRICE_IN_PER_M = os.environ.get("GEMINI_PRICE_IN_PER_M")
+PRICE_OUT_PER_M = os.environ.get("GEMINI_PRICE_OUT_PER_M")
+
+
+def generation_config(thinking=True) -> dict:
+    """The bound every key-route call carries. Never empty: max_output_tokens is always set."""
+    config = {"max_output_tokens": max(1, MAX_OUTPUT_TOKENS)}
+    if thinking and THINKING_LEVEL in THINKING_LEVELS:
+        config["thinking_level"] = THINKING_LEVEL
+    return config
+
+
+def cost_estimate(usage) -> str:
+    """One pipe-free line for the reply row: the tokens, and USD only when the job states its prices."""
+    if not usage:
+        return ""
+    tin = usage.get("in") or 0
+    tout = (usage.get("out") or 0) + (usage.get("thought") or 0)
+    line = "in %s out %s thought %s" % (usage.get("in", "?"), usage.get("out", "?"), usage.get("thought", "?"))
+    # Which model answered, and which alias was asked for, so the line can be priced afterwards.
+    if usage.get("model") or usage.get("asked"):
+        line = "model %s asked %s %s" % (usage.get("model") or "unreported", usage.get("asked") or "?", line)
+    try:
+        usd = float(PRICE_IN_PER_M) * tin / 1e6 + float(PRICE_OUT_PER_M) * tout / 1e6
+        return line + " est_usd %.4f" % usd
+    except (TypeError, ValueError):
+        return line + " est_usd unpriced"
+
+
 KEY_NAMES = ["GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"]
 
 
@@ -172,7 +212,24 @@ def usage_of(d):
         "in": u.get("total_input_tokens"),
         "out": u.get("total_output_tokens"),
         "thought": u.get("total_thought_tokens"),
+        # THE MODEL THAT ANSWERED, not the alias that was asked for. gemini-pro-latest names whatever
+        # Google points it at that day, so a cost line without the resolved model cannot be priced
+        # afterwards (Aya, AYA-GEMINI-COST-RECONCILE-20261008T194011Z: gemini-waker-c9qfw logged usage
+        # and no model). The Interactions envelope carries `model`; Vertex carries `modelVersion`.
+        "model": _resolved_model(d),
     }
+
+
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
+
+def _resolved_model(d) -> str:
+    """The response's own model name, cleaned for a pipe-delimited row; "" when it gives none."""
+    for field in ("model", "modelVersion"):
+        value = (d or {}).get(field) if isinstance(d, dict) else None
+        if isinstance(value, str) and _MODEL_NAME.match(value.strip()):
+            return value.strip()
+    return ""
 
 
 def ask(prompt, model=None):
@@ -183,16 +240,22 @@ def ask(prompt, model=None):
     ask.last_usage = None
     name, key = api_key()
     if key:
-        status, body = _post(INTERACTIONS,
-                             {"x-goog-api-key": key},
-                             {"model": model or DEFAULT_MODEL, "input": prompt},
+        request = {"model": model or DEFAULT_MODEL, "input": prompt,
+                   "generation_config": generation_config()}
+        status, body = _post(INTERACTIONS, {"x-goog-api-key": key}, request,
                              timeout=KEY_TIMEOUT_SECONDS)
+        if status == 400 and "thinking" in str(body).lower() and "thinking_level" in request["generation_config"]:
+            # A model that does not take thinking_level refuses the call before any work (a 400 is
+            # not billed). Once, without it - the output cap still holds.
+            request["generation_config"] = generation_config(thinking=False)
+            status, body = _post(INTERACTIONS, {"x-goog-api-key": key}, request,
+                                 timeout=KEY_TIMEOUT_SECONDS)
         if status == 200:
             try:
                 d = json.loads(body)
             except Exception:
                 return None, "key route returned 200 but unparseable JSON"
-            ask.last_usage = usage_of(d)
+            ask.last_usage = dict(usage_of(d), asked=request["model"])
             text = extract_text(d)
             if not text:
                 return None, ("key route returned 200 but no text found; "
@@ -207,10 +270,15 @@ def ask(prompt, model=None):
         url = ("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s"
                "/publishers/google/models/%s:generateContent" % (loc, proj, loc, model or VERTEX_MODEL))
         status, body = _post(url, {"Authorization": "Bearer " + tok},
-                             {"contents": [{"role": "user", "parts": [{"text": prompt}]}]})
+                             {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                              "generationConfig": {"maxOutputTokens": max(1, MAX_OUTPUT_TOKENS)}})
         if status == 200:
             try:
                 d = json.loads(body)
+                m = d.get("usageMetadata") or {}
+                ask.last_usage = {"total": m.get("totalTokenCount"), "in": m.get("promptTokenCount"),
+                                  "out": m.get("candidatesTokenCount"), "thought": m.get("thoughtsTokenCount"),
+                                  "model": _resolved_model(d), "asked": model or VERTEX_MODEL}
                 return d["candidates"][0]["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
             except Exception:
                 return None, "vertex returned 200 but an unexpected shape"
