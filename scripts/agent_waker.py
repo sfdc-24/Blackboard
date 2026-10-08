@@ -449,7 +449,20 @@ def is_waker_reply(row) -> bool:
     if WAKER_REPLY_MARK in payload:
         return True
     sender = str(row[C_SOURCE] if len(row) > C_SOURCE else "").strip().lower()
-    return sender in AGENTS and "answers=" in payload
+    if sender not in AGENTS:
+        return False
+    # THE FIELD, NOT THE SUBSTRING - and the warning above, about a substring carrying a distinction,
+    # turned out to apply to this very line. 2026-10-08: Grok's GROK-GOV-ARCH-REVIEW-GEMINI-1415, the
+    # one Gemini review Mr. Salam had approved, was dropped by the board watcher because its TEXT said
+    # "Reply RESULT answers=GROK-GOV-...". A row answers something only when answers= is a BCB field,
+    # at the start of the payload or after a pipe.
+    if not re.search(r"(?:^|\|)\s*answers=", payload):
+        return False
+    # And a peer's row that answers one thing while ASKING another - a DISPATCH or REQUEST that names
+    # what it follows up - is an ask. A waker's own replies are RESULT or DONE (reply_phase) and carry
+    # the marker, and the pre-marker ones carry no phase at all, so the loop above stays closed.
+    phase = re.search(r"(?:^|\|)phase=([A-Za-z_]+)", payload)
+    return not (phase and phase.group(1).upper() in RESULT_FOR)
 
 
 def is_from(row, me: str) -> bool:
