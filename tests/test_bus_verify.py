@@ -333,9 +333,16 @@ class TheRatifiedExemption(unittest.TestCase):
     def test_a_named_duplicate_is_still_NOT_eligible_without_a_ratified_census(self):
         """This asserted AGREE and gate_eligible=True until 2026-10-07, and that was the hole.
 
-        Naming an id forgave it with UNBOUNDED multiplicity. The shipped list carries no census yet,
-        so a named duplicate now counts as over-census and the board is ineligible. The HOLD Codex
-        asked for is this assertion, not a promise in a comment."""
+        Naming an id forgave it with UNBOUNDED multiplicity. The HOLD Codex asked for is this
+        assertion, not a promise in a comment.
+
+        ITS PREMISE MOVED ON 2026-10-08, and the property did not. It used to say "the shipped list
+        carries no census yet", so a named duplicate counted as over-census. bus-verify-88vgs then
+        MEASURED the census and it now ships in the file - so within the census, this board's one
+        repeat is no longer over it, and the comparison itself can agree. What still keeps the gate
+        shut is that the census is MEASURED, NOT RATIFIED: RATIFIED_CENSUS_DIGEST is None. That
+        distinction - the verdict reads the file, eligibility reads the owner's pin - is the same
+        one the id list has always had, and it is what this test now pins down."""
         dup = sorted(self.exempt["ids"])[0]
         board = [HEADER, row(1), row(2)]
         board[2][0] = dup
@@ -350,10 +357,11 @@ class TheRatifiedExemption(unittest.TestCase):
         self.assertEqual(1, result["duplicate_row_ids"])
         self.assertEqual(1, result["duplicates_ratified"])
         self.assertEqual(0, result["duplicates_unratified"])
-        self.assertFalse(result["census_present"], "the shipped list carries no census yet")
-        self.assertEqual(1, result["duplicates_over_census"])
-        self.assertEqual(bv.DIVERGE, result["verdict"])
-        self.assertFalse(bv.gate_eligible(result))
+        self.assertTrue(result["census_present"], "the measured census ships in the file now")
+        self.assertEqual(0, result["duplicates_over_census"], "one repeat, within its census of one")
+        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST, "measured, not ratified")
+        self.assertFalse(bv.gate_eligible(result),
+                         "an UNRATIFIED census must never open the gate, however well it matches")
 
     def test_a_FORTY_SEVENTH_duplicate_fails(self):
         """The whole point. An id nobody ratified is divergence, however old it looks."""
@@ -761,6 +769,41 @@ class AFlappingGatewayStILLProducesARecord(unittest.TestCase):
         self.assertEqual(bv.UNKNOWN, result["verdict"])
         self.assertGreaterEqual(result["read_failures"], 1)
 
+
+
+class TheShippedCensusIsTheMeasuredOne(unittest.TestCase):
+    """bus-verify-88vgs walked rows 1-3770 of 3770 on 2026-10-08 and found 46 distinct duplicate ids
+    in 55 occurrences - identical to the ratified list and to the 55 the file has always claimed.
+    That census is now IN the file, with its digest. It is MEASURED, NOT RATIFIED."""
+
+    def setUp(self):
+        self.exempt = bv.ratified()
+
+    def test_the_census_loads_and_covers_exactly_the_listed_ids(self):
+        self.assertTrue(self.exempt["census_present"])
+        self.assertEqual(self.exempt["ids"], set(self.exempt["census"]))
+        self.assertEqual(55, sum(self.exempt["census"].values()))
+        self.assertEqual("0c52ebc3f888f1f5", self.exempt["census_digest"])
+
+    def test_the_owner_ratified_id_list_is_untouched(self):
+        """Adding the census must not move the digest the owner already ratified."""
+        self.assertEqual(bv.RATIFIED_DIGEST, self.exempt["digest"])
+        self.assertEqual("ced284b2333c27dd", self.exempt["digest"])
+
+    def test_the_gate_is_STILL_closed_because_the_census_is_not_ratified(self):
+        """The measurement is not the ratification. Until the owner ratifies 0c52ebc3f888f1f5 and it
+        is pinned, a board holding a duplicate is ineligible - which is what Codex is holding for."""
+        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST)
+        record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
+                  "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
+                  "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
+                  "positions_shifted": 0, "positions_rechecked": 8, "missing_from_redis": 0,
+                  "differing": 0, "extra_in_redis": 0, "duplicates_unratified": 0,
+                  "idless_unratified": 0, "duplicate_row_ids": 55,
+                  "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
+                  "duplicates_over_census": 0, "census_present": True,
+                  "census_digest": self.exempt["census_digest"]}
+        self.assertFalse(bv.gate_eligible(record))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
