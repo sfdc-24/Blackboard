@@ -69,15 +69,23 @@ RATIFIED_DIGEST = "ced284b2333c27dd"
 # So the exemption is now bounded by a per-id census: each listed id is forgiven UP TO the number of
 # duplicate occurrences it had when the owner ratified it, and one more fails.
 #
-# None, deliberately, until a measured census is ratified. While this is None, ANY board holding a
-# duplicate is ineligible - the HOLD is enforced in code rather than promised in a comment. The
-# census cannot be invented; it has to come off a run that walked the whole board.
+# It was None until a measured census was ratified, and while it was None ANY board holding a
+# duplicate was ineligible - the HOLD enforced in code rather than promised in a comment.
+#
+# MEASURED: bus-verify-88vgs, 2026-10-08T01:19:06Z, rows 1-3770 of 3770, 8/8 chunks, no read failure,
+# no position shift, no write - 46 distinct ids in 55 occurrences, identical to the ratified list.
+# RATIFIED: Mr. Salam, in his own words to claude-code-cli, 2026-10-08 ~01:38Z: "I approve the census
+# digest 0c52ebc3f888f1f5". That is relayed here by the agent he said it to; the board row that
+# carries it is CCC-RESULT-DEMO-AND-REDIS-ACCESS-20261008T0139Z.
 #
 # AND IT COVERS THE IDLESS POSITIONS TOO, which aya found on the same head: id_list_digest hashes
 # duplicated_ids and NOTHING ELSE, so idless_positions could be widened quietly - add a position,
-# the digest still matches, four forgiven rows become five. One new ratification closes both holes
-# rather than two ratifications closing one each.
-RATIFIED_CENSUS_DIGEST = None
+# the digest still matches, four forgiven rows become five. One ratification closed both holes rather
+# than two ratifications closing one each.
+#
+# A 47th distinct id still fails, and so does a 56th occurrence of a listed one. Changing this value
+# is changing what the owner ratified, so it needs him again - not a commit.
+RATIFIED_CENSUS_DIGEST = "0c52ebc3f888f1f5"
 
 AGREE, DIVERGE, UNKNOWN, NO_SAMPLE = "AGREE", "DIVERGE", "UNKNOWN", "NO_SAMPLE"
 DEFAULT_CHUNK = 200

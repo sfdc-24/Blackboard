@@ -330,19 +330,20 @@ class TheRatifiedExemption(unittest.TestCase):
         self.assertEqual(bv.RATIFIED_DIGEST, self.exempt["digest"])
         self.assertEqual({1563, 1564, 1565, 1566}, self.exempt["idless"])
 
-    def test_a_named_duplicate_is_still_NOT_eligible_without_a_ratified_census(self):
+    def test_a_named_duplicate_opens_the_gate_ONLY_under_the_ratified_census(self):
         """This asserted AGREE and gate_eligible=True until 2026-10-07, and that was the hole.
 
-        Naming an id forgave it with UNBOUNDED multiplicity. The HOLD Codex asked for is this
-        assertion, not a promise in a comment.
+        Naming an id forgave it with UNBOUNDED multiplicity. Its premise has moved twice since, and
+        the property it guards has not:
 
-        ITS PREMISE MOVED ON 2026-10-08, and the property did not. It used to say "the shipped list
-        carries no census yet", so a named duplicate counted as over-census. bus-verify-88vgs then
-        MEASURED the census and it now ships in the file - so within the census, this board's one
-        repeat is no longer over it, and the comparison itself can agree. What still keeps the gate
-        shut is that the census is MEASURED, NOT RATIFIED: RATIFIED_CENSUS_DIGEST is None. That
-        distinction - the verdict reads the file, eligibility reads the owner's pin - is the same
-        one the id list has always had, and it is what this test now pins down."""
+          2026-10-07  no census in the file      -> a named repeat counted as over-census; shut.
+          2026-10-08  census MEASURED, unpinned  -> within the census, but unratified; shut.
+          2026-10-08  owner RATIFIED 0c52eb...   -> within the ratified census; OPEN - and only
+                                                    because the census in the file is the one he
+                                                    ratified, which the second half proves.
+
+        The verdict reads the census from the file; eligibility reads the owner's pin. Same split
+        the id list has always had."""
         dup = sorted(self.exempt["ids"])[0]
         board = [HEADER, row(1), row(2)]
         board[2][0] = dup
@@ -359,9 +360,17 @@ class TheRatifiedExemption(unittest.TestCase):
         self.assertEqual(0, result["duplicates_unratified"])
         self.assertTrue(result["census_present"], "the measured census ships in the file now")
         self.assertEqual(0, result["duplicates_over_census"], "one repeat, within its census of one")
-        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST, "measured, not ratified")
-        self.assertFalse(bv.gate_eligible(result),
-                         "an UNRATIFIED census must never open the gate, however well it matches")
+        self.assertEqual(bv.RATIFIED_CENSUS_DIGEST, result["census_digest"],
+                         "the census in the file is the one the owner ratified")
+        self.assertTrue(bv.gate_eligible(result),
+                        "within the RATIFIED census, a named repeat is no longer a reason to hold")
+        # And the same record, had the census been anything he did not ratify, stays shut.
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", "0000000000000000"):
+            self.assertFalse(bv.gate_eligible(result),
+                             "a census he did not ratify must never open the gate, however well it "
+                             "matches the board")
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", None):
+            self.assertFalse(bv.gate_eligible(result), "nor may an unpinned one")
 
     def test_a_FORTY_SEVENTH_duplicate_fails(self):
         """The whole point. An id nobody ratified is divergence, however old it looks."""
@@ -635,10 +644,13 @@ class TheExemptionIsBoundedByACensus(unittest.TestCase):
             self.assertFalse(bv.gate_eligible(record),
                              "a census the owner did not ratify must not be waved through")
 
-    def test_an_UNRATIFIED_census_digest_blocks_the_gate_today(self):
-        """RATIFIED_CENSUS_DIGEST is None until a measured census is ratified, and while it is None
-        no board holding a duplicate can be eligible. This is the HOLD, in code."""
-        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST)
+    def test_a_census_digest_that_is_not_the_RATIFIED_one_blocks_the_gate(self):
+        """Until 2026-10-08 this asserted RATIFIED_CENSUS_DIGEST was None - the HOLD, in code. The
+        owner has since ratified 0c52ebc3f888f1f5, and the property survives the ratification: a
+        record carrying any census digest other than the pinned one - here, none at all - stays
+        shut, and so does every record if the pin is ever removed."""
+        self.assertEqual("0c52ebc3f888f1f5", bv.RATIFIED_CENSUS_DIGEST,
+                         "changing the pin is changing what the owner ratified")
         record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
                   "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
                   "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
@@ -648,6 +660,10 @@ class TheExemptionIsBoundedByACensus(unittest.TestCase):
                   "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
                   "duplicates_over_census": 0, "census_present": True, "census_digest": ""}
         self.assertFalse(bv.gate_eligible(record))
+        record["census_digest"] = bv.RATIFIED_CENSUS_DIGEST
+        with mock.patch.object(bv, "RATIFIED_CENSUS_DIGEST", None):
+            self.assertFalse(bv.gate_eligible(record),
+                             "remove the pin and nothing with a duplicate is eligible again")
 
     def test_a_board_with_NO_duplicates_is_unaffected(self):
         """The census bounds an exemption. A board that needs no exemption must not be held up by
@@ -790,10 +806,14 @@ class TheShippedCensusIsTheMeasuredOne(unittest.TestCase):
         self.assertEqual(bv.RATIFIED_DIGEST, self.exempt["digest"])
         self.assertEqual("ced284b2333c27dd", self.exempt["digest"])
 
-    def test_the_gate_is_STILL_closed_because_the_census_is_not_ratified(self):
-        """The measurement is not the ratification. Until the owner ratifies 0c52ebc3f888f1f5 and it
-        is pinned, a board holding a duplicate is ineligible - which is what Codex is holding for."""
-        self.assertIsNone(bv.RATIFIED_CENSUS_DIGEST)
+    def test_the_shipped_census_IS_the_one_the_owner_ratified(self):
+        """The measurement is not the ratification - they are two acts by two parties. bus-verify-88vgs
+        measured 0c52ebc3f888f1f5 at 01:19Z; Mr. Salam ratified exactly that digest at ~01:38Z. This
+        test is the place they must agree: the census in the file, the digest pinned in the module,
+        and the digest the owner named, all one value. If anyone edits the file's counts, the first
+        assertion fails; if anyone edits the pin, the second does."""
+        self.assertEqual("0c52ebc3f888f1f5", self.exempt["census_digest"])
+        self.assertEqual(self.exempt["census_digest"], bv.RATIFIED_CENSUS_DIGEST)
         record = {"verdict": bv.AGREE, "covered_from": 1, "covered_to": 10, "frozen_total": 10,
                   "total_at_end": 10, "data_rows": 5, "unique_row_ids": 4, "matched": 4,
                   "header_matches_schema": True, "writes_performed": 0, "read_failures": 0,
@@ -803,7 +823,11 @@ class TheShippedCensusIsTheMeasuredOne(unittest.TestCase):
                   "ratification_readable": True, "ratification_digest": bv.RATIFIED_DIGEST,
                   "duplicates_over_census": 0, "census_present": True,
                   "census_digest": self.exempt["census_digest"]}
-        self.assertFalse(bv.gate_eligible(record))
+        self.assertTrue(bv.gate_eligible(record),
+                        "the ratified census, within its counts, no longer holds the gate")
+        record["duplicates_over_census"] = 1
+        self.assertFalse(bv.gate_eligible(record),
+                         "and ONE occurrence beyond it still does - ratification is not amnesty")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

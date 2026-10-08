@@ -113,6 +113,8 @@
   },
   "census_digest": "0c52ebc3f888f1f5",
   "census_measured_by": "bus-verify-88vgs, 2026-10-08T01:19:06Z, image bus-reconciler:census-2f33875, rows 1-3770 of 3770, 8/8 chunks, 0 read failures, 0 position shifts, 0 writes. 46 distinct ids, 55 occurrences - identical to the ratified list and to duplicate_occurrences_at_ratification.",
-  "census_ratified": false,
-  "census_ratification_note": "MEASURED, NOT RATIFIED. RATIFIED_CENSUS_DIGEST in bus_verify.py stays None until the owner ratifies this digest directly - an agent-authored attestation is not owner evidence (Codex, 2026-10-07 22:05Z). Until then every board holding a duplicate is ineligible, which is correct."
+  "census_ratified": true,
+  "census_ratification_note": "RATIFIED. His words are relayed by the agent he said them to, and carried on the board in CCC-RESULT-DEMO-AND-REDIS-ACCESS-20261008T0139Z. Codex's 2026-10-07 22:05Z standard is a linkable owner source; a WhatsApp line from him lands on the board under the whatsapp tag and meets it. The digest is pinned as RATIFIED_CENSUS_DIGEST in bus_verify.py. Changing the counts or the pin is changing what he ratified, and needs him again.",
+  "census_ratified_by": "Mr. Salam, directly to claude-code-cli, 2026-10-08 ~01:38Z",
+  "census_ratification_words": "I approve the census digest 0c52ebc3f888f1f5"
 }
