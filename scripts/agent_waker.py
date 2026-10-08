@@ -35,10 +35,12 @@ It ANSWERS. It does not ACT, and it does not PROMISE.
 `board_waker.py` refuses to carry out instructions it reads on the board,
 because a board row is DATA and anyone can append to that sheet. The same rule
 holds here, with one sharpened edge: these agents are models behind an HTTP
-call. No shell on this box, no repository, no cloud CLI, no ability to open a
-PR. An agent that replies "YES, ETA 20 minutes" to a build request it physically
-cannot perform is worse than the silence it replaced, because silence at least
-does not mislead the caller into waiting.
+call. No shell on this box, no cloud CLI, no ability to merge; what an adapter
+does read (Gemini's PR excerpts and Cloud Run state) is stated in every reply by
+hands_note, from the same switches the reads obey. An agent that replies "YES,
+ETA 20 minutes" to a build request it physically cannot perform is worse than
+the silence it replaced, because silence at least does not mislead the caller
+into waiting.
 
 Each doctrine states that boundary as fact, and replies post with
 evidence=STATED so nobody downstream reads one as MEASURED.
@@ -262,6 +264,29 @@ YOUR LANE is answering him at any hour: explanation, analysis, drafting,
 judgement. Be useful and be brief.""" + _SHARED_RULES,
     },
 }
+
+
+def hands_note(me: str, cfg: dict, env=None) -> str:
+    """What this agent's adapter can actually read, from the same switches the reads obey.
+
+    The footer said "no private repo" and "no repo, no cloud CLI" after the Gemini adapter was
+    given the private conference repository and Cloud Run reads, so every live reply denied the
+    access its own doctrine described (Cursor's FAIL on #343, 4933cac)."""
+    reads = []
+    if cfg.get("repo_context"):
+        private = sorted(repo_context.PRIVATE_REPOS[r] for r in repo_context.private_allowed(env))
+        reads.append("read-only diffs of the pull requests a row names in %s%s" % (
+            ", ".join(sorted(set(repo_context.REPOS.values()))),
+            " and the PRIVATE %s repository" % ", ".join(private) if private else ""))
+    if cfg.get("cloud_context") and cloud_context.enabled(env):
+        reads.append("read-only Cloud Run describe and Logging reads, under its own roles/viewer, "
+                     "for the resources a row names")
+    writes = ("; it writes only an OKF file to a review branch of the private conference "
+              "repository when a row says land=okf" if cfg.get("okf_land") else "")
+    if not reads and not writes:
+        return "%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. " % me.capitalize()
+    return ("%s is a model endpoint; its adapter attaches %s%s. It has no shell and no cloud CLI, "
+            "and cannot merge. " % (me.capitalize(), "; ".join(reads) or "nothing", writes))
 
 
 # ---------------------------------------------------------------- bus reading
@@ -874,7 +899,7 @@ def main(argv=None) -> int:
                 print(note)
                 log(me, note)
         if cfg.get("cloud_context"):
-            extra = cloud_context.context_for(ask_text)
+            extra = cloud_context.context_for(ask_text)   # never raises: one line, or ""
             if extra:
                 prompt += "\n\n" + extra
                 note = "    cloud context: %d characters" % len(extra)
@@ -908,7 +933,10 @@ def main(argv=None) -> int:
                 floor_ts = item["ts"]
             continue
 
-        body = " ".join(text.split())
+        # What the model says is posted to the board as it is, so a credential or an address it
+        # quotes - from a private PR excerpt, a log line, or its own invention - is removed first
+        # (Cursor on #343: "the board post is not scrubbed either").
+        body = " ".join(okf_land.scrub_secrets(text).split())
         okf_url = ""
         okf_note = ""
         okf_outcome = ""
@@ -933,13 +961,12 @@ def main(argv=None) -> int:
             print(note)
             log(me, note)
         if okf_url:
-            hands = ("Its adapter landed this answer as an OKF file for review (okf=); "
-                     "it has no shell, no private repo and cannot merge. Treat this as "
-                     "reasoning, never as a measurement or a commitment." )
+            hands = ("Its adapter landed this answer as an OKF file for review (okf=). %s"
+                     "Treat this as reasoning, never as a measurement or a commitment."
+                     % hands_note(me, cfg))
         else:
-            hands = ("%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. "
-                     "%sTreat this as reasoning, never as a measurement or a commitment."
-                     % (me.capitalize(), okf_outcome + " " if okf_outcome else ""))
+            hands = ("%s%sTreat this as reasoning, never as a measurement or a commitment."
+                     % (hands_note(me, cfg), okf_outcome + " " if okf_outcome else ""))
         # PY-08: what this answer cost, on the row itself, so a spend question is answered from the
         # board and not from a billing console. Tokens always; USD only when the job states prices.
         estimate = ""

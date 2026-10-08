@@ -70,24 +70,89 @@ TOKEN_ENVS = (TOKEN_ENV, "GEMINI_GITHUB_TOKEN")
 
 # Kept out of the file even in a private repository: a key, a token or a
 # person's contact details have no place in the OKF.
-_SCRUB = (
+#
+# _SECRETS and _ADDRESSES are also what keeps a credential or a private address
+# off the BOARD: scripts/cloud_context.py runs them over every log line it puts
+# in a prompt, and agent_waker runs them over every reply before it is posted
+# (Cursor's FAIL on Blackboard #343, 4933cac: a Redis URL kept its password, and
+# a ya29. token, an AKIA key id, an AWS secret key, Basic credentials, the middle
+# of a JWT and an IPv6 address all came through whole). One list, three users.
+
+
+def _not_a_word(prefix):
+    """Replace "<prefix> <value>" only when the value is not a plain English word.
+
+    "Bearer authentication" and "Basic credentials" are prose this fleet writes
+    about every day; a credential has a digit, a symbol or a capital past its
+    first letter."""
+    def sub(m):
+        value = m.group(1)
+        if re.fullmatch(r"[A-Za-z][a-z]*", value):
+            return m.group(0)
+        return prefix + " [token removed]"
+    return sub
+
+
+def _aws_secret(m):
+    """A 40-character AWS secret key shape. A git SHA is 40 lower-case hex characters
+    and is cited in every review, so a run with no capital letter is left alone."""
+    value = m.group(0)
+    if re.search(r"[A-Z]", value) and re.search(r"[a-z]", value):
+        return "[token removed]"
+    return value
+
+
+def _compressed_ipv6(m):
+    """fe80::1 and 2001:db8::5 are addresses; a[::2], a::b and ::1 are code or loopback."""
+    groups = [g for g in re.split(r":+", m.group(0)) if g]
+    return "[ip]" if len(groups) >= 2 and max(len(g) for g in groups) >= 3 else m.group(0)
+
+
+_SECRETS = (
+    # scheme://user:password@host, the whole userinfo (a password may itself hold an @).
+    (re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]{1,15}://)[^\s/?#@]*(?:@[^\s/?#@]*)*@"),
+     r"\1[credentials removed]@"),
+    # A JWT, all three segments (the payload is base64, not a secret's absence).
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"), "[token removed]"),
+    (re.compile(r"\bya29\.[A-Za-z0-9_.-]{10,}"), "[token removed]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[token removed]"),
+    (re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])"), _aws_secret),
     (re.compile(r"(?i)(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{10,}"), "[token removed]"),
     (re.compile(r"(?i)\b(?:sk|xox[baprs])-[A-Za-z0-9-]{8,}"), "[token removed]"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), "[token removed]"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "[token removed]"),
+    (re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{8,})"), _not_a_word("Bearer")),
+    (re.compile(r"(?i)\bbasic\s+([A-Za-z0-9+/]{8,}={0,2})"), _not_a_word("Basic")),
     (re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]*?(?:-----END [A-Z ]+-----|$)"), "[key removed]"),
+)
+_ADDRESSES = (
+    (re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.]*\d)"), "[ip]"),
+    # IPv6, full (eight groups) or compressed (has ::). A clock time has neither.
+    (re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])"), "[ip]"),
+    (re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::"
+                r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?(?![\w:])"), _compressed_ipv6),
+)
+_PERSONAL = (
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[email removed]"),
     (re.compile(r"(?<![\w/.-])\+?\d[\d ().-]{8,}\d(?![\w/-])"), "[number removed]"),
     (re.compile(r"(https?://[^\s?#)]+)\?[^\s)#]*"), r"\1"),
 )
 
 
-def scrub(text: str) -> str:
-    """The reply without key shapes, tokens, email addresses, phone numbers or URL queries."""
+def _apply(text, rules) -> str:
     out = text or ""
-    for pattern, replacement in _SCRUB:
+    for pattern, replacement in rules:
         out = pattern.sub(replacement, out)
     return out
+
+
+def scrub_secrets(text: str) -> str:
+    """The text without credentials or network addresses: what must never reach the board."""
+    return _apply(text, _SECRETS + _ADDRESSES)
+
+
+def scrub(text: str) -> str:
+    """The reply without key shapes, tokens, addresses, email addresses, phone numbers or URL queries."""
+    return _apply(scrub_secrets(text), _PERSONAL)
 
 
 def token_from(env) -> tuple[str, str]:

@@ -16,14 +16,24 @@ WHAT IT READS, AND ONLY WHEN ASKED
     as NAME <- secret SECRET_NAME. ENV VALUES ARE NEVER READ OUT: a plain value can be a private
     address (the Redis host is never committed anywhere), and the reply goes on the board.
   - When the row also says "log", "logs", "error" or "failed", the resource's most recent WARNING-or-
-    worse log lines from the last two hours, at most MAX_LOG_LINES, each cut to LOG_LINE_CAP and
-    REDACTED: IPv4 addresses, e-mail addresses, bearer values and long token-shaped strings become
-    placeholders, and a URL loses its query string.
+    worse log lines from the last two hours in REGION, at most MAX_LOG_LINES, each cut to
+    LOG_LINE_CAP and REDACTED: first by okf_land.scrub_secrets (passwords in URLs, JWTs, ya29. and
+    AWS keys, Basic and Bearer credentials, IPv4 and IPv6 addresses - the same list that scrubs the
+    OKF and every reply before the board), then e-mail addresses, any bearer value and long
+    token-shaped strings become placeholders, and a URL loses its query string.
   - At most MAX_RESOURCES resources per row, every request inside one DEADLINE_SECONDS budget.
+
+THE SWITCH
+  GEMINI_CLOUD_CONTEXT=off (or 0, false, no) turns every read here off: no token is asked for and
+  no request is made. Unset means on (owner, 2026-10-08). The waker's posted footer reads the same
+  switch, so a reply never claims a read that is off.
 
 WHAT IT CANNOT DO
   roles/viewer holds no secret values and no write of any kind; this module adds neither. It never
   fails the answer: a missing token or an API error becomes one line of context, or none.
+
+THE TOKEN IS NEVER SENT ACROSS A REDIRECT. It is an unredirected header, and every redirect is
+refused (the same rule as repo_context._StayOnGitHub and okf_land; Cursor on #343, 4933cac).
 
 THE DISCLOSURE, STATED. Gemini's reply is posted to the board. Whatever this attaches can be quoted
 there, which is why values are withheld and logs are redacted rather than trusted to the model.
@@ -37,6 +47,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import okf_land
 
 PROJECT = "sfdc24"
 REGION = "us-central1"
@@ -53,12 +65,20 @@ BUDGET = 12000
 DEADLINE_SECONDS = 30.0
 TIMEOUT = 15
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_LIST_PAGES = 5
+SWITCH = "GEMINI_CLOUD_CONTEXT"
+_OFF = ("0", "off", "false", "no")
 _LOG_WORDS = re.compile(r"\b(logs?|errors?|failed|failing|failure)\b", re.IGNORECASE)
 
+# A row that names no resource is told nothing when the list fails, unless it is plainly about
+# Cloud Run (Cursor on #343: the failure line was attached to every Gemini row).
+_CLOUD_WORDS = re.compile(r"(?i)\b(cloud[\s-]*run|services?|jobs?|worker[\s-]*pools?|revisions?|"
+                          r"deploy(?:s|ed|ment)?|executions?)\b")
+
+# Applied AFTER okf_land.scrub_secrets: logs are not prose, so these are blunter than that list.
 _REDACT = (
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[ip]"),
     (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
-    (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer [token]"),
+    (re.compile(r"(?i)\bbearer\s+(?!\[)\S+"), "Bearer [token]"),
     (re.compile(r"(https?://[^\s?#]+)\?\S*"), r"\1?[query]"),
     (re.compile(r"\b[A-Za-z0-9_\-]{32,}\b"), "[token]"),
 )
@@ -68,8 +88,28 @@ class OutOfTime(Exception):
     pass
 
 
+def enabled(env=None) -> bool:
+    """False only when GEMINI_CLOUD_CONTEXT says off."""
+    value = str((os.environ if env is None else env).get(SWITCH) or "").strip().lower()
+    return value not in _OFF
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect. urllib copies a Request's constructor headers onto the redirected
+    request (Python 3.12: unredirected_hdrs is the only exception), so the viewer token would
+    reach whatever host run.googleapis.com or logging.googleapis.com pointed at. Neither API
+    redirects; one that does is an error, never a hop."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, "redirect refused: the viewer token stays put",
+                                     headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def redact(text) -> str:
-    out = str(text or "")
+    out = okf_land.scrub_secrets(str(text or ""))
     for pattern, placeholder in _REDACT:
         out = pattern.sub(placeholder, out)
     return out
@@ -93,9 +133,9 @@ def metadata_token(timeout=5, env=None):
 def _call(url, token, body=None, timeout=TIMEOUT):
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET",
-                                 headers={"Authorization": "Bearer " + token,
-                                          "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+                                 headers={"Content-Type": "application/json"})
+    req.add_unredirected_header("Authorization", "Bearer " + token)   # never copied onto a redirect
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("response too large")
@@ -121,35 +161,46 @@ def named(text, resources) -> list:
     return out
 
 
+def _d(value) -> dict:
+    """A dict, or an empty one: the API's shape is data, and a wrong shape must not crash the pass."""
+    return value if isinstance(value, dict) else {}
+
+
+def _l(value) -> list:
+    return value if isinstance(value, list) else []
+
+
 def _env_names(container) -> list:
     names = []
-    for e in container.get("env") or []:
-        ref = ((e.get("valueSource") or {}).get("secretKeyRef") or {}).get("secret")
+    for e in _l(_d(container).get("env")):
+        e = _d(e)
+        ref = _d(_d(e.get("valueSource")).get("secretKeyRef")).get("secret")
         names.append("%s <- secret %s" % (e.get("name"), _short(ref)) if ref else str(e.get("name")))
     return names
 
 
 def describe(kind, item) -> str:
     """One resource as lines of metadata. Env VALUES are never included."""
-    template = item.get("template") or {}
+    item = _d(item)
+    template = _d(item.get("template"))
     if kind == "job":
-        template = (template.get("template") or {})
-    containers = template.get("containers") or []
-    c = containers[0] if containers else {}
-    ready = next((x for x in item.get("conditions") or [] if x.get("type") == "Ready"),
-                 item.get("terminalCondition") or {})
-    vpc = template.get("vpcAccess") or {}
+        template = _d(template.get("template"))
+    containers = _l(template.get("containers"))
+    c = _d(containers[0]) if containers else {}
+    ready = next((x for x in map(_d, _l(item.get("conditions"))) if x.get("type") == "Ready"),
+                 _d(item.get("terminalCondition")))
+    vpc = _d(template.get("vpcAccess"))
     lines = [
         "%s %s" % (kind, _short(item.get("name"))),
         "  image: %s" % c.get("image", "?"),
         "  ready: %s %s" % (ready.get("state", "?"), redact(ready.get("message", ""))[:160]),
         "  latest ready revision: %s" % _short(item.get("latestReadyRevision")) if kind != "job" else
-        "  latest execution: %s" % _short((item.get("latestCreatedExecution") or {}).get("name")),
+        "  latest execution: %s" % _short(_d(item.get("latestCreatedExecution")).get("name")),
         "  service account: %s" % (template.get("serviceAccount") or "default compute"),
         "  vpc egress: %s" % (vpc.get("egress") or "none"),
         "  env names (values withheld): %s" % (", ".join(_env_names(c)) or "none"),
     ]
-    scaling = item.get("scaling") or template.get("scaling") or {}
+    scaling = _d(item.get("scaling")) or _d(template.get("scaling"))
     if scaling:
         lines.append("  scaling: %s" % json.dumps(scaling, sort_keys=True)[:200])
     return "\n".join(lines)
@@ -159,8 +210,9 @@ def _log_filter(kind, short, since) -> str:
     label = {"service": ('resource.type="cloud_run_revision"', "service_name"),
              "job": ('resource.type="cloud_run_job"', "job_name"),
              "worker pool": ('resource.type="cloud_run_worker_pool"', "worker_pool_name")}[kind]
-    return '%s AND resource.labels.%s="%s" AND severity>=WARNING AND timestamp>="%s"' % (
-        label[0], label[1], short, since)
+    # Pinned to REGION: a same-named resource in another region is not this one (Cursor on #343).
+    return ('%s AND resource.labels.location="%s" AND resource.labels.%s="%s" AND severity>=WARNING '
+            'AND timestamp>="%s"' % (label[0], REGION, label[1], short, since))
 
 
 def logs(kind, short, token, call, deadline) -> str:
@@ -172,7 +224,7 @@ def logs(kind, short, token, call, deadline) -> str:
                                 "filter": _log_filter(kind, short, since),
                                 "orderBy": "timestamp desc", "pageSize": MAX_LOG_LINES},
                min(TIMEOUT, left))
-    entries = got.get("entries") or []
+    entries = [e for e in _l(_d(got).get("entries")) if isinstance(e, dict)]
     if not entries:
         return "  logs: no WARNING-or-worse lines in the last %d h" % LOG_HOURS
     out = ["  logs, WARNING or worse, newest first, redacted:"]
@@ -183,24 +235,50 @@ def logs(kind, short, token, call, deadline) -> str:
     return "\n".join(out)
 
 
-def context_for(text: str, token=None, call=None) -> str:
-    """The cloud context for a row, framed as data, or "" when the row names no Cloud Run resource."""
-    if not text:
+def _list(plural, token, call, deadline) -> list:
+    """Every resource of one kind, following nextPageToken for at most MAX_LIST_PAGES pages."""
+    out, page = [], ""
+    for _ in range(MAX_LIST_PAGES):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise OutOfTime()
+        url = "%s/%s?pageSize=100" % (RUN, plural)
+        if page:
+            url += "&pageToken=" + urllib.parse.quote(page, safe="")
+        got = _d(call(url, token, None, min(TIMEOUT, left)))
+        out.extend(item for item in _l(got.get(plural)) if isinstance(item, dict))
+        page = str(got.get("nextPageToken") or "")
+        if not page:
+            break
+    return out
+
+
+def context_for(text: str, token=None, call=None, env=None) -> str:
+    """The cloud context for a row, framed as data, or "" when the row names no Cloud Run resource.
+
+    It never fails the answer: anything unexpected is one line, or nothing (Cursor on #343: a
+    non-dict container raised AttributeError out of describe() and aborted the pass)."""
+    try:
+        return _context_for(text, token, call, env)
+    except Exception as error:                                   # noqa: BLE001 - see docstring
+        return "CLOUD CONTEXT: not attached (%s)." % type(error).__name__
+
+
+def _context_for(text, token, call, env) -> str:
+    if not text or not enabled(env):
         return ""
     call = call or _call
-    token = token if token is not None else metadata_token()
+    token = token if token is not None else metadata_token(env=env)
     if not token:
         return ""
     deadline = time.monotonic() + DEADLINE_SECONDS
     resources = []
     try:
         for plural, kind in KINDS:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise OutOfTime()
-            got = call("%s/%s?pageSize=100" % (RUN, plural), token, None, min(TIMEOUT, left))
-            resources.extend((kind, item) for item in got.get(plural) or [] if isinstance(item, dict))
+            resources.extend((kind, item) for item in _list(plural, token, call, deadline))
     except (urllib.error.URLError, OSError, ValueError, OutOfTime) as error:
+        if not _CLOUD_WORDS.search(text):
+            return ""
         return "CLOUD CONTEXT: not attached (listing Cloud Run failed: %s)." % type(error).__name__
     found = named(text, resources)
     if not found:
@@ -208,7 +286,11 @@ def context_for(text: str, token=None, call=None) -> str:
     want_logs = bool(_LOG_WORDS.search(text))
     parts = []
     for kind, item in found:
-        part = describe(kind, item)
+        try:
+            part = describe(kind, item)
+        except Exception as error:                               # noqa: BLE001 - one resource, one line
+            part = "%s %s\n  state: not attached (%s)" % (kind, _short(item.get("name")),
+                                                          type(error).__name__)
         if want_logs:
             try:
                 part += "\n" + logs(kind, _short(item.get("name")), token, call, deadline)
