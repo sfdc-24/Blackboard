@@ -31,5 +31,11 @@
     "fleet:": 2592000,
     "proj:": 2592000
   },
-  "max_value_bytes": 2048
+  "max_value_bytes": 2048,
+  "git": {
+    "why": "Mr. Salam, 2026-10-08 ~14:00Z, directly to claude-code-cli: 'Cursor works out of Git but is the only representative from GIT we can count on, as such Cursor also needs access (read write) in Redis.' GitHub authenticates a comment's author, so a principal is bound to the bot's NUMERIC user id, never a login. See scripts/git_requests.py.",
+    "owner": "sfdc-24",
+    "repos": ["Blackboard", "conference"],
+    "bots": {"206951365": "cursor"}
+  }
 }

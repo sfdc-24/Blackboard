@@ -103,6 +103,15 @@ def main() -> int:
     since = (now - datetime.timedelta(minutes=WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = bus_reconcile.board_rows(env, since=since)
     log.info("window since=%s: %d board row(s)", since, len(rows))
+    # THE GIT CHANNEL (scripts/git_requests.py): requests from the GitHub bot accounts the access list
+    # binds by numeric id - Cursor's only way in. Appended AFTER the board rows, so the board's RESULT
+    # rows are what makes a git request "already answered" too. A GitHub failure costs this channel one
+    # run and nothing else.
+    import git_requests                                                  # noqa: PLC0415
+    git = git_requests.git_rows(now - datetime.timedelta(minutes=WINDOW_MINUTES),
+                                token=os.environ.get("GITHUB_READ_TOKEN") or None, log=log.warning)
+    log.info("git channel: %d request row(s)", len(git))
+    rows = list(rows) + git
 
     out = bus_request.handle(rows, conn, now=now, append=appender(env), max_per_run=MAX_PER_RUN)
     log.info("requests: %s", bus_request.summary(out))
