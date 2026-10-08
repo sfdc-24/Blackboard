@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""The bridge's auth is the whole product, so the tests are about auth and about absence.
+
+Run directly: `python tests/test_redis_tool_bridge.py`. These suites are plain scripts that exit 1
+on failure; `unittest discover` does not collect them and would report a green tick over zero
+assertions.
+
+WHAT IS BEING GUARDED, in the words of the review that found it
+(CCC-BRIDGE-REVIEW-20261006T1330Z, verdict CHANGES-REQUESTED):
+
+  1. "verifyIdToken is called with the token alone and NO AUDIENCE ... ANY Google-signed ID token
+     minted for ANY service passes that middleware."
+  2. "checkServerIdentity returning undefined DISABLES SERVER IDENTITY VERIFICATION."
+  3. "authentication without authorisation: the middleware extracts payload.email and calls next,
+     so any verified Google identity is in."
+  4. "the secrets are bound as ENVIRONMENT VARIABLES. An env var is listable from anything that can
+     read the process."
+
+Each one gets a test that fails if the defect comes back, and three of the four are checked against
+the SOURCE as well as the behaviour - because defect 2 is a line that can be deleted without any
+test noticing, and defect 4 is a deploy argument, not a code path.
+"""
+import ast
+import contextlib
+import io
+import os
+import pathlib
+import ssl
+import sys
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "cloud" / "redis-tool-bridge"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import main as bridge  # noqa: E402
+
+AUD = "https://bridge.example.invalid"
+CALLER = "caller@example.invalid"
+SOURCE = (ROOT / "cloud" / "redis-tool-bridge" / "main.py").read_text(encoding="utf-8")
+DOCKERFILE = (ROOT / "cloud" / "redis-tool-bridge" / "Dockerfile").read_text(encoding="utf-8")
+DEPLOY = (ROOT / "cloud" / "redis-tool-bridge" / "deploy.sh").read_text(encoding="utf-8")
+
+
+def statements(source: str) -> str:
+    """The source with its PROSE removed: no docstrings, no comments, no blank lines.
+
+    THIS EXISTS BECAUSE THE FIRST VERSION OF THESE TESTS FAILED ON ITS OWN DOCUMENTATION.
+    `test_the_bridge_does_not_implement_its_own_tls` forbids the string "ssl_cert_reqs" in the
+    bridge - and the module docstring NAMES ssl_cert_reqs while explaining that the bridge borrows
+    it rather than setting it. The test read prose as if it were code and failed a file that was
+    correct.
+
+    That is the third time this exact shape has bitten: in tests/test_bus_verify.py the
+    cross-row-digest guard first asserted "hashlib is not imported", then matched the module
+    docstring describing the old collision, before it was finally made to scan statements. A guard
+    that greps a whole file greps the explanation of the bug along with the bug.
+    """
+    import io
+    import tokenize
+    out = []
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except tokenize.TokenError:                      # pragma: no cover - a syntax error fails louder
+        return source
+    for tok in tokens:
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type == tokenize.STRING and tok.line.strip().startswith(('"""', "'''")):
+            continue                                 # a docstring, standing alone on its own line
+        if tok.type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            continue
+        out.append(tok.string)
+    return "\n".join(out)
+
+
+CODE = statements(SOURCE)
+
+
+def redis_methods(source):
+    """An absent audience must refuse every request, NOT verify without one."""
+    return {node.func.attr for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "conn"}
+
+
+EXPECTED_REDIS_METHODS = {"setex", "get", "ttl", "delete"}
+
+
+class Defect1TheAudienceIsChecked(unittest.TestCase):
+    """Two real deploy bugs in the first version of deploy.sh, both invisible to every auth test."""
+
+    def test_no_configured_audience_refuses(self):
+        who, why = bridge.verify_caller("any.token", "", frozenset({CALLER}))
+        self.assertIsNone(who)
+        self.assertIn("audience", why)
+
+    def test_the_verifier_is_called_with_an_audience_argument(self):
+        """The caller selects no key, no command, no namespace and no TTL. Absence, not refusal."""
+        where = SOURCE.index("verify_oauth2_token(")
+        call = SOURCE[where:where + 220]
+        self.assertIn("audience=", call,
+                      "verify_oauth2_token without audience= is defect 1, exactly")
+
+    def test_the_audience_is_not_defaulted(self):
+        """The missing-COPY/missing-allowlist bug, which has now cost four builds.
+
+    tests/test_image_layout.py does this - for cloud/bus-reconciler/Dockerfile ONLY, hardcoded. Its
+    green tick says nothing about this directory, so running it and feeling covered would be the
+    same mistake as the guard that parsed one agenda section while the chair parsed every one. The
+    assertion belongs beside the Dockerfile it is about.
+
+    /.gcloudignore is an ALLOWLIST: it ignores `/*` and then re-admits, directory by directory. A
+    COPY of a path nobody re-admitted builds fine locally and fails in Cloud Build, where the file
+    simply is not there.
+    """
+        self.assertNotIn('BRIDGE_AUDIENCE", "http', SOURCE)
+        self.assertNotIn("BRIDGE_AUDIENCE', 'http", SOURCE)
+
+
+class Defect2ServerIdentityVerificationStaysOn(unittest.TestCase):
+    def test_the_bridge_does_not_implement_its_own_tls(self):
+        """Stand in for google.oauth2.id_token so the authorisation half can be tested without a real
+    Google token. It does NOT stand in for the audience check - that is asserted against the source,
+    because a fake verifier that ignores the audience would pass either way."""
+        for forbidden in ("ssl_cert_reqs", "check_hostname", "checkServerIdentity",
+                          "CERT_NONE", "SSLContext", "verify=False"):
+            self.assertNotIn(forbidden, CODE,
+                             "%s in the bridge means it is making its own TLS decisions" % forbidden)
+
+    def test_it_connects_through_redis_dual(self):
+        self.assertIn("redis_dual", CODE)
+        self.assertIn("client", CODE)
+        self.assertIn("redis_dual.client(", SOURCE)
+
+    def test_the_image_copies_the_shared_client_and_its_settings(self):
+        self.assertIn("COPY scripts/redis_dual.py", DOCKERFILE)
+        self.assertIn("COPY scripts/redis_dual.settings.json", DOCKERFILE)
+
+
+class Defect3AuthenticationIsNotAuthorisation(unittest.TestCase):
+    def test_no_configured_allowlist_refuses(self):
+        who, why = bridge.verify_caller("any.token", AUD, frozenset())
+        self.assertIsNone(who)
+        self.assertIn("allowlist", why)
+
+    def test_a_verified_identity_off_the_allowlist_is_refused(self):
+        """A default audience would be worse than none: it would look configured and check the
+        wrong thing. os.environ.get must not supply a fallback URL."""
+        claims = {"email": "other@example.invalid", "email_verified": True}
+        with Verifier(claims):
+            who, why = bridge.verify_caller("tok", AUD, frozenset({CALLER}))
+        self.assertIsNone(who, "a verified identity is not an authorised one")
+        self.assertEqual("not authorised", why)
+
+    def test_the_allowlisted_caller_is_accepted_and_named(self):
+        """It borrows scripts/redis_dual.py. A private client here is how one process ends up with
+        verification off while the other has it on."""
+        with Verifier({"email": CALLER, "email_verified": True}):
+            who, why = bridge.verify_caller("tok", AUD, frozenset({CALLER}))
+        self.assertEqual(CALLER, who)
+        self.assertIsNone(why)
+
+    def test_an_unverified_email_claim_is_refused(self):
+        with Verifier({"email": CALLER, "email_verified": False}):
+            who, why = bridge.verify_caller("tok", AUD, frozenset({CALLER}))
+        self.assertIsNone(who)
+
+    def test_the_allowlist_is_case_insensitive_but_not_substring(self):
+        os.environ["BRIDGE_CALLERS"] = "CALLER@example.invalid, second@example.invalid"
+        try:
+            self.assertIn(CALLER, bridge.allowlist())
+            self.assertNotIn("caller@example.invalid.evil.com",
+                             bridge.allowlist())
+        finally:
+            del os.environ["BRIDGE_CALLERS"]
+
+    def test_the_platform_gate_is_demanded_too(self):
+        """The borrowed path is only a defence while it still verifies. Asserted against the module
+        this image actually copies, not against a comment about it."""
+        self.assertIn("--no-allow-unauthenticated", DEPLOY)
+        self.assertNotIn("--allow-unauthenticated", DEPLOY.replace("--no-allow-unauthenticated", ""))
+
+    def test_the_invoker_is_never_everyone(self):
+        """THE DEFECT ITSELF. A real, verified, Google-signed token for a real service account that
+        nobody authorised must not get in."""
+        members = [line for line in DEPLOY.splitlines()
+                   if "INVOKERS=(" in line or "--member=" in line]
+        self.assertTrue(members, "the deploy script grants no invoker at all")
+        for line in members:
+            for bad in ("allUsers", "allAuthenticatedUsers", "domain:", "allauthenticated"):
+                self.assertNotIn(bad, line, "an everyone-binding in %r" % line.strip()[:80])
+            # A literal member must be a named service account; a VARIABLE member is fine, because
+            # the only thing it can expand from is INVOKERS, which this same loop checks.
+            self.assertTrue("serviceAccount:" in line or "${member}" in line or "$member" in line,
+                            "a member that is neither a named SA nor the checked variable: %r"
+                            % line.strip()[:90])
+        self.assertTrue(any("INVOKERS=(" in line and "serviceAccount:" in line
+                            for line in members),
+                        "INVOKERS must list named service accounts literally")
+
+
+class Defect4SecretsAreFilesNotEnvironmentVariables(unittest.TestCase):
+    def test_the_deploy_mounts_both_secrets_as_files_in_separate_dirs(self):
+        self.assertIn("/secrets/auth/redis-auth=REDIS_AUTH_STRING", DEPLOY)
+        self.assertIn("/secrets/ca/redis-ca.pem=REDIS_CA_CERT", DEPLOY)
+
+    def test_no_secret_is_bound_as_an_environment_variable(self):
+        """The control. Without this the tests above would pass on a bridge that refuses everyone."""
+        bindings = [line for line in DEPLOY.splitlines() if "--set-secrets=" in line]
+        self.assertTrue(bindings, "the deploy script mounts no secrets at all")
+        for line in bindings:
+            for binding in line.split("--set-secrets=", 1)[1].split("\\")[0].split(","):
+                binding = binding.strip()
+                if binding:
+                    self.assertTrue(binding.startswith("/"),
+                                    "%r binds a secret to an env var, not a file" % binding)
+
+    def test_no_secret_value_is_read_from_the_environment_by_the_bridge(self):
+        for forbidden in ("REDIS_AUTH_STRING", "REDIS_PASSWORD", "AUTH_STRING"):
+            self.assertNotIn(forbidden, SOURCE)
+
+
+class TheDeployScriptIsCorrectNotJustSafe(unittest.TestCase):
+    """Two real deploy bugs in the first version of deploy.sh, both invisible to every auth test."""
+
+    def test_the_private_address_is_not_committed(self):
+        """Cloud Run must refuse an unauthenticated request before it reaches the container. Two
+        independent gates: --no-allow-unauthenticated is the one the deploy script owns."""
+        import re
+        self.assertIsNone(re.search(r"\b10\.\d+\.\d+\.\d+\b", DEPLOY),
+                          "a private address is written into a public repository")
+        self.assertIn("${REDIS_HOST}", DEPLOY)
+
+    def test_set_env_vars_appears_ONCE(self):
+        """ASSERTED AS A PROPERTY OF THE MEMBERS, not as the absence of a word.
+
+        The first version forbade the string "allUsers" anywhere in deploy.sh - and failed, because
+        the script's own readback checklist tells a human to look for exactly that. Grepping a file
+        for a word finds the warning about the word. So: every principal this script would grant
+        must be a NAMED service account."""
+        flags = [line for line in DEPLOY.splitlines() if "--set-env-vars=" in line]
+        self.assertEqual(1, len(flags), flags)
+        for name in ("REDIS_HOST", "REDIS_PORT", "REDIS_AUTH_FILE", "REDIS_CA_CERT_PATH",
+                     "BRIDGE_AUDIENCE", "BRIDGE_CALLERS"):
+            self.assertIn(name + "=", flags[0], "%s is missing from the one env flag" % name)
+
+    def test_a_deploy_without_REDIS_HOST_refuses(self):
+        self.assertIn('if [ -z "${REDIS_HOST:-}" ]', DEPLOY)
+
+
+class ItCannotDoAnythingButProbe(unittest.TestCase):
+    """The caller selects no key, no command, no namespace and no TTL. Absence, not refusal."""
+
+    def test_there_is_no_arbitrary_command_surface(self):
+        for forbidden in ("KEYS", "SCAN", "FLUSHDB", "FLUSHALL", "eval(", "exec(",
+                          "execute_command", "getattr"):
+            self.assertNotIn(forbidden, CODE,
+                             "%s is a command surface this bridge must not have" % forbidden)
+
+    def test_the_only_redis_calls_are_the_five_the_probe_makes(self):
+        """set-secrets with a BARE NAME binds an env var; with a PATH it mounts a file. The
+        difference is one character and it is the whole defect."""
+        self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods(SOURCE))
+
+    def test_the_method_guard_detects_an_added_method(self):
+        mutated = SOURCE + '\nconn.set("unexpected", "value")\n'
+        with self.assertRaises(AssertionError):
+            self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods(mutated))
+
+    def test_the_method_guard_cannot_pass_on_no_calls(self):
+        with self.assertRaises(AssertionError):
+            self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods("pass"))
+
+    def test_the_probe_key_is_the_servers(self):
+        self.assertIn("PROBE_NAMESPACE + secrets.token_hex", SOURCE)
+
+    def test_the_request_body_is_read_and_discarded(self):
+        self.assertIn("DISCARD", SOURCE)
+
+    def test_only_two_endpoints_exist(self):
+        self.assertIn('path == "/healthz"', SOURCE)
+        self.assertIn('path != "/probe"', SOURCE)
+
+    def test_the_probe_cleans_up_and_says_whether_it_did(self):
+        conn = FakeRedis()
+        out = bridge.synthetic_probe(conn)
+        self.assertEqual("OK", out["status"])
+        self.assertEqual("verified", out["steps"]["cleanup"])
+        self.assertEqual({}, conn.store, "the probe left a key behind")
+
+    def test_a_probe_that_cannot_clean_up_is_not_OK(self):
+        conn = FakeRedis(refuse_delete=True)
+        out = bridge.synthetic_probe(conn)
+        self.assertNotEqual("OK", out["status"])
+
+    def test_a_store_error_reports_the_TYPE_and_not_the_message(self):
+        conn = FakeRedis(raise_on_set=RuntimeError("auth string is hunter2"))
+        out = bridge.synthetic_probe(conn)
+        self.assertEqual("ERROR", out["status"])
+        self.assertEqual("RuntimeError", out["failed_with"])
+        self.assertNotIn("hunter2", repr(out))
+
+
+class EveryFileTheImageCopiesIsUploadedToCloudBuild(unittest.TestCase):
+    """The missing-COPY/missing-allowlist bug, which has now cost four builds.
+
+    tests/test_image_layout.py does this - for cloud/bus-reconciler/Dockerfile ONLY, hardcoded. Its
+    green tick says nothing about this directory, so running it and feeling covered would be the
+    same mistake as the guard that parsed one agenda section while the chair parsed every one. The
+    assertion belongs beside the Dockerfile it is about.
+
+    /.gcloudignore is an ALLOWLIST: it ignores `/*` and then re-admits, directory by directory. A
+    COPY of a path nobody re-admitted builds fine locally and fails in Cloud Build, where the file
+    simply is not there.
+    """
+
+    def test_each_copy_source_is_admitted_by_the_allowlist(self):
+        """cloud/bus-reconciler/main.py: the instance is 'never committed to this public repository'."""
+        sys.path.insert(0, str(ROOT / "tests"))
+        import test_image_layout as layout
+
+        rules = layout.gcloudignore_rules((ROOT / ".gcloudignore").read_text(encoding="utf-8"))
+        sources = [line.split()[1] for line in DOCKERFILE.splitlines()
+                   if line.startswith("COPY ") and len(line.split()) >= 3]
+        self.assertTrue(sources, "the Dockerfile COPYs nothing, which cannot be right")
+        for src in sources:
+            self.assertTrue(layout.in_build_context(src, rules),
+                            "COPY %s is excluded by .gcloudignore, so Cloud Build will not receive "
+                            "it and the build will fail on a file that exists locally" % src)
+
+    def test_the_file_each_copy_names_actually_exists(self):
+        for line in DOCKERFILE.splitlines():
+            if line.startswith("COPY ") and len(line.split()) >= 3:
+                src = line.split()[1]
+                self.assertTrue((ROOT / src).exists(), "COPY %s does not exist in the repo" % src)
+
+
+class TheLogsAndRepliesLeakNothing(unittest.TestCase):
+    def test_request_logging_does_not_emit_query_tokens(self):
+        handler = object.__new__(bridge.Handler)
+        handler.requestline = "GET /healthz?token=FAKE_SECRET_MARKER HTTP/1.1"
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            handler.log_request(200, 99)
+        self.assertEqual("", output.getvalue())
+
+    def test_error_logging_does_not_emit_request_details(self):
+        handler = object.__new__(bridge.Handler)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            handler.log_error("Bad request: %s", "FAKE_SECRET_MARKER")
+        self.assertEqual("", output.getvalue())
+
+    def test_the_default_request_logger_is_overridden(self):
+        """--set-env-vars REPLACES the environment. Repeated, only the last survives - which would
+        have shipped a bridge with no audience, no host and no CA path."""
+        self.assertIn("def log_message", SOURCE)
+        self.assertIn("NO REQUEST LINE", SOURCE)
+
+    def test_healthz_touches_nothing(self):
+        where = SOURCE.index('path == "/healthz"')
+        block = SOURCE[where:where + 500]
+        for forbidden in ("connect(", "synthetic_probe", "allowlist()", "audience()"):
+            self.assertNotIn(forbidden, block,
+                             "a health check that reveals state is a disclosure")
+
+
+# ---------------------------------------------------------------- doubles
+
+
+class RuntimeTransportIsDeclared(unittest.TestCase):
+    def test_requests_extra_and_clean_image_import_smoke_are_present(self):
+        requirements = (ROOT / "cloud" / "redis-tool-bridge" / "requirements.txt").read_text()
+        self.assertIn("google-auth[requests]>=2.35,<3", requirements.splitlines())
+        self.assertIn("from google.auth.transport.requests import Request", DOCKERFILE)
+
+
+class Verifier:
+    """Stand in for google.oauth2.id_token so the authorisation half can be tested without a real
+    Google token. It does NOT stand in for the audience check - that is asserted against the source,
+    because a fake verifier that ignores the audience would pass either way."""
+
+    def __init__(self, claims):
+        self.claims = claims
+        self.saved = {}
+
+    def __enter__(self):
+        import types
+        oauth2 = types.ModuleType("google.oauth2")
+        id_token = types.ModuleType("google.oauth2.id_token")
+        transport = types.ModuleType("google.auth.transport")
+        requests_mod = types.ModuleType("google.auth.transport.requests")
+
+        def verify_oauth2_token(token, request, audience=None):
+            if not audience:
+                raise AssertionError("called without an audience: that is defect 1")
+            return self.claims
+
+        id_token.verify_oauth2_token = verify_oauth2_token
+        requests_mod.Request = lambda *a, **k: object()
+        for name, mod in (("google.oauth2", oauth2), ("google.oauth2.id_token", id_token),
+                          ("google.auth.transport", transport),
+                          ("google.auth.transport.requests", requests_mod)):
+            self.saved[name] = sys.modules.get(name)
+            sys.modules[name] = mod
+        sys.modules["google.oauth2"].id_token = id_token
+        sys.modules["google.auth.transport"].requests = requests_mod
+        return self
+
+    def __exit__(self, *exc):
+        for name, mod in self.saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        return False
+
+
+class FakeRedis:
+    def __init__(self, refuse_delete=False, raise_on_set=None):
+        self.store = {}
+        self.refuse_delete = refuse_delete
+        self.raise_on_set = raise_on_set
+
+    def setex(self, key, ttl, value):
+        if self.raise_on_set:
+            raise self.raise_on_set
+        self.store[key] = (value, ttl)
+
+    def get(self, key):
+        found = self.store.get(key)
+        return found[0] if found else None
+
+    def ttl(self, key):
+        found = self.store.get(key)
+        return found[1] if found else -2
+
+    def delete(self, key):
+        if not self.refuse_delete:
+            self.store.pop(key, None)
+
+
+
+try:
+    import redis as REDIS_LIB                         # installed in CI's bridge venv, pinned 5.3.1
+except ImportError:                                   # pragma: no cover - this laptop has no redis
+    REDIS_LIB = None
+
+
+@unittest.skipUnless(REDIS_LIB, "the redis library is not installed here; CI's bridge venv has it")
+class TheRealRedisClientTrustsOnlyTheMountedCA(unittest.TestCase):
+    """Cursor, PR 340, FAIL on 36479378, finding 1, against the library the image actually pins.
+
+    redis-py 5.3.1's SSLConnection builds ssl.create_default_context() - the public bundle - and
+    then ADDS the mounted CA, with ssl_check_hostname defaulting to False. The previous test here
+    only asserted that redis_dual.py contained the text '"ssl_cert_reqs": "required"', which stayed
+    true while any publicly-chained certificate was accepted. This one drives the real pool to the
+    point of the handshake and reads the context it would use."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tests"))
+        import test_redis_dual as dual_tests
+        self.t = dual_tests
+
+    def test_the_handshake_trusts_the_mounted_ca_and_nothing_else(self):
+        conn = self.t.connect_with(REDIS_LIB)
+        self.assertIsInstance(conn.connection_pool.make_connection(),
+                              REDIS_LIB.connection.SSLConnection)
+        seen, ctx, server_hostname = self.t.first_handshake(self, conn)
+        self.assertEqual([], seen.default_loads,
+                         "the public CA bundle was loaded: the mounted CA must REPLACE it")
+        self.assertEqual([self.t.TEST_CA_CN], self.t.trusted_subjects(ctx))
+        self.assertEqual(ssl.CERT_REQUIRED, ctx.verify_mode)
+        self.assertFalse(ctx.check_hostname, "hostname matching is off until the SAN is read")
+        self.assertEqual("10.0.0.1", server_hostname)
+
+    def test_the_switch_turns_hostname_matching_on_in_the_real_client(self):
+        conn = self.t.connect_with(REDIS_LIB, environ={"REDIS_TLS_CHECK_HOSTNAME": "1"})
+        seen, ctx, _ = self.t.first_handshake(self, conn)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual([], seen.default_loads)
+
+
+class EmailVerifiedMustBeBooleanTrue(unittest.TestCase):
+    """Cursor, PR 340, finding 2: `claims.get("email_verified", True)` failed OPEN - a missing claim,
+    the string "false", the string "true" and the integer 1 were all accepted. Only boolean True is
+    what a Google service-account ID token carries, and only boolean True gets in."""
+
+    def verdict(self, claims):
+        with Verifier(claims):
+            return bridge.verify_caller("tok", AUD, frozenset({CALLER}))
+
+    def test_everything_but_boolean_true_is_refused(self):
+        for label, claims in (("missing", {"email": CALLER}),
+                              ("'false'", {"email": CALLER, "email_verified": "false"}),
+                              ("'true'", {"email": CALLER, "email_verified": "true"}),
+                              ("1", {"email": CALLER, "email_verified": 1}),
+                              ("None", {"email": CALLER, "email_verified": None}),
+                              ("False", {"email": CALLER, "email_verified": False})):
+            who, why = self.verdict(claims)
+            self.assertIsNone(who, "email_verified=%s was accepted" % label)
+            self.assertEqual("unauthenticated", why, label)
+
+    def test_boolean_true_is_accepted(self):
+        self.assertEqual((CALLER, None), self.verdict({"email": CALLER, "email_verified": True}))
+
+
+class AMisconfiguredBridgeSaysNothingAboutWhy(unittest.TestCase):
+    """Cursor, PR 340, residual: the 503 body was `why if code == 503 else why` - `why` on both
+    arms - so the caller was told which setting was missing. The detail belongs in our log."""
+
+    def post(self, environ):
+        handler = object.__new__(bridge.Handler)
+        handler.path = "/probe"
+        handler.headers = {"Content-Length": "0", "Authorization": "Bearer tok"}
+        handler.rfile = io.BytesIO(b"")
+        sent = []
+        handler._send = lambda code, body: sent.append((code, body))
+        saved = {k: os.environ.pop(k, None) for k in ("BRIDGE_AUDIENCE", "BRIDGE_CALLERS")}
+        os.environ.update(environ)
+        log = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(log):
+                handler.do_POST()
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(1, len(sent))
+        return sent[0], log.getvalue()
+
+    def test_no_audience_is_a_generic_503_and_a_specific_log_line(self):
+        (code, body), log = self.post({"BRIDGE_CALLERS": CALLER})
+        self.assertEqual(503, code)
+        self.assertEqual({"error": bridge.UNAVAILABLE}, body)
+        self.assertNotIn("audience", repr(body))
+        self.assertIn("audience", log)
+
+    def test_no_allowlist_is_a_generic_503_and_a_specific_log_line(self):
+        (code, body), log = self.post({"BRIDGE_AUDIENCE": AUD})
+        self.assertEqual(503, code)
+        self.assertEqual({"error": bridge.UNAVAILABLE}, body)
+        self.assertNotIn("allowlist", repr(body))
+        self.assertIn("allowlist", log)
+
+    def test_a_caller_failure_is_still_401_or_403_not_503(self):
+        with Verifier({"email": CALLER, "email_verified": "true"}):
+            (code, body), _ = self.post({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": CALLER})
+        self.assertEqual((401, {"error": "unauthenticated"}), (code, body))
+        with Verifier({"email": "other@example.invalid", "email_verified": True}):
+            (code, body), _ = self.post({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": CALLER})
+        self.assertEqual((403, {"error": "not authorised"}), (code, body))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
