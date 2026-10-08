@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -105,6 +106,75 @@ PROBE_SECONDS = float(os.environ.get("REDIS_PROBE_SECONDS", "1.5"))
 # The real connect gets longer than the pre-check. The pre-check exists to fail fast on a hot
 # path; a connection that is actually wanted should not inherit a hot path's impatience.
 CONNECT_SECONDS = float(os.environ.get("REDIS_CONNECT_SECONDS", "10"))
+
+
+# HOSTNAME MATCHING IS A SWITCH, AND IT IS OFF UNTIL SOMEONE HAS READ THE CERTIFICATE.
+#
+# Cursor, PR 340 (FAIL on 36479378): redis-py 5.3.1 defaults ssl_check_hostname to False, and this
+# module never set it. That half is kept OFF by default on purpose: Memorystore server certificates
+# usually carry the instance IP in their SAN, but nobody here has read this instance's certificate,
+# and turning the check on against a SAN that does not hold REDIS_HOST would break every live job
+# (bus-requests, milestones-sync, the reconciler) for a reason that looks like an outage.
+# Turn it on - REDIS_TLS_CHECK_HOSTNAME=true - AFTER reading the server certificate's SAN.
+#
+# With it off, the other half below still holds: the chain must end at the MOUNTED CA and nothing
+# else, so a certificate chained to a public root no longer completes the handshake at all.
+CHECK_HOSTNAME_ENV = "REDIS_TLS_CHECK_HOSTNAME"
+
+
+def check_hostname_on(environ=None) -> bool:
+    """Whether the TLS handshake must match REDIS_HOST against the server certificate. Off unless
+    the environment says one of 1/true/yes/on; anything else, including garbage, is off - which is
+    the CURRENT live behaviour, so a typo cannot take the jobs down."""
+    environ = environ if environ is not None else os.environ
+    return (environ.get(CHECK_HOSTNAME_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def private_ca_context(ca_path, check_hostname=False):
+    """A TLS client context that trusts the ONE CA at `ca_path` and nothing else.
+
+    Cursor, PR 340: redis-py 5.3.1's SSLConnection starts from ssl.create_default_context() - the
+    public CA bundle, 146 roots on the image - and then load_verify_locations() ADDS the mounted CA.
+    With hostname matching off, a certificate for any name chained to any public root satisfied that
+    handshake, and the AUTH string is the first thing sent over it.
+
+    So this context is built FROM NOTHING: no create_default_context, no load_default_certs, no
+    set_default_verify_paths. The mounted CA is the whole trust store. A missing path is an error,
+    never a quiet fall back to the defaults."""
+    if not ca_path:
+        raise ValueError("a private-CA context needs a CA path; refusing to fall back to defaults")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = bool(check_hostname)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    # Parity with create_default_context on Python 3.13+, which the live image's context had: the
+    # mounted CA may be accepted as a trust anchor even if it is not self-signed. It widens nothing -
+    # the only certificate in this store is the one Secret Manager mounts.
+    context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    context.load_verify_locations(cafile=str(ca_path))
+    return context
+
+
+_PRIVATE_CA_CONNECTION = {}
+
+
+def private_ca_connection_class(redis_module):
+    """redis-py's SSLConnection with ONE method replaced: the socket is wrapped in
+    private_ca_context() instead of the library's default-plus-ours context.
+
+    redis-py 5.3.1 has no argument for a caller-built SSLContext (ssl_ca_certs/ssl_ca_data only ADD
+    to the public bundle), so the context is supplied by overriding _wrap_socket_with_ssl. The OCSP
+    branches of the original are not carried over; nothing here enables them."""
+    base = redis_module.connection.SSLConnection
+    cls = _PRIVATE_CA_CONNECTION.get(base)
+    if cls is None:
+        class PrivateCASSLConnection(base):
+            def _wrap_socket_with_ssl(self, sock):
+                context = private_ca_context(self.ca_certs, self.check_hostname)
+                return context.wrap_socket(sock, server_hostname=self.host)
+
+        cls = _PRIVATE_CA_CONNECTION[base] = PrivateCASSLConnection
+    return cls
 
 
 class Settings:
@@ -332,12 +402,20 @@ def client(settings, factory=None, precheck=True):
     kwargs = {"host": settings.host, "port": int(settings.port), "password": secret,
               "socket_timeout": CONNECT_SECONDS, "socket_connect_timeout": CONNECT_SECONDS,
               "decode_responses": True}
+    private_ca = bool(settings.tls and settings.ca_cert_path)
     if settings.tls:
-        kwargs.update({"ssl": True, "ssl_cert_reqs": "required"})
+        kwargs.update({"ssl": True, "ssl_cert_reqs": "required",
+                       "ssl_check_hostname": check_hostname_on()})
         if settings.ca_cert_path:
             kwargs["ssl_ca_certs"] = settings.ca_cert_path
     try:
-        return redis.Redis(**kwargs)
+        conn = redis.Redis(**kwargs)
+        if private_ca:
+            # Everything redis.Redis put in the pool's kwargs stays exactly as it was; only the
+            # class that wraps the socket changes, so the mounted CA REPLACES the public bundle
+            # instead of being added to it. No connection exists yet: redis-py connects lazily.
+            conn.connection_pool.connection_class = private_ca_connection_class(redis)
+        return conn
     except Exception:
         return None
 
@@ -548,6 +626,10 @@ def status(settings=None) -> dict:
         "port": settings.port,
         "tls": bool(settings.tls),
         "ca_cert_configured": bool(settings.ca_cert_path),
+        # What the handshake trusts: ONLY the mounted CA when one is configured, else the defaults.
+        "tls_trust": ("mounted CA only" if settings.ca_cert_path else "system defaults")
+                     if settings.tls else "(no tls)",
+        "tls_check_hostname": check_hostname_on() if settings.tls else None,
         "redis_library_installed": library,
         "would_attempt_connection": may_connect,
         "reachable": reachable(settings.host, settings.port) if may_connect else None,

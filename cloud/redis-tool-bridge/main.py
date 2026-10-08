@@ -78,6 +78,8 @@ MAX_BODY_BYTES = 4096
 # that the check is skipped. Defect 1 shipped because an absent audience meant "verify nothing".
 AUDIENCE_ENV = "BRIDGE_AUDIENCE"
 CALLERS_ENV = "BRIDGE_CALLERS"
+# The ONLY body a misconfigured bridge returns. Which setting is missing goes to the log, not out.
+UNAVAILABLE = "service unavailable"
 
 
 def stamp() -> str:
@@ -118,7 +120,11 @@ def verify_caller(token: str, expected_audience: str, permitted: frozenset) -> t
         # The TYPE is not even reported outward: a verifier's message can quote the token.
         return None, "unauthenticated"
     principal = str(claims.get("email") or "").strip().lower()
-    if not principal or not claims.get("email_verified", True):
+    # BOOLEAN True AND NOTHING ELSE. Cursor, PR 340: `claims.get("email_verified", True)` read a
+    # MISSING claim as verified, and the strings "false"/"true" and the integer 1 were all truthy.
+    # A Google service-account ID token carries boolean true; anything else is not that token.
+    # The same fail-open was already closed on the governor (tests/test_governor_auth.cjs).
+    if not principal or claims.get("email_verified") is not True:
         return None, "unauthenticated"
     if principal not in permitted:
         # Defect 3. A verified Google identity is NOT an authorised one.
@@ -218,10 +224,11 @@ class Handler(BaseHTTPRequestHandler):
             code = 401 if why == "unauthenticated" else 403
             if why.startswith("the service has no configured"):
                 # A misconfiguration is OURS, not the caller's, and it must be loud in our logs and
-                # opaque in the response.
+                # opaque in the response. Cursor, PR 340: the old body was `why if code == 503 else
+                # why` - `why` on both arms - so the missing setting was named to the caller.
                 sys.stderr.write("%s REFUSING EVERY REQUEST: %s\n" % (stamp(), why))
-                code = 503
-            return self._send(code, {"error": why if code == 503 else why})
+                return self._send(503, {"error": UNAVAILABLE})
+            return self._send(code, {"error": why})
 
         result = synthetic_probe(connect())
         sys.stderr.write("%s probe by %s: %s\n" % (stamp(), principal, result["status"]))

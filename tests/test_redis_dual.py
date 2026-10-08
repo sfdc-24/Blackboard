@@ -4,14 +4,21 @@ Every test here is one of the four promises in his GO - old path authoritative, 
 background shadow read, write-through, off-switch via settings not redeploy - turned into something
 that fails if the promise stops being true.
 """
+import atexit
 import io
 import json
+import os
+import shutil
+import ssl
 import sys
+import tempfile
 import threading
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -584,6 +591,227 @@ class TheDiagnosticCannotBecomeTheFailure(unittest.TestCase):
             redis_dual.threading.Thread = original
         self.assertEqual([], run.threads, "a worker that never started must not be tracked")
         self.assertEqual(1, run.counters.snapshot()["shadow_errors"])
+
+
+
+# ---------------------------------------------------------------- TLS trust (Cursor, PR 340)
+
+# A throwaway self-signed certificate made for these tests; its key was discarded. It stands in for
+# the instance CA that Cloud Run mounts. Not an authority anything trusts. Inline rather than a
+# fixture file because *.pem is gitignored here, and that guard is worth keeping.
+TEST_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIDSzCCAjOgAwIBAgIUF8AEBr6C21aPBNjnzllEUMWV5rIwDQYJKoZIhvcNAQEL
+BQAwNDEyMDAGA1UEAwwpcmVkaXMtZHVhbCB0ZXN0IENBIChub3QgYSByZWFsIGF1
+dGhvcml0eSkwIBcNMjYxMDA4MjIyOTI0WhgPMjEyNjA5MTQyMjI5MjRaMDQxMjAw
+BgNVBAMMKXJlZGlzLWR1YWwgdGVzdCBDQSAobm90IGEgcmVhbCBhdXRob3JpdHkp
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvp7oa98H10ouLe15D9b5
+yu4oqJctg8z++3SYUzRgewpVUfd3tSqhpIB8TTOrSY9L4JBRuFr6RkGU60q29GzM
+T3qOUyNXuacxd+npyKMKeBfq6L4HZ2VgAhRL9zXK8w+EdNn8K7VjbJlvttS7zGkb
+DTi2P3NU2mXZrEop3z1nlRqr2cOjeCq4I5Imtn3jfODzjJUwbFUzPMUmxKB1Rg+F
+2jCqJ+IwoMxgievcDX5pWngTRxCDqH0GNfLABJlU8kHiFALqPHP2lOgi8AQW2HhW
+f2LyXej3V4bvy3ZuiohVr3lQ6AEtoaflEd/0Dark4yiycmBE+966JCiPXi8RxHUT
+PQIDAQABo1MwUTAdBgNVHQ4EFgQUyZVD3l6jvHH7Q9S9bXX38oe2URowHwYDVR0j
+BBgwFoAUyZVD3l6jvHH7Q9S9bXX38oe2URowDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAQEAkhtqS7VnYkLQW7knbuh/GHYx7Vp0ihIo6Nj84hfzvsxC
+BUX0x5y0kxF33KLgooxM3ZJNeY4anrB0vjSiJtoPQTrhnreCEo3pEzMDuK13QfQ6
+eyiXStxT1SiaFjUcJCXOFNQ298IL4GlCXkOLiYkHbpHgWaFuKoqONJAhrC57rm/s
+X2bYkaqlyHo7R8kAPWHIo40EEOBqHm39BFUMYUJ8mE1wCegzyBiqtaJbvohtOtP7
+6CaYoofcBpaHPlH4R7rbOF1QkZKq+KIPEI4AVSYV11msbUgZdR7oFRELNUUco3f1
+swPgFp5/IDYokSXKt91nIMmCmWiCSJtoRyMGZKSOtw==
+-----END CERTIFICATE-----
+"""
+_TEST_CA_DIR = tempfile.mkdtemp(prefix="redis-dual-test-ca-")
+atexit.register(shutil.rmtree, _TEST_CA_DIR, True)
+TEST_CA = Path(_TEST_CA_DIR) / "redis-ca.pem"
+TEST_CA.write_text(TEST_CA_PEM, encoding="ascii")
+TEST_CA_CN = "redis-dual test CA (not a real authority)"
+
+
+class TrustRecorder:
+    """Records what a TLS handshake WOULD trust, without a socket.
+
+    Patches ssl so that loading the platform's default roots is RECORDED (and not done), and so that
+    wrap_socket hands back the context it was called on instead of shaking hands. A context built
+    the way redis-py 5.3.1 builds it - create_default_context() and then the CA added on top - shows
+    up here as a default-trust load; a context built from nothing does not."""
+
+    def __init__(self):
+        self.default_loads, self.contexts = [], []
+
+    def __enter__(self):
+        recorder = self
+
+        def load_default_certs(ctx, *a, **k):
+            recorder.default_loads.append("load_default_certs")
+
+        def set_default_verify_paths(ctx, *a, **k):
+            recorder.default_loads.append("set_default_verify_paths")
+
+        def wrap_socket(ctx, sock, server_hostname=None, **k):
+            recorder.contexts.append((ctx, server_hostname))
+            return "wrapped"
+
+        self.patches = [mock.patch.object(ssl.SSLContext, "load_default_certs", load_default_certs),
+                        mock.patch.object(ssl.SSLContext, "set_default_verify_paths",
+                                          set_default_verify_paths),
+                        mock.patch.object(ssl.SSLContext, "wrap_socket", wrap_socket)]
+        for patch in self.patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        for patch in reversed(self.patches):
+            patch.stop()
+        return False
+
+
+def trusted_subjects(ctx):
+    """The CN of every CA a context trusts, as loaded into it."""
+    names = []
+    for cert in ctx.get_ca_certs():
+        for rdn in cert.get("subject", ()):
+            for key, value in rdn:
+                if key == "commonName":
+                    names.append(value)
+    return names
+
+
+def fake_redis_module():
+    """redis-py's shape, small enough to read: Redis builds a pool, the pool builds connections, and
+    SSLConnection._wrap_socket_with_ssl is redis-py 5.3.1's own trust logic - the default context
+    with the CA ADDED. That is what makes the old client() fail these tests. The real library is
+    exercised in tests/test_redis_tool_bridge.py, where CI installs redis==5.3.1."""
+    redis = types.ModuleType("redis")
+    connection = types.ModuleType("redis.connection")
+
+    class Connection:
+        def __init__(self, host="", **kwargs):
+            self.host, self.kwargs = host, kwargs
+
+    class SSLConnection(Connection):
+        def __init__(self, ssl_cert_reqs="required", ssl_ca_certs=None, ssl_check_hostname=False,
+                     **kwargs):
+            super().__init__(**kwargs)
+            self.cert_reqs = {"required": ssl.CERT_REQUIRED, "none": ssl.CERT_NONE}[ssl_cert_reqs]
+            self.ca_certs, self.check_hostname = ssl_ca_certs, ssl_check_hostname
+
+        def _wrap_socket_with_ssl(self, sock):
+            context = ssl.create_default_context()
+            context.check_hostname = self.check_hostname
+            context.verify_mode = self.cert_reqs
+            if self.ca_certs is not None:
+                context.load_verify_locations(cafile=self.ca_certs)
+            return context.wrap_socket(sock, server_hostname=self.host)
+
+    class ConnectionPool:
+        def __init__(self, connection_class=Connection, **kwargs):
+            self.connection_class, self.connection_kwargs = connection_class, kwargs
+
+        def make_connection(self):
+            return self.connection_class(**self.connection_kwargs)
+
+    class Redis:
+        def __init__(self, ssl=False, **kwargs):
+            self.kwargs = dict(kwargs, ssl=ssl)
+            self.connection_pool = ConnectionPool(
+                connection_class=SSLConnection if ssl else Connection, **kwargs)
+
+    connection.Connection, connection.SSLConnection = Connection, SSLConnection
+    redis.Redis, redis.ConnectionPool, redis.connection = Redis, ConnectionPool, connection
+    return redis
+
+
+def connect_with(redis_module, settings=None, environ=None):
+    """redis_dual.client() against `redis_module`, with a throwaway auth file and a clean switch."""
+    settings = settings or redis_dual.Settings(dict(CONNECT_ONLY, ca_cert_path=str(TEST_CA)),
+                                               environ={})
+    with TemporaryDirectory() as tmp:
+        auth = Path(tmp) / "auth"
+        auth.write_text("not-a-real-auth-string", encoding="utf-8")
+        env = dict(environ or {}, REDIS_AUTH_FILE=str(auth))
+        modules = {"redis": redis_module, "redis.connection": redis_module.connection}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, modules):
+            if "REDIS_TLS_CHECK_HOSTNAME" not in env:
+                os.environ.pop("REDIS_TLS_CHECK_HOSTNAME", None)
+            return redis_dual.client(settings, precheck=False)
+
+
+def first_handshake(test, conn):
+    """What the first connection the pool makes would trust. No socket is opened."""
+    with TrustRecorder() as seen:
+        test.assertEqual("wrapped",
+                         conn.connection_pool.make_connection()._wrap_socket_with_ssl(object()))
+    test.assertEqual(1, len(seen.contexts))
+    return seen, seen.contexts[0][0], seen.contexts[0][1]
+
+
+class TheMountedCAIsTheWholeTrustStore(unittest.TestCase):
+    """Cursor, PR 340, FAIL on 36479378: client() let redis-py start from the PUBLIC CA bundle and
+    add the mounted CA to it, with hostname matching off - so any certificate chained to any public
+    root, for any name, completed the handshake the AUTH string is sent over."""
+
+    def test_no_default_roots_are_loaded_only_the_mounted_ca(self):
+        seen, ctx, server_hostname = first_handshake(self, connect_with(fake_redis_module()))
+        self.assertEqual([], seen.default_loads,
+                         "the public CA bundle was loaded: the mounted CA must REPLACE it")
+        self.assertEqual([TEST_CA_CN], trusted_subjects(ctx))
+        self.assertEqual(ssl.CERT_REQUIRED, ctx.verify_mode)
+        self.assertEqual("10.0.0.1", server_hostname)
+
+    def test_hostname_matching_is_off_by_default_so_the_live_jobs_keep_working(self):
+        conn = connect_with(fake_redis_module())
+        self.assertIs(False, conn.kwargs["ssl_check_hostname"])
+        _, ctx, _ = first_handshake(self, conn)
+        self.assertFalse(ctx.check_hostname)
+
+    def test_the_switch_turns_hostname_matching_on(self):
+        conn = connect_with(fake_redis_module(), environ={"REDIS_TLS_CHECK_HOSTNAME": "true"})
+        self.assertIs(True, conn.kwargs["ssl_check_hostname"])
+        seen, ctx, _ = first_handshake(self, conn)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual([], seen.default_loads)
+
+    def test_a_garbled_switch_is_off(self):
+        for value in ("", "maybe", "0", "false", "off"):
+            self.assertFalse(redis_dual.check_hostname_on({"REDIS_TLS_CHECK_HOSTNAME": value}),
+                             value)
+        self.assertTrue(redis_dual.check_hostname_on({"REDIS_TLS_CHECK_HOSTNAME": " ON "}))
+
+    def test_without_a_ca_path_the_library_default_is_unchanged(self):
+        """Not this fix's scope, and not a silent change for a caller that never configured a CA."""
+        module = fake_redis_module()
+        conn = connect_with(module, settings=redis_dual.Settings(dict(CONNECT_ONLY), environ={}))
+        self.assertIs(module.connection.SSLConnection, conn.connection_pool.connection_class)
+        self.assertNotIn("ssl_ca_certs", conn.kwargs)
+
+    def test_the_other_kwargs_are_what_they_were(self):
+        """client() is shared with bus-requests, milestones-sync and the reconciler."""
+        conn = connect_with(fake_redis_module())
+        for key, value in (("host", "10.0.0.1"), ("port", redis_dual.DEFAULT_PORT), ("ssl", True),
+                           ("ssl_cert_reqs", "required"), ("ssl_ca_certs", str(TEST_CA)),
+                           ("password", "not-a-real-auth-string"), ("decode_responses", True)):
+            self.assertEqual(value, conn.kwargs[key], key)
+
+    def test_no_ca_path_is_an_error_not_a_fall_back_to_the_defaults(self):
+        with self.assertRaises(ValueError):
+            redis_dual.private_ca_context("")
+
+    def test_the_context_alone_trusts_one_ca(self):
+        with TrustRecorder() as seen:
+            ctx = redis_dual.private_ca_context(str(TEST_CA))
+        self.assertEqual([], seen.default_loads)
+        self.assertEqual([TEST_CA_CN], trusted_subjects(ctx))
+        self.assertEqual(ssl.CERT_REQUIRED, ctx.verify_mode)
+        self.assertFalse(ctx.check_hostname)
+        self.assertTrue(redis_dual.private_ca_context(str(TEST_CA), True).check_hostname)
+
+    def test_the_recorder_sees_the_old_shape(self):
+        """The control: the library's own default-plus-CA context IS caught by the recorder, so an
+        empty default_loads above means something."""
+        with TrustRecorder() as seen:
+            ctx = ssl.create_default_context()
+            ctx.load_verify_locations(cafile=str(TEST_CA))
+        self.assertTrue(seen.default_loads)
 
 
 if __name__ == "__main__":

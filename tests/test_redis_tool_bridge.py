@@ -25,6 +25,7 @@ import contextlib
 import io
 import os
 import pathlib
+import ssl
 import sys
 import unittest
 
@@ -131,13 +132,6 @@ class Defect2ServerIdentityVerificationStaysOn(unittest.TestCase):
         self.assertIn("redis_dual", CODE)
         self.assertIn("client", CODE)
         self.assertIn("redis_dual.client(", SOURCE)
-
-    def test_redis_dual_still_requires_a_verified_server(self):
-        """The defect was ONE MISSING ARGUMENT, and no behavioural test can see it without a real
-        Google token. So the source is the evidence: the call must pass audience=."""
-        dual = (ROOT / "scripts" / "redis_dual.py").read_text(encoding="utf-8")
-        self.assertIn('"ssl_cert_reqs": "required"', dual)
-        self.assertIn("ssl_ca_certs", dual)
 
     def test_the_image_copies_the_shared_client_and_its_settings(self):
         self.assertIn("COPY scripts/redis_dual.py", DOCKERFILE)
@@ -445,6 +439,119 @@ class FakeRedis:
     def delete(self, key):
         if not self.refuse_delete:
             self.store.pop(key, None)
+
+
+
+try:
+    import redis as REDIS_LIB                         # installed in CI's bridge venv, pinned 5.3.1
+except ImportError:                                   # pragma: no cover - this laptop has no redis
+    REDIS_LIB = None
+
+
+@unittest.skipUnless(REDIS_LIB, "the redis library is not installed here; CI's bridge venv has it")
+class TheRealRedisClientTrustsOnlyTheMountedCA(unittest.TestCase):
+    """Cursor, PR 340, FAIL on 36479378, finding 1, against the library the image actually pins.
+
+    redis-py 5.3.1's SSLConnection builds ssl.create_default_context() - the public bundle - and
+    then ADDS the mounted CA, with ssl_check_hostname defaulting to False. The previous test here
+    only asserted that redis_dual.py contained the text '"ssl_cert_reqs": "required"', which stayed
+    true while any publicly-chained certificate was accepted. This one drives the real pool to the
+    point of the handshake and reads the context it would use."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tests"))
+        import test_redis_dual as dual_tests
+        self.t = dual_tests
+
+    def test_the_handshake_trusts_the_mounted_ca_and_nothing_else(self):
+        conn = self.t.connect_with(REDIS_LIB)
+        self.assertIsInstance(conn.connection_pool.make_connection(),
+                              REDIS_LIB.connection.SSLConnection)
+        seen, ctx, server_hostname = self.t.first_handshake(self, conn)
+        self.assertEqual([], seen.default_loads,
+                         "the public CA bundle was loaded: the mounted CA must REPLACE it")
+        self.assertEqual([self.t.TEST_CA_CN], self.t.trusted_subjects(ctx))
+        self.assertEqual(ssl.CERT_REQUIRED, ctx.verify_mode)
+        self.assertFalse(ctx.check_hostname, "hostname matching is off until the SAN is read")
+        self.assertEqual("10.0.0.1", server_hostname)
+
+    def test_the_switch_turns_hostname_matching_on_in_the_real_client(self):
+        conn = self.t.connect_with(REDIS_LIB, environ={"REDIS_TLS_CHECK_HOSTNAME": "1"})
+        seen, ctx, _ = self.t.first_handshake(self, conn)
+        self.assertTrue(ctx.check_hostname)
+        self.assertEqual([], seen.default_loads)
+
+
+class EmailVerifiedMustBeBooleanTrue(unittest.TestCase):
+    """Cursor, PR 340, finding 2: `claims.get("email_verified", True)` failed OPEN - a missing claim,
+    the string "false", the string "true" and the integer 1 were all accepted. Only boolean True is
+    what a Google service-account ID token carries, and only boolean True gets in."""
+
+    def verdict(self, claims):
+        with Verifier(claims):
+            return bridge.verify_caller("tok", AUD, frozenset({CALLER}))
+
+    def test_everything_but_boolean_true_is_refused(self):
+        for label, claims in (("missing", {"email": CALLER}),
+                              ("'false'", {"email": CALLER, "email_verified": "false"}),
+                              ("'true'", {"email": CALLER, "email_verified": "true"}),
+                              ("1", {"email": CALLER, "email_verified": 1}),
+                              ("None", {"email": CALLER, "email_verified": None}),
+                              ("False", {"email": CALLER, "email_verified": False})):
+            who, why = self.verdict(claims)
+            self.assertIsNone(who, "email_verified=%s was accepted" % label)
+            self.assertEqual("unauthenticated", why, label)
+
+    def test_boolean_true_is_accepted(self):
+        self.assertEqual((CALLER, None), self.verdict({"email": CALLER, "email_verified": True}))
+
+
+class AMisconfiguredBridgeSaysNothingAboutWhy(unittest.TestCase):
+    """Cursor, PR 340, residual: the 503 body was `why if code == 503 else why` - `why` on both
+    arms - so the caller was told which setting was missing. The detail belongs in our log."""
+
+    def post(self, environ):
+        handler = object.__new__(bridge.Handler)
+        handler.path = "/probe"
+        handler.headers = {"Content-Length": "0", "Authorization": "Bearer tok"}
+        handler.rfile = io.BytesIO(b"")
+        sent = []
+        handler._send = lambda code, body: sent.append((code, body))
+        saved = {k: os.environ.pop(k, None) for k in ("BRIDGE_AUDIENCE", "BRIDGE_CALLERS")}
+        os.environ.update(environ)
+        log = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(log):
+                handler.do_POST()
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(1, len(sent))
+        return sent[0], log.getvalue()
+
+    def test_no_audience_is_a_generic_503_and_a_specific_log_line(self):
+        (code, body), log = self.post({"BRIDGE_CALLERS": CALLER})
+        self.assertEqual(503, code)
+        self.assertEqual({"error": bridge.UNAVAILABLE}, body)
+        self.assertNotIn("audience", repr(body))
+        self.assertIn("audience", log)
+
+    def test_no_allowlist_is_a_generic_503_and_a_specific_log_line(self):
+        (code, body), log = self.post({"BRIDGE_AUDIENCE": AUD})
+        self.assertEqual(503, code)
+        self.assertEqual({"error": bridge.UNAVAILABLE}, body)
+        self.assertNotIn("allowlist", repr(body))
+        self.assertIn("allowlist", log)
+
+    def test_a_caller_failure_is_still_401_or_403_not_503(self):
+        with Verifier({"email": CALLER, "email_verified": "true"}):
+            (code, body), _ = self.post({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": CALLER})
+        self.assertEqual((401, {"error": "unauthenticated"}), (code, body))
+        with Verifier({"email": "other@example.invalid", "email_verified": True}):
+            (code, body), _ = self.post({"BRIDGE_AUDIENCE": AUD, "BRIDGE_CALLERS": CALLER})
+        self.assertEqual((403, {"error": "not authorised"}), (code, body))
 
 
 if __name__ == "__main__":
