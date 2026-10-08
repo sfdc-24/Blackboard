@@ -158,7 +158,20 @@ function handleAppend_(body, cfg) {
       const sheet = body.sheetName ? ss.getSheetByName(body.sheetName) : ss.getSheets()[0];
       if (!sheet) return jsonOut_({ ok: false, error: 'Sheet tab not found: ' + body.sheetName }, 400);
       const row = body.sheetRow || [nowStamp_(), body.text || ''];
+      // PY-01: checked UNDER THE LOCK, so two racing retries cannot both pass the check.
+      const dup = Array.isArray(body.sheetRow) ? findDuplicate_(sheet, body.sheetRow) : null;
+      if (dup) {
+        return jsonOut_({ ok: false, error: 'DUPLICATE', duplicate: dup.kind, id: dup.id,
+                          existing_row: dup.row }, 409);
+      }
       sheet.appendRow(row);
+      if (Array.isArray(body.sheetRow)) {
+        const trigger = maybeTriggerWorker_(body.sheetRow);
+        if (trigger !== 'off' && trigger !== 'not-a-request') {
+          return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_(),
+                            worker: trigger });
+        }
+      }
     } else {
       return jsonOut_({ ok: false, error: 'Unsupported file type for append: ' + mime }, 400);
     }
@@ -166,6 +179,84 @@ function handleAppend_(body, cfg) {
     return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), appendedAt: nowStamp_() });
   } finally {
     lock.releaseLock();
+  }
+}
+
+// ---- PY-01: NO ROW TWICE ---------------------------------------------
+//
+// Grok's poka-yoke audit, 2026-10-08: overnight a client POST retry appended five Grok rows TWICE,
+// same Row_ID, same millisecond. The client was fixed at 2:12 PM ET; this makes it impossible at the
+// one place every writer passes. A sheetRow whose Row_ID (column A) is already on the sheet, or whose
+// BCB `id=` already appears as the id of an earlier payload (column F), is refused with DUPLICATE and
+// the row it collides with - nothing is appended. Both lookups are server-side TextFinder searches
+// over one column, not a read of the sheet. APPEND_DEDUP=off (Script Property) turns it off without
+// a redeploy; absent, it is ON.
+//
+// What it does not catch, stated: a row written with a DIFFERENT Row_ID and NO BCB id. There is
+// nothing to compare it on, and guessing from the text would refuse honest repeats.
+
+// THE BCB-ID HALF CHANGES A HABIT, stated: an agent that re-asks by re-posting the SAME id= (the
+// wakers collapse such re-asks) is now refused, and must re-ask under a new id. APPEND_DEDUP=rowid
+// keeps the Row_ID check alone if that habit turns out to matter more than the retry it stops.
+
+function findDuplicate_(sheet, sheetRow) {
+  const mode = PropertiesService.getScriptProperties().getProperty('APPEND_DEDUP');
+  if (mode === 'off') return null;
+  const last = sheet.getLastRow();
+  if (last < 1) return null;
+  const rowId = String(sheetRow[0] == null ? '' : sheetRow[0]).trim();
+  if (rowId) {
+    const hit = sheet.getRange(1, 1, last, 1).createTextFinder(rowId).matchEntireCell(true)
+      .matchCase(true).findNext();
+    if (hit) return { kind: 'row_id', id: rowId, row: hit.getRow() };
+  }
+  const bcb = mode === 'rowid' ? '' : bcbId_(sheetRow[5]);
+  if (bcb) {
+    const pattern = '(^|\\|)id=' + bcb.replace(/[.\-]/g, '\\$&') + '(\\||$)';
+    const hit = sheet.getRange(1, 6, last, 1).createTextFinder(pattern).useRegularExpression(true)
+      .matchCase(true).findNext();
+    if (hit) return { kind: 'bcb_id', id: bcb, row: hit.getRow() };
+  }
+  return null;
+}
+
+// The payload's own `id=` - the field, never a substring of another (answers=, req=, row_id=).
+function bcbId_(payload) {
+  const m = /(?:^|\|)id=([A-Za-z0-9._-]{1,200})(?:\||$)/.exec(String(payload == null ? '' : payload));
+  return m ? m[1] : '';
+}
+
+// ---- PY-02: A REQUEST STARTS THE WORKER, NO POLLING ---------------------
+//
+// SHIPPED OFF. Grok's audit asked for it and said "the trigger and IAM need owner GO", so it does
+// nothing unless the Script Property WORKER_TRIGGER is exactly 'on'. When on: an appended AYA_REQ row
+// addressed to bus-reconciler starts ONE execution of the Cloud Run job bus-requests, as the script's
+// owner (ScriptApp.getOAuthToken, which needs the cloud-platform scope in appsscript.json). At most
+// one start per WORKER_DEBOUNCE_S (default 45 s): a burst of requests is served by the run already
+// starting, which reads every unanswered request in its window. The append never fails because the
+// trigger did - the row is on the board either way, and the response says what the trigger did.
+
+function maybeTriggerWorker_(sheetRow) {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('WORKER_TRIGGER') !== 'on') return 'off';
+  const target = String(sheetRow[3] == null ? '' : sheetRow[3]).trim().toLowerCase();
+  const action = String(sheetRow[4] == null ? '' : sheetRow[4]).trim().toUpperCase();
+  if (action !== 'AYA_REQ' || target !== 'bus-reconciler') return 'not-a-request';
+  const cache = CacheService.getScriptCache();
+  if (cache.get('worker-trigger')) return 'debounced';
+  const seconds = Math.max(10, Math.min(300, Number(props.getProperty('WORKER_DEBOUNCE_S')) || 45));
+  cache.put('worker-trigger', String(Date.now()), seconds);
+  const job = props.getProperty('WORKER_JOB') ||
+    'projects/sfdc24/locations/us-central1/jobs/bus-requests';
+  if (!/^projects\/[a-z0-9-]+\/locations\/[a-z0-9-]+\/jobs\/[a-z0-9-]+$/.test(job)) return 'bad-job-name';
+  try {
+    const resp = UrlFetchApp.fetch('https://run.googleapis.com/v2/' + job + ':run', {
+      method: 'post', contentType: 'application/json', payload: '{}', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    });
+    return 'started-http-' + resp.getResponseCode();
+  } catch (err) {
+    return 'start-failed';
   }
 }
 
