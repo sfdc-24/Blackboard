@@ -218,6 +218,43 @@ function handleRead_(params, cfg) {
     const limit = parseInt(params.limit, 10);
     const match = String(params.match || '').toLowerCase();
     const since = String(params.since || '');
+
+    // A CLOSED PHYSICAL RANGE: start is 1-based and INCLUSIVE, count is how many rows.
+    //
+    // Gemini, architect lead, 2026-10-07: "Drop time completely. Physical index range is the
+    // correct architectural boundary. Comparing a closed interval [start, end] turns an
+    // indeterminate time query into an exact identity and count match, eliminating timestamp
+    // jitter and lexical comparison bugs." Codex had shown that no predicate over a time-windowed
+    // verdict can establish zero divergence, because this sheet's ROW ORDER IS NOT ITS TIMESTAMP
+    // ORDER and both other filters lean on time.
+    //
+    // The machinery was already here - `limit` is getRange(total - n + 1, ...), a physical tail -
+    // and simply not exposed. This exposes it without moving the tail path.
+    //
+    // ADDITIVE: a caller that does not send start behaves exactly as before.
+    const start = parseInt(params.start, 10);
+    const count = parseInt(params.count, 10);
+    if (start > 0) {
+      if (!(count > 0)) {
+        return jsonOut_({ ok: false,
+                          error: 'count must be a positive integer when start is given' }, 400);
+      }
+      if (start > total) {
+        // Past the end is not an error and not an empty board: it is an empty RANGE, and the
+        // caller needs `total` back to know that is why.
+        return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: [],
+                          total: total, filtered: 0, start: start, count: 0 });
+      }
+      const n = Math.min(count, total - start + 1);
+      const rangedRows = sheet.getRange(start, 1, n, cols).getValues();
+      // `total` travels with every ranged read ON PURPOSE. Gemini: "The reconciler must read total
+      // first, freeze end_index to that snapshot, and query only that closed slice. A floating
+      // upper bound reintroduces edge leaks." The caller freezes it; this tells it what the sheet
+      // held at the moment of the read. The echoed start and count are how a caller knows the
+      // gateway understood the question rather than ignoring it and answering with everything.
+      return jsonOut_({ ok: true, fileId: file.getId(), title: file.getName(), rows: rangedRows,
+                        total: total, filtered: rangedRows.length, start: start, count: n });
+    }
     const filtered = (limit > 0) || !!match || !!since;
 
     if (!filtered) {
@@ -237,11 +274,30 @@ function handleRead_(params, cfg) {
     } else {
       rows = sheet.getDataRange().getValues();
       if (since) {
+        const sinceMs = Date.parse(since);
+        // jsonOut_, not respond(): a cutoff we cannot parse must not silently return everything or
+        // nothing. 400 with ok:false, the way every other error path in this file answers.
+        if (isNaN(sinceMs)) {
+          return jsonOut_({ ok: false, error: 'since is not a parseable timestamp' }, 400);
+        }
         rows = rows.filter(function (r) {
           for (let i = 0; i < r.length; i++) {
             const cell = r[i];
-            if (cell instanceof Date) return cell.toISOString() >= since;
-            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) return cell >= since;
+            // PARSED, NOT COMPARED AS TEXT. Codex found the same defect in the Python reconciler,
+            // except this one is upstream of every `since` reader on the fleet and it is DEPLOYED.
+            // An ISO string compare drops a row whose stamp carries sub-second precision at the
+            // cutoff second:
+            //     "2026-10-07T03:32:22.588753Z" >= "2026-10-07T03:32:22Z"   is FALSE
+            // because "." sorts below "Z". scripts/append.py stamps microseconds, so this silently
+            // excluded rows the caller asked for - and a row no reader receives is a row no
+            // reconciler can find missing.
+            if (cell instanceof Date) return cell.getTime() >= sinceMs;
+            if (typeof cell === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(cell)) {
+              const t = Date.parse(cell);
+              // Unparseable means UNKNOWN, and a filter cannot return unknown - so the row is KEPT.
+              // Dropping it would hide it from every reader; keeping it costs one extra row.
+              return isNaN(t) ? true : t >= sinceMs;
+            }
           }
           return false;   // a row with no timestamp cannot satisfy a since
         });
