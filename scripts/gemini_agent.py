@@ -80,11 +80,16 @@ def cost_estimate(usage) -> str:
     tin = usage.get("in") or 0
     tout = (usage.get("out") or 0) + (usage.get("thought") or 0)
     line = "in %s out %s thought %s" % (usage.get("in", "?"), usage.get("out", "?"), usage.get("thought", "?"))
+    # Which model answered, and which alias was asked for, so the line can be priced afterwards.
+    if usage.get("model") or usage.get("asked"):
+        line = "model %s asked %s %s" % (usage.get("model") or "unreported", usage.get("asked") or "?", line)
     try:
         usd = float(PRICE_IN_PER_M) * tin / 1e6 + float(PRICE_OUT_PER_M) * tout / 1e6
         return line + " est_usd %.4f" % usd
     except (TypeError, ValueError):
         return line + " est_usd unpriced"
+
+
 KEY_NAMES = ["GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"]
 
 
@@ -207,7 +212,24 @@ def usage_of(d):
         "in": u.get("total_input_tokens"),
         "out": u.get("total_output_tokens"),
         "thought": u.get("total_thought_tokens"),
+        # THE MODEL THAT ANSWERED, not the alias that was asked for. gemini-pro-latest names whatever
+        # Google points it at that day, so a cost line without the resolved model cannot be priced
+        # afterwards (Aya, AYA-GEMINI-COST-RECONCILE-20261008T194011Z: gemini-waker-c9qfw logged usage
+        # and no model). The Interactions envelope carries `model`; Vertex carries `modelVersion`.
+        "model": _resolved_model(d),
     }
+
+
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
+
+def _resolved_model(d) -> str:
+    """The response's own model name, cleaned for a pipe-delimited row; "" when it gives none."""
+    for field in ("model", "modelVersion"):
+        value = (d or {}).get(field) if isinstance(d, dict) else None
+        if isinstance(value, str) and _MODEL_NAME.match(value.strip()):
+            return value.strip()
+    return ""
 
 
 def ask(prompt, model=None):
@@ -233,7 +255,7 @@ def ask(prompt, model=None):
                 d = json.loads(body)
             except Exception:
                 return None, "key route returned 200 but unparseable JSON"
-            ask.last_usage = usage_of(d)
+            ask.last_usage = dict(usage_of(d), asked=request["model"])
             text = extract_text(d)
             if not text:
                 return None, ("key route returned 200 but no text found; "
@@ -253,6 +275,10 @@ def ask(prompt, model=None):
         if status == 200:
             try:
                 d = json.loads(body)
+                m = d.get("usageMetadata") or {}
+                ask.last_usage = {"total": m.get("totalTokenCount"), "in": m.get("promptTokenCount"),
+                                  "out": m.get("candidatesTokenCount"), "thought": m.get("thoughtsTokenCount"),
+                                  "model": _resolved_model(d), "asked": model or VERTEX_MODEL}
                 return d["candidates"][0]["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
             except Exception:
                 return None, "vertex returned 200 but an unexpected shape"

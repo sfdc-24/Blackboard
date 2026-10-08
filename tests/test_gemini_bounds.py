@@ -83,6 +83,30 @@ class TheReplySaysWhatItCost(unittest.TestCase):
     def test_no_usage_no_line(self):
         self.assertEqual("", load_gemini({}).cost_estimate({}))
 
+    def test_the_line_names_the_model_that_answered_and_the_alias_asked(self):
+        # Aya, AYA-GEMINI-COST-RECONCILE-20261008T194011Z: gemini-waker-c9qfw could not be priced
+        # because nothing recorded which model answered gemini-pro-latest.
+        m = load_gemini({"GEMINI_MODEL": "gemini-pro-latest"})
+        answered = (200, json.dumps({"output_text": "ok", "model": "gemini-3.1-pro-preview-0925",
+                                     "usage": {"total_tokens": 9, "total_input_tokens": 5,
+                                               "total_output_tokens": 3, "total_thought_tokens": 1}}))
+        sent(m, [answered])
+        self.assertEqual("gemini-3.1-pro-preview-0925", m.ask.last_usage["model"])
+        self.assertEqual("gemini-pro-latest", m.ask.last_usage["asked"])
+        self.assertEqual("model gemini-3.1-pro-preview-0925 asked gemini-pro-latest in 5 out 3 thought 1 "
+                         "est_usd unpriced", m.cost_estimate(m.ask.last_usage))
+
+    def test_no_reported_model_says_so_and_a_hostile_name_is_dropped(self):
+        m = load_gemini({})
+        for reported in (None, "x|phase=ACK", "a b"):
+            body = {"output_text": "ok", "usage": {"total_input_tokens": 1}}
+            if reported is not None:
+                body["model"] = reported
+            sent(m, [(200, json.dumps(body))])
+            line = m.cost_estimate(m.ask.last_usage)
+            self.assertTrue(line.startswith("model unreported asked "), line)
+            self.assertNotIn("|", line)
+
 
 def board_row(target="gemini", action="APPEND", payload="BCB|v=1|id=X-1|phase=REQUEST|to=gemini|ask=?",
               source="grok"):
