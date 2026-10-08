@@ -30,6 +30,22 @@ something that matters, it needs a real identity first, not a longer allowlist.
 
 The rest of the bounds exist so a forged flood is not free: a stale request is ignored, a repeat for
 a request id already answered does nothing, and the number honoured per run and per hour is capped.
+
+THE OWNER DECIDED, 2026-10-08 ~01:40Z - and this is where his decision lands against the paragraph above.
+That paragraph says a request that can do something that matters "needs a real identity first, not a
+longer allowlist". On 2026-10-07 that was the advice - mine and, independently, aya's - and he took
+it: "don't widen the stopgap". On 2026-10-08 he decided the trade differently, directly to
+claude-code-cli: "Everyone gets read write access, you control the Redis access rights and make
+actions auditable so there is governance."
+
+So `redis-op` exists, bounded by GOVERNANCE rather than by identity (scripts/redis_gov.py): every fleet
+agent may read everything and write the governed namespaces; one controller owns the access list
+(scripts/redis_acl.json); every operation, allowed or refused, is audited in gov:audit with the raw
+tag, the board row, and the old and new values; and the namespaces other things depend on - the board
+mirror the comparison gate checks, the roster, the chair's projection, the audit itself - are refused
+for writes in code, whatever the access list says. The identity is still a claim, and the audit says
+so by recording the raw tag beside the principal. Per-agent identity is the redis-tool-bridge (OIDC)
+for the agents that have a Google identity at all; until then, this is the path every agent can reach.
 """
 from __future__ import annotations
 
@@ -39,6 +55,8 @@ import json
 import re
 import secrets
 import time
+
+import redis_gov
 
 # The board's ten cells, as scripts/append.py writes them.
 ROW_ID, TS, SOURCE, TARGET, ACTION, PAYLOAD, CATEGORY, PROJECT, GIST, SUBGIST = range(10)
@@ -50,7 +68,14 @@ WORKER_TAG = "bus-reconciler"
 
 # Who MAY ask. Not who DID ask: see the module docstring. This bounds the claim, never the identity.
 SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp")
-# What may be asked. One action, and nothing in the request selects a key, a command or a TTL.
+# What may be asked. The probe selects no key, command or TTL.
+#
+# redis-op IS NOT LISTED YET, deliberately. The governed path (scripts/redis_gov.py) is built and
+# tested, but the hunk in handle() that executes it was refused by the agent-permission layer on the
+# laptop that wrote it. Listing the action without that hunk would route a redis-op request into the
+# SYNTHETIC PROBE path and answer it "OK" - a result for something that was never done. So the action
+# stays unlisted, a redis-op request is refused as "not allowlisted", and enabling it is one reviewed
+# change: add "redis-op" here AND the handle() branch, together.
 ACTIONS = ("redis-synthetic-probe",)
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
@@ -58,7 +83,9 @@ _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
 _FIELD = re.compile(r"(?:^|\|)\s*%s\s*=\s*([^|]*)")
 
 STALE_MINUTES = 30          # the outbox that delivered 18 stale messages; a late diagnostic is noise
-MAX_PER_RUN = 3             # a forged flood is not free, so it is not unbounded either
+# Raised from 3 when every agent got redis-op: five-plus agents, a handful of ops each per run. It still
+# bounds EVERY board response, refusals included - a forged flood is not free.
+MAX_PER_RUN = 25
 PROBE_NAMESPACE = "v1:synth:probe:"
 PROBE_TTL_SECONDS = 10
 
@@ -100,7 +127,22 @@ def parse_request(row):
         "action": (field(payload, "do") or "").strip().lower(),
         "row_id": str(row[ROW_ID] or "").strip(),
         "at": read_ts(row[TS]),
+        # redis-op only. Taken verbatim and judged by scripts/redis_gov.py, never used here.
+        "op": field(payload, "op"),
+        "key": field(payload, "key"),
+        "field": field(payload, "field"),
+        "val": field(payload, "val"),
+        "enc": field(payload, "enc"),
+        "count": field(payload, "count"),
     }
+
+
+def recognised(req, acl) -> bool:
+    """A sender this worker answers at all. For redis-op that is the ACCESS LIST, which the controller
+    owns; for the probe it is SENDERS, unchanged."""
+    if req.get("action") == "redis-op":
+        return bool(redis_gov.principal(acl, req.get("claimed_sender")))
+    return req.get("claimed_sender") in SENDERS
 
 
 def safe(value) -> str:
@@ -154,12 +196,13 @@ def answered(rows) -> set:
     return done
 
 
-def refusals(req, now, already) -> list:
+def refusals(req, now, already, acl=None) -> list:
     """Every reason not to act on this request. Empty means act."""
     out = []
+    acl = acl if acl is not None else redis_gov.load_acl()
     if not req["req_id"] or not _REQ_ID.match(req["req_id"]):
         out.append("the request id is missing or not an id")
-    if req["claimed_sender"] not in SENDERS:
+    if not recognised(req, acl):
         # Named honestly: the sender is a CLAIM. This refuses an unrecognised claim, which is worth
         # doing and is not the same as verifying anybody.
         #
@@ -216,7 +259,13 @@ def reply_to(req) -> str:
     address of our own row, which is both a malformed row and a sender choosing where our answer
     goes."""
     claimed = (req.get("claimed_sender") or "").strip().lower()
-    return claimed if claimed in SENDERS else "ALL"
+    if claimed in SENDERS:
+        return claimed
+    # A redis-op sender the access list knows is answered under its own tag - which the grammar of
+    # an ACL key already guarantees is pipe-free and short. Anything else is "ALL", as before.
+    if req.get("action") == "redis-op" and redis_gov.principal(redis_gov.load_acl(), claimed):
+        return claimed if re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", claimed) else "ALL"
+    return "ALL"
 
 
 def row_for(kind, req, text, gist) -> dict:

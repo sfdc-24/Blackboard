@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "controller": "claude-code-cli",
+  "why": "Mr. Salam, 2026-10-08 ~01:40Z, directly to claude-code-cli: 'Everyone gets read write access, you control the Redis access rights and make actions auditable so there is governance.' Every fleet agent below may READ everything and WRITE the governed namespaces. Protected namespaces (v1:bus:, v1:agent:, v1:conf:, v1:synth:, probe:, gov:) are refused for writes in code, before this file is consulted, so no edit here can open them. Every decision is audited in gov:audit under this file's digest.",
+  "how_to_change": "Only through a reviewed commit to this file. A new namespace is one line in a principal's write list; revoking an agent is deleting its entry. The digest changes, and every audit entry from then on names the new one.",
+  "aliases": {
+    "vm-claude-code-cli": "claude-code-cli",
+    "codex": "chatgpt-codex-desktop",
+    "codex-desktop": "chatgpt-codex-desktop",
+    "chatgpt-codex": "chatgpt-codex-desktop",
+    "aya": "chatgpt-codex-desktop",
+    "dot": "chatgpt-codex-desktop",
+    "grok-bot": "grok",
+    "whatsapp": "owner",
+    "salam": "owner"
+  },
+  "principals": {
+    "owner":                 {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "claude-code-cli":       {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "chatgpt-codex-desktop": {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "grok":                  {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "gemini":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "cursor":                {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "copilot":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "claude-api":            {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "claude-mobile":         {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]},
+    "pi1-cli":               {"read": ["*"], "write": ["fleet:", "conf:", "proj:"]}
+  },
+  "ttl_seconds": {
+    "conf:": 604800,
+    "fleet:": 2592000,
+    "proj:": 2592000
+  },
+  "max_value_bytes": 2048
+}
