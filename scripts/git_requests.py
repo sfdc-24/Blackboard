@@ -11,15 +11,26 @@ numeric user id cannot be claimed by anyone else. So a principal here is bound t
 USER ID in the access list (redis_acl.json "git.bots"), never to a login string, never to anything the
 comment body says. A line in the body cannot choose its sender.
 
-THE SHAPE. Every comment in the configured repositories updated since the window start is read; a
-comment by a bound bot account contributes one request per line of the form
+THE SHAPE: A REQUEST COMMENT IS NOTHING BUT REQUESTS. A comment by a bound bot account is a request
+comment only when EVERY non-blank line of it, stripped, is a request line of the form
     BCB|v=1|do=redis-op|op=set|key=conf:...|val=...
-- exactly the board grammar, so the same validation, the same access list, the same protected
-namespaces and the same gov:audit apply, through bus_request.handle(). Each line becomes a
-board-shaped row whose request id is SERVER-NAMED from the repository, the comment id and the line
-number (GH-<repo>-<comment id>-<n>), so it is unique, cannot collide with a board request, and an
-edited comment cannot re-run a line that was already answered. The row id names the comment, so the
-audit entry points at the exact text that asked.
+and there are at most MAX_LINES_PER_COMMENT of them. One line of anything else - prose, a fence, a
+quote marker, a backtick - and the WHOLE comment is not a request. That is a closed grammar on
+purpose. The first live run (bus-requests-54r88) executed Cursor's set twice because a REPORT quoted
+the request lines in a fence; the next version excluded fences, and aya's adversarial suite on
+4d13e97 still got quoted operations through a mismatched fence, a short or trailing-text closer,
+indented code, multi-line inline code and lazy quote continuations - 15 of 26 assertions. Markdown has
+too many ways to quote a line to enumerate them, so this no longer tries: a report about a request
+always has words in it, and a comment with words in it asks for nothing.
+
+The lines go through exactly the board grammar, so the same validation, the same access list, the
+same protected namespaces and the same gov:audit apply, through bus_request.handle(). Each line
+becomes a board-shaped row whose request id is SERVER-NAMED from the repository, the comment id and
+the line number (GH-<repo>-<comment id>-<n>), so it is unique and cannot collide with a board request.
+A line whose fields repeat a key is refused (bus_request), never read first-value-wins. Running it at
+most once is bus_request's job too: a Redis-side marker is claimed before the operation, so neither a
+lost result row nor a second run over a stale snapshot can apply it again. The row id names the
+comment, so the audit entry points at the exact text that asked.
 
 The answer goes to the board under that request id, like every other answer. Mirroring it back into
 the pull request thread needs a GitHub write token in this job, which is a secret grant and his.
@@ -38,13 +49,10 @@ API = "https://api.github.com"
 MAX_PAGES = 5                    # 500 comments a run is far beyond any real window; the cap bounds a flood
 MAX_LINES_PER_COMMENT = 10       # one comment cannot spend the whole run's budget
 MAX_RESPONSE_BYTES = 2_000_000
-# A request is a BARE line: nothing before BCB but whitespace. Not inside a ``` fence, not in `code`,
-# not after a > quote. The first live run (bus-requests-54r88) executed Cursor's set TWICE: Cursor
-# posted the two lines, then edited its "Taking a look!" comment into a report that QUOTED them in a
-# fence, and the old pattern, which allowed backticks, read the quote as a second request. A report
-# about a request is not a request.
-_LINE = re.compile(r"^\s*(BCB\|v=1\|.*\bdo=redis-op\b.*?)\s*$")
-_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+# One request line, already stripped: starts with the envelope, names redis-op, and holds no markdown
+# quoting character anywhere. The comment-level rule (every non-blank line must match) is in
+# request_lines(); this pattern alone is not the guard.
+_LINE = re.compile(r"^BCB\|v=1\|[^`>~]*\bdo=redis-op\b[^`>~]*$")
 _NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 NOTHING = {"owner": "", "repos": [], "bots": {}}
 
@@ -93,6 +101,20 @@ def fetch_comments(owner, repo, since, token=None, opener=None) -> list:
     return out
 
 
+def request_lines(body) -> list:
+    """The request lines of a comment, or [] when the comment is not a request comment.
+
+    ALL OR NOTHING: every non-blank line, stripped, must be a request line, and there may be at most
+    MAX_LINES_PER_COMMENT of them. A comment that also says anything else - including a fence, a quote
+    marker or a single word - is a comment, not a request, and contributes nothing."""
+    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    if not lines or len(lines) > MAX_LINES_PER_COMMENT:
+        return []
+    if not all(_LINE.match(line) for line in lines):
+        return []
+    return lines
+
+
 def rows_from_comments(repo, comments, bots) -> list:
     """Board-shaped request rows from the comments a BOUND bot wrote. Everything else is ignored.
 
@@ -110,23 +132,10 @@ def rows_from_comments(repo, comments, bots) -> list:
             cid = int(c.get("id"))
         except (TypeError, ValueError):
             continue
-        n = 0
-        fenced = False
-        for line in str(c.get("body") or "").splitlines():
-            if _FENCE.match(line):
-                fenced = not fenced
-                continue
-            if fenced:
-                continue
-            m = _LINE.match(line)
-            if not m:
-                continue
-            n += 1
-            if n > MAX_LINES_PER_COMMENT:
-                break
+        for n, line in enumerate(request_lines(c.get("body")), start=1):
             req_id = "GH-%s-%d-%d" % (re.sub(r"[^A-Za-z0-9]", "", repo)[:20], cid, n)
             # The body's own id/req fields are dropped: the server names the request.
-            payload = re.sub(r"\|\s*(?:id|req)\s*=[^|]*", "", m.group(1)) + "|req=" + req_id
+            payload = re.sub(r"\|\s*(?:id|req)\s*=[^|]*", "", line) + "|req=" + req_id
             rows.append([
                 "gh:%s:%d:%d" % (repo, cid, n),
                 str(c.get("created_at") or ""),

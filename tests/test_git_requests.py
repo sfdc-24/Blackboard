@@ -58,25 +58,43 @@ class TheSenderIsTheAuthenticatedAuthor(unittest.TestCase):
         self.assertEqual("GH-Blackboard-9001-1", req["req_id"])
         self.assertNotIn("AYA-COST-SET", gr.rows_from_comments("Blackboard", [comment(body)], BOTS)[0][5])
 
-    def test_ordinary_text_and_other_actions_are_ignored(self):
-        body = "Reviewed 7333b5d, looks fine.\nBCB|v=1|do=redis-synthetic-probe\n" + GET
-        rows = gr.rows_from_comments("Blackboard", [comment(body)], BOTS)
-        self.assertEqual(["GH-Blackboard-9001-1"], [br.parse_request(r)["req_id"] for r in rows])
+    def test_a_comment_of_only_requests_is_a_request_comment(self):
+        # Cursor's real request comment, 6062025739: exactly two lines, blank lines allowed around them.
+        rows = gr.rows_from_comments("Blackboard", [comment("\n" + SET + "\n\n  " + GET + "  \n")], BOTS)
+        self.assertEqual(["set", "get"], [br.parse_request(r)["op"] for r in rows])
 
-    def test_a_quoted_request_is_not_a_request(self):
+    def test_one_word_of_anything_else_and_the_comment_asks_for_nothing(self):
+        for body in ("Reviewed 7333b5d, looks fine.\n" + GET,
+                     GET + "\nDone.",
+                     GET + "\nBCB|v=1|do=redis-synthetic-probe"):
+            self.assertEqual([], gr.rows_from_comments("Blackboard", [comment(body)], BOTS), body)
+
+    def test_the_live_report_that_ran_the_set_twice(self):
         # bus-requests-54r88: Cursor's report QUOTED its two lines in a fence and the set ran twice.
-        report = ("I posted the live Redis round trip.\n\n```\n" + SET + "\n" + GET + "\n```\n\n"
-                  "Inline `" + GET + "` and\n> " + GET + "\n~~~\n" + SET + "\n~~~")
+        report = ("I posted the live Redis round trip as `cursor[bot]` on PR #342.\n\n```\n" + SET + "\n"
+                  + GET + "\n```\n\nNo code was changed.")
         self.assertEqual([], gr.rows_from_comments("Blackboard", [comment(report)], BOTS))
 
-    def test_a_bare_line_after_a_closed_fence_still_counts(self):
-        body = "```\n" + SET + "\n```\n" + GET
-        rows = gr.rows_from_comments("Blackboard", [comment(body)], BOTS)
-        self.assertEqual(["get"], [br.parse_request(r)["op"] for r in rows])
+    def test_aya_quoting_shapes_on_4d13e97(self):
+        # Every way aya's adversarial suite got a quoted operation executed. None may yield a request.
+        shapes = {
+            "mismatched fence type": "~~~\n" + SET + "\n```",
+            "short closer": "````\n" + SET + "\n```",
+            "trailing-text closer": "```\n" + SET + "\n``` done",
+            "fence alone around requests": "```\n" + SET + "\n" + GET + "\n```",
+            "indented code under prose": "Example:\n\n    " + SET,
+            "multi-line inline code": "`\n" + SET + "\n`",
+            "lazy quote continuation": "> quoted\n" + SET,
+            "quote marker": "> " + SET,
+            "inline code": "`" + SET + "`",
+            "tilde in the line": SET + "~",
+        }
+        for name, body in shapes.items():
+            self.assertEqual([], gr.rows_from_comments("Blackboard", [comment(body)], BOTS), name)
 
-    def test_one_comment_cannot_spend_the_whole_run(self):
-        rows = gr.rows_from_comments("Blackboard", [comment("\n".join([GET] * 40))], BOTS)
-        self.assertEqual(gr.MAX_LINES_PER_COMMENT, len(rows))
+    def test_more_than_the_cap_is_refused_whole_not_truncated(self):
+        self.assertEqual([], gr.rows_from_comments("Blackboard", [comment("\n".join([GET] * 11))], BOTS))
+        self.assertEqual(10, len(gr.rows_from_comments("Blackboard", [comment("\n".join([GET] * 10))], BOTS)))
 
 
 class ItRunsThroughTheSameGovernance(unittest.TestCase):
@@ -104,6 +122,43 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         out = br.handle([done] + rows, conn, now=NOW, append=[].append)
         self.assertEqual([], out["answered"])
         self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
+
+    def test_a_lost_result_row_does_not_run_the_write_again(self):
+        # aya on 4d13e97: the op ran, its RESULT append failed, and the next run - seeing no RESULT -
+        # applied it again. The second run must find the Redis marker and leave the value alone.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+
+        def lost(spec):
+            raise SystemExit(2)
+        with self.assertRaises(SystemExit):
+            br.handle(rows, conn, now=NOW, append=lost)
+        self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
+        conn.set("conf:2026-10-08:git:cursor", "changed since by someone else")
+        posted = []
+        out = br.handle(rows, conn, now=NOW, append=posted.append)
+        self.assertEqual([], out["answered"])
+        self.assertEqual("changed since by someone else", conn.get("conf:2026-10-08:git:cursor"))
+        self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+
+    def test_two_runs_over_one_stale_snapshot_apply_it_once(self):
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        first = br.handle(rows, conn, now=NOW, append=None)
+        second = br.handle(rows, conn, now=NOW, append=None)       # same snapshot: no RESULT row in it
+        self.assertEqual(["OK"], [a["status"] for a in first["answered"]])
+        self.assertEqual([], second["answered"])
+        writes = [e for e in conn.audit() if "conf:2026-10-08:git:cursor" in json.dumps(e)]
+        self.assertEqual(1, len(writes), "one set in the audit, not two")
+
+    def test_a_repeated_field_is_refused_not_read_first_value_wins(self):
+        conn = FakeRedis()
+        body = "BCB|v=1|do=redis-op|op=get|key=conf:a|op=set|val=x"
+        rows = gr.rows_from_comments("Blackboard", [comment(body)], BOTS)
+        out = br.handle(rows, conn, now=NOW, append=[].append)
+        self.assertEqual([], out["answered"])
+        self.assertIn("ambiguous", "; ".join(out["refused"][0]["why"]))
+        self.assertIsNone(conn.get("conf:a"))
 
     def test_staleness_is_judged_from_when_it_was_asked(self):
         rows = gr.rows_from_comments("Blackboard", [comment(SET, at="2026-10-08T13:00:00Z")], BOTS)

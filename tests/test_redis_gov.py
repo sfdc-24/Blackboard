@@ -49,8 +49,10 @@ class FakeRedis:
         self._need(key, "string")
         return self.data.get(key)
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
         self._need(key, "string")
+        if nx and key in self.data:
+            return None                     # redis-py: SET NX on an existing key returns None
         self.data[key] = str(value)
         self._bump(key)
         if ex:

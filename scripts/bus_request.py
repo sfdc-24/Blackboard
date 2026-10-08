@@ -84,6 +84,11 @@ STALE_MINUTES = 30          # the outbox that delivered 18 stale messages; a lat
 MAX_PER_RUN = 25
 PROBE_NAMESPACE = "v1:synth:probe:"
 PROBE_TTL_SECONDS = 10
+# redis-op run markers (handle()). Under gov:, which redis_gov refuses to every agent, so a request
+# cannot pre-claim or clear another's. Kept well past the 120-minute scan window and the 30-minute
+# staleness bound, so a request is unrunnable by staleness long before its marker can expire.
+DONE_PREFIX = "gov:req:"
+DONE_TTL_SECONDS = 6 * 3600
 
 
 def field(payload: str, name: str) -> str:
@@ -130,7 +135,23 @@ def parse_request(row):
         "val": field(payload, "val"),
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
+        "repeated": repeated_keys(payload),
     }
+
+
+def repeated_keys(payload) -> list:
+    """Keys written more than once in a payload. A redis-op naming `op` or `key` twice is AMBIGUOUS:
+    field() reads the first, another reader might read the last, and the two disagree about what was
+    asked (aya on 4d13e97). Such a request is refused, never resolved first-value-wins."""
+    seen, out = set(), []
+    for part in str(payload or "").split("|"):
+        if "=" not in part:
+            continue
+        name = part.split("=", 1)[0].strip().lower()
+        if name in seen and name not in out:
+            out.append(name)
+        seen.add(name)
+    return out
 
 
 def recognised(req, acl) -> bool:
@@ -217,6 +238,9 @@ def refusals(req, now, already, acl=None) -> list:
         out.append("the request is stamped in the future")
     if req["req_id"] in already:
         out.append("already answered: a RESULT row for this request id is on the board")
+    if req.get("action") == "redis-op" and req.get("repeated"):
+        out.append("ambiguous: the field(s) %s appear more than once"
+                   % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
     return out
 
 
@@ -345,6 +369,32 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             except ValueError:
                 count = 10
             started = time.time()
+            # AT MOST ONCE, DECIDED IN REDIS. The board's RESULT rows are not enough: if the op ran
+            # and its result row was lost, or a second run read a snapshot taken before the first
+            # run's row landed, "no RESULT on the board" re-applied the write (aya on 4d13e97). So
+            # the run is CLAIMED first with SET NX on a marker under gov:, which no agent can write.
+            # Claimed before the op on purpose: a crash between the claim and the op loses that op
+            # and says so - it never applies one twice.
+            marker = DONE_PREFIX + hashlib.sha256(req["req_id"].encode("utf-8")).hexdigest()[:32]
+            try:
+                claimed = conn.set(marker, safe(req["row_id"])[:120] or "-", nx=True, ex=DONE_TTL_SECONDS)
+            except Exception as error:
+                out["errors"].append(req["req_id"])
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["could not claim the run marker (%s); not run"
+                                               % type(error).__name__]})
+                continue
+            if not claimed:
+                already.add(req["req_id"])
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["already run: Redis holds this request's run marker"]})
+                if append:
+                    append(row_for(RESULT_ACTION, req,
+                                   "NOT RUN AGAIN. This request was already run once (Redis holds its "
+                                   "run marker); its earlier result row may be missing. Its outcome is "
+                                   "in gov:audit under this request id.",
+                                   "Already run: " + req["req_id"][:60]))
+                continue
             result = redis_gov.execute(conn, acl, req["claimed_sender"],
                                        "%s/%s" % (req["req_id"], req["row_id"]),
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
