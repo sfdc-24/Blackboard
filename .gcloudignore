@@ -25,6 +25,7 @@
 !/cloud/ack-once
 !/cloud/studio-controller
 !/cloud/bus-reconciler
+!/cloud/redis-tool-bridge
 
 !/scripts
 /scripts/*

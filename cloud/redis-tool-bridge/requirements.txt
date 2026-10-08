@@ -1,0 +1,11 @@
+# Two dependencies, and each one earns its place.
+#
+# redis: speaking RESP over TLS with AUTH is not something to hand-roll on a socket, and a
+# hand-rolled client is a far worse dependency than a pinned library. Pinned to the exact version a
+# real build already resolved for cloud/bus-reconciler, so the two images share one client.
+redis==5.3.1
+# google-auth: the OIDC verification. THE WHOLE POINT of this dependency is the `audience=` argument
+# - defect 1 was a verifier called without it, which checks a signature and an issuer and says
+# nothing about who the token was minted for. Range deliberately open at the patch level for
+# security fixes in a verifier; pin exactly once a build has resolved it and the digest is recorded.
+google-auth>=2.35,<3
