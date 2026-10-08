@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
-"""The bridge's auth is the whole product, so the tests are about auth and about absence.
-
-Run directly: `python tests/test_redis_tool_bridge.py`. These suites are plain scripts that exit 1
-on failure; `unittest discover` does not collect them and would report a green tick over zero
-assertions.
-
-WHAT IS BEING GUARDED, in the words of the review that found it
-(CCC-BRIDGE-REVIEW-20261006T1330Z, verdict CHANGES-REQUESTED):
-
-  1. "verifyIdToken is called with the token alone and NO AUDIENCE ... ANY Google-signed ID token
-     minted for ANY service passes that middleware."
-  2. "checkServerIdentity returning undefined DISABLES SERVER IDENTITY VERIFICATION."
-  3. "authentication without authorisation: the middleware extracts payload.email and calls next,
-     so any verified Google identity is in."
-  4. "the secrets are bound as ENVIRONMENT VARIABLES. An env var is listable from anything that can
-     read the process."
-
-Each one gets a test that fails if the defect comes back, and three of the four are checked against
-the SOURCE as well as the behaviour - because defect 2 is a line that can be deleted without any
-test noticing, and defect 4 is a deploy argument, not a code path.
-"""
+"""Validate the bounded bridge contract."""
+import ast
+import contextlib
+import io
 import os
 import pathlib
 import sys
@@ -31,27 +14,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import main as bridge  # noqa: E402
 
-AUD = "https://redis-tool-bridge-yzet4vuplq-uc.a.run.app"
-CALLER = "aya-runtime@sfdc24.iam.gserviceaccount.com"
+AUD = "https://bridge.example.invalid"
+CALLER = "caller@example.invalid"
 SOURCE = (ROOT / "cloud" / "redis-tool-bridge" / "main.py").read_text(encoding="utf-8")
 DOCKERFILE = (ROOT / "cloud" / "redis-tool-bridge" / "Dockerfile").read_text(encoding="utf-8")
 DEPLOY = (ROOT / "cloud" / "redis-tool-bridge" / "deploy.sh").read_text(encoding="utf-8")
 
 
 def statements(source: str) -> str:
-    """The source with its PROSE removed: no docstrings, no comments, no blank lines.
-
-    THIS EXISTS BECAUSE THE FIRST VERSION OF THESE TESTS FAILED ON ITS OWN DOCUMENTATION.
-    `test_the_bridge_does_not_implement_its_own_tls` forbids the string "ssl_cert_reqs" in the
-    bridge - and the module docstring NAMES ssl_cert_reqs while explaining that the bridge borrows
-    it rather than setting it. The test read prose as if it were code and failed a file that was
-    correct.
-
-    That is the third time this exact shape has bitten: in tests/test_bus_verify.py the
-    cross-row-digest guard first asserted "hashlib is not imported", then matched the module
-    docstring describing the old collision, before it was finally made to scan statements. A guard
-    that greps a whole file greps the explanation of the bug along with the bug.
-    """
+    """Validate the bounded bridge contract."""
     import io
     import tokenize
     out = []
@@ -73,8 +44,18 @@ def statements(source: str) -> str:
 CODE = statements(SOURCE)
 
 
+def redis_methods(source):
+    """Validate the bounded bridge contract."""
+    return {node.func.attr for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "conn"}
+
+
+EXPECTED_REDIS_METHODS = {"setex", "get", "ttl", "delete"}
+
+
 class Defect1TheAudienceIsChecked(unittest.TestCase):
-    """An absent audience must refuse every request, NOT verify without one."""
+    """Validate the bounded bridge contract."""
 
     def test_no_configured_audience_refuses(self):
         who, why = bridge.verify_caller("any.token", "", frozenset({CALLER}))
@@ -82,24 +63,21 @@ class Defect1TheAudienceIsChecked(unittest.TestCase):
         self.assertIn("audience", why)
 
     def test_the_verifier_is_called_with_an_audience_argument(self):
-        """The defect was ONE MISSING ARGUMENT, and no behavioural test can see it without a real
-        Google token. So the source is the evidence: the call must pass audience=."""
+        """Validate the bounded bridge contract."""
         where = SOURCE.index("verify_oauth2_token(")
         call = SOURCE[where:where + 220]
         self.assertIn("audience=", call,
                       "verify_oauth2_token without audience= is defect 1, exactly")
 
     def test_the_audience_is_not_defaulted(self):
-        """A default audience would be worse than none: it would look configured and check the
-        wrong thing. os.environ.get must not supply a fallback URL."""
+        """Validate the bounded bridge contract."""
         self.assertNotIn('BRIDGE_AUDIENCE", "http', SOURCE)
         self.assertNotIn("BRIDGE_AUDIENCE', 'http", SOURCE)
 
 
 class Defect2ServerIdentityVerificationStaysOn(unittest.TestCase):
     def test_the_bridge_does_not_implement_its_own_tls(self):
-        """It borrows scripts/redis_dual.py. A private client here is how one process ends up with
-        verification off while the other has it on."""
+        """Validate the bounded bridge contract."""
         for forbidden in ("ssl_cert_reqs", "check_hostname", "checkServerIdentity",
                           "CERT_NONE", "SSLContext", "verify=False"):
             self.assertNotIn(forbidden, CODE,
@@ -111,8 +89,7 @@ class Defect2ServerIdentityVerificationStaysOn(unittest.TestCase):
         self.assertIn("redis_dual.client(", SOURCE)
 
     def test_redis_dual_still_requires_a_verified_server(self):
-        """The borrowed path is only a defence while it still verifies. Asserted against the module
-        this image actually copies, not against a comment about it."""
+        """Validate the bounded bridge contract."""
         dual = (ROOT / "scripts" / "redis_dual.py").read_text(encoding="utf-8")
         self.assertIn('"ssl_cert_reqs": "required"', dual)
         self.assertIn("ssl_ca_certs", dual)
@@ -129,16 +106,15 @@ class Defect3AuthenticationIsNotAuthorisation(unittest.TestCase):
         self.assertIn("allowlist", why)
 
     def test_a_verified_identity_off_the_allowlist_is_refused(self):
-        """THE DEFECT ITSELF. A real, verified, Google-signed token for a real service account that
-        nobody authorised must not get in."""
-        claims = {"email": "someone-else@sfdc24.iam.gserviceaccount.com", "email_verified": True}
+        """Validate the bounded bridge contract."""
+        claims = {"email": "other@example.invalid", "email_verified": True}
         with Verifier(claims):
             who, why = bridge.verify_caller("tok", AUD, frozenset({CALLER}))
         self.assertIsNone(who, "a verified identity is not an authorised one")
         self.assertEqual("not authorised", why)
 
     def test_the_allowlisted_caller_is_accepted_and_named(self):
-        """The control. Without this the tests above would pass on a bridge that refuses everyone."""
+        """Validate the bounded bridge contract."""
         with Verifier({"email": CALLER, "email_verified": True}):
             who, why = bridge.verify_caller("tok", AUD, frozenset({CALLER}))
         self.assertEqual(CALLER, who)
@@ -150,27 +126,21 @@ class Defect3AuthenticationIsNotAuthorisation(unittest.TestCase):
         self.assertIsNone(who)
 
     def test_the_allowlist_is_case_insensitive_but_not_substring(self):
-        os.environ["BRIDGE_CALLERS"] = "AYA-Runtime@sfdc24.iam.gserviceaccount.com, other@x.com"
+        os.environ["BRIDGE_CALLERS"] = "CALLER@example.invalid, second@example.invalid"
         try:
             self.assertIn(CALLER, bridge.allowlist())
-            self.assertNotIn("aya-runtime@sfdc24.iam.gserviceaccount.com.evil.com",
+            self.assertNotIn("caller@example.invalid.evil.com",
                              bridge.allowlist())
         finally:
             del os.environ["BRIDGE_CALLERS"]
 
     def test_the_platform_gate_is_demanded_too(self):
-        """Cloud Run must refuse an unauthenticated request before it reaches the container. Two
-        independent gates: --no-allow-unauthenticated is the one the deploy script owns."""
+        """Validate the bounded bridge contract."""
         self.assertIn("--no-allow-unauthenticated", DEPLOY)
         self.assertNotIn("--allow-unauthenticated", DEPLOY.replace("--no-allow-unauthenticated", ""))
 
     def test_the_invoker_is_never_everyone(self):
-        """ASSERTED AS A PROPERTY OF THE MEMBERS, not as the absence of a word.
-
-        The first version forbade the string "allUsers" anywhere in deploy.sh - and failed, because
-        the script's own readback checklist tells a human to look for exactly that. Grepping a file
-        for a word finds the warning about the word. So: every principal this script would grant
-        must be a NAMED service account."""
+        """Validate the bounded bridge contract."""
         members = [line for line in DEPLOY.splitlines()
                    if "INVOKERS=(" in line or "--member=" in line]
         self.assertTrue(members, "the deploy script grants no invoker at all")
@@ -193,8 +163,7 @@ class Defect4SecretsAreFilesNotEnvironmentVariables(unittest.TestCase):
         self.assertIn("/secrets/ca/redis-ca.pem=REDIS_CA_CERT", DEPLOY)
 
     def test_no_secret_is_bound_as_an_environment_variable(self):
-        """set-secrets with a BARE NAME binds an env var; with a PATH it mounts a file. The
-        difference is one character and it is the whole defect."""
+        """Validate the bounded bridge contract."""
         bindings = [line for line in DEPLOY.splitlines() if "--set-secrets=" in line]
         self.assertTrue(bindings, "the deploy script mounts no secrets at all")
         for line in bindings:
@@ -210,18 +179,17 @@ class Defect4SecretsAreFilesNotEnvironmentVariables(unittest.TestCase):
 
 
 class TheDeployScriptIsCorrectNotJustSafe(unittest.TestCase):
-    """Two real deploy bugs in the first version of deploy.sh, both invisible to every auth test."""
+    """Validate the bounded bridge contract."""
 
     def test_the_private_address_is_not_committed(self):
-        """cloud/bus-reconciler/main.py: the instance is 'never committed to this public repository'."""
+        """Validate the bounded bridge contract."""
         import re
         self.assertIsNone(re.search(r"\b10\.\d+\.\d+\.\d+\b", DEPLOY),
                           "a private address is written into a public repository")
         self.assertIn("${REDIS_HOST}", DEPLOY)
 
     def test_set_env_vars_appears_ONCE(self):
-        """--set-env-vars REPLACES the environment. Repeated, only the last survives - which would
-        have shipped a bridge with no audience, no host and no CA path."""
+        """Validate the bounded bridge contract."""
         flags = [line for line in DEPLOY.splitlines() if "--set-env-vars=" in line]
         self.assertEqual(1, len(flags), flags)
         for name in ("REDIS_HOST", "REDIS_PORT", "REDIS_AUTH_FILE", "REDIS_CA_CERT_PATH",
@@ -233,7 +201,7 @@ class TheDeployScriptIsCorrectNotJustSafe(unittest.TestCase):
 
 
 class ItCannotDoAnythingButProbe(unittest.TestCase):
-    """The caller selects no key, no command, no namespace and no TTL. Absence, not refusal."""
+    """Validate the bounded bridge contract."""
 
     def test_there_is_no_arbitrary_command_surface(self):
         for forbidden in ("KEYS", "SCAN", "FLUSHDB", "FLUSHALL", "eval(", "exec(",
@@ -242,10 +210,17 @@ class ItCannotDoAnythingButProbe(unittest.TestCase):
                              "%s is a command surface this bridge must not have" % forbidden)
 
     def test_the_only_redis_calls_are_the_five_the_probe_makes(self):
-        """Named explicitly, so adding a sixth is a test change and therefore a review."""
-        calls = {tok.split("(")[0] for tok in CODE.split("conn .")[1:]}
-        self.assertEqual(set(), calls - {"setex", "get", "ttl", "delete"},
-                         "an unexpected Redis call: %s" % sorted(calls))
+        """Validate the bounded bridge contract."""
+        self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods(SOURCE))
+
+    def test_the_method_guard_detects_an_added_method(self):
+        mutated = SOURCE + '\nconn.set("unexpected", "value")\n'
+        with self.assertRaises(AssertionError):
+            self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods(mutated))
+
+    def test_the_method_guard_cannot_pass_on_no_calls(self):
+        with self.assertRaises(AssertionError):
+            self.assertEqual(EXPECTED_REDIS_METHODS, redis_methods("pass"))
 
     def test_the_probe_key_is_the_servers(self):
         self.assertIn("PROBE_NAMESPACE + secrets.token_hex", SOURCE)
@@ -278,29 +253,10 @@ class ItCannotDoAnythingButProbe(unittest.TestCase):
 
 
 class EveryFileTheImageCopiesIsUploadedToCloudBuild(unittest.TestCase):
-    """The missing-COPY/missing-allowlist bug, which has now cost four builds.
-
-    tests/test_image_layout.py does this - for cloud/bus-reconciler/Dockerfile ONLY, hardcoded. Its
-    green tick says nothing about this directory, so running it and feeling covered would be the
-    same mistake as the guard that parsed one agenda section while the chair parsed every one. The
-    assertion belongs beside the Dockerfile it is about.
-
-    /.gcloudignore is an ALLOWLIST: it ignores `/*` and then re-admits, directory by directory. A
-    COPY of a path nobody re-admitted builds fine locally and fails in Cloud Build, where the file
-    simply is not there.
-    """
+    """Validate the bounded bridge contract."""
 
     def test_each_copy_source_is_admitted_by_the_allowlist(self):
-        """THE MATCHER IS IMPORTED, NOT REWRITTEN, and the first version of this test is why.
-
-        I wrote my own check: collect every `!` line and see whether the path or one of its
-        ancestors appears. It passed with the negation for this directory DELETED - because
-        `!/cloud` admits `cloud`, and my prefix walk stopped there and called it covered. It never
-        saw the `/cloud/*` line that re-ignores everything inside. A permissive guard that reports
-        OK is worse than no guard, and that is the third one of mine today.
-
-        tests/test_image_layout.py already implements gitignore semantics correctly - last matching
-        rule wins, every ancestor tested. Borrowing it means one description of the rules."""
+        """Validate the bounded bridge contract."""
         sys.path.insert(0, str(ROOT / "tests"))
         import test_image_layout as layout
 
@@ -321,9 +277,23 @@ class EveryFileTheImageCopiesIsUploadedToCloudBuild(unittest.TestCase):
 
 
 class TheLogsAndRepliesLeakNothing(unittest.TestCase):
+    def test_request_logging_does_not_emit_query_tokens(self):
+        handler = object.__new__(bridge.Handler)
+        handler.requestline = "GET /healthz?token=FAKE_SECRET_MARKER HTTP/1.1"
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            handler.log_request(200, 99)
+        self.assertEqual("", output.getvalue())
+
+    def test_error_logging_does_not_emit_request_details(self):
+        handler = object.__new__(bridge.Handler)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            handler.log_error("Bad request: %s", "FAKE_SECRET_MARKER")
+        self.assertEqual("", output.getvalue())
+
     def test_the_default_request_logger_is_overridden(self):
-        """BaseHTTPRequestHandler logs the request line. A bearer token in a query string would go
-        straight into Cloud Logging."""
+        """Validate the bounded bridge contract."""
         self.assertIn("def log_message", SOURCE)
         self.assertIn("NO REQUEST LINE", SOURCE)
 
@@ -338,10 +308,15 @@ class TheLogsAndRepliesLeakNothing(unittest.TestCase):
 # ---------------------------------------------------------------- doubles
 
 
+class RuntimeTransportIsDeclared(unittest.TestCase):
+    def test_requests_extra_and_clean_image_import_smoke_are_present(self):
+        requirements = (ROOT / "cloud" / "redis-tool-bridge" / "requirements.txt").read_text()
+        self.assertIn("google-auth[requests]>=2.35,<3", requirements.splitlines())
+        self.assertIn("from google.auth.transport.requests import Request", DOCKERFILE)
+
+
 class Verifier:
-    """Stand in for google.oauth2.id_token so the authorisation half can be tested without a real
-    Google token. It does NOT stand in for the audience check - that is asserted against the source,
-    because a fake verifier that ignores the audience would pass either way."""
+    """Validate the bounded bridge contract."""
 
     def __init__(self, claims):
         self.claims = claims

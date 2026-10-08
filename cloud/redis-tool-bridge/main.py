@@ -1,53 +1,4 @@
-"""redis-tool-bridge: an IAM-authenticated HTTPS surface over the private Redis instance.
-
-WHY THIS FILE EXISTS, WHICH IS NOT THE USUAL REASON
-The service is ALREADY RUNNING. `redis-tool-bridge-00001-hsg` serves
-https://redis-tool-bridge-yzet4vuplq-uc.a.run.app from image digest cd88ac6cc786, holding a mounted
-database credential, and its SOURCE IS IN NO REPOSITORY. Nobody can review the code that reads that
-credential, nobody can diff it against the four defects raised in CCC-BRIDGE-REVIEW-20261006T1330Z,
-and nobody can rebuild it. That is the defect this PR is really about. Everything below is written
-to be reviewable FIRST and deployed only after Codex verifies it, per the owner's GO
-(GROK-REDIS-BRIDGE-OWNER-GO-20261007T2307Z): "Deploy, new SA and IAM only AFTER Codex verifies the
-source."
-
-MEASURED STATE OF THE RUNNING SERVICE, 2026-10-07 (read-only, nothing changed)
-    service account      redis-tool-bridge@sfdc24.iam.gserviceaccount.com   (dedicated)
-    egress               private-ranges-only, Direct VPC (network-interfaces, not a connector)
-    secrets              FILE MOUNTS in separate dirs: /secrets/auth, /secrets/ca
-    run.invoker          serviceAccount:aya-runtime@sfdc24.iam.gserviceaccount.com  -- and NOTHING
-                         else. No allUsers, no allAuthenticatedUsers.
-    ingress              all
-So three of the four locked decisions are already honoured by the deployment. What cannot be checked
-from outside is the application layer, and that is what this file pins down.
-
-THE FOUR DEFECTS FROM MY OWN 2026-10-06 REVIEW, AND HOW EACH IS CLOSED HERE
-  1. verifyIdToken WITHOUT AN AUDIENCE. google-auth-library does not check `aud` unless you pass it,
-     so any Google-signed token for any service satisfied that middleware. Here the audience is
-     REQUIRED configuration (BRIDGE_AUDIENCE) and passed explicitly to the verifier; if it is unset
-     the service refuses every request rather than verifying nothing.
-  2. checkServerIdentity RETURNING undefined DISABLES SERVER IDENTITY VERIFICATION. It was written as
-     though a private CA demanded that. It does not. This connects through scripts/redis_dual.py,
-     which sets ssl_cert_reqs="required" with the mounted CA - the same path my 2026-10-06 probe
-     verified end to end against this instance (PING True, SET/GET byte-identical at 94 chars, TTL
-     read back, DEL gone, zero keys left behind). First-hand proof, not an argument.
-  3. AUTHENTICATION WITHOUT AUTHORISATION: the old middleware verified a token, read payload.email
-     and called next(). Any verified Google identity was in. Here a verified token must ALSO name a
-     principal on a server-side allowlist (BRIDGE_CALLERS), and Cloud Run's own IAM check runs first.
-     Two independent gates, and the allowlist is the one this repository can review.
-  4. SECRETS AS ENVIRONMENT VARIABLES. An env var is listable from anything that can read the
-     process. Both secrets are read from FILE MOUNTS, which is also what the running service already
-     does, so this file does not regress what is deployed.
-
-WHAT THIS SERVICE DELIBERATELY CANNOT DO
-The only endpoint that touches Redis is a synthetic probe (locked decision 3: "first endpoint:
-test-only synthetic-probe yes"). The caller selects NO key, NO command, NO namespace and NO TTL -
-the server chooses all four. That is the same bound as scripts/bus_request.py and for the same
-reason, with one difference that matters: here the caller is actually AUTHENTICATED, which is
-precisely why the board-row worker was not widened tonight.
-
-There is no action for GET, SET, HSET, XADD, KEYS, SCAN, FLUSHDB, FLUSHALL or DEL. Not refused -
-ABSENT. A refusal is a line of code that can be got wrong.
-"""
+"""Authenticated synthetic Redis probe."""
 from __future__ import annotations
 
 import datetime
@@ -75,7 +26,7 @@ def stamp() -> str:
 
 
 def allowlist() -> frozenset:
-    """The service-account emails this bridge answers. Server-side, and reviewable in git."""
+    """Validate the bounded bridge contract."""
     raw = os.environ.get(CALLERS_ENV, "")
     return frozenset(p.strip().lower() for p in raw.replace(";", ",").split(",") if p.strip())
 
@@ -85,12 +36,7 @@ def audience() -> str:
 
 
 def verify_caller(token: str, expected_audience: str, permitted: frozenset) -> tuple:
-    """(principal, None) when the caller is verified AND authorised, else (None, reason).
-
-    BOTH HALVES, IN THIS ORDER, AND NEITHER IS OPTIONAL. The reason strings are deliberately coarse:
-    a caller learns that it failed, not which of several checks it failed, because the difference is
-    an oracle and is of no use to a legitimate caller.
-    """
+    """Validate the bounded bridge contract."""
     if not expected_audience:
         return None, "the service has no configured audience, so no token can be verified"
     if not permitted:
@@ -117,24 +63,13 @@ def verify_caller(token: str, expected_audience: str, permitted: frozenset) -> t
 
 
 def connect():
-    """The proven path: scripts/redis_dual.py, TLS with ssl_cert_reqs=required against the MOUNTED CA.
-
-    Defect 2 lives or dies here, and it is settled by REUSE rather than by a new implementation -
-    this is the same client() a probe verified against this instance on 2026-10-06.
-
-    precheck=False on purpose, and that is a defect I already made once: redis_dual's 1.5 s TCP
-    latency guard is right on a hot path, where a fast no beats a slow yes, and WRONG here. A cold
-    container whose Direct VPC interface is still coming up needs longer than 1.5 s, and a process
-    whose whole job is to connect should let the connect itself be the authority. That guard turned
-    into a false `reachable: false` on 2026-10-06 and cost a run."""
+    """Validate the bounded bridge contract."""
     import redis_dual
     return redis_dual.client(redis_dual.Settings(), precheck=False)
 
 
 def synthetic_probe(conn) -> dict:
-    """SET a server-named nonce key, read it back, check its TTL, delete it, verify it is gone.
-
-    The caller chose none of: the key, the namespace, the nonce, the TTL. That is the whole design."""
+    """Validate the bounded bridge contract."""
     key = PROBE_NAMESPACE + secrets.token_hex(8)
     nonce = secrets.token_hex(16)
     started = time.time()
@@ -179,7 +114,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args) -> None:
         # NO REQUEST LINE, NO HEADERS. The default handler logs the path and would put a bearer
         # token into Cloud Logging the first time anyone put one in a query string.
-        sys.stderr.write("%s %s\n" % (stamp(), fmt % args if args else fmt))
+        # Inherited log_request/log_error pass raw request-derived values in args.
+        # Suppress them entirely; explicit probe outcome logs below remain available.
+        return
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
