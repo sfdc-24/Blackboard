@@ -88,6 +88,10 @@ class TheSenderIsTheAuthenticatedAuthor(unittest.TestCase):
             "quote marker": "> " + SET,
             "inline code": "`" + SET + "`",
             "tilde in the line": SET + "~",
+            # aya on ce941b6: a comment of ONLY indented lines is a Markdown code block.
+            "four-space indented code alone": "    " + SET + "\n    " + GET,
+            "tab-indented code alone": "\t" + SET,
+            "one indented line among bare ones": SET + "\n    " + GET,
         }
         for name, body in shapes.items():
             self.assertEqual([], gr.rows_from_comments("Blackboard", [comment(body)], BOTS), name)
@@ -140,6 +144,19 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual([], out["answered"])
         self.assertEqual("changed since by someone else", conn.get("conf:2026-10-08:git:cursor"))
         self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
+
+    def test_a_claim_without_an_operation_is_reported_as_unknown_not_as_run(self):
+        # aya on ce941b6: the worker died after claiming the marker and before the op. Nothing ran,
+        # so the retry must not say it did.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        req_id = br.parse_request(rows[0])["req_id"]
+        conn.set(br.DONE_PREFIX + __import__("hashlib").sha256(req_id.encode()).hexdigest()[:32], "x")
+        posted = []
+        br.handle(rows, conn, now=NOW, append=posted.append)
+        self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
+        self.assertIn("UNKNOWN", posted[0]["payload"])
+        self.assertNotIn("already run once", posted[0]["payload"])
 
     def test_two_runs_over_one_stale_snapshot_apply_it_once(self):
         conn = FakeRedis()

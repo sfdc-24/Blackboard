@@ -387,13 +387,16 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             if not claimed:
                 already.add(req["req_id"])
                 out["refused"].append({"req_id": req["req_id"],
-                                       "why": ["already run: Redis holds this request's run marker"]})
+                                       "why": ["already claimed: Redis holds this request's run marker"]})
                 if append:
+                    # CLAIMED, NOT "RAN" (aya on ce941b6). The marker is set BEFORE the op, so a worker
+                    # that died between the two left a marker and no operation. What is known is the
+                    # claim; whether the op happened is only in gov:audit, and this row says so.
                     append(row_for(RESULT_ACTION, req,
-                                   "NOT RUN AGAIN. This request was already run once (Redis holds its "
-                                   "run marker); its earlier result row may be missing. Its outcome is "
-                                   "in gov:audit under this request id.",
-                                   "Already run: " + req["req_id"][:60]))
+                                   "NOT RUN AGAIN. An earlier run CLAIMED this request (Redis holds its "
+                                   "run marker). Whether that run completed is UNKNOWN here: a gov:audit "
+                                   "entry naming this request id means it ran; none means it did not.",
+                                   "Already claimed: " + req["req_id"][:60]))
                 continue
             result = redis_gov.execute(conn, acl, req["claimed_sender"],
                                        "%s/%s" % (req["req_id"], req["row_id"]),

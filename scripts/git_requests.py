@@ -106,8 +106,14 @@ def request_lines(body) -> list:
 
     ALL OR NOTHING: every non-blank line, stripped, must be a request line, and there may be at most
     MAX_LINES_PER_COMMENT of them. A comment that also says anything else - including a fence, a quote
-    marker or a single word - is a comment, not a request, and contributes nothing."""
-    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    marker or a single word - is a comment, not a request, and contributes nothing.
+
+    INDENTED CODE IS QUOTED CODE (aya on ce941b6): a line starting with a tab or four or more spaces
+    is a Markdown code block - something shown, not asked - so it too makes the comment not a request."""
+    raw = [line for line in str(body or "").splitlines() if line.strip()]
+    if any(line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4 for line in raw):
+        return []
+    lines = [line.strip() for line in raw]
     if not lines or len(lines) > MAX_LINES_PER_COMMENT:
         return []
     if not all(_LINE.match(line) for line in lines):

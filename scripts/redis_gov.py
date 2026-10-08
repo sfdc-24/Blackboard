@@ -70,7 +70,13 @@ AUDIT_MAXLEN = 200000
 PROTECTED = ("v1:bus:", "v1:agent:", "v1:conf:", "v1:synth:", "probe:", "gov:")
 
 OPS_READ = ("get", "hgetall", "xrange")
-OPS_WRITE = ("set", "del", "hset", "xadd")
+# hput: REPLACE a whole hash from one b64 JSON object {field: string}, in one transaction with one
+# audit entry. Mr. Salam, 2026-10-08 18:05Z, directly: "keep the repo copy, Redis as the live copy" -
+# for the milestone chart Grok assembles: ten hashes of up to ~11 fields would otherwise be ~110
+# one-field requests and ~110 result rows on the board (a row is money he pays). Replace, not merge,
+# so a field dropped from a new version does not survive from the old one.
+OPS_WRITE = ("set", "del", "hset", "hput", "xadd")
+MAX_PUT_FIELDS = 50
 OPS = OPS_READ + OPS_WRITE
 
 # A key reaches the server verbatim, so its grammar is closed: no space, no glob character (* ? [ ]),
@@ -122,6 +128,8 @@ def load_acl(path=None) -> dict:
         "aliases": {str(k).lower(): str(v).lower() for k, v in (data.get("aliases") or {}).items()},
         "ttl_seconds": {str(k): int(v) for k, v in (data.get("ttl_seconds") or {}).items()},
         "max_value_bytes": int(data.get("max_value_bytes") or 2048),
+        "value_bytes_by_prefix": {str(k): int(v) for k, v in
+                                  (data.get("value_bytes_by_prefix") or {}).items()},
         "controller": str(data.get("controller") or ""),
         "version": data.get("version"),
         "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
@@ -177,7 +185,37 @@ def ttl_for(acl: dict, key: str):
     return best[1] if best else None
 
 
-def decode_value(raw: str, enc: str, acl: dict) -> str:
+def value_cap(acl: dict, key: str) -> int:
+    """The byte cap for a value under `key`: the longest matching prefix in value_bytes_by_prefix,
+    else max_value_bytes. A per-prefix cap can only be set in the reviewed access list."""
+    best = None
+    for prefix, cap in (acl.get("value_bytes_by_prefix") or {}).items():
+        if key.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, cap)
+    return best[1] if best else acl["max_value_bytes"]
+
+
+def decode_mapping(raw: str, enc: str, acl: dict, key: str) -> dict:
+    """hput's value: b64 of a JSON object of field -> string, every field name in the field grammar,
+    at most MAX_PUT_FIELDS, the whole JSON within the key's cap. Anything else is refused whole."""
+    if enc != "b64":
+        raise Refused("hput needs enc=b64")
+    text = decode_value(raw, enc, acl, key)
+    try:
+        mapping = json.loads(text)
+    except ValueError:
+        raise Refused("hput val is not JSON")
+    if not isinstance(mapping, dict) or not mapping:
+        raise Refused("hput val must be a non-empty JSON object")
+    if len(mapping) > MAX_PUT_FIELDS:
+        raise Refused("hput takes at most %d fields" % MAX_PUT_FIELDS)
+    for name, value in mapping.items():
+        if not _FIELD.match(name) or not isinstance(value, str):
+            raise Refused("every hput field must be a field name with a string value")
+    return mapping
+
+
+def decode_value(raw: str, enc: str, acl: dict, key: str = "") -> str:
     """The value to store. `enc=b64` carries anything the board grammar cannot (a pipe, a newline)."""
     if enc:
         if enc != "b64":
@@ -188,8 +226,9 @@ def decode_value(raw: str, enc: str, acl: dict) -> str:
             raise Refused("val is not valid base64 of UTF-8")
     else:
         value = raw
-    if len(value.encode("utf-8")) > acl["max_value_bytes"]:
-        raise Refused("the value is over %d bytes" % acl["max_value_bytes"])
+    cap = value_cap(acl, key)
+    if len(value.encode("utf-8")) > cap:
+        raise Refused("the value is over %d bytes" % cap)
     return value
 
 
@@ -228,9 +267,13 @@ def execute(conn, acl: dict, raw_tag: str, via: str, op: str, key: str, field: s
     field = (field or "").strip()
     try:
         check(acl, who, op, key, field)
-        value = decode_value(raw_value, enc, acl) if op in ("set", "hset", "xadd") else None
+        value = decode_value(raw_value, enc, acl, key) if op in ("set", "hset", "xadd") else None
         if op == "hset" and not field:
             raise Refused("hset needs field=")
+        if op == "hput":
+            if field:
+                raise Refused("hput replaces the whole hash; it takes no field=")
+            value = decode_mapping(raw_value, enc, acl, key)
         if op in OPS_READ:
             return _read(conn, acl, who, raw_tag, via, op, key, count, now)
         return _write(conn, acl, who, raw_tag, via, op, key, field, value, now)
@@ -274,7 +317,13 @@ def _read(conn, acl, who, raw_tag, via, op, key, count, now) -> dict:
 
 
 # The key types each write may touch. `del` may remove any type, so it has no entry.
-WRITABLE_TYPES = {"set": ("none", "string"), "hset": ("none", "hash"), "xadd": ("none", "stream")}
+WRITABLE_TYPES = {"set": ("none", "string"), "hset": ("none", "hash"), "hput": ("none", "hash"),
+                  "xadd": ("none", "stream")}
+
+
+def canonical(mapping) -> str:
+    """A hash as one string, for the audit's old/new and a reader's checksum: sorted, compact JSON."""
+    return json.dumps(mapping or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _text(value) -> str:
@@ -299,10 +348,14 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
             old = pipe.get(key) if kind in ("none", "string") else "(%s)" % kind
         elif op == "hset":
             old = pipe.hget(key, field)
+        elif op == "hput":
+            found = pipe.hgetall(key) or {}
+            old = canonical({_text(k): _text(v) for k, v in found.items()}) if found else None
         else:
             old = None                               # xadd appends; nothing is replaced
         entry = audit_fields(acl, who, raw_tag, via, op, key, field, True, "", old=old,
-                             new=(None if op == "del" else value), now=now)
+                             new=(None if op == "del" else
+                                  canonical(value) if op == "hput" else value), now=now)
         pipe.multi()
         if op == "set":
             if ttl:
@@ -313,6 +366,11 @@ def _write(conn, acl, who, raw_tag, via, op, key, field, value, now) -> dict:
             pipe.delete(key)
         elif op == "hset":
             pipe.hset(key, field, value)
+            if ttl:
+                pipe.expire(key, ttl)
+        elif op == "hput":
+            pipe.delete(key)                         # replace, not merge: no field outlives its version
+            pipe.hset(key, mapping=value)
             if ttl:
                 pipe.expire(key, ttl)
         else:                                                                   # xadd

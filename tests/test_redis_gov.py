@@ -71,11 +71,17 @@ class FakeRedis:
         self._need(key, "hash")
         return (self.data.get(key) or {}).get(field)
 
-    def hset(self, key, field, value):
+    def hset(self, key, field=None, value=None, mapping=None):
         self._need(key, "hash")
-        self.data.setdefault(key, {})[field] = str(value)
+        items = dict(mapping or {})
+        if field is not None:
+            items[field] = value
+        for name, val in items.items():
+            if not isinstance(val, str):
+                raise TypeError("redis-py refuses to encode %r" % type(val).__name__)
+            self.data.setdefault(key, {})[name] = val
         self._bump(key)
-        return 1
+        return len(items)
 
     def hgetall(self, key):
         self._need(key, "hash")
