@@ -13,6 +13,7 @@ TOPICS = {
     "app": "Develop an app - screens, flows and the data behind them",
     "salesforce_admin": "Salesforce admin - automation, routing, approvals and access in a Salesforce org",
     "salesforce_data": "Salesforce data - the data model, reports, dashboards, imports and data quality",
+    "conference": "Work on the conference line - architecture, data model, process and what to build next",
     "other": "Something else - listen first, then shape it",
 }
 
@@ -26,6 +27,7 @@ TOPIC_AGENT = {
     "app": "meta",
     "salesforce_admin": "claude",
     "salesforce_data": "claude",
+    "conference": "claude",
     "other": "claude",
 }
 FALLBACK = ("claude", "openai", "gemini", "meta")
@@ -75,6 +77,18 @@ CHARTER_FRAMES = {
         ("scope", "Scope", "the pages and components"),
         ("timeline", "Timeline", "when it needs to launch"),
         ("close", "Decision and budget", "who decides, the budget range, and the next step"),
+    ),
+    # The conference experience page (owner, 2026-10-09): the owner opens with
+    # "What are we working on today?" and works with the agents on the
+    # conference line itself. A working session, not a sale: no budget.
+    "conference": (
+        ("goal", "Today's goal", "what we are working on today and what done looks like"),
+        ("architecture", "Architecture", "the parts and how they connect"),
+        ("data", "Data model", "the objects, fields and relationships"),
+        ("process", "Process", "the steps, who does what, and the hand-offs"),
+        ("risks", "Risks", "what could break - latency, cost, abuse"),
+        ("decisions", "Decisions", "what the owner decides now"),
+        ("next", "Next steps", "who builds what next and how it will be tested"),
     ),
 }
 DEFAULT_CHARTER_FRAME = (
@@ -127,7 +141,7 @@ DEFAULT_QUOTE_LINES = (
 
 
 def quote_lines(topic) -> tuple:
-    """The topic's ordered quote lines; the default lines for logo, app, other and no topic."""
+    """The topic's ordered quote lines; the default lines for logo, app, conference, other and no topic."""
     return QUOTE_LINES.get(topic if isinstance(topic, str) else "", DEFAULT_QUOTE_LINES)
 
 
@@ -144,18 +158,35 @@ def charter_frame(topic) -> tuple:
     return CHARTER_FRAMES.get(topic if isinstance(topic, str) else "", DEFAULT_CHARTER_FRAME)
 
 
+# A topic's brief beyond its one line, put in front of every lane with it.
+# Only the conference has one; every other topic's line is unchanged.
+TOPIC_BRIEFS = {
+    "conference": (
+        "In this session the owner works with the agents on the SFDC24 conference line itself - the "
+        "live call where the owner and several AI agents work together. The thing being designed is "
+        "that line: its architecture, data model, process, risks, the decisions to take now and what "
+        "to build next. Draw it, explain it, challenge it and defend it. Ground every claim in what the "
+        "owner said or what is on the canvas, and mark anything else as an assumption."
+    ),
+}
+
+
 def topic_line(state: dict | None) -> str:
-    """One line naming the topic, or "" when the visitor did not pick one."""
+    """One line naming the topic (and its brief, if it has one), or "" when the
+    visitor did not pick one."""
     topic = (state or {}).get("topic") or ""
     if topic not in TOPICS:
         return ""
-    return "The visitor picked this topic before starting: %s.\n" % TOPICS[topic]
+    line = "The visitor picked this topic before starting: %s.\n" % TOPICS[topic]
+    if topic in TOPIC_BRIEFS:
+        line += TOPIC_BRIEFS[topic] + "\n"
+    return line
 
 
 def with_topic(state: dict | None, canvas: str) -> str:
     return topic_line(state) + (canvas or "")
 
 
-__all__ = ["TOPICS", "TOPIC_AGENT", "FALLBACK", "route_agent", "topic_line", "with_topic",
+__all__ = ["TOPICS", "TOPIC_AGENT", "TOPIC_BRIEFS", "FALLBACK", "route_agent", "topic_line", "with_topic",
            "CHARTER_FRAMES", "DEFAULT_CHARTER_FRAME", "charter_frame",
            "QUOTE_LINES", "DEFAULT_QUOTE_LINES", "quote_lines", "session_type"]

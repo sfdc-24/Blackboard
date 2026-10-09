@@ -30,6 +30,7 @@ class Map(unittest.TestCase):
         self.assertEqual(set(TOPICS), set(TOPIC_AGENT))
         self.assertEqual("openai", TOPIC_AGENT["logo"])
         self.assertEqual(("claude", "claude"), (TOPIC_AGENT["salesforce_admin"], TOPIC_AGENT["salesforce_data"]))
+        self.assertEqual("claude", TOPIC_AGENT["conference"])
         self.assertEqual({"claude", "openai", "gemini", "meta"}, set(TOPIC_AGENT.values()))
 
     def test_each_topic_reaches_its_agent_when_everyone_is_available(self):

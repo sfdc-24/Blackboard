@@ -691,12 +691,60 @@ except ImportError:  # loaded from its file (tests): read the sibling topics.py 
     _topic_line = _topics.topic_line
 
 
+# What the architect draws for a topic, beyond SYSTEM, put after the topic line
+# in the turn's own context (SYSTEM, and every other topic's context, are
+# unchanged). The conference experience page (owner, 2026-10-09) works on the
+# conference line itself, so its canvas is diagrams, not a page or a logo. The
+# words follow the real renderer (sfdc24-site assets/prototype-canvas.js): a
+# "process-step" is a box with its label as the title and its detail under it;
+# an "edge" is one line of text, "label - detail" (the patch ops cannot set the
+# contract's from/to, so the detail names both ends); neither holds children;
+# children render in insertion order. The data model is the analyst's
+# model.updated diagram (objects, fields, relationships of kind lookup,
+# master-detail or many-to-many), drawn beside the canvas, not canvas nodes.
+TOPIC_GUIDANCE = {
+    "conference": (
+        "CONFERENCE LINE - DRAW DIAGRAMS, NOT PAGES. This session designs a system, the conference line, "
+        "so the canvas is a set of diagrams. Do not build website screens of headings, forms, fields and "
+        "buttons, and do not build a scene or a logo.\n"
+        "- Architecture and process flows: under the root screen insert one section per diagram, labelled "
+        "with what it shows (\"Architecture: the call path\", \"Process: one turn on the line\"). Inside it, "
+        "in flow order, insert a \"process-step\" node for each part or step - label: the part or step in a "
+        "few words (\"Gateway\", \"Message bus\", \"Chair picks the speaker\"); detail: what it does and who "
+        "owns it, in one or two sentences - and between two steps an \"edge\" node for the connection or "
+        "hand-off - label: what passes (\"Turn request\", \"Audio frames\"); detail: \"<from step> -> <to "
+        "step>\" and the protocol or trigger when known (\"Gateway -> Message bus, on every turn\"). The page draws "
+        "a process-step as a titled box with its detail under it and an edge as one line of text, label "
+        "then detail, in the order inserted: the order of the children IS the flow, so insert step, edge, "
+        "step, edge, step, and an edge must name both of its ends in its detail. A process-step and an "
+        "edge hold no children.\n"
+        "- A decision with alternatives, or a risk: a \"card\" in the section it belongs to (label: the "
+        "decision or the risk; detail: the options, or the mitigation).\n"
+        "- Data model: the analyst lane draws it live as the data model diagram (a model.updated event: "
+        "objects with their fields, and relationships of kind lookup, master-detail or many-to-many). Never "
+        "redraw objects, fields or relationships as canvas nodes; change only the diagrams the data affects.\n"
+        "When the canvas is only the root screen, the first version is the diagram the latest input asks "
+        "for - usually the architecture - with every part named, and set_label the root screen to what is "
+        "being worked on today (\"Conference line - today's work\")."
+    ),
+}
+
+
+def topic_guidance(state: dict | None) -> str:
+    """The architect's extra guidance for the session's topic, or "" for every
+    topic that has none."""
+    topic = (state or {}).get("topic")
+    return TOPIC_GUIDANCE.get(topic, "") if isinstance(topic, str) else ""
+
+
 def _describe(state: dict, trigger: dict) -> str:
     """Everything the model needs to act on a choice: each question's options WITH
     their meaning, and the chosen option spelled out - an opaque id like "a" is
     not an answer the model can enact (Codex review of PR 200, P1)."""
     nodes = _flatten(state["artifact"], {})
     lines = [_topic_line(state).strip()] if _topic_line(state) else []
+    if topic_guidance(state):
+        lines.append(topic_guidance(state))
     lines.append("CURRENT PROTOTYPE (id | kind | label | detail | parent):")
     for nid, n in nodes.items():
         lines.append("%s | %s | %s | %s | %s" % (nid, n["kind"], n["label"], n["detail"], n["parent"] or "-"))

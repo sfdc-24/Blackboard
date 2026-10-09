@@ -108,5 +108,104 @@ class TopicLine(unittest.TestCase):
         self.assertNotIn("picked this topic", cw._describe(dict(state, topic=""), {"kind": "utterance", "text": "a"}))
 
 
+CONFERENCE_FRAME = ["goal", "architecture", "data", "process", "risks", "decisions", "next"]
+
+
+class ConferenceTopic(unittest.TestCase):
+    """The conference experience page (owner, 2026-10-09): the owner works with the
+    agents on the conference line itself, drawn live as diagrams on the canvas."""
+    origin = base.TalkLaneTests.origin
+    make = base.TalkLaneTests.make
+    create = TopicTests.create
+
+    def test_the_validator_takes_it_and_stores_it(self):
+        with TestClient(self.make()) as client:
+            created = self.create(client, {"creation_id": "topic-conf", "start": "blank", "topic": "conference"})
+            for bad in ("Conference", "conference ", "conference_line"):
+                refused = self.create(client, {"creation_id": "topic-conf-bad", "start": "blank", "topic": bad})
+                self.assertEqual(400, refused.status_code, (bad, refused.text))
+        self.assertEqual(200, created.status_code, created.text)
+        self.assertEqual("conference", StudioRepository(self.store).load(created.json()["session_id"]).state["topic"])
+
+    def test_claude_talks_on_it(self):
+        from workers.topics import TOPIC_AGENT, route_agent
+        self.assertEqual("claude", TOPIC_AGENT["conference"])
+        self.assertEqual("claude", route_agent("conference", ("claude", "openai", "gemini", "meta")))
+        self.assertEqual("openai", route_agent("conference", ("openai", "gemini")))   # FALLBACK order
+
+    def test_the_talk_lane_hears_the_brief(self):
+        with TestClient(self.make()) as client:
+            created = self.create(client, {"creation_id": "topic-conf-talk", "start": "blank",
+                                           "topic": "conference"}).json()
+            headers = {**self.origin, "Authorization": "Bearer " + created["token"]}
+            client.post("/v1/session/%s/talk" % created["session_id"], headers=headers,
+                        json={"text": "What are we working on today?"})
+        canvas = self.talk.calls[0]["canvas"]
+        self.assertTrue(canvas.startswith("The visitor picked this topic before starting: Work on the conference line"),
+                        canvas[:120])
+        self.assertIn("conference line itself", canvas)
+
+    def test_its_charter_frame_is_the_seven_ids_in_order(self):
+        from workers.topics import CHARTER_FRAMES, charter_frame
+        self.assertEqual(CONFERENCE_FRAME, [d[0] for d in CHARTER_FRAMES["conference"]])
+        self.assertEqual(CHARTER_FRAMES["conference"], charter_frame("conference"))
+        for did, label, covers in charter_frame("conference"):
+            self.assertTrue(label and covers, did)
+        self.assertEqual(("goal", "Today's goal", "what we are working on today and what done looks like"),
+                         charter_frame("conference")[0])
+        from workers import charter as ch
+        self.assertEqual(CONFERENCE_FRAME, ch.tool_for("conference")["input_schema"]["properties"]["dimensions"]
+                         ["items"]["properties"]["id"]["enum"])
+        dims = [{"id": i, "level": 1, "captured": "About " + i} for i in CONFERENCE_FRAME]
+        checked, problems = ch.validate({"dimensions": dims, "next": "What does done look like today?"}, "conference")
+        self.assertIsNotNone(checked, problems)
+        self.assertEqual(CONFERENCE_FRAME, [d["id"] for d in checked["dimensions"]])
+
+    def test_its_session_type_and_quote_lines(self):
+        from workers.topics import DEFAULT_QUOTE_LINES, quote_lines, session_type
+        self.assertEqual("Work on the conference line", session_type("conference"))
+        self.assertEqual(DEFAULT_QUOTE_LINES, quote_lines("conference"))
+
+    def test_the_architect_draws_diagrams_with_the_kinds_the_page_renders(self):
+        guidance = cw.topic_guidance({"topic": "conference"})
+        for needed in ('"process-step"', '"edge"', "model.updated", "lookup", "master-detail", "many-to-many"):
+            self.assertIn(needed, guidance)
+        self.assertIn("process-step", cw.KINDS)
+        self.assertIn("edge", cw.KINDS)
+        from workers import analyst
+        self.assertEqual(("lookup", "master-detail", "many-to-many"), analyst.LINK_KINDS)
+        state = {"artifact": {"id": "screen", "kind": "screen", "label": "x", "children": []},
+                 "questions": [], "transcript": [], "topic": "conference"}
+        described = cw._describe(state, {"kind": "utterance", "text": "What are we working on today?"})
+        self.assertTrue(described.startswith("The visitor picked this topic before starting: Work on the conference"),
+                        described[:120])
+        self.assertIn(guidance, described)
+        self.assertLess(described.index(guidance), described.index("CURRENT PROTOTYPE"))
+
+    def test_no_other_topic_gets_conference_guidance(self):
+        from workers import analyst
+        state = {"artifact": {"id": "screen", "kind": "screen", "label": "x", "children": []},
+                 "questions": [], "transcript": []}
+        self.assertEqual("", cw.topic_guidance({"topic": ["conference"]}))
+        for topic in list(TOPICS) + ["", None, 7]:
+            if topic == "conference":
+                continue
+            self.assertEqual("", cw.topic_guidance({"topic": topic}), topic)
+            described = cw._describe(dict(state, topic=topic), {"kind": "utterance", "text": "a"})
+            self.assertNotIn("CONFERENCE LINE", described, topic)
+            self.assertNotIn("CONFERENCE LINE", analyst._describe(dict(state, topic=topic), "a", ""), topic)
+            if isinstance(topic, str) and topic in TOPICS:   # every other topic's line is exactly as before
+                self.assertEqual("The visitor picked this topic before starting: %s.\n" % TOPICS[topic],
+                                 topic_line({"topic": topic}))
+
+    def test_the_analyst_maps_the_conference_lines_own_data_model(self):
+        from workers import analyst
+        state = {"transcript": [], "questions": [], "topic": "conference"}
+        described = analyst._describe(state, "the data model for a call", "canvas")
+        self.assertTrue(described.startswith(analyst.TOPIC_GUIDANCE["conference"]), described[:120])
+        for needed in ("lookup", "master-detail", "many-to-many"):
+            self.assertIn(needed, described)
+
+
 if __name__ == "__main__":
     unittest.main()
