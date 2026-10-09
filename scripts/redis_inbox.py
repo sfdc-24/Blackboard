@@ -56,6 +56,11 @@ BOOKMARK = os.path.join(REPO, ".redis_inbox_seen.json")
 REQUEST_ACTION = "AYA_REQ"
 RESULT_PHASE = "AYA_RESULT"
 MAX_TEXT = 900                      # one message, not a document: the row carries it as base64
+# What to wait for an answer, by default. MEASURED, not guessed: on 2026-10-09 a request posted at
+# 21:30:22Z was answered at 21:31:14Z - 52 seconds - and a 40-second budget turned that into a
+# "no answer". The owner's mark for this path is a complete reply within a few minutes, so the
+# default sits inside that and above the measurement, and the caller can still shorten it.
+WAIT_SECONDS = 180
 
 
 def stamp() -> str:
@@ -155,6 +160,18 @@ def answer(rid: str, wait: float, since: str) -> dict | None:
         time.sleep(10)
 
 
+def not_yet(waited: float) -> str:
+    """What a timeout actually knows, and nothing more.
+
+    The first version of this line said "the governed worker is not running". It said that on a
+    40-second budget about a request that was answered at 52 seconds, by a worker that had been
+    running for five minutes. A timeout is evidence about the wait, never about the peer: the
+    row is on the board either way, and the RESULT row is where the truth is."""
+    return ("NO ANSWER YET after %gs. The request row is on the board and is not lost; it may be "
+            "answered after this wait. Look for the AYA_RESULT row answering its id, and check "
+            "the worker with: gcloud run jobs executions list --job=bus-requests" % waited)
+
+
 def seen() -> dict:
     try:
         with open(BOOKMARK, encoding="utf-8") as fh:
@@ -184,9 +201,7 @@ def cmd_send(args) -> int:
     rid = post(request_row("xadd", KEY % to, value=message(args.text)))
     print("sent to %s, request %s" % (to, rid))
     got = answer(rid, args.wait, since=args.since or stamp())
-    print("worker: %s" % (got["payload"][:300] if got else
-                          "NO ANSWER in %gs - the governed worker is not running, so the row is "
-                          "queued, not lost" % args.wait))
+    print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait)))
     return 0 if got else 2
 
 
@@ -194,7 +209,7 @@ def cmd_read(args) -> int:
     rid = post(request_row("xrange", KEY % ME, count=args.count))
     got = answer(rid, args.wait, since=args.since or stamp())
     if not got:
-        print("NO ANSWER in %gs - the governed worker is not running; nothing was read" % args.wait)
+        print(not_yet(args.wait) + " Nothing was read, which is not the same as an empty inbox.")
         return 2
     rows = entries_of(got["payload"])
     last = seen().get("last_id") or ""
@@ -245,7 +260,8 @@ def main(argv=()) -> int:
     for name in ("send", "read", "selftest"):
         p = sub.add_parser(name)
         if name != "selftest":
-            p.add_argument("--wait", type=float, default=120.0, help="seconds to wait for the worker")
+            p.add_argument("--wait", type=float, default=WAIT_SECONDS,
+                           help="seconds to wait for the worker (default %d)" % WAIT_SECONDS)
             p.add_argument("--since", default="", help="board timestamp to read answers from")
         if name == "send":
             p.add_argument("--to", required=True)
