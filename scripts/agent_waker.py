@@ -717,6 +717,72 @@ def reply_phase(row) -> str:
     return "RESULT" if m and m.group(1).upper() in RESULT_FOR else "DONE"
 
 
+# WHAT ONE ROW MAY CARRY, and why this is a BUDGET and not a knife.
+#
+# Until 2026-10-09 this file posted `text[:1500]`. Grok's scorecard that morning measured what that
+# cost: all 13 of 13 Gemini replies of the day stopped mid-word at about 1,620 characters, and the
+# architecture answer the fleet was waiting on arrived cut off. A trim is the worst of the three
+# possible answers, because the asker cannot tell a finished answer from a cut one - there is no
+# marker, no character count and no way back to the rest.
+#
+# So: the answer is landed IN FULL first (okf_land, the private conference repository - the only
+# destination Codex's security review allows for free model text), and the row carries as much of it
+# as ENDS IN A WHOLE SENTENCE, with the link and the full character count. When landing is not
+# available the row says so, with the count, and still ends in a whole sentence.
+BOARD_TEXT_CAP = 1500
+# What a row carries besides the answer: the authority fields, the preamble naming the waker, and
+# the tail saying where the whole answer is. Measured on a live reply, rounded up - it decides only
+# WHETHER to land a file, never what the row says, and fit_reply measures the real lengths.
+REPLY_OVERHEAD = 700
+# Below this there is no room for a sentence, so a word boundary is the best a cut can do.
+SENTENCE_FLOOR = 80
+
+
+def okf_reason(ask_text: str, too_long: bool) -> str:
+    """Why a file was being landed, for an answer that has to say it was not."""
+    if okf_land.wants_okf(ask_text):
+        return "OKF file this row asked for"
+    return "OKF file this answer needed, being too long for one row" if too_long else "OKF file"
+
+
+def ends_whole(text: str, cap: int) -> str:
+    """At most `cap` characters, ending where a sentence ends - or, failing that, where a word does.
+
+    NEVER inside a word. A cut word is the signature of the defect this replaces: "stop mid-word at
+    about 1,621 characters" (Grok, 2026-10-09)."""
+    text = text.strip()
+    if cap <= 0:
+        return ""
+    if len(text) <= cap:
+        return text
+    window = text[:cap]
+    if cap >= SENTENCE_FLOOR:
+        at = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+        if at >= cap // 2:                      # a sentence end in the back half: cut there
+            return window[:at + 1]
+        if window.rstrip()[-1:] in ".!?":       # the window itself ends a sentence
+            return window.rstrip()
+    at = window.rfind(" ")
+    return window[:at].rstrip() if at > 0 else window
+
+
+def fit_reply(head: str, body: str, tail: str, cap: int = BOARD_TEXT_CAP) -> str:
+    """`head` + as much of `body` as ends in a whole sentence + `tail`, at most `cap` characters.
+
+    The head carries the authority fields (a reader parses them), so it is never cut; the tail says
+    where the whole answer is, so it is never cut either. What gives is the body, and it gives at a
+    sentence."""
+    room = cap - len(head) - len(tail)
+    if room <= 0:                               # nothing but the head and the tail will fit
+        return head + tail
+    return head + ends_whole(body, room) + tail
+
+
+def over_board_cap(head: str, body: str, tail: str, cap: int = BOARD_TEXT_CAP) -> bool:
+    """Whether the whole answer fits in one row as it is."""
+    return len(head) + len(body.strip()) + len(tail) > cap
+
+
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
                phase: str = "DONE") -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
@@ -726,8 +792,10 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     replies because nobody was addressed.
     """
     rid = reply_row_id(me, answers)
+    # The caller fits the row (fit_reply). This is the last guard, and it cuts at a sentence or
+    # a word - never mid-word, which is the defect it replaces.
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
-            "post", text[:1500],
+            "post", ends_whole(text, BOARD_TEXT_CAP),
             "--tag", me,
             "--to", to,
             "--phase", phase,
@@ -735,7 +803,7 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
             "--project", cfg["project"],
             "--id", rid,
             "--prefix", "%s-WAKE" % me.upper(),
-            "--gist", text[:160]]
+            "--gist", ends_whole(text, 160)]
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -940,7 +1008,11 @@ def main(argv=None) -> int:
         okf_url = ""
         okf_note = ""
         okf_outcome = ""
-        if cfg.get("okf_land") and okf_land.wants_okf(ask_text):
+        # A LONG ANSWER IS LANDED WHETHER OR NOT THE ROW ASKED FOR IT. The ask says land=okf when
+        # the asker wants a file; length says it when the answer will not fit in a row, and the
+        # alternative is losing the rest of it (Grok's scorecard, 2026-10-09).
+        too_long = len(body) > BOARD_TEXT_CAP - REPLY_OVERHEAD
+        if cfg.get("okf_land") and (okf_land.wants_okf(ask_text) or too_long):
             landed = okf_land.land(
                 answers_id=src_id, ask_text=ask_text, reply_body=text, route=str(route or ""))
             # Landed means a review PR is open (okf_land.land); a file without one is not.
@@ -951,13 +1023,14 @@ def main(argv=None) -> int:
             elif landed.get("skipped"):
                 note = "    okf skip: %s (path would be %s)" % (
                     landed.get("skipped"), landed.get("path", ""))
-                okf_outcome = ("The OKF file this row asked for was NOT landed: %s."
-                               % landed.get("skipped"))
+                okf_outcome = ("The %s was NOT landed: %s."
+                               % (okf_reason(ask_text, too_long), landed.get("skipped")))
             else:
                 note = "    okf land failed: %s" % (landed.get("error") or landed)
                 # The exact blocker, in the answer, so the asker need not read logs.
-                okf_outcome = ("The OKF file this row asked for was NOT landed: %s at %s."
-                               % (landed.get("error") or "unknown error", landed.get("path", "")))
+                okf_outcome = ("The %s was NOT landed: %s at %s."
+                               % (okf_reason(ask_text, too_long), landed.get("error") or "unknown error",
+                                  landed.get("path", "")))
             print(note)
             log(me, note)
         if okf_url:
@@ -973,7 +1046,7 @@ def main(argv=None) -> int:
         mod_for_cost = sys.modules.get(cfg["module"])
         if mod_for_cost is not None and hasattr(mod_for_cost, "cost_estimate"):
             estimate = mod_for_cost.cost_estimate(getattr(mod_for_cost.ask, "last_usage", None) or {})
-        reply = (
+        head = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
@@ -982,9 +1055,18 @@ def main(argv=None) -> int:
             + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
               "what it says. %s REPLY: " % (me, me, hands)
-            + body
-            + okf_note
         )
+        # THE WHOLE ANSWER IS ALWAYS ACCOUNTED FOR: either it is in this row, or the row says how
+        # long it is and where the rest of it is. It is never silently shorter than what was said.
+        tail = okf_note
+        if over_board_cap(head, body, tail):
+            if okf_url:
+                tail += (" [This row carries as much of the answer as fits; the whole %d-character"
+                         " answer is the OKF file at %s.]" % (len(body), okf_url))
+            else:
+                tail += (" [This row carries as much of the answer as fits; the whole answer is %d"
+                         " characters and the rest was NOT landed anywhere.]" % len(body))
+        reply = fit_reply(head, body, tail)
         if post_reply(me, cfg, reply, to=sender + ";ALL", answers=src_id,
                       verbose=args.verbose, phase=reply_phase(row)):
             state["answered_ids"].append(src_id)

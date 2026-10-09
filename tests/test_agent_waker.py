@@ -534,6 +534,78 @@ class ReplyPhaseTest(unittest.TestCase):
             fleet_agent.build_parser().parse_args(["post", "text", "--phase", "FINISHED"])
 
 
+class ALongAnswerIsNeverTrimmed(unittest.TestCase):
+    """Grok's scorecard, 2026-10-09 12:25Z: all 13 of 13 Gemini waker replies that day stopped
+    mid-word at about 1,620 characters, because post_reply posted text[:1500]. A row may still be
+    the shorter thing; what it may never be is silently shorter, or cut inside a word."""
+
+    LONG = ("Redis is reachable from the worker pool over Direct VPC egress. "
+            "The chair reads the live state each turn and caches it for five seconds. ") * 40
+
+    def test_the_answer_is_five_thousand_characters(self):
+        self.assertGreater(len(self.LONG), 5000)                  # the case Grok asked to be tested
+
+    def test_a_five_thousand_character_answer_ends_in_a_whole_sentence(self):
+        head = "wakerreply=1|answers=X|evidence=STATED|route=r|REPLY: "
+        tail = " okf=https://github.com/sfdc-24/conference/pull/900"
+        self.assertTrue(aw.over_board_cap(head, self.LONG, tail))
+        row = aw.fit_reply(head, self.LONG, tail)
+        self.assertLessEqual(len(row), aw.BOARD_TEXT_CAP)
+        self.assertTrue(row.startswith(head))
+        self.assertTrue(row.endswith(tail))
+        body = row[len(head):-len(tail)]
+        self.assertIn(body, " ".join(self.LONG.split()))          # a prefix of what was said
+        self.assertTrue(body.rstrip().endswith("."))              # a whole sentence, not a cut word
+        self.assertNotIn("  ", body)
+
+    def test_the_row_says_how_long_the_whole_answer_is_and_where_it_is(self):
+        head = "wakerreply=1|answers=X|evidence=STATED|route=r|okf=https://x/900|REPLY: "
+        pr = "https://github.com/sfdc-24/conference/pull/900"
+        tail = (" okf=%s [This row carries as much of the answer as fits; the whole %d-character"
+                " answer is the OKF file at %s.]" % (pr, len(self.LONG), pr))
+        row = aw.fit_reply(head, self.LONG, tail)
+        self.assertLessEqual(len(row), aw.BOARD_TEXT_CAP)
+        self.assertIn(str(len(self.LONG)), row)
+        self.assertIn(pr, row)
+
+    def test_a_short_answer_is_not_touched_at_all(self):
+        head, tail = "wakerreply=1|REPLY: ", " okf=https://x/1"
+        short = "Yes. Redis is live on the pool."
+        self.assertFalse(aw.over_board_cap(head, short, tail))
+        self.assertEqual(head + short + tail, aw.fit_reply(head, short, tail))
+
+    def test_a_cut_never_lands_inside_a_word(self):
+        for cap in range(20, 400, 7):
+            cut = aw.ends_whole(self.LONG, cap)
+            self.assertLessEqual(len(cut), cap)
+            self.assertTrue(self.LONG.startswith(cut), cap)
+            rest = self.LONG[len(cut):]
+            self.assertTrue(not rest or not cut or cut[-1] in " .!?" or rest[0] in " .!?",
+                            "cut inside a word at cap %d: %r|%r" % (cap, cut[-12:], rest[:12]))
+
+    def test_post_reply_no_longer_trims_mid_word(self):
+        from unittest import mock
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args)
+            return mock.Mock(stdout="VERIFIED on the board", stderr="")
+        with mock.patch.object(aw.subprocess, "run", side_effect=run):
+            self.assertTrue(aw.post_reply("gemini", {"project": "Blackboard"}, self.LONG,
+                                          "grok;ALL", "X", False))
+        posted = seen[0][seen[0].index("post") + 1]
+        self.assertLessEqual(len(posted), aw.BOARD_TEXT_CAP)
+        self.assertTrue(posted.rstrip().endswith(".") or posted[-1] != self.LONG[len(posted)])
+        self.assertNotEqual(self.LONG[:1500], posted)             # the old trim, gone
+        gist = seen[0][seen[0].index("--gist") + 1]
+        self.assertLessEqual(len(gist), 160)
+        self.assertTrue(self.LONG.startswith(gist))
+
+    def test_the_reason_a_file_was_being_landed_is_named(self):
+        self.assertIn("asked for", aw.okf_reason("BCB|v=1|land=okf|ask=write it", False))
+        self.assertIn("too long", aw.okf_reason("BCB|v=1|ask=just answer", True))
+
+
 class TheBoardIsTheSharedDEDUPE(unittest.TestCase):
     """MEASURED ON THE LIVE BOARD, 2026-10-07. One Row_ID,
     GEMINI-WAKE-CCC-GEMINI-COMPARISON-DESIGN-20261007T04-be7c918643, appended TWICE with DIFFERENT
