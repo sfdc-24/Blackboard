@@ -18,7 +18,7 @@ Account and Lead layouts are not deployed. Adding the Service Requests related l
 
 ## Sample data
 
-`sf-demo/live-model/data/sample-data-plan.json` imports 2 Accounts, 1 Lead, and 4 Service Requests. Account names, the Lead last name, the Lead company, and every Service Request summary end with `(Sample)`. Service Request Name is the auto-number and is not set in the JSON. Lookups use `@AccountRef1`, `@AccountRef2`, and `@LeadRef1`. Lead Status is the standard scratch-org value `Open - Not Contacted`.
+`sf-demo/live-model/data/sample-data-plan.json` imports 2 Accounts, 1 Lead, and 4 Service Requests. Account names, the Lead last name, the Lead company, and every Service Request summary end with `(Sample)`. Service Request Name is the auto-number and is not set in the JSON. Lookups use `@AccountRef1`, `@AccountRef2`, and `@LeadRef1`. Lead Status is the standard scratch-org value `Open - Not Contacted`. Paths inside the plan are relative to the plan file. `saveRefs` and `resolveRefs` are kept for older CLIs. Salesforce CLI 2.153.5 warns that those two properties are ignored and still resolves the `@AccountRef1`-style references from file order.
 
 ## Live change (not in the initial deploy)
 

@@ -47,6 +47,8 @@ Dev Hub budget: 3 active scratch orgs, 6 creations per 24 hours. If the Salesfor
 
 `data/sample-data-plan.json` loads the JSON files beside it (paths are relative to the plan file). References are `@AccountRef1`, `@AccountRef2`, and `@LeadRef1`.
 
+`saveRefs` and `resolveRefs` are in the plan for older CLIs. Salesforce CLI 2.153.5 prints that those two properties are ignored; it still resolves `@AccountRef1`-style references from the file order. The warning is expected.
+
 | Object | Records | Name |
 | --- | --- | --- |
 | Account | 2 | Haiti Solar Clinic (Sample), Port-au-Prince Depot (Sample) |
