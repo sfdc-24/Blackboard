@@ -269,6 +269,26 @@ class ConferenceTopic(unittest.TestCase):
             self.assertEqual([], out["events"], ops)
             self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]), out["problems"])
 
+    def test_a_diagram_lives_in_a_section_and_nothing_hides_under_a_non_container(self):
+        # Aya on 7337700: screen -> text -> heading + step passed the first-child-heading check, though
+        # the page never descends into a text; and a heading could be relabelled blank.
+        cases = (
+            [self.insert("screen", "t", "text", "Notes"),
+             self.insert("t", "t-h", "heading", "Hidden title"),
+             self.insert("t", "t-s", "process-step", "Hidden step", "")],
+            [self.insert("screen", "c", "card", "Card"),
+             self.insert("c", "c-h", "heading", "Title"),
+             self.insert("c", "c-s", "process-step", "Step", "")],                        # titled, but not a section
+            [self.insert("screen", "t", "text", "Notes"),
+             self.insert("t", "t-h", "heading", "A title nobody sees")],                 # anything under a text
+            [{"op": "set_label", "node_id": "arch-h", "value": "   "}],
+            [{"op": "set_label", "node_id": "arch-h", "value": ""}],
+        )
+        for ops in cases:
+            out = self.turn("conference", ops)
+            self.assertEqual([], out["events"], ops)
+            self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]), out["problems"])
+
     def test_a_titled_section_may_still_lose_its_steps_then_its_heading(self):
         out = self.turn("conference", [{"op": "remove", "node_id": "gw", "value": ""},
                                        {"op": "remove", "node_id": "gw-bus", "value": ""},
@@ -286,6 +306,9 @@ class ConferenceTopic(unittest.TestCase):
             self.assertEqual([], untitled["problems"], topic)
             under = self.turn(topic, [self.insert("arch-h", "under", "text", "Under a heading")])
             self.assertEqual([], under["problems"], topic)
+            in_text = self.turn(topic, [self.insert("screen", "t", "text", "Notes"),
+                                        self.insert("t", "t-s", "process-step", "Step", "")])
+            self.assertEqual([], in_text["problems"], topic)
 
     def test_the_analyst_maps_the_conference_lines_own_data_model(self):
         from workers import analyst

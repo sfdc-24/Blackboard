@@ -470,6 +470,7 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     refused_kinds = TOPIC_REFUSED_KINDS.get(topic_key, ())
     leaf_kinds = TOPIC_LEAF_KINDS.get(topic_key, ())
     titled_kinds = TOPIC_TITLED_KINDS.get(topic_key, ())
+    containers = TOPIC_CONTAINERS.get(topic_key)
 
     def untitled(holder):
         first = (holder.get("children") or [None])[0]
@@ -494,6 +495,8 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 parent = parents[nid]
                 if not _txt(op.get("value")):
                     why = "value too long"
+                elif titled_kinds and kind == "set_label" and index[nid].get("kind") == "heading"                         and not (op.get("value") or "").strip():
+                    why = "a diagram's heading may not be blank"
                 elif kind == "set_detail" and visual_problem(
                         index[nid].get("kind"), op["value"], parent.get("kind") if parent else None):
                     why = visual_problem(index[nid].get("kind"), op["value"], parent.get("kind") if parent else None)
@@ -518,7 +521,10 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                     why = "a %s is not drawn in this session's topic" % nn["kind"]
                 elif index[nid].get("kind") in leaf_kinds:
                     why = "a %s holds nothing" % index[nid].get("kind")
-                elif nn["kind"] in titled_kinds and untitled(index[nid]):
+                elif containers is not None and index[nid].get("kind") not in containers:
+                    why = "a %s holds nothing on this canvas" % index[nid].get("kind")
+                elif nn["kind"] in titled_kinds and (index[nid].get("kind") != TITLED_HOLDER
+                                                     or untitled(index[nid])):
                     why = "a %s goes in a section whose first child is its heading" % nn["kind"]
                 elif index[nid].get("kind") == "entity":
                     why = "an entity holds nothing"
@@ -762,6 +768,12 @@ TOPIC_LEAF_KINDS = {"conference": ("process-step", "edge", "heading")}
 # steps was accepted and would show no title; a heading is a leaf for the same
 # reason - the page draws no children of a heading, so steps under one vanish).
 TOPIC_TITLED_KINDS = {"conference": ("process-step", "edge")}
+# The kinds the page draws children of (sfdc24-site prototype-canvas.js CONTAINERS). For the conference
+# canvas anything inserted under another kind would be invisible, so only these may hold children, and a
+# titled diagram lives in a section (Aya on 7337700: screen -> text -> heading + step passed the
+# first-child-heading check although the page never descends into a text).
+TOPIC_CONTAINERS = {"conference": ("screen", "section", "form", "list", "card", "nav")}
+TITLED_HOLDER = "section"
 
 
 def topic_guidance(state: dict | None) -> str:
