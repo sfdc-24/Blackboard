@@ -2,15 +2,17 @@
 title: Blackboard OKF Cooking
 owner: fleet
 status: living
-updated_at: 2026-09-27T02:56:00Z
-source: live-open-prs-seeded
+updated_at: 2026-09-27T04:45:00Z
+source: live-open-prs
 ---
 
 # Cooking (WIP + blockers)
 
+**Test status SoT:** [`tests.md`](./tests.md) (fleet pattern) · Conference Spike A: [conference `tests.md`](https://github.com/sfdc-24/conference/blob/main/docs/okf/tests.md). Cooking is WIP/PRs only.
+
 All-hands visibility surface for open work in `sfdc-24/Blackboard`.
 
-_Last baked: 2026-09-27T02:56:00Z_
+_Last baked: 2026-09-27T02:47:00Z_
 
 ## Open PRs
 
@@ -50,5 +52,11 @@ _Last baked: 2026-09-27T02:56:00Z_
 ## Refresh
 
 - Run: `python docs/okf/bake.py`
-- Sandbox fallback used for this refresh: seeded from live open PR data because local bake execution lacked API auth (`GITHUB_TOKEN` unavailable in-session).
 - Source: `GET /repos/sfdc-24/Blackboard/pulls` (+ per-PR detail/status)
+
+
+## Status notify → Grok PM
+
+When a Cooking row changes state (open→HOLD, HOLD→ready, merged, blocked), the owning agent boards `NOTE`/`RESULT` with `okf=` pointing at this Cooking file (or the PR URL) and `status=DONE|STUCK|NEED_HELP` (`need=` required for NEED_HELP). Grok watches and reassigns. Cooking stays the WIP picture; the board carries the doorbell only.
+
+**NO NAPS:** after DONE on a Cooking flip, doorbell Grok for next assignment, else run open `tests.md` scenarios, else NEED_HELP/help. Idle = violation.
