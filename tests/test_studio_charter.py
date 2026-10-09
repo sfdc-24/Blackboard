@@ -72,6 +72,8 @@ class Frames(unittest.TestCase):
         self.assertEqual(["objects", "quality", "reports", "sources", "access", "timeline", "close"],
                          [d[0] for d in CHARTER_FRAMES["salesforce_data"]])
         self.assertEqual(["type", "audience", "business", "design", "scope", "timeline", "close"], WEBSITE)
+        self.assertEqual(["goal", "architecture", "data", "process", "risks", "decisions", "next"],
+                         [d[0] for d in CHARTER_FRAMES["conference"]])
         default = ["objectives", "scope", "design", "refinement", "timeline", "close"]
         for topic in ("logo", "app", "other", "", None, "nonsense", 7):
             self.assertEqual(default, [d[0] for d in charter_frame(topic)], topic)

@@ -147,8 +147,28 @@ def _txt(s, cap=TEXT_MAX):
     return isinstance(s, str) and s.strip() != "" and len(s) <= cap
 
 
+# What the analyst maps for a topic, beyond SYSTEM, put at the top of the
+# turn's own context (SYSTEM, and every other topic's context, are unchanged).
+# The conference experience page (owner, 2026-10-09) works on the conference
+# line itself: its data model is drawn live from this lane's model.updated.
+TOPIC_GUIDANCE = {
+    "conference": (
+        "THIS SESSION DESIGNS THE CONFERENCE LINE ITSELF. Map the data model of that system - only the "
+        "objects the conversation names or clearly needs - with plain custom names, and use Salesforce "
+        "standard objects only when the owner brings Salesforce in. Give every relationship its kind: "
+        "lookup, master-detail (the child cannot exist without its parent) or many-to-many (one link "
+        "between the two objects, no junction object). The page draws objects, fields and relationships "
+        "live as the data model diagram. Findings name risks to the design - latency, cost, abuse - "
+        "where the model shows one."
+    ),
+}
+
+
 def _describe(state: dict, text: str, canvas: str) -> str:
     lines = ["CONVERSATION (oldest first):"]
+    topic = state.get("topic")
+    if isinstance(topic, str) and topic in TOPIC_GUIDANCE:
+        lines = [TOPIC_GUIDANCE[topic], ""] + lines
     for turn in (state.get("transcript") or [])[-16:]:
         lines.append("- %s: %s" % (turn.get("role", "visitor"), turn.get("text", "")))
     lines.append("- visitor (latest): %s" % text)

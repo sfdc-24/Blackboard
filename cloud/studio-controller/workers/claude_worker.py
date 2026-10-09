@@ -402,7 +402,7 @@ def _scope_ids(state_questions, trigger, resolves):
 
 
 def validate(draft: dict, artifact_root: dict, state_questions: list,
-             trigger: dict | None = None) -> tuple[dict, list]:
+             trigger: dict | None = None, topic: str = "") -> tuple[dict, list]:
     """Everything the schema cannot express. Returns (clean_draft, problems).
 
     Codex review of PR 200 (CODEX-PR200-REVIEW-20260924T0501Z) shaped this:
@@ -466,6 +466,16 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 allowed |= _subtree_ids(index[a])
         return allowed
 
+    topic_key = topic if isinstance(topic, str) else ""
+    refused_kinds = TOPIC_REFUSED_KINDS.get(topic_key, ())
+    leaf_kinds = TOPIC_LEAF_KINDS.get(topic_key, ())
+    titled_kinds = TOPIC_TITLED_KINDS.get(topic_key, ())
+    containers = TOPIC_CONTAINERS.get(topic_key)
+
+    def untitled(holder):
+        first = (holder.get("children") or [None])[0]
+        return not (isinstance(first, dict) and first.get("kind") == "heading")
+
     def transaction(scope):
         tree = json.loads(json.dumps(artifact_root))
         index, parents = _index(tree)
@@ -485,6 +495,8 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 parent = parents[nid]
                 if not _txt(op.get("value")):
                     why = "value too long"
+                elif titled_kinds and kind == "set_label" and index[nid].get("kind") == "heading"                         and not (op.get("value") or "").strip():
+                    why = "a diagram's heading may not be blank"
                 elif kind == "set_detail" and visual_problem(
                         index[nid].get("kind"), op["value"], parent.get("kind") if parent else None):
                     why = visual_problem(index[nid].get("kind"), op["value"], parent.get("kind") if parent else None)
@@ -505,6 +517,15 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                     why = visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind"))
                 elif index[nid].get("kind") == "scene" and nn["kind"] != "entity":
                     why = "a scene holds only entities"
+                elif nn["kind"] in refused_kinds:
+                    why = "a %s is not drawn in this session's topic" % nn["kind"]
+                elif index[nid].get("kind") in leaf_kinds:
+                    why = "a %s holds nothing" % index[nid].get("kind")
+                elif containers is not None and index[nid].get("kind") not in containers:
+                    why = "a %s holds nothing on this canvas" % index[nid].get("kind")
+                elif nn["kind"] in titled_kinds and (index[nid].get("kind") != TITLED_HOLDER
+                                                     or untitled(index[nid])):
+                    why = "a %s goes in a section whose first child is its heading" % nn["kind"]
                 elif index[nid].get("kind") == "entity":
                     why = "an entity holds nothing"
                 elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
@@ -524,6 +545,9 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
             elif kind == "remove":
                 if parents[nid] is None:
                     why = "would remove the root"
+                elif titled_kinds and index[nid].get("kind") == "heading" and any(
+                        c.get("kind") in titled_kinds for c in parents[nid].get("children") or []) and                         parents[nid]["children"][0].get("id") == nid:
+                    why = "would leave a diagram without its title; remove its steps first"
                 else:
                     gone = _subtree_ids(index[nid])
                     p = parents[nid]
@@ -691,12 +715,82 @@ except ImportError:  # loaded from its file (tests): read the sibling topics.py 
     _topic_line = _topics.topic_line
 
 
+# What the architect draws for a topic, beyond SYSTEM, put after the topic line
+# in the turn's own context (SYSTEM, and every other topic's context, are
+# unchanged). The conference experience page (owner, 2026-10-09) works on the
+# conference line itself, so its canvas is diagrams, not a page or a logo. The
+# words follow the real renderer (sfdc24-site assets/prototype-canvas.js): a
+# "process-step" is a box with its label as the title and its detail under it;
+# an "edge" is one line of text, "label - detail" (the patch ops cannot set the
+# contract's from/to, so the detail names both ends); neither holds children;
+# children render in insertion order. The data model is the analyst's
+# model.updated diagram (objects, fields, relationships of kind lookup,
+# master-detail or many-to-many), drawn beside the canvas, not canvas nodes.
+TOPIC_GUIDANCE = {
+    "conference": (
+        "CONFERENCE LINE - DRAW DIAGRAMS, NOT PAGES. This session designs a system, the conference line, "
+        "so the canvas is a set of diagrams. This replaces BUILDING FROM AN EMPTY SCREEN and LIVE SCENES "
+        "above for this session: build no website screens of forms, fields and buttons, and never insert a "
+        "scene or an entity - they are refused here.\n"
+        "- Architecture and process flows: under the root screen insert one section per diagram. A "
+        "section's label is never shown, so its FIRST child is a \"heading\" node whose label is the "
+        "diagram's title (\"Architecture: the call path\", \"Process: one turn on the line\"); give the "
+        "section the same label. After the heading, in flow order, insert a \"process-step\" node for each "
+        "part or step - label: the part or step in a few words (\"Gateway\", \"Message bus\", \"Chair picks "
+        "the speaker\"); detail: what it does and who owns it, in one or two sentences - and between two "
+        "steps an \"edge\" node for the connection or hand-off - label: what passes (\"Turn request\", "
+        "\"Audio frames\"); detail: \"<from step> -> <to step>\" and the protocol or trigger when known "
+        "(\"Gateway -> Message bus, on every turn\"). The page draws a heading as the visible title, a "
+        "process-step as a titled box with its detail under it, and an edge as one line of text, label "
+        "then detail, all in the order inserted: the order of the children IS the flow, so insert heading, "
+        "step, edge, step, edge, step, and an edge must name both of its ends in its detail. A "
+        "process-step and an edge hold no children - anything inserted under one is refused.\n"
+        "- A decision with alternatives, or a risk: a \"card\" in the section it belongs to (label: the "
+        "decision or the risk; detail: the options, or the mitigation).\n"
+        "- Data model: the analyst lane draws it live as the data model diagram (a model.updated event: "
+        "objects with their fields, and relationships of kind lookup, master-detail or many-to-many). Never "
+        "redraw objects, fields or relationships as canvas nodes; change only the diagrams the data affects.\n"
+        "When the canvas is only the root screen, the first version is the diagram the latest input asks "
+        "for - usually the architecture - with its heading and every part named, and set_label the root "
+        "screen to what is being worked on today (\"Conference line - today's work\")."
+    ),
+}
+# What the gate refuses for a topic, beyond what it refuses everywhere: the
+# kinds that may not be inserted, and the kinds that may hold no children. The
+# conference canvas is diagrams: no scene engine, and a step or an edge is a
+# leaf the page never draws children of (sfdc24-site prototype-canvas.js
+# CONTAINERS). Every other topic is gated exactly as before.
+TOPIC_REFUSED_KINDS = {"conference": ("scene", "entity")}
+TOPIC_LEAF_KINDS = {"conference": ("process-step", "edge", "heading")}
+# Kinds that are drawn only under a title: on the conference canvas a step or an
+# edge goes in a section whose FIRST child is a heading, because the page shows a
+# section's label only as an aria-label (Cursor on 9fa8589: a section of only
+# steps was accepted and would show no title; a heading is a leaf for the same
+# reason - the page draws no children of a heading, so steps under one vanish).
+TOPIC_TITLED_KINDS = {"conference": ("process-step", "edge")}
+# The kinds the page draws children of (sfdc24-site prototype-canvas.js CONTAINERS). For the conference
+# canvas anything inserted under another kind would be invisible, so only these may hold children, and a
+# titled diagram lives in a section (Aya on 7337700: screen -> text -> heading + step passed the
+# first-child-heading check although the page never descends into a text).
+TOPIC_CONTAINERS = {"conference": ("screen", "section", "form", "list", "card", "nav")}
+TITLED_HOLDER = "section"
+
+
+def topic_guidance(state: dict | None) -> str:
+    """The architect's extra guidance for the session's topic, or "" for every
+    topic that has none."""
+    topic = (state or {}).get("topic")
+    return TOPIC_GUIDANCE.get(topic, "") if isinstance(topic, str) else ""
+
+
 def _describe(state: dict, trigger: dict) -> str:
     """Everything the model needs to act on a choice: each question's options WITH
     their meaning, and the chosen option spelled out - an opaque id like "a" is
     not an answer the model can enact (Codex review of PR 200, P1)."""
     nodes = _flatten(state["artifact"], {})
     lines = [_topic_line(state).strip()] if _topic_line(state) else []
+    if topic_guidance(state):
+        lines.append(topic_guidance(state))
     lines.append("CURRENT PROTOTYPE (id | kind | label | detail | parent):")
     for nid, n in nodes.items():
         lines.append("%s | %s | %s | %s | %s" % (nid, n["kind"], n["label"], n["detail"], n["parent"] or "-"))
@@ -798,7 +892,8 @@ class ClaudeWorker:
             draft = json.loads(text)
         except ValueError:
             return {"events": [], "problems": ["model output was not JSON"]}
-        clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger)
+        clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger,
+                                   topic=state.get("topic") or "")
         if state.get("analyst"):
             # The analyst lane asks the questions in this session (it maps the
             # data model in parallel); the builder builds and confirms. Two
