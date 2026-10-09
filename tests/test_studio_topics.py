@@ -251,12 +251,41 @@ class ConferenceTopic(unittest.TestCase):
             self.assertEqual([], out["events"], ops)
             self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]), out["problems"])
 
+    def test_a_diagram_step_needs_its_heading_first_and_a_heading_holds_nothing(self):
+        # Cursor on 9fa8589: a section of only steps was accepted (no visible title), and a step under
+        # the heading was accepted (the page draws no children of a heading, so it would vanish).
+        cases = (
+            [self.insert("screen", "proc", "section", "Process"),
+             self.insert("proc", "s1", "process-step", "Owner speaks", "")],            # no heading at all
+            [self.insert("screen", "proc", "section", "Process"),
+             self.insert("proc", "s1", "process-step", "Owner speaks", ""),
+             self.insert("proc", "proc-h", "heading", "Process")],                      # heading after the step
+            [self.insert("arch-h", "under", "process-step", "Hidden", "")],             # a step under a heading
+            [self.insert("arch-h", "under", "text", "Hidden")],                         # anything under a heading
+            [{"op": "remove", "node_id": "arch-h", "value": ""}],                      # strip a drawn diagram's title
+        )
+        for ops in cases:
+            out = self.turn("conference", ops)
+            self.assertEqual([], out["events"], ops)
+            self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]), out["problems"])
+
+    def test_a_titled_section_may_still_lose_its_steps_then_its_heading(self):
+        out = self.turn("conference", [{"op": "remove", "node_id": "gw", "value": ""},
+                                       {"op": "remove", "node_id": "gw-bus", "value": ""},
+                                       {"op": "remove", "node_id": "arch-h", "value": ""}])
+        self.assertEqual([], out["problems"])
+
     def test_every_other_topic_is_gated_as_before(self):
         for topic in [t for t in TOPICS if t != "conference"] + [""]:
             scene = self.turn(topic, [self.insert("screen", "sc", "scene", "Banner", "800x400 bg=#101820")])
             self.assertEqual([], scene["problems"], topic)
             nested = self.turn(topic, [self.insert("gw", "inside", "text", "Inside a step")])
             self.assertEqual([], nested["problems"], topic)
+            untitled = self.turn(topic, [self.insert("screen", "proc", "section", "Process"),
+                                         self.insert("proc", "s1", "process-step", "Step", "")])
+            self.assertEqual([], untitled["problems"], topic)
+            under = self.turn(topic, [self.insert("arch-h", "under", "text", "Under a heading")])
+            self.assertEqual([], under["problems"], topic)
 
     def test_the_analyst_maps_the_conference_lines_own_data_model(self):
         from workers import analyst

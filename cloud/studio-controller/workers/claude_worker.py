@@ -469,6 +469,11 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
     topic_key = topic if isinstance(topic, str) else ""
     refused_kinds = TOPIC_REFUSED_KINDS.get(topic_key, ())
     leaf_kinds = TOPIC_LEAF_KINDS.get(topic_key, ())
+    titled_kinds = TOPIC_TITLED_KINDS.get(topic_key, ())
+
+    def untitled(holder):
+        first = (holder.get("children") or [None])[0]
+        return not (isinstance(first, dict) and first.get("kind") == "heading")
 
     def transaction(scope):
         tree = json.loads(json.dumps(artifact_root))
@@ -513,6 +518,8 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                     why = "a %s is not drawn in this session's topic" % nn["kind"]
                 elif index[nid].get("kind") in leaf_kinds:
                     why = "a %s holds nothing" % index[nid].get("kind")
+                elif nn["kind"] in titled_kinds and untitled(index[nid]):
+                    why = "a %s goes in a section whose first child is its heading" % nn["kind"]
                 elif index[nid].get("kind") == "entity":
                     why = "an entity holds nothing"
                 elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
@@ -532,6 +539,9 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
             elif kind == "remove":
                 if parents[nid] is None:
                     why = "would remove the root"
+                elif titled_kinds and index[nid].get("kind") == "heading" and any(
+                        c.get("kind") in titled_kinds for c in parents[nid].get("children") or []) and                         parents[nid]["children"][0].get("id") == nid:
+                    why = "would leave a diagram without its title; remove its steps first"
                 else:
                     gone = _subtree_ids(index[nid])
                     p = parents[nid]
@@ -745,7 +755,13 @@ TOPIC_GUIDANCE = {
 # leaf the page never draws children of (sfdc24-site prototype-canvas.js
 # CONTAINERS). Every other topic is gated exactly as before.
 TOPIC_REFUSED_KINDS = {"conference": ("scene", "entity")}
-TOPIC_LEAF_KINDS = {"conference": ("process-step", "edge")}
+TOPIC_LEAF_KINDS = {"conference": ("process-step", "edge", "heading")}
+# Kinds that are drawn only under a title: on the conference canvas a step or an
+# edge goes in a section whose FIRST child is a heading, because the page shows a
+# section's label only as an aria-label (Cursor on 9fa8589: a section of only
+# steps was accepted and would show no title; a heading is a leaf for the same
+# reason - the page draws no children of a heading, so steps under one vanish).
+TOPIC_TITLED_KINDS = {"conference": ("process-step", "edge")}
 
 
 def topic_guidance(state: dict | None) -> str:
