@@ -4,8 +4,10 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+# Every module agent_waker.py imports must be here too (tests/test_image_imports.py): the watcher
+# crashed on `import repo_context` from 19:27Z Oct 8, and no waker was started for seven hours.
 COPY scripts/bus.py scripts/agent_waker.py scripts/wa_board_outbox.py \
-     scripts/state_store.py /app/scripts/
+     scripts/state_store.py scripts/repo_context.py scripts/okf_land.py /app/scripts/
 COPY cloud/board-watcher/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1
