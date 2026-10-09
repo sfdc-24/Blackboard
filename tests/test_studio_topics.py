@@ -200,7 +200,8 @@ class ConferenceTopic(unittest.TestCase):
             described = cw._describe(dict(state, topic=topic), {"kind": "utterance", "text": "a"})
             self.assertNotIn("CONFERENCE LINE", described, topic)
             self.assertNotIn("CONFERENCE LINE", analyst._describe(dict(state, topic=topic), "a", ""), topic)
-            if isinstance(topic, str) and topic in TOPICS:   # every other topic's line is exactly as before
+            # every other topic's line is exactly as before (salesforce_build, new with its lane, has a brief)
+            if isinstance(topic, str) and topic in TOPICS and topic != "salesforce_build":
                 self.assertEqual("The visitor picked this topic before starting: %s.\n" % TOPICS[topic],
                                  topic_line({"topic": topic}))
 

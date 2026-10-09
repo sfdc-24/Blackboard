@@ -14,6 +14,8 @@ TOPICS = {
     "salesforce_admin": "Salesforce admin - automation, routing, approvals and access in a Salesforce org",
     "salesforce_data": "Salesforce data - the data model, reports, dashboards, imports and data quality",
     "conference": "Work on the conference line - architecture, data model, process and what to build next",
+    # Operator only, and only while STUDIO_SF_BUILD is on (app/main.py refuses it otherwise).
+    "salesforce_build": "Prototype it in Salesforce - options, a data model, then built live in the org",
     "other": "Something else - listen first, then shape it",
 }
 
@@ -28,6 +30,7 @@ TOPIC_AGENT = {
     "salesforce_admin": "claude",
     "salesforce_data": "claude",
     "conference": "claude",
+    "salesforce_build": "claude",
     "other": "claude",
 }
 FALLBACK = ("claude", "openai", "gemini", "meta")
@@ -89,6 +92,17 @@ CHARTER_FRAMES = {
         ("risks", "Risks", "what could break - latency, cost, abuse"),
         ("decisions", "Decisions", "what the owner decides now"),
         ("next", "Next steps", "who builds what next and how it will be tested"),
+    ),
+    # The Salesforce build lane's five phases (owner, 2026-10-09), in order, then what is next.
+    "salesforce_build": (
+        ("discuss", "Discuss", "the solution architecture: sources, capture, storage, roll-up and reporting"),
+        ("options", "Options", "two or three designs with their trade-offs, and the one recommended"),
+        ("prototype", "Prototype", "the data model and how it looks in Salesforce, before anything is built"),
+        ("build", "Build", "validated, confirmed and deployed to the session's scratch org"),
+        ("display", "Display", "read back from the scratch org, with sample records and links"),
+        ("test", "Test", "acceptance checks in the scratch org: records, links and roll-ups"),
+        ("promote", "Promote", "once tested and approved, the same package into the developer org"),
+        ("next", "Next steps", "what to iterate, build next or undo"),
     ),
 }
 DEFAULT_CHARTER_FRAME = (
@@ -167,6 +181,15 @@ TOPIC_BRIEFS = {
         "that line: its architecture, data model, process, risks, the decisions to take now and what "
         "to build next. Draw it, explain it, challenge it and defend it. Ground every claim in what the "
         "owner said or what is on the canvas, and mark anything else as an assumption."
+    ),
+    "salesforce_build": (
+        "In this session the owner prototypes a solution in Salesforce, live. Builds go into a scratch org "
+        "shaped like the owner's own OmniStudio developer org; the developer org changes only on promote, and "
+        "everything built is reversible (undo removes the last build). The work goes in order: discuss the "
+        "architecture, offer two or three design options with trade-offs, prototype the data model and how it "
+        "will look, build it in the scratch org only after the owner says yes, display what the org reports "
+        "back, test it there, and promote it to the developer org once it passes and the owner approves. "
+        "Never claim something is built until the org has confirmed it."
     ),
 }
 

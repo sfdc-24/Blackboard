@@ -80,6 +80,13 @@ class Settings:
     charter_enabled: bool = False
     # The build plan's prices (app/pricing.py): the owner's numbers or nothing.
     price_table: str = ""
+    # The Salesforce build lane (workers/sf_build.py): off unless switched on.
+    # Operator sessions only; pinned to the owner's OmniStudio developer org.
+    sf_build_enabled: bool = False
+    # Publish the lane's steps to Redis (workers/sf_sink.py) instead of a log line.
+    sf_redis_enabled: bool = False
+    # How long one request polls a Salesforce deploy before handing back "still running".
+    sf_deploy_wait_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -135,6 +142,9 @@ class Settings:
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
             charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
+            sf_build_enabled=_enabled(os.environ.get("STUDIO_SF_BUILD", "false")),
+            sf_redis_enabled=_enabled(os.environ.get("STUDIO_SF_REDIS", "false")),
+            sf_deploy_wait_seconds=float(os.environ.get("STUDIO_SF_DEPLOY_WAIT_SECONDS", "30")),
         )
 
     @property
@@ -148,6 +158,10 @@ class Settings:
         if self.charter_enabled and not self.moderation_enabled:
             # The charter's lines reach the page; they are moderated first.
             raise RuntimeError("STUDIO_ENABLE_CHARTER requires STUDIO_ENABLE_MODERATION")
+        if self.sf_redis_enabled and not self.sf_build_enabled:
+            raise RuntimeError("STUDIO_SF_REDIS publishes the build lane's steps; it needs STUDIO_SF_BUILD")
+        if type(self.sf_deploy_wait_seconds) not in (int, float) or not 5 <= self.sf_deploy_wait_seconds <= 40:
+            raise RuntimeError("STUDIO_SF_DEPLOY_WAIT_SECONDS must be 5 to 40 (under Cloud Run's 60)")
         from .pricing import parse_price_table
         from workers.topics import TOPICS, quote_lines
         try:

@@ -569,6 +569,60 @@ class StudioController:
                 if conflicts >= self.repository.attempts:
                     raise StateConflict("inspiration could not be recorded; the session kept changing")
 
+    LANE_EVENT_TYPES = frozenset({"artifact.patch", "model.updated", "question.asked", "question.answered",
+                                  "decision.batch", "progress", "confirm"})
+
+    def commit_lane(self, session_id: str, change) -> list[dict]:
+        """Commit one step of a side lane (the Salesforce build lane, workers/sf_build.py).
+
+        Same discipline as commit_analysis: the lane's slow work (a model call, a
+        Salesforce deploy) runs outside any lock; only this write waits while a
+        build holds the command lock, then one compare-and-set saves the state and
+        the events together. `change(state)` gets a fresh copy on every attempt
+        and returns event drafts ({"type", "payload"}), or None to write nothing;
+        whatever it raises is raised here and nothing is saved.
+        """
+        conflicts = 0
+        waits = 0
+        while True:
+            record = self.repository.load(session_id)
+            state = record.state
+            self._assert_live(state)
+            if state.get("active_command"):
+                waits += 1
+                if waits > self.analysis_wait_polls:
+                    raise StateConflict("the build lane could not record its step; a build is still running")
+                self.sleep(self.analysis_poll_seconds)
+                continue
+            drafts = change(state)
+            if drafts is None:
+                return []
+            events = []
+            for draft in drafts:
+                event_type, payload = draft.get("type"), draft.get("payload")
+                if event_type not in self.LANE_EVENT_TYPES or not isinstance(payload, dict):
+                    raise ValueError("lane event %r refused" % event_type)
+                if event_type == "artifact.patch":
+                    state["artifact"] = apply_ops(state["artifact"], payload.get("ops") or [])
+                    state["artifact_version"] += 1
+                elif event_type == "model.updated":
+                    state["model"] = copy.deepcopy(payload["model"])
+                elif event_type == "question.asked":
+                    state.setdefault("questions", []).append(copy.deepcopy(payload["question"]))
+                elif event_type == "decision.batch":
+                    questions = copy.deepcopy(payload.get("questions") or [])
+                    state.setdefault("questions", []).extend(questions)
+                    state.setdefault("batches", {})[payload["batch_id"]] = {
+                        "status": "open", "question_ids": [q["question_id"] for q in questions]}
+                events.append(self._event(state, event_type, payload))
+            try:
+                self.repository.save(session_id, state, record.token)
+                return copy.deepcopy(events)
+            except StateConflict:
+                conflicts += 1
+                if conflicts >= self.repository.attempts:
+                    raise StateConflict("the build lane could not record its step; the session kept changing")
+
     def stop_session(self, session_id: str, command: dict,
                      reason: str = "You ended this session.") -> dict:
         """Fail-safe stop that fences any late worker commit with CAS.
