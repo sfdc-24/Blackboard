@@ -34,6 +34,10 @@
 !/scripts/redis_dual.settings.json
 !/scripts/bus_reconcile.py
 !/scripts/bus_request.py
+!/scripts/redis_gov.py
+!/scripts/redis_acl.json
+!/scripts/git_requests.py
+!/scripts/milestones_sync.py
 !/scripts/roster_seed.py
 !/scripts/signature.py
 !/scripts/agent_roster.json

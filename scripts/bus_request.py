@@ -30,6 +30,22 @@ something that matters, it needs a real identity first, not a longer allowlist.
 
 The rest of the bounds exist so a forged flood is not free: a stale request is ignored, a repeat for
 a request id already answered does nothing, and the number honoured per run and per hour is capped.
+
+THE OWNER DECIDED, 2026-10-08 ~01:40Z - and this is where his decision lands against the paragraph above.
+That paragraph says a request that can do something that matters "needs a real identity first, not a
+longer allowlist". On 2026-10-07 that was the advice - mine and, independently, aya's - and he took
+it: "don't widen the stopgap". On 2026-10-08 he decided the trade differently, directly to
+claude-code-cli: "Everyone gets read write access, you control the Redis access rights and make
+actions auditable so there is governance."
+
+So `redis-op` exists, bounded by GOVERNANCE rather than by identity (scripts/redis_gov.py): every fleet
+agent may read everything and write the governed namespaces; one controller owns the access list
+(scripts/redis_acl.json); every operation, allowed or refused, is audited in gov:audit with the raw
+tag, the board row, and the old and new values; and the namespaces other things depend on - the board
+mirror the comparison gate checks, the roster, the chair's projection, the audit itself - are refused
+for writes in code, whatever the access list says. The identity is still a claim, and the audit says
+so by recording the raw tag beside the principal. Per-agent identity is the redis-tool-bridge (OIDC)
+for the agents that have a Google identity at all; until then, this is the path every agent can reach.
 """
 from __future__ import annotations
 
@@ -39,6 +55,8 @@ import json
 import re
 import secrets
 import time
+
+import redis_gov
 
 # The board's ten cells, as scripts/append.py writes them.
 ROW_ID, TS, SOURCE, TARGET, ACTION, PAYLOAD, CATEGORY, PROJECT, GIST, SUBGIST = range(10)
@@ -50,17 +68,27 @@ WORKER_TAG = "bus-reconciler"
 
 # Who MAY ask. Not who DID ask: see the module docstring. This bounds the claim, never the identity.
 SENDERS = ("aya", "chatgpt-codex-desktop", "claude-code-cli", "owner", "whatsapp")
-# What may be asked. One action, and nothing in the request selects a key, a command or a TTL.
-ACTIONS = ("redis-synthetic-probe",)
+# What may be asked. The probe selects no key, command or TTL. redis-op selects a key and an op -
+# inside scripts/redis_gov.py's grammar, its access list and its protected namespaces, every use
+# audited. It is listed TOGETHER with its branch in handle(), never without it: listed alone, a
+# redis-op request would fall into the synthetic-probe path and be answered "OK" for nothing done.
+ACTIONS = ("redis-synthetic-probe", "redis-op")
 
 # A request id is the only thing taken from the row, so its grammar is closed and narrow.
 _REQ_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$")
 _FIELD = re.compile(r"(?:^|\|)\s*%s\s*=\s*([^|]*)")
 
 STALE_MINUTES = 30          # the outbox that delivered 18 stale messages; a late diagnostic is noise
-MAX_PER_RUN = 3             # a forged flood is not free, so it is not unbounded either
+# Raised from 3 when every agent got redis-op: five-plus agents, a handful of ops each per run. It still
+# bounds EVERY board response, refusals included - a forged flood is not free.
+MAX_PER_RUN = 25
 PROBE_NAMESPACE = "v1:synth:probe:"
 PROBE_TTL_SECONDS = 10
+# redis-op run markers (handle()). Under gov:, which redis_gov refuses to every agent, so a request
+# cannot pre-claim or clear another's. Kept well past the 120-minute scan window and the 30-minute
+# staleness bound, so a request is unrunnable by staleness long before its marker can expire.
+DONE_PREFIX = "gov:req:"
+DONE_TTL_SECONDS = 6 * 3600
 
 
 def field(payload: str, name: str) -> str:
@@ -100,7 +128,41 @@ def parse_request(row):
         "action": (field(payload, "do") or "").strip().lower(),
         "row_id": str(row[ROW_ID] or "").strip(),
         "at": read_ts(row[TS]),
+        # redis-op only. Taken verbatim and judged by scripts/redis_gov.py, never used here.
+        "op": field(payload, "op"),
+        "key": field(payload, "key"),
+        "field": field(payload, "field"),
+        "val": field(payload, "val"),
+        "enc": field(payload, "enc"),
+        "count": field(payload, "count"),
+        "repeated": repeated_keys(payload),
+        # Where the row came from: "git" only for a row git_requests built from an authenticated
+        # comment (its type says so; no cell can), "board" for everything else.
+        "channel": getattr(row, "channel", "board"),
     }
+
+
+def repeated_keys(payload) -> list:
+    """Keys written more than once in a payload. A redis-op naming `op` or `key` twice is AMBIGUOUS:
+    field() reads the first, another reader might read the last, and the two disagree about what was
+    asked (aya on 4d13e97). Such a request is refused, never resolved first-value-wins."""
+    seen, out = set(), []
+    for part in str(payload or "").split("|"):
+        if "=" not in part:
+            continue
+        name = part.split("=", 1)[0].strip().lower()
+        if name in seen and name not in out:
+            out.append(name)
+        seen.add(name)
+    return out
+
+
+def recognised(req, acl) -> bool:
+    """A sender this worker answers at all. For redis-op that is the ACCESS LIST, which the controller
+    owns; for the probe it is SENDERS, unchanged."""
+    if req.get("action") == "redis-op":
+        return bool(redis_gov.principal(acl, req.get("claimed_sender")))
+    return req.get("claimed_sender") in SENDERS
 
 
 def safe(value) -> str:
@@ -154,12 +216,25 @@ def answered(rows) -> set:
     return done
 
 
-def refusals(req, now, already) -> list:
+RESERVED_REFUSAL = "a GH-/gh: id is reserved for requests read from GitHub; a board row may not use it"
+_GIT_SHAPED = re.compile(r"^\s*(?:gh[-:]|\S*\s+gh[-:])", re.IGNORECASE)
+
+
+def run_marker(req) -> str:
+    """The Redis key that claims a request's one run. A git request's marker is in its own space, so
+    nothing a board row names can reach it; a board request's key is unchanged from 39ebd38, so the
+    markers already set today still hold."""
+    name = req["req_id"] if req.get("channel", "board") != "git" else "git " + req["req_id"]
+    return DONE_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+
+
+def refusals(req, now, already, acl=None) -> list:
     """Every reason not to act on this request. Empty means act."""
     out = []
+    acl = acl if acl is not None else redis_gov.load_acl()
     if not req["req_id"] or not _REQ_ID.match(req["req_id"]):
         out.append("the request id is missing or not an id")
-    if req["claimed_sender"] not in SENDERS:
+    if not recognised(req, acl):
         # Named honestly: the sender is a CLAIM. This refuses an unrecognised claim, which is worth
         # doing and is not the same as verifying anybody.
         #
@@ -176,8 +251,17 @@ def refusals(req, now, already) -> list:
         out.append("the request is older than %d minutes" % STALE_MINUTES)
     elif req["at"] > now + datetime.timedelta(minutes=5):
         out.append("the request is stamped in the future")
-    if req["req_id"] in already:
+    if req.get("channel", "board") != "git" and _GIT_SHAPED.match(
+            "%s %s" % (req["req_id"] or "", req.get("row_id") or "")):
+        # Cursor on 39ebd38: a board row naming a git request's id spent that request's run.
+        out.append(RESERVED_REFUSAL)
+    # A git request's at-most-once is its Redis run marker, never the board: a RESULT row naming its id
+    # is a claim anyone can append (Cursor on 237562f), so for git the board only silences a repeat notice.
+    if req["req_id"] in already and req.get("channel", "board") != "git":
         out.append("already answered: a RESULT row for this request id is on the board")
+    if req.get("action") == "redis-op" and req.get("repeated"):
+        out.append("ambiguous: the field(s) %s appear more than once"
+                   % ", ".join(safe(k)[:20] for k in req["repeated"][:5]))
     return out
 
 
@@ -216,7 +300,13 @@ def reply_to(req) -> str:
     address of our own row, which is both a malformed row and a sender choosing where our answer
     goes."""
     claimed = (req.get("claimed_sender") or "").strip().lower()
-    return claimed if claimed in SENDERS else "ALL"
+    if claimed in SENDERS:
+        return claimed
+    # A redis-op sender the access list knows is answered under its own tag - which the grammar of
+    # an ACL key already guarantees is pipe-free and short. Anything else is "ALL", as before.
+    if req.get("action") == "redis-op" and redis_gov.principal(redis_gov.load_acl(), claimed):
+        return claimed if re.match(r"^[a-z0-9][a-z0-9._-]{0,63}$", claimed) else "ALL"
+    return "ALL"
 
 
 def row_for(kind, req, text, gist) -> dict:
@@ -259,10 +349,13 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
     # write and one read-back each - max_per_run=3 and all of them answered. The cap exists because
     # a forged flood costs him money, and a cap that only counts the expensive path is not a cap.
     budget = max(0, int(max_per_run))
+    # ONE access list per run, so every decision in a run is made under the same rules - and its
+    # digest goes into every audit entry those decisions write.
+    acl = redis_gov.load_acl()
     out = {"seen": len(requests), "answered": [], "refused": [], "capped": 0, "errors": [],
-           "receipts_reused": []}
+           "receipts_reused": [], "acl": acl.get("digest", "")}
     for req in requests:
-        why = refusals(req, now, already)
+        why = refusals(req, now, already, acl)
         if why:
             out["refused"].append({"req_id": req["req_id"], "why": why,
                                    # The unrecognised tag is recorded HERE, where nothing publishes it.
@@ -271,9 +364,12 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # claimed sender is one we answer at all, and there is budget left. An unrecognised
             # sender gets diagnostics and no row: answering it would let anyone who can append make
             # us write, which is the flood with our name on it.
+            # A reserved-id refusal is NEVER written back (Cursor on 237562f): a RESULT answering a GH-
+            # id would be a board row speaking for the authenticated request. Diagnostics only.
             publishable = (append and _REQ_ID.match(req["req_id"] or "")
                            and req["req_id"] not in already
-                           and req["claimed_sender"] in SENDERS)
+                           and RESERVED_REFUSAL not in why
+                           and recognised(req, acl))
             if publishable and budget <= 0:
                 out["capped"] += 1
                 continue
@@ -287,6 +383,68 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             out["capped"] += 1
             continue
         budget -= 1
+
+        if req["action"] == "redis-op":
+            # ONE ROW, NOT TWO. The probe writes a RECEIPT then a RESULT because it takes a moment;
+            # a governed op is one round trip, and every row addressed to an agent can wake it (a row
+            # is money he pays). The op is in gov:audit whether or not this row lands.
+            try:
+                count = int(req.get("count") or 10)
+            except ValueError:
+                count = 10
+            started = time.time()
+            # AT MOST ONCE, DECIDED IN REDIS. The board's RESULT rows are not enough: if the op ran
+            # and its result row was lost, or a second run read a snapshot taken before the first
+            # run's row landed, "no RESULT on the board" re-applied the write (aya on 4d13e97). So
+            # the run is CLAIMED first with SET NX on a marker under gov:, which no agent can write.
+            # Claimed before the op on purpose: a crash between the claim and the op loses that op
+            # and says so - it never applies one twice.
+            marker = run_marker(req)
+            try:
+                claimed = conn.set(marker, safe(req["row_id"])[:120] or "-", nx=True, ex=DONE_TTL_SECONDS)
+            except Exception as error:
+                out["errors"].append(req["req_id"])
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["could not claim the run marker (%s); not run"
+                                               % type(error).__name__]})
+                continue
+            if not claimed:
+                noticed = req["req_id"] in already
+                already.add(req["req_id"])
+                out["refused"].append({"req_id": req["req_id"],
+                                       "why": ["already claimed: Redis holds this request's run marker"]})
+                if append and not noticed:
+                    # CLAIMED, NOT "RAN" (aya on ce941b6). The marker is set BEFORE the op, so a worker
+                    # that died between the two left a marker and no operation. What is known is the
+                    # claim; whether the op happened is only in gov:audit, and this row says so.
+                    append(row_for(RESULT_ACTION, req,
+                                   "NOT RUN AGAIN. An earlier run CLAIMED this request (Redis holds its "
+                                   "run marker). Whether that run completed is UNKNOWN here: a gov:audit "
+                                   "entry naming this request id means it ran; none means it did not.",
+                                   "Already claimed: " + req["req_id"][:60]))
+                continue
+            result = redis_gov.execute(conn, acl, req["claimed_sender"],
+                                       "%s/%s" % (req["req_id"], req["row_id"]),
+                                       req.get("op"), req.get("key"), field=req.get("field") or "",
+                                       raw_value=req.get("val") or "", enc=req.get("enc") or "",
+                                       count=count, now=now)
+            if append:
+                append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
+                               ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
+                                              req.get("op") or "?", req.get("key") or "?"))[:100]))
+            already.add(req["req_id"])
+            status = ("OK" if result.get("ok")
+                      else "REFUSED" if "refused" in result else "ERROR")
+            if status == "ERROR":
+                out["errors"].append(req["req_id"])
+            # latency_ms is part of the contract, not decoration: cloud/bus-reconciler/serve_requests.py
+            # logs item["latency_ms"] for every answer. The first live run, bus-requests-hl95p at
+            # 02:25Z, did all four test ops correctly, posted all four results - and then exited 1
+            # on a KeyError here, so Cloud Run recorded a FAILED execution over a run that had worked.
+            out["answered"].append({"req_id": req["req_id"], "status": status,
+                                    "op": req.get("op"), "key": req.get("key"),
+                                    "latency_ms": int((time.time() - started) * 1000)})
+            continue
 
         if append:
             # REUSE AN EXISTING RECEIPT RATHER THAN REPLAY IT. A receipt that landed while the
@@ -326,6 +484,24 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
         out["answered"].append({"req_id": req["req_id"], "status": receipt["status"],
                                 "latency_ms": receipt["latency_ms"]})
     return out
+
+
+HEARTBEAT_KEY = "gov:worker:heartbeat"
+HEARTBEAT_TTL_SECONDS = 3600
+
+
+def heartbeat(conn, state, now=None, **fields) -> bool:
+    """PY-02 (Grok's poka-yoke audit, 2026-10-08): where the worker says when it last ran, so a poster
+    can check before sending instead of posting into a worker that is not coming. One JSON string at
+    gov:worker:heartbeat - under gov:, which no agent may write, and which every agent may READ with
+    a redis-op get. It expires an hour after the last run: an absent key means "no run in the last
+    hour", never "running". Never raises: a heartbeat must not cost the run it reports."""
+    value = dict(fields, state=state, at=stamp(now))
+    try:
+        conn.set(HEARTBEAT_KEY, json.dumps(value, sort_keys=True), ex=HEARTBEAT_TTL_SECONDS)
+        return True
+    except Exception:                                                   # noqa: BLE001
+        return False
 
 
 def summary(out) -> str:

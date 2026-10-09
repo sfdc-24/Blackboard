@@ -36,6 +36,15 @@ COPY cloud/bus-reconciler/probe.py /app/probe.py
 # ONE board-write path on this fleet that sends a single transport attempt and then reads the
 # row back by Row_ID; a second implementation in here would be a second thing to get wrong.
 COPY scripts/bus_request.py /app/bus_request.py
+# Governed Redis access (redis-op): the module that decides, and the access list it decides by.
+# The ACL is baked in, so changing anyone's rights is a reviewed commit and a rebuild - and every
+# audit entry names the ACL digest it was decided under.
+COPY scripts/redis_gov.py /app/redis_gov.py
+COPY scripts/redis_acl.json /app/redis_acl.json
+# The git channel: Redis requests from GitHub bot accounts the access list binds by numeric id (Cursor).
+COPY scripts/git_requests.py /app/git_requests.py
+# The scheduled rewrite of the live milestone chart from its durable repo copy (milestones-sync job).
+COPY scripts/milestones_sync.py /app/milestones_sync.py
 COPY scripts/append.py /app/append.py
 # append.py imports signature: a row must name the INSTANCE that wrote it and how it got here,
 # checked at the writer. WITHOUT THIS LINE THE IMAGE DIES ON IMPORT - the request worker's only

@@ -120,6 +120,14 @@ gcloud run jobs create bus-requests --project=sfdc24 --region=us-central1 \
   --network default --subnet default --vpc-egress private-ranges-only \
   --max-retries 0 --task-timeout 5m --cpu 1 --memory 512Mi
 
+# 2b. LIVE MODE for a meeting (serve_requests.py loops while LOOP_UNTIL is ahead). The 5m timeout
+#     above is for ONE pass; Cloud Run kills an execution at its task timeout whatever the loop
+#     intends, so a live run MUST pass a timeout that covers LOOP_UNTIL (Cursor on 39ebd38). This is
+#     the exact command run for the 2026-10-08 10 PM ET call (execution bus-requests-rk5zr):
+gcloud run jobs execute bus-requests --region=us-central1 --project=sfdc24   --update-env-vars=LOOP_UNTIL=2026-10-09T03:30:00Z,LOOP_INTERVAL=10,LOOP_MAX_MINUTES=340   --task-timeout=6h --async
+#     Without GITHUB_READ_TOKEN the git channel is read every 144 s (two repos under GitHub's 60
+#     unauthenticated calls an hour); with it, once a minute.
+
 # 3. READ BACK before trusting any of it. Three of this job's four defects were found this way.
 gcloud run jobs describe bus-requests --project=sfdc24 --region=us-central1 --format=json
 #    Check: no env value rewritten into a C:/Program Files/... path; both secret mounts present;
