@@ -1,0 +1,6 @@
+# Live-call fields stay out of the initial deploy. Copy one into force-app first.
+# See live-change/README.md.
+live-change/
+
+# Sample records are loaded with sf data import tree, not as metadata.
+data/
