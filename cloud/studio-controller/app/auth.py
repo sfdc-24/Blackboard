@@ -106,9 +106,13 @@ class AuthService:
         wait_until: Callable[[float], None] = _wait_until,
         public_visitors: bool = False,
         visitor_daily_cap: int = 100,
+        pilot_emails: Iterable[str] = (),
     ):
         allowed = frozenset(allowed_emails)
-        for email in allowed:
+        # Invited pilots (STUDIO_PILOT): a second exact allowlist, empty unless
+        # the pilot is on. An address on both lists is an operator.
+        pilots = frozenset(pilot_emails) - allowed
+        for email in allowed | pilots:
             if (
                 not isinstance(email, str)
                 or email != email.lower()
@@ -128,6 +132,7 @@ class AuthService:
 
         self.store = store
         self.allowed_emails = allowed
+        self.pilot_emails = pilots
         self.secret = secret
         self.sender = sender
         self.clock = clock
@@ -274,10 +279,11 @@ class AuthService:
                          client_key: str, client_ip: str = "") -> None:
         clean = isinstance(email, str) and len(email) <= 320 and email == email.lower()
         operator = clean and email in self.allowed_emails
-        visitor = (clean and not operator and self.public_visitors
+        pilot = clean and not operator and email in self.pilot_emails
+        visitor = (clean and not operator and not pilot and self.public_visitors
                    and len(email) <= 254 and bool(_VISITOR_EMAIL_RE.fullmatch(email)))
         eligible_client = isinstance(client_key, str) and 0 < len(client_key) <= 512
-        if not (operator or visitor) or not eligible_client:
+        if not (operator or pilot or visitor) or not eligible_client:
             return
 
         now = int(self.clock())
@@ -299,7 +305,7 @@ class AuthService:
             "expires_at": now + OTP_TTL_SECONDS,
             "attempts": 0,
             "used_at": None,
-            "role": "operator" if operator else "visitor",
+            "role": "operator" if operator else "pilot" if pilot else "visitor",
         }
         try:
             self.store.save(self._challenge_name(challenge_id), record, None)
@@ -358,7 +364,7 @@ class AuthService:
                 continue
             if matches:
                 # A challenge written before roles existed was an operator's.
-                role = state.get("role") if state.get("role") in ("operator", "visitor") else "operator"
+                role = state.get("role") if state.get("role") in ("operator", "visitor", "pilot") else "operator"
                 return {"verified": True, "subject_hash": stored_subject, "role": role}
             return failure
         return failure

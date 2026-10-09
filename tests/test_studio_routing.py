@@ -86,7 +86,9 @@ class Routing(unittest.TestCase):
         return client.post("/v1/session/%s/talk" % sid, headers=headers, json=body)
 
     def test_without_an_agent_the_topic_picks_it_and_the_speaker_says_which(self):
-        for topic, agent in list(TOPIC_AGENT.items()) + [("", "claude")]:
+        # A server-only topic (the pilot's) is never sent by a page; its route is in test_studio_pilot.
+        from workers.topics import SERVER_TOPICS
+        for topic, agent in [(t, a) for t, a in TOPIC_AGENT.items() if t not in SERVER_TOPICS] + [("", "claude")]:
             with self.subTest(topic=topic):
                 with TestClient(self.make_with(RecordingTalk(agents=ALL))) as client:
                     sid, headers = self.topic_session(client, topic)

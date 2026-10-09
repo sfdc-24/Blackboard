@@ -25,6 +25,7 @@ except ImportError:
     from state_store import Conflict, open_store
 
 from . import governance
+from . import pilot
 from .core import CommandError, StudioController
 from .auth import AuthService
 from .leads import LeadBook, LeadCapExceeded
@@ -89,7 +90,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None, charter=None) -> FastAPI:
+               advisor=None, charter=None, pilot_feedback_sink=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
@@ -238,6 +239,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 ended = await end_voice_call(session_id, "expired")
             except Exception:
                 ended = False
+            if ended and settings.pilot_enabled:
+                await emit_pilot_feedback(session_id)    # a pilot's call ran to its time limit
             if ended:
                 summary["completed"] += 1
             else:
@@ -371,6 +374,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     auth_service = AuthService(
         store, settings.operator_emails, settings.session_secret, send_auth_email, clock=clock,
         public_visitors=settings.public_visitors, visitor_daily_cap=settings.visitor_codes_daily_cap,
+        pilot_emails=settings.pilot_emails if settings.pilot_enabled else (),
     )
     app.state.auth_service = auth_service
     lead_book = LeadBook(store, clock=clock)
@@ -436,14 +440,21 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return ""
 
     def require_signed_in(request: Request) -> tuple[dict, str]:
-        """An operator, or - only while public visitors are on - a verified visitor."""
+        """An operator; while the pilot is on, an invited pilot; and - only while
+        public visitors are on - a verified visitor."""
         auth = request.headers.get("authorization") or ""
         token = auth[7:] if auth.lower().startswith("bearer ") else ""
         try:
             return verify_token(token, settings.session_secret, now=clock(), scope="operator"), "operator"
         except InvalidToken as operator_error:
-            if not settings.public_visitors:
-                raise HTTPException(401, str(operator_error)) from operator_error
+            refused = operator_error
+        if settings.pilot_enabled:
+            try:
+                return verify_token(token, settings.session_secret, now=clock(), scope="pilot"), "pilot"
+            except InvalidToken:
+                pass
+        if not settings.public_visitors:
+            raise HTTPException(401, str(refused)) from refused
         try:
             return verify_token(token, settings.session_secret, now=clock(), scope="visitor"), "visitor"
         except InvalidToken as exc:
@@ -908,6 +919,93 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                 return candidate
         return ""
 
+    # THE PILOT (STUDIO_PILOT, app/pilot.py). An invited guest's five-minute
+    # check: its no-PII feedback record goes to a sink when the call ends (the
+    # recap, the rating, or the voice call's time limit), and the owner gets a
+    # copy of the guest's summary. Off, none of this runs.
+    feedback_sink = pilot_feedback_sink if pilot_feedback_sink is not None else pilot.log_sink
+
+    def feedback_key(record) -> tuple:
+        record = record or {}
+        return (record.get("rating"), tuple(record.get("frames_covered") or ()))
+
+    async def emit_pilot_feedback(session_id: str) -> None:
+        """Keep the record on the session and hand it to the sink - again only
+        when what it says (the rating, the frames covered) changed. Never raises."""
+        if not settings.pilot_enabled:
+            return
+        out: dict = {}
+        now = int(clock())
+
+        def mark(current):
+            out.clear()                           # a compare-and-set retry starts over
+            if not pilot.is_pilot(current):
+                return None
+            record = pilot.feedback_record(current, now)
+            prior = current.get("pilot_feedback")
+            if prior and feedback_key(prior) == feedback_key(record):
+                return None
+            current["pilot_feedback"] = record
+            out["record"] = record
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, mark)
+        except Exception as exc:
+            governance.log_event("studio.pilot_feedback_failed", session_id=session_id,
+                                 reason=type(exc).__name__)
+            return
+        if not out:
+            return
+        try:
+            await asyncio.to_thread(feedback_sink, dict(out["record"]))
+        except Exception as exc:                  # the call is over; the record stays on the session
+            governance.log_event("studio.pilot_feedback_sink_failed", session_id=session_id,
+                                 reason=type(exc).__name__)
+
+    async def send_pilot_copy(session_id: str, pdf: bytes) -> None:
+        """The pilot's summary PDF to the owner (STUDIO_PILOT_NOTIFY): one
+        attempt per session, ever, reserved before sending like the summary
+        itself. Its outcome never changes the guest's answer and is logged
+        without any address."""
+        reservation = secrets.token_hex(8)
+        claimed: dict = {}
+
+        def reserve(current):
+            claimed.clear()                       # a compare-and-set retry starts over
+            if (current.get("pilot_copy") or {}).get("status"):
+                return None                       # already tried: never a second copy
+            current["pilot_copy"] = {"status": "sending", "at": int(clock()), "reservation": reservation}
+            claimed["ok"] = True
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, reserve)
+        except Exception:
+            return
+        if not claimed:
+            return
+        try:
+            await asyncio.to_thread(send_summary_email, settings.pilot_notify, pdf)
+            outcome = "sent"
+        except SummaryNotSent:
+            outcome = "failed"
+        except Exception:
+            outcome = "unconfirmed"
+
+        def settle_copy(current):
+            if (current.get("pilot_copy") or {}).get("reservation") != reservation:
+                return None
+            current["pilot_copy"] = {"status": outcome, "at": int(clock())}
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, settle_copy)
+        except Exception:
+            pass
+        governance.log_event("studio.pilot_copy", session_id=session_id, outcome=outcome,
+                             severity="INFO" if outcome == "sent" else "WARNING")
+
     @app.post("/v1/auth/start")
     async def auth_start(request: Request):
         require_origin(request)
@@ -937,11 +1035,21 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         # but public visitors are no longer admitted.
         if visitor and not settings.public_visitors:
             raise HTTPException(401, "verification code was not accepted")
+        invited = verified.get("role") == "pilot"
+        # The same for a pilot: the pilot switched off, or the address taken
+        # off the invite list, after the code was sent.
+        if invited and not (settings.pilot_enabled and body.get("email") in settings.pilot_emails):
+            raise HTTPException(401, "verification code was not accepted")
         if settings.summary_email_enabled:
             try:
                 await asyncio.to_thread(record_contact, verified["subject_hash"], body["email"])
             except Exception:
                 pass  # sign-in never fails on this; the summary falls back to the allowlist
+        if invited:
+            # A pilot is never a lead and never an operator: its own scope.
+            expires_at = int(clock()) + settings.visitor_token_seconds
+            token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="pilot")
+            return {"token": token, "expires_at": expires_at, "scope": "pilot"}
         if visitor:
             expires_at = int(clock()) + settings.visitor_token_seconds
             token = mint_token(verified["subject_hash"], expires_at, settings.session_secret, scope="visitor")
@@ -960,13 +1068,17 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         body = await json_object(request, "session")
         if set(body) - {"title", "creation_id", "start", "topic"}:
             raise HTTPException(400, "session body has unknown fields")
-        from workers.topics import TOPICS
+        from workers.topics import SERVER_TOPICS, TOPICS
+        pickable = [t for t in TOPICS if t not in SERVER_TOPICS]
+        invited = role == "pilot"
         topic = body.get("topic")
+        if invited:
+            topic = pilot.ROLE                     # a pilot's session is the pilot check, whatever was sent
         if topic is None:                          # omitted or null: no topic
             topic = ""
         # false, 0, [] and {} are not "no topic": every non-string is a 400.
-        if not isinstance(topic, str) or (topic and topic not in TOPICS):
-            raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(TOPICS)))
+        if not invited and (not isinstance(topic, str) or (topic and topic not in pickable)):
+            raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(pickable)))
         start = body.get("start") or "template"
         if start not in ("template", "blank"):
             raise HTTPException(400, "start must be template or blank")
@@ -980,12 +1092,19 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if visitor and await asyncio.to_thread(
                 lead_book.remaining_today, operator["sid"], settings.visitor_sessions_per_day) <= 0:
             raise HTTPException(429, "the conversations for today are used up")
+        # A pilot is admitted like a visitor (below the operator's reserve) for
+        # a shorter session, but is never a lead.
+        max_seconds = settings.max_session_seconds
+        extra = {}
+        if invited:
+            max_seconds = min(settings.max_session_seconds, settings.pilot_seconds)
+            extra = {"pilot": True, "max_seconds": max_seconds}
         try:
             state, admitted = await asyncio.to_thread(
-                controller.create_session, title[:600], operator["sid"], creation_id, start, visitor,
-                settings.daily_session_cap - settings.operator_reserved_sessions if visitor else None,
+                controller.create_session, title[:600], operator["sid"], creation_id, start, visitor or invited,
+                settings.daily_session_cap - settings.operator_reserved_sessions if visitor or invited else None,
                 start == "blank" and analyst_ready(),
-                topic,
+                topic, **extra,
             )
         except CommandError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
@@ -1004,7 +1123,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             "generation": state["generation"],
             "artifact_version": state["artifact_version"],
             "expires_at": state["expires_at"],
-            "max_session_seconds": settings.max_session_seconds,
+            "max_session_seconds": max_seconds,
             "daily_admission_number": admitted,
             "token": token,
             "events_url": "/v1/session/%s/events" % state["session_id"],
@@ -1287,7 +1406,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(503, "the recap is unavailable right now") from exc
         if not text:
             raise HTTPException(503, "the recap came back empty")
-        if state.get("visitor_subject"):
+        if state.get("visitor_subject") and not pilot.is_pilot(state):
             # The recap is what the visitor was told they would get back: keep it with their lead.
             await asyncio.to_thread(lead_book.record_recap, state["visitor_subject"], session_id, text)
         kept_at = int(clock())
@@ -1300,6 +1419,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             await asyncio.to_thread(update_state, session_id, keep)
         except (StateConflict, SessionNotFound):
             pass  # the recap is still spoken; only the summary PDF goes without it
+        if pilot.is_pilot(state):
+            await emit_pilot_feedback(session_id)    # the host closed a pilot's call
         return {"recap": text, "speaker": agent}
 
     @app.get("/v1/leads")
@@ -1333,11 +1454,13 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return current
 
         try:
-            await asyncio.to_thread(update_state, session_id, rate)
+            rated = await asyncio.to_thread(update_state, session_id, rate)
         except SessionNotFound as exc:
             raise HTTPException(404, "session not found") from exc
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
+        if pilot.is_pilot(rated):
+            await emit_pilot_feedback(session_id)    # the guest's 1-5 arrived
         return {"ok": True}
 
     @app.post("/v1/session/{session_id}/summary")
@@ -1456,6 +1579,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return current
 
         await settle(sent)
+        if pilot.is_pilot(state) and settings.pilot_enabled and settings.pilot_notify:
+            await send_pilot_copy(session_id, pdf)
         return {"sent": True, "to": masked}
 
     @app.post("/v1/session/{session_id}/analyze")
