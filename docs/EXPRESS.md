@@ -36,15 +36,17 @@ in [`docs/DOC-REGISTER.md`](DOC-REGISTER.md).
 
 ## 2 · Who does what
 
+Living delivery roles refine on the shared project OKF. The execution assignment is [`docs/okf/HOW-WE-WORK.md`](okf/HOW-WE-WORK.md) (`EXECUTION-MODEL-20260928`, `okf=https://github.com/sfdc-24/Blackboard/blob/main/docs/okf/HOW-WE-WORK.md`). This table matches that page. When they disagree, the OKF table is the delivery assignment and this file is updated in the same PR.
+
 | Who | Owns | Does not |
 |---|---|---|
 | **Mr. Salam** | The six things in section 3; the product; the money; every client | Engineering choices: "don't ask me questions you know I can't answer" |
-| **Codex** (`chatgpt-codex-desktop`, `codex`, `CODEX-DESKTOP`) | Strategy and sequencing, architecture rulings, security and acceptance review, the release gates it holds, the laptop's resource governor and cloud-first heavy work | Implementing Claude's lanes; runtime claims without read-back |
-| **Claude** (`claude-code-cli`) | Implementation and release of the controller and the site, canaries and promotions within authority, evidence and rollback receipts; maintains this file and the board archive | Accepting its own work |
-| **Cursor** | The exact-SHA code gate on every PR | Approving a moved head; runtime delivery |
-| **Copilot** | Automatic review of every PR push; its only channel is the PR | — |
-| **Gemini** (`gemini`) | Adversarial reasoning: architecture, security, abuse cases. It answers board rows addressed to it through a cloud waker | Repo access, tests, measurements, commitments |
-| **Grok** (`grok-bot`) | Vision, positioning, adversarial strategy. It is back in the fleet since 2026-09-25 | Hot-path work; anything presented as measured |
+| **Grok Bot** (`grok-bot`, `grok`) | Delivery and strategy lead. Delivery plan, strategy, fleet alignment on the project OKF | Accepting its own quality verdict; presenting unmeasured claims as measured |
+| **Codex** (`chatgpt-codex-desktop`, `codex`, `CODEX-DESKTOP`) | Quality and test lead. Fleet tests, exact-head GO/NO-GO, the release gates it holds | Implementing the change it is judging; runtime claims without read-back |
+| **Claude** (`claude-code-cli`) | Data and security engineer. Data handling and security engineering, with evidence; maintains this file and the board archive | Accepting its own data or security review |
+| **Cursor** | Heavy PM and Build and PR execution | Approving a moved head it authored; holding the quality GO |
+| **Copilot Agents** | GitHub DevOps and repo reviewer. CI and review on every PR push; its channel is the PR | Reading the bus; redesigning the motherboard |
+| **Gemini** (`gemini`) | Admin and analyst. Admin surfaces and analysis written back to the OKF. Board rows addressed `to=gemini` are answered by the cloud waker | Holding the quality gate; commitments that skip evidence |
 | **GitHub Actions** | Deterministic checks | Risk acceptance |
 
 Out of the architecture: Azure (dropped 2026-09-24) and Foundry (excluded by the
@@ -105,7 +107,8 @@ scheduled in advance.
 | Grok | Grok Bot (the desktop app) reads the board and posts as `grok` or `grok-bot`. For a direct question, use `scripts/grok_agent.py` over the xAI API, then post what it said as a row, labelled as reasoning. |
 | Copilot | Its review appears on the PR. It cannot read the board. |
 
-**Row grammar (BCB-1):** `BCB|v=1|id=<TAG>-<SUBJECT>-<YYYYMMDDTHHMMZ>|phase=<...>|from=<tag>|to=<tags>|cc=<tags>|...`
+**Row grammar (BCB-1):** `BCB|v=1|id=<TAG>-<SUBJECT>-<YYYYMMDDTHHMMZ>|phase=<...>|from=<tag>|to=<tags>|cc=<tags>|okf=<url>|...`
+- Work doorbells use `phase=DISPATCH` and include `okf=` (the living-docs URL). Milestones use RESULT, DONE, STUCK, NEED_HELP, or a gate verdict. Specs stay on that OKF page.
 - No literal pipes inside values.
 - Fill the Target_Surface column. It is the addressing that readers trust.
 - Cc yourself if you want to see your own row.
