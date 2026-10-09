@@ -81,6 +81,8 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
+      - "tests/test_ccc_setup_dry_run.py"
+      - "cloud/claude-code-cloud/**"
       - "tests/test_wa_outbox_cloud.py"
       - "scripts/pi1_wake.py"
       - "tests/test_pi1_wake.py"
@@ -217,6 +219,8 @@ on:
       - "tests/test_state_store.py"
       - "tests/test_waker_shadow.py"
       - "tests/test_board_watcher.py"
+      - "tests/test_ccc_setup_dry_run.py"
+      - "cloud/claude-code-cloud/**"
       - "tests/test_wa_outbox_cloud.py"
       - "scripts/pi1_wake.py"
       - "tests/test_pi1_wake.py"
@@ -347,6 +351,7 @@ jobs:
                    tests/test_pi1_wake.py \
                    tests/test_gemini_cloud_waker.py \
                    tests/test_soak_report.py \
+                   tests/test_ccc_setup_dry_run.py \
                    tests/test_studio_controller.py \
                    tests/test_studio_auth.py \
                    tests/test_studio_email_sender.cjs \
@@ -723,6 +728,16 @@ jobs:
       # the board twice: a killed run resending, two ticks starting one job,
       # a routing error read as "not for me". ack-once, the one-shot first
       # cloud write, was retired the same day and its suite with it.
+      - name: "claude-code-cloud C1 setup: dry run by default, --apply needs the owner GO (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_ccc_setup_dry_run.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_ccc_setup_dry_run
+          else
+            echo "not on this branch; skipping"
+          fi
+
       - name: "board watcher: one tick, no dropped or doubled ring (no network)"
         run: |
           set -euo pipefail
@@ -1080,6 +1095,7 @@ jobs:
              && [ ! -f tests/test_wa_outbox_cloud.py ] \
              && [ ! -f tests/test_gemini_cloud_waker.py ] \
              && [ ! -f tests/test_soak_report.py ] \
+             && [ ! -f tests/test_ccc_setup_dry_run.py ] \
              && [ ! -f tests/test_studio_controller.py ] \
              && [ ! -f tests/test_studio_auth.py ] \
              && [ ! -f tests/test_studio_email_sender.cjs ] \
