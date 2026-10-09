@@ -168,8 +168,14 @@ class ConferenceTopic(unittest.TestCase):
 
     def test_the_architect_draws_diagrams_with_the_kinds_the_page_renders(self):
         guidance = cw.topic_guidance({"topic": "conference"})
-        for needed in ('"process-step"', '"edge"', "model.updated", "lookup", "master-detail", "many-to-many"):
+        for needed in ('"heading"', '"process-step"', '"edge"', "model.updated", "lookup", "master-detail",
+                       "many-to-many"):
             self.assertIn(needed, guidance)
+        # A section's label is only an aria-label on the page; the visible title
+        # of a diagram is a heading (h4), so each diagram starts with one.
+        self.assertIn("FIRST child is a \"heading\" node whose label is the diagram's title", guidance)
+        self.assertIn("insert heading, step, edge, step", guidance)
+        self.assertNotIn("headings, forms", guidance)
         self.assertIn("process-step", cw.KINDS)
         self.assertIn("edge", cw.KINDS)
         from workers import analyst
@@ -197,6 +203,60 @@ class ConferenceTopic(unittest.TestCase):
             if isinstance(topic, str) and topic in TOPICS:   # every other topic's line is exactly as before
                 self.assertEqual("The visitor picked this topic before starting: %s.\n" % TOPICS[topic],
                                  topic_line({"topic": topic}))
+
+    def turn(self, topic, ops):
+        from types import SimpleNamespace
+        import json as _json
+        draft = {"ops": ops, "confirm": "Drawn.", "questions": [], "batch_title": "",
+                 "resolves": {"question_id": "", "option_id": "", "freeform_answer": ""}}
+        resp = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=_json.dumps(draft))])
+        client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: resp)))
+        root = {"id": "screen", "kind": "screen", "label": "x", "children": [
+            {"id": "arch", "kind": "section", "label": "Architecture", "children": [
+                {"id": "arch-h", "kind": "heading", "label": "Architecture"},
+                {"id": "gw", "kind": "process-step", "label": "Gateway"},
+                {"id": "gw-bus", "kind": "edge", "label": "Turn request", "detail": "Gateway -> Bus"}]}]}
+        state = {"artifact": root, "questions": [], "transcript": [], "session_id": "s1", "turn_seq": 1,
+                 "topic": topic}
+        return cw.ClaudeWorker(client=client).on_turn(state, {"kind": "utterance", "text": "draw it"})
+
+    @staticmethod
+    def insert(parent, node_id, kind, label, detail=""):
+        return {"op": "insert_child", "node_id": parent, "value": "",
+                "new_node": {"id": node_id, "kind": kind, "label": label, "detail": detail}}
+
+    def test_the_gate_draws_a_titled_flow_on_the_conference_canvas(self):
+        out = self.turn("conference", [
+            self.insert("screen", "proc", "section", "Process: one turn"),
+            self.insert("proc", "proc-h", "heading", "Process: one turn"),
+            self.insert("proc", "s1", "process-step", "Owner speaks", "The owner asks a question."),
+            self.insert("proc", "e1", "edge", "Utterance", "Owner speaks -> Chair picks the speaker"),
+            self.insert("proc", "s2", "process-step", "Chair picks the speaker", "The chair routes the turn.")])
+        self.assertEqual([], out["problems"])
+        ops = out["events"][0]["payload"]["ops"]
+        self.assertEqual(["section", "heading", "process-step", "edge", "process-step"],
+                         [o["node"]["kind"] for o in ops])
+
+    def test_the_conference_gate_refuses_scenes_and_children_of_steps_and_edges(self):
+        cases = (
+            [self.insert("screen", "sc", "scene", "Diagram", "800x400 bg=#101820")],
+            [self.insert("gw", "inside", "text", "Inside a step")],
+            [self.insert("gw-bus", "inside", "text", "Inside an edge")],
+            # one refused op drops the whole patch, as everywhere
+            [self.insert("arch", "ok", "process-step", "Bus", "Carries turns."),
+             self.insert("gw", "inside", "process-step", "Nested", "")],
+        )
+        for ops in cases:
+            out = self.turn("conference", ops)
+            self.assertEqual([], out["events"], ops)
+            self.assertTrue(any("whole patch is dropped" in p for p in out["problems"]), out["problems"])
+
+    def test_every_other_topic_is_gated_as_before(self):
+        for topic in [t for t in TOPICS if t != "conference"] + [""]:
+            scene = self.turn(topic, [self.insert("screen", "sc", "scene", "Banner", "800x400 bg=#101820")])
+            self.assertEqual([], scene["problems"], topic)
+            nested = self.turn(topic, [self.insert("gw", "inside", "text", "Inside a step")])
+            self.assertEqual([], nested["problems"], topic)
 
     def test_the_analyst_maps_the_conference_lines_own_data_model(self):
         from workers import analyst

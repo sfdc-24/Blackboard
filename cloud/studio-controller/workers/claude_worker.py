@@ -402,7 +402,7 @@ def _scope_ids(state_questions, trigger, resolves):
 
 
 def validate(draft: dict, artifact_root: dict, state_questions: list,
-             trigger: dict | None = None) -> tuple[dict, list]:
+             trigger: dict | None = None, topic: str = "") -> tuple[dict, list]:
     """Everything the schema cannot express. Returns (clean_draft, problems).
 
     Codex review of PR 200 (CODEX-PR200-REVIEW-20260924T0501Z) shaped this:
@@ -466,6 +466,10 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                 allowed |= _subtree_ids(index[a])
         return allowed
 
+    topic_key = topic if isinstance(topic, str) else ""
+    refused_kinds = TOPIC_REFUSED_KINDS.get(topic_key, ())
+    leaf_kinds = TOPIC_LEAF_KINDS.get(topic_key, ())
+
     def transaction(scope):
         tree = json.loads(json.dumps(artifact_root))
         index, parents = _index(tree)
@@ -505,6 +509,10 @@ def validate(draft: dict, artifact_root: dict, state_questions: list,
                     why = visual_problem(nn["kind"], nn.get("detail", ""), index[nid].get("kind"))
                 elif index[nid].get("kind") == "scene" and nn["kind"] != "entity":
                     why = "a scene holds only entities"
+                elif nn["kind"] in refused_kinds:
+                    why = "a %s is not drawn in this session's topic" % nn["kind"]
+                elif index[nid].get("kind") in leaf_kinds:
+                    why = "a %s holds nothing" % index[nid].get("kind")
                 elif index[nid].get("kind") == "entity":
                     why = "an entity holds nothing"
                 elif len(index[nid].get("children") or []) >= MAX_CHILDREN:
@@ -705,29 +713,39 @@ except ImportError:  # loaded from its file (tests): read the sibling topics.py 
 TOPIC_GUIDANCE = {
     "conference": (
         "CONFERENCE LINE - DRAW DIAGRAMS, NOT PAGES. This session designs a system, the conference line, "
-        "so the canvas is a set of diagrams. Do not build website screens of headings, forms, fields and "
-        "buttons, and do not build a scene or a logo.\n"
-        "- Architecture and process flows: under the root screen insert one section per diagram, labelled "
-        "with what it shows (\"Architecture: the call path\", \"Process: one turn on the line\"). Inside it, "
-        "in flow order, insert a \"process-step\" node for each part or step - label: the part or step in a "
-        "few words (\"Gateway\", \"Message bus\", \"Chair picks the speaker\"); detail: what it does and who "
-        "owns it, in one or two sentences - and between two steps an \"edge\" node for the connection or "
-        "hand-off - label: what passes (\"Turn request\", \"Audio frames\"); detail: \"<from step> -> <to "
-        "step>\" and the protocol or trigger when known (\"Gateway -> Message bus, on every turn\"). The page draws "
-        "a process-step as a titled box with its detail under it and an edge as one line of text, label "
-        "then detail, in the order inserted: the order of the children IS the flow, so insert step, edge, "
-        "step, edge, step, and an edge must name both of its ends in its detail. A process-step and an "
-        "edge hold no children.\n"
+        "so the canvas is a set of diagrams. This replaces BUILDING FROM AN EMPTY SCREEN and LIVE SCENES "
+        "above for this session: build no website screens of forms, fields and buttons, and never insert a "
+        "scene or an entity - they are refused here.\n"
+        "- Architecture and process flows: under the root screen insert one section per diagram. A "
+        "section's label is never shown, so its FIRST child is a \"heading\" node whose label is the "
+        "diagram's title (\"Architecture: the call path\", \"Process: one turn on the line\"); give the "
+        "section the same label. After the heading, in flow order, insert a \"process-step\" node for each "
+        "part or step - label: the part or step in a few words (\"Gateway\", \"Message bus\", \"Chair picks "
+        "the speaker\"); detail: what it does and who owns it, in one or two sentences - and between two "
+        "steps an \"edge\" node for the connection or hand-off - label: what passes (\"Turn request\", "
+        "\"Audio frames\"); detail: \"<from step> -> <to step>\" and the protocol or trigger when known "
+        "(\"Gateway -> Message bus, on every turn\"). The page draws a heading as the visible title, a "
+        "process-step as a titled box with its detail under it, and an edge as one line of text, label "
+        "then detail, all in the order inserted: the order of the children IS the flow, so insert heading, "
+        "step, edge, step, edge, step, and an edge must name both of its ends in its detail. A "
+        "process-step and an edge hold no children - anything inserted under one is refused.\n"
         "- A decision with alternatives, or a risk: a \"card\" in the section it belongs to (label: the "
         "decision or the risk; detail: the options, or the mitigation).\n"
         "- Data model: the analyst lane draws it live as the data model diagram (a model.updated event: "
         "objects with their fields, and relationships of kind lookup, master-detail or many-to-many). Never "
         "redraw objects, fields or relationships as canvas nodes; change only the diagrams the data affects.\n"
         "When the canvas is only the root screen, the first version is the diagram the latest input asks "
-        "for - usually the architecture - with every part named, and set_label the root screen to what is "
-        "being worked on today (\"Conference line - today's work\")."
+        "for - usually the architecture - with its heading and every part named, and set_label the root "
+        "screen to what is being worked on today (\"Conference line - today's work\")."
     ),
 }
+# What the gate refuses for a topic, beyond what it refuses everywhere: the
+# kinds that may not be inserted, and the kinds that may hold no children. The
+# conference canvas is diagrams: no scene engine, and a step or an edge is a
+# leaf the page never draws children of (sfdc24-site prototype-canvas.js
+# CONTAINERS). Every other topic is gated exactly as before.
+TOPIC_REFUSED_KINDS = {"conference": ("scene", "entity")}
+TOPIC_LEAF_KINDS = {"conference": ("process-step", "edge")}
 
 
 def topic_guidance(state: dict | None) -> str:
@@ -846,7 +864,8 @@ class ClaudeWorker:
             draft = json.loads(text)
         except ValueError:
             return {"events": [], "problems": ["model output was not JSON"]}
-        clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger)
+        clean, problems = validate(draft, state["artifact"], state.get("questions") or [], trigger,
+                                   topic=state.get("topic") or "")
         if state.get("analyst"):
             # The analyst lane asks the questions in this session (it maps the
             # data model in parallel); the builder builds and confirms. Two
