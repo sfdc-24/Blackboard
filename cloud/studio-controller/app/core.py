@@ -199,7 +199,8 @@ class StudioController:
     def create_session(self, title: str = "Live prototype", subject: str = "",
                        creation_id: str = "", start: str = "template",
                        visitor: bool = False, admit_limit: int | None = None,
-                       analyst: bool = False, topic: str = "") -> tuple[dict, int]:
+                       analyst: bool = False, topic: str = "",
+                       pilot: bool = False, max_seconds: int | None = None) -> tuple[dict, int]:
         if creation_id and not ID_RE.fullmatch(creation_id):
             raise CommandError("creation_id must be a contract id")
         if start not in START_MODES:
@@ -230,7 +231,8 @@ class StudioController:
             "schema_version": 1,
             "session_id": session_id,
             "created_at": now,
-            "expires_at": now + self.max_seconds,
+            # A pilot's session is shorter (STUDIO_PILOT_SECONDS), never longer.
+            "expires_at": now + (min(self.max_seconds, max_seconds) if max_seconds else self.max_seconds),
             "generation": 1,
             "last_seq": 0,
             "task_id": self.id_factory("task"),
@@ -258,6 +260,10 @@ class StudioController:
             "voice_item_ids": [],
             "voice_epoch": 0,
         }
+        if pilot:
+            # An invited pilot (STUDIO_PILOT): admitted like a visitor (never an
+            # operator, no operator reserve), and marked so its feedback is kept.
+            state["role"] = "pilot"
         if analyst and start == "blank":
             # A homepage (blank) session with the analyst lane: the analyst owns
             # the questions from the first turn, so the builder never opens one
@@ -293,7 +299,8 @@ class StudioController:
                 raise
             existing = self.repository.load(session_id).state
             owner = existing.get("operator_subject") or existing.get("visitor_subject") or ""
-            if owner != subject or bool(existing.get("visitor_subject")) != bool(visitor):
+            if (owner != subject or bool(existing.get("visitor_subject")) != bool(visitor)
+                    or (existing.get("role") == "pilot") != bool(pilot)):
                 raise StateConflict("creation_id belongs to another operator")
             return copy.deepcopy(existing), admitted
 

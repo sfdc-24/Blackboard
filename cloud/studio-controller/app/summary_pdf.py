@@ -95,7 +95,8 @@ def build_summary_pdf(state: dict, *, design_png: bytes | None = None, price_tab
                       prepared_for: str | None = None) -> bytes:
     """One PDF of the working session - the build plan and quote when the session
     has a charter. Raises DesignImageError for an unreadable PNG."""
-    if _charter(state) is not None:
+    # A pilot's check (STUDIO_PILOT) is feedback, not a sale: never a quote.
+    if _charter(state) is not None and state.get("role") != "pilot":
         return build_quote_pdf(state, design_png=design_png, price_table=price_table, prepared_for=prepared_for)
     from fpdf import FPDF
 

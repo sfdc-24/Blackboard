@@ -242,6 +242,16 @@ Required secrets/environment:
 - `STUDIO_VOICE_MINT_CAP=3` for the initial voice envelope
 - `OPENAI_API_KEY` and `STUDIO_MAINTENANCE_SECRET` only after voice is enabled
 
+The Converspan pilot (off unless `STUDIO_PILOT=true`; see `app/pilot.py`):
+`STUDIO_PILOT_EMAILS` (exact lowercase invite list, from Secret Manager),
+`STUDIO_PILOT_SECONDS` (default 300, never above `STUDIO_MAX_SESSION_SECONDS`)
+and `STUDIO_PILOT_NOTIFY` (the owner's address for a copy of each pilot's
+summary, from Secret Manager). It cannot run with `STUDIO_ENABLE_LEAD_FACTS`.
+The Apps Script sender mails a sign-in code only to an address in its own
+`STUDIO_OPERATOR_EMAILS` Script Property (and a summary too, unless
+`STUDIO_SUMMARY_ANY_RECIPIENT=true`), so the invited addresses and the notify
+address must be there as well.
+
 Keep `STUDIO_MAX_SESSION_SECONDS=600`, `STUDIO_DAILY_SESSION_CAP=20`, and
 the operator allowlist for the approved initial envelope. Voice is one call per
 Studio session. The controller reserves one `STUDIO_VOICE_MINT_CAP` slot

@@ -23,6 +23,19 @@ def _enabled(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _pilot_from_env() -> dict:
+    """The pilot's settings, read only while STUDIO_PILOT is on: off, a stray
+    pilot variable can neither change nor break anything."""
+    if not _enabled(os.environ.get("STUDIO_PILOT", "false")):
+        return {}
+    return {
+        "pilot_enabled": True,
+        "pilot_emails": _emails(os.environ.get("STUDIO_PILOT_EMAILS", "")),
+        "pilot_seconds": int(os.environ.get("STUDIO_PILOT_SECONDS", "300")),
+        "pilot_notify": os.environ.get("STUDIO_PILOT_NOTIFY", "").strip(),
+    }
+
+
 @dataclass(frozen=True)
 class Settings:
     allowed_origins: tuple[str, ...]
@@ -80,6 +93,14 @@ class Settings:
     charter_enabled: bool = False
     # The build plan's prices (app/pricing.py): the owner's numbers or nothing.
     price_table: str = ""
+    # The Converspan pilot (owner, 2026-10-09): invited close contacts sign in
+    # with an email code and get one short check-in call. Off unless
+    # STUDIO_PILOT=true; off, nothing below is read and nothing changes.
+    pilot_enabled: bool = False
+    pilot_emails: tuple[str, ...] = ()
+    pilot_seconds: int = 300
+    # The owner's address: each pilot's summary is also sent here, once.
+    pilot_notify: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -135,7 +156,25 @@ class Settings:
             advisor_enabled=_enabled(os.environ.get("STUDIO_ENABLE_ADVISOR", "false")),
             charter_enabled=_enabled(os.environ.get("STUDIO_ENABLE_CHARTER", "false")),
             price_table=os.environ.get("STUDIO_PRICE_TABLE", ""),
+            **_pilot_from_env(),
         )
+
+    def _validate_pilot(self) -> None:
+        """Only while STUDIO_PILOT is on. No message ever names an address."""
+        if not self.pilot_emails:
+            raise RuntimeError("STUDIO_PILOT requires STUDIO_PILOT_EMAILS")
+        if any(not isinstance(email, str) or email != email.lower() or email != email.strip()
+               or len(email) > 320 or email.count("@") != 1 for email in self.pilot_emails):
+            raise RuntimeError("STUDIO_PILOT_EMAILS must contain exact lowercase addresses")
+        if type(self.pilot_seconds) is not int or not 60 <= self.pilot_seconds <= 600:
+            raise RuntimeError("STUDIO_PILOT_SECONDS must be between 60 and 600")
+        if self.pilot_notify and (self.pilot_notify != self.pilot_notify.lower()
+                                  or len(self.pilot_notify) > 320 or self.pilot_notify.count("@") != 1):
+            raise RuntimeError("STUDIO_PILOT_NOTIFY must be one exact lowercase address")
+        if self.lead_facts_enabled:
+            # Lead facts read the Salesforce org for any session; a pilot is
+            # not an operator and must never reach that path.
+            raise RuntimeError("STUDIO_PILOT cannot be on while STUDIO_ENABLE_LEAD_FACTS is on")
 
     @property
     def production(self) -> bool:
@@ -185,9 +224,11 @@ class Settings:
             raise RuntimeError("STUDIO_VISITOR_SESSIONS_PER_DAY must be between 1 and 20")
         if not 600 <= self.visitor_token_seconds <= 86400:
             raise RuntimeError("STUDIO_VISITOR_TOKEN_SECONDS must be between 600 and 86400")
-        if self.public_visitors and not 1 <= self.operator_reserved_sessions < self.daily_session_cap:
+        # Pilots are admitted below the operator's reserve, like visitors.
+        shares_reserve = self.public_visitors or self.pilot_enabled
+        if shares_reserve and not 1 <= self.operator_reserved_sessions < self.daily_session_cap:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_SESSIONS must leave visitors at least one daily session")
-        if self.public_visitors and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
+        if shares_reserve and not 1 <= self.operator_reserved_voice < self.voice_mint_cap:
             raise RuntimeError("STUDIO_OPERATOR_RESERVED_VOICE must leave visitors at least one daily voice call")
         if self.public_visitors and self.lead_facts_enabled:
             # Lead facts read the Salesforce org for any session; a public
@@ -195,6 +236,8 @@ class Settings:
             raise RuntimeError("STUDIO_PUBLIC_VISITORS cannot be on while STUDIO_ENABLE_LEAD_FACTS is on")
         if any(email != email.lower() or email != email.strip() for email in self.operator_emails):
             raise RuntimeError("STUDIO_OPERATOR_EMAILS must contain exact lowercase addresses")
+        if self.pilot_enabled:
+            self._validate_pilot()
         if self.production and self.session_secret == "local-development-only-change-me":
             raise RuntimeError("STUDIO_SESSION_SECRET is required in Cloud Run")
         if self.production and len(self.session_secret.encode("utf-8")) < 32:

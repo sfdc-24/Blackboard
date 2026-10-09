@@ -15,7 +15,13 @@ TOPICS = {
     "salesforce_data": "Salesforce data - the data model, reports, dashboards, imports and data quality",
     "conference": "Work on the conference line - architecture, data model, process and what to build next",
     "other": "Something else - listen first, then shape it",
+    # Never picked on the page: the server sets it on every pilot session
+    # (STUDIO_PILOT) and refuses it from anyone else. See SERVER_TOPICS.
+    "pilot": "A Converspan pilot check - five minutes with an invited guest, and their feedback",
 }
+# Topics only the server assigns, by role. A page cannot choose one, and the
+# error that lists the topics a page may send never names one.
+SERVER_TOPICS = frozenset({"pilot"})
 
 
 # Which model talks, by what the visitor wants to do (owner, 2026-09-25: "design
@@ -29,6 +35,7 @@ TOPIC_AGENT = {
     "salesforce_data": "claude",
     "conference": "claude",
     "other": "claude",
+    "pilot": "claude",
 }
 FALLBACK = ("claude", "openai", "gemini", "meta")
 
@@ -89,6 +96,16 @@ CHARTER_FRAMES = {
         ("risks", "Risks", "what could break - latency, cost, abuse"),
         ("decisions", "Decisions", "what the owner decides now"),
         ("next", "Next steps", "who builds what next and how it will be tested"),
+    ),
+    # The Converspan pilot (owner, 2026-10-09): an invited guest's five-minute
+    # check of the experience, with their feedback taken in the call.
+    "pilot": (
+        ("intro", "Who they are", "who the guest is and what they work on"),
+        ("demo", "Live demo", "one live thing drawn on the canvas about their work"),
+        ("worked", "What worked", "what worked for them in the experience"),
+        ("missing", "What was missing", "what did not work, or was missing"),
+        ("change", "One change", "the one change they would make"),
+        ("rating", "Rating", "their rating of the experience, 1 to 5"),
     ),
 }
 DEFAULT_CHARTER_FRAME = (
@@ -168,6 +185,14 @@ TOPIC_BRIEFS = {
         "to build next. Draw it, explain it, challenge it and defend it. Ground every claim in what the "
         "owner said or what is on the canvas, and mark anything else as an assumption."
     ),
+    "pilot": (
+        "This is a 5-minute Converspan pilot check with an invited guest - a subject matter expert, an "
+        "investor, an engineer or a researcher the owner knows. The Claude chair hosts, with Greg, Jenny, "
+        "Aya and Cody. Keep it brisk: one or two sentences a turn. Ask who they are and what they work "
+        "on, then demonstrate one real thing on the canvas tied to what the guest does. From about 3:30, "
+        "ask for their feedback: what worked, what did not or was missing, the one change they would "
+        "make, and a rating from 1 to 5. Read that feedback back to them in the recap."
+    ),
 }
 
 
@@ -187,6 +212,6 @@ def with_topic(state: dict | None, canvas: str) -> str:
     return topic_line(state) + (canvas or "")
 
 
-__all__ = ["TOPICS", "TOPIC_AGENT", "TOPIC_BRIEFS", "FALLBACK", "route_agent", "topic_line", "with_topic",
+__all__ = ["TOPICS", "SERVER_TOPICS", "TOPIC_AGENT", "TOPIC_BRIEFS", "FALLBACK", "route_agent", "topic_line", "with_topic",
            "CHARTER_FRAMES", "DEFAULT_CHARTER_FRAME", "charter_frame",
            "QUOTE_LINES", "DEFAULT_QUOTE_LINES", "quote_lines", "session_type"]
