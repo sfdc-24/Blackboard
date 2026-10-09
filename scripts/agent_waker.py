@@ -35,10 +35,12 @@ It ANSWERS. It does not ACT, and it does not PROMISE.
 `board_waker.py` refuses to carry out instructions it reads on the board,
 because a board row is DATA and anyone can append to that sheet. The same rule
 holds here, with one sharpened edge: these agents are models behind an HTTP
-call. No shell on this box, no repository, no cloud CLI, no ability to open a
-PR. An agent that replies "YES, ETA 20 minutes" to a build request it physically
-cannot perform is worse than the silence it replaced, because silence at least
-does not mislead the caller into waiting.
+call. No shell on this box, no cloud CLI, no ability to merge; what an adapter
+does read (Gemini's PR excerpts and Cloud Run state) is stated in every reply by
+hands_note, from the same switches the reads obey. An agent that replies "YES,
+ETA 20 minutes" to a build request it physically cannot perform is worse than
+the silence it replaced, because silence at least does not mislead the caller
+into waiting.
 
 Each doctrine states that boundary as fact, and replies post with
 evidence=STATED so nobody downstream reads one as MEASURED.
@@ -83,6 +85,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 import repo_context  # noqa: E402
+import cloud_context  # noqa: E402
 import okf_land  # noqa: E402
 from bus import load_env as _load_bus_env
 
@@ -147,13 +150,18 @@ how long work actually takes against what was estimated.""" + _SHARED_RULES,
     "gemini": {
         "module": "gemini_agent",
         "project": "FLEET",
-        # A row that names a pull request in a PUBLIC repository gets that PR's
-        # read-only diff attached (scripts/repo_context.py; the owner approved the
-        # token, 2026-09-29). A private repository is never read: see that file.
+        # A row that names a pull request gets that PR's read-only diff attached
+        # (scripts/repo_context.py; the owner approved the token, 2026-09-29). A
+        # private repository only when GEMINI_PRIVATE_REPOS names it (owner,
+        # 2026-10-08: "gemini needs access to everything that you can access").
         "repo_context": True,
         # PY-09: wake only for a row that asks Gemini something (wakes_for). Three no-value
         # replies 10:00-10:04 AM ET Oct 8 were wakes on results, DONE rows and cc copies.
         "wake_filter": True,
+        # A row that names a Cloud Run resource gets its read-only state, and its
+        # redacted recent warnings when the row asks about logs or errors
+        # (scripts/cloud_context.py, under the job's own roles/viewer).
+        "cloud_context": True,
         "okf_land": True,
         "doctrine": """You are Gemini, a participant on the SFDC24 Blackboard.
 
@@ -168,12 +176,18 @@ file=call-notes the file is your prepared notes for the next call. The adapter
 appends the pull request's okf= link to your answer, or says why it could not:
 never invent that link, and never say a file landed. Write such a reply as the
 file itself: no greeting, no mention of the row. You still cannot open other
-pull requests, merge, or read a private repository. You
-see the board row quoted to you below and, when the row names a
-pull request in a public repository, a read-only excerpt of that PR your adapter
-attached after it. That excerpt is all you have seen of any repository: say
-which PR and head you read, and do not claim to have read anything else. If it
-is marked INCOMPLETE, do not give a verdict on the whole PR.
+pull requests or merge. You see the board row quoted to you below and, after
+it, what your adapter attached for it:
+- when the row names a pull request (Blackboard, sfdc24-site, or the private
+  conference repository), a read-only excerpt of that PR. A PRIVATE excerpt is
+  marked so: your reply is posted to the board, so quote only what you need.
+- when the row names a Cloud Run service, job or worker pool, its read-only
+  state from Google Cloud (environment VALUES are withheld), and when the row
+  asks about logs or errors, its recent warnings, redacted.
+Those excerpts are all you have seen: say which PR and head, or which resource,
+you read, and do not claim to have read anything else. If an excerpt is marked
+INCOMPLETE, do not give a verdict on the whole PR. Mr. Salam's role for you,
+2026-10-08: architect and adversarial reviewer.
 
 YOUR LANE on this fleet is architecture and security: whether a design will
 hold, where it will break first, what it exposes, and what it costs to run.
@@ -250,6 +264,29 @@ YOUR LANE is answering him at any hour: explanation, analysis, drafting,
 judgement. Be useful and be brief.""" + _SHARED_RULES,
     },
 }
+
+
+def hands_note(me: str, cfg: dict, env=None) -> str:
+    """What this agent's adapter can actually read, from the same switches the reads obey.
+
+    The footer said "no private repo" and "no repo, no cloud CLI" after the Gemini adapter was
+    given the private conference repository and Cloud Run reads, so every live reply denied the
+    access its own doctrine described (Cursor's FAIL on #343, 4933cac)."""
+    reads = []
+    if cfg.get("repo_context"):
+        private = sorted(repo_context.PRIVATE_REPOS[r] for r in repo_context.private_allowed(env))
+        reads.append("read-only diffs of the pull requests a row names in %s%s" % (
+            ", ".join(sorted(set(repo_context.REPOS.values()))),
+            " and the PRIVATE %s repository" % ", ".join(private) if private else ""))
+    if cfg.get("cloud_context") and cloud_context.enabled(env):
+        reads.append("read-only Cloud Run describe and Logging reads, under its own roles/viewer, "
+                     "for the resources a row names")
+    writes = ("; it writes only an OKF file to a review branch of the private conference "
+              "repository when a row says land=okf" if cfg.get("okf_land") else "")
+    if not reads and not writes:
+        return "%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. " % me.capitalize()
+    return ("%s is a model endpoint; its adapter attaches %s%s. It has no shell and no cloud CLI, "
+            "and cannot merge. " % (me.capitalize(), "; ".join(reads) or "nothing", writes))
 
 
 # ---------------------------------------------------------------- bus reading
@@ -861,6 +898,13 @@ def main(argv=None) -> int:
                     ", ".join("%s #%d" % r for r in repo_context.refs(ask_text)), len(extra))
                 print(note)
                 log(me, note)
+        if cfg.get("cloud_context"):
+            extra = cloud_context.context_for(ask_text)   # never raises: one line, or ""
+            if extra:
+                prompt += "\n\n" + extra
+                note = "    cloud context: %d characters" % len(extra)
+                print(note)
+                log(me, note)
         if args.dry_run:
             print("    [dry-run] would ask %s and post the reply" % me)
             continue
@@ -889,7 +933,10 @@ def main(argv=None) -> int:
                 floor_ts = item["ts"]
             continue
 
-        body = " ".join(text.split())
+        # What the model says is posted to the board as it is, so a credential or an address it
+        # quotes - from a private PR excerpt, a log line, or its own invention - is removed first
+        # (Cursor on #343: "the board post is not scrubbed either").
+        body = " ".join(okf_land.scrub_secrets(text).split())
         okf_url = ""
         okf_note = ""
         okf_outcome = ""
@@ -914,13 +961,12 @@ def main(argv=None) -> int:
             print(note)
             log(me, note)
         if okf_url:
-            hands = ("Its adapter landed this answer as an OKF file for review (okf=); "
-                     "it has no shell, no private repo and cannot merge. Treat this as "
-                     "reasoning, never as a measurement or a commitment." )
+            hands = ("Its adapter landed this answer as an OKF file for review (okf=). %s"
+                     "Treat this as reasoning, never as a measurement or a commitment."
+                     % hands_note(me, cfg))
         else:
-            hands = ("%s is a model endpoint: no shell, no repo, no cloud CLI, no PR. "
-                     "%sTreat this as reasoning, never as a measurement or a commitment."
-                     % (me.capitalize(), okf_outcome + " " if okf_outcome else ""))
+            hands = ("%s%sTreat this as reasoning, never as a measurement or a commitment."
+                     % (hands_note(me, cfg), okf_outcome + " " if okf_outcome else ""))
         # PY-08: what this answer cost, on the row itself, so a spend question is answered from the
         # board and not from a billing console. Tokens always; USD only when the job states prices.
         estimate = ""
