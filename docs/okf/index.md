@@ -18,6 +18,7 @@ This is the living OKF surface for work in `sfdc-24/Blackboard`.
 - [Utilization metrics](./utilization.md)
 - [Doorbell → living docs](./doorbell-living-docs.md)
 - [Session pack (fluid)](./session-pack.md)
+- [Real-time work during a call (side conversation in Redis)](./realtime.md)
 - EXPRESS: [`docs/EXPRESS.md`](../EXPRESS.md)
 
 ## Operating rhythm
