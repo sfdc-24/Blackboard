@@ -318,7 +318,7 @@ Assert-True 'a legacy timestamp cursor reads from the top' (
 
 # ── The board is NOT sorted by timestamp, and the fallback must not assume it ──
 #
-# apps-script/blackboard-bus-v1/Code.gs:154-155 appends the CALLER's row
+# apps-script/blackboard-bus-v1/Code.gs:160-161 appends the CALLER's row
 # verbatim:
 #
 #     const row = body.sheetRow || [nowStamp_(), body.text || ''];
