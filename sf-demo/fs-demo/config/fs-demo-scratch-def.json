@@ -1,0 +1,9 @@
+{
+  "orgName": "Converspan Serialized WO Demo",
+  "edition": "Developer",
+  "features": ["FieldService:1"],
+  "settings": {
+    "lightningExperienceSettings": { "enableS1DesktopEnabled": true },
+    "fieldServiceSettings": { "fieldServiceOrgPref": true, "enableWorkOrders": true }
+  }
+}
