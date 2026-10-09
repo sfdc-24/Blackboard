@@ -504,6 +504,40 @@ second time, the reviewer spent its whole budget and returned no verdict.
 
 ---
 
+## L-114 — Recursive work must not refresh its own permission to run
+
+**Risk raised by the owner (session, 2026-10-03).** Individually sensible
+retries, re-reviews, acknowledgements, heartbeats and handoffs can feed themselves
+or one another. A new task/row ID or agent can hide the same unchanged work;
+restarts and children can replenish local counters. A loop detector that emits
+an unbounded chain of alerts is another loop. This entry records the risk, not
+an unsupported claim that a particular fleet runaway was observed.
+
+**Naive rule.** "Don't get stuck; stop after a few retries."
+
+**Operating rule NOW; fleet mechanism TARGET, not deployed.**
+The [shared loop-prevention contract](AGENT-LOOP-PREVENTION.md) requires an
+actionability/progress preflight, trusted stable root lineage, atomic shared
+finite limits and effect intents, deadlines that survive delegation/restarts,
+duplicate/terminal-message filtering, collective no-progress and dependency-cycle
+checks, and a scoped breaker with one non-recursive incident receipt. Human
+requests and bounded unchanged monitoring remain legitimate; neither silently
+resets automatic work limits. Codex applies the preflight to itself and its
+delegation now. This is a manual rule until software enforcement is proved.
+
+Claude owns runtime integration; Codex owns architecture/acceptance and Cursor
+the independent exact-head gate. Synthetic tests must break each named guard,
+including A -> B -> A, concurrent children, ACK-of-ACK, restart resets and
+notification recursion. Reconcile unknown effects instead of retrying them.
+Require per-route stimulus and exact receipt before calling any agent protected;
+documentation, agreement and source-only CI do not establish runtime coverage.
+No new paid calls, credentials, deployment or production policy are authorized.
+The narrower posting mechanism proposed in [PR317](https://github.com/sfdc-24/Blackboard/pull/317)
+is separate; it must use a distinct lesson number and must not claim this whole
+contract's coverage.
+
+---
+
 ## The first thing this file failed to prevent
 
 Recorded because a doctrine document that omits its own first failure is exactly
