@@ -89,7 +89,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                clock=time.time, id_factory=None, voice_client=None,
                email_sender=None, email_client=None, talk_client=None,
                analyst=None, moderation_client=None, muse=None, summary_sender=None,
-               advisor=None, charter=None) -> FastAPI:
+               advisor=None, charter=None, sf_build=None) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
     from workers.topics import TOPICS as _TOPICS, quote_lines as _quote_lines
@@ -110,6 +110,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         metadata_proposals_enabled=settings.metadata_proposals_enabled,
         metadata_org_id=settings.salesforce_org_id,
     )
+
+    # THE SALESFORCE BUILD LANE (workers/sf_build.py), only while STUDIO_SF_BUILD
+    # is on: discuss, options, prototype, build (scratch org), display, test,
+    # promote (developer org). Operator sessions of the salesforce_build topic only.
+    sf_lane = None
+    if settings.sf_build_enabled:
+        from workers.sf_build import LazyArchitect, SfBuildLane
+        from workers.sf_org import Targets
+        from workers.sf_sink import sink_from_env
+        parts = dict(sf_build or {})
+        sf_lane = SfBuildLane(
+            load=lambda sid: repository.load(sid).state, commit=controller.commit_lane,
+            targets=parts.get("targets") or Targets(),   # the sf CLI and its own auth
+            architect=parts.get("architect") or LazyArchitect(),
+            sink=parts.get("sink") or sink_from_env(settings.sf_redis_enabled),
+            viewer=parts.get("viewer"), clock=clock, deploy_wait=settings.sf_deploy_wait_seconds)
 
     def voice_config() -> dict:
         return {
@@ -475,7 +491,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                          "voices": voices_available(),
                          "rating": True, "summary_email": settings.summary_email_enabled,
                          "routing": True, "advisor": advisor_lane.ready(),
-                         "charter": charter_ready()},
+                         "charter": charter_ready(),
+                         **({"sf_build": {"redis": settings.sf_redis_enabled}} if sf_lane is not None else {})},
         }
 
     # THE TALK LANE. A spoken reply to what the visitor just said, in about a
@@ -965,8 +982,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         if topic is None:                          # omitted or null: no topic
             topic = ""
         # false, 0, [] and {} are not "no topic": every non-string is a 400.
-        if not isinstance(topic, str) or (topic and topic not in TOPICS):
-            raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(TOPICS)))
+        offered = TOPICS if sf_lane is not None else {t: v for t, v in TOPICS.items() if t != "salesforce_build"}
+        if not isinstance(topic, str) or (topic and topic not in offered):
+            raise HTTPException(400, "topic must be one of: %s" % ", ".join(sorted(offered)))
+        if topic == "salesforce_build" and role != "operator":
+            raise HTTPException(403, "the Salesforce build topic is for the operator only")
         start = body.get("start") or "template"
         if start not in ("template", "blank"):
             raise HTTPException(400, "start must be template or blank")
@@ -1489,6 +1509,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = record.state
         if state.get("stopped") or int(state.get("expires_at") or 0) <= int(clock()):
             raise HTTPException(410, "session has ended")
+        if sf_lane is not None and state.get("topic") == "salesforce_build":
+            raise HTTPException(503, "the analyst is not available: the build lane owns the data model here")
         if session_id in analyze_busy:
             raise HTTPException(409, "an analysis is already running for this session")
         used = analyze_counts.get(session_id, 0)
@@ -1540,6 +1562,87 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         return {"turn": turn, "model": result["model"], "events": events,
                 "problems": result.get("problems") or [], "searched": result.get("searched", 0)}
 
+    def current_operator(state: dict) -> bool:
+        """An operator session whose subject is still on the operator allowlist. Visitors never."""
+        subject = state.get("operator_subject") or ""
+        return bool(subject) and not state.get("visitor_subject") and any(
+            hmac.compare_digest(auth_service._subject_hash(email), subject) for email in settings.operator_emails)
+
+    SF_ACTIONS = {"ask", "options", "pick", "revise", "build", "confirm", "sample", "test", "promote", "undo",
+                  "status", "attach_scratch"}
+    SF_FIELDS = {"action", "text", "option_id", "scope", "answer", "question_id", "org_id", "alias", "target"}
+
+    async def sf_run(session_id: str, intent: dict) -> dict:
+        from workers.sf_build import LaneRefused
+        try:
+            return await asyncio.to_thread(sf_lane.handle, session_id, intent)
+        except LaneRefused as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+        except SessionNotFound as exc:
+            raise HTTPException(404, "session not found") from exc
+        except CommandError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    async def sf_claim(session_id: str, command: dict):
+        """A page command that belongs to the build lane: speech in a Salesforce build
+        session, or a tap on one of the lane's own questions. None for everything else."""
+        try:
+            state = (await asyncio.to_thread(repository.load, session_id)).state
+        except SessionNotFound:
+            return None
+        if state.get("topic") != "salesforce_build":
+            return None
+        kind = command.get("type")
+        if kind == "utterance":
+            intent = {"action": "say", "text": str(command.get("transcript") or "").strip(),
+                      "item_id": str(command.get("item_id") or "")}
+        elif kind == "answer" and str(command.get("question_id") or "").startswith("sfb-"):
+            intent = {"action": "answer", "question_id": command["question_id"],
+                      "option_id": command.get("option_id")}
+        elif kind == "answer_batch" and str(command.get("batch_id") or "").startswith("sfb-"):
+            intent = {"action": "answer", "batch_id": command["batch_id"], "answers": command.get("answers")}
+        else:
+            return None
+        controller._validate_command(state, command, stateful=False)
+        controller._assert_live(state)
+        if not current_operator(state):
+            raise HTTPException(403, "the build lane is for the operator only")
+        result = await sf_run(session_id, intent)
+        latest = (await asyncio.to_thread(repository.load, session_id)).state
+        answer = {"command_id": str(command.get("command_id") or ""), "session_id": session_id,
+                  "artifact_version": latest.get("artifact_version"), "events": result.get("events") or [],
+                  "problems": []}
+        if result.get("deduplicated"):
+            answer["deduplicated"] = True
+        return answer
+
+    if sf_lane is not None:
+        @app.post("/v1/session/{session_id}/sf-build")
+        async def sf_build_route(request: Request, session_id: str):
+            """The build lane, driven directly (the operator console, scripts/sf_scratch.py attach)."""
+            require_origin(request)
+            require_session(request, session_id)
+            body = await json_object(request, "sf-build")
+            if set(body) - SF_FIELDS:
+                raise HTTPException(400, "sf-build body has unknown fields")
+            if body.get("action") not in SF_ACTIONS:
+                raise HTTPException(400, "action must be one of: %s" % ", ".join(sorted(SF_ACTIONS)))
+            for key in SF_FIELDS - {"action"}:
+                if key in body and (not isinstance(body[key], str) or len(body[key]) > 600):
+                    raise HTTPException(400, "%s must be text of at most 600 characters" % key)
+            state = await asyncio.to_thread(live_state, session_id)
+            if not current_operator(state):
+                raise HTTPException(403, "the build lane is for the operator only")
+            if body.get("text"):
+                outcome = await policy_gate(session_id, "sf_build", [body["text"]])
+                if outcome == "ended":
+                    raise HTTPException(410, "session has ended")
+                if outcome:
+                    raise HTTPException(422, governance.POLICY_PROBLEM)
+            return await sf_run(session_id, dict(body))
+
     @app.post("/v1/session/{session_id}/commands")
     async def commands(request: Request, session_id: str):
         require_origin(request)
@@ -1558,6 +1661,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
                         return {"command_id": str(command.get("command_id") or ""), "session_id": session_id,
                                 "artifact_version": state.get("artifact_version"), "events": [],
                                 "problems": [governance.POLICY_PROBLEM], "refused": True}
+            if sf_lane is not None:
+                claimed = await sf_claim(session_id, command)
+                if claimed is not None:
+                    return claimed
             result = await asyncio.to_thread(controller.execute, session_id, command)
         except SessionNotFound as exc:
             raise HTTPException(404, "session not found") from exc

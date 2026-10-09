@@ -87,6 +87,8 @@ class Routing(unittest.TestCase):
 
     def test_without_an_agent_the_topic_picks_it_and_the_speaker_says_which(self):
         for topic, agent in list(TOPIC_AGENT.items()) + [("", "claude")]:
+            if topic == "salesforce_build":
+                continue        # offered only while STUDIO_SF_BUILD is on: tests/test_studio_sf_build.py
             with self.subTest(topic=topic):
                 with TestClient(self.make_with(RecordingTalk(agents=ALL))) as client:
                     sid, headers = self.topic_session(client, topic)
