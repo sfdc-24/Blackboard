@@ -823,6 +823,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     END_CARD_GRACE_SECONDS = 30 * 60
     SUMMARY_BODY_MAX = 2_100_000
     SUMMARY_STALE_SECONDS = 120
+    # How many times the owner's pilot copy may be reserved in all, counting a reservation that
+    # stopped before it settled (pilot_copy_due).
+    PILOT_COPY_ATTEMPTS = 2
     SUMMARY_MARK_ATTEMPTS = 3
     SUMMARY_UNCONFIRMED = "the summary may already have been sent; check your inbox"
     RATING_COMMENT_MAX = 300
@@ -971,6 +974,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return
         record = dict(out["record"])
         try:
+            # A RETURN of any kind means the sink holds this seq or a newer one, so the pending
+            # flag is cleared below; only a RAISE keeps the record pending (the sink contract in
+            # pilot.py, which is why a sink must never answer false for a failure).
             await asyncio.to_thread(feedback_sink, dict(record))
         except Exception as exc:                  # still pending: the next trigger publishes it again
             governance.log_event("studio.pilot_feedback_sink_failed", session_id=session_id,
@@ -991,9 +997,26 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
     def pilot_copy_due(state: dict) -> bool:
         """An owner copy is owed: a pilot session, the pilot on with a notify
-        address, and no copy that is sent, sending or may have been sent."""
-        return (pilot.is_pilot(state) and settings.pilot_enabled and bool(settings.pilot_notify)
-                and (state.get("pilot_copy") or {}).get("status") in (None, "failed"))
+        address, and no copy that is sent or may have been sent.
+
+        A RESERVATION THAT STOPPED IS OWED AGAIN (Cursor on 9b01a79). The reserve
+        writes "sending" before the send; a process that stopped there, or a
+        settle that never committed, left it "sending" for ever and the copy that
+        never left was never sent. Past SUMMARY_STALE_SECONDS it is owed again,
+        at most PILOT_COPY_ATTEMPTS times in all. The guest's summary turns such
+        a reservation into "unconfirmed" and never resends it, because a second
+        copy would reach a guest who may already hold one; this copy goes to the
+        OWNER, about his own pilot call, where a duplicate costs him a line in
+        his inbox and a lost copy costs him the feedback he asked for."""
+        if not (pilot.is_pilot(state) and settings.pilot_enabled and bool(settings.pilot_notify)):
+            return False
+        copy = state.get("pilot_copy") or {}
+        status = copy.get("status")
+        if int(copy.get("attempts") or 0) >= PILOT_COPY_ATTEMPTS:
+            return False
+        if status in (None, "failed"):
+            return True
+        return status == "sending" and int(clock()) - int(copy.get("at") or 0) >= SUMMARY_STALE_SECONDS
 
     async def send_pilot_copy(session_id: str, pdf: bytes) -> None:
         """The pilot's summary PDF to the owner (STUDIO_PILOT_NOTIFY): one
@@ -1007,7 +1030,9 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             claimed.clear()                       # a compare-and-set retry starts over
             if not pilot_copy_due(current):
                 return None                       # sent, on its way, or maybe sent: never again
-            current["pilot_copy"] = {"status": "sending", "at": int(clock()), "reservation": reservation}
+            attempts = int((current.get("pilot_copy") or {}).get("attempts") or 0) + 1
+            current["pilot_copy"] = {"status": "sending", "at": int(clock()),
+                                     "reservation": reservation, "attempts": attempts}
             claimed["ok"] = True
             return current
 
@@ -1026,9 +1051,11 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             outcome = "unconfirmed"
 
         def settle_copy(current):
-            if (current.get("pilot_copy") or {}).get("reservation") != reservation:
-                return None
-            current["pilot_copy"] = {"status": outcome, "at": int(clock())}
+            prior = current.get("pilot_copy") or {}
+            if prior.get("reservation") != reservation:
+                return None                       # a later reservation owns it now
+            current["pilot_copy"] = {"status": outcome, "at": int(clock()),
+                                     "attempts": int(prior.get("attempts") or 1)}
             return current
 
         try:

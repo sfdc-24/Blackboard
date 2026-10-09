@@ -20,8 +20,21 @@ and a rating overlap) and a record can be published more than once (a sink
 that failed is retried on the next trigger). So a sink MUST keep a record only
 when its seq is greater than the seq it already holds for that session_id,
 and drop it otherwise - for Redis, one atomic compare-and-set (a Lua script, or
-WATCH/MULTI) on the stored seq. Raising means "not kept": the record stays
-pending on the session and is published again.
+WATCH/MULTI) on the stored seq.
+
+WHAT AN ANSWER MEANS, and there are only two (Cursor on 9b01a79):
+    RETURNING - true or false - means THE SINK HOLDS THIS SEQ OR A NEWER ONE.
+        True: it kept this record. False: it already held this seq or a newer
+        one and dropped this record, which is the same news for the session -
+        this seq is done, and the pending flag is cleared.
+    RAISING means NOT KEPT. The record stays pending and is published again on
+        the next trigger. A write that failed, a lost WATCH, a timeout, a
+        connection that went: all of them MUST raise. A sink that returns
+        false for a failure says the record arrived when it did not, and the
+        session will never publish that seq again.
+The call site cannot soften this: pending is ONE seq, so a false that meant
+"try again" would be indistinguishable from the sink having kept the record
+before a clearing write failed, and that record would be republished for ever.
 """
 from __future__ import annotations
 
@@ -73,7 +86,16 @@ def supersedes(record: dict, prior: dict) -> bool:
 class LatestOnlySink:
     """The default sink: keeps the newest seq per session in memory and logs
     one line for each record it keeps - only the record's own fields. An older
-    or repeated seq is dropped silently (the contract above)."""
+    or repeated seq is dropped silently (the contract above).
+
+    THE LINE IS WRITTEN BEFORE THE WATERMARK MOVES. A logging call that raises
+    used to leave the seq held and the record cleared of its pending flag, so
+    the line was never written again (Cursor on 9b01a79). Now the watermark
+    moves only once the line is out, and a raise leaves the record pending.
+
+    EVICTION IS BY WHEN A SESSION WAS LAST KEPT, not by when it was first seen:
+    a session published a moment ago sat in the half that was dropped, and a
+    later, OLDER seq for it then looked newer than nothing."""
 
     MAX_SESSIONS = 1000
 
@@ -88,12 +110,12 @@ class LatestOnlySink:
         with self._lock:
             if seq <= self.held.get(session_id, 0):
                 return False
+            governance.log_event("studio.pilot_feedback", severity="INFO",
+                                 **{key: record.get(key) for key in RECORD_FIELDS})
+            self.held.pop(session_id, None)            # last kept goes last: eviction is LRU
             self.held[session_id] = seq
-            if len(self.held) > self.MAX_SESSIONS:
-                for stale in list(self.held)[: self.MAX_SESSIONS // 2]:
-                    self.held.pop(stale, None)
-        governance.log_event("studio.pilot_feedback", severity="INFO",
-                             **{key: record.get(key) for key in RECORD_FIELDS})
+            while len(self.held) > self.MAX_SESSIONS:
+                self.held.pop(next(iter(self.held)), None)
         return True
 
 

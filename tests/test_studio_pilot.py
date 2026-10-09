@@ -318,6 +318,60 @@ class Feedback(App):
         self.assertNotIn("Ada", out.getvalue())
         self.assertEqual(3, sink.held["s-1"])
 
+    def test_the_line_is_written_before_the_watermark_moves(self):
+        """Cursor on 9b01a79: the watermark moved first, so a logging call that raised
+        left the seq held and the line was never written again. Now the raise reaches
+        the caller - which leaves the record pending - and nothing is held."""
+        sink = pilot.LatestOnlySink()
+        record = {"session_id": "s-1", "role": "pilot", "rating": 5, "duration_s": 10,
+                  "frames_covered": [], "seq": 1}
+        with mock.patch.object(pilot.governance, "log_event", side_effect=OSError("stdout gone")):
+            with self.assertRaises(OSError):
+                sink(dict(record))
+        self.assertEqual({}, sink.held)                            # nothing held: it is published again
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(sink(dict(record)))
+        self.assertEqual(1, sink.held["s-1"])
+        self.assertEqual([1], [json.loads(line)["seq"] for line in out.getvalue().strip().splitlines()])
+
+    def test_eviction_drops_the_sessions_kept_longest_ago_not_the_first_seen(self):
+        """Cursor on 9b01a79: updating a seq did not move the key, so a session published
+        a moment ago sat in the half that was dropped and a later OLDER seq for it then
+        looked newer than nothing."""
+        sink = pilot.LatestOnlySink()
+        sink.MAX_SESSIONS = 4
+        record = lambda name, seq: {"session_id": name, "role": "pilot", "rating": 5,
+                                    "duration_s": 10, "frames_covered": [], "seq": seq}
+        with contextlib.redirect_stdout(io.StringIO()):
+            for name in ("a", "b", "c", "d"):
+                self.assertTrue(sink(record(name, 5)))
+            self.assertTrue(sink(record("a", 6)))                  # "a" is the most recently kept now
+            self.assertTrue(sink(record("e", 1)))                  # one too many: the oldest kept goes
+        self.assertEqual(["c", "d", "a", "e"], list(sink.held))    # "b" went, "a" stayed
+        self.assertEqual(6, sink.held["a"])
+        self.assertFalse(sink(record("a", 5)))                     # and an older seq is still refused
+
+    def test_a_sink_that_drops_a_record_it_already_holds_does_not_keep_it_pending(self):
+        """The contract's two answers. A return - true or false - means the sink holds
+        this seq or a newer one, so the session is done with it; only a raise keeps it
+        pending. False cannot mean "try again": pending is one seq, so it would be the
+        same answer as a sink that kept the record before the clearing write failed."""
+        answers = []
+
+        def holds_it_already(record):
+            answers.append(record["seq"])
+            return False
+
+        with TestClient(self.make(sink_fn=holds_it_already)) as client:
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            self.now[0] = START + 100
+            with contextlib.redirect_stdout(io.StringIO()):
+                client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 5})
+                self.assertNotIn("pilot_feedback_pending", self.state(sid))
+                client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 5})
+        self.assertEqual([1], answers)                             # nothing new, and nothing republished
+
     def test_the_app_default_sink_is_the_latest_only_sink(self):
         app = create_app(settings=pilot_settings(), store=MemoryStore(), worker=CountingWorker(),
                          clock=lambda: START, id_factory=IDs(), email_sender=EmailSender())
@@ -532,6 +586,54 @@ class OwnerCopy(App):
             client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
         self.assertEqual([GUEST, OWNER, OWNER], [e for e, _ in self.summaries.calls])
         self.assertEqual("sent", self.state(sid)["pilot_copy"]["status"])
+
+    def test_a_reservation_that_stopped_at_sending_is_owed_again_and_only_twice(self):
+        """Cursor on 9b01a79: the reserve writes "sending" before the send, and a process
+        that stopped there left it "sending" for ever - so a copy that never left was
+        never sent. Past SUMMARY_STALE_SECONDS it is owed again, and the attempts are
+        counted so it cannot be owed for ever."""
+        from app.main import SummaryNotSent
+
+        class OwnerNeverArrives(SummarySender):
+            def __call__(self, email, pdf):
+                self.calls.append((email, pdf))
+                if email == OWNER:
+                    raise SummaryNotSent("the script refused")
+
+        with TestClient(self.make(pilot_notify=OWNER, summaries=OwnerNeverArrives())) as client, \
+                contextlib.redirect_stdout(io.StringIO()):
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            # a reservation that stopped before it settled, as a killed process leaves it
+            self.state(sid)["pilot_copy"] = {"status": "sending", "at": START, "reservation": "gone"}
+            self.state(sid)["summary"] = {"status": "sent", "at": START, "to": "g***@lab.example"}
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual([], [e for e, _ in self.summaries.calls])          # still fresh: not owed
+            self.now[0] = START + 121                                           # SUMMARY_STALE_SECONDS
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual([OWNER], [e for e, _ in self.summaries.calls])     # owed again, and refused
+            self.assertEqual("failed", self.state(sid)["pilot_copy"]["status"])
+            self.assertEqual(1, self.state(sid)["pilot_copy"]["attempts"])
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual([OWNER, OWNER], [e for e, _ in self.summaries.calls])  # twice in all, never more
+        self.assertEqual(2, self.state(sid)["pilot_copy"]["attempts"])
+
+    def test_a_reservation_that_stopped_cannot_settle_over_the_one_that_replaced_it(self):
+        """The stopped attempt's settle arrives late: the reservation it names is not the
+        one the session holds, so it changes nothing."""
+        with TestClient(self.make(pilot_notify=OWNER)) as client, \
+                contextlib.redirect_stdout(io.StringIO()):
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            self.state(sid)["pilot_copy"] = {"status": "sending", "at": START, "reservation": "gone"}
+            self.state(sid)["summary"] = {"status": "sent", "at": START, "to": "g***@lab.example"}
+            self.now[0] = START + 121
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        copy = self.state(sid)["pilot_copy"]
+        self.assertEqual("sent", copy["status"])
+        self.assertNotEqual("gone", copy.get("reservation"))
+        self.assertEqual([OWNER], [e for e, _ in self.summaries.calls])
 
     def test_a_pilot_with_no_contact_on_record_still_gets_the_summary_and_the_owner_a_copy(self):
         with TestClient(self.make(pilot_notify=OWNER)) as client:
