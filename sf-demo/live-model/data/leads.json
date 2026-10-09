@@ -1,0 +1,13 @@
+{
+  "records": [
+    {
+      "attributes": {
+        "type": "Lead",
+        "referenceId": "LeadRef1"
+      },
+      "LastName": "Marie Jean (Sample)",
+      "Company": "Cap-Haitien Cooperative (Sample)",
+      "Status": "Open - Not Contacted"
+    }
+  ]
+}

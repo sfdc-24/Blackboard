@@ -1,0 +1,44 @@
+{
+  "records": [
+    {
+      "attributes": {
+        "type": "Service_Request__c",
+        "referenceId": "Service_Request__cRef1"
+      },
+      "Account__c": "@AccountRef1",
+      "Status__c": "New",
+      "Priority__c": "High",
+      "Summary__c": "Inverter inspection at the clinic (Sample)"
+    },
+    {
+      "attributes": {
+        "type": "Service_Request__c",
+        "referenceId": "Service_Request__cRef2"
+      },
+      "Account__c": "@AccountRef1",
+      "Status__c": "In Progress",
+      "Priority__c": "Medium",
+      "Summary__c": "Panel cleaning follow-up (Sample)"
+    },
+    {
+      "attributes": {
+        "type": "Service_Request__c",
+        "referenceId": "Service_Request__cRef3"
+      },
+      "Account__c": "@AccountRef2",
+      "Status__c": "Resolved",
+      "Priority__c": "Low",
+      "Summary__c": "Depot battery check (Sample)"
+    },
+    {
+      "attributes": {
+        "type": "Service_Request__c",
+        "referenceId": "Service_Request__cRef4"
+      },
+      "Lead__c": "@LeadRef1",
+      "Status__c": "New",
+      "Priority__c": "High",
+      "Summary__c": "New site survey (Sample)"
+    }
+  ]
+}
