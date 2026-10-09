@@ -120,6 +120,15 @@ def main() -> int:
     payload = Path(args.payload_file).read_text(encoding="utf-8").strip()
     if not payload.startswith("BCB|"):
         raise SystemExit("payload does not start with BCB| - refusing to write a malformed row")
+    # Imported here, not at the top: cloud/board-probe imports this module only for its read
+    # transport, and its image should not need the writer's rule file.
+    import board_row  # never trim a row silently (scripts/board_row.py)
+    try:
+        payload, fitted = board_row.fit("", payload, key=uuid.uuid4().hex, spill=board_row.store_spill())
+    except board_row.RowRejected as exc:
+        raise SystemExit(str(exc))
+    if fitted["spilled"] or fitted["truncated"]:
+        print("LONG PAYLOAD: %d chars -> %s" % (fitted["chars"], fitted["pointer"] or "truncated=1 (not stored)"))
 
     env = load_env()
     for key in ("BUS_URL", "BUS_SECRET"):

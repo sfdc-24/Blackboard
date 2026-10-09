@@ -11,6 +11,7 @@ import json
 import re
 import sys
 
+import board_row
 import signature
 from bus import fetch, load_env, read_rows
 
@@ -81,6 +82,15 @@ def main():
     payload = spec["payload"]
     if not payload.startswith("BCB|"):
         raise SystemExit("payload must be a BCB envelope starting with 'BCB|'")
+    # NEVER TRIM SILENTLY (scripts/board_row.py): a payload over the 1,500-char row limit is stored
+    # whole and the row carries full=<pointer>|chars=|sha256=, or truncated=1 if it cannot be stored.
+    try:
+        payload, fitted = board_row.fit("", payload, key=spec["row_id"], spill=board_row.store_spill())
+    except board_row.RowRejected as exc:
+        raise SystemExit(str(exc))
+    if fitted["spilled"] or fitted["truncated"]:
+        print("LONG PAYLOAD: %d chars -> %s" % (fitted["chars"], fitted["pointer"] or "truncated=1 (not stored)"))
+    row[5] = payload
     conflicts = sorted(_conflicting_keys(payload))
     if conflicts:
         raise SystemExit(

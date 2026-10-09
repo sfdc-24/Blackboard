@@ -28,6 +28,9 @@ COPY scripts/redis_dual.py /app/redis_dual.py
 # stops the dual-run with no redeploy.
 COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
 COPY scripts/bus_reconcile.py /app/bus_reconcile.py
+# append.py's one write rule (never trim a row silently) and the store a long row is kept in.
+COPY scripts/board_row.py /app/board_row.py
+COPY scripts/state_store.py /app/state_store.py
 COPY cloud/bus-reconciler/main.py /app/main.py
 # The connectivity probe. One key under its own prefix, read back, deleted. It exists so that
 # "does the pipe work" can be answered without running the reconciler, which is under hold.

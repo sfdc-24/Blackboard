@@ -13,6 +13,8 @@ COPY scripts/bus.py /app/bus.py
 COPY scripts/board_say.py /app/board_say.py
 COPY scripts/board_waker.py /app/board_waker.py
 COPY scripts/state_store.py /app/state_store.py
+# board_say's append path applies the one write rule (never trim a row silently).
+COPY scripts/board_row.py /app/board_row.py
 COPY cloud/waker-shadow/main.py /app/main.py
 
 # Unbuffered so a job killed mid-run still leaves its verdict in Cloud Logging.

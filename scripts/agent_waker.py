@@ -79,6 +79,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -702,6 +703,8 @@ def claim_answer(answers_id: str) -> bool:
 # posts. Membership is exact: REVIEW_RESULT is not REVIEW, and REQUEST is not REQ.
 # fleet_agent post appends once, then reads back; this bounds both.
 POST_TIMEOUT_SECONDS = 400
+# The ask quoted to the model is bounded for cost; a longer ask is marked as cut, never cut silently.
+ASK_CHARS = 2500
 
 RESULT_FOR = (
     "DISPATCH", "REVIEW_REQUEST", "REQUEST",
@@ -717,6 +720,13 @@ def reply_phase(row) -> str:
     return "RESULT" if m and m.group(1).upper() in RESULT_FOR else "DONE"
 
 
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
                phase: str = "DONE") -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
@@ -726,8 +736,15 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     replies because nobody was addressed.
     """
     rid = reply_row_id(me, answers)
+    # NO SLICE HERE (board_row, 2026-10-09). This line was text[:1500], and fleet_agent then added a
+    # ~120-char BCB header, so every long reply landed at 1,618-1,623 chars, cut mid-word, with
+    # nothing on the row saying so. fleet_agent post now owns the limit: it stores a long reply
+    # whole and posts full=<pointer>|chars=|sha256=. The text goes by file, so no argv limit applies.
+    fd, text_path = tempfile.mkstemp(prefix="waker-reply-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
-            "post", text[:1500],
+            "post", "--text-file", text_path,
             "--tag", me,
             "--to", to,
             "--phase", phase,
@@ -739,6 +756,7 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     try:
         res = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=POST_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        _unlink_quietly(text_path)
         # NOT CONFIRMED IS NOT FAILED. fleet_agent appends once and then reads the row back; a
         # flapping gateway can hold the read-back past the timeout after the row has landed
         # (gemini-waker-tmm8l, 2026-09-29: the RESULT row landed at 07:41:19Z, the read-back hung
@@ -748,6 +766,7 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
         print("    post NOT CONFIRMED after %d s: it may have landed; not posted again"
               % POST_TIMEOUT_SECONDS)
         return False
+    _unlink_quietly(text_path)
     out = (res.stdout or "") + (res.stderr or "")
     ok = "VERIFIED on the board" in out
     if verbose or not ok:
@@ -879,7 +898,12 @@ def main(argv=None) -> int:
         src_id = bcb_id(row)
         sender = sender_of(row)
         reasks = item["reasks"]
-        ask_text = str(row[C_PAYLOAD])[:2500]
+        full_ask = str(row[C_PAYLOAD])
+        ask_text = full_ask[:ASK_CHARS]
+        if len(full_ask) > ASK_CHARS:
+            # Say it, never hide it: the model is told it sees only part of the ask.
+            ask_text += (" [ASK CUT BY THE ADAPTER: first %d of %d chars shown; say so if the answer "
+                         "depends on the rest.]" % (ASK_CHARS, len(full_ask)))
 
         note = "  %s from=%s%s" % (
             src_id, sender,
@@ -973,11 +997,21 @@ def main(argv=None) -> int:
         mod_for_cost = sys.modules.get(cfg["module"])
         if mod_for_cost is not None and hasattr(mod_for_cost, "cost_estimate"):
             estimate = mod_for_cost.cost_estimate(getattr(mod_for_cost.ask, "last_usage", None) or {})
+        # MODEL CUT-OFF IS SAID ON THE ROW (board_row, 2026-10-09). An adapter that saw its model stop
+        # on the output cap (Gemini status=incomplete / finishReason MAX_TOKENS, Claude stop_reason
+        # max_tokens) sets ask.last_finish = "MAX_TOKENS"; the reply then carries model_stop= and
+        # a plain note, so a half answer is never read as a whole one.
+        finish = getattr(getattr(sys.modules.get(cfg["module"]), "ask", None), "last_finish", None)
+        model_cut = finish == "MAX_TOKENS"
+        if model_cut:
+            body += (" [INCOMPLETE: the model stopped at its output cap, so this answer is cut "
+                     "short. Ask again for the rest.]")
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
             + ("cost=%s|" % " ".join(estimate.replace("|", " ").split()) if estimate else "")
+            + ("model_stop=max_tokens|" if model_cut else "")
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
