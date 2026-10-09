@@ -906,7 +906,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     def email_for_subject(subject: str) -> str:
         """The session owner's verified address, from server records only: the
         contact written at sign-in (checked against the subject it claims), or
-        the operator allowlist. Never from the request."""
+        the operator allowlist - or, while the pilot is on, the pilot list.
+        Never from the request."""
         if not subject:
             return ""
         record, _ = store.load(contact_name(subject))
@@ -917,21 +918,28 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         for candidate in settings.operator_emails:
             if hmac.compare_digest(auth_service._subject_hash(candidate), subject):
                 return candidate
+        for candidate in (settings.pilot_emails if settings.pilot_enabled else ()):
+            if hmac.compare_digest(auth_service._subject_hash(candidate), subject):
+                return candidate
         return ""
 
     # THE PILOT (STUDIO_PILOT, app/pilot.py). An invited guest's five-minute
     # check: its no-PII feedback record goes to a sink when the call ends (the
     # recap, the rating, or the voice call's time limit), and the owner gets a
     # copy of the guest's summary. Off, none of this runs.
-    feedback_sink = pilot_feedback_sink if pilot_feedback_sink is not None else pilot.log_sink
-
-    def feedback_key(record) -> tuple:
-        record = record or {}
-        return (record.get("rating"), tuple(record.get("frames_covered") or ()))
+    feedback_sink = pilot_feedback_sink if pilot_feedback_sink is not None else pilot.LatestOnlySink()
+    app.state.pilot_feedback_sink = feedback_sink
 
     async def emit_pilot_feedback(session_id: str) -> None:
-        """Keep the record on the session and hand it to the sink - again only
-        when what it says (the rating, the frames covered) changed. Never raises."""
+        """Keep the record on the session and hand it to the sink. Never raises.
+
+        A new record - one that says something new (pilot.supersedes) - gets
+        the next `seq` and is marked pending in the SAME compare-and-set, so
+        two overlapping triggers can never hand out one seq twice. The sink
+        keeps a record only if its seq is newer than the one it holds, so a
+        slower, older publish cannot overwrite a newer one. Pending is cleared
+        only after the sink accepted that seq; until then every trigger
+        publishes the pending record again, even when nothing changed."""
         if not settings.pilot_enabled:
             return
         out: dict = {}
@@ -941,11 +949,15 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             out.clear()                           # a compare-and-set retry starts over
             if not pilot.is_pilot(current):
                 return None
+            prior = current.get("pilot_feedback") or {}
             record = pilot.feedback_record(current, now)
-            prior = current.get("pilot_feedback")
-            if prior and feedback_key(prior) == feedback_key(record):
+            if prior and not pilot.supersedes(record, prior):
+                if current.get("pilot_feedback_pending") == prior.get("seq"):
+                    out["record"] = prior         # published before, but not accepted: again
                 return None
+            record["seq"] = int(prior.get("seq") or 0) + 1
             current["pilot_feedback"] = record
+            current["pilot_feedback_pending"] = record["seq"]
             out["record"] = record
             return current
 
@@ -957,11 +969,31 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return
         if not out:
             return
+        record = dict(out["record"])
         try:
-            await asyncio.to_thread(feedback_sink, dict(out["record"]))
-        except Exception as exc:                  # the call is over; the record stays on the session
+            await asyncio.to_thread(feedback_sink, dict(record))
+        except Exception as exc:                  # still pending: the next trigger publishes it again
             governance.log_event("studio.pilot_feedback_sink_failed", session_id=session_id,
+                                 seq=record.get("seq"), reason=type(exc).__name__)
+            return
+
+        def published(current):
+            if current.get("pilot_feedback_pending") != record.get("seq"):
+                return None                       # a newer record is pending: it is not done yet
+            current.pop("pilot_feedback_pending", None)
+            return current
+
+        try:
+            await asyncio.to_thread(update_state, session_id, published)
+        except Exception as exc:                  # left pending: a later publish is harmless (same seq)
+            governance.log_event("studio.pilot_feedback_failed", session_id=session_id,
                                  reason=type(exc).__name__)
+
+    def pilot_copy_due(state: dict) -> bool:
+        """An owner copy is owed: a pilot session, the pilot on with a notify
+        address, and no copy that is sent, sending or may have been sent."""
+        return (pilot.is_pilot(state) and settings.pilot_enabled and bool(settings.pilot_notify)
+                and (state.get("pilot_copy") or {}).get("status") in (None, "failed"))
 
     async def send_pilot_copy(session_id: str, pdf: bytes) -> None:
         """The pilot's summary PDF to the owner (STUDIO_PILOT_NOTIFY): one
@@ -973,8 +1005,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
 
         def reserve(current):
             claimed.clear()                       # a compare-and-set retry starts over
-            if (current.get("pilot_copy") or {}).get("status"):
-                return None                       # already tried: never a second copy
+            if not pilot_copy_due(current):
+                return None                       # sent, on its way, or maybe sent: never again
             current["pilot_copy"] = {"status": "sending", "at": int(clock()), "reservation": reservation}
             claimed["ok"] = True
             return current
@@ -1005,6 +1037,22 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             pass
         governance.log_event("studio.pilot_copy", session_id=session_id, outcome=outcome,
                              severity="INFO" if outcome == "sent" else "WARNING")
+
+    async def replay_pilot_copy(session_id: str, state: dict, design) -> None:
+        """The guest's summary already went: build it again for the owner's
+        copy that is still owed. Never changes the guest's answer."""
+        try:
+            subject = state.get("operator_subject") or state.get("visitor_subject") or ""
+            email = await asyncio.to_thread(email_for_subject, subject)
+            if not email:
+                return
+            pdf = await asyncio.to_thread(build_summary_pdf, state, design_png=design,
+                                          price_table=price_table, prepared_for=mask_email(email))
+        except Exception as exc:
+            governance.log_event("studio.pilot_copy", session_id=session_id, outcome="not built",
+                                 reason=type(exc).__name__)
+            return
+        await send_pilot_copy(session_id, pdf)
 
     @app.post("/v1/auth/start")
     async def auth_start(request: Request):
@@ -1487,6 +1535,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         state = await asyncio.to_thread(recent_state, session_id)
         done = state.get("summary") or {}
         if done.get("status") == "sent":
+            if pilot_copy_due(state):
+                await replay_pilot_copy(session_id, state, design)
             return {"sent": True, "to": done.get("to", "")}
         subject = state.get("operator_subject") or state.get("visitor_subject") or ""
         email = await asyncio.to_thread(email_for_subject, subject)
@@ -1534,6 +1584,8 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
         except StateConflict as exc:
             raise HTTPException(409, str(exc)) from exc
         if outcome.get("replay"):
+            if pilot_copy_due(state):
+                await send_pilot_copy(session_id, pdf)
             return {"sent": True, "to": outcome["replay"].get("to", "")}
         if outcome.get("unconfirmed"):
             raise HTTPException(409, SUMMARY_UNCONFIRMED)
@@ -1579,7 +1631,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             return current
 
         await settle(sent)
-        if pilot.is_pilot(state) and settings.pilot_enabled and settings.pilot_notify:
+        if pilot_copy_due(state):
             await send_pilot_copy(session_id, pdf)
         return {"sent": True, "to": masked}
 

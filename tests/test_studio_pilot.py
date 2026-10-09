@@ -56,7 +56,7 @@ def pilot_settings(**overrides):
 
 
 class App(unittest.TestCase):
-    def make(self, *, on=True, public=False, sink=None, summaries=None, **overrides):
+    def make(self, *, on=True, public=False, sink=None, summaries=None, sink_fn=None, **overrides):
         self.now = getattr(self, "now", [START])
         self.store = MemoryStore()
         self.email_sender = EmailSender()
@@ -69,7 +69,7 @@ class App(unittest.TestCase):
         return create_app(settings=made, store=self.store, worker=CountingWorker(), clock=lambda: self.now[0],
                           id_factory=IDs(), voice_client=FakeVoiceClient(), email_sender=self.email_sender,
                           talk_client=RecapTalk(), summary_sender=self.summaries,
-                          pilot_feedback_sink=self.records.append)
+                          pilot_feedback_sink=sink_fn or self.records.append)
 
     def sign_in(self, client, email):
         started = client.post("/v1/auth/start", headers=ORIGIN, json={"email": email, "client_key": CLIENT})
@@ -295,37 +295,126 @@ class Feedback(App):
         record = self.records[0]
         self.assertEqual(set(pilot.RECORD_FIELDS), set(record))
         self.assertEqual({"session_id": sid, "role": "pilot", "rating": 4, "duration_s": 250,
-                          "frames_covered": ["intro", "demo"]}, record)
+                          "frames_covered": ["intro", "demo"], "seq": 1}, record)
         text = json.dumps(record)
         state = self.state(sid)
         for secret in (GUEST, "guest", "Ada", "Lovelace", "loved", "secret words", state["visitor_subject"]):
             self.assertNotIn(secret, text)
         self.assertEqual(record, state["pilot_feedback"])          # the session keeps it too
+        self.assertNotIn("pilot_feedback_pending", state)          # the sink took it
 
-    def test_the_default_sink_logs_one_line_and_nothing_else(self):
+    def test_the_default_sink_keeps_only_a_newer_seq_and_logs_no_pii(self):
+        sink = pilot.LatestOnlySink()
         out = io.StringIO()
+        base = {"session_id": "s-1", "role": "pilot", "rating": 5, "duration_s": 280,
+                "frames_covered": ["intro"], "email": GUEST, "comment": "Ada"}
         with contextlib.redirect_stdout(out):
-            pilot.log_sink({"session_id": "s-1", "role": "pilot", "rating": 5, "duration_s": 280,
-                            "frames_covered": ["intro"], "email": GUEST, "comment": "Ada"})
+            kept = [sink(dict(base, seq=seq)) for seq in (2, 1, 2, 3)] + [sink(dict(base))]
+        self.assertEqual([True, False, False, True, False], kept)
         lines = out.getvalue().strip().splitlines()
-        self.assertEqual(1, len(lines))
-        logged = json.loads(lines[0])
-        self.assertEqual("studio.pilot_feedback", logged["event"])
-        self.assertNotIn(GUEST, lines[0])
-        self.assertNotIn("Ada", lines[0])
+        self.assertEqual([2, 3], [json.loads(line)["seq"] for line in lines])
+        self.assertEqual({"studio.pilot_feedback"}, {json.loads(line)["event"] for line in lines})
+        self.assertNotIn(GUEST, out.getvalue())
+        self.assertNotIn("Ada", out.getvalue())
+        self.assertEqual(3, sink.held["s-1"])
 
-    def test_the_recap_sends_the_record_and_a_later_rating_sends_it_again_once(self):
+    def test_the_app_default_sink_is_the_latest_only_sink(self):
+        app = create_app(settings=pilot_settings(), store=MemoryStore(), worker=CountingWorker(),
+                         clock=lambda: START, id_factory=IDs(), email_sender=EmailSender())
+        self.assertIsInstance(app.state.pilot_feedback_sink, pilot.LatestOnlySink)
+
+    def test_each_new_record_gets_the_next_seq_and_nothing_new_sends_nothing(self):
         with TestClient(self.make()) as client:
             created, headers = self.pilot_session(client)
             sid = created["session_id"]
             self.now[0] = START + 200
             recap = client.post("/v1/session/%s/recap" % sid, headers=headers, json={})
             self.assertEqual(200, recap.status_code, recap.text)
-            self.now[0] = START + 260
             client.post("/v1/session/%s/recap" % sid, headers=headers, json={})       # nothing new: not sent
+            self.now[0] = START + 260
+            client.post("/v1/session/%s/recap" % sid, headers=headers, json={})       # a longer call: sent
             client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 5})
             client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 5})
-        self.assertEqual([(None, 200), (5, 260)], [(r["rating"], r["duration_s"]) for r in self.records])
+        self.assertEqual([(1, None, 200), (2, None, 260), (3, 5, 260)],
+                         [(r["seq"], r["rating"], r["duration_s"]) for r in self.records])
+
+    def test_an_older_publish_that_lands_last_never_overwrites_a_newer_one(self):
+        """The recap's publish is slow; the rating commits and publishes in
+        between. The sink sees seq 2, then seq 1 - and keeps seq 2."""
+        latest = pilot.LatestOnlySink()
+        delivered = []
+        held = {}
+
+        def slow_sink(record):
+            if not held.get("raced"):
+                held["raced"] = True
+                self.now[0] = START + 260
+                rated = held["client"].post("/v1/session/%s/rating" % held["sid"], headers=held["headers"],
+                                            json={"score": 5})
+                self.assertEqual(200, rated.status_code, rated.text)
+            delivered.append(record["seq"])
+            latest(record)
+
+        with TestClient(self.make(sink_fn=slow_sink)) as client, contextlib.redirect_stdout(io.StringIO()) as out:
+            created, headers = self.pilot_session(client)
+            held.update(client=client, sid=created["session_id"], headers=headers)
+            self.now[0] = START + 200
+            recap = client.post("/v1/session/%s/recap" % created["session_id"], headers=headers, json={})
+        self.assertEqual(200, recap.status_code, recap.text)
+        self.assertEqual([2, 1], delivered)
+        self.assertEqual(2, latest.held[created["session_id"]])
+        logged = [json.loads(line) for line in out.getvalue().splitlines() if '"studio.pilot_feedback"' in line]
+        self.assertEqual([(2, 5)], [(r["seq"], r["rating"]) for r in logged])
+        state = self.state(created["session_id"])
+        self.assertEqual((2, 5), (state["pilot_feedback"]["seq"], state["pilot_feedback"]["rating"]))
+        self.assertNotIn("pilot_feedback_pending", state)
+
+    def test_an_older_publish_never_clears_a_newer_pending_record(self):
+        """seq 1's publish is slow; seq 2 commits meanwhile and its publish fails.
+        seq 1 then succeeds - and must leave seq 2 pending for the next trigger."""
+        held = {}
+        delivered = []
+
+        def sink(record):
+            if record["seq"] == 1 and not held.get("raced"):
+                held["raced"] = True
+                self.now[0] = START + 260
+                held["client"].post("/v1/session/%s/rating" % held["sid"], headers=held["headers"],
+                                    json={"score": 4})
+            if record["seq"] == 2 and not held.get("failed"):
+                held["failed"] = True
+                raise RuntimeError("redis is down")
+            delivered.append(record["seq"])
+
+        with TestClient(self.make(sink_fn=sink)) as client, contextlib.redirect_stdout(io.StringIO()):
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            held.update(client=client, sid=sid, headers=headers)
+            self.now[0] = START + 200
+            client.post("/v1/session/%s/recap" % sid, headers=headers, json={})
+            self.assertEqual(2, self.state(sid).get("pilot_feedback_pending"))
+            client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 4})   # the retry
+        self.assertEqual([1, 2], delivered)
+        self.assertNotIn("pilot_feedback_pending", self.state(sid))
+
+    def test_a_failed_publish_stays_pending_and_the_next_trigger_retries_it(self):
+        calls = []
+
+        def flaky(record):
+            calls.append(record["seq"])
+            if len(calls) == 1:
+                raise RuntimeError("redis is down")
+
+        with TestClient(self.make(sink_fn=flaky)) as client, contextlib.redirect_stdout(io.StringIO()):
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            self.now[0] = START + 120
+            client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 3})
+            self.assertEqual(1, self.state(sid)["pilot_feedback_pending"])
+            client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 3})   # unchanged: retried
+            self.assertNotIn("pilot_feedback_pending", self.state(sid))
+            client.post("/v1/session/%s/rating" % sid, headers=headers, json={"score": 3})   # published: nothing
+        self.assertEqual([1, 1], calls)
 
     def test_a_pilot_recap_never_writes_the_lead_book(self):
         with TestClient(self.make(public=True)) as client:
@@ -371,6 +460,16 @@ class Feedback(App):
         self.assertEqual(200, swept.status_code, swept.text)
         self.assertEqual([(created["session_id"], 300)], [(r["session_id"], r["duration_s"]) for r in self.records])
 
+    def test_the_time_limit_after_a_recap_updates_the_duration(self):
+        with TestClient(self.make()) as client:
+            created, headers = self.pilot_session(client)
+            client.post("/v1/session/%s/voice" % created["session_id"], headers=headers, json={"sdp": "v=0"})
+            self.now[0] = START + 200
+            client.post("/v1/session/%s/recap" % created["session_id"], headers=headers, json={})
+            self.now[0] = START + 301
+            client.post("/v1/maintenance/voice-sweep", headers={"Authorization": "Bearer " + "m" * 40})
+        self.assertEqual([(1, 200), (2, 300)], [(r["seq"], r["duration_s"]) for r in self.records])
+
 
 class OwnerCopy(App):
     def test_a_pilots_summary_is_also_sent_to_the_owner_once(self):
@@ -402,6 +501,65 @@ class OwnerCopy(App):
         self.assertEqual([200, 200], [first.status_code, again.status_code])
         self.assertEqual([GUEST, OWNER, GUEST], [e for e, _ in self.summaries.calls])
         self.assertEqual("unconfirmed", self.state(sid)["pilot_copy"]["status"])
+
+    def test_a_copy_still_owed_after_a_stop_goes_on_the_replay(self):
+        with TestClient(self.make(pilot_notify=OWNER)) as client:
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            self.state(sid)["summary"] = {"status": "sent", "at": START, "to": "g***@lab.example"}
+            replay = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            again = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual([200, 200], [replay.status_code, again.status_code])
+        self.assertEqual([OWNER], [e for e, _ in self.summaries.calls])         # the guest's is not resent
+        self.assertEqual("sent", self.state(sid)["pilot_copy"]["status"])
+
+    def test_a_copy_that_certainly_did_not_go_is_tried_again(self):
+        from app.main import SummaryNotSent
+
+        class OwnerRefusedOnce(SummarySender):
+            def __call__(self, email, pdf):
+                self.calls.append((email, pdf))
+                if email == OWNER and sum(1 for e, _ in self.calls if e == OWNER) == 1:
+                    raise SummaryNotSent("the script refused")
+
+        with TestClient(self.make(pilot_notify=OWNER, summaries=OwnerRefusedOnce())) as client, \
+                contextlib.redirect_stdout(io.StringIO()):
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            self.assertEqual("failed", self.state(sid)["pilot_copy"]["status"])
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+            client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual([GUEST, OWNER, OWNER], [e for e, _ in self.summaries.calls])
+        self.assertEqual("sent", self.state(sid)["pilot_copy"]["status"])
+
+    def test_a_pilot_with_no_contact_on_record_still_gets_the_summary_and_the_owner_a_copy(self):
+        with TestClient(self.make(pilot_notify=OWNER)) as client:
+            created, headers = self.pilot_session(client)
+            sid = created["session_id"]
+            for name in [k for k in self.store.data if k.startswith("studio_contact_")]:
+                del self.store.data[name]                               # the write at verify failed
+            sent = client.post("/v1/session/%s/summary" % sid, headers=headers, json={})
+        self.assertEqual(200, sent.status_code, sent.text)
+        self.assertEqual([GUEST, OWNER], [e for e, _ in self.summaries.calls])
+
+    def test_a_copy_already_sent_by_another_request_is_never_sent_again(self):
+        """The summary's early read says no copy yet; another request sends the
+        copy before this one reserves it. The reserve, not the early read, decides."""
+        case = self
+
+        class CopySentMeanwhile(SummarySender):
+            def __call__(self, email, pdf):
+                self.calls.append((email, pdf))
+                if email == GUEST:
+                    case.state(case.sid)["pilot_copy"] = {"status": "sent", "at": START}
+
+        with TestClient(self.make(pilot_notify=OWNER, summaries=CopySentMeanwhile())) as client:
+            created, headers = self.pilot_session(client)
+            self.sid = created["session_id"]
+            sent = client.post("/v1/session/%s/summary" % self.sid, headers=headers, json={})
+        self.assertEqual(200, sent.status_code, sent.text)
+        self.assertEqual([GUEST], [e for e, _ in self.summaries.calls])
 
     def test_a_pilots_summary_is_never_a_quote(self):
         with TestClient(self.make()) as client:

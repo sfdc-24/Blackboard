@@ -9,23 +9,30 @@ rating (POST /rating) and the charter lane's frame for the `pilot` topic
 This module builds the one record that leaves the session about it, and it
 carries NO personal data: no email, no name, no subject hash, no words the
 guest said and no comment. Only the session id, the role, the 1-5 score, the
-seconds the call lasted and WHICH frame items were covered.
+seconds the call lasted, WHICH frame items were covered, and `seq`.
 
-The record goes to a sink, a callable taking the record. The default sink
-logs one line. `pilot_feedback_sink` (app/main.py create_app) is the seam a
-later change wires to Redis proj:pilot:feedback; the record is keyed by
-session_id, so a sink must treat a second record for one session as a
-replacement (the record is re-sent only when it changed, e.g. a rating
-arrived after the recap).
+THE SINK CONTRACT. The record goes to a sink, a callable taking the record.
+`pilot_feedback_sink` (app/main.py create_app) is the seam a later change wires
+to Redis proj:pilot:feedback. Records are keyed by session_id and numbered by
+`seq`, which the controller assigns inside the session's compare-and-set, so
+it only ever grows for a session. Publishes can arrive out of order (a recap
+and a rating overlap) and a record can be published more than once (a sink
+that failed is retried on the next trigger). So a sink MUST keep a record only
+when its seq is greater than the seq it already holds for that session_id,
+and drop it otherwise - for Redis, one atomic compare-and-set (a Lua script, or
+WATCH/MULTI) on the stored seq. Raising means "not kept": the record stays
+pending on the session and is published again.
 """
 from __future__ import annotations
+
+import threading
 
 from . import governance
 
 ROLE = "pilot"
 # A frame item counts as covered once the charter rates it clear (level 2+).
 COVERED_LEVEL = 2
-RECORD_FIELDS = ("session_id", "role", "rating", "duration_s", "frames_covered")
+RECORD_FIELDS = ("session_id", "role", "rating", "duration_s", "frames_covered", "seq")
 
 
 def is_pilot(state: dict | None) -> bool:
@@ -33,7 +40,7 @@ def is_pilot(state: dict | None) -> bool:
 
 
 def feedback_record(state: dict, now: int) -> dict:
-    """The no-PII record for a pilot session at `now`."""
+    """The no-PII record for a pilot session at `now`, without its seq."""
     from workers.topics import charter_frame
     rating = (state.get("rating") or {}).get("score")
     if type(rating) is not int or not 1 <= rating <= 5:
@@ -55,10 +62,40 @@ def feedback_record(state: dict, now: int) -> dict:
     }
 
 
-def log_sink(record: dict) -> None:
-    """The default sink: one structured line, and only the record's own fields."""
-    governance.log_event("studio.pilot_feedback", severity="INFO",
-                         **{key: record.get(key) for key in RECORD_FIELDS})
+def supersedes(record: dict, prior: dict) -> bool:
+    """A record is worth a new seq when it says something new: another rating,
+    other frames covered, or a longer call (the time limit after a recap)."""
+    return (record.get("rating") != prior.get("rating")
+            or list(record.get("frames_covered") or []) != list(prior.get("frames_covered") or [])
+            or int(record.get("duration_s") or 0) > int(prior.get("duration_s") or 0))
 
 
-__all__ = ["COVERED_LEVEL", "RECORD_FIELDS", "ROLE", "feedback_record", "is_pilot", "log_sink"]
+class LatestOnlySink:
+    """The default sink: keeps the newest seq per session in memory and logs
+    one line for each record it keeps - only the record's own fields. An older
+    or repeated seq is dropped silently (the contract above)."""
+
+    MAX_SESSIONS = 1000
+
+    def __init__(self):
+        self.held: dict = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, record: dict) -> bool:
+        session_id, seq = record.get("session_id"), record.get("seq")
+        if type(seq) is not int:
+            return False
+        with self._lock:
+            if seq <= self.held.get(session_id, 0):
+                return False
+            self.held[session_id] = seq
+            if len(self.held) > self.MAX_SESSIONS:
+                for stale in list(self.held)[: self.MAX_SESSIONS // 2]:
+                    self.held.pop(stale, None)
+        governance.log_event("studio.pilot_feedback", severity="INFO",
+                             **{key: record.get(key) for key in RECORD_FIELDS})
+        return True
+
+
+__all__ = ["COVERED_LEVEL", "LatestOnlySink", "RECORD_FIELDS", "ROLE", "feedback_record", "is_pilot",
+           "supersedes"]
