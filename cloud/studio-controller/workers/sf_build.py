@@ -43,15 +43,17 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
 import sys
 import threading
 import time
+import uuid
 
 try:  # the app and the image import these as part of the workers package
-    from workers import sf_plan, sf_views, sf_sink, sf_view
+    from workers import sf_plan, sf_views, sf_sink, sf_view, sf_org
     from workers import bounded
     from workers.policy import USE_POLICY
 except ImportError:  # loaded from their files (tests)
@@ -64,6 +66,7 @@ except ImportError:  # loaded from their files (tests)
         spec.loader.exec_module(mod)
         return mod
     sf_plan, sf_views, sf_sink, sf_view = _load("sf_plan"), _load("sf_views"), _load("sf_sink"), _load("sf_view")
+    sf_org = _load("sf_org")
     bounded = _load("bounded")
     USE_POLICY = _load("policy").USE_POLICY
 
@@ -72,6 +75,8 @@ PHASES = ("idle", "discuss", "options", "prototype", "build", "display", "test",
 QUESTION_PREFIX = "sfb-"
 MAX_AUDIT = 50
 DEFAULT_DEPLOY_WAIT = 30.0
+UNKNOWN_OUTCOME = ("Salesforce may have accepted this deploy, but its outcome is unknown. "
+                   "The attempt is held; do not start another deploy. Check this build or reconcile it manually.")
 SCRATCH, DEVORG = "scratch", "devorg"
 
 UNDO_PROMOTE_RE = re.compile(r"\b(undo|roll ?back|revert)\b.{0,24}\bpromot", re.I)
@@ -114,7 +119,7 @@ def classify(text: str, sf: dict) -> dict:
     model decides what is built, tested, promoted or when."""
     phase, step = sf.get("phase", "idle"), sf.get("step", "")
     pending = sf.get("pending") or {}
-    if pending.get("deploy_id") or STATUS_RE.search(text):
+    if pending.get("kind") in ("deploy", "undo") or pending.get("deploy_id") or STATUS_RE.search(text):
         return {"action": "status"}
     if step in CONFIRM_STEPS:
         if YES_RE.search(text):
@@ -311,6 +316,10 @@ class SfBuildLane:
         if action == "answer":
             intent = self._from_answer(sf, intent)
             action = intent["action"]
+        pending = sf.get("pending") or {}
+        if pending.get("kind") in ("deploy", "undo") and action != "status":
+            raise LaneRefused(UNKNOWN_OUTCOME if not pending.get("deploy_id") else
+                              "A Salesforce deploy is pending; check the build before changing it.")
         handler = {"ask": self._ask, "options": self._options, "pick": self._pick, "revise": self._revise,
                    "build": self._build, "confirm": self._confirm_answer, "sample": self._sample,
                    "test": self._test, "promote": self._promote, "undo": self._undo, "status": self._status,
@@ -356,6 +365,8 @@ class SfBuildLane:
 
     # -- the scratch org for this session ------------------------------------
     def _attach(self, sid: str, intent: dict) -> list:
+        if (self.load(sid).get("sf_build") or {}).get("pending"):
+            raise LaneRefused("finish the pending Salesforce operation before changing its target")
         record = self.targets.attach({"org_id": intent.get("org_id"), "alias": intent.get("alias")})
 
         def attach(state, sf, out):
@@ -636,20 +647,25 @@ class SfBuildLane:
         result = org.wait(job, self.deploy_wait)
         if not result["done"]:
             def still(state, sf, out):
-                kind = (sf.get("pending") or {}).get("kind")
+                current = sf.get("pending") or {}
+                if current.get("deploy_id") != job:
+                    raise LaneRefused("this Salesforce job is no longer pending")
+                kind = current.get("kind")
                 return [_progress(state, "Salesforce is still %s (%d of %d components) - say \"check the build\"."
                                   % ({"validate": "validating", "deploy": "deploying", "undo": "undoing"}.get(kind, "working"),
                                      result["deployed"], result["total"]))]
             events, _ = self._commit(sid, still)
             return events
         pending = (self.load(sid).get("sf_build") or {}).get("pending") or {}
+        if pending.get("deploy_id") != job:
+            return []  # another worker already settled or replaced this job
         kind, target = pending.get("kind"), pending.get("target", SCRATCH)
         if kind == "validate":
             return self._validated(sid, target, result)
         if kind == "deploy":
-            return self._deployed(sid, target, org, result)
+            return self._deployed(sid, target, org, result, pending.get("attempt_id"), job)
         if kind == "undo":
-            return self._undone(sid, target, org, result)
+            return self._undone(sid, target, org, result, pending.get("attempt_id"), job)
         return []
 
     def _fail(self, sid: str, action: str, target: str, text: str, components: int) -> list:
@@ -709,6 +725,7 @@ class SfBuildLane:
 
     def _confirm_answer(self, sid: str, intent: dict) -> list:
         answer = intent.get("answer")
+        attempt_id = uuid.uuid4().hex
 
         def take(state, sf, out):
             pending = sf.get("pending") or {}
@@ -731,7 +748,10 @@ class SfBuildLane:
                 build = _build_n(sf, pending.get("build"))
                 out["result"]["build"] = build
                 sf.update(step="undoing", pending={"kind": "undo", "target": build["target"], "build": build["n"],
-                                                   "components": build["undo_components"]})
+                                                   "components": build["undo_components"],
+                                                    "plan_hash": build["plan_hash"],
+                                                    "package_hash": build["package_hash"],
+                                                    "attempt_id": attempt_id, "dispatch_state": "preparing"})
                 self._rec(sid, sf, out, "undoing", components=build["undo_components"], objects=build["new_objects"])
                 return drafts + [_progress(state, "Undoing %s %d: removing %s..." % (
                     "promote" if build["target"] == DEVORG else "build", build["n"],
@@ -744,7 +764,8 @@ class SfBuildLane:
                 raise LaneRefused("the package changed after it was validated; validate it again")
             out["result"]["pkg"] = pkg
             sf.update(step="deploying", pending={"kind": "deploy", "target": target, "plan_hash": pkg["plan_hash"],
-                                                 "package_hash": pkg["package_hash"], "components": pkg["components"]})
+                                                 "package_hash": pkg["package_hash"], "components": pkg["components"],
+                                                  "attempt_id": attempt_id, "dispatch_state": "preparing"})
             self._rec(sid, sf, out, "promoting" if target == DEVORG else "deploying", components=pkg["components"],
                       objects=pkg["new_objects"])
             return drafts + [_progress(state, "Deploying %d components to %s..." % (
@@ -758,29 +779,137 @@ class SfBuildLane:
         action = ("promote_undo" if target == DEVORG else "undo") if undo else \
             ("promote_deploy" if target == DEVORG else "deploy")
         comps = held["build"]["undo_components"] if undo else held["pkg"]["components"]
+        # Prepare the exact target and payload before the dispatch fence. These failures
+        # are known to precede org.deploy and can use the ordinary failure path.
         try:
             org = self._open(target, self.load(sid)["sf_build"])
-            if undo:
-                job = org.deploy(sf_plan.destructive_zip(held["build"]["destructive_xml"]), check_only=False,
-                                 purge_on_delete=target == SCRATCH)
-            else:
-                job = org.deploy(sf_plan.package_zip(held["pkg"]), check_only=False)
+            payload = (sf_plan.destructive_zip(held["build"]["destructive_xml"]) if undo
+                       else sf_plan.package_zip(held["pkg"]))
+            org_id, alias = org.org_id, org.alias
+            if not org_id or not alias:
+                raise LaneRefused("the Salesforce target has no exact identity")
         except Exception as exc:
             return events + self._fail(sid, action, target, "Did not start: %s" % _why(exc), comps)
 
-        def started(state, sf, out):
-            sf["pending"] = dict(sf.get("pending") or {}, deploy_id=job)
+        def dispatching(state, sf, out):
+            pending = sf.get("pending") or {}
+            if (pending.get("attempt_id") != attempt_id or pending.get("dispatch_state") != "preparing"
+                    or pending.get("target") != target):
+                raise LaneRefused("this deploy attempt is no longer current")
+            pending.update(dispatch_state="outcome_unknown", org_id=org_id, alias=alias,
+                           payload_sha256=hashlib.sha256(payload).hexdigest())
             return []
 
-        self._commit(sid, started)
-        return events + self._follow(sid, org, job)
+        # A failed CAS here cannot dispatch. A successful CAS fences all later retries.
+        self._commit(sid, dispatching)
+        expected = held["build"] if undo else held["pkg"]
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        def admit(state, sf, out):
+            # commit_lane checks stopped/expiry on its fresh load before this callback.
+            pending = sf.get("pending") or {}
+            if (pending.get("attempt_id") != attempt_id or
+                    pending.get("dispatch_state") != "outcome_unknown" or
+                    pending.get("kind") != ("undo" if undo else "deploy") or
+                    pending.get("target") != target or pending.get("org_id") != org_id or
+                    pending.get("alias") != alias or pending.get("plan_hash") != expected["plan_hash"] or
+                    pending.get("package_hash") != expected["package_hash"] or
+                    pending.get("payload_sha256") != payload_hash or
+                    org.org_id != org_id or org.alias != alias):
+                raise LaneRefused(UNKNOWN_OUTCOME)
+            if undo:
+                build = _build_n(sf, expected["n"])
+                if (pending.get("build") != expected["n"] or build.get("target") != target or
+                        build.get("plan_hash") != expected["plan_hash"] or
+                        build.get("package_hash") != expected["package_hash"] or
+                        hashlib.sha256(sf_plan.destructive_zip(build["destructive_xml"])).hexdigest() != payload_hash):
+                    raise LaneRefused(UNKNOWN_OUTCOME)
+            else:
+                plan = sf["plan"] if target == SCRATCH else sf["built_plan"]
+                pkg = sf_plan.build_package(plan, sf.get(_built_key(target)))
+                if (pkg["plan_hash"] != expected["plan_hash"] or
+                        pkg["package_hash"] != expected["package_hash"] or
+                        hashlib.sha256(sf_plan.package_zip(pkg)).hexdigest() != payload_hash):
+                    raise LaneRefused(UNKNOWN_OUTCOME)
+            return None  # read-only admission; a later stop still requires coordination
+        self._commit(sid, admit)
+        try:
+            if undo:
+                job = org.deploy(payload, check_only=False, purge_on_delete=target == SCRATCH)
+            else:
+                job = org.deploy(payload, check_only=False)
+        except Exception:
+            try:
+                return events + self._hold_unknown(sid, attempt_id, action, target, comps)
+            except Exception:
+                raise LaneRefused(UNKNOWN_OUTCOME) from None
+        if not isinstance(job, str) or not sf_org.JOB_ID_RE.fullmatch(job):
+            try:
+                return events + self._hold_unknown(sid, attempt_id, action, target, comps)
+            except Exception:
+                raise LaneRefused(UNKNOWN_OUTCOME) from None
 
-    def _deployed(self, sid: str, target: str, org, result: dict) -> list:
+        def started(state, sf, out):
+            pending = sf.get("pending") or {}
+            if pending.get("attempt_id") != attempt_id or pending.get("dispatch_state") != "outcome_unknown":
+                raise LaneRefused("this deploy attempt is no longer current")
+            pending.update(deploy_id=job, dispatch_state="running")
+            return []
+
+        try:
+            self._commit(sid, started)
+        except Exception:
+            # The fence remains persisted even when the job-id save fails.
+            try:
+                return events + self._hold_unknown(sid, attempt_id, action, target, comps, job)
+            except Exception:
+                raise LaneRefused(UNKNOWN_OUTCOME) from None
+        try:
+            return events + self._follow(sid, org, job)
+        except Exception:
+            current = (self.load(sid).get("sf_build") or {}).get("pending") or {}
+            if current.get("attempt_id") != attempt_id:
+                raise
+            try:
+                return events + self._hold_unknown(sid, attempt_id, action, target, comps, job)
+            except Exception:
+                raise LaneRefused(UNKNOWN_OUTCOME) from None
+
+    def _hold_unknown(self, sid: str, attempt_id: str, action: str, target: str,
+                      components: int, job: str | None = None) -> list:
+        def hold(state, sf, out):
+            pending = sf.get("pending") or {}
+            if pending.get("attempt_id") != attempt_id or pending.get("target") != target:
+                raise LaneRefused("this deploy attempt is no longer current")
+            pending["dispatch_state"] = "outcome_unknown"
+            if job and sf_org.JOB_ID_RE.fullmatch(job):
+                pending["deploy_id"] = job
+            self._audit(sid, sf, out, action, components, "outcome_unknown",
+                        pending.get("plan_hash", ""), target)
+            self._rec(sid, sf, out, "outcome_unknown", components=components)
+            return [_progress(state, UNKNOWN_OUTCOME)]
+        events, _ = self._commit(sid, hold)
+        return events
+
+    def _deployed(self, sid: str, target: str, org, result: dict, attempt_id: str | None, job: str) -> list:
         promote = target == DEVORG
         action = "promote_deploy" if promote else "deploy"
 
         def settle(state, sf, out):
             pending = sf.get("pending") or {}
+            if (pending.get("kind") != "deploy" or pending.get("target") != target or
+                    pending.get("deploy_id") != job or pending.get("attempt_id") != attempt_id):
+                raise LaneRefused("this Salesforce job is no longer pending")
+            if pending.get("attempt_id"):
+                if (pending.get("target") != target or pending.get("org_id") != org.org_id or
+                        pending.get("alias") != org.alias):
+                    raise LaneRefused(UNKNOWN_OUTCOME)
+                bound_plan = sf["plan"] if not promote else sf["built_plan"]
+                bound_pkg = sf_plan.build_package(bound_plan, sf.get(_built_key(target)))
+                if (bound_pkg["plan_hash"] != pending.get("plan_hash") or
+                        bound_pkg["package_hash"] != pending.get("package_hash") or
+                        hashlib.sha256(sf_plan.package_zip(bound_pkg)).hexdigest() !=
+                        pending.get("payload_sha256")):
+                    raise LaneRefused(UNKNOWN_OUTCOME)
             if not result["success"]:
                 self._audit(sid, sf, out, action, pending.get("components", 0), "failed", target=target)
                 sf.update(phase="test" if promote else "prototype", step=action + "_failed", pending=None)
@@ -1100,12 +1229,22 @@ class SfBuildLane:
         events, _ = self._commit(sid, ask)
         return events
 
-    def _undone(self, sid: str, target: str, org, result: dict) -> list:
+    def _undone(self, sid: str, target: str, org, result: dict, attempt_id: str | None, job: str) -> list:
         action = "promote_undo" if target == DEVORG else "undo"
 
         def settle(state, sf, out):
             pending = sf.get("pending") or {}
+            if (pending.get("kind") != "undo" or pending.get("target") != target or
+                    pending.get("deploy_id") != job or pending.get("attempt_id") != attempt_id):
+                raise LaneRefused("this Salesforce job is no longer pending")
             build = _build_n(sf, pending.get("build"))
+            if pending.get("attempt_id") and (pending.get("target") != target or
+                    pending.get("org_id") != org.org_id or pending.get("alias") != org.alias or
+                    pending.get("plan_hash") != build["plan_hash"] or
+                    pending.get("package_hash") != build["package_hash"] or
+                    hashlib.sha256(sf_plan.destructive_zip(build["destructive_xml"])).hexdigest() !=
+                    pending.get("payload_sha256")):
+                raise LaneRefused(UNKNOWN_OUTCOME)
             if not result["success"]:
                 self._audit(sid, sf, out, action, build["undo_components"], "failed", build["plan_hash"], target)
                 sf.update(phase=sf.get("undo_from") or "display", step="undo_failed", pending=None)
@@ -1135,10 +1274,22 @@ class SfBuildLane:
         sf = self.load(sid).get("sf_build") or new_state()
         pending = sf.get("pending") or {}
         job = pending.get("deploy_id")
+        if pending.get("kind") in ("deploy", "undo") and not job:
+            return self._note(sid, UNKNOWN_OUTCOME)
         if not job:
             return self._note(sid, "Nothing is running in Salesforce right now (phase: %s)." % sf.get("phase"))
-        org = self._open(pending.get("target", SCRATCH), sf)
-        return self._follow(sid, org, job)
+        try:
+            org = self._open(pending.get("target", SCRATCH), sf)
+            if pending.get("attempt_id") and (pending.get("org_id") != org.org_id or
+                    pending.get("alias") != org.alias):
+                raise LaneRefused("the target identity changed")
+            return self._follow(sid, org, job)
+        except Exception:
+            if pending.get("attempt_id"):
+                return self._hold_unknown(sid, pending["attempt_id"],
+                                          "undo" if pending.get("kind") == "undo" else "deploy",
+                                          pending.get("target", SCRATCH), pending.get("components", 0), job)
+            raise
 
     def _hint(self, sid: str, intent: dict) -> list:
         return self._note(sid, "Answer the question on screen - yes goes ahead, not yet keeps things as they are.")
