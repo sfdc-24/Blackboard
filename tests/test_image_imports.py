@@ -54,6 +54,9 @@ NOT_IN_IMAGE = {
                       # wa_board_outbox imports wa_notify inside its SEND functions; the watcher only
                       # uses its row matching and never sends.
                       "wa_notify"},
+    # board_say imports board_row inside main(), its APPEND path; the probe only uses its read
+    # transport (bus_get) and never appends.
+    "board-probe": {"board_row"},
 }
 
 

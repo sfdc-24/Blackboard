@@ -73,7 +73,8 @@ DEFAULT_MODEL = "claude-opus-5"
 # Generous on purpose. The skill's guidance for a non-streaming request is
 # ~16000, and the Foundry failure above is what a thrifty number looks like:
 # thinking consumes the budget and the caller receives silence. A board reply
-# is capped at 1500 characters downstream anyway, so this buys correctness, not
+# is limited to 1500 characters per board row downstream (longer replies are stored whole and the
+# row carries a full= pointer, scripts/board_row.py), so this buys correctness, not
 # length.
 DEFAULT_MAX_TOKENS = 16000
 
@@ -124,6 +125,7 @@ def ask(prompt: str, model: str | None = None, max_tokens: int = DEFAULT_MAX_TOK
     stashes usage on ask.last_usage because agent_waker reports mod.ask.last_usage.
     """
     ask.last_usage = None
+    ask.last_finish = None
     env = load_env()
     model = model or os.environ.get(MODEL_ENV) or env.get(MODEL_ENV) or DEFAULT_MODEL
     key = api_key()
@@ -163,6 +165,8 @@ def ask(prompt: str, model: str | None = None, max_tokens: int = DEFAULT_MAX_TOK
                       "total": (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)}
 
     stop = body.get("stop_reason")
+    # board_row, 2026-10-09: a reply cut by the token cap is marked by the waker, not passed as whole.
+    ask.last_finish = "MAX_TOKENS" if stop == "max_tokens" else None
     text = text_of(body.get("content"))
     if text:
         return text, route
