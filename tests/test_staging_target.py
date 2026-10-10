@@ -19,6 +19,8 @@ SCRIPT = ROOT / 'scripts/gas_staging_target.py'
 spec = importlib.util.spec_from_file_location('staging_target', SCRIPT)
 target = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(target)
+sys.path.insert(0, str(ROOT / 'scripts'))
+identity = importlib.import_module('gas_build_identity')
 INVENTORY = json.loads(target.TARGETS.read_text())
 PROJECT = 'governor-page-api'
 REVIEWED = INVENTORY[PROJECT]
@@ -128,6 +130,35 @@ def workflow_blocks(name):
             body = match[1] + '\n'
         blocks[title] = body
     return blocks
+
+
+def workflow_projects(name):
+    """Every project the workflow will actually try to deploy: its dispatch
+    choices and its push matrix. Expression placeholders like ["{0}"] are the
+    dispatch input being spliced in, not a project, so they are skipped."""
+    workflow = (ROOT / '.github/workflows' / name).read_text()
+    offered = set()
+    for match in re.finditer(r'options: \[([^\]]+)\]', workflow):
+        offered.update(part.strip() for part in match[1].split(','))
+    for match in re.finditer(r"fromJSON\('(\[[^']+\])'\)", workflow):
+        offered.update(json.loads(match[1]))
+    return {project for project in offered if '{' not in project}
+
+
+class WorkflowProjectContract(unittest.TestCase):
+    def test_every_offered_project_has_a_reviewed_build_health_contract(self):
+        # A project these workflows offer but gas_build_identity cannot build is
+        # a run that mutates nothing and always ends red: prepare refuses it
+        # ('sweeper is not a gateway'), but only after the deployment-binding
+        # step. Keep the offered set inside the contract instead.
+        for filename in ('staging-deploy.yml', 'staging-rollback.yml'):
+            projects = workflow_projects(filename)
+            with self.subTest(workflow=filename):
+                self.assertTrue(projects)
+            for project in sorted(projects):
+                with self.subTest(workflow=filename, project=project):
+                    self.assertIn(project, identity.PROJECTS)
+                    self.assertIn(project, INVENTORY)
 
 
 class WorkflowSupplyChain(unittest.TestCase):

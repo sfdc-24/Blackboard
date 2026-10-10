@@ -11,6 +11,14 @@ name: Deploy Apps Script to STAGING
 #   STAGING_DEPLOYMENT_ID_<PROJECT>   — the stable web-app deployment id on that copy
 #   STAGING_EXEC_URL_<PROJECT>        — the /exec URL of that deployment (for the HTTP assertion)
 #
+# Only a project with a reviewed build-health contract is deployable here
+# (gas_build_identity.PROJECTS). blackboard-production is deliberately absent:
+# it holds the Drive sweeper, which has no doGet at all, so its /exec can never
+# answer the ?health=build assertion this pipeline ends on. Offering it only
+# produced a dispatch choice and a matrix leg that fail on every run, and the
+# failure arrived after the deployment-binding step rather than before it.
+# tests/test_staging_target.py keeps these lists and that contract in step.
+#
 # Source proof: a build marker is generated from the selected commit. Before
 # redeploy, the new immutable version must match every prepared source file.
 # After redeploy, the API configuration, pinned source and fresh HTTP marker
@@ -27,7 +35,7 @@ on:
         required: true
         default: 'governor-page-api'
         type: choice
-        options: [governor-page-api, blackboard-production, glasses-intake-uploader]
+        options: [governor-page-api, glasses-intake-uploader]
 
 permissions:
   contents: read
@@ -46,7 +54,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","blackboard-production","glasses-intake-uploader"]') }}
+        project: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', github.event.inputs.project)) || fromJSON('["governor-page-api","glasses-intake-uploader"]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
