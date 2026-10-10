@@ -26,6 +26,7 @@
 !/cloud/studio-controller
 !/cloud/bus-reconciler
 !/cloud/redis-tool-bridge
+!/cloud/inbox-wake
 
 !/scripts
 /scripts/*

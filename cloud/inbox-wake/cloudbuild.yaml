@@ -1,0 +1,14 @@
+# Repo root as context, so the Dockerfile can copy scripts/redis_dual.py.
+# The default tag is not a release. The owner sets _IMAGE. Nothing here deploys.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/inbox-wake:unreleased
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, '${_IMAGE}', -f, cloud/inbox-wake/Dockerfile, .]
+
+images:
+  - '${_IMAGE}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
