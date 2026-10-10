@@ -143,6 +143,12 @@ on:
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
+      - "tests/test_inbox_wake.py"
+      - "cloud/inbox-wake/main.py"
+      - "cloud/inbox-wake/Dockerfile"
+      - ".github/workflows/inbox-wake-sweep.yml"
+      - ".github/workflows/inbox-wake-claude.yml"
+      - ".github/workflows/inbox-wake-codex.yml"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -246,6 +252,12 @@ on:
       - "scripts/bridge_client.py"
       - "tests/test_bridge_client.py"
       - "cloud/redis-tool-bridge/callers.json"
+      - "tests/test_inbox_wake.py"
+      - "cloud/inbox-wake/main.py"
+      - "cloud/inbox-wake/Dockerfile"
+      - ".github/workflows/inbox-wake-sweep.yml"
+      - ".github/workflows/inbox-wake-claude.yml"
+      - ".github/workflows/inbox-wake-codex.yml"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -1110,6 +1122,12 @@ jobs:
           if [ -f tests/test_redis_gov_verify.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov_verify -v
+      - name: "inbox wake is default off and idempotent on message id (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_inbox_wake.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_inbox_wake.py
           else
             echo "not on this branch; skipping"
           fi
