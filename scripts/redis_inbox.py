@@ -26,11 +26,12 @@ THE KEY, AND WHY THIS ONE
 WHAT IT DOES NOT DO
     It is not always-on. Each call is one row out and one row back, so a poll costs a row, and a row
     costs money (the owner, 2026-10-04). `--wait` holds for an answer rather than spinning, and the
-    caller decides when to look. It also cannot work while the governed worker is stopped: with no
-    worker, a request row simply sits there - which is exactly what this prints rather than hanging.
+    caller decides when to look. A wait that ends is evidence about the wait, not about the worker
+    and not about the peer: the request row is on the board either way, and the RESULT row that
+    answers its id is where the truth is.
 
     python scripts/redis_inbox.py send --to grok --text "..."    one message
-    python scripts/redis_inbox.py read [--wait 120] [--count 20] new messages to me
+    python scripts/redis_inbox.py read [--wait 180] [--count 20] new messages to me
     python scripts/redis_inbox.py selftest                       the grammar, no network
 """
 from __future__ import annotations
@@ -146,8 +147,10 @@ def post(row: dict) -> str:
 
 
 def answer(rid: str, wait: float, since: str) -> dict | None:
-    """The worker's RESULT row for `rid`, or None if it has not come. A missing answer is NOT a
-    failure to report as one: with the governed worker stopped, no row is ever executed."""
+    """The worker's RESULT row for `rid`, or None when this wait ends before one arrives.
+
+    None is not a report that the worker is stopped. The request row may be answered later.
+    """
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     import bus                                                   # noqa: E402
 
@@ -167,16 +170,27 @@ def answer(rid: str, wait: float, since: str) -> dict | None:
         time.sleep(10)
 
 
-def not_yet(waited: float) -> str:
+def not_yet(waited: float, request_id: str) -> str:
     """What a timeout actually knows, and nothing more.
 
     The first version of this line said "the governed worker is not running". It said that on a
     40-second budget about a request that was answered at 52 seconds, by a worker that had been
     running for five minutes. A timeout is evidence about the wait, never about the peer: the
-    row is on the board either way, and the RESULT row is where the truth is."""
+    row is on the board either way. The line names that row. The gcloud command is on its own
+    line, with the project and region this repo puts on the same invocation, so it can be pasted.
+    """
     return ("NO ANSWER YET after %gs. The request row is on the board and is not lost; it may be "
-            "answered after this wait. Look for the AYA_RESULT row answering its id, and check "
-            "the worker with: gcloud run jobs executions list --job=bus-requests" % waited)
+            "answered after this wait. Look for the AYA_RESULT row answering %s. Check the worker "
+            "with:\n"
+            "gcloud run jobs executions list --job=bus-requests --project=sfdc24 --region=us-central1"
+            % (waited, request_id))
+
+
+def read_timeout(waited: float, request_id: str) -> str:
+    """The read path's timeout. The 'nothing was read' sentence is its own line, after the command,
+    so it is not glued onto `gcloud`."""
+    return (not_yet(waited, request_id)
+            + "\nNothing was read, which is not the same as an empty inbox.")
 
 
 def seen() -> dict:
@@ -208,7 +222,7 @@ def cmd_send(args) -> int:
     rid = post(request_row("xadd", KEY % to, value=message(args.text)))
     print("sent to %s, request %s" % (to, rid))
     got = answer(rid, args.wait, since=args.since or stamp())
-    print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait)))
+    print("worker: %s" % (got["payload"][:300] if got else not_yet(args.wait, rid)))
     return 0 if got else 2
 
 
@@ -216,7 +230,7 @@ def cmd_read(args) -> int:
     rid = post(request_row("xrange", KEY % ME, count=args.count))
     got = answer(rid, args.wait, since=args.since or stamp())
     if not got:
-        print(not_yet(args.wait) + " Nothing was read, which is not the same as an empty inbox.")
+        print(read_timeout(args.wait, rid))
         return 2
     rows = entries_of(got["payload"])
     last = seen().get("last_id") or ""
@@ -261,6 +275,21 @@ def cmd_selftest(_args) -> int:
               '"by": "grok", "id": "1-0", "text": "ping"}]')
     assert entries_of(sample)[0]["by"] == "grok", entries_of(sample)
     assert entries_of("text=refused: nothing here") == []
+    # THE TIMEOUT WORDING. A timeout that does not name the request, or that glues the next
+    # sentence onto the gcloud command, or that still claims the worker is stopped, fails here.
+    timed = read_timeout(WAIT_SECONDS, "CCC-INBOX-TEST")
+    assert "CCC-INBOX-TEST" in timed, timed
+    assert "NO ANSWER YET after 180s." in timed, timed
+    assert "the governed worker is not running" not in timed, timed
+    lines = timed.splitlines()
+    command = [ln for ln in lines if ln.startswith("gcloud ")]
+    assert command == ["gcloud run jobs executions list --job=bus-requests "
+                       "--project=sfdc24 --region=us-central1"], command
+    assert "Nothing was read" not in command[0], command
+    assert lines[-1] == "Nothing was read, which is not the same as an empty inbox.", lines
+    assert "--wait 180" in __doc__ and "--wait 120" not in __doc__, __doc__
+    assert "exactly what this prints" not in __doc__, __doc__
+    assert "governed worker stopped" not in (answer.__doc__ or ""), answer.__doc__
     print("selftest OK: the grammar is what redis_gov parses, and only fleet:inbox: is addressed")
     return 0
 
