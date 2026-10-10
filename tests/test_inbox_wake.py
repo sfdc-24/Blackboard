@@ -10,6 +10,8 @@ import json
 import os
 import pathlib
 import sys
+import threading
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -363,8 +365,6 @@ class PickupReceipt(unittest.TestCase):
         self.assertEqual(drive_key(), item["idempotency_key"])
         self.assertNotIn("text", item)
         self.assertLessEqual(len(json.dumps(item)), 2048)
-        claim = wake.RECEIPT_CLAIM_PREFIX + item["idempotency_key"]
-        self.assertEqual(2592000, client.store[claim][1])
         self.assertEqual(2592000, client.store[key][1])
 
     def test_the_drive_key_ignores_recipient_and_message_id(self):
@@ -433,29 +433,37 @@ class PickupReceipt(unittest.TestCase):
         self.assertEqual("duplicate", again["receipt"])
         self.assertEqual(1, len(entries(client)))
 
-    def test_claim_is_set_nx_before_the_entry_and_a_repeat_does_not_set_again(self):
+    def test_the_entry_is_one_set_nx_with_a_ttl_and_a_repeat_does_not_write(self):
         class Order(FakeRedis):
             def __init__(self):
                 super().__init__()
                 self.ops = []
 
+            def get(self, key):
+                raise AssertionError("check-then-set read %s" % key)
+
+            def exists(self, key):
+                raise AssertionError("check-then-set exists %s" % key)
+
             def set(self, key, value, nx=False, ex=None):
-                self.ops.append((key, bool(nx)))
+                self.ops.append((key, bool(nx), ex, value))
                 return super().set(key, value, nx=nx, ex=ex)
 
         client = Order()
         receipts = wake.RedisReceipts(client)
         entry = wake.receipt_entry({"id": "m-1", "to": "grok"}, "grok", STAMP)
         self.assertEqual("written", receipts.record(entry))
-        self.assertTrue(client.ops[0][0].startswith(wake.RECEIPT_CLAIM_PREFIX))
-        self.assertTrue(client.ops[0][1])
-        self.assertTrue(client.ops[1][0].startswith(wake.RECEIPT_ENTRY_PREFIX))
-        self.assertFalse(client.ops[1][1])
-        ops = len(client.ops)
+        self.assertEqual(1, len(client.ops))
+        key, nx, ttl, payload = client.ops[0]
+        self.assertTrue(key.startswith(wake.RECEIPT_ENTRY_PREFIX))
+        self.assertTrue(nx)
+        self.assertEqual(wake.SEEN_TTL, ttl)
+        self.assertEqual("RECEIVED", json.loads(payload)["state"])
+        before = dict(client.store)
         self.assertEqual("duplicate", receipts.record(entry))
-        # The duplicate attempts the claim and, finding it held, does not write an entry.
-        self.assertEqual(ops + 1, len(client.ops))
-        self.assertTrue(client.ops[-1][0].startswith(wake.RECEIPT_CLAIM_PREFIX))
+        self.assertEqual(before, client.store)
+        self.assertEqual(2, len(client.ops))
+        self.assertTrue(client.ops[1][1])
         self.assertEqual(1, len(entries(client)))
 
     def test_sweep_copies_the_inbox_tuple_onto_the_receipt(self):
@@ -494,7 +502,7 @@ class PickupReceipt(unittest.TestCase):
 
 
 class ReceiptWriteFailure(unittest.TestCase):
-    def test_a_redis_exception_is_unknown_and_does_not_wake(self):
+    def test_a_redis_exception_is_an_error_and_does_not_wake(self):
         class EntryWriteFails(FakeRedis):
             def set(self, key, value, nx=False, ex=None):
                 if key.startswith(wake.RECEIPT_ENTRY_PREFIX):
@@ -505,15 +513,14 @@ class ReceiptWriteFailure(unittest.TestCase):
         d, rec = receipt_deps(client)
         with self.assertLogs("inbox_wake", level="ERROR") as caught:
             got = wake.decide({"id": "m-1", "to": "grok", "text": "ACCEPTED please"}, d)
-        self.assertEqual("unknown", got["status"])
+        self.assertEqual("error", got["status"])
         self.assertFalse(got["woke"])
         self.assertNotEqual("woke", got["status"])
         self.assertNotEqual("success", got["status"])
         self.assertEqual([], rec.http)
         self.assertEqual({}, entries(client))
-        self.assertFalse(any(key.startswith(wake.RECEIPT_CLAIM_PREFIX) for key in client.store))
         self.assertNotIn("fleet:wake:seen:grok:m-1", client.store)
-        self.assertTrue(any("unknown" in line and "m-1" in line for line in caught.output))
+        self.assertTrue(any("error" in line and "m-1" in line for line in caught.output))
         self.assertFalse(any("ACCEPTED" in line for line in caught.output))
 
     def test_a_rejected_write_is_an_error_and_does_not_wake(self):
@@ -533,21 +540,132 @@ class ReceiptWriteFailure(unittest.TestCase):
         self.assertEqual({}, entries(client))
         self.assertTrue(any("error" in line for line in caught.output))
 
-    def test_a_claim_that_raises_is_unknown_and_does_not_wake(self):
-        class ClaimWriteFails(FakeRedis):
+    def test_a_redis_outage_is_a_fast_reported_error(self):
+        class Outage(FakeRedis):
             def set(self, key, value, nx=False, ex=None):
-                if key.startswith(wake.RECEIPT_CLAIM_PREFIX):
-                    raise ConnectionError("redis unreachable")
-                return super().set(key, value, nx=nx, ex=ex)
+                raise TimeoutError("redis outage")
 
-        client = ClaimWriteFails()
+        client = Outage()
         d, rec = receipt_deps(client)
-        with self.assertLogs("inbox_wake", level="ERROR"):
+        started = time.monotonic()
+        with self.assertLogs("inbox_wake", level="ERROR") as caught:
             got = wake.decide({"id": "m-3", "to": "gemini", "text": "ping"}, d)
-        self.assertEqual("unknown", got["status"])
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual("error", got["status"])
         self.assertFalse(got["woke"])
+        self.assertNotEqual("success", got["status"])
         self.assertEqual([], rec.jobs)
         self.assertEqual({}, entries(client))
+        self.assertTrue(any("error" in line and "m-3" in line for line in caught.output))
+        self.assertLessEqual(wake.REDIS_CONNECT_TIMEOUT, 2.0)
+        self.assertLessEqual(wake.REDIS_READ_TIMEOUT, 2.0)
+        self.assertLess(wake.REDIS_CONNECT_TIMEOUT, 10)
+        self.assertLess(wake.REDIS_READ_TIMEOUT, 10)
+
+
+class ConcurrentPickup(unittest.TestCase):
+    def test_two_concurrent_pickups_produce_exactly_one_entry(self):
+        # Two is the required case. Three is the service's instance cap.
+        for n in (2, 3):
+            with self.subTest(instances=n):
+                self.assertEqual(1, self._pickups(n))
+
+    def _pickups(self, n):
+        client = AtomicRedis()
+        d, _rec = receipt_deps(client)
+        barrier = threading.Barrier(n)
+        results = []
+        gate = threading.Lock()
+
+        def pickup():
+            barrier.wait()
+            got = wake.decide({"id": "m-race", "to": "grok", "text": "ping"}, d)
+            with gate:
+                results.append(got)
+
+        threads = [threading.Thread(target=pickup) for _ in range(n)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(n, len(results))
+        found = entries(client)
+        self.assertEqual(1, len(found))
+        item = next(iter(found.values()))
+        self.assertEqual("RECEIVED", item["state"])
+        self.assertNotEqual("ACCEPTED", item["state"])
+        receipt_sets = [op for op in client.commands
+                        if op[0] == "set" and str(op[1]).startswith(wake.RECEIPT_ENTRY_PREFIX)]
+        self.assertGreaterEqual(len(receipt_sets), 1)
+        self.assertTrue(all(op[2] and op[3] == wake.SEEN_TTL for op in receipt_sets))
+        self.assertEqual(1, sum(1 for op in receipt_sets if op[4]))
+        self.assertFalse(any(op[0] in ("get", "exists") for op in client.commands))
+        self.assertEqual(1, sum(1 for got in results if got["status"] == "woke"))
+        return len(found)
+
+
+class AtomicRedis(FakeRedis):
+    """SET NX is atomic, the way Redis is. A get and a later set are not one command."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.commands = []
+
+    def get(self, key):
+        with self._lock:
+            self.commands.append(("get", key, False, None, False))
+            item = self.store.get(key)
+        return None if item is None else item[0]
+
+    def exists(self, key):
+        with self._lock:
+            self.commands.append(("exists", key, False, None, False))
+            return key in self.store
+
+    def set(self, key, value, nx=False, ex=None):
+        with self._lock:
+            wrote = not (nx and key in self.store)
+            self.commands.append(("set", key, bool(nx), ex, wrote))
+            if not wrote:
+                return None
+            self.store[key] = (value, ex)
+            return True
+
+    def delete(self, key):
+        with self._lock:
+            self.commands.append(("delete", key, False, None, True))
+            self.deleted.append(key)
+            self.store.pop(key, None)
+
+
+class PrivateRangeAndTimeouts(unittest.TestCase):
+    def test_only_private_ranges_only_destinations_count_as_reachable(self):
+        for host in ("10.1.2.3", "172.16.5.5", "192.168.0.1", "100.64.0.1"):
+            self.assertTrue(wake.host_on_private_range(host), host)
+        for host in ("8.8.8.8", "1.2.3.4", "169.254.1.1", "redis.internal", "", "  "):
+            self.assertFalse(wake.host_on_private_range(host), host)
+
+    def test_timeouts_replace_the_long_defaults_on_the_client(self):
+        class Pool:
+            def __init__(self):
+                self.connection_kwargs = {
+                    "socket_connect_timeout": 10,
+                    "socket_timeout": 10,
+                }
+
+        class Client:
+            def __init__(self):
+                self.connection_pool = Pool()
+
+        client = Client()
+        wake.apply_redis_timeouts(client)
+        self.assertEqual(wake.REDIS_CONNECT_TIMEOUT, client.connection_pool.connection_kwargs["socket_connect_timeout"])
+        self.assertEqual(wake.REDIS_READ_TIMEOUT, client.connection_pool.connection_kwargs["socket_timeout"])
+        self.assertLessEqual(wake.REDIS_CONNECT_TIMEOUT, 2.0)
+        self.assertLessEqual(wake.REDIS_READ_TIMEOUT, 2.0)
 
 
 class NeverAccepted(unittest.TestCase):

@@ -14,15 +14,16 @@ to off. Turning it off is the rollback that does not need a new build.
 
 THE RECEIPT. INBOX_WAKE_RECEIPTS must be exactly "on", and it does nothing
 unless the wake flag is on too. On pickup, one responder entry is written
-under fleet:wake:receipt:entry:<idempotency key>: the message id, received_at
-(UTC ISO 8601), the recipient, the correlation tuple, that key, and the state
-RECEIVED. The key is claimed with SET NX before the entry is written. A repeat
-finds the claim and writes nothing. A failed write is logged and returned as
-unknown or error, and that pickup is not a success. This process never writes
-ACCEPTED; that word belongs to the worker that actually takes the work (L-116).
-The image sets the variable to off. Turning it off is the rollback that does
-not need a new build, and with it off the replies are the ones this file
-already returned.
+under fleet:wake:receipt:entry:<idempotency key> by a single SET NX with the
+fleet TTL. That command is the claim. There is no read before it and no second
+write after it, so three instances cannot check-then-set a second entry. A
+repeat finds the key and writes nothing. A Redis timeout or outage is logged
+and returned as error, and that pickup is not a success. Connect and read
+timeouts on this service's client are short so a hung Redis fails fast. This
+process never writes ACCEPTED; that word belongs to the worker that actually
+takes the work (L-116). The image sets the variable to off. Turning it off is
+the rollback that does not need a new build, and with it off the replies are
+the ones this file already returned.
 
 THIS PROCESS DOES NOT DECIDE THE REPLY. It rings the recipient. The reply still
 has to come back through that agent's own path, inside five minutes, with the
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -47,6 +49,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PROJECT = os.environ.get("RUN_PROJECT") or "sfdc24"
 REGION = os.environ.get("RUN_REGION") or "us-central1"
 SEEN_TTL = 2592000  # fleet: ttl in scripts/redis_acl.json; no new grant
+# Shorter than scripts/redis_dual.CONNECT_SECONDS (10). A hung Memorystore
+# must surface as an error while the request is still the request.
+REDIS_CONNECT_TIMEOUT = 2.0
+REDIS_READ_TIMEOUT = 2.0
+# private-ranges-only routes these through the VPC connector and nothing else.
+# RFC1918 plus RFC6598. Link-local is not on that path.
+PRIVATE_RANGES = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+)
 MAX_BODY = 65536
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 FILE_ID_OK = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
@@ -56,7 +70,6 @@ COMMENT_LINE = re.compile(r"(?m)^inbox\s+to=(\S+)\s+id=(\S+)\s+by=(\S+)\s+text=(
 RECEIVED = "RECEIVED"
 DISPATCHED = "DISPATCHED"
 RECEIPT_STATES = (RECEIVED, DISPATCHED)
-RECEIPT_CLAIM_PREFIX = "fleet:wake:receipt:claim:"
 RECEIPT_ENTRY_PREFIX = "fleet:wake:receipt:entry:"
 LOG = logging.getLogger("inbox_wake")
 
@@ -93,6 +106,29 @@ def receipts_enabled(environ=None) -> bool:
     """The receipt flag. Exactly "on". Anything else writes nothing back."""
     environ = os.environ if environ is None else environ
     return environ.get("INBOX_WAKE_RECEIPTS") == "on"
+
+
+def host_on_private_range(host: str) -> bool:
+    """True when private-ranges-only will send this host through the VPC connector.
+
+    Memorystore's address is a private service-access IP. A public address is
+    not on that route, and a hostname is not one either. Empty is not a host.
+    """
+    try:
+        ip = ipaddress.ip_address(str(host or "").strip())
+    except ValueError:
+        return False
+    return any(ip in network for network in PRIVATE_RANGES)
+
+
+def apply_redis_timeouts(client, connect=REDIS_CONNECT_TIMEOUT, read=REDIS_READ_TIMEOUT):
+    """Bound connect and read on a lazy redis-py client. No socket is opened here."""
+    pool = getattr(client, "connection_pool", None)
+    kwargs = getattr(pool, "connection_kwargs", None) if pool is not None else None
+    if isinstance(kwargs, dict):
+        kwargs["socket_connect_timeout"] = connect
+        kwargs["socket_timeout"] = read
+    return client
 
 
 def utc_now() -> str:
@@ -217,10 +253,12 @@ def _log_receipt(outcome, message_id, recipient_id, error) -> None:
 
 
 class RedisReceipts:
-    """One responder entry under fleet:. The claim is SET NX, then the entry.
+    """One responder entry under fleet:. The entry is the claim.
 
-    A duplicate claim writes nothing. A failed write releases the claim, is
-    logged, and returns unknown or error. It does not return a success.
+    SET NX with the fleet TTL is the whole write. A duplicate NX writes
+    nothing. A timeout or a refused write is an error, not a success, and the
+    key is left alone: deleting it after a lost reply could let a second
+    instance write a second entry.
     """
 
     def __init__(self, client):
@@ -237,33 +275,28 @@ class RedisReceipts:
         if not KEY_OK.fullmatch(key):
             _log_receipt("error", message_id, recipient_id, "bad-key")
             return "error"
-        claim = RECEIPT_CLAIM_PREFIX + key
-        entry_key = RECEIPT_ENTRY_PREFIX + key
-        try:
-            claimed = self.client.set(claim, "1", nx=True, ex=SEEN_TTL)
-        except Exception as exc:  # noqa: BLE001 - a lost claim is unknown, not received
-            _log_receipt("unknown", message_id, recipient_id, type(exc).__name__)
-            return "unknown"
-        if not claimed:
-            return "duplicate"
+        redis_key = RECEIPT_ENTRY_PREFIX + key
         try:
             payload = json.dumps(entry, sort_keys=True, separators=(",", ":"))
-            wrote = self.client.set(entry_key, payload, ex=SEEN_TTL)
-        except Exception as exc:  # noqa: BLE001 - the write may not have landed
-            _log_receipt("unknown", message_id, recipient_id, type(exc).__name__)
-            self._release(claim, message_id, recipient_id)
-            return "unknown"
-        if not wrote:
-            _log_receipt("error", message_id, recipient_id, "write-rejected")
-            self._release(claim, message_id, recipient_id)
+        except (TypeError, ValueError) as exc:
+            _log_receipt("error", message_id, recipient_id, type(exc).__name__)
             return "error"
-        return "written"
-
-    def _release(self, claim, message_id, recipient_id) -> None:
         try:
-            self.client.delete(claim)
-        except Exception as exc:  # noqa: BLE001 - the caller already has the failure
-            _log_receipt("unknown", message_id, recipient_id, "claim-release-" + type(exc).__name__)
+            wrote = self.client.set(redis_key, payload, nx=True, ex=SEEN_TTL)
+        except OSError as exc:
+            # TimeoutError is an OSError. A hung or dead Redis is an error.
+            _log_receipt("error", message_id, recipient_id, type(exc).__name__)
+            return "error"
+        except Exception as exc:  # noqa: BLE001 - not an outage, and not a success
+            _log_receipt("unknown", message_id, recipient_id, type(exc).__name__)
+            return "unknown"
+        if wrote:
+            return "written"
+        if wrote is None:
+            # NX lost: another instance already holds the entry. Nothing new.
+            return "duplicate"
+        _log_receipt("error", message_id, recipient_id, "write-rejected")
+        return "error"
 
 
 def _record_receipt(message, agent, deps) -> str:
@@ -352,7 +385,19 @@ def decide(message: dict, deps) -> dict:
     key = "%s:%s" % (agent, mid)
     # Receipts are a second flag. No writer means the flag is off, and the
     # rest of this function is the path it had before the receipt existed.
-    if not deps.seen.claim(key):
+    try:
+        claimed = deps.seen.claim(key)
+    except Exception as exc:  # noqa: BLE001 - a dead Redis must not read as a wake
+        if deps.receipts is None:
+            raise
+        _log_receipt("error", mid, agent, type(exc).__name__)
+        try:
+            deps.seen.release(key)
+        except Exception:  # noqa: BLE001 - the outage is already the result
+            _log_receipt("error", mid, agent, "seen-release")
+        return {"status": "error", "woke": False, "to": agent, "id": mid,
+                "error": type(exc).__name__, "receipt": "error"}
+    if not claimed:
         if deps.receipts is not None:
             receipt = _record_receipt(message, agent, deps)
             if receipt in ("error", "unknown"):
@@ -575,12 +620,26 @@ def _metadata_token() -> str:
 
 
 def _redis_client():
-    """The fleet's client, or None. A missing client refuses wakes; it does not fall open."""
+    """The fleet's client, or None. A missing client refuses wakes; it does not fall open.
+
+    Connect and read are capped here, on this service's client only, after
+    redis_dual builds it and before the first command (the client connects
+    lazily). A public REDIS_HOST is not on the private-ranges-only path to
+    Memorystore, so it is refused before a socket. No network setting is changed.
+    """
     try:
         import redis_dual  # noqa: PLC0415
     except ImportError:
         return None
-    return redis_dual.client(redis_dual.Settings(), precheck=False)
+    settings = redis_dual.Settings()
+    host = str(settings.host or "").strip()
+    if host and not host_on_private_range(host):
+        LOG.error("inbox-wake redis host is outside private-ranges-only; not connecting")
+        return None
+    client = redis_dual.client(settings, precheck=False)
+    if client is not None:
+        apply_redis_timeouts(client)
+    return client
 
 
 class Handler(BaseHTTPRequestHandler):
