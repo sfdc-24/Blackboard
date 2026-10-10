@@ -12,6 +12,18 @@ THE FLAG. INBOX_WAKE_ENABLED must be exactly "on". Anything else, including
 unset, wakes nobody and does not open Redis. The image also sets the variable
 to off. Turning it off is the rollback that does not need a new build.
 
+THE RECEIPT. INBOX_WAKE_RECEIPTS must be exactly "on", and it does nothing
+unless the wake flag is on too. On pickup, one responder entry is written
+under fleet:wake:receipt:entry:<idempotency key>: the message id, received_at
+(UTC ISO 8601), the recipient, the correlation tuple, that key, and the state
+RECEIVED. The key is claimed with SET NX before the entry is written. A repeat
+finds the claim and writes nothing. A failed write is logged and returned as
+unknown or error, and that pickup is not a success. This process never writes
+ACCEPTED; that word belongs to the worker that actually takes the work (L-116).
+The image sets the variable to off. Turning it off is the rollback that does
+not need a new build, and with it off the replies are the ones this file
+already returned.
+
 THIS PROCESS DOES NOT DECIDE THE REPLY. It rings the recipient. The reply still
 has to come back through that agent's own path, inside five minutes, with the
 laptop closed. The test plan for that is in the pull request, and it is not
@@ -25,9 +37,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROJECT = os.environ.get("RUN_PROJECT") or "sfdc24"
@@ -35,7 +49,16 @@ REGION = os.environ.get("RUN_REGION") or "us-central1"
 SEEN_TTL = 2592000  # fleet: ttl in scripts/redis_acl.json; no new grant
 MAX_BODY = 65536
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
+FILE_ID_OK = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
+KEY_OK = re.compile(r"[0-9a-f]{64}\Z")
 COMMENT_LINE = re.compile(r"(?m)^inbox\s+to=(\S+)\s+id=(\S+)\s+by=(\S+)\s+text=(.*)$")
+# Legal receipt labels. ACCEPTED is absent on purpose: only the worker writes it.
+RECEIVED = "RECEIVED"
+DISPATCHED = "DISPATCHED"
+RECEIPT_STATES = (RECEIVED, DISPATCHED)
+RECEIPT_CLAIM_PREFIX = "fleet:wake:receipt:claim:"
+RECEIPT_ENTRY_PREFIX = "fleet:wake:receipt:entry:"
+LOG = logging.getLogger("inbox_wake")
 
 # Canonical ids are scripts/redis_acl.json principals. Aliases are the ones that
 # file already maps onto exactly one of the four routes below.
@@ -64,6 +87,17 @@ class Unconfigured(Exception):
 def enabled_from_env(environ=None) -> bool:
     environ = os.environ if environ is None else environ
     return environ.get("INBOX_WAKE_ENABLED") == "on"
+
+
+def receipts_enabled(environ=None) -> bool:
+    """The receipt flag. Exactly "on". Anything else writes nothing back."""
+    environ = os.environ if environ is None else environ
+    return environ.get("INBOX_WAKE_RECEIPTS") == "on"
+
+
+def utc_now() -> str:
+    """UTC ISO 8601, second precision, Zulu suffix. The receipt's received_at."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def canonical(agent: str):
@@ -99,6 +133,149 @@ class RedisSeen:
 
     def release(self, key: str) -> None:
         self.client.delete("fleet:wake:seen:" + key)
+
+
+def _bounded_id(value, pattern) -> str:
+    value = str(value or "").strip()
+    return value if pattern.fullmatch(value) else ""
+
+
+def correlation_tuple(message, recipient_id: str) -> dict:
+    """The tuple drive-intake carries, plus the recipient we actually picked up.
+
+    source_revision and request_revision are the same value: the request
+    revision (a hash of the request half of the doc), not Drive's revisionId.
+    Board-origin messages have no doc, so those fields are empty strings.
+    The recipient is the canonical agent this process is waking, not a field
+    on the message, which a sender could set to someone else.
+    """
+    revision = _bounded_id(message.get("source_revision"), ID_OK) or _bounded_id(
+        message.get("request_revision"), ID_OK)
+    return {
+        "source_doc_id": _bounded_id(message.get("source_doc_id"), FILE_ID_OK),
+        "source_revision": revision,
+        "request_revision": revision,
+        "request_id": _bounded_id(message.get("request_id"), ID_OK),
+        "task_id": _bounded_id(message.get("task_id"), ID_OK),
+        "recipient_id": recipient_id,
+    }
+
+
+def idempotency_key(tuple_: dict, message_id: str = "") -> str:
+    """sha256 over the request identity, joined by the same separator as drive-intake.
+
+    When the doc, request revision, request id and task id are all present this
+    is drive-intake's idempotency_key (PR 362): the recipient is not part of
+    that identity. A board-origin message has those fields empty, and hashing
+    the empty tuple would make every board message one key, so the message id
+    and recipient are included in that case only.
+    """
+    doc = str(tuple_.get("source_doc_id") or "")
+    rev = str(tuple_.get("request_revision") or tuple_.get("source_revision") or "")
+    req = str(tuple_.get("request_id") or "")
+    task = str(tuple_.get("task_id") or "")
+    if doc and rev and req and task:
+        parts = (doc, rev, req, task)
+    else:
+        parts = (str(message_id or ""), str(tuple_.get("recipient_id") or ""), doc, rev, req, task)
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def receipt_entry(message, recipient_id: str, received_at: str) -> dict:
+    """One responder entry. State is RECEIVED: the ring has not been confirmed yet."""
+    mid = str(message.get("id") or "")
+    correlation = correlation_tuple(message, recipient_id)
+    return {
+        "message_id": mid,
+        "received_at": received_at,
+        "recipient_id": recipient_id,
+        "source_doc_id": correlation["source_doc_id"],
+        "source_revision": correlation["source_revision"],
+        "request_revision": correlation["request_revision"],
+        "request_id": correlation["request_id"],
+        "task_id": correlation["task_id"],
+        "correlation": correlation,
+        "idempotency_key": idempotency_key(correlation, mid),
+        "state": RECEIVED,
+    }
+
+
+def _stamp(deps) -> str:
+    clock = getattr(deps, "clock", None)
+    if clock is None:
+        return utc_now()
+    stamp = clock() if callable(clock) else clock
+    return str(stamp)
+
+
+def _log_receipt(outcome, message_id, recipient_id, error) -> None:
+    # Ids and the failure class only. The message text is not a log line.
+    LOG.error(
+        "inbox-wake receipt %s message_id=%s recipient_id=%s error=%s",
+        outcome, message_id, recipient_id, error,
+    )
+
+
+class RedisReceipts:
+    """One responder entry under fleet:. The claim is SET NX, then the entry.
+
+    A duplicate claim writes nothing. A failed write releases the claim, is
+    logged, and returns unknown or error. It does not return a success.
+    """
+
+    def __init__(self, client):
+        self.client = client
+
+    def record(self, entry: dict) -> str:
+        message_id = str(entry.get("message_id") or "")
+        recipient_id = str(entry.get("recipient_id") or "")
+        state = entry.get("state")
+        if state not in RECEIPT_STATES:
+            _log_receipt("error", message_id, recipient_id, "refused-state")
+            return "error"
+        key = str(entry.get("idempotency_key") or "")
+        if not KEY_OK.fullmatch(key):
+            _log_receipt("error", message_id, recipient_id, "bad-key")
+            return "error"
+        claim = RECEIPT_CLAIM_PREFIX + key
+        entry_key = RECEIPT_ENTRY_PREFIX + key
+        try:
+            claimed = self.client.set(claim, "1", nx=True, ex=SEEN_TTL)
+        except Exception as exc:  # noqa: BLE001 - a lost claim is unknown, not received
+            _log_receipt("unknown", message_id, recipient_id, type(exc).__name__)
+            return "unknown"
+        if not claimed:
+            return "duplicate"
+        try:
+            payload = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+            wrote = self.client.set(entry_key, payload, ex=SEEN_TTL)
+        except Exception as exc:  # noqa: BLE001 - the write may not have landed
+            _log_receipt("unknown", message_id, recipient_id, type(exc).__name__)
+            self._release(claim, message_id, recipient_id)
+            return "unknown"
+        if not wrote:
+            _log_receipt("error", message_id, recipient_id, "write-rejected")
+            self._release(claim, message_id, recipient_id)
+            return "error"
+        return "written"
+
+    def _release(self, claim, message_id, recipient_id) -> None:
+        try:
+            self.client.delete(claim)
+        except Exception as exc:  # noqa: BLE001 - the caller already has the failure
+            _log_receipt("unknown", message_id, recipient_id, "claim-release-" + type(exc).__name__)
+
+
+def _record_receipt(message, agent, deps) -> str:
+    try:
+        return deps.receipts.record(receipt_entry(message, agent, _stamp(deps)))
+    except Exception as exc:  # noqa: BLE001 - a receipt that raises is not a received message
+        _log_receipt("unknown", str(message.get("id") or ""), agent, type(exc).__name__)
+        return "unknown"
+
+
+def _receipt_failure(agent, mid, outcome) -> dict:
+    return {"status": outcome, "woke": False, "to": agent, "id": mid, "receipt": outcome}
 
 
 class Wakers:
@@ -173,8 +350,20 @@ def decide(message: dict, deps) -> dict:
     if deps.seen is None:
         return {"status": "no_store", "woke": False, "to": agent, "id": mid}
     key = "%s:%s" % (agent, mid)
+    # Receipts are a second flag. No writer means the flag is off, and the
+    # rest of this function is the path it had before the receipt existed.
     if not deps.seen.claim(key):
+        if deps.receipts is not None:
+            receipt = _record_receipt(message, agent, deps)
+            if receipt in ("error", "unknown"):
+                return _receipt_failure(agent, mid, receipt)
         return {"status": "duplicate", "woke": False, "to": agent, "id": mid}
+    receipt = None
+    if deps.receipts is not None:
+        receipt = _record_receipt(message, agent, deps)
+        if receipt in ("error", "unknown"):
+            deps.seen.release(key)
+            return _receipt_failure(agent, mid, receipt)
     try:
         deps.wakers.dispatch(agent, ROUTES[agent], {
             "id": mid, "to": agent, "by": by, "text": message.get("text") or "",
@@ -188,8 +377,11 @@ def decide(message: dict, deps) -> dict:
         return {"status": "error", "woke": False, "to": agent, "id": mid,
                 "error": type(exc).__name__}
     kind, target = ROUTES[agent]
-    return {"status": "woke", "woke": True, "to": agent, "id": mid,
-            "route": kind, "target": target}
+    result = {"status": "woke", "woke": True, "to": agent, "id": mid,
+              "route": kind, "target": target}
+    if receipt is not None:
+        result["receipt"] = receipt
+    return result
 
 
 def sweep(deps) -> list:
@@ -320,20 +512,40 @@ def read_inbox(client, agent: str) -> list:
                 value = value.decode("utf-8", "replace")
             return value or ""
 
-        out.append({"id": str(entry_id), "text": field("text"), "by": field("by"),
-                    "at": field("at")})
+        item = {"id": str(entry_id), "text": field("text"), "by": field("by"),
+                "at": field("at")}
+        for name in ("source_doc_id", "source_revision", "request_revision",
+                     "request_id", "task_id", "recipient_id"):
+            item[name] = field(name)
+        out.append(item)
     return out
 
 
 class Deps:
     def __init__(self, enabled=False, seen=None, wakers=None, reader=None,
-                 webhook_secret="", sweep_token=""):
+                 webhook_secret="", sweep_token="", receipts=None, clock=None):
         self.enabled = enabled
         self.seen = seen
         self.wakers = wakers or Wakers()
         self.reader = reader
         self.webhook_secret = webhook_secret or ""
         self.sweep_token = sweep_token or ""
+        self.receipts = receipts
+        self.clock = clock
+
+
+def attach_store(deps, client, receipts=None):
+    """Seen-set and inbox reader on one fleet client. Receipts follow the flag.
+
+    `receipts` None reads INBOX_WAKE_RECEIPTS. The wake flag is the caller's:
+    this function is only reached when that flag is already on.
+    """
+    if receipts is None:
+        receipts = receipts_enabled()
+    deps.seen = RedisSeen(client)
+    deps.reader = lambda agent, client=client: read_inbox(client, agent)
+    deps.receipts = RedisReceipts(client) if receipts else None
+    return deps
 
 
 def deps_from_env() -> Deps:
@@ -353,8 +565,7 @@ def deps_from_env() -> Deps:
         return deps
     client = _redis_client()
     if client is not None:
-        deps.seen = RedisSeen(client)
-        deps.reader = lambda agent, client=client: read_inbox(client, agent)
+        attach_store(deps, client)
     return deps
 
 

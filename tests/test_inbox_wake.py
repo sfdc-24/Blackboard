@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import unittest
@@ -246,6 +247,332 @@ class DefinitionStaysOff(unittest.TestCase):
                 self.assertNotIn(needle, text, name)
         sweep = (REPO / ".github" / "workflows" / "inbox-wake-sweep.yml").read_text(encoding="utf-8")
         self.assertIn("*/15 * * * *", sweep)
+
+
+DOC = "1pKWJYbJzMqxSA9Vy_PSR93BU2OAAgP-N3WBEkCj7oj4"
+REV = "ab" * 32
+TASK = "task-0123456789abcdef"
+REQ = "OT-20261010"
+STAMP = "2026-10-10T22:12:00Z"
+
+
+def entries(client):
+    """Responder entries only. The claim key is the lock, not the entry."""
+    found = {}
+    for key, (value, _ex) in client.store.items():
+        if key.startswith(wake.RECEIPT_ENTRY_PREFIX):
+            found[key] = json.loads(value)
+    return found
+
+
+def drive_key(doc=DOC, rev=REV, req=REQ, task=TASK):
+    """cloud/drive-intake idempotency_key: doc, request revision, request id, task id."""
+    return hashlib.sha256("\x1f".join((doc, rev, req, task)).encode("utf-8")).hexdigest()
+
+
+def receipt_deps(client, clock=STAMP):
+    d, rec = deps(seen=wake.RedisSeen(client))
+    d.receipts = wake.RedisReceipts(client)
+    d.clock = lambda: clock
+    return d, rec
+
+
+class FlagOffWritesNothing(unittest.TestCase):
+    def test_only_the_exact_string_on_enables_receipts(self):
+        for value in ("", "off", "ON", "true", "1", "yes", " on"):
+            self.assertFalse(wake.receipts_enabled({"INBOX_WAKE_RECEIPTS": value}), value)
+        self.assertFalse(wake.receipts_enabled({}))
+        self.assertTrue(wake.receipts_enabled({"INBOX_WAKE_RECEIPTS": "on"}))
+
+    def test_the_image_defaults_the_receipt_flag_off(self):
+        docker = (REPO / "cloud" / "inbox-wake" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ENV INBOX_WAKE_RECEIPTS=off", docker)
+
+    def test_wake_off_does_not_attach_a_writer_even_if_receipts_are_requested(self):
+        saved = os.environ.get("INBOX_WAKE_ENABLED"), os.environ.get("INBOX_WAKE_RECEIPTS")
+        os.environ.pop("INBOX_WAKE_ENABLED", None)
+        os.environ["INBOX_WAKE_RECEIPTS"] = "on"
+        try:
+            built = wake.deps_from_env()
+        finally:
+            for name, value in zip(("INBOX_WAKE_ENABLED", "INBOX_WAKE_RECEIPTS"), saved):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        self.assertFalse(built.enabled)
+        self.assertIsNone(built.seen)
+        self.assertIsNone(built.receipts)
+
+    def test_flag_off_writes_no_responder_entry(self):
+        client = FakeRedis()
+        saved = os.environ.get("INBOX_WAKE_RECEIPTS")
+        os.environ["INBOX_WAKE_RECEIPTS"] = "off"
+        try:
+            d, rec = deps()
+            wake.attach_store(d, client)
+        finally:
+            if saved is None:
+                os.environ.pop("INBOX_WAKE_RECEIPTS", None)
+            else:
+                os.environ["INBOX_WAKE_RECEIPTS"] = saved
+        self.assertIsNone(d.receipts)
+        got = wake.decide({"id": "m-1", "to": "grok", "text": "ping"}, d)
+        self.assertEqual("woke", got["status"])
+        self.assertTrue(got["woke"])
+        self.assertNotIn("receipt", got)
+        self.assertEqual(["fleet:wake:seen:grok:m-1"], list(client.store))
+        self.assertEqual({}, entries(client))
+        self.assertEqual(1, len(rec.http))
+
+
+class PickupReceipt(unittest.TestCase):
+    def test_first_pickup_writes_one_received_entry_with_the_whole_tuple(self):
+        client = FakeRedis()
+        d, rec = receipt_deps(client)
+        message = {
+            "id": "1-0", "to": "grok-bot", "by": "drive-intake", "text": "fix the telephone",
+            "source_doc_id": DOC, "source_revision": REV,
+            "request_id": REQ, "task_id": TASK, "recipient_id": "gemini",
+        }
+        got = wake.decide(message, d)
+        self.assertEqual("woke", got["status"])
+        self.assertEqual("written", got["receipt"])
+        self.assertEqual(1, len(rec.http))
+        found = entries(client)
+        self.assertEqual(1, len(found))
+        key, item = next(iter(found.items()))
+        self.assertEqual(wake.RECEIPT_ENTRY_PREFIX + drive_key(), key)
+        self.assertEqual("1-0", item["message_id"])
+        self.assertEqual(STAMP, item["received_at"])
+        self.assertRegex(item["received_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual("grok", item["recipient_id"])
+        self.assertEqual("RECEIVED", item["state"])
+        self.assertEqual(DOC, item["source_doc_id"])
+        self.assertEqual(REV, item["request_revision"])
+        self.assertEqual(REV, item["source_revision"])
+        self.assertEqual(REQ, item["request_id"])
+        self.assertEqual(TASK, item["task_id"])
+        corr = item["correlation"]
+        self.assertEqual(DOC, corr["source_doc_id"])
+        self.assertEqual(REV, corr["request_revision"])
+        self.assertEqual(REV, corr["source_revision"])
+        self.assertEqual(REQ, corr["request_id"])
+        self.assertEqual(TASK, corr["task_id"])
+        self.assertEqual("grok", corr["recipient_id"])
+        self.assertEqual(drive_key(), item["idempotency_key"])
+        self.assertNotIn("text", item)
+        self.assertLessEqual(len(json.dumps(item)), 2048)
+        claim = wake.RECEIPT_CLAIM_PREFIX + item["idempotency_key"]
+        self.assertEqual(2592000, client.store[claim][1])
+        self.assertEqual(2592000, client.store[key][1])
+
+    def test_the_drive_key_ignores_recipient_and_message_id(self):
+        one = wake.idempotency_key(
+            {"source_doc_id": DOC, "request_revision": REV, "request_id": REQ,
+             "task_id": TASK, "recipient_id": "grok"}, "1-0")
+        two = wake.idempotency_key(
+            {"source_doc_id": DOC, "source_revision": REV, "request_id": REQ,
+             "task_id": TASK, "recipient_id": "gemini"}, "9-9")
+        self.assertEqual(drive_key(), one)
+        self.assertEqual(one, two)
+        changed = wake.idempotency_key(
+            {"source_doc_id": DOC, "request_revision": REV, "request_id": REQ,
+             "task_id": TASK + "ff", "recipient_id": "grok"}, "1-0")
+        self.assertNotEqual(one, changed)
+
+    def test_a_board_row_keeps_an_empty_tuple_and_a_repeat_writes_nothing(self):
+        client = FakeRedis()
+        d, rec = receipt_deps(client)
+        body = json.dumps({
+            "action": "created",
+            "comment": {"body": "inbox to=claude-code-cli id=row-7 by=grok text=are you there"},
+        }).encode()
+        headers = {
+            "X-GitHub-Event": "issue_comment",
+            "X-Hub-Signature-256": sign("hook", body),
+        }
+        status, payload = wake.handle("POST", "/wake", headers, body, d)
+        self.assertEqual(200, status)
+        self.assertEqual("woke", payload["woke"][0]["status"])
+        found = entries(client)
+        self.assertEqual(1, len(found))
+        item = next(iter(found.values()))
+        self.assertEqual("row-7", item["message_id"])
+        self.assertEqual(STAMP, item["received_at"])
+        self.assertEqual("claude-code-cli", item["recipient_id"])
+        self.assertEqual("RECEIVED", item["state"])
+        for field in ("source_doc_id", "request_revision", "source_revision", "request_id", "task_id"):
+            self.assertEqual("", item[field])
+            self.assertEqual("", item["correlation"][field])
+        self.assertEqual("claude-code-cli", item["correlation"]["recipient_id"])
+        self.assertEqual(item["idempotency_key"], wake.idempotency_key(item["correlation"], "row-7"))
+        before = dict(client.store)
+        status, payload = wake.handle("POST", "/wake", headers, body, d)
+        self.assertEqual(200, status)
+        self.assertEqual("duplicate", payload["woke"][0]["status"])
+        self.assertFalse(payload["woke"][0]["woke"])
+        self.assertEqual(before, client.store)
+        self.assertEqual(1, len(entries(client)))
+        self.assertEqual(1, len(rec.github))
+
+    def test_two_board_messages_are_two_entries(self):
+        client = FakeRedis()
+        d, _rec = receipt_deps(client)
+        wake.decide({"id": "row-1", "to": "grok", "text": "one"}, d)
+        wake.decide({"id": "row-2", "to": "grok", "text": "two"}, d)
+        self.assertEqual(2, len(entries(client)))
+
+    def test_the_same_drive_request_under_a_new_stream_id_does_not_write_a_second_entry(self):
+        client = FakeRedis()
+        d, _rec = receipt_deps(client)
+        base = {"to": "grok", "text": "x", "source_doc_id": DOC, "source_revision": REV,
+                "request_id": REQ, "task_id": TASK}
+        self.assertEqual("woke", wake.decide(dict(base, id="1-0"), d)["status"])
+        again = wake.decide(dict(base, id="2-0"), d)
+        self.assertEqual("duplicate", again["receipt"])
+        self.assertEqual(1, len(entries(client)))
+
+    def test_claim_is_set_nx_before_the_entry_and_a_repeat_does_not_set_again(self):
+        class Order(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.ops = []
+
+            def set(self, key, value, nx=False, ex=None):
+                self.ops.append((key, bool(nx)))
+                return super().set(key, value, nx=nx, ex=ex)
+
+        client = Order()
+        receipts = wake.RedisReceipts(client)
+        entry = wake.receipt_entry({"id": "m-1", "to": "grok"}, "grok", STAMP)
+        self.assertEqual("written", receipts.record(entry))
+        self.assertTrue(client.ops[0][0].startswith(wake.RECEIPT_CLAIM_PREFIX))
+        self.assertTrue(client.ops[0][1])
+        self.assertTrue(client.ops[1][0].startswith(wake.RECEIPT_ENTRY_PREFIX))
+        self.assertFalse(client.ops[1][1])
+        ops = len(client.ops)
+        self.assertEqual("duplicate", receipts.record(entry))
+        # The duplicate attempts the claim and, finding it held, does not write an entry.
+        self.assertEqual(ops + 1, len(client.ops))
+        self.assertTrue(client.ops[-1][0].startswith(wake.RECEIPT_CLAIM_PREFIX))
+        self.assertEqual(1, len(entries(client)))
+
+    def test_sweep_copies_the_inbox_tuple_onto_the_receipt(self):
+        class Stream:
+            def xrange(self, key, count=None):
+                self.key = key
+                return [(b"1-0", {
+                    b"text": b"hello", b"by": b"drive-intake", b"at": STAMP.encode(),
+                    b"source_doc_id": DOC.encode(), b"source_revision": REV.encode(),
+                    b"request_id": REQ.encode(), b"task_id": TASK.encode(),
+                    b"recipient_id": b"gemini",
+                })]
+
+        stream = Stream()
+        rows = wake.read_inbox(stream, "grok")
+        self.assertEqual("fleet:inbox:grok", stream.key)
+        self.assertEqual(DOC, rows[0]["source_doc_id"])
+        self.assertEqual(REV, rows[0]["source_revision"])
+        client = FakeRedis()
+        d, rec = receipt_deps(client)
+
+        def reader(agent):
+            return rows if agent == "grok" else []
+
+        d.reader = reader
+        out = wake.sweep(d)
+        woke = [item for item in out if item.get("status") == "woke"]
+        self.assertEqual(["grok"], [item["to"] for item in woke])
+        item = next(iter(entries(client).values()))
+        self.assertEqual("1-0", item["message_id"])
+        self.assertEqual(drive_key(), item["idempotency_key"])
+        self.assertEqual("grok", item["recipient_id"])
+        self.assertEqual(1, len(rec.http))
+        wake.sweep(d)
+        self.assertEqual(1, len(entries(client)))
+
+
+class ReceiptWriteFailure(unittest.TestCase):
+    def test_a_redis_exception_is_unknown_and_does_not_wake(self):
+        class EntryWriteFails(FakeRedis):
+            def set(self, key, value, nx=False, ex=None):
+                if key.startswith(wake.RECEIPT_ENTRY_PREFIX):
+                    raise OSError("redis down")
+                return super().set(key, value, nx=nx, ex=ex)
+
+        client = EntryWriteFails()
+        d, rec = receipt_deps(client)
+        with self.assertLogs("inbox_wake", level="ERROR") as caught:
+            got = wake.decide({"id": "m-1", "to": "grok", "text": "ACCEPTED please"}, d)
+        self.assertEqual("unknown", got["status"])
+        self.assertFalse(got["woke"])
+        self.assertNotEqual("woke", got["status"])
+        self.assertNotEqual("success", got["status"])
+        self.assertEqual([], rec.http)
+        self.assertEqual({}, entries(client))
+        self.assertFalse(any(key.startswith(wake.RECEIPT_CLAIM_PREFIX) for key in client.store))
+        self.assertNotIn("fleet:wake:seen:grok:m-1", client.store)
+        self.assertTrue(any("unknown" in line and "m-1" in line for line in caught.output))
+        self.assertFalse(any("ACCEPTED" in line for line in caught.output))
+
+    def test_a_rejected_write_is_an_error_and_does_not_wake(self):
+        class EntryWriteRejected(FakeRedis):
+            def set(self, key, value, nx=False, ex=None):
+                if key.startswith(wake.RECEIPT_ENTRY_PREFIX):
+                    return False
+                return super().set(key, value, nx=nx, ex=ex)
+
+        client = EntryWriteRejected()
+        d, rec = receipt_deps(client)
+        with self.assertLogs("inbox_wake", level="ERROR") as caught:
+            got = wake.decide({"id": "m-2", "to": "grok", "text": "ping"}, d)
+        self.assertEqual("error", got["status"])
+        self.assertFalse(got["woke"])
+        self.assertEqual([], rec.http)
+        self.assertEqual({}, entries(client))
+        self.assertTrue(any("error" in line for line in caught.output))
+
+    def test_a_claim_that_raises_is_unknown_and_does_not_wake(self):
+        class ClaimWriteFails(FakeRedis):
+            def set(self, key, value, nx=False, ex=None):
+                if key.startswith(wake.RECEIPT_CLAIM_PREFIX):
+                    raise ConnectionError("redis unreachable")
+                return super().set(key, value, nx=nx, ex=ex)
+
+        client = ClaimWriteFails()
+        d, rec = receipt_deps(client)
+        with self.assertLogs("inbox_wake", level="ERROR"):
+            got = wake.decide({"id": "m-3", "to": "gemini", "text": "ping"}, d)
+        self.assertEqual("unknown", got["status"])
+        self.assertFalse(got["woke"])
+        self.assertEqual([], rec.jobs)
+        self.assertEqual({}, entries(client))
+
+
+class NeverAccepted(unittest.TestCase):
+    def test_the_service_never_emits_accepted(self):
+        self.assertEqual((wake.RECEIVED, wake.DISPATCHED), wake.RECEIPT_STATES)
+        self.assertNotIn("ACCEPTED", wake.RECEIPT_STATES)
+        client = FakeRedis()
+        receipts = wake.RedisReceipts(client)
+        refused = wake.receipt_entry({"id": "m-1", "text": "ACCEPTED"}, "grok", STAMP)
+        refused["state"] = "ACCEPTED"
+        with self.assertLogs("inbox_wake", level="ERROR"):
+            self.assertEqual("error", receipts.record(refused))
+        self.assertEqual({}, client.store)
+        d, _rec = receipt_deps(client)
+        got = wake.decide({"id": "m-2", "to": "grok", "text": "status ACCEPTED"}, d)
+        self.assertEqual("woke", got["status"])
+        self.assertEqual("RECEIVED", got["receipt"] and next(iter(entries(client).values()))["state"])
+        blob = json.dumps({key: value[0] for key, value in client.store.items()})
+        self.assertNotIn("ACCEPTED", blob)
+        for item in entries(client).values():
+            self.assertIn(item["state"], ("RECEIVED", "DISPATCHED"))
+            self.assertNotEqual("ACCEPTED", item["state"])
+        source = (REPO / "cloud" / "inbox-wake" / "main.py").read_text(encoding="utf-8")
+        self.assertNotIn('"ACCEPTED"', source)
+        self.assertNotIn("'ACCEPTED'", source)
 
 
 if __name__ == "__main__":
