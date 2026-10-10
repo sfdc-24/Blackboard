@@ -390,7 +390,8 @@ def names_tag(field: str, me: str) -> bool:
 
 def addressed_to(row, me: str) -> bool:
     """Target_Surface names me, or the payload's to=/cc= does, or a WhatsApp
-    message begins with my tag.
+    message begins with my tag, with Fleet or all, or with Claude when I am
+    the claude-api stand-in.
 
     Deliberately inclusive. The board reader has hidden rows from their own
     recipient before by trusting one addressing field, and a doorbell that
@@ -429,6 +430,21 @@ def addressed_to(row, me: str) -> bool:
     # line that makes it work.
     if source == "whatsapp" and re.match(r"^\s*%s\b" % re.escape(me), payload, re.I):
         return True
+    # Mr Salam, 2026-10-10: a WhatsApp row whose text starts "Fleet" or "all"
+    # is to the whole fleet. Target_Surface is the sheet, so the prefix is the
+    # address. WRK-a6e462ac and WRK-54582903 woke nobody.
+    if source == "whatsapp" and re.match(r"^\s*(fleet|all)\b", payload, re.I):
+        return True
+    # WRK-a4527d85 starts "Claude - Fleet", not "Fleet". The lead-in does not
+    # hide the fleet address after the separator. A Claude prefix that is not
+    # that address stays with the stand-in below.
+    if source == "whatsapp" and re.match(r"^\s*claude\b\s*[-,]\s*(fleet|all)\b", payload, re.I):
+        return True
+    # "Claude - ..." and "Claude, ..." are the claude-api stand-in. The
+    # claude-code-cli prefix already matches above; a bare Claude did not.
+    # Other tags do not take this prefix.
+    if me == "claude-api" and source == "whatsapp" and re.match(r"^\s*claude\b", payload, re.I):
+        return True
     return False
 
 
@@ -443,7 +459,8 @@ def wakes_for(row, me: str) -> bool:
 
     No for a result, receipt, DONE or ACK - by Action_Type or by the payload's phase=. And no when
     `me` is only on the cc= line: a copy is for reading, not answering. A row that names me in
-    Target_Surface or to= (or a WhatsApp message that starts with my name) still wakes me."""
+    Target_Surface or to= still wakes me, as does a WhatsApp message that starts with my name,
+    with Fleet or all, or with Claude when I am the claude-api stand-in."""
     action = str(row[C_ACTION] if len(row) > C_ACTION else "").strip().upper()
     payload = str(row[C_PAYLOAD] if len(row) > C_PAYLOAD else "")
     if action in NO_WAKE_ACTIONS:
@@ -459,6 +476,14 @@ def wakes_for(row, me: str) -> bool:
     if to and names_tag(to.group(1), me):
         return True
     if source == "whatsapp" and re.match(r"^\s*%s\b" % re.escape(me), payload, re.I):
+        return True
+    # Same fleet prefix as addressed_to. Gemini's wake_filter consults this
+    # function, so a Fleet row that only addressed_to accepted would still be dropped.
+    if source == "whatsapp" and re.match(r"^\s*(fleet|all)\b", payload, re.I):
+        return True
+    if source == "whatsapp" and re.match(r"^\s*claude\b\s*[-,]\s*(fleet|all)\b", payload, re.I):
+        return True
+    if me == "claude-api" and source == "whatsapp" and re.match(r"^\s*claude\b", payload, re.I):
         return True
     return False                                   # reached me only through cc= (or standby)
 
