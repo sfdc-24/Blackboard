@@ -138,6 +138,34 @@ finally:
 
 check("nothing was sent to the bus", not attempts, attempts)
 
+# A conflicting v= sits past the summary cutoff. fit() used to run first and the guard then saw
+# only the short row, so the smuggled v=999 was stored in the spill and the posted row looked clean.
+long_smuggle = ("BCB|v=1|id=LONG-1|phase=RESULT|from=claude-code-cli|to=codex|"
+                + ("The architecture keeps Redis as the live store. " * 80)
+                + "|v=999")
+# The prose segment is not a field, so the trailing v=999 is in the free text fit() may cut.
+fitted_only, _info = __import__("board_row").fit(
+    "", long_smuggle, key="LONG-1", spill=lambda k, t: "gs://b/x.json")
+check("the fitted summary hides the smuggled v=999",
+      "v" not in ap._conflicting_keys(fitted_only), ap._conflicting_keys(fitted_only))
+check("the original payload still conflicts", "v" in ap._conflicting_keys(long_smuggle))
+
+attempts.clear()
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+    _json.dump({"row_id": "LONG-1", "source_tag": "claude-code-cli", "payload": long_smuggle}, fh)
+    long_path = fh.name
+sys.argv = ["append.py", long_path]
+try:
+    ap.main()
+    check("main() refuses a conflict that the summary would hide", False, "it returned normally")
+except SystemExit as e:
+    msg = str(e)
+    check("main() refuses a conflict that the summary would hide", "BCB_PAYLOAD_AMBIGUOUS" in msg, msg)
+finally:
+    sys.argv = old_argv
+    os.unlink(long_path)
+check("a hidden conflict was not appended", not attempts, attempts)
+
 print("")
 print("{0} passed, {1} failed".format(PASS, FAIL))
 for f in FAILURES:

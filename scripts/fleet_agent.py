@@ -362,17 +362,15 @@ def cmd_post(args):
     header = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|" % (
         rid, args.phase, args.klass, tag, to.replace(";", ","))
     # NEVER TRIM SILENTLY (board_row, 2026-10-09). Every agent's post comes through here, so this is
-    # the one place the 1,500-char limit is applied: a longer text is stored whole and the row
-    # carries full=<pointer>|chars=|sha256=, or says truncated=1 on its face if it cannot be stored.
+    # the one place the 1,500-char limit is applied. fit(write=False) only NAMES the spill object.
+    # The bytes are written by commit() after the append, so a slow store is not on the post.
+    spill = board_row.store_spill()
     try:
-        payload, fitted = board_row.fit(header, text, key=rid, spill=board_row.store_spill())
+        payload, fitted = board_row.fit(header, text, key=rid, spill=spill, write=False)
     except board_row.RowRejected as exc:
         print("  %s" % exc)
         return 2
-    if fitted["spilled"]:
-        print("  long text (%d chars) stored whole at %s; the row carries the pointer"
-              % (fitted["chars"], fitted["pointer"]))
-    elif fitted["truncated"]:
+    if fitted["truncated"]:
         print("  WARNING: %d chars could not be stored (%s); the row is marked truncated=1"
               % (fitted["chars"], fitted["error"] or "no spill store"))
     gist = args.gist or board_row.split_fields(text)[1][:180]
@@ -393,6 +391,19 @@ def cmd_post(args):
     except Exception as exc:  # noqa: BLE001
         print("  append raised %s: %s" % (type(exc).__name__, exc))
         print("  This does NOT mean the row is absent. Reading back to find out.")
+
+    # The spill is off the post: the append above did not wait on the store. Commit now, so a
+    # reader that resolves the pointer after this process returns finds the bytes. A failure is
+    # said; it does not pretend the append failed, and it does not overwrite an object that landed.
+    if fitted.get("deferred"):
+        try:
+            board_row.commit(fitted, spill)
+            print("  long text (%d chars) stored whole at %s; the row carries the pointer"
+                  % (fitted["chars"], fitted["pointer"]))
+        except Exception as exc:  # noqa: BLE001
+            print("  SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
+            print("  The row is already posted. The object name is the row id plus the sha256, so "
+                  "a later commit of the same text reuses it and cannot overwrite a different one.")
 
     # D-4: the response is not the proof. Read the row back by its own id.
     data = read_board(quiet=True)

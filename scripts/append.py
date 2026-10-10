@@ -82,15 +82,9 @@ def main():
     payload = spec["payload"]
     if not payload.startswith("BCB|"):
         raise SystemExit("payload must be a BCB envelope starting with 'BCB|'")
-    # NEVER TRIM SILENTLY (scripts/board_row.py): a payload over the 1,500-char row limit is stored
-    # whole and the row carries full=<pointer>|chars=|sha256=, or truncated=1 if it cannot be stored.
-    try:
-        payload, fitted = board_row.fit("", payload, key=spec["row_id"], spill=board_row.store_spill())
-    except board_row.RowRejected as exc:
-        raise SystemExit(str(exc))
-    if fitted["spilled"] or fitted["truncated"]:
-        print("LONG PAYLOAD: %d chars -> %s" % (fitted["chars"], fitted["pointer"] or "truncated=1 (not stored)"))
-    row[5] = payload
+    # The ambiguity guard reads the ORIGINAL payload, before fit() replaces the tail with a summary.
+    # A conflicting authority key past the summary cutoff would otherwise ride out inside the spill
+    # and the posted row would look clean. Refusing here also means a rejected row never spills.
     conflicts = sorted(_conflicting_keys(payload))
     if conflicts:
         raise SystemExit(
@@ -118,6 +112,16 @@ def main():
         raise SystemExit(
             "ROW_ATTRIBUTION_UNCLEAR: refusing to append.\n  - "
             + "\n  - ".join(signature_problems))
+    # NEVER TRIM SILENTLY (scripts/board_row.py). write=False only names the spill object. The
+    # bytes go out in commit(), after the append below, so the store is not on the post.
+    spill = board_row.store_spill()
+    try:
+        payload, fitted = board_row.fit("", payload, key=spec["row_id"], spill=spill, write=False)
+    except board_row.RowRejected as exc:
+        raise SystemExit(str(exc))
+    if fitted["truncated"]:
+        print("LONG PAYLOAD: %d chars -> truncated=1 (not stored)" % fitted["chars"])
+    row[5] = payload
     # tries=1 is deliberately explicit even though fetch() now enforces the same
     # rule for every append. The v1 bus does not dedup, and a googleusercontent
     # 404 on the redirect hop can be raised client-side AFTER the row has already
@@ -139,6 +143,14 @@ def main():
     except Exception as exc:  # noqa: BLE001 - the transport failure is not the answer
         print("APPEND raised %s: %s" % (type(exc).__name__, exc))
         print("This does NOT mean the row is absent. Reading back to find out.")
+
+    if fitted.get("deferred"):
+        try:
+            board_row.commit(fitted, spill)
+            print("LONG PAYLOAD: %d chars stored at %s" % (fitted["chars"], fitted["pointer"]))
+        except Exception as exc:  # noqa: BLE001
+            print("SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
+            print("The row is already posted. A later commit of the same text reuses the object.")
 
     # read back — ok:true is not proof, and an exception is not proof of absence
     # (ISSUE 020 and its inverse). Reads are idempotent, so retry those freely.

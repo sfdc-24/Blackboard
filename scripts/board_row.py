@@ -11,10 +11,14 @@ THE DEFECT THIS CLOSES (Grok's daily scorecard, 2026-10-09)
 
 THE RULE (poka-yoke, not a gate on the owner)
     1. A row is at most ROW_LIMIT characters (1,500, the owner's limit).
-    2. A longer text is NEVER cut quietly. fit() writes the full text to a spill store (the waker's
-       own state store: GCS in the cloud, a directory on a laptop) and posts a short row carrying
+    2. A longer text is NEVER cut quietly. fit() names a spill object (the waker's own state store:
+       GCS in the cloud, a directory on a laptop) and the row carries
            full=<pointer>|chars=<N>|sha256=<hex>|
-       and a summary that ends on a whole sentence plus a note saying where the rest is.
+       plus a summary that ends on a whole sentence and a note saying where the rest is.
+       The object name is the row id plus the sha256 of the whole payload, and the write is
+       create-only (GCS ifGenerationMatch=0). Two different rows cannot land on one object, and a
+       second writer cannot overwrite the first. The write itself runs AFTER the board append, so a
+       slow store cannot sit on the post.
     3. If the full text cannot be stored, the row still goes out, but it says so on its face:
            truncated=1|chars=<N>|sha256=<hex>|  ... [TRUNCATED: ...]
        A visible mark, never a silent loss.
@@ -106,25 +110,49 @@ def sentence_cut(text: str, room: int) -> str:
     return (window[:sp] if sp > room // 2 else window).rstrip() + " ..."
 
 
-def fit(header: str, text: str, key: str, spill=None, limit: int = ROW_LIMIT):
+def object_name(key: str, full: str) -> str:
+    """One object per row id AND per payload.
+
+    The id is kept so a person can see which row a file is, but it is not the identity: sanitising
+    it drops characters (`ab/c` and `abc` become one string) and a 80-character cut would do the
+    same to a long id. The sha256 of the whole payload is what makes two concurrent spills two
+    objects. The same id with the same bytes is the same name, so a retry does not create a second
+    copy.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", key or "")[:80] or "row"
+    return "%s%s-%s" % (SPILL_PREFIX, safe, sha256(full))
+
+
+def fit(header: str, text: str, key: str, spill=None, limit: int = ROW_LIMIT, write: bool = True):
     """Return (payload, info). payload = header + text when it fits, else a pointer row.
 
     header: everything the writer puts before `text` (e.g. "BCB|v=1|id=...|to=...|").
     text:   leading k=v fields, then the free text.
     spill:  callable(key, full_text) -> pointer string; None or a raise means "could not store".
+            A store_spill() callable also has .plan(key, full), which names the object and does no IO.
+    write:  True writes during fit() (direct callers and tests). False only names the object.
+            The board posters pass False and call commit() AFTER the append, so the store is not on
+            the post.
     The spilled text is the WHOLE payload (header included), so the sha256 covers exactly what the
     row would have said.
     """
     full = header + (text or "")
     info = {"chars": len(full), "sha256": sha256(full), "spilled": False, "pointer": None,
-            "truncated": False, "error": None}
+            "truncated": False, "error": None, "deferred": False, "key": key, "full": full}
     if len(full) <= limit:
         return guard(full), info
     fields, free = split_fields(text or "")
     pointer = None
     if spill is not None:
         try:
-            pointer = spill(key, full)
+            if write:
+                pointer = spill(key, full)
+            else:
+                planner = getattr(spill, "plan", None)
+                if planner is None:
+                    raise TypeError("spill cannot be deferred: no plan()")
+                pointer = planner(key, full)
+                info["deferred"] = True
         except Exception as exc:  # noqa: BLE001 - a failed store becomes a visible mark, never a drop
             info["error"] = "%s: %s" % (type(exc).__name__, exc)
     n, h = info["chars"], info["sha256"]
@@ -155,8 +183,9 @@ def store_spill(store=None):
     """A spill callable backed by state_store (gs://... in the cloud, a directory on a laptop).
 
     BOARD_SPILL_URI wins, then BLACKBOARD_STATE_URI (the waker's own bucket, so no new grant),
-    then <repo>/board-full/. Objects are create-only: an existing object is reused only when its
-    sha256 matches, so a pointer can never be repointed at different text.
+    then <repo>/board-full/. The object name is object_name() (row id + sha256). The write passes
+    token None, which on GCS is ifGenerationMatch=0: create the object only if it is absent.
+    A 412 is reused only when the stored sha256 matches, so a concurrent spill cannot overwrite.
     """
     if store is None:
         import state_store
@@ -170,17 +199,39 @@ def store_spill(store=None):
             uri = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "board-full")
         store = state_store.open_store(uri)
 
+    def plan(key: str, full: str) -> str:
+        return "%s/%s.json" % (store.describe().rstrip("/"), object_name(key, full))
+
     def spill(key: str, full: str) -> str:
-        name = SPILL_PREFIX + re.sub(r"[^A-Za-z0-9._-]", "", key or "")[:120]
+        name = object_name(key, full)
         record = {"row_id": key, "chars": len(full), "sha256": sha256(full), "text": full}
+        # token None is the create-only precondition: GCS ifGenerationMatch=0. Passing the
+        # generation a load returned would be an update, and an update is how a concurrent spill
+        # overwrites. This function never does that.
         try:
             store.save(name, record, None)
         except Exception as exc:  # noqa: BLE001
             existing, _ = store.load(name)
             if (existing or {}).get("sha256") != record["sha256"]:
                 raise exc
-        return "%s/%s.json" % (store.describe().rstrip("/"), name)
+        return plan(key, full)
+
+    spill.plan = plan
     return spill
+
+
+def commit(info: dict, spill) -> str | None:
+    """Write a spill that fit(..., write=False) only named. Call this AFTER the board append.
+
+    Same bytes are the same object, so a retry is a no-op rather than a second copy. A failure
+    here does not un-post the row: the caller says SPILL_UNCONFIRMED, and resolve() refuses a
+    pointer whose bytes are not the sha256 on the row.
+    """
+    if not info.get("deferred"):
+        return info.get("pointer")
+    if spill is None:
+        raise OSError("no spill store configured")
+    return spill(info["key"], info["full"])
 
 
 def resolve(payload: str, store=None) -> str:

@@ -117,7 +117,9 @@ class FiveThousandCharReplySurvives(unittest.TestCase):
     def test_a_tampered_spill_is_caught(self):
         board, spill = FakeBoard(), tempfile.mkdtemp()
         self.assertEqual(0, post_through_fleet_agent(["post", five_thousand_char_reply(), "--id", "T-1"], board, spill))
-        path = Path(spill) / "board-full-T-1.json"
+        pointer = board_row.field(board.rows[0][5], "full")
+        path = Path(pointer.split("file:", 1)[-1])
+        self.assertTrue(path.is_file(), pointer)
         rec = json.loads(path.read_text())
         rec["text"] = rec["text"][:-1]
         path.write_text(json.dumps(rec))
@@ -162,13 +164,92 @@ class NeverSilent(unittest.TestCase):
                                    key="P", spill=lambda k, t: "gs://b/board-full-P.json")
         self.assertTrue(payload.startswith("BCB|v=1|id=P|from=grok|to=ALL|full=gs://b/board-full-P.json|"))
 
-    def test_spill_is_create_only(self):
+    def test_spill_is_create_only_and_unique_per_row(self):
+        """Measured failure on a312e13: spill('ab/c') and spill('abc') shared board-full-abc.json,
+        and the second raise was a Conflict rather than a second object. The name now includes the
+        payload sha256, and save is called with token None (GCS ifGenerationMatch=0)."""
         store = state_store.open_store(tempfile.mkdtemp())
+        tokens = []
+        real_save = store.save
+
+        def recording_save(name, state, token):
+            tokens.append((name, token))
+            return real_save(name, state, token)
+
+        store.save = recording_save
         spill = board_row.store_spill(store)
         p1 = spill("K", "one text")
-        self.assertEqual(p1, spill("K", "one text"), "same text, same pointer")
+        self.assertEqual(p1, spill("K", "one text"), "same text, same pointer, no second object")
+        p2 = spill("K", "a different text")
+        self.assertNotEqual(p1, p2, "different text must not reuse the first object")
+        first = json.loads(Path(p1.split("file:", 1)[-1]).read_text())
+        self.assertEqual("one text", first["text"], "the first object was overwritten")
+        # The lossy id that collided before this fix.
+        collapsed_a = spill("ab/c", "alpha")
+        collapsed_b = spill("abc", "beta")
+        self.assertNotEqual(collapsed_a, collapsed_b)
+        self.assertTrue(all(token is None for _, token in tokens), tokens)
+        self.assertEqual(len({name for name, _ in tokens}), 4, tokens)
+        # A generation-match miss with different bytes must not become an update.
+        path = Path(p1.split("file:", 1)[-1])
+        path.write_text(json.dumps({"row_id": "K", "sha256": "0" * 64, "text": "tampered", "chars": 8}))
         with self.assertRaises(Exception):
-            spill("K", "a different text")
+            spill("K", "one text")
+        self.assertEqual("tampered", json.loads(path.read_text())["text"])
+
+
+class SpillIsOffThePost(unittest.TestCase):
+    """The board append must not wait on the spill write."""
+
+    def test_a_long_post_appends_before_the_object_exists(self):
+        order = []
+        board, spill_dir = FakeBoard(), tempfile.mkdtemp()
+
+        original = board.fetch
+
+        def fetch(url, payload, tries=1):
+            order.append("post")
+            pointer = board_row.field(payload["sheetRow"][5], "full")
+            path = Path(pointer.split("file:", 1)[-1])
+            self.assertFalse(path.exists(), "the spill object existed before the append returned")
+            return original(url, payload, tries)
+
+        real_commit = board_row.commit
+
+        def commit(info, spill):
+            order.append("spill")
+            return real_commit(info, spill)
+
+        board.fetch = fetch
+        with mock.patch.object(board_row, "commit", commit):
+            rc = post_through_fleet_agent(
+                ["post", five_thousand_char_reply(), "--id", "ORDER-1"], board, spill_dir)
+        self.assertEqual(0, rc)
+        self.assertEqual(["post", "spill"], order)
+        full = board_row.resolve(board.rows[0][5])
+        self.assertTrue(full.endswith("END-OF-REPLY."))
+
+    def test_a_short_post_does_not_spill(self):
+        order = []
+        board, spill_dir = FakeBoard(), tempfile.mkdtemp()
+
+        original = board.fetch
+
+        def fetch(url, payload, tries=1):
+            order.append("post")
+            return original(url, payload, tries)
+
+        def commit(info, spill):
+            order.append("spill")
+            raise AssertionError("a short row must not commit a spill")
+
+        board.fetch = fetch
+        with mock.patch.object(board_row, "commit", commit):
+            rc = post_through_fleet_agent(["post", "hello from the short path", "--id", "SHORT-1"],
+                                          board, spill_dir)
+        self.assertEqual(0, rc)
+        self.assertEqual(["post"], order)
+        self.assertNotIn("full=", board.rows[0][5])
 
 
 class ModelCutOffIsSaid(unittest.TestCase):
