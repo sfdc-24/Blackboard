@@ -127,6 +127,10 @@ gcloud run jobs create bus-requests --project=sfdc24 --region=us-central1 \
 gcloud run jobs execute bus-requests --region=us-central1 --project=sfdc24   --update-env-vars=LOOP_UNTIL=2026-10-09T03:30:00Z,LOOP_INTERVAL=10,LOOP_MAX_MINUTES=340   --task-timeout=6h --async
 #     Without GITHUB_READ_TOKEN the git channel is read every 144 s (two repos under GitHub's 60
 #     unauthenticated calls an hour); with it, once a minute.
+#     KEEPALIVE, NOT APPLIED (2026-10-10): a past LOOP_UNTIL runs zero passes. The free
+#     definition that sets a fresh LOOP_UNTIL every 3 hours, default off, is
+#     .github/workflows/bus-requests-keepalive.yml. The command the owner runs is in
+#     docs/CLOUD-FLEET-RUNBOOK.md under "bus-requests keepalive". No IAM in that file.
 
 # 3. READ BACK before trusting any of it. Three of this job's four defects were found this way.
 gcloud run jobs describe bus-requests --project=sfdc24 --region=us-central1 --format=json

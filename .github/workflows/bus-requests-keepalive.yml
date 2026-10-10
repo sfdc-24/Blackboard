@@ -1,0 +1,57 @@
+# Re-execute bus-requests before its loop ends, so the governed Redis path does not
+# stop when one Cloud Run execution reaches LOOP_UNTIL.
+#
+# SHIPPED OFF. The job runs only when the repository variable BUS_REQUESTS_KEEPALIVE
+# is exactly "on" AND GCP_WIF_PROVIDER and GCP_WORKER_SA are set. Those two are the
+# same workload-identity pair worker-trigger.yml already uses. This file grants no
+# IAM, creates no Cloud Scheduler job, and contains no secret.
+#
+# Why a workflow and not a new Cloud Scheduler job: the fleet runbook already lists
+# four scheduler jobs (board-watcher-2min, board-probe-hourly, waker-shadow-hourly,
+# studio-voice-sweep-every-minute). Cloud Scheduler's free tier is 3 jobs per
+# billing account; another job would be paid. This schedule is a GitHub-hosted
+# workflow, which stays inside the free minutes while the job below is skipped.
+#
+# Cadence, from cloud/bus-reconciler/serve_requests.py: the loop stops at LOOP_UNTIL
+# or LOOP_MAX_MINUTES (this command sets 240, four hours), whichever is sooner.
+# A LOOP_UNTIL in the past is not the single-pass path: _loop_until returns a
+# datetime, and the while loop then runs zero times. Each execution therefore sets
+# a fresh LOOP_UNTIL four hours ahead. The cron is every 3 hours, so the next
+# start is before that loop ends. GitHub may delay a schedule; the overlap is the
+# margin. Redis ops are at-most-once via the run marker in scripts/bus_request.py.
+name: bus-requests-keepalive
+
+on:
+  schedule:
+    - cron: '7 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: bus-requests-keepalive
+  cancel-in-progress: false
+
+jobs:
+  reexecute:
+    if: >-
+      vars.BUS_REQUESTS_KEEPALIVE == 'on' &&
+      vars.GCP_WIF_PROVIDER != '' && vars.GCP_WORKER_SA != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_WORKER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Re-execute bus-requests with a future LOOP_UNTIL
+        run: |
+          set -euo pipefail
+          UNTIL=$(date -u -d '+4 hours' +%Y-%m-%dT%H:%M:%SZ)
+          gcloud run jobs execute bus-requests \
+            --project=sfdc24 --region=us-central1 \
+            --update-env-vars="LOOP_UNTIL=${UNTIL},LOOP_INTERVAL=10,LOOP_MAX_MINUTES=240" \
+            --task-timeout=5h --async
