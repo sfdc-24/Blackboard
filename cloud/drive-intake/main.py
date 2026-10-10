@@ -41,12 +41,19 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      other reports in_progress; the inbox is read back across EVERY worker's
      stream, newest first; and a failed ring or a receipt not read back
      leaves the state where it was, for the next pass to finish.
-     RESIDUAL, NAMED NOT CLOSED: two passes that both resume ONE
-     delivering:<worker> state (a crash's successor racing a poll) read the
-     inbox empty together and can both put. The compare-and-set after the
-     put stops the loser from writing a receipt or ringing, so the cost is
-     one duplicate inbox entry, same task id, same worker. A lease on the
-     delivering state closes it; add one when a live run measures it.
+     The delivering state carries a LEASE (delivering:<worker>:<since>):
+     a second pass that finds it fresh reports in_progress instead of
+     resuming, so two resumes of one delivery cannot both put (Cursor on
+     57a23ab). A delivery older than DELIVER_LEASE is a dead pass and is
+     resumed. The ring is sent BEFORE the claim moves to rung, so a crash
+     in between rings again - and that is safe only because the ring
+     carries task_id as its message id and cloud/inbox-wake claims
+     fleet:wake:seen:<agent>:<id> SET NX, so the second ring is a
+     duplicate there, not a second wake. The ring adapter MUST pass
+     id=task_id; nothing here reads a wake back.
+     A REQUESTED line that was not read back is re-attempted on every
+     later pass (the receipt id has no clock, so the attempt is idempotent)
+     before the DISPATCHED line is written.
   4. "Picked up" is narrated by something that cannot pick anything up. This
      service can only reach REQUESTED and DISPATCHED. ACCEPTED belongs to the
      named worker and is written by the worker (L-116). With no ring
@@ -81,6 +88,7 @@ CLAIM_TTL = 2592000       # 30 days, the ttl cloud/inbox-wake already uses for f
 DEFAULT_HEARTBEAT = 300   # the owner's suggested 5 minutes
 DEFAULT_RENEW_WARN = 172800
 INBOX_LOOKBACK = 500      # newest entries read back per worker stream
+DELIVER_LEASE = 60        # seconds a delivering pass owns the put before another may resume it
 
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 FILE_ID_OK = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
@@ -374,11 +382,19 @@ def _now(deps) -> float:
 
 
 def _split(state):
-    """'delivering:claude-api' -> ('delivering', 'claude-api'); 'intake' -> ('intake', None)."""
+    """'delivering:claude-api:1000' -> ('delivering', 'claude-api', 1000.0); 'intake' -> ('intake', None, None)."""
     if not state:
-        return None, None
-    name, _, worker = str(state).partition(":")
-    return name, (worker or None)
+        return None, None, None
+    parts = str(state).split(":")
+    name = parts[0]
+    worker = parts[1] if len(parts) > 1 and parts[1] else None
+    since = None
+    if len(parts) > 2:
+        try:
+            since = float(parts[2])
+        except ValueError:
+            since = None
+    return name, worker, since
 
 
 def _advance(deps, key, current, new):
@@ -447,7 +463,7 @@ def decide(hint: dict, deps) -> dict:
         return {"status": "claim_error", "task": tuple_["task_id"], "error": "unreadable"}
     if current == DONE:
         return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_}
-    phase, bound = _split(current)
+    phase, bound, since = _split(current)
     if bound:
         # A worker was chosen on an earlier pass. Routing is settled; finish THAT delivery.
         recipient, state = bound, REQUESTED
@@ -473,11 +489,17 @@ def decide(hint: dict, deps) -> dict:
     detail = "" if current == INTAKE else "now that a worker is online"
     if phase in (INTAKE, WAIT_QUEUED, WAIT_BLOCKED):
         # Bind the worker BEFORE the put, so a crash or a flip cannot re-put elsewhere.
-        if not _advance(deps, key, current, DELIVERING + ":" + recipient):
+        # The lease (the clock, in the state) keeps a second pass from resuming this one.
+        leased = "%s:%s:%d" % (DELIVERING, recipient, int(now))
+        if not _advance(deps, key, current, leased):
             out["status"] = "in_progress"
             return out
-        current, phase = DELIVERING + ":" + recipient, DELIVERING
+        current, phase, since = leased, DELIVERING, None
     if phase == DELIVERING:
+        if since is not None and 0 <= now - since < DELIVER_LEASE:
+            # Another pass is inside its lease on this put. Resuming now is the double put.
+            out["status"] = "in_progress"
+            return out
         try:
             holder = _on_any_inbox(deps, tuple_["task_id"])
             if holder is None:
@@ -487,9 +509,13 @@ def decide(hint: dict, deps) -> dict:
                     raise
                 except Exception as exc:  # noqa: BLE001 - it may have landed anyway
                     if _on_any_inbox(deps, tuple_["task_id"]) is None:
+                        # Nothing landed, and this pass knows it: give the lease up (worker kept)
+                        # so the next pass may retry at once instead of waiting it out.
+                        _advance(deps, key, current, "%s:%s:0" % (DELIVERING, recipient))
                         return {"status": "queue_error", "task": tuple_["task_id"],
                                 "error": type(exc).__name__}
         except Unconfigured as exc:
+            _advance(deps, key, current, "%s:%s:0" % (DELIVERING, recipient))
             return {"status": "unconfigured", "task": tuple_["task_id"], "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - an inbox that cannot be read back is unknown
             return {"status": "queue_unknown", "task": tuple_["task_id"], "error": type(exc).__name__}
@@ -517,6 +543,10 @@ def decide(hint: dict, deps) -> dict:
             return out
         current, phase = RUNG + ":" + recipient, RUNG
     if phase == RUNG:
+        # A REQUESTED line that never read back is owed too; has() makes this a no-op otherwise.
+        if out.get("receipt") not in ("written", "no_receipt_writer"):
+            out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
+            text = with_heading(text)
         out["receipt_dispatched"] = write_receipt(deps, tuple_, text, DISPATCHED, deps.at)
         if out["receipt_dispatched"] not in ("written", "no_receipt_writer"):
             # Rung, but the phone cannot see it yet. Say so; the next pass writes the line.

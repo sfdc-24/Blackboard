@@ -354,6 +354,33 @@ class FailoverTest(unittest.TestCase):
         self.assertEqual("claude-api", out["tuple"]["recipient_id"])
         self.assertEqual(["claude-api"], [c["recipient_id"] for c in d.ring.calls])
 
+    def test_a_fresh_delivering_lease_is_not_resumed_and_a_dead_one_is(self):
+        """Cursor on 57a23ab: two resumes of one delivering state both saw an empty inbox and both put."""
+        d = deps()
+        d.claims.states[key_for()] = "delivering:claude-api:%d" % (1000 - 30)   # another pass, 30 s in
+        out = di.decide(hint(), d)
+        self.assertEqual("in_progress", out["status"], out)
+        self.assertEqual([], d.queue.puts)
+        self.assertEqual([], d.receipts.lines)
+        d.now = 1000.0 + di.DELIVER_LEASE + 1                                     # that pass is dead
+        later = di.decide(hint(), d)
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(["claude-api"], d.queue.recipients())
+
+    def test_the_bind_carries_the_clock_and_the_ring_carries_the_task_id(self):
+        """The ring is sent before the claim moves to rung, so a crash in between rings again; that is
+        safe only because the id the ring carries is the task id and #359 claims (agent, id) SET NX."""
+        d = deps()
+        out = di.decide(hint(), d)
+        self.assertEqual(out["task"], d.ring.calls[0]["task_id"])
+        self.assertEqual("claude-api", d.ring.calls[0]["recipient_id"])
+        seen = []
+        orig = d.claims.advance
+        d2 = deps()
+        d2.claims.advance = lambda key, current, new: (seen.append(new), orig.__func__(d2.claims, key, current, new))[1]
+        di.decide(hint(), d2)
+        self.assertTrue(seen[0].startswith("delivering:claude-api:1000"), seen)
+
     def test_a_crash_before_the_put_resumes_to_the_bound_worker(self):
         d = deps()
         d.claims.states[key_for()] = "delivering:claude-api"     # bound, then died before the put
@@ -424,7 +451,7 @@ class RetryTest(unittest.TestCase):
         out = di.decide(hint(), d)
         self.assertEqual("queue_error", out["status"])
         self.assertEqual([], d.receipts.lines)      # nothing landed, so nothing is claimed in the doc
-        self.assertEqual("delivering:claude-api", list(d.claims.states.values())[0])
+        self.assertEqual("delivering:claude-api:0", list(d.claims.states.values())[0])   # bound, lease given up
         d.queue = Queue()
         self.assertEqual("dispatched", di.decide(hint(), d)["status"])
         self.assertEqual(1, len(d.queue.puts))
@@ -491,9 +518,31 @@ class RetryTest(unittest.TestCase):
         d.receipts = good
         later = di.decide(hint(), d)
         self.assertEqual("dispatched", later["status"], later)
-        self.assertEqual(["DISPATCHED"], good.states())          # only the owed line, once
+        self.assertEqual(["REQUESTED", "DISPATCHED"], good.states())   # both owed lines, each once
         self.assertEqual(1, len(d.ring.calls))                   # and no second wake
         self.assertEqual(1, len(d.queue.puts))
+
+    def test_a_requested_line_not_read_back_is_rewritten_before_dispatched(self):
+        """Cursor on 57a23ab: only the REQUESTED append dropped; the doc ended with DISPATCHED alone."""
+        class DropFirst(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                if self.appends == 0:
+                    self.appends += 1
+                    return self.revision                       # said ok, wrote nothing
+                return super().append(file_id, expected_revision, receipt_id, block)
+        d = deps(receipts=DropFirst())
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+        # and the crash shape: on_inbox with the task queued and no REQUESTED line yet
+        d = deps()
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        d.claims.states[key_for()] = "on_inbox:claude-api"
+        d.queue.puts.append((dict(t), di.gist(REQUEST), d.at))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+        self.assertEqual(1, len(d.ring.calls))
 
     def test_a_receipt_id_does_not_carry_the_clock_so_a_retry_finds_its_own_line(self):
         t = di.correlate(FILE, REQUEST, "r1", "claude-api")
