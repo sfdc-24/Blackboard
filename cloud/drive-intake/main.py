@@ -30,21 +30,35 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      part of that identity: Cursor's review of 05a8079 showed a heartbeat
      flip minting a second task for the same request. Routing is a state the
      request moves through, not a new request.
-  3. Work queued for the laptop is lost when the laptop comes back. The claim
-     is a small state machine (intake -> queued/blocked -> on_inbox ->
-     dispatched), so a later pass delivers what an earlier pass could only
-     queue, and never delivers twice.
-  4. A hand-off whose response was lost. The inbox is read back by task id
-     before and after a put; a put that raised but landed is a landed put.
-     A claim that raised is left alone: the next pass resumes from the state
-     it finds, it does not start again.
-  5. "Picked up" is narrated by something that cannot pick anything up. This
+  3. The claim is a small forward-only state machine, and every hop is
+     finished by whichever pass comes next: intake -> queued/blocked ->
+     delivering:<worker> -> on_inbox:<worker> -> rung:<worker> -> dispatched.
+     Cursor's review of d150d84: a ring that failed was never retried, a
+     crash between the put and the claim re-put to a second worker, and two
+     overlapping passes (push and poll) both delivered. So: the worker is
+     recorded in the claim BEFORE the put and a resume delivers to THAT
+     worker; each transition is a compare-and-set, so one pass wins and the
+     other reports in_progress; the inbox is read back across EVERY worker's
+     stream, newest first; and a failed ring or a receipt not read back
+     leaves the state where it was, for the next pass to finish.
+     RESIDUAL, NAMED NOT CLOSED: two passes that both resume ONE
+     delivering:<worker> state (a crash's successor racing a poll) read the
+     inbox empty together and can both put. The compare-and-set after the
+     put stops the loser from writing a receipt or ringing, so the cost is
+     one duplicate inbox entry, same task id, same worker. A lease on the
+     delivering state closes it; add one when a live run measures it.
+  4. "Picked up" is narrated by something that cannot pick anything up. This
      service can only reach REQUESTED and DISPATCHED. ACCEPTED belongs to the
      named worker and is written by the worker (L-116). With no ring
      configured the status is queued_not_rung, never dispatched.
+  5. A receipt is one per (task, state): the id does not carry the time, so a
+     retry finds its own line instead of writing it again. An append whose
+     response was lost is settled by reading the line back and refreshing the
+     doc's write revision from the doc, never by trusting the old revision.
   6. The Drive watch channel expires (7 days, max) and the day-8 outage is
-     silent. /healthz reports the expiry and goes DEGRADED before it lands;
-     missing evidence reads "unknown", and ok is false until it reads ok.
+     silent. /healthz reports the expiry against the clock NOW (not the clock
+     at boot) and goes DEGRADED before it lands; missing evidence reads
+     "unknown", and ok is false until it reads ok.
 
 Deploy is not this file's job: the command, the grants it needs and the test
 plan are in the pull request. Nothing here is applied, and this service holds
@@ -57,6 +71,7 @@ import hmac
 import json
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BODY = 65536
@@ -65,6 +80,7 @@ MAX_GIST = 900
 CLAIM_TTL = 2592000       # 30 days, the ttl cloud/inbox-wake already uses for fleet: keys
 DEFAULT_HEARTBEAT = 300   # the owner's suggested 5 minutes
 DEFAULT_RENEW_WARN = 172800
+INBOX_LOOKBACK = 500      # newest entries read back per worker stream
 
 ID_OK = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 FILE_ID_OK = re.compile(r"[A-Za-z0-9_-]{10,128}\Z")
@@ -99,11 +115,14 @@ QUEUED = "QUEUED"
 BLOCKED = "BLOCKED"
 
 # The claim's states. A request is claimed once and then moves forward only.
-INTAKE = "intake"            # claimed, nothing delivered yet (resume from here)
+# The three worker-bound states carry the worker after a colon.
+INTAKE = "intake"            # claimed, nothing delivered yet
 WAIT_QUEUED = "queued"       # written QUEUED in the doc, awaiting the laptop
 WAIT_BLOCKED = "blocked"     # written BLOCKED in the doc, awaiting a named worker
-ON_INBOX = "on_inbox"        # the task is on fleet:inbox, ring still owed
-DONE = "dispatched"          # rung; this service's job is over
+DELIVERING = "delivering"    # a put to <worker> is in flight (or died mid-way)
+ON_INBOX = "on_inbox"        # the task is on <worker>'s inbox, ring owed
+RUNG = "rung"                # rung; the DISPATCHED receipt still owed
+DONE = "dispatched"          # receipt read back; this service's job is over
 
 
 class Unconfigured(Exception):
@@ -274,44 +293,97 @@ def with_heading(doc_text: str) -> str:
     return (doc_text or "") + "\n" + HEADING_TEXT + "\n"
 
 
+def receipt_id_for(tuple_: dict, state: str) -> str:
+    """One receipt per (task, state). No clock in it, so a retry finds its own line (guard 5)."""
+    return hashlib.sha256((tuple_["task_id"] + "\x1f" + state).encode("utf-8")).hexdigest()[:16]
+
+
+def _refresh_revision(deps, tuple_):
+    """After a write whose response was lost, the doc's revision is whatever the doc says NOW."""
+    try:
+        doc = deps.docs.read(tuple_["source_doc_id"]) if deps.docs is not None else None
+    except Exception:  # noqa: BLE001 - keep the old revision; the next write will say if it is stale
+        return
+    revision = str((doc or {}).get("revision_id") or "")
+    if ID_OK.fullmatch(revision):
+        tuple_["drive_revision"] = revision
+
+
 def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail: str = "") -> str:
     """Append one receipt, then READ IT BACK. A lost response is UNKNOWN, never success.
 
     The guard is Drive's own revisionId (the write revision), kept apart from
     the request revision above: one is concurrency, the other is identity.
-    The adapter returns the revision after its write, and that is what the
-    NEXT append is guarded with - a second receipt sent with the first one's
-    revision is a stale write (Cursor, on 05a8079).
+    The adapter returns the revision after its write and the NEXT append is
+    guarded with that one. If the response is lost, the line is looked for
+    and the revision is re-read from the doc - then ONE retry with that.
     """
     if deps.receipts is None:
         return "no_receipt_writer"
+    doc_id = tuple_["source_doc_id"]
+    receipt_id = receipt_id_for(tuple_, state)
+    try:
+        if deps.receipts.has(doc_id, receipt_id):
+            return "written"                      # an earlier pass wrote it; nothing to add
+    except Exception as exc:  # noqa: BLE001
+        return "unknown:" + type(exc).__name__
     line = receipt_line(state, tuple_, at, detail)
-    receipt_id = hashlib.sha256((tuple_["task_id"] + state + line).encode("utf-8")).hexdigest()[:16]
-    try:
-        new_revision = deps.receipts.append(tuple_["source_doc_id"], tuple_.get("drive_revision") or "",
-                                            receipt_id, receipt_block(doc_text, line))
-    except Exception as exc:  # noqa: BLE001 - the write may have landed anyway
+    block = receipt_block(doc_text, line)
+    for attempt in (1, 2):
         try:
-            landed = deps.receipts.has(tuple_["source_doc_id"], receipt_id)
-        except Exception:  # noqa: BLE001
-            return "unknown:" + type(exc).__name__
-        if not landed:
-            return "unknown:" + type(exc).__name__
-        new_revision = None
-    if new_revision:
-        tuple_["drive_revision"] = str(new_revision)
+            new_revision = deps.receipts.append(doc_id, tuple_.get("drive_revision") or "",
+                                                receipt_id, block)
+        except Exception as exc:  # noqa: BLE001 - the write may have landed anyway
+            try:
+                landed = deps.receipts.has(doc_id, receipt_id)
+            except Exception:  # noqa: BLE001
+                return "unknown:" + type(exc).__name__
+            _refresh_revision(deps, tuple_)
+            if landed:
+                return "written"
+            if attempt == 2:
+                return "unknown:" + type(exc).__name__
+            continue                              # stale guard or a clean miss: once more, fresh revision
+        if new_revision:
+            tuple_["drive_revision"] = str(new_revision)
+        break
     try:
-        return "written" if deps.receipts.has(tuple_["source_doc_id"], receipt_id) else "not_read_back"
+        return "written" if deps.receipts.has(doc_id, receipt_id) else "not_read_back"
     except Exception as exc:  # noqa: BLE001
         return "unknown:" + type(exc).__name__
 
 
-def _on_inbox(deps, tuple_) -> bool:
-    """Is this task already on the recipient's inbox? A queue that cannot say raises."""
+def _on_any_inbox(deps, task_id: str):
+    """Which worker's inbox already holds this task, or None. Every stream, newest first.
+
+    Cursor on d150d84: looking only at the routed worker's inbox let a resume
+    after a heartbeat flip append the same task to a second worker.
+    """
     has = getattr(deps.queue, "has", None)
     if has is None:
-        return False
-    return bool(has(tuple_["recipient_id"], tuple_["task_id"]))
+        return None
+    for worker in WORKERS:
+        if has(worker, task_id):
+            return worker
+    return None
+
+
+def _now(deps) -> float:
+    """The clock NOW. deps.now is for tests; a server never freezes it at boot (guard 6)."""
+    return float(deps.now) if deps.now is not None else time.time()
+
+
+def _split(state):
+    """'delivering:claude-api' -> ('delivering', 'claude-api'); 'intake' -> ('intake', None)."""
+    if not state:
+        return None, None
+    name, _, worker = str(state).partition(":")
+    return name, (worker or None)
+
+
+def _advance(deps, key, current, new):
+    """Compare-and-set. False means another pass moved first; this one must not act."""
+    return bool(deps.claims.advance(key, current, new))
 
 
 def decide(hint: dict, deps) -> dict:
@@ -350,7 +422,8 @@ def decide(hint: dict, deps) -> dict:
     if addressed and canonical(addressed.group(1)) is None:
         return {"status": "bad_recipient", "task": None, "to": addressed.group(1)[:64]}
     wants_cli = needs_cli_tools(text)
-    alive = heartbeat_age(deps.claims, deps.now, window=deps.heartbeat_window)
+    now = _now(deps)
+    alive = heartbeat_age(deps.claims, now, window=deps.heartbeat_window)
     if addressed:
         recipient, state = canonical(addressed.group(1)), REQUESTED
         if recipient == "claude-code-cli" and alive is None:
@@ -370,10 +443,15 @@ def decide(hint: dict, deps) -> dict:
             current = INTAKE if deps.claims.claim(key) else deps.claims.state(key)
     except Exception as exc:  # noqa: BLE001 - an unclaimable key is not a free one
         return {"status": "claim_error", "task": tuple_["task_id"], "error": type(exc).__name__}
-    if current in (ON_INBOX, DONE):
-        return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_}
     if current is None:
         return {"status": "claim_error", "task": tuple_["task_id"], "error": "unreadable"}
+    if current == DONE:
+        return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_}
+    phase, bound = _split(current)
+    if bound:
+        # A worker was chosen on an earlier pass. Routing is settled; finish THAT delivery.
+        recipient, state = bound, REQUESTED
+        tuple_["recipient_id"] = bound
 
     out = {"status": state.lower(), "state": state, "task": tuple_["task_id"], "tuple": tuple_,
            "gist": gist(text)}
@@ -383,49 +461,70 @@ def decide(hint: dict, deps) -> dict:
             # Already said so in the doc; an unchanged request waiting is not news.
             out["status"] = "waiting"
             return out
+        if not _advance(deps, key, current, wait):
+            out["status"] = "in_progress"
+            return out
         out["receipt"] = write_receipt(
             deps, tuple_, text, state, deps.at,
             "no capable worker online" if state == BLOCKED else "awaiting the laptop")
-        deps.claims.set_state(key, wait)
         return out
 
-    # Deliver. The inbox is read back first: a put whose response was lost on
-    # an earlier pass has already landed.
-    try:
-        if not _on_inbox(deps, tuple_):
-            try:
-                deps.queue.put(tuple_, gist(text), deps.at)
-            except Unconfigured:
-                raise
-            except Exception as exc:  # noqa: BLE001 - it may have landed anyway
-                if not _on_inbox(deps, tuple_):
-                    return {"status": "queue_error", "task": tuple_["task_id"],
-                            "error": type(exc).__name__}
-    except Unconfigured as exc:
-        return {"status": "unconfigured", "task": tuple_["task_id"], "error": str(exc)}
-    except Exception as exc:  # noqa: BLE001 - an inbox that cannot be read back is unknown
-        return {"status": "queue_unknown", "task": tuple_["task_id"], "error": type(exc).__name__}
-    deps.claims.set_state(key, ON_INBOX)
+    # Deliver, one hop per state, each hop idempotent by read-back.
     detail = "" if current == INTAKE else "now that a worker is online"
-    out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
-    text = with_heading(text)
-
-    # The ring is cloud/inbox-wake's job, and it is the LAST thing: a ring whose
-    # task is not on the queue wakes an agent to find nothing.
-    try:
-        deps.ring(tuple_)
-    except Unconfigured as exc:
-        out["status"] = "queued_not_rung"
-        out["error"] = str(exc)
-        return out
-    except Exception as exc:  # noqa: BLE001
-        out["status"] = "queued_not_rung"
-        out["error"] = type(exc).__name__
-        return out
-    deps.claims.set_state(key, DONE)
-    out["status"] = DISPATCHED.lower()
-    out["state"] = DISPATCHED
-    out["receipt_dispatched"] = write_receipt(deps, tuple_, text, DISPATCHED, deps.at)
+    if phase in (INTAKE, WAIT_QUEUED, WAIT_BLOCKED):
+        # Bind the worker BEFORE the put, so a crash or a flip cannot re-put elsewhere.
+        if not _advance(deps, key, current, DELIVERING + ":" + recipient):
+            out["status"] = "in_progress"
+            return out
+        current, phase = DELIVERING + ":" + recipient, DELIVERING
+    if phase == DELIVERING:
+        try:
+            holder = _on_any_inbox(deps, tuple_["task_id"])
+            if holder is None:
+                try:
+                    deps.queue.put(tuple_, gist(text), deps.at)
+                except Unconfigured:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - it may have landed anyway
+                    if _on_any_inbox(deps, tuple_["task_id"]) is None:
+                        return {"status": "queue_error", "task": tuple_["task_id"],
+                                "error": type(exc).__name__}
+        except Unconfigured as exc:
+            return {"status": "unconfigured", "task": tuple_["task_id"], "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - an inbox that cannot be read back is unknown
+            return {"status": "queue_unknown", "task": tuple_["task_id"], "error": type(exc).__name__}
+        if not _advance(deps, key, current, ON_INBOX + ":" + recipient):
+            out["status"] = "in_progress"
+            return out
+        current, phase = ON_INBOX + ":" + recipient, ON_INBOX
+        out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
+        text = with_heading(text)
+    if phase == ON_INBOX:
+        # The ring is cloud/inbox-wake's job, and it comes AFTER the put: a ring
+        # whose task is not on the queue wakes an agent to find nothing.
+        try:
+            deps.ring(tuple_)
+        except Unconfigured as exc:
+            out["status"] = "queued_not_rung"
+            out["error"] = str(exc)
+            return out
+        except Exception as exc:  # noqa: BLE001 - rung again by the next pass
+            out["status"] = "queued_not_rung"
+            out["error"] = type(exc).__name__
+            return out
+        if not _advance(deps, key, current, RUNG + ":" + recipient):
+            out["status"] = "in_progress"
+            return out
+        current, phase = RUNG + ":" + recipient, RUNG
+    if phase == RUNG:
+        out["receipt_dispatched"] = write_receipt(deps, tuple_, text, DISPATCHED, deps.at)
+        if out["receipt_dispatched"] not in ("written", "no_receipt_writer"):
+            # Rung, but the phone cannot see it yet. Say so; the next pass writes the line.
+            out["status"] = "dispatched_receipt_owed"
+            return out
+        _advance(deps, key, current, DONE)
+        out["status"] = DISPATCHED.lower()
+        out["state"] = DISPATCHED
     return out
 
 
@@ -489,10 +588,11 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
     path = path.split("?", 1)[0]
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     if method == "GET" and path == "/healthz":
-        health = channel_health(deps.channel_expires_at, deps.now, deps.renew_warn)
+        now = _now(deps)
+        health = channel_health(deps.channel_expires_at, now, deps.renew_warn)
         out = {"ok": health["channel"] == "ok", "enabled": bool(deps.enabled)}
         out.update(health)
-        alive = heartbeat_age(deps.claims, deps.now, window=deps.heartbeat_window)
+        alive = heartbeat_age(deps.claims, now, window=deps.heartbeat_window)
         out["worker"] = {"claude-code-cli": "online" if alive is not None else "offline",
                          "api": canonical(deps.api_worker) or "none"}
         return 200, out
@@ -533,11 +633,19 @@ class MemoryClaims:
     def state(self, key):
         return self.states.get(key)
 
-    def set_state(self, key, state):
-        self.states[key] = state
+    def advance(self, key, current, new):
+        if self.states.get(key) != current:
+            return False
+        self.states[key] = new
+        return True
 
     def heartbeat(self, agent):
         return self.beats.get(agent)
+
+
+# Compare-and-set in one round trip, so two passes cannot both win a transition.
+CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+           "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]) return 1 else return 0 end")
 
 
 class RedisClaims:
@@ -559,8 +667,8 @@ class RedisClaims:
             raw = raw.decode("utf-8", "replace")
         return raw or None
 
-    def set_state(self, key, state):
-        self.client.set("fleet:intake:claim:" + key, state, ex=CLAIM_TTL)
+    def advance(self, key, current, new):
+        return bool(self.client.eval(CAS_LUA, 1, "fleet:intake:claim:" + key, current, new, CLAIM_TTL))
 
     def heartbeat(self, agent):
         raw = self.client.get("fleet:alive:" + agent)
@@ -583,7 +691,10 @@ class InboxQueue:
     def has(self, recipient, task_id):
         if self.client is None:
             raise Unconfigured("no Redis client for fleet:inbox")
-        for _entry_id, fields in self.client.xrange("fleet:inbox:" + recipient, count=500) or ():
+        # NEWEST first: the entry a lost response is being settled for is the newest one,
+        # and the oldest 500 of a busy stream never contain it (Cursor on d150d84).
+        rows = self.client.xrevrange("fleet:inbox:" + recipient, count=INBOX_LOOKBACK) or ()
+        for _entry_id, fields in rows:
             value = fields.get("task_id")
             if value is None:
                 value = fields.get(b"task_id")
@@ -611,7 +722,7 @@ class InboxQueue:
 class Deps:
     def __init__(self, enabled=False, docs=None, claims=None, queue=None, receipts=None,
                  changes=None, ring=None, folder_id="", channel_token="", poll_token="",
-                 api_worker="", now=0.0, at="", channel_expires_at=None,
+                 api_worker="", now=None, at="", channel_expires_at=None,
                  heartbeat_window=DEFAULT_HEARTBEAT, renew_warn=DEFAULT_RENEW_WARN):
         self.enabled = enabled
         self.docs = docs

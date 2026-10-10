@@ -3,16 +3,19 @@
 The ways this goes wrong, each with a test that fails when the guard is removed:
 a receipt that retriggers its own task, the same change arriving twice, a
 heartbeat flip minting a second task for the same request, queued work lost
-when the laptop returns, a hand-off whose response was lost, "neither worker"
+when the laptop returns, a failed ring never rung again, a crash between the
+put and the claim re-putting to a second worker, two overlapping passes both
+delivering, a hand-off or receipt whose response was lost, "neither worker"
 happening silently, a receipt that claims more than the state reached, a
-stale write revision on the second receipt, and a watch channel that expires
-on day eight with /healthz still saying ok.
+stale write revision on the second receipt, a busy inbox hiding the newest
+entry, and a watch channel that expires with /healthz still saying ok.
 
 Offline by construction: every outside call is an injected adapter.
 """
 import importlib.util
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -28,15 +31,19 @@ RECEIPTS = "\n\nRECEIPTS\n"
 
 
 class Docs:
-    """A doc store whose read is counted, so a flag-off path can prove it read nothing."""
+    """A doc store whose read is counted, so a flag-off path can prove it read nothing.
 
-    def __init__(self, text=REQUEST, revision="r1", folder=FOLDER):
-        self.text, self.revision, self.folder = text, revision, folder
+    When bound to a Receipts double it reports that double's current revision,
+    the way a real doc does after an append."""
+
+    def __init__(self, text=REQUEST, revision="r1", folder=FOLDER, receipts=None):
+        self.text, self.revision, self.folder, self.receipts = text, revision, folder, receipts
         self.reads = 0
 
     def read(self, file_id):
         self.reads += 1
-        return {"text": self.text, "revision_id": self.revision, "folder_id": self.folder}
+        revision = self.receipts.revision if self.receipts is not None else self.revision
+        return {"text": self.text, "revision_id": revision, "folder_id": self.folder}
 
 
 class RevisionConflict(Exception):
@@ -52,9 +59,10 @@ class Receipts:
 
     def __init__(self, lose=False, drop=False, guard=False, revision="r1"):
         self.lines, self.lose, self.drop, self.guard = [], lose, drop, guard
-        self.revision, self.n = revision, 1
+        self.revision, self.n, self.appends = revision, 1, 0
 
     def append(self, file_id, expected_revision, receipt_id, block):
+        self.appends += 1
         if self.guard and expected_revision != self.revision:
             raise RevisionConflict("expected %s, doc is at %s" % (expected_revision, self.revision))
         if not self.drop:
@@ -92,10 +100,23 @@ class Queue:
         if self.fail_after:
             raise self.fail_after
 
+    def recipients(self):
+        return [t["recipient_id"] for t, _, _ in self.puts]
+
+
+class Ring:
+    def __init__(self, fail_first=0):
+        self.calls, self.fail_first = [], fail_first
+
+    def __call__(self, t):
+        self.calls.append(dict(t))
+        if len(self.calls) <= self.fail_first:
+            raise TimeoutError("wake timed out")
+
 
 def deps(**over):
     base = dict(enabled=True, docs=Docs(), claims=di.MemoryClaims(), queue=Queue(),
-                receipts=Receipts(), ring=lambda t: None, folder_id=FOLDER, channel_token="tok",
+                receipts=Receipts(), ring=Ring(), folder_id=FOLDER, channel_token="tok",
                 poll_token="poll", api_worker="claude-api", now=1000.0, at="2026-10-10T21:00:00Z")
     base.update(over)
     return di.Deps(**base)
@@ -111,6 +132,10 @@ def laptop_up(d, at=990.0):
 
 def laptop_down(d):
     d.claims.beats.pop("claude-code-cli", None)
+
+
+def key_for(recipient="claude-api", text=REQUEST):
+    return di.idempotency_key(di.correlate(FILE, text, "r1", recipient))
 
 
 class FlagTest(unittest.TestCase):
@@ -228,6 +253,46 @@ class DuplicateTest(unittest.TestCase):
         self.assertFalse(di.tuple_ok(dict(a, source_doc_id="short")))
         self.assertFalse(di.tuple_ok(dict(a, drive_revision="")))
 
+    def test_two_overlapping_passes_deliver_once(self):
+        """Cursor on d150d84: push and poll both observed `intake` and each put to a worker."""
+        class Racing(di.MemoryClaims):
+            """The other pass wins every transition the first time it is tried."""
+            def __init__(self):
+                super().__init__()
+                self.lost = []
+
+            def advance(self, key, current, new):
+                if current == di.INTAKE and not self.lost:
+                    self.lost.append(new)
+                    self.states[key] = "delivering:claude-code-cli"   # the other pass bound the laptop
+                    return False
+                return super().advance(key, current, new)
+        d = deps(claims=Racing())
+        out = di.decide(hint(), d)
+        self.assertEqual("in_progress", out["status"], out)
+        self.assertEqual([], d.queue.puts)                      # the loser did not put
+        self.assertEqual([], d.receipts.lines)
+        # the next pass finishes the OTHER pass's delivery, to the worker it bound
+        later = di.decide(hint(), d)
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(["claude-code-cli"], d.queue.recipients())
+
+    def test_a_pass_that_loses_the_race_after_its_put_writes_nothing_and_rings_nobody(self):
+        """Two resumes of one delivering state can both put (the residual window, named in the
+        module docstring); the one that then loses the compare-and-set must stop there, or the
+        doc gets two REQUESTED lines and the worker two wakes."""
+        class LateLoser(di.MemoryClaims):
+            def advance(self, key, current, new):
+                if new.startswith(di.ON_INBOX):
+                    self.states[key] = "rung:claude-api"              # the other pass got here first
+                    return False
+                return super().advance(key, current, new)
+        d = deps(claims=LateLoser())
+        out = di.decide(hint(), d)
+        self.assertEqual("in_progress", out["status"], out)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual([], d.ring.calls)
+
 
 class FailoverTest(unittest.TestCase):
     """The owner's rule: one worker or the other, never neither, never silently, never both."""
@@ -275,6 +340,27 @@ class FailoverTest(unittest.TestCase):
         laptop_down(d)
         self.assertEqual("duplicate", di.decide(hint(), d)["status"])
         self.assertEqual(1, len(d.queue.puts))
+
+    def test_a_crash_between_the_put_and_the_claim_resumes_to_the_same_worker(self):
+        """Cursor on d150d84: the resume re-routed to the laptop and put the task there too."""
+        d = deps()
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        d.claims.states[key_for()] = "delivering:claude-api"     # bound, put landed, then it died
+        d.queue.puts.append((dict(t), di.gist(REQUEST), d.at))
+        laptop_up(d)                                             # routing would now say the laptop
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["claude-api"], d.queue.recipients())    # no second put, nowhere
+        self.assertEqual("claude-api", out["tuple"]["recipient_id"])
+        self.assertEqual(["claude-api"], [c["recipient_id"] for c in d.ring.calls])
+
+    def test_a_crash_before_the_put_resumes_to_the_bound_worker(self):
+        d = deps()
+        d.claims.states[key_for()] = "delivering:claude-api"     # bound, then died before the put
+        laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["claude-api"], d.queue.recipients())
 
     def test_work_queued_for_the_laptop_is_delivered_when_the_laptop_returns(self):
         """Cursor on 05a8079: QUEUED kept its claim and the second pass was a duplicate; nothing ever queued."""
@@ -331,14 +417,14 @@ class FailoverTest(unittest.TestCase):
 
 
 class RetryTest(unittest.TestCase):
-    """A lost response is settled by reading back, never by doing it again."""
+    """A lost response is settled by reading back, never by doing it again; every hop is finished later."""
 
     def test_a_failed_queue_put_is_retryable_and_the_retry_delivers_once(self):
         d = deps(queue=Queue(fail=RuntimeError("redis down")))
         out = di.decide(hint(), d)
         self.assertEqual("queue_error", out["status"])
         self.assertEqual([], d.receipts.lines)      # nothing landed, so nothing is claimed in the doc
-        self.assertEqual(di.INTAKE, list(d.claims.states.values())[0])
+        self.assertEqual("delivering:claude-api", list(d.claims.states.values())[0])
         d.queue = Queue()
         self.assertEqual("dispatched", di.decide(hint(), d)["status"])
         self.assertEqual(1, len(d.queue.puts))
@@ -354,8 +440,7 @@ class RetryTest(unittest.TestCase):
 
     def test_a_claim_that_landed_before_a_crash_is_resumed_not_restarted(self):
         d = deps()
-        key = di.idempotency_key(di.correlate(FILE, REQUEST, "r1", "claude-api"))
-        d.claims.states[key] = di.INTAKE                 # claimed, then the process died
+        d.claims.states[key_for()] = di.INTAKE                 # claimed, then the process died
         out = di.decide(hint(), d)
         self.assertEqual("dispatched", out["status"], out)
         self.assertEqual(1, len(d.queue.puts))
@@ -370,38 +455,54 @@ class RetryTest(unittest.TestCase):
         d.queue = Queue()
         self.assertEqual("dispatched", di.decide(hint(), d)["status"])
 
-    def test_a_task_on_the_queue_whose_ring_failed_keeps_its_place_and_is_rung_later(self):
-        calls = []
-
-        def ring(t):
-            if not calls:
-                calls.append(t)
-                raise di.Unconfigured("INBOX_WAKE_URL unset")
-            calls.append(t)
-        d = deps(ring=ring)
+    def test_a_failed_ring_is_rung_by_the_next_pass_without_a_second_put(self):
+        """Cursor on d150d84: on_inbox was treated as finished and a failed ring was never sent later."""
+        d = deps(ring=Ring(fail_first=1))
         out = di.decide(hint(), d)
         self.assertEqual("queued_not_rung", out["status"])
         self.assertEqual(1, len(d.queue.puts))
         self.assertEqual(["REQUESTED"], d.receipts.states())     # the doc says exactly that much
-        # the next pass finds the task on the inbox and only rings
         later = di.decide(hint(), d)
-        self.assertEqual("duplicate", later["status"])            # on_inbox: this pass does not re-deliver
-        self.assertEqual(1, len(d.queue.puts))
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(2, len(d.ring.calls))                   # rung again, once
+        self.assertEqual(1, len(d.queue.puts))                   # and not put again
+        self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
+        self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+        self.assertEqual(2, len(d.ring.calls))
 
-    def test_the_default_ring_is_not_configured_and_never_writes_dispatched(self):
+    def test_the_default_ring_is_not_configured_and_a_real_one_installed_later_rings(self):
         d = deps(ring=None)
         out = di.decide(hint(), d)
         self.assertEqual("queued_not_rung", out["status"], out)
         self.assertIn("no ring configured", out["error"])
         self.assertEqual(["REQUESTED"], d.receipts.states())
+        d.ring = Ring()
+        self.assertEqual("dispatched", di.decide(hint(), d)["status"])
+        self.assertEqual(1, len(d.ring.calls))
+        self.assertEqual(1, len(d.queue.puts))
 
-    def test_a_claim_store_that_cannot_answer_is_not_a_free_key(self):
-        class Broken(di.MemoryClaims):
-            def claim(self, key):
-                raise ConnectionError("redis unreachable")
-        d = deps(claims=Broken())
-        self.assertEqual("claim_error", di.decide(hint(), d)["status"])
-        self.assertEqual([], d.queue.puts)
+    def test_a_dispatched_receipt_not_read_back_is_owed_and_written_by_the_next_pass(self):
+        """Cursor on d150d84: both receipts not read back, status still dispatched, the retry gave up."""
+        d = deps(receipts=Receipts(drop=True))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched_receipt_owed", out["status"], out)
+        self.assertEqual(1, len(d.ring.calls))
+        good = Receipts()
+        d.receipts = good
+        later = di.decide(hint(), d)
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(["DISPATCHED"], good.states())          # only the owed line, once
+        self.assertEqual(1, len(d.ring.calls))                   # and no second wake
+        self.assertEqual(1, len(d.queue.puts))
+
+    def test_a_receipt_id_does_not_carry_the_clock_so_a_retry_finds_its_own_line(self):
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        self.assertEqual(di.receipt_id_for(t, "REQUESTED"), di.receipt_id_for(dict(t, drive_revision="r9"), "REQUESTED"))
+        self.assertNotEqual(di.receipt_id_for(t, "REQUESTED"), di.receipt_id_for(t, "DISPATCHED"))
+        d = deps()
+        self.assertEqual("written", di.write_receipt(d, t, REQUEST, "REQUESTED", "t1"))
+        self.assertEqual("written", di.write_receipt(d, t, REQUEST, "REQUESTED", "t2"))
+        self.assertEqual(1, len(d.receipts.lines))
 
     def test_a_claim_lost_between_set_and_read_is_an_error_not_a_fresh_start(self):
         """claim() says somebody holds it and state() says nobody: a race or a dying store.
@@ -418,6 +519,14 @@ class RetryTest(unittest.TestCase):
         self.assertEqual([], d.queue.puts)
         self.assertEqual([], d.receipts.lines)
 
+    def test_a_claim_store_that_cannot_answer_is_not_a_free_key(self):
+        class Broken(di.MemoryClaims):
+            def claim(self, key):
+                raise ConnectionError("redis unreachable")
+        d = deps(claims=Broken())
+        self.assertEqual("claim_error", di.decide(hint(), d)["status"])
+        self.assertEqual([], d.queue.puts)
+
     def test_an_inbox_that_cannot_be_read_back_is_unknown_not_a_second_put(self):
         class Blind(Queue):
             def has(self, recipient, task_id):
@@ -429,7 +538,7 @@ class RetryTest(unittest.TestCase):
 
 
 class ReceiptTest(unittest.TestCase):
-    """Guard 5: the receipt names the state reached and nothing past it."""
+    """Guard 4 and 5: the receipt names the state reached and nothing past it, and is settled by read-back."""
 
     def test_the_receipt_trail_is_requested_then_dispatched_and_never_accepted(self):
         d = deps()
@@ -451,6 +560,24 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual("written", out["receipt_dispatched"])
         self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
         self.assertEqual("r3", out["tuple"]["drive_revision"])
+
+    def test_a_lost_append_response_refreshes_the_revision_from_the_doc(self):
+        """Cursor on d150d84: the landed-but-lost append threw its new revision away, so the next
+        guarded append offered r1 against a doc at r2 and the DISPATCHED line never landed."""
+        receipts = Receipts(guard=True, lose=True, revision="r1")
+        d = deps(receipts=receipts, docs=Docs(receipts=receipts))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["REQUESTED", "DISPATCHED"], receipts.states())
+        self.assertEqual("r3", out["tuple"]["drive_revision"])
+
+    def test_a_stale_guard_on_a_clean_miss_is_retried_once_with_the_fresh_revision(self):
+        receipts = Receipts(guard=True, revision="r5")           # the doc moved under us
+        d = deps(receipts=receipts, docs=Docs(receipts=receipts))
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        self.assertEqual("written", di.write_receipt(d, t, REQUEST, "REQUESTED", d.at))
+        self.assertEqual(2, receipts.appends)                   # one stale miss, one fresh hit
+        self.assertEqual(receipts.revision, t["drive_revision"])  # and the tuple carries the doc's revision
 
     def test_a_lost_write_that_landed_is_written_and_one_that_vanished_is_unknown(self):
         t = di.correlate(FILE, REQUEST, "r1", "claude-code-cli")
@@ -509,20 +636,28 @@ class ScopeTest(unittest.TestCase):
         self.assertEqual("read_error", out["status"])
         self.assertEqual({}, d.claims.states)
 
+
+class StreamClient:
+    """Enough of a Redis stream to prove the read-back reads the NEWEST entries."""
+
+    def __init__(self):
+        self.streams, self.n = {}, 0
+
+    def xadd(self, key, fields):
+        self.n += 1
+        self.streams.setdefault(key, []).append(("%d-0" % self.n, dict(fields)))
+
+    def xrevrange(self, key, count=None):
+        rows = list(reversed(self.streams.get(key, [])))
+        return rows[:count] if count else rows
+
+
+class InboxQueueTest(unittest.TestCase):
     def test_the_queue_entry_carries_the_whole_tuple_and_is_read_back_by_task_id(self):
-        class Client:
-            def __init__(self):
-                self.streams = {}
-
-            def xadd(self, key, fields):
-                self.streams.setdefault(key, []).append(("1-0", dict(fields)))
-
-            def xrange(self, key, count=None):
-                return list(self.streams.get(key, []))
-        q = di.InboxQueue(client=Client())
+        q = di.InboxQueue(client=StreamClient())
         d = deps(queue=q)
         out = di.decide(hint(), d)
-        key, fields = "fleet:inbox:claude-api", q.client.streams["fleet:inbox:claude-api"][0][1]
+        fields = q.client.streams["fleet:inbox:claude-api"][0][1]
         self.assertEqual(["fleet:inbox:claude-api"], list(q.client.streams))
         for part in ("source_doc_id", "source_revision", "request_id", "task_id", "recipient_id"):
             self.assertEqual(out["tuple"][part], fields[part], part)
@@ -532,11 +667,45 @@ class ScopeTest(unittest.TestCase):
         self.assertTrue(q.has("claude-api", out["task"]))
         self.assertFalse(q.has("claude-code-cli", out["task"]))
         self.assertEqual("duplicate", di.decide(hint(), d)["status"])
-        self.assertEqual(1, len(q.client.streams[key]))
+        self.assertEqual(1, len(q.client.streams["fleet:inbox:claude-api"]))
+
+    def test_a_busy_inbox_still_finds_the_entry_just_appended(self):
+        """Cursor on d150d84: xrange read the OLDEST 500, so a lost response on a busy stream
+        re-appended the same task on every later poll (501, 502, ...)."""
+        client = StreamClient()
+        for i in range(di.INBOX_LOOKBACK + 100):
+            client.xadd("fleet:inbox:claude-api", {"task_id": "task-%016x" % i, "by": "older"})
+        q = di.InboxQueue(client=client)
+
+        class LossyPut(di.InboxQueue):
+            def put(self, tuple_, gist_, at):
+                super().put(tuple_, gist_, at)
+                raise TimeoutError("response lost")
+        d = deps(queue=LossyPut(client=client))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(di.INBOX_LOOKBACK + 101, len(client.streams["fleet:inbox:claude-api"]))
+        for _ in range(3):
+            self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+        self.assertEqual(di.INBOX_LOOKBACK + 101, len(client.streams["fleet:inbox:claude-api"]))
+        self.assertTrue(q.has("claude-api", out["task"]))
+
+    def test_the_lua_compare_and_set_is_what_advance_runs(self):
+        calls = []
+
+        class Client:
+            def eval(self, script, numkeys, key, current, new, ttl):
+                calls.append((script, numkeys, key, current, new, ttl))
+                return 1
+        self.assertTrue(di.RedisClaims(Client()).advance("k", "intake", "delivering:grok"))
+        self.assertEqual(1, calls[0][1])
+        self.assertEqual("fleet:intake:claim:k", calls[0][2])
+        self.assertIn("redis.call('get'", calls[0][0])
+        self.assertEqual(("intake", "delivering:grok", di.CLAIM_TTL), calls[0][3:])
 
 
 class ChannelTest(unittest.TestCase):
-    """Guard 6: the day-eight outage is announced on day six, and never read as ok by default."""
+    """Guard 6: the day-eight outage is announced on day six, never read as ok by default, and read against NOW."""
 
     def test_no_expiry_on_record_is_unknown_not_ok(self):
         self.assertEqual({"channel": "unknown", "renew": True}, di.channel_health(None, 1000.0))
@@ -558,6 +727,14 @@ class ChannelTest(unittest.TestCase):
         self.assertNotIn("telephone", json.dumps(out))
         self.assertFalse(di.handle("GET", "/healthz", {}, b"", deps())[1]["ok"])
         self.assertTrue(di.handle("GET", "/healthz", {}, b"", deps(channel_expires_at=1000.0 + 10 ** 6))[1]["ok"])
+
+    def test_a_server_reads_the_clock_now_not_the_clock_at_boot(self):
+        """Cursor on d150d84: main() never moved deps.now, so a healthy expiry at boot stayed ok forever."""
+        d = deps(now=None, channel_expires_at=time.time() + 10 ** 6)
+        self.assertTrue(di.handle("GET", "/healthz", {}, b"", d)[1]["ok"])
+        d.channel_expires_at = time.time() - 1
+        self.assertEqual("expired", di.handle("GET", "/healthz", {}, b"", d)[1]["channel"])
+        self.assertIsNone(di.Deps().now)
 
 
 class AuthTest(unittest.TestCase):
