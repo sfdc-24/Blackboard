@@ -586,5 +586,119 @@ class TheBoardIsTheSharedDEDUPE(unittest.TestCase):
                          aw.reply_row_id("gemini", "ASK-1"))
 
 
+class TheCutMarkIsOffUntilAsked(unittest.TestCase):
+    """2026-10-10: two Gemini replies ended mid-sentence. Out tokens were 211 and 236, under the
+    4096 output cap, and the post path's text[:1500] is what removes the end once the waker header
+    has used its share. The mark stays off until WAKER_NO_SILENT_CUT is set."""
+
+    LONG = "The spill stores the whole reply. " * 80
+
+    def _post(self, text, env):
+        from unittest import mock
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args)
+            return mock.Mock(stdout="VERIFIED on the board", stderr="")
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(aw.subprocess, "run", side_effect=run):
+            self.assertTrue(aw.post_reply("gemini", {"project": "FLEET"}, text, "grok;ALL", "ASK-1",
+                                          False))
+        args = seen[0]
+        return args[args.index("post") + 1], seen
+
+    def test_the_flag_off_still_slices_and_names_nothing(self):
+        self.assertFalse(aw.cuts_marked({}))
+        posted, _ = self._post(self.LONG, {"WAKER_NO_SILENT_CUT": "", "BOARD_SPILL_URI": "",
+                                            "BLACKBOARD_STATE_URI": ""})
+        self.assertEqual(self.LONG[:1500], posted)
+        self.assertNotIn("truncated=", posted)
+        self.assertNotIn("chars=", posted)
+        self.assertNotIn("full=", posted)
+
+    def test_the_flag_on_marks_a_long_reply_when_there_is_no_store(self):
+        posted, _ = self._post(self.LONG, {"WAKER_NO_SILENT_CUT": "1", "BOARD_SPILL_URI": "",
+                                            "BLACKBOARD_STATE_URI": ""})
+        self.assertLessEqual(len(posted), 1500)
+        self.assertIn("truncated=1", posted)
+        self.assertIn("chars=%d" % len(self.LONG), posted)
+        self.assertNotEqual(posted, self.LONG[:1500])
+        self.assertNotIn("full=", posted)
+
+    def test_the_flag_on_writes_the_spill_after_the_append(self):
+        import json
+        import tempfile
+        from unittest import mock
+        directory = tempfile.mkdtemp()
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args)
+            self.assertEqual([], os.listdir(directory))
+            return mock.Mock(stdout="VERIFIED on the board", stderr="")
+
+        env = {"WAKER_NO_SILENT_CUT": "1", "BOARD_SPILL_URI": directory, "BLACKBOARD_STATE_URI": ""}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(aw.subprocess, "run", side_effect=run):
+            self.assertTrue(aw.post_reply("gemini", {"project": "FLEET"}, self.LONG, "grok;ALL",
+                                          "ASK-1", False))
+        posted = seen[0][seen[0].index("post") + 1]
+        files = os.listdir(directory)
+        self.assertEqual(1, len(files))
+        self.assertTrue(files[0].startswith("board-full-"))
+        with open(os.path.join(directory, files[0]), encoding="utf-8") as fh:
+            stored = json.loads(fh.read())
+        self.assertEqual(self.LONG, stored["text"])
+        self.assertEqual(len(self.LONG), stored["chars"])
+        self.assertIn("full=", posted)
+        self.assertIn("chars=%d" % len(self.LONG), posted)
+        self.assertIn(stored["sha256"], posted)
+        self.assertIn("board-full-", posted)
+        self.assertLessEqual(len(posted), 1500)
+
+    def test_a_model_cap_is_marked_on_the_reply_only_when_the_flag_is_on(self):
+        import tempfile
+        from unittest import mock
+        captured = []
+
+        class Adapter(object):
+            @staticmethod
+            def ask(prompt, max_tokens=None):
+                return ("The design holds if the spill ", "fake-route")
+
+        Adapter.ask.last_finish = "MAX_TOKENS"
+        Adapter.ask.last_usage = {}
+        rows = [["ROW-A", "2026-10-10T13:30:00Z", "grok", "gemini", "APPEND",
+                 "BCB|v=1|id=ASK-CUT|phase=ASK|to=gemini|please finish the sentence"]]
+        saved = (aw.read_since, aw.load_env, aw.log, aw.post_reply, aw.state_path)
+        saved_module = aw.AGENTS["gemini"]["module"]
+        tmp = tempfile.mkdtemp()
+        aw.sys.modules["fake_cut_adapter"] = Adapter
+        aw.AGENTS["gemini"]["module"] = "fake_cut_adapter"
+        aw.read_since = lambda env, since, tries=3: {"rows": rows, "total": 1, "filtered": 1}
+        aw.load_env = lambda: {}
+        aw.log = lambda me, line: None
+        aw.post_reply = lambda me, cfg, text, to, answers, verbose, phase="DONE": captured.append(text) or True
+        aw.state_path = lambda me: os.path.join(tmp, ".gemini_state.json")
+        try:
+            with mock.patch.dict(os.environ, {"WAKER_NO_SILENT_CUT": "", "GEMINI_CLOUD_CONTEXT": "off"}):
+                aw.main(["--agent", "gemini", "--max", "1"])
+            self.assertEqual(1, len(captured))
+            self.assertNotIn("model_stop=max_tokens", captured[0])
+            self.assertNotIn("finish_reason=MAX_TOKENS", captured[0])
+            captured.clear()
+            aw.state_path = lambda me: os.path.join(tmp, ".gemini_state_on.json")
+            with mock.patch.dict(os.environ, {"WAKER_NO_SILENT_CUT": "1", "GEMINI_CLOUD_CONTEXT": "off"}):
+                aw.main(["--agent", "gemini", "--max", "1"])
+        finally:
+            aw.read_since, aw.load_env, aw.log, aw.post_reply, aw.state_path = saved
+            aw.AGENTS["gemini"]["module"] = saved_module
+            aw.sys.modules.pop("fake_cut_adapter", None)
+        self.assertEqual(1, len(captured))
+        self.assertIn("model_stop=max_tokens|", captured[0])
+        self.assertIn("finish_reason=MAX_TOKENS", captured[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

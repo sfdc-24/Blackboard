@@ -63,6 +63,22 @@ class EveryCallIsBounded(unittest.TestCase):
         self.assertEqual({"max_output_tokens": 4096}, seen[1]["generation_config"])
         self.assertEqual("an answer", text)
 
+    def test_an_incomplete_interaction_is_marked_and_the_text_is_still_returned(self):
+        incomplete = (200, json.dumps({
+            "output_text": "cut mid sent", "status": "incomplete",
+            "usage": {"total_tokens": 240, "total_input_tokens": 20, "total_output_tokens": 220,
+                      "total_thought_tokens": 0}}))
+        module = load_gemini({})
+        seen, text = sent(module, [incomplete])
+        self.assertEqual("cut mid sent", text)
+        self.assertEqual("MAX_TOKENS", module.ask.last_finish)
+        self.assertEqual(1, len(seen))
+
+    def test_a_finished_interaction_does_not_claim_the_cap(self):
+        module = load_gemini({})
+        sent(module, [OK])
+        self.assertIsNone(module.ask.last_finish)
+
     def test_any_other_error_is_not_retried(self):
         seen, text = sent(load_gemini({}), [(400, '{"error": "bad request"}')])
         self.assertEqual(1, len(seen))

@@ -820,6 +820,31 @@ class RepoContextForGemini(unittest.TestCase):
         self.assertTrue(self._marker(out).startswith("COMPLETE"))
         self.assertIn("--- a.py -> b.py", out)
 
+    def test_named_cuts_list_the_file_and_the_line_only_when_the_flag_is_on(self):
+        # A new file whose unified diff is longer than PATCH_CAP, plus files that will not fit
+        # after it. The line is the new-file line the kept patch does not contain whole.
+        lines = ["+line %04d %s\n" % (i, "x" * 60) for i in range(1, 160)]
+        patch = "@@ -0,0 +1,160 @@\n" + "".join(lines)
+        where = self.rc.patch_cut_line(patch, self.rc.PATCH_CAP)
+        self.assertIsNotNone(where)
+        self.assertGreater(where, 1)
+        self.assertLess(where, 160)
+        files = [{"filename": "scripts/board_row.py", "status": "added", "additions": 160,
+                  "deletions": 0, "changes": 160, "patch": patch}]
+        for i in range(6):
+            files.append({"filename": "scripts/left_%d.py" % i, "status": "added", "additions": 1,
+                          "deletions": 0, "changes": 1,
+                          "patch": "@@ -0,0 +1,1 @@\n+" + ("y" * 5900)})
+        off = self.rc.context_for("Blackboard #297", env={}, get=self.fake_get([], files=files))
+        self.assertNotIn("cut at line", off)
+        self.assertNotIn("scripts/left_0.py left out", off)
+        on = self.rc.context_for("Blackboard #297", env={"GEMINI_NAME_DIFF_CUTS": "1"},
+                                 get=self.fake_get([], files=files))
+        self.assertIn("scripts/board_row.py cut at line %d" % where, on)
+        self.assertIn("left out", on)
+        self.assertIn("INCOMPLETE:", on)
+        self.assertLessEqual(len(on), self.rc.BUDGET + 800)
+
     def test_a_list_too_long_for_the_room_is_cut_and_marked(self):
         many = [{"filename": "deep/path/to/a/module/number_%04d_with_a_long_name.py" % i, "status": "modified",
                  "additions": 1, "deletions": 0, "changes": 1, "patch": "+x"} for i in range(300)]

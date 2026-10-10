@@ -717,6 +717,149 @@ def reply_phase(row) -> str:
     return "RESULT" if m and m.group(1).upper() in RESULT_FOR else "DONE"
 
 
+# WAKER_NO_SILENT_CUT is off unless set to 1/true/on/yes. Off keeps text[:1500], the slice this
+# file has posted since it learned to post. On, a reply that does not fit carries chars=<N> and
+# either full=<pointer> or truncated=1, and a model that stopped on its output cap is marked.
+# Measured 2026-10-10: two Gemini replies (out tokens 211 and 236) ended mid-sentence with neither
+# mark. GEMINI_MAX_OUTPUT_TOKENS defaults to 4096, so that count is not the output cap. The waker
+# header is about 700 characters, which leaves about 800 of the 1,500 for the answer, and 211-236
+# tokens of prose is longer than that. The slice is what cut them. The cap is still reported when
+# an adapter sets ask.last_finish = "MAX_TOKENS", so a job that lowers the cap cannot hide it.
+CUT_FLAG = "WAKER_NO_SILENT_CUT"
+_CUT_ON = ("1", "true", "on", "yes")
+POST_TEXT_LIMIT = 1500
+
+
+def cuts_marked(env=None) -> bool:
+    """True only when WAKER_NO_SILENT_CUT is on. Default off."""
+    env = os.environ if env is None else env
+    return str(env.get(CUT_FLAG) or "").strip().lower() in _CUT_ON
+
+
+def _sentence_cut(text: str, room: int) -> str:
+    """At most `room` characters, ending on a sentence when one fits in the back two-thirds."""
+    text = text or ""
+    if len(text) <= room:
+        return text
+    if room <= 0:
+        return ""
+    window = text[:room]
+    ends = [m.end() for m in re.finditer(r"[.!?](?:[\"')\]]*)(?=\s)", window)]
+    if ends and ends[-1] >= max(1, room // 3):
+        return window[:ends[-1]]
+    space = window.rfind(" ")
+    return (window[:space] if space > room // 2 else window).rstrip()
+
+
+def spill_store(env=None):
+    """The waker's existing state store, or None. No new bucket and no new grant.
+
+    BOARD_SPILL_URI wins, then BLACKBOARD_STATE_URI (already set on the gemini-waker job).
+    Neither set: the row is marked truncated=1 and nothing is written.
+    """
+    env = os.environ if env is None else env
+    uri = (env.get("BOARD_SPILL_URI") or env.get("BLACKBOARD_STATE_URI") or "").strip()
+    if not uri:
+        return None
+    import state_store
+    return state_store.open_store(uri)
+
+
+def spill_object_name(key: str, full: str) -> str:
+    """board-full-<id>-<sha256>. The hash keeps two different replies from sharing one object."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", key or "")[:80] or "row"
+    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+    return "board-full-%s-%s" % (safe, digest)
+
+
+def model_cut(cfg: dict) -> tuple:
+    """(field, note) when the flag is on and the adapter saw an output-cap stop. Otherwise empty.
+
+    The field is a pipe field (`model_stop=max_tokens|`). The note is prose that stays at the
+    front of the answer, so a later summary still says the model stopped.
+    """
+    if not cuts_marked():
+        return "", ""
+    mod = sys.modules.get(cfg.get("module") or "")
+    finish = getattr(getattr(mod, "ask", None), "last_finish", None)
+    if finish != "MAX_TOKENS":
+        return "", ""
+    return ("model_stop=max_tokens|",
+            "[INCOMPLETE: the model stopped at its output cap, finish_reason=MAX_TOKENS. "
+            "This answer is cut short.] ")
+
+
+def fit_post_text(text: str, key: str, store=None) -> tuple:
+    """The text `fleet_agent post` receives, and a note about a spill still to write.
+
+    Flag off: `text[:1500]`, including the silent cut. Flag on and the text fits: the text.
+    Flag on and it does not: chars=<N> and either full=<pointer> or truncated=1, inside 1,500
+    characters, ending on a sentence when one fits. The object is not written here.
+    """
+    text = text or ""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    info = {"chars": len(text), "sha256": digest, "deferred": False, "truncated": False,
+            "pointer": None, "name": None, "key": key, "full": text}
+    if not cuts_marked() or len(text) <= POST_TEXT_LIMIT:
+        return (text if cuts_marked() else text[:POST_TEXT_LIMIT]), info
+    pointer = None
+    if store is not None:
+        name = spill_object_name(key, text)
+        info["name"] = name
+        pointer = "%s/%s" % (store.describe().rstrip("/"), name)
+        info.update(deferred=True, pointer=pointer)
+    if pointer:
+        meta = "chars=%d|full=%s|sha256=%s|" % (info["chars"], pointer, digest)
+        note = " [Summary only. Full text: %d chars at full=.]" % info["chars"]
+    else:
+        info["truncated"] = True
+        meta = "chars=%d|truncated=1|sha256=%s|" % (info["chars"], digest)
+        note = " [TRUNCATED: %d chars in total; the full text was not stored.]" % info["chars"]
+    segs = text.split("|")
+    i = 0
+    while i < len(segs) - 1 and re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*=", segs[i]):
+        i += 1
+    head = "|".join(segs[:i]) + ("|" if i else "")
+    free = "|".join(segs[i:])
+    room = POST_TEXT_LIMIT - len(head) - len(meta) - len(note)
+    if room < 0:
+        head = "wakerreply=1|" if text.startswith("wakerreply=1|") else ""
+        free = text[len(head):]
+        room = POST_TEXT_LIMIT - len(head) - len(meta) - len(note)
+    posted = head + meta + _sentence_cut(free, max(0, room)) + note
+    if len(posted) > POST_TEXT_LIMIT:
+        posted = (head + meta + note)[:POST_TEXT_LIMIT]
+    return posted, info
+
+
+def _commit_after_post(info: dict, store) -> None:
+    """The spill is off the post: the append above did not wait on the store."""
+    if not info.get("deferred"):
+        return
+    try:
+        commit_spill(info, store)
+    except Exception as exc:  # noqa: BLE001 - the row is already posted; say the object is not
+        print("    SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
+
+
+def commit_spill(info: dict, store) -> None:
+    """Write the spill fit_post_text only named. Call this after the board append.
+
+    token None is create-only (GCS ifGenerationMatch=0). An object that already holds these
+    bytes is reused. Different bytes are not overwritten.
+    """
+    if not info.get("deferred") or store is None:
+        return
+    record = {"row_id": info["key"], "chars": info["chars"], "sha256": info["sha256"],
+              "text": info["full"]}
+    try:
+        store.save(info["name"], record, None)
+    except Exception as exc:  # noqa: BLE001 - reuse only when the stored bytes are these bytes
+        existing, _ = store.load(info["name"])
+        if (existing or {}).get("sha256") != record["sha256"]:
+            raise exc
+
+
 def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bool,
                phase: str = "DONE") -> bool:
     """Write the reply through fleet_agent post, never a hand-built row.
@@ -726,8 +869,10 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
     replies because nobody was addressed.
     """
     rid = reply_row_id(me, answers)
+    store = spill_store() if cuts_marked() else None
+    posted, spill = fit_post_text(text, rid, store)
     args = [sys.executable, os.path.join(REPO, "scripts", "fleet_agent.py"),
-            "post", text[:1500],
+            "post", posted,
             "--tag", me,
             "--to", to,
             "--phase", phase,
@@ -747,7 +892,9 @@ def post_reply(me: str, cfg: dict, text: str, to: str, answers: str, verbose: bo
         # next run reconciles the row from the board.
         print("    post NOT CONFIRMED after %d s: it may have landed; not posted again"
               % POST_TIMEOUT_SECONDS)
+        _commit_after_post(spill, store)
         return False
+    _commit_after_post(spill, store)
     out = (res.stdout or "") + (res.stderr or "")
     ok = "VERIFIED on the board" in out
     if verbose or not ok:
@@ -973,15 +1120,18 @@ def main(argv=None) -> int:
         mod_for_cost = sys.modules.get(cfg["module"])
         if mod_for_cost is not None and hasattr(mod_for_cost, "cost_estimate"):
             estimate = mod_for_cost.cost_estimate(getattr(mod_for_cost.ask, "last_usage", None) or {})
+        cut_field, cut_note = model_cut(cfg)
         reply = (
             # WAKER_REPLY_MARK first, so the guard can see it without parsing
             # the rest. See is_waker_reply for what it stops.
             "%s|answers=%s|evidence=STATED|route=%s|" % (WAKER_REPLY_MARK, src_id, route)
             + ("cost=%s|" % " ".join(estimate.replace("|", " ").split()) if estimate else "")
+            + cut_field
             + ("collapsed=%d re-asks of this id|" % reasks if reasks else "")
             + ("okf=%s|" % okf_url if okf_url else "")
             + "Answered by the %s waker, which asks the %s deployment and posts "
               "what it says. %s REPLY: " % (me, me, hands)
+            + cut_note
             + body
             + okf_note
         )
