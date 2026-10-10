@@ -1,0 +1,19 @@
+# Build context is the repo root, the same as cloud/inbox-wake, so the Redis
+# client is scripts/redis_dual.py and not a second copy.
+#
+# DRIVE_INTAKE_ENABLED=off is the image default. A deploy that forgets the env
+# var reads no doc, claims nothing and writes no receipt. Scale-to-zero is a
+# deploy flag (--min-instances=0), not something this image can turn on.
+FROM python:3.12-slim
+
+WORKDIR /app
+RUN pip install --no-cache-dir "redis>=5,<6"
+
+COPY scripts/redis_dual.py /app/redis_dual.py
+COPY scripts/redis_dual.settings.json /app/redis_dual.settings.json
+COPY cloud/drive-intake/main.py /app/main.py
+
+ENV PYTHONUNBUFFERED=1
+ENV DRIVE_INTAKE_ENABLED=off
+
+CMD ["python", "/app/main.py"]
