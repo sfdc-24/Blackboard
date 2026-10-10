@@ -120,6 +120,19 @@ def main() -> int:
     payload = Path(args.payload_file).read_text(encoding="utf-8").strip()
     if not payload.startswith("BCB|"):
         raise SystemExit("payload does not start with BCB| - refusing to write a malformed row")
+    # Imported here, not at the top: cloud/board-probe imports this module only for its read
+    # transport, and its image should not need the writer's rule file.
+    import board_row  # never trim a row silently (scripts/board_row.py)
+    # The spill key is the row id, generated first so the object name is that row and not a second
+    # random id that nothing else records.
+    rid = str(uuid.uuid4())
+    spill = board_row.store_spill()
+    try:
+        payload, fitted = board_row.fit("", payload, key=rid, spill=spill, write=False)
+    except board_row.RowRejected as exc:
+        raise SystemExit(str(exc))
+    if fitted["truncated"]:
+        print("LONG PAYLOAD: %d chars -> truncated=1 (not stored)" % fitted["chars"])
 
     env = load_env()
     for key in ("BUS_URL", "BUS_SECRET"):
@@ -127,7 +140,6 @@ def main() -> int:
             raise SystemExit("missing %s in .env" % key)
 
     now = datetime.now(timezone.utc)
-    rid = str(uuid.uuid4())
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
     row = [rid, ts, TAG, args.to, "APPEND", payload,
            args.status, "Blackboard", args.subject or rid[:8], args.kind]
@@ -135,6 +147,12 @@ def main() -> int:
     code, body = bus(env, {"secret": env["BUS_SECRET"], "action": "append",
                            "title": BOARD, "sheetRow": row})
     print("POST   HTTP %s  %s" % (code, body[:160].replace("\n", " ")))
+    if fitted.get("deferred"):
+        try:
+            board_row.commit(fitted, spill)
+            print("LONG PAYLOAD: %d chars stored at %s" % (fitted["chars"], fitted["pointer"]))
+        except Exception as exc:  # noqa: BLE001
+            print("SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
 
     # The POST result is not the verdict. Read the board back and look for the id.
     #

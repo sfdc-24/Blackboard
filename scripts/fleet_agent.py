@@ -58,6 +58,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # failure raised client-side can arrive after the row has already landed.
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 from bus import fetch as _bus_fetch, load_env as _bus_load_env  # noqa: E402
+import board_row  # noqa: E402  - the one write rule: never trim a row silently
 ENV = os.path.join(REPO, ".env")
 BOARD = "Blackboard - Alpha DB"
 BACKUPS = os.path.join(os.path.dirname(REPO), "blackboard-backups")
@@ -351,9 +352,29 @@ def cmd_post(args):
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rid = args.id or ("%s-%s" % (args.prefix, dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%MZ")))
     to = args.to
-    payload = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|%s" % (
-        rid, args.phase, args.klass, tag, to.replace(";", ","), args.text)
-    row = [rid, now, tag, to, args.phase, payload, args.category, args.project, args.gist or args.text[:180], ""]
+    text = args.text
+    if getattr(args, "text_file", None):
+        with open(args.text_file, encoding="utf-8") as fh:
+            text = fh.read()
+    if not (text or "").strip():
+        print("  refusing an empty post: pass text or --text-file with content")
+        return 2
+    header = "BCB|v=1|id=%s|phase=%s|class=%s|from=%s|to=%s|" % (
+        rid, args.phase, args.klass, tag, to.replace(";", ","))
+    # NEVER TRIM SILENTLY (board_row, 2026-10-09). Every agent's post comes through here, so this is
+    # the one place the 1,500-char limit is applied. fit(write=False) only NAMES the spill object.
+    # The bytes are written by commit() after the append, so a slow store is not on the post.
+    spill = board_row.store_spill()
+    try:
+        payload, fitted = board_row.fit(header, text, key=rid, spill=spill, write=False)
+    except board_row.RowRejected as exc:
+        print("  %s" % exc)
+        return 2
+    if fitted["truncated"]:
+        print("  WARNING: %d chars could not be stored (%s); the row is marked truncated=1"
+              % (fitted["chars"], fitted["error"] or "no spill store"))
+    gist = args.gist or board_row.split_fields(text)[1][:180]
+    row = [rid, now, tag, to, args.phase, payload, args.category, args.project, gist[:180], ""]
 
     # tries=1 is not a tuning choice. The v1 bus does not dedup, and a
     # googleusercontent 404 on the redirect hop can be raised client-side AFTER
@@ -370,6 +391,19 @@ def cmd_post(args):
     except Exception as exc:  # noqa: BLE001
         print("  append raised %s: %s" % (type(exc).__name__, exc))
         print("  This does NOT mean the row is absent. Reading back to find out.")
+
+    # The spill is off the post: the append above did not wait on the store. Commit now, so a
+    # reader that resolves the pointer after this process returns finds the bytes. A failure is
+    # said; it does not pretend the append failed, and it does not overwrite an object that landed.
+    if fitted.get("deferred"):
+        try:
+            board_row.commit(fitted, spill)
+            print("  long text (%d chars) stored whole at %s; the row carries the pointer"
+                  % (fitted["chars"], fitted["pointer"]))
+        except Exception as exc:  # noqa: BLE001
+            print("  SPILL_UNCONFIRMED: %s: %s" % (type(exc).__name__, exc))
+            print("  The row is already posted. The object name is the row id plus the sha256, so "
+                  "a later commit of the same text reuses it and cannot overwrite a different one.")
 
     # D-4: the response is not the proof. Read the row back by its own id.
     data = read_board(quiet=True)
@@ -418,7 +452,9 @@ def build_parser():
     a.set_defaults(fn=cmd_archive)
 
     po = sub.add_parser("post", help="write a correctly shaped BCB row and read it back")
-    po.add_argument("text")
+    po.add_argument("text", nargs="?", default="")
+    po.add_argument("--text-file", dest="text_file", default=None,
+                    help="read the text from this path (no argv length limit)")
     po.add_argument("--tag", default="claude-code-cli")
     po.add_argument("--to", default="ALL")
     po.add_argument("--phase", default="OPEN", choices=["WIP", "OPEN", "DONE", "ASK", "BLOCKED", "RESULT"])

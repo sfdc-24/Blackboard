@@ -7,7 +7,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY scripts/bus.py scripts/agent_waker.py scripts/gemini_agent.py \
      scripts/claude_agent.py scripts/repo_context.py scripts/cloud_context.py \
-     scripts/okf_land.py scripts/fleet_agent.py scripts/state_store.py /app/scripts/
+     scripts/okf_land.py scripts/fleet_agent.py scripts/state_store.py \
+     scripts/board_row.py /app/scripts/
 COPY cloud/agent-waker/main.py /app/main.py
 
 ENV PYTHONUNBUFFERED=1

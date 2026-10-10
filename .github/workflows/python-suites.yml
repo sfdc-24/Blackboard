@@ -145,6 +145,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/board_row.py"
+      - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
@@ -274,6 +276,8 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
+      - "scripts/board_row.py"
+      - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
@@ -414,6 +418,13 @@ jobs:
           else
             echo "not on this branch; skipping"
           fi
+
+      # Board rows are never trimmed silently: a 5,000-char reply survives whole behind a full=
+      # pointer, and no writer may slice the text it hands to a post (scripts/board_row.py).
+      - name: board row never trimmed silently (no network)
+        run: |
+          set -euo pipefail
+          sudo unshare -n python3 tests/test_board_row.py
 
       - name: bcb linter (no network)
         run: |

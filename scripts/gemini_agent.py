@@ -61,6 +61,10 @@ THINKING_LEVEL = (os.environ.get("GEMINI_THINKING_LEVEL") or "low").strip().lowe
 THINKING_LEVELS = ("minimal", "low", "medium", "high")
 # USD per million tokens, input and output (thought tokens bill as output). Unset = no estimate: a
 # price written into code would be a price nobody checked, so the job states the price it is billed.
+# board_row, 2026-10-09: a reply the model stopped on its output cap is continued, at most this many
+# times (each continuation carries the same cap, so one answer costs at most (1 + this) bounded calls),
+# and if it is STILL incomplete ask.last_finish says MAX_TOKENS so the waker marks the row.
+MAX_CONTINUATIONS = max(0, int(os.environ.get("GEMINI_MAX_CONTINUATIONS") or 1))
 PRICE_IN_PER_M = os.environ.get("GEMINI_PRICE_IN_PER_M")
 PRICE_OUT_PER_M = os.environ.get("GEMINI_PRICE_OUT_PER_M")
 
@@ -238,6 +242,7 @@ def ask(prompt, model=None):
     Also stashes the last usage dict on ask.last_usage for the caller.
     """
     ask.last_usage = None
+    ask.last_finish = None
     name, key = api_key()
     if key:
         request = {"model": model or DEFAULT_MODEL, "input": prompt,
@@ -260,6 +265,32 @@ def ask(prompt, model=None):
             if not text:
                 return None, ("key route returned 200 but no text found; "
                               "top-level keys were: %s" % list(d.keys()))
+            # status "incomplete" = the call stopped on max_output_tokens (ai.google.dev/api/
+            # interactions-api, read 2026-10-09). Continue with the continuation_token when the API
+            # gives one; otherwise, or when still incomplete, say MAX_TOKENS - never pass a cut
+            # answer on as if it were whole.
+            tries = 0
+            while str(d.get("status") or "").lower() == "incomplete" and d.get("continuation_token") \
+                    and tries < MAX_CONTINUATIONS:
+                tries += 1
+                more = dict(request, continuation_token=d["continuation_token"])
+                st2, body2 = _post(INTERACTIONS, {"x-goog-api-key": key}, more,
+                                   timeout=KEY_TIMEOUT_SECONDS)
+                try:
+                    d2 = json.loads(body2) if st2 == 200 else None
+                except Exception:
+                    d2 = None
+                if not d2:
+                    break
+                more_text = extract_text(d2) or ""
+                u1, u2 = ask.last_usage, usage_of(d2)
+                for k in ("total", "in", "out", "thought"):
+                    if isinstance(u2.get(k), int):
+                        u1[k] = (u1.get(k) or 0) + u2[k]
+                text += more_text
+                d = d2
+            if str(d.get("status") or "").lower() == "incomplete":
+                ask.last_finish = "MAX_TOKENS"
             return text, "api-key (%s)" % name
         return None, "key route HTTP %s: %s" % (status, body[:200])
 
@@ -279,7 +310,10 @@ def ask(prompt, model=None):
                 ask.last_usage = {"total": m.get("totalTokenCount"), "in": m.get("promptTokenCount"),
                                   "out": m.get("candidatesTokenCount"), "thought": m.get("thoughtsTokenCount"),
                                   "model": _resolved_model(d), "asked": model or VERTEX_MODEL}
-                return d["candidates"][0]["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
+                cand = d["candidates"][0]
+                if str(cand.get("finishReason") or "").upper() == "MAX_TOKENS":
+                    ask.last_finish = "MAX_TOKENS"
+                return cand["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
             except Exception:
                 return None, "vertex returned 200 but an unexpected shape"
         return None, "vertex HTTP %s: %s" % (status, body[:200])
@@ -346,8 +380,9 @@ def cmd_board(args):
         return 1
     print("  [%s] %s\n" % (route, text.strip()[:160]))
     fa = os.path.join(REPO, "scripts", "fleet_agent.py")
+    # No [:1200] here any more: fleet_agent post applies the board limit and never trims silently.
     out = subprocess.run(
-        [sys.executable, fa, "post", text.strip()[:1200],
+        [sys.executable, fa, "post", text.strip(),
          "--tag", "gemini", "--to", args.to, "--phase", "OPEN",
          "--klass", "NOTE", "--project", "SITE",
          "--prefix", "GEMINI-" + (args.prefix or "SAYS"),

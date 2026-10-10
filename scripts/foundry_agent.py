@@ -340,7 +340,8 @@ def cmd_board(args):
     print("  [%s] %s\n" % (route, text.strip()[:160]))
     fa = os.path.join(REPO, "scripts", "fleet_agent.py")
     out = subprocess.run(
-        [sys.executable, fa, "post", text.strip()[:1200],
+        # No [:1200]: fleet_agent post applies the board limit and never trims silently.
+        [sys.executable, fa, "post", text.strip(),
          "--tag", args.tag, "--to", args.to, "--phase", "OPEN",
          "--klass", "NOTE", "--project", "SITE",
          "--prefix", "FOUNDRY-" + (args.prefix or "SAYS"),
