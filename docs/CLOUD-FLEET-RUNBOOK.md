@@ -125,6 +125,46 @@ state proves nothing on its own.
 - **Recent executions** of any job:
   `gcloud run jobs executions list --job <job> --project sfdc24 --region us-central1 --limit 20`.
 
+## bus-requests keepalive (defined here, not applied)
+
+The governed worker is one Cloud Run execution of `bus-requests`. It stops at
+`LOOP_UNTIL` or `LOOP_MAX_MINUTES` (default 240 in `cloud/bus-reconciler/serve_requests.py`),
+whichever is sooner. A `LOOP_UNTIL` that is already in the past does not fall
+through to a single pass: `_loop_until` returns that datetime, and the loop
+body does not run. The execution that was started with
+`LOOP_UNTIL=2026-10-09T03:30:00Z` ended then, and nothing in this repo started
+another one. Cody did not apply the schedule below.
+
+`.github/workflows/bus-requests-keepalive.yml` is the free definition. It is
+off until the repository variable `BUS_REQUESTS_KEEPALIVE` is exactly `on`
+and `GCP_WIF_PROVIDER` / `GCP_WORKER_SA` are set (the identity
+`worker-trigger.yml` already documents). It does not grant IAM. A new Cloud
+Scheduler job is not used: this page already lists four scheduler jobs, and
+Cloud Scheduler's free tier is 3 jobs per billing account, so another one
+would be a paid service. That pricing note is reasoning from this page's job
+table (read 2026-09-24), not a live `gcloud scheduler jobs list`.
+
+Owner or Claude applies it by setting those three repository variables, or by
+running this once. `LOOP_UNTIL` has to be in the future or the execution
+exits without a pass:
+
+```bash
+UNTIL=$(date -u -d '+4 hours' +%Y-%m-%dT%H:%M:%SZ)
+gcloud run jobs execute bus-requests --project=sfdc24 --region=us-central1 \
+  --update-env-vars="LOOP_UNTIL=${UNTIL},LOOP_INTERVAL=10,LOOP_MAX_MINUTES=240" \
+  --task-timeout=5h --async
+```
+
+The cron is `7 */3 * * *` (every 3 hours). The loop it starts is 4 hours, so
+the next start lands before the previous loop ends.
+
+**Rollback:** set `BUS_REQUESTS_KEEPALIVE` to any value other than `on`, or
+delete the variable. The workflow then skips and starts nothing. To stop an
+execution that is already running:
+`gcloud run jobs executions cancel EXECUTION --project=sfdc24 --region=us-central1`.
+Removing the workflow is `git revert` of the merge commit. Do not delete the
+`bus-requests` job as a rollback of this schedule; other callers use it.
+
 ## Known behaviour that is not a fault
 
 - **The gateway flaps.** Google sometimes answers a read with an HTTP 404

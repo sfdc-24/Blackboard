@@ -127,6 +127,8 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "tests/test_bus_requests_keepalive.py"
+      - ".github/workflows/bus-requests-keepalive.yml"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -200,6 +202,8 @@ on:
       - "tests/test_bus_reconcile.py"
       - "scripts/bus_request.py"
       - "tests/test_bus_request.py"
+      - "tests/test_bus_requests_keepalive.py"
+      - ".github/workflows/bus-requests-keepalive.yml"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -949,6 +953,16 @@ jobs:
           if [ -f tests/test_bus_request.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_bus_request -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      - name: "bus-requests keepalive is defined and default off (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_bus_requests_keepalive.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B tests/test_bus_requests_keepalive.py
           else
             echo "not on this branch; skipping"
           fi
