@@ -93,6 +93,10 @@ BUDGET = 24000              # characters of context per row, across every PR it 
 RESERVE = 600               # the header and the COMPLETE/INCOMPLETE line, always inside the cap
 MIN_ROOM = 1500             # below this, a further PR is named as not attached, not half-read
 PATCH_CAP = 6000            # characters of one file's patch
+# GEMINI_NAME_DIFF_CUTS names each file a patch left out or cut, and the new-file line, in the
+# excerpt. Unset is off: the counts above stay as they are, and nothing here changes a live prompt.
+_NAME_CUTS = "GEMINI_NAME_DIFF_CUTS"
+_ON = ("1", "true", "on", "yes")
 PER_PAGE = 100
 MAX_FILE_PAGES = 3          # 300 files; GitHub's files endpoint stops at 3000
 MAX_RESPONSE_BYTES = 2_000_000
@@ -139,6 +143,48 @@ class OutOfTime(Exception):
     pass
 
 
+def name_cuts(env=None) -> bool:
+    """True only when GEMINI_NAME_DIFF_CUTS is on. Default off."""
+    env = os.environ if env is None else env
+    return str(env.get(_NAME_CUTS) or "").strip().lower() in _ON
+
+
+def patch_cut_line(patch: str, cap: int):
+    """The 1-based new-file line that `patch[:cap]` does not contain whole.
+
+    None when the patch fits, or when no hunk header has named a new-file line before the cut.
+    A cut inside an added or context line reports that line. Deletions do not advance it.
+    """
+    if not patch or cap < 0 or len(patch) <= cap:
+        return None
+    new_line = None
+    consumed = 0
+    for line in patch.splitlines(keepends=True):
+        end = consumed + len(line)
+        if line.startswith("@@"):
+            found = re.search(r"\+(\d+)", line)
+            if found:
+                new_line = int(found.group(1))
+            if end > cap:
+                return new_line
+            consumed = end
+            continue
+        counts = (new_line is not None and not line.startswith("-") and not line.startswith("\\")
+                  and not line.startswith("+++") and not line.startswith("---"))
+        if end > cap:
+            return new_line if counts else new_line
+        consumed = end
+        if counts:
+            new_line += 1
+    return None
+
+
+def patch_start_line(patch: str):
+    """The first new-file line a unified diff names, or None when it names none."""
+    found = re.search(r"^@@ [^\n]*\+(\d+)", patch or "", re.M)
+    return int(found.group(1)) if found else None
+
+
 def refs(text: str, env=None):
     """The (repository, number) pairs a row names explicitly, in order, at most MAX_PRS. A private
     repository is recognised only when GEMINI_PRIVATE_REPOS names it."""
@@ -173,7 +219,7 @@ def _shas(pr) -> tuple:
 
 
 def _one(repo: str, number: int, token: str, room: int, get, deadline: float,
-         allow_private: bool = False) -> str:
+         allow_private: bool = False, name_cuts_on: bool = False) -> str:
     base = "/repos/%s/%s/pulls/%d" % (OWNER, repo, number)
 
     def fetch(path):
@@ -209,7 +255,7 @@ def _one(repo: str, number: int, token: str, room: int, get, deadline: float,
         return "%s #%d: not attached (the %.0f s read budget was spent)." % (repo, number, DEADLINE_SECONDS)
     except Exception as e:  # noqa: BLE001 - context is optional; the answer must not fail on it
         return "%s #%d: not readable (%s)." % (repo, number, type(e).__name__)
-    out = _render(repo, number, pr, files, before, room)
+    out = _render(repo, number, pr, files, before, room, name_cuts_on=name_cuts_on)
     if private:
         out = ("PRIVATE REPOSITORY - your reply is posted to the board; quote only what the answer "
                "needs.\n" + out)
@@ -232,11 +278,12 @@ def _path(f) -> str:
     return f.get("filename", "?")
 
 
-def _render(repo, number, pr, files, shas, room) -> str:
+def _render(repo, number, pr, files, shas, room, name_cuts_on: bool = False) -> str:
     """Header, then COMPLETE or INCOMPLETE with every reason, then the file list and patches."""
     budget = room - RESERVE
     used, listed, patches = 0, [], []
     list_cut, missing, capped, omitted = False, 0, 0, 0
+    listed_n = 0
     for f in files:
         line = "  %s %s (+%s -%s)" % (f.get("status", "?"), _path(f),
                                       f.get("additions", "?"), f.get("deletions", "?"))
@@ -244,7 +291,9 @@ def _render(repo, number, pr, files, shas, room) -> str:
             list_cut = True
             break
         listed.append(line)
+        listed_n += 1
         used += len(line) + 1
+    cut_where, omitted_where = [], []
     for f in files:
         patch = f.get("patch")
         if not patch:
@@ -257,9 +306,19 @@ def _render(repo, number, pr, files, shas, room) -> str:
         if len(patch) > PATCH_CAP:
             capped += 1
             piece += "\n[patch cut at %d of %d characters]" % (PATCH_CAP, len(patch))
+            if name_cuts_on:
+                where = patch_cut_line(patch, PATCH_CAP)
+                if where:
+                    piece += "\n[%s cut at line %d]" % (_path(f), where)
+                else:
+                    piece += "\n[%s cut; the patch has no line numbers]" % _path(f)
         if used + len(piece) > budget:
             omitted += 1
+            if name_cuts_on:
+                omitted_where.append((_path(f), patch_start_line(patch)))
             continue
+        if name_cuts_on and len(patch) > PATCH_CAP:
+            cut_where.append((_path(f), patch_cut_line(patch, PATCH_CAP)))
         patches.append(piece)
         used += len(piece)
 
@@ -277,6 +336,26 @@ def _render(repo, number, pr, files, shas, room) -> str:
         reasons.append("%d patch(es) were cut at %d characters" % (capped, PATCH_CAP))
     if omitted:
         reasons.append("%d patch(es) were left out to fit" % omitted)
+    # Off by default. On, the excerpt names the files, not only the counts, and a cut names the
+    # new-file line the kept patch does not contain whole. That is how a reader can see that
+    # scripts/board_row.py stopped inside fit() and store_spill was past the cut.
+    if name_cuts_on:
+        for path, where in cut_where:
+            if where:
+                reasons.append("%s cut at line %d" % (path, where))
+            else:
+                reasons.append("%s cut (no line numbers in the patch)" % path)
+        for path, start in omitted_where:
+            if start:
+                reasons.append("%s left out (from line %d)" % (path, start))
+            else:
+                reasons.append("%s left out" % path)
+        named = {path for path, _ in cut_where} | {path for path, _ in omitted_where}
+        if list_cut:
+            for f in files[listed_n:]:
+                path = _path(f)
+                if path not in named:
+                    reasons.append("%s left out of the file list" % path)
     state = "merged" if pr.get("merged_at") else str(pr.get("state") or "?")
     header = "%s #%d: %s [%s, head %s, base %s, %d files]" % (
         repo, number, str(pr.get("title") or "")[:160], state, shas[0][:12], shas[1][:12],
@@ -305,7 +384,8 @@ def context_for(text: str, env=None, get=None) -> str:
             parts.append("%s #%d: not attached (the context budget was spent on the PR before it)."
                          % (repo, number))
             continue
-        part = _one(repo, number, token, room, get, deadline, allow_private=repo.lower() in allowed)
+        part = _one(repo, number, token, room, get, deadline, allow_private=repo.lower() in allowed,
+                    name_cuts_on=name_cuts(env))
         parts.append(part)
         room -= len(part)
     return ("REPOSITORY CONTEXT, fetched read-only by your adapter for the pull requests this row "

@@ -238,6 +238,7 @@ def ask(prompt, model=None):
     Also stashes the last usage dict on ask.last_usage for the caller.
     """
     ask.last_usage = None
+    ask.last_finish = None
     name, key = api_key()
     if key:
         request = {"model": model or DEFAULT_MODEL, "input": prompt,
@@ -260,6 +261,11 @@ def ask(prompt, model=None):
             if not text:
                 return None, ("key route returned 200 but no text found; "
                               "top-level keys were: %s" % list(d.keys()))
+            # status "incomplete" is the Interactions API's max-output stop. The text is still
+            # returned; last_finish says it was cut. The waker marks that on the row only when
+            # WAKER_NO_SILENT_CUT is on, so this attribute changes no posted text by itself.
+            if str(d.get("status") or "").lower() == "incomplete":
+                ask.last_finish = "MAX_TOKENS"
             return text, "api-key (%s)" % name
         return None, "key route HTTP %s: %s" % (status, body[:200])
 
@@ -279,7 +285,10 @@ def ask(prompt, model=None):
                 ask.last_usage = {"total": m.get("totalTokenCount"), "in": m.get("promptTokenCount"),
                                   "out": m.get("candidatesTokenCount"), "thought": m.get("thoughtsTokenCount"),
                                   "model": _resolved_model(d), "asked": model or VERTEX_MODEL}
-                return d["candidates"][0]["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
+                cand = d["candidates"][0]
+                if str(cand.get("finishReason") or "").upper() == "MAX_TOKENS":
+                    ask.last_finish = "MAX_TOKENS"
+                return cand["content"]["parts"][0]["text"], "vertex-adc (%s)" % proj
             except Exception:
                 return None, "vertex returned 200 but an unexpected shape"
         return None, "vertex HTTP %s: %s" % (status, body[:200])
