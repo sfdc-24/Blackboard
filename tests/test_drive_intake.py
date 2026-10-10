@@ -367,6 +367,31 @@ class FailoverTest(unittest.TestCase):
         self.assertEqual("dispatched", later["status"], later)
         self.assertEqual(["claude-api"], d.queue.recipients())
 
+    def test_a_lease_ahead_of_this_clock_is_a_live_pass_not_a_dead_one(self):
+        """Cursor on c408819: a one-second skew let a second pass treat a live lease as dead."""
+        d = deps()
+        d.claims.states[key_for()] = "delivering:claude-api:%d" % (1000 + 1)
+        self.assertEqual("in_progress", di.decide(hint(), d)["status"])
+        self.assertEqual([], d.queue.puts)
+
+    def test_two_resumers_of_a_dead_lease_put_once(self):
+        """Cursor on c408819: both resumers of delivering:<w>:0 (or an old lease) appended."""
+        class Overtaken(di.MemoryClaims):
+            """The other resumer takes the dead lease first."""
+            def advance(self, key, current, new):
+                if current.startswith("delivering:") and new.startswith("delivering:"):
+                    self.states[key] = "delivering:claude-api:1000"     # taken by the other pass, now
+                    return False
+                return super().advance(key, current, new)
+        for dead in ("delivering:claude-api:0", "delivering:claude-api", "delivering:claude-api:%d" % (1000 - 61)):
+            d = deps(claims=Overtaken())
+            d.claims.states[key_for()] = dead
+            out = di.decide(hint(), d)
+            self.assertEqual("in_progress", out["status"], (dead, out))
+            self.assertEqual([], d.queue.puts, dead)                 # the loser never touched the inbox
+            self.assertEqual([], d.receipts.lines, dead)
+            self.assertEqual("in_progress", di.decide(hint(), d)["status"])   # and the fresh lease holds
+
     def test_the_bind_carries_the_clock_and_the_ring_carries_the_task_id(self):
         """The ring is sent before the claim moves to rung, so a crash in between rings again; that is
         safe only because the id the ring carries is the task id and #359 claims (agent, id) SET NX."""
@@ -543,6 +568,53 @@ class RetryTest(unittest.TestCase):
         self.assertEqual("dispatched", out["status"], out)
         self.assertEqual(["REQUESTED", "DISPATCHED"], d.receipts.states())
         self.assertEqual(1, len(d.ring.calls))
+
+    def test_dispatched_needs_both_lines_read_back_not_just_the_last(self):
+        """Cursor on c408819: every REQUESTED append dropped, DISPATCHED kept -> sealed as dispatched."""
+        class DropRequested(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                if "REQUESTED - task" in block:
+                    self.appends += 1
+                    return self.revision                       # said ok, wrote nothing
+                return super().append(file_id, expected_revision, receipt_id, block)
+        d = deps(receipts=DropRequested())
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched_receipt_owed", out["status"], out)
+        self.assertEqual(["DISPATCHED"], d.receipts.states())
+        self.assertTrue(list(d.claims.states.values())[0].startswith("rung:"))
+        good = Receipts()
+        good.lines = list(d.receipts.lines)
+        d.receipts = good
+        later = di.decide(hint(), d)
+        self.assertEqual("dispatched", later["status"], later)
+        self.assertEqual(["DISPATCHED", "REQUESTED"], good.states())   # the owed line, once
+        self.assertEqual(1, len(d.ring.calls))
+        self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+
+    def test_a_queued_or_blocked_line_not_read_back_is_owed_until_it_is(self):
+        """Cursor on c408819: the claim moved to queued before the write, so the next pass was `waiting`."""
+        class SaysOkWritesNothingOnce(Receipts):
+            def append(self, file_id, expected_revision, receipt_id, block):
+                if self.appends == 0:
+                    self.appends += 1
+                    return self.revision
+                return super().append(file_id, expected_revision, receipt_id, block)
+        for text, api, expect in ((REQUEST + "Use the sf CLI.\n", "claude-api", "QUEUED"),
+                                  (REQUEST, "", "BLOCKED")):
+            d = deps(docs=Docs(text=text), api_worker=api, receipts=SaysOkWritesNothingOnce())
+            first = di.decide(hint(), d)
+            self.assertEqual(expect.lower(), first["status"], first)
+            self.assertEqual("not_read_back", first["receipt"])
+            self.assertEqual([], d.receipts.lines)
+            again = di.decide(hint(), d)
+            self.assertEqual("waiting", again["status"], again)   # rewritten, now it is only waiting
+            self.assertEqual([expect], d.receipts.states())
+            self.assertEqual("waiting", di.decide(hint(), d)["status"])
+            self.assertEqual([expect], d.receipts.states())       # and not a third time
+            # a writer that never lands says so every pass instead of "waiting"
+            d = deps(docs=Docs(text=text), api_worker=api, receipts=Receipts(drop=True))
+            di.decide(hint(), d)
+            self.assertEqual(expect.lower() + "_receipt_owed", di.decide(hint(), d)["status"])
 
     def test_a_receipt_id_does_not_carry_the_clock_so_a_retry_finds_its_own_line(self):
         t = di.correlate(FILE, REQUEST, "r1", "claude-api")
@@ -751,6 +823,47 @@ class InboxQueueTest(unittest.TestCase):
         self.assertEqual("fleet:intake:claim:k", calls[0][2])
         self.assertIn("redis.call('get'", calls[0][0])
         self.assertEqual(("intake", "delivering:grok", di.CLAIM_TTL), calls[0][3:])
+
+
+class WakeRingTest(unittest.TestCase):
+    """The ring into #359: the message id IS the task id, and the body is signed the GitHub way."""
+
+    def test_unconfigured_rings_nobody_and_says_which_setting_is_missing(self):
+        t = di.correlate(FILE, REQUEST, "r1", "claude-api")
+        for ring in (di.WakeRing(), di.WakeRing(url="https://x"), di.WakeRing(url="https://x", secret="s"),
+                     di.WakeRing(secret="s", post=lambda *a: None)):
+            with self.assertRaises(di.Unconfigured) as caught:
+                ring(t)
+            self.assertIn("INBOX_WAKE_URL", str(caught.exception))
+
+    def test_the_body_carries_the_task_id_as_the_message_id_and_the_signature_verifies(self):
+        sent = []
+        ring = di.WakeRing(url="https://wake/wake", secret="s3cret", post=lambda u, b, h: sent.append((u, b, h)))
+        t = di.correlate(FILE, REQUEST, "r1", "claude-code-cli")
+        ring(t)
+        ring(t)
+        self.assertEqual(2, len(sent))
+        url, body, headers = sent[0]
+        self.assertEqual("https://wake/wake", url)
+        parsed = json.loads(body.decode("utf-8"))
+        self.assertEqual(t["task_id"], parsed["id"])                 # #359 dedupes on (to, id)
+        self.assertEqual("claude-code-cli", parsed["to"])
+        self.assertEqual("drive-intake", parsed["by"])
+        self.assertNotIn("telephone", body.decode("utf-8"))          # never the doc's words
+        self.assertEqual(sent[0][1], sent[1][1])                     # byte-identical, so the same seen key
+        # #359's check: hmac.compare_digest("sha256=" + hex(hmac(secret, body)), header)
+        import hashlib
+        import hmac
+        expect = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+        self.assertEqual(expect, headers["X-Hub-Signature-256"])
+        self.assertEqual("application/json", headers["Content-Type"])
+
+    def test_decide_rings_through_the_adapter_with_the_task_id(self):
+        sent = []
+        d = deps(ring=di.WakeRing(url="https://wake/wake", secret="s", post=lambda u, b, h: sent.append(b)))
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(out["task"], json.loads(sent[0].decode("utf-8"))["id"])
 
 
 class ChannelTest(unittest.TestCase):

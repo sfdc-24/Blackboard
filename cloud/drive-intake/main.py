@@ -42,18 +42,25 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      stream, newest first; and a failed ring or a receipt not read back
      leaves the state where it was, for the next pass to finish.
      The delivering state carries a LEASE (delivering:<worker>:<since>):
-     a second pass that finds it fresh reports in_progress instead of
-     resuming, so two resumes of one delivery cannot both put (Cursor on
-     57a23ab). A delivery older than DELIVER_LEASE is a dead pass and is
-     resumed. The ring is sent BEFORE the claim moves to rung, so a crash
-     in between rings again - and that is safe only because the ring
-     carries task_id as its message id and cloud/inbox-wake claims
-     fleet:wake:seen:<agent>:<id> SET NX, so the second ring is a
-     duplicate there, not a second wake. The ring adapter MUST pass
-     id=task_id; nothing here reads a wake back.
-     A REQUESTED line that was not read back is re-attempted on every
-     later pass (the receipt id has no clock, so the attempt is idempotent)
-     before the DISPATCHED line is written.
+     a second pass that finds it fresh - or AHEAD of its own clock, which
+     is skew, not death - reports in_progress instead of resuming. A dead
+     or missing lease is TAKEN by compare-and-set before the inbox is
+     touched, so of two resumers exactly one puts (Cursor on 57a23ab and
+     c408819). RESIDUAL, NAMED: a pass whose put itself takes longer than
+     DELIVER_LEASE can be overtaken and both land; one duplicate entry,
+     same task, same worker, and never a second receipt or wake.
+     The ring is sent BEFORE the claim moves to rung, so a crash in between
+     rings again - safe only because WakeRing sends id=task_id and
+     cloud/inbox-wake claims fleet:wake:seen:<agent>:<id> SET NX, so the
+     second ring is a duplicate there. Two gaps on #359's side, measured
+     by Cursor at c204039 and owed to that PR, not this one: its ROUTES
+     have no claude-api, so a ring for the api worker is unknown_agent
+     until step 2 lands; and its sweep keys the seen-set by stream entry
+     id, not task_id, so two copies of one task wake twice there.
+     EVERY receipt line (QUEUED, BLOCKED, REQUESTED, DISPATCHED) is owed
+     until it reads back, and re-attempted on every later pass; the
+     receipt id has no clock, so the attempt is a no-op once the line is
+     there. dispatched means BOTH its lines read back.
   4. "Picked up" is narrated by something that cannot pick anything up. This
      service can only reach REQUESTED and DISPATCHED. ACCEPTED belongs to the
      named worker and is written by the worker (L-116). With no ring
@@ -473,16 +480,18 @@ def decide(hint: dict, deps) -> dict:
            "gist": gist(text)}
     if state in (QUEUED, BLOCKED):
         wait = WAIT_QUEUED if state == QUEUED else WAIT_BLOCKED
-        if current == wait:
-            # Already said so in the doc; an unchanged request waiting is not news.
-            out["status"] = "waiting"
-            return out
-        if not _advance(deps, key, current, wait):
+        if current != wait and not _advance(deps, key, current, wait):
             out["status"] = "in_progress"
             return out
+        # Written every pass: has() makes it a no-op once the line is there, and a line that
+        # never read back is owed until it is (Cursor on c408819).
         out["receipt"] = write_receipt(
             deps, tuple_, text, state, deps.at,
             "no capable worker online" if state == BLOCKED else "awaiting the laptop")
+        if current == wait:
+            # An unchanged request still waiting is not news - unless its line is still owed.
+            out["status"] = "waiting" if out["receipt"] in ("written", "no_receipt_writer") \
+                else state.lower() + "_receipt_owed"
         return out
 
     # Deliver, one hop per state, each hop idempotent by read-back.
@@ -494,12 +503,23 @@ def decide(hint: dict, deps) -> dict:
         if not _advance(deps, key, current, leased):
             out["status"] = "in_progress"
             return out
-        current, phase, since = leased, DELIVERING, None
+        current, phase, since, just_bound = leased, DELIVERING, None, True
+    else:
+        just_bound = False
     if phase == DELIVERING:
-        if since is not None and 0 <= now - since < DELIVER_LEASE:
-            # Another pass is inside its lease on this put. Resuming now is the double put.
-            out["status"] = "in_progress"
-            return out
+        if not just_bound:
+            if since is not None and now - since < DELIVER_LEASE:
+                # Another pass is inside its lease on this put (a lease AHEAD of this clock
+                # is a skewed live pass, not a dead one). Resuming now is the double put.
+                out["status"] = "in_progress"
+                return out
+            # Dead, missing or given-up lease: TAKE it by compare-and-set before touching
+            # the inbox, so of two resumers exactly one puts (Cursor on c408819).
+            taken = "%s:%s:%d" % (DELIVERING, recipient, int(now))
+            if not _advance(deps, key, current, taken):
+                out["status"] = "in_progress"
+                return out
+            current = taken
         try:
             holder = _on_any_inbox(deps, tuple_["task_id"])
             if holder is None:
@@ -548,8 +568,10 @@ def decide(hint: dict, deps) -> dict:
             out["receipt"] = write_receipt(deps, tuple_, text, REQUESTED, deps.at, detail)
             text = with_heading(text)
         out["receipt_dispatched"] = write_receipt(deps, tuple_, text, DISPATCHED, deps.at)
-        if out["receipt_dispatched"] not in ("written", "no_receipt_writer"):
-            # Rung, but the phone cannot see it yet. Say so; the next pass writes the line.
+        settled = ("written", "no_receipt_writer")
+        if out.get("receipt") not in settled or out["receipt_dispatched"] not in settled:
+            # Rung, but the phone cannot see the whole trail yet. Say so; the next pass
+            # writes whichever line is still owed (Cursor on c408819: BOTH lines gate done).
             out["status"] = "dispatched_receipt_owed"
             return out
         _advance(deps, key, current, DONE)
@@ -645,6 +667,38 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
 def no_ring(_tuple):
     """The default ring: not configured. A ring that silently succeeds would write DISPATCHED."""
     raise Unconfigured("no ring configured (INBOX_WAKE_URL)")
+
+
+class WakeRing:
+    """The ring into cloud/inbox-wake (#359): POST /wake, signed the way GitHub signs.
+
+    THE CONTRACT THAT MAKES A REPEATED RING SAFE: the message id IS the task
+    id. #359 claims fleet:wake:seen:<agent>:<id> SET NX, so the second ring
+    for one task is a duplicate there, not a second wake. Posting is an
+    injected callable, so this module still opens no socket and a test can
+    read the exact body and header it would send.
+    """
+
+    def __init__(self, url="", secret="", post=None):
+        self.url, self.secret, self.post = url or "", secret or "", post
+
+    def body_for(self, tuple_) -> bytes:
+        return json.dumps({
+            "id": tuple_["task_id"], "to": tuple_["recipient_id"], "by": "drive-intake",
+            "text": "drive request %s from doc %s" % (tuple_["request_id"], tuple_["source_doc_id"]),
+        }, sort_keys=True).encode("utf-8")
+
+    def signature_for(self, body: bytes) -> str:
+        return "sha256=" + hmac.new(self.secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+    def __call__(self, tuple_):
+        if not self.url or not self.secret or self.post is None:
+            raise Unconfigured("no ring configured (INBOX_WAKE_URL, INBOX_WAKE_SECRET)")
+        body = self.body_for(tuple_)
+        self.post(self.url, body, {
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": self.signature_for(body),
+        })
 
 
 class MemoryClaims:
