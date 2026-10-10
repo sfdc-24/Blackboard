@@ -586,5 +586,84 @@ class TheBoardIsTheSharedDEDUPE(unittest.TestCase):
                          aw.reply_row_id("gemini", "ASK-1"))
 
 
+class FleetWhatsApp(unittest.TestCase):
+    """WhatsApp rows to the whole fleet woke nobody on 2026-10-10.
+
+    WRK-a6e462ac (11:52 AM ET) and WRK-54582903 (11:59 AM ET) start
+    "Fleet — OWNER TRIGGER". WRK-a4527d85 (12:00 PM ET) starts
+    "Claude - Fleet — OWNER TRIGGER". addressed_to and wakes_for were False
+    for gemini, grok and claude-api. A row starting "CLAUDE-code-cli" already
+    matched, and that control must keep matching.
+    """
+
+    EVIDENCE = (
+        ("WRK-a6e462ac", "2026-10-10T15:52:00Z", "Fleet — OWNER TRIGGER"),
+        ("WRK-54582903", "2026-10-10T15:59:00Z", "Fleet — OWNER TRIGGER"),
+        ("WRK-a4527d85", "2026-10-10T16:00:00Z", "Claude - Fleet — OWNER TRIGGER"),
+    )
+    WAKE = ("gemini", "grok", "claude-api")
+
+    def _wa(self, rid, ts, payload):
+        return row("whatsapp", "Blackboard Alpha DB", payload, ts=ts, rid=rid)
+
+    def test_the_three_owner_triggers_wake_gemini_grok_and_claude_api(self):
+        for rid, ts, payload in self.EVIDENCE:
+            r = self._wa(rid, ts, payload)
+            for tag in self.WAKE:
+                with self.subTest(rid=rid, tag=tag):
+                    self.assertTrue(aw.addressed_to(r, tag))
+                    self.assertTrue(aw.wakes_for(r, tag))
+                    self.assertEqual(1, len(aw.select([r], set(), tag)))
+
+    def test_a_leading_claude_wakes_only_the_stand_in(self):
+        """Claude - ... and Claude, ... wake claude-api, not the other agents."""
+        for payload in ("Claude, what is the board status?", "Claude - please look"):
+            r = self._wa("WRK-claude", "2026-10-10T16:00:00Z", payload)
+            with self.subTest(payload=payload):
+                self.assertTrue(aw.addressed_to(r, "claude-api"))
+                self.assertTrue(aw.wakes_for(r, "claude-api"))
+                self.assertEqual(1, len(aw.select([r], set(), "claude-api")))
+                self.assertFalse(aw.addressed_to(r, "gemini"))
+                self.assertFalse(aw.addressed_to(r, "grok"))
+                self.assertFalse(aw.wakes_for(r, "gemini"))
+                self.assertFalse(aw.wakes_for(r, "grok"))
+
+    def test_non_whatsapp_fleet_does_not_wake_everyone(self):
+        r = row(OTHER, "codex", "Fleet — OWNER TRIGGER",
+                ts="2026-10-10T15:52:00Z", rid="WRK-not-wa")
+        for tag in self.WAKE:
+            with self.subTest(tag=tag):
+                self.assertFalse(aw.addressed_to(r, tag))
+                self.assertFalse(aw.wakes_for(r, tag))
+                self.assertEqual([], aw.select([r], set(), tag))
+
+    def test_existing_tag_matching_still_works(self):
+        """The control that already matched, plus the per-tag prefixes."""
+        cli = self._wa("WRK-cli", "2026-10-10T16:01:00Z",
+                       "CLAUDE-code-cli can you answers questions on health science?")
+        self.assertTrue(aw.addressed_to(cli, "claude-api"))
+        self.assertTrue(aw.wakes_for(cli, "claude-api"))
+        self.assertEqual(1, len(aw.select([cli], set(), "claude-api")))
+        self.assertFalse(aw.addressed_to(cli, "gemini"))
+        self.assertFalse(aw.addressed_to(cli, "grok"))
+
+        gem = self._wa("WRK-gem", "2026-10-10T16:02:00Z", "Gemini - TRACK speed")
+        self.assertTrue(aw.addressed_to(gem, "gemini"))
+        self.assertTrue(aw.wakes_for(gem, "gemini"))
+        self.assertFalse(aw.addressed_to(gem, "grok"))
+        self.assertFalse(aw.addressed_to(gem, "claude-api"))
+
+        grok = self._wa("WRK-grok", "2026-10-10T16:03:00Z", "Grok can you reply?")
+        self.assertTrue(aw.addressed_to(grok, "grok"))
+        self.assertTrue(aw.wakes_for(grok, "grok"))
+        self.assertFalse(aw.addressed_to(grok, "gemini"))
+        self.assertFalse(aw.addressed_to(grok, "claude-api"))
+
+        board = row(OTHER, "claude-code-cli", "BCB|v=1|to=gemini;ALL|ask=x")
+        self.assertTrue(aw.addressed_to(board, "gemini"))
+        self.assertFalse(aw.addressed_to(board, "grok"))
+        self.assertFalse(aw.addressed_to(board, "claude-api"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
