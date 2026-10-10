@@ -85,7 +85,14 @@ def message(text: str) -> str:
     text = " ".join((text or "").split())
     if not text:
         raise SystemExit("a message needs text")
-    return text[:MAX_TEXT]
+    if len(text) <= MAX_TEXT:
+        return text
+    # NEVER SILENTLY. The first real message through this inbox - Grok to me, 21:33:36Z - arrived
+    # ending in "..." because its sender trimmed it, which is the same defect Blackboard PR 354
+    # closes for board rows and had not been carried to a Redis value. My own code did it too,
+    # one line above this one. A cut now says it was cut and how much there was.
+    note = " [cut here: %d characters in all]" % len(text)
+    return text[:MAX_TEXT - len(note)].rstrip() + note
 
 
 def request_row(op: str, key: str, *, value: str | None = None, count: int | None = None,
@@ -237,6 +244,10 @@ def cmd_selftest(_args) -> int:
     # My first draft sent one, and a selftest that asserted my own shape said it was fine.
     assert body == "hello there again", body                      # one line, whatever was typed
     assert "{" not in body, body
+    long_one = message("word " * 400)
+    assert len(long_one) <= MAX_TEXT, len(long_one)
+    assert long_one.endswith("characters in all]"), long_one[-60:]      # never silently
+    assert "1999 characters in all" in long_one, long_one[-60:]   # the true length, not the kept one
     read = request_row("xrange", KEY % ME, count=20, row_id="CCC-INBOX-READ")
     assert read["payload"].endswith("|count=20"), read["payload"]
     assert "val=" not in read["payload"], read["payload"]         # a read carries no value
