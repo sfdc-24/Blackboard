@@ -14,8 +14,10 @@ Offline by construction: every outside call is an injected adapter.
 """
 import importlib.util
 import json
+import re
 import sys
 import time
+import urllib.parse
 import unittest
 from pathlib import Path
 
@@ -1617,13 +1619,7 @@ class FeedTest(unittest.TestCase):
 
         def fetch(method, url, body, headers):
             calls.append(url)
-            since = url.split("modifiedTime+%3E+%27")[1].split("%27")[0].replace("%3A", ":")
-            listed = [f for f in docs if f["modifiedTime"] > since]
-            page, rest = listed[:drive_feed.PAGE], listed[drive_feed.PAGE:]
-            answer = {"files": page}
-            if rest:
-                answer["nextPageToken"] = "more"
-            return 200, json.dumps(answer).encode()
+            return 200, json.dumps(drive_listing(url, docs)).encode()
 
         store = di.MemoryClaims()
         feed = drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=1)
@@ -1634,12 +1630,85 @@ class FeedTest(unittest.TestCase):
         store.note_poll(base + 10000, first["watermark"], resume=True)
         feed.now = base + 10120
         second = feed.changes(FOLDER)
-        resumed = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99).replace(":", "%3A")
-        rewound = "modifiedTime+%3E+%27" + drive_feed.iso(base + 99 - 600).replace(":", "%3A")
+        # The resume asks for the last doc's second AND after: the cursor is only good to the second.
+        resumed = "modifiedTime+%3E%3D+%27" + drive_feed.iso(base + 99).replace(":", "%3A")
         self.assertIn(resumed, calls[-1])
-        self.assertNotIn(rewound, calls[-1])
-        self.assertEqual(["doc-%03d" % i for i in range(100, 150)], [h["file_id"] for h in second["hints"]])
+        self.assertNotIn(drive_feed.iso(base + 99 - 600).replace(":", "%3A"), calls[-1])
+        self.assertEqual(["doc-%03d" % i for i in range(99, 150)], [h["file_id"] for h in second["hints"]])
         self.assertTrue(second["complete"])
+        self.assertIn("modifiedTime+%3E+%27", calls[0])                    # a first poll is still strictly after
+
+    def feed_over(self, docs, base, max_pages=1):
+        calls = []
+
+        def fetch(method, url, body, headers):
+            calls.append(url)
+            return 200, json.dumps(drive_listing(url, docs)).encode()
+
+        store = di.MemoryClaims()
+        return drive_feed.DriveFolder(lambda: "tok", fetch, store, now=base + 10000, max_pages=max_pages), store, calls
+
+    def poll_until_complete(self, feed, store, base, limit=20):
+        """Poll as main.poll() does: keep the watermark in WHOLE SECONDS, as Redis does, and resume."""
+        seen, polls = [], 0
+        while True:
+            polls += 1
+            self.assertLessEqual(polls, limit, "the cursor never reached the end")
+            listed = feed.changes(FOLDER)
+            seen.extend(h["file_id"] for h in listed["hints"])
+            store.note_poll(base + 10000, int(listed["watermark"]), resume=not listed["complete"])
+            if listed["complete"]:
+                return seen, polls
+
+    def test_docs_that_share_the_second_the_cap_fell_in_are_not_skipped(self):
+        """Copilot on ff15a56: the resume asked for strictly after the last doc's timestamp, so the
+        docs past the cap that shared that whole second were never listed by any later poll."""
+        base = 1760000000.0
+        stamps = [base + i for i in range(95)] + [base + 95] * 10 + [base + 200 + i for i in range(45)]
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER], "modifiedTime": drive_feed.iso(stamp)}
+                for i, stamp in enumerate(stamps)]
+        feed, store, _calls = self.feed_over(docs, base)
+        seen, polls = self.poll_until_complete(feed, store, base)
+        self.assertEqual({d["id"] for d in docs}, set(seen))               # 100..104 share doc-099's second
+        self.assertEqual(2, polls)
+
+    def test_a_cap_that_fell_inside_one_second_reads_on_instead_of_asking_for_it_again(self):
+        """The other half: 250 docs inside one second, fractions and all. Resuming at that second
+        returned the same first page every poll; now the listing reads on until the second moves."""
+        base = 1760000000.0
+        docs = [{"id": "doc-%03d" % i, "parents": [FOLDER],
+                 "modifiedTime": drive_feed.iso(base)[:-1] + ".%03dZ" % (i * 3)} for i in range(250)]
+        docs += [{"id": "doc-late", "parents": [FOLDER], "modifiedTime": drive_feed.iso(base + 30)}]
+        feed, store, calls = self.feed_over(docs, base)
+        seen, polls = self.poll_until_complete(feed, store, base)
+        self.assertEqual({d["id"] for d in docs}, set(seen))
+        self.assertLessEqual(polls, 3)
+        # And a second holding more than a poll may ever list is said, never skipped past.
+        many = [{"id": "doc-%04d" % i, "parents": [FOLDER], "modifiedTime": drive_feed.iso(base)} for i in range(1200)]
+        feed, store, calls = self.feed_over(many, base)
+        store.note_poll(base + 10000, int(base), resume=True)
+        with self.assertRaises(RuntimeError) as raised:
+            feed.changes(FOLDER)
+        self.assertIn("share one second", str(raised.exception))
+        self.assertEqual(drive_feed.STUCK_FACTOR, len(calls))              # ten caps of one page, then it says so
+        self.assertEqual(int(base), int(store.watermark()))                # and the cursor did not move
+
+
+def drive_listing(url, docs):
+    """files.list as Drive answers it: the query's own operator and time, oldest first, a page at
+    a time, the page token an offset. Milliseconds compare as Drive compares them."""
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    q = query["q"][0]
+    operator, since = re.search(r"modifiedTime (>=|>) '([^']+)'", q).groups()
+    after = drive_feed.epoch_of(since)
+    listed = sorted((f for f in docs if (drive_feed.epoch_of(f["modifiedTime"]) >= after if operator == ">="
+                                         else drive_feed.epoch_of(f["modifiedTime"]) > after)),
+                    key=lambda f: drive_feed.epoch_of(f["modifiedTime"]))
+    start = int(query.get("pageToken", ["0"])[0])
+    answer = {"files": listed[start:start + drive_feed.PAGE]}
+    if start + drive_feed.PAGE < len(listed):
+        answer["nextPageToken"] = str(start + drive_feed.PAGE)
+    return answer
 
 
 trail_spec = importlib.util.spec_from_file_location("drive_trail", REPO / "cloud" / "drive-intake" / "trail.py")

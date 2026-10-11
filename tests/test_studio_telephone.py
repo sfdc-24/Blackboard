@@ -6,8 +6,12 @@ this service's identity and the shared token, only the trail keys handed on, nev
 one upstream read per session and doc per few seconds, and a refusal upstream named as 502, never
 forged into a trail.
 """
+import asyncio
 import json
+import threading
 import unittest
+
+import httpx
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -47,11 +51,12 @@ class FakeTelephone:
     """The upstream drive-intake, recorded: every GET with its url, params and headers."""
 
     def __init__(self, answer=None):
-        self.calls, self.answer, self.closed = [], answer or Answer(200, TRAIL), False
+        self.calls, self.answer, self.closed = [], answer, False
 
     def get(self, url, params=None, headers=None):
         self.calls.append((url, dict(params or {}), dict(headers or {})))
-        return self.answer
+        # Unless a test fixed the answer, drive-intake answers for the doc it was asked for.
+        return self.answer or Answer(200, dict(TRAIL, doc=(params or {}).get("doc")))
 
     def close(self):
         self.closed = True
@@ -165,6 +170,33 @@ class TelephoneTests(unittest.TestCase):
                 self.assertEqual(502, response.status_code, response.text)
                 self.assertIn(words, response.json()["detail"])
 
+        # A JSON object is not yet a trail (Copilot on ff15a56): {} and a list where the entries
+        # belong were handed to the page as one. Each is a broken upstream, and says which way.
+        entry = TRAIL["entries"][0]
+        for body, words in (({}, "no trail"),
+                            ({"enabled": True}, "no trail"),
+                            (dict(TRAIL, enabled="yes"), "no trail"),
+                            (dict(TRAIL, status="fine"), "no trail"),
+                            (dict(TRAIL, doc="1gZlJFDD2Wm419YOuolIXC3HXwzXOWYfP"), "another doc"),
+                            (dict(TRAIL, entries="not a list"), "no known shape"),
+                            (dict(TRAIL, entries=[["REQUESTED"]]), "no known shape"),
+                            (dict(TRAIL, entries=[dict(entry, state=7)]), "no known shape"),
+                            (dict(TRAIL, entries=[{k: v for k, v in entry.items() if k != "at"}]), "no known shape"),
+                            (dict(TRAIL, entries=[dict(entry, result="one line")]), "no known shape"),
+                            (dict(TRAIL, entries=[dict(entry, result=[{"x": 1}])]), "no known shape"),
+                            (dict(TRAIL, tasks="task-0123456789abcdef"), "no known shape"),
+                            (dict(TRAIL, tasks=[7]), "no known shape"),
+                            (dict(TRAIL, live=["online"]), "no known shape"),
+                            (dict(TRAIL, live={"laptop": {"forged": "html"}}), "no known shape"),
+                            (dict(TRAIL, task={"id": 1}), "no known shape"),
+                            ({k: v for k, v in TRAIL.items() if k != "live"}, "no known shape")):
+            with TestClient(self.app(upstream=FakeTelephone(Answer(200, body)))) as client:
+                sid, headers, _created = self.session(client)
+                self.bind(client, sid, DOC)
+                response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+                self.assertEqual(502, response.status_code, (body, response.text))
+                self.assertIn(words, response.json()["detail"], body)
+
         class Broken(FakeTelephone):
             def get(self, url, params=None, headers=None):
                 raise ConnectionError("down")
@@ -174,6 +206,163 @@ class TelephoneTests(unittest.TestCase):
             response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
             self.assertEqual(502, response.status_code)
             self.assertIn("ConnectionError", response.json()["detail"])
+
+    def test_the_answers_that_are_not_a_trail_but_are_not_broken_keep_their_own_shape(self):
+        # The intake's own flag off, and the four ways it says it could not give the trail: each
+        # is a true answer, passed on with only its own keys, and none of them carries entries.
+        for body, expected in (
+                ({"enabled": False, "trail": None}, {"enabled": False}),
+                ({"enabled": True, "doc": DOC, "at": "2026-10-11T07:00:00Z", "status": "no_store"},
+                 {"enabled": True, "doc": DOC, "at": "2026-10-11T07:00:00Z", "status": "no_store"}),
+                ({"enabled": True, "doc": DOC, "at": "t", "status": "read_error", "error": "HttpError"},
+                 {"enabled": True, "doc": DOC, "at": "t", "status": "read_error", "error": "HttpError"}),
+                ({"enabled": True, "doc": DOC, "at": "t", "status": "out_of_scope",
+                  "entries": [{"state": "FORGED"}], "request_text": "x"},
+                 {"enabled": True, "doc": DOC, "at": "t", "status": "out_of_scope"}),
+                ({"enabled": True, "doc": DOC, "at": "t", "status": "too_large", "chars": 900000},
+                 {"enabled": True, "doc": DOC, "at": "t", "status": "too_large"})):
+            with TestClient(self.app(upstream=FakeTelephone(Answer(200, body)))) as client:
+                sid, headers, _created = self.session(client)
+                self.bind(client, sid, DOC)
+                response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+                self.assertEqual(200, response.status_code, response.text)
+                self.assertEqual(expected, response.json())
+
+    def test_an_entry_is_rebuilt_from_its_named_keys_and_nothing_rides_inside_it(self):
+        entry = dict(TRAIL["entries"][0], request_text="NEVER HANDED ON", result=["the answer"])
+        body = dict(TRAIL, entries=[entry])
+        with TestClient(self.app(upstream=FakeTelephone(Answer(200, body)))) as client:
+            sid, headers, _created = self.session(client)
+            self.bind(client, sid, DOC)
+            response = client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+            self.assertEqual(200, response.status_code, response.text)
+            self.assertNotIn("NEVER HANDED ON", response.text)
+            got = response.json()["entries"][0]
+            self.assertEqual(["the answer"], got["result"])
+            self.assertEqual({"state", "task", "request", "rev", "recipient", "by", "at", "detail", "id", "result"},
+                             set(got))
+
+    def test_callers_that_miss_the_cache_together_share_one_upstream_read(self):
+        # Copilot on ff15a56: the lookup and the read were not one step, so every caller that
+        # arrived before the first read came back made its own Docs read. Ten arrive while the
+        # upstream is held; one read goes out, and all ten get its answer.
+        gate, arrived = threading.Event(), threading.Event()
+
+        class Slow(FakeTelephone):
+            def get(self, url, params=None, headers=None):
+                answer = super().get(url, params, headers)
+                arrived.set()
+                gate.wait(10)
+                return answer
+
+        app = self.app(upstream=Slow())
+        with TestClient(app) as client:
+            sid, headers, _created = self.session(client)
+            self.bind(client, sid, DOC)
+            sid2, headers2, _created = self.session(client, "create-2")
+            self.bind(client, sid2, DOC)
+
+        async def storm():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+                calls = [http.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+                         for _ in range(10)]
+                tasks = [asyncio.ensure_future(call) for call in calls]
+                await asyncio.to_thread(arrived.wait, 10)
+                await asyncio.sleep(0.2)                 # the other nine are now waiting on the same read
+                first_reads = len(self.upstream.calls)
+                gate.set()
+                answers = await asyncio.gather(*tasks)
+                # Another session's read of the same doc is its own: a flight is per session and doc.
+                other = await http.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC}, headers=headers2)
+                return first_reads, answers, other
+
+        first_reads, answers, other = asyncio.run(storm())
+        self.assertEqual(1, first_reads)
+        self.assertEqual([200] * 10, [answer.status_code for answer in answers])
+        self.assertEqual(1, len({answer.text for answer in answers}))
+        self.assertEqual(200, other.status_code)
+        self.assertEqual(2, len(self.upstream.calls))
+        self.assertEqual({}, app.state.telephone_flights)                 # nothing left in flight
+
+    def test_a_failed_read_is_shared_too_and_is_not_kept(self):
+        gate, arrived = threading.Event(), threading.Event()
+
+        class Down(FakeTelephone):
+            def get(self, url, params=None, headers=None):
+                self.calls.append((url, dict(params or {}), dict(headers or {})))
+                arrived.set()
+                gate.wait(10)
+                raise ConnectionError("down")
+
+        app = self.app(upstream=Down())
+        with TestClient(app) as client:
+            sid, headers, _created = self.session(client)
+            self.bind(client, sid, DOC)
+
+        async def storm():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+                tasks = [asyncio.ensure_future(http.get("/v1/session/%s/telephone" % sid, params={"doc": DOC},
+                                                        headers=headers)) for _ in range(5)]
+                await asyncio.to_thread(arrived.wait, 10)
+                await asyncio.sleep(0.2)
+                gate.set()
+                answers = await asyncio.gather(*tasks)
+                again = await http.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)
+                return answers, again
+
+        answers, again = asyncio.run(storm())
+        self.assertEqual([502] * 5, [answer.status_code for answer in answers])
+        self.assertEqual(502, again.status_code)                          # a failure is not cached: asked again
+        self.assertEqual(2, len(self.upstream.calls))
+        self.assertEqual({}, app.state.telephone_flights)
+        self.assertEqual({}, app.state.telephone_cache)
+
+    def test_a_page_that_goes_away_does_not_cancel_the_read_the_others_wait_on(self):
+        gate, arrived = threading.Event(), threading.Event()
+
+        class Slow(FakeTelephone):
+            def get(self, url, params=None, headers=None):
+                answer = super().get(url, params, headers)
+                arrived.set()
+                gate.wait(10)
+                return answer
+
+        app = self.app(upstream=Slow())
+        with TestClient(app) as client:
+            sid, headers, _created = self.session(client)
+            self.bind(client, sid, DOC)
+
+        async def storm():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+                ask = lambda: http.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers)  # noqa: E731
+                first = asyncio.ensure_future(ask())
+                await asyncio.to_thread(arrived.wait, 10)
+                second = asyncio.ensure_future(ask())
+                await asyncio.sleep(0.2)                 # both now wait on the one read
+                first.cancel()                           # the page that started it goes away
+                await asyncio.sleep(0.1)
+                gate.set()
+                return await second
+
+        answer = asyncio.run(storm())
+        self.assertEqual(200, answer.status_code, answer.text)
+        self.assertEqual(1, len(self.upstream.calls))
+
+    def test_a_trail_past_its_five_seconds_is_dropped_when_the_next_one_is_kept(self):
+        app = self.app()
+        with TestClient(app) as client:
+            sid, headers, _created = self.session(client)
+            self.bind(client, sid, DOC)
+            sid2, headers2, _created = self.session(client, "create-2")
+            self.bind(client, sid2, DOC)
+            self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid, params={"doc": DOC}, headers=headers).status_code)
+            self.assertEqual({(sid, DOC)}, set(app.state.telephone_cache))
+            self.now[0] += 6.0
+            self.assertEqual(200, client.get("/v1/session/%s/telephone" % sid2, params={"doc": DOC}, headers=headers2).status_code)
+            self.assertEqual({(sid2, DOC)}, set(app.state.telephone_cache))   # the first session's trail is gone
 
     def test_no_identity_token_sends_only_the_shared_token(self):
         with TestClient(self.app()) as client:

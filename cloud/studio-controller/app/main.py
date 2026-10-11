@@ -364,6 +364,7 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             app.state.telephone_client = None
             app.state.close_telephone_client = False
         app.state.telephone_cache = {}
+        app.state.telephone_flights = {}
         app.state.voice_sweeper = asyncio.create_task(voice_sweeper())
         yield
         if app.state.close_telephone_client and app.state.telephone_client is not None:
@@ -1534,6 +1535,10 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
     TELEPHONE_MAX_BYTES = 262144
     TELEPHONE_KEYS = ("status", "enabled", "doc", "revision", "task", "request", "tasks", "entries",
                       "live", "at", "error")
+    # The answer's shape, as cloud/drive-intake writes it (trail_for_doc, trail.parse). An answer
+    # outside it is a broken upstream and a 502, never a page's trail (Copilot on ff15a56).
+    TELEPHONE_STATUSES = ("ok", "no_store", "read_error", "out_of_scope", "too_large")
+    TELEPHONE_ENTRY_TEXT = ("state", "task", "request", "rev", "recipient", "by", "at", "detail", "id")
 
     class TelephoneUnavailable(Exception):
         pass
@@ -1566,9 +1571,39 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             body = response.json()
         except ValueError as exc:
             raise TelephoneUnavailable("drive-intake gave no JSON") from exc
+        return checked_trail(body, doc)
+
+    def checked_trail(body, doc: str) -> dict:
+        """Upstream's answer in the one shape the page is promised, rebuilt from the named keys."""
         if not isinstance(body, dict):
             raise TelephoneUnavailable("drive-intake gave no object")
-        return {key: body.get(key) for key in TELEPHONE_KEYS if key in body}
+        if body.get("enabled") is False:
+            return {"enabled": False}                     # the intake's own flag is off: said, not a trail
+        if body.get("enabled") is not True or body.get("status") not in TELEPHONE_STATUSES:
+            raise TelephoneUnavailable("drive-intake gave no trail")
+        if body.get("doc") != doc:
+            raise TelephoneUnavailable("drive-intake answered for another doc")
+        out = {key: body.get(key) for key in TELEPHONE_KEYS if key in body}
+        for key in ("revision", "task", "request", "at", "error"):
+            if out.get(key) is not None and not isinstance(out[key], str):
+                raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+        if body["status"] != "ok":
+            return {key: out[key] for key in ("status", "enabled", "doc", "at", "error") if key in out}
+        entries, tasks, live = body.get("entries"), body.get("tasks"), body.get("live")
+        scalar = (str, bool, int, float, type(None))
+        if not (isinstance(entries, list) and isinstance(tasks, list) and isinstance(live, dict)
+                and all(isinstance(task, str) for task in tasks)
+                and all(isinstance(name, str) and isinstance(value, scalar) for name, value in live.items())):
+            raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+        rebuilt = []
+        for entry in entries:
+            if not (isinstance(entry, dict) and isinstance(entry.get("result"), list)
+                    and all(isinstance(entry.get(key), str) for key in TELEPHONE_ENTRY_TEXT)
+                    and all(isinstance(line, str) for line in entry["result"])):
+                raise TelephoneUnavailable("drive-intake gave a trail in no known shape")
+            rebuilt.append({**{key: entry[key] for key in TELEPHONE_ENTRY_TEXT}, "result": list(entry["result"])})
+        out["entries"] = rebuilt
+        return out
 
     def bind_telephone_doc(session_id: str, doc: str) -> None:
         """Record the one Drive doc this live session may read.
@@ -1636,16 +1671,35 @@ def create_app(*, settings: Settings | None = None, store=None, worker=None,
             raise HTTPException(403, "this session is not bound to that doc")
         now = clock()
         cache_key = (session_id, doc)
-        cached = app.state.telephone_cache.get(cache_key)
+        cache = app.state.telephone_cache
+        cached = cache.get(cache_key)
         if cached and 0 <= now - cached[0] < TELEPHONE_CACHE_SECONDS:
             return cached[1]
+        # ONE read in flight per session and doc (Copilot on ff15a56): callers that all miss the
+        # cache share the first one's read, and its answer or its failure, instead of each
+        # reading the doc. Nothing awaits between the lookup and the set, so no second read
+        # can start. Shielded: one page going away does not cancel the read the others wait on.
+        flights = app.state.telephone_flights
+        flight = flights.get(cache_key)
+        if flight is None:
+            flight = asyncio.ensure_future(asyncio.to_thread(telephone_trail, doc))
+            flights[cache_key] = flight
+
+            def landed(done, key=cache_key):
+                if flights.get(key) is done:
+                    del flights[key]
+                if not done.cancelled():
+                    done.exception()                      # read here, so a read nobody waited for is not logged as lost
+            flight.add_done_callback(landed)
         try:
-            trail = await asyncio.to_thread(telephone_trail, doc)
+            trail = await asyncio.shield(flight)
         except TelephoneUnavailable as exc:
             raise HTTPException(502, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - a transport failure, named by type only
             raise HTTPException(502, "the trail could not be read: " + type(exc).__name__) from exc
-        app.state.telephone_cache[cache_key] = (now, trail)
+        for key in [key for key, kept in cache.items() if not 0 <= now - kept[0] < TELEPHONE_CACHE_SECONDS]:
+            del cache[key]                                # a stopped session's last trail does not stay in memory
+        cache[cache_key] = (now, trail)
         return trail
 
     @app.get("/v1/leads")
