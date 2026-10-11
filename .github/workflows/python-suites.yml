@@ -157,6 +157,7 @@ on:
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
       - "tests/test_claude_api_lane.py"
+      - "tests/test_phone_intake.py"
       - "cloud/drive-intake/deploy.sh"
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
@@ -299,6 +300,7 @@ on:
       - "cloud/claude-api-worker/**"
       - "tests/test_claude_api_worker.py"
       - "tests/test_claude_api_lane.py"
+      - "tests/test_phone_intake.py"
       - "cloud/drive-intake/deploy.sh"
       - "cloud/claude-api-worker/deploy.sh"
       - "tests/test_telephone_deploy.py"
@@ -392,6 +394,7 @@ jobs:
                    tests/test_drive_intake.py \
                    tests/test_claude_api_worker.py \
                    tests/test_claude_api_lane.py \
+                   tests/test_phone_intake.py \
                    tests/test_telephone_deploy.py \
                    tests/test_telephone_smoke.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
@@ -503,7 +506,7 @@ jobs:
           set -euo pipefail
           if [ -f tests/test_claude_api_worker.py ]; then
             python_bin="$(command -v python3)"
-            sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker tests.test_claude_api_lane tests.test_telephone_deploy -v
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker tests.test_claude_api_lane tests.test_phone_intake tests.test_telephone_deploy -v
           else
             echo "not on this branch; skipping"
           fi
