@@ -142,6 +142,59 @@ state proves nothing on its own.
   target, and every read returns all matching rows, so reads slow down as it
   grows. The gateway has no create path; the rollover sheet needs Mr Salam.
 
+## The broken-telephone path (Drive → intake → worker or laptop → the doc)
+
+The owner's priority one (2026-10-10): he speaks on claude-mobile, it lands in
+a Drive doc, the fleet is triggered, and receipts come back into the SAME doc.
+Four merged pieces, every flag OFF in the image, each proven only when the
+flag is on and the laptop is closed:
+
+| piece | what | runs as | flag | deploy |
+|---|---|---|---|---|
+| `drive-intake` | a doc in the folder becomes ONE correlated task on `fleet:inbox:<worker>`, with REQUESTED/DISPATCHED (or QUEUED/BLOCKED) in the doc | private Cloud Run **service**, polled every 2 min by `drive-intake-poll` (OIDC) | `DRIVE_INTAKE_ENABLED` | `cloud/drive-intake/deploy.sh` |
+| `claude-api-worker` | the always-on worker: when the laptop is off, ACCEPTED then SUCCEEDED with the answer, under the day cap `fleet:spend:<Toronto day>` | Cloud Run **job**, ticked every 5 min by `claude-api-worker-tick` | `CLAUDE_API_WORKER_ENABLED` | `cloud/claude-api-worker/deploy.sh` |
+| the laptop lane | in the same job: the doorbell row for claude-code-cli (ids only), and its governed `accept` / `done` mirrored into the doc | same job | `CLAUDE_API_LANE_ENABLED` | same |
+| the laptop's words | `python scripts/redis_inbox.py beat | accept | done`, each one governed board row | the laptop | - | - |
+
+Routing is drive-intake's `pick_worker`: `fleet:alive:claude-code-cli` inside
+300 s means the laptop takes it; otherwise the named api worker; a request that
+needs laptop-only tools is QUEUED for the laptop by name; no worker at all is
+BLOCKED - written in the doc, never silent.
+
+**Order to turn on, and the proof for each.** The scripts' `setup`, `tokens`,
+`build`, `deploy`, `schedule`, `readback` first, flags off, and the Drive share
+of the folder (Viewer) and the two originals (Editor) with both service
+accounts - a share nobody but the owner can do.
+
+1. `drive-intake/deploy.sh on`, laptop OFF (no beat). A doc from the phone →
+   within one tick REQUESTED (recipient claude-api) and DISPATCHED in the doc,
+   `/healthz` poll ok. Nothing else runs yet: the task waits on
+   `fleet:inbox:claude-api`.
+2. `claude-api-worker/deploy.sh worker on`. The next tick: ACCEPTED, then
+   SUCCEEDED with the answer under it, one call in the Anthropic console,
+   `fleet:spend:<day>` moved by one reservation; the tick after: `idle`.
+3. `claude-api-worker/deploy.sh lane on`, laptop ON with
+   `python scripts/redis_inbox.py beat --every 240` running. A new doc routes
+   to claude-code-cli; the next tick rings one row `CAW-WAKE-<task>` on the
+   board, no doc text in it; `accept --task` and `done --task` become the
+   ACCEPTED and SUCCEEDED lines by claude-code-cli; the api worker reports
+   `taken`.
+
+**Rollback** is the flag, never a redeploy: `deploy.sh off`, `worker off`,
+`lane off`. A doc already claimed keeps its claim (30 days) and its receipts;
+turning a flag back on resumes from the doc's own trail.
+
+**What a health line means.** drive-intake `/healthz`: `ok` only when the
+watch channel is live or the last poll is inside three ticks; `poll: unknown`
+is "never polled", not "fine". The worker prints one JSON line per pass:
+`idle`, `ran` (with `considered`), `lane_only`, or `disabled`; `no_store`
+means Redis or Docs did not wire - read the job's env back.
+
+**Cost lines.** The worker spends only under a reservation in the shared day
+ledger; the lane spends nothing; a laptop beat is one request row plus one
+RESULT row on the board, about 15 rows an hour at `--every 240`; the
+bus-requests loop must be alive for any laptop word to land (#358).
+
 ## Changing an image safely
 
 The pattern every rollout on 2026-09-24 used, with no failed swap:
