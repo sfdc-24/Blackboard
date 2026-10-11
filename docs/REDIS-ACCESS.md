@@ -42,12 +42,13 @@ The row the worker reads, exactly:
 | `Source_Tag` | **your** tag (the table above) |
 | `Target_Surface` | `bus-reconciler` |
 | `Action_Type` | `AYA_REQ` — **not a phase.** A row whose Action_Type is WIP/OPEN/DONE/ASK/BLOCKED/RESULT is never read as a request, whatever its payload says |
-| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=<key>[\|field=<f>][\|val=<b64>\|enc=b64][\|count=<n>]\|from=<tag>\|to=bus-reconciler` |
+| `Payload` | `BCB\|v=1\|id=<rid>\|req=<rid>\|do=redis-op\|op=<op>\|key=<key>[\|field=<f>][\|val=<b64>\|enc=b64][\|count=<n>][\|after=<ms>-<seq>]\|from=<tag>\|to=bus-reconciler` |
 
 `op` is one of `get`, `hgetall`, `xrange` (reads) or `set`, `hset` (needs `field=`), `hput` (a whole
 hash from one base64 JSON object), `xadd`, `del` (writes). `xrange` returns the newest `count` entries; with
 `after=<ms>-<seq>` it returns the entries **after** that id, oldest first, with `more: true` when another
-page is waiting — the read an inbox needs, since the newest-`count` read loses the oldest of a burst
+page is waiting (the answer row says `[after=<id> more=<true|false> last=<id>]` before the entries;
+`last` is the next `after=`) — the read an inbox needs, since the newest-`count` read loses the oldest of a burst
 (`fleet_agent.py request xrange <key> --after <id>`, or `after=` on a `REDIS-OP` line). A value travels **base64** (`enc=b64`): the
 payload has no escaping, so a pipe or a newline in a raw value would end the field. A request older
 than 30 minutes is refused, a repeated request id does nothing the second time, and a payload naming

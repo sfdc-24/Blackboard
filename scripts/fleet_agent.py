@@ -482,7 +482,9 @@ def request_row(tag, op, key, val=None, field=None, count=None, project="FLEET",
     if count is not None:
         parts.append("count=%d" % int(count))
     if after:
-        if op != "xrange" or not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", str(after).strip()):
+        pieces = str(after).strip().split("-")
+        if (op != "xrange" or not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", str(after).strip())
+                or any(int(p) > 2 ** 64 - 1 for p in pieces)):
             raise ValueError("--after is for xrange only, and is a stream entry id <ms>-<seq>")
         parts.append("after=%s" % str(after).strip())
     parts += ["from=%s" % tag, "to=%s" % REQUEST_WORKER]

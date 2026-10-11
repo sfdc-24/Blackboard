@@ -563,6 +563,27 @@ class XrangeAfterACursor(unittest.TestCase):
             self.assertFalse(got["ok"], bad)
             self.assertIn("stream entry id", got["refused"], bad)
 
+    def test_a_cursor_part_above_the_unsigned_64_bit_maximum_is_refused_and_the_maximum_is_not(self):
+        conn = self.stream(1)
+        top = str(2 ** 64 - 1)
+        for bad in (str(2 ** 64) + "-0", "0-" + str(2 ** 64), "99999999999999999999-0"):
+            got = self.read(conn, after=bad)
+            self.assertFalse(got["ok"], bad)
+            self.assertIn("stream entry id", got["refused"], bad)
+        self.assertTrue(self.read(conn, after=top + "-" + top)["ok"])
+
+    def test_the_board_answer_says_where_the_page_stands_before_the_entries(self):
+        conn = self.stream(25)
+        first = self.read(conn, after="0-0", count=20)
+        line = gov.summarise(first)
+        self.assertIn("[after=0-0 more=true last=%s]" % first["value"][-1]["id"], line)
+        self.assertLess(line.index("more=true"), line.index("m1"), "before the entries, so truncation keeps it")
+        last = gov.summarise(self.read(conn, after=first["value"][-1]["id"], count=20))
+        self.assertIn("more=false", last)
+        empty = gov.summarise(self.read(conn, after=conn.data["fleet:inbox:gemini"][-1][0]))
+        self.assertIn("more=false last=%s]" % conn.data["fleet:inbox:gemini"][-1][0], empty)
+        self.assertNotIn("more=", gov.summarise(self.read(conn)), "the newest-n read is unchanged")
+
     def test_the_read_still_obeys_the_access_list(self):
         conn = self.stream(1)
         conn.data["probe:x"] = []
@@ -638,7 +659,8 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
 
     def test_the_tool_refuses_after_where_the_worker_would(self):
         import fleet_agent
-        for op, after in (("get", "1-0"), ("xrange", "1"), ("xrange", "1-0|op=del")):
+        for op, after in (("get", "1-0"), ("xrange", "1"), ("xrange", "1-0|op=del"),
+                          ("xrange", str(2 ** 64) + "-0")):
             with self.assertRaises(ValueError):
                 fleet_agent.request_row("gemini", op, "fleet:inbox:gemini", after=after)
 
