@@ -388,7 +388,9 @@ def write_receipt(deps, tuple_: dict, doc_text: str, state: str, at: str, detail
             return "written"                      # an earlier pass wrote it; nothing to add
     except Exception as exc:  # noqa: BLE001
         return "unknown:" + type(exc).__name__
-    line = receipt_line(state, tuple_, at, detail)
+    # The id goes INTO the line: a read-back against a real doc looks for "id <receipt_id>",
+    # and a line that does not carry it can never be found (cloud/claude-api-worker/gdocs.py).
+    line = receipt_line(state, tuple_, at, detail) + " - id " + receipt_id
     block = receipt_block(doc_text, line)
     for attempt in (1, 2):
         try:

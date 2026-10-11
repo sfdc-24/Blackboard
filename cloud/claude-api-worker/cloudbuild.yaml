@@ -1,0 +1,14 @@
+# Repo root as context, so the Dockerfile can copy scripts/redis_dual.py and
+# cloud/drive-intake/main.py. The default tag is not a release. Nothing here deploys.
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/sfdc24/cloud-run-source-deploy/claude-api-worker:unreleased
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, '${_IMAGE}', -f, cloud/claude-api-worker/Dockerfile, .]
+
+images:
+  - '${_IMAGE}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -27,6 +27,7 @@
 !/cloud/bus-reconciler
 !/cloud/redis-tool-bridge
 !/cloud/drive-intake
+!/cloud/claude-api-worker
 
 !/scripts
 /scripts/*
