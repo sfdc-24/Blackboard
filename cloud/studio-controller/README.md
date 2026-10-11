@@ -260,7 +260,11 @@ happens only for a live session whose server-side record already stores that
 same id (`telephone_doc`). A stopped, expired, deleted, or unknown session is
 refused before any read. A doc the session is not bound to is refused with
 nothing about that doc's contents, size, or existence. The five-second cache
-is per session and doc, so one session is not handed another's trail. It needs
+is per session and doc, so one session is not handed another's trail, and
+callers that miss it together share one upstream read. The answer is checked
+against the shape drive-intake writes (the doc that was asked for, a known
+status, typed entries) and rebuilt from its named keys; anything else is a 502,
+never a trail. It needs
 `STUDIO_TELEPHONE_URL` (the service URL), `STUDIO_TELEPHONE_TOKEN` (the same
 value as `DRIVE_INTAKE_POLL_TOKEN`, from Secret Manager), and `roles/run.invoker`
 on drive-intake for this service's account, since the call carries this
