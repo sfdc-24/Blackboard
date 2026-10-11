@@ -375,7 +375,7 @@ jobs:
                    tests/test_org_publish.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py \
-                   tests/test_drive_intake.py \r
+                   tests/test_drive_intake.py \
                    tests/test_claude_api_worker.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
