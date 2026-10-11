@@ -28,8 +28,8 @@ OPTIONAL = {
     "claude-api-worker": {"CLAUDE_API_WORKER_USD_PER_MTOK_IN", "CLAUDE_API_WORKER_USD_PER_MTOK_OUT",
                           "FLEET_CAD_PER_USD"},
 }
-# #370's deps_from_env reads these. This branch's main.py does not, yet; an env name the script
-# drops is ignored until that image boots, and then the service runs on the default.
+# Pinned as well as scanned. These are the names deps_from_env wires for a real deploy (#370).
+# The scan above catches a rename in main.py; this set catches a script that drops one.
 WIRED_BY_370 = {
     "DRIVE_INTAKE_FOLDER_ID", "DRIVE_INTAKE_CHANNEL_TOKEN", "DRIVE_INTAKE_POLL_TOKEN",
     "DRIVE_INTAKE_API_WORKER", "DRIVE_INTAKE_HEARTBEAT_SECONDS", "DRIVE_INTAKE_POLL_SECONDS",
