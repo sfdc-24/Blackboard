@@ -189,6 +189,181 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertIn("owner-20261011-02", self.docs.documents[self.doc]["text"])
         self.assertNotIn("fleet:intake:poll:last", self.redis.values)
 
+    def test_queued_older_request_runs_before_newer_request_from_same_doc(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        self.pass_once()
+        calls = []
+
+        def model(_system, prompt):
+            calls.append(prompt)
+            return {"text": "A short answer.", "input_tokens": 10,
+                    "output_tokens": 5, "model": "offline-mock", "stop_reason": "end_turn"}
+
+        views = pilot.PilotDocs(self.docs)
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=worker.MemoryClaims(),
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
+        deps.pilot_docs = views
+        first = worker.run_once(deps)
+        second = worker.run_once(deps)
+        third = worker.run_once(deps)
+        self.assertEqual((first["calls"], second["calls"]), (1, 1))
+        self.assertEqual(first["considered"][0]["status"], "succeeded")
+        self.assertEqual(second["considered"][0]["status"], "succeeded")
+        self.assertEqual(third["calls"], 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Summarize the new change.", calls[0])
+        self.assertNotIn("Handle the second change.", calls[0])
+        self.assertIn("Handle the second change.", calls[1])
+        rows = self.redis.streams["fleet:inbox:claude-api"]
+        self.assertEqual(len({row[1]["task_id"] for row in rows}), 2)
+        self.assertEqual(sum("SUCCEEDED - task" in text for text in
+                             self.docs.documents[self.doc]["text"].splitlines()), 2)
+
+    def test_edited_queued_block_is_superseded_without_using_newer_text(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        self.pass_once()
+        doc = self.docs.documents[self.doc]
+        doc["text"] = doc["text"].replace("Summarize the new change.", "Edited after queueing.")
+        doc["revision_id"] = "r99"
+        calls = []
+
+        def model(_system, prompt):
+            calls.append(prompt)
+            return {"text": "A short answer.", "input_tokens": 10,
+                    "output_tokens": 5, "model": "offline-mock", "stop_reason": "end_turn"}
+
+        views = pilot.PilotDocs(self.docs)
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=worker.MemoryClaims(),
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
+        deps.pilot_docs = views
+        out = worker.run_once(deps)
+        self.assertEqual([entry["status"] for entry in out["considered"]],
+                         ["superseded", "succeeded"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Handle the second change.", calls[0])
+        self.assertNotIn("Edited after queueing.", calls[0])
+
+    def test_edit_during_accepted_receipt_retry_never_calls_model(self):
+        self.fresh()
+        original_append = self.docs.append
+        edited = False
+
+        def edit_before_append(file_id, expected_revision, receipt_id, receipt):
+            nonlocal edited
+            if not edited and "ACCEPTED - task" in receipt:
+                edited = True
+                doc = self.docs.documents[file_id]
+                doc["text"] = doc["text"].replace(
+                    "Summarize the new change.", "Edited during receipt retry.")
+                doc["revision_id"] = "r99"
+            return original_append(file_id, expected_revision, receipt_id, receipt)
+
+        self.docs.append = edit_before_append
+        calls = []
+        views = pilot.PilotDocs(self.docs)
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=worker.MemoryClaims(),
+            ledger=worker.MemoryLedger(), model=lambda *_: calls.append(1),
+            model_name="offline-mock", folder_id=pilot.FOLDER_ID, now=self.now,
+            at="2026-10-11T05:00:00Z", cap_cents=100, reserve_cents=1,
+            price_in=1, price_out=1, cad_per_usd=1, max_input_tokens=12000,
+            authorized_until=self.now + 3600)
+        deps.pilot_docs = views
+        out = worker.run_once(deps)
+        self.assertTrue(edited)
+        self.assertEqual(out["calls"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(out["considered"][0]["status"], "accepted_receipt_owed")
+        self.assertNotIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+
+    def test_edit_during_model_call_still_records_stored_result(self):
+        self.fresh()
+        calls = []
+
+        def model(_system, _prompt):
+            calls.append(1)
+            doc = self.docs.documents[self.doc]
+            doc["text"] = doc["text"].replace(
+                "Summarize the new change.", "Edited while model was running.")
+            doc["revision_id"] = "r99"
+            return {"text": "A short answer.", "input_tokens": 10,
+                    "output_tokens": 5, "model": "offline-mock", "stop_reason": "end_turn"}
+
+        claims = worker.MemoryClaims()
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=claims,
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        out = worker.run_once(deps)
+        self.assertEqual((out["calls"], out["considered"][0]["status"]), (1, "succeeded"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+        self.assertIn("A short answer.", self.docs.documents[self.doc]["text"])
+        self.assertTrue(claims.result(out["considered"][0]["task"]))
+
+    def test_stored_result_recovers_after_edit_and_failed_terminal_append(self):
+        self.fresh()
+        original_append = self.docs.append
+        terminal_failures = 0
+
+        def fail_first_terminal(file_id, expected_revision, receipt_id, receipt):
+            nonlocal terminal_failures
+            if "SUCCEEDED - task" in receipt and terminal_failures < 2:
+                terminal_failures += 1
+                raise TimeoutError("terminal append temporarily unavailable")
+            return original_append(file_id, expected_revision, receipt_id, receipt)
+
+        self.docs.append = fail_first_terminal
+        calls = []
+
+        def model(_system, _prompt):
+            calls.append(1)
+            doc = self.docs.documents[self.doc]
+            doc["text"] = doc["text"].replace(
+                "Summarize the new change.", "Edited while model was running.")
+            doc["revision_id"] = "r99"
+            return {"text": "A short answer.", "input_tokens": 10,
+                    "output_tokens": 5, "model": "offline-mock", "stop_reason": "end_turn"}
+
+        claims = worker.MemoryClaims()
+        deps = worker.Deps(
+            enabled=True, inbox=pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis),
+            docs=self.docs, receipts=self.docs, claims=claims,
+            ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
+            folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
+            cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
+            max_input_tokens=12000, authorized_until=self.now + 3600)
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        first = worker.run_once(deps)
+        self.assertEqual((first["calls"], first["considered"][0]["status"]),
+                         (1, "terminal_receipt_owed"))
+        task_id = first["considered"][0]["task"]
+        self.assertTrue(claims.result(task_id))
+        self.assertNotIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+        second = worker.run_once(deps)
+        self.assertEqual((second["calls"], second["considered"][0]["status"]),
+                         (0, "succeeded"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("SUCCEEDED - task", self.docs.documents[self.doc]["text"])
+        self.assertTrue(claims.done(task_id))
+
     def test_shared_parser_request_alias_cannot_smuggle_a_different_id(self):
         self.pass_once()
         smuggled = block().replace("REQUEST: owner-20261011-01",
