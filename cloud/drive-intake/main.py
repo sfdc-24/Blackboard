@@ -772,8 +772,9 @@ def poll(deps) -> list:
         return [{"status": "read_error", "task": None, "error": type(exc).__name__}]
     if isinstance(listed, dict):
         hints, watermark = list(listed.get("hints") or []), listed.get("watermark")
+        complete = bool(listed.get("complete", True))
     else:
-        hints, watermark = list(listed), None
+        hints, watermark, complete = list(listed), None, True
     try:
         pending = [{"file_id": f, "folder_id": ""} for f in sorted(deps.claims.pending() or ())]
     except Exception as exc:  # noqa: BLE001 - the unfinished cannot be found: nothing goes on record
@@ -798,7 +799,9 @@ def poll(deps) -> list:
     if not undecided:
         now = _now(deps)
         try:
-            deps.claims.note_poll(now, watermark if watermark is not None else now)
+            # resume: the listing was capped, so the next poll starts at this watermark.
+            # A finished listing stores where it got to and the next one looks back the margin.
+            deps.claims.note_poll(now, watermark if watermark is not None else now, resume=not complete)
         except Exception:  # noqa: BLE001 - health will read unknown; the intake itself is done
             pass
     return out
@@ -963,9 +966,14 @@ class MemoryClaims:
     def watermark(self):
         return self.beats.get("watermark")
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.beats["poll"] = float(now)
         self.beats["watermark"] = float(now if watermark is None else watermark)
+        self.beats["resume"] = bool(resume)
+
+    def resume(self):
+        """True when the last listing was capped and the next poll must start at the watermark."""
+        return bool(self.beats.get("resume"))
 
     def pending(self):
         return set(self.beats.setdefault("pending", set()))
@@ -1057,10 +1065,20 @@ class RedisClaims:
         except (TypeError, ValueError):
             return None
 
-    def note_poll(self, now, watermark=None):
+    def note_poll(self, now, watermark=None, resume=False):
         self.client.set("fleet:intake:poll:last", "%d" % int(now), ex=CLAIM_TTL)
         self.client.set("fleet:intake:poll:watermark", "%d" % int(now if watermark is None else watermark),
                         ex=CLAIM_TTL)
+        if resume:
+            self.client.set("fleet:intake:poll:resume", "1", ex=CLAIM_TTL)
+        else:
+            self.client.delete("fleet:intake:poll:resume")
+
+    def resume(self):
+        raw = self.client.get("fleet:intake:poll:resume")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return bool(raw)
 
     def watermark(self):
         """fleet:intake:poll:watermark - where the last poll got to (not when it ran)."""
