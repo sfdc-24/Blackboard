@@ -130,6 +130,7 @@ on:
       - "scripts/redis_gov.py"
       - "tests/test_redis_gov_verify.py"
       - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
       - "scripts/git_requests.py"
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
@@ -227,6 +228,7 @@ on:
       - "scripts/redis_gov.py"
       - "tests/test_redis_gov_verify.py"
       - "tests/test_redis_gov.py"
+      - "scripts/redis_acl.json"
       - "scripts/git_requests.py"
       - "tests/test_git_requests.py"
       - "cloud/bus-reconciler/serve_requests.py"
@@ -1059,16 +1061,26 @@ jobs:
       # The governed Redis path end to end, and the live worker around it. Until 2026-10-11 none of
       # these four files ran in CI: PR 390's lock and one-answer tests and PR 392's after= tests were
       # green here only because nothing executed them. Each suite is offline (fake Redis, fake board,
-      # fake bucket), proved by the empty network namespace; a file not on this branch is skipped.
+      # fake bucket), proved by the empty network namespace.
       - name: "redis gov, git requests, live mode, archive: the governed path and its worker (no network)"
         run: |
           set -euo pipefail
           python_bin="$(command -v python3)"
-          for suite in test_redis_gov test_git_requests test_live_mode test_redis_archive; do
+          # Each suite with the code it guards. A suite is skipped ONLY when that code is absent too: a
+          # branch that deletes the suite and keeps the code fails here (Copilot on 9cbcda6; the Pi1 step
+          # refuses the same shape).
+          for pair in "test_redis_gov:scripts/redis_gov.py" \
+                      "test_git_requests:scripts/git_requests.py" \
+                      "test_live_mode:cloud/bus-reconciler/serve_requests.py" \
+                      "test_redis_archive:cloud/bus-reconciler/redis_archive.py"; do
+            suite="${pair%%:*}"; code="${pair#*:}"
             if [ -f "tests/${suite}.py" ]; then
               sudo unshare -n -- "$python_bin" -B -m unittest "tests.${suite}" -v
+            elif [ -f "$code" ]; then
+              echo "::error::${code} is on this branch but tests/${suite}.py is not: the code would ship ungated"
+              exit 1
             else
-              echo "tests/${suite}.py not on this branch; skipping"
+              echo "tests/${suite}.py and ${code} are both absent on this branch; skipping"
             fi
           done
 
