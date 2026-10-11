@@ -1,6 +1,7 @@
 # Redis primary, the board as doorbell and record — the plan
 
-**Status:** plan for review, 2026-10-11. Nothing here is built unless a phase below says so.<br>
+**Status:** plan for review, 2026-10-11; revised the same day on Gemini's adversarial review (§8, §7).
+Nothing here is built unless a phase below says so.<br>
 **Owner of the plan:** `claude-code-cli`. Reviewers: Codex (verification), Gemini (where it breaks first),
 Grok (order and fallback). Mr. Salam decides the five questions in §6.<br>
 **His words, 2026-10-11:** *"start minimizing the bus usage and start using the redis — use the bus as a
@@ -20,7 +21,7 @@ Sheet is the record, never the live bus"* — applied to the whole fleet.
 | Carries | message content, replies, room lines, state | ids only: who has mail, where, which entry; the hourly ledger |
 | Keys / rows | `fleet:inbox:<agent>` (stream), `conf:side:<yyyymmdd>` (room), `proj:` (state), `gov:audit` (every op) | `DING` rows (§3), `LEDGER` rows (§4), escalations |
 | Identity | authenticated where the path allows (bridge token, Cloud Run identity) | a claimed `Source_Tag`, as today |
-| Durability | hourly RDB snapshots; TTL 7 d (`conf:`), 30 d (`fleet:`, `proj:`) | permanent |
+| Durability | **to be verified** (§8.1): RDB snapshots at best hourly, no AOF on this product; Standard tier fails over to a replica; TTL 7 d (`conf:`), 30 d (`fleet:`, `proj:`) | permanent |
 
 ## 2. What is true today, and why the order matters
 
@@ -35,12 +36,12 @@ goal. So the plan gives each agent a direct path first, and moves its traffic th
 
 | Agent | Runs where | Direct path to Redis | Phase |
 |---|---|---|---|
-| Gemini | Cloud Run job `gemini-waker` | **In-process**: the waker is already in our project; give the job VPC egress and the Redis credential, and run `redis_gov.execute` under principal `gemini` | 1 |
-| Grok (API route) | the adapter on Mr. Salam's laptop | **Move it to the cloud**: the `agent-waker` image already carries every adapter (`AGENT` picks one), so a `grok-waker` job is the same image with `AGENT=grok` and `XAI_API_KEY` — then in-process like Gemini | 1 |
-| The voices in a call | the chair (Cloud Run worker pool) | **Already has Redis** (`chair/conf_chair/redis_state.py`); it reads the side channel and never writes it — the write is a chair change | 1 |
-| Aya (Codex desktop) | Mr. Salam's laptop / Codex workspace | **Bridge**: `redis-tool-bridge` with an op endpoint (§5), token minted by impersonating `aya-runtime@` — no key file | 2 |
-| claude-code-cli | laptop / VM, has `gcloud` | **Bridge**, same way, its own service account | 2 |
-| Grok Bot (desktop app) | laptop | Bridge, as Aya, if it needs Redis at all; otherwise it rides the API route | 2 |
+| Gemini | Cloud Run job `gemini-waker` | **In-process**: the waker is already in our project; give the job VPC egress and the Redis credential, and run `redis_gov.execute` under principal `gemini` | 2 |
+| Grok (API route) | the adapter on Mr. Salam's laptop | **Move it to the cloud**: the `agent-waker` image already carries every adapter (`AGENT` picks one), so a `grok-waker` job is the same image with `AGENT=grok` and `XAI_API_KEY` — then in-process like Gemini | 2 |
+| The voices in a call | the chair (Cloud Run worker pool) | **Already has Redis** (`chair/conf_chair/redis_state.py`); it reads the side channel and never writes it — the write is a chair change | 2 |
+| Aya (Codex desktop) | Mr. Salam's laptop / Codex workspace | **Bridge**: `redis-tool-bridge` with an op endpoint (§5), token minted by impersonating `aya-runtime@` — no key file | 3 |
+| claude-code-cli | laptop / VM, has `gcloud` | **Bridge**, same way, its own service account | 3 |
+| Grok Bot (desktop app) | laptop | Bridge, as Aya, if it needs Redis at all; otherwise it rides the API route | 3 |
 | Cursor | GitHub only | **Git channel** (authenticated by GitHub's numeric bot id) — already a direct path in; its answers move from board rows to a PR comment | 3 |
 
 ## 3. The doorbell
@@ -75,7 +76,10 @@ Payload     = BCB|v=1|id=<rid>|from=<tag>|to=<agent>|key=fleet:inbox:<agent>|ent
   subject). So the board stops carrying conversation and keeps catching what the conversation dropped.
 - **Archive, so a Redis loss loses nothing that mattered** (decision D5): the same hourly job writes the
   streams to `gs://sfdc24-fleet-state/redis-archive/` before the ledger row; the row's hash is the
-  archive's hash.
+  archive's hash. This is **required**, not optional: Memorystore for Redis (the standalone product this
+  instance is) offers RDB snapshots only — no AOF, which is a Redis Cluster feature — at intervals of
+  1, 6, 12 or 24 hours, and a snapshot is used for automated recovery only, never for a manual restore.
+  The archive is the only copy we can restore from ourselves.
 
 ## 5. The two gaps that are code, not policy
 
@@ -98,60 +102,112 @@ Payload     = BCB|v=1|id=<rid>|from=<tag>|to=<agent>|key=fleet:inbox:<agent>|ent
 | D2 | Grant `roles/iam.serviceAccountTokenCreator` on `aya-runtime@` (and a `claude-code-cli@` account) to the laptop identity — owner-only | **Yes** | No key files: the laptop mints short-lived tokens by impersonation |
 | D3 | Run Grok's API route as a `grok-waker` Cloud Run job (same image as Gemini's) instead of on the laptop | **Yes** | In-process Redis with no new credential type; and it stops depending on the laptop being awake |
 | D4 | Give the waker jobs VPC egress and the Redis credential (env bindings, as the chair has) | **Yes, as a phase choice** | It co-locates a database credential with a model key — the same trade already accepted for the chair (2026-10-06 ruling), recorded, with the bridge as the hardening |
-| D5 | Archive Redis streams to GCS hourly | **Yes** | Snapshots are hourly; without an archive, up to an hour of conversation can vanish with no record but the ledger's hash |
+| D5 | Archive Redis streams to GCS hourly | **Yes — required** | No AOF on this product; snapshots are at best hourly and restorable only by Google's automated recovery. Without our archive, a whole-instance loss takes the conversation with it |
+| D6 | If minutes of loss are unacceptable: move to Memorystore for Redis **Cluster** (AOF every second) | **Not now** | A product migration, not a setting; revisit only if the archive plus a Standard-tier replica proves insufficient in practice |
 
 ## 7. Phases, each with the test that ends it
 
-**Phase 0 — done or in review (2026-10-11).** Governed access proved for four principals. Blackboard
-PR 390: one answer per request, one worker at a time, a bad append no longer ends the live channel.
-*Exit:* PR 390 merged and the `bus-requests` image rebuilt.
+Revised on Gemini's review: **the safety nets go in before any traffic moves**, so a Redis failure
+during the migration is caught by something already proved. The bridge stays out of the safety-net
+phase: it is a new door, not a net, and it waits on D1.
 
-**Phase 1 — inside the VPC goes Redis-first (no new identity; needs D3, D4).**
+**Phase 0 — prerequisites (2026-10-11 onward).**
+- Blackboard PR 390 merged and the `bus-requests` image rebuilt: one answer per request, one worker at a
+  time, a bad append no longer ends the live channel.
+- **The persistence fact settled** (§8.1): read the instance's configuration; if RDB is off, turn hourly
+  snapshots on (owner-gated, `cloud/bus-reconciler/instance-config.sh` is the declared-state file).
+- The board baseline taken (rows per day by tag, board reads per day) before anything moves.
+- *Exit:* all three recorded with their evidence.
+
+**Phase 1 — safety nets, no traffic moves (needs D5).**
+- Hourly GCS archive + LEDGER row (§4), under a `gov:` lock like PR 390's.
+- `xrange after=<id>` (§5.1) and **idempotency by entry id**: a reply names the entry it answers
+  (`answers=<stream id>`), and a reader skips an entry that already has an answer — the board's own
+  `answered()` pattern, so a crash before the cursor moves costs no duplicate (§8.6).
+- MISSING handling (§8.5) and the Redis-down fallback (§8.7), built and **exercised**.
+- *Exit tests:* (a) a LEDGER row reconciles with its archive object by hash; (b) with Redis made
+  unreachable for a test sender, the message lands on the board with the reason, once; (c) a DING to a
+  deleted test entry produces one MISSING row and no crash.
+
+**Phase 2 — inside the VPC goes Redis-first (needs D3, D4).**
 - `gemini-waker` and a new `grok-waker` read `fleet:inbox:<agent>` after their cursor and execute a reply's
   `REDIS-OP` line in-process under their own principal — no request row, no result row.
-- The `after=` read (§5.1).
 - The chair writes a voice's side-channel line for it, so the 2026-10-09 failure (four voices said they
-  wrote; none had) cannot recur: a line a voice claims is a line in the stream, or the voice is told it
-  is not.
-- *Exit test:* a Gemini → Grok → Gemini exchange through `fleet:inbox:` with **zero** board rows,
-  every op in `gov:audit`; and in a call, a voice's line is in `conf:side` under the chair's principal
-  with the voice named.
+  wrote; none had) cannot recur.
+- DING for recipients without an in-VPC waker; UNREAD escalation with its cap (§8.6).
+- *Exit tests:* a Gemini → Grok → Gemini exchange through `fleet:inbox:` with **zero** board rows, every op
+  in `gov:audit`; in a call, a voice's line is in `conf:side` under the chair's principal with the voice
+  named; a message deliberately left unread is flagged by the next LEDGER row (negative control).
 
-**Phase 2 — the desktop agents get the bridge (needs D1, D2).**
+**Phase 3 — the desktop agents get the bridge (needs D1, D2).**
 - `POST /op` on `redis-tool-bridge`; `scripts/redis_inbox.py` sends through it when it can mint a token
-  and falls back to the governed board row when it cannot.
-- *Exit test:* Aya and claude-code-cli each complete a round trip with zero board rows, and `gov:audit`
-  names the **verified** caller, not a claimed tag.
+  and falls back as §8.8 says when it cannot or is refused. Cursor's git-channel answers move to PR comments.
+- *Exit tests:* Aya and claude-code-cli each complete a round trip with zero board rows, and `gov:audit`
+  names the **verified** caller; a deliberately broken access-list entry produces the §8.8 fallback and
+  alert, not silence.
 
-**Phase 3 — the doorbell and the record (needs D5).**
-- DING rows (§3) replace content rows; wakers read Redis first; the hourly LEDGER + archive (§4); UNREAD
-  escalation; Cursor's git-channel answers as PR comments.
-- *Exit tests:* (a) board rows per day down against the Phase-0 baseline (measured, not estimated — the
-  baseline is taken before Phase 1 starts); (b) **a negative control**: a message deliberately left
-  unread is flagged by the next LEDGER row and escalated, inside one hour.
+**Phase 4 — the Sheet stops being a live channel.** Mr. Salam's 2026-10-09 condition, made checkable: 48
+hours in which every agent's traffic is on Redis, every LEDGER row reconciles with the archive, and no
+UNREAD escalation is left unexplained; board rows per day measured against the Phase-0 baseline. Then
+the board carries doorbells, ledgers, escalations and fallbacks only; anything else on it is a defect.
 
-**Phase 4 — the Sheet stops being a live channel.** Mr. Salam's 2026-10-09 condition, made checkable:
-48 hours of fleet operation in which every agent's traffic is on Redis, every LEDGER row reconciles with
-the archive, and no UNREAD escalation is left unexplained. Then the board carries doorbells, ledgers and
-escalations only; anything else on it is a defect.
+## 8. What would break first
 
-## 8. What would break first (for Gemini to attack)
+The first four are from the original plan; 8.5–8.8 are Gemini's adversarial review of 2026-10-11, each
+checked against the code before it was taken, with the corrections noted.
 
-- **Redis down = the fleet goes quiet.** Mitigation: `redis_inbox.py` already falls back to the governed
-  board row; a sender that cannot reach Redis posts the message on the board as today and says so. The
-  fallback must be exercised in Phase 3, not assumed.
-- **Value size.** 2,048 bytes per value (8 KB under `proj:milestones:`). A longer message is a pointer
-  (GCS object or a PR), as `board_row`'s spill already does.
-- **A doorbell nobody reads.** The LEDGER's unread count is what catches it — the reason the record is
-  written by the worker and not by the sender.
-- **Two workers again.** PR 390's lock; the same lock pattern for any new hourly job.
-- **Cost moves, it does not vanish.** Fewer board reads and rows; more Cloud Run executions (wakers,
-  hourly job) and Redis ops. The Phase-3 measurement counts both sides.
+1. **Persistence is unverified, and the product cannot do AOF.** An instance note of 2026-10-06
+   (`cloud/bus-reconciler/instance-config.sh`) says persistence is DISABLED; the call notes of
+   2026-10-09 say hourly RDB is on. Whichever is true, standalone Memorystore for Redis has no AOF and
+   restores snapshots only by itself. A Standard-tier failover to the replica keeps what was replicated;
+   a whole-instance loss keeps at most the last snapshot. Mitigation: settle the fact in Phase 0; the
+   archive (D5) in Phase 1.
+2. **Value size.** 2,048 bytes per value (8 KB under `proj:milestones:`). A longer message is a pointer
+   (GCS object or a PR), as `board_row`'s spill already does.
+3. **Two workers again.** PR 390's lock; the same lock pattern for the hourly archive/LEDGER job.
+4. **Cost moves, it does not vanish.** Fewer board reads and rows; more Cloud Run executions (wakers,
+   hourly job) and Redis ops. The Phase-4 measurement counts both sides.
+5. **A DING that points at nothing** (Gemini: "the ghost DING"). Redis loses the entry after the
+   doorbell was rung. *Scenario:* the recipient reads the DING, the entry id is not in the stream, and a
+   reader that assumes it is crashes or stalls. *Mitigation:* the DING carries the entry's SHA-256; a
+   reader that cannot find the entry posts ONE `MISSING` row to the sender (id and hash, no content) and
+   moves on; the sender, or the archive, re-sends. *Test:* a DING pointing at a deliberately deleted
+   **test** entry yields one MISSING row and no crash. *Correction:* Gemini proposed restarting the
+   instance to test this; that takes the whole fleet down for one test, and deleting one test entry
+   proves the same code path.
+6. **A crash between reading and recording it** (Gemini: duplicate actions, escalation loops).
+   *Scenario:* an agent acts on an entry and dies before its cursor moves; the LEDGER calls it unread,
+   UNREAD escalates, the agent wakes and does the work twice. *Mitigation:* idempotency by entry id —
+   the reply names `answers=<stream id>` and a reader skips an answered entry — so the cursor is an
+   optimisation, not the guard. UNREAD fires **once per entry** and at most three times per agent per
+   day; past that the LEDGER marks the agent DOWN and stops paging. *Correction:* Gemini proposed moving
+   the cursor *before* acting; that trades a duplicate for a silently lost message, which is the worse
+   failure here. *Test:* the cursor write is made to fail after a reply; the next run sends no second
+   reply, and escalation stops at the cap.
+7. **Everyone falls back at once** (Gemini: thundering herd). *Scenario:* Redis is unreachable; every
+   agent posts its full message to the board in the same second and meets Apps Script's limit on
+   simultaneous executions, so not even the outage gets reported. *Mitigation:* a random delay (0–30 s)
+   **before** a fallback post; **no retry** of an append — `bus.py` refuses that on purpose, because a
+   failed-looking append can already have landed, and a retry is a duplicate; the outage itself is one
+   row from the worker, not one per agent. *Correction:* Gemini proposed exponential backoff on retries;
+   on this board a retried append is the bug. *Test:* five test senders with Redis unreachable produce
+   staggered posts, no duplicate row, and one outage row.
+8. **A refusal that nobody hears** (Gemini: ACL desync). *Scenario:* an access-list edit or a principal
+   typo makes the bridge refuse an agent's write; a client that treats only network errors as failures
+   reports nothing. *Mitigation:* any non-OK answer from `/op` is a failure the client says out loud.
+   *Correction:* falling back to a governed board row would be refused again — it goes through the same
+   `redis_gov` and the same access list — so the fallback is a **plain board message** carrying the
+   content and the refusal reason, plus one alert to the access list's owner (`claude-code-cli`). And a
+   CI test catches the typo before deploy: every tag the wakers and tools post as must resolve to a
+   principal with write on `fleet:` and `conf:`. *Test:* a deliberately broken entry for a test
+   principal produces the plain message and the alert, not silence.
 
 ## 9. Start today
 
 1. Merge Blackboard PR 390 and rebuild `bus-requests` — the channel must not fall over again.
-2. Take the board baseline (rows per day by tag, board reads per day) before anything moves.
-3. For the next call: room lines go to `conf:side`, the board carries only DING and decisions — run as a
+2. Settle the persistence fact (read-only):
+   `gcloud redis instances describe redis-central --region us-central1 --project sfdc24 --format="table(name,tier,state,persistenceConfig.persistenceMode,persistenceConfig.rdbSnapshotPeriod)"`
+3. Take the board baseline (rows per day by tag, board reads per day) before anything moves.
+4. For the next call: room lines go to `conf:side`, the board carries only DING and decisions — run as a
    convention before any code changes, so the team learns the habit while the paths are built.
-4. Mr. Salam answers D1–D5; Phase 1 starts on D3 and D4 alone.
+5. Mr. Salam answers D1–D6; Phase 1 starts on D5 alone, Phase 2 on D3 and D4.
