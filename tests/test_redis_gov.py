@@ -87,6 +87,45 @@ class FakeRedis:
         self._need(key, "hash")
         return dict(self.data.get(key) or {})
 
+    def hlen(self, key):
+        self._need(key, "hash")
+        return len(self.data.get(key) or {})
+
+    def hkeys(self, key):
+        self._need(key, "hash")
+        return list((self.data.get(key) or {}).keys())
+
+    def hstrlen(self, key, field):
+        self._need(key, "hash")
+        raw = (self.data.get(key) or {}).get(field)
+        if raw is None:
+            return 0
+        if isinstance(raw, bytes):
+            return len(raw)
+        return len(str(raw).encode("utf-8"))
+
+    def keys(self, pattern="*"):
+        import fnmatch
+        return [key for key in list(self.data) if fnmatch.fnmatch(key, pattern)]
+
+    def eval(self, script, numkeys, *args):
+        """Unused by haudit. The verifier does not call EVAL or walk the keyspace.
+
+        A call still stops at the supplied cap so an accidental listing cannot grow without bound."""
+        import fnmatch
+        cap = int(args[0])
+        pattern = args[1].decode("utf-8") if isinstance(args[1], bytes) else str(args[1])
+        found, truncated = [], 0
+        for key in list(self.data):
+            text = key.decode("utf-8") if isinstance(key, bytes) else key
+            if not fnmatch.fnmatch(text, pattern):
+                continue
+            if len(found) >= cap:
+                truncated = 1
+                break
+            found.append(key)
+        return [truncated, found]
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
         return True

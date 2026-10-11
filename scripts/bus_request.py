@@ -153,6 +153,11 @@ def parse_request(row):
         "val": field(payload, "val"),
         "enc": field(payload, "enc"),
         "count": field(payload, "count"),
+        # haudit only. Ignored by every other op. The manifest in val is digests and lengths;
+        # redis_gov refuses anything else and never copies a stored string into the result.
+        "gen": field(payload, "gen"),
+        "cid": field(payload, "cid"),
+        "head": field(payload, "head"),
         "repeated": repeated_keys(payload),
         "nameless": nameless_segments(payload),
         # Where the row came from: "git" only for a row git_requests built from an authenticated
@@ -465,6 +470,18 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             continue
         budget -= 1
 
+        if req["action"] == "redis-op" and (req.get("op") or "").strip().lower() == redis_gov.VERIFY_OP:
+            # The public Sheet is not the haudit route. Do not run the manifest and do not publish
+            # a receipt. Counts and digests stay with the in-process caller. C11.
+            if append:
+                append(row_for(RESULT_ACTION, req,
+                               "HAUDIT withheld. Request and receipt stay off the board.",
+                               "HAUDIT withheld"))
+            already.add(req["req_id"])
+            out["answered"].append({"req_id": req["req_id"], "status": "REFUSED",
+                                    "op": req.get("op"), "key": "",
+                                    "latency_ms": 0})
+            continue
         if req["action"] == "redis-op":
             # ONE ROW, NOT TWO. The probe writes a RECEIPT then a RESULT because it takes a moment;
             # a governed op is one round trip, and every row addressed to an agent can wake it (a row
@@ -508,14 +525,21 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                                        "%s/%s" % (req["req_id"], req["row_id"]),
                                        req.get("op"), req.get("key"), field=req.get("field") or "",
                                        raw_value=req.get("val") or "", enc=req.get("enc") or "",
-                                       count=count, now=now)
+                                       count=count, now=now, generation=req.get("gen") or "",
+                                       correlation=req.get("cid") or "", head=req.get("head") or "")
             if append:
                 append(row_for(RESULT_ACTION, req, redis_gov.summarise(result),
                                ("%s %s %s" % ("OK" if result.get("ok") else "NOT DONE",
                                               req.get("op") or "?", req.get("key") or "?"))[:100]))
             already.add(req["req_id"])
-            status = ("OK" if result.get("ok")
-                      else "REFUSED" if "refused" in result else "ERROR")
+            # A finished haudit that did not match is FAILED, not ERROR: ERROR is a crash, and the
+            # entrypoint counts those. The row itself says missing, extra, changed, moved or partial.
+            if (result.get("op") == redis_gov.VERIFY_OP and not result.get("ok")
+                    and "refused" not in result and not result.get("error")):
+                status = "FAILED"
+            else:
+                status = ("OK" if result.get("ok")
+                          else "REFUSED" if "refused" in result else "ERROR")
             if status == "ERROR":
                 out["errors"].append(req["req_id"])
             # latency_ms is part of the contract, not decoration: cloud/bus-reconciler/serve_requests.py
