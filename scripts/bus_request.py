@@ -92,6 +92,19 @@ DONE_TTL_SECONDS = 6 * 3600
 # What the marker says once this request's RESULT row is on the board (read back by append). Until then
 # it holds the requesting row id: claimed, outcome unknown.
 ANSWERED_MARK = "ANSWERED|"
+# A claim younger than this is another worker's run still in flight, not a lost one: say nothing yet. The
+# two RESULT rows under GEMINI-REDIS-20261011T221508Z-8f6635 were 112 ms apart - two executions over one
+# snapshot, the second finding the first's claim before its answer was out. A claim older than this with
+# no answer is the crash or the lost row, and gets the UNKNOWN notice (well inside the 30-minute bound).
+CLAIM_GRACE_SECONDS = 120
+
+
+def claim_age(held, now) -> float | None:
+    """Seconds since a claim written as `<row id>|<epoch>`; None for a marker that carries no time."""
+    head, _, stamp = str(held or "").rpartition("|")
+    if not head or not stamp.isdigit():
+        return None
+    return now.timestamp() - int(stamp)
 
 
 def field(payload: str, name: str) -> str:
@@ -421,7 +434,8 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
             # and says so - it never applies one twice.
             marker = run_marker(req)
             try:
-                claimed = conn.set(marker, safe(req["row_id"])[:120] or "-", nx=True, ex=DONE_TTL_SECONDS)
+                claimed = conn.set(marker, "%s|%d" % (safe(req["row_id"])[:100] or "-", int(now.timestamp())),
+                                   nx=True, ex=DONE_TTL_SECONDS)
             except Exception as error:
                 out["errors"].append(req["req_id"])
                 out["refused"].append({"req_id": req["req_id"],
@@ -445,6 +459,14 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN) -> dict:
                 if str(held or "").startswith(ANSWERED_MARK):
                     out["refused"].append({"req_id": req["req_id"],
                                            "why": ["already answered: its RESULT row is on the board"]})
+                    continue
+                age = claim_age(held, now)
+                if age is not None and age < CLAIM_GRACE_SECONDS:
+                    # Not added to `already`: a later pass must still see this claim, answered or not.
+                    if not noticed:
+                        already.discard(req["req_id"])
+                    out["refused"].append({"req_id": req["req_id"],
+                                           "why": ["in flight: another run claimed it %ds ago" % max(0, int(age))]})
                     continue
                 out["refused"].append({"req_id": req["req_id"],
                                        "why": ["already claimed: Redis holds this request's run marker"]})

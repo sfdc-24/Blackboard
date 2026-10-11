@@ -144,7 +144,9 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual("from git", conn.get("conf:2026-10-08:git:cursor"))
         conn.set("conf:2026-10-08:git:cursor", "changed since by someone else")
         posted = []
-        out = br.handle(rows, conn, now=NOW, append=posted.append)
+        # Past the grace window: a younger claim is presumed in flight and says nothing yet.
+        out = br.handle(rows, conn, now=NOW + datetime.timedelta(seconds=br.CLAIM_GRACE_SECONDS + 60),
+                        append=posted.append)
         self.assertEqual([], out["answered"])
         self.assertEqual("changed since by someone else", conn.get("conf:2026-10-08:git:cursor"))
         self.assertIn("NOT RUN AGAIN", posted[0]["payload"])
@@ -186,6 +188,19 @@ class ItRunsThroughTheSameGovernance(unittest.TestCase):
         self.assertEqual(1, len(posted), "one RESULT row, not an OK and then an UNKNOWN")
         self.assertNotIn("UNKNOWN", posted[0]["payload"])
         self.assertIn("already answered", json.dumps(second["refused"]))
+
+    def test_a_second_worker_over_the_same_snapshot_stays_silent_while_the_first_is_in_flight(self):
+        # The same request, two executions, 112 ms apart: the second finds the first's fresh claim before
+        # its answer is out. It must neither run the op nor publish UNKNOWN.
+        conn = FakeRedis()
+        rows = gr.rows_from_comments("Blackboard", [comment(SET)], BOTS)
+        conn.set(br.run_marker(br.parse_request(rows[0])), "row-1|%d" % int(NOW.timestamp()))
+        posted = []
+        out = br.handle(rows, conn, now=NOW + datetime.timedelta(seconds=1), append=posted.append)
+        self.assertEqual([], out["answered"])
+        self.assertEqual([], posted)
+        self.assertIsNone(conn.get("conf:2026-10-08:git:cursor"))
+        self.assertIn("in flight", json.dumps(out["refused"]))
 
     def test_a_repeated_field_is_refused_not_read_first_value_wins(self):
         conn = FakeRedis()
