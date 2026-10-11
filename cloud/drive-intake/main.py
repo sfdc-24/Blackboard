@@ -106,11 +106,25 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _load_trail():
+    """cloud/drive-intake/trail.py, beside this file: the one parser of the receipt shape."""
+    spec = importlib.util.spec_from_file_location(
+        "drive_intake_trail", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trail.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+trail_module = _load_trail()
 
 MAX_BODY = 65536
 MAX_DOC = 400000          # a doc larger than this is refused, not truncated (PR 354's rule)
@@ -827,7 +841,8 @@ def poll_token_ok(secret: str, headers: dict) -> bool:
 
 
 def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
-    path = path.split("?", 1)[0]
+    path, _sep, raw_query = path.partition("?")
+    query = urllib.parse.parse_qs(raw_query, keep_blank_values=False)
     headers = {str(k).lower(): v for k, v in (headers or {}).items()}
     if method == "GET" and path == "/healthz":
         now = _now(deps)
@@ -862,7 +877,75 @@ def handle(method: str, path: str, headers: dict, body: bytes, deps) -> tuple:
         if not deps.enabled:
             return 200, {"enabled": False, "intake": []}
         return 200, {"enabled": True, "intake": poll(deps)}
+    if method == "GET" and path == "/trail":
+        # The page's read (step 4): the same token as the poll, before anything else.
+        if not poll_token_ok(deps.poll_token, headers):
+            return 401, {"error": "bad poll token"}
+        if not deps.enabled:
+            return 200, {"enabled": False, "trail": None}
+        file_id = (query.get("doc") or [""])[0]
+        if not FILE_ID_OK.fullmatch(file_id):
+            return 400, {"error": "doc must be a Drive file id"}
+        return 200, trail_for_doc(deps, file_id)
     return 404, {"error": "not found"}
+
+
+API_HEARTBEAT = 900   # the worker beats once per tick (5 min); three ticks silent reads offline
+
+
+def trail_for_doc(deps, file_id: str) -> dict:
+    """The doc's receipt trail and the live state behind it. Never the request's own words.
+
+    The doc is read every time (it is the record); what Redis adds is the claim's phase, whether
+    the doc is still pending a pass, the two heartbeats, the worker's claim and the doorbell
+    marker. Anything Redis cannot answer reads "unknown", never a guess.
+    """
+    out = {"enabled": True, "doc": file_id, "at": deps.at}
+    if deps.docs is None:
+        out["status"] = "no_store"
+        return out
+    try:
+        doc = deps.docs.read(file_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update(status="read_error", error=type(exc).__name__)
+        return out
+    if not isinstance(doc, dict):
+        out.update(status="read_error", error="shape")
+        return out
+    if deps.folder_id and doc.get("folder_id") != deps.folder_id:
+        out["status"] = "out_of_scope"
+        return out
+    text = doc.get("text") or ""
+    if len(text) > MAX_DOC:
+        out.update(status="too_large", chars=len(text))
+        return out
+    entries = trail_module.parse(text)
+    revision = str(doc.get("revision_id") or "")
+    recipient = next((e["recipient"] for e in entries if e["state"] == REQUESTED and canonical(e["recipient"])),
+                     "claude-code-cli")
+    tuple_ = correlate(file_id, text, revision, recipient) if strip_receipts(text).strip() else None
+    out.update(status="ok", revision=revision, entries=entries, tasks=trail_module.tasks_of(entries),
+               task=tuple_["task_id"] if tuple_ else None, request=tuple_["request_id"] if tuple_ else None)
+    now = _now(deps)
+    live = {"laptop": "unknown", "api_worker": "unknown", "intake": "unknown", "pending": "unknown",
+            "worker_claim": "unknown", "doorbell": "unknown"}
+    if deps.claims is not None:
+        live["laptop"] = "online" if heartbeat_age(deps.claims, now, window=deps.heartbeat_window) is not None else "offline"
+        live["api_worker"] = "online" if heartbeat_age(deps.claims, now, "claude-api", API_HEARTBEAT) is not None else "offline"
+        if tuple_:
+            for name, read in (("intake", lambda: deps.claims.state(idempotency_key(tuple_))),
+                               ("pending", lambda: file_id in (deps.claims.pending() or ())),
+                               ("worker_claim", lambda: deps.claims.worker_state(tuple_["task_id"])),
+                               ("doorbell", lambda: deps.claims.doorbell_state(tuple_["task_id"]))):
+                try:
+                    value = read()
+                except Exception:  # noqa: BLE001 - unreadable is unknown
+                    continue
+                live[name] = value if value is not None else "none"
+            if isinstance(live["intake"], str) and ":" in live["intake"]:
+                live["intake"] = live["intake"].split(":", 1)[0] + ":" + live["intake"].split(":")[1]
+    out["live"] = live
+    return out
 
 
 def no_ring(_tuple):
@@ -971,6 +1054,13 @@ class MemoryClaims:
     def pending_remove(self, file_id):
         self.beats.setdefault("pending", set()).discard(file_id)
 
+    # Read only, for the trail: what the worker and the lane wrote under their own keys.
+    def worker_state(self, task_id):
+        return self.beats.get("fleet:worker:claim:" + task_id)
+
+    def doorbell_state(self, task_id):
+        return self.beats.get("fleet:worker:woke:" + task_id)
+
 
 # Compare-and-set in one round trip, so two passes cannot both win a transition.
 CAS_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
@@ -1078,6 +1168,15 @@ class RedisClaims:
 
     def pending_remove(self, file_id):
         self.client.srem("fleet:intake:pending", file_id)
+
+    # Read only, for the trail: the worker's claim and the lane's doorbell marker.
+    def worker_state(self, task_id):
+        raw = self.client.get("fleet:worker:claim:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+    def doorbell_state(self, task_id):
+        raw = self.client.get("fleet:worker:woke:" + task_id)
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
 
 
 class InboxQueue:
