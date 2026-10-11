@@ -88,8 +88,7 @@ VERIFY_OP = "haudit"
 VERIFY_FLAG = "REDIS_GOV_VERIFY"
 # bus_request.HEARTBEAT_KEY. Repeated here so this module does not import the worker.
 HEARTBEAT_READ_KEY = "gov:worker:heartbeat"
-MAX_AUDIT_KEYS = 128
-MAX_AUDIT_LISTED = 128
+MAX_AUDIT_KEYS = 128          # manifest cap. The verifier does not list or scan the keyspace.
 MAX_AUDIT_MANIFEST_BYTES = 65536
 _VERIFY_ON = {"1", "true", "on", "yes"}
 
@@ -512,71 +511,6 @@ def _bound_head(prefix: str, generation: str) -> str:
     return head
 
 
-# Confirmation listing. Runs inside the WATCH transaction, so it sees a key inserted after the
-# second scan. SCAN stops once `cap` matches are in hand; the reply is that many names plus a
-# truncated flag, never the rest of the generation. KEYS is not used: it has no result cap.
-_BOUND_CONFIRM = """
-local cap = tonumber(ARGV[1])
-local pattern = ARGV[2]
-local cursor = '0'
-local found = {}
-local truncated = 0
-if cap == nil or cap < 1 then
-  return redis.error_reply('cap')
-end
-repeat
-  local reply = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', cap)
-  cursor = reply[1]
-  local batch = reply[2]
-  for i = 1, #batch do
-    if #found >= cap then
-      truncated = 1
-      break
-    end
-    found[#found + 1] = batch[i]
-  end
-  if truncated == 1 then
-    break
-  end
-until cursor == '0'
-return {truncated, found}
-"""
-
-
-def _bounded_page(raw, prefix, cap):
-    """(names, truncated) from a confirmation page, or None when the page is unusable.
-
-    At most `cap` names are kept. A longer page is truncated and the extra names are not read.
-    Over the cap is not a confirmed set."""
-    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-        return None
-    flag, listed_raw = raw
-    if isinstance(flag, bytes):
-        try:
-            flag = flag.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    try:
-        truncated = bool(int(flag))
-    except (TypeError, ValueError):
-        return None
-    if isinstance(listed_raw, (str, bytes)) or not isinstance(listed_raw, (list, tuple)):
-        return None
-    names = []
-    for key in listed_raw:
-        if len(names) >= cap:
-            return names, True
-        try:
-            text = _strict_text(key)
-        except UnicodeDecodeError:
-            return None
-        if text.startswith(prefix):
-            names.append(text)
-    if len(listed_raw) > cap:
-        truncated = True
-    return names, truncated
-
-
 def _exec_error(results) -> str:
     """The type name of the first failed command, or "" when every result is a value.
 
@@ -603,38 +537,49 @@ def _hash_generation(conn, key):
     return (raw if re.fullmatch(r"[0-9a-f]{64}", raw) else ""), raw
 
 
-def _keys_under(conn, prefix, limit):
-    """Keys that start with prefix. The second value is True when the listing stopped early."""
-    scan = getattr(conn, "scan_iter", None)
-    if not callable(scan):
-        raise Refused("this connection cannot list a generation, so the audit cannot cover it")
-    found, seen = [], set()
-    try:
-        for key in scan(match=prefix + "*", count=100):
-            text = _strict_text(key)
-            if text in seen or not text.startswith(prefix):
-                continue
-            if len(found) >= limit:
-                return found, True
-            seen.add(text)
-            found.append(text)
-    except Exception as error:
-        if _is_timeout(error):
-            raise TimeoutError("generation listing timed out")
-        raise
-    return found, False
+def manifest_body(specs) -> bytes:
+    """Canonical UTF-8 of the manifest object. The head key is not a member.
+
+    ``{"keys": {name: {"len": n, "sha256": hex}}}`` with sorted keys and compact separators.
+    ``len`` sorts before ``sha256``. This is the manifest digest's preimage, not the report."""
+    keys = {name: {"len": int(specs[name]["len"]), "sha256": specs[name]["sha256"]}
+            for name in specs}
+    return json.dumps({"keys": keys}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
-def _audit_report(entries) -> tuple:
-    lines = ["%s\t%s\t%d\t%s" % (entry["key"], entry["sha256"], entry["len"], entry["status"])
-             for entry in sorted(entries, key=lambda item: item["key"])]
-    raw = "\n".join(lines).encode("utf-8")
+def manifest_digest(specs) -> str:
+    """SHA-256 hex of manifest_body(specs)."""
+    return hashlib.sha256(manifest_body(specs)).hexdigest()
+
+
+def report_body(specs) -> bytes:
+    """One line per generation document, excluding the head: ``key<TAB>sha256<TAB>len``, sorted.
+
+    No status column. The writer and the verifier hash these same bytes."""
+    lines = ["%s\t%s\t%d" % (name, specs[name]["sha256"], int(specs[name]["len"]))
+             for name in sorted(specs)]
+    return "\n".join(lines).encode("utf-8")
+
+
+def report_digest(specs) -> tuple:
+    """(sha256 hex, byte length) of report_body(specs)."""
+    raw = report_body(specs)
     return hashlib.sha256(raw).hexdigest(), len(raw)
 
 
+def _audit_report(entries) -> tuple:
+    specs = {entry["key"]: {"sha256": entry.get("sha256") or "", "len": int(entry.get("len") or 0)}
+             for entry in entries}
+    return report_digest(specs)
+
+
 def _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
-                   head_generation, audit="ok", refused="", error=""):
-    """The only shape haudit returns. There is no field for a stored string."""
+                   head_generation, audit="ok", refused="", error="", manifest_digest_hex=""):
+    """The receipt haudit returns. There is no field for a stored string.
+
+    Partial or incomplete is never ok. ``extra`` is not a keyspace claim: unlisted keys are
+    ignored, not scanned for."""
     out = {
         "ok": False,
         "op": VERIFY_OP,
@@ -665,6 +610,9 @@ def _publish_audit(entries, generation, correlation, coverage, partial, moved, t
     digest, length = _audit_report(out["keys"])
     out["digest"] = digest
     out["length"] = length
+    out["listed"] = int(coverage.get("expected") or 0)
+    out["manifest_digest"] = (manifest_digest_hex
+                              if re.fullmatch(r"[0-9a-f]{64}", manifest_digest_hex or "") else "")
     clean = (out["coverage"]["missing"] == 0 and out["coverage"]["extra"] == 0
              and out["coverage"]["changed"] == 0 and out["coverage"]["matched"] == out["coverage"]["expected"]
              and out["coverage"]["expected"] > 0 and not out["partial"] and not out["moved"]
@@ -680,17 +628,53 @@ def _publish_audit(entries, generation, correlation, coverage, partial, moved, t
     return out
 
 
+def _read_listed(pipe, names, records):
+    """Digest each manifest key. Returns (partial, timed_out, hard_error).
+
+    Stops at the first failure so a partial read is not reported as a complete match.
+    No key outside ``names`` is read."""
+    partial = timed_out = False
+    hard_error = ""
+    for name in names:
+        try:
+            kind = _text(pipe.type(name))
+            if kind == "none":
+                records[name] = ("missing", "", 0)
+                continue
+            if kind != "hash":
+                records[name] = ("changed", "", 0)
+                continue
+            raw_hash = pipe.hgetall(name) or {}
+            try:
+                digest, length = payload_digest(raw_hash)
+            except UnicodeDecodeError:
+                records[name] = ("changed", "", 0)
+                continue
+            except Refused:
+                records[name] = ("changed", "", 0)
+                partial = True
+                continue
+            records[name] = ("hash", digest, length)
+        except Exception as error:
+            partial = True
+            if _is_timeout(error):
+                timed_out = True
+            else:
+                hard_error = type(error).__name__
+            break
+    return partial, timed_out, hard_error
+
+
 def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, enc,
                       generation, correlation, head, now) -> dict:
-    """Compare one generation to the caller's digest manifest.
+    """Receipt for one generation against the caller's manifest. Shared contract v1.
 
-    Reads are watched. The head key is derived from the generation namespace and a different head
-    is refused. The key set is confirmed inside the transaction by a SCAN that stops at the listing
-    cap, so a key inserted after the second scan still fails the audit and a generation over the
-    cap is partial, not a pass. Every command result from that transaction is checked; a queued
-    error is not a pass. A listing that stops early, or a read that does not finish, is partial and
-    is not a pass. TimeoutError is returned as timeout, with the correlation id, and its message is
-    not. Invalid UTF-8 is not decoded with replacement and is not a match."""
+    The head is bound from the generation namespace and its generation id is read before any
+    document. Only manifest-listed keys are read, each under WATCH, at most MAX_AUDIT_KEYS of
+    them. There is no KEYS, no SCAN, and no Lua walk of the keyspace. An unlisted key is ignored.
+    A listed key or the head that changes before EXEC is moved. A queued command error is not a
+    pass. A read that stops early is partial, and partial is never ok. Invalid UTF-8 is not a
+    match."""
     if field:
         raise Refused("haudit takes no field=")
     if not generation:
@@ -710,29 +694,19 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
             raise Refused("a manifest key is outside the generation prefix")
         _guard_verify_key(acl, who, name)
 
-    try:
-        found, truncated = _keys_under(conn, prefix, MAX_AUDIT_LISTED)
-    except TimeoutError:
-        return _finish_audit(conn, acl, who, raw_tag, via, prefix, [], generation, correlation,
-                             {"expected": len(expected), "seen": 0, "head_match": False},
-                             partial=True, moved=False, timeout=True, head_generation="", now=now,
-                             error="TimeoutError")
-    for name in found:
-        _guard_verify_key(acl, who, name)
-
-    watched = sorted(set(found) | set(expected) | {head})
+    claimed = manifest_digest(expected)
+    names = sorted(expected)
     pipe = conn.pipeline(transaction=True)
     records = {}
-    partial = truncated
+    partial = False
     moved = False
     timed_out = False
     hard_error = ""
     head_generation = ""
     head_match = False
-    found_after = list(found)
+    started = False
     try:
-        for name in watched:
-            pipe.watch(name)
+        pipe.watch(head)
         try:
             head_generation, head_raw_before = _hash_generation(pipe, head)
         except Exception as error:
@@ -742,81 +716,41 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
                 hard_error = type(error).__name__
             partial = True
             head_raw_before = None
-        if not timed_out and not hard_error:
-            for name in sorted(set(found) | set(expected)):
+        # Head -> generation id before any document read. A mismatch does not open the manifest keys.
+        if not timed_out and not hard_error and head_raw_before == generation:
+            started = True
+            for name in names:
+                pipe.watch(name)
+            read_partial, timed_out, hard_error = _read_listed(pipe, names, records)
+            partial = partial or read_partial
+            head_raw_after = head_raw_before
+            if not timed_out and not hard_error:
                 try:
-                    kind = _text(pipe.type(name))
-                    if kind == "none":
-                        records[name] = ("missing", "", 0)
-                        continue
-                    if kind != "hash":
-                        records[name] = ("changed", "", 0)
-                        continue
-                    raw_hash = pipe.hgetall(name) or {}
-                    try:
-                        digest, length = payload_digest(raw_hash)
-                    except UnicodeDecodeError:
-                        records[name] = ("changed", "", 0)
-                        continue
-                    except Refused:
-                        records[name] = ("changed", "", 0)
-                        partial = True
-                        continue
-                    records[name] = ("hash", digest, length)
+                    _published_after, head_raw_after = _hash_generation(pipe, head)
                 except Exception as error:
                     partial = True
                     if _is_timeout(error):
                         timed_out = True
                     else:
                         hard_error = type(error).__name__
-                    break
-        head_raw_after = head_raw_before
-        if not timed_out and not hard_error:
-            try:
-                _published_after, head_raw_after = _hash_generation(pipe, head)
-                found_after, truncated_after = _keys_under(conn, prefix, MAX_AUDIT_LISTED)
-                if truncated_after:
-                    partial = True
-            except Exception as error:
-                partial = True
-                if _is_timeout(error):
-                    timed_out = True
-                else:
-                    hard_error = type(error).__name__
-        if head_raw_before is not None and head_raw_after != head_raw_before:
-            moved = True
-        if not timed_out and not hard_error and set(found_after) != set(found):
-            moved = True
+            if head_raw_before is not None and head_raw_after != head_raw_before:
+                moved = True
         head_match = bool(head_raw_before) and head_raw_before == generation and not moved
-        if not timed_out and not hard_error:
+        if started and not timed_out and not hard_error:
             try:
-                # The second scan has already returned. A key created after it is not watched, so
-                # WATCH on the old set would still confirm. The SCAN below runs at EXEC and stops
-                # at the cap: a finished page that differs is movement, and a page that hits the
-                # cap with keys left over is partial. Neither is a pass. KEYS is not used.
+                # TYPE each watched key inside the transaction. An error in any result is not a
+                # pass. WATCH aborts EXEC when a listed key or the head changes. Nothing here
+                # lists the keyspace.
                 pipe.multi()
                 pipe.type(head)
-                pipe.eval(_BOUND_CONFIRM, 0, str(MAX_AUDIT_LISTED), prefix + "*")
+                for name in names:
+                    pipe.type(name)
                 confirmed = pipe.execute(raise_on_error=False)
                 failed = _exec_error(confirmed)
-                if failed or len(confirmed) != 2:
+                if failed or len(confirmed) != 1 + len(names):
                     hard_error = failed or "ExecError"
                     partial = True
                     head_match = False
-                else:
-                    page = _bounded_page(confirmed[1], prefix, MAX_AUDIT_LISTED)
-                    if page is None:
-                        hard_error = "ExecError"
-                        partial = True
-                        head_match = False
-                    else:
-                        listed, truncated_page = page
-                        if truncated_page:
-                            partial = True
-                            head_match = False
-                        elif set(listed) != set(found):
-                            moved = True
-                            head_match = False
             except Exception as error:
                 if type(error).__name__ == "WatchError":
                     moved = True
@@ -833,48 +767,41 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
         pipe.reset()
 
     entries = []
-    missing = extra = changed = matched = 0
-    for name in sorted(expected):
-        if name not in records:
-            partial = True
-            continue
-        kind, digest, length = records[name]
-        want = expected[name]
-        if kind == "missing":
-            if truncated:
+    missing = changed = matched = 0
+    if started:
+        for name in names:
+            if name not in records:
                 partial = True
                 continue
-            status = "missing"
-            missing += 1
-            digest, length = "", 0
-        elif kind != "hash" or digest != want["sha256"] or length != want["len"]:
-            status = "changed"
-            changed += 1
-        else:
-            status = "match"
-            matched += 1
-        entries.append({"key": name, "sha256": digest, "len": length, "status": status})
-    for name in sorted(found):
-        if name in expected:
-            continue
-        kind, digest, length = records.get(name, ("changed", "", 0))
-        extra += 1
-        entries.append({"key": name, "sha256": digest if kind == "hash" else "",
-                        "len": length if kind == "hash" else 0, "status": "extra"})
+            kind, digest, length = records[name]
+            want = expected[name]
+            if kind == "missing":
+                status = "missing"
+                missing += 1
+                digest, length = "", 0
+            elif kind != "hash" or digest != want["sha256"] or length != want["len"]:
+                status = "changed"
+                changed += 1
+            else:
+                status = "match"
+                matched += 1
+            entries.append({"key": name, "sha256": digest, "len": length, "status": status})
     coverage = {
-        "expected": len(expected), "seen": len(found), "missing": missing, "extra": extra,
+        "expected": len(expected), "seen": len(records), "missing": missing, "extra": 0,
         "changed": changed, "matched": matched, "head_match": head_match,
     }
     return _finish_audit(conn, acl, who, raw_tag, via, prefix, entries, generation, correlation,
                          coverage, partial=partial or bool(hard_error), moved=moved,
                          timeout=timed_out, head_generation=head_generation, now=now,
-                         error=("TimeoutError" if timed_out else hard_error))
+                         error=("TimeoutError" if timed_out else hard_error),
+                         manifest_digest_hex=claimed)
 
 
 def _finish_audit(conn, acl, who, raw_tag, via, key, entries, generation, correlation, coverage,
-                  partial, moved, timeout, head_generation, now, error=""):
+                  partial, moved, timeout, head_generation, now, error="", manifest_digest_hex=""):
     result = _publish_audit(entries, generation, correlation, coverage, partial, moved, timeout,
-                            head_generation, audit="ok", error=error)
+                            head_generation, audit="ok", error=error,
+                            manifest_digest_hex=manifest_digest_hex)
     reason = "missing=%d extra=%d changed=%d partial=%d moved=%d timeout=%d" % (
         result["coverage"]["missing"], result["coverage"]["extra"], result["coverage"]["changed"],
         int(result["partial"]), int(result["moved"]), int(result["timeout"]))
@@ -969,14 +896,16 @@ def _summarise_verify(result: dict) -> str:
             result.get("generation") or "-", result.get("correlation") or "-",
             result["refused"], result.get("audit", "?"))
     cov = result.get("coverage") or {}
-    base = ("HAUDIT ok=%d gen=%s cid=%s expected=%d seen=%d missing=%d extra=%d changed=%d "
-            "matched=%d covered=%d partial=%d moved=%d timeout=%d digest=%s length=%d" % (
+    base = ("HAUDIT ok=%d gen=%s cid=%s listed=%d expected=%d seen=%d missing=%d extra=%d changed=%d "
+            "matched=%d covered=%d partial=%d moved=%d timeout=%d manifest=%s digest=%s length=%d" % (
                 int(bool(result.get("ok"))), result.get("generation") or "-",
-                result.get("correlation") or "-", int(cov.get("expected") or 0),
+                result.get("correlation") or "-", int(result.get("listed") or cov.get("expected") or 0),
+                int(cov.get("expected") or 0),
                 int(cov.get("seen") or 0), int(cov.get("missing") or 0), int(cov.get("extra") or 0),
                 int(cov.get("changed") or 0), int(cov.get("matched") or 0),
                 int(bool(cov.get("covered"))), int(bool(result.get("partial"))),
                 int(bool(result.get("moved"))), int(bool(result.get("timeout"))),
+                result.get("manifest_digest") or "-",
                 result.get("digest") or "-", int(result.get("length") or 0)))
     if result.get("error"):
         base += " error=%s" % result["error"]

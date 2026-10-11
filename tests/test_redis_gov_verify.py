@@ -70,16 +70,6 @@ def put_hash(conn, key, mapping):
     conn.hset(key, mapping=dict(mapping))
 
 
-def _page_size(result):
-    """How many key names a confirmation command returned, or None when it is not a listing."""
-    if isinstance(result, (list, tuple)) and len(result) == 2 and isinstance(result[1], (list, tuple)):
-        if not isinstance(result[0], (list, tuple, dict)):
-            return len(result[1])
-    if isinstance(result, (list, tuple)) and result and isinstance(result[0], (str, bytes)):
-        return len(result)
-    return None
-
-
 def audit(conn, gen, expected, cid="cid-audit-1", who="cursor", head=None, prefix=None, **kw):
     prefix = prefix or prefix_for(gen)
     head = head or "proj:pr-board:v1:head"
@@ -160,6 +150,37 @@ class CanonicalUtf8(unittest.TestCase):
         # hput's existing canonical is untouched: it does not normalise.
         self.assertNotEqual(gov.canonical({"a": "e\u0301"}), gov.canonical({"a": "\u00e9"}))
 
+    def test_shared_contract_cross_check_vector(self):
+        documents = {"a": {"x": "1"}, "b": {"y": "\u00e9"}}
+        raw = {name: gov.canonical_utf8(fields) for name, fields in documents.items()}
+        self.assertEqual(b'{"x":"1"}', raw["a"])
+        self.assertEqual('{"y":"\u00e9"}'.encode("utf-8"), raw["b"])
+        specs = {}
+        for name, blob in raw.items():
+            digest = hashlib.sha256(blob).hexdigest()
+            specs[name] = {"sha256": digest, "len": len(blob)}
+            self.assertEqual(specs[name], dict(zip(("sha256", "len"), gov.payload_digest(documents[name]))))
+        self.assertEqual(
+            "013bdcb2b4d38b7d26f13f2a48631e9a5ae45530c3ef0e5946668d4f1892baa1", specs["a"]["sha256"])
+        self.assertEqual(9, specs["a"]["len"])
+        self.assertEqual(
+            "e37ae44535cf9436886c8517b4a6346e25fcd0501667d96726dd1831b3b7b232", specs["b"]["sha256"])
+        self.assertEqual(10, specs["b"]["len"])
+        self.assertEqual(
+            b'{"keys":{"a":{"len":9,"sha256":"013bdcb2b4d38b7d26f13f2a48631e9a5ae45530c3ef0e5946668d4f1892baa1"},'
+            b'"b":{"len":10,"sha256":"e37ae44535cf9436886c8517b4a6346e25fcd0501667d96726dd1831b3b7b232"}}}',
+            gov.manifest_body(specs))
+        self.assertEqual("7ee61c4addbd4d475a50ace20c2060118887e158a0b85e8529a009e8c509d1fc",
+                         gov.manifest_digest(specs))
+        report_hex, report_len = gov.report_digest(specs)
+        self.assertEqual(
+            b"a\t013bdcb2b4d38b7d26f13f2a48631e9a5ae45530c3ef0e5946668d4f1892baa1\t9\n"
+            b"b\te37ae44535cf9436886c8517b4a6346e25fcd0501667d96726dd1831b3b7b232\t10",
+            gov.report_body(specs))
+        self.assertEqual("d7f90960d6066e7208157ed3b0a559ec11d32a325d46686f23dea23ba6cb6960", report_hex)
+        self.assertEqual(138, report_len)
+        self.assertNotEqual(report_hex, gov.manifest_digest(specs))
+
     def test_a_stored_nfd_hash_matches_the_nfc_digest_and_hides_the_text(self):
         os.environ[gov.VERIFY_FLAG] = "1"
         conn = AuditRedis()
@@ -219,11 +240,15 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual(gen, out["generation"])
         self.assertEqual(gen, out["head_generation"])
         self.assertEqual({"match", "match"}, {entry["status"] for entry in out["keys"]})
-        lines = ["%s\t%s\t%d\t%s" % (entry["key"], entry["sha256"], entry["len"], entry["status"])
+        lines = ["%s\t%s\t%d" % (entry["key"], entry["sha256"], entry["len"])
                  for entry in sorted(out["keys"], key=lambda item: item["key"])]
         report = "\n".join(lines).encode("utf-8")
         self.assertEqual(hashlib.sha256(report).hexdigest(), out["digest"])
         self.assertEqual(len(report), out["length"])
+        self.assertEqual(2, out["listed"])
+        self.assertEqual(gov.manifest_digest(expected), out["manifest_digest"])
+        self.assertNotEqual(out["digest"], out["manifest_digest"])
+        self.assertEqual(0, conn.scans)
         blob = json.dumps(out)
         self.assertNotIn("alpha", blob)
         self.assertNotIn("beta", blob)
@@ -256,11 +281,12 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual([prefix + "ok"], by_status["match"])
         self.assertEqual([prefix + "bad"], by_status["changed"])
         self.assertEqual([missing], by_status["missing"])
-        self.assertEqual([prefix + "extra"], by_status["extra"])
+        self.assertNotIn("extra", by_status)
         self.assertEqual(1, out["coverage"]["missing"])
-        self.assertEqual(1, out["coverage"]["extra"])
+        self.assertEqual(0, out["coverage"]["extra"])
         self.assertEqual(1, out["coverage"]["changed"])
         self.assertEqual(1, out["coverage"]["matched"])
+        self.assertEqual(0, conn.scans)
         self.assertFalse(out["ok"])
         self.assertFalse(out["coverage"]["covered"])
         self.assertFalse(out["partial"])
@@ -271,7 +297,7 @@ class GenerationAudit(unittest.TestCase):
         self.assertNotIn(HEAD_SECRET, blob)
         self.assertIn("changed=1", gov.summarise(out))
         self.assertIn("missing=1", gov.summarise(out))
-        self.assertIn("extra=1", gov.summarise(out))
+        self.assertIn("extra=0", gov.summarise(out))
 
     def test_head_movement_during_the_audit_is_not_a_pass(self):
         conn = AuditRedis()
@@ -300,30 +326,39 @@ class GenerationAudit(unittest.TestCase):
         self.assertNotIn(SECRET, blob)
         self.assertNotIn("SECRET-HEAD-MOVED", blob)
 
-    def test_a_partial_listing_is_partial(self):
+    def test_a_partial_read_is_never_ok(self):
         conn = AuditRedis()
         gen = generation("f")
         prefix = prefix_for(gen)
         keys = {prefix + "a": {"n": "1"}, prefix + "b": {"n": "2"}}
         self._plant(conn, gen, keys)
-        expected = {prefix + "a": spec(keys[prefix + "a"])}
-        with patch.object(gov, "MAX_AUDIT_LISTED", 1):
-            out = audit(conn, gen, expected, cid="cid-partial-1")
+        real = conn.hgetall
+
+        def hgetall(name):
+            if str(name).endswith("b"):
+                raise RuntimeError("page ended early " + SECRET)
+            return real(name)
+
+        conn.hgetall = hgetall
+        expected = {key: spec(mapping) for key, mapping in keys.items()}
+        out = audit(conn, gen, expected, cid="cid-partial-1")
         self.assertTrue(out["partial"], out)
         self.assertFalse(out["ok"])
         self.assertFalse(out["coverage"]["covered"])
         self.assertEqual("cid-partial-1", out["correlation"])
-        self.assertNotIn(SECRET, json.dumps(out))
+        self.assertNotIn(SECRET, json.dumps(out) + gov.summarise(out))
+        self.assertEqual(0, conn.scans)
 
     def test_a_timeout_is_surfaced_and_its_message_is_not(self):
-        class TimingOut(AuditRedis):
-            def scan_iter(self, match=None, count=None):
-                raise TimeoutError("timed out at 10.9.9.9 with " + TOKEN)
-
-        conn = TimingOut()
+        conn = AuditRedis()
         gen = generation("1")
         key = prefix_for(gen) + "meta"
         self._plant(conn, gen, {key: {"body": SECRET}})
+
+        def hget(key, field):
+            raise TimeoutError("timed out at 10.9.9.9 with " + TOKEN)
+
+        conn.hget = hget
         out = audit(conn, gen, {key: spec({"body": SECRET})}, cid="cid-time-1")
         self.assertFalse(out["ok"])
         self.assertTrue(out["timeout"])
@@ -384,14 +419,13 @@ class GenerationAudit(unittest.TestCase):
         self.assertIn("cid-echo-99", gov.summarise(out))
         self.assertEqual("changed", out["keys"][0]["status"])
 
-    def test_a_key_inserted_after_the_second_scan_is_not_a_pass(self):
+    def test_a_listed_key_changed_before_exec_is_not_a_pass(self):
         conn = AuditRedis()
         gen = generation("a")
         prefix = prefix_for(gen)
         key = prefix + "meta"
         mapping = {"body": "kept"}
         self._plant(conn, gen, {key: mapping})
-        extra = prefix + "raced"
         real_pipeline = conn.pipeline
 
         def pipeline(transaction=True):
@@ -399,21 +433,19 @@ class GenerationAudit(unittest.TestCase):
             real_execute = pipe.execute
 
             def execute(raise_on_error=True):
-                self.assertGreaterEqual(conn.scans, 2)
-                if extra not in conn.data:
-                    FakeRedis.hset(conn, extra, mapping={"body": TOKEN})
+                FakeRedis.hset(conn, key, "body", TOKEN)
                 return real_execute(raise_on_error=raise_on_error)
 
             pipe.execute = execute
             return pipe
 
         conn.pipeline = pipeline
-        out = audit(conn, gen, {key: spec(mapping)}, cid="cid-race-1")
-        self.assertIn(extra, conn.data)
+        out = audit(conn, gen, {key: spec(mapping)}, cid="cid-moved-key")
         self.assertTrue(out["moved"], out)
         self.assertFalse(out["ok"])
         self.assertFalse(out["coverage"]["covered"])
-        self.assertEqual("cid-race-1", out["correlation"])
+        self.assertEqual("cid-moved-key", out["correlation"])
+        self.assertEqual(0, conn.scans)
         blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
         self.assertNotIn(TOKEN, blob)
 
@@ -482,68 +514,60 @@ class GenerationAudit(unittest.TestCase):
         self.assertEqual("match", good["keys"][0]["status"])
         self.assertEqual(spec(text)["sha256"], good["keys"][0]["sha256"])
 
-    def test_confirmation_fetches_at_most_the_cap(self):
-        """300 generation keys, cap 128. The confirmation reply stops at the cap and is not a pass.
-
-        The race test still has to pass: a key inserted after the second scan is movement."""
-        cap = 128
-        self.assertEqual(cap, gov.MAX_AUDIT_LISTED)
+    def test_unlisted_keys_are_not_scanned_and_a_match_can_pass(self):
         conn = AuditRedis()
         gen = generation("f")
         prefix = prefix_for(gen)
-        for n in range(300):
+        one = prefix + "000"
+        put_hash(conn, one, {"n": "1"})
+        for n in range(1, 300):
             put_hash(conn, prefix + "%03d" % n, {"n": "1"})
         put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
-        pulled = {"n": 0}
+        called = {"keys": 0, "scan": 0, "eval": 0}
 
-        def watch(name):
-            real = getattr(conn, name)
-
+        def forbid(name):
             def wrapped(*args, **kwargs):
-                result = real(*args, **kwargs)
-                size = _page_size(result)
-                if size is not None:
-                    pulled["n"] = max(pulled["n"], size)
-                return result
-
+                called[name] += 1
+                raise AssertionError(name)
             return wrapped
 
         for name in ("keys", "scan", "eval"):
-            if hasattr(AuditRedis, name) or name in conn.__dict__:
-                setattr(conn, name, watch(name))
-        one = prefix + "000"
-        out = audit(conn, gen, {one: spec({"n": "1"})}, cid="cid-cap-300")
-        self.assertLessEqual(pulled["n"], cap)
-        self.assertEqual(cap, pulled["n"])
-        self.assertTrue(out["partial"] or not out["ok"])
-        self.assertTrue(out["partial"], out)
-        self.assertFalse(out["ok"])
-        self.assertFalse(out["coverage"]["covered"])
-        self.assertEqual("cid-cap-300", out["correlation"])
+            setattr(conn, name, forbid(name))
+        out = audit(conn, gen, {one: spec({"n": "1"})}, cid="cid-nolist-1")
+        self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
+        self.assertEqual(0, conn.scans)
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["partial"])
+        self.assertEqual(1, out["listed"])
+        self.assertEqual(0, out["coverage"]["extra"])
+        self.assertEqual("cid-nolist-1", out["correlation"])
+        self.assertNotIn(prefix + "001", json.dumps(out))
 
-        exact = AuditRedis()
-        gen2 = generation("0")
-        prefix2 = prefix_for(gen2)
-        hashes = {prefix2 + "%03d" % n: {"n": "1"} for n in range(cap)}
-        for key, mapping in hashes.items():
-            put_hash(exact, key, mapping)
-        put_hash(exact, "proj:pr-board:v1:head", {"generation": gen2})
-        exact_pulled = {"n": 0}
-        real_eval = exact.eval
+    def test_a_manifest_over_the_cap_is_refused_and_never_ok(self):
+        conn = AuditRedis()
+        gen = generation("0")
+        prefix = prefix_for(gen)
+        expected = {}
+        for n in range(gov.MAX_AUDIT_KEYS + 1):
+            name = prefix + "k%03d" % n
+            expected[name] = {"sha256": "ab" * 32, "len": 1}
+        called = {"keys": 0, "scan": 0, "eval": 0}
 
-        def eval_exact(*args, **kwargs):
-            result = real_eval(*args, **kwargs)
-            exact_pulled["n"] = max(exact_pulled["n"], _page_size(result) or 0)
-            return result
+        def forbid(name):
+            def wrapped(*args, **kwargs):
+                called[name] += 1
+                raise AssertionError(name)
+            return wrapped
 
-        exact.eval = eval_exact
-        covered = audit(exact, gen2, {key: spec(mapping) for key, mapping in hashes.items()},
-                        cid="cid-cap-exact")
-        self.assertLessEqual(exact_pulled["n"], cap)
-        self.assertTrue(covered["ok"], covered)
-        self.assertFalse(covered["partial"])
-
-        self.test_a_key_inserted_after_the_second_scan_is_not_a_pass()
+        for name in ("keys", "scan", "eval"):
+            setattr(conn, name, forbid(name))
+        out = audit(conn, gen, expected, cid="cid-over-cap")
+        self.assertFalse(out["ok"], out)
+        self.assertIn("too many", out["refused"])
+        self.assertEqual({"keys": 0, "scan": 0, "eval": 0}, called)
+        self.assertEqual(0, conn.scans)
+        self.assertEqual("cid-over-cap", out["correlation"])
+        self.assertNotIn("ab" * 32, out["refused"])
 
 
 class ScopeAndManifest(unittest.TestCase):
@@ -686,13 +710,14 @@ class ThroughTheWorker(unittest.TestCase):
         self.assertIn("changed=1", rows[0]["payload"])
         self.assertNotIn(SECRET, rows[0]["payload"])
 
-        class TimingOut(AuditRedis):
-            def scan_iter(self, match=None, count=None):
-                raise TimeoutError("nope " + TOKEN)
-
-        conn = TimingOut()
+        conn = AuditRedis()
         put_hash(conn, key, {"body": SECRET})
         put_hash(conn, "proj:pr-board:v1:head", {"generation": gen})
+
+        def hget(key, field):
+            raise TimeoutError("nope " + TOKEN)
+
+        conn.hget = hget
         rows = []
         out = br.handle([self._row(gen, {key: spec({"body": SECRET})}, "cid-fail-2",
                                     req="REQ-AUDIT04")], conn, now=self.now, append=rows.append)

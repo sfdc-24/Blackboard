@@ -92,10 +92,9 @@ class FakeRedis:
         return [key for key in list(self.data) if fnmatch.fnmatch(key, pattern)]
 
     def eval(self, script, numkeys, *args):
-        """The bounded confirmation: at most `cap` matching keys, then stop.
+        """Unused by haudit. The verifier does not call EVAL or walk the keyspace.
 
-        The same rule as redis_gov._BOUND_CONFIRM. The reply does not grow past the cap; one more
-        match sets the truncated flag and is not included."""
+        A call still stops at the supplied cap so an accidental listing cannot grow without bound."""
         import fnmatch
         cap = int(args[0])
         pattern = args[1].decode("utf-8") if isinstance(args[1], bytes) else str(args[1])
