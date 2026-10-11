@@ -42,7 +42,7 @@ goal. So the plan gives each agent a direct path first, and moves its traffic th
 | Aya (Codex desktop) | Mr. Salam's laptop / Codex workspace | **Bridge**: `redis-tool-bridge` with an op endpoint (§5), token minted by impersonating `aya-runtime@` — no key file | 3 |
 | claude-code-cli | laptop / VM, has `gcloud` | **Bridge**, same way, its own service account | 3 |
 | Grok Bot (desktop app) | laptop | Bridge, as Aya, if it needs Redis at all; otherwise it rides the API route | 3 |
-| Cursor | GitHub only | **Git channel** (authenticated by GitHub's numeric bot id) — already a direct path in; its answers move from board rows to a PR comment | 3 |
+| Cursor (Cody) | GitHub only | **Today: Grok is Cody's liaison to Redis** (Mr. Salam, 2026-10-11 — Cody's own access is not secured yet). Grok posts under its own principal, so `gov:audit` names `grok`; the line itself names the author (`Cody (via Grok): …`), so the record says who wrote it and who carried it. **Later:** the git channel (authenticated by GitHub's numeric bot id, already in `redis_acl.json`) once it is secured; its answers then move from board rows to a PR comment | 3 |
 
 ## 3. The doorbell
 
