@@ -130,6 +130,7 @@ on:
       - "scripts/redis_gov.py"
       - "scripts/redis_acl.json"
       - "tests/test_redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
       - "scripts/sf360.py"
       - "tests/test_org_publish.py"
       - "scripts/org_publish.py"
@@ -154,7 +155,17 @@ on:
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
       - "cloud/drive-intake/main.py"
+      - "cloud/drive-intake/drive_feed.py"
+      - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
+      - "cloud/claude-api-worker/**"
+      - "tests/test_claude_api_worker.py"
+      - "tests/test_claude_api_lane.py"
+      - "tests/test_phone_intake.py"
+      - "cloud/drive-intake/deploy.sh"
+      - "cloud/claude-api-worker/deploy.sh"
+      - "tests/test_telephone_deploy.py"
+      - "tests/test_telephone_smoke.py"
       - ".github/workflows/python-suites.yml"
   push:
     branches: [main]
@@ -210,6 +221,7 @@ on:
       - "scripts/redis_gov.py"
       - "scripts/redis_acl.json"
       - "tests/test_redis_gov.py"
+      - "tests/test_redis_gov_verify.py"
       - "scripts/roster_seed.py"
       - "tests/test_roster_seed.py"
       - "tests/test_image_layout.py"
@@ -290,7 +302,17 @@ on:
       - "tools/board_governor/governor.py"
       - "tests/test_board_governor.py"
       - "cloud/drive-intake/main.py"
+      - "cloud/drive-intake/drive_feed.py"
+      - "cloud/claude-api-worker/gdocs.py"
       - "tests/test_drive_intake.py"
+      - "cloud/claude-api-worker/**"
+      - "tests/test_claude_api_worker.py"
+      - "tests/test_claude_api_lane.py"
+      - "tests/test_phone_intake.py"
+      - "cloud/drive-intake/deploy.sh"
+      - "cloud/claude-api-worker/deploy.sh"
+      - "tests/test_telephone_deploy.py"
+      - "tests/test_telephone_smoke.py"
       - ".github/workflows/python-suites.yml"
 
 permissions:
@@ -377,7 +399,12 @@ jobs:
                    tests/test_org_publish.py \
                    tests/test_agent_waker.py \
                    tests/test_board_governor.py \
-                   tests/test_drive_intake.py; do
+                   tests/test_drive_intake.py \
+                   tests/test_claude_api_worker.py \
+                   tests/test_claude_api_lane.py \
+                   tests/test_phone_intake.py \
+                   tests/test_telephone_deploy.py \
+                   tests/test_telephone_smoke.py; do
             if [ -f "$t" ]; then echo "present : $t"; else echo "absent  : $t"; fi
           done
 
@@ -473,6 +500,33 @@ jobs:
           if [ -f tests/test_drive_intake.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -m unittest tests.test_drive_intake -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # claude-api worker (cloud/claude-api-worker/main.py): the always-on stand-in that does one
+      # bounded piece of work per pass when the laptop is off. The guards: no second model call
+      # for a task the doc already shows answered or taken, no call before ACCEPTED reads back,
+      # no call without a reservation under the day cap, an answer kept before its receipt, an
+      # edited request superseded, a timeout UNKNOWN and never re-run. Offline by construction.
+      - name: claude-api worker gate, cap, acceptance and receipts (no network)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_claude_api_worker.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -m unittest tests.test_claude_api_worker tests.test_claude_api_lane tests.test_phone_intake tests.test_telephone_deploy -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # The two telephone entry points as processes on loopback (tests/test_telephone_smoke.py):
+      # drive-intake's real server with the flag off and on, the worker job with its flags off and
+      # on, no cloud around them. Loopback only, so not under unshare -n, whose lo is down.
+      - name: telephone entry points on loopback (no network beyond this runner)
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_telephone_smoke.py ]; then
+            python3 -m unittest tests.test_telephone_smoke -v
           else
             echo "not on this branch; skipping"
           fi
@@ -1000,6 +1054,19 @@ jobs:
           if [ -f tests/test_redis_gov.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov -v
+          else
+            echo "not on this branch; skipping"
+          fi
+
+      # Generation digest audit. Flag off, synthetic hashes only: no Redis, no network.
+      # A stored string must not come back; missing, extra, changed, movement, partial
+      # and timeout must not look like a pass.
+      - name: "redis gov: generation digest audit returns no stored strings (no network)"
+        run: |
+          set -euo pipefail
+          if [ -f tests/test_redis_gov_verify.py ]; then
+            python_bin="$(command -v python3)"
+            sudo unshare -n -- "$python_bin" -B -m unittest tests.test_redis_gov_verify -v
           else
             echo "not on this branch; skipping"
           fi
