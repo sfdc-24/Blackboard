@@ -472,10 +472,11 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
         # gov:req:*, and only for a request it accepted, so a marker is proof of an earlier acceptance.
         # Judging it again let a request claimed at 29:00 be answered "REFUSED ... older than 30 minutes"
         # after its op had run (Cursor on 6dc6f86) - under the same Row_ID as the answer it may have had.
-        is_op = req["action"] == "redis-op" and bool(_REQ_ID.match(req["req_id"] or ""))
-        # EVERY redis-op request is checked against its marker, RESULT row on the board or not. A git
-        # request is not stopped by a RESULT row (anyone can append one), so skipping the marker when the
-        # snapshot showed a RESULT let a git haudit be answered twice (Cursor on 2d9a669).
+        # EVERY request with a usable id is judged by its marker first - every action, not only redis-op
+        # (Cursor on ec758c7: the probe and a refused unknown action published twice under one Row_ID).
+        # RESULT row on the board or not: a git request is not stopped by a RESULT row (anyone can append
+        # one), so skipping the marker there let a git haudit be answered twice (Cursor on 2d9a669).
+        is_op = bool(_REQ_ID.match(req["req_id"] or ""))
         if is_op:
             state, age = marker_state(conn, run_marker(req), clock)
             if state != "none":
@@ -503,8 +504,8 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
                 budget -= 1
                 already.add(req["req_id"])
                 # A refusal is an answer under the same RESULT Row_ID, so it takes the same marker: a stale
-                # snapshot must not publish it twice. Not for a request with no marker space (non redis-op
-                # rows keep their own receipt path), and never before the sender was recognised above.
+                # snapshot must not publish it twice, whatever the action. Never before the sender was
+                # recognised above, so a forged flood cannot make us write markers.
                 if is_op and not _mark_answering(conn, req, nx=True):
                     out["refused"][-1]["why"] = why + ["the run marker could not be set; no refusal row"]
                     continue
@@ -605,6 +606,22 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
                                     "latency_ms": int((time.time() - started) * 1000)})
             continue
 
+        # THE PROBE CLAIMS ITS RUN like a redis-op does, before its receipt: a second pass over a snapshot
+        # that does not yet show the RESULT found no marker, ran the probe again and appended both rows
+        # again (Cursor on ec758c7). Its RESULT takes ANSWERING before the append, like every answer.
+        marker = run_marker(req)
+        try:
+            claimed = conn.set(marker, "%s|%d" % (safe(req["row_id"])[:100] or "-", int(clock())),
+                               nx=True, ex=DONE_TTL_SECONDS)
+        except Exception as error:                                       # noqa: BLE001
+            out["errors"].append(req["req_id"])
+            out["refused"].append({"req_id": req["req_id"],
+                                   "why": ["could not claim the run marker (%s); not run" % type(error).__name__]})
+            continue
+        if not claimed:
+            state, age = marker_state(conn, marker, clock)
+            budget = _claimed(req, state, age, conn, append, already, out, budget, acl, clock)
+            continue
         if append:
             # REUSE AN EXISTING RECEIPT RATHER THAN REPLAY IT. A receipt that landed while the
             # result did not leaves the request pending and its receipt Row_ID taken; appending it
@@ -637,8 +654,12 @@ def handle(rows, conn, now=None, append=None, max_per_run=MAX_PER_RUN, clock=tim
             text += " failed_with=" + receipt["failed_with"]
             out["errors"].append(req["req_id"])
         if append:
-            append(row_for(RESULT_ACTION, req, text,
-                           "%s for %s" % (receipt["status"], req["req_id"][:50])))
+            if _mark_answering(conn, req):
+                append(row_for(RESULT_ACTION, req, text,
+                               "%s for %s" % (receipt["status"], req["req_id"][:50])))
+                _mark_answered(conn, req)
+            else:
+                out["errors"].append(req["req_id"])
         already.add(req["req_id"])
         out["answered"].append({"req_id": req["req_id"], "status": receipt["status"],
                                 "latency_ms": receipt["latency_ms"]})
