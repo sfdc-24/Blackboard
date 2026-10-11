@@ -6,8 +6,11 @@ import io
 import json
 import pathlib
 import sys
+import threading
 import unittest
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 
@@ -257,6 +260,85 @@ class MatchIsNotIdentityTests(unittest.TestCase):
         served = {"rows": [row("WRK-narrow", spec["payload"])], "total": 2953, "filtered": 1}
         _, _, _, _, read = AppendClientTests().run_client(spec, [served])
         self.assertEqual(read.call_args.kwargs.get("match"), "WRK-narrow")
+
+
+class ExecRedirectTests(unittest.TestCase):
+    """The /exec 302 is followed as a bare GET. The automatic handler 404s."""
+
+    def serve(self, location):
+        hits = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                hits.append((self.command, self.path, self.headers.get("Content-Type")))
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.end_headers()
+
+            def do_GET(self):
+                content_type = self.headers.get("Content-Type")
+                hits.append((self.command, self.path, content_type))
+                if content_type:
+                    body = b"content-type-404"
+                    code = 404
+                elif self.path.startswith("/echo"):
+                    body = b""
+                    code = 302
+                    self.send_response(code)
+                    self.send_header("Location", "/final")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                elif self.path.startswith("/final"):
+                    body = b'{"ok":true,"rows":[["R1"]]}'
+                    code = 200
+                else:
+                    body = b"missing"
+                    code = 404
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, hits
+
+    def test_exec_redirect_is_a_bare_get_on_every_hop(self):
+        server, hits = self.serve("/echo?k=1")
+        url = "http://127.0.0.1:%d/exec" % server.server_address[1]
+        try:
+            with mock.patch.object(
+                urllib.request, "urlopen", side_effect=AssertionError("automatic redirect")
+            ):
+                body = bus._fetch_once(url, {"action": "read", "match": "R1"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual('{"ok":true,"rows":[["R1"]]}', body)
+        self.assertEqual("POST", hits[0][0])
+        self.assertEqual("/exec", hits[0][1])
+        self.assertEqual("application/json", hits[0][2])
+        self.assertEqual(("GET", "/echo?k=1", None), hits[1])
+        self.assertEqual(("GET", "/final", None), hits[2])
+
+    def test_a_redirect_off_the_script_host_is_not_followed(self):
+        server, hits = self.serve("https://evil.example/steal")
+        url = "http://127.0.0.1:%d/exec" % server.server_address[1]
+        try:
+            with self.assertRaises(urllib.error.HTTPError):
+                bus._fetch_once(url, {"action": "read"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual([("POST", "/exec", "application/json")], hits)
 
 
 class ReaderAndDiagnosticTests(unittest.TestCase):

@@ -165,6 +165,12 @@ function handleAppend_(body, cfg) {
                           existing_row: dup.row }, 409);
       }
       sheet.appendRow(row);
+      // Queue only. UrlFetch here would add a Cloud Run cold start to the append.
+      try {
+        queueBoardHook_(row, sheet.getLastRow());
+      } catch (hookErr) {
+        console.error('board hook queue failed: ' + hookErr);
+      }
       if (Array.isArray(body.sheetRow)) {
         const trigger = maybeTriggerWorker_(body.sheetRow);
         if (trigger !== 'off' && trigger !== 'not-a-request') {
@@ -453,4 +459,173 @@ function jsonOut_(obj, code) {
   obj._httpStatus = code || 200;
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---- BOARD HOOK — copy a new row toward Redis, without slowing the append ----
+//
+// Gemini's path: an installable onChange/onEdit on the board sheet POSTs one
+// small signed event to inbox-wake (POST /hooks/board). The secret is the
+// Script Property BOARD_HOOK_SECRET. The URL is BOARD_HOOK_URL. Neither value
+// is in this file.
+//
+// INSTALL ONCE, as the owner, from the script editor. This file does not
+// install them on each request:
+//   ScriptApp.newTrigger('onBoardEdit').forSpreadsheet(ss).onEdit().create();
+//   ScriptApp.newTrigger('onBoardChange').forSpreadsheet(ss).onChange().create();
+//
+// A change the web app itself makes with appendRow does not fire those
+// triggers. queueBoardHook_ records the event and, if one is not already
+// waiting, creates a single one-shot time trigger a minute out. That trigger
+// POSTs once and deletes itself. It does not reschedule on failure. The Cloud
+// Run reconcile pass is what copies a row this drop missed.
+//
+// Unset BOARD_HOOK_URL or BOARD_HOOK_SECRET: queueBoardHook_ returns without
+// a fetch and without a trigger. Appends stay as they were.
+
+function onBoardEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var sheet = e.range.getSheet();
+    var sheetRow = e.range.getRow();
+    if (sheetRow < 2) return;
+    var row = sheet.getRange(sheetRow, 1, 1, 10).getValues()[0];
+    postBoardHook_(boardEvent_(row, sheetRow));
+  } catch (err) {
+    console.error('board hook edit failed: ' + err);
+  }
+}
+
+function onBoardChange(e) {
+  try {
+    var ss = e && e.source;
+    if (!ss) return;
+    var sheet = ss.getSheets()[0];
+    var sheetRow = sheet.getLastRow();
+    if (sheetRow < 2) return;
+    var row = sheet.getRange(sheetRow, 1, 1, 10).getValues()[0];
+    postBoardHook_(boardEvent_(row, sheetRow));
+  } catch (err) {
+    console.error('board hook change failed: ' + err);
+  }
+}
+
+function boardEvent_(row, sheetRow) {
+  var cells = row || [];
+  var payload = String(cells[5] == null ? '' : cells[5]);
+  return {
+    row_id: String(cells[0] == null ? '' : cells[0]).trim(),
+    sheet_row: sheetRow || 0,
+    appended_at: String(cells[1] == null ? '' : cells[1]),
+    from: String(cells[2] == null ? '' : cells[2]),
+    to: String(cells[3] == null ? '' : cells[3]),
+    phase: String(cells[4] == null ? '' : cells[4]),
+    id: bcbId_(payload),
+    sha256: sha256Hex_(payload)
+  };
+}
+
+function queueBoardHook_(row, sheetRow) {
+  var props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('BOARD_HOOK_URL') || !props.getProperty('BOARD_HOOK_SECRET')) return;
+  var event = boardEvent_(row, sheetRow);
+  if (!event.row_id) return;
+  var cache = CacheService.getScriptCache();
+  var events = [];
+  try {
+    events = JSON.parse(cache.get('board-hook-queue') || '[]');
+  } catch (err) {
+    events = [];
+  }
+  if (!Array.isArray(events)) events = [];
+  if (events.length >= 20) {
+    console.error('board hook queue full; row_id=' + event.row_id + ' left for reconcile');
+    return;
+  }
+  events.push(event);
+  cache.put('board-hook-queue', JSON.stringify(events), 600);
+  if (cache.get('board-hook-armed')) return;
+  // One shot, a minute out, and only when one is not already armed. Not a
+  // repeating schedule, and not a fetch on the append path. Listing the
+  // project's triggers here would hold the append lock on a slow call.
+  try {
+    ScriptApp.newTrigger('deliverBoardHook_').timeBased().after(60 * 1000).create();
+    cache.put('board-hook-armed', '1', 600);
+  } catch (err) {
+    console.error('board hook trigger failed: ' + err);
+  }
+}
+
+function deliverBoardHook_() {
+  var events = [];
+  try {
+    var cache = CacheService.getScriptCache();
+    try {
+      events = JSON.parse(cache.get('board-hook-queue') || '[]');
+    } catch (err) {
+      events = [];
+    }
+    cache.remove('board-hook-queue');
+    cache.remove('board-hook-armed');
+    removeBoardHookTriggers_();
+    if (!Array.isArray(events)) return;
+    events.forEach(function (event) {
+      postBoardHook_(event);
+    });
+  } catch (err) {
+    console.error('board hook deliver failed: ' + err);
+  }
+}
+
+function removeBoardHookTriggers_() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'deliverBoardHook_') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+function postBoardHook_(event) {
+  if (!event || !event.row_id) return;
+  var props = PropertiesService.getScriptProperties();
+  var url = props.getProperty('BOARD_HOOK_URL');
+  var secret = props.getProperty('BOARD_HOOK_SECRET');
+  if (!url || !secret) return;
+  var body = JSON.stringify(event);
+  var sig = 'sha256=' + hmacHex_(secret, body);
+  try {
+    var resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      muteHttpExceptions: true,
+      followRedirects: false,
+      headers: { 'X-Board-Signature-256': sig }
+    });
+    var code = resp.getResponseCode();
+    if (code < 200 || code >= 300) {
+      console.error('board hook failed row_id=' + event.row_id + ' http=' + code);
+    }
+  } catch (err) {
+    console.error('board hook failed row_id=' + event.row_id + ' error=' + err);
+  }
+}
+
+function hmacHex_(secret, body) {
+  var bytes = Utilities.computeHmacSha256Signature(body, secret);
+  return bytes.map(function (b) {
+    var v = b < 0 ? b + 256 : b;
+    var s = v.toString(16);
+    return s.length === 1 ? '0' + s : s;
+  }).join('');
+}
+
+function sha256Hex_(text) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, String(text), Utilities.Charset.UTF_8);
+  return bytes.map(function (b) {
+    var v = b < 0 ? b + 256 : b;
+    var s = v.toString(16);
+    return s.length === 1 ? '0' + s : s;
+  }).join('');
 }

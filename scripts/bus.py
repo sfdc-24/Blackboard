@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Python client for the Blackboard bus. See README-board-clients.md.
 
-Apps Script quirk: the /exec URL 302s to a googleusercontent host and the
-redirect must be followed with a BARE GET (no method/body carried over).
-So: suppress redirects, catch the HTTPError, urlopen(Location).
+Apps Script quirk: POST /exec answers 302, and the JSON is on the next host
+(script.googleusercontent.com). urllib's automatic redirect handler follows
+that hop with enough of the original POST left on the request that the echo
+URL answers HTTP 404. Every hop here is a new bare GET: no body, no
+Content-Type, Location resolved against the current URL, and only onto the
+originating host or a script.google / googleusercontent host. The default
+urlopen redirect handler is not used.
 """
 import json
 import os
@@ -64,22 +68,89 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(NoRedirect)
 
+# One POST plus the echo hop, and one more if Google inserts a hop between them.
+MAX_EXEC_HOPS = 4
+EXEC_TIMEOUT = 120
+
+
+def _hostname(url):
+    return (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+
+
+def _script_host(host):
+    """script.google.com and the googleusercontent echo host, nothing broader."""
+    host = (host or "").lower().rstrip(".")
+    if host in ("script.google.com", "script.googleusercontent.com"):
+        return True
+    # Per-deployment echo hosts look like <id>-script.googleusercontent.com.
+    # The leading dot keeps evilgoogleusercontent.com from matching.
+    return host.endswith(".googleusercontent.com")
+
+
+def _may_follow(origin, target):
+    """A redirect may stay on the origin, or move to Google's script echo host.
+
+    Localhost HTTP is allowed only when the origin itself is localhost, so a
+    test can stand in for /exec. Everything else has to be HTTPS. An open
+    redirect would carry the next hop wherever the Location header pointed.
+    """
+    if not target or not target.startswith(("http://", "https://")):
+        return False
+    origin_host = _hostname(origin)
+    target_host = _hostname(target)
+    if origin_host in ("127.0.0.1", "localhost") and target_host == origin_host:
+        return target.startswith("http://")
+    if not target.startswith("https://"):
+        return False
+    if target_host == origin_host:
+        return True
+    return _script_host(target_host)
+
+
+def _location(error, current):
+    headers = getattr(error, "headers", None)
+    loc = ""
+    if headers is not None and hasattr(headers, "get"):
+        loc = headers.get("Location") or headers.get("location") or ""
+    loc = str(loc or "").strip()
+    if not loc:
+        return ""
+    return urllib.parse.urljoin(current, loc)
+
 
 def _fetch_once(url, data=None):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode() if data is not None else None,
-        headers={"Content-Type": "application/json"} if data is not None else {},
-    )
-    try:
-        with OPENER.open(req, timeout=120) as resp:
-            return resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        loc = e.headers.get("Location")
-        if e.code in (301, 302, 303, 307, 308) and loc:
-            with urllib.request.urlopen(loc, timeout=120) as resp2:
-                return resp2.read().decode("utf-8", "replace")
-        raise
+    """One transport attempt. A 302 is followed as a bare GET, hop by hop.
+
+    The body and Content-Type go on the first request only. Each later request
+    is a new GET with neither. That is the difference between the echo URL
+    returning the JSON and returning HTTP 404.
+    """
+    body = json.dumps(data).encode() if data is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    current = url
+    request = urllib.request.Request(current, data=body, headers=headers)
+    last = None
+    for _hop in range(MAX_EXEC_HOPS):
+        try:
+            with OPENER.open(request, timeout=EXEC_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            last = error
+            if error.code not in (301, 302, 303, 307, 308):
+                raise
+            nxt = _location(error, current)
+            try:
+                error.close()
+            except Exception:  # noqa: BLE001 - closing a spent redirect body
+                pass
+            if not nxt or not _may_follow(url, nxt):
+                raise
+            current = nxt
+            # method GET, no data, no Content-Type. A copied header is the 404.
+            request = urllib.request.Request(current, method="GET")
+    if last is not None:
+        raise last
+    raise urllib.error.HTTPError(url, 310, "too many redirects", None, None)
 
 
 def fetch(url, data=None, tries=None):
