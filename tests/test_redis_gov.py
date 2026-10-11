@@ -87,6 +87,10 @@ class FakeRedis:
         self._need(key, "hash")
         return dict(self.data.get(key) or {})
 
+    def keys(self, pattern="*"):
+        import fnmatch
+        return [key for key in list(self.data) if fnmatch.fnmatch(key, pattern)]
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
         return True

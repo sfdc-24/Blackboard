@@ -374,17 +374,29 @@ def _text(value) -> str:
     return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
 
 
+def _strict_text(value) -> str:
+    """UTF-8 text, or UnicodeDecodeError. Invalid bytes are never replaced.
+
+    Replacement would make two different byte strings one payload, so a manifest of U+FFFD would
+    match data that was never valid UTF-8. Callers that digest a hash use this. `_text` stays for
+    paths that only need a type name or an audit quote."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
 def _nfc(value) -> str:
-    return unicodedata.normalize("NFC", _text(value))
+    return unicodedata.normalize("NFC", _strict_text(value))
 
 
 def canonical_utf8(mapping) -> bytes:
     """The hash as canonical UTF-8 bytes.
 
-    Field names and values are decoded as UTF-8 and NFC-normalised before they are sorted, so a
-    composed character and its decomposed form are one payload, and insertion order is not part of
-    the payload. The JSON is compact and not ASCII-escaped. Two fields whose names collapse to the
-    same NFC string are a collision: this raises Refused rather than dropping one of them."""
+    Field names and values are decoded as strict UTF-8 and NFC-normalised before they are sorted,
+    so a composed character and its decomposed form are one payload, and insertion order is not
+    part of the payload. Invalid UTF-8 raises UnicodeDecodeError and is not a payload. The JSON is
+    compact and not ASCII-escaped. Two fields whose names collapse to the same NFC string are a
+    collision: this raises Refused rather than dropping one of them."""
     clean = {}
     for key, value in (mapping or {}).items():
         name = _nfc(key)
@@ -484,6 +496,35 @@ def _parse_manifest(raw: str, enc: str) -> dict:
     return expected
 
 
+def _bound_head(prefix: str, generation: str) -> str:
+    """The head key that belongs to `<namespace>g:<16 hex>:`.
+
+    That key is `<namespace>head`. `proj:pr-board:v1:g:<gen16>:` binds to
+    `proj:pr-board:v1:head`. The caller does not choose it: a head in another namespace can store
+    the same generation id and must not stand in for this one."""
+    marker = "g:" + (generation or "")[:16] + ":"
+    if len(generation or "") != 64 or not str(prefix or "").endswith(marker):
+        raise Refused("the prefix is not this generation")
+    namespace = prefix[:-len(marker)]
+    head = namespace + "head"
+    if not namespace.endswith(":") or not _KEY.match(head):
+        raise Refused("the prefix is not this generation")
+    return head
+
+
+def _exec_error(results) -> str:
+    """The type name of the first failed command, or "" when every result is a value.
+
+    Pipeline.execute(raise_on_error=False) returns an exception in the list and does not raise.
+    A confirmation that does not read that list can report a pass for a command that failed."""
+    if not isinstance(results, (list, tuple)) or not results:
+        return "ExecError"
+    for item in results:
+        if isinstance(item, BaseException):
+            return type(item).__name__
+    return ""
+
+
 def _hash_generation(conn, key):
     """The head hash's generation field, and the raw field for the movement compare.
 
@@ -505,7 +546,7 @@ def _keys_under(conn, prefix, limit):
     found, seen = [], set()
     try:
         for key in scan(match=prefix + "*", count=100):
-            text = _text(key)
+            text = _strict_text(key)
             if text in seen or not text.startswith(prefix):
                 continue
             if len(found) >= limit:
@@ -578,10 +619,12 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
                       generation, correlation, head, now) -> dict:
     """Compare one generation to the caller's digest manifest.
 
-    Reads are watched. A head generation or a key set that changes before the watch is confirmed
-    is reported as moved and is not a pass. A listing that stops early, or a read that does not
+    Reads are watched. The head key is derived from the generation namespace and a different head
+    is refused. The key set is listed again inside the confirming transaction, so a key inserted
+    after the second scan still fails the audit. Every command result from that transaction is
+    checked; a queued error is not a pass. A listing that stops early, or a read that does not
     finish, is partial and is not a pass. TimeoutError is returned as timeout, with the correlation
-    id, and its message is not."""
+    id, and its message is not. Invalid UTF-8 is not decoded with replacement and is not a match."""
     if field:
         raise Refused("haudit takes no field=")
     if not generation:
@@ -590,11 +633,10 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
         raise Refused("haudit needs a correlation id")
     if not head:
         raise Refused("haudit needs a head key")
-    if not prefix.endswith(":") or (":" + generation[:16] + ":") not in prefix:
-        raise Refused("the prefix is not this generation")
-    if head.startswith(prefix):
-        raise Refused("the head key must sit outside the generation prefix")
+    bound_head = _bound_head(prefix, generation)
     _guard_verify_key(acl, who, prefix)
+    if head != bound_head:
+        raise Refused("the head key is not this generation's head")
     _guard_verify_key(acl, who, head)
     expected = _parse_manifest(raw_value, enc)
     for name in expected:
@@ -645,9 +687,11 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
                         records[name] = ("changed", "", 0)
                         continue
                     raw_hash = pipe.hgetall(name) or {}
-                    mapping = {_text(k): _text(v) for k, v in raw_hash.items()}
                     try:
-                        digest, length = payload_digest(mapping)
+                        digest, length = payload_digest(raw_hash)
+                    except UnicodeDecodeError:
+                        records[name] = ("changed", "", 0)
+                        continue
                     except Refused:
                         records[name] = ("changed", "", 0)
                         partial = True
@@ -680,9 +724,34 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
         head_match = bool(head_raw_before) and head_raw_before == generation and not moved
         if not timed_out and not hard_error:
             try:
+                # The second scan has already returned. A key created after it is not watched, so
+                # WATCH on the old set would still confirm. Listing inside this transaction is the
+                # key set at confirmation; any difference is movement and is not a pass.
                 pipe.multi()
                 pipe.type(head)
-                pipe.execute(raise_on_error=False)
+                pipe.keys(prefix + "*")
+                confirmed = pipe.execute(raise_on_error=False)
+                failed = _exec_error(confirmed)
+                if failed or len(confirmed) != 2:
+                    hard_error = failed or "ExecError"
+                    partial = True
+                    head_match = False
+                else:
+                    listed_raw = confirmed[1]
+                    if isinstance(listed_raw, (str, bytes)) or not isinstance(
+                            listed_raw, (list, tuple, set)):
+                        hard_error = "ExecError"
+                        partial = True
+                        head_match = False
+                    else:
+                        listed = []
+                        for key in listed_raw:
+                            text = _strict_text(key)
+                            if text.startswith(prefix):
+                                listed.append(text)
+                        if set(listed) != set(found):
+                            moved = True
+                            head_match = False
             except Exception as error:
                 if type(error).__name__ == "WatchError":
                     moved = True
@@ -690,9 +759,11 @@ def _audit_generation(conn, acl, who, raw_tag, via, prefix, field, raw_value, en
                 elif _is_timeout(error):
                     timed_out = True
                     partial = True
+                    head_match = False
                 else:
                     hard_error = type(error).__name__
                     partial = True
+                    head_match = False
     finally:
         pipe.reset()
 

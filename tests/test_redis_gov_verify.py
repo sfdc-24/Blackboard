@@ -374,6 +374,104 @@ class GenerationAudit(unittest.TestCase):
         self.assertIn("cid-echo-99", gov.summarise(out))
         self.assertEqual("changed", out["keys"][0]["status"])
 
+    def test_a_key_inserted_after_the_second_scan_is_not_a_pass(self):
+        conn = AuditRedis()
+        gen = generation("a")
+        prefix = prefix_for(gen)
+        key = prefix + "meta"
+        mapping = {"body": "kept"}
+        self._plant(conn, gen, {key: mapping})
+        extra = prefix + "raced"
+        real_pipeline = conn.pipeline
+
+        def pipeline(transaction=True):
+            pipe = real_pipeline(transaction=transaction)
+            real_execute = pipe.execute
+
+            def execute(raise_on_error=True):
+                self.assertGreaterEqual(conn.scans, 2)
+                if extra not in conn.data:
+                    FakeRedis.hset(conn, extra, mapping={"body": TOKEN})
+                return real_execute(raise_on_error=raise_on_error)
+
+            pipe.execute = execute
+            return pipe
+
+        conn.pipeline = pipeline
+        out = audit(conn, gen, {key: spec(mapping)}, cid="cid-race-1")
+        self.assertIn(extra, conn.data)
+        self.assertTrue(out["moved"], out)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["coverage"]["covered"])
+        self.assertEqual("cid-race-1", out["correlation"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(TOKEN, blob)
+
+    def test_a_queued_type_error_is_not_a_pass(self):
+        conn = AuditRedis()
+        gen = generation("b")
+        key = prefix_for(gen) + "meta"
+        mapping = {"body": SECRET}
+        self._plant(conn, gen, {key: mapping})
+        conn.fail_next["type"] = RuntimeError("WRONGTYPE " + SECRET)
+        out = audit(conn, gen, {key: spec(mapping)}, cid="cid-type-1")
+        self.assertFalse(out["ok"], out)
+        self.assertFalse(out["coverage"]["covered"])
+        self.assertEqual("RuntimeError", out.get("error"))
+        self.assertEqual("cid-type-1", out["correlation"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(SECRET, blob)
+        self.assertNotIn("WRONGTYPE", blob)
+
+    def test_a_head_from_another_namespace_is_refused(self):
+        conn = AuditRedis()
+        gen = generation("c")
+        prefix = prefix_for(gen)
+        key = prefix + "meta"
+        mapping = {"body": SECRET}
+        self._plant(conn, gen, {key: mapping}, head_generation=generation("9"))
+        put_hash(conn, "proj:fake", {"generation": gen, "witness": HEAD_SECRET})
+        out = audit(conn, gen, {key: spec(mapping)}, head="proj:fake", cid="cid-fake-head")
+        self.assertFalse(out["ok"], out)
+        self.assertIn("head", out["refused"])
+        self.assertEqual(0, conn.scans)
+        self.assertEqual("cid-fake-head", out["correlation"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn(SECRET, blob)
+        self.assertNotIn(HEAD_SECRET, blob)
+        self.assertEqual(gov._bound_head(prefix, gen), "proj:pr-board:v1:head")
+
+    def test_invalid_utf8_is_not_a_digest_match(self):
+        conn = AuditRedis()
+        gen = generation("d")
+        prefix = prefix_for(gen)
+        key = prefix + "meta"
+        self._plant(conn, gen, {})
+        conn.data[key] = {b"note": b"\xff"}
+        replaced = {"note": b"\xff".decode("utf-8", "replace")}
+        self.assertEqual("\ufffd", replaced["note"])
+        with self.assertRaises(UnicodeDecodeError):
+            gov.payload_digest({b"note": b"\xff"})
+        out = audit(conn, gen, {key: spec(replaced)}, cid="cid-utf8-1")
+        self.assertFalse(out["ok"], out)
+        self.assertFalse(out["coverage"]["covered"])
+        self.assertNotEqual(["match"], [entry["status"] for entry in out["keys"]])
+        self.assertNotEqual(spec(replaced)["sha256"], out["keys"][0]["sha256"])
+        blob = json.dumps(out) + gov.summarise(out) + json.dumps(conn.audit())
+        self.assertNotIn("\ufffd", blob)
+        self.assertEqual("cid-utf8-1", out["correlation"])
+
+        valid = AuditRedis()
+        gen2 = generation("e")
+        key2 = prefix_for(gen2) + "meta"
+        text = {"note": "caf\u00e9"}
+        valid.data[key2] = {b"note": "caf\u00e9".encode("utf-8")}
+        put_hash(valid, "proj:pr-board:v1:head", {"generation": gen2})
+        good = audit(valid, gen2, {key2: spec(text)}, cid="cid-utf8-ok")
+        self.assertTrue(good["ok"], good)
+        self.assertEqual("match", good["keys"][0]["status"])
+        self.assertEqual(spec(text)["sha256"], good["keys"][0]["sha256"])
+
 
 class ScopeAndManifest(unittest.TestCase):
     def setUp(self):
@@ -389,9 +487,9 @@ class ScopeAndManifest(unittest.TestCase):
         own_prefix = "fleet:inbox:cursor:g:%s:" % gen[:16]
         own = own_prefix + "meta"
         put_hash(conn, own, {"body": "mine"})
-        put_hash(conn, "fleet:inbox:cursor", {"generation": gen})
+        put_hash(conn, "fleet:inbox:cursor:head", {"generation": gen})
         out = audit(conn, gen, {own: spec({"body": "mine"})}, who="cursor",
-                    prefix=own_prefix, head="fleet:inbox:cursor")
+                    prefix=own_prefix, head="fleet:inbox:cursor:head")
         self.assertTrue(out["ok"], out)
         self.assertEqual(["match"], [entry["status"] for entry in out["keys"]])
 
