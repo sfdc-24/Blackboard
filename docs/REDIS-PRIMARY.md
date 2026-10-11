@@ -102,7 +102,7 @@ Payload     = BCB|v=1|id=<rid>|from=<tag>|to=<agent>|key=fleet:inbox:<agent>|ent
 | D2 | Grant `roles/iam.serviceAccountTokenCreator` on `aya-runtime@` (and a `claude-code-cli@` account) to the laptop identity — owner-only | **Yes** | No key files: the laptop mints short-lived tokens by impersonation |
 | D3 | Run Grok's API route as a `grok-waker` Cloud Run job (same image as Gemini's) instead of on the laptop | **Yes** | In-process Redis with no new credential type; and it stops depending on the laptop being awake |
 | D4 | Give the waker jobs VPC egress and the Redis credential (env bindings, as the chair has) | **Yes, as a phase choice** | It co-locates a database credential with a model key — the same trade already accepted for the chair (2026-10-06 ruling), recorded, with the bridge as the hardening |
-| D5 | Archive Redis streams to GCS hourly | **Yes — required** | Snapshots are hourly (verified) and restorable only by Google's automated recovery; no AOF on this product. Without our archive, a whole-instance loss can take up to an hour of conversation with no copy we can restore |
+| D5 | Archive Redis streams to GCS hourly — **APPROVED by Mr. Salam, 2026-10-11 ~23:30Z** | **Yes — required** | Snapshots are hourly (verified) and restorable only by Google's automated recovery; no AOF on this product. Without our archive, a whole-instance loss can take up to an hour of conversation with no copy we can restore |
 | D6 | If minutes of loss are unacceptable: move to Memorystore for Redis **Cluster** (AOF every second) | **Not now** | A product migration, not a setting; revisit only if the archive plus a Standard-tier replica proves insufficient in practice |
 
 ## 7. Phases, each with the test that ends it
@@ -236,4 +236,5 @@ checked against the code before it was taken, with the corrections noted.
 3. Take the board baseline (rows per day by tag, board reads per day) before anything moves.
 4. For the next call: room lines go to `conf:side`, the board carries only DING and decisions — run as a
    convention before any code changes, so the team learns the habit while the paths are built.
-5. Mr. Salam answers D1–D6; Phase 1 starts on D5 alone, Phase 2 on D3 and D4.
+5. ~~D5~~ approved 2026-10-11, so Phase 1 starts; D1–D4 and D6 remain his. Phase 0's PR 390 may be merged
+   on Cursor's GO (his authorisation, the same evening).
