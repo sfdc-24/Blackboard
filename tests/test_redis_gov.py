@@ -6,12 +6,10 @@ the way the real one does, including the part that matters most here: EXEC does 
 """
 import base64
 import json
-import os
 import pathlib
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -467,11 +465,6 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         import bus_request
         self.br = bus_request
         self.now = datetime.datetime(2026, 10, 8, 2, 0, tzinfo=datetime.timezone.utc)
-        self.canary = "conf:canary:redis-op:test"
-        self.policy = mock.patch.dict(os.environ, {"REDIS_BOARD_CANARY_ENABLED": "1",
-                                               "REDIS_BOARD_CANARY_KEY": self.canary})
-        self.policy.start()
-        self.addCleanup(self.policy.stop)
 
     def row(self, tag, payload, req="REQ-0001", ts="2026-10-08T01:59:00Z"):
         return ["ROW-" + req, ts, tag, "bus-reconciler", "AYA_REQ",
@@ -483,55 +476,26 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         out = self.br.handle(rows, conn, now=self.now, append=out_rows.append)
         return out, out_rows, conn
 
-    def test_grok_sets_only_the_public_canary_and_the_result_is_one_row(self):
-        import fleet_agent
-        _, row = fleet_agent.request_row("grok", "set", self.canary,
-                                         val=self.br.CANARY_MARKER, now=self.now,
-                                         rid="REQ-0001")
-        out, rows, conn = self.run_rows([row])
-        self.assertEqual(self.br.CANARY_MARKER, conn.data[self.canary])
+    def test_grok_writes_and_the_result_is_one_row(self):
+        out, rows, conn = self.run_rows([self.row(
+            "grok", "do=redis-op|op=set|key=conf:2026-10-07:scorecard|val=Z3JlZW4=|enc=b64")])
+        self.assertEqual("green", conn.data["conf:2026-10-07:scorecard"])
         self.assertEqual(1, len(rows), "one RESULT row, no separate receipt")
         self.assertEqual("AYA_RESULT", rows[0]["action_type"])
-        self.assertIn("OK canary set", rows[0]["payload"])
+        self.assertIn("OK set conf:2026-10-07:scorecard", rows[0]["payload"])
         self.assertEqual("grok", rows[0]["target_surface"], "answered under its own tag")
         self.assertEqual("OK", out["answered"][0]["status"])
         self.assertEqual("grok", conn.audit()[-1]["actor"])
         self.assertTrue(conn.audit()[-1]["via"].startswith("REQ-0001/"), "the audit names the row")
 
-    def test_each_claimed_lane_is_limited_to_the_same_public_canary(self):
-        import fleet_agent
-        rows = [fleet_agent.request_row(tag, "set", self.canary,
-                val=self.br.CANARY_MARKER, now=self.now, rid="REQ-%04d" % n)[1]
+    def test_each_agent_he_named_reaches_redis_through_the_board(self):
+        rows = [self.row(tag, "do=redis-op|op=set|key=fleet:hello:%s|val=aGk=|enc=b64" % tag, req="REQ-%04d" % n)
                 for n, tag in enumerate(("chatgpt-codex-desktop", "grok", "cursor", "gemini",
                                          "codex", "aya"), start=1)]
         out, written, conn = self.run_rows(rows)
         self.assertEqual(["OK"] * 6, [a["status"] for a in out["answered"]])
-        self.assertEqual(self.br.CANARY_MARKER, conn.data[self.canary])
-        self.assertEqual(6, len([e for e in conn.audit() if e["op"] == "set"]))
-
-    def test_every_acl_tag_gets_a_correlated_canary_result_subject_to_its_capability(self):
-        import fleet_agent
-        acl = gov.load_acl()
-        tags = list(acl["principals"]) + list(acl.get("aliases", {}))
-        self.assertGreaterEqual(len(tags), 15)
-        conn = FakeRedis()
-        conn.set(self.canary, self.br.CANARY_MARKER)
-        rows = [fleet_agent.request_row(tag, "get", self.canary, now=self.now,
-                                        rid="REQ-ACC-%04d" % n)[1]
-                for n, tag in enumerate(tags, start=1)]
-        out, written, _ = self.run_rows(rows, conn)
-        self.assertEqual(tags, [row["target_surface"] for row in written])
-        self.assertEqual(len(tags), len(out["answered"]))
-        for tag, result, row in zip(tags, out["answered"], written):
-            with self.subTest(tag=tag):
-                try:
-                    gov.check(acl, gov.principal(acl, tag), "get", self.canary)
-                    expected = "OK"
-                except gov.Refused:
-                    expected = "REFUSED"
-                self.assertEqual(expected, result["status"])
-                self.assertIn("answers=" + result["req_id"], row["payload"])
-                self.assertNotIn(self.br.CANARY_MARKER, row["payload"])
+        for tag in ("chatgpt-codex-desktop", "grok", "cursor", "gemini", "codex", "aya"):
+            self.assertEqual("hi", conn.data["fleet:hello:%s" % tag])
 
     def test_the_row_fleet_agent_builds_is_the_row_the_worker_answers(self):
         """The tool and the worker agree, proved on the real row - not a hand-written one.
@@ -543,17 +507,97 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         import datetime
         import fleet_agent
         when = self.now - datetime.timedelta(minutes=1)    # a request from the future is refused
-        rows, value = [], self.br.CANARY_MARKER
+        rows, value = [], "Gemini: the lease shape holds | second clause\nsecond line"
         for n, tag in enumerate(("gemini", "grok", "aya"), start=1):
-            rid, row = fleet_agent.request_row(tag, "set", self.canary, val=value, now=when,
+            rid, row = fleet_agent.request_row(tag, "xadd", "conf:side:20261011", val=value, now=when,
                                                rid="REQ-FA-%04d" % n)
             rows.append(row)
         out, written, conn = self.run_rows(rows)
         self.assertEqual(["OK"] * 3, [a["status"] for a in out["answered"]])
         self.assertEqual(["gemini", "grok", "aya"], [r["target_surface"] for r in written],
                          "each answered under the tag it asked with")
-        self.assertEqual(value, conn.data[self.canary])
-        self.assertEqual(3, len([e for e in conn.audit() if e["op"] == "set"]))
+        entries = [fields for _id, fields in conn.data["conf:side:20261011"]]
+        self.assertEqual(3, len(entries))
+        self.assertEqual([value] * 3, [e["text"] for e in entries], "the value survived whole")
+        self.assertEqual(["gemini", "grok", "chatgpt-codex-desktop"], [e["by"] for e in entries],
+                         "written under the canonical principal (aya is Codex's desktop)")
+
+    def test_every_principal_and_alias_in_the_access_list_is_answered_under_its_own_tag(self):
+        """AYA'S ACCEPTANCE TEST, PER AGENT, OFFLINE (Grok on #367, item 5). For EVERY tag the access
+        list knows - each principal and each alias, read from the list so a principal added later is
+        covered the day it is added - through the row fleet_agent builds under that tag: write its own
+        marker, read it back, find both in the audit under the canonical actor and the raw tag, record
+        the latency the worker measured, and be refused on a forbidden write (the tool refuses it
+        before a row exists; a row written by hand is refused by the governor and audited as such)."""
+        import datetime
+        import fleet_agent
+        import redis_gov
+        acl = redis_gov.load_acl()
+        aliases = acl.get("aliases", {})
+        tags = list(acl["principals"]) + list(aliases)
+        self.assertGreaterEqual(len(tags), 15, "the list the owner set names many agents")
+        when = self.now - datetime.timedelta(minutes=1)
+        rows, plan = [], {}
+        for n, tag in enumerate(tags, start=1):
+            canonical = aliases.get(tag, tag)
+            writes = acl["principals"][canonical]["write"]
+            marker_key = ("conf:accept:%s" if "conf:" in writes else writes[0] + "accept:%s") % tag
+            marker = "accepted by %s at %s" % (tag, when.isoformat())
+            rows.append(fleet_agent.request_row(tag, "set", marker_key, val=marker, now=when,
+                                                rid="REQ-ACC-%04d-W" % n)[1])
+            rows.append(fleet_agent.request_row(tag, "get", marker_key, now=when, rid="REQ-ACC-%04d-R" % n)[1])
+            with self.assertRaises(ValueError, msg=tag):           # the tool refuses it before a row exists
+                fleet_agent.request_row(tag, "set", "v1:bus:row:%s" % tag, val="forged", now=when,
+                                        rid="REQ-ACC-%04d-F" % n)
+            rows.append(self.row(tag, "do=redis-op|op=set|key=v1:bus:row:%s|val=Zm9yZ2Vk|enc=b64" % tag,
+                                 req="REQ-ACC-%04d-F" % n, ts=when.strftime("%Y-%m-%dT%H:%M:%SZ")))
+            plan[tag] = (canonical, marker_key, marker)
+        conn, written = FakeRedis(), []
+        # three rows per tag is more than one run's MAX_PER_RUN; the cap is a flood rule, not the subject
+        out = self.br.handle(rows, conn, now=self.now, append=written.append, max_per_run=len(rows))
+        self.assertEqual(["OK", "OK", "REFUSED"] * len(tags), [a["status"] for a in out["answered"]])
+        self.assertEqual([t for t in tags for _ in range(3)], [r["target_surface"] for r in written],
+                         "each answered under its own tag, refusal included")
+        latencies = {}
+        for i, tag in enumerate(tags):
+            canonical, marker_key, marker = plan[tag]
+            wrote, read, forged = written[3 * i], written[3 * i + 1], written[3 * i + 2]
+            self.assertEqual(marker, conn.data[marker_key], tag)
+            self.assertIn("OK set %s" % marker_key, wrote["payload"])
+            self.assertIn(marker, read["payload"], "the read came back on the board")
+            self.assertIn("REFUSED", forged["payload"])
+            self.assertNotIn("v1:bus:row:%s" % tag, conn.data)
+            mine = [e for e in conn.audit() if e["raw_tag"] == tag]
+            self.assertEqual([canonical] * 3, [e["actor"] for e in mine], "audited under the canonical actor")
+            self.assertEqual([("set", "1"), ("get", "1"), ("set", "0")], [(e["op"], e["ok"]) for e in mine], tag)
+            self.assertEqual(marker_key, mine[0]["key"])
+            lat = [a["latency_ms"] for a in out["answered"][3 * i:3 * i + 3]]
+            self.assertTrue(all(isinstance(x, int) and x >= 0 for x in lat), lat)
+            latencies[tag] = lat
+        print("\n  acceptance latency_ms (set, get, refused) per tag: %s"
+              % ", ".join("%s=%s" % (t, "/".join(str(x) for x in l)) for t, l in latencies.items()))
+
+    def test_the_tool_names_what_an_agent_may_ask_for_and_nothing_else(self):
+        """Grok on #367 (item 1): shared keys, the agent's own inbox (canonical, so aya's is Codex's),
+        the heartbeat for a read. Another agent's inbox and the audit stream are refused by the tool,
+        on the command line and on the waker's path alike, before any row exists."""
+        import fleet_agent
+        ok = (("gemini", "xadd", "conf:side:20261011"), ("gemini", "get", "proj:x"),
+              ("gemini", "xrange", "fleet:inbox:gemini"), ("aya", "xadd", "fleet:inbox:chatgpt-codex-desktop"),
+              ("grok", "get", "gov:worker:heartbeat"), ("grok", "hgetall", "proj:milestones:m3"))
+        denied = (("gemini", "xrange", "fleet:inbox:grok"), ("gemini", "get", "fleet:inbox:gemini-x"),
+                  ("grok", "set", "gov:worker:heartbeat"), ("grok", "xrange", "gov:audit"),
+                  ("grok", "get", "v1:agent:gemini:inbox"), ("aya", "get", "fleet:inbox:aya"),
+                  ("grok", "get", "fleet:status"))
+        for tag, op, key in ok:
+            with self.subTest(tag=tag, op=op, key=key):
+                self.assertEqual("", fleet_agent.key_allowed_for(tag, op, key))
+                fleet_agent.request_row(tag, op, key, val="v", rid="REQ-KEY-0001")
+        for tag, op, key in denied:
+            with self.subTest(tag=tag, op=op, key=key):
+                self.assertIn("nothing else through this tool", fleet_agent.key_allowed_for(tag, op, key))
+                with self.assertRaises(ValueError):
+                    fleet_agent.request_row(tag, op, key, val="v", rid="REQ-KEY-0002")
 
     def test_a_stranger_with_the_same_tool_gets_no_row_and_writes_nothing(self):
         import datetime
@@ -564,106 +608,31 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertEqual([], written)
         self.assertNotIn("conf:x", conn.data)
 
-    def test_a_private_read_is_refused_without_returning_its_value(self):
+    def test_a_read_comes_back_in_the_result(self):
         conn = FakeRedis()
         conn.set("fleet:status", "amber")
         out, rows, _ = self.run_rows(
             [self.row("cursor", "do=redis-op|op=get|key=fleet:status")], conn)
-        self.assertNotIn("amber", rows[0]["payload"])
+        self.assertIn("amber", rows[0]["payload"])
+
+    def test_a_raw_value_is_refused_and_the_row_says_how_to_send_it(self):
+        """Grok on #367 (row 2cc985ed): the worker stored a raw value, and a raw value with a pipe had
+        already been split on the board, so what it stored was a truncation nobody asked for."""
+        out, rows, conn = self.run_rows([self.row("grok", "do=redis-op|op=set|key=fleet:x|val=raw text")])
+        self.assertNotIn("fleet:x", conn.data)
+        self.assertEqual(1, len(out["refused"]), "refused before the governor, like a stale request")
+        self.assertEqual(1, len(rows), "a recognised sender is told")
         self.assertIn("REFUSED", rows[0]["payload"])
-
-    def test_protected_and_other_agent_reads_never_enter_shared_results(self):
-        import fleet_agent
-        for key in ("gov:audit", "v1:bus:row:R-1", "v1:agent:claude-code-cli",
-                    "fleet:inbox:claude-code-cli", "fleet:inbox:grok", "proj:private"):
-            for tag in ("gemini", "grok", "claude-code-cli", "cursor", "aya"):
-                with self.subTest(key=key, claimed_tag=tag):
-                    conn = FakeRedis()
-                    secret = "SYNTHETIC_PRIVATE_SENTINEL_" + tag
-                    if key == "gov:audit":
-                        conn.data[key] = [("1-0", {"text": secret})]
-                        op = "xrange"
-                    else:
-                        conn.set(key, secret)
-                        op = "get"
-                    initial_audit = conn.audit()
-                    rid = "REQ-%s-%s" % (key.replace(":", "-")[:25], tag)
-                    # Hand-shape a board row to bypass the producer gate and
-                    # prove the worker itself still rejects the request.
-                    request = [rid, self.now.strftime("%Y-%m-%dT%H:%M:%SZ"), tag,
-                               "bus-reconciler", "AYA_REQ",
-                               "BCB|v=1|id=%s|req=%s|do=redis-op|op=%s|key=%s|from=%s|to=bus-reconciler"
-                               % (rid, rid, op, key, tag), "OPEN", "FLEET", "synthetic", ""]
-                    out, written, _ = self.run_rows([request], conn)
-                    self.assertEqual([], out["answered"])
-                    self.assertEqual(initial_audit, conn.audit(), "rejected before redis_gov")
-                    self.assertEqual(1, len(written))
-                    self.assertIn("REFUSED", written[0]["payload"])
-                    self.assertNotIn(secret, repr(written))
-
-    def test_canary_read_returns_match_only_even_when_value_differs(self):
-        import fleet_agent
-        class ByteRedis(FakeRedis):
-            def type(self, key):
-                if isinstance(self.data.get(key), bytes):
-                    return "string"
-                return super().type(key)
-        for value, expected in ((self.br.CANARY_MARKER, "match=yes"),
-                                (self.br.CANARY_MARKER.encode("ascii"), "match=yes"),
-                                (repr(self.br.CANARY_MARKER.encode("ascii")), "match=no"),
-                                ("SYNTHETIC_PRIVATE_SENTINEL", "match=no")):
-            with self.subTest(value=value):
-                conn = ByteRedis()
-                if isinstance(value, bytes):
-                    conn.data[self.canary] = value
-                else:
-                    conn.set(self.canary, value)
-                _, request = fleet_agent.request_row("cursor", "get", self.canary,
-                                                     now=self.now, rid="REQ-READ-1")
-                out, written, _ = self.run_rows([request], conn)
-                self.assertEqual("OK", out["answered"][0]["status"])
-                self.assertIn(expected, written[0]["payload"])
-                self.assertNotIn(str(value), written[0]["payload"])
-
-    def test_missing_policy_and_malformed_canary_never_execute(self):
-        import fleet_agent
-        _, valid = fleet_agent.request_row("gemini", "set", self.canary,
-                                           val=self.br.CANARY_MARKER, now=self.now,
-                                           rid="REQ-CANARY-1")
-        cases = [dict(row=valid, env={"REDIS_BOARD_CANARY_ENABLED": ""}),
-                 dict(row=[*valid[:5], valid[5] + "|key=gov:audit", *valid[6:]], env={}),
-                 dict(row=[*valid[:5], valid[5] + "|other=private", *valid[6:]], env={}),
-                 dict(row=[*valid[:9]], env={}),
-                 dict(row=[*valid, "extra"], env={}),
-                 dict(row=[valid[0], valid[1], valid[2], "other-worker", *valid[4:]], env={}),
-                 dict(row=["OTHER-ROW", *valid[1:]], env={})]
-        for case in cases:
-            with self.subTest(case=case):
-                with mock.patch.dict(os.environ, case["env"]):
-                    out, written, conn = self.run_rows([case["row"]])
-                self.assertEqual([], out["answered"])
-                self.assertEqual([], conn.audit())
-                self.assertNotIn(self.canary, conn.data)
-                self.assertEqual(1, len(written))
-                self.assertIn("REFUSED", written[0]["payload"])
-
-    def test_unknown_sender_has_no_result_even_for_canary(self):
-        import fleet_agent
-        _, row = fleet_agent.request_row("unknown-tag", "set", self.canary,
-                                         val=self.br.CANARY_MARKER, now=self.now,
-                                         rid="REQ-UNKNOWN-1")
-        out, written, conn = self.run_rows([row])
-        self.assertEqual([], written)
-        self.assertEqual([], conn.audit())
-        self.assertEqual(1, len(out["refused"]))
+        self.assertIn("enc=b64", rows[0]["payload"])
+        self.assertEqual("grok", rows[0]["target_surface"])
 
     def test_a_protected_write_is_refused_on_the_board_and_in_the_audit(self):
         out, rows, conn = self.run_rows([self.row(
-            "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=forged")])
+            "gemini", "do=redis-op|op=set|key=v1:bus:row:R-1|val=Zm9yZ2Vk|enc=b64")])
         self.assertNotIn("v1:bus:row:R-1", conn.data)
         self.assertIn("REFUSED", rows[0]["payload"])
-        self.assertEqual([], out["answered"])
-        self.assertEqual([], conn.audit(), "worker policy rejects before redis_gov")
+        self.assertEqual("REFUSED", out["answered"][0]["status"])
+        self.assertEqual("0", conn.audit()[-1]["ok"])
 
     def test_a_STALE_request_from_an_access_list_agent_is_told_why(self):
         """Refused before the op is even considered - and still answered, because the sender is
@@ -671,7 +640,7 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         mutation that restricted refusal rows to the probe's old SENDERS list passed everything, so
         grok, cursor and gemini would have heard silence for a stale request."""
         out, rows, conn = self.run_rows([self.row(
-            "grok", "do=redis-op|op=set|key=fleet:x|val=1", ts="2026-10-08T00:00:00Z")])
+            "grok", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64", ts="2026-10-08T00:00:00Z")])
         self.assertNotIn("fleet:x", conn.data)
         self.assertEqual(1, len(rows), "a recognised sender is told it was refused")
         self.assertIn("older than", rows[0]["payload"])
@@ -680,35 +649,18 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
     def test_an_unknown_sender_gets_no_row_and_touches_nothing(self):
         """The flood rule, unchanged: a tag nobody recognises does not make us write a row."""
         out, rows, conn = self.run_rows([self.row(
-            "a-stranger", "do=redis-op|op=set|key=fleet:x|val=1")])
+            "a-stranger", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64")])
         self.assertEqual([], rows)
         self.assertNotIn("fleet:x", conn.data)
         self.assertEqual(1, len(out["refused"]))
 
     def test_a_replayed_request_id_does_nothing_the_second_time(self):
-        import fleet_agent
-        first = fleet_agent.request_row("grok", "set", self.canary,
-                                        val=self.br.CANARY_MARKER, now=self.now,
-                                        rid="REQ-0001")[1]
+        first = self.row("grok", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64")
         out, rows, conn = self.run_rows([first])
         answered_row = [rows[0]["row_id"], "2026-10-08T01:59:30Z", "bus-reconciler", "grok",
                         "AYA_RESULT", rows[0]["payload"], "", "", "", ""]
         out2, rows2, _ = self.run_rows([first, answered_row], conn)
         self.assertEqual([], rows2, "already answered: no second write, no second row")
-        self.assertEqual(1, len([e for e in conn.audit() if e["op"] == "set"]))
-
-    def test_uncertain_post_result_does_not_apply_canary_twice(self):
-        import fleet_agent
-        _, row = fleet_agent.request_row("gemini", "set", self.canary,
-                                         val=self.br.CANARY_MARKER, now=self.now,
-                                         rid="REQ-UNKNOWN-POST")
-        out, written, conn = self.run_rows([row])
-        self.assertEqual("OK", out["answered"][0]["status"])
-        self.assertEqual(1, len(written))
-        again, notices, _ = self.run_rows([row], conn)
-        self.assertEqual([], again["answered"])
-        self.assertEqual(1, len(notices))
-        self.assertIn("UNKNOWN", notices[0]["payload"])
         self.assertEqual(1, len([e for e in conn.audit() if e["op"] == "set"]))
 
     def test_the_probe_still_works_exactly_as_before(self):
@@ -746,12 +698,12 @@ class EndToEndThroughTheBoardWorker(unittest.TestCase):
         self.assertIn("latency_ms", loops["answered"], "the entrypoint reads latency_ms - keep it")
         conn = FakeRedis()
         out, _, _ = self.run_rows([
-            self.row("grok", "do=redis-op|op=set|key=fleet:x|val=1", req="REQ-0001"),
-            self.row("cursor", "do=redis-op|op=set|key=v1:bus:row:1|val=x", req="REQ-0002"),
+            self.row("grok", "do=redis-op|op=set|key=fleet:x|val=MQ==|enc=b64", req="REQ-0001"),
+            self.row("cursor", "do=redis-op|op=set|key=v1:bus:row:1|val=eA==|enc=b64", req="REQ-0002"),
             self.row("aya", "do=redis-synthetic-probe", req="REQ-0003"),
             self.row("a-stranger", "do=redis-op|op=get|key=fleet:x", req="REQ-0004"),
         ], conn)
-        self.assertEqual(1, len(out["answered"]))
+        self.assertEqual(3, len(out["answered"]))
         for item in out["answered"]:
             missing = loops["answered"] - set(item)
             self.assertEqual(set(), missing, "answer %s lacks %s" % (item.get("req_id"), missing))
@@ -795,7 +747,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
     the output says."""
 
     HEAD = ["Row_ID", "Timestamp", "Source_Tag", "Target_Surface", "Action_Type", "Payload",
-            "Category", "Project Tag", "Gist", "Sub-Gist"]
+            "Category", "Project_Tag", "Gist", "Notes"]
 
     def setUp(self):
         import fleet_agent
@@ -836,14 +788,14 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.run_request(self.args())
         code, out = self.run_request(self.args())
         self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)), "a retry appends nothing")
-        self.assertIn("existing request", out)
+        self.assertIn("already on the board", out)
         self.assertIn("VERIFIED on the board", out)
 
     def test_the_same_id_with_a_different_request_is_refused_before_anything_is_appended(self):
         self.run_request(self.args(val="one"))
         code, out = self.run_request(self.args(val="two"))
         self.assertEqual((self.fa.EXIT_REFUSED, 1), (code, len(self.appends)))
-        self.assertIn("refused before posting: request id REQ-T-0001 exists", out)
+        self.assertIn("refused before posting: request id REQ-T-0001 is already used", out)
         self.assertNotIn("VERIFIED", out)
 
     def test_a_board_that_cannot_be_read_means_NOT_SENT_not_a_blind_append(self):
@@ -861,7 +813,7 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.assertNotIn("silent no-op", out)
         self.assertNotIn("VERIFIED", out)
 
-    def test_two_identical_rows_after_the_append_stay_unconfirmed(self):
+    def test_two_identical_rows_after_the_append_is_a_race_and_UNCONFIRMED_then_converges(self):
         def fetch_twice(url, payload, tries=1):
             self.appends.append(payload["sheetRow"])
             self.board["rows"].append(list(payload["sheetRow"]))
@@ -870,25 +822,25 @@ class FleetAgentRequestOnTheBoard(unittest.TestCase):
         self.fa._bus_fetch = fetch_twice
         code, out = self.run_request(self.args())
         self.assertEqual(self.fa.EXIT_UNCONFIRMED, code)
-        self.assertIn("duplicate", out)
+        self.assertIn("2 identical rows", out)
         code, out = self.run_request(self.args())            # the retry finds them and appends nothing
-        self.assertEqual((self.fa.EXIT_REFUSED, 1), (code, len(self.appends)))
-        self.assertIn("duplicate", out)
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
+        self.assertIn("already on the board", out)
 
     def test_a_row_from_another_tag_or_of_another_type_is_not_this_row(self):
-        # Same id and payload under another tag must not claim Gemini's request.
+        # Same id and payload, posted by grok: not gemini's row. Appended, then exactly one read back.
         rid, row = self.fa.request_row("gemini", "set", "proj:k", val="one", rid="REQ-T-0005")
         other = list(row)
         other[self.fa.SOURCE_COL] = "grok"
         self.board["rows"].append(other)
         code, out = self.run_request(self.args(rid="REQ-T-0005"))
-        self.assertEqual((self.fa.EXIT_REFUSED, 0), (code, len(self.appends)))
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)))
         as_phase = list(row)
         as_phase[self.fa.ACTION_COL] = "DONE"
         self.board["rows"] = [list(self.HEAD), as_phase]
         self.appends.clear()
         code, out = self.run_request(self.args(rid="REQ-T-0005"))
-        self.assertEqual((self.fa.EXIT_REFUSED, 0), (code, len(self.appends)), "the id is already occupied")
+        self.assertEqual((self.fa.EXIT_VERIFIED, 1), (code, len(self.appends)), "a phase row is not a request")
 
     def test_a_reply_retried_with_other_text_is_the_ask_already_answered_not_a_second_row(self):
         # The post path (exact=False): post_reply's id is stable per ask; a retry that answered

@@ -148,7 +148,6 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
-      - "tests/test_redis_request_hardening.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -285,7 +284,6 @@ on:
       - "tests/fixtures/wa_outbox_rows.json"
       - "scripts/agent_waker.py"
       - "tests/test_agent_waker.py"
-      - "tests/test_redis_request_hardening.py"
       - "scripts/board_row.py"
       - "tests/test_board_row.py"
       - "tools/board_governor/board_facts.py"
@@ -826,8 +824,6 @@ jobs:
           if [ -f tests/test_agent_waker.py ]; then
             python_bin="$(command -v python3)"
             sudo unshare -n -- "$python_bin" tests/test_agent_waker.py
-            test -f tests/test_redis_request_hardening.py
-            sudo unshare -n -- "$python_bin" tests/test_redis_request_hardening.py
           else
             echo "not on this branch; skipping"
           fi

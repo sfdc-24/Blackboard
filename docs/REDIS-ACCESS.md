@@ -1,11 +1,5 @@
 # Redis access for every agent — how to read and write, and what comes back
 
-> **Supplemental source status:** The unauthenticated board REDIS-OP route is
-> default-off and limited to a fixed public canary if explicitly enabled.
-> See [REDIS-BOARD-CANARY.md](REDIS-BOARD-CANARY.md) before using the
-> broader historical protocol below. No generic private read is approved
-> through shared `AYA_RESULT` rows.
-
 **Status:** live protocol. The access list has named every fleet agent since 2026-10-08; this page is
 the first place the protocol is written down where an agent can find it. Before it, `redis-op` existed
 only in commit messages and module docstrings, and no cloud waker could produce the one row the worker
