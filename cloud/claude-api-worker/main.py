@@ -115,6 +115,17 @@ def _load_lane():
 
 lane = _load_lane()
 
+
+def _load_pilot():
+    """Load the local module when tests import main.py without changing sys.path."""
+    spec = importlib.util.spec_from_file_location("phone_intake", os.path.join(HERE, "phone_intake.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+pilot = _load_pilot()
+
 WORKER = "claude-api"
 ACCEPTED = "ACCEPTED"
 SUCCEEDED = "SUCCEEDED"
@@ -774,7 +785,17 @@ def run_once(deps) -> dict:
     now = _now(deps)
     out = {"status": "disabled", "considered": []}
     if deps.enabled:
-        out = _api_pass(deps, now)
+        if getattr(deps, "pilot_docs", None) is None:
+            out = _api_pass(deps, now)
+        else:
+            # The API sees the latest approved block. Restore raw Docs before
+            # the existing laptop lane runs, so its contract is untouched.
+            original_docs, original_receipts = deps.docs, deps.receipts
+            deps.docs = deps.receipts = deps.pilot_docs
+            try:
+                out = _api_pass(deps, now)
+            finally:
+                deps.docs, deps.receipts = original_docs, original_receipts
     if deps.lane_enabled:
         out["lane"] = lane.run(_contract(), deps, now)
         if not deps.enabled:
@@ -1318,8 +1339,16 @@ def main():  # pragma: no cover - the job entry point
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
     board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
+    pilot_enabled = enabled_from_env() and os.environ.get("PHONE_DOC_INTAKE_ENABLED") == "on"
+    intake = pilot.run_prepass(client, docs, enabled=True) if pilot_enabled else None
     deps = deps_from_env(client=client, docs=docs, board=board)
+    if pilot_enabled and client is not None and docs is not None:
+        # API entries from these two Docs only; other queued work cannot call the model.
+        deps.inbox = pilot.PilotInbox(deps.inbox, client)
+        deps.pilot_docs = pilot.PilotDocs(docs)
     out = run_once(deps)
+    if pilot_enabled:
+        out["intake"] = intake
     print(json.dumps(out, sort_keys=True))     # statuses and task ids; never the doc's text
     return 0
 

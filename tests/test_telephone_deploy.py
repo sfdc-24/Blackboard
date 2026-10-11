@@ -115,6 +115,7 @@ class WorkerDeployTest(unittest.TestCase):
         self.assertEqual(set(), missing)
         self.assertIn("CLAUDE_API_WORKER_ENABLED=off", self.script)
         self.assertIn("CLAUDE_API_LANE_ENABLED=off", self.script)
+        self.assertIn("PHONE_DOC_INTAKE_ENABLED=off", self.script)
         self.assertIn("REDIS_CONNECT=true", self.script)
         self.assertIn("REDIS_HOST=${REDIS_HOST}", self.script)
 
