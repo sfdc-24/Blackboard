@@ -1078,6 +1078,93 @@ class WakeRingTest(unittest.TestCase):
         self.assertEqual(out["task"], json.loads(sent[0].decode("utf-8"))["id"])
 
 
+class TrailTest(unittest.TestCase):
+    """The doc is the record with no TTL. Cursor on 96b645c: every Redis key expires, and each
+    expiry re-did the hop it guarded - a second put, a second ring after 30 days, a lost wait line."""
+
+    def dispatched_doc(self, text=REQUEST, recipient="claude-api"):
+        d = deps(docs=Docs(text=text), api_worker="claude-api")
+        if recipient == "claude-code-cli":
+            laptop_up(d)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        doc = text + d.receipts.text()
+        return out, doc
+
+    def test_trail_for_reads_our_lines_and_nobody_elses(self):
+        out, doc = self.dispatched_doc()
+        trail = di.trail_for(doc, out["task"])
+        self.assertEqual({"REQUESTED": "claude-api", "DISPATCHED": "claude-api"}, trail)
+        self.assertEqual({}, di.trail_for(doc, "task-0000000000000000"))
+        self.assertEqual({}, di.trail_for("DISPATCHED by somebody - task " + out["task"], out["task"]))
+
+    def test_a_dispatched_line_in_the_doc_is_a_duplicate_with_every_key_gone(self):
+        out, doc = self.dispatched_doc()
+        d = deps(docs=Docs(text=doc, revision="r9"))     # fresh Redis: no claim, no marker
+        laptop_up(d)                                      # routing would now pick the laptop
+        again = di.decide(hint(), d)
+        self.assertEqual("duplicate", again["status"], again)
+        self.assertEqual("doc", again["by"])
+        self.assertEqual([], d.queue.puts)
+        self.assertEqual([], d.ring.calls)
+        self.assertEqual([], d.receipts.lines)
+        self.assertEqual({}, d.claims.states)             # not even claimed
+
+    def test_a_requested_line_in_the_doc_means_no_second_put_and_the_ring_goes_to_that_worker(self):
+        """The claim and the marker aged out, the seen key on #359 too; the doc still says who has it."""
+        text = REQUEST + "Use the sf CLI.\n"
+        d = deps(docs=Docs(text=text))
+        self.assertEqual("queued", di.decide(hint(), d)["status"])
+        laptop_up(d)
+        d.ring = Ring(fail_first=1)
+        self.assertEqual("queued_not_rung", di.decide(hint(), d)["status"])   # QUEUED, REQUESTED in the doc
+        doc = text + d.receipts.text()
+        task = di.correlate(FILE, text, "r1", "claude-code-cli")["task_id"]
+        self.assertEqual({"QUEUED": "claude-code-cli", "REQUESTED": "claude-code-cli"}, di.trail_for(doc, task))
+        fresh = deps(docs=Docs(text=doc, revision="r9"))  # every key gone; laptop DOWN now
+        fresh.receipts.lines = list(d.receipts.lines)
+        out = di.decide(hint(), fresh)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual([], fresh.queue.puts)            # no second put, on any stream
+        self.assertEqual(["claude-code-cli"], [c["recipient_id"] for c in fresh.ring.calls])
+        self.assertEqual(["QUEUED", "REQUESTED", "DISPATCHED"], fresh.receipts.states())
+        self.assertEqual("duplicate", di.decide(hint(), fresh)["status"])
+
+    def test_a_wait_line_in_the_doc_restores_the_wait_after_the_claim_expired(self):
+        text = REQUEST + "Use the sf CLI.\n"
+        d = deps(docs=Docs(text=text))
+        self.assertEqual("queued", di.decide(hint(), d)["status"])
+        doc = text + d.receipts.text()
+        fresh = deps(docs=Docs(text=doc, revision="r9"))  # claim gone, laptop up
+        fresh.receipts.lines = list(d.receipts.lines)
+        laptop_up(fresh)
+        out = di.decide(hint(), fresh)
+        self.assertEqual("dispatched", out["status"], out)
+        self.assertEqual(["QUEUED", "REQUESTED", "DISPATCHED"], fresh.receipts.states())
+        self.assertEqual(1, len(fresh.queue.puts))
+        self.assertTrue(":q" in list(fresh.claims.states.values())[0] or
+                        list(fresh.claims.states.values()) == [di.DONE])
+
+    def test_the_marker_gone_and_the_claim_back_at_delivering_is_still_one_copy(self):
+        """Cursor on 96b645c: deleting fleet:intake:put:<task> with the entry buried appended again."""
+        client = StreamClient()
+        d = deps(queue=di.InboxQueue(client=client))
+        out = di.decide(hint(), d)
+        doc = REQUEST + d.receipts.text()
+        for i in range(600):
+            client.xadd("fleet:inbox:claude-api", {"task_id": "task-%016x" % i})
+        client.kv.clear()                                 # the marker's EX fired
+        d.docs.text, d.docs.revision = doc, "r9"
+        d.claims.states[key_for()] = "delivering:claude-api:0:"
+        again = di.decide(hint(), d)
+        self.assertEqual("duplicate", again["status"], again)
+        self.assertEqual(1, len([f for _, f in client.streams["fleet:inbox:claude-api"] if f.get("task_id") == out["task"]]))
+        d.claims.states.clear()
+        laptop_up(d)
+        self.assertEqual("duplicate", di.decide(hint(), d)["status"])
+        self.assertNotIn("fleet:inbox:claude-code-cli", client.streams)
+
+
 class ChannelTest(unittest.TestCase):
     """Guard 6: the day-eight outage is announced on day six, never read as ok by default, and read against NOW."""
 

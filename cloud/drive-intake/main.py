@@ -57,6 +57,15 @@ THE THINGS THAT GO WRONG, AND WHERE EACH IS STOPPED
      Which inbox holds a task is answered from that marker, never from a
      scan. Lines owed so far are re-attempted BEFORE the ring, so a ring
      that is refused pass after pass does not keep the doc empty.
+     EVERY REDIS KEY HERE EXPIRES - the claim, the put marker, #359's seen
+     key - and Cursor on 96b645c showed each expiry re-doing the hop it
+     guarded. The record with no TTL is the DOC: its receipt trail is read
+     first on every pass (trail_for). A DISPATCHED line for the task is a
+     duplicate whatever Redis remembers; a REQUESTED line names the worker
+     whose inbox holds it and the pass resumes from on_inbox with no put;
+     a QUEUED or BLOCKED line restores the wait the request came through.
+     RESIDUAL, NAMED: a request whose receipts never landed has no durable
+     record, and after the keys expire Redis has forgotten it too.
      The ring is sent BEFORE the claim moves to rung, so a crash in between
      rings again - safe only because WakeRing sends id=task_id and
      cloud/inbox-wake claims fleet:wake:seen:<agent>:<id> SET NX, so the
@@ -302,6 +311,28 @@ def receipt_line(state: str, tuple_: dict, at: str, detail: str = "") -> str:
     return " - ".join(parts)
 
 
+TRAIL_LINE = re.compile(
+    r"(?m)^\s*(?P<state>REQUESTED|DISPATCHED|QUEUED|BLOCKED) - task (?P<task>task-[0-9a-f]{16}) - "
+    r"request \S+ - rev \S+ - recipient (?P<recipient>\S+) - by drive-intake - ")
+
+
+def trail_for(doc_text: str, task_id: str) -> dict:
+    """What the DOC says already happened to this task: {state: recipient}.
+
+    The doc is the durable record - the owner's requirement, and the only one
+    with no TTL. Every Redis key here (claim, put marker, #359's seen key)
+    expires, and Cursor on 96b645c showed each expiry re-doing the work: a
+    second put at any depth, a second ring after 30 days, a lost wait line.
+    So the trail the doc already carries is read FIRST, every pass, and a
+    line it shows is a hop that is not repeated whatever Redis remembers.
+    """
+    found = {}
+    for match in TRAIL_LINE.finditer(doc_text or ""):
+        if match.group("task") == task_id:
+            found[match.group("state")] = match.group("recipient")
+    return found
+
+
 def receipt_block(doc_text: str, line: str) -> str:
     """The text actually appended: the heading first when the doc has none (guard 1)."""
     if RECEIPTS_HEADING.search(doc_text or ""):
@@ -488,6 +519,12 @@ def decide(hint: dict, deps) -> dict:
         return {"status": "bad_correlation", "task": None}
     key = idempotency_key(tuple_)
 
+    # The doc's own trail first: it is the record with no TTL (Cursor on 96b645c).
+    trail = trail_for(text, tuple_["task_id"])
+    if DISPATCHED in trail:
+        return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_, "by": "doc"}
+    trail_via = "q" if QUEUED in trail else "b" if BLOCKED in trail else ""
+
     # The claim is a state the request moves through, forward only.
     try:
         current = deps.claims.state(key)
@@ -499,6 +536,13 @@ def decide(hint: dict, deps) -> dict:
         return {"status": "claim_error", "task": tuple_["task_id"], "error": "unreadable"}
     if current == DONE:
         return {"status": "duplicate", "task": tuple_["task_id"], "tuple": tuple_}
+    if current == INTAKE and REQUESTED in trail and canonical(trail[REQUESTED]) == trail[REQUESTED]:
+        # Redis forgot this request (a claim that aged out) but the doc says it is already on a
+        # worker's inbox. Resume from THERE: no put, the ring and the last line still owed.
+        seeded = _state(ON_INBOX, trail[REQUESTED], now, trail_via)
+        if not _advance(deps, key, current, seeded):
+            return {"status": "in_progress", "task": tuple_["task_id"], "tuple": tuple_}
+        current = seeded
     phase, bound, since, via = _split(current)
     if bound:
         # A worker was chosen on an earlier pass. Routing is settled; finish THAT delivery.
@@ -529,7 +573,7 @@ def decide(hint: dict, deps) -> dict:
         # Bind the worker BEFORE the put, so a crash or a flip cannot re-put elsewhere.
         # The lease (the clock, in the state) keeps a second pass from resuming this one,
         # and the wait it came through rides along so that line stays owed.
-        via = "q" if phase == WAIT_QUEUED else "b" if phase == WAIT_BLOCKED else ""
+        via = "q" if phase == WAIT_QUEUED else "b" if phase == WAIT_BLOCKED else trail_via
         leased = _state(DELIVERING, recipient, now, via)
         if not _advance(deps, key, current, leased):
             out["status"] = "in_progress"
