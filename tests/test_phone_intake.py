@@ -59,6 +59,12 @@ class Redis:
                 return 0
             self.values[key] = new
             return 1
+        if script == worker.CAS_LUA:
+            key, old, new, _ttl = args
+            if self.values.get(key) != old:
+                return 0
+            self.values[key] = new
+            return 1
         if script == di.PUT_ONCE_LUA:
             if self.fail_queue:
                 raise RuntimeError("mock queue failure")
@@ -150,10 +156,12 @@ class PhoneIntakeTests(unittest.TestCase):
         return pilot.target_from_env({"PHONE_DOC_PILOT_TARGET": json.dumps(record)})
 
     def targeted_deps(self, target, claims=None, model=None):
+        claims = claims or worker.MemoryClaims()
         return worker.Deps(
             enabled=True,
-            inbox=worker.pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis, target=target),
-            docs=self.docs, receipts=self.docs, claims=claims or worker.MemoryClaims(),
+            inbox=worker.pilot.PilotInbox(worker.RedisInbox(self.redis), self.redis,
+                                         target=target, claims=claims),
+            docs=self.docs, receipts=self.docs, claims=claims,
             ledger=worker.MemoryLedger(), model=model, model_name="offline-mock",
             folder_id=pilot.FOLDER_ID, now=self.now, at="2026-10-11T05:00:00Z",
             cap_cents=100, reserve_cents=1, price_in=1, price_out=1, cad_per_usd=1,
@@ -388,6 +396,254 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertEqual((result["calls"], calls, deps.ledger.days), (0, [], {}))
         self.assertIn("approval not confirmed", self.docs.documents[self.doc]["text"])
 
+    def test_unreadable_approval_and_owed_failure_receipt_never_become_unknown(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append, original_get = self.docs.append, self.redis.get
+        failure_writes = 0
+        unreadable = False
+
+        def append(file_id, revision, receipt_id, receipt):
+            nonlocal failure_writes, unreadable
+            if "ACCEPTED - task" in receipt:
+                unreadable = True
+            if "FAILED - task" in receipt and failure_writes < 2:
+                failure_writes += 1
+                raise TimeoutError("failure receipt unavailable")
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        def get(key):
+            if unreadable and key == approval:
+                raise OSError("approval read unavailable")
+            return original_get(key)
+
+        self.docs.append, self.redis.get = append, get
+        calls = []
+        deps = self.targeted_deps(target, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        first = worker.run_once(deps)
+        self.assertEqual(first["considered"][0]["status"], "approval_unconfirmed_receipt_owed")
+        self.redis.get = original_get  # the approval was only transiently unreadable
+        deps.now += worker.WORK_LEASE + 1
+        second = worker.run_once(deps)
+        self.assertEqual(second["considered"][0]["status"], "approval_unconfirmed")
+        self.assertEqual((first["calls"], second["calls"], calls), (0, 0, []))
+        self.assertIn("FAILED - task " + target["task_id"], self.docs.documents[self.doc]["text"])
+        self.assertNotIn("UNKNOWN - task " + target["task_id"], self.docs.documents[self.doc]["text"])
+
+    def test_expired_approval_retries_owed_failure_receipt_after_restart(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append = self.docs.append
+        failure_writes = 0
+
+        def append(file_id, revision, receipt_id, receipt):
+            nonlocal failure_writes
+            if "ACCEPTED - task" in receipt:
+                self.redis.values.pop(approval, None)
+            if "FAILED - task" in receipt and failure_writes < 4:
+                failure_writes += 1
+                raise TimeoutError("failure receipt unavailable")
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        self.docs.append = append
+        calls = []
+        first = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                   model=lambda *_: calls.append(1))
+        first.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(first)["considered"][0]["status"],
+                         "approval_unconfirmed_receipt_owed")
+        self.assertEqual(first.claims.state(target["task_id"]), worker.STATE_APPROVAL_FAILED)
+        intake = pilot.run_prepass(self.redis, self.docs, enabled=True, target=target)
+        self.assertFalse(pilot.target_ready(intake, target))
+        self.assertTrue(pilot.target_recovery_ready(intake, target, first.claims))
+
+        restarted = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                       model=lambda *_: calls.append(1))
+        restarted.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(restarted)["considered"][0]["status"],
+                         "approval_unconfirmed_receipt_owed")
+        last = worker.run_once(restarted)
+        self.assertEqual((last["considered"][0]["status"], last["calls"], calls),
+                         ("approval_unconfirmed", 0, []))
+        self.assertEqual(restarted.claims.state(target["task_id"]), worker.STATE_DONE)
+        text = self.docs.documents[self.doc]["text"]
+        self.assertEqual(text.count("FAILED - task " + target["task_id"]), 1)
+        self.assertNotIn("UNKNOWN - task " + target["task_id"], text)
+
+    def test_lost_failure_receipt_ack_reads_back_after_restart_without_duplicate(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append, original_read = self.docs.append, self.docs.read
+        unreadable = False
+
+        def append(file_id, revision, receipt_id, receipt):
+            nonlocal unreadable
+            if "ACCEPTED - task" in receipt:
+                self.redis.values.pop(approval, None)
+            result = original_append(file_id, revision, receipt_id, receipt)
+            if "FAILED - task" in receipt:
+                unreadable = True
+                raise TimeoutError("receipt acknowledgement lost")
+            return result
+
+        def read(file_id):
+            if unreadable:
+                raise TimeoutError("receipt readback unavailable")
+            return original_read(file_id)
+
+        self.docs.append, self.docs.read = append, read
+        calls = []
+        first = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                   model=lambda *_: calls.append(1))
+        first.pilot_docs = pilot.PilotDocs(self.docs)
+        self.assertEqual(worker.run_once(first)["considered"][0]["status"],
+                         "approval_unconfirmed_receipt_owed")
+        self.docs.read = original_read
+        restarted = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                       model=lambda *_: calls.append(1))
+        restarted.pilot_docs = pilot.PilotDocs(self.docs)
+        again = worker.run_once(restarted)
+        self.assertEqual((again["considered"][0]["status"], again["calls"], calls),
+                         ("done", 0, []))
+        self.assertEqual(self.docs.documents[self.doc]["text"].count(
+            "FAILED - task " + target["task_id"]), 1)
+        self.assertNotIn("UNKNOWN - task " + target["task_id"],
+                         self.docs.documents[self.doc]["text"])
+
+    def test_no_call_claim_commits_then_loses_ack_and_retries_failed_receipt(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append, original_eval = self.docs.append, self.redis.eval
+        lost_ack = False
+
+        def append(file_id, revision, receipt_id, receipt):
+            if "ACCEPTED - task" in receipt:
+                self.redis.values.pop(approval, None)
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        def eval_with_lost_ack(script, keys, *args):
+            nonlocal lost_ack
+            result = original_eval(script, keys, *args)
+            if script == worker.CAS_LUA and args[2] == worker.STATE_APPROVAL_FAILED and not lost_ack:
+                lost_ack = True
+                raise TimeoutError("no-call claim acknowledgement lost")
+            return result
+
+        self.docs.append, self.redis.eval = append, eval_with_lost_ack
+        calls = []
+        first = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                   model=lambda *_: calls.append(1))
+        first.pilot_docs = pilot.PilotDocs(self.docs)
+        outcome = worker.run_once(first)
+        self.assertEqual((outcome["considered"][0]["status"], outcome["calls"], calls),
+                         ("approval_unconfirmed_claim_unknown", 0, []))
+        self.assertTrue(lost_ack)
+        self.assertEqual(first.claims.state(target["task_id"]), worker.STATE_APPROVAL_FAILED)
+        self.assertEqual(first.ledger.days, {})
+        restarted = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                       model=lambda *_: calls.append(1))
+        restarted.pilot_docs = pilot.PilotDocs(self.docs)
+        retry = worker.run_once(restarted)
+        self.assertEqual((retry["considered"][0]["status"], retry["calls"], calls),
+                         ("approval_unconfirmed", 0, []))
+        self.assertEqual(restarted.claims.state(target["task_id"]), worker.STATE_DONE)
+        self.assertEqual(self.docs.documents[self.doc]["text"].count(
+            "FAILED - task " + target["task_id"]), 1)
+        self.assertNotIn("UNKNOWN - task " + target["task_id"],
+                         self.docs.documents[self.doc]["text"])
+
+    def test_refund_claim_commits_then_loses_ack_and_retries_failed_receipt(self):
+        self._post_refund_cas_probe(commit_then_lose_ack=True)
+
+    def test_post_refund_claim_failure_before_commit_holds_for_manual_reconciliation(self):
+        self._post_refund_cas_probe(commit_then_lose_ack=False)
+
+    def _post_refund_cas_probe(self, *, commit_then_lose_ack):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_eval = self.redis.eval
+        cas_attempts = 0
+
+        class RevokingLedger(worker.MemoryLedger):
+            def __init__(self):
+                super().__init__()
+                self.refunds = 0
+
+            def reserve(self, day, cents, cap, *args):
+                admitted = super().reserve(day, cents, cap, *args)
+                redis.values.pop(approval, None)
+                return admitted
+
+            def settle(self, day, delta):
+                self.refunds += 1
+                return super().settle(day, delta)
+
+        def eval_with_cas_fault(script, keys, *args):
+            nonlocal cas_attempts
+            if (script == worker.CAS_LUA and args[1] == worker.STATE_APPROVAL_REFUND_UNKNOWN
+                    and args[2] == worker.STATE_APPROVAL_FAILED):
+                cas_attempts += 1
+                if commit_then_lose_ack:
+                    self.assertEqual(original_eval(script, keys, *args), 1)
+                    raise TimeoutError("post-refund claim acknowledgement lost")
+                return 0  # no commit; manual hold cannot safely retry a possible refund
+            return original_eval(script, keys, *args)
+
+        redis = self.redis
+        self.redis.eval = eval_with_cas_fault
+        calls = []
+        ledger = RevokingLedger()
+        first = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                   model=lambda *_: calls.append(1))
+        first.pilot_docs = pilot.PilotDocs(self.docs)
+        first.ledger = ledger
+        outcome = worker.run_once(first)
+        self.assertEqual((outcome["considered"][0]["status"], outcome["calls"], calls),
+                         ("approval_unconfirmed_reservation_unknown", 0, []))
+        self.assertEqual((cas_attempts, ledger.refunds, ledger.days),
+                         (1, 1, {"2026-10-10": 0}))
+        expected = (worker.STATE_APPROVAL_FAILED if commit_then_lose_ack
+                    else worker.STATE_APPROVAL_REFUND_UNKNOWN)
+        self.assertEqual(first.claims.state(target["task_id"]), expected)
+        self.assertNotIn("FAILED - task " + target["task_id"],
+                         self.docs.documents[self.doc]["text"])
+        restarted = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                       model=lambda *_: calls.append(1))
+        restarted.pilot_docs = pilot.PilotDocs(self.docs)
+        restarted.ledger = ledger
+        retry = worker.run_once(restarted)
+        expected_status = ("approval_unconfirmed" if commit_then_lose_ack
+                           else "approval_unconfirmed_reservation_unknown")
+        self.assertEqual((retry["considered"][0]["status"], retry["calls"], calls),
+                         (expected_status, 0, []))
+        self.assertEqual((cas_attempts, ledger.refunds, ledger.days),
+                         (1, 1, {"2026-10-10": 0}))
+        self.assertEqual(self.docs.documents[self.doc]["text"].count(
+            "FAILED - task " + target["task_id"]), int(commit_then_lose_ack))
+        self.assertNotIn("UNKNOWN - task " + target["task_id"],
+                         self.docs.documents[self.doc]["text"])
+
     def test_approval_removed_during_reservation_refunds_unstarted_call(self):
         self.fresh()
         self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
@@ -423,6 +679,60 @@ class PhoneIntakeTests(unittest.TestCase):
         self.assertEqual(worker.run_once(deps)["status"], "target_unavailable")
         self.assertNotIn("fleet:worker:inbox_scan:claude-api", self.redis.values)
 
+    def test_refunded_unstarted_call_retries_failed_receipt_without_second_refund(self):
+        self.fresh()
+        self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
+        target = self.target()
+        self.assertTrue(pilot.target_ready(pilot.run_prepass(
+            self.redis, self.docs, enabled=True, target=target), target))
+        approval = pilot._approval_key(self.doc, target["request_id"])
+        original_append = self.docs.append
+        failure_writes = 0
+
+        class RevokingLedger(worker.MemoryLedger):
+            def __init__(self):
+                super().__init__()
+                self.refunds = 0
+
+            def reserve(self, day, cents, cap, *args):
+                admitted = super().reserve(day, cents, cap, *args)
+                self_redis.values.pop(approval, None)
+                return admitted
+
+            def settle(self, day, delta):
+                self.refunds += 1
+                return super().settle(day, delta)
+
+        def append(file_id, revision, receipt_id, receipt):
+            nonlocal failure_writes
+            if "FAILED - task" in receipt and failure_writes < 2:
+                failure_writes += 1
+                raise TimeoutError("failure receipt unavailable")
+            return original_append(file_id, revision, receipt_id, receipt)
+
+        self_redis = self.redis
+        self.docs.append = append
+        ledger = RevokingLedger()
+        calls = []
+        claims = worker.RedisClaims(self.redis)
+        deps = self.targeted_deps(target, claims=claims, model=lambda *_: calls.append(1))
+        deps.pilot_docs = pilot.PilotDocs(self.docs)
+        deps.ledger = ledger
+        first = worker.run_once(deps)
+        self.assertEqual(first["considered"][0]["status"], "approval_unconfirmed_receipt_owed")
+        self.assertEqual(first["considered"][0]["ledger"], "unstarted_reservation_released")
+        self.assertEqual((ledger.refunds, ledger.days), (1, {"2026-10-10": 0}))
+        restarted = self.targeted_deps(target, claims=worker.RedisClaims(self.redis),
+                                       model=lambda *_: calls.append(1))
+        restarted.pilot_docs = pilot.PilotDocs(self.docs)
+        restarted.ledger = ledger
+        again = worker.run_once(restarted)
+        self.assertEqual((again["considered"][0]["status"], again["calls"], calls),
+                         ("approval_unconfirmed", 0, []))
+        self.assertEqual((ledger.refunds, ledger.days), (1, {"2026-10-10": 0}))
+        self.assertNotIn("UNKNOWN - task " + target["task_id"],
+                         self.docs.documents[self.doc]["text"])
+
     def test_unconfirmed_refund_after_approval_loss_keeps_reservation_for_reconciliation(self):
         self.fresh()
         self.docs.add_request(self.doc, block("owner-20261011-02", "Handle the second change."))
@@ -450,7 +760,11 @@ class PhoneIntakeTests(unittest.TestCase):
                          "approval_unconfirmed_reservation_unknown")
         self.assertEqual((result["calls"], calls), (0, []))
         self.assertEqual(deps.ledger.days, {"2026-10-10": 2})
-        self.assertEqual(worker.run_once(deps)["status"], "target_unavailable")
+        again = worker.run_once(deps)
+        self.assertEqual(again["considered"][0]["status"],
+                         "approval_unconfirmed_reservation_unknown")
+        self.assertEqual((again["calls"], calls, deps.ledger.days),
+                         (0, [], {"2026-10-10": 2}))
 
     def test_targeted_pilot_ignores_concurrent_unrelated_stream_append(self):
         self.fresh()

@@ -32,6 +32,8 @@ DOC_IDS = (
 DOC_SET = frozenset(DOC_IDS)
 TARGET_FIELDS = ("source_doc_id", "source_revision", "request_id", "task_id", "recipient_id")
 TARGET_LOOKBACK = 500
+APPROVAL_RECEIPT_OWED = "approval_failed"
+APPROVAL_REFUND_UNKNOWN = "approval_refund_unknown"
 BASELINE_TTL = 30 * 86400
 APPROVAL_TTL = 30 * 86400
 BEGIN = "BEGIN OWNER REQUEST"
@@ -307,12 +309,22 @@ def admitted(fields, client) -> bool:
 class PilotInbox:
     """Keep the laptop lane's inbox untouched; admit only approved API tasks."""
 
-    def __init__(self, inbox, client, target=None):
-        self.inbox, self.client, self.target = inbox, client, target
+    def __init__(self, inbox, client, target=None, claims=None):
+        self.inbox, self.client, self.target, self.claims = inbox, client, target, claims
 
     def target_approved_now(self, fields):
         return (self.target is not None and _entry_tuple(fields) == self.target and
                 admitted(fields, self.client) and _issued_matches(self.client, self.target))
+
+    def target_recovery_owed(self, fields):
+        if self.target is None or self.claims is None or _entry_tuple(fields) != self.target:
+            return False
+        try:
+            state = self.claims.state(self.target["task_id"])
+            return state is not None and state.split(":", 1)[0] in (
+                APPROVAL_RECEIPT_OWED, APPROVAL_REFUND_UNKNOWN)
+        except Exception:
+            return False
 
     def read(self, agent, count):
         if self.target is not None:
@@ -325,7 +337,7 @@ class PilotInbox:
             matches = []
             for entry_id, raw in rows:
                 fields = {_as_text(key): _as_text(value) for key, value in raw.items()}
-                if self.target_approved_now(fields):
+                if self.target_approved_now(fields) or self.target_recovery_owed(fields):
                     matches.append((_as_text(entry_id), fields))
             if len(matches) != 1:
                 raise TargetUnavailable("target absent, outside lookup bound, or duplicated")
@@ -499,3 +511,21 @@ def target_ready(outcomes, target):
                     result.get("task") == target["task_id"] and
                     (result.get("status") == "candidate" or result.get("admitted") is True))
                 for result in outcomes))
+
+
+def target_recovery_ready(outcomes, target, claims):
+    """Allow only an already claimed no-call outcome past a lapsed approval."""
+    try:
+        state = claims.state(target["task_id"])
+    except Exception:
+        return False
+    if state is None or state.split(":", 1)[0] not in (
+            APPROVAL_RECEIPT_OWED, APPROVAL_REFUND_UNKNOWN):
+        return False
+    return (len(outcomes) == len(DOC_IDS) and
+            sum(result.get("doc") == target["source_doc_id"] and
+                result.get("status") in ("approval_lapsed", "target_mismatch", "already_approved")
+                for result in outcomes) == 1 and
+            sum(result.get("status") == "non_target" and
+                result.get("doc") != target["source_doc_id"]
+                for result in outcomes) == len(DOC_IDS) - 1)

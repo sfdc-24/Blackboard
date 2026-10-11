@@ -155,6 +155,8 @@ STATE_ACCEPTED = "accepted"  # accepted:<since>:<attempt>:<rejections> - a call 
 STATE_CAPPED = "capped"      # capped:<day>:<attempt>:<rejections> - the day's cap refused it; tomorrow retries
 STATE_RESULTED = "resulted"  # resulted:<since>:<attempt>:<rejections> - answer stored, terminal line owed
 STATE_UNCERTAIN = "uncertain"  # a call happened, but its result could not be confirmed in the store
+STATE_APPROVAL_FAILED = pilot.APPROVAL_RECEIPT_OWED  # no call; FAILED receipt alone is owed
+STATE_APPROVAL_REFUND_UNKNOWN = pilot.APPROVAL_REFUND_UNKNOWN  # no call; refund needs manual reconciliation
 STATE_DONE = "done"
 
 # Any receipt in the shared shape, by anyone: "<STATE> - task <id> - request .. - rev .. - recipient .. - by <who> - "
@@ -479,6 +481,12 @@ def consider(entry_id, fields: dict, deps) -> dict:
         out["status"] = "done"
         return out
 
+    if phase == STATE_APPROVAL_FAILED:
+        return _finish_approval_failure(deps, tuple_, text, current, out)
+    if phase == STATE_APPROVAL_REFUND_UNKNOWN:
+        out["status"] = "approval_unconfirmed_reservation_unknown"
+        return out
+
     if phase in (STATE_RESULTED, STATE_UNCERTAIN):
         # The answer exists; only its line is owed. No model call, whatever the lease says.
         if phase == STATE_RESULTED:
@@ -675,7 +683,16 @@ def _pilot_approval_live(deps, fields):
 
 
 def _stop_unstarted_for_approval(deps, tuple_, text, current, out, day=None, reserve_cents=0):
-    """The provider was not called; release only a confirmed admission reservation."""
+    """Persist the no-call outcome before any refund or fallible receipt write."""
+    task_id = tuple_["task_id"]
+    pending = (STATE_APPROVAL_REFUND_UNKNOWN if reserve_cents else STATE_APPROVAL_FAILED)
+    try:
+        moved = deps.claims.advance(task_id, current, pending)
+    except Exception:
+        moved = False
+    if not moved:
+        out["status"] = "approval_unconfirmed_claim_unknown"
+        return out
     if reserve_cents:
         try:
             deps.ledger.settle(day, -int(reserve_cents))
@@ -683,6 +700,18 @@ def _stop_unstarted_for_approval(deps, tuple_, text, current, out, day=None, res
         except Exception:
             out["status"] = "approval_unconfirmed_reservation_unknown"
             return out  # uncertain ledger state requires manual reconciliation
+        try:
+            moved = deps.claims.advance(task_id, pending, STATE_APPROVAL_FAILED)
+        except Exception:
+            moved = False
+        if not moved:
+            out["status"] = "approval_unconfirmed_reservation_unknown"
+            return out  # never repeat a refund after an uncertain claim update
+    return _finish_approval_failure(deps, tuple_, text, STATE_APPROVAL_FAILED, out)
+
+
+def _finish_approval_failure(deps, tuple_, text, current, out):
+    """Retry only the FAILED receipt; this claim can never reach inference."""
     out["receipt"] = write_receipt(deps, tuple_, text, FAILED, deps.at,
                                    "pilot approval not confirmed before inference; no provider call")
     if out["receipt"] in ("written", "no_receipt_writer"):
@@ -807,6 +836,11 @@ def _recover_pilot_result(deps, tuple_, text, out):
         out.update(status="claim_error", error=type(exc).__name__)
         return out
     phase, _middle, attempt, rejected = _split(current)
+    if phase == STATE_APPROVAL_FAILED:
+        return _finish_approval_failure(deps, tuple_, text, current, out)
+    if phase == STATE_APPROVAL_REFUND_UNKNOWN:
+        out["status"] = "approval_unconfirmed_reservation_unknown"
+        return out
     if phase == STATE_RESULTED:
         return _finish_from_store(deps, tuple_, text, current, attempt, out)
     if phase not in (STATE_ACCEPTED, STATE_UNCERTAIN):
@@ -1435,13 +1469,15 @@ def main():  # pragma: no cover - the job entry point
         print(json.dumps({"status": "no_docs", "error": type(exc).__name__}))
     board = AppendBoard() if os.environ.get("BUS_URL") and os.environ.get("BUS_SECRET") else None
     intake = pilot.run_prepass(client, docs, enabled=True, target=target) if pilot_enabled else None
-    if pilot_enabled and not pilot.target_ready(intake, target):
+    if pilot_enabled and not (pilot.target_ready(intake, target) or
+            (client is not None and pilot.target_recovery_ready(
+                intake, target, RedisClaims(client)))):
         print(json.dumps({"status": "pilot_hold", "intake": intake}, sort_keys=True))
         return 1
     deps = deps_from_env(client=client, docs=docs, board=board)
     if pilot_enabled and client is not None and docs is not None:
         # Only the exact approved tuple can reach the ordinary worker path.
-        deps.inbox = pilot.PilotInbox(deps.inbox, client, target=target)
+        deps.inbox = pilot.PilotInbox(deps.inbox, client, target=target, claims=deps.claims)
         deps.pilot_docs = pilot.PilotDocs(docs)
     out = run_once(deps)
     if pilot_enabled:
