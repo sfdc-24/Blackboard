@@ -1614,5 +1614,145 @@ class FeedTest(unittest.TestCase):
         self.assertTrue(second["complete"])
 
 
+trail_spec = importlib.util.spec_from_file_location("drive_trail", REPO / "cloud" / "drive-intake" / "trail.py")
+trail_mod = importlib.util.module_from_spec(trail_spec)
+trail_spec.loader.exec_module(trail_mod)
+
+
+def worker_line(state, t, at, by="claude-api", detail="", rid="feedfeedfeedfeed"):
+    """A line the worker or the lane writes: the shared shape, by a worker, ending with its id."""
+    parts = [state, "task " + t["task_id"], "request " + t["request_id"], "rev " + t["source_revision"][:12],
+             "recipient " + by, "by " + by, at]
+    if detail:
+        parts.append(detail)
+    parts.append("id " + rid)
+    return " - ".join(parts)
+
+
+class TrailPageTest(unittest.TestCase):
+    """Step 4: the page reads the trail. Receipts and the answer lines, never the request."""
+
+    def trail_doc(self):
+        d = deps(ring=di.polled_ring)
+        out = di.decide(hint(), d)
+        self.assertEqual("dispatched", out["status"], out)
+        t = out["tuple"]
+        d.docs.text = (REQUEST + d.receipts.text()
+                       + worker_line("ACCEPTED", t, "2026-10-11T04:05:00Z", detail="attempt 1 - lease until 2026-10-11T04:15:00Z - model x", rid="aaaaaaaaaaaaaaaa") + "\n"
+                       + worker_line("SUCCEEDED", t, "2026-10-11T04:05:09Z", detail="model x - tokens in 1200 out 300 - 1 cents CAD", rid="bbbbbbbbbbbbbbbb") + "\n"
+                       + "> The answer.\n> FOR THE LAPTOP:\n> nothing\n")
+        d.docs.receipts = None
+        d.docs.revision = "r7"
+        return d, t
+
+    def test_the_parser_reads_every_writer_and_groups_the_answer_under_its_line(self):
+        d, t = self.trail_doc()
+        entries = trail_mod.parse(d.docs.text)
+        self.assertEqual(["REQUESTED", "DISPATCHED", "ACCEPTED", "SUCCEEDED"], [e["state"] for e in entries])
+        self.assertEqual(["drive-intake", "drive-intake", "claude-api", "claude-api"], [e["by"] for e in entries])
+        self.assertEqual("on fleet:inbox:claude-api, which the worker polls; no wake rung", entries[1]["detail"])
+        self.assertEqual("attempt 1 - lease until 2026-10-11T04:15:00Z - model x", entries[2]["detail"])
+        self.assertEqual("aaaaaaaaaaaaaaaa", entries[2]["id"])
+        self.assertEqual(di.receipt_id_for(t, "REQUESTED"), entries[0]["id"])
+        self.assertEqual(["The answer.", "FOR THE LAPTOP:", "nothing"], entries[3]["result"])
+        self.assertEqual([], entries[2]["result"])
+        self.assertEqual([t["task_id"]], trail_mod.tasks_of(entries))
+        self.assertEqual("SUCCEEDED", trail_mod.latest(entries, t["task_id"])["state"])
+        self.assertIsNone(trail_mod.latest(entries, "task-0000000000000000"))
+        # the request's own words are not in any entry
+        self.assertNotIn("broken telephone", json.dumps(entries))
+
+    def test_the_parser_ignores_prose_and_bounds_the_answer(self):
+        text = ("hello - task task-0123456789abcdef - request x\n"                       # not the shape
+                "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - id cccccccccccccccc\n"
+                + "".join("> line %d\n" % i for i in range(205)))
+        entries = trail_mod.parse(text)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("", entries[0]["detail"])
+        self.assertEqual(201, len(entries[0]["result"]))
+        self.assertEqual("[answer cut here at 200 lines]", entries[0]["result"][-1])
+        self.assertEqual([], trail_mod.parse("> an answer with no line above it\n"))
+        long_line = "SUCCEEDED - task task-0123456789abcdef - request R - rev abc - recipient claude-api - by claude-api - 2026-10-11T04:05:09Z - " + "d" * 900 + " - id cccccccccccccccc"
+        self.assertEqual(400, len(trail_mod.parse(long_line)[0]["detail"]))
+
+    def test_the_route_wants_the_token_first_then_the_flag_then_a_file_id(self):
+        d, t = self.trail_doc()
+        self.assertEqual(401, di.handle("GET", "/trail?doc=" + FILE, {}, b"", d)[0])
+        self.assertEqual(401, di.handle("GET", "/trail?doc=" + FILE, {"Authorization": "Bearer nope"}, b"", d)[0])
+        off = deps(enabled=False)
+        self.assertEqual((200, {"enabled": False, "trail": None}),
+                         di.handle("GET", "/trail?doc=" + FILE, {"X-Drive-Intake-Poll-Token": "poll"}, b"", off))
+        self.assertEqual(0, off.docs.reads)
+        self.assertEqual(400, di.handle("GET", "/trail?doc=short", {"Authorization": "Bearer poll"}, b"", d)[0])
+        self.assertEqual(400, di.handle("GET", "/trail", {"Authorization": "Bearer poll"}, b"", d)[0])
+        status, out = di.handle("GET", "/trail?doc=" + FILE, {"Authorization": "Bearer poll"}, b"", d)
+        self.assertEqual(200, status)
+        self.assertEqual("ok", out["status"])
+        self.assertEqual((FILE, "r7", t["task_id"], "OT-20261010"), (out["doc"], out["revision"], out["task"], out["request"]))
+        self.assertEqual(["REQUESTED", "DISPATCHED", "ACCEPTED", "SUCCEEDED"], [e["state"] for e in out["entries"]])
+        self.assertEqual([t["task_id"]], out["tasks"])
+        self.assertNotIn("broken telephone", json.dumps(out))
+
+    def test_the_live_state_comes_from_redis_and_reads_unknown_when_it_cannot(self):
+        d, t = self.trail_doc()
+        d.claims.beats["fleet:worker:claim:" + t["task_id"]] = "done"
+        d.claims.beats["fleet:worker:woke:" + t["task_id"]] = "rung"
+        d.claims.pending_add(FILE)
+        laptop_up(d)
+        d.claims.beats["claude-api"] = 900.0
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual({"laptop": "online", "api_worker": "online", "intake": "dispatched", "pending": True,
+                          "worker_claim": "done", "doorbell": "rung"}, out["live"])
+        d.claims.beats["claude-api"] = 99.0
+        laptop_down(d)
+        d.claims.pending_remove(FILE)
+        del d.claims.beats["fleet:worker:claim:" + t["task_id"]]
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual({"laptop": "offline", "api_worker": "offline", "intake": "dispatched", "pending": False,
+                          "worker_claim": "none", "doorbell": "rung"}, out["live"])
+        d.claims.states[di.idempotency_key(t)] = "delivering:claude-api:1000:q"
+        self.assertEqual("delivering:claude-api", di.trail_for_doc(d, FILE)["live"]["intake"])
+
+        class Broken(di.MemoryClaims):
+            def worker_state(self, task_id):
+                raise ConnectionError()
+        d.claims = Broken()
+        self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["worker_claim"])
+        d.claims = None
+        self.assertEqual("unknown", di.trail_for_doc(d, FILE)["live"]["laptop"])
+
+    def test_a_doc_outside_the_folder_unreadable_or_without_a_request_is_said_so(self):
+        d, _t = self.trail_doc()
+        d.docs.folder = "elsewhere"
+        self.assertEqual("out_of_scope", di.trail_for_doc(d, FILE)["status"])
+
+        class Broken(Docs):
+            def read(self, file_id):
+                raise ConnectionError()
+        d.docs = Broken(REQUEST)
+        self.assertEqual("read_error", di.trail_for_doc(d, FILE)["status"])
+        d = deps(docs=Docs(text="\nRECEIPTS\n"))
+        out = di.trail_for_doc(d, FILE)
+        self.assertEqual(("ok", None, None, []), (out["status"], out["task"], out["request"], out["entries"]))
+        self.assertEqual("no_store", di.trail_for_doc(deps(docs=None), FILE)["status"])
+
+    def test_the_redis_adapter_reads_the_workers_keys_and_never_writes_them(self):
+        class Client:
+            def __init__(self):
+                self.kv, self.writes = {"fleet:worker:claim:task-1": b"accepted:1:1:0", "fleet:worker:woke:task-1": "rung"}, []
+
+            def get(self, key):
+                return self.kv.get(key)
+
+            def set(self, *a, **k):
+                self.writes.append(a)
+        c = Client()
+        claims = di.RedisClaims(c)
+        self.assertEqual("accepted:1:1:0", claims.worker_state("task-1"))
+        self.assertEqual("rung", claims.doorbell_state("task-1"))
+        self.assertIsNone(claims.worker_state("task-2"))
+        self.assertEqual([], c.writes)
+
+
 if __name__ == "__main__":
     unittest.main()
